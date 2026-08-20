@@ -18,6 +18,21 @@ jobs:
       - run: python -m pip install -e .
       - run: python -m unittest discover -s tests -v
       - run: python -m json.tool manifests/components.json >/dev/null
+      - name: Verify CRSA source digest
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path("manifests/components.json").read_text())
+          crsa = next(item for item in manifest["components"] if item["name"] == "CRSA")
+          expected = crsa["revision"].removeprefix("sha256:")
+          actual = hashlib.sha256(Path(crsa["integration"]).read_bytes()).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"CRSA digest mismatch: {actual} != {expected}")
+          print(actual)
+          PY
 
   neural:
     runs-on: ubuntu-latest
