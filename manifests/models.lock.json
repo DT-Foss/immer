@@ -1,0 +1,33 @@
+{
+  "schema": "immer-models-lock-v1",
+  "policy": "models are external resources; IMMER never downloads them implicitly",
+  "models": [
+    {
+      "name": "LFM2.5-1.2B-Instruct",
+      "source": "LiquidAI/LFM2.5-1.2B-Instruct",
+      "format": "GGUF or safetensors",
+      "sha256": null,
+      "local_env": "IMMER_LFM_MODEL",
+      "optional": true,
+      "notes": "Required only for Liquid-QAD/CRSA deployment modes."
+    },
+    {
+      "name": "FERTIG-HSSLM",
+      "source": "local FERTIG data/hsslm_form_v7.pt",
+      "format": "torch checkpoint",
+      "sha256": null,
+      "local_env": "IMMER_FERTIG_CHECKPOINT",
+      "optional": true,
+      "notes": "The exact solver does not require this checkpoint."
+    },
+    {
+      "name": "donor-models",
+      "source": "local experiment manifests",
+      "format": "external checkpoint",
+      "sha256": null,
+      "local_env": "IMMER_DONOR_MODEL",
+      "optional": true,
+      "notes": "Organ distillation references output distributions; donor weights are never published here."
+    }
+  ]
+}

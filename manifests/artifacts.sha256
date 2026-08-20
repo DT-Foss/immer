@@ -1,0 +1,6 @@
+# No large artifacts are shipped by IMMER.
+# External artifact digests inspected during assembly:
+54a664624a348d9cdd7dcfca79f924090652f57a2d5e27d1aa533a7d4dc72dee  external://self-verification_fable/neue attention/crsa_nope_moonshot/crsa_3way_audit.json
+af2c52c2cdf22c8f03ac27eec0d2b4fe5d0bf75212da5b990433321aeab690c9  external://Liquid-QAD/artifacts/crsa_precision_islands.json
+837a31f30a5fead2cf9c5e04b148d3fa14c0ecd3e776b0bf68faf06b2165be08  external://FLCA/MANIFEST.sha256
+6891bfb9fcd39e37b7ec2a8d15c0f71d40b18dc73fbe0ca5aa74cbf6dce60be0  external://FORGE/forge/docs/MICROCORTEX_PROVENANCE.json

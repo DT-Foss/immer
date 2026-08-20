@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "immer"
+version = "0.1.0"
+description = "A provenance-first integration shell for persistent neuro-symbolic runtimes."
+requires-python = ">=3.11"
+authors = [{name = "David Tom Foss"}]
+readme = "README.md"
+license = {file = "NOTICE.md"}
+dependencies = []
+
+[project.scripts]
+immer = "immer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

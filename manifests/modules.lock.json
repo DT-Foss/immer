@@ -1,0 +1,61 @@
+{
+  "schema": "immer-modules-lock-v1",
+  "modules": [
+    {
+      "module": "immer.core",
+      "integrated_path": "src/immer/core",
+      "origin_repo": "new:immer",
+      "origin_commit": "working-tree",
+      "origin_path": "integration contracts and bootstrap runtime",
+      "policy": "owned by IMMER"
+    },
+    {
+      "module": "immer.cognition.fertig",
+      "integrated_path": "src/immer/cognition/fertig/adapter.py",
+      "origin_repo": "DT-Foss/FERTIG",
+      "origin_commit": "edea94a4a25fd639cbc02328ceb06489bb3c0170",
+      "origin_path": "fertig/solver.py",
+      "policy": "adapter only; no silent weight transfer"
+    },
+    {
+      "module": "immer.runtimes.o1_state",
+      "integrated_path": "src/immer/runtimes/o1_state/adapter.py",
+      "origin_repo": "DT-Foss/o1-state",
+      "origin_commit": "bb5e443f1b101dac0faedc25d3450343b59c93cd",
+      "origin_path": "src and runtime documentation",
+      "policy": "explicit host boundary; no private API guessing"
+    },
+    {
+      "module": "immer.capabilities.organbank",
+      "integrated_path": "src/immer/capabilities/organbank/adapter.py",
+      "origin_repo": "local:self-verification_fable",
+      "origin_commit": "1331f4f7641b69bcde20bb8bda6ba9581df46813",
+      "origin_path": "mirkoNN-analysis/s3/wesen_organbank.py",
+      "policy": "manifest and digest boundary; weights remain external"
+    },
+    {
+      "module": "immer.attention.crsa",
+      "integrated_path": "src/immer/attention/crsa",
+      "origin_repo": "local:self-verification_fable",
+      "origin_commit": "1331f4f7641b69bcde20bb8bda6ba9581df46813",
+      "origin_path": "neue attention/operators.py",
+      "policy": "measured backend reference; no weights copied"
+    },
+    {
+      "module": "immer.compiler.flca",
+      "integrated_path": "src/immer/compiler/flca/adapter.py",
+      "origin_repo": "DT-Foss/FLCA + local:Liquid-QAD",
+      "origin_commit": "fdfde800dc121da125606f668940b2b539d9097b",
+      "origin_path": "components/spectral-regime-router; qad/flca_router.py",
+      "policy": "route only admitted evidence families"
+    },
+    {
+      "module": "immer.deployment.foss_qad",
+      "integrated_path": "src/immer/deployment/foss_qad",
+      "origin_repo": "local:Liquid-QAD",
+      "origin_commit": "working-tree",
+      "origin_path": "qad/fertig_bridge.py and qad/attention_backend.py",
+      "policy": "optional, model-dependent, acceptance-gated"
+    }
+  ]
+}

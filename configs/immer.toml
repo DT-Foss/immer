@@ -1,0 +1,13 @@
+[runtime]
+default_capability = "exact_math"
+abstain_on_backend_error = true
+
+[paths]
+# Optional local resources; no model is downloaded automatically.
+fertig_root_env = "IMMER_FERTIG_ROOT"
+o1_root_env = "IMMER_O1_ROOT"
+lfm_model_env = "IMMER_LFM_MODEL"
+
+[policy]
+weight_transfer = "none"
+unknown_capability = "hold_for_evidence"
