@@ -1,13 +1,7 @@
-# Notice
+# IMMER Notice
 
-IMMER is an integration shell and provenance record assembled from several
-independent research workspaces. It does not relicense, vend, or replace those
-projects. Consult each upstream repository's license and publication notice
-before copying code, models, checkpoints, or evidence artifacts.
+IMMER integrates independently developed cognitive, state, capability, attention, compilation and deployment components behind a common runtime contract.
 
-The repository intentionally excludes model weights, Hugging Face caches,
-private evidence archives, build outputs, and local experiment databases.
-Their locations and digests are recorded only when they are safe and useful to
-identify, never as a redistribution mechanism.
+Large model weights, checkpoints, caches and private experiment archives are not distributed in this repository. Canonical external components and revisions are recorded in `manifests/components.json`.
 
 Copyright (c) 2026 David Tom Foss.

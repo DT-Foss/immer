@@ -1,5 +1,3 @@
-"""FERTIG integration boundary."""
+from .adapter import FertigSolver
 
-from ...adapters import FertigAdapter
-
-__all__ = ["FertigAdapter"]
+__all__ = ["FertigSolver"]

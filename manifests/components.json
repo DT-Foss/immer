@@ -1,0 +1,47 @@
+{
+  "schema": "immer.components.v1",
+  "components": [
+    {
+      "name": "FERTIG",
+      "role": "grounded cognition",
+      "repository": "https://github.com/DT-Foss/FERTIG",
+      "revision": "d8c47117f5fc36f4fbd51f0fe7ac9737d19927b1",
+      "integration": "src/immer/cognition/fertig/adapter.py"
+    },
+    {
+      "name": "o1-state",
+      "role": "persistent O(1)-state host",
+      "repository": "https://github.com/DT-Foss/o1-state",
+      "revision": "bb5e443f1b101dac0faedc25d3450343b59c93cd",
+      "integration": "external canonical component"
+    },
+    {
+      "name": "FLCA",
+      "role": "evidence-typed compilation and replay",
+      "repository": "https://github.com/DT-Foss/FLCA",
+      "revision": "fdfde800dc121da125606f668940b2b539d9097b",
+      "integration": "external canonical component"
+    },
+    {
+      "name": "CRSA",
+      "role": "causal attention routing",
+      "repository": null,
+      "revision": "sha256:4ec7da81a72cfc5ce968e38787d962a197de52db868df68c698f0720671729a4",
+      "integration": "src/immer/attention/crsa/operators.py"
+    },
+    {
+      "name": "OrganBank",
+      "role": "digest-addressed structural capabilities",
+      "repository": null,
+      "revision": "paper:v0.1",
+      "integration": "src/immer/capabilities/organbank/bank.py"
+    },
+    {
+      "name": "QAD",
+      "role": "precision-aware deployment",
+      "repository": null,
+      "revision": "external",
+      "integration": "external model/compiler artifacts"
+    }
+  ]
+}

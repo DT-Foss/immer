@@ -1,12 +1,10 @@
 cff-version: 1.2.0
-title: "IMMER: persistent neuro-symbolic integration runtime"
-message: "If you use IMMER, cite the repository and the specific upstream component commits listed in manifests/sources.json."
+title: "IMMER"
+message: "If you use IMMER, cite this repository and the canonical component revisions recorded in manifests/components.json."
 type: software
 authors:
   - family-names: Foss
     given-names: David Tom
-    orcid: ""
 repository-code: "https://github.com/DT-Foss/immer"
-license: "NOASSERTION"
-version: "0.1.0"
+version: "0.2.0"
 date-released: "2026-08-20"
