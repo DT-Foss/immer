@@ -1,6 +1,6 @@
-"""IMMER integration contracts and fail-closed runtime."""
+"""IMMER unified cognitive runtime."""
 
-from .core.contracts import BackendStatus, SolveRequest, SolveResult
-from .core.runtime import ImmerRuntime
+from .contracts import ExecutionStatus, Request, Result
+from .runtime import ImmerRuntime
 
-__all__ = ["BackendStatus", "ImmerRuntime", "SolveRequest", "SolveResult"]
+__all__ = ["ExecutionStatus", "ImmerRuntime", "Request", "Result"]

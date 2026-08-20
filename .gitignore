@@ -9,13 +9,14 @@ build/
 *.egg-info/
 .DS_Store
 
-# Checkpoints, model caches, and local evidence archives stay outside git.
 *.pt
 *.pth
 *.safetensors
 *.gguf
 *.ckpt
+*.onnx
+*.npz
 models/
+checkpoints/
+hf-cache/
 artifacts/private/
-extern/*
-!extern/README.md

@@ -1,1 +1,1 @@
-"""Attention backends."""
+"""Neural routing components."""

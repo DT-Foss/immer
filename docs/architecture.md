@@ -1,49 +1,143 @@
-# IMMER architecture
+# IMMER Architecture
 
-## Ownership
+IMMER is the integration runtime for a modular cognitive system. It keeps cognition, persistent state, structured capabilities, neural routing, compilation and deployment as distinct planes connected by explicit contracts.
 
-IMMER owns only the integration contracts, routing policy, adapters, manifests,
-and cross-component tests. The upstream projects own their model/runtime
-implementations and research claims.
+## 1. Control plane
 
-| Layer | Owner | Boundary |
-| --- | --- | --- |
-| Meaning and exact arithmetic | FERTIG | `solve(text) -> answer | abstain` |
-| Persistent sequential host | o1-state / gssm | host-specific runtime adapter |
-| Capability sidecars | OrganBank / grafting | digest-bound organ load and route |
-| Causal attention | CRSA | measured attention backend/plan |
-| Evidence and replay | FLCA / FORGE | typed route, compile, replay |
-| Deployment compiler | Liquid-QAD | precision plan and acceptance evidence |
-| Integration | IMMER | contracts, policy, provenance |
+### FERTIG
 
-## Runtime flow
+FERTIG owns grounded interpretation and explicit cognitive structure:
 
 ```text
-request
-  │
-  ▼
-CapabilityRouter ── no safe route ──> abstain
-  │
-  ├── exact_math ──> FertigAdapter ──> exact answer / abstain
-  ├── persistent_state ──> O1StateAdapter ──> external runtime result
-  ├── evidence_route ──> FLCAAdapter ──> route / hold
-  └── attention_plan ──> CRSA/QAD external plan reference
+world / observation
+  → grounding
+  → binding / semantic structure
+  → plan
+  → skill or tool selection
+  → verification
 ```
 
-No adapter is allowed to convert “backend unavailable” into a guessed answer.
-No recipe projection is a weight transfer. No benchmark artifact becomes a
-claim unless its upstream evidence contract says it may.
+Its neural surface is constrained: learned models rank grounded candidates rather than becoming the source of factual state.
 
-## FERTIG correction
+### IMMER registry
 
-FERTIG is currently integrated as a small exact solver. The active solver order
-is `bindings → semantic → math → miner`, with abstention when no engine can
-prove a result. The older architecture document in the source checkout
-describes a broader compiler framing and is therefore not used as the IMMER
-contract.
+IMMER maps a capability name to exactly one registered component.
 
-## Publication boundary
+```text
+Request(capability, payload, metadata)
+  → ComponentRegistry
+  → Component.handle(...)
+  → Result(status, output, evidence)
+```
 
-Public IMMER contains code that is small enough to audit, source references,
-and reproducibility metadata. Local checkpoints, Hugging Face caches, vendored
-build trees, and private evidence archives remain outside the repository.
+The registry is the common execution contract across symbolic, persistent, organ and neural backends.
+
+### FLCA
+
+FLCA is the compilation and evidence plane. It owns typed operator classification, compiler admission and deterministic replay. IMMER consumes explicit FLCA products through component contracts.
+
+## 2. Persistent-state plane
+
+### o1-state
+
+o1-state is the long-lived O(1)-state host. It supplies the persistent streaming substrate, surprise-gated plasticity, external knowledge index and portable life state. Its repository remains canonical and is pinned in `manifests/components.json`.
+
+Host-specific execution enters IMMER through an explicit component adapter.
+
+## 3. Capability plane
+
+### OrganBank
+
+Structured capabilities live as cold external artifacts. IMMER's in-tree `OrganBank` implements the artifact boundary:
+
+```text
+manifest
+  → OrganDescriptor
+  → capability lookup
+  → SHA-256 verification
+  → verified artifact path
+```
+
+The registry carries artifact metadata while model and organ weights remain external.
+
+The structural recipe behind those artifacts is:
+
+```text
+STRUCTURAL FORM
+      + MAP
+      + ROUTE GATE
+      + CRYSTAL
+```
+
+The host stays frozen while capability is added through explicit structure around it.
+
+## 4. Neural-routing plane
+
+### CRSA
+
+The CRSA production core is included as executable source.
+
+The critical causal path is Log-Prefix:
+
+```text
+causal logits
+  → masked log-softmax
+  → prefix log-usage via logcumsumexp over query rows
+  → usage debit
+  → exact future re-mask
+  → row softmax
+```
+
+Future support remains exactly zero. The integrated tests also verify zero gradient from a current row into future query rows.
+
+CRSA composes three principal routing roles:
+
+- **Local** — recency-biased routing;
+- **Balanced** — Prefix/RAPS usage regulation;
+- **Free** — untouched causal softmax for content-addressable long-range retrieval.
+
+The free-head invariant keeps an unrestricted causal-softmax channel available alongside specialization.
+
+## 5. Deployment plane
+
+QAD is the precision and deployment axis for neural students and hosts. Precision plans and compiled model artifacts remain external to the source repository.
+
+## 6. End-to-end flow
+
+```text
+request / observation
+        │
+        ▼
+      FERTIG
+ grounding + plan
+        │
+        ▼
+   IMMER registry
+        │
+ ┌──────┼───────────┬──────────────┐
+ │      │           │              │
+ ▼      ▼           ▼              ▼
+exact  o1-state   OrganBank      LFM / CRSA
+path   state      capability     neural path
+ │      │           │              │
+ └──────┴─────┬─────┴──────────────┘
+              ▼
+         verification
+              │
+              ▼
+            result
+
+FLCA: compile / evidence / replay across planes
+QAD:  precision / deployment compilation
+```
+
+## 7. Source ownership
+
+- **FERTIG** is canonical in `DT-Foss/FERTIG`;
+- **o1-state** is canonical in `DT-Foss/o1-state`;
+- **FLCA** is canonical in `DT-Foss/FLCA`;
+- **CRSA operators** live in IMMER until they receive a canonical repository;
+- **OrganBank integration** lives in IMMER while organ artifacts remain external;
+- **QAD model artifacts** remain external.
+
+Machine-readable revisions are recorded in `manifests/components.json`.
