@@ -3,6 +3,63 @@
 Alle Änderungen an IMMER. Jeder Eintrag endet mit Deutung + nächster Frage —
 nie mit der nackten Zahl.
 
+## [0.4.0] — 2026-08-21 — Scharfgestellt: es lernt, es spricht, man sieht es
+
+**Ziel:** Aus dem Substrat einen lernenden Organismus machen — mit Qwen-Mund,
+Intent-Gefühl, Gedächtnis und einer Suite: UI für David, Maschinenfutter für Agenten.
+
+### Lernen (Plastizität)
+
+- `runtimes/o1_state/plasticity.py` — `LearningStream`: Surprise-Gate nach dem
+  gemessenen o1-Rezept (rolling-quantile). Nur Überraschendes löst Gradienten-
+  schritte aus; Überraschungen wandern in den Span-Puffer. `sleep()` replayed
+  den Puffer mit kleiner LR und leert ihn (Konsolidierung ohne Drift).
+  torch threads = 1 (Hausregel). Gemessen: Wiederholter Text → EMA fällt;
+  Seed-Determinismus hält.
+
+### Mund (Qwen)
+
+- `runtimes/qwen/adapter.py` — `QwenBrain`: lokales HF-Cache-Qwen als
+  Chat-Fähigkeit. Auflösung: IMMER_QWEN_MODEL → Qwen2.5-1.5B-Instruct
+  Snapshot → 0.5B → offline. transformers-5.x-BatchEncoding abgefangen.
+  Erste Worte des Wesens: „Hallo! Wie kann ich dir helfen?"
+
+### Kopf (Intent + Gedächtnis)
+
+- `intent.py` — regelbasierter Router: TEACH / RECALL / MATH / STATUS / CHAT.
+  Inspektierbar, keine Magie.
+- `memory.py` — `SpanStore`: „merke: …" lehrt, „was weißt du über …" ruft ab.
+  Wissen liegt außerhalb der Gewichte (die Bibliothek wächst durchs Leben),
+  überlebt Neustarts.
+
+### Suite (Metriken)
+
+- `suite.py` — `Metrics` schreibt bei jedem Turn `status.json` (Maschinenfutter:
+  vollständiger Snapshot) und hängt an `metrics.jsonl` (Audit/Graphen).
+- Dashboard: stdlib-HTTP auf :8787 — `/status` = JSON, `/` = dunkle UI mit
+  Live-Karten (Leben, Lernen, Gehirne, Erinnerung, Absichten), Poll alle 2 s.
+
+### Der Scharfsteller-Lauf (live, Mac)
+
+```text
+chat      → [qwen] antwortet (1.5B-Instruct, MPS)
+merke: …  → (gemerkt: immer heisst mein integrationsprojekt)
+was weißt du über sterne? → Überraschung! updates: 1 (Gradientenschritt!)
+John has 5 apples…        → [exact] 5
+/sleep    → {'replayed': 2, 'sleeps': 1}
+/state    → tokens 253 · loss_ema 5.79 (Start: 5.99) · alle Zähler gefüllt
+```
+
+### Deutung + nächste Frage
+
+Der Organismus hört, lernt vom Überraschenden, schläft, erinnert Gelerntes,
+rechnet exakt und redet darüber — und sein Leben ist als JSON ablesbar.
+Zwei Anomalien mit Wert: (1) Das Qwen-1.5B-Weltwissen ist fuzzy („Stellaren",
+falsche Meeresszahlen) — genau die Lücke, die Donor-Bibliothek + Denkmodell-
+Graft schließen sollen; (2) Gesprochenes wird gestreamt, aber nicht automatisch
+als Fakt gespeichert — Auto-Extraktion aus CHAT in Spans ist der nächste Hebel
+(Hebel 2: Donor→Index). Danach: Council mit mehreren Qwen-Rollen live schalten.
+
 ## [0.3.0] — 2026-08-21 — Alles eingepflanzt, alles verdrahtet, erster Lebenszyklus
 
 **Ziel:** Originale unangetastet, alles Arbeitsfähige ins Repo kopiert und

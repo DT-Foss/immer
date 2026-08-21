@@ -80,16 +80,30 @@ def _organs(args: argparse.Namespace) -> int:
 
 
 def _serve(args: argparse.Namespace) -> int:
-    """The organism lives in this terminal: type to it, it remembers."""
-    from .runtimes.o1_state.adapter import O1StateStream, is_available
+    """The organism lives in this terminal: it learns, remembers and answers."""
+    from .intent import classify
+    from .memory import SpanStore
+    from .runtimes.o1_state.adapter import is_available
+    from .runtimes.o1_state.plasticity import LearningStream
+    from .runtimes.qwen.adapter import QwenBrain
+    from .suite import Metrics, start_dashboard
+
+    state = Path(args.state).expanduser()
+    state.parent.mkdir(parents=True, exist_ok=True)
 
     stream = None
     if is_available():
         try:
-            sidecar = Path(args.state).expanduser()
-            stream = O1StateStream(sidecar=sidecar.with_suffix(".pt"))
+            stream = LearningStream(sidecar=state.with_suffix(".pt"))
         except RuntimeError as exc:
-            print(f"· o1-state bridge: {exc}", file=sys.stderr)
+            print(f"· lernender Strom: {exc}", file=sys.stderr)
+    else:
+        print("· o1-state bridge nicht verfügbar — Leben ohne Lernen", file=sys.stderr)
+
+    qwen = QwenBrain()
+    store = SpanStore(state.parent / "memory.json")
+    metrics = Metrics(status_path=state.parent / "status.json", jsonl_path=state.parent / "metrics.jsonl")
+
     bank = None
     organbank = os.environ.get("IMMER_ORGANBANK")
     if organbank and Path(organbank).expanduser().is_file():
@@ -98,8 +112,34 @@ def _serve(args: argparse.Namespace) -> int:
         bank = OrganBank.from_manifest(organbank)
     daemon = LifeDaemon(stream=stream, bank=bank, state_path=args.state)
     daemon.register(FertigSolver())
+
+    history: list[dict[str, str]] = []
+
+    def gauges() -> dict:
+        life = stream.metrics() if stream is not None else {}
+        return {
+            "turns": daemon.turns,
+            "tokens": life.get("tokens", 0),
+            "loss_ema": life.get("loss_ema"),
+            "surprises": life.get("surprises", 0),
+            "updates": life.get("updates", 0),
+            "sleeps": life.get("sleeps", 0),
+            "span_buffer": life.get("span_buffer", 0),
+            "qwen": qwen.loaded,
+            "qwen_model": qwen.model_id,
+            "spans": store.count(),
+        }
+
+    port = None if args.no_dashboard else (args.dashboard or 8787)
+    if port:
+        try:
+            start_dashboard(metrics, gauges, port)
+            print(f"◆ dashboard: http://127.0.0.1:{port}/  (Maschinenfutter: /status)")
+        except OSError as exc:
+            print(f"· dashboard aus: {exc}", file=sys.stderr)
+
     print(f"immer serve — turns alive: {daemon.turns}; organs: {', '.join(daemon.rack.mounted()) or 'none'}")
-    print("commands: /state /say <text> /quit — anything else is experience")
+    print("commands: /state /say <text> /sleep /quit — alles andere ist Erfahrung")
     for line in sys.stdin:
         text = line.strip()
         if not text:
@@ -107,19 +147,63 @@ def _serve(args: argparse.Namespace) -> int:
         if text == "/quit":
             break
         if text == "/state":
-            print(json.dumps(daemon.snapshot(), ensure_ascii=False, sort_keys=True))
+            print(json.dumps(metrics.emit(gauges()), ensure_ascii=False, sort_keys=True))
             continue
         if text.startswith("/say "):
             daemon.say("utterance", text[5:])
             print("(gesagt)")
             continue
-        daemon.submit_user(text)
-        answer = daemon.request("exact_math", text)
-        if answer.ok:
-            print(f"[exact] {answer.output}")
-        elif answer.status.value == "abstained":
-            print("[exact] weiß ich nicht")
-        print(f"(turns: {daemon.turns}, tokens: {getattr(stream, 'tokens', 0)})")
+        if text == "/sleep":
+            if stream is not None:
+                print(f"(konsolidiert: {stream.sleep()})")
+            else:
+                print("(kein Strom zum Konsolidieren)")
+            continue
+
+        intent = classify(text)
+        daemon.submit_user(text)  # das Leben trinkt zuerst alles
+
+        if intent.kind == "TEACH":
+            span = store.teach(intent.payload)
+            metrics.bump("teaches")
+            print(f"(gemerkt: {span['key']})")
+        elif intent.kind == "RECALL":
+            hits = store.recall(intent.payload)
+            metrics.bump("recalls")
+            if hits:
+                for span in hits:
+                    print(f"[erinnerung] {span['text']}")
+            else:
+                print("[erinnerung] da weiß ich noch nichts — lehr mich (merke: …)")
+        elif intent.kind == "MATH":
+            answer = daemon.request("exact_math", intent.payload)
+            if answer.ok:
+                metrics.bump("math_ok")
+                print(f"[exact] {answer.output}")
+            else:
+                metrics.bump("math_abstained")
+                print("[exact] weiß ich nicht")
+        elif intent.kind == "STATUS":
+            metrics.bump("status")
+            print(json.dumps(metrics.snapshot(gauges()), ensure_ascii=False))
+        else:  # CHAT
+            metrics.bump("chat")
+            result = qwen.handle(Request("chat", intent.payload, metadata={
+                "history": history[-6:],
+                "life": f"turns={daemon.turns} tokens={getattr(stream, 'tokens', 0)}",
+            }))
+            if result.ok:
+                print(f"[qwen] {result.output}")
+                history.append({"role": "user", "content": intent.payload})
+                history.append({"role": "assistant", "content": result.output})
+            else:
+                print(f"[stille] (kein Mund: {result.reason})")
+
+        metrics.emit(gauges())
+        life_line = f"turns: {daemon.turns}"
+        if stream is not None:
+            life_line += f", tokens: {stream.tokens}, updates: {stream.updates}, überraschungen: {stream.surprises}"
+        print(f"({life_line})")
     return 0
 
 
@@ -138,6 +222,11 @@ def build_parser() -> argparse.ArgumentParser:
     mount.add_argument("name")
     serve = sub.add_parser("serve", help="let the organism live in this terminal")
     serve.add_argument("--state", default="~/.immer/life.json")
+    serve.add_argument(
+        "--dashboard", nargs="?", const=8787, type=int, default=8787,
+        help="metrics UI port (default 8787)",
+    )
+    serve.add_argument("--no-dashboard", action="store_true", help="disable the metrics UI")
     return parser
 
 
