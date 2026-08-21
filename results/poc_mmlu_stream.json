@@ -1,12 +1,13 @@
 {
   "schema": "immer.benchmark/v1",
   "benchmark": "MMLU:high_school_geography",
-  "gegen": "Qwen/Qwen3-32B",
-  "modell_groesse_gb": 61.0,
+  "gegen": "Qwen/Qwen3.8-27B",
+  "modell_groesse_gb": 51.7,
   "n": 12,
   "accuracy_alpha_router": 0.4167,
-  "bytes_pro_frage_kb": 201.67,
-  "anteil_modell_pct": 0.003782,
-  "sekunden": 107.6,
+  "scorer": "dense+0.3lexik",
+  "bytes_pro_frage_kb": 165.77,
+  "anteil_modell_pct": 0.003666,
+  "sekunden": 28.1,
   "note": "Alpha: Token-Embedding-Aehnlichkeit. Forschungskurve: FFN-Seiten-Routing (KIMI S8)."
 }

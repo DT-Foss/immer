@@ -13,7 +13,9 @@ Byte-Budget wird mitgezählt — die Zahl, die die Demo trägt.
 
 from __future__ import annotations
 
+import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -41,10 +43,39 @@ class Streamer:
         return self._reader
 
     def inventory(self) -> dict[str, Any]:
-        """Header-only-Inventar ohne Payload (der billige Teil)."""
+        """Header-only-Inventar ohne Payload — mit lokalem Cache und Retry
+        gegen CDN-Flakiness."""
         if self._inventory is None:
-            self._inventory = hor.scan_inventory(self.reader, budget=self.budget)
+            cache = self._cache_path()
+            if cache.is_file():
+                document = json.loads(cache.read_text(encoding="utf-8"))
+                if document.get("revision") == self.revision:
+                    self._inventory = document
+                    self._restore_budget_from(document)
+                    return self._inventory
+            last: Exception | None = None
+            for attempt in range(3):
+                try:
+                    self._inventory = hor.scan_inventory(self.reader, budget=self.budget)
+                    break
+                except (ConnectionError, TimeoutError, OSError) as exc:
+                    last = exc
+                    time.sleep(2 * (attempt + 1))
+            if self._inventory is None:
+                raise RuntimeError(f"Inventar nach 3 Versuchen fehlgeschlagen: {last}")
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(self._inventory), encoding="utf-8")
         return self._inventory
+
+    def _cache_path(self) -> Path:
+        slug = self.repo_id.replace("/", "_").replace(".", "-")
+        return Path(__file__).resolve().parents[3] / "results" / f"hf_scan_{slug}.json"
+
+    def _restore_budget_from(self, document: dict[str, Any]) -> None:
+        spent = document.get("budget", {}) or {}
+        body = int(spent.get("bytes_body", spent.get("body", 0)) or 0)
+        if body:
+            self.budget.charge(body, 0, "cache-replay")
 
     def tensors(self) -> list[dict[str, Any]]:
         """Flache Liste aller Tensor-Einträge aus dem Inventar."""

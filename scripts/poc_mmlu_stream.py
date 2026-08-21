@@ -29,7 +29,7 @@ import numpy as np  # noqa: E402
 
 from streamer import Streamer  # noqa: E402
 
-REPO = "Qwen/Qwen3-32B"
+REPO = "Qwen/Qwen3.8-27B"
 CHOICE_KEYS = ["A", "B", "C", "D"]
 
 
@@ -46,6 +46,7 @@ def main() -> int:
     ap.add_argument("--subject", default="high_school_geography")
     ap.add_argument("--limit", type=int, default=30)
     ap.add_argument("--budget-mb", type=float, default=300.0)
+    ap.add_argument("--lexik", type=float, default=0.3)
     args = ap.parse_args()
 
     local = ROOT / "evals" / f"mmlu_{args.subject}_test.parquet"
@@ -75,36 +76,103 @@ def main() -> int:
     tok = PreTrainedTokenizerFast(tokenizer_file=tok_path)
 
     inv = s.inventory()
-    emb = next(t for t in s.tensors() if t["name"] == "model.embed_tokens.weight")
+    all_ts = s.tensors()
+    names = [t["name"] for t in all_ts]
+    emb_name = ("model.embed_tokens.weight" if "model.embed_tokens.weight" in names
+                else next(n for n in names if n.endswith("embed_tokens.weight")))
+    emb = next(t for t in all_ts if t["name"] == emb_name)
     print(f"Inventar: {len(inv['tensors'])} Tensoren, Modell "
-          f"{inv['model_payload_bytes'] / 1024 ** 3:.1f} GB | Ziel-Tensor "
+          f"{inv['model_payload_bytes'] / 1024 ** 3:.1f} GB | Ziel-Tensor {emb_name} "
           f"{emb['bytes'] / 1048576:.0f} MB\n")
 
     def vec(text: str) -> tuple[np.ndarray, int]:
-        """Mittelwert der embed_tokens-Zeilen aller Tokens — jede benoetigte
-        Zeile wird EINZELN gestreamt (fetch_uniform_rows: merge bei Luecke
-        <32 KB, sonst eigener Request). Kein contiguous Overfetch."""
-        ids = tok.encode(text, add_special_tokens=False)
+        """IDF-gewichtete Mittelung der embed_tokens-Zeilen — Stoppwörter und
+        Satzzeichen fliegen raus, seltene Tokens tragen mehr (IR-Standard).
+        Jede benötigte Zeile wird einzeln gestreamt (merge <32 KB)."""
+        ids = tok.encode(text.lower(), add_special_tokens=False)
+        toks = tok.convert_ids_to_tokens(ids)
         n_cols = int(emb["shape"][1])
-        uniq = sorted(set(ids))
+        kept: list[tuple[int, float]] = []
+        for i, t in zip(ids, toks):
+            w = _clean_token(t)
+            if w is None:
+                continue
+            weight = idf.get(w, 4.0)
+            kept.append((i, weight))
+        uniq = sorted({i for i, _ in kept})
         missing = [i for i in uniq if i not in row_cache]
         if missing:
             import hf_organ_reader as hor
             import casi_tensor_map as ctm
+            from concurrent.futures import ThreadPoolExecutor
 
-            raw = hor.fetch_uniform_rows(
-                s.reader, emb["shard"], emb["data_start"],
-                emb["offset_in_shard"][0], n_cols, 2, missing,
+            raw = None  # parallel: jede fehlende Zeile eigener Range-Request
+            row_bytes = n_cols * 2
+
+            def _grab(i: int) -> tuple[int, bytes]:
+                abs_off = emb["data_start"] + emb["offset_in_shard"][0] + i * row_bytes
+                return i, s.reader.get_range(emb["shard"], abs_off, abs_off + row_bytes - 1)
+
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                got = dict(pool.map(_grab, missing))
+            matm = ctm.bf16_rows_to_f32(
+                np.frombuffer(b"".join(got[i] for i in missing), dtype=np.uint8).view(np.uint16),
+                (len(missing), n_cols),
             )
-            mat = ctm.bf16_rows_to_f32(raw.view(np.uint16), (len(missing), n_cols))
             for j, i in enumerate(missing):
-                row_cache[i] = mat[j]
-        mat2 = np.stack([row_cache[i] for i in ids])
-        v = mat2.mean(axis=0)
-        n = np.linalg.norm(v)
-        return v / (n + 1e-9), len(missing) * n_cols * 2
+                row_cache[i] = matm[j]
+        acc = np.zeros(n_cols, dtype=np.float32)
+        wsum = 0.0
+        for i, weight in kept:
+            acc += weight * row_cache[i]
+            wsum += weight
+        v = acc / (wsum + 1e-9)
+        nrm = np.linalg.norm(v)
+        return v / (nrm + 1e-9), len(missing) * n_cols * 2
 
     row_cache: dict[int, np.ndarray] = {}
+
+    # --- IDF aus der Fragen-Menge selbst (lokal, keine externe Info) ---
+    import math as _math
+    import re as _re
+
+    def _clean_token(t: str | None) -> str | None:
+        if t is None:
+            return None
+        w = t.replace("Ġ", "").replace("▁", "").lower()
+        w = _re.sub(r"[^a-zäöüß]", "", w)
+        if len(w) < 3:
+            return None
+        if w in _STOPS:
+            return None
+        return w
+
+    _STOPS = {
+        "the", "and", "for", "with", "that", "this", "from", "was", "were",
+        "are", "have", "has", "had", "not", "but", "its", "his", "her",
+        "which", "what", "when", "where", "who", "how", "why", "into", "onto",
+        "der", "die", "das", "und", "ist", "ein", "eine", "sich",
+    }
+    docs = []
+    for item in rows[: args.limit]:
+        words = set(_clean_token(t) for t in tok.convert_ids_to_tokens(
+            tok.encode((item["question"] + " " + " ".join(item["choices"][:64])).lower(),
+                       add_special_tokens=False)))
+        docs.append({w for w in words if w})
+    n_docs = max(len(docs), 1)
+    df_counts: dict[str, int] = {}
+    for dset in docs:
+        for w in dset:
+            df_counts[w] = df_counts.get(w, 0) + 1
+    idf = {w: _math.log(n_docs / c) + 1.0 for w, c in df_counts.items()}
+
+    def lexical_overlap(q: str, ch: str) -> float:
+        qs = {_clean_token(t) for t in tok.convert_ids_to_tokens(tok.encode(q.lower(), add_special_tokens=False))}
+        cs = {_clean_token(t) for t in tok.convert_ids_to_tokens(tok.encode(ch.lower(), add_special_tokens=False))}
+        qs.discard(None); cs.discard(None)
+        if not qs or not cs:
+            return 0.0
+        return len(qs & cs) / _math.sqrt(len(qs) * len(cs))
 
     correct = total = 0
     q_bytes_total = 0
@@ -119,7 +187,9 @@ def main() -> int:
             scores = []
             for ch in choices:
                 cv, _b = vec(ch[:64])
-                scores.append(float(np.dot(qv, cv)))
+                dense = float(np.dot(qv, cv))
+                lexik = lexical_overlap(frage, ch[:64])
+                scores.append((1 - args.lexik) * dense + args.lexik * lexik)
         except Exception as exc:  # noqa: BLE001
             print(f"SKIP ({type(exc).__name__}: {exc})")
             continue
@@ -137,6 +207,7 @@ def main() -> int:
         "modell_groesse_gb": round(inv["model_payload_bytes"] / 1024 ** 3, 1),
         "n": total,
         "accuracy_alpha_router": round(acc, 4),
+        "scorer": f"dense+{args.lexik}lexik",
         "bytes_pro_frage_kb": round(q_bytes_total / max(total, 1) / 1024, 2),
         "anteil_modell_pct": round(100 * q_bytes_total / inv["model_payload_bytes"], 6),
         "sekunden": round(time.time() - t_run, 1),
