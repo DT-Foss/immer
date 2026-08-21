@@ -20,3 +20,8 @@ models/
 checkpoints/
 hf-cache/
 artifacts/private/
+
+# Modelle/Gewichte: lokal ja, Git nein (Manifest+SHA statt Blob)
+vendor/o1state/results/*.pt
+vendor/o1state/s3_ship/*.pt
+vendor/o1state/s3_ship/donor_data/*.npz

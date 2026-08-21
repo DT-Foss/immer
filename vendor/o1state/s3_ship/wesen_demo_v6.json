@@ -1,0 +1,8 @@
+{
+ "aufgaben": 152,
+ "korrekt": 152,
+ "route_ok": 152,
+ "text_ok": 30,
+ "nll": 8.6656,
+ "runtime_s": 12.4
+}
