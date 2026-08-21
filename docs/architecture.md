@@ -131,7 +131,23 @@ FLCA: compile / evidence / replay across planes
 QAD:  precision / deployment compilation
 ```
 
-## 7. Source ownership
+## 7. Substrate plane
+
+The substrate (`src/immer/substrate/`) owns continuity, not behaviour:
+
+```text
+EventBus        priority channels (USER preempts INTERNAL)
+LifeDaemon      life stream + state port + organ rack + services
+LifeStatePort   restart-safe JSON snapshot of the whole life
+OrganRack       cold organ mounting over OrganBank, digest-verified
+```
+
+Design rule: physics, not politics. The daemon makes attention, memory,
+organ mounting and exact services *possible*; when and how the organism
+uses them is its own first acquired competence. There is no turn loop,
+no speech censor and no memory schema in the substrate.
+
+## 8. Source ownership
 
 - **FERTIG** is canonical in `DT-Foss/FERTIG`;
 - **o1-state** is canonical in `DT-Foss/o1-state`;

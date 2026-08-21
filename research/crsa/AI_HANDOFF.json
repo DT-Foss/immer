@@ -1,0 +1,49 @@
+{
+  "schema": "fertig.w16-semigroup-fix-handoff.v1",
+  "status": {
+    "semigroup": "fixed, rerun, verified",
+    "w16": "source and evaluation contract fixed; numeric rerun pending missing external artifacts",
+    "tests": "12 passed"
+  },
+  "semigroup": {
+    "root_cause": "masked zeros were clamped to tiny positive values and amplified for alpha>=1",
+    "legacy_future_mass_alpha1": 114.51433563232422,
+    "legacy_future_mass_alpha2": 379.9998779296875,
+    "fixed_future_mass_alpha2": 0.0,
+    "exact_closures": 0,
+    "pair_count": 49,
+    "approx_5pct": 14,
+    "median_relative_residual": 0.09446176185591446,
+    "max_relative_residual": 0.2583138865076878,
+    "max_commutator_tv": 0.12718326703934782,
+    "verdict": "no scalar semigroup; weak passes are locally approximable, strong passes are non-closed and order-dependent"
+  },
+  "w16": {
+    "old_96_of_96_valid": false,
+    "critical_bugs": [
+      "ground-truth value passed to emitter",
+      "crystal inverse applied twice",
+      "map snapped without exact readout replacement",
+      "held labels used in crystal fit"
+    ],
+    "fixed_headline_metric": "aggregate.end_to_end_held_unique_mean",
+    "oracle_metric": "aggregate.oracle_emitter_all_unique_mean",
+    "missing_artifacts": [
+      "donor_targets_twostep_pos_27b.npz",
+      "pos_ckpt.pt",
+      "length_extrap_v2.py",
+      "streaming_train.py"
+    ]
+  },
+  "read_order": [
+    "FIX_REPORT.md",
+    "semigroup/SEMIGROUP_REPORT_FIXED.md",
+    "w16/W16_RERUN_REQUIRED.md",
+    "tests/"
+  ],
+  "entrypoints": {
+    "tests": "./run_tests.sh",
+    "semigroup": "PYTHONPATH=. python semigroup/semigroup_test_fixed.py --output semigroup/semigroup_results_fixed.json",
+    "w16": "PYTHONPATH=. python w16/w16_twostep_organ_fixed.py --o1-root <O1_juli> --donor-npz <npz> --output <json>"
+  }
+}

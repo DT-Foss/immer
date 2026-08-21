@@ -529,26 +529,6 @@ def apply_attention(logits: Tensor, spec: AttentionSpec) -> Tensor:
         if c < h:
             parts.append(_base(logits[:, c:])[0])
         return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
-    if spec.kind == "role_complete":
-        return role_complete_attention(logits, spec)
     if spec.kind == "leaky_sinkhorn":
         return leaky_masked_sinkhorn(logits)
     raise ValueError(f"unsupported attention kind: {spec.kind}")
-
-
-def role_complete_attention(logits: Tensor, spec: AttentionSpec) -> Tensor:
-    """Fixed Local | Balanced | Free causal head program."""
-    h = logits.shape[1]
-    counts = (spec.local_heads, spec.balanced_heads, spec.free_heads)
-    if any(n < 0 for n in counts) or sum(counts) != h:
-        raise ValueError("local_heads + balanced_heads + free_heads must equal the head count")
-    a = spec.local_heads
-    b = a + spec.balanced_heads
-    parts: list[Tensor] = []
-    if a:
-        parts.append(recency_attention(logits[:, :a], spec.slope, exclude_self=True))
-    if b > a:
-        parts.append(prefix_log(logits[:, a:b], replace(spec, kind="raps")))
-    if b < h:
-        parts.append(_base(logits[:, b:])[0])
-    return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]

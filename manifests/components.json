@@ -5,7 +5,7 @@
       "name": "FERTIG",
       "role": "grounded cognition",
       "repository": "https://github.com/DT-Foss/FERTIG",
-      "revision": "d8c47117f5fc36f4fbd51f0fe7ac9737d19927b1",
+      "revision": "edea94a4a25fd639cbc02328ceb06489bb3c0170",
       "integration": "src/immer/cognition/fertig/adapter.py"
     },
     {
@@ -26,7 +26,7 @@
       "name": "CRSA",
       "role": "causal attention routing",
       "repository": null,
-      "revision": "sha256:4ec7da81a72cfc5ce968e38787d962a197de52db868df68c698f0720671729a4",
+      "revision": "sha256:a84d059f6e22f3eece2f3275794efe157a5559701cfe085ea7721bba82a29117",
       "integration": "src/immer/attention/crsa/operators.py"
     },
     {

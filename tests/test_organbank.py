@@ -29,7 +29,7 @@ class OrganBankTests(unittest.TestCase):
             bank = OrganBank.from_manifest(manifest)
             descriptor = bank.resolve("arithmetic")
             self.assertEqual(descriptor.name, "arith-dual")
-            self.assertEqual(bank.verify("arith-dual"), artifact)
+            self.assertEqual(bank.verify("arith-dual"), artifact.resolve())
 
     def test_digest_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
