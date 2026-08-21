@@ -32,6 +32,26 @@ class Library:
 
     def grow(self, query: str) -> dict[str, Any] | None:
         """Harvest knowledge for a query from the brain; returns the new card."""
+        result = self.ask_harvester(query)
+        if result is None:
+            return None
+        span = self.store.teach(str(result), question=query)
+        span["source"] = f"harvest:{self.harvester.name}"
+        model_id = getattr(self.harvester, "model_id", "")
+        if "snapshots" in str(model_id):  # lokale Snapshots: kurzer Modellname
+            span["source"] += f":{Path_safe(str(model_id))}"
+        self._rewrite_last_source(span)
+        return span
+
+    def capture(self, question: str, answer: str) -> dict[str, Any]:
+        """Write a spoken answer into the library — repeats become free."""
+        span = self.store.teach(answer, question=question)
+        span["source"] = f"gespraech:{self.harvester.name if self.harvester else 'lokal'}"
+        self._rewrite_last_source(span)
+        return span
+
+    def ask_harvester(self, query: str) -> str | None:
+        """One harvest call; returns clean answer text or None."""
         if self.harvester is None:
             return None
         result = self.harvester.handle(
@@ -43,13 +63,20 @@ class Library:
         )
         if result.status is not ExecutionStatus.OK or not result.output:
             return None
-        span = self.store.teach(str(result.output))
-        span["source"] = f"harvest:{self.harvester.name}"
-        model_id = getattr(self.harvester, "model_id", "")
-        if "snapshots" in str(model_id):  # lokale Snapshots: kurzer Modellname
-            span["source"] += f":{Path_safe(str(model_id))}"
-        self._rewrite_last_source(span)
-        return span
+        return str(result.output)
+
+    def refine(self, query: str, old_text: str) -> dict[str, Any] | None:
+        """Upgrade an existing card with a fresh harvest (provenance kept)."""
+        answer = self.ask_harvester(query)
+        if answer is None:
+            return None
+        for span in self.store.spans:
+            if span["text"] == old_text:
+                span["text"] = answer
+                span["source"] = f"harvest:{self.harvester.name}"
+                self.store._persist()
+                return span
+        return None
 
     def _rewrite_last_source(self, span: dict[str, Any]) -> None:
         if self.store.spans and self.store.spans[-1]["text"] == span["text"]:

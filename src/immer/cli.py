@@ -216,40 +216,23 @@ def _serve(args: argparse.Namespace) -> int:
             answer = daemon.request("exact_math", intent.payload)
             if answer.ok:
                 metrics.bump("math_ok")
-                print(f"[exact] {answer.output}")
+                print(f"[exact] {answer.output}  (0 ms — exakt ist gratis)")
             else:
                 metrics.bump("math_abstained")
-                print("[exact] weiß ich nicht")
+                # Abstinenz heißt nicht Endstation: gleiche Kaskade wie Chat
+                _answer_via_cascade(
+                    intent.payload, library, council, donor, qwen, daemon, history,
+                    metrics, stream,
+                )
         elif intent.kind == "STATUS":
             metrics.bump("status")
             print(json.dumps(metrics.snapshot(gauges()), ensure_ascii=False))
-        else:  # CHAT — Kaskade: Donor (SOTA, beast) → lokal (Fallback) → Stille
+        else:  # CHAT — Stufen: Bibliothek (0 ms) → Entwurf → Donor → Veredelung im Hintergrund
+            _answer_via_cascade(
+                intent.payload, library, council, donor, qwen, daemon, history,
+                metrics, stream,
+            )
             metrics.bump("chat")
-            meta = {
-                "history": history[-6:],
-                "life": f"turns={daemon.turns} tokens={getattr(stream, 'tokens', 0)}",
-            }
-            if council is not None:
-                result = council.deliberate("chat", intent.payload, metadata=meta)
-            elif donor.available():
-                result = donor.handle(Request("chat", intent.payload, metadata=meta))
-            elif qwen is not None:
-                result = qwen.handle(Request("chat", intent.payload, metadata=meta))
-            else:
-                result = None
-            if result is not None and result.ok:
-                tag = "[rat]" if council is not None else ("[donor]" if result.component.startswith("donor") else "[qwen]")
-                print(f"{tag} {result.output}")
-                if council is not None and result.evidence.get("votes"):
-                    print(
-                        f"         (stimmen: {result.evidence['votes']}, "
-                        f"übereinstimmend: {result.evidence['agree']})"
-                    )
-                history.append({"role": "user", "content": intent.payload})
-                history.append({"role": "assistant", "content": result.output})
-            else:
-                reason = result.reason if result is not None else "kein Mund konfiguriert (--local-brain?)"
-                print(f"[stille] ({reason})")
 
         metrics.emit(gauges())
         life_line = f"turns: {daemon.turns}"
@@ -257,6 +240,88 @@ def _serve(args: argparse.Namespace) -> int:
             life_line += f", tokens: {stream.tokens}, updates: {stream.updates}, überraschungen: {stream.surprises}"
         print(f"({life_line})")
     return 0
+
+
+def _answer_via_cascade(
+    payload: str,
+    library,
+    council,
+    donor,
+    qwen,
+    daemon,
+    history: list[dict[str, str]],
+    metrics,
+    stream,
+) -> None:
+    """Stufen des Mundwerks, nach Latenz sortiert — gemessen, nicht behauptet.
+
+    Tier 0  Bibliothek   ~0 ms      (die Karte existiert schon)
+    Tier 1  Donor        ~19 s      (SOTA-Orakel, sync wenn nichts Besseres da)
+    Tier 2  Veredelung   im Hintergrund (Donor verbessert den Entwurf nachträglich)
+    """
+    import threading
+    import time as _time
+
+    meta = {
+        "history": history[-6:],
+        "life": f"turns={daemon.turns} tokens={getattr(stream, 'tokens', 0)}",
+    }
+
+    # ---- Tier 0: die Bibliothek ist schneller als jedes Modell -------------
+    t0 = _time.perf_counter()
+    hits = library.recall(payload)
+    if hits:
+        latency = int((_time.perf_counter() - t0) * 1000)
+        metrics.bump("tier_bibliothek")
+        metrics.emit_gauge("last_latency_ms", latency)
+        print(f"[bibliothek] {hits[0]['text']}  ({latency} ms, quelle: {hits[0].get('source', '?')})")
+        history.append({"role": "user", "content": payload})
+        history.append({"role": "assistant", "content": hits[0]["text"]})
+        return
+
+    # ---- Tier 1: der Donor antwortet synchron und die Karte wird sofort geschrieben
+    if council is not None:
+        result = council.deliberate("chat", payload, metadata=meta)
+        tag = "[rat]"
+    elif donor.available():
+        t1 = _time.perf_counter()
+        result = donor.handle(Request("chat", payload, metadata=meta))
+        latency = int((_time.perf_counter() - t1) * 1000)
+        metrics.emit_gauge("last_latency_ms", latency)
+        tag = f"[donor {latency / 1000:.1f}s]"
+    elif qwen is not None:
+        t1 = _time.perf_counter()
+        result = qwen.handle(Request("chat", payload, metadata=meta))
+        latency = int((_time.perf_counter() - t1) * 1000)
+        metrics.emit_gauge("last_latency_ms", latency)
+        tag = f"[entwurf {latency / 1000:.1f}s]"
+        # Tier 2: der Donor veredelt den Entwurf, ohne zu blockieren
+        if donor.available() and result.ok:
+
+            def _refine() -> None:
+                card = library.grow(payload)
+                if card is not None:
+                    metrics.bump("refined")
+
+            threading.Thread(target=_refine, daemon=True).start()
+            print("         (donor veredelt im hintergrund…)")
+    else:
+        result = None
+
+    if result is not None and result.ok:
+        print(f"{tag} {result.output}")
+        if council is not None and result.evidence.get("votes"):
+            print(
+                f"         (stimmen: {result.evidence['votes']}, "
+                f"übereinstimmend: {result.evidence['agree']})"
+            )
+        # Jede gesprochene Antwort wird Karte — die Wiederholung ist gratis.
+        library.capture(payload, result.output)
+        history.append({"role": "user", "content": payload})
+        history.append({"role": "assistant", "content": result.output})
+    else:
+        reason = result.reason if result is not None else "kein Mund konfiguriert (--local-brain?)"
+        print(f"[stille] ({reason})")
 
 
 def build_parser() -> argparse.ArgumentParser:

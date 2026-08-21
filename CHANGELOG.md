@@ -3,6 +3,53 @@
 Alle Änderungen an IMMER. Jeder Eintrag endet mit Deutung + nächster Frage —
 nie mit der nackten Zahl.
 
+## [0.6.1] — 2026-08-21 — 19 s sind unbrauchbar: einmal zahlen, immer gratis
+
+**Anlass:** Davids Rüge: „19 s für eine Antwort ist literally unbrauchbar."
+Er hatte die Geschwindigkeits-Maschinerie längst gebaut (Organe <1 ms,
+Kaskade, Verifier) — ich hatte den langsamsten Pfad verdrahtet: jeder Turn
+ein frischer 27B-Call.
+
+### Die Stufen-Kaskade (`_answer_via_cascade`)
+
+```text
+Tier 0  [bibliothek]   ~0 ms   Karte existiert → sofort
+Tier 1  [donor Xs]     sync    nur wenn nichts Besseres da — UND: jede
+                                gesprochene Antwort wird SOFORT Karte
+Tier 2  Veredelung     Hintergrund (Donor verbessert Entwürfe ohne zu blockieren)
+```
+
+- `library.capture()` — jede Donor-Antwort wandert nach dem Sprechen in die
+  Bibliothek; Wiederholungen kosten danach exakt 0 ms.
+- Prefix-Stemming pro Wort (4 Zeichen) im Recall — „was **sind schwarze
+  löcher**?" trifft die Karte von „was ist ein **schwarzes loch**?".
+  Gemessen: beide Varianten → 0 ms.
+- Latenz pro Antwort gemessen und angezeigt (`[donor 64.3s]`, `(0 ms)`),
+  `last_latency_ms` in status.json; MATH-Abstinenz fällt jetzt in dieselbe
+  Kascade statt Endstation „weiß ich nicht".
+
+### Der Geschwindigkeits-Beweis (live)
+
+```text
+Q1 "was ist ein schwarzes loch?"   → [donor 64.3s]
+Q2 identisch                        → [bibliothek] 0 ms
+Q3 "was sind schwarze loecher?"     → [bibliothek] 0 ms   (Stemming!)
+Q4 "wer war ada lovelace?"          → [donor 64.9s] → ab jetzt auch 0 ms
+```
+
+Amortisationskurve: jede Frage genau einmal teuer, für immer gratis —
+die Bibliothek IST der Antwort-Cache mit Herkunfts-Stempel.
+
+### Deutung + nächste Frage
+
+Donor-Tempo auf beast schwankt (19–66 s je nach Last der Mitmieter) —
+egal, denn er ist nur noch beim ersten Mal im kritischen Pfad. Die echte
+Zahl ist jetzt die Trefferquote von Tier 0: bei 0 % Erstdruck bleibt jedes
+Gespräch langsam; je mehr gelebt wird, desto schneller wird es. Nächste
+Frage: Auto-Ernte im Leerlauf (das Wesen rechnet beliebte Themen vor,
+während niemand fragt) und Ship-v6-Organe als Tier −1 (arithmetisch antwortet
+es dann in Millisekunden OHNE jede Karte).
+
 ## [0.6.0] — 2026-08-21 — Das echte Gehirn: Donor 27B auf beast, Kaskade lebt
 
 **Anlass:** Berechtigte Rüge — der Mund war ein lokaler 1.5B (langsam, fuzzy),

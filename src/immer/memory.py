@@ -21,12 +21,14 @@ class SpanStore:
             document = json.loads(self.path.read_text(encoding="utf-8"))
             self.spans = list(document.get("spans", []))
 
-    def teach(self, text: str) -> dict[str, Any]:
+    def teach(self, text: str, *, question: str | None = None) -> dict[str, Any]:
         span = {
             "text": text.strip(),
-            "key": _key_of(text),
+            "key": _key_of(question if question else text),
             "ts": time.time(),
         }
+        if question:
+            span["q"] = question.strip()
         self.spans.append(span)
         self._persist()
         return span
@@ -35,12 +37,14 @@ class SpanStore:
         needle = query.strip().lower()
         if not needle:
             return []
-        words = [w for w in re.findall(r"\w+", needle) if len(w) > 2]
+        # Prefix-Stemming pro Wort: "schwarzes"/"Schwarzen"/"schwarze" → "schw"
+        words = {_stem(w) for w in re.findall(r"\w+", needle) if len(w) > 3}
         hits: list[tuple[int, dict[str, Any]]] = []
         for span in self.spans:
-            haystack = f"{span['key']} {span['text']}".lower()
-            score = sum(1 for w in words if w in haystack)
-            if score or needle in haystack:
+            source_text = f"{span.get('q', '')} {span['key']} {span['text']}"
+            hay_words = {_stem(w) for w in re.findall(r"\w+", source_text.lower())}
+            score = sum(1 for w in words if w in hay_words)
+            if score:
                 hits.append((score, span))
         hits.sort(key=lambda pair: -pair[0])
         return [span for _, span in hits[:limit]]
@@ -62,3 +66,9 @@ class SpanStore:
 def _key_of(text: str) -> str:
     words = re.findall(r"\w+", text.lower())
     return " ".join(words[:4])
+
+
+def _stem(word: str) -> str:
+    """Prefix-Stemmung: die ersten 4 Zeichen tragen den Stamm der meisten
+    deutschen/englischen Wortformen (schwarzes→schw, apples→appl)."""
+    return word[:4]

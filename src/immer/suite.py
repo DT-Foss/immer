@@ -20,17 +20,23 @@ class Metrics:
         self.status_path = Path(status_path).expanduser()
         self.jsonl_path = Path(jsonl_path).expanduser() if jsonl_path else None
         self.counters: dict[str, int] = {}
+        self.gauges_override: dict[str, Any] = {}
         self.started_at = time.time()
 
     def bump(self, name: str, amount: int = 1) -> None:
         self.counters[name] = self.counters.get(name, 0) + amount
 
+    def emit_gauge(self, name: str, value: Any) -> None:
+        self.gauges_override[name] = value
+
     def snapshot(self, gauges: dict[str, Any] | None = None) -> dict[str, Any]:
+        merged = dict(self.gauges_override)
+        merged.update(gauges or {})
         return {
             "ts": time.time(),
             "uptime_s": round(time.time() - self.started_at, 1),
             "counters": dict(self.counters),
-            "gauges": gauges or {},
+            "gauges": merged,
         }
 
     def emit(self, gauges: dict[str, Any] | None = None) -> dict[str, Any]:
