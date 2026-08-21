@@ -45,8 +45,9 @@ class Library:
             return None
         span = self.store.teach(str(result.output))
         span["source"] = f"harvest:{self.harvester.name}"
-        if hasattr(self.harvester, "model_id"):
-            span["source"] += f":{Path_safe(self.harvester.model_id)}"
+        model_id = getattr(self.harvester, "model_id", "")
+        if "snapshots" in str(model_id):  # lokale Snapshots: kurzer Modellname
+            span["source"] += f":{Path_safe(str(model_id))}"
         self._rewrite_last_source(span)
         return span
 

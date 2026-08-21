@@ -84,6 +84,7 @@ def _serve(args: argparse.Namespace) -> int:
     from .intent import classify
     from .library import Library
     from .memory import SpanStore
+    from .runtimes.donor.adapter import DonorBrain
     from .runtimes.o1_state.adapter import is_available
     from .runtimes.o1_state.plasticity import LearningStream
     from .runtimes.qwen.adapter import QwenBrain
@@ -101,9 +102,14 @@ def _serve(args: argparse.Namespace) -> int:
     else:
         print("· o1-state bridge nicht verfügbar — Leben ohne Lernen", file=sys.stderr)
 
-    qwen = QwenBrain()
+    qwen = QwenBrain() if args.local_brain else None
+    donor = DonorBrain()
     council = None
-    if args.council and qwen.model_id is not None:
+    if args.council and donor.available():
+        from .runtimes.donor.adapter import build_council
+
+        council = build_council()
+    elif args.council and qwen is not None and qwen.model_id is not None:
         from .council import Council
 
         council = Council(
@@ -123,7 +129,8 @@ def _serve(args: argparse.Namespace) -> int:
             ),
             name="rat",
         )
-    library = Library(SpanStore(state.parent / "memory.json"), harvester=qwen)
+    harvester = donor if donor.available() else qwen
+    library = Library(SpanStore(state.parent / "memory.json"), harvester=harvester)
     metrics = Metrics(status_path=state.parent / "status.json", jsonl_path=state.parent / "metrics.jsonl")
 
     bank = None
@@ -147,8 +154,9 @@ def _serve(args: argparse.Namespace) -> int:
             "updates": life.get("updates", 0),
             "sleeps": life.get("sleeps", 0),
             "span_buffer": life.get("span_buffer", 0),
-            "qwen": qwen.loaded,
-            "qwen_model": qwen.model_id,
+            "donor": donor.available(),
+            "donor_modell": donor.model_id,
+            "lokal_gehirn": qwen.loaded if qwen is not None else False,
             "spans": library.store.count(),
         }
 
@@ -192,17 +200,17 @@ def _serve(args: argparse.Namespace) -> int:
         elif intent.kind == "RECALL":
             hits = library.recall(intent.payload)
             metrics.bump("recalls")
-            if not hits and qwen.model_id is not None:
+            if not hits and harvester is not None:
                 metrics.bump("harvests")
                 card = library.grow(intent.payload)
                 if card is not None:
                     print(f"[ernte] {card['text']}")
-                    print(f"         (quelle: {card['source']} — geprüft?)")
+                    print(f"         (quelle: {card['source']})")
                     hits = [card]
             if hits:
                 for span in hits:
                     print(f"[erinnerung] {span['text']} ({span.get('source', '?')})")
-            elif not hits:
+            else:
                 print("[erinnerung] da weiß ich noch nichts — lehr mich (merke: …)")
         elif intent.kind == "MATH":
             answer = daemon.request("exact_math", intent.payload)
@@ -215,7 +223,7 @@ def _serve(args: argparse.Namespace) -> int:
         elif intent.kind == "STATUS":
             metrics.bump("status")
             print(json.dumps(metrics.snapshot(gauges()), ensure_ascii=False))
-        else:  # CHAT
+        else:  # CHAT — Kaskade: Donor (SOTA, beast) → lokal (Fallback) → Stille
             metrics.bump("chat")
             meta = {
                 "history": history[-6:],
@@ -223,10 +231,14 @@ def _serve(args: argparse.Namespace) -> int:
             }
             if council is not None:
                 result = council.deliberate("chat", intent.payload, metadata=meta)
-            else:
+            elif donor.available():
+                result = donor.handle(Request("chat", intent.payload, metadata=meta))
+            elif qwen is not None:
                 result = qwen.handle(Request("chat", intent.payload, metadata=meta))
-            if result.ok:
-                tag = "[rat]" if council is not None else "[qwen]"
+            else:
+                result = None
+            if result is not None and result.ok:
+                tag = "[rat]" if council is not None else ("[donor]" if result.component.startswith("donor") else "[qwen]")
                 print(f"{tag} {result.output}")
                 if council is not None and result.evidence.get("votes"):
                     print(
@@ -236,7 +248,8 @@ def _serve(args: argparse.Namespace) -> int:
                 history.append({"role": "user", "content": intent.payload})
                 history.append({"role": "assistant", "content": result.output})
             else:
-                print(f"[stille] (kein Mund: {result.reason})")
+                reason = result.reason if result is not None else "kein Mund konfiguriert (--local-brain?)"
+                print(f"[stille] ({reason})")
 
         metrics.emit(gauges())
         life_line = f"turns: {daemon.turns}"
@@ -266,7 +279,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="metrics UI port (default 8787)",
     )
     serve.add_argument("--no-dashboard", action="store_true", help="disable the metrics UI")
-    serve.add_argument("--council", action="store_true", help="chat through a council of three Qwen roles")
+    serve.add_argument("--council", action="store_true", help="chat through the rat (donor council)")
+    serve.add_argument("--local-brain", action="store_true", help="allow the local Qwen as fallback mouth")
     return parser
 
 

@@ -3,6 +3,54 @@
 Alle Änderungen an IMMER. Jeder Eintrag endet mit Deutung + nächster Frage —
 nie mit der nackten Zahl.
 
+## [0.6.0] — 2026-08-21 — Das echte Gehirn: Donor 27B auf beast, Kaskade lebt
+
+**Anlass:** Berechtigte Rüge — der Mund war ein lokaler 1.5B (langsam, fuzzy),
+der Rat Prompt-Personas statt der eigenen Mechanismen. Die Ressourcen-Wahrheit
+dieses Projekts: klein resident, SOTA auf Abruf.
+
+### Neulich gelernt (Korrektur-Serie)
+
+- **DonorBrain** (`runtimes/donor/adapter.py`) — Qwen3.8-27B-Q3 auf beast
+  :8780 (llama-cpp-python, OpenAI-API), erreicht über SSH-Tunnel
+  (`ssh -N -L 8780:localhost:8780 root@89.167.35.196`). Null lokaler RAM,
+  ~2,7 tok/s CPU — der Preis der Größe, bezahlt nur bei Escalation.
+  Qwen3.8 denkt vor dem Reden: Denk-Block wird abgetrennt (`</think>`-Strip),
+  `/no_think` für schnelles Plaudern.
+- **Kaskade in serve**: FERTIG exakt (gratis) → Donor 27B (Wissen/Chat) →
+  lokales Qwen nur noch hinter `--local-brain` (Fallback). Ernte bevorzugt
+  den Donor: Karten kommen jetzt von SOTA, nicht vom 1.5B-Müll.
+- **Rat aus Donor-Rollen** (`build_council`): drei Stimmen, EIN geladenes
+  Modell auf beast — Personas teilen Gewichte im Server, nicht im RAM.
+- Q4_K_M (15,9 GB) starb auf beast beim Repack-OOM neben den Mitmietern;
+  Q3_K_M (12,9 GB) läuft stabil. Gemessen, nicht geraten.
+
+### Der Beweis (live, Mac ↔ beast)
+
+```text
+"was ist ein schwarzes loch?"
+→ [donor] Ein Schwarzes Loch ist ein Bereich im Weltraum, dessen Schwerkraft
+   so stark ist, dass selbst Licht nicht entkommen kann.        (~19 s)
+"was weißt du über schwarze löcher?"
+→ Bibliothek leer → ERNTE vom 27B → Karte mit Stempel harvest:donor.brain
+   → sofortiger Recall-Treffer
+"John has 5 apples and 3 oranges…" → [exact] 5                (gratis)
+/state → donor: true · lokal_gehirn: false · spans: 1
+```
+
+Die Kette steht: klein resident, groß auf Abruf, und jede Antwort bleibt
+als gestempelte Karte in der wachsenden Bibliothek.
+
+### Deutung + nächste Frage
+
+Damit ist die ursprüngliche Architektur-These zum ersten Mal END-TO-END
+wahr: maximalstes Können bei minimalem residentem Footprint. Die offene
+Frage ist die Ökonomie: 19 s/Turn ist Orakel-Tempo, kein Gesprächs-Tempo.
+Zug: (a) Auto-Ernte im Hintergrund — Antworten vorrechnen, wenn das Wesen
+wartet, nicht wenn David fragt; (b) Graft-Organ für häufige Fragen
+(Hebel 4), dann antwortet das paar-hundert-MB-Gehirn statt des 27B; bis
+dahin bleibt der Donor der Mund bei Wissen, FERTIG bei Exaktheit.
+
 ## [0.5.0] — 2026-08-21 — Bibliothek wächst, Rat tagt, alles ist festgehalten
 
 **Ziel:** Hebel 2 lokal erden (Bibliothek), Council verdrahten, die Doku

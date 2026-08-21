@@ -83,8 +83,9 @@ const CARDS = [
     ["span_buffer", s.gauges.span_buffer],
   ]],
   ["Gehirne", s => [
-    ["qwen", s.gauges.qwen ? "✓ geladen" : "· offline", s.gauges.qwen ? "ok" : "off"],
-    ["qwen_modell", short(s.gauges.qwen_model)],
+    ["donor_27b", s.gauges.donor ? "✓ beast:8780" : "· offline", s.gauges.donor ? "ok" : "off"],
+    ["donor_modell", short(s.gauges.donor_modell)],
+    ["lokal_fallback", s.gauges.lokal_gehirn ? "✓ geladen" : "aus", s.gauges.lokal_gehirn ? "warn" : "off"],
     ["fertig", "✓ vendored", "ok"],
     ["crsa", "✓ v0.5", "ok"],
   ]],

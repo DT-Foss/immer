@@ -63,7 +63,7 @@ class LearningStream(O1StateStream):
             x = torch.tensor(list(chunk), dtype=torch.long).unsqueeze(0)
             logits, self.states = self.model(x, self.states)
             loss = torch.nn.functional.cross_entropy(logits[0], x[0])
-            value = float(loss)
+            value = loss.detach().item()
             self.loss_ema = value if self.loss_ema is None else 0.99 * self.loss_ema + 0.01 * value
             self.tokens += len(chunk)
             self.window.append(value)
