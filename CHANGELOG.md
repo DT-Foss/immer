@@ -3,6 +3,55 @@
 Alle Änderungen an IMMER. Jeder Eintrag endet mit Deutung + nächster Frage —
 nie mit der nackten Zahl.
 
+## [0.3.0] — 2026-08-21 — Alles eingepflanzt, alles verdrahtet, erster Lebenszyklus
+
+**Ziel:** Originale unangetastet, alles Arbeitsfähige ins Repo kopiert und
+miteinander verbunden — ab jetzt wird hier gefrickelt, nicht mehr gesucht.
+
+### Eingepflanzt (Vendoring, Originale bleiben read-only)
+
+- `vendor/o1state/{src,reference}/` — der komplette o1-State-Quellstamm
+  (137 + 4 Dateien, Spiegel der Original-Pfadlogik `SRC`/`REF`, damit die
+  Importkette unverändert schließt: streaming_train → moebius_scan_* →
+  length_extrap_v2 → width_fix)
+- `src/immer/cognition/fertig/_vendor/fertig/` — das komplette FERTIG-Paket
+  (53 Dateien, 51k Zeilen); Adapter nutzt Vendor standardmäßig
+  (Reproduzierbarkeit schlägt Environment-Glück), `IMMER_FERTIG_ROOT`
+  bleibt als Override
+
+### Neu verdrahtet
+
+- **O1StateStream** (`runtimes/o1_state/adapter.py`) — ECHTE Brücke: der
+  Lebensstrom ist ein byte-level StreamingNoPELM; jede Nachricht wird
+  Erfahrung, per-layer Z trägt das kontinuierliche Leben, Sidecar-Datei
+  = portables Wesen. Determinismus per Seed gemessen.
+- **Council** (`council.py`) — BO3-Muster als Baustein: k Gehirne stimmen ab,
+  Mehrheit gewinnt, Abstinenz ist ein Ergebnis, Hirntod zählt als Enthaltung,
+  nicht als Kollaps.
+- **CLI** — `immer serve` (Leben im Terminal: labern, /state, /say, /quit),
+  `immer organs list|mount --manifest`, doctor prüft jetzt Vendor+Bridge.
+
+### Der Abnahmetest: bestanden
+
+```text
+LEBEN 1: "hallo kleines wesen" → 19 Tokens Strom, exact: "weiß ich nicht"
+         "John has 5 apples and 3 oranges…" → [exact] 5   (FERTIG vendored)
+         /state → turns 2, tokens 81, loss_ema 5.8598
+NEUSTART: "turns alive: 2" — gleicher loss_ema, gleicher Token-Stand.
+```
+
+Kill & Restart & erinnert sich — die Substrat-Zusage aus 0.2.0 ist eingelöst.
+
+### Deutung + nächste Frage
+
+Das Gerüst steht komplett: Identität (Stream+Port), Exakt-Wissen (FERTIG),
+Können (OrganBank), Denken (CRSA/Council) — alle verdrahtet, 30 Tests grün.
+Die offene Frage ist keine Architektur-Frage mehr, sondern eine Zucht-Frage:
+**Der Organismus streamt, aber er lernt noch nicht aus dem, was er streamt
+(Plastizität aus, eval-only). Wann bekommt der Stream seinen Surprise-Gate +
+Schlaf-Zyklus aus portable_organism.py, und wann spricht das erste Denkmodell
+statt des Echo-Munds?**
+
 ## [0.2.0] — 2026-08-21 — Konsolidierung: alle Teile an einem Ort
 
 **Ziel:** Nicht mehr wild an Einzelteilen rumschrauben. Dieser Commit führt die

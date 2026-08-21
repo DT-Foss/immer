@@ -58,11 +58,22 @@ class FertigSolver:
         if self.root is not None:
             with _solver_from_checkout(self.root) as solver:
                 return solver.solve(question)
+        # The vendored copy ships with immer and always wins over an
+        # ambient installation — reproducibility beats environment luck.
+        vendor = Path(__file__).resolve().parent / "_vendor"
+        if (vendor / "fertig" / "solver.py").is_file():
+            if str(vendor) not in sys.path:
+                sys.path.insert(0, str(vendor))
+            try:
+                solver = importlib.import_module("fertig.solver")
+            except ModuleNotFoundError as exc:
+                raise FileNotFoundError(f"broken vendored FERTIG under {vendor}") from exc
+            return solver.solve(question)
         try:
             solver = importlib.import_module("fertig.solver")
         except ModuleNotFoundError as exc:
             raise FileNotFoundError(
-                "FERTIG is not installed and IMMER_FERTIG_ROOT is not configured"
+                "FERTIG is not installed, not vendored, and IMMER_FERTIG_ROOT is not configured"
             ) from exc
         return solver.solve(question)
 
