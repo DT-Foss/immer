@@ -1,0 +1,12 @@
+{
+  "schema": "immer.benchmark/v1",
+  "benchmark": "GSM8K-test",
+  "n": 100,
+  "correct": 99,
+  "abstained": 1,
+  "wrong": 0,
+  "wrong_must_be_zero": true,
+  "accuracy_on_attempted": 1.0,
+  "seconds": 10.3,
+  "engine": "FERTIG vendored (bindings->semantic->math->miner), no neural net"
+}
