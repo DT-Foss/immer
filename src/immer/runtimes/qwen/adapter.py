@@ -21,6 +21,8 @@ _CANDIDATES = (
     "models--Qwen--Qwen2.5-0.5B",
 )
 
+_ENGINE_CACHE: dict[str, tuple[Any, Any, str]] = {}
+
 
 def resolve_model() -> str | None:
     configured = os.environ.get("IMMER_QWEN_MODEL")
@@ -37,18 +39,22 @@ def resolve_model() -> str | None:
 class QwenBrain:
     """Chat capability backed by a locally cached Qwen model."""
 
-    name = "qwen.brain"
-    capabilities = frozenset({"chat"})
-
-    def __init__(self, *, max_new_tokens: int = 96) -> None:
+    def __init__(self, *, max_new_tokens: int = 96, persona: str | None = None,
+                 name: str = "qwen.brain") -> None:
         self.model_id = resolve_model()
         self.max_new_tokens = max_new_tokens
+        self.persona = persona
+        self.name = name
         self._model: Any = None
         self._tokenizer: Any = None
 
     @property
     def loaded(self) -> bool:
         return self._model is not None
+
+    @property
+    def capabilities(self) -> frozenset:
+        return frozenset({"chat"})
 
     def _ensure_loaded(self) -> None:
         if self.loaded or self.model_id is None:
@@ -57,6 +63,9 @@ class QwenBrain:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.torch = torch
+        if self.model_id in _ENGINE_CACHE:  # personas share one weight set
+            self._model, self._tokenizer, self.device = _ENGINE_CACHE[self.model_id]
+            return
         device = "mps" if torch.backends.mps.is_available() else "cpu"
         dtype = torch.float16 if device == "mps" else torch.float32
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_id)
@@ -65,6 +74,7 @@ class QwenBrain:
         ).to(device)
         self._model.eval()
         self.device = device
+        _ENGINE_CACHE[self.model_id] = (self._model, self._tokenizer, self.device)
 
     def handle(self, request: Request) -> Result:
         if request.capability not in self.capabilities:
@@ -76,12 +86,15 @@ class QwenBrain:
         except Exception as exc:  # noqa: BLE001 - a missing mouth must not kill the life
             return Result(ExecutionStatus.UNAVAILABLE, self.name, reason=f"{type(exc).__name__}: {exc}")
         history = request.metadata.get("history") or []
+        system = self.persona or (
+            "Du bist das Mundwerk eines kleinen Lebewesens. Antworte kurz, "
+            "ehrlich und auf Deutsch. Wenn du etwas nicht weißt: sag es. "
+        )
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "Du bist das Mundwerk eines kleinen Lebewesens. Antworte kurz, "
-                    "ehrlich und auf Deutsch. Wenn du etwas nicht weißt: sag es. "
+                    f"{system}"
                     f"Bisheriges Leben des Wesens: {request.metadata.get('life', '')}"
                 ),
             },

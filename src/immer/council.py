@@ -23,13 +23,13 @@ class Council:
         self.name = name
         self.capabilities = frozenset().union(*(m.capabilities for m in members))
 
-    def deliberate(self, capability: str, payload: Any) -> Result:
+    def deliberate(self, capability: str, payload: Any, metadata: dict[str, Any] | None = None) -> Result:
         votes: list[Result] = []
         for member in self.members:
             if capability not in member.capabilities:
                 continue
             try:
-                result = member.handle(Request(capability, payload))
+                result = member.handle(Request(capability, payload, metadata=metadata or {}))
             except Exception as exc:  # noqa: BLE001 - one brain failing must not kill the vote
                 votes.append(Result(ExecutionStatus.ERROR, member.name, reason=f"{type(exc).__name__}: {exc}"))
                 continue

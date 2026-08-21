@@ -1,150 +1,71 @@
 # IMMER
 
-**Unified cognitive runtime for grounded reasoning, persistent state, structured capabilities, causal neural routing and hardware-aware deployment.**
-
-IMMER joins grounded cognition, persistent state, structured capabilities, causal neural routing, compilation and deployment behind one explicit runtime contract.
-
-```text
-                                  IMMER
-                                    │
-             ┌──────────────────────┼──────────────────────┐
-             │                      │                      │
-             ▼                      ▼                      ▼
-          FERTIG                 o1-state              LFM / CRSA
-   grounded cognition       persistent O(1) state     neural execution
-             │                      │                      │
-             └──────────────┬───────┴────────┬─────────────┘
-                            ▼                ▼
-                        OrganBank           FLCA
-                 structured capabilities   compilation
-                            │                │
-                            └────────┬───────┘
-                                     ▼
-                                    QAD
-                              deployment target
-```
-
-The system separates six concerns:
-
-| Plane | Component | Role |
-| --- | --- | --- |
-| Cognition | **FERTIG** | grounding, explicit reasoning, executable skills, verification and process compilation |
-| Persistent state | **o1-state** | constant-memory streaming state, lifelong adaptation and external memory |
-| Capabilities | **OrganBank / Grafting** | digest-addressed structural organs, crystallization and cold capability loading |
-| Neural routing | **CRSA** | causal Local / Balanced / Free attention programs with an untouched free-head invariant |
-| Compilation | **FLCA** | evidence-typed operator routing, compilation and deterministic replay |
-| Deployment | **QAD** | precision-aware distillation and hardware deployment |
-
-FERTIG, o1-state and FLCA remain canonical projects with their own repositories. IMMER owns the integration contracts and carries the components that do not yet have a separate canonical home, including the CRSA operator core and the cold OrganBank registry.
-
-## Research foundations
-
-### FERTIG — grounded cognition
-
-FERTIG supplies grounded neuro-symbolic cognition: deterministic symbolic state, grounding, the Desktop Apprentice, constrained HSSLM ranking, verification loops and agent-trace process compilation.
-
-Current GSM8K structure-solver result:
-
-- **1056 / 1319 = 80.06% correct**
-- **0 incorrect answers** in the full test
-- **731 binding regression tests passing**
-
-### Organ Grafting — capabilities without host weight edits
-
-The Organ Grafting program transfers capabilities from a 27B donor into a frozen 1.713M-parameter o1-state host through small structured logit-space organs. The strict recipe is:
+**Unified cognitive runtime: ein Lebewesen aus getrennten Organen —
+Identität im Strom, Wissen in der Bibliothek, Können als kalte Organe,
+Denken als Rat, Sprache als Mund.**
 
 ```text
-STRUCTURAL FORM + MAP + ROUTE GATE + CRYSTAL
+                ┌─────────────────────────────────────┐
+                │              IMMER                  │
+                │   Substrat · Lernen · Rat · Suite   │
+                └──────────────┬──────────────────────┘
+       ┌───────────┬───────────┼───────────┬───────────┐
+       ▼           ▼           ▼           ▼           ▼
+   o1-state    FERTIG     OrganBank    CRSA/Rat     QAD/Fleet
+   Identität   Exakt-     kalte        Denken/      Körper:
+   (Strom+Port) wissen     Organe       Diversität   Mac/Server
 ```
 
-The measured Ship v6 system used a cold OrganBank with additive, multiplicative, cyclic and decimal capabilities and reached **152/152 measured tasks**, **30/30 text routes**, with the host language NLL unchanged. Organ artifacts remain external and digest-addressed; IMMER contains the registry and verification layer, not the weights.
-
-### CRSA — causal routing
-
-IMMER carries the production CRSA operator core in `src/immer/attention/crsa/operators.py`, extracted from the v0.5 implementation for the overlapping operators.
-
-The integrated operator core includes:
-
-- causal Prefix-Sinkhorn / Log-Prefix balancing;
-- RAPS diagonal debit;
-- geometric prefix usage;
-- reservoir prefix routing;
-- Local / Balanced / Free role programs;
-- untouched causal-softmax free heads;
-- the full-support Sinkhorn leak probe as a negative control.
-
-The v0.5 program verifies exact zero future support, reports **69 automated tests**, preserves long-range retrieval with a whole free head, and shows scaling gains that rise to roughly **1.18 bpb** by width 512–1024 instead of vanishing.
-
-### o1-state — persistent organism
-
-The persistent host remains the canonical `DT-Foss/o1-state` project. IMMER uses it as the long-lived state substrate.
-
-### FLCA and QAD — compilation to deployment
-
-FLCA supplies the evidence-typed compilation and replay layer. QAD supplies the precision and deployment axis for neural students and hosts. Compiler decisions enter IMMER as explicit artifacts and contracts.
-
-## Executable kernel
-
-```text
-src/immer/
-├── contracts.py                  component/request/result contract
-├── registry.py                   explicit capability ownership
-├── runtime.py                    unified dispatcher
-├── cognition/
-│   └── fertig/adapter.py         FERTIG exact-math adapter
-├── capabilities/
-│   └── organbank/bank.py         digest-addressed cold organ registry
-└── attention/
-    └── crsa/
-        └── operators.py          CRSA attention implementation
-```
-
-Capability ownership is explicit in the runtime registry. External canonical components are attached by configured paths or installed packages, while in-tree components remain directly executable.
+Jede Verbindung hat einen gemessenen Anker: twostep 1,000 (Organ-Transfer) ·
+BO3 86,5 % (Verifier) · Kaskade 0,875 @ 8 Calls · Cold-Load 0,9 ms ·
+NLL 8,6656 unverändert. Kein Baustein ist Spekulation.
 
 ## Quick start
 
 ```bash
-git clone https://github.com/DT-Foss/immer.git
-cd immer
+git clone https://github.com/DT-Foss/immer.git && cd immer
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e '.[neural]'          # torch für den Lebensstrom
 
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+# Exakt rechnen (FERTIG ist vendored — läuft sofort):
+python -m immer solve "John has 5 apples and 3 oranges. How many apples?"
 
-immer components
-immer doctor
-python -m unittest discover -s tests -v
+# Das Wesen leben lassen (lernt, erinnert sich, redet):
+python -m immer serve               # Dashboard: http://127.0.0.1:8787/
+#   du tippst normal — alles andere ist Erfahrung für es
+#   merke: <fakt>            lehrt es
+#   was weißt du über <x>?   ruft ab; bei Fehlschlag erntet der Mund
+#                            und die Bibliothek wächst (mit Herkunfts-Stempel)
+#   /sleep                   konsolidiert (Replay der Überraschungs-Spans)
+#   /state /say <text> /quit
+python -m immer serve --council     # Chat durch den Rat: Basis/Kritiker/Freigeist
+python -m immer organs list         # kalte Organe inspizieren
+python -m immer doctor              # was ist wach?
 ```
 
-Enable neural routing with:
+## Die Ebenen
 
-```bash
-pip install -e '.[neural]'
-```
+| Ebene | Modul | Rolle |
+|---|---|---|
+| Substrat | `substrate/` | Bus, LifeDaemon, State-Port, OrganRack — Physik, nicht Politik |
+| Identität | `runtimes/o1_state/` | byte-level StreamingNoPELM + Plastizität (Surprise-Gate, Schlaf) |
+| Exakt-Wissen | `cognition/fertig/_vendor/` | FERTIG-Solver, bindings→semantic→math→miner, Abstinenz |
+| Mund | `runtimes/qwen/` | lokales Qwen als flüssige Zunge (Personas teilen ein Gewichtssatz) |
+| Kopf | `intent.py`, `memory.py`, `library.py` | Absichten, Spans, Bibliothek mit Herkunft |
+| Rat | `council.py` | BO3-Deliberation: Mehrheit gewinnt, Abstinenz zählt |
+| Attention | `attention/crsa/` | voller v0.5-Kern: Local/Balanced/Free, exakt kausal |
+| Organe | `capabilities/organbank/` | digest-addressierte kalte Artefakte, <1 ms montiert |
+| Suite | `suite.py` | status.json + metrics.jsonl + Dashboard |
 
-Attach FERTIG:
+## Design-Gesetz
 
-```bash
-export IMMER_FERTIG_ROOT=/path/to/FERTIG
-immer solve "A store sold 12 items and then 15 more. How many were sold?"
-```
+**Substrat = Physik, Politik = sein.** Der Daemon macht Aufmerksamkeit,
+Gedächtnis, Organ-Montage und Exakt-Dienste *möglich*; wann und wie das
+Wesen sie benutzt, ist seine erste erworbene Kompetenz. Kein Turn-Loop,
+kein Sprech-Zensor, kein Gedächtnis-Schema.
 
-Attach a cold OrganBank:
-
-```bash
-export IMMER_ORGANBANK=/path/to/organbank.json
-```
-
-A bank manifest contains artifact paths and SHA-256 digests. Model weights, GGUF files, checkpoints and Hugging Face caches stay outside Git.
-
-## Repository layout
-
-```text
-src/immer/              executable integration runtime
-tests/                  component, digest and causal-support tests
-docs/                   architecture and research map
-manifests/              neutral source/component pins
-```
+Modelle/Gewichte liegen **nicht** im Repo — nur Manifests mit SHA-256
+(`manifests/`). Herkunft jedes Bestandteils: `docs/source-inventory.md`.
 
 ## Author
 

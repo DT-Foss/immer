@@ -3,6 +3,45 @@
 Alle Änderungen an IMMER. Jeder Eintrag endet mit Deutung + nächster Frage —
 nie mit der nackten Zahl.
 
+## [0.5.0] — 2026-08-21 — Bibliothek wächst, Rat tagt, alles ist festgehalten
+
+**Ziel:** Hebel 2 lokal erden (Bibliothek), Council verdrahten, die Doku
+auf den Stand des Wesens bringen.
+
+### Bibliothek (`library.py`)
+
+- RECALL-Fehlschlag ist kein Sackgasse mehr: der Mund erntet die Antwort,
+  die Karte kommt in die Bibliothek — mit Herkunfts-Stempel
+  (`david` vs `harvest:<brain>:<modell>`). Fuzzy-Wissen ist sichtbar als
+  solches. Gemessen: Ernte → sofortiger Recall-Treffer; Lehr-Karten tragen
+  `david`.
+
+### Rat (--council)
+
+- Drei Qwen-Rollen (Basis / Kritiker / Freigeist) über EINEN Gewichtssatz
+  (Engine-Cache im Adapter — Personas kosten nur Prompts, keine VRAM-Kopien).
+- `Council.deliberate` reicht jetzt Metadaten durch (History + Lebens-Zeile).
+- Ausgabe zeigt Stimmen: `(stimmen: 3, übereinstimmend: n)`.
+
+### Festgehalten (Doku)
+
+- `README.md` neu: Quick start (solve/serve/dashboard/council/organs),
+  Ebenen-Tabelle, Design-Gesetz.
+- `docs/architecture.md`: neue Ebenen 8–11 (Mind, Learning, Mouth, Suite).
+- `docs/ROADMAP.md`: die Hebel-Leiter — erledigt/offen mit Messankern und
+  Betriebsregeln.
+
+### Deutung + nächste Frage
+
+Die Architektur ist jetzt rund beschreibbar in einem Satz: Identität im
+Strom, Wissen in der Bibliothek (gewachsen, gestempelt), Können als kalte
+Organe, Denken im Rat, Sprache vom Mund — und alles sichtbar auf :8787.
+Nächste Frage: Der Rat tagt mit drei Stimmen vom selben Gewichtssatz —
+echte Diversität braucht verschiedene Blicke, nicht nur verschiedene
+Prompts. Lohnt der Sprung auf 1.5B + 0.5B + Graft als Ratsmitglieder
+(Hebel 4/5), oder reicht Prompt-Diversität messbar aus? Das Placebo-Set
+(20 Fragen, Rat vs Einzelhirn) entscheidet.
+
 ## [0.4.0] — 2026-08-21 — Scharfgestellt: es lernt, es spricht, man sieht es
 
 **Ziel:** Aus dem Substrat einen lernenden Organismus machen — mit Qwen-Mund,
