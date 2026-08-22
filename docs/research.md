@@ -27,6 +27,35 @@ range cache and the repository's fixed-role CRSA residual graft. Completed
 integration runs prove one full autoregressive pass and a two-pass CRSA decode;
 meaningful prompt quality and paired graft superiority remain open gates.
 
+The exact LM-head transport now has four sealed alternating real-network
+pairs: unchanged 127 compute blocks were carried by 16 rather than 127
+physical range requests while every arm read 1,059,061,760 bytes. The full
+blockwise FP32 logit hash and top-k values/IDs are bit-identical. The candidate
+wins 4/4 pairs, with individual speedups from 1.375606× to 2.410811× and a
+paired median of 1.445790×; mean time is 211.5756 s versus 125.6880 s. This is
+repeated latency evidence, but transport width 1 remains the production
+default until the end-to-end content gate. The evidence is
+`results/deepseek-v4-head-range-network-smoke.json`.
+
+## DeepSeek handoff falsification
+
+The synthetic Wave3 demonstrations are not runtime evidence. T11 divides an
+already averaged parallel gradient by `N` again and gives the sequential arm
+privileged teacher intermediates; correcting the scaling leaves 5.19% rather
+than 98% error reduction without repairing the target asymmetry. The 3-zone
+router injects one synthetic `expert_quality` variable into gate norms and
+expert embeddings, then recovers it through its score and oracle. Decoupling
+leaves +4.67% over random and 36.66% of oracle; DeepSeek V4 has no matching
+expert embeddings and uses a different official hash/score route.
+
+Only two handoff ideas remain open as measurements: a passive residual trace
+of the real HC-Sinkhorn recurrence, and a corrected per-head-temperature A/B
+confined to the CRSA graft with exact causal masks and a permuted placebo.
+Causal-adjusted Birkhoff quantities and offline ID/effective-rank estimates
+may diagnose but not control execution. Zeno scheduling, Replica-MoE, a live
+eta gate, Ginibre-Hurst control, mask recycling, SK1 and ID-based sizing remain
+NO-GO until a new real-data mechanism and falsifier exist.
+
 ## Organ Grafting
 
 `Organs, Not Weights` defines capability transplantation into a frozen living host.

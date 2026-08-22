@@ -38,12 +38,20 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
   Geography-Items, `off` 3/4 korrekt; Resultat, Identität und finales
   BF16-Objekt versiegelt an Commit `d0a1dc4`.
 - [x] Begrenzter Remote-Transport `requests-session-pool-2/v1`: zwei geleaste
-  Ein-Verbindungs-Sessions, bounded stream reads, deterministischer Close und
-  1,140549× im aktuellen bitgleichen No-Cache-3-Expert-A/B.
+  Ein-Verbindungs-Sessions, bounded stream reads und deterministischer Close.
+  Das neuversiegelte q3/`off`-A/B bleibt bitidentisch, liefert wegen hoher
+  Netzvarianz aber keinen stabilen Speedup-Claim.
 - [x] Exaktes Multi-Range-Instrument mit Leaf-Cache-Reuse und
-  Adjacent-Pair-A/B: kalt 6→4 Envelopes ohne Zusatzbytes, aber nur 1,44 %
-  mittlerer Gewinn und cache-resident 3,06 % Verlust; q3/Width 1 bleibt
-  Default, Pair/Width 2 explizit aus.
+  Adjacent-Pair-A/B: kalt 6→4 Envelopes ohne Zusatzbytes und 1,161604× im
+  Mittel über zehn Paare gegen q3; cache-resident 1,005050× neutral. Da der
+  direkte `off`/Pair-Kontrast fehlt, bleibt q3/Width 1 Default und Pair/Width 2
+  explizit aus.
+- [x] Reales exaktes LM-Head-A/B: unveränderte 127 Rechenblöcke, aber
+  127→16 physische Requests bei identischen 1.059.061.760 Byte sowie
+  bitidentischem vollständigem Logitstrom und Top-k. Vier alternierende Paare
+  gewinnt der Kandidat 4/4; gepaarter Median 1,445790×. Damit ist der
+  Latenzmechanismus wiederholt positiv, bleibt bis zum End-to-End-Gate opt-in;
+  Produktionsdefault Breite 1.
 - [x] FERTIG-GSM8K-Vollsplit mit Item-Provenienz und hartem Wrong-Gate:
   1.060 korrekt, 259 abstinent, 0 falsch, 0 Fehler.
 - [x] FERTIG-Grammatik für endliche affine Rekurrenzen mit exaktem
@@ -52,6 +60,11 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
 - [x] DeepSeek-Hungarian gegen alle 259 FERTIG-Abstinenzen auditiert: 144
   Coreference-Scope, 115 Grammar-Scope und null bereits extrahierte exklusive
   Assignment-Verträge; die replizierte Demo zerfällt in unabhängige Argmins.
+- [x] DeepSeek-Wave3 und Resthandoff auditiert: T11 nach doppelter `/N`-
+  Korrektur nur 5,19 % bei weiterhin privilegierten Zwischenzielen;
+  zirkulärer 3-Zonen-Router entkoppelt nur +4,67 % über Random und 36,66 % des
+  Oracle. Nur HC-Residualtrace und CRSA-Graft-only-Temperatur bleiben als
+  kontrollierte Messungen offen; Birkhoff/ID nur als Diagnostik.
 
 ## Jetzt
 
@@ -71,7 +84,10 @@ Wrong-Gate bleibt null.
 Die erste `off`-Baseline ist mit 3/4 korrekt positiv. Nach stabilem Transport
 folgt ein gepaarter `off`/CRSA-Lauf mit offiziellem Encoding, festem Split und
 kandidatengestütztem Scoring unter exakt derselben Runtime-Identität. Erst
-größere Splits dürfen einen Qualitäts- oder Ähnlichkeitsclaim tragen.
+größere Splits dürfen einen Qualitäts- oder Ähnlichkeitsclaim tragen. Das
+LM-Head-Batching hat Exaktheit und vier wiederholte Zeitpaare bestanden, bleibt
+bis zu diesem End-to-End-Gate jedoch explizit opt-in; ein Produktionsdefault
+darf den Rechenblockpfad weiterhin nicht ändern.
 
 ### 3. Breiter Router-Kontrast
 
@@ -105,6 +121,21 @@ ist bereits negativ und kein R17. Der externe „R25-18×“-PoC zählt ebenfall
 nicht: Er erzeugt die Layerstruktur synthetisch und vergleicht KL mit SNR.
 Zulässig ist ein neuer klassenkonditionierter Donor-KL-Versuch nur mit vorab
 getrenntem Train/Held-out, gleicher Metrik, All-Layer-Arm und Label-Shuffles.
+
+### 7. Handoff-Messungen statt synthetischer Prozentwerte
+
+Zwei schmale Messungen bleiben zulässig:
+
+- passive Residuen-Spur des real ausgeführten HC-Sinkhorn-Kerns; ein späterer
+  Early-stop-Kontrast wäre approximativ und muss Zeit, Logit-Delta und
+  Entscheidungen gemeinsam berichten;
+- Per-Head-Temperatur ausschließlich im CRSA-Graft, mit exakter Kausalmaske
+  und permutiertem Placebo.
+
+Kausal angepasste Birkhoff-Größen und ID/effective rank dürfen offline
+diagnostizieren, aber keine Runtime steuern. Zeno-Schedule, Replica-MoE,
+Live-η-Gate, Ginibre-Hurst, Mask-Recycling, SK1 und ID-Dimensionierung bleiben
+NO-GO; dasselbe gilt für T11 und den 3-Zonen-Router aus Wave3.
 
 ## Später
 

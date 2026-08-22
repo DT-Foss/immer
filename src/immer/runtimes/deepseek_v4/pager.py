@@ -33,6 +33,13 @@ class PagerMetrics:
     expert_source_ranges: int = 0
     embedding_rows: int = 0
     head_rows: int = 0
+    head_logical_leaves: int = 0
+    head_transport_batches: int = 0
+    head_transport_envelopes: int = 0
+    head_transport_source_bytes: int = 0
+    head_planned_range_calls_avoided: int = 0
+    head_transport_fallbacks: int = 0
+    head_transport_fallback_leaves: int = 0
     logical_weight_bytes: int = 0
     materialized_float_bytes: int = 0
     materialized_scale_bytes: int = 0
@@ -96,6 +103,14 @@ class _ExpertBatchPlan:
     experts: tuple[_ExpertReadPlan, ...]
     payload_bytes: int
     range_requests_avoided: int
+
+
+@dataclass(frozen=True, slots=True)
+class _HeadRowLeaf:
+    start_row: int
+    count: int
+    absolute: int
+    length: int
 
 
 @dataclass(slots=True)
@@ -185,6 +200,11 @@ class DeepSeekWeightPager:
     EXPERT_RANGE_COALESCE_DEFAULT_MAX_EXPERTS = 1
     EXPERT_RANGE_COALESCE_MAX_EXPERTS = 2
     EXPERT_RANGE_COALESCE_MAX_GAP_BYTES = 0
+    HEAD_TRANSPORT_POLICY = "exact-head-leaf-adjacent-envelope/v1"
+    HEAD_TRANSPORT_DEFAULT_RANGE_BATCH_BLOCKS = 1
+    HEAD_TRANSPORT_MAX_RANGE_BATCH_BLOCKS = 8
+    HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES = 64 * 1024**2
+    HEAD_TRANSPORT_MAX_GAP_BYTES = 0
 
     def __init__(
         self,
@@ -342,6 +362,14 @@ class DeepSeekWeightPager:
                 np.ones(bits.shape, dtype=np.float32),
                 bits.astype(np.int16) - 127,
             )
+        elif dtype == "BF16":
+            words = np.frombuffer(tensor.payload, dtype="<u2").astype(np.uint32)
+            words <<= 16
+            values = words.view(np.float32)
+        elif dtype == "F16":
+            values = np.frombuffer(tensor.payload, dtype="<f2").copy()
+        elif dtype == "F32":
+            values = np.frombuffer(tensor.payload, dtype="<f4").copy()
         else:  # guarded by _coalesced_expert below
             raise DeepSeekPagerError(
                 f"unsupported coalesced dtype {dtype!r} at {tensor.name}"
@@ -352,6 +380,141 @@ class DeepSeekWeightPager:
                 f"{values.size} values for {tensor.shape}"
             )
         return values.reshape(tensor.shape)
+
+    @staticmethod
+    def _head_row_layout(
+        meta: dict[str, Any],
+        *,
+        block_rows: int,
+    ) -> tuple[str, str, int, tuple[_HeadRowLeaf, ...]] | None:
+        """Plan exact LM-head leaves, or decline before transport I/O.
+
+        Every planned leaf is byte-identical to the range ``TensorSource.rows``
+        requests for the same unchanged compute block. Only plain floating
+        checkpoint rows are eligible; quantized heads require scale-aware
+        decoding and remain on the scalar source path.
+        """
+
+        itemsize_by_dtype = {"BF16": 2, "F16": 2, "F32": 4}
+        try:
+            shape = tuple(int(value) for value in meta["shape"])
+            if len(shape) != 2 or shape[0] <= 0 or shape[1] <= 0:
+                return None
+            dtype = str(meta["dtype"]).upper()
+            itemsize = itemsize_by_dtype.get(dtype)
+            if itemsize is None:
+                return None
+            shard = str(meta["shard"])
+            data_start = int(meta["data_start"])
+            offsets = meta["offset_in_shard"]
+            if (
+                not shard
+                or data_start < 8
+                or not isinstance(offsets, (list, tuple))
+                or len(offsets) != 2
+            ):
+                return None
+            begin, end = (int(value) for value in offsets)
+            if begin < 0 or end <= begin:
+                return None
+            vocab, columns = shape
+            row_bytes = columns * itemsize
+            if end - begin != vocab * row_bytes:
+                return None
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+        leaves = tuple(
+            _HeadRowLeaf(
+                start_row=start,
+                count=min(block_rows, vocab - start),
+                absolute=data_start + begin + start * row_bytes,
+                length=min(block_rows, vocab - start) * row_bytes,
+            )
+            for start in range(0, vocab, block_rows)
+        )
+        return shard, dtype, columns, leaves
+
+    def _read_head_leaf_batch(
+        self,
+        *,
+        name: str,
+        shard: str,
+        dtype: str,
+        columns: int,
+        leaves: tuple[_HeadRowLeaf, ...],
+    ) -> tuple[_CoalescedTensor, ...]:
+        """Fetch exact row leaves with a bounded, fail-closed receipt."""
+
+        raw_bytes_many = getattr(self.source, "raw_bytes_many", None)
+        if not callable(raw_bytes_many):  # guarded by topk_logits planning
+            raise DeepSeekPagerError("head multi-range capability disappeared")
+        requested = tuple((leaf.absolute, leaf.length) for leaf in leaves)
+        requested_bytes = sum(leaf.length for leaf in leaves)
+        if requested_bytes > self.HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES:
+            raise DeepSeekPagerError(
+                "head multi-range plan exceeds the raw resident limit"
+            )
+        result = raw_bytes_many(
+            shard,
+            requested,
+            resident_limit_bytes=self.HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES,
+            max_gap_bytes=self.HEAD_TRANSPORT_MAX_GAP_BYTES,
+        )
+        try:
+            parts = tuple(result.parts)
+            resident_bytes = int(result.resident_bytes)
+            source_requests = int(result.source_requests)
+            source_bytes = int(result.source_bytes)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise DeepSeekPagerError(
+                f"invalid head multi-range receipt for {shard}"
+            ) from exc
+        if len(parts) != len(leaves):
+            raise DeepSeekPagerError(
+                f"head multi-range part count mismatch for {shard}: "
+                f"{len(parts)}/{len(leaves)}"
+            )
+        if (
+            resident_bytes != requested_bytes
+            or resident_bytes > self.HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES
+            or not 0 <= source_requests <= len(leaves)
+            or not 0 <= source_bytes <= requested_bytes
+        ):
+            raise DeepSeekPagerError(
+                f"invalid head multi-range receipt for {shard}: resident="
+                f"{resident_bytes}/{requested_bytes}, requests={source_requests}, "
+                f"source_bytes={source_bytes}"
+            )
+
+        tensors: list[_CoalescedTensor] = []
+        for leaf, part in zip(leaves, parts, strict=True):
+            view = part if isinstance(part, memoryview) else memoryview(part)
+            if not view.readonly or len(view) != leaf.length:
+                raise DeepSeekPagerError(
+                    f"invalid readonly head leaf for {name}[{leaf.start_row}:"
+                    f"{leaf.start_row + leaf.count}]: {len(view)}/{leaf.length} bytes"
+                )
+            tensors.append(
+                _CoalescedTensor(
+                    name=(
+                        f"{name}[{leaf.start_row}:"
+                        f"{leaf.start_row + leaf.count}]"
+                    ),
+                    dtype=dtype,
+                    shape=(leaf.count, columns),
+                    logical_bytes=leaf.length,
+                    payload=view,
+                )
+            )
+        self._stats.head_transport_batches += 1
+        self._stats.head_transport_envelopes += source_requests
+        self._stats.head_transport_source_bytes += source_bytes
+        # This is caller-level planning, not a physical-I/O claim: warm leaves
+        # also avoid scalar API calls while the receipt correctly reports zero
+        # source envelopes/bytes.
+        self._stats.head_planned_range_calls_avoided += max(0, len(leaves) - 1)
+        return tuple(tensors)
 
     @staticmethod
     def _coalesced_group_layout(
@@ -1803,10 +1966,19 @@ class DeepSeekWeightPager:
         *,
         k: int = 1,
         block_rows: int = 1024,
+        transport_range_batch_blocks: int = 1,
         name: str = "head.weight",
         progress: Callable[[dict[str, int]], None] | None = None,
+        instrument_block_observer: Callable[[int, Any], None] | None = None,
     ) -> tuple[Any, Any]:
-        """Scan the vocabulary head in bounded row blocks and return global top-k."""
+        """Scan the vocabulary head in bounded row blocks and return global top-k.
+
+        ``transport_range_batch_blocks`` is transport-only: values above one
+        batch exact adjacent source leaves without changing ``block_rows``,
+        decode order, compute order, or top-k reduction order. The observer is
+        an instrumentation hook and receives a detached clone of each original
+        compute block's logits after that block has been reduced.
+        """
 
         torch = self.torch
         if isinstance(k, bool) or not isinstance(k, int) or k <= 0:
@@ -1817,8 +1989,25 @@ class DeepSeekWeightPager:
             or block_rows <= 0
         ):
             raise ValueError("block_rows must be a positive integer")
+        if (
+            isinstance(transport_range_batch_blocks, bool)
+            or not isinstance(transport_range_batch_blocks, int)
+            or not self.HEAD_TRANSPORT_DEFAULT_RANGE_BATCH_BLOCKS
+            <= transport_range_batch_blocks
+            <= self.HEAD_TRANSPORT_MAX_RANGE_BATCH_BLOCKS
+        ):
+            raise ValueError(
+                "transport_range_batch_blocks must be an integer in [1, 8]"
+            )
+        if instrument_block_observer is not None and not callable(
+            instrument_block_observer
+        ):
+            raise ValueError("instrument_block_observer must be callable or None")
         meta = self.source.find(name)
-        vocab = int(meta["shape"][0])
+        shape = tuple(int(value) for value in meta["shape"])
+        if len(shape) != 2:
+            raise DeepSeekPagerError(f"head tensor {name} must be 2D")
+        vocab = shape[0]
         if k > vocab:
             raise ValueError("k exceeds vocabulary size")
         # Match the published ParallelHead, which promotes both activation and
@@ -1826,36 +2015,107 @@ class DeepSeekWeightPager:
         x = hidden.to(self.device, dtype=torch.float32)
         best_values = None
         best_ids = None
-        for start in range(0, vocab, block_rows):
-            count = min(block_rows, vocab - start)
-            with self._priority_scope(name, 1):
-                rows = self.source.rows(name, start_row=start, n_rows=count)
+
+        def consume_block(start: int, count: int, rows: np.ndarray) -> None:
+            nonlocal best_values, best_ids
             weight = torch.from_numpy(np.ascontiguousarray(rows)).to(
                 self.device, dtype=torch.float32
             )
-            logits = torch.nn.functional.linear(x, weight)
-            local_k = min(k, count)
-            token_ids = torch.arange(
-                start, start + count, dtype=torch.long, device=logits.device
-            ).expand_as(logits)
-            values, indices = self._stable_topk(logits, token_ids, local_k)
-            if best_values is None:
-                best_values, best_ids = values, indices
-            else:
-                joined_values = torch.cat((best_values, values), dim=-1)
-                joined_ids = torch.cat((best_ids, indices), dim=-1)
-                best_values, best_ids = self._stable_topk(joined_values, joined_ids, k)
-            self._stats.head_rows += count
-            if progress is not None:
-                progress(
-                    {
-                        "start_row": start,
-                        "rows": count,
-                        "rows_done": start + count,
-                        "vocab_rows": vocab,
-                    }
-                )
-            del weight
+            try:
+                logits = torch.nn.functional.linear(x, weight)
+                local_k = min(k, count)
+                token_ids = torch.arange(
+                    start, start + count, dtype=torch.long, device=logits.device
+                ).expand_as(logits)
+                values, indices = self._stable_topk(logits, token_ids, local_k)
+                if best_values is None:
+                    best_values, best_ids = values, indices
+                else:
+                    joined_values = torch.cat((best_values, values), dim=-1)
+                    joined_ids = torch.cat((best_ids, indices), dim=-1)
+                    best_values, best_ids = self._stable_topk(
+                        joined_values, joined_ids, k
+                    )
+                self._stats.head_rows += count
+                if instrument_block_observer is not None:
+                    instrument_block_observer(start, logits.detach().clone())
+                if progress is not None:
+                    progress(
+                        {
+                            "start_row": start,
+                            "rows": count,
+                            "rows_done": start + count,
+                            "vocab_rows": vocab,
+                        }
+                    )
+            finally:
+                del weight
+
+        logical_leaves = tuple(
+            (start, min(block_rows, vocab - start))
+            for start in range(0, vocab, block_rows)
+        )
+        self._stats.head_logical_leaves += len(logical_leaves)
+        raw_bytes_many = getattr(self.source, "raw_bytes_many", None)
+        head_layout = None
+        if transport_range_batch_blocks > 1 and callable(raw_bytes_many):
+            head_layout = self._head_row_layout(meta, block_rows=block_rows)
+
+        if transport_range_batch_blocks == 1:
+            for start, count in logical_leaves:
+                with self._priority_scope(name, 1):
+                    rows = self.source.rows(
+                        name, start_row=start, n_rows=count
+                    )
+                consume_block(start, count, rows)
+        elif head_layout is None:
+            self._stats.head_transport_fallbacks += 1
+            self._stats.head_transport_fallback_leaves += len(logical_leaves)
+            for start, count in logical_leaves:
+                with self._priority_scope(name, 1):
+                    rows = self.source.rows(
+                        name, start_row=start, n_rows=count
+                    )
+                consume_block(start, count, rows)
+        else:
+            shard, dtype, columns, leaves = head_layout
+            index = 0
+            while index < len(leaves):
+                leaf = leaves[index]
+                if leaf.length > self.HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES:
+                    self._stats.head_transport_fallbacks += 1
+                    self._stats.head_transport_fallback_leaves += 1
+                    with self._priority_scope(name, 1):
+                        rows = self.source.rows(
+                            name,
+                            start_row=leaf.start_row,
+                            n_rows=leaf.count,
+                        )
+                    consume_block(leaf.start_row, leaf.count, rows)
+                    index += 1
+                    continue
+
+                stop = index
+                resident_bytes = 0
+                while stop < len(leaves) and stop - index < transport_range_batch_blocks:
+                    candidate_bytes = resident_bytes + leaves[stop].length
+                    if candidate_bytes > self.HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES:
+                        break
+                    resident_bytes = candidate_bytes
+                    stop += 1
+                batch = leaves[index:stop]
+                with self._priority_scope(name, 1):
+                    tensors = self._read_head_leaf_batch(
+                        name=name,
+                        shard=shard,
+                        dtype=dtype,
+                        columns=columns,
+                        leaves=batch,
+                    )
+                for original, tensor in zip(batch, tensors, strict=True):
+                    rows = self._decode_coalesced_tensor(tensor)
+                    consume_block(original.start_row, original.count, rows)
+                index = stop
         assert best_values is not None and best_ids is not None
         return best_values, best_ids
 
@@ -1888,6 +2148,17 @@ class DeepSeekWeightPager:
             "device": str(self.device),
             "compute_dtype": str(self.compute_dtype).removeprefix("torch."),
             "quantized_accumulation_policy": self.QUANTIZED_ACCUMULATION_POLICY,
+            "head_transport_policy": self.HEAD_TRANSPORT_POLICY,
+            "head_transport_default_range_batch_blocks": (
+                self.HEAD_TRANSPORT_DEFAULT_RANGE_BATCH_BLOCKS
+            ),
+            "head_transport_max_range_batch_blocks": (
+                self.HEAD_TRANSPORT_MAX_RANGE_BATCH_BLOCKS
+            ),
+            "head_transport_resident_limit_bytes": (
+                self.HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES
+            ),
+            "head_transport_max_gap_bytes": self.HEAD_TRANSPORT_MAX_GAP_BYTES,
             "expert_prefetch_policy": self.expert_prefetch_policy,
             "expert_prefetch_transport_policy": (
                 self.expert_prefetch_transport_policy

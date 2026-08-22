@@ -1,0 +1,1100 @@
+{
+  "finished_at": "2026-08-22T19:26:31.505987+00:00",
+  "protocol": {
+    "baseline_transport_range_batch_blocks": 1,
+    "candidate_transport_range_batch_blocks": 8,
+    "compute_block_rows": 1024,
+    "compute_order": "unchanged sequential row blocks",
+    "exactness_gate": "full blockwise FP32 logit stream + top-k values/IDs bit-identical",
+    "pairs": 4,
+    "raw_resident_limit_bytes": 67108864,
+    "same_hidden_for_all_arms": true,
+    "separate_cold_leaf_cache_per_arm": true,
+    "temporary_cache_free_bytes_at_preflight": 32349962240,
+    "temporary_cache_required_free_bytes": 1327497216,
+    "top_k": 16,
+    "trial_schedule": [
+      [
+        "baseline",
+        "candidate"
+      ],
+      [
+        "candidate",
+        "baseline"
+      ],
+      [
+        "baseline",
+        "candidate"
+      ],
+      [
+        "candidate",
+        "baseline"
+      ]
+    ]
+  },
+  "provenance": {
+    "activation": {
+      "checkpoint": {
+        "bucket": 0,
+        "dtype": "bfloat16",
+        "file": "2cd7351fe1fcfddaf1b85bfc6ba0e196c5e3506cd892a4e9c8195c87d35f0570.safetensors",
+        "file_bytes": 6291680,
+        "generation_layer": 42,
+        "schema": "immer.deepseek-v4-layerwise-activation/v4",
+        "sha256": "2cd7351fe1fcfddaf1b85bfc6ba0e196c5e3506cd892a4e9c8195c87d35f0570",
+        "shape": [
+          4,
+          48,
+          4,
+          4096
+        ],
+        "tensor_bytes": 6291456,
+        "variant": "off",
+        "version": 4
+      },
+      "manifest_body_sha256": "b4b4549583e08bf529e3108847528cae1653e52ad3e80240379c1afed90605b9",
+      "manifest_path": "/Users/bhkmie/immer/artifacts/private/deepseek-v4-mmlu-off-4-exact-v4-window2x3/manifest.json",
+      "manifest_sha256": "2db5023b1053bb22a9c0759f578fd88fcd8678ef5fdaac2525e6c358928fd463",
+      "object_path": "/Users/bhkmie/immer/artifacts/private/deepseek-v4-mmlu-off-4-exact-v4-window2x3/objects/2cd7351fe1fcfddaf1b85bfc6ba0e196c5e3506cd892a4e9c8195c87d35f0570.safetensors",
+      "object_sha256": "2cd7351fe1fcfddaf1b85bfc6ba0e196c5e3506cd892a4e9c8195c87d35f0570",
+      "selected_bucket": 0,
+      "selected_bucket_row": 0,
+      "selected_item_index": 2,
+      "selected_sequence_position": 36
+    },
+    "config": {
+      "bytes": 1888,
+      "path": "/Users/bhkmie/immer/artifacts/private/deepseek-v4-reference/config.json",
+      "sha256": "6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023"
+    },
+    "execution": {
+      "compute_dtype": "bfloat16",
+      "device": "mps",
+      "head_transport_default_range_batch_blocks": 1,
+      "head_transport_max_range_batch_blocks": 8,
+      "head_transport_policy": "exact-head-leaf-adjacent-envelope/v1",
+      "head_transport_resident_limit_bytes": 67108864
+    },
+    "hardware": {
+      "machine": "arm64",
+      "platform": "macOS-26.5-arm64-arm-64bit-Mach-O",
+      "python": "3.13.1"
+    },
+    "harness_sha256": "4bfeb3eea3d837353fac72237f59b55eae993f3a060512bfcece65c5e738caa0",
+    "preparation": {
+      "hidden_dtype": "bfloat16",
+      "hidden_sha256": "cef0d7d8e28942b6089e194542a9821ceb01ff58e85be1bf47069b86b45f98c4",
+      "hidden_shape": [
+        1,
+        4096
+      ],
+      "source": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "source_metrics_delta": {
+        "cache_bytes_written": 0,
+        "cache_hits": 4,
+        "cache_misses": 0,
+        "cache_writes": 0,
+        "failed_requests": 0,
+        "network_or_source_body_bytes": 0,
+        "range_bytes_requested": 0,
+        "range_logical_leaf_bytes": 270356,
+        "range_logical_leaves": 4,
+        "range_requests": 0,
+        "range_source_bytes": 0,
+        "range_source_requests": 0,
+        "transport_requests": 0,
+        "transport_retries": 0
+      }
+    },
+    "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+    "runtime_dependencies": {
+      "numpy": "2.2.6",
+      "python": "3.13.1",
+      "requests": "2.34.2",
+      "safetensors": "0.7.0",
+      "torch": "2.9.1"
+    },
+    "runtime_dependency_sha256": "35a9b482adfb022b61fc789bc086bfaf542c7cd8f7ac962998dbc8a01e12febb",
+    "runtime_source_sha256": "a558cf9b225aa4e0718ef6cfef782a343ce504d68099a575a1cab01bc468adca",
+    "runtime_sources": [
+      {
+        "path": "immer/runtimes/deepseek_v4/__init__.py",
+        "sha256": "705fa1c6c74e51ce906fa62243a0962ed6f54ffe7c3c52f8df3c40e2dfbf03e0"
+      },
+      {
+        "path": "immer/runtimes/deepseek_v4/config.py",
+        "sha256": "bc5d5b9951c30c2bfb0534816f668dc21c58a04df659672c5b608d6b19a700e4"
+      },
+      {
+        "path": "immer/runtimes/deepseek_v4/encoding.py",
+        "sha256": "879149b0ba9faf8256e448542197cc910cd6f36cddd56d29dacd90ee9a3d958f"
+      },
+      {
+        "path": "immer/runtimes/deepseek_v4/graft.py",
+        "sha256": "0430d760c921777598506ca0354fac2890636d252254777c9023f5d0b594e0c8"
+      },
+      {
+        "path": "immer/runtimes/deepseek_v4/kernels.py",
+        "sha256": "78ff19e40bab42a33c871822943d8c12a148d784ec0fd8edb3172dd754d5115e"
+      },
+      {
+        "path": "immer/runtimes/deepseek_v4/model.py",
+        "sha256": "280c11d3e882de3d23c3cd3d5230776645bc02d976a831a99c79fa35559e3389"
+      },
+      {
+        "path": "immer/runtimes/deepseek_v4/pager.py",
+        "sha256": "b13b032cfc55fe71aa34bc96a677c6e565b31881c781febd0a9a65608189b428"
+      },
+      {
+        "path": "immer/runtimes/deepseek_v4/provenance.py",
+        "sha256": "4a1b687dd7c140bde65eb3e5ef5bce66bc2875bed2b127b2abaaa11947fe0e88"
+      },
+      {
+        "path": "immer/runtimes/deepseek_v4/quantization.py",
+        "sha256": "97f1425b4760f4f5452c405b7ef32ae668152a197a2f463df8d6105447b308b3"
+      },
+      {
+        "path": "immer/runtimes/deepseek_v4/snapshot.py",
+        "sha256": "c2ba86691fae502787ed7d2ff34c1906cd61bff51e0939d953810b26fa65471c"
+      },
+      {
+        "path": "immer/runtimes/deepseek_v4/stateful.py",
+        "sha256": "77ab4cff7405dc1392c901ff5376371f822cee3bc4bc9ab8be22e44d6f2de6a2"
+      },
+      {
+        "path": "immer/knowledge/__init__.py",
+        "sha256": "fc7b7de4189b4a2527ad17dcbece5f8bae1db336691ff52ba2bb6001aead9e0d"
+      },
+      {
+        "path": "immer/knowledge/_hf_source.py",
+        "sha256": "fa54ddeb6b2bfce47598275637513b6ac02c15ccce94d970d80e88889c3724ff"
+      },
+      {
+        "path": "immer/knowledge/streamer.py",
+        "sha256": "37a9b6c73d548664dc4a88baad02bd290132e6e029006189d77eca96f02bfe23"
+      },
+      {
+        "path": "scripts/deepseek_v4_head_range_smoke.py",
+        "sha256": "4bfeb3eea3d837353fac72237f59b55eae993f3a060512bfcece65c5e738caa0"
+      }
+    ],
+    "source": "deepseek-ai/DeepSeek-V4-Flash-0731"
+  },
+  "report_sha256": "fb5927c5c626ca15d11ec98de7b310b30a9a55e46370fa15dc2dac6e4cedb4f4",
+  "schema": "immer.deepseek-v4-head-range-smoke/v1",
+  "started_at": "2026-08-22T18:53:09.492861+00:00",
+  "status": "passed",
+  "summary": {
+    "baseline": {
+      "mean_seconds": 211.57558170800075,
+      "median_seconds": 182.28082704150074,
+      "p90_seconds": 278.74655517850334
+    },
+    "candidate": {
+      "mean_seconds": 125.68796385425048,
+      "median_seconds": 126.15536749999956,
+      "p90_seconds": 131.71453059189952
+    },
+    "candidate_wins": 4,
+    "median_speedup_baseline_over_candidate": 1.4457904181806898,
+    "pairs": 4,
+    "performance_claim": "paired latency evidence; inspect dispersion and tails",
+    "speedups_baseline_over_candidate": [
+      1.4775203059478497,
+      1.3756060049473324,
+      1.4140605304135299,
+      2.4108108035722924
+    ]
+  },
+  "trials": [
+    {
+      "baseline": {
+        "arm": "baseline",
+        "head": {
+          "data_start": 400,
+          "dtype": "BF16",
+          "name": "head.weight",
+          "offset_in_shard": [
+            262164,
+            1059323924
+          ],
+          "payload_bytes": 1059061760,
+          "sha256": "d9e5948d013554621ccac532122b921e47dc86977fd7e993b588df32008198f0",
+          "shape": [
+            129280,
+            4096
+          ],
+          "shard": "model-00045-of-00048.safetensors"
+        },
+        "logit_blocks": 127,
+        "logit_rows": 129280,
+        "logit_stream_sha256": "7e7031941115dd9a438a69f4b1443dd72599249d3959195c8cb0ee9bad5ab229",
+        "pager_metrics_delta": {
+          "head_logical_leaves": 127,
+          "head_planned_range_calls_avoided": 0,
+          "head_rows": 129280,
+          "head_transport_batches": 0,
+          "head_transport_envelopes": 0,
+          "head_transport_fallback_leaves": 0,
+          "head_transport_fallbacks": 0,
+          "head_transport_source_bytes": 0
+        },
+        "seconds": 181.11683804199856,
+        "source": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "source_identity": {
+          "inventory_source_fingerprint": "61600c552f3e52ae382b3eca0370001905fc4e2ecdd2da5f3e66fa95809206c7",
+          "revision_is_mutable": false,
+          "revision_is_pinned": true,
+          "transport_active_leases": 0,
+          "transport_closed": true,
+          "transport_connection_limit": 2,
+          "transport_peak_leases": 1,
+          "transport_policy": "requests-session-pool-2/v1"
+        },
+        "source_metrics_delta": {
+          "cache_bytes_written": 1059061760,
+          "cache_hits": 0,
+          "cache_misses": 127,
+          "cache_writes": 127,
+          "failed_requests": 0,
+          "network_or_source_body_bytes": 1059061760,
+          "range_bytes_requested": 1059061760,
+          "range_logical_leaf_bytes": 1059061760,
+          "range_logical_leaves": 127,
+          "range_requests": 127,
+          "range_source_bytes": 1059061760,
+          "range_source_requests": 127,
+          "transport_requests": 127,
+          "transport_retries": 0
+        },
+        "topk_token_ids": [
+          [
+            345,
+            2619,
+            2143,
+            539,
+            223,
+            874,
+            14320,
+            334,
+            455,
+            343,
+            6776,
+            420,
+            1004,
+            406,
+            1,
+            76085
+          ]
+        ],
+        "topk_token_ids_sha256": "9f18027b319d9f0afee94bd39028ae192d49f74b85d50fb460b3ab942bf975fd",
+        "topk_values": [
+          [
+            31.723651885986328,
+            29.46108055114746,
+            26.987611770629883,
+            22.199142456054688,
+            22.155771255493164,
+            22.008026123046875,
+            21.943832397460938,
+            21.57022476196289,
+            21.51248550415039,
+            21.476200103759766,
+            21.378578186035156,
+            20.547801971435547,
+            20.356990814208984,
+            20.215591430664062,
+            20.0413818359375,
+            20.004608154296875
+          ]
+        ],
+        "topk_values_sha256": "68a1af7e943d9854c2485a66181802eb5d0cf54590c3f6bd2e177cacc2d9fbf0",
+        "transport_range_batch_blocks": 1
+      },
+      "candidate": {
+        "arm": "candidate",
+        "head": {
+          "data_start": 400,
+          "dtype": "BF16",
+          "name": "head.weight",
+          "offset_in_shard": [
+            262164,
+            1059323924
+          ],
+          "payload_bytes": 1059061760,
+          "sha256": "d9e5948d013554621ccac532122b921e47dc86977fd7e993b588df32008198f0",
+          "shape": [
+            129280,
+            4096
+          ],
+          "shard": "model-00045-of-00048.safetensors"
+        },
+        "logit_blocks": 127,
+        "logit_rows": 129280,
+        "logit_stream_sha256": "7e7031941115dd9a438a69f4b1443dd72599249d3959195c8cb0ee9bad5ab229",
+        "pager_metrics_delta": {
+          "head_logical_leaves": 127,
+          "head_planned_range_calls_avoided": 111,
+          "head_rows": 129280,
+          "head_transport_batches": 16,
+          "head_transport_envelopes": 16,
+          "head_transport_fallback_leaves": 0,
+          "head_transport_fallbacks": 0,
+          "head_transport_source_bytes": 1059061760
+        },
+        "seconds": 122.58162362500298,
+        "source": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "source_identity": {
+          "inventory_source_fingerprint": "61600c552f3e52ae382b3eca0370001905fc4e2ecdd2da5f3e66fa95809206c7",
+          "revision_is_mutable": false,
+          "revision_is_pinned": true,
+          "transport_active_leases": 0,
+          "transport_closed": true,
+          "transport_connection_limit": 2,
+          "transport_peak_leases": 1,
+          "transport_policy": "requests-session-pool-2/v1"
+        },
+        "source_metrics_delta": {
+          "cache_bytes_written": 1059061760,
+          "cache_hits": 0,
+          "cache_misses": 127,
+          "cache_writes": 127,
+          "failed_requests": 0,
+          "network_or_source_body_bytes": 1059061760,
+          "range_bytes_requested": 1059061760,
+          "range_logical_leaf_bytes": 1059061760,
+          "range_logical_leaves": 127,
+          "range_requests": 16,
+          "range_source_bytes": 1059061760,
+          "range_source_requests": 16,
+          "transport_requests": 16,
+          "transport_retries": 0
+        },
+        "topk_token_ids": [
+          [
+            345,
+            2619,
+            2143,
+            539,
+            223,
+            874,
+            14320,
+            334,
+            455,
+            343,
+            6776,
+            420,
+            1004,
+            406,
+            1,
+            76085
+          ]
+        ],
+        "topk_token_ids_sha256": "9f18027b319d9f0afee94bd39028ae192d49f74b85d50fb460b3ab942bf975fd",
+        "topk_values": [
+          [
+            31.723651885986328,
+            29.46108055114746,
+            26.987611770629883,
+            22.199142456054688,
+            22.155771255493164,
+            22.008026123046875,
+            21.943832397460938,
+            21.57022476196289,
+            21.51248550415039,
+            21.476200103759766,
+            21.378578186035156,
+            20.547801971435547,
+            20.356990814208984,
+            20.215591430664062,
+            20.0413818359375,
+            20.004608154296875
+          ]
+        ],
+        "topk_values_sha256": "68a1af7e943d9854c2485a66181802eb5d0cf54590c3f6bd2e177cacc2d9fbf0",
+        "transport_range_batch_blocks": 8
+      },
+      "comparison": {
+        "baseline_source_requests": 127,
+        "bit_identical": true,
+        "candidate_source_requests": 16,
+        "request_reduction_fraction": 0.8740157480314961,
+        "source_bytes_equal": true,
+        "source_requests_avoided": 111,
+        "speedup_baseline_over_candidate": 1.4775203059478497
+      },
+      "execution_order": [
+        "baseline",
+        "candidate"
+      ],
+      "pair": 0
+    },
+    {
+      "baseline": {
+        "arm": "baseline",
+        "head": {
+          "data_start": 400,
+          "dtype": "BF16",
+          "name": "head.weight",
+          "offset_in_shard": [
+            262164,
+            1059323924
+          ],
+          "payload_bytes": 1059061760,
+          "sha256": "d9e5948d013554621ccac532122b921e47dc86977fd7e993b588df32008198f0",
+          "shape": [
+            129280,
+            4096
+          ],
+          "shard": "model-00045-of-00048.safetensors"
+        },
+        "logit_blocks": 127,
+        "logit_rows": 129280,
+        "logit_stream_sha256": "7e7031941115dd9a438a69f4b1443dd72599249d3959195c8cb0ee9bad5ab229",
+        "pager_metrics_delta": {
+          "head_logical_leaves": 127,
+          "head_planned_range_calls_avoided": 0,
+          "head_rows": 129280,
+          "head_transport_batches": 0,
+          "head_transport_envelopes": 0,
+          "head_transport_fallback_leaves": 0,
+          "head_transport_fallbacks": 0,
+          "head_transport_source_bytes": 0
+        },
+        "seconds": 162.15051508299803,
+        "source": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "source_identity": {
+          "inventory_source_fingerprint": "61600c552f3e52ae382b3eca0370001905fc4e2ecdd2da5f3e66fa95809206c7",
+          "revision_is_mutable": false,
+          "revision_is_pinned": true,
+          "transport_active_leases": 0,
+          "transport_closed": true,
+          "transport_connection_limit": 2,
+          "transport_peak_leases": 1,
+          "transport_policy": "requests-session-pool-2/v1"
+        },
+        "source_metrics_delta": {
+          "cache_bytes_written": 1059061760,
+          "cache_hits": 0,
+          "cache_misses": 127,
+          "cache_writes": 127,
+          "failed_requests": 0,
+          "network_or_source_body_bytes": 1059061760,
+          "range_bytes_requested": 1059061760,
+          "range_logical_leaf_bytes": 1059061760,
+          "range_logical_leaves": 127,
+          "range_requests": 127,
+          "range_source_bytes": 1059061760,
+          "range_source_requests": 127,
+          "transport_requests": 127,
+          "transport_retries": 0
+        },
+        "topk_token_ids": [
+          [
+            345,
+            2619,
+            2143,
+            539,
+            223,
+            874,
+            14320,
+            334,
+            455,
+            343,
+            6776,
+            420,
+            1004,
+            406,
+            1,
+            76085
+          ]
+        ],
+        "topk_token_ids_sha256": "9f18027b319d9f0afee94bd39028ae192d49f74b85d50fb460b3ab942bf975fd",
+        "topk_values": [
+          [
+            31.723651885986328,
+            29.46108055114746,
+            26.987611770629883,
+            22.199142456054688,
+            22.155771255493164,
+            22.008026123046875,
+            21.943832397460938,
+            21.57022476196289,
+            21.51248550415039,
+            21.476200103759766,
+            21.378578186035156,
+            20.547801971435547,
+            20.356990814208984,
+            20.215591430664062,
+            20.0413818359375,
+            20.004608154296875
+          ]
+        ],
+        "topk_values_sha256": "68a1af7e943d9854c2485a66181802eb5d0cf54590c3f6bd2e177cacc2d9fbf0",
+        "transport_range_batch_blocks": 1
+      },
+      "candidate": {
+        "arm": "candidate",
+        "head": {
+          "data_start": 400,
+          "dtype": "BF16",
+          "name": "head.weight",
+          "offset_in_shard": [
+            262164,
+            1059323924
+          ],
+          "payload_bytes": 1059061760,
+          "sha256": "d9e5948d013554621ccac532122b921e47dc86977fd7e993b588df32008198f0",
+          "shape": [
+            129280,
+            4096
+          ],
+          "shard": "model-00045-of-00048.safetensors"
+        },
+        "logit_blocks": 127,
+        "logit_rows": 129280,
+        "logit_stream_sha256": "7e7031941115dd9a438a69f4b1443dd72599249d3959195c8cb0ee9bad5ab229",
+        "pager_metrics_delta": {
+          "head_logical_leaves": 127,
+          "head_planned_range_calls_avoided": 111,
+          "head_rows": 129280,
+          "head_transport_batches": 16,
+          "head_transport_envelopes": 16,
+          "head_transport_fallback_leaves": 0,
+          "head_transport_fallbacks": 0,
+          "head_transport_source_bytes": 1059061760
+        },
+        "seconds": 117.87569587500184,
+        "source": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "source_identity": {
+          "inventory_source_fingerprint": "61600c552f3e52ae382b3eca0370001905fc4e2ecdd2da5f3e66fa95809206c7",
+          "revision_is_mutable": false,
+          "revision_is_pinned": true,
+          "transport_active_leases": 0,
+          "transport_closed": true,
+          "transport_connection_limit": 2,
+          "transport_peak_leases": 1,
+          "transport_policy": "requests-session-pool-2/v1"
+        },
+        "source_metrics_delta": {
+          "cache_bytes_written": 1059061760,
+          "cache_hits": 0,
+          "cache_misses": 127,
+          "cache_writes": 127,
+          "failed_requests": 0,
+          "network_or_source_body_bytes": 1059061760,
+          "range_bytes_requested": 1059061760,
+          "range_logical_leaf_bytes": 1059061760,
+          "range_logical_leaves": 127,
+          "range_requests": 16,
+          "range_source_bytes": 1059061760,
+          "range_source_requests": 16,
+          "transport_requests": 16,
+          "transport_retries": 0
+        },
+        "topk_token_ids": [
+          [
+            345,
+            2619,
+            2143,
+            539,
+            223,
+            874,
+            14320,
+            334,
+            455,
+            343,
+            6776,
+            420,
+            1004,
+            406,
+            1,
+            76085
+          ]
+        ],
+        "topk_token_ids_sha256": "9f18027b319d9f0afee94bd39028ae192d49f74b85d50fb460b3ab942bf975fd",
+        "topk_values": [
+          [
+            31.723651885986328,
+            29.46108055114746,
+            26.987611770629883,
+            22.199142456054688,
+            22.155771255493164,
+            22.008026123046875,
+            21.943832397460938,
+            21.57022476196289,
+            21.51248550415039,
+            21.476200103759766,
+            21.378578186035156,
+            20.547801971435547,
+            20.356990814208984,
+            20.215591430664062,
+            20.0413818359375,
+            20.004608154296875
+          ]
+        ],
+        "topk_values_sha256": "68a1af7e943d9854c2485a66181802eb5d0cf54590c3f6bd2e177cacc2d9fbf0",
+        "transport_range_batch_blocks": 8
+      },
+      "comparison": {
+        "baseline_source_requests": 127,
+        "bit_identical": true,
+        "candidate_source_requests": 16,
+        "request_reduction_fraction": 0.8740157480314961,
+        "source_bytes_equal": true,
+        "source_requests_avoided": 111,
+        "speedup_baseline_over_candidate": 1.3756060049473324
+      },
+      "execution_order": [
+        "candidate",
+        "baseline"
+      ],
+      "pair": 1
+    },
+    {
+      "baseline": {
+        "arm": "baseline",
+        "head": {
+          "data_start": 400,
+          "dtype": "BF16",
+          "name": "head.weight",
+          "offset_in_shard": [
+            262164,
+            1059323924
+          ],
+          "payload_bytes": 1059061760,
+          "sha256": "d9e5948d013554621ccac532122b921e47dc86977fd7e993b588df32008198f0",
+          "shape": [
+            129280,
+            4096
+          ],
+          "shard": "model-00045-of-00048.safetensors"
+        },
+        "logit_blocks": 127,
+        "logit_rows": 129280,
+        "logit_stream_sha256": "7e7031941115dd9a438a69f4b1443dd72599249d3959195c8cb0ee9bad5ab229",
+        "pager_metrics_delta": {
+          "head_logical_leaves": 127,
+          "head_planned_range_calls_avoided": 0,
+          "head_rows": 129280,
+          "head_transport_batches": 0,
+          "head_transport_envelopes": 0,
+          "head_transport_fallback_leaves": 0,
+          "head_transport_fallbacks": 0,
+          "head_transport_source_bytes": 0
+        },
+        "seconds": 183.44481604100292,
+        "source": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "source_identity": {
+          "inventory_source_fingerprint": "61600c552f3e52ae382b3eca0370001905fc4e2ecdd2da5f3e66fa95809206c7",
+          "revision_is_mutable": false,
+          "revision_is_pinned": true,
+          "transport_active_leases": 0,
+          "transport_closed": true,
+          "transport_connection_limit": 2,
+          "transport_peak_leases": 1,
+          "transport_policy": "requests-session-pool-2/v1"
+        },
+        "source_metrics_delta": {
+          "cache_bytes_written": 1059061760,
+          "cache_hits": 0,
+          "cache_misses": 127,
+          "cache_writes": 127,
+          "failed_requests": 0,
+          "network_or_source_body_bytes": 1059061760,
+          "range_bytes_requested": 1059061760,
+          "range_logical_leaf_bytes": 1059061760,
+          "range_logical_leaves": 127,
+          "range_requests": 127,
+          "range_source_bytes": 1059061760,
+          "range_source_requests": 127,
+          "transport_requests": 127,
+          "transport_retries": 0
+        },
+        "topk_token_ids": [
+          [
+            345,
+            2619,
+            2143,
+            539,
+            223,
+            874,
+            14320,
+            334,
+            455,
+            343,
+            6776,
+            420,
+            1004,
+            406,
+            1,
+            76085
+          ]
+        ],
+        "topk_token_ids_sha256": "9f18027b319d9f0afee94bd39028ae192d49f74b85d50fb460b3ab942bf975fd",
+        "topk_values": [
+          [
+            31.723651885986328,
+            29.46108055114746,
+            26.987611770629883,
+            22.199142456054688,
+            22.155771255493164,
+            22.008026123046875,
+            21.943832397460938,
+            21.57022476196289,
+            21.51248550415039,
+            21.476200103759766,
+            21.378578186035156,
+            20.547801971435547,
+            20.356990814208984,
+            20.215591430664062,
+            20.0413818359375,
+            20.004608154296875
+          ]
+        ],
+        "topk_values_sha256": "68a1af7e943d9854c2485a66181802eb5d0cf54590c3f6bd2e177cacc2d9fbf0",
+        "transport_range_batch_blocks": 1
+      },
+      "candidate": {
+        "arm": "candidate",
+        "head": {
+          "data_start": 400,
+          "dtype": "BF16",
+          "name": "head.weight",
+          "offset_in_shard": [
+            262164,
+            1059323924
+          ],
+          "payload_bytes": 1059061760,
+          "sha256": "d9e5948d013554621ccac532122b921e47dc86977fd7e993b588df32008198f0",
+          "shape": [
+            129280,
+            4096
+          ],
+          "shard": "model-00045-of-00048.safetensors"
+        },
+        "logit_blocks": 127,
+        "logit_rows": 129280,
+        "logit_stream_sha256": "7e7031941115dd9a438a69f4b1443dd72599249d3959195c8cb0ee9bad5ab229",
+        "pager_metrics_delta": {
+          "head_logical_leaves": 127,
+          "head_planned_range_calls_avoided": 111,
+          "head_rows": 129280,
+          "head_transport_batches": 16,
+          "head_transport_envelopes": 16,
+          "head_transport_fallback_leaves": 0,
+          "head_transport_fallbacks": 0,
+          "head_transport_source_bytes": 1059061760
+        },
+        "seconds": 129.72911137499614,
+        "source": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "source_identity": {
+          "inventory_source_fingerprint": "61600c552f3e52ae382b3eca0370001905fc4e2ecdd2da5f3e66fa95809206c7",
+          "revision_is_mutable": false,
+          "revision_is_pinned": true,
+          "transport_active_leases": 0,
+          "transport_closed": true,
+          "transport_connection_limit": 2,
+          "transport_peak_leases": 1,
+          "transport_policy": "requests-session-pool-2/v1"
+        },
+        "source_metrics_delta": {
+          "cache_bytes_written": 1059061760,
+          "cache_hits": 0,
+          "cache_misses": 127,
+          "cache_writes": 127,
+          "failed_requests": 0,
+          "network_or_source_body_bytes": 1059061760,
+          "range_bytes_requested": 1059061760,
+          "range_logical_leaf_bytes": 1059061760,
+          "range_logical_leaves": 127,
+          "range_requests": 16,
+          "range_source_bytes": 1059061760,
+          "range_source_requests": 16,
+          "transport_requests": 16,
+          "transport_retries": 0
+        },
+        "topk_token_ids": [
+          [
+            345,
+            2619,
+            2143,
+            539,
+            223,
+            874,
+            14320,
+            334,
+            455,
+            343,
+            6776,
+            420,
+            1004,
+            406,
+            1,
+            76085
+          ]
+        ],
+        "topk_token_ids_sha256": "9f18027b319d9f0afee94bd39028ae192d49f74b85d50fb460b3ab942bf975fd",
+        "topk_values": [
+          [
+            31.723651885986328,
+            29.46108055114746,
+            26.987611770629883,
+            22.199142456054688,
+            22.155771255493164,
+            22.008026123046875,
+            21.943832397460938,
+            21.57022476196289,
+            21.51248550415039,
+            21.476200103759766,
+            21.378578186035156,
+            20.547801971435547,
+            20.356990814208984,
+            20.215591430664062,
+            20.0413818359375,
+            20.004608154296875
+          ]
+        ],
+        "topk_values_sha256": "68a1af7e943d9854c2485a66181802eb5d0cf54590c3f6bd2e177cacc2d9fbf0",
+        "transport_range_batch_blocks": 8
+      },
+      "comparison": {
+        "baseline_source_requests": 127,
+        "bit_identical": true,
+        "candidate_source_requests": 16,
+        "request_reduction_fraction": 0.8740157480314961,
+        "source_bytes_equal": true,
+        "source_requests_avoided": 111,
+        "speedup_baseline_over_candidate": 1.4140605304135299
+      },
+      "execution_order": [
+        "baseline",
+        "candidate"
+      ],
+      "pair": 2
+    },
+    {
+      "baseline": {
+        "arm": "baseline",
+        "head": {
+          "data_start": 400,
+          "dtype": "BF16",
+          "name": "head.weight",
+          "offset_in_shard": [
+            262164,
+            1059323924
+          ],
+          "payload_bytes": 1059061760,
+          "sha256": "d9e5948d013554621ccac532122b921e47dc86977fd7e993b588df32008198f0",
+          "shape": [
+            129280,
+            4096
+          ],
+          "shard": "model-00045-of-00048.safetensors"
+        },
+        "logit_blocks": 127,
+        "logit_rows": 129280,
+        "logit_stream_sha256": "7e7031941115dd9a438a69f4b1443dd72599249d3959195c8cb0ee9bad5ab229",
+        "pager_metrics_delta": {
+          "head_logical_leaves": 127,
+          "head_planned_range_calls_avoided": 0,
+          "head_rows": 129280,
+          "head_transport_batches": 0,
+          "head_transport_envelopes": 0,
+          "head_transport_fallback_leaves": 0,
+          "head_transport_fallbacks": 0,
+          "head_transport_source_bytes": 0
+        },
+        "seconds": 319.5901576660035,
+        "source": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "source_identity": {
+          "inventory_source_fingerprint": "61600c552f3e52ae382b3eca0370001905fc4e2ecdd2da5f3e66fa95809206c7",
+          "revision_is_mutable": false,
+          "revision_is_pinned": true,
+          "transport_active_leases": 0,
+          "transport_closed": true,
+          "transport_connection_limit": 2,
+          "transport_peak_leases": 1,
+          "transport_policy": "requests-session-pool-2/v1"
+        },
+        "source_metrics_delta": {
+          "cache_bytes_written": 1059061760,
+          "cache_hits": 0,
+          "cache_misses": 127,
+          "cache_writes": 127,
+          "failed_requests": 0,
+          "network_or_source_body_bytes": 1059061760,
+          "range_bytes_requested": 1059061760,
+          "range_logical_leaf_bytes": 1059061760,
+          "range_logical_leaves": 127,
+          "range_requests": 127,
+          "range_source_bytes": 1059061760,
+          "range_source_requests": 127,
+          "transport_requests": 127,
+          "transport_retries": 0
+        },
+        "topk_token_ids": [
+          [
+            345,
+            2619,
+            2143,
+            539,
+            223,
+            874,
+            14320,
+            334,
+            455,
+            343,
+            6776,
+            420,
+            1004,
+            406,
+            1,
+            76085
+          ]
+        ],
+        "topk_token_ids_sha256": "9f18027b319d9f0afee94bd39028ae192d49f74b85d50fb460b3ab942bf975fd",
+        "topk_values": [
+          [
+            31.723651885986328,
+            29.46108055114746,
+            26.987611770629883,
+            22.199142456054688,
+            22.155771255493164,
+            22.008026123046875,
+            21.943832397460938,
+            21.57022476196289,
+            21.51248550415039,
+            21.476200103759766,
+            21.378578186035156,
+            20.547801971435547,
+            20.356990814208984,
+            20.215591430664062,
+            20.0413818359375,
+            20.004608154296875
+          ]
+        ],
+        "topk_values_sha256": "68a1af7e943d9854c2485a66181802eb5d0cf54590c3f6bd2e177cacc2d9fbf0",
+        "transport_range_batch_blocks": 1
+      },
+      "candidate": {
+        "arm": "candidate",
+        "head": {
+          "data_start": 400,
+          "dtype": "BF16",
+          "name": "head.weight",
+          "offset_in_shard": [
+            262164,
+            1059323924
+          ],
+          "payload_bytes": 1059061760,
+          "sha256": "d9e5948d013554621ccac532122b921e47dc86977fd7e993b588df32008198f0",
+          "shape": [
+            129280,
+            4096
+          ],
+          "shard": "model-00045-of-00048.safetensors"
+        },
+        "logit_blocks": 127,
+        "logit_rows": 129280,
+        "logit_stream_sha256": "7e7031941115dd9a438a69f4b1443dd72599249d3959195c8cb0ee9bad5ab229",
+        "pager_metrics_delta": {
+          "head_logical_leaves": 127,
+          "head_planned_range_calls_avoided": 111,
+          "head_rows": 129280,
+          "head_transport_batches": 16,
+          "head_transport_envelopes": 16,
+          "head_transport_fallback_leaves": 0,
+          "head_transport_fallbacks": 0,
+          "head_transport_source_bytes": 1059061760
+        },
+        "seconds": 132.56542454200098,
+        "source": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "source_identity": {
+          "inventory_source_fingerprint": "61600c552f3e52ae382b3eca0370001905fc4e2ecdd2da5f3e66fa95809206c7",
+          "revision_is_mutable": false,
+          "revision_is_pinned": true,
+          "transport_active_leases": 0,
+          "transport_closed": true,
+          "transport_connection_limit": 2,
+          "transport_peak_leases": 1,
+          "transport_policy": "requests-session-pool-2/v1"
+        },
+        "source_metrics_delta": {
+          "cache_bytes_written": 1059061760,
+          "cache_hits": 0,
+          "cache_misses": 127,
+          "cache_writes": 127,
+          "failed_requests": 0,
+          "network_or_source_body_bytes": 1059061760,
+          "range_bytes_requested": 1059061760,
+          "range_logical_leaf_bytes": 1059061760,
+          "range_logical_leaves": 127,
+          "range_requests": 16,
+          "range_source_bytes": 1059061760,
+          "range_source_requests": 16,
+          "transport_requests": 16,
+          "transport_retries": 0
+        },
+        "topk_token_ids": [
+          [
+            345,
+            2619,
+            2143,
+            539,
+            223,
+            874,
+            14320,
+            334,
+            455,
+            343,
+            6776,
+            420,
+            1004,
+            406,
+            1,
+            76085
+          ]
+        ],
+        "topk_token_ids_sha256": "9f18027b319d9f0afee94bd39028ae192d49f74b85d50fb460b3ab942bf975fd",
+        "topk_values": [
+          [
+            31.723651885986328,
+            29.46108055114746,
+            26.987611770629883,
+            22.199142456054688,
+            22.155771255493164,
+            22.008026123046875,
+            21.943832397460938,
+            21.57022476196289,
+            21.51248550415039,
+            21.476200103759766,
+            21.378578186035156,
+            20.547801971435547,
+            20.356990814208984,
+            20.215591430664062,
+            20.0413818359375,
+            20.004608154296875
+          ]
+        ],
+        "topk_values_sha256": "68a1af7e943d9854c2485a66181802eb5d0cf54590c3f6bd2e177cacc2d9fbf0",
+        "transport_range_batch_blocks": 8
+      },
+      "comparison": {
+        "baseline_source_requests": 127,
+        "bit_identical": true,
+        "candidate_source_requests": 16,
+        "request_reduction_fraction": 0.8740157480314961,
+        "source_bytes_equal": true,
+        "source_requests_avoided": 111,
+        "speedup_baseline_over_candidate": 2.4108108035722924
+      },
+      "execution_order": [
+        "candidate",
+        "baseline"
+      ],
+      "pair": 3
+    }
+  ],
+  "verdict": "exact LM-head transport-envelope mechanism proven; production default remains one leaf until repeated latency evidence"
+}

@@ -73,11 +73,13 @@ Originale zur Laufzeit zu importieren.
   Envelope-, Quellbyte-, Gap- und Cancellation-Receipts genau einmal. Die
   Produktionsidentity bleibt dynamisch q3/Width 1; `disabled` und der
   explizite Pair-Kandidat versiegeln ihre tatsächliche Transportpolicy.
-- Reales MPS/BF16-A/B: q3 gegen aus ist cache-resident 1,109698× und ohne
-  Cache 1,140549× bei bitgleichen Outputs. Adjacent-Pairs reduziert kalt
-  sechs auf vier Envelopes ohne ein Zusatzbyte, ist aber cache-resident 3,06 %
-  langsamer und kalt nur 1,014611× schneller bei 6/10 Paar-Wins. Width 2 wird
-  deshalb nicht Default; Infrastruktur und Falsifikator bleiben erhalten.
+- Neuversiegeltes MPS/BF16-A/B: q3 gegen aus bleibt bitidentisch, zeigt aber
+  keinen stabilen Latenzgewinn (cache-resident 0,973489×, kalt 0,726000×).
+  Adjacent-Pairs reduziert kalt sechs auf vier Envelopes ohne ein Zusatzbyte
+  und erreicht gegen q3 über zehn Paare 1,161604× im Mittel bei 6/10
+  Paar-Wins; cache-resident ist 1,005050× praktisch neutral. Da der direkte
+  Kontrast gegen `off` noch fehlt, bleibt Width 2 explizites Instrument statt
+  Default.
 - DeepSeeks FERTIG-Hungarian ist gegen die echten 259 Abstinenzen geprüft und
   als direkte Integration verworfen: 65 Fälle besitzen im Legacy-Parser kein
   Frageziel, 171 kein zum Ziel passendes Quantity, 20 eine unvollständige
@@ -89,15 +91,42 @@ Originale zur Laufzeit zu importieren.
   extrahierte, exklusive Slots mit IR-/Eindeutigkeitszertifikat zulässig. Der
   gold-label-freie Lauf ist mit allen 259 Item-Diagnosen und Parser-/Harness-
   Hashes in `results/fertig-abstention-audit.json` versiegelt.
-- Ein exaktes LM-Head-Request-A/B bleibt aus dem Handoff prüfbar.
-  Der externe „R25-Format-Brücke“-PoC ist dagegen kein R25-/CRSA-Beleg: Er
+- Das exakte LM-Head-Request-A/B ist auf dem realen gepinnten Head gelaufen:
+  bei unveränderten 127 Rechenblöcken bündelt der Kandidat je acht
+  benachbarte Leafs und reduziert so 127 auf 16 physische Requests. Beide
+  Arme lesen exakt 1.059.061.760 Byte; vollständiger FP32-Logitstrom sowie
+  Top-k-Werte und -IDs sind bitidentisch. Über vier alternierende kalte Paare
+  gewinnt der Kandidat 4/4 mit Einzel-Speedups von 1,375606× bis 2,410811×
+  und einem gepaarten Median von 1,445790×; die Mittelzeiten fallen von
+  211,5756 s auf 125,6880 s. Das ist wiederholte Latenzevidenz, bleibt bis zum
+  End-to-End-Inhaltsgate jedoch opt-in; Produktionsdefault ist weiterhin
+  Batchbreite 1.
+  Der versiegelte Beleg steht in
+  `results/deepseek-v4-head-range-network-smoke.json`.
+- Der externe „R25-Format-Brücke“-PoC ist kein R25-/CRSA-Beleg: Er
   baut die positive Mid-Depth-Struktur synthetisch ein und dividiert KL durch
   SNR, sodass der behauptete 18×-Wert per Amplitudenskalierung frei beweglich
   ist. Als neuer Versuch bleibt nur ein echter klassenkonditionierter
   Donor-KL-Readout mit vorab getrenntem Train/Held-out und Label-Shuffles.
-  Möbius-/Sinkhorn-Shortcuts, PPM-Head-Ersetzung, compute-paralleler Shared
-  Expert und approximatives Cross-Layer-Recycling bleiben ohne Gleichheits-/
-  Memory-Beweis geschlossen.
+- Wave3-T11 ist ebenfalls kein Integrationskandidat: Der Parallelarm teilt
+  einen bereits gemittelten Gradienten nochmals durch `N`, während der
+  Sequenzarm privilegierte Zwischenziele des Lehrers erhält. Nach Korrektur
+  der doppelten Skalierung bleiben im synthetischen Aufbau 5,19 % statt
+  behaupteter 98 % Fehlerreduktion; der Vergleich bleibt durch die Ziele
+  unfair. Der konstruktive 3-Zonen-Router ist ein harter NO-GO, weil dieselbe
+  synthetische `expert_quality` in Gate-Normen und Embeddings eingespeist und
+  anschließend als Score/Oracle zurückgelesen wird. Entkoppelt bleiben
+  +4,67 % über Random und 36,66 % des Oracle; V4 besitzt zudem keine solchen
+  Expert-Embeddings und nutzt eine andere offizielle Routinggleichung.
+- Aus dem Resthandoff werden nur zwei reale Messungen geöffnet: eine passive
+  Residuen-Spur des tatsächlichen HC-Sinkhorn-Kerns und ein korrigiertes,
+  ausschließlich auf den CRSA-Graft begrenztes Per-Head-Temperatur-A/B mit
+  exakter Kausalmaske und permutiertem Placebo. Kausal angepasste Birkhoff-
+  Größen und ID/effective rank sind reine Offline-Diagnostik. Zeno-Schedule,
+  Replica-MoE, Live-η-Gate, Ginibre-Hurst, Mask-Recycling, SK1 sowie ID als
+  Dimensionierungsregel bleiben geschlossen; ebenso Möbius-/Sinkhorn-
+  Shortcuts, PPM-Head-Ersetzung und compute-paralleler Shared Expert ohne
+  Gleichheits-/Memory-Beweis.
 
 ### Deutung + nächste Frage
 

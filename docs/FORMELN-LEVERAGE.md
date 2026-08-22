@@ -27,9 +27,12 @@ Werte und serielle FP32-Akkumulation bleiben unverändert.
 
 Der Streamer besitzt zusätzlich einen exakten Multi-Range-Vertrag mit
 Leaf-Cache-Reuse, Single-Flight, aggregiertem Hard-Budget und readonly Views.
-Das daraus gebaute Adjacent-Pairing bleibt jedoch explizit aus: cache-resident
-war es 3,06 % langsamer als q3; kalt gewann es bei identischen Bytes nur
-1,44 % im Mittel und 6/10 Paare, ohne P90-Gewinn. Width 1 bleibt Default.
+Das daraus gebaute Adjacent-Pairing bleibt jedoch explizit aus: im
+neuversiegelten Lauf ist es cache-resident mit 1,005050× praktisch neutral;
+kalt gewinnt es bei identischen Bytes 1,161604× im Mittel und 6/10 Paare
+gegen q3. Weil q3 selbst im zeitgleichen Neuversiegeln keinen stabilen Vorteil
+gegen `off` zeigt und ein direkter `off`/Pair-Kontrast fehlt, bleibt Width 1
+Default.
 
 **NEGATIV als Retrieval-Mechanismus:** Statisches Embedding-Mittel
 → `gate_proj` → Value-Sketch erreichte 24 % gegen 32 % Placebo bei
@@ -41,8 +44,15 @@ geschlossen; die Tensorquelle bleibt verwendbar.
 
 - **Verwertbar:** begrenztes Keep-alive ist deployt; exaktes Range-Coalescing
   ist als ausgeschaltetes Messinstrument implementiert; Cache-Admission und
-  -Identität wurden fail-closed verschärft. Ein exaktes LM-Head-Request-A/B
-  bleibt überprüfbar.
+  -Identität wurden fail-closed verschärft. Das reale LM-Head-A/B fasst bei
+  unveränderten 127 Rechenblöcken je acht benachbarte Leafs zusammen: 127→16
+  physische Requests, weiterhin exakt 1.059.061.760 Quellbytes und
+  bitidentischer vollständiger Logitstrom samt Top-k. Vier alternierende Paare
+  gewinnt der Kandidat 4/4; Einzel-Speedups 1,375606× bis 2,410811×,
+  gepaarter Median 1,445790× und Mittelzeiten 211,5756 s gegen 125,6880 s.
+  Trotz wiederholter Latenzevidenz bleibt der Default bis zum End-to-End-Gate
+  Breite 1. Maßgeblich ist der
+  versiegelte Report `results/deepseek-v4-head-range-network-smoke.json`.
 - **Falsifiziert für den heutigen FERTIG-Pfad:** DeepSeeks M-fache Entity-
   Replikation macht aus dem vermeintlich globalen Hungarian-Problem nur
   unabhängige `argmin`-Entscheidungen pro Ziel. Die 259 Abstinenzen zerfallen
@@ -59,10 +69,29 @@ geschlossen; die Tensorquelle bleibt verwendbar.
 - **Bedingt:** Shared-Expert-I/O darf erst nach einem Resident-Peak-Beweis
   überlappen. Compute-Parallelisierung würde die heutige serielle
   Akkumulationssemantik ändern und ist deshalb kein kleiner Transportfix.
+- **Wave3 geschlossen:** T11 skaliert im Parallelarm einen bereits
+  gemittelten Gradienten ein zweites Mal durch `N` und gibt dem Sequenzarm
+  privilegierte Lehrer-Zwischenziele. Korrigiert bleiben im synthetischen
+  Aufbau 5,19 % statt 98 % Fehlerreduktion; durch die ungleichen Ziele ist
+  auch das kein fairer Kausalbeleg. Der 3-Zonen-Router ist zirkulär:
+  `expert_quality` erzeugt Gate-Normen und Expert-Embeddings und wird danach
+  als Score/Oracle zurückgelesen. Entkoppelt bleiben +4,67 % über Random und
+  36,66 % des Oracle. V4 hat keine solchen Expert-Embeddings und eine andere
+  offizielle Hash-/Score-Routingregel. Urteil: NO-GO beziehungsweise harter
+  NO-GO.
+- **Nur als neue Messung offen:** passive Residuen-Spuren des tatsächlich
+  ausgeführten HC-Sinkhorn-Kerns; danach höchstens ein gekennzeichnet
+  approximatives Fixed-20/Early-stop-A/B mit Logit-/Choice-Delta. Außerdem
+  ein korrigiertes Per-Head-Temperatur-A/B ausschließlich im CRSA-Graft, mit
+  exakter Kausalmaske und permutiertem Placebo. Kausal angepasste Birkhoff-
+  Größen sowie ID/effective rank bleiben Runtime-sichere Offline-Diagnostik,
+  keine Steuerung.
 - **Geschlossen oder unbelegt:** Möbius als Ersatz für den offiziellen
   Sinkhorn-Pfad, pauschal 20→3 Sinkhorn-Schritte, PPM als approximativer
-  LM-Head-Ersatz und approximatives Cross-Layer-Recycling haben keinen exakten
-  V4-Gleichheitsbeweis. Sie werden nicht aufgrund einer erwarteten Prozentzahl
+  LM-Head-Ersatz, approximatives Cross-Layer-Recycling, Zeno-Schedule,
+  Replica-MoE, Live-η-Gate, Ginibre-Hurst, Mask-Recycling, SK1 und ID als
+  Dimensionierungsregel haben keinen realen kausalen beziehungsweise exakten
+  V4-Beleg. Sie werden nicht aufgrund einer synthetischen Prozentzahl
   eingebaut.
 
 ## Gesetzes-Familie Organ-Bau
@@ -131,18 +160,30 @@ Fähigkeit, keine nachträgliche Optimierung am GSM8K-Split.
   Content-Smoke, noch kein allgemeiner MMLU- oder Frontier-Claim.
 - **Exakter Expert-Transport:** offizielle 3-Expert-MPS-BF16-A/Bs sind
   bitgleich. Warm, nach zwei symmetrischen Warmups und 20 alternierenden
-  Trials: 0,192510 s ohne gegen 0,173479 s mit q3, also 1,109698×.
+  Trials: 0,215072 s ohne gegen 0,220929 s mit q3, also 0,973489× im
+  Mittel; der gepaarte Median liegt trotz 7/10 Wins bei 1,032965×.
   Ohne Range-Cache, nach einem Warmup und 8 alternierenden Trials:
-  5,495380 s gegen 4,818187 s, also 1,140549× beziehungsweise 12,32 % weniger
-  Latenz. Der begrenzte Keep-alive-Pool sah bei 158 Requests sieben
+  6,474703 s gegen 8,918329 s, also 0,726000× und nur 1/4 Wins. Der begrenzte
+  Keep-alive-Pool sah bei 158 Requests sieben
   Connection-Objekte, Peak zwei aktive Leases, danach null und wurde vor dem
-  Report geschlossen. Die einzelnen Netztrials streuen stark. Peak-Payload
-  jeweils exakt 40.108.032 B. Das belegt exakte begrenzte
-  Transport-Überlappung, aber noch keine Modellqualität oder Frontier-Parität.
+  Report geschlossen. Die einzelnen Netztrials streuen stark; ein stabiler
+  q3-Speedup ist damit nicht belegt. Peak-Payload jeweils exakt 40.108.032 B.
+  Das belegt exakte begrenzte Transport-Überlappung, aber noch keine
+  Modellqualität oder Frontier-Parität.
 - **Adjacent-Pairing:** kalt 6→4 Envelopes bei weiterhin 40.108.032 B;
-  6,797533 s q3 gegen 6,699645 s Pair, nur 1,44 % mittlerer Gewinn und 6/10
-  Paar-Wins. Cache-resident ist Pair 3,06 % langsamer. Das ist kein Default;
-  die Topologie- und Byte-Receipts bleiben als Instrument.
+  5,132159 s q3 gegen 4,418166 s Pair, 1,161604× im Mittel und 6/10
+  Paar-Wins. Cache-resident ist Pair mit 1,005050× praktisch neutral. Ohne
+  direkten `off`/Pair-Kontrast ist das kein Default; Topologie- und
+  Byte-Receipts bleiben als Instrument.
+- **Exakter LM-Head-Transport:** das reale kalte MPS/BF16-A/B reduziert
+  127 physische Requests auf 16, ohne die 1.059.061.760 Byte, den vollständigen
+  FP32-Logit-Hash oder Top-k-Werte/-IDs zu ändern. Über vier alternierende
+  Paare gewinnt Breite 8 4/4 mit einem gepaarten Median von 1,445790×;
+  Default Breite 1 bleibt bis zum End-to-End-Gate unangetastet.
+- **Wave3-Audit:** T11 fällt nach Korrektur der doppelten `/N`-Skalierung von
+  98 % auf 5,19 % und behält ungleiche Lehrerziele. Der zirkuläre 3-Zonen-
+  Router fällt entkoppelt auf +4,67 % über Random beziehungsweise 36,66 % des
+  Oracle und entspricht weder V4s Datenstrukturen noch seinem Routing.
 
 ## Hebel-Ranking
 
@@ -158,7 +199,11 @@ Fähigkeit, keine nachträgliche Optimierung am GSM8K-Split.
    Invariante; Falsifikator vor Implementierung benennen.
 5. **R17 strikt anwenden:** trainieren → Invariante messen → Fit/R²
    verifizieren → exakte Struktur. Kein Cross-Model-LS-Ersatz.
-6. **Hugging Face ganz zuletzt:** erst wenn Runtime und Inhaltsgates lokal
+6. **Handoff nur über Falsifikatoren öffnen:** realen HC-Residualverlauf
+   passiv messen und CRSA-Graft-only-Temperaturen gegen ein permutiertes
+   Placebo prüfen; Birkhoff kausal angepasst und ID/effective rank offline.
+   Die übrigen synthetischen Demos bleiben NO-GO.
+7. **Hugging Face ganz zuletzt:** erst wenn Runtime und Inhaltsgates lokal
    golden sind und die Lizenzkette geklärt ist, exportieren oder hochladen.
 
 ## Offene Endpunkte aus dem Fundament

@@ -69,6 +69,17 @@ Die Resultate in `results/router_v2_stage1.json` und
 Ein negatives Ergebnis darf nur durch ein neues, vorab benanntes Protokoll mit
 passendem Eingabeverteilungsmechanismus erneut geöffnet werden.
 
+Auch die beiden Wave3-Demos liefern keinen Runtime-Beleg. T11s Parallelarm
+teilt den bereits gemittelten Gradienten nochmals durch `N`; nach dieser
+Korrektur sinkt die synthetische Fehlerreduktion von behaupteten 98 % auf
+5,19 %, während der Sequenzarm weiterhin privilegierte Lehrer-Zwischenziele
+erhält. Der 3-Zonen-Router kodiert `expert_quality` zugleich in seinen
+synthetischen Gate-Normen und Expert-Embeddings und liest sie im Score/Oracle
+wieder aus. Im entkoppelten Kontrolllauf bleiben +4,67 % über Random und
+36,66 % des Oracle. DeepSeek V4 besitzt diese Expert-Embeddings nicht und sein
+offizieller Hash-/Score-Router folgt einer anderen Gleichung; beide Demos sind
+daher NO-GO, nicht erwartete Verbesserungen.
+
 ## 4. FERTIG-GSM8K-Vollsplit
 
 ```bash
@@ -193,20 +204,22 @@ Offizielle 3-Expert-A/Bs auf MPS/BF16 ergaben:
 
 | Cache/Trials | aus | Fenster an | Speedup | Ausgabe | Peak |
 |---|---:|---:|---:|---|---:|
-| cache-resident, 20 | 0,192510 s | 0,173479 s | 1,109698× | bitgleich | 40.108.032 B |
-| Cache aus, 8 | 5,495380 s | 4,818187 s | 1,140549× | bitgleich | 40.108.032 B |
+| cache-resident, 20 | 0,215072 s | 0,220929 s | 0,973489× | bitgleich | 40.108.032 B |
+| Cache aus, 8 | 6,474703 s | 8,918329 s | 0,726000× | bitgleich | 40.108.032 B |
 
 Der aktuelle Remote-Pfad `requests-session-pool-2/v1` least exakt zwei
 voneinander getrennte Ein-Verbindungs-Sessions und liest Bodies ausschließlich
-begrenzt aus dem Stream. Im No-Cache-Lauf sind das 12,32 % weniger mittlere
-Latenz bei 320.864.256 gemessenen Expert-Quellbytes. 158 Requests sahen sieben
-Connection-Objekte, maximal zwei aktive Leases und danach null; Retries und
-Fehler blieben null, der Transport war vor der Versiegelung geschlossen. Alle
-vier gepaarten Vergleiche gewann q3. Der frühere unabhängige urllib-Lauf bei
-Commit `d0a1dc4` erreichte 1,020702×;
-Vergleiche über Laufgrenzen bleiben netzwerkbedingt diagnostisch. Alle Outputs
-eines Laufs hatten denselben SHA-256; Futures, Peak und Fehlerpfade blieben
-innerhalb ihrer Gates. Die versiegelten Rohresultate stehen in
+begrenzt aus dem Stream. Der neuversiegelte Lauf zeigt keinen stabilen
+Latenzgewinn: warm gewinnt q3 zwar 7/10 Paare und erreicht einen gepaarten
+Median von 1,032965×, der Mittelwert fällt durch einen Ausreißer aber auf
+0,973489×; kalt gewinnt q3 nur 1/4 Paare und liegt im Mittel bei 0,726000×.
+158 Requests sahen sieben Connection-Objekte, maximal zwei aktive Leases und
+danach null; Retries und Fehler blieben null, der Transport war vor der
+Versiegelung geschlossen. Der frühere unabhängige urllib-Lauf bei Commit
+`d0a1dc4` erreichte 1,020702×; Vergleiche über Laufgrenzen bleiben
+netzwerkbedingt diagnostisch. Alle Outputs eines Laufs hatten denselben
+SHA-256; Futures, Peak und Fehlerpfade blieben innerhalb ihrer Gates. Die
+versiegelten Rohresultate stehen in
 `results/deepseek-v4-exact-prefetch-window-smoke.json` und
 `results/deepseek-v4-exact-prefetch-window-network-smoke.json`. Das sind
 ausdrücklich keine Qualitäts-, MMLU- oder Frontier-Paritätsbelege; der reale
@@ -221,21 +234,45 @@ Quellbytes und bitgleichem Ergebnis:
 
 | Cache/Trials | q3 | Adjacent-Pairs | q3/Pair | Paar-Wins | Urteil |
 |---|---:|---:|---:|---:|---|
-| cache-resident, 20 | 0,164031 s | 0,169043 s | 0,970353× | 3/10 | Pair 3,06 % langsamer |
-| Cache aus, 20 | 6,797533 s | 6,699645 s | 1,014611× | 6/10 | nur 1,44 % schneller |
+| cache-resident, 20 | 0,169708 s | 0,168855 s | 1,005050× | 3/10 | im Mittel neutral |
+| Cache aus, 20 | 5,132159 s | 4,418166 s | 1,161604× | 6/10 | 13,91 % weniger mittlere Latenz |
 
-Der kalte P90 bleibt praktisch gleich und leicht schlechter
-(12,735 s q3 gegen 12,754 s Pair), während das Pairing im warmen Pfad
-zusätzliche Batch-/Owner-Verwaltung bezahlt. Geplante
+Der kalte P90 sinkt im Neuversiegeln von 6,653425 s auf 4,407713 s; zugleich
+zeigen 6/10 Paar-Wins und der 9,155616-s-Ausreißer im Pair-Arm weiter deutliche
+Netzvarianz. Geplante
 `expert_range_requests_avoided=2` sind bei warmen Cache-Hits ausdrücklich
 keine physisch vermiedenen Requests; beide Arme lesen dort null Quellbytes.
-Darum bleibt q3/Width 1 der Default und Adjacent-Pairs/Width 2 ein explizites
-Instrument, kein Produktions-Speedup. Die beiden zusätzlichen Belege stehen
+Der getrennt neuversiegelte q3/`off`-Kontrast ist zwar bitidentisch, aber mit
+0,973489× warm und 0,726000× kalt selbst nicht stabil positiv. Ohne direkten
+`off`/Adjacent-Pair-Kontrast bleibt q3/Width 1 daher der heutige Default und
+Adjacent-Pairs/Width 2 ein explizites Instrument, kein Produktionsclaim. Die
+beiden zusätzlichen Belege stehen
 in `results/deepseek-v4-adjacent-range-warm-smoke.json` und
-`results/deepseek-v4-adjacent-range-network-smoke.json`. Als nächstes folgt
-ein gepaarter `off`/CRSA-Inhaltslauf auf derselben Runtime-Identität; der
-vermeintliche FERTIG-Bindungskontrast ist durch die Abstention-Taxonomie
-ersetzt.
+`results/deepseek-v4-adjacent-range-network-smoke.json`.
+
+Der exakte LM-Head-Kontrast verwendet denselben finalisierten realen
+BF16-Hidden-State, unveränderte 1.024-Zeilen-Rechenblöcke und getrennte kalte
+Leaf-Caches. Nur die Transporthülle unterscheidet sich: ein Leaf pro Request
+gegen bis zu acht exakt benachbarte Leafs pro höchstens 64-MiB-Envelope.
+
+| Paare | Baseline-Requests | Kandidat-Requests | Quellbytes je Arm | Baseline-Mittel | Kandidat-Mittel | gepaarter Median |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 127 | 16 | 1.059.061.760 | 211,5756 s | 125,6880 s | 1,445790× |
+
+Der vollständige blockweise FP32-Logitstrom, die Top-k-Werte und die Token-IDs
+sind bitidentisch; Retries, Fallbacks und Fehler blieben null. Das beweist die
+exakte Request-Zusammenfassung 127→16 bei gleicher Bytezahl. Der Kandidat
+gewinnt alle vier alternierenden Paare; die einzelnen Speedups betragen
+1,477520×, 1,375606×, 1,414061× und 2,410811×. Das ist wiederholte gepaarte
+Latenzevidenz, kein Qualitätsclaim. Bis zum End-to-End-Inhaltsgate bleibt
+`transport_range_batch_blocks=1` der Produktionsdefault und Breite 8 ein
+expliziter Kandidat. Der versiegelte Report
+`results/deepseek-v4-head-range-network-smoke.json` trägt Report-SHA-256
+`fb5927c5c626ca15d11ec98de7b310b30a9a55e46370fa15dc2dac6e4cedb4f4`.
+
+Als nächstes folgt ein gepaarter `off`/CRSA-Inhaltslauf auf derselben Runtime-
+Identität; der vermeintliche FERTIG-Bindungskontrast ist durch die Abstention-
+Taxonomie ersetzt.
 
 ## 7. Lebensstrom-Verträge
 
@@ -269,6 +306,10 @@ Akzeptanzlauf neu gemessene Sprachmodell-Qualität.
    klassenkonditionierte Donor-Verteilungen auf Train, Held-out-KL/NLL und
    Balanced Accuracy gegen All-Layer plus Label-Shuffles. Kein Revival des
    statischen Value-Sketches und kein 18×-Claim aus KL/SNR.
+6. Zwei Handoff-Ideen nur als kontrollierte Messungen: passive Residuen-Spur
+   des realen HC-Sinkhorn-Kerns; korrigiertes CRSA-Graft-only-Per-Head-
+   Temperatur-A/B mit exakter Kausalmaske und permutiertem Placebo. Birkhoff-
+   Größen nur kausal angepasst und ID/effective rank nur offline auswerten.
 
 Ein Hugging-Face-Export kommt erst ganz am Ende nach lokalem Golden und
 geklärter Lizenzkette; er ist kein aktueller Benchmark-Fokus.

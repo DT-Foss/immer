@@ -47,6 +47,148 @@ class _Source:
         return {"network_or_source_body_bytes": 0}
 
 
+class _AdjacentHeadSource:
+    """BF16 head whose unchanged compute leaves are physically adjacent."""
+
+    def __init__(
+        self,
+        *,
+        vocab: int = 8,
+        columns: int = 4,
+        dtype: str = "BF16",
+    ) -> None:
+        values = (
+            np.arange(vocab * columns, dtype=np.float32).reshape(vocab, columns)
+            / np.float32(16.0)
+            - np.float32(0.75)
+        )
+        words = (values.view(np.uint32) >> 16).astype("<u2")
+        self.payload = words.tobytes()
+        decoded_words = np.frombuffer(self.payload, dtype="<u2").astype(np.uint32)
+        decoded_words <<= 16
+        self.data = decoded_words.view(np.float32).reshape(vocab, columns).copy()
+        self.dtype = dtype
+        self.data_start = 16
+        self.shard = "head.safetensors"
+        self.row_calls: list[tuple[str, int, int]] = []
+        self.batch_calls: list[
+            tuple[str, tuple[tuple[int, int], ...], int, int]
+        ] = []
+        self.envelopes: list[tuple[int, int]] = []
+
+    def find(self, name: str) -> dict:
+        if name != "head.weight":
+            raise KeyError(name)
+        return {
+            "name": name,
+            "dtype": self.dtype,
+            "shape": list(self.data.shape),
+            "shard": self.shard,
+            "data_start": self.data_start,
+            "offset_in_shard": [0, len(self.payload)],
+        }
+
+    def rows(
+        self, name: str, start_row: int = 0, n_rows: int = 8, **_
+    ) -> np.ndarray:
+        self.row_calls.append((name, start_row, n_rows))
+        return self.data[start_row : start_row + n_rows].copy()
+
+    def raw_bytes_many(
+        self,
+        shard: str,
+        ranges,
+        *,
+        resident_limit_bytes: int,
+        max_gap_bytes: int = 0,
+    ):
+        from immer.knowledge.streamer import RawBytesManyResult
+
+        requested = tuple((int(offset), int(length)) for offset, length in ranges)
+        self.batch_calls.append(
+            (shard, requested, resident_limit_bytes, max_gap_bytes)
+        )
+        if shard != self.shard or max_gap_bytes != 0:
+            raise ValueError("invalid exact head request")
+        ordered = sorted(enumerate(requested), key=lambda item: item[1][0])
+        envelopes: list[tuple[int, int, list[int]]] = []
+        for original, (offset, length) in ordered:
+            end = offset + length
+            if envelopes and envelopes[-1][1] == offset:
+                begin, _, members = envelopes[-1]
+                members.append(original)
+                envelopes[-1] = (begin, end, members)
+            else:
+                envelopes.append((offset, end, [original]))
+        resident = sum(end - begin for begin, end, _ in envelopes)
+        if resident > resident_limit_bytes:
+            raise ValueError("head fixture resident limit exceeded")
+        parts: list[memoryview | None] = [None] * len(requested)
+        for begin, end, members in envelopes:
+            self.envelopes.append((begin, end - begin))
+            relative = begin - self.data_start
+            owner = self.payload[relative : relative + end - begin]
+            owner_view = memoryview(owner)
+            for original in members:
+                offset, length = requested[original]
+                parts[original] = owner_view[
+                    offset - begin : offset - begin + length
+                ]
+        if any(part is None for part in parts):
+            raise AssertionError("head fixture omitted a range")
+        return RawBytesManyResult(
+            parts=tuple(part for part in parts if part is not None),
+            resident_bytes=resident,
+            source_requests=len(envelopes),
+            source_bytes=resident,
+        )
+
+    def metrics(self) -> dict:
+        return {
+            "network_or_source_body_bytes": sum(
+                length for _, length in self.envelopes
+            )
+        }
+
+
+class _InvalidHeadReceiptSource(_AdjacentHeadSource):
+    def raw_bytes_many(self, shard: str, ranges, **kwargs):
+        from immer.knowledge.streamer import RawBytesManyResult
+
+        result = super().raw_bytes_many(shard, ranges, **kwargs)
+        return RawBytesManyResult(
+            parts=result.parts,
+            resident_bytes=result.resident_bytes + 1,
+            source_requests=result.source_requests,
+            source_bytes=result.source_bytes,
+        )
+
+
+class _WarmHeadSource(_AdjacentHeadSource):
+    """Return verified resident leaves without claiming physical source I/O."""
+
+    def raw_bytes_many(self, shard: str, ranges, **kwargs):
+        from immer.knowledge.streamer import RawBytesManyResult
+
+        result = super().raw_bytes_many(shard, ranges, **kwargs)
+        return RawBytesManyResult(
+            parts=result.parts,
+            resident_bytes=result.resident_bytes,
+            source_requests=0,
+            source_bytes=0,
+        )
+
+
+class _HeadCapabilityWithoutLayout(_Source):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_calls = 0
+
+    def raw_bytes_many(self, *_args, **_kwargs):
+        self.batch_calls += 1
+        raise AssertionError("invalid metadata must decline before transport")
+
+
 class _EncodedExpertSource:
     """Synthetic safetensors source with controllable expert adjacency."""
 
@@ -1452,6 +1594,271 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         torch.testing.assert_close(values, expected_values)
         torch.testing.assert_close(ids, expected_ids)
         self.assertEqual(pager.metrics()["head_rows"], 4)
+
+    def test_head_transport_batches_eight_exact_leaves_with_bit_parity(self) -> None:
+        import hashlib
+
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        hidden = torch.asarray([[0.5, -1.0, 1.5, 0.25]])
+        scalar_source = _AdjacentHeadSource(vocab=8)
+        scalar = DeepSeekWeightPager(
+            scalar_source, device="cpu", compute_dtype="float32"
+        )
+        scalar_blocks: list[tuple[int, str]] = []
+
+        def observe_scalar(start: int, logits) -> None:
+            digest = hashlib.sha256(
+                logits.detach().cpu().numpy().tobytes()
+            ).hexdigest()
+            scalar_blocks.append((start, digest))
+
+        expected_values, expected_ids = scalar.topk_logits(
+            hidden,
+            k=1,
+            block_rows=1,
+            instrument_block_observer=observe_scalar,
+        )
+
+        batch_source = _AdjacentHeadSource(vocab=8)
+        batched = DeepSeekWeightPager(
+            batch_source, device="cpu", compute_dtype="float32"
+        )
+        batch_blocks: list[tuple[int, str]] = []
+
+        def observe_batch(start: int, logits) -> None:
+            digest = hashlib.sha256(
+                logits.detach().cpu().numpy().tobytes()
+            ).hexdigest()
+            batch_blocks.append((start, digest))
+
+        actual_values, actual_ids = batched.topk_logits(
+            hidden,
+            k=1,
+            block_rows=1,
+            transport_range_batch_blocks=8,
+            instrument_block_observer=observe_batch,
+        )
+
+        self.assertTrue(torch.equal(actual_values, expected_values))
+        self.assertTrue(torch.equal(actual_ids, expected_ids))
+        self.assertEqual(batch_blocks, scalar_blocks)
+        self.assertEqual([start for start, _ in batch_blocks], list(range(8)))
+        self.assertEqual(scalar_source.row_calls, [
+            ("head.weight", row, 1) for row in range(8)
+        ])
+        self.assertEqual(batch_source.row_calls, [])
+        self.assertEqual(len(batch_source.batch_calls), 1)
+        shard, ranges, resident_limit, max_gap = batch_source.batch_calls[0]
+        self.assertEqual(shard, "head.safetensors")
+        self.assertEqual(len(ranges), 8)
+        self.assertEqual(resident_limit, 64 * 1024**2)
+        self.assertEqual(max_gap, 0)
+        self.assertEqual(len(batch_source.envelopes), 1)
+        metrics = batched.metrics()
+        self.assertEqual(metrics["head_logical_leaves"], 8)
+        self.assertEqual(metrics["head_transport_batches"], 1)
+        self.assertEqual(metrics["head_transport_envelopes"], 1)
+        self.assertEqual(metrics["head_planned_range_calls_avoided"], 7)
+        self.assertEqual(metrics["head_transport_source_bytes"], 64)
+        self.assertEqual(metrics["head_transport_fallbacks"], 0)
+        self.assertEqual(
+            metrics["head_transport_policy"],
+            "exact-head-leaf-adjacent-envelope/v1",
+        )
+
+    def test_head_transport_tail_group_preserves_compute_blocks(self) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        source = _AdjacentHeadSource(vocab=10)
+        pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="float32")
+        observed: list[int] = []
+        pager.topk_logits(
+            torch.ones((1, 4)),
+            k=1,
+            block_rows=1,
+            transport_range_batch_blocks=8,
+            instrument_block_observer=lambda start, _logits: observed.append(start),
+        )
+
+        self.assertEqual(observed, list(range(10)))
+        self.assertEqual([len(call[1]) for call in source.batch_calls], [8, 2])
+        self.assertEqual(len(source.envelopes), 2)
+        metrics = pager.metrics()
+        self.assertEqual(metrics["head_transport_batches"], 2)
+        self.assertEqual(metrics["head_transport_envelopes"], 2)
+        self.assertEqual(metrics["head_planned_range_calls_avoided"], 8)
+
+    def test_head_transport_warm_receipt_does_not_claim_physical_requests(
+        self,
+    ) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        pager = DeepSeekWeightPager(
+            _WarmHeadSource(vocab=8), device="cpu", compute_dtype="float32"
+        )
+        pager.topk_logits(
+            torch.ones((1, 4)),
+            block_rows=1,
+            transport_range_batch_blocks=8,
+        )
+
+        metrics = pager.metrics()
+        self.assertEqual(metrics["head_transport_envelopes"], 0)
+        self.assertEqual(metrics["head_transport_source_bytes"], 0)
+        self.assertEqual(metrics["head_planned_range_calls_avoided"], 7)
+
+    def test_head_transport_default_keeps_scalar_row_calls(self) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        source = _AdjacentHeadSource(vocab=8)
+        pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="float32")
+        pager.topk_logits(torch.ones((1, 4)), k=1, block_rows=2)
+
+        self.assertEqual(
+            source.row_calls,
+            [("head.weight", 0, 2), ("head.weight", 2, 2),
+             ("head.weight", 4, 2), ("head.weight", 6, 2)],
+        )
+        self.assertEqual(source.batch_calls, [])
+        metrics = pager.metrics()
+        self.assertEqual(metrics["head_logical_leaves"], 4)
+        self.assertEqual(metrics["head_transport_batches"], 0)
+        self.assertEqual(metrics["head_transport_fallbacks"], 0)
+
+    def test_head_transport_falls_back_before_io_for_missing_layout_or_dtype(
+        self,
+    ) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        missing = _HeadCapabilityWithoutLayout()
+        missing_pager = DeepSeekWeightPager(
+            missing, device="cpu", compute_dtype="float32"
+        )
+        missing_pager.topk_logits(
+            torch.asarray([[2.0, 3.0]]),
+            k=1,
+            block_rows=2,
+            transport_range_batch_blocks=8,
+        )
+        self.assertEqual(missing.batch_calls, 0)
+        self.assertEqual(
+            missing.row_calls,
+            [("head.weight", 0, 2), ("head.weight", 2, 2)],
+        )
+        self.assertEqual(missing_pager.metrics()["head_transport_fallbacks"], 1)
+        self.assertEqual(
+            missing_pager.metrics()["head_transport_fallback_leaves"], 2
+        )
+
+        unsupported = _AdjacentHeadSource(vocab=4, dtype="I8")
+        unsupported_pager = DeepSeekWeightPager(
+            unsupported, device="cpu", compute_dtype="float32"
+        )
+        unsupported_pager.topk_logits(
+            torch.ones((1, 4)),
+            k=1,
+            block_rows=2,
+            transport_range_batch_blocks=8,
+        )
+        self.assertEqual(unsupported.batch_calls, [])
+        self.assertEqual(len(unsupported.row_calls), 2)
+
+    def test_head_transport_splits_before_raw_resident_cap(self) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        source = _AdjacentHeadSource(vocab=8)
+        pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="float32")
+        with mock.patch.object(pager, "HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES", 16):
+            pager.topk_logits(
+                torch.ones((1, 4)),
+                k=1,
+                block_rows=1,
+                transport_range_batch_blocks=8,
+            )
+
+        self.assertEqual([len(call[1]) for call in source.batch_calls], [2, 2, 2, 2])
+        self.assertTrue(all(call[2] == 16 for call in source.batch_calls))
+        self.assertTrue(
+            all(
+                sum(length for _, length in call[1]) <= call[2]
+                for call in source.batch_calls
+            )
+        )
+
+    def test_head_transport_rejects_invalid_batch_width_and_receipt(self) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+        from immer.runtimes.deepseek_v4.pager import DeepSeekPagerError
+
+        hidden = torch.ones((1, 4))
+        pager = DeepSeekWeightPager(
+            _AdjacentHeadSource(), device="cpu", compute_dtype="float32"
+        )
+        for invalid in (True, 0, 9, 2.0):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    pager.topk_logits(
+                        hidden,
+                        transport_range_batch_blocks=invalid,
+                    )
+        with self.assertRaises(ValueError):
+            pager.topk_logits(hidden, instrument_block_observer=object())
+
+        invalid_receipt = DeepSeekWeightPager(
+            _InvalidHeadReceiptSource(),
+            device="cpu",
+            compute_dtype="float32",
+        )
+        with self.assertRaisesRegex(
+            DeepSeekPagerError, "invalid head multi-range receipt"
+        ):
+            invalid_receipt.topk_logits(
+                hidden,
+                block_rows=1,
+                transport_range_batch_blocks=8,
+            )
+
+    def test_head_block_observer_isolated_and_fail_closed(self) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        hidden = torch.ones((1, 4))
+        baseline = DeepSeekWeightPager(
+            _AdjacentHeadSource(), device="cpu", compute_dtype="float32"
+        ).topk_logits(hidden, k=1, block_rows=2)
+        pager = DeepSeekWeightPager(
+            _AdjacentHeadSource(), device="cpu", compute_dtype="float32"
+        )
+        actual = pager.topk_logits(
+            hidden,
+            k=1,
+            block_rows=2,
+            transport_range_batch_blocks=8,
+            instrument_block_observer=lambda _start, logits: logits.zero_(),
+        )
+        self.assertTrue(torch.equal(actual[0], baseline[0]))
+        self.assertTrue(torch.equal(actual[1], baseline[1]))
+
+        def fail(_start, _logits) -> None:
+            raise RuntimeError("observer failed")
+
+        with self.assertRaisesRegex(RuntimeError, "observer failed"):
+            pager.topk_logits(hidden, instrument_block_observer=fail)
 
     def test_blockwise_head_topk_breaks_exact_ties_by_lower_token_id(self) -> None:
         import torch
