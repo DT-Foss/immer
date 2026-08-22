@@ -593,16 +593,12 @@ class StreamedDeepSeekV4:
                     self.pager.QUANTIZED_ACCUMULATION_POLICY
                 ),
                 "attention_qat_policy": self.ATTENTION_QAT_POLICY,
-                "expert_prefetch_policy": (
-                    self.pager.EXPERT_PREFETCH_POLICY
-                    if self.pager.expert_prefetch_enabled
-                    else "disabled"
-                ),
+                "expert_prefetch_policy": self.pager.expert_prefetch_policy,
                 "expert_prefetch_payload_limit_bytes": (
                     self.pager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
                 ),
                 "expert_prefetch_transport_policy": (
-                    self.pager.EXPERT_PREFETCH_TRANSPORT_POLICY
+                    self.pager.expert_prefetch_transport_policy
                 ),
                 "expert_prefetch_workers": self.pager.EXPERT_PREFETCH_WORKERS,
                 "expert_prefetch_active_read_limit": (
@@ -614,6 +610,12 @@ class StreamedDeepSeekV4:
                 "expert_prefetch_max_experts": (self.pager.EXPERT_PREFETCH_MAX_EXPERTS),
                 "expert_prefetch_resident_limit_bytes": (
                     self.pager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+                ),
+                "expert_range_coalesce_max_experts": (
+                    self.pager.expert_range_coalesce_max_experts
+                ),
+                "expert_range_coalesce_max_gap_bytes": (
+                    self.pager.EXPERT_RANGE_COALESCE_MAX_GAP_BYTES
                 ),
                 "source_transport_policy": str(
                     metrics.get("transport_policy", "unreported")

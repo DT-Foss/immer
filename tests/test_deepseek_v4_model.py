@@ -299,7 +299,7 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
 
         config = replace(_config(), n_activated_experts=2)
 
-        def execute(enabled: bool):
+        def execute(enabled: bool, *, width: int | None = None):
             model = StreamedDeepSeekV4(
                 config,
                 DeepSeekWeightPager(
@@ -307,6 +307,7 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
                     device="cpu",
                     compute_dtype="float32",
                     expert_prefetch=enabled,
+                    expert_range_coalesce_max_experts=width,
                 ),
             )
             calls: list[str] = []
@@ -324,7 +325,8 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
             return hidden, evidence, model.pager.metrics(), calls
 
         expected, expected_evidence, off_metrics, off_calls = execute(False)
-        actual, actual_evidence, on_metrics, on_calls = execute(True)
+        actual, actual_evidence, q3_metrics, on_calls = execute(True)
+        _, _, adjacent_metrics, _ = execute(True, width=2)
         self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(actual_evidence.selected_experts, ((0, 1),))
         self.assertEqual(
@@ -332,12 +334,25 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
             expected_evidence.selected_experts,
         )
         self.assertEqual(off_metrics["expert_prefetch_policy"], "disabled")
+        self.assertEqual(off_metrics["expert_prefetch_transport_policy"], "disabled")
         self.assertEqual(
-            on_metrics["expert_prefetch_policy"],
+            q3_metrics["expert_prefetch_policy"],
             "exact-router-window-q3-a2/v2",
         )
-        self.assertEqual(on_metrics["expert_prefetch_submitted"], 2)
-        self.assertEqual(on_metrics["expert_prefetch_consumed"], 2)
+        self.assertEqual(
+            q3_metrics["expert_prefetch_transport_policy"],
+            "streamer-exact-range/v1",
+        )
+        self.assertEqual(
+            adjacent_metrics["expert_prefetch_policy"],
+            "exact-router-window-q3-a2-adjacent-pairs/v3",
+        )
+        self.assertEqual(
+            adjacent_metrics["expert_prefetch_transport_policy"],
+            "streamer-exact-leaf-adjacent-envelope/v2",
+        )
+        self.assertEqual(q3_metrics["expert_prefetch_submitted"], 2)
+        self.assertEqual(q3_metrics["expert_prefetch_consumed"], 2)
         self.assertEqual(on_calls, off_calls)
         self.assertEqual(
             on_calls,

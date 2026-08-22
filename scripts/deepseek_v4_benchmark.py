@@ -1451,6 +1451,12 @@ def _build_report(
         "expert_prefetch_resident_limit_bytes": header[
             "expert_prefetch_resident_limit_bytes"
         ],
+        "expert_range_coalesce_max_experts": header[
+            "expert_range_coalesce_max_experts"
+        ],
+        "expert_range_coalesce_max_gap_bytes": header[
+            "expert_range_coalesce_max_gap_bytes"
+        ],
         "source_transport_policy": header["source_transport_policy"],
         "source_transport_connection_limit": header[
             "source_transport_connection_limit"
@@ -1596,6 +1602,13 @@ def _run_with_source(
         }
     )
     source_identity_metrics = source.metrics()
+    pager = DeepSeekWeightPager(
+        source,
+        device=args.device,
+        compute_dtype=args.dtype,
+        simulate_activation_quantization=not args.no_activation_quantization,
+        expert_prefetch=not args.no_expert_prefetch,
+    )
     inventory_sha = _digest_or_canonical(
         source_identity_metrics.get("inventory_source_fingerprint"), inventory
     )
@@ -1636,16 +1649,12 @@ def _run_with_source(
                 DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
             ),
             "attention_qat_policy": StreamedDeepSeekV4.ATTENTION_QAT_POLICY,
-            "expert_prefetch_policy": (
-                DeepSeekWeightPager.EXPERT_PREFETCH_POLICY
-                if not args.no_expert_prefetch
-                else "disabled"
-            ),
+            "expert_prefetch_policy": pager.expert_prefetch_policy,
             "expert_prefetch_payload_limit_bytes": (
                 DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
             ),
             "expert_prefetch_transport_policy": (
-                DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
+                pager.expert_prefetch_transport_policy
             ),
             "expert_prefetch_workers": DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS,
             "expert_prefetch_active_read_limit": (
@@ -1659,6 +1668,12 @@ def _run_with_source(
             ),
             "expert_prefetch_resident_limit_bytes": (
                 DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+            ),
+            "expert_range_coalesce_max_experts": (
+                pager.expert_range_coalesce_max_experts
+            ),
+            "expert_range_coalesce_max_gap_bytes": (
+                DeepSeekWeightPager.EXPERT_RANGE_COALESCE_MAX_GAP_BYTES
             ),
             "source_transport_policy": str(
                 source_identity_metrics.get("transport_policy", "unreported")
@@ -1706,17 +1721,11 @@ def _run_with_source(
             DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
         ),
         "attention_qat_policy": StreamedDeepSeekV4.ATTENTION_QAT_POLICY,
-        "expert_prefetch_policy": (
-            DeepSeekWeightPager.EXPERT_PREFETCH_POLICY
-            if not args.no_expert_prefetch
-            else "disabled"
-        ),
+        "expert_prefetch_policy": pager.expert_prefetch_policy,
         "expert_prefetch_payload_limit_bytes": (
             DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
         ),
-        "expert_prefetch_transport_policy": (
-            DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
-        ),
+        "expert_prefetch_transport_policy": pager.expert_prefetch_transport_policy,
         "expert_prefetch_workers": DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS,
         "expert_prefetch_active_read_limit": (
             DeepSeekWeightPager.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
@@ -1727,6 +1736,12 @@ def _run_with_source(
         "expert_prefetch_max_experts": DeepSeekWeightPager.EXPERT_PREFETCH_MAX_EXPERTS,
         "expert_prefetch_resident_limit_bytes": (
             DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+        ),
+        "expert_range_coalesce_max_experts": (
+            pager.expert_range_coalesce_max_experts
+        ),
+        "expert_range_coalesce_max_gap_bytes": (
+            DeepSeekWeightPager.EXPERT_RANGE_COALESCE_MAX_GAP_BYTES
         ),
         "source_transport_policy": str(
             source_identity_metrics.get("transport_policy", "unreported")
@@ -1752,13 +1767,6 @@ def _run_with_source(
         "allow_closed_set_gsm8k": args.allow_closed_set_gsm8k,
     }
     signature = canonical_digest(signature_payload)
-    pager = DeepSeekWeightPager(
-        source,
-        device=args.device,
-        compute_dtype=args.dtype,
-        simulate_activation_quantization=not args.no_activation_quantization,
-        expert_prefetch=not args.no_expert_prefetch,
-    )
     if args.preflight != "none":
         model = _model_for_mode(config, pager, args, "off", seeds[0])
         model.checkpoint_preflight(exhaustive_experts=args.preflight == "exhaustive")
@@ -1781,17 +1789,11 @@ def _run_with_source(
             DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
         ),
         "attention_qat_policy": StreamedDeepSeekV4.ATTENTION_QAT_POLICY,
-        "expert_prefetch_policy": (
-            DeepSeekWeightPager.EXPERT_PREFETCH_POLICY
-            if not args.no_expert_prefetch
-            else "disabled"
-        ),
+        "expert_prefetch_policy": pager.expert_prefetch_policy,
         "expert_prefetch_payload_limit_bytes": (
             DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
         ),
-        "expert_prefetch_transport_policy": (
-            DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
-        ),
+        "expert_prefetch_transport_policy": pager.expert_prefetch_transport_policy,
         "expert_prefetch_workers": DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS,
         "expert_prefetch_active_read_limit": (
             DeepSeekWeightPager.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
@@ -1802,6 +1804,12 @@ def _run_with_source(
         "expert_prefetch_max_experts": DeepSeekWeightPager.EXPERT_PREFETCH_MAX_EXPERTS,
         "expert_prefetch_resident_limit_bytes": (
             DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+        ),
+        "expert_range_coalesce_max_experts": (
+            pager.expert_range_coalesce_max_experts
+        ),
+        "expert_range_coalesce_max_gap_bytes": (
+            DeepSeekWeightPager.EXPERT_RANGE_COALESCE_MAX_GAP_BYTES
         ),
         "source_transport_policy": str(
             source_identity_metrics.get("transport_policy", "unreported")

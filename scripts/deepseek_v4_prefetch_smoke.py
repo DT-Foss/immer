@@ -53,6 +53,11 @@ _PREFETCH_COUNTERS = (
     "expert_prefetch_wait_ns",
     "expert_prefetch_ready_before_consume",
     "expert_prefetch_cancelled",
+    "expert_prefetch_batches_submitted",
+    "expert_transport_envelopes",
+    "expert_transport_source_bytes",
+    "expert_range_requests_avoided",
+    "expert_range_gap_bytes",
 )
 
 
@@ -196,25 +201,48 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup-rounds", type=_positive_int, default=1)
     parser.add_argument("--trials", type=_positive_even_int, default=20)
+    parser.add_argument(
+        "--contrast",
+        choices=("off-vs-prefetch", "q3-vs-adjacent-pairs"),
+        default="off-vs-prefetch",
+    )
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     return parser
 
 
-def _trial_schedule(trials: int) -> tuple[str, ...]:
+def _trial_schedule(
+    trials: int,
+    modes: tuple[str, str] = ("off", "on"),
+) -> tuple[str, ...]:
     if isinstance(trials, bool) or not isinstance(trials, int) or trials <= 0:
         raise SmokeError("trial count must be a positive integer")
     if trials % 2:
         raise SmokeError("trial count must be even for a balanced A/B")
+    if (
+        len(modes) != 2
+        or modes[0] == modes[1]
+        or any(not isinstance(mode, str) or not mode for mode in modes)
+    ):
+        raise SmokeError("trial modes must be two distinct non-empty strings")
     result: list[str] = []
     for pair in range(trials // 2):
-        result.extend(("off", "on") if pair % 2 == 0 else ("on", "off"))
+        result.extend(modes if pair % 2 == 0 else tuple(reversed(modes)))
     return tuple(result)
+
+
+def _candidate_coalesce_width(contrast: str) -> int:
+    if contrast == "off-vs-prefetch":
+        return 1
+    if contrast == "q3-vs-adjacent-pairs":
+        return 2
+    raise SmokeError(f"unsupported contrast {contrast!r}")
 
 
 def _summarize_trials(
     trials: Sequence[Mapping[str, Any]],
+    mode_order: tuple[str, str] = ("off", "on"),
 ) -> dict[str, Any]:
-    grouped: dict[str, list[float]] = {"off": [], "on": []}
+    grouped: dict[str, list[float]] = {mode: [] for mode in mode_order}
     for index, row in enumerate(trials):
         mode = row.get("mode")
         seconds = row.get("seconds")
@@ -228,26 +256,65 @@ def _summarize_trials(
         ):
             raise SmokeError(f"trial {index} has invalid elapsed time")
         grouped[str(mode)].append(float(seconds))
-    if not grouped["off"] or len(grouped["off"]) != len(grouped["on"]):
+    if not grouped[mode_order[0]] or len(grouped[mode_order[0]]) != len(
+        grouped[mode_order[1]]
+    ):
         raise SmokeError("A/B trials must contain equal non-empty mode counts")
 
-    modes: dict[str, dict[str, float | int | list[float]]] = {}
+    modes_summary: dict[str, dict[str, float | int | list[float]]] = {}
     for mode, values in grouped.items():
-        modes[mode] = {
+        ordered = sorted(values)
+        p90_index = max(0, math.ceil(0.9 * len(ordered)) - 1)
+        modes_summary[mode] = {
             "count": len(values),
             "seconds": values,
             "mean_seconds": statistics.fmean(values),
             "median_seconds": statistics.median(values),
+            "population_stdev_seconds": statistics.pstdev(values),
+            "p90_seconds_nearest_rank": ordered[p90_index],
             "minimum_seconds": min(values),
             "maximum_seconds": max(values),
         }
-    off_mean = float(modes["off"]["mean_seconds"])
-    on_mean = float(modes["on"]["mean_seconds"])
-    return {
-        "modes": modes,
-        "mean_speedup_off_over_on": off_mean / on_mean,
-        "mean_latency_reduction_fraction": 1.0 - on_mean / off_mean,
+    baseline_mean = float(modes_summary[mode_order[0]]["mean_seconds"])
+    candidate_mean = float(modes_summary[mode_order[1]]["mean_seconds"])
+    result = {
+        "modes": modes_summary,
+        "baseline_mode": mode_order[0],
+        "candidate_mode": mode_order[1],
+        "mean_speedup_baseline_over_candidate": baseline_mean / candidate_mean,
+        "mean_latency_reduction_fraction": 1.0
+        - candidate_mean / baseline_mean,
     }
+    paired_speedups: list[float] = []
+    candidate_wins = 0
+    for pair_index in range(0, len(trials), 2):
+        pair = trials[pair_index : pair_index + 2]
+        if len(pair) != 2 or {str(row.get("mode")) for row in pair} != set(
+            mode_order
+        ):
+            raise SmokeError(
+                "A/B trials must be adjacent counterbalanced mode pairs"
+            )
+        values = {str(row["mode"]): float(row["seconds"]) for row in pair}
+        speedup = values[mode_order[0]] / values[mode_order[1]]
+        paired_speedups.append(speedup)
+        candidate_wins += int(speedup > 1.0)
+    result["paired"] = {
+        "count": len(paired_speedups),
+        "candidate_wins": candidate_wins,
+        "candidate_win_fraction": candidate_wins / len(paired_speedups),
+        "median_speedup_baseline_over_candidate": statistics.median(
+            paired_speedups
+        ),
+        "speedups_baseline_over_candidate": paired_speedups,
+    }
+    if mode_order == ("off", "on"):
+        result["mean_speedup_off_over_on"] = baseline_mean / candidate_mean
+    elif mode_order == ("q3", "adjacent_pairs"):
+        result["mean_speedup_q3_over_adjacent_pairs"] = (
+            baseline_mean / candidate_mean
+        )
+    return result
 
 
 def _local_source_path(value: str) -> Path | None:
@@ -448,6 +515,12 @@ def _pager_projection(pager: DeepSeekWeightPager) -> dict[str, Any]:
         "expert_prefetch_resident_limit_bytes": int(
             metrics["expert_prefetch_resident_limit_bytes"]
         ),
+        "expert_range_coalesce_max_experts": int(
+            metrics["expert_range_coalesce_max_experts"]
+        ),
+        "expert_range_coalesce_max_gap_bytes": int(
+            metrics["expert_range_coalesce_max_gap_bytes"]
+        ),
         "expert_prefetch_draining": bool(metrics["expert_prefetch_draining"]),
         "device": metrics["device"],
         "compute_dtype": metrics["compute_dtype"],
@@ -568,17 +641,30 @@ def _run_with_source(
     source_metrics_before = source.metrics()
     body_before_warmup = int(source.bytes_moved())
 
-    off = DeepSeekWeightPager(
-        source,
-        device=args.device,
-        compute_dtype=args.dtype,
-        expert_prefetch=False,
-    )
+    if args.contrast == "off-vs-prefetch":
+        mode_order = ("off", "on")
+        off = DeepSeekWeightPager(
+            source,
+            device=args.device,
+            compute_dtype=args.dtype,
+            expert_prefetch=False,
+        )
+    else:
+        mode_order = ("q3", "adjacent_pairs")
+        off = DeepSeekWeightPager(
+            source,
+            device=args.device,
+            compute_dtype=args.dtype,
+            expert_prefetch=True,
+            expert_range_coalesce_max_experts=1,
+        )
+    candidate_coalesce_width = _candidate_coalesce_width(args.contrast)
     on = DeepSeekWeightPager(
         source,
         device=args.device,
         compute_dtype=args.dtype,
         expert_prefetch=True,
+        expert_range_coalesce_max_experts=candidate_coalesce_width,
     )
     if off.device != on.device or off.compute_dtype != on.compute_dtype:
         raise SmokeError("A/B pager device or dtype resolution diverged")
@@ -593,9 +679,31 @@ def _run_with_source(
     reference = None
     warmup_records: list[dict[str, Any]] = []
     trials: list[dict[str, Any]] = []
+    arm_contracts: dict[str, dict[str, int]] = {}
+    for mode, pager in zip(mode_order, (off, on), strict=True):
+        if not pager.expert_prefetch_enabled:
+            arm_contracts[mode] = {
+                "submitted": 0,
+                "batches": 0,
+                "range_requests_avoided": 0,
+                "minimum_source_envelopes": 0,
+            }
+            continue
+        planned_experts = tuple(pager._expert_plan(base) for base in bases)
+        if any(plan is None for plan in planned_experts):
+            raise SmokeError(f"{mode} could not pre-plan every selected expert")
+        concrete = tuple(plan for plan in planned_experts if plan is not None)
+        batches = pager._batch_expert_plans(concrete)
+        avoided = sum(batch.plan.range_requests_avoided for batch in batches)
+        arm_contracts[mode] = {
+            "submitted": len(concrete),
+            "batches": len(batches),
+            "range_requests_avoided": avoided,
+            "minimum_source_envelopes": 2 * len(concrete) - avoided,
+        }
     try:
         for round_index in range(args.warmup_rounds):
-            for mode, pager in (("off", off), ("on", on)):
+            for mode, pager in zip(mode_order, (off, on), strict=True):
                 output, seconds, delta, source_delta = _timed_trial(
                     mode,
                     pager,
@@ -629,8 +737,8 @@ def _run_with_source(
         if reference is None:
             raise SmokeError("warmup did not produce a reference output")
         body_after_warmup = int(source.bytes_moved())
-        for index, mode in enumerate(_trial_schedule(args.trials)):
-            pager = off if mode == "off" else on
+        for index, mode in enumerate(_trial_schedule(args.trials, mode_order)):
+            pager = off if mode == mode_order[0] else on
             output, seconds, delta, source_delta = _timed_trial(
                 mode,
                 pager,
@@ -643,13 +751,19 @@ def _run_with_source(
                 output, reference, label=f"trial {index} {mode}"
             )
             expert_count = len(bases)
-            expected_prefetch = expert_count if mode == "on" else 0
+            contract = arm_contracts[mode]
+            expected_prefetch = contract["submitted"]
             if (
                 delta["expert_calls"] != expert_count
                 or delta["coalesced_expert_calls"] != expert_count
                 or delta["expert_source_ranges"] != 2 * expert_count
                 or delta["expert_prefetch_submitted"] != expected_prefetch
                 or delta["expert_prefetch_consumed"] != expected_prefetch
+                or delta["expert_prefetch_batches_submitted"]
+                != contract["batches"]
+                or delta["expert_range_requests_avoided"]
+                != contract["range_requests_avoided"]
+                or delta["expert_range_gap_bytes"] != 0
                 or delta["expert_prefetch_failures"]
                 or delta["expert_prefetch_sync_fallbacks"]
                 or delta["expert_prefetch_cancelled"]
@@ -657,6 +771,16 @@ def _run_with_source(
                 raise SmokeError(
                     f"trial {index} {mode}: exact prefetch counter contract failed"
                 )
+            if args.no_cache and expected_prefetch:
+                if (
+                    delta["expert_transport_envelopes"]
+                    < contract["minimum_source_envelopes"]
+                    or delta["expert_transport_source_bytes"]
+                    < sum(expert_payload_bytes.values())
+                ):
+                    raise SmokeError(
+                        f"trial {index} {mode}: physical source receipt undercounted"
+                    )
             trials.append(
                 {
                     "index": index,
@@ -678,7 +802,9 @@ def _run_with_source(
 
     off_metrics = _pager_projection(off)
     on_metrics = _pager_projection(on)
-    if on_metrics["expert_prefetch_draining"]:
+    if off_metrics["expert_prefetch_draining"] or on_metrics[
+        "expert_prefetch_draining"
+    ]:
         raise SmokeError("exact prefetch worker is still draining after the run")
     if on_metrics["expert_prefetch_peak_bytes"] != expected_prefetch_peak:
         raise SmokeError(
@@ -687,13 +813,16 @@ def _run_with_source(
     expected_outstanding = min(
         len(bases), DeepSeekWeightPager.EXPERT_PREFETCH_MAX_OUTSTANDING
     )
-    if (
-        on_metrics["expert_prefetch_max_outstanding"] != expected_outstanding
-        or on_metrics["expert_prefetch_active_read_limit"]
-        != DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS
-    ):
-        raise SmokeError("exact prefetch queue/active-read contract failed")
-    summary = _summarize_trials(trials)
+    for mode, projection in zip(mode_order, (off_metrics, on_metrics), strict=True):
+        if arm_contracts[mode]["submitted"] and (
+            projection["expert_prefetch_max_outstanding"] != expected_outstanding
+            or projection["expert_prefetch_active_read_limit"]
+            != DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS
+        ):
+            raise SmokeError(
+                f"{mode}: exact prefetch queue/active-read contract failed"
+            )
+    summary = _summarize_trials(trials, mode_order)
     runtime_sources = runtime_source_manifest()
     runtime_dependencies = runtime_dependency_versions()
     harness_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -719,10 +848,17 @@ def _run_with_source(
             "finished_at": _utc_now(),
             "arguments": _arguments(args),
             "protocol": {
-                "trial_schedule": list(_trial_schedule(args.trials)),
-                "warmup_schedule": ["off", "on"] * args.warmup_rounds,
+                "contrast": args.contrast,
+                "cache_mode": (
+                    "disabled_cold_source_each_execution"
+                    if args.no_cache
+                    else "shared_exact_leaf_cache_after_symmetric_warmup"
+                ),
+                "trial_schedule": list(_trial_schedule(args.trials, mode_order)),
+                "warmup_schedule": list(mode_order) * args.warmup_rounds,
                 "same_input_for_all_executions": True,
                 "same_source_and_revision_for_both_modes": True,
+                "arm_contracts": arm_contracts,
                 "expert_execution_order": "ascending_official_modulelist_order",
                 "accumulation": "serial_fp32_add_then_cast_to_compute_dtype",
                 "route_weight_dtype": "float32",
@@ -772,15 +908,21 @@ def _run_with_source(
                     "quantized_accumulation_policy": (
                         DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
                     ),
-                    "expert_prefetch_policy": (
-                        DeepSeekWeightPager.EXPERT_PREFETCH_POLICY
-                    ),
+                    "baseline_mode": mode_order[0],
+                    "candidate_mode": mode_order[1],
+                    "baseline_expert_prefetch_policy": off_metrics[
+                        "expert_prefetch_policy"
+                    ],
+                    "expert_prefetch_policy": on_metrics["expert_prefetch_policy"],
                     "expert_prefetch_payload_limit_bytes": (
                         DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
                     ),
-                    "expert_prefetch_transport_policy": (
-                        DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
-                    ),
+                    "baseline_expert_prefetch_transport_policy": off_metrics[
+                        "expert_prefetch_transport_policy"
+                    ],
+                    "expert_prefetch_transport_policy": on_metrics[
+                        "expert_prefetch_transport_policy"
+                    ],
                     "expert_prefetch_workers": (
                         DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS
                     ),
@@ -796,6 +938,12 @@ def _run_with_source(
                     "expert_prefetch_resident_limit_bytes": (
                         DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
                     ),
+                    "expert_range_coalesce_max_experts": on_metrics[
+                        "expert_range_coalesce_max_experts"
+                    ],
+                    "expert_range_coalesce_max_gap_bytes": on_metrics[
+                        "expert_range_coalesce_max_gap_bytes"
+                    ],
                     "source_transport_policy": str(
                         source_metrics_after.get("transport_policy", "unreported")
                     ),
@@ -817,7 +965,10 @@ def _run_with_source(
             "trials": trials,
             "summary": summary,
             "metrics": {
-                "pager": {"off": off_metrics, "on": on_metrics},
+                "pager": {
+                    mode_order[0]: off_metrics,
+                    mode_order[1]: on_metrics,
+                },
                 "source": {
                     "before": source_metrics_before,
                     "after": source_metrics_after,
@@ -852,7 +1003,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "output": str(Path(args.output).expanduser().resolve()),
         "report_sha256": report["report_sha256"],
         "bit_equal": report["exactness"]["all_outputs_bit_equal"],
-        "mean_speedup_off_over_on": report["summary"]["mean_speedup_off_over_on"],
+        "baseline_mode": report["summary"]["baseline_mode"],
+        "candidate_mode": report["summary"]["candidate_mode"],
+        "mean_speedup_baseline_over_candidate": report["summary"][
+            "mean_speedup_baseline_over_candidate"
+        ],
     }
     print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     return 0

@@ -311,16 +311,12 @@ def _provenance(
                 DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
             ),
             "attention_qat_policy": StreamedDeepSeekV4.ATTENTION_QAT_POLICY,
-            "expert_prefetch_policy": (
-                DeepSeekWeightPager.EXPERT_PREFETCH_POLICY
-                if pager.expert_prefetch_enabled
-                else "disabled"
-            ),
+            "expert_prefetch_policy": pager.expert_prefetch_policy,
             "expert_prefetch_payload_limit_bytes": (
                 DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
             ),
             "expert_prefetch_transport_policy": (
-                DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
+                pager.expert_prefetch_transport_policy
             ),
             "expert_prefetch_workers": DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS,
             "expert_prefetch_active_read_limit": (
@@ -334,6 +330,12 @@ def _provenance(
             ),
             "expert_prefetch_resident_limit_bytes": (
                 DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+            ),
+            "expert_range_coalesce_max_experts": (
+                pager.expert_range_coalesce_max_experts
+            ),
+            "expert_range_coalesce_max_gap_bytes": (
+                DeepSeekWeightPager.EXPERT_RANGE_COALESCE_MAX_GAP_BYTES
             ),
             "source_transport_policy": str(
                 metrics.get("transport_policy", "unreported")

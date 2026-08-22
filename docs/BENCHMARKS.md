@@ -166,17 +166,17 @@ Offizielle 3-Expert-A/Bs auf MPS/BF16 ergaben:
 
 | Cache/Trials | aus | Fenster an | Speedup | Ausgabe | Peak |
 |---|---:|---:|---:|---|---:|
-| warm, 20 | 0,172745 s | 0,160813 s | 1,074197× | bitgleich | 40.108.032 B |
-| aus, 8 | 7,250212 s | 5,244157 s | 1,382532× | bitgleich | 40.108.032 B |
+| cache-resident, 20 | 0,192510 s | 0,173479 s | 1,109698× | bitgleich | 40.108.032 B |
+| Cache aus, 8 | 5,495380 s | 4,818187 s | 1,140549× | bitgleich | 40.108.032 B |
 
 Der aktuelle Remote-Pfad `requests-session-pool-2/v1` least exakt zwei
 voneinander getrennte Ein-Verbindungs-Sessions und liest Bodies ausschließlich
-begrenzt aus dem Stream. Im No-Cache-Lauf sind das 27,67 % weniger mittlere
-Latenz bei 320.864.256 gemessenen Quellbytes. 158 Requests sahen sechs
+begrenzt aus dem Stream. Im No-Cache-Lauf sind das 12,32 % weniger mittlere
+Latenz bei 320.864.256 gemessenen Expert-Quellbytes. 158 Requests sahen sieben
 Connection-Objekte, maximal zwei aktive Leases und danach null; Retries und
-Fehler blieben null, der Transport war vor der Versiegelung geschlossen. Die
-Netztrials streuen jedoch stark: `off` 4,62–11,53 s, `on` 3,63–6,36 s. Der
-frühere unabhängige urllib-Lauf bei Commit `d0a1dc4` erreichte 1,020702×;
+Fehler blieben null, der Transport war vor der Versiegelung geschlossen. Alle
+vier gepaarten Vergleiche gewann q3. Der frühere unabhängige urllib-Lauf bei
+Commit `d0a1dc4` erreichte 1,020702×;
 Vergleiche über Laufgrenzen bleiben netzwerkbedingt diagnostisch. Alle Outputs
 eines Laufs hatten denselben SHA-256; Futures, Peak und Fehlerpfade blieben
 innerhalb ihrer Gates. Die versiegelten Rohresultate stehen in
@@ -185,10 +185,29 @@ innerhalb ihrer Gates. Die versiegelten Rohresultate stehen in
 ausdrücklich keine Qualitäts-, MMLU- oder Frontier-Paritätsbelege; der reale
 Layerwise-Lauf entscheidet über den End-to-End-Nutzen.
 
-Der q3/a2-Pfad ist gegen `off` positiv; sein marginaler Vorteil gegenüber q2
-ist wegen getrennter Netzläufe noch nur diagnostisch. Der nächste isolierte
-Kontrast bündelt exakt benachbarte selektierte Ranges. Anschließend folgt ein
-gepaarter `off`/CRSA-Inhaltslauf auf derselben Runtime-Identität.
+Der direkte Kontrast gegen exakt benachbarte selektierte Ranges ist ebenfalls
+abgeschlossen. `raw_bytes_many` hält dafür weiterhin exakte Leaf-Cache-Keys,
+vereinigt nur kalte, lückenlos angrenzende Leafs und gibt physische
+Envelope-/Byte-Receipts zurück. Für drei Layer-40-Experts wurden so pro kaltem
+Trial sechs Envelopes auf vier reduziert, bei identischen 40.108.032
+Quellbytes und bitgleichem Ergebnis:
+
+| Cache/Trials | q3 | Adjacent-Pairs | q3/Pair | Paar-Wins | Urteil |
+|---|---:|---:|---:|---:|---|
+| cache-resident, 20 | 0,164031 s | 0,169043 s | 0,970353× | 3/10 | Pair 3,06 % langsamer |
+| Cache aus, 20 | 6,797533 s | 6,699645 s | 1,014611× | 6/10 | nur 1,44 % schneller |
+
+Der kalte P90 bleibt praktisch gleich und leicht schlechter
+(12,735 s q3 gegen 12,754 s Pair), während das Pairing im warmen Pfad
+zusätzliche Batch-/Owner-Verwaltung bezahlt. Geplante
+`expert_range_requests_avoided=2` sind bei warmen Cache-Hits ausdrücklich
+keine physisch vermiedenen Requests; beide Arme lesen dort null Quellbytes.
+Darum bleibt q3/Width 1 der Default und Adjacent-Pairs/Width 2 ein explizites
+Instrument, kein Produktions-Speedup. Die beiden zusätzlichen Belege stehen
+in `results/deepseek-v4-adjacent-range-warm-smoke.json` und
+`results/deepseek-v4-adjacent-range-network-smoke.json`. Als nächstes folgt
+der exakte FERTIG-Bindungskontrast; danach ein gepaarter `off`/CRSA-Inhaltslauf
+auf derselben Runtime-Identität.
 
 ## 7. Lebensstrom-Verträge
 
@@ -208,8 +227,8 @@ Akzeptanzlauf neu gemessene Sprachmodell-Qualität.
 
 ## 8. Nächste belastbare Messungen
 
-1. Queue-Tiefe drei und benachbarte Range-Coalescings jeweils einzeln gegen
-   identische Outputs, Bytes, Peak und kalte Wandzeit falsifizieren.
+1. Exakten Hungarian-Bindungslöser für FERTIG gegen die heutigen Abstinenzen
+   und einen Greedy-/Placebo-Kontrast messen; Wrong-Gate bleibt null.
 2. Gepaarter `off`/CRSA-Content-Gate mit offiziellem Encoding, festem Split,
    vollständigen Fehlerdenominatoren und atomarem Proof-Schema v4.
 3. Router auf einem größeren, nicht synthetisch eng getrennten Text/Math-Split,

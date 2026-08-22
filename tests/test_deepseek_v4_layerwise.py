@@ -53,11 +53,17 @@ def _model(
     ratio: int = 0,
     batch: int = 2,
     layers: int = 1,
+    expert_range_coalesce_max_experts: int | None = None,
 ) -> StreamedDeepSeekV4:
     config = _config(ratio, n_layers=layers)
     if layers > 1:
         config = replace(config, n_hash_layers=layers)
-    pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="bfloat16")
+    pager = DeepSeekWeightPager(
+        source,
+        device="cpu",
+        compute_dtype="bfloat16",
+        expert_range_coalesce_max_experts=expert_range_coalesce_max_experts,
+    )
     return StreamedDeepSeekV4(config, pager, max_batch_size=batch, max_seq_len=16)
 
 
@@ -240,12 +246,33 @@ class LayerwiseScorerTests(unittest.TestCase):
             self.assertEqual(execution["expert_prefetch_active_read_limit"], 2)
             self.assertEqual(execution["expert_prefetch_max_outstanding"], 3)
             self.assertEqual(execution["expert_prefetch_max_experts"], 3)
+            self.assertEqual(execution["expert_range_coalesce_max_experts"], 1)
+            self.assertEqual(execution["expert_range_coalesce_max_gap_bytes"], 0)
             self.assertEqual(
                 execution["expert_prefetch_resident_limit_bytes"],
                 48 * 1024**2,
             )
             self.assertEqual(execution["source_transport_policy"], "unreported")
             self.assertEqual(execution["source_transport_connection_limit"], 0)
+            adjacent_execution = _scorer(
+                _model(
+                    _source(),
+                    batch=2,
+                    expert_range_coalesce_max_experts=2,
+                ),
+                run_dir,
+            ).identity["execution"]
+            self.assertEqual(
+                adjacent_execution["expert_prefetch_policy"],
+                "exact-router-window-q3-a2-adjacent-pairs/v3",
+            )
+            self.assertEqual(
+                adjacent_execution["expert_prefetch_transport_policy"],
+                "streamer-exact-leaf-adjacent-envelope/v2",
+            )
+            self.assertEqual(
+                adjacent_execution["expert_range_coalesce_max_experts"], 2
+            )
             initial, *_ = first._load_or_initialize(resume=False)
             activation = initial["body"]["state"]["checkpoints"][0]
             self.assertEqual(

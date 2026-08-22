@@ -61,6 +61,28 @@ Originale zur Laufzeit zu importieren.
 - Cross-Model-Least-Squares-Projektion: negativ und kein R17. R17 bleibt
   trainieren → Invariante messen → Fit/R² als Verifier → exakte Struktur.
 
+### DeepSeek-Transport v5 und Handoff-Triage
+
+- `Streamer.raw_bytes_many()` vereinigt ausschließlich kalte, exakt
+  angrenzende Leafs. Cache-Keys bleiben range-exakt; Scalar↔Batch-Reuse,
+  Single-Flight, readonly Views, aggregierte Vorabreservierung und
+  thread-lokale Byte-Receipts sind getestet. Eine bekannte Quellidentität bei
+  fehlender Cache-Identität scheitert jetzt geschlossen.
+- Der Pager kann zwei physisch angrenzende Experts als gemeinsamen Batch lesen,
+  hält den gesamten Owner bis zum letzten Consumer resident und zählt
+  Envelope-, Quellbyte-, Gap- und Cancellation-Receipts genau einmal. Die
+  Produktionsidentity bleibt dynamisch q3/Width 1; `disabled` und der
+  explizite Pair-Kandidat versiegeln ihre tatsächliche Transportpolicy.
+- Reales MPS/BF16-A/B: q3 gegen aus ist cache-resident 1,109698× und ohne
+  Cache 1,140549× bei bitgleichen Outputs. Adjacent-Pairs reduziert kalt
+  sechs auf vier Envelopes ohne ein Zusatzbyte, ist aber cache-resident 3,06 %
+  langsamer und kalt nur 1,014611× schneller bei 6/10 Paar-Wins. Width 2 wird
+  deshalb nicht Default; Infrastruktur und Falsifikator bleiben erhalten.
+- Aus DeepSeeks Handoff bleiben exakte Ideen übrig: FERTIG-Hungarian und ein
+  LM-Head-Request-A/B. Möbius-/Sinkhorn-Shortcuts, PPM-Head-Ersetzung,
+  compute-paralleler Shared Expert und approximatives Cross-Layer-Recycling
+  bleiben ohne Gleichheits-/Memory-Beweis geschlossen.
+
 ### Deutung + nächste Frage
 
 Der belastbare Gewinn dieser Version ist ein lokaler, digest-geprüfter und

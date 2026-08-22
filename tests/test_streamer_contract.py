@@ -486,6 +486,43 @@ class StreamerContractTests(unittest.TestCase):
             {("weights.bin", 0, 3), ("weights.bin", 16, 19)},
         )
 
+    def test_parallel_wrapper_charges_are_attributed_to_the_calling_thread(
+        self,
+    ) -> None:
+        first_in_source = threading.Event()
+        second_fully_returned = threading.Event()
+
+        def order_reads(index, _filename, _start, _end) -> None:
+            if index == 0:
+                first_in_source.set()
+                if not second_fully_returned.wait(timeout=5):
+                    raise TimeoutError("second wrapper read did not finish")
+
+        upstream = _ParallelRangeReader(order_reads)
+        source = Streamer(
+            "fixture",
+            revision="pinned",
+            reader=upstream,
+            use_cache=False,
+        )
+
+        def second_read() -> bytes:
+            try:
+                return source.raw_bytes("weights.bin", 16, 4)
+            finally:
+                second_fully_returned.set()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(source.raw_bytes, "weights.bin", 0, 4)
+            self.assertTrue(first_in_source.wait(timeout=5))
+            second = pool.submit(second_read)
+            self.assertEqual(second.result(timeout=5), bytes(range(16, 20)))
+            self.assertEqual(first.result(timeout=5), bytes(range(4)))
+
+        self.assertEqual(source.budget.body, 8)
+        self.assertEqual(source.budget.requests, 2)
+        self.assertEqual(len(source.budget.log), 2)
+
     def test_same_raw_key_is_single_flight_through_shared_cache(self) -> None:
         first_upstream_read = threading.Event()
         release_upstream = threading.Event()
@@ -521,6 +558,240 @@ class StreamerContractTests(unittest.TestCase):
             self.assertEqual(upstream.calls, [("weights.bin", 32, 39)])
             self.assertEqual(source.metrics()["cache_misses"], 1)
             self.assertEqual(source.metrics()["cache_hits"], 1)
+
+    def test_raw_bytes_many_coalesces_cold_adjacency_into_exact_leaf_cache(
+        self,
+    ) -> None:
+        upstream = _ParallelRangeReader()
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "cache"
+            source = Streamer(
+                "fixture",
+                revision="pinned",
+                reader=upstream,
+                cache_dir=cache,
+            )
+            result = source.raw_bytes_many(
+                "weights.bin",
+                [(8, 4), (0, 4), (4, 4), (0, 4), (99, 0)],
+                resident_limit_bytes=12,
+            )
+
+            self.assertEqual(upstream.calls, [("weights.bin", 0, 11)])
+            self.assertEqual(
+                [bytes(part) for part in result.parts],
+                [
+                    bytes(range(8, 12)),
+                    bytes(range(4)),
+                    bytes(range(4, 8)),
+                    bytes(range(4)),
+                    b"",
+                ],
+            )
+            self.assertTrue(all(isinstance(part, memoryview) for part in result.parts))
+            self.assertTrue(all(part.readonly for part in result.parts))
+            self.assertIs(result.parts[0].obj, result.parts[1].obj)
+            self.assertIs(result.parts[1].obj, result.parts[2].obj)
+            self.assertIs(result.parts[1].obj, result.parts[3].obj)
+            self.assertEqual(result.resident_bytes, 12)
+            self.assertEqual(result.source_requests, 1)
+            self.assertEqual(result.source_bytes, 12)
+            with self.assertRaises(AttributeError):
+                result.source_bytes = 99  # type: ignore[misc]
+
+            contracts = set()
+            for meta_path in (cache / "ranges").glob("*.json"):
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                contract = meta["contract"]
+                contracts.add((contract["start"], contract["end"]))
+            self.assertEqual(contracts, {(0, 3), (4, 7), (8, 11)})
+            self.assertNotIn((0, 11), contracts)
+
+            calls_before_hits = len(upstream.calls)
+            for offset in (0, 4, 8):
+                self.assertEqual(
+                    source.raw_bytes("weights.bin", offset, 4),
+                    bytes(range(offset, offset + 4)),
+                )
+            warm = source.raw_bytes_many(
+                "weights.bin",
+                [(8, 4), (0, 4), (4, 4)],
+                resident_limit_bytes=12,
+            )
+            self.assertEqual(len(upstream.calls), calls_before_hits)
+            self.assertEqual(warm.source_requests, 0)
+            self.assertEqual(warm.source_bytes, 0)
+            self.assertEqual(warm.resident_bytes, 12)
+
+            metrics = source.metrics()
+            self.assertEqual(metrics["range_logical_leaves"], 10)
+            self.assertEqual(metrics["range_logical_leaf_bytes"], 40)
+            self.assertEqual(metrics["range_source_requests"], 1)
+            self.assertEqual(metrics["range_source_bytes"], 12)
+
+    def test_raw_bytes_many_merges_only_adjacent_cache_misses(self) -> None:
+        upstream = _ParallelRangeReader()
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Streamer(
+                "fixture",
+                revision="pinned",
+                reader=upstream,
+                cache_dir=Path(tmp) / "cache",
+            )
+            self.assertEqual(
+                source.raw_bytes("weights.bin", 0, 4), bytes(range(4))
+            )
+            upstream.calls.clear()
+
+            result = source.raw_bytes_many(
+                "weights.bin",
+                [(0, 4), (4, 4), (8, 4), (20, 4)],
+                resident_limit_bytes=16,
+            )
+
+            self.assertEqual(
+                upstream.calls,
+                [("weights.bin", 4, 11), ("weights.bin", 20, 23)],
+            )
+            self.assertEqual(result.source_requests, 2)
+            self.assertEqual(result.source_bytes, 12)
+            self.assertEqual(result.resident_bytes, 16)
+            self.assertEqual(
+                [bytes(part) for part in result.parts],
+                [
+                    bytes(range(4)),
+                    bytes(range(4, 8)),
+                    bytes(range(8, 12)),
+                    bytes(range(20, 24)),
+                ],
+            )
+            self.assertIsNot(result.parts[0].obj, result.parts[1].obj)
+            self.assertIs(result.parts[1].obj, result.parts[2].obj)
+            self.assertIsNot(result.parts[2].obj, result.parts[3].obj)
+
+    def test_raw_bytes_many_is_single_flight_with_scalar_reader(self) -> None:
+        batch_in_source = threading.Event()
+        release_source = threading.Event()
+
+        def hold_batch(index, _filename, _start, _end) -> None:
+            if index == 0:
+                batch_in_source.set()
+                if not release_source.wait(timeout=5):
+                    raise TimeoutError("batch source read was not released")
+
+        upstream = _ParallelRangeReader(hold_batch)
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Streamer(
+                "fixture",
+                revision="pinned",
+                reader=upstream,
+                cache_dir=Path(tmp) / "cache",
+            )
+            scalar_started = threading.Event()
+            scalar_returned = threading.Event()
+
+            def scalar_read() -> bytes:
+                scalar_started.set()
+                try:
+                    return source.raw_bytes("weights.bin", 4, 4)
+                finally:
+                    scalar_returned.set()
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                batch = pool.submit(
+                    source.raw_bytes_many,
+                    "weights.bin",
+                    [(0, 4), (4, 4)],
+                    8,
+                )
+                self.assertTrue(batch_in_source.wait(timeout=5))
+                scalar = pool.submit(scalar_read)
+                self.assertTrue(scalar_started.wait(timeout=5))
+                self.assertFalse(scalar_returned.is_set())
+                release_source.set()
+                batch_result = batch.result(timeout=5)
+                scalar_result = scalar.result(timeout=5)
+
+            self.assertEqual(batch_result.source_requests, 1)
+            self.assertEqual(scalar_result, bytes(range(4, 8)))
+            self.assertEqual(upstream.calls, [("weights.bin", 0, 7)])
+
+    def test_raw_bytes_many_fails_closed_before_any_source_read(self) -> None:
+        upstream = _ParallelRangeReader()
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "cache"
+            source = Streamer(
+                "fixture",
+                revision="pinned",
+                reader=upstream,
+                cache_dir=cache,
+            )
+            source.raw_bytes("weights.bin", 0, 4)
+            cached_calls = len(upstream.calls)
+            meta_path = next((cache / "ranges").glob("*.json"))
+            meta_path.with_suffix(".bin").write_bytes(b"bad")
+
+            with self.assertRaises(CacheIntegrityError):
+                source.raw_bytes_many(
+                    "weights.bin",
+                    [(8, 4), (0, 4)],
+                    resident_limit_bytes=8,
+                )
+            self.assertEqual(len(upstream.calls), cached_calls)
+
+            for kwargs in (
+                {"resident_limit_bytes": 7},
+                {"resident_limit_bytes": 8, "max_gap_bytes": 1},
+            ):
+                with self.assertRaises(RangeValidationError):
+                    Streamer(
+                        "fixture",
+                        revision="pinned",
+                        reader=_ParallelRangeReader(),
+                        use_cache=False,
+                    ).raw_bytes_many(
+                        "weights.bin",
+                        [(0, 4), (4, 4)],
+                        **kwargs,
+                    )
+
+    def test_reserved_batch_budget_cannot_be_stolen_by_parallel_scalar(self) -> None:
+        batch_in_source = threading.Event()
+        release_source = threading.Event()
+
+        def hold_batch(index, _filename, _start, _end) -> None:
+            if index == 0:
+                batch_in_source.set()
+                if not release_source.wait(timeout=5):
+                    raise TimeoutError("batch source read was not released")
+
+        upstream = _ParallelRangeReader(hold_batch)
+        source = Streamer(
+            "fixture",
+            revision="pinned",
+            reader=upstream,
+            use_cache=False,
+        )
+        source.budget.limit = 8
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            batch = pool.submit(
+                source.raw_bytes_many,
+                "weights.bin",
+                [(0, 4), (4, 4)],
+                8,
+            )
+            self.assertTrue(batch_in_source.wait(timeout=5))
+            try:
+                with self.assertRaises(ByteBudgetExceeded):
+                    source.raw_bytes("weights.bin", 16, 1)
+                self.assertEqual(upstream.calls, [("weights.bin", 0, 7)])
+            finally:
+                release_source.set()
+            result = batch.result(timeout=5)
+
+        self.assertEqual(result.source_bytes, 8)
+        self.assertEqual(source.budget.total, 8)
+        self.assertLessEqual(source.budget.total, source.budget.limit)
 
     def test_wheel_style_import_has_no_repository_vendor_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -675,6 +946,26 @@ print("wheel-safe")
             corrupted = Streamer.from_local(root, cache_dir=cache, budget_mb=1.0)
             with self.assertRaises(CacheIntegrityError):
                 corrupted.rows("float.weight", 1, 2)
+
+    def test_range_cache_rejects_missing_known_source_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            cache = Path(tmp) / "cache"
+            root.mkdir()
+            _write_fixture(root)
+            first = Streamer.from_local(root, cache_dir=cache, budget_mb=1.0)
+            expected = first.raw_bytes("model.safetensors", 0, 8)
+            self.assertEqual(len(expected), 8)
+
+            meta_path = next((cache / "ranges").glob("*.json"))
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            del meta["source_identity"]
+            meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+            resumed = Streamer.from_local(root, cache_dir=cache, budget_mb=1.0)
+            with self.assertRaisesRegex(CacheIntegrityError, "Quellidentitaet fehlt"):
+                resumed.raw_bytes("model.safetensors", 0, 8)
+            self.assertEqual(resumed.bytes_moved(), 0)
 
     def test_budget_is_preflighted_and_never_overshoots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

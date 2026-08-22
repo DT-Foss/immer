@@ -162,6 +162,190 @@ class _MultiEncodedExpertSource:
         }
 
 
+class _AdjacentBatchExpertSource:
+    """Three experts where E0/E1 share exact physical range boundaries."""
+
+    def __init__(self, bases: list[str]) -> None:
+        if len(bases) < 3:
+            raise ValueError("adjacent batch fixture requires at least three experts")
+        self.data_start = 8
+        self.shard_name = "adjacent-experts.safetensors"
+        self.raw_calls: list[tuple[str, int, int]] = []
+        self.tensor_calls: list[str] = []
+        self.meta: dict[str, dict] = {}
+        self.data: dict[str, np.ndarray] = {}
+        children = [
+            _EncodedExpertSource(base, "fp4", adjacent=True) for base in bases
+        ]
+        self.data.update(
+            (name, value)
+            for child in children
+            for name, value in child.data.items()
+        )
+
+        payload = bytearray()
+        for group in ("scale", "weight"):
+            if payload:
+                payload.extend(b"gap-between-scale-and-weight-groups")
+            for index, child in enumerate(children):
+                if index >= 2:
+                    payload.extend(f"gap-before-expert-{index}".encode("ascii"))
+                names = [f"{child.base}.{role}.{group}" for role in ("w1", "w2", "w3")]
+                group_begin = min(
+                    int(child.meta[name]["offset_in_shard"][0]) for name in names
+                )
+                group_end = max(
+                    int(child.meta[name]["offset_in_shard"][1]) for name in names
+                )
+                target_begin = len(payload)
+                payload.extend(child.payload[group_begin:group_end])
+                for name in names:
+                    record = dict(child.meta[name])
+                    begin, end = (
+                        int(value) for value in record["offset_in_shard"]
+                    )
+                    record["shard"] = self.shard_name
+                    record["data_start"] = self.data_start
+                    record["offset_in_shard"] = [
+                        target_begin + begin - group_begin,
+                        target_begin + end - group_begin,
+                    ]
+                    self.meta[name] = record
+        self.payload = bytes(payload)
+        self.plan_ranges: dict[str, tuple[tuple[int, int], ...]] = {}
+        for base in bases:
+            layouts = []
+            for group in ("scale", "weight"):
+                names = [f"{base}.{role}.{group}" for role in ("w1", "w2", "w3")]
+                begin = min(
+                    int(self.meta[name]["offset_in_shard"][0]) for name in names
+                )
+                end = max(
+                    int(self.meta[name]["offset_in_shard"][1]) for name in names
+                )
+                layouts.append((self.data_start + begin, end - begin))
+            self.plan_ranges[base] = tuple(layouts)
+
+    def find(self, name: str) -> dict:
+        return dict(self.meta[name])
+
+    def tensor(self, name: str) -> np.ndarray:
+        self.tensor_calls.append(name)
+        return self.data[name].copy()
+
+    def raw_bytes(self, shard: str, offset: int, length: int) -> bytes:
+        if shard != self.shard_name:
+            raise KeyError(shard)
+        self.raw_calls.append((shard, offset, length))
+        start = offset - self.data_start
+        return self.payload[start : start + length]
+
+    def raw_bytes_many(
+        self,
+        shard: str,
+        ranges,
+        *,
+        resident_limit_bytes: int,
+        max_gap_bytes: int = 0,
+    ):
+        from immer.knowledge.streamer import RawBytesManyResult
+
+        if max_gap_bytes != 0:
+            raise ValueError("fixture only supports exact adjacency")
+        requested = tuple((int(offset), int(length)) for offset, length in ranges)
+        ordered = sorted(enumerate(requested), key=lambda item: item[1][0])
+        envelopes: list[tuple[int, int, list[int]]] = []
+        for original, (offset, length) in ordered:
+            end = offset + length
+            if envelopes and envelopes[-1][1] == offset:
+                begin, _, members = envelopes[-1]
+                members.append(original)
+                envelopes[-1] = (begin, end, members)
+            else:
+                envelopes.append((offset, end, [original]))
+        resident = sum(end - begin for begin, end, _ in envelopes)
+        if resident > resident_limit_bytes:
+            raise ValueError("fixture resident limit exceeded")
+        parts: list[memoryview | None] = [None] * len(requested)
+        for begin, end, members in envelopes:
+            owner = self.raw_bytes(shard, begin, end - begin)
+            owner_view = memoryview(owner)
+            for original in members:
+                offset, length = requested[original]
+                parts[original] = owner_view[offset - begin : offset - begin + length]
+        if any(part is None for part in parts):
+            raise AssertionError("fixture omitted requested range")
+        return RawBytesManyResult(
+            parts=tuple(part for part in parts if part is not None),
+            resident_bytes=resident,
+            source_requests=len(envelopes),
+            source_bytes=resident,
+        )
+
+    def metrics(self) -> dict:
+        return {
+            "network_or_source_body_bytes": sum(
+                length for _, _, length in self.raw_calls
+            )
+        }
+
+
+class _BlockingAdjacentBatchExpertSource(_AdjacentBatchExpertSource):
+    """Event-driven batch source exposing pair ownership and cancellation."""
+
+    def __init__(self, bases: list[str]) -> None:
+        super().__init__(bases)
+        self.batch_keys = [(bases[0], bases[1]), *((base,) for base in bases[2:])]
+        self.started = {key: threading.Event() for key in self.batch_keys}
+        self.release = {key: threading.Event() for key in self.batch_keys}
+        self.completed = {key: threading.Event() for key in self.batch_keys}
+        self.fail: set[tuple[str, ...]] = set()
+        self.max_active = 0
+        self._active: set[tuple[str, ...]] = set()
+        self._batch_lock = threading.Lock()
+
+    def _batch_key(self, ranges: tuple[tuple[int, int], ...]) -> tuple[str, ...]:
+        requested = set(ranges)
+        members = tuple(
+            base
+            for base, planned in self.plan_ranges.items()
+            if requested.intersection(planned)
+        )
+        if members not in self.started:
+            raise AssertionError(f"unexpected batch members: {members}")
+        return members
+
+    def raw_bytes_many(
+        self,
+        shard: str,
+        ranges,
+        *,
+        resident_limit_bytes: int,
+        max_gap_bytes: int = 0,
+    ):
+        requested = tuple((int(offset), int(length)) for offset, length in ranges)
+        key = self._batch_key(requested)
+        with self._batch_lock:
+            self._active.add(key)
+            self.max_active = max(self.max_active, len(self._active))
+            self.started[key].set()
+        if not self.release[key].wait(timeout=5):
+            raise RuntimeError(f"test did not release adjacent batch {key}")
+        try:
+            if key in self.fail:
+                raise RuntimeError(f"simulated adjacent batch failure {key}")
+            return super().raw_bytes_many(
+                shard,
+                requested,
+                resident_limit_bytes=resident_limit_bytes,
+                max_gap_bytes=max_gap_bytes,
+            )
+        finally:
+            with self._batch_lock:
+                self._active.discard(key)
+                self.completed[key].set()
+
+
 class _BlockingExpertSource(_MultiEncodedExpertSource):
     def __init__(self, bases: list[str]) -> None:
         super().__init__(bases)
@@ -417,8 +601,263 @@ class DeepSeekV4PagerTests(unittest.TestCase):
             metrics["expert_prefetch_transport_policy"],
             "streamer-exact-range/v1",
         )
+        self.assertEqual(
+            metrics["expert_prefetch_policy"],
+            "exact-router-window-q3-a2/v2",
+        )
         self.assertEqual(metrics["expert_prefetch_max_experts"], 3)
         self.assertEqual(metrics["expert_prefetch_resident_limit_bytes"], 48 * 1024**2)
+        pager.release()
+
+    def test_prefetch_identity_tracks_disabled_q3_and_adjacent_modes(self) -> None:
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        source = _Source()
+        disabled = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="float32",
+            expert_prefetch=False,
+        )
+        self.assertEqual(disabled.expert_prefetch_policy, "disabled")
+        self.assertEqual(disabled.expert_prefetch_transport_policy, "disabled")
+        self.assertEqual(disabled.metrics()["expert_prefetch_policy"], "disabled")
+        self.assertEqual(
+            disabled.metrics()["expert_prefetch_transport_policy"], "disabled"
+        )
+
+        q3 = DeepSeekWeightPager(source, device="cpu", compute_dtype="float32")
+        self.assertEqual(q3.expert_prefetch_policy, "exact-router-window-q3-a2/v2")
+        self.assertEqual(
+            q3.expert_prefetch_transport_policy, "streamer-exact-range/v1"
+        )
+
+        adjacent = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="float32",
+            expert_range_coalesce_max_experts=2,
+        )
+        self.assertEqual(
+            adjacent.expert_prefetch_policy,
+            "exact-router-window-q3-a2-adjacent-pairs/v3",
+        )
+        self.assertEqual(
+            adjacent.expert_prefetch_transport_policy,
+            "streamer-exact-leaf-adjacent-envelope/v2",
+        )
+        disabled.release()
+        q3.release()
+        adjacent.release()
+
+    def test_exact_adjacent_pair_reduces_six_ranges_to_four_with_bit_parity(
+        self,
+    ) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        bases = [f"layers.0.ffn.experts.{value}" for value in range(3)]
+        hidden = torch.linspace(-0.01, 0.01, 128, dtype=torch.bfloat16)[None, :]
+
+        reference_source = _AdjacentBatchExpertSource(bases)
+        reference = DeepSeekWeightPager(
+            reference_source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            expert_prefetch=False,
+        )
+        expected = [reference.expert(hidden, base) for base in bases]
+
+        q3_source = _AdjacentBatchExpertSource(bases)
+        q3 = DeepSeekWeightPager(
+            q3_source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            expert_range_coalesce_max_experts=1,
+        )
+        q3_window = q3.prefetch_expert_window(bases)
+        assert q3_window is not None
+        q3_outputs = []
+        for base in bases:
+            payload = q3.consume_expert_window(q3_window, base)
+            q3_outputs.append(q3.expert(hidden, base, prefetched_payload=payload))
+        q3.close_expert_window(q3_window)
+
+        source = _AdjacentBatchExpertSource(bases)
+        pager = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            expert_range_coalesce_max_experts=2,
+        )
+        window = pager.prefetch_expert_window(bases)
+        assert window is not None
+        actual = []
+        for base in bases:
+            payload = pager.consume_expert_window(window, base)
+            actual.append(pager.expert(hidden, base, prefetched_payload=payload))
+        pager.close_expert_window(window)
+
+        self.assertTrue(
+            all(torch.equal(left, right) for left, right in zip(actual, expected))
+        )
+        self.assertTrue(
+            all(torch.equal(left, right) for left, right in zip(actual, q3_outputs))
+        )
+        self.assertEqual(len(reference_source.raw_calls), 6)
+        self.assertEqual(len(q3_source.raw_calls), 6)
+        self.assertEqual(len(source.raw_calls), 4)
+        self.assertEqual(
+            sum(length for _, _, length in reference_source.raw_calls),
+            sum(length for _, _, length in source.raw_calls),
+        )
+        metrics = pager.metrics()
+        self.assertEqual(metrics["expert_prefetch_submitted"], 3)
+        self.assertEqual(metrics["expert_prefetch_batches_submitted"], 2)
+        self.assertEqual(metrics["expert_transport_envelopes"], 4)
+        self.assertEqual(metrics["expert_range_requests_avoided"], 2)
+        self.assertEqual(metrics["expert_range_gap_bytes"], 0)
+        self.assertEqual(metrics["expert_source_ranges"], 6)
+        self.assertEqual(metrics["expert_prefetch_max_outstanding"], 3)
+        self.assertEqual(metrics["expert_prefetch_peak_bytes"], 3 * 26112)
+        self.assertEqual(metrics["expert_range_coalesce_max_experts"], 2)
+        self.assertEqual(metrics["expert_range_coalesce_max_gap_bytes"], 0)
+        self.assertEqual(
+            metrics["expert_prefetch_policy"],
+            "exact-router-window-q3-a2-adjacent-pairs/v3",
+        )
+        self.assertEqual(q3.metrics()["expert_prefetch_batches_submitted"], 3)
+        self.assertEqual(q3.metrics()["expert_range_requests_avoided"], 0)
+        self.assertEqual(
+            q3.metrics()["expert_prefetch_policy"],
+            "exact-router-window-q3-a2/v2",
+        )
+        reference.release()
+        q3.release()
+        pager.release()
+
+    def test_adjacent_pair_reverse_completion_keeps_owner_until_second_release(
+        self,
+    ) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        bases = [f"layers.0.ffn.experts.{value}" for value in range(4)]
+        pair = (bases[0], bases[1])
+        second = (bases[2],)
+        fourth = (bases[3],)
+        source = _BlockingAdjacentBatchExpertSource(bases)
+        pager = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            expert_range_coalesce_max_experts=2,
+        )
+        hidden = torch.zeros((1, 128), dtype=torch.bfloat16)
+        with mock.patch.object(
+            pager,
+            "EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES",
+            3 * 26112,
+        ):
+            window = pager.prefetch_expert_window(bases)
+            assert window is not None
+            self.assertTrue(source.started[pair].wait(timeout=2))
+            self.assertTrue(source.started[second].wait(timeout=2))
+            self.assertFalse(source.started[fourth].is_set())
+            self.assertEqual(source.max_active, 2)
+
+            # The later singleton may finish first, but ordered E0 consumption
+            # still waits for the shared E0/E1 envelope.
+            source.release[second].set()
+            self.assertTrue(source.completed[second].wait(timeout=2))
+            entered = threading.Event()
+            consumed = threading.Event()
+            first_payload: list[object] = []
+
+            def consume_first() -> None:
+                entered.set()
+                first_payload.append(pager.consume_expert_window(window, bases[0]))
+                consumed.set()
+
+            consumer = threading.Thread(target=consume_first)
+            consumer.start()
+            self.assertTrue(entered.wait(timeout=1))
+            self.assertFalse(consumed.is_set())
+            source.release[pair].set()
+            self.assertTrue(consumed.wait(timeout=2))
+            consumer.join(timeout=1)
+            self.assertFalse(consumer.is_alive())
+
+            pager.expert(hidden, bases[0], prefetched_payload=first_payload[0])
+            # E1's view still pins the full pair owner, so the honest 3-expert
+            # cap cannot start E3 yet.
+            self.assertFalse(source.started[fourth].is_set())
+            payload = pager.consume_expert_window(window, bases[1])
+            pager.expert(hidden, bases[1], prefetched_payload=payload)
+            self.assertTrue(source.started[fourth].wait(timeout=2))
+
+            source.release[fourth].set()
+            for base in bases[2:]:
+                payload = pager.consume_expert_window(window, base)
+                pager.expert(hidden, base, prefetched_payload=payload)
+            pager.close_expert_window(window)
+
+        self.assertLessEqual(source.max_active, 2)
+        metrics = pager.metrics()
+        self.assertEqual(metrics["expert_prefetch_submitted"], 4)
+        self.assertEqual(metrics["expert_prefetch_batches_submitted"], 3)
+        self.assertEqual(metrics["expert_prefetch_max_outstanding"], 3)
+        self.assertEqual(metrics["expert_prefetch_peak_bytes"], 3 * 26112)
+        self.assertEqual(metrics["expert_transport_envelopes"], 6)
+        self.assertEqual(metrics["expert_range_requests_avoided"], 2)
+        pager.release()
+
+    def test_adjacent_pair_failure_detaches_shared_future_once(self) -> None:
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        bases = [f"layers.0.ffn.experts.{value}" for value in range(3)]
+        pair = (bases[0], bases[1])
+        singleton = (bases[2],)
+        source = _BlockingAdjacentBatchExpertSource(bases)
+        source.fail.add(pair)
+        pager = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            expert_range_coalesce_max_experts=2,
+        )
+        callback_finished = threading.Event()
+        original_finish = pager._finish_cancelled_prefetch
+
+        def finish(*args, **kwargs) -> None:
+            try:
+                original_finish(*args, **kwargs)
+            finally:
+                if kwargs.get("detached"):
+                    callback_finished.set()
+
+        with mock.patch.object(
+            pager, "_finish_cancelled_prefetch", side_effect=finish
+        ):
+            window = pager.prefetch_expert_window(bases)
+            assert window is not None
+            self.assertTrue(source.started[pair].wait(timeout=2))
+            self.assertTrue(source.started[singleton].wait(timeout=2))
+            source.release[pair].set()
+            with self.assertRaisesRegex(RuntimeError, "adjacent batch failure"):
+                pager.consume_expert_window(window, bases[0])
+            self.assertEqual(len(pager._draining_prefetch), 1)
+            self.assertIsNone(pager.prefetch_expert_window(bases))
+            source.release[singleton].set()
+            self.assertTrue(callback_finished.wait(timeout=2))
+
+        self.assertFalse(pager.metrics()["expert_prefetch_draining"])
+        self.assertEqual(pager.metrics()["expert_prefetch_failures"], 1)
+        self.assertEqual(pager.metrics()["expert_prefetch_cancelled"], 3)
+        self.assertEqual(pager.metrics()["expert_transport_envelopes"], 2)
+        self.assertLessEqual(source.max_active, 2)
         pager.release()
 
     def test_window_plans_all_or_falls_back_before_any_read(self) -> None:

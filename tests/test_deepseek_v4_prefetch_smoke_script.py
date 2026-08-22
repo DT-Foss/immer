@@ -32,8 +32,19 @@ class DeepSeekV4PrefetchSmokeScriptTests(unittest.TestCase):
         self.assertEqual(args.layer, 3)
         self.assertEqual(args.experts, (0, 1, 2))
         self.assertEqual(args.trials, 20)
+        self.assertEqual(args.contrast, "off-vs-prefetch")
         self.assertEqual(args.route_weight, 0.25)
         self.assertEqual(smoke._trial_schedule(4), ("off", "on", "on", "off"))
+        self.assertEqual(
+            smoke._trial_schedule(4, ("q3", "adjacent_pairs")),
+            ("q3", "adjacent_pairs", "adjacent_pairs", "q3"),
+        )
+        self.assertEqual(smoke._candidate_coalesce_width("off-vs-prefetch"), 1)
+        self.assertEqual(
+            smoke._candidate_coalesce_width("q3-vs-adjacent-pairs"), 2
+        )
+        with self.assertRaisesRegex(smoke.SmokeError, "unsupported"):
+            smoke._candidate_coalesce_width("mislabeled")
         with self.assertRaisesRegex(smoke.SmokeError, "even"):
             smoke._trial_schedule(3)
 
@@ -57,10 +68,44 @@ class DeepSeekV4PrefetchSmokeScriptTests(unittest.TestCase):
         self.assertEqual(summary["modes"]["on"]["count"], 2)
         self.assertAlmostEqual(summary["modes"]["off"]["mean_seconds"], 1.0)
         self.assertAlmostEqual(summary["modes"]["on"]["mean_seconds"], 0.5)
+        self.assertAlmostEqual(
+            summary["modes"]["off"]["population_stdev_seconds"], 0.2
+        )
+        self.assertAlmostEqual(
+            summary["modes"]["on"]["p90_seconds_nearest_rank"], 0.6
+        )
         self.assertAlmostEqual(summary["mean_speedup_off_over_on"], 2.0)
         self.assertAlmostEqual(summary["mean_latency_reduction_fraction"], 0.5)
+        self.assertEqual(summary["paired"]["candidate_wins"], 2)
+        self.assertEqual(summary["paired"]["candidate_win_fraction"], 1.0)
+        self.assertEqual(
+            summary["paired"]["speedups_baseline_over_candidate"],
+            [2.0, 2.0],
+        )
+        direct = smoke._summarize_trials(
+            (
+                {"mode": "q3", "seconds": 1.0},
+                {"mode": "adjacent_pairs", "seconds": 1.25},
+            ),
+            ("q3", "adjacent_pairs"),
+        )
+        self.assertEqual(direct["baseline_mode"], "q3")
+        self.assertEqual(direct["candidate_mode"], "adjacent_pairs")
+        self.assertAlmostEqual(
+            direct["mean_speedup_q3_over_adjacent_pairs"], 0.8
+        )
+        self.assertEqual(direct["paired"]["candidate_wins"], 0)
         with self.assertRaisesRegex(smoke.SmokeError, "equal"):
             smoke._summarize_trials(({"mode": "off", "seconds": 1.0},))
+        with self.assertRaisesRegex(smoke.SmokeError, "counterbalanced"):
+            smoke._summarize_trials(
+                (
+                    {"mode": "off", "seconds": 1.0},
+                    {"mode": "off", "seconds": 1.0},
+                    {"mode": "on", "seconds": 1.0},
+                    {"mode": "on", "seconds": 1.0},
+                )
+            )
 
     def test_atomic_schema_report_is_sealed_and_does_not_follow_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

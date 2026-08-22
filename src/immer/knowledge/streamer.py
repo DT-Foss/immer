@@ -27,7 +27,8 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -62,6 +63,21 @@ class InventoryValidationError(TensorSourceError):
 
 class TensorEncodingError(InventoryValidationError):
     """A tensor payload contains a reserved or non-finite raw encoding."""
+
+
+@dataclass(frozen=True, slots=True)
+class RawBytesManyResult:
+    """Immutable zero-copy result of one exact multi-range read.
+
+    ``parts`` are readonly views in caller order. Adjacent cold leaves can
+    share one backing ``bytes`` owner, while independently cached leaves keep
+    their own verified owners. ``resident_bytes`` counts those owners once.
+    """
+
+    parts: tuple[memoryview, ...]
+    resident_bytes: int
+    source_requests: int
+    source_bytes: int
 
 
 @runtime_checkable
@@ -103,24 +119,106 @@ class HardByteBudget(Budget):
         self.exceeded_error = ByteBudgetExceeded
         self.rejected_charges = 0
         self._charge_lock = threading.Lock()
+        self._reserved_bytes = 0
+        self._reservation_local = threading.local()
+
+    def _reservation_stack(self) -> list[dict[str, Any]]:
+        stack = getattr(self._reservation_local, "stack", None)
+        if stack is None:
+            stack = []
+            self._reservation_local.stack = stack
+        return stack
+
+    def thread_charge_snapshot(self) -> tuple[int, int, int]:
+        """Return charges made by the calling thread only."""
+
+        return (
+            int(getattr(self._reservation_local, "charged_body", 0)),
+            int(getattr(self._reservation_local, "charged_overhead", 0)),
+            int(getattr(self._reservation_local, "charged_requests", 0)),
+        )
+
+    @contextmanager
+    def reservation(self, amount: int, tag: str) -> Any:
+        """Reserve a hard-budget slice for charges made by this thread.
+
+        The upstream range reader charges the shared budget itself. A
+        thread-local receipt lets those charges atomically consume this
+        reservation without serializing independent network reads.
+        """
+
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+            raise ValueError("Budget-Reservierung darf nicht negativ sein")
+        receipt: dict[str, Any] = {
+            "remaining": amount,
+            "tag": str(tag),
+            "body": 0,
+            "overhead": 0,
+            "requests": 0,
+        }
+        with self._charge_lock:
+            attempted = self.total + self._reserved_bytes + amount
+            if attempted > self.limit:
+                self.rejected_charges += 1
+                raise ByteBudgetExceeded(
+                    f"Bytebudget reicht vor I/O nicht fuer {tag!r}: "
+                    f"{attempted}/{self.limit} Bytes"
+                )
+            self._reserved_bytes += amount
+        stack = self._reservation_stack()
+        stack.append(receipt)
+        try:
+            yield receipt
+        finally:
+            popped = stack.pop()
+            if popped is not receipt:  # pragma: no cover - internal invariant
+                raise RuntimeError("Budget-Reservierungen wurden nicht LIFO beendet")
+            with self._charge_lock:
+                self._reserved_bytes -= int(receipt["remaining"])
+                if self._reserved_bytes < 0:  # pragma: no cover - invariant
+                    self._reserved_bytes = 0
+                    raise RuntimeError("Budget-Reservierung ist untergelaufen")
 
     def charge(self, body: int, overhead: int, tag: str) -> None:
         body = int(body)
         overhead = int(overhead)
         if body < 0 or overhead < 0:
             raise ValueError("Budget-Charge darf nicht negativ sein")
+        amount = body + overhead
         with self._charge_lock:
-            attempted = self.total + body + overhead
+            stack = self._reservation_stack()
+            receipt = stack[-1] if stack else None
+            thread_body, thread_overhead, thread_requests = (
+                self.thread_charge_snapshot()
+            )
+            if receipt is not None and amount > int(receipt["remaining"]):
+                self.rejected_charges += 1
+                raise ByteBudgetExceeded(
+                    f"Budget-Charge fuer {tag!r} uebersteigt die vorab "
+                    f"reservierten Bytes: {amount}/{receipt['remaining']}"
+                )
+            attempted = self.total + self._reserved_bytes + (
+                0 if receipt is not None else amount
+            )
             if attempted > self.limit:
                 self.rejected_charges += 1
                 raise ByteBudgetExceeded(
                     f"Bytebudget reicht nicht fuer {tag!r}: "
                     f"{attempted}/{self.limit} Bytes"
                 )
+            if receipt is not None:
+                receipt["remaining"] = int(receipt["remaining"]) - amount
+                receipt["body"] = int(receipt["body"]) + body
+                receipt["overhead"] = int(receipt["overhead"]) + overhead
+                receipt["requests"] = int(receipt["requests"]) + 1
+                self._reserved_bytes -= amount
             self.body += body
             self.overhead += overhead
             self.requests += 1
             self.log.append((str(tag), body, overhead))
+            self._reservation_local.charged_body = thread_body + body
+            self._reservation_local.charged_overhead = thread_overhead + overhead
+            self._reservation_local.charged_requests = thread_requests + 1
 
     def as_dict(self) -> dict[str, int]:
         result = dict(super().as_dict())
@@ -253,11 +351,11 @@ def _canonical_json(document: Any) -> bytes:
     ).encode("utf-8")
 
 
-def _sha256(data: bytes) -> str:
+def _sha256(data: bytes | memoryview) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _atomic_write(path: Path, data: bytes) -> None:
+def _atomic_write(path: Path, data: bytes | memoryview) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -339,11 +437,14 @@ class _ContractReader:
         if self.max_metadata_bytes <= 0:
             raise ValueError("max_metadata_bytes muss positiv sein")
         self._lock = threading.Lock()
-        self._reserved = 0
         self._key_locks: dict[str, threading.Lock] = {}
         self._stats = {
+            "range_logical_leaves": 0,
+            "range_logical_leaf_bytes": 0,
             "range_requests": 0,
             "range_bytes_requested": 0,
+            "range_source_requests": 0,
+            "range_source_bytes": 0,
             "file_requests": 0,
             "failed_requests": 0,
             "optional_misses": 0,
@@ -405,6 +506,23 @@ class _ContractReader:
                 self._enforce_cache_limit()
 
     @contextmanager
+    def _locked_cache_keys(self, keys: Iterable[str]) -> Any:
+        """Lock an exact key set in canonical order for batch single-flight."""
+
+        locks = [self._key_lock(key) for key in sorted(set(keys))]
+        acquired: list[threading.Lock] = []
+        try:
+            for lock in locks:
+                lock.acquire()
+                acquired.append(lock)
+            yield
+        finally:
+            for lock in reversed(acquired):
+                lock.release()
+            if self.max_cache_bytes is not None:
+                self._enforce_cache_limit()
+
+    @contextmanager
     def uncached(self) -> Any:
         """Temporarily bypass cache reads while still replacing fresh entries."""
         previous = bool(getattr(self._cache_bypass, "active", False))
@@ -449,24 +567,6 @@ class _ContractReader:
             return
         with coordinator.lock:
             self._cache_priorities.clear()
-
-    def _reserve(self, amount: int, tag: str) -> None:
-        amount = int(amount)
-        with self._lock:
-            projected = self.budget.total + self._reserved + amount
-            if projected > self.budget.limit:
-                self.budget.rejected_charges += 1
-                raise ByteBudgetExceeded(
-                    f"Bytebudget reicht vor I/O nicht fuer {tag!r}: "
-                    f"{projected}/{self.budget.limit} Bytes"
-                )
-            self._reserved += amount
-
-    def _release(self, amount: int) -> None:
-        with self._lock:
-            self._reserved -= int(amount)
-            if self._reserved < 0:
-                self._reserved = 0
 
     def update_file_info(
         self,
@@ -717,11 +817,16 @@ class _ContractReader:
         if meta.get("sha256") != _sha256(body):
             raise CacheIntegrityError(f"Cache-SHA256 stimmt nicht: {blob_path}")
         known_identity = self._identity(str(contract["filename"]))
-        cached_identity = meta.get("source_identity") or {}
-        if known_identity and cached_identity and known_identity != cached_identity:
-            raise CacheIntegrityError(
-                f"Quellidentitaet fuer Cache-Eintrag hat sich geaendert: {blob_path}"
-            )
+        cached_identity = meta.get("source_identity")
+        if known_identity:
+            if not isinstance(cached_identity, Mapping) or not cached_identity:
+                raise CacheIntegrityError(
+                    f"Quellidentitaet fehlt im Cache-Eintrag: {blob_path}"
+                )
+            if known_identity != dict(cached_identity):
+                raise CacheIntegrityError(
+                    f"Quellidentitaet fuer Cache-Eintrag hat sich geaendert: {blob_path}"
+                )
         self._bump("cache_hits")
         self._bump("cache_bytes_reused", len(body))
         self._bump("cache_integrity_checks")
@@ -739,7 +844,7 @@ class _ContractReader:
         kind: str,
         key: str,
         contract: Mapping[str, Any],
-        body: bytes,
+        body: bytes | memoryview,
     ) -> None:
         paths = self._cache_paths(kind, key)
         if paths is None:
@@ -849,6 +954,8 @@ class _ContractReader:
     def get_range(self, filename: str, start: int, end: int) -> bytes:
         start, end = _validate_inclusive_range(start, end)
         expected = end - start + 1
+        self._bump("range_logical_leaves")
+        self._bump("range_logical_leaf_bytes", expected)
         key, contract = self._cache_key("range", filename, start, end)
         with self._locked_cache_key(key):
             cached = self._load_cache("range", key, contract, expected)
@@ -863,32 +970,210 @@ class _ContractReader:
                 )
             )
             reserve = expected + max(0, overhead)
-            self._reserve(reserve, f"range:{filename}:{start}-{end}")
-            before_body = self.budget.body
-            before_total = self.budget.total
-            self._bump("range_requests")
-            self._bump("range_bytes_requested", expected)
-            try:
-                result = self.upstream.get_range(filename, start, end)
-                body = bytes(result)
-                if len(body) != expected:
-                    raise RangeValidationError(
-                        f"Range {filename}[{start}:{end}] lieferte "
-                        f"{len(body)} statt {expected} Bytes"
-                    )
-                if self.budget.total == before_total:
-                    self.budget.charge(len(body), 0, f"range:{filename}:{start}")
-                elif self.budget.body - before_body < len(body):
-                    raise RangeValidationError(
-                        f"Reader verbuchte fuer {filename} weniger als die gelieferte Bytezahl"
-                    )
-            except Exception:
-                self._bump("failed_requests")
-                raise
-            finally:
-                self._release(reserve)
+            with self.budget.reservation(
+                reserve, f"range:{filename}:{start}-{end}"
+            ) as receipt:
+                self._bump("range_requests")
+                self._bump("range_bytes_requested", expected)
+                self._bump("range_source_requests")
+                try:
+                    result = self.upstream.get_range(filename, start, end)
+                    body = bytes(result)
+                    if len(body) != expected:
+                        raise RangeValidationError(
+                            f"Range {filename}[{start}:{end}] lieferte "
+                            f"{len(body)} statt {expected} Bytes"
+                        )
+                    charged_body = int(receipt["body"])
+                    if charged_body == 0:
+                        self.budget.charge(
+                            len(body), 0, f"range:{filename}:{start}"
+                        )
+                    elif charged_body < len(body):
+                        raise RangeValidationError(
+                            f"Reader verbuchte fuer {filename} weniger als die gelieferte Bytezahl"
+                        )
+                    self._bump("range_source_bytes", int(receipt["body"]))
+                except Exception:
+                    self._bump("failed_requests")
+                    raise
             self._write_cache("range", key, contract, body)
             return body
+
+    def get_ranges(
+        self,
+        filename: str,
+        ranges: tuple[tuple[int, int], ...],
+        resident_limit_bytes: int,
+    ) -> RawBytesManyResult:
+        """Resolve exact half-open leaves, coalescing only cold adjacency."""
+
+        nonempty = tuple((start, length) for start, length in ranges if length)
+        self._bump("range_logical_leaves", len(nonempty))
+        self._bump(
+            "range_logical_leaf_bytes",
+            sum(length for _start, length in nonempty),
+        )
+        if not nonempty:
+            empty = memoryview(b"").toreadonly()
+            return RawBytesManyResult(
+                parts=tuple(empty for _item in ranges),
+                resident_bytes=0,
+                source_requests=0,
+                source_bytes=0,
+            )
+
+        unique: dict[tuple[int, int], tuple[str, dict[str, Any]]] = {}
+        for start, length in nonempty:
+            bounds = (start, start + length - 1)
+            if bounds not in unique:
+                unique[bounds] = self._cache_key(
+                    "range", filename, bounds[0], bounds[1]
+                )
+        resident_preflight = sum(end - start + 1 for start, end in unique)
+        if resident_preflight > resident_limit_bytes:
+            raise RangeValidationError(
+                "Multi-Range-Resultat ueberschreitet resident_limit_bytes: "
+                f"{resident_preflight}/{resident_limit_bytes} Bytes"
+            )
+
+        known_size: int | None = None
+        info_size = self.file_info_snapshot(filename).get("size")
+        if info_size is not None:
+            try:
+                known_size = int(info_size)
+            except (TypeError, ValueError) as exc:
+                raise RangeValidationError(
+                    f"Ungueltige bekannte Quelldateigroesse fuer {filename!r}"
+                ) from exc
+        else:
+            size_method = getattr(self.upstream, "file_size", None)
+            if callable(size_method):
+                known_size = int(size_method(filename))
+        if known_size is not None:
+            for start, end in unique:
+                if end >= known_size:
+                    raise RangeValidationError(
+                        f"Range ausserhalb {filename}: [{start}, {end}] "
+                        f"bei {known_size} Bytes"
+                    )
+
+        ordered_leaves = sorted(
+            (
+                (start, end, key, contract)
+                for (start, end), (key, contract) in unique.items()
+            ),
+            key=lambda item: (item[2], item[0], item[1]),
+        )
+        resolved: dict[tuple[int, int], memoryview] = {}
+        source_requests = 0
+        source_bytes = 0
+        with self._locked_cache_keys(item[2] for item in ordered_leaves):
+            misses: list[tuple[int, int, str, dict[str, Any]]] = []
+            for start, end, key, contract in ordered_leaves:
+                cached = self._load_cache(
+                    "range", key, contract, end - start + 1
+                )
+                if cached is None:
+                    self._bump("cache_misses")
+                    misses.append((start, end, key, contract))
+                else:
+                    resolved[(start, end)] = memoryview(cached).toreadonly()
+
+            envelopes: list[
+                tuple[int, int, list[tuple[int, int, str, dict[str, Any]]]]
+            ] = []
+            for leaf in sorted(misses, key=lambda item: (item[0], item[1], item[2])):
+                if envelopes and leaf[0] == envelopes[-1][1] + 1:
+                    envelope_start, _envelope_end, leaves = envelopes[-1]
+                    leaves.append(leaf)
+                    envelopes[-1] = (envelope_start, leaf[1], leaves)
+                else:
+                    envelopes.append((leaf[0], leaf[1], [leaf]))
+
+            overhead = int(
+                getattr(
+                    self.upstream,
+                    "range_overhead_reserve",
+                    8192 if isinstance(self.upstream, HFRangeReader) else 0,
+                )
+            )
+            planned_source_bytes = sum(
+                end - start + 1 for start, end, _ in envelopes
+            )
+            reserve = planned_source_bytes + len(envelopes) * max(0, overhead)
+            with self.budget.reservation(
+                reserve, f"ranges:{filename}:{len(envelopes)}"
+            ) as receipt:
+                for envelope_start, envelope_end, leaves in envelopes:
+                    expected = envelope_end - envelope_start + 1
+                    before_receipt_body = int(receipt["body"])
+                    self._bump("range_requests")
+                    self._bump("range_bytes_requested", expected)
+                    self._bump("range_source_requests")
+                    source_requests += 1
+                    try:
+                        result = self.upstream.get_range(
+                            filename, envelope_start, envelope_end
+                        )
+                        body = bytes(result)
+                        if len(body) != expected:
+                            raise RangeValidationError(
+                                f"Range {filename}[{envelope_start}:{envelope_end}] "
+                                f"lieferte {len(body)} statt {expected} Bytes"
+                            )
+                        charged_body = (
+                            int(receipt["body"]) - before_receipt_body
+                        )
+                        if charged_body == 0:
+                            self.budget.charge(
+                                len(body),
+                                0,
+                                f"ranges:{filename}:{envelope_start}",
+                            )
+                        elif charged_body < len(body):
+                            raise RangeValidationError(
+                                f"Reader verbuchte fuer {filename} weniger als "
+                                "die gelieferte Bytezahl"
+                            )
+                        physical_body = (
+                            int(receipt["body"]) - before_receipt_body
+                        )
+                        self._bump("range_source_bytes", physical_body)
+                        source_bytes += physical_body
+                    except Exception:
+                        self._bump("failed_requests")
+                        raise
+
+                    owner = memoryview(body).toreadonly()
+                    for start, end, key, contract in leaves:
+                        leaf = owner[
+                            start - envelope_start : end - envelope_start + 1
+                        ].toreadonly()
+                        self._write_cache("range", key, contract, leaf)
+                        resolved[(start, end)] = leaf
+
+        empty = memoryview(b"").toreadonly()
+        parts = tuple(
+            empty if length == 0 else resolved[(start, start + length - 1)]
+            for start, length in ranges
+        )
+        owners: dict[int, int] = {}
+        for part in parts:
+            owner = part.obj
+            owners.setdefault(id(owner), memoryview(owner).nbytes)
+        resident_bytes = sum(owners.values())
+        if resident_bytes > resident_limit_bytes:  # pragma: no cover - invariant
+            raise RangeValidationError(
+                "Multi-Range-Owner ueberschreiten resident_limit_bytes: "
+                f"{resident_bytes}/{resident_limit_bytes} Bytes"
+            )
+        return RawBytesManyResult(
+            parts=parts,
+            resident_bytes=resident_bytes,
+            source_requests=source_requests,
+            source_bytes=source_bytes,
+        )
 
     def fetch_file(
         self,
@@ -922,8 +1207,7 @@ class _ContractReader:
                 return cached
             self._bump("cache_misses")
             self._bump("file_requests")
-            before_body = self.budget.body
-            before_total = self.budget.total
+            before_thread_body = self.budget.thread_charge_snapshot()[0]
             known_size = None
             try:
                 bounded_fetch = getattr(self.upstream, "fetch_file_bounded", None)
@@ -938,12 +1222,13 @@ class _ContractReader:
                                 f"Metadatei {filename!r} ist {known_size} Bytes gross; "
                                 f"Grenze ist {ceiling}"
                             )
-                        self._reserve(known_size, f"file:{filename}")
-                    try:
+                    if known_size is None:
                         body = bytes(self.upstream.fetch_file(filename))
-                    finally:
-                        if known_size is not None:
-                            self._release(known_size)
+                    else:
+                        with self.budget.reservation(
+                            known_size, f"file:{filename}"
+                        ):
+                            body = bytes(self.upstream.fetch_file(filename))
                 if len(body) > ceiling:
                     raise RangeValidationError(
                         f"Reader lieferte fuer {filename!r} {len(body)} Bytes; "
@@ -953,9 +1238,12 @@ class _ContractReader:
                     raise RangeValidationError(
                         f"Metadatei {filename!r} aenderte ihre Groesse beim Lesen"
                     )
-                if self.budget.total == before_total:
+                charged_body = (
+                    self.budget.thread_charge_snapshot()[0] - before_thread_body
+                )
+                if charged_body == 0:
                     self.budget.charge(len(body), 0, f"file:{filename}")
-                elif self.budget.body - before_body < len(body):
+                elif charged_body < len(body):
                     raise RangeValidationError(
                         f"Reader verbuchte fuer {filename} weniger als die gelieferte Bytezahl"
                     )
@@ -1657,6 +1945,60 @@ class Streamer:
         # HFRangeReader uses an inclusive end. The old facade accidentally
         # requested length+1 bytes here.
         return self.reader.get_range(shard, offset, offset + length - 1)
+
+    def raw_bytes_many(
+        self,
+        shard: str,
+        ranges: Iterable[tuple[int, int]],
+        resident_limit_bytes: int,
+        *,
+        max_gap_bytes: int = 0,
+    ) -> RawBytesManyResult:
+        """Read exact leaves and merge only adjacent cold source ranges.
+
+        Cache identity stays leaf-exact, so scalar and batch reads warm one
+        another. Gap reads are intentionally unsupported: transferred bytes
+        must always belong to a requested leaf.
+        """
+
+        if not isinstance(shard, str) or not shard:
+            raise RangeValidationError("shard muss ein nichtleerer String sein")
+        resident_limit_bytes = _validate_nonnegative_int(
+            resident_limit_bytes, "resident_limit_bytes"
+        )
+        max_gap_bytes = _validate_nonnegative_int(max_gap_bytes, "max_gap_bytes")
+        if max_gap_bytes != 0:
+            raise RangeValidationError(
+                "max_gap_bytes muss 0 bleiben; Gap-Bytes sind nicht zugelassen"
+            )
+        try:
+            raw_ranges = tuple(ranges)
+        except TypeError as exc:
+            raise RangeValidationError(
+                "ranges muss ein Iterable aus (offset, length)-Paaren sein"
+            ) from exc
+        validated: list[tuple[int, int]] = []
+        for index, raw in enumerate(raw_ranges):
+            try:
+                pair = tuple(raw)
+            except TypeError as exc:
+                raise RangeValidationError(
+                    f"Range {index} ist kein (offset, length)-Paar"
+                ) from exc
+            if len(pair) != 2:
+                raise RangeValidationError(
+                    f"Range {index} ist kein (offset, length)-Paar"
+                )
+            offset = _validate_nonnegative_int(pair[0], f"ranges[{index}].offset")
+            length = _validate_nonnegative_int(pair[1], f"ranges[{index}].length")
+            validated.append((offset, length))
+        if not validated:
+            return RawBytesManyResult((), 0, 0, 0)
+        return self.reader.get_ranges(
+            shard,
+            tuple(validated),
+            resident_limit_bytes,
+        )
 
     @contextmanager
     def cache_priority(self, priority: int) -> Any:

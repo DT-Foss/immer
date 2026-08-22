@@ -44,6 +44,47 @@ def _pair_bytes(pair: tuple[Path, Path, dict]) -> int:
 
 
 class StreamerCacheLimitTests(unittest.TestCase):
+    def test_multi_range_admission_keeps_leaf_keys_under_hard_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            cache = Path(tmp) / "cache"
+            _write_source(root)
+            limit = 700
+            source = Streamer.from_local(
+                root,
+                cache_dir=cache,
+                budget_mb=1.0,
+                max_cache_bytes=limit,
+            )
+
+            result = source.raw_bytes_many(
+                "payload.dat",
+                [(0, 256), (256, 256), (512, 256), (768, 256)],
+                resident_limit_bytes=1024,
+            )
+
+            self.assertEqual(result.source_requests, 1)
+            self.assertEqual(result.source_bytes, 1024)
+            self.assertEqual(result.resident_bytes, 1024)
+            self.assertEqual(
+                b"".join(bytes(part) for part in result.parts),
+                bytes(range(256)) * 4,
+            )
+            pairs = _complete_pairs(cache)
+            self.assertGreaterEqual(len(pairs), 1)
+            self.assertTrue(
+                all(
+                    pair[2]["contract"]["end"]
+                    - pair[2]["contract"]["start"]
+                    + 1
+                    == 256
+                    for pair in pairs
+                )
+            )
+            metrics = source.metrics()
+            self.assertLessEqual(metrics["cache_bytes"], limit)
+            self.assertGreater(metrics["cache_write_skips_oversize"], 0)
+
     def test_default_is_unlimited_and_capped_cache_evicts_true_lru(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "source"

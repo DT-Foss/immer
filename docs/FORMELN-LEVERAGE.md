@@ -25,11 +25,33 @@ Experts beziehungsweise 48 MiB Rohpayload sind
 resident/inflight, jeder einzelne bleibt unter 14 MiB. Konsumreihenfolge,
 Werte und serielle FP32-Akkumulation bleiben unverändert.
 
+Der Streamer besitzt zusätzlich einen exakten Multi-Range-Vertrag mit
+Leaf-Cache-Reuse, Single-Flight, aggregiertem Hard-Budget und readonly Views.
+Das daraus gebaute Adjacent-Pairing bleibt jedoch explizit aus: cache-resident
+war es 3,06 % langsamer als q3; kalt gewann es bei identischen Bytes nur
+1,44 % im Mittel und 6/10 Paare, ohne P90-Gewinn. Width 1 bleibt Default.
+
 **NEGATIV als Retrieval-Mechanismus:** Statisches Embedding-Mittel
 → `gate_proj` → Value-Sketch erreichte 24 % gegen 32 % Placebo bei
 138,4 KB/Frage. Die Eingabe entspricht nicht den RMSNorm-ten
 Post-Attention-Zuständen, die `gate_proj` im Modell sieht. Dieser Shortcut ist
 geschlossen; die Tensorquelle bleibt verwendbar.
+
+## DeepSeek-Handoff: verwertbar, bedingt, geschlossen
+
+- **Verwertbar:** begrenztes Keep-alive ist deployt; exaktes Range-Coalescing
+  ist als ausgeschaltetes Messinstrument implementiert; Cache-Admission und
+  -Identität wurden fail-closed verschärft. Der exakte Hungarian-Löser für
+  FERTIG und ein LM-Head-Request-A/B bleiben die nächsten überprüfbaren
+  Algorithmen.
+- **Bedingt:** Shared-Expert-I/O darf erst nach einem Resident-Peak-Beweis
+  überlappen. Compute-Parallelisierung würde die heutige serielle
+  Akkumulationssemantik ändern und ist deshalb kein kleiner Transportfix.
+- **Geschlossen oder unbelegt:** Möbius als Ersatz für den offiziellen
+  Sinkhorn-Pfad, pauschal 20→3 Sinkhorn-Schritte, PPM als approximativer
+  LM-Head-Ersatz und approximatives Cross-Layer-Recycling haben keinen exakten
+  V4-Gleichheitsbeweis. Sie werden nicht aufgrund einer erwarteten Prozentzahl
+  eingebaut.
 
 ## Gesetzes-Familie Organ-Bau
 
@@ -93,14 +115,18 @@ Fähigkeit, keine nachträgliche Optimierung am GSM8K-Split.
   Content-Smoke, noch kein allgemeiner MMLU- oder Frontier-Claim.
 - **Exakter Expert-Transport:** offizielle 3-Expert-MPS-BF16-A/Bs sind
   bitgleich. Warm, nach zwei symmetrischen Warmups und 20 alternierenden
-  Trials: 0,172745 s ohne gegen 0,160813 s mit Fenster, also 1,074197×.
+  Trials: 0,192510 s ohne gegen 0,173479 s mit q3, also 1,109698×.
   Ohne Range-Cache, nach einem Warmup und 8 alternierenden Trials:
-  7,250212 s gegen 5,244157 s, also 1,382532× beziehungsweise 27,67 % weniger
-  Latenz. Der begrenzte Keep-alive-Pool sah bei 158 Requests sechs
+  5,495380 s gegen 4,818187 s, also 1,140549× beziehungsweise 12,32 % weniger
+  Latenz. Der begrenzte Keep-alive-Pool sah bei 158 Requests sieben
   Connection-Objekte, Peak zwei aktive Leases, danach null und wurde vor dem
   Report geschlossen. Die einzelnen Netztrials streuen stark. Peak-Payload
   jeweils exakt 40.108.032 B. Das belegt exakte begrenzte
   Transport-Überlappung, aber noch keine Modellqualität oder Frontier-Parität.
+- **Adjacent-Pairing:** kalt 6→4 Envelopes bei weiterhin 40.108.032 B;
+  6,797533 s q3 gegen 6,699645 s Pair, nur 1,44 % mittlerer Gewinn und 6/10
+  Paar-Wins. Cache-resident ist Pair 3,06 % langsamer. Das ist kein Default;
+  die Topologie- und Byte-Receipts bleiben als Instrument.
 
 ## Hebel-Ranking
 

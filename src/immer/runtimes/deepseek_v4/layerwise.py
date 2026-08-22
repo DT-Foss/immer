@@ -833,16 +833,12 @@ class LayerwiseScorer:
                     model.pager.QUANTIZED_ACCUMULATION_POLICY
                 ),
                 "attention_qat_policy": model.ATTENTION_QAT_POLICY,
-                "expert_prefetch_policy": (
-                    model.pager.EXPERT_PREFETCH_POLICY
-                    if model.pager.expert_prefetch_enabled
-                    else "disabled"
-                ),
+                "expert_prefetch_policy": model.pager.expert_prefetch_policy,
                 "expert_prefetch_payload_limit_bytes": (
                     model.pager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
                 ),
                 "expert_prefetch_transport_policy": (
-                    model.pager.EXPERT_PREFETCH_TRANSPORT_POLICY
+                    model.pager.expert_prefetch_transport_policy
                 ),
                 "expert_prefetch_workers": model.pager.EXPERT_PREFETCH_WORKERS,
                 "expert_prefetch_active_read_limit": (
@@ -856,6 +852,12 @@ class LayerwiseScorer:
                 ),
                 "expert_prefetch_resident_limit_bytes": (
                     model.pager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+                ),
+                "expert_range_coalesce_max_experts": (
+                    model.pager.expert_range_coalesce_max_experts
+                ),
+                "expert_range_coalesce_max_gap_bytes": (
+                    model.pager.EXPERT_RANGE_COALESCE_MAX_GAP_BYTES
                 ),
                 "activation_dtype": "bfloat16",
                 "microbatch_size": microbatch_size,

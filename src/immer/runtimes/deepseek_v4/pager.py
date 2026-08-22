@@ -53,6 +53,11 @@ class PagerMetrics:
     expert_prefetch_ready_before_consume: int = 0
     expert_prefetch_cancelled: int = 0
     expert_prefetch_max_outstanding: int = 0
+    expert_prefetch_batches_submitted: int = 0
+    expert_transport_envelopes: int = 0
+    expert_transport_source_bytes: int = 0
+    expert_range_requests_avoided: int = 0
+    expert_range_gap_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,17 +77,42 @@ class _CoalescedExpert:
 
 
 @dataclass(frozen=True, slots=True)
+class _CoalescedExpertBatch:
+    experts: dict[str, _CoalescedExpert]
+    resident_bytes: int
+    source_requests: int
+    source_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class _ExpertReadPlan:
     base: str
     layouts: tuple[tuple[str, int, int, tuple[dict[str, Any], ...]], ...]
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class _ExpertBatchPlan:
+    experts: tuple[_ExpertReadPlan, ...]
+    payload_bytes: int
+    range_requests_avoided: int
+
+
+@dataclass(slots=True)
+class _ExpertPrefetchBatch:
+    plan: _ExpertBatchPlan
+    future: Future[_CoalescedExpertBatch] | None
+    remaining: int
+    submitted: bool = False
+    retired: bool = False
+    metrics_accounted: bool = False
+
+
 @dataclass(slots=True)
 class _ExpertPrefetch:
     base: str
     plan: _ExpertReadPlan
-    future: Future[_CoalescedExpert] | None
+    batch: _ExpertPrefetchBatch
     payload_bytes: int
     index: int
     window: _ExpertPrefetchWindow | None = None
@@ -93,6 +123,7 @@ class _ExpertPrefetch:
 class _ExpertPrefetchWindow:
     bases: tuple[str, ...]
     tickets: tuple[_ExpertPrefetch, ...]
+    batches: tuple[_ExpertPrefetchBatch, ...]
     executor: ThreadPoolExecutor | None
     next_submit: int = 0
     next_consume: int = 0
@@ -106,6 +137,7 @@ class _ExpertPayload:
     expert: _CoalescedExpert | None
     payload_bytes: int
     window: _ExpertPrefetchWindow
+    batch: _ExpertPrefetchBatch
     consumed: bool = False
 
 
@@ -138,12 +170,21 @@ class DeepSeekWeightPager:
     QUANTIZED_ACCUMULATION_POLICY = "mx-block-scaled-fp32/v1"
     EXPERT_PREFETCH_POLICY = "exact-router-window-q3-a2/v2"
     EXPERT_PREFETCH_TRANSPORT_POLICY = "streamer-exact-range/v1"
+    EXPERT_PREFETCH_ADJACENT_POLICY = (
+        "exact-router-window-q3-a2-adjacent-pairs/v3"
+    )
+    EXPERT_PREFETCH_ADJACENT_TRANSPORT_POLICY = (
+        "streamer-exact-leaf-adjacent-envelope/v2"
+    )
     EXPERT_PREFETCH_WORKERS = 2
     EXPERT_PREFETCH_ACTIVE_READ_LIMIT = 2
     EXPERT_PREFETCH_MAX_OUTSTANDING = 3
     EXPERT_PREFETCH_MAX_EXPERTS = 3
     EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES = 48 * 1024**2
     EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES = 14 * 1024**2
+    EXPERT_RANGE_COALESCE_DEFAULT_MAX_EXPERTS = 1
+    EXPERT_RANGE_COALESCE_MAX_EXPERTS = 2
+    EXPERT_RANGE_COALESCE_MAX_GAP_BYTES = 0
 
     def __init__(
         self,
@@ -153,6 +194,7 @@ class DeepSeekWeightPager:
         compute_dtype: str = "auto",
         simulate_activation_quantization: bool = True,
         expert_prefetch: bool = True,
+        expert_range_coalesce_max_experts: int | None = None,
     ) -> None:
         try:
             import torch
@@ -184,13 +226,46 @@ class DeepSeekWeightPager:
         self.compute_dtype = dtype
         self.simulate_activation_quantization = bool(simulate_activation_quantization)
         self.expert_prefetch_enabled = bool(expert_prefetch)
+        if expert_range_coalesce_max_experts is None:
+            expert_range_coalesce_max_experts = (
+                self.EXPERT_RANGE_COALESCE_DEFAULT_MAX_EXPERTS
+            )
+        if (
+            isinstance(expert_range_coalesce_max_experts, bool)
+            or not isinstance(expert_range_coalesce_max_experts, int)
+            or not 1
+            <= expert_range_coalesce_max_experts
+            <= self.EXPERT_RANGE_COALESCE_MAX_EXPERTS
+        ):
+            raise ValueError(
+                "expert_range_coalesce_max_experts must be an integer in [1, 2]"
+            )
+        self.expert_range_coalesce_max_experts = (
+            expert_range_coalesce_max_experts
+        )
         self._stats = PagerMetrics()
         self._prefetch_lock = threading.Lock()
         self._prefetch_executor: ThreadPoolExecutor | None = None
         self._active_prefetch_window: _ExpertPrefetchWindow | None = None
         self._active_prefetch_payload: _ExpertPayload | None = None
-        self._draining_prefetch: set[Future[_CoalescedExpert]] = set()
+        self._draining_prefetch: set[Future[_CoalescedExpertBatch]] = set()
         self._draining_executor: ThreadPoolExecutor | None = None
+
+    @property
+    def expert_prefetch_policy(self) -> str:
+        if not self.expert_prefetch_enabled:
+            return "disabled"
+        if self.expert_range_coalesce_max_experts >= 2:
+            return self.EXPERT_PREFETCH_ADJACENT_POLICY
+        return self.EXPERT_PREFETCH_POLICY
+
+    @property
+    def expert_prefetch_transport_policy(self) -> str:
+        if not self.expert_prefetch_enabled:
+            return "disabled"
+        if self.expert_range_coalesce_max_experts >= 2:
+            return self.EXPERT_PREFETCH_ADJACENT_TRANSPORT_POLICY
+        return self.EXPERT_PREFETCH_TRANSPORT_POLICY
 
     @staticmethod
     def _weight_name(prefix: str) -> str:
@@ -370,17 +445,37 @@ class DeepSeekWeightPager:
     def _read_expert_plan(self, plan: _ExpertReadPlan) -> _CoalescedExpert:
         """Read one pre-resolved plan without any metadata/source discovery."""
 
-        tensors: dict[str, _CoalescedTensor] = {}
+        payloads: list[memoryview] = []
         for layout in plan.layouts:
-            shard, absolute, length, ordered = layout
+            shard, absolute, length, _ = layout
             payload = self.source.raw_bytes(shard, absolute, length)
             if len(payload) != length:
                 raise DeepSeekPagerError(
                     f"short coalesced source range for {plan.base}: "
                     f"{len(payload)}/{length} bytes"
                 )
+            payloads.append(memoryview(payload))
+        return self._expert_from_layout_payloads(plan, tuple(payloads))
+
+    @staticmethod
+    def _expert_from_layout_payloads(
+        plan: _ExpertReadPlan,
+        payloads: tuple[memoryview, ...],
+    ) -> _CoalescedExpert:
+        if len(payloads) != len(plan.layouts):
+            raise DeepSeekPagerError(
+                f"coalesced layout count mismatch for {plan.base}: "
+                f"{len(payloads)}/{len(plan.layouts)}"
+            )
+        tensors: dict[str, _CoalescedTensor] = {}
+        for layout, group_view in zip(plan.layouts, payloads, strict=True):
+            _, _, length, ordered = layout
+            if len(group_view) != length:
+                raise DeepSeekPagerError(
+                    f"short coalesced source range for {plan.base}: "
+                    f"{len(group_view)}/{length} bytes"
+                )
             group_begin = int(ordered[0]["offset_in_shard"][0])
-            group_view = memoryview(payload)
             for meta in ordered:
                 begin, end = (int(value) for value in meta["offset_in_shard"])
                 name = str(meta["name"])
@@ -397,6 +492,159 @@ class DeepSeekWeightPager:
             payload_bytes=plan.payload_bytes,
         )
 
+    @staticmethod
+    def _plans_are_exactly_adjacent(
+        left: _ExpertReadPlan, right: _ExpertReadPlan
+    ) -> bool:
+        if len(left.layouts) != len(right.layouts):
+            return False
+        return all(
+            left_layout[0] == right_layout[0]
+            and left_layout[1] + left_layout[2] == right_layout[1]
+            for left_layout, right_layout in zip(
+                left.layouts, right.layouts, strict=True
+            )
+        )
+
+    def _batch_expert_plans(
+        self, plans: tuple[_ExpertReadPlan, ...]
+    ) -> tuple[_ExpertPrefetchBatch, ...]:
+        raw_bytes_many = getattr(self.source, "raw_bytes_many", None)
+        batches: list[_ExpertPrefetchBatch] = []
+        capacity = min(
+            self.EXPERT_PREFETCH_MAX_OUTSTANDING,
+            self.EXPERT_PREFETCH_MAX_EXPERTS,
+        )
+        for chunk_start in range(0, len(plans), capacity):
+            chunk = plans[chunk_start : chunk_start + capacity]
+            index = 0
+            while index < len(chunk):
+                width = 1
+                if (
+                    callable(raw_bytes_many)
+                    and self.expert_range_coalesce_max_experts >= 2
+                    and index + 1 < len(chunk)
+                    and self._plans_are_exactly_adjacent(
+                        chunk[index], chunk[index + 1]
+                    )
+                ):
+                    width = 2
+                experts = chunk[index : index + width]
+                requests_avoided = (
+                    len(experts[0].layouts) if len(experts) == 2 else 0
+                )
+                plan = _ExpertBatchPlan(
+                    experts=experts,
+                    payload_bytes=sum(expert.payload_bytes for expert in experts),
+                    range_requests_avoided=requests_avoided,
+                )
+                batches.append(
+                    _ExpertPrefetchBatch(
+                        plan=plan,
+                        future=None,
+                        remaining=len(experts),
+                    )
+                )
+                index += width
+        return tuple(batches)
+
+    def _read_expert_batch(
+        self, plan: _ExpertBatchPlan
+    ) -> _CoalescedExpertBatch:
+        """Read one or two planned experts through exact leaf-cache keys."""
+
+        raw_bytes_many = getattr(self.source, "raw_bytes_many", None)
+        if not callable(raw_bytes_many):
+            experts = {
+                expert.base: self._read_expert_plan(expert) for expert in plan.experts
+            }
+            return _CoalescedExpertBatch(
+                experts=experts,
+                resident_bytes=plan.payload_bytes,
+                source_requests=sum(len(expert.layouts) for expert in plan.experts),
+                source_bytes=plan.payload_bytes,
+            )
+
+        indexed: dict[
+            str,
+            list[
+                tuple[
+                    int,
+                    int,
+                    tuple[str, int, int, tuple[dict[str, Any], ...]],
+                ]
+            ],
+        ] = {}
+        for expert_index, expert in enumerate(plan.experts):
+            for layout_index, layout in enumerate(expert.layouts):
+                indexed.setdefault(layout[0], []).append(
+                    (expert_index, layout_index, layout)
+                )
+
+        parts_by_layout: dict[tuple[int, int], memoryview] = {}
+        resident_bytes = 0
+        source_requests = 0
+        source_bytes = 0
+        for shard, entries in indexed.items():
+            requested = tuple((layout[1], layout[2]) for _, _, layout in entries)
+            result = raw_bytes_many(
+                shard,
+                requested,
+                resident_limit_bytes=sum(length for _, length in requested),
+                max_gap_bytes=self.EXPERT_RANGE_COALESCE_MAX_GAP_BYTES,
+            )
+            parts = tuple(result.parts)
+            if len(parts) != len(entries):
+                raise DeepSeekPagerError(
+                    f"multi-range part count mismatch for {shard}: "
+                    f"{len(parts)}/{len(entries)}"
+                )
+            batch_resident = int(result.resident_bytes)
+            batch_requests = int(result.source_requests)
+            batch_source_bytes = int(result.source_bytes)
+            requested_bytes = sum(length for _, length in requested)
+            if (
+                batch_resident != requested_bytes
+                or batch_requests < 0
+                or batch_source_bytes < 0
+            ):
+                raise DeepSeekPagerError(
+                    f"invalid multi-range receipt for {shard}: resident="
+                    f"{batch_resident}, requests={batch_requests}, "
+                    f"source_bytes={batch_source_bytes}"
+                )
+            resident_bytes += batch_resident
+            source_requests += batch_requests
+            source_bytes += batch_source_bytes
+            for (expert_index, layout_index, layout), part in zip(
+                entries, parts, strict=True
+            ):
+                view = part if isinstance(part, memoryview) else memoryview(part)
+                if not view.readonly or len(view) != layout[2]:
+                    raise DeepSeekPagerError(
+                        f"invalid readonly multi-range part for {shard}: "
+                        f"{len(view)}/{layout[2]} bytes"
+                    )
+                parts_by_layout[(expert_index, layout_index)] = view
+
+        if resident_bytes != plan.payload_bytes:
+            raise DeepSeekPagerError(
+                "multi-range resident bytes do not match the exact expert payload"
+            )
+        experts: dict[str, _CoalescedExpert] = {}
+        for expert_index, expert in enumerate(plan.experts):
+            payloads = tuple(
+                parts_by_layout[(expert_index, layout_index)]
+                for layout_index in range(len(expert.layouts))
+            )
+            experts[expert.base] = self._expert_from_layout_payloads(expert, payloads)
+        return _CoalescedExpertBatch(
+            experts=experts,
+            resident_bytes=resident_bytes,
+            source_requests=source_requests,
+            source_bytes=source_bytes,
+        )
+
     def _coalesced_expert(self, base: str) -> _CoalescedExpert | None:
         """Synchronously fetch an adjacent expert or decline safely."""
 
@@ -404,12 +652,10 @@ class DeepSeekWeightPager:
         return None if plan is None else self._read_expert_plan(plan)
 
     def _window_resident_bytes_locked(self, window: _ExpertPrefetchWindow) -> int:
-        resident = self._active_prefetch_payload
-        total = resident.payload_bytes if resident is not None else 0
-        return total + sum(
-            ticket.payload_bytes
-            for ticket in window.tickets
-            if ticket.future is not None and not ticket.consumed
+        return sum(
+            batch.plan.payload_bytes
+            for batch in window.batches
+            if batch.submitted and not batch.retired
         )
 
     def _submit_window_reads_locked(self, window: _ExpertPrefetchWindow) -> None:
@@ -418,30 +664,31 @@ class DeepSeekWeightPager:
         executor = window.executor
         if executor is None:
             raise DeepSeekPagerError("expert prefetch window has no executor")
-        while window.next_submit < len(window.tickets):
+        while window.next_submit < len(window.batches):
             outstanding = sum(
-                ticket.future is not None and not ticket.consumed
-                for ticket in window.tickets
+                batch.remaining
+                for batch in window.batches
+                if batch.submitted and not batch.retired
             )
-            active = 1 if self._active_prefetch_payload is not None else 0
-            if (
-                outstanding >= self.EXPERT_PREFETCH_MAX_OUTSTANDING
-                or outstanding + active >= self.EXPERT_PREFETCH_MAX_EXPERTS
-            ):
+            batch = window.batches[window.next_submit]
+            expert_capacity = min(
+                self.EXPERT_PREFETCH_MAX_OUTSTANDING,
+                self.EXPERT_PREFETCH_MAX_EXPERTS,
+            )
+            if outstanding + batch.remaining > expert_capacity:
                 break
-            ticket = window.tickets[window.next_submit]
             resident_after = (
-                self._window_resident_bytes_locked(window) + ticket.payload_bytes
+                self._window_resident_bytes_locked(window) + batch.plan.payload_bytes
             )
             if resident_after > self.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES:
-                raise DeepSeekPagerError(
-                    "expert prefetch window exceeds its resident byte limit"
-                )
-            ticket.future = executor.submit(self._read_expert_plan, ticket.plan)
+                break
+            batch.future = executor.submit(self._read_expert_batch, batch.plan)
+            batch.submitted = True
             window.next_submit += 1
-            self._stats.expert_prefetch_submitted += 1
-            self._stats.expert_prefetch_payload_bytes += ticket.payload_bytes
-            outstanding += 1
+            self._stats.expert_prefetch_submitted += batch.remaining
+            self._stats.expert_prefetch_batches_submitted += 1
+            self._stats.expert_prefetch_payload_bytes += batch.plan.payload_bytes
+            outstanding += batch.remaining
             self._stats.expert_prefetch_max_outstanding = max(
                 self._stats.expert_prefetch_max_outstanding,
                 outstanding,
@@ -483,13 +730,20 @@ class DeepSeekWeightPager:
             plan.payload_bytes > self.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
             for plan in plans
         ) or any(
-            sum(plan.payload_bytes for plan in plans[start : start + 3])
+            sum(
+                plan.payload_bytes
+                for plan in plans[
+                    start : start + self.EXPERT_PREFETCH_MAX_EXPERTS
+                ]
+            )
             > self.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
             for start in range(len(plans))
         ):
             self._stats.expert_prefetch_sync_fallbacks += 1
             return None
 
+        frozen_plans = tuple(plans)
+        batches = self._batch_expert_plans(frozen_plans)
         executor = ThreadPoolExecutor(
             max_workers=self.EXPERT_PREFETCH_WORKERS,
             thread_name_prefix="immer-v4-expert-prefetch",
@@ -497,18 +751,24 @@ class DeepSeekWeightPager:
         window = _ExpertPrefetchWindow(
             bases=bases,
             tickets=(),
+            batches=batches,
             executor=executor,
         )
+        batch_by_base = {
+            expert.base: batch
+            for batch in batches
+            for expert in batch.plan.experts
+        }
         tickets = tuple(
             _ExpertPrefetch(
                 base=plan.base,
                 plan=plan,
-                future=None,
+                batch=batch_by_base[plan.base],
                 payload_bytes=plan.payload_bytes,
                 index=index,
                 window=window,
             )
-            for index, plan in enumerate(plans)
+            for index, plan in enumerate(frozen_plans)
         )
         window.tickets = tickets
         try:
@@ -535,7 +795,7 @@ class DeepSeekWeightPager:
     def consume_expert_window(
         self, window: _ExpertPrefetchWindow, expected_base: str
     ) -> _ExpertPayload:
-        """Consume the next planned expert in order and refill the 2x3 window."""
+        """Consume the next planned expert without changing compute order."""
 
         with self._prefetch_lock:
             if window is not self._active_prefetch_window or window.closed:
@@ -551,16 +811,22 @@ class DeepSeekWeightPager:
                 raise DeepSeekPagerError(
                     "expert prefetch window consume is out of order"
                 )
-            if ticket.consumed or ticket.future is None:
+            batch = ticket.batch
+            if ticket.consumed or batch.retired or batch.future is None:
                 raise DeepSeekPagerError("expert prefetch ticket is stale or consumed")
-            future = ticket.future
+            future = batch.future
             ready = future.done()
         started = time.perf_counter_ns()
         try:
-            expert = future.result()
-        except BaseException:
+            batch_result = future.result()
+            expert = batch_result.experts[ticket.base]
+        except BaseException as exc:
             self._stats.expert_prefetch_failures += 1
             self.close_expert_window(window, cancel=True)
+            if isinstance(exc, KeyError):
+                raise DeepSeekPagerError(
+                    f"prefetch batch omitted planned expert {ticket.base}"
+                ) from exc
             raise
         waited = time.perf_counter_ns() - started
         payload = _ExpertPayload(
@@ -568,6 +834,7 @@ class DeepSeekWeightPager:
             expert=expert,
             payload_bytes=ticket.payload_bytes,
             window=window,
+            batch=batch,
         )
         try:
             with self._prefetch_lock:
@@ -579,12 +846,16 @@ class DeepSeekWeightPager:
                     raise DeepSeekPagerError(
                         "expert prefetch ticket changed during consume"
                     )
+                if batch.future is not future or batch.retired:
+                    raise DeepSeekPagerError(
+                        "expert prefetch batch changed during consume"
+                    )
                 ticket.consumed = True
-                ticket.future = None
                 window.next_consume += 1
                 self._active_prefetch_payload = payload
                 self._stats.expert_prefetch_consumed += 1
                 self._stats.expert_prefetch_wait_ns += waited
+                self._account_expert_batch_result_locked(batch, batch_result)
                 if ready:
                     self._stats.expert_prefetch_ready_before_consume += 1
                 self._submit_window_reads_locked(window)
@@ -593,12 +864,19 @@ class DeepSeekWeightPager:
             raise
         return payload
 
-    @staticmethod
-    def _silence_future(future: Future[_CoalescedExpert]) -> None:
-        try:
-            future.exception()
-        except BaseException:
-            pass
+    def _account_expert_batch_result_locked(
+        self,
+        batch: _ExpertPrefetchBatch,
+        result: _CoalescedExpertBatch,
+    ) -> None:
+        if batch.metrics_accounted:
+            return
+        batch.metrics_accounted = True
+        self._stats.expert_transport_envelopes += result.source_requests
+        self._stats.expert_transport_source_bytes += result.source_bytes
+        self._stats.expert_range_requests_avoided += (
+            batch.plan.range_requests_avoided
+        )
 
     def close_expert_window(
         self, window: _ExpertPrefetchWindow, *, cancel: bool = False
@@ -616,7 +894,8 @@ class DeepSeekWeightPager:
                     "cannot close expert prefetch window with an active payload"
                 )
             if window.next_consume != len(window.tickets) or any(
-                ticket.future is not None for ticket in window.tickets
+                not batch.retired or batch.future is not None or batch.remaining
+                for batch in window.batches
             ):
                 raise DeepSeekPagerError(
                     "cannot close expert prefetch window before ordered consumption"
@@ -631,24 +910,32 @@ class DeepSeekWeightPager:
             executor.shutdown(wait=False, cancel_futures=True)
 
     def _cancel_expert_window(self, window: _ExpertPrefetchWindow) -> None:
-        done: list[Future[_CoalescedExpert]] = []
-        draining: list[Future[_CoalescedExpert]] = []
+        done: list[tuple[Future[_CoalescedExpertBatch], _ExpertPrefetchBatch]] = []
+        draining: list[
+            tuple[Future[_CoalescedExpertBatch], _ExpertPrefetchBatch]
+        ] = []
         with self._prefetch_lock:
             if window is not self._active_prefetch_window or window.closed:
                 raise DeepSeekPagerError("expert prefetch window is stale or closed")
             window.closed = True
-            for ticket in window.tickets:
-                future = ticket.future
+            for batch in window.batches:
+                future = batch.future
                 if future is None:
+                    batch.remaining = 0
+                    batch.retired = True
                     continue
                 future.cancel()
-                ticket.future = None
-                ticket.consumed = True
-                self._stats.expert_prefetch_cancelled += 1
+                batch.future = None
+                batch.remaining = 0
+                batch.retired = True
                 if future.done():
-                    done.append(future)
+                    done.append((future, batch))
                 else:
-                    draining.append(future)
+                    draining.append((future, batch))
+            for ticket in window.tickets:
+                if not ticket.consumed:
+                    ticket.consumed = True
+                    self._stats.expert_prefetch_cancelled += 1
             payload = self._active_prefetch_payload
             if payload is not None and payload.window is window:
                 payload.expert = None
@@ -662,22 +949,38 @@ class DeepSeekWeightPager:
                 self._prefetch_executor = None
             if len(draining) > self.EXPERT_PREFETCH_ACTIVE_READ_LIMIT:
                 raise DeepSeekPagerError("expert prefetch drain bound was exceeded")
-            self._draining_prefetch.update(draining)
+            self._draining_prefetch.update(future for future, _batch in draining)
             if draining:
                 self._draining_executor = executor
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
-        for future in done:
-            self._silence_future(future)
-        for future in draining:
-            future.add_done_callback(self._finish_cancelled_prefetch)
+        for future, batch in done:
+            self._finish_cancelled_prefetch(future, batch, detached=False)
+        for future, batch in draining:
+            future.add_done_callback(
+                lambda completed, owned_batch=batch: self._finish_cancelled_prefetch(
+                    completed, owned_batch, detached=True
+                )
+            )
 
-    def _finish_cancelled_prefetch(self, future: Future[_CoalescedExpert]) -> None:
+    def _finish_cancelled_prefetch(
+        self,
+        future: Future[_CoalescedExpertBatch],
+        batch: _ExpertPrefetchBatch,
+        *,
+        detached: bool,
+    ) -> None:
         """Retire one of at most two detached exact source reads."""
 
-        self._silence_future(future)
+        try:
+            result = future.result()
+        except BaseException:
+            result = None
         with self._prefetch_lock:
-            self._draining_prefetch.discard(future)
+            if result is not None:
+                self._account_expert_batch_result_locked(batch, result)
+            if detached:
+                self._draining_prefetch.discard(future)
             if not self._draining_prefetch:
                 self._draining_executor = None
 
@@ -730,6 +1033,18 @@ class DeepSeekWeightPager:
             payload.consumed = True
         return expert
 
+    def _retire_expert_payload_locked(self, payload: _ExpertPayload) -> None:
+        batch = payload.batch
+        if batch.retired or batch.remaining <= 0:
+            raise DeepSeekPagerError("expert prefetch batch release is invalid")
+        batch.remaining -= 1
+        if batch.remaining == 0:
+            batch.future = None
+            batch.retired = True
+        window = payload.window
+        if window is self._active_prefetch_window and not window.closed:
+            self._submit_window_reads_locked(window)
+
     def discard_expert_payload(self, payload: _ExpertPayload) -> None:
         """Release an unclaimed payload when planning the next read fails."""
 
@@ -739,6 +1054,7 @@ class DeepSeekWeightPager:
             payload.consumed = True
             payload.expert = None
             self._active_prefetch_payload = None
+            self._retire_expert_payload_locked(payload)
             self._stats.expert_prefetch_cancelled += 1
             close_compatibility = (
                 payload.window.compatibility_single and not payload.window.closed
@@ -752,6 +1068,7 @@ class DeepSeekWeightPager:
                 raise DeepSeekPagerError("expert prefetch payload release is invalid")
             payload.expert = None
             self._active_prefetch_payload = None
+            self._retire_expert_payload_locked(payload)
             close_compatibility = (
                 payload.window.compatibility_single and not payload.window.closed
             )
@@ -1181,6 +1498,10 @@ class DeepSeekWeightPager:
             )
         finally:
             if claimed_payload is not None:
+                # The local expert view may pin a two-expert envelope. Drop it
+                # before retiring the batch so a refill cannot exceed the
+                # resident-byte proof while this frame still owns the buffer.
+                del payload
                 self._release_expert_payload(claimed_payload)
         return result
 
@@ -1567,12 +1888,10 @@ class DeepSeekWeightPager:
             "device": str(self.device),
             "compute_dtype": str(self.compute_dtype).removeprefix("torch."),
             "quantized_accumulation_policy": self.QUANTIZED_ACCUMULATION_POLICY,
-            "expert_prefetch_policy": (
-                self.EXPERT_PREFETCH_POLICY
-                if self.expert_prefetch_enabled
-                else "disabled"
+            "expert_prefetch_policy": self.expert_prefetch_policy,
+            "expert_prefetch_transport_policy": (
+                self.expert_prefetch_transport_policy
             ),
-            "expert_prefetch_transport_policy": (self.EXPERT_PREFETCH_TRANSPORT_POLICY),
             "expert_prefetch_payload_limit_bytes": (
                 self.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
             ),
@@ -1586,6 +1905,12 @@ class DeepSeekWeightPager:
             "expert_prefetch_max_experts": self.EXPERT_PREFETCH_MAX_EXPERTS,
             "expert_prefetch_resident_limit_bytes": (
                 self.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+            ),
+            "expert_range_coalesce_max_experts": (
+                self.expert_range_coalesce_max_experts
+            ),
+            "expert_range_coalesce_max_gap_bytes": (
+                self.EXPERT_RANGE_COALESCE_MAX_GAP_BYTES
             ),
             "expert_prefetch_draining": draining,
             "source": source_metrics,

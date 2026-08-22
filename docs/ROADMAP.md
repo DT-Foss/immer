@@ -39,7 +39,11 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
   BF16-Objekt versiegelt an Commit `d0a1dc4`.
 - [x] Begrenzter Remote-Transport `requests-session-pool-2/v1`: zwei geleaste
   Ein-Verbindungs-Sessions, bounded stream reads, deterministischer Close und
-  1,382532× im aktuellen bitgleichen No-Cache-3-Expert-A/B.
+  1,140549× im aktuellen bitgleichen No-Cache-3-Expert-A/B.
+- [x] Exaktes Multi-Range-Instrument mit Leaf-Cache-Reuse und
+  Adjacent-Pair-A/B: kalt 6→4 Envelopes ohne Zusatzbytes, aber nur 1,44 %
+  mittlerer Gewinn und cache-resident 3,06 % Verlust; q3/Width 1 bleibt
+  Default, Pair/Width 2 explizit aus.
 - [x] FERTIG-GSM8K-Vollsplit mit Item-Provenienz und hartem Wrong-Gate:
   1.060 korrekt, 259 abstinent, 0 falsch, 0 Fehler.
 - [x] FERTIG-Grammatik für endliche affine Rekurrenzen mit exaktem
@@ -48,13 +52,12 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
 
 ## Jetzt
 
-### 1. DeepSeek-V4-Transport v5
+### 1. FERTIG-Bindungslöser
 
-Der q3/a2-Pfad ist gegen `off` positiv; sein marginaler Vorteil gegenüber q2
-ist wegen getrennter Netzläufe noch nur diagnostisch. Als Nächstes werden nur
-tatsächlich selektierte physisch benachbarte Ranges gebündelt. Outputbits,
-gelesene Nutzbytes, Zwei-Read-Aktivgrenze und serielle
-FP32-Akkumulationsreihenfolge müssen identisch bleiben.
+Der Vollsplit hat 259 sichere Abstinenzen bei null falschen Antworten. Als
+nächster exakter Hebel wird die Zuordnung mehrdeutiger Bindungen als
+Minimum-Cost-Matching formuliert und gegen Greedy/Placebo gemessen. Hungarian
+darf nur neue zertifizierte Antworten öffnen; das Wrong-Gate bleibt null.
 
 ### 2. DeepSeek-V4-Inhaltsgate
 

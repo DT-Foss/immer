@@ -301,6 +301,8 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
             self.assertEqual(execution["expert_prefetch_active_read_limit"], 2)
             self.assertEqual(execution["expert_prefetch_max_outstanding"], 3)
             self.assertEqual(execution["expert_prefetch_max_experts"], 3)
+            self.assertEqual(execution["expert_range_coalesce_max_experts"], 1)
+            self.assertEqual(execution["expert_range_coalesce_max_gap_bytes"], 0)
             self.assertEqual(
                 execution["expert_prefetch_resident_limit_bytes"],
                 48 * 1024**2,
@@ -342,6 +344,12 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
             synchronous_report = json.loads(synchronous.stdout)
             self.assertEqual(
                 synchronous_report["provenance"]["execution"]["expert_prefetch_policy"],
+                "disabled",
+            )
+            self.assertEqual(
+                synchronous_report["provenance"]["execution"][
+                    "expert_prefetch_transport_policy"
+                ],
                 "disabled",
             )
             self.assertEqual(
