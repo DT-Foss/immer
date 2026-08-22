@@ -1448,6 +1448,10 @@ def _build_report(
         "expert_prefetch_resident_limit_bytes": header[
             "expert_prefetch_resident_limit_bytes"
         ],
+        "source_transport_policy": header["source_transport_policy"],
+        "source_transport_connection_limit": header[
+            "source_transport_connection_limit"
+        ],
         "runtime_source_sha256": header["runtime_source_sha256"],
         "runtime_sources": header["runtime_sources"],
         "runtime_dependency_sha256": header["runtime_dependency_sha256"],
@@ -1541,6 +1545,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     selected_rows = rows[: args.limit] if args.limit is not None else rows
     source, source_label = _build_source(args)
+    try:
+        return _run_with_source(
+            args,
+            task=task,
+            modes=modes,
+            seeds=seeds,
+            rows=rows,
+            selected_rows=selected_rows,
+            source=source,
+            source_label=source_label,
+        )
+    finally:
+        close = getattr(source, "close", None)
+        if callable(close):
+            close()
+
+
+def _run_with_source(
+    args: argparse.Namespace,
+    *,
+    task: BenchmarkTask,
+    modes: tuple[str, ...],
+    seeds: tuple[int, ...],
+    rows: list[dict[str, Any]],
+    selected_rows: list[dict[str, Any]],
+    source: Streamer,
+    source_label: str,
+) -> dict[str, Any]:
     config, config_meta = _load_config(args, source)
     tokenizer = _load_tokenizer(args, source, selected_rows, task)
     if args.graft_layer is not None and not 0 <= args.graft_layer < config.n_layers:
@@ -1560,8 +1592,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if plan.assistant_generation_prefix is not None
         }
     )
+    source_identity_metrics = source.metrics()
     inventory_sha = _digest_or_canonical(
-        source.metrics().get("inventory_source_fingerprint"), inventory
+        source_identity_metrics.get("inventory_source_fingerprint"), inventory
     )
     tokenizer_sha = (
         tokenizer.sha256
@@ -1621,6 +1654,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "expert_prefetch_resident_limit_bytes": (
                 DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
             ),
+            "source_transport_policy": str(
+                source_identity_metrics.get("transport_policy", "unreported")
+            ),
+            "source_transport_connection_limit": int(
+                source_identity_metrics.get("transport_connection_limit", 0)
+            ),
             "runtime_source_sha256": runtime_source_sha256,
             "runtime_sources": runtime_sources,
             "runtime_dependency_sha256": runtime_dependency_sha256,
@@ -1679,6 +1718,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "expert_prefetch_max_experts": DeepSeekWeightPager.EXPERT_PREFETCH_MAX_EXPERTS,
         "expert_prefetch_resident_limit_bytes": (
             DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+        ),
+        "source_transport_policy": str(
+            source_identity_metrics.get("transport_policy", "unreported")
+        ),
+        "source_transport_connection_limit": int(
+            source_identity_metrics.get("transport_connection_limit", 0)
         ),
         "runtime_source_sha256": runtime_source_sha256,
         "runtime_sources": runtime_sources,
@@ -1746,6 +1791,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "expert_prefetch_resident_limit_bytes": (
             DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
         ),
+        "source_transport_policy": str(
+            source_identity_metrics.get("transport_policy", "unreported")
+        ),
+        "source_transport_connection_limit": int(
+            source_identity_metrics.get("transport_connection_limit", 0)
+        ),
         "runtime_source_sha256": runtime_source_sha256,
         "runtime_sources": runtime_sources,
         "runtime_dependency_sha256": runtime_dependency_sha256,
@@ -1805,6 +1856,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 model.reset_state(release=True)
                 del model
                 pager.release()
+    pager.release()
+    close = getattr(source, "close", None)
+    if callable(close):
+        close()
     report = _build_report(
         journal,
         source=source,

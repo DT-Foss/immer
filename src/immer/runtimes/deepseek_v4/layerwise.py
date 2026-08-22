@@ -862,6 +862,12 @@ class LayerwiseScorer:
                 "graft_seed": int(graft_seed),
                 "modes": list(self.plan.modes),
                 "source_cache_reserve_bytes": source_cache_reserve_bytes,
+                "source_transport_policy": str(
+                    source_metrics.get("transport_policy", "unreported")
+                ),
+                "source_transport_connection_limit": int(
+                    source_metrics.get("transport_connection_limit", 0)
+                ),
             },
         }
         self.identity_sha256 = _digest(self.identity)

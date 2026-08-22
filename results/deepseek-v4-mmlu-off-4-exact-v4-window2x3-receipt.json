@@ -1,0 +1,77 @@
+{
+  "artifact": {
+    "identity_sha256": "bc6d4c0de6dd34ff34461d8ab9466e288d54c76cbf392c99edfef23967fea9b7",
+    "manifest_body_sha256": "b4b4549583e08bf529e3108847528cae1653e52ad3e80240379c1afed90605b9",
+    "manifest_file_sha256": "2db5023b1053bb22a9c0759f578fd88fcd8678ef5fdaac2525e6c358928fd463",
+    "result_body_sha256": "12bbbce0305bce323db9f49832ec38c37355f3df780299241d24e66618866d36",
+    "result_file_sha256": "5beeac86acf9dbdeb6436fbcc2c0afcfd37ee4e5564f025fdff3d3edcaae771e",
+    "run": "artifacts/private/deepseek-v4-mmlu-off-4-exact-v4-window2x3"
+  },
+  "bindings": {
+    "dataset_sha256": "d083f0a37e9802ff70af8c0ccee95dc6836d80db74f45327519756327076a2c1",
+    "inventory_fingerprint": "61600c552f3e52ae382b3eca0370001905fc4e2ecdd2da5f3e66fa95809206c7",
+    "items_sha256": "64c66e341b23d8631cd35d7898eb7d1237cc25a93314cf12fd42e9bc2bd5cc73",
+    "model_revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+    "runtime_dependency_sha256": "c54e31cdf85392f9816b6f9d9406e804df269d8b61a340d9c0eb796c9e6366a7",
+    "runtime_git_commit": "d0a1dc40da7e8f78d8a5bf9747758276ccc8ed49",
+    "runtime_source_sha256": "07e559182b49525e1f555773391d1b779827862b008dfe259a16dc2041a1fc4f",
+    "tokenizer_sha256": "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf"
+  },
+  "claim": "official-checkpoint-four-item-content-smoke-not-frontier-parity",
+  "final_checkpoint": {
+    "dtype": "bfloat16",
+    "file_bytes": 6291680,
+    "generation_layer": 42,
+    "sha256": "2cd7351fe1fcfddaf1b85bfc6ba0e196c5e3506cd892a4e9c8195c87d35f0570",
+    "shape": [
+      4,
+      48,
+      4,
+      4096
+    ],
+    "variant": "off"
+  },
+  "outcomes": [
+    {
+      "correct": true,
+      "expected": 1,
+      "item_id": "row-000000",
+      "predicted": 1
+    },
+    {
+      "correct": true,
+      "expected": 3,
+      "item_id": "row-000001",
+      "predicted": 3
+    },
+    {
+      "correct": true,
+      "expected": 2,
+      "item_id": "row-000002",
+      "predicted": 2
+    },
+    {
+      "correct": false,
+      "expected": 0,
+      "item_id": "row-000003",
+      "predicted": 1
+    }
+  ],
+  "report_sha256": "2eda10671ca120f319d71797bf67b9bfb28a6a85a292cea8bd7c1b835e8addff",
+  "schema": "immer.deepseek-v4-layerwise-receipt/v1",
+  "scope": {
+    "accuracy": 0.75,
+    "completed_layer": 42,
+    "correct": 3,
+    "items": 4,
+    "mode": "off"
+  },
+  "status": "complete",
+  "timing_observation": {
+    "caveat": "filesystem-mtime-minus-hashed-start; mutable clock metadata, not a trusted timestamp",
+    "manifest_mtime_unix_ns": 1787409934365232965,
+    "observed_wall_span_seconds": 8644.855301,
+    "performance_claim": false,
+    "started_at_unix": 1787401289.509932
+  }
+}

@@ -243,6 +243,8 @@ class LayerwiseScorerTests(unittest.TestCase):
                 execution["expert_prefetch_resident_limit_bytes"],
                 48 * 1024**2,
             )
+            self.assertEqual(execution["source_transport_policy"], "unreported")
+            self.assertEqual(execution["source_transport_connection_limit"], 0)
             initial, *_ = first._load_or_initialize(resume=False)
             activation = initial["body"]["state"]["checkpoints"][0]
             self.assertEqual(
@@ -297,7 +299,7 @@ class LayerwiseScorerTests(unittest.TestCase):
             self.assertEqual(runtime["source_sha256"], _body_sha(runtime["sources"]))
             self.assertEqual(
                 set(runtime["dependencies"]),
-                {"python", "torch", "numpy", "safetensors"},
+                {"python", "torch", "numpy", "requests", "safetensors"},
             )
             self.assertEqual(
                 runtime["dependency_sha256"],

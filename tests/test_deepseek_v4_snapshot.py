@@ -222,7 +222,7 @@ class DeepSeekV4SnapshotTests(unittest.TestCase):
             )
             self.assertEqual(
                 set(runtime["dependencies"]),
-                {"python", "torch", "numpy", "safetensors"},
+                {"python", "torch", "numpy", "requests", "safetensors"},
             )
             self.assertEqual(
                 runtime["dependency_sha256"],
@@ -264,6 +264,8 @@ class DeepSeekV4SnapshotTests(unittest.TestCase):
                 execution["expert_prefetch_resident_limit_bytes"],
                 48 * 1024**2,
             )
+            self.assertEqual(execution["source_transport_policy"], "unreported")
+            self.assertEqual(execution["source_transport_connection_limit"], 0)
 
             incompatible_prefetch = self._compressed_model(4, graft=True)
             incompatible_prefetch.pager.expert_prefetch_enabled = False

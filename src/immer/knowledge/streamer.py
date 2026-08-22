@@ -132,6 +132,8 @@ class LocalRangeReader:
     """Offline inclusive-range reader for a directory of source files."""
 
     range_overhead_reserve = 0
+    transport_policy = "local-range/v1"
+    transport_connection_limit = 0
 
     def __init__(
         self,
@@ -213,6 +215,22 @@ class LocalRangeReader:
         self.budget.charge(len(body), 0, f"local-file:{filename}")
         self._remember(filename, path)
         return body
+
+    def transport_metrics(self) -> dict[str, Any]:
+        return {
+            "transport_policy": self.transport_policy,
+            "transport_connection_limit": self.transport_connection_limit,
+            "transport_active_lease_limit": 0,
+            "transport_requests": int(self.budget.requests),
+            "transport_retries": 0,
+            "transport_active_leases": 0,
+            "transport_peak_leases": 0,
+            "transport_connection_objects_seen": 0,
+            "transport_closed": False,
+        }
+
+    def close(self) -> None:
+        """Match the remote reader lifecycle; local files are per-call."""
 
 
 def _validate_nonnegative_int(value: Any, label: str) -> int:
@@ -1658,6 +1676,8 @@ class Streamer:
 
     def metrics(self) -> dict[str, Any]:
         reader_stats = self.reader.stats()
+        transport_method = getattr(self.reader.upstream, "transport_metrics", None)
+        transport = dict(transport_method()) if callable(transport_method) else {}
         pinned_revision = bool(re.fullmatch(r"[0-9a-fA-F]{40,64}", self.revision))
         return {
             "repo_id": self.repo_id,
@@ -1671,8 +1691,26 @@ class Streamer:
             "inventory_cache_hits": int(self._inventory_cache_hits),
             "inventory_cache_writes": int(self._inventory_cache_writes),
             "inventory_source_fingerprint": self._inventory_fingerprint,
+            **transport,
             **reader_stats,
         }
+
+    def close(self) -> None:
+        """Close persistent source transport after all reads have finished."""
+
+        with self._state_lock:
+            upstream = self._upstream
+            if upstream is None and self._reader is not None:
+                upstream = self._reader.upstream
+        close = getattr(upstream, "close", None)
+        if callable(close):
+            close()
+
+    def __enter__(self) -> Streamer:
+        return self
+
+    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
+        self.close()
 
 
 def available() -> bool:

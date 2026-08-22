@@ -33,6 +33,7 @@ _TENSOR_SOURCE_FILES = (
 _RUNTIME_DISTRIBUTIONS = (
     "torch",
     "numpy",
+    "requests",
     "safetensors",
 )
 

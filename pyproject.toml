@@ -11,6 +11,7 @@ authors = [{name = "David Tom Foss"}]
 readme = "README.md"
 dependencies = [
   "numpy>=1.26",
+  "requests>=2.32",
 ]
 
 [project.optional-dependencies]

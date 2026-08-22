@@ -515,6 +515,24 @@ def _arguments(args: argparse.Namespace) -> dict[str, Any]:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     started_at = _utc_now()
     source, source_label = _build_source(args)
+    try:
+        return _run_with_source(
+            args,
+            source=source,
+            source_label=source_label,
+            started_at=started_at,
+        )
+    finally:
+        source.close()
+
+
+def _run_with_source(
+    args: argparse.Namespace,
+    *,
+    source: Streamer,
+    source_label: str,
+    started_at: str,
+) -> dict[str, Any]:
     config, config_meta = _load_config(args, source)
     requested = tuple(int(value) for value in args.experts)
     if args.layer >= config.n_layers:
@@ -667,6 +685,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     runtime_sources = runtime_source_manifest()
     runtime_dependencies = runtime_dependency_versions()
     harness_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    source.close()
     source_metrics_after = source.metrics()
     report = _seal_report(
         {
@@ -751,6 +770,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                     "expert_prefetch_resident_limit_bytes": (
                         DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+                    ),
+                    "source_transport_policy": str(
+                        source_metrics_after.get("transport_policy", "unreported")
+                    ),
+                    "source_transport_connection_limit": int(
+                        source_metrics_after.get("transport_connection_limit", 0)
                     ),
                     "expected_prefetch_peak_bytes": expected_prefetch_peak,
                     "requested_experts": list(requested),

@@ -309,6 +309,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         rows = rows[: args.limit]
     tokenizer = LocalTokenizer(Path(args.tokenizer_json))
     source, source_label = _source(args)
+    try:
+        return _run_with_source(
+            args,
+            dataset=dataset,
+            rows=rows,
+            tokenizer=tokenizer,
+            source=source,
+            source_label=source_label,
+        )
+    finally:
+        close = getattr(source, "close", None)
+        if callable(close):
+            close()
+
+
+def _run_with_source(
+    args: argparse.Namespace,
+    *,
+    dataset: Path,
+    rows: list[dict[str, Any]],
+    tokenizer: LocalTokenizer,
+    source: Streamer,
+    source_label: str,
+) -> dict[str, Any]:
     config, config_sha256 = _config(args, source)
     items = _items(rows, tokenizer, config, args)
     pager = DeepSeekWeightPager(

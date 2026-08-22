@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -24,7 +25,12 @@ from immer.knowledge.streamer import (
     Streamer,
     TensorSource,
 )
-from immer.knowledge._hf_source import HFRangeReader, SourceRangeError
+from immer.knowledge._hf_source import (
+    HFRangeReader,
+    SourceError,
+    SourceNotFound,
+    SourceRangeError,
+)
 
 
 class _FakeResponse:
@@ -62,6 +68,40 @@ class _FakeOpener:
     def open(self, request, timeout):
         self.requests.append((request, timeout))
         return self.responses.pop(0)
+
+
+class _FakeRequestsResponse:
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        status: int,
+        headers: dict[str, str],
+        url: str = "https://cdn.example/file",
+    ) -> None:
+        self.raw = io.BytesIO(body)
+        self.status_code = status
+        self.headers = headers
+        self.url = url
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeRequestsSession:
+    def __init__(self, responses: list[_FakeRequestsResponse]) -> None:
+        self.responses = responses
+        self.headers: dict[str, str] = {}
+        self.requests: list[dict] = []
+        self.closed = False
+
+    def get(self, url: str, **kwargs):
+        self.requests.append({"url": url, **kwargs})
+        return self.responses.pop(0)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _ParallelRangeReader:
@@ -117,6 +157,162 @@ def _write_fixture(root: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 class StreamerContractTests(unittest.TestCase):
+    def test_default_requests_transport_enforces_two_single_connection_pools(self) -> None:
+        reader = HFRangeReader(
+            "org/repo",
+            budget=Streamer("fixture", budget_mb=2, use_cache=False).budget,
+        )
+        try:
+            metrics = reader.transport_metrics()
+            self.assertEqual(metrics["transport_policy"], "requests-session-pool-2/v1")
+            self.assertEqual(metrics["transport_connection_limit"], 2)
+            self.assertEqual(metrics["transport_active_lease_limit"], 2)
+            self.assertEqual(len(reader._sessions), 2)
+            for session in reader._sessions:
+                adapter = session.get_adapter("https://")
+                self.assertEqual(adapter._pool_connections, 1)
+                self.assertEqual(adapter._pool_maxsize, 1)
+                self.assertTrue(adapter._pool_block)
+        finally:
+            reader.close()
+
+    def test_requests_range_never_materializes_an_ignored_full_shard(self) -> None:
+        response = _FakeRequestsResponse(
+            b"x" * (1024 * 1024),
+            status=200,
+            headers={"Content-Length": str(1024 * 1024)},
+        )
+        session = _FakeRequestsSession([response])
+        budget = Streamer("fixture", budget_mb=2, use_cache=False).budget
+        reader = HFRangeReader("org/repo", budget=budget, session=session)
+
+        with self.assertRaisesRegex(SourceRangeError, "statt einer exakten Range"):
+            reader.get_range("model.safetensors", 2, 5)
+
+        self.assertEqual(response.raw.tell(), 5)
+        self.assertTrue(response.closed)
+        self.assertEqual(reader.transport_metrics()["transport_active_leases"], 0)
+
+    def test_requests_bounded_file_stops_after_ceiling_plus_one(self) -> None:
+        response = _FakeRequestsResponse(
+            b"x" * (1024 * 1024),
+            status=200,
+            headers={},
+        )
+        session = _FakeRequestsSession([response])
+        reader = HFRangeReader(
+            "org/repo",
+            budget=Streamer("fixture", budget_mb=2, use_cache=False).budget,
+            session=session,
+        )
+
+        with self.assertRaisesRegex(SourceRangeError, "ueberschreitet"):
+            reader.fetch_file_bounded("config.json", 16)
+
+        self.assertEqual(response.raw.tell(), 17)
+        self.assertTrue(response.closed)
+
+    def test_requests_http_errors_are_classified_and_retried(self) -> None:
+        not_found = _FakeRequestsResponse(
+            b"missing",
+            status=404,
+            headers={"Content-Length": "7"},
+        )
+        missing_session = _FakeRequestsSession([not_found])
+        missing = HFRangeReader(
+            "org/repo",
+            budget=Streamer("fixture", budget_mb=2, use_cache=False).budget,
+            session=missing_session,
+        )
+        with self.assertRaises(SourceNotFound):
+            missing.fetch_file_bounded("config.json", 64)
+        self.assertTrue(not_found.closed)
+
+        throttled = _FakeRequestsResponse(
+            b"retry",
+            status=429,
+            headers={"Content-Length": "5"},
+        )
+        success = _FakeRequestsResponse(
+            b"cdef",
+            status=206,
+            headers={"Content-Range": "bytes 2-5/10"},
+        )
+        retry_session = _FakeRequestsSession([throttled, success])
+        retrying = HFRangeReader(
+            "org/repo",
+            budget=Streamer("fixture", budget_mb=2, use_cache=False).budget,
+            session=retry_session,
+        )
+        with mock.patch("immer.knowledge._hf_source.time.sleep") as sleep:
+            self.assertEqual(
+                retrying.get_range("model.safetensors", 2, 5),
+                b"cdef",
+            )
+        sleep.assert_called_once_with(1)
+        self.assertEqual(retrying.transport_metrics()["transport_retries"], 1)
+        self.assertEqual(len(retry_session.requests), 2)
+
+    def test_requests_transport_never_exceeds_two_active_leases(self) -> None:
+        entered = threading.Barrier(3)
+        release = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+
+        class BlockingSession(_FakeRequestsSession):
+            def __init__(self) -> None:
+                super().__init__([])
+
+            def get(self, url: str, **kwargs):
+                nonlocal calls
+                with calls_lock:
+                    calls += 1
+                    call_index = calls
+                if call_index <= 2:
+                    entered.wait(timeout=5)
+                    if not release.wait(timeout=5):
+                        raise TimeoutError("request was not released")
+                raw_range = kwargs["headers"]["Range"]
+                match = re.fullmatch(r"bytes=(\d+)-(\d+)", raw_range)
+                assert match is not None
+                start, end = map(int, match.groups())
+                return _FakeRequestsResponse(
+                    bytes(range(start, end + 1)),
+                    status=206,
+                    headers={"Content-Range": f"bytes {start}-{end}/64"},
+                )
+
+        reader = HFRangeReader(
+            "org/repo",
+            budget=Streamer("fixture", budget_mb=2, use_cache=False).budget,
+            sessions=(BlockingSession(), BlockingSession()),
+        )
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [
+                pool.submit(reader.get_range, "model.safetensors", start, start + 3)
+                for start in (0, 4, 8)
+            ]
+            entered.wait(timeout=5)
+            with calls_lock:
+                self.assertEqual(calls, 2)
+            release.set()
+            self.assertEqual(
+                [future.result(timeout=5) for future in futures],
+                [bytes(range(0, 4)), bytes(range(4, 8)), bytes(range(8, 12))],
+            )
+
+        metrics = reader.transport_metrics()
+        self.assertEqual(metrics["transport_policy"], "requests-injected-session-leases-2/v1")
+        self.assertEqual(metrics["transport_connection_limit"], 0)
+        self.assertEqual(metrics["transport_active_lease_limit"], 2)
+        self.assertEqual(metrics["transport_peak_leases"], 2)
+        self.assertEqual(metrics["transport_active_leases"], 0)
+        self.assertEqual(calls, 3)
+        reader.close()
+        self.assertTrue(reader.transport_metrics()["transport_closed"])
+        with self.assertRaises(SourceError):
+            reader.get_range("model.safetensors", 0, 3)
+
     def test_packaged_hf_reader_enforces_content_range_and_bounded_files(self) -> None:
         digest = "a" * 64
         opener = _FakeOpener(

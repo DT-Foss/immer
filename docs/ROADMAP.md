@@ -33,6 +33,12 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
 - [x] Exaktes Routed-Expert-Prefetch `exact-router-window-2x3/v1`: zwei
   I/O-Worker, höchstens zwei Futures und drei residente/inflight Experts,
   14 MiB pro Expert, 48 MiB Gesamtgrenze und bitgleiche A/B-Ausgabe.
+- [x] Erster vollständiger DeepSeek-Inhaltslauf: 43/43 Layer, vier feste
+  Geography-Items, `off` 3/4 korrekt; Resultat, Identität und finales
+  BF16-Objekt versiegelt an Commit `d0a1dc4`.
+- [x] Begrenzter Remote-Transport `requests-session-pool-2/v1`: zwei geleaste
+  Ein-Verbindungs-Sessions, bounded stream reads, deterministischer Close und
+  1,251639× im aktuellen bitgleichen No-Cache-3-Expert-A/B.
 - [x] FERTIG-GSM8K-Vollsplit mit Item-Provenienz und hartem Wrong-Gate:
   1.060 korrekt, 259 abstinent, 0 falsch, 0 Fehler.
 - [x] FERTIG-Grammatik für endliche affine Rekurrenzen mit exaktem
@@ -41,24 +47,29 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
 
 ## Jetzt
 
-### 1. DeepSeek-V4-Inhaltsgate
+### 1. DeepSeek-V4-Transport v5
 
-Als nächstes läuft ein frischer, unverfälschter MMLU-`off`-Content-Gate mit
-offiziellem Encoding, festem Split und kandidatengestütztem Scoring. Der Lauf
-beginnt in einem neuen Proof-v4-Verzeichnis und publiziert jede BF16-
-Aktivierungsgeneration samt Manifest atomar und content-addressed. Runtime,
-Dependencies, Revision, Items, Bytes, Zeit und Cachebilanz sind gebunden. Erst
-wenn diese Baseline inhaltlich valide ist, folgen gepaarte CRSA-Ablationen.
-Token-Smokes und der Prefetch-Transportbenchmark sind keine Qualitätsclaims.
+Nächste exakte Hebel werden einzeln falsifiziert: zuerst drei sofort
+eingereihte Expert-Tickets bei weiterhin höchstens zwei aktiven Reads und
+40.108.032 Byte Payload, danach nur tatsächlich selektierte physisch
+benachbarte Ranges. Outputbits, gelesene Nutzbytes und serielle
+FP32-Akkumulationsreihenfolge müssen identisch bleiben.
 
-### 2. Breiter Router-Kontrast
+### 2. DeepSeek-V4-Inhaltsgate
+
+Die erste `off`-Baseline ist mit 3/4 korrekt positiv. Nach stabilem Transport
+folgt ein gepaarter `off`/CRSA-Lauf mit offiziellem Encoding, festem Split und
+kandidatengestütztem Scoring unter exakt derselben Runtime-Identität. Erst
+größere Splits dürfen einen Qualitäts- oder Ähnlichkeitsclaim tragen.
+
+### 3. Breiter Router-Kontrast
 
 Der heutige Split zeigt Kontextsignal, aber keinen CRSA-Sieg gegen Softmax.
 Nächster zulässiger Versuch: größerer, fachlich gemischter, deduplizierter
 Split; gleicher Ridge-Budgetdeckel; CRSA, Softmax, Roh-A1 und permutierte
 Labels. Kein Rollen-Adaption-Claim ohne Stabilitätsmessung.
 
-### 3. Lebenskurve
+### 4. Lebenskurve
 
 Fixes held-out Byte-Set, Messpunkte über echte Lebenszeit:
 
@@ -68,13 +79,13 @@ Fixes held-out Byte-Set, Messpunkte über echte Lebenszeit:
 - Resume-Bitexaktheit;
 - Drift des Frozen-Exact-Pfads muss null bleiben.
 
-### 4. FERTIG-Evaluationsfamilien
+### 5. FERTIG-Evaluationsfamilien
 
 Der vollständige GSM8K-Basissplit ist jetzt so gemessen. Nächster Ausbau sind
 familienweise Guard-Sets für Mengenänderungen, mehrdeutige Bindings und
 Desktop-Requests; falsche Antworten/Aktionsbehauptungen bleiben der Fehler.
 
-### 5. Kontextuell korrekter WorldStream-Mechanismus
+### 6. Kontextuell korrekter WorldStream-Mechanismus
 
 Stage 1 zeigte Mid-Depth-Struktur, Stage 2 mit statischem Embedding-Mittel war
 schlechter als Placebo. Ein neuer Versuch braucht echte RMSNorm-te

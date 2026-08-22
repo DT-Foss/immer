@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from immer.knowledge import Streamer
 from immer.runtimes.deepseek_v4.cache_profile import (
     PHASE_SCHEMA,
     CacheProfileError,
@@ -160,6 +161,30 @@ def _phase_envelope(
         source_budget_bytes=source_budget_bytes,
         cache_budget_bytes=cache_budget_bytes,
     )
+    try:
+        return _phase_envelope_with_source(
+            phase=phase,
+            owner_token=owner_token,
+            workload=workload,
+            cache_dir=cache_dir,
+            cache_files_before=cache_files_before,
+            cache_bytes_before=cache_bytes_before,
+            source=source,
+        )
+    finally:
+        source.close()
+
+
+def _phase_envelope_with_source(
+    *,
+    phase: str,
+    owner_token: str,
+    workload: CacheWorkload,
+    cache_dir: Path,
+    cache_files_before: int,
+    cache_bytes_before: int,
+    source: Streamer,
+) -> dict[str, Any]:
     reader_instance = f"pid:{os.getpid()}:reader:{id(source.reader)}"
     if phase == "cold":
         cold = execute_workload(

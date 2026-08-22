@@ -160,6 +160,8 @@ class LayerwiseScriptTests(unittest.TestCase):
                 "0",
                 "--disk-margin-gb",
                 "0",
+                "--cache-budget-gb",
+                "0",
             ]
             rows = [
                 {

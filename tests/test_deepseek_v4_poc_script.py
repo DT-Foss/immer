@@ -304,6 +304,8 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
                 execution["expert_prefetch_resident_limit_bytes"],
                 48 * 1024**2,
             )
+            self.assertEqual(execution["source_transport_policy"], "local-range/v1")
+            self.assertEqual(execution["source_transport_connection_limit"], 0)
             self.assertRegex(
                 report["provenance"]["runtime_source_sha256"],
                 r"^[0-9a-f]{64}$",
@@ -318,7 +320,7 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
             )
             self.assertEqual(
                 set(report["provenance"]["runtime_dependencies"]),
-                {"python", "torch", "numpy", "safetensors"},
+                {"python", "torch", "numpy", "requests", "safetensors"},
             )
             self.assertEqual(json.loads(preflight_output.read_text()), report)
             events = [

@@ -612,6 +612,12 @@ class StreamedDeepSeekV4:
                 "expert_prefetch_resident_limit_bytes": (
                     self.pager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
                 ),
+                "source_transport_policy": str(
+                    metrics.get("transport_policy", "unreported")
+                ),
+                "source_transport_connection_limit": int(
+                    metrics.get("transport_connection_limit", 0)
+                ),
                 "max_batch_size": self.max_batch_size,
                 "max_seq_len": self.max_seq_len,
                 "max_position_embeddings": self.config.max_position_embeddings,

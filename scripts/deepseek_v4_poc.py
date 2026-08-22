@@ -332,6 +332,12 @@ def _provenance(
             "expert_prefetch_resident_limit_bytes": (
                 DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
             ),
+            "source_transport_policy": str(
+                metrics.get("transport_policy", "unreported")
+            ),
+            "source_transport_connection_limit": int(
+                metrics.get("transport_connection_limit", 0)
+            ),
         },
         "decoder": {
             "architecture": "DeepseekV4ForCausalLM",
@@ -360,6 +366,26 @@ def _runtime(
     str,
 ]:
     source, source_label = _build_source(args)
+    try:
+        return _runtime_with_source(args, progress, source, source_label)
+    except BaseException:
+        source.close()
+        raise
+
+
+def _runtime_with_source(
+    args: argparse.Namespace,
+    progress: ProgressLog,
+    source: Streamer,
+    source_label: str,
+) -> tuple[
+    Streamer,
+    DeepSeekV4Config,
+    DeepSeekWeightPager,
+    StreamedDeepSeekV4,
+    dict[str, Any],
+    str,
+]:
     progress.emit(
         "source_ready",
         source=source_label,
@@ -414,14 +440,39 @@ def _runtime(
     return source, config, pager, model, config_meta, source_label
 
 
+def _release_runtime(runtime: tuple[Any, ...]) -> None:
+    source, _config, pager, model, _config_meta, _source_label = runtime
+    try:
+        model.reset_state(release=True)
+    finally:
+        try:
+            pager.release()
+        finally:
+            source.close()
+
+
 def _preflight(
     args: argparse.Namespace,
     progress: ProgressLog,
     base: dict[str, Any],
 ) -> dict[str, Any]:
-    source, config, pager, model, config_meta, source_label = _runtime(args, progress)
+    runtime = _runtime(args, progress)
+    try:
+        return _preflight_with_runtime(args, progress, base, runtime)
+    finally:
+        _release_runtime(runtime)
+
+
+def _preflight_with_runtime(
+    args: argparse.Namespace,
+    progress: ProgressLog,
+    base: dict[str, Any],
+    runtime: tuple[Any, ...],
+) -> dict[str, Any]:
+    source, config, pager, model, config_meta, source_label = runtime
     checks = model.checkpoint_preflight(exhaustive_experts=not args.sampled_experts)
     progress.emit("preflight_complete", **checks)
+    source.close()
     return {
         **base,
         "status": "ok",
@@ -450,7 +501,20 @@ def _one_token(
     progress: ProgressLog,
     base: dict[str, Any],
 ) -> dict[str, Any]:
-    source, config, pager, model, config_meta, source_label = _runtime(args, progress)
+    runtime = _runtime(args, progress)
+    try:
+        return _one_token_with_runtime(args, progress, base, runtime)
+    finally:
+        _release_runtime(runtime)
+
+
+def _one_token_with_runtime(
+    args: argparse.Namespace,
+    progress: ProgressLog,
+    base: dict[str, Any],
+    runtime: tuple[Any, ...],
+) -> dict[str, Any]:
+    source, config, pager, model, config_meta, source_label = runtime
     checks = model.checkpoint_preflight(exhaustive_experts=not args.sampled_experts)
     progress.emit("preflight_complete", **checks)
 
@@ -507,6 +571,7 @@ def _one_token(
         source_body_bytes=evidence.source_body_bytes,
         seconds=evidence.seconds,
     )
+    source.close()
     return {
         **base,
         "status": "ok",
@@ -617,7 +682,20 @@ def _generate(
 ) -> dict[str, Any]:
     if args.prompt is not None and args.token_ids is not None:
         raise ValueError("pass either --prompt or --token-ids, not both")
-    source, config, pager, model, config_meta, source_label = _runtime(args, progress)
+    runtime = _runtime(args, progress)
+    try:
+        return _generate_with_runtime(args, progress, base, runtime)
+    finally:
+        _release_runtime(runtime)
+
+
+def _generate_with_runtime(
+    args: argparse.Namespace,
+    progress: ProgressLog,
+    base: dict[str, Any],
+    runtime: tuple[Any, ...],
+) -> dict[str, Any]:
+    source, config, pager, model, config_meta, source_label = runtime
     checks = model.checkpoint_preflight(exhaustive_experts=not args.sampled_experts)
     progress.emit("preflight_complete", **checks)
     prompt_ids, encoding = _tokenize_prompt(source, args)
@@ -669,6 +747,7 @@ def _generate(
         source_body_bytes=evidence.source_body_bytes,
         seconds=evidence.seconds,
     )
+    source.close()
     return {
         **base,
         "status": "ok",

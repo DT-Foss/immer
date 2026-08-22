@@ -86,23 +86,28 @@ Fähigkeit, keine nachträgliche Optimierung am GSM8K-Split.
   Package-Exports, das konkrete CLI, Streamer, HF-Range-Reader, Snapshot und
   Dependency-Versionen. Das getrennte item-major Journal v2 bildet eine
   kanonische Hash-Kette.
+- **Erster Inhaltslauf:** vier feste Geography-Items vollständig durch alle
+  43 Layer: 3/4 korrekt. Manifest, Resultat und finales BF16-Objekt sind
+  versiegelt und an Commit `d0a1dc4` gebunden. Das ist ein positiver
+  Content-Smoke, noch kein allgemeiner MMLU- oder Frontier-Claim.
 - **Exakter Expert-Transport:** offizielle 3-Expert-MPS-BF16-A/Bs sind
   bitgleich. Warm, nach zwei symmetrischen Warmups und 20 alternierenden
-  Trials: 0,548137 s ohne gegen 0,464826 s mit Fenster, also 1,179230×.
+  Trials: 0,159458 s ohne gegen 0,149599 s mit Fenster, also 1,065901×.
   Ohne Range-Cache, nach einem Warmup und 8 alternierenden Trials:
-  6,452119 s gegen 6,321257 s, also konservativ nur 1,020702×. Der Median
-  beträgt 1,126882×; ein 8,977372-s-Ausreißer macht die Netzwerkmessung noch
-  nicht stabil. Peak jeweils exakt 40.108.032 B. Das belegt exakte begrenzte
-  Transport-Überlappung, aber noch keinen stabilen End-to-End-Speedup,
-  Modellqualität oder Frontier-Parität.
+  7,271718 s gegen 5,809757 s, also 1,251639× beziehungsweise 20,10 % weniger
+  Latenz. Der begrenzte Keep-alive-Pool sah bei 158 Requests sieben
+  Connection-Objekte, Peak zwei aktive Leases, danach null und wurde vor dem
+  Report geschlossen. Die einzelnen Netztrials streuen stark. Peak-Payload
+  jeweils exakt 40.108.032 B. Das belegt exakte begrenzte
+  Transport-Überlappung, aber noch keine Modellqualität oder Frontier-Parität.
 
 ## Hebel-Ranking
 
 1. **Lokale v0.7-Akzeptanz konservieren:** Frozen A1, vier Organe, Router,
    FERTIG-Guards, Artefakt-Digests und Wheel-Isolation gemeinsam golden halten.
-2. **DeepSeek-Inhaltsgate messen:** zuerst einen frischen MMLU-`off`-Lauf mit
-   offiziellem Encoding, festem Split und atomarem Proof-Schema v4; erst
-   danach gepaarte Graft-Ablationen unter gleicher Byte-/Cachebilanz.
+2. **DeepSeek-Inhaltsgate verbreitern:** die 3/4-`off`-Baseline steht; nach den
+   einzeln falsifizierten Transporthebeln folgen gepaarte Graft-Ablationen
+   unter identischer Runtime-, Byte- und Cachebilanz.
 3. **Breiteren Router-Kontrast messen:** deduplizierter Fachsplit mit gleichem
    Budget für CRSA, kausale Softmax, Roh-A1 und permutierte Labels.
 4. **WorldStream erst mit korrekter Zustandsverteilung neu öffnen:** echte

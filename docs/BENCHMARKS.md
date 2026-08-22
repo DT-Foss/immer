@@ -141,6 +141,22 @@ Der zweite Lauf hält 17,84 MB Attention-State und den Cache bei
 12.881.453.756 von 12.884.901.888 Bytes; 891 LRU-Evictions überschritten die
 Grenze nicht.
 
+Der erste vollständige Layerwise-Inhaltslauf über vier feste
+High-School-Geography-Items ist jetzt ebenfalls abgeschlossen:
+
+| Modus | Layer | korrekt | Accuracy | beobachtete Wandzeit | Urteil |
+|---|---:|---:|---:|---:|---|
+| `off` | 43/43 | 3/4 | 0,75 | 8.644,9 s | positiver Content-Smoke |
+
+Drei Entscheidungen stimmen, eine ist `B` statt erwartet `A`. Manifest,
+Resultat und finales 6.291.680-Byte-BF16-Objekt sind kreuzgebunden und
+selbstversiegelt; alle 16 Runtime-Quellen entsprechen Commit `d0a1dc4`. Der
+Receipt steht in
+`results/deepseek-v4-mmlu-off-4-exact-v4-window2x3-receipt.json`. Die Zeit ist
+nur `mtime - started_at` und ausdrücklich kein kryptografischer
+Performancebeleg; vier Items sind kein allgemeiner MMLU- oder
+Frontier-Paritätsclaim.
+
 Der konservative Expert-Prefetch `exact-router-window-2x3/v1` startet erst
 nach der offiziellen Routerentscheidung und plant alle ausgewählten Experts
 vor dem ersten Read. Er erlaubt zwei I/O-Worker, höchstens zwei Futures,
@@ -149,13 +165,18 @@ Offizielle 3-Expert-A/Bs auf MPS/BF16 ergaben:
 
 | Cache/Trials | aus | Fenster an | Speedup | Ausgabe | Peak |
 |---|---:|---:|---:|---|---:|
-| warm, 20 | 0,548137 s | 0,464826 s | 1,179230× | bitgleich | 40.108.032 B |
-| aus, 8 | 6,452119 s | 6,321257 s | 1,020702× | bitgleich | 40.108.032 B |
+| warm, 20 | 0,159458 s | 0,149599 s | 1,065901× | bitgleich | 40.108.032 B |
+| aus, 8 | 7,271718 s | 5,809757 s | 1,251639× | bitgleich | 40.108.032 B |
 
-Im No-Cache-Lauf sind das konservativ nur 2,03 % weniger mittlere Latenz bei
-320.864.256 gemessenen Quellbytes. Der Median liegt bei 6,482392 s gegen
-5,752504 s (1,126882×), aber ein 8,977372-s-Ausreißer im Fensterpfad zeigt,
-dass acht Netzwerk-Trials keinen stabilen Durchsatzclaim tragen. Alle Outputs
+Der aktuelle Remote-Pfad `requests-session-pool-2/v1` least exakt zwei
+voneinander getrennte Ein-Verbindungs-Sessions und liest Bodies ausschließlich
+begrenzt aus dem Stream. Im No-Cache-Lauf sind das 20,10 % weniger mittlere
+Latenz bei 320.864.256 gemessenen Quellbytes. 158 Requests sahen sieben
+Connection-Objekte, maximal zwei aktive Leases und danach null; Retries und
+Fehler blieben null, der Transport war vor der Versiegelung geschlossen. Die
+Netztrials streuen jedoch stark: `off` 4,42–11,67 s, `on` 4,09–7,94 s. Der
+frühere unabhängige urllib-Lauf bei Commit `d0a1dc4` erreichte 1,020702×;
+Vergleiche über Laufgrenzen bleiben netzwerkbedingt diagnostisch. Alle Outputs
 eines Laufs hatten denselben SHA-256; Futures, Peak und Fehlerpfade blieben
 innerhalb ihrer Gates. Die versiegelten Rohresultate stehen in
 `results/deepseek-v4-exact-prefetch-window-smoke.json` und
@@ -163,10 +184,9 @@ innerhalb ihrer Gates. Die versiegelten Rohresultate stehen in
 ausdrücklich keine Qualitäts-, MMLU- oder Frontier-Paritätsbelege; der reale
 Layerwise-Lauf entscheidet über den End-to-End-Nutzen.
 
-Der nächste inhaltliche Gate ist deshalb ein neuer, unverfälschter
-MMLU-`off`-Lauf mit offiziellem Encoding, festem Split und atomarem
-Proof-Schema v4. Erst nach einer validen Baseline folgen gepaarte
-CRSA-Ablationen.
+Der nächste Runtime-Kontrast ist Queue-Tiefe drei bei weiterhin nur zwei
+aktiven Reads, danach exakt benachbarte selektierte Ranges. Anschließend folgt
+ein gepaarter `off`/CRSA-Inhaltslauf auf derselben Runtime-Identität.
 
 ## 7. Lebensstrom-Verträge
 
@@ -186,14 +206,14 @@ Akzeptanzlauf neu gemessene Sprachmodell-Qualität.
 
 ## 8. Nächste belastbare Messungen
 
-1. Frischer MMLU-`off`-Content-Gate mit offiziellem Encoding, festem Split,
+1. Queue-Tiefe drei und benachbarte Range-Coalescings jeweils einzeln gegen
+   identische Outputs, Bytes, Peak und kalte Wandzeit falsifizieren.
+2. Gepaarter `off`/CRSA-Content-Gate mit offiziellem Encoding, festem Split,
    vollständigen Fehlerdenominatoren und atomarem Proof-Schema v4.
-2. Router auf einem größeren, nicht synthetisch eng getrennten Text/Math-Split,
+3. Router auf einem größeren, nicht synthetisch eng getrennten Text/Math-Split,
    erneut CRSA gegen kausale Softmax und Label-Placebos.
-3. Lebenskurve mit fixem held-out Byte-Stream: NLL vor/nach Surprise-Updates,
+4. Lebenskurve mit fixem held-out Byte-Stream: NLL vor/nach Surprise-Updates,
    Post-Sleep-Delta und State-Größe über die Zeit.
-4. Nach der validen `off`-Baseline gepaarte DeepSeek-Graft-Ablationen bei
-   gleicher Cache-/Bytebilanz.
 5. WorldStream-Budgetkurve nur mit einem neuen, kontextuell korrekten
    Retrievalmechanismus; kein Revival des statischen Value-Sketches.
 

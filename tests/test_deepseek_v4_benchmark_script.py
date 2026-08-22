@@ -370,11 +370,13 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
                 document["expert_prefetch_resident_limit_bytes"],
                 48 * 1024**2,
             )
+            self.assertEqual(document["source_transport_policy"], "local-range/v1")
+            self.assertEqual(document["source_transport_connection_limit"], 0)
             self.assertRegex(document["runtime_source_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(document["runtime_dependency_sha256"], r"^[0-9a-f]{64}$")
             self.assertEqual(
                 set(document["runtime_dependencies"]),
-                {"python", "torch", "numpy", "safetensors"},
+                {"python", "torch", "numpy", "requests", "safetensors"},
             )
             self.assertIn(
                 "immer/runtimes/deepseek_v4/benchmark.py",
