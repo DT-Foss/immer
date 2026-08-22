@@ -29,6 +29,7 @@ class CompositionRoot:
     exact_math: ExactCascade
     grounded_chat: Component | None = None
     life_stream: LifeStream | None = None
+    general_chat: Component | None = None
 
     @classmethod
     def build(
@@ -41,6 +42,7 @@ class CompositionRoot:
         s3_artifact_root: str | Path | None = None,
         fertig_root: str | Path | None = None,
         grounded_chat: Component | None = None,
+        general_chat: Component | None = None,
         fertig_state_dir: str | Path | None = None,
         fertig_graph: str | Path | None = None,
     ) -> CompositionRoot:
@@ -87,16 +89,17 @@ class CompositionRoot:
                 fertig_state_dir,
                 graph_path=fertig_graph,
             )
-        components: tuple[Component, ...] = (
-            (exact_math,)
-            if grounded_chat is None
-            else (exact_math, grounded_chat)
+        components = tuple(
+            component
+            for component in (exact_math, grounded_chat, general_chat)
+            if component is not None
         )
         runtime = ImmerRuntime(components)
         return cls(
             runtime=runtime,
             exact_math=exact_math,
             grounded_chat=grounded_chat,
+            general_chat=general_chat,
             life_stream=life_stream,
         )
 
@@ -122,6 +125,7 @@ def compose_runtime(
     s3_artifact_root: str | Path | None = None,
     fertig_root: str | Path | None = None,
     grounded_chat: Component | None = None,
+    general_chat: Component | None = None,
     fertig_state_dir: str | Path | None = None,
     fertig_graph: str | Path | None = None,
 ) -> CompositionRoot:
@@ -135,6 +139,7 @@ def compose_runtime(
         s3_artifact_root=s3_artifact_root,
         fertig_root=fertig_root,
         grounded_chat=grounded_chat,
+        general_chat=general_chat,
         fertig_state_dir=fertig_state_dir,
         fertig_graph=fertig_graph,
     )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from immer.composition import CompositionRoot
+from immer.composition import CompositionRoot, compose_runtime
 from immer.contracts import ExecutionStatus, Request, Result
 from immer.cognition.exact_cascade import ExactCascade
 
@@ -210,6 +210,46 @@ class CompositionRootTests(unittest.TestCase):
                 grounded_chat=grounded,
                 fertig_state_dir="state",
             )
+
+    def test_general_chat_is_injected_without_cross_capability_fallback(self) -> None:
+        s3 = StubBackend("s3", _abstain("s3"))
+        fertig = StubBackend("fertig", _ok("fertig", 2))
+        chat = StubBackend(
+            "deepseek-v4.chat",
+            Result(ExecutionStatus.OK, "deepseek-v4.chat", output="frontier"),
+        )
+        chat.capabilities = frozenset({"chat"})
+        grounded = StubBackend(
+            "fertig.grounded",
+            Result(ExecutionStatus.OK, "fertig.grounded", output="grounded"),
+        )
+        grounded.capabilities = frozenset({"grounded_chat"})
+
+        root = compose_runtime(
+            s3_arithmetic=s3,
+            fertig=fertig,
+            grounded_chat=grounded,
+            general_chat=chat,
+        )
+
+        self.assertIs(root.general_chat, chat)
+        self.assertEqual(
+            root.runtime.registry.capabilities(),
+            ("chat", "exact_math", "grounded_chat"),
+        )
+        self.assertIs(root.runtime.registry.get("exact_math"), root.exact_math)
+        self.assertIs(root.runtime.registry.get("chat"), chat)
+        self.assertIs(root.runtime.registry.get("grounded_chat"), grounded)
+        exact = root.dispatch("exact_math", "one plus one")
+        self.assertTrue(exact.ok)
+        self.assertFalse(chat.requests)
+        self.assertFalse(grounded.requests)
+        exact_request_counts = (len(s3.requests), len(fertig.requests))
+        general = root.dispatch("chat", "hello")
+        self.assertEqual(general.output, "frontier")
+        self.assertEqual(len(chat.requests), 1)
+        self.assertFalse(grounded.requests)
+        self.assertEqual((len(s3.requests), len(fertig.requests)), exact_request_counts)
 
 
 if __name__ == "__main__":
