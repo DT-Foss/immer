@@ -438,6 +438,9 @@ def _pager_projection(pager: DeepSeekWeightPager) -> dict[str, Any]:
         ),
         "expert_prefetch_transport_policy": metrics["expert_prefetch_transport_policy"],
         "expert_prefetch_workers": int(metrics["expert_prefetch_workers"]),
+        "expert_prefetch_active_read_limit": int(
+            metrics["expert_prefetch_active_read_limit"]
+        ),
         "expert_prefetch_max_outstanding_limit": int(
             metrics["expert_prefetch_max_outstanding_limit"]
         ),
@@ -681,12 +684,31 @@ def _run_with_source(
         raise SmokeError(
             "exact prefetch payload peak does not match the selected expert window"
         )
+    expected_outstanding = min(
+        len(bases), DeepSeekWeightPager.EXPERT_PREFETCH_MAX_OUTSTANDING
+    )
+    if (
+        on_metrics["expert_prefetch_max_outstanding"] != expected_outstanding
+        or on_metrics["expert_prefetch_active_read_limit"]
+        != DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS
+    ):
+        raise SmokeError("exact prefetch queue/active-read contract failed")
     summary = _summarize_trials(trials)
     runtime_sources = runtime_source_manifest()
     runtime_dependencies = runtime_dependency_versions()
     harness_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     source.close()
     source_metrics_after = source.metrics()
+    if (
+        int(source_metrics_after.get("transport_active_leases", 0)) != 0
+        or int(source_metrics_after.get("transport_peak_leases", 0))
+        > DeepSeekWeightPager.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
+    ):
+        raise SmokeError("source transport lease bound failed")
+    if str(source_metrics_after.get("transport_policy", "")).startswith(
+        "requests-session-pool-"
+    ) and not bool(source_metrics_after.get("transport_closed")):
+        raise SmokeError("persistent source transport did not close")
     report = _seal_report(
         {
             "schema": RESULT_SCHEMA,
@@ -761,6 +783,9 @@ def _run_with_source(
                     ),
                     "expert_prefetch_workers": (
                         DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS
+                    ),
+                    "expert_prefetch_active_read_limit": (
+                        DeepSeekWeightPager.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
                     ),
                     "expert_prefetch_max_outstanding": (
                         DeepSeekWeightPager.EXPERT_PREFETCH_MAX_OUTSTANDING

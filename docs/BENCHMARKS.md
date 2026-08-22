@@ -157,24 +157,25 @@ nur `mtime - started_at` und ausdrücklich kein kryptografischer
 Performancebeleg; vier Items sind kein allgemeiner MMLU- oder
 Frontier-Paritätsclaim.
 
-Der konservative Expert-Prefetch `exact-router-window-2x3/v1` startet erst
+Der konservative Expert-Prefetch `exact-router-window-q3-a2/v2` startet erst
 nach der offiziellen Routerentscheidung und plant alle ausgewählten Experts
-vor dem ersten Read. Er erlaubt zwei I/O-Worker, höchstens zwei Futures,
-drei residente/inflight Experts, 14 MiB pro Expert und 48 MiB insgesamt.
+vor dem ersten Read. Er reiht höchstens drei Futures sofort ein, lässt durch
+zwei I/O-Worker aber höchstens zwei Reads gleichzeitig laufen und hält drei
+residente/inflight Experts, 14 MiB pro Expert und 48 MiB insgesamt.
 Offizielle 3-Expert-A/Bs auf MPS/BF16 ergaben:
 
 | Cache/Trials | aus | Fenster an | Speedup | Ausgabe | Peak |
 |---|---:|---:|---:|---|---:|
-| warm, 20 | 0,159458 s | 0,149599 s | 1,065901× | bitgleich | 40.108.032 B |
-| aus, 8 | 7,271718 s | 5,809757 s | 1,251639× | bitgleich | 40.108.032 B |
+| warm, 20 | 0,172745 s | 0,160813 s | 1,074197× | bitgleich | 40.108.032 B |
+| aus, 8 | 7,250212 s | 5,244157 s | 1,382532× | bitgleich | 40.108.032 B |
 
 Der aktuelle Remote-Pfad `requests-session-pool-2/v1` least exakt zwei
 voneinander getrennte Ein-Verbindungs-Sessions und liest Bodies ausschließlich
-begrenzt aus dem Stream. Im No-Cache-Lauf sind das 20,10 % weniger mittlere
-Latenz bei 320.864.256 gemessenen Quellbytes. 158 Requests sahen sieben
+begrenzt aus dem Stream. Im No-Cache-Lauf sind das 27,67 % weniger mittlere
+Latenz bei 320.864.256 gemessenen Quellbytes. 158 Requests sahen sechs
 Connection-Objekte, maximal zwei aktive Leases und danach null; Retries und
 Fehler blieben null, der Transport war vor der Versiegelung geschlossen. Die
-Netztrials streuen jedoch stark: `off` 4,42–11,67 s, `on` 4,09–7,94 s. Der
+Netztrials streuen jedoch stark: `off` 4,62–11,53 s, `on` 3,63–6,36 s. Der
 frühere unabhängige urllib-Lauf bei Commit `d0a1dc4` erreichte 1,020702×;
 Vergleiche über Laufgrenzen bleiben netzwerkbedingt diagnostisch. Alle Outputs
 eines Laufs hatten denselben SHA-256; Futures, Peak und Fehlerpfade blieben
@@ -184,9 +185,10 @@ innerhalb ihrer Gates. Die versiegelten Rohresultate stehen in
 ausdrücklich keine Qualitäts-, MMLU- oder Frontier-Paritätsbelege; der reale
 Layerwise-Lauf entscheidet über den End-to-End-Nutzen.
 
-Der nächste Runtime-Kontrast ist Queue-Tiefe drei bei weiterhin nur zwei
-aktiven Reads, danach exakt benachbarte selektierte Ranges. Anschließend folgt
-ein gepaarter `off`/CRSA-Inhaltslauf auf derselben Runtime-Identität.
+Der q3/a2-Pfad ist gegen `off` positiv; sein marginaler Vorteil gegenüber q2
+ist wegen getrennter Netzläufe noch nur diagnostisch. Der nächste isolierte
+Kontrast bündelt exakt benachbarte selektierte Ranges. Anschließend folgt ein
+gepaarter `off`/CRSA-Inhaltslauf auf derselben Runtime-Identität.
 
 ## 7. Lebensstrom-Verträge
 

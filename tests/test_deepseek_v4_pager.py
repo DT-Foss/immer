@@ -351,7 +351,7 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         self.assertEqual(fallback_source.raw_calls, [])
         self.assertEqual(pager.metrics()["linear_calls"], 3)
 
-    def test_exact_window_runs_two_not_three_and_reverse_completion_is_ordered(
+    def test_exact_window_queues_three_runs_two_and_reverse_completion_is_ordered(
         self,
     ) -> None:
         import torch
@@ -371,6 +371,8 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         # Expert 1 may finish first, but ordered consumption still blocks on 0.
         source.release[bases[1]].set()
         self.assertTrue(source.completed[bases[1]].wait(timeout=2))
+        self.assertTrue(source.started[bases[2]].wait(timeout=2))
+        self.assertEqual(source.max_active, 2)
         entered = threading.Event()
         consumed = threading.Event()
         payloads: list[object] = []
@@ -388,7 +390,6 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         self.assertTrue(consumed.wait(timeout=2))
         consumer.join(timeout=1)
         self.assertFalse(consumer.is_alive())
-        self.assertTrue(source.started[bases[2]].wait(timeout=2))
 
         x = torch.zeros((1, 128), dtype=torch.bfloat16)
         outputs = [pager.expert(x, bases[0], prefetched_payload=payloads[0])]
@@ -408,9 +409,10 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         self.assertEqual(set(source.find_threads), {source.main_thread})
         self.assertNotIn(source.main_thread, set(source.raw_threads))
         metrics = pager.metrics()
-        self.assertEqual(metrics["expert_prefetch_max_outstanding"], 2)
+        self.assertEqual(metrics["expert_prefetch_max_outstanding"], 3)
         self.assertEqual(metrics["expert_prefetch_peak_bytes"], 3 * 26112)
         self.assertEqual(metrics["expert_prefetch_workers"], 2)
+        self.assertEqual(metrics["expert_prefetch_active_read_limit"], 2)
         self.assertEqual(
             metrics["expert_prefetch_transport_policy"],
             "streamer-exact-range/v1",

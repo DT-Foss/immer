@@ -334,7 +334,7 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
         self.assertEqual(off_metrics["expert_prefetch_policy"], "disabled")
         self.assertEqual(
             on_metrics["expert_prefetch_policy"],
-            "exact-router-window-2x3/v1",
+            "exact-router-window-q3-a2/v2",
         )
         self.assertEqual(on_metrics["expert_prefetch_submitted"], 2)
         self.assertEqual(on_metrics["expert_prefetch_consumed"], 2)

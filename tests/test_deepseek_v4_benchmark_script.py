@@ -353,7 +353,7 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             )
             self.assertEqual(
                 document["expert_prefetch_policy"],
-                "exact-router-window-2x3/v1",
+                "exact-router-window-q3-a2/v2",
             )
             self.assertEqual(
                 document["expert_prefetch_payload_limit_bytes"],
@@ -364,7 +364,8 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
                 "streamer-exact-range/v1",
             )
             self.assertEqual(document["expert_prefetch_workers"], 2)
-            self.assertEqual(document["expert_prefetch_max_outstanding"], 2)
+            self.assertEqual(document["expert_prefetch_active_read_limit"], 2)
+            self.assertEqual(document["expert_prefetch_max_outstanding"], 3)
             self.assertEqual(document["expert_prefetch_max_experts"], 3)
             self.assertEqual(
                 document["expert_prefetch_resident_limit_bytes"],

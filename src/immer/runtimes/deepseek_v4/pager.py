@@ -136,10 +136,11 @@ class DeepSeekWeightPager:
     """
 
     QUANTIZED_ACCUMULATION_POLICY = "mx-block-scaled-fp32/v1"
-    EXPERT_PREFETCH_POLICY = "exact-router-window-2x3/v1"
+    EXPERT_PREFETCH_POLICY = "exact-router-window-q3-a2/v2"
     EXPERT_PREFETCH_TRANSPORT_POLICY = "streamer-exact-range/v1"
     EXPERT_PREFETCH_WORKERS = 2
-    EXPERT_PREFETCH_MAX_OUTSTANDING = 2
+    EXPERT_PREFETCH_ACTIVE_READ_LIMIT = 2
+    EXPERT_PREFETCH_MAX_OUTSTANDING = 3
     EXPERT_PREFETCH_MAX_EXPERTS = 3
     EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES = 48 * 1024**2
     EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES = 14 * 1024**2
@@ -659,7 +660,7 @@ class DeepSeekWeightPager:
             self._active_prefetch_window = None
             if self._prefetch_executor is executor:
                 self._prefetch_executor = None
-            if len(draining) > self.EXPERT_PREFETCH_MAX_OUTSTANDING:
+            if len(draining) > self.EXPERT_PREFETCH_ACTIVE_READ_LIMIT:
                 raise DeepSeekPagerError("expert prefetch drain bound was exceeded")
             self._draining_prefetch.update(draining)
             if draining:
@@ -1576,6 +1577,9 @@ class DeepSeekWeightPager:
                 self.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
             ),
             "expert_prefetch_workers": self.EXPERT_PREFETCH_WORKERS,
+            "expert_prefetch_active_read_limit": (
+                self.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
+            ),
             "expert_prefetch_max_outstanding_limit": (
                 self.EXPERT_PREFETCH_MAX_OUTSTANDING
             ),

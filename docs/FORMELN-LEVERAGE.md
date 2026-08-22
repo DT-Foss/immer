@@ -18,9 +18,10 @@ Bytebudget, atomaren Cache und SHA-geprüften Resume. Der Streamer instanziiert
 kein Donormodell und ist nicht heimlich mit dem Antwortpfad verbunden.
 
 Der DeepSeek-Hauptpfad nutzt dieselbe Selektivität jetzt konservativ als
-`exact-router-window-2x3/v1`: Erst der offizielle Router entscheidet, danach
-lesen zwei Worker höchstens zwei vorab vollständig geplante Expert-Ranges
-parallel. Maximal drei Experts beziehungsweise 48 MiB Rohpayload sind
+`exact-router-window-q3-a2/v2`: Erst der offizielle Router entscheidet, danach
+werden höchstens drei vorab vollständig geplante Expert-Futures eingereiht;
+zwei Worker lesen weiterhin höchstens zwei Ranges parallel. Maximal drei
+Experts beziehungsweise 48 MiB Rohpayload sind
 resident/inflight, jeder einzelne bleibt unter 14 MiB. Konsumreihenfolge,
 Werte und serielle FP32-Akkumulation bleiben unverändert.
 
@@ -92,10 +93,10 @@ Fähigkeit, keine nachträgliche Optimierung am GSM8K-Split.
   Content-Smoke, noch kein allgemeiner MMLU- oder Frontier-Claim.
 - **Exakter Expert-Transport:** offizielle 3-Expert-MPS-BF16-A/Bs sind
   bitgleich. Warm, nach zwei symmetrischen Warmups und 20 alternierenden
-  Trials: 0,159458 s ohne gegen 0,149599 s mit Fenster, also 1,065901×.
+  Trials: 0,172745 s ohne gegen 0,160813 s mit Fenster, also 1,074197×.
   Ohne Range-Cache, nach einem Warmup und 8 alternierenden Trials:
-  7,271718 s gegen 5,809757 s, also 1,251639× beziehungsweise 20,10 % weniger
-  Latenz. Der begrenzte Keep-alive-Pool sah bei 158 Requests sieben
+  7,250212 s gegen 5,244157 s, also 1,382532× beziehungsweise 27,67 % weniger
+  Latenz. Der begrenzte Keep-alive-Pool sah bei 158 Requests sechs
   Connection-Objekte, Peak zwei aktive Leases, danach null und wurde vor dem
   Report geschlossen. Die einzelnen Netztrials streuen stark. Peak-Payload
   jeweils exakt 40.108.032 B. Das belegt exakte begrenzte

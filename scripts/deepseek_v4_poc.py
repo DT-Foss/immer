@@ -323,6 +323,9 @@ def _provenance(
                 DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
             ),
             "expert_prefetch_workers": DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS,
+            "expert_prefetch_active_read_limit": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
+            ),
             "expert_prefetch_max_outstanding": (
                 DeepSeekWeightPager.EXPERT_PREFETCH_MAX_OUTSTANDING
             ),

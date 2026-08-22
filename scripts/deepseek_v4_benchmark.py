@@ -1443,6 +1443,9 @@ def _build_report(
         ],
         "expert_prefetch_transport_policy": header["expert_prefetch_transport_policy"],
         "expert_prefetch_workers": header["expert_prefetch_workers"],
+        "expert_prefetch_active_read_limit": header[
+            "expert_prefetch_active_read_limit"
+        ],
         "expert_prefetch_max_outstanding": header["expert_prefetch_max_outstanding"],
         "expert_prefetch_max_experts": header["expert_prefetch_max_experts"],
         "expert_prefetch_resident_limit_bytes": header[
@@ -1645,6 +1648,9 @@ def _run_with_source(
                 DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
             ),
             "expert_prefetch_workers": DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS,
+            "expert_prefetch_active_read_limit": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
+            ),
             "expert_prefetch_max_outstanding": (
                 DeepSeekWeightPager.EXPERT_PREFETCH_MAX_OUTSTANDING
             ),
@@ -1712,6 +1718,9 @@ def _run_with_source(
             DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
         ),
         "expert_prefetch_workers": DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS,
+        "expert_prefetch_active_read_limit": (
+            DeepSeekWeightPager.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
+        ),
         "expert_prefetch_max_outstanding": (
             DeepSeekWeightPager.EXPERT_PREFETCH_MAX_OUTSTANDING
         ),
@@ -1784,6 +1793,9 @@ def _run_with_source(
             DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
         ),
         "expert_prefetch_workers": DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS,
+        "expert_prefetch_active_read_limit": (
+            DeepSeekWeightPager.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
+        ),
         "expert_prefetch_max_outstanding": (
             DeepSeekWeightPager.EXPERT_PREFETCH_MAX_OUTSTANDING
         ),

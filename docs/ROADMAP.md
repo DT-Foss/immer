@@ -30,15 +30,16 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
   CLI-, Streamer-, HF-Range-, Snapshot- und Dependency-Identität; getrennt
   davon ein manipulationssichtbares Hash-Chain-Journal v2 für item-major
   Benchmarks.
-- [x] Exaktes Routed-Expert-Prefetch `exact-router-window-2x3/v1`: zwei
-  I/O-Worker, höchstens zwei Futures und drei residente/inflight Experts,
-  14 MiB pro Expert, 48 MiB Gesamtgrenze und bitgleiche A/B-Ausgabe.
+- [x] Exaktes Routed-Expert-Prefetch `exact-router-window-q3-a2/v2`: drei
+  sofort eingereihte Futures, höchstens zwei aktive I/O-Worker und drei
+  residente/inflight Experts, 14 MiB pro Expert, 48 MiB Gesamtgrenze und
+  bitgleiche A/B-Ausgabe.
 - [x] Erster vollständiger DeepSeek-Inhaltslauf: 43/43 Layer, vier feste
   Geography-Items, `off` 3/4 korrekt; Resultat, Identität und finales
   BF16-Objekt versiegelt an Commit `d0a1dc4`.
 - [x] Begrenzter Remote-Transport `requests-session-pool-2/v1`: zwei geleaste
   Ein-Verbindungs-Sessions, bounded stream reads, deterministischer Close und
-  1,251639× im aktuellen bitgleichen No-Cache-3-Expert-A/B.
+  1,382532× im aktuellen bitgleichen No-Cache-3-Expert-A/B.
 - [x] FERTIG-GSM8K-Vollsplit mit Item-Provenienz und hartem Wrong-Gate:
   1.060 korrekt, 259 abstinent, 0 falsch, 0 Fehler.
 - [x] FERTIG-Grammatik für endliche affine Rekurrenzen mit exaktem
@@ -49,10 +50,10 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
 
 ### 1. DeepSeek-V4-Transport v5
 
-Nächste exakte Hebel werden einzeln falsifiziert: zuerst drei sofort
-eingereihte Expert-Tickets bei weiterhin höchstens zwei aktiven Reads und
-40.108.032 Byte Payload, danach nur tatsächlich selektierte physisch
-benachbarte Ranges. Outputbits, gelesene Nutzbytes und serielle
+Der q3/a2-Pfad ist gegen `off` positiv; sein marginaler Vorteil gegenüber q2
+ist wegen getrennter Netzläufe noch nur diagnostisch. Als Nächstes werden nur
+tatsächlich selektierte physisch benachbarte Ranges gebündelt. Outputbits,
+gelesene Nutzbytes, Zwei-Read-Aktivgrenze und serielle
 FP32-Akkumulationsreihenfolge müssen identisch bleiben.
 
 ### 2. DeepSeek-V4-Inhaltsgate

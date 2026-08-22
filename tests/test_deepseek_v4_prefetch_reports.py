@@ -43,6 +43,12 @@ class DeepSeekV4PrefetchReportsTests(unittest.TestCase):
                 self.assertEqual(provenance["harness_sha256"], harness_sha256)
                 execution = provenance["execution"]
                 self.assertEqual(
+                    execution["expert_prefetch_policy"],
+                    "exact-router-window-q3-a2/v2",
+                )
+                self.assertEqual(execution["expert_prefetch_active_read_limit"], 2)
+                self.assertEqual(execution["expert_prefetch_max_outstanding"], 3)
+                self.assertEqual(
                     execution["source_transport_policy"],
                     "requests-session-pool-2/v1",
                 )

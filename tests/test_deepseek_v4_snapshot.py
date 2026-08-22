@@ -250,7 +250,7 @@ class DeepSeekV4SnapshotTests(unittest.TestCase):
             )
             self.assertEqual(
                 manifest["body"]["identity"]["execution"]["expert_prefetch_policy"],
-                "exact-router-window-2x3/v1",
+                "exact-router-window-q3-a2/v2",
             )
             execution = manifest["body"]["identity"]["execution"]
             self.assertEqual(
@@ -258,7 +258,8 @@ class DeepSeekV4SnapshotTests(unittest.TestCase):
                 "streamer-exact-range/v1",
             )
             self.assertEqual(execution["expert_prefetch_workers"], 2)
-            self.assertEqual(execution["expert_prefetch_max_outstanding"], 2)
+            self.assertEqual(execution["expert_prefetch_active_read_limit"], 2)
+            self.assertEqual(execution["expert_prefetch_max_outstanding"], 3)
             self.assertEqual(execution["expert_prefetch_max_experts"], 3)
             self.assertEqual(
                 execution["expert_prefetch_resident_limit_bytes"],

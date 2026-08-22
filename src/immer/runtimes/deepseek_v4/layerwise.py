@@ -845,6 +845,9 @@ class LayerwiseScorer:
                     model.pager.EXPERT_PREFETCH_TRANSPORT_POLICY
                 ),
                 "expert_prefetch_workers": model.pager.EXPERT_PREFETCH_WORKERS,
+                "expert_prefetch_active_read_limit": (
+                    model.pager.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
+                ),
                 "expert_prefetch_max_outstanding": (
                     model.pager.EXPERT_PREFETCH_MAX_OUTSTANDING
                 ),

@@ -605,6 +605,9 @@ class StreamedDeepSeekV4:
                     self.pager.EXPERT_PREFETCH_TRANSPORT_POLICY
                 ),
                 "expert_prefetch_workers": self.pager.EXPERT_PREFETCH_WORKERS,
+                "expert_prefetch_active_read_limit": (
+                    self.pager.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
+                ),
                 "expert_prefetch_max_outstanding": (
                     self.pager.EXPERT_PREFETCH_MAX_OUTSTANDING
                 ),
