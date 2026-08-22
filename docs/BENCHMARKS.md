@@ -1,107 +1,110 @@
-# BENCHMARKS — Mess-Suite für den StreamingNoPELM-Organismus
+# Benchmarks
 
-Stand: 2026-08-21 · Zielgruppe: HF-Model-Card `DT-Foss/immer-organism-v0` + CI.
-Prinzip: jede Zahl reproduzierbar (Seed, threads=1, Gewichte eingefroren während
-Eval), jede Zahl landet in `results/benchmark.json` (Schema unten).
+Stand: 2026-08-22. Nur Werte mit einem heute ausführbaren Reproduktionspfad
+gelten als aktueller IMMER-Befund. Historische Forschungsanker werden nicht
+als Runtime-Golden ausgegeben.
 
-## 1. Perplexity / NLL
+## 1. Lokale Akzeptanz
 
-Byte-Vokabular (257) macht Token-PPL über Corpora unvergleichlich. Primärmaß
-ist **bpb** (bits pro UTF-8-Byte = NLL_nats / ln 2); NLL in nats/byte läuft
-mit. Word-PPL nur optional, mit angegebenem bytes/token-Faktor.
-
-| Corpus | Rolle | Protokoll |
-|---|---|---|
-| Wikitext-2 heldout | Projekt-Anker (8,6656 nats) | Single Pass, kein Fenster |
-| TinyStories test | offener Zweitsplit, einfach | Single Pass |
-| Simple Wiki test | offener Zweitsplit, enzyklopädisch | Single Pass |
-
-Protokoll je Corpus: Lernen aus (`eval_mode`, keine Gradienten), Zustand
-einmal auf Null, ganzer Split als ein Strom, Mittel über alle Bytes. Das
-O(1)-State-Design macht Fenster-Tricks (Sliding-Window-PPL à la GPT-2-Eval)
-unnötig — ein Pass, eine Zahl, exakt kausal. Zu melden: nats/byte, bpb,
-Bytes gesamt, Dauer, torch-Version.
-
-## 2. Streamende Metriken (Alleinstellungsmerkmal)
-
-Standardisierte Definitionen, alle aus `LearningStream.metrics()` plus
-Sidecar (`adapter.snapshot/restore`):
-
-1. **Loss-over-life-Kurve**: NLL auf fixem Probe-Set (WT2-heldout-Ausschnitt,
-   1 MB, eingefroren) bei Lebens-Marken 10³/10⁴/10⁵/10⁶ Tokens; x-Achse
-   log(tokens), gelernt wird zwischen Marken weiter. Artefakt:
-   `loss_curve.jsonl`.
-2. **Post-Sleep-Delta**: ΔNLL(Probe) nach minus vor `sleep()`. Zielband
-   |Δ| ≤ 0,01 nats (Konsolidierung ohne Drift); zusätzlich `replayed`,
-   `sleeps`. Ein positives ΔNLL (Schlechterwerb) ist ein Fail.
-3. **Surprise-Rate**: surprises und updates pro 10⁶ gelebte Tokens
-   (Quantil-Gate window=64, q=0,50 im Report mitangeben).
-4. **Resume-Exaktheit**: Snapshot → Restore → gleicher Textstrom → Logits
-   bitidentisch (`torch.equal`). Metrik: max_abs_diff = 0,0, bool.
-5. **Migrations-Verlust = 0**: Export (ckpt → safetensors → Reload,
-   andere Maschine) → Gewichtsdigest gleich, WT2-NLL float-exakt gleich,
-   Organ-SHA-256 laut Manifest unverändert.
-6. **State-Größe**: Sidecar-Bytes bei 10³ vs 10⁶ gelebten Tokens — flach
-   (O(1)-Nachweis). Kurve gehört in die Model-Card.
-
-## 3. Fähigkeits-Tests
-
-Organ-Batterie (n=100 frische Aufgaben je Task, argmax, Accuracy):
-
-| Task | Anchor |
-|---|---|
-| twostep | 1,000 held-out (Organ-Transfer) |
-| mul2x2 | gemessen, zu kuratieren als Anchor |
-| wordlen | Kaskade 0,875 @ 8 Calls als Referenz |
-
-Je Task zwei Zahlen: unmontiert (nacktes LM) vs montiert (Organ <1 ms
-Cold-Load). Differenz = Transfer-Effekt, Kernverkaufspunkt der Organe.
-
-Systemtest GSM8K via FERTIG: 152-Aufgaben-Subset, Route → Solver, Antwort
-exakt. Melden: solve_rate, abstain_rate, falsche Antworten (= 0 laut Anker
-152/152).
-
-## 4. Vergleichsanker
-
-Jede Kennzahl gegen drei Zeilen derselben Architektur desselben Seeds:
-
-- **A nacktes Model ohne Leben**: Gewichte wie shipped, kein Online-Lernen.
-  Isoliert, was das Leben bringt: ΔNLL(WT2) nach X Tokens, ΔTask-Accuracy.
-- **B Modell ohne Organe**: A + gelebt, aber OrganBank leer. Isoliert den
-  Organ-Beitrag auf der Batterie.
-- **C Trigramm-Floor**: `_wikitext_lm` aus FERTIG-bench als Unteranker für
-  bpb — zeigt sofort, ob die 1,7M-Parameter lernen.
-
-Card-Tabelle: Zeilen = Metriken, Spalten = Organismus / A / B / C.
-
-## 5. Schema `results/benchmark.json`
-
-```json
-{
-  "schema": "immer.benchmark/v1",
-  "created_utc": "2026-08-21T00:00:00Z",
-  "git_sha": "<sha>",
-  "model": {"d_model": 64, "n_layers": 2, "params": 1700000, "seed": 42},
-  "environment": {"torch": "<version>", "threads": 1},
-  "perplexity": [{"corpus": "wt2_heldout", "bytes": 0, "nll_nats_per_byte": 8.6656,
-                   "bpb": 12.5, "seconds": 0}],
-  "streaming": {
-    "loss_curve": "loss_curve.jsonl",
-    "post_sleep_delta_nats": 0.0,
-    "surprises_per_mtok": 0.0, "updates_per_mtok": 0.0,
-    "resume_exact": true, "resume_max_abs_diff": 0.0,
-    "migration_loss_zero": true,
-    "state_bytes_at_1e3": 0, "state_bytes_at_1e6": 0},
-  "capabilities": [{"task": "twostep", "n": 100, "acc_unmounted": 0.0,
-                     "acc_mounted": 1.0, "cold_load_ms": 0.9}],
-  "system": {"suite": "gsm8k_fertig", "n": 152, "solve_rate": 1.0,
-              "abstain_rate": 0.0, "wrong_answers": 0},
-  "baselines": {"no_life_bpb": 0.0, "no_organs_twostep_acc": 0.0,
-                 "trigram_bpb": 0.0}
-}
+```bash
+PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests
+PYTHONPATH=src python -m immer doctor --deep
+PYTHONPATH=src python -m immer eval
 ```
 
-CI-Regeln: JSON validiert gegen das Schema; Golden-Werte (twostep 1,000,
-NLL 8,6656 ± 0,001, resume_exact=true, wrong_answers=0) müssen reproduzieren;
-Abweichung bricht den Build. Jede Model-Card-Zahl stammt aus genau dieser
-Datei.
+`immer eval` lädt den Frozen-A1-Host und die benötigten Organe kalt, prüft alle
+Digests und führt die 152 kanonischen SHIP-v6-Fälle aus. Passkriterium:
+
+- `correct == cases == 152`;
+- `route_correct == cases == 152`;
+- `no_training is true`;
+- Host-Digest entspricht dem Manifest;
+- Router-Digest entspricht dem persistierten Head.
+
+Die Suite besteht aus Addition/Subtraktion, kleinem multiplikativem
+Log-Carrier, `z3sum` und dem kristallisierten Dezimalpfad. Sie ist kein
+GSM8K-Subset.
+
+## 2. Routermessung
+
+```bash
+PYTHONPATH=src python scripts/crsa_route_eval.py \
+  --router-out /tmp/immer-crsa-router-repro.json
+cmp /tmp/immer-crsa-router-repro.json manifests/crsa_router_v1.json
+```
+
+Protokoll:
+
+- Frozen A1, kontextuelle Layer-0-Scan-Zustände;
+- feste Rollen `2 Local + 1 Balanced + 1 Free`;
+- Feature `[raw_last | role_complete_last]`;
+- 64 Arithmetik- und 64 Text-Kalibrationsfälle;
+- alle 48 Arithmetik-Duplikate gegenüber dem Evalsplit entfernt;
+- 152 Arithmetik- plus 30 Text-Evalfälle;
+- Ridge `10.0`, Seed `7`;
+- 32 Kontrollen mit permutierten Kalibrationslabels;
+- Roh-A1- und kausale-Softmax-Ablation.
+
+| Pfad | Balanced Accuracy |
+|---|---:|
+| CRSA-Residual | 1,000000 |
+| Roh-A1 | 0,983333 |
+| kausale Softmax | 1,000000 |
+| Label-Placebo, Mittel | 0,510328 |
+| Label-Placebo, Maximum | 0,748026 |
+
+Urteil: Kontextsignal positiv; CRSA-spezifischer Vorteil gegenüber Softmax
+nicht gezeigt.
+
+## 3. Negativkontrollen
+
+Die Resultate in `results/router_v2_stage1.json` und
+`results/router_v2_stage2.json` bleiben Teil der Beweiskette:
+
+- Stage 1: Themenstruktur liegt messbar vor allem in mittleren Donor-Layern;
+- Stage 2: statisches Embedding-Mittel plus Value-Sketch erzielt 24 % gegen
+  32 % Placebo bei 138 KB/Frage;
+- Konsequenz: Stage 2 ist falsifiziert und nicht im Answer-Pfad aktiv.
+
+Ein negatives Ergebnis darf nur durch ein neues, vorab benanntes Protokoll mit
+passendem Eingabeverteilungsmechanismus erneut geöffnet werden.
+
+## 4. Streaming-Verträge
+
+Die automatisierte Contract-Suite misst keine Modellqualität, sondern
+Sicherheits- und Ressourceninvarianten:
+
+- Budget wird vor dem Lesen reserviert und niemals überschritten;
+- lokale und HTTP-Ranges liefern exakt die angeforderte Bytezahl;
+- Cache-Resume bewegt null Quellbytes und prüft SHA-256;
+- beschädigte Caches werden nicht still neu geholt;
+- BF16-Zeilen werden deterministisch dekodiert;
+- `rows_torch()` erzeugt einen gradientenfreien Tensor, ohne ein Donormodell
+  zu konstruieren.
+
+## 5. Lebensstrom-Verträge
+
+Die Tests des O1-Lebensstroms prüfen:
+
+- gleicher Seed plus gleiche Erfahrung ergibt gleichen Loss;
+- Snapshot/Restore setzt Leben und Zustände fort;
+- nicht überraschende Chunks tragen keinen Autograd-Graph weiter;
+- überraschende Chunks werden aus demselben detached Eingangszustand neu
+  gerechnet und aktualisieren Parameter;
+- Plastizitätszustand und Replay-Puffer überleben Neustarts;
+- `/sleep` replayt und leert den Puffer.
+
+Das ist noch kein veröffentlichter Milliarden-Token-Loss-Report. NLL 8,6656
+bleibt ein historischer Host-Anker im SHIP-Manifest, nicht eine in diesem
+Akzeptanzlauf neu gemessene Sprachmodell-Qualität.
+
+## 6. Nächste belastbare Messungen
+
+1. Router auf einem größeren, nicht synthetisch eng getrennten Text/Math-Split,
+   erneut CRSA gegen kausale Softmax und Label-Placebos.
+2. Lebenskurve mit fixem held-out Byte-Stream: NLL vor/nach Surprise-Updates,
+   Post-Sleep-Delta und State-Größe über die Zeit.
+3. FERTIG-Systemsplit mit expliziten Familien: korrekte Antwort, sichere
+   Abstinenz, falsche Antwort. Falsche Antworten sind der harte Fehler.
+4. WorldStream-Budgetkurve nur mit einem neuen, kontextuell korrekten
+   Retrievalmechanismus; kein Revival des statischen Value-Sketches.

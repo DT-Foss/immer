@@ -12,8 +12,18 @@ except ImportError:
 from immer.runtimes.o1_state.adapter import O1StateStream, is_available
 
 
-@unittest.skipIf(torch is None or not is_available(), "torch or vendored o1-state missing")
+@unittest.skipIf(torch is None or not is_available(), "torch or production o1-state missing")
 class O1StateStreamTests(unittest.TestCase):
+    def test_construction_is_local_to_its_rng_and_backend_settings(self) -> None:
+        torch.manual_seed(991)
+        rng_state = torch.random.get_rng_state().clone()
+        mps_predicate = torch.backends.mps.is_available
+        thread_count = torch.get_num_threads()
+        O1StateStream(seed=17)
+        self.assertTrue(torch.equal(torch.random.get_rng_state(), rng_state))
+        self.assertIs(torch.backends.mps.is_available, mps_predicate)
+        self.assertEqual(torch.get_num_threads(), thread_count)
+
     def test_observe_streams_tokens_and_updates_ema(self) -> None:
         stream = O1StateStream()
         self.assertEqual(stream.tokens, 0)

@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
+import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,34 +24,52 @@ class Metrics:
         self.counters: dict[str, int] = {}
         self.gauges_override: dict[str, Any] = {}
         self.started_at = time.time()
+        self._lock = threading.RLock()
 
     def bump(self, name: str, amount: int = 1) -> None:
-        self.counters[name] = self.counters.get(name, 0) + amount
+        with self._lock:
+            self.counters[name] = self.counters.get(name, 0) + amount
 
     def emit_gauge(self, name: str, value: Any) -> None:
-        self.gauges_override[name] = value
+        with self._lock:
+            self.gauges_override[name] = value
 
     def snapshot(self, gauges: dict[str, Any] | None = None) -> dict[str, Any]:
-        merged = dict(self.gauges_override)
-        merged.update(gauges or {})
-        return {
-            "ts": time.time(),
-            "uptime_s": round(time.time() - self.started_at, 1),
-            "counters": dict(self.counters),
-            "gauges": merged,
-        }
+        with self._lock:
+            merged = dict(self.gauges_override)
+            merged.update(gauges or {})
+            return {
+                "ts": time.time(),
+                "uptime_s": round(time.time() - self.started_at, 1),
+                "counters": dict(self.counters),
+                "gauges": merged,
+            }
 
     def emit(self, gauges: dict[str, Any] | None = None) -> dict[str, Any]:
-        document = self.snapshot(gauges)
-        self.status_path.parent.mkdir(parents=True, exist_ok=True)
-        self.status_path.write_text(
-            json.dumps(document, ensure_ascii=False, sort_keys=True), encoding="utf-8"
-        )
-        if self.jsonl_path is not None:
-            self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.jsonl_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(document, ensure_ascii=False) + "\n")
-        return document
+        with self._lock:
+            document = self.snapshot(gauges)
+            self.status_path.parent.mkdir(parents=True, exist_ok=True)
+            encoded = json.dumps(document, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            fd, temporary = tempfile.mkstemp(
+                dir=self.status_path.parent,
+                prefix=f".{self.status_path.name}.",
+                suffix=".tmp",
+            )
+            temporary_path = Path(temporary)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_path, self.status_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+            if self.jsonl_path is not None:
+                self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.jsonl_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(document, ensure_ascii=False) + "\n")
+                    handle.flush()
+            return document
 
 
 _DARK_HTML = """<!doctype html>

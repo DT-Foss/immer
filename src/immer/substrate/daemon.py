@@ -9,6 +9,8 @@ NOT decide when any of this happens — it makes it possible.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -40,7 +42,21 @@ class LifeStatePort:
     def save(self, state: Mapping[str, Any]) -> Path:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         document = {"saved_at": time.time(), "state": dict(state)}
-        self.path.write_text(json.dumps(document, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        encoded = json.dumps(document, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        fd, temporary = tempfile.mkstemp(
+            dir=self.path.parent,
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+        )
+        temporary_path = Path(temporary)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, self.path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
         return self.path
 
     def load(self) -> dict[str, Any] | None:
@@ -108,14 +124,25 @@ class LifeDaemon:
 
     def register(self, component: Component) -> None:
         for capability in component.capabilities:
+            owner = self.services.get(capability)
+            if owner is not None and owner is not component:
+                raise ValueError(
+                    f"capability {capability!r} already owned by {owner.name!r}"
+                )
             self.services[capability] = component
 
-    def request(self, capability: str, payload: Any) -> Result:
+    def request(
+        self,
+        capability: str,
+        payload: Any,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Result:
         component = self.services.get(capability)
         if component is None:
             return Result(ExecutionStatus.UNAVAILABLE, "immer", reason=f"no service for {capability!r}")
         try:
-            return component.handle(Request(capability, payload))
+            return component.handle(Request(capability, payload, metadata or {}))
         except Exception as exc:  # noqa: BLE001 - substrate never crashes the life
             return Result(ExecutionStatus.ERROR, component.name, reason=f"{type(exc).__name__}: {exc}")
 

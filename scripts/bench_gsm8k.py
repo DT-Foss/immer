@@ -11,18 +11,14 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 import time
 from pathlib import Path
+from typing import Any
+
+from immer.cognition.fertig import FertigSolver
+from immer.contracts import ExecutionStatus, Request
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "src" / "immer" / "cognition" / "fertig" / "_vendor"))
-
-import pandas as pd  # noqa: E402
-
-from fertig import solver  # noqa: E402
-
 EVAL_PATH = ROOT / "evals" / "gsm8k_test.parquet"
 RESULTS_DIR = ROOT / "results"
 
@@ -34,7 +30,7 @@ def gold_number(answer_field: str) -> float | None:
     return float(match.group(1).replace(",", ""))
 
 
-def solver_number(output: str | None) -> float | None:
+def solver_number(output: Any | None) -> float | None:
     if output is None:
         return None
     numbers = re.findall(r"-?\d[\d,]*(?:\.\d+)?", str(output))
@@ -48,11 +44,14 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0, help="0 = alle 1319")
     args = parser.parse_args()
 
+    import pandas as pd
+
     df = pd.read_parquet(EVAL_PATH)
     if args.limit:
         df = df.head(args.limit)
 
     correct = abstain = wrong = errors = 0
+    solver = FertigSolver()
     t0 = time.time()
     for _, row in df.iterrows():
         gold = gold_number(str(row["answer"]))
@@ -60,12 +59,18 @@ def main() -> int:
             errors += 1
             continue
         try:
-            out = solver.solve(str(row["question"]))
+            result = solver.handle(Request("exact_math", str(row["question"])))
         except Exception:
             wrong += 1  # eine Exception ist ein falsches Verhalten, kein Abstinenz
             continue
-        got = solver_number(out)
-        if out is None or got is None:
+        if result.status is ExecutionStatus.ABSTAINED:
+            abstain += 1
+            continue
+        if result.status is not ExecutionStatus.OK:
+            wrong += 1
+            continue
+        got = solver_number(result.output)
+        if got is None:
             abstain += 1
         elif abs(got - gold) < 1e-6:
             correct += 1
@@ -85,7 +90,7 @@ def main() -> int:
         "wrong_must_be_zero": wrong == 0,
         "accuracy_on_attempted": round(accuracy_on_attempted, 4),
         "seconds": round(seconds, 1),
-        "engine": "FERTIG vendored (bindings->semantic->math->miner), no neural net",
+        "engine": "immer.cognition.fertig.FertigSolver (bindings->semantic->math->miner), no neural net",
     }
     RESULTS_DIR.mkdir(exist_ok=True)
     out_path = RESULTS_DIR / "bench_gsm8k.json"

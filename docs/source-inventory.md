@@ -1,52 +1,98 @@
-# Source Inventory — wo was auf der Welt ist
+# Source Inventory — Code, Artefakte und externe Herkunft
 
-Stand: 2026-08-21. Diese Datei ist DIE Landkarte: kanonische Quellen,
-Redundanz, Server-Rollen. Modelle/Gewichte liegen bewusst NICHT im Repo —
-nur Pfade + Digests (`manifests/`).
+Stand: 2026-08-22. Diese Landkarte unterscheidet den laufenden lokalen
+v0.7-Core von externen Originalen und historischen Messquellen. Originale
+außerhalb dieses Repositories sind read-only; IMMER importiert nur explizit
+gewählte, digest-geprüfte Artefakte.
 
-## Mac (lokal)
+## Produktions-Core in diesem Repository
 
-| Strang | Kanonisch (neueste Version) | Redundant/alt | GitHub |
-|---|---|---|---|
-| o1-state (Host) | `~/Documents/Forschung/O1_juli` @ `bb5e443` — **181 Dateien uncommitted!** | `fabel_video` (gleicher Stand, 36 dirty), `O1`, `O1-O`, `o1-state_kram_August` (Prediction-Docs/Zips) | `DT-Foss/o1-state` |
-| gssm (Basis) | `~/Documents/Forschung/gssm-public` @ `d7dbfec`, sauber | `GSSM_Research*` (4 Kopien, Juni) | `DT-Foss/gssm` |
-| FERTIG (Exakt-Solver) | `~/Documents/Forschung/LanguageModel/FERTIG` @ `edea94a` (kuratiertes Runtime-Repo) | `~/Downloads/Forschung/FERTIG` (ident + pycache), `FERTIG copy`, FERTIG-Zips | noch keins → eigenes Repo geplant |
-| Labor (mirkoNN-analysis) | `~/self-verification_fable/mirkoNN-analysis` (CHANGELOG 8.x, s3/, verifier/) | `~/Documents/Forschung/mirkoNN` (historischer Ursprung) | — |
-| CRSA / neue Attention | `~/self-verification_fable/neue attention/` (operators.py 534 Zeilen = v0.5-Kern) | 225-Zeilen-Extrakt (bis 0.2.0 in src/) | noch keins |
-| FLCA | `~/Downloads/Forschung/Alte AI Projekte/FLCA` @ `fdfde80`, sauber | — | `DT-Foss/FLCA` |
-| QAD / Liquid | `~/Downloads/Forschung/Liquid-QAD` (1.7G, models/ drin — bleibt draußen) | — | noch keins |
-| Verifier | `~/self-verification_fable/llm-as-a-verifier` (TB-2.1: BO3 79,4→86,5 %) | — | noch keins |
-| .causal-Ökosystem | `~/Desktop/dotcausal`, `~/Desktop/ANALYSIEREN/pipeline_dza` (PDF→Triplets→.causal, 14-step Foss Gate) | GW150914_MacMini (Sonderfall) | `DT-Foss/dotcausal` |
-
-**Server-Ops-Ordner:** `~/Desktop/SERVER` (Zugänge, Fleet-Doku, Regeln).
-**Frozen Weights/Evidence:** `/Volumes/LEXAR/dfc-evidence-smoke`
-(causal-store-freeze, Traces), `/Volumes/SDKARTE/HIER/hf-cache` (11G
-Grafts/HF-Cache — extern, nur Manifest+SHA).
-
-## Server-Fleet (Hetzner, Details: `docs/fleet/O1_STATE_OPERATIONS.md`)
-
-| Alias | IP | O1-Rolle |
+| Strang | Kanonischer Laufzeitort | Stand |
 |---|---|---|
-| **intel** (`ki`) | 89.167.47.205 | **DER LIFETIME-LAUF — NIE ANFASSEN.** 12,07 Mrd Tokens seit 2026-07-24, ein Prozess, RSS 0,82 GB. davidfoss-Website läuft mit darauf |
-| **core** (`kc`) | 89.167.31.243 | Freie Experiment-Maschine (Konpeki entfernt), torch 2.13 cpu, `/root/o1lab/` |
-| **beast** (`kb`) | 89.167.35.196 | Stärkste Maschine: Experimente + 27B-GGUF-Donor (Tailnet 100.119.16.99, `/root/o1x_data/qwen38-27b-gguf/`) + Ollama |
-| **aero** (`ka`) | 89.167.35.24 | Reiner Storage (`/storage/archive`) — KEINE O1-Nutzung, kein Python-Stack |
+| Composition Root | `src/immer/composition.py` | ein `exact_math`-Besitzer; Frozen- und Lebenspfad getrennt |
+| Exact-Kaskade | `src/immer/cognition/exact_cascade.py` | S3 zuerst, FERTIG Verifier/Fallback, bewachte Abstinenz |
+| Frozen A1 | `src/immer/runtimes/o1_state/model.py` + `adapter.py` | eigener, state-dict-kompatibler Produktionskern; keine Vendor-Imports |
+| SHIP-v6 | `src/immer/capabilities/s3_runtime.py` + `manifests/s3_ship_v6.json` | vier Organe, 152/152 Antworten und Routen, kein Runtime-Training |
+| OrganBank | `src/immer/capabilities/organbank/bank.py` | SHA-256 außen plus interner State-Digest vor Mount |
+| Eigene CRSA-Attention | `src/immer/attention/crsa/operators.py` | exakt kausale Operatoren |
+| Online-Router | `src/immer/attention/router.py` + `manifests/crsa_router_v1.json` | Frozen A1; fest `2 Local + 1 Balanced + 1 Free`, slope `0.8`, Debit `3` |
+| FERTIG exakt | `src/immer/cognition/fertig/adapter.py` | vendorter Solver oder expliziter read-only Override |
+| FERTIG geerdet | `src/immer/cognition/fertig/grounded.py` | Graph, Bindings, Pläne, Skills und Verifier; Aktions-Gates geschlossen |
+| WorldStream | `src/immer/knowledge/streamer.py` + `_hf_source.py` | lokale/HF-Ranges, hartes Budget, atomarer SHA-Cache; kein Modell-Loader |
+| Lebensstrom | `src/immer/runtimes/o1_state/plasticity.py` | persistent, surprise-gated, getrennt vom Frozen Host |
 
-Betriebsregeln (aus Messungen): intel nie anfassen · torch threads=1 ·
-ein rechenintensiver Job pro Maschine · erst Smoke dann Full · vor Build
-in `analysis/PREDICTIONS.md` registrieren · SSH stdin-detached.
+Der WorldStream ist integriert, aber absichtlich keine verdeckte
+Antwortkomponente. Der einzige bislang getestete Value-Sketch war mit 24 %
+gegen 32 % Placebo negativ.
 
-## Architektur-Bild (wohin das hier wächst)
+## Externe Originale und Forschungsquellen
+
+| Strang | Kanonische externe Quelle | Redundant/historisch | Einbindung heute |
+|---|---|---|---|
+| o1-state | `~/Documents/Forschung/O1_juli` @ `bb5e443` | `fabel_video`, `O1`, `O1-O`, `o1-state_kram_August` | Produktionsport liegt in `src/immer/runtimes/o1_state/`; Frozen Checkpoint wird nur per SHA importiert |
+| FERTIG | `~/Documents/Forschung/LanguageModel/FERTIG` @ `edea94a` | `~/Downloads/Forschung/FERTIG`, `FERTIG copy`, Archive | kuratierter Snapshot ist vendort; `IMMER_FERTIG_ROOT` bleibt expliziter Override |
+| CRSA-Forschung | `~/self-verification_fable/neue attention/` | frühere 225-Zeilen-Extrakte | eigener Operator plus gemessener Router liegen jetzt im Core |
+| Organ-/Verifier-Labor | `~/self-verification_fable/mirkoNN-analysis` | `~/Documents/Forschung/mirkoNN` | Formeln/Evidence in `research/`; keine Runtime-Imports |
+| GSSM | `~/Documents/Forschung/gssm-public` @ `d7dbfec` | `GSSM_Research*` | Forschungsbasis, keine heutige Runtime-Abhängigkeit |
+| FLCA | `~/Downloads/Forschung/Alte AI Projekte/FLCA` @ `fdfde80` | — | externer kanonischer Strang, nicht als Core vorgetäuscht |
+| QAD/Liquid | `~/Downloads/Forschung/Liquid-QAD` | Modelle bleiben extern | externer Compiler-/Deployment-Strang |
+| Verifier | `~/self-verification_fable/llm-as-a-verifier` | — | historischer BO3-Messanker, kein v0.7-Core-Golden |
+| `.causal` | `~/Desktop/dotcausal`, `~/Desktop/ANALYSIEREN/pipeline_dza` | GW150914-Sonderfall | FERTIG-Weltgraph nur über explizites `IMMER_FERTIG_GRAPH` |
+
+## Frozen Artefakte
+
+Große Gewichte liegen nicht im Git-Commit. `manifests/s3_ship_v6.json`
+adressiert exakt fünf Blobs:
+
+| Artefakt | SHA-256 |
+|---|---|
+| Frozen A1 Host | `84f7ac90375668067f348421c581ca60cf3f27dbdb447ae13248dbcc85ea251c` |
+| `arith-dual` | `50c76fe0fd9bfb3d18aa76a143c55c35a940d406910ef1425bba6744442fb2fe` |
+| `mul-log` | `a3afac05dbcf9bdb7ae4bef9883af5cef90da5a03dcade2fed3ae18b9ae0a41a` |
+| `z3-circle` | `a0a94a665b41661ac16d274b096001655c18c2916ee1d989df92d9d21c737053` |
+| `decimal-crystal` | `ad64764e6298650aad5d273df4a17ba155825b4eeec379ef10bbda2a263e5a19` |
+
+Historische Evidence-/Cache-Orte sind `/Volumes/LEXAR/dfc-evidence-smoke`
+und `/Volumes/SDKARTE/HIER/hf-cache`. Sie sind keine stillen
+Produktionsabhängigkeiten. Der lokale Bootstrap kopiert aus einem expliziten
+Quellordner atomar in den IMMER-Artefakt-Root und akzeptiert nur die
+Manifest-Digests.
+
+## Server-Fleet: Operationsquelle, keine Runtime-Abhängigkeit
+
+Details stehen in `docs/fleet/O1_STATE_OPERATIONS.md`; Zugangsdaten bleiben in
+`~/Desktop/SERVER` und gehören nicht ins Repository.
+
+| Alias | Rolle |
+|---|---|
+| `intel` / `ki` | historischer Lifetime-Lauf; nicht für Experimente anfassen |
+| `core` / `kc` | freie Experimentmaschine |
+| `beast` / `kb` | historischer 27B-Donor und schwere Experimente |
+| `aero` / `ka` | Storage, keine O1-Rechenrolle |
+
+`torch threads=1` ist eine Regel für reproduzierbare Benchmark-Harnesses auf
+der Fleet. Die Produktions-`LearningStream`-Runtime verändert die
+prozessglobale Torch-Threadzahl nicht.
+
+## Mess- und Claim-Grenzen
+
+- SHIP-v6 ist lokal reproduzierbar: 152/152 Antworten, 152/152 Routen.
+- CRSA zeigt einen positiven Kontextrouter, aber keinen Vorteil gegen
+  kausale Softmax: beide erreichen Balanced Accuracy 1,0.
+- Stage 1 lokalisiert Donor-Themenstruktur mid-depth; Stage 2 mit statischem
+  Embedding-Mittel ist unter Placebo und bleibt außerhalb der Runtime.
+- Cross-Model Least Squares ist negativ. R17 bedeutet
+  trainieren → Invariante messen → Fit/R² verifizieren → exakte Struktur.
+- Hugging Face ist Verpackung ganz am Ende. Ein öffentlicher Upload bleibt
+  bis zum lokalen Golden und zur Klärung der Lizenzkette gesperrt.
+
+## Architektur in einem Bild
 
 ```text
-IDENTITÄT  = o1-state      Lebensstrom, O(1), swap-feste Person
-DENKEN     = Denkmodelle   paar hundert MB Reasoning ohne Weltwissen,
-                           mehrere davon, interner Rat (Multi-Agent)
-WISSEN     = Bibliothek    .causal-Index, aus Donor geerntet, wächst durchs Leben
-KÖNNEN     = OrganBank     kalte Organe, <1 ms montiert
-KÖRPER     = QAD/Fleet     Mac / core / beast / Redmi / iPad
+IDENTITÄT = persistenter O(1)-Lebensstrom
+DENKEN    = Frozen A1 + eigene, feste CRSA-Attention
+KÖNNEN   = vier kalte, kristallisierte Organe
+ERDUNG    = FERTIG: Graph, Bindings, Pläne, Skills, Verifier
+WISSEN    = Bibliothek + begrenzter WorldStream als separates Instrument
+KÖRPER   = lokale Runtime; Fleet/QAD nur über explizite Verträge
 ```
-
-Jede Verbindung hat Messanker: twostep 1,000 (Organ-Transfer) · BO3 86,5 %
-(Verifier) · Kaskade 0,875 @ 8 Calls · Shell>State-Injection 0,969 vs 0,531 ·
-Cold-Load 0,9 ms · NLL 8,6656 unverändert.

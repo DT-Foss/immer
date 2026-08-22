@@ -3,6 +3,75 @@
 Alle Änderungen an IMMER. Jeder Eintrag endet mit Deutung + nächster Frage —
 nie mit der nackten Zahl.
 
+## [0.7.0] — 2026-08-22 — Der lokale Pfad läuft; Verpackung kommt zuletzt
+
+**Ziel:** Die vorhandenen Mechanismen zu einem reproduzierbaren lokalen
+Runtime-Pfad verbinden, ohne negative Experimente umzudeuten oder externe
+Originale zur Laufzeit zu importieren.
+
+### Frozen Exact-Core
+
+- Eigener, state-dict-kompatibler A1-Produktionskern statt `sys.path`-Importen
+  aus Research-/Vendorbäumen.
+- Vier SHA-adressierte SHIP-v6-Organe (`arith-dual`, `mul-log`, `z3-circle`,
+  `decimal-crystal`) werden vor `torch.load(weights_only=True)` außen und
+  innen geprüft. Es gibt kein Runtime-Training.
+- Die kanonische Suite erreicht 152/152 Antworten und 152/152 Organrouten.
+  `z3-circle` ist korrekt nur als Addition in `Z₃` veröffentlicht; der
+  Dezimalpfad setzt nach dem gemessenen Carrier exakt `h ← 10h + v` ein.
+
+### Eigene Attention und ehrlicher Routerclaim
+
+- Der Online-Pfad nutzt die eigene, exakt kausale CRSA-Attention mit festem
+  Programm: `2 Local + 1 Balanced + 1 Free`, Steigung `0.8`,
+  Diagonal-Debit `3`. Der Free-Head ist bitgleich zur kausalen Softmax.
+- Der persistierte Kontext-Head erreicht Balanced Accuracy 1,000000 gegen
+  Roh-A1 0,983333 und 32 Label-Placebos mit Mittel 0,510328/Maximum 0,748026.
+  Die kausale-Softmax-Ablation erreicht ebenfalls 1,000000. Der Befund ist
+  deshalb `POSITIVE_CONTEXT_ROUTER__CRSA_NOT_UNIQUE_VS_SOFTMAX`, kein
+  CRSA-Überlegenheitsclaim.
+
+### FERTIG und Komposition
+
+- `ExactCascade` ist der einzige Registry-Besitzer von `exact_math`: S3 wird
+  zuerst ausgewertet, FERTIG verifiziert oder fällt zurück, und unbekannte
+  beziehungsweise widersprüchliche Fälle enden bewacht in Abstinenz.
+- Der geerdete FERTIG-Adapter bindet Graph, Bindings, semantische Pläne,
+  Skills und Verifier ein. Desktop-, Recorder- und Mutationspfade benötigen
+  explizite Backends/Gates; ohne sie wird keine Aktion erfunden.
+
+### Lebensstrom, Artefakte und WorldStream
+
+- Der persistente Surprise-/Sleep-Lebensstrom bleibt strikt vom Frozen Host
+  getrennt; atomare Sidecars bewahren Modell-, Optimizer-, Scan- und
+  Replayzustand. Die Produktionsruntime ändert keine globalen
+  Torch-/MPS-Einstellungen.
+- Artefakte werden aus expliziten read-only Quellen atomar importiert und nur
+  nach Manifest-SHA verwendet. Manifeste werden als Paketressourcen ins Wheel
+  übernommen.
+- WorldStream ist als begrenzte lokale/HF-Tensorquelle integriert: exakte
+  Safetensors-Ranges, Preflight-Bytebudget, BF16-Dekodierung und atomarer,
+  SHA-geprüfter Resume-Cache. Er lädt kein Donormodell und ist nicht
+  automatisch mit dem Antwortpfad verbunden.
+
+### Negative Ergebnisse bleiben geschlossen
+
+- Statisches Embedding-Mittel → `gate_proj` → Value-Sketch: 24 % gegen
+  32 % Placebo bei 138,4 KB/Frage. Nicht deployt.
+- Cross-Model-Least-Squares-Projektion: negativ und kein R17. R17 bleibt
+  trainieren → Invariante messen → Fit/R² als Verifier → exakte Struktur.
+
+### Deutung + nächste Frage
+
+Der belastbare Gewinn dieser Version ist ein lokaler, digest-geprüfter und
+bewacht zusammengesetzter PoC. Erst nach dessen Golden Run kam die Verpackung:
+Der A1-only-Offline-Export erzeugt 6.857.284 Byte Safetensors statt des
+74.335.278-Byte-Forschungscheckpoints, kopiert vier Organe bytegleich und
+prüft sich checkout-isoliert erneut mit 152/152 Antworten und Routen. Er
+enthält bewusst keinen Hub-/Login-/Uploadpfad. Als Nächstes werden breitere
+Router-/FERTIG-Kontraste golden gehalten; eine öffentliche Veröffentlichung
+bleibt allein durch die ungeklärte Lizenzkette gesperrt.
+
 ## [0.6.1] — 2026-08-21 — 19 s sind unbrauchbar: einmal zahlen, immer gratis
 
 **Anlass:** Davids Rüge: „19 s für eine Antwort ist literally unbrauchbar."

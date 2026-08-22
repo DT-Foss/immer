@@ -4,16 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "immer"
-version = "0.2.0"
+version = "0.7.0"
 description = "Unified cognitive runtime for grounded cognition, persistent state, structured capabilities and causal neural routing."
 requires-python = ">=3.11"
 authors = [{name = "David Tom Foss"}]
 readme = "README.md"
-dependencies = []
+dependencies = [
+  "numpy>=1.26",
+]
 
 [project.optional-dependencies]
 neural = ["torch>=2.5"]
-dev = ["pytest>=8"]
+mouth = ["torch>=2.5", "transformers>=4.45"]
+fertig-binary = ["msgpack>=1.0", "xxhash>=3.5"]
+export = ["safetensors>=0.4"]
+dev = ["build>=1.2", "pytest>=8"]
 
 [project.scripts]
 immer = "immer.cli:main"

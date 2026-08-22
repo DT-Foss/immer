@@ -1,47 +1,116 @@
 {
   "schema": "immer.components.v1",
+  "package_version": "0.7.0",
+  "runtime_policy": {
+    "local_first": true,
+    "exact_math_owner": "ExactCascade",
+    "runtime_training_on_frozen_path": false,
+    "external_originals": "read-only",
+    "hugging_face": "offline bundle implemented last; public upload blocked until license clearance"
+  },
   "components": [
     {
-      "name": "FERTIG",
-      "role": "grounded cognition",
-      "repository": "https://github.com/DT-Foss/FERTIG",
-      "revision": "edea94a4a25fd639cbc02328ceb06489bb3c0170",
-      "integration": "src/immer/cognition/fertig/adapter.py"
+      "name": "ExactCascade",
+      "role": "single guarded owner of exact_math",
+      "repository": null,
+      "revision": "package:0.7.0",
+      "status": "integrated",
+      "integration": "src/immer/cognition/exact_cascade.py",
+      "composition": "S3 first; FERTIG verifier/fallback; guarded abstention"
+    },
+    {
+      "name": "SHIP-v6",
+      "role": "frozen structural arithmetic over four exact organs",
+      "repository": null,
+      "revision": "manifest-sha256:fe68095a6f6653b144b7c8fccf890a87055b5becd5b248e6b83462c114b92134",
+      "status": "integrated",
+      "integration": "src/immer/capabilities/s3_runtime.py",
+      "manifest": "manifests/s3_ship_v6.json",
+      "evidence": {
+        "answers": "152/152",
+        "routes": "152/152",
+        "organs": 4,
+        "runtime_training": false
+      }
     },
     {
       "name": "o1-state",
-      "role": "persistent O(1)-state host",
+      "role": "frozen A1 host plus separate persistent O(1)-state life stream",
       "repository": "https://github.com/DT-Foss/o1-state",
       "revision": "bb5e443f1b101dac0faedc25d3450343b59c93cd",
-      "integration": "external canonical component"
+      "status": "ported into production core",
+      "integration": "src/immer/runtimes/o1_state/model.py",
+      "additional_integrations": [
+        "src/immer/runtimes/o1_state/adapter.py",
+        "src/immer/runtimes/o1_state/plasticity.py"
+      ],
+      "frozen_checkpoint_sha256": "84f7ac90375668067f348421c581ca60cf3f27dbdb447ae13248dbcc85ea251c"
+    },
+    {
+      "name": "CRSA",
+      "role": "own causal attention and frozen-A1 context routing",
+      "repository": null,
+      "revision": "operator-sha256:a84d059f6e22f3eece2f3275794efe157a5559701cfe085ea7721bba82a29117",
+      "status": "integrated",
+      "integration": "src/immer/attention/crsa/operators.py",
+      "additional_integrations": [
+        "src/immer/attention/router.py",
+        "manifests/crsa_router_v1.json"
+      ],
+      "router_manifest_sha256": "d353008039737cf59c01acea3c97bc10ad407885d64e08856eac753433162439",
+      "router_semantic_digest": "561db8fc50ea029288f318eb9f7c206bd5c007757dbdd60843f1a03990efd819",
+      "program": "2 Local + 1 Balanced + 1 bit-exact Free; slope=0.8; diagonal_debit=3",
+      "measurement": "POSITIVE_CONTEXT_ROUTER__CRSA_NOT_UNIQUE_VS_SOFTMAX"
+    },
+    {
+      "name": "FERTIG",
+      "role": "grounding, bindings, semantic plans, skills and verification",
+      "repository": "https://github.com/DT-Foss/FERTIG",
+      "revision": "edea94a4a25fd639cbc02328ceb06489bb3c0170",
+      "status": "vendored and integrated",
+      "integration": "src/immer/cognition/fertig/adapter.py",
+      "additional_integrations": [
+        "src/immer/cognition/fertig/grounded.py",
+        "src/immer/cognition/fertig/_vendor/fertig"
+      ],
+      "safety": "desktop, recorder and mutation paths require explicit gates; otherwise abstain"
+    },
+    {
+      "name": "OrganBank",
+      "role": "digest-addressed structural capabilities",
+      "repository": null,
+      "revision": "paper:v0.1;package:0.7.0",
+      "status": "integrated",
+      "integration": "src/immer/capabilities/organbank/bank.py",
+      "integrity": "external SHA-256 plus internal state digest"
+    },
+    {
+      "name": "WorldStream",
+      "role": "bounded local/HF safetensors tensor source",
+      "repository": null,
+      "revision": "package:0.7.0",
+      "status": "integrated instrument; not connected to answer routing",
+      "integration": "src/immer/knowledge/streamer.py",
+      "additional_integrations": [
+        "src/immer/knowledge/_hf_source.py"
+      ],
+      "negative_result": "static embed-mean value sketch 24% vs placebo 32%; not deployed"
     },
     {
       "name": "FLCA",
       "role": "evidence-typed compilation and replay",
       "repository": "https://github.com/DT-Foss/FLCA",
       "revision": "fdfde800dc121da125606f668940b2b539d9097b",
-      "integration": "external canonical component"
-    },
-    {
-      "name": "CRSA",
-      "role": "causal attention routing",
-      "repository": null,
-      "revision": "sha256:a84d059f6e22f3eece2f3275794efe157a5559701cfe085ea7721bba82a29117",
-      "integration": "src/immer/attention/crsa/operators.py"
-    },
-    {
-      "name": "OrganBank",
-      "role": "digest-addressed structural capabilities",
-      "repository": null,
-      "revision": "paper:v0.1",
-      "integration": "src/immer/capabilities/organbank/bank.py"
+      "status": "external canonical component",
+      "integration": "not integrated into the v0.7 runtime core"
     },
     {
       "name": "QAD",
       "role": "precision-aware deployment",
       "repository": null,
       "revision": "external",
-      "integration": "external model/compiler artifacts"
+      "status": "external canonical component",
+      "integration": "not integrated; external model/compiler artifacts only"
     }
   ]
 }

@@ -8,27 +8,67 @@ Kette pro Frage:
 
 Placebo: aktivierungspermutierte Neuronen-Auswahl je Frage.
 Alles gegen Bytes/Frage geloggt. Chance = 25 %.
+
+Diese Methode bleibt als NEGATIVER Befund erhalten: Der statische
+Embedding-Mittelwert ist nicht die RMSNorm-te Post-Attention-Verteilung, die
+``gate_proj`` im laufenden Modell sieht. Das Instrument darf den falsifizierten
+Shortcut messen, aber nicht nachtraeglich als funktionierenden Router ausgeben.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import re
-import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
+
+from immer.knowledge import Streamer
+
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "src" / "immer" / "knowledge"))
-sys.path.insert(0, str(ROOT / "vendor" / "mitglm"))
-
-import numpy as np  # noqa: E402
-
 REPO = "Qwen/Qwen3.8-27B"
 STOPS = {"the", "and", "for", "with", "that", "this", "from", "was", "are",
          "have", "has", "not", "but", "which", "what", "when", "where", "how"}
 WINNERS = [18, 36, 45]   # aus Stufe 1 (Δ real-vs-placebo)
+METHOD_VERDICT = "NEGATIVE_METHOD_FALSIFIED"
+MECHANISM_HYPOTHESIS = (
+    "static embed-mean h_q is not the RMSNormed post-attention state "
+    "distribution seen by gate_proj in vivo"
+)
+
+
+def _fetch_rows(
+    source: Streamer, tensor_name: str, row_indices: list[int] | np.ndarray
+) -> np.ndarray:
+    """Read arbitrary rows via ``Streamer.rows`` without vendor helpers."""
+    wanted = [int(index) for index in row_indices]
+    if not wanted:
+        width = int(source.find(tensor_name)["shape"][1])
+        return np.empty((0, width), dtype=np.float32)
+    unique = sorted(set(wanted))
+    runs: list[tuple[int, int]] = []
+    start = previous = unique[0]
+    for index in unique[1:]:
+        if index != previous + 1:
+            runs.append((start, previous - start + 1))
+            start = index
+        previous = index
+    runs.append((start, previous - start + 1))
+
+    def read(run: tuple[int, int]) -> tuple[int, np.ndarray]:
+        start_row, count = run
+        return start_row, source.rows(tensor_name, start_row, count)
+
+    with ThreadPoolExecutor(max_workers=min(12, len(runs))) as pool:
+        chunks = dict(pool.map(read, runs))
+    by_index = {
+        start_row + offset: row
+        for start_row, matrix in chunks.items()
+        for offset, row in enumerate(matrix)
+    }
+    return np.stack([by_index[index] for index in wanted])
 
 
 def main() -> int:
@@ -47,14 +87,11 @@ def main() -> int:
     frame = pd.read_parquet(ROOT / "evals" / f"mmlu_{args.subject}_test.parquet")
     rows_data = list(frame.head(args.limit).to_dict("records"))
 
-    from streamer import Streamer  # noqa: E402
-
     s = Streamer(REPO, budget_mb=args.budget_mb)
     inv = s.inventory()
     all_ts = s.tensors()
     emb = next(t for t in all_ts if t["name"].endswith("embed_tokens.weight"))
     hidden = int(emb["shape"][1])
-    row_bytes = hidden * 2
 
     tok_raw = s.reader.fetch_file("tokenizer.json")
     import tempfile
@@ -81,17 +118,9 @@ def main() -> int:
     def fetch_embed_rows(missing):
         if not missing:
             return
-        from concurrent.futures import ThreadPoolExecutor
-
-        def grab(i):
-            off = emb["data_start"] + emb["offset_in_shard"][0] + i * row_bytes
-            return i, s.reader.get_range(emb["shard"], off, off + row_bytes - 1)
-
-        with ThreadPoolExecutor(max_workers=12) as pool:
-            got = dict(pool.map(grab, missing))
-        for i, rawb in got.items():
-            u16 = np.frombuffer(rawb, dtype=np.uint8).view(np.uint16)
-            row_cache[i] = (u16.astype(np.uint32) << 16).view(np.float32)
+        matrix = _fetch_rows(s, emb["name"], missing)
+        for index, row in zip(missing, matrix):
+            row_cache[index] = row
 
     def evec(text: str, coords=None) -> np.ndarray:
         keep = clean(text)
@@ -101,9 +130,6 @@ def main() -> int:
         for i, _w in keep:
             v += row_cache[i][coords] if coords is not None else row_cache[i]
         return v / (max(len(keep), 1) * np.sqrt(len(v)))
-
-    import hf_organ_reader as hor  # noqa: E402
-    import casi_tensor_map as ctm  # noqa: E402
 
     def layer_parts(L: int):
         gate = next(t for t in all_ts
@@ -118,26 +144,15 @@ def main() -> int:
         gate, down = layer_parts(L)
         n_inter = int(gate["shape"][0])
         idxs = np.sort(rng.choice(n_inter, size=256, replace=False))
-        graw = hor.fetch_uniform_rows(
-            s.reader, gate["shard"], gate["data_start"],
-            gate["offset_in_shard"][0], int(gate["shape"][1]), 2,
-            [int(i) for i in idxs],
-        )
-        gkeys = ctm.bf16_rows_to_f32(graw.view(np.uint16), (len(idxs), int(gate["shape"][1])))
+        gkeys = _fetch_rows(s, gate["name"], idxs)
         gkeys /= (np.linalg.norm(gkeys, axis=1, keepdims=True) + 1e-9)
         # down_proj-Zeilenblöcke (hidden-dim Zeilen!): Strategie c
         d_rows_total = args.blocks * args.rows_per_block
         starts = np.linspace(0, int(down["shape"][0]) - d_rows_total,
                              num=args.blocks).astype(int)
         blocks = []
-        d_row_bytes = int(down["shape"][1]) * 2
         for st in starts:
-            abs_off = down["data_start"] + down["offset_in_shard"][0] + st * d_row_bytes
-            span = args.rows_per_block * d_row_bytes
-            data = s.reader.get_range(down["shard"], abs_off, abs_off + span - 1)
-            mat = ctm.bf16_rows_to_f32(
-                np.frombuffer(data, dtype=np.uint8).view(np.uint16),
-                (args.rows_per_block, int(down["shape"][1])))
+            mat = s.rows(down["name"], int(st), args.rows_per_block)
             blocks.append((st, mat))
         coords = np.concatenate([np.arange(st, st + args.rows_per_block)
                                  for st, _ in blocks])
@@ -152,7 +167,7 @@ def main() -> int:
     t0 = time.time()
     for item in rows_data:
         frage, choices, gold = item["question"], item["choices"], int(item["answer"])
-        before = s.budget.body
+        before = s.bytes_moved()
         try:
             hq = evec(frage)
             cvecs = [evec(c[:64]) for c in choices]
@@ -188,7 +203,7 @@ def main() -> int:
         total += 1
         correct += int(pred_real == gold)
         acc_plac.append(int(pred_plac == gold))
-        used = s.budget.body - before
+        used = s.bytes_moved() - before
         q_bytes_list.append(used)
 
     report = {
@@ -201,8 +216,12 @@ def main() -> int:
                                    / inv["model_payload_bytes"], 4),
         "layer": WINNERS, "top_neuronen": args.top_neurons,
         "sekunden": round(time.time() - t0, 1),
+        "verdict": METHOD_VERDICT,
+        "mechanism_hypothesis": MECHANISM_HYPOTHESIS,
+        "eligible_as_runtime_router": False,
     }
     out = ROOT / "results" / "router_v2_stage2.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0

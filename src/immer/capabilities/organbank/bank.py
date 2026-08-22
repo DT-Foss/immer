@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from ...artifacts import resolve_artifact_path
+
 
 class DigestMismatch(ValueError):
     pass
@@ -31,7 +33,12 @@ class OrganBank:
             self.register(descriptor)
 
     @classmethod
-    def from_manifest(cls, manifest_path: str | Path) -> "OrganBank":
+    def from_manifest(
+        cls,
+        manifest_path: str | Path,
+        *,
+        artifact_root: str | Path | None = None,
+    ) -> "OrganBank":
         manifest = Path(manifest_path).expanduser().resolve()
         data = json.loads(manifest.read_text(encoding="utf-8"))
         raw_organs = data.get("organs")
@@ -41,9 +48,18 @@ class OrganBank:
         for raw in raw_organs:
             if not isinstance(raw, dict):
                 raise ValueError("each organ entry must be an object")
-            artifact = Path(str(raw["artifact"]))
-            if not artifact.is_absolute():
-                artifact = (manifest.parent / artifact).resolve()
+            raw_artifact = Path(str(raw["artifact"]))
+            artifact = (
+                resolve_artifact_path(
+                    manifest,
+                    raw_artifact,
+                    configured_root=artifact_root,
+                )
+                if artifact_root is not None
+                else raw_artifact.resolve()
+                if raw_artifact.is_absolute()
+                else (manifest.parent / raw_artifact).resolve()
+            )
             descriptors.append(
                 OrganDescriptor(
                     name=str(raw["name"]),
@@ -61,6 +77,8 @@ class OrganBank:
             raise ValueError(f"duplicate organ name: {descriptor.name}")
         if descriptor.capability in self._by_capability:
             raise ValueError(f"duplicate organ capability: {descriptor.capability}")
+        if not descriptor.name.strip() or not descriptor.capability.strip() or not descriptor.group.strip():
+            raise ValueError("organ name, capability and group must be non-empty")
         if len(descriptor.sha256) != 64 or any(c not in "0123456789abcdef" for c in descriptor.sha256):
             raise ValueError(f"invalid sha256 for organ {descriptor.name}")
         self._by_name[descriptor.name] = descriptor
@@ -82,12 +100,21 @@ class OrganBank:
         descriptor = self.descriptor(name)
         if not descriptor.artifact.is_file():
             raise FileNotFoundError(descriptor.artifact)
-        digest = hashlib.sha256(descriptor.artifact.read_bytes()).hexdigest()
+        checksum = hashlib.sha256()
+        with descriptor.artifact.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                checksum.update(chunk)
+        digest = checksum.hexdigest()
         if digest != descriptor.sha256:
             raise DigestMismatch(
                 f"organ {name!r} digest mismatch: expected {descriptor.sha256}, got {digest}"
             )
         return descriptor.artifact
+
+    def verify_all(self) -> Mapping[str, Path]:
+        """Verify every registered artifact and return paths by organ name."""
+
+        return {name: self.verify(name) for name in self.names()}
 
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._by_name))

@@ -50,6 +50,7 @@ class DashboardTests(unittest.TestCase):
                 self.assertIn("Lebenszeichen", html)
             finally:
                 server.shutdown()
+                server.server_close()
 
 
 if __name__ == "__main__":

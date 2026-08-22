@@ -1,4 +1,4 @@
-"""poc_mmlu_stream.py — MMLU gegen gestreamte Qwen3-32B-Gewichte.
+"""poc_mmlu_stream.py — MMLU gegen gestreamte Qwen3.8-27B-Gewichte.
 
 Der erste ehrliche Retrieval-Pfad auf dem Weg zur Demo-Tafel:
 
@@ -16,21 +16,49 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
+
+from immer.knowledge import Streamer
+
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "src" / "immer" / "knowledge"))
-sys.path.insert(0, str(ROOT / "vendor" / "mitglm"))
-
-import numpy as np  # noqa: E402
-
-from streamer import Streamer  # noqa: E402
-
 REPO = "Qwen/Qwen3.8-27B"
 CHOICE_KEYS = ["A", "B", "C", "D"]
+
+
+def _fetch_rows(
+    source: Streamer, tensor_name: str, row_indices: list[int]
+) -> np.ndarray:
+    """Read only requested rows through the installed tensor-source API."""
+    wanted = [int(index) for index in row_indices]
+    if not wanted:
+        width = int(source.find(tensor_name)["shape"][1])
+        return np.empty((0, width), dtype=np.float32)
+    unique = sorted(set(wanted))
+    runs: list[tuple[int, int]] = []
+    start = previous = unique[0]
+    for index in unique[1:]:
+        if index != previous + 1:
+            runs.append((start, previous - start + 1))
+            start = index
+        previous = index
+    runs.append((start, previous - start + 1))
+
+    def read(run: tuple[int, int]) -> tuple[int, np.ndarray]:
+        start_row, count = run
+        return start_row, source.rows(tensor_name, start_row, count)
+
+    with ThreadPoolExecutor(max_workers=min(12, len(runs))) as pool:
+        chunks = dict(pool.map(read, runs))
+    by_index = {
+        start_row + offset: row
+        for start_row, matrix in chunks.items()
+        for offset, row in enumerate(matrix)
+    }
+    return np.stack([by_index[index] for index in wanted])
 
 
 def fetch_tokenizer_bytes(s: Streamer) -> bytes:
@@ -102,23 +130,7 @@ def main() -> int:
         uniq = sorted({i for i, _ in kept})
         missing = [i for i in uniq if i not in row_cache]
         if missing:
-            import hf_organ_reader as hor
-            import casi_tensor_map as ctm
-            from concurrent.futures import ThreadPoolExecutor
-
-            raw = None  # parallel: jede fehlende Zeile eigener Range-Request
-            row_bytes = n_cols * 2
-
-            def _grab(i: int) -> tuple[int, bytes]:
-                abs_off = emb["data_start"] + emb["offset_in_shard"][0] + i * row_bytes
-                return i, s.reader.get_range(emb["shard"], abs_off, abs_off + row_bytes - 1)
-
-            with ThreadPoolExecutor(max_workers=12) as pool:
-                got = dict(pool.map(_grab, missing))
-            matm = ctm.bf16_rows_to_f32(
-                np.frombuffer(b"".join(got[i] for i in missing), dtype=np.uint8).view(np.uint16),
-                (len(missing), n_cols),
-            )
+            matm = _fetch_rows(s, emb_name, missing)
             for j, i in enumerate(missing):
                 row_cache[i] = matm[j]
         acc = np.zeros(n_cols, dtype=np.float32)
@@ -169,7 +181,8 @@ def main() -> int:
     def lexical_overlap(q: str, ch: str) -> float:
         qs = {_clean_token(t) for t in tok.convert_ids_to_tokens(tok.encode(q.lower(), add_special_tokens=False))}
         cs = {_clean_token(t) for t in tok.convert_ids_to_tokens(tok.encode(ch.lower(), add_special_tokens=False))}
-        qs.discard(None); cs.discard(None)
+        qs.discard(None)
+        cs.discard(None)
         if not qs or not cs:
             return 0.0
         return len(qs & cs) / _math.sqrt(len(qs) * len(cs))
@@ -181,7 +194,7 @@ def main() -> int:
         frage = item["question"]
         choices = item["choices"]
         gold = int(item["answer"])
-        before = s.budget.body
+        before = s.bytes_moved()
         try:
             qv, _ = vec(frage)
             scores = []
@@ -193,7 +206,7 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"SKIP ({type(exc).__name__}: {exc})")
             continue
-        used = s.budget.body - before
+        used = s.bytes_moved() - before
         q_bytes_total += used
         pred = int(np.argmax(scores))
         total += 1

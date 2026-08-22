@@ -1,3 +1,4 @@
 from .adapter import FertigSolver
+from .grounded import FertigGrounded
 
-__all__ = ["FertigSolver"]
+__all__ = ["FertigGrounded", "FertigSolver"]

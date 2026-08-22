@@ -14,20 +14,54 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
+
+from immer.knowledge import Streamer
+
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "src" / "immer" / "knowledge"))
-sys.path.insert(0, str(ROOT / "vendor" / "mitglm"))
-
-import numpy as np  # noqa: E402
-
 REPO = "Qwen/Qwen3.8-27B"
 STOPS = {"the", "and", "for", "with", "that", "this", "from", "was", "are",
          "have", "has", "not", "but", "which", "what", "when", "where", "how"}
+
+
+def _fetch_rows(
+    source: Streamer, tensor_name: str, row_indices: list[int] | np.ndarray
+) -> np.ndarray:
+    """Read selected rows through the public range-only tensor contract.
+
+    Consecutive indices share one request; no unselected row is transferred.
+    The returned order follows ``row_indices`` exactly.
+    """
+    wanted = [int(index) for index in row_indices]
+    if not wanted:
+        width = int(source.find(tensor_name)["shape"][1])
+        return np.empty((0, width), dtype=np.float32)
+    unique = sorted(set(wanted))
+    runs: list[tuple[int, int]] = []
+    start = previous = unique[0]
+    for index in unique[1:]:
+        if index != previous + 1:
+            runs.append((start, previous - start + 1))
+            start = index
+        previous = index
+    runs.append((start, previous - start + 1))
+
+    def read(run: tuple[int, int]) -> tuple[int, np.ndarray]:
+        start_row, count = run
+        return start_row, source.rows(tensor_name, start_row, count)
+
+    with ThreadPoolExecutor(max_workers=min(12, len(runs))) as pool:
+        chunks = dict(pool.map(read, runs))
+    by_index = {
+        start_row + offset: row
+        for start_row, matrix in chunks.items()
+        for offset, row in enumerate(matrix)
+    }
+    return np.stack([by_index[index] for index in wanted])
 
 
 def main() -> int:
@@ -45,10 +79,7 @@ def main() -> int:
     frame = pd.read_parquet(ROOT / "evals" / f"mmlu_{args.subject}_test.parquet")
     rows = list(frame.head(args.limit).to_dict("records"))
 
-    from streamer import Streamer  # noqa: E402
-
     s = Streamer(REPO, budget_mb=args.budget_mb)
-    inv = s.inventory()
     all_ts = s.tensors()
     layer_ids = sorted({t["layer"] for t in all_ts
                         if "/mlp/gate_proj.weight" in t["name"]
@@ -80,32 +111,19 @@ def main() -> int:
 
     row_cache: dict[int, np.ndarray] = {}
     hidden = int(emb["shape"][1])
-    row_bytes = hidden * 2
 
     def h_vec(text: str) -> np.ndarray:
         keep = tok_clean(text)
         missing = sorted({i for i, _ in keep if i not in row_cache})
         if missing:
-            def grab(i: int):
-                off = emb["data_start"] + emb["offset_in_shard"][0] + i * row_bytes
-                return i, s.reader.get_range(emb["shard"], off, off + row_bytes - 1)
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(max_workers=12) as pool:
-                got = dict(pool.map(grab, missing))
-            mats = [np.frombuffer(got[i], dtype=np.uint8).view(np.uint16) for i in missing]
-            for j, i in enumerate(missing):
-                row_cache[i] = np.frombuffer(
-                    mats[j].tobytes(), dtype=np.uint16).astype(np.float32).view(np.float32) \
-                    if False else _bf16(mats[j])
+            matrix = _fetch_rows(s, emb["name"], missing)
+            for index, row in zip(missing, matrix):
+                row_cache[index] = row
         v = np.zeros(hidden, dtype=np.float32)
         for i, _w in keep:
             v += row_cache[i]
         v /= max(len(keep), 1)
         return v / (np.linalg.norm(v) + 1e-9)
-
-    def _bf16(u16: np.ndarray) -> np.ndarray:
-        return (u16.astype(np.uint32) << 16).view(np.float32)
 
     # Zwei Cluster: physisch vs. menschlich-geografisch (Lexik, lokal)
     PHYS = {"climate", "temperature", "rainfall", "erosion", "plate", "tectonic",
@@ -138,16 +156,9 @@ def main() -> int:
         n_neurons = int(meta["shape"][0])
         idxs = np.sort(rng.choice(n_neurons, size=min(args.neurons, n_neurons),
                                   replace=False))
-        before_b, before_r = s.budget.body, s.budget.requests
-        import hf_organ_reader as hor
-        import casi_tensor_map as ctm
-
-        raw = hor.fetch_uniform_rows(
-            s.reader, meta["shard"], meta["data_start"],
-            meta["offset_in_shard"][0], int(meta["shape"][1]), 2,
-            [int(i) for i in idxs],
-        )
-        keys = ctm.bf16_rows_to_f32(raw.view(np.uint16), (len(idxs), int(meta["shape"][1])))
+        before_b = s.bytes_moved()
+        before_r = int(s.metrics()["budget"]["requests"])
+        keys = _fetch_rows(s, gate_name, idxs)
         keys_n = keys / (np.linalg.norm(keys, axis=1, keepdims=True) + 1e-9)
 
         profiles_real, profiles_shuf, labs = [], [], []
@@ -174,21 +185,24 @@ def main() -> int:
 
         s_real = separation(P)
         s_plac = separation(S)
-        used = s.budget.body - before_b
+        used = s.bytes_moved() - before_b
+        requests = int(s.metrics()["budget"]["requests"]) - before_r
         report["layers"][str(L)] = {
             "separation_real": None if s_real is None else round(s_real, 5),
             "separation_placebo": None if s_plac is None else round(s_plac, 5),
             "signal_over_placebo": None if s_real is None or s_plac is None
             else round(s_real - s_plac, 5),
-            "bytes_layer": used, "requests": s.budget.requests - before_r,
+            "bytes_layer": used, "requests": requests,
         }
-        print(f"L{L:02d}: real={s_real} placebo={s_plac} ", end="", flush=True); print(
+        print(f"L{L:02d}: real={s_real} placebo={s_plac} ", end="", flush=True)
+        print(
               f"Δ={report['layers'][str(L)]['signal_over_placebo']} "
               f"({used / 1024:.0f} KB)")
 
-    report["bytes_total"] = s.budget.body
+    report["bytes_total"] = s.bytes_moved()
     report["sekunden"] = round(time.time() - t0, 1)
     out = ROOT / "results" / "router_v2_stage1.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
                    encoding="utf-8")
     print(json.dumps({k: v for k, v in report.items() if k != "layers"},

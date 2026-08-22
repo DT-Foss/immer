@@ -1,0 +1,60 @@
+{
+  "schema": "immer.s3-ship-v6/v1",
+  "organs": [
+    {
+      "name": "arith-dual",
+      "capability": "s3_arith_dual",
+      "group": "(R,+)",
+      "artifact": "../vendor/o1state/s3_ship/organ_dual_donor.pt",
+      "sha256": "50c76fe0fd9bfb3d18aa76a143c55c35a940d406910ef1425bba6744442fb2fe",
+      "metadata": {"internal_digest": "e6931667f93eff05", "carrier": "number words one..nine", "crystal_metric": {"ship_v6_route_accuracy": 1.0, "held_api": "8/8"}}
+    },
+    {
+      "name": "mul-log",
+      "capability": "s3_mul_log",
+      "group": "(R+,*)",
+      "artifact": "../vendor/o1state/s3_ship/organ_mul_donor.pt",
+      "sha256": "a3afac05dbcf9bdb7ae4bef9883af5cef90da5a03dcade2fed3ae18b9ae0a41a",
+      "metadata": {"internal_digest": "a8e293ed7675ba63", "carrier": "number words one..eight", "crystal_metric": {"r2_log": 0.99887}}
+    },
+    {
+      "name": "z3-circle",
+      "capability": "s3_z3sum",
+      "group": "Z_3 under addition",
+      "artifact": "../vendor/o1state/s3_ship/organ_mod_kreis.pt",
+      "sha256": "a0a94a665b41661ac16d274b096001655c18c2916ee1d989df92d9d21c737053",
+      "metadata": {"internal_digest": "acf21489862a3d45", "public_operation": "z3sum", "forbidden_aliases": ["mod", "modulo", "remainder", "%"], "carrier": "number words one..nine", "crystal_metric": {"resultant_min": 0.99936}}
+    },
+    {
+      "name": "decimal-crystal",
+      "capability": "s3_decimal_crystal",
+      "group": "(R,+) with decimal recurrence h <- 10h + v",
+      "artifact": "../vendor/o1state/s3_ship/organ_dezimal.pt",
+      "sha256": "ad64764e6298650aad5d273df4a17ba155825b4eeec379ef10bbda2a263e5a19",
+      "metadata": {"internal_digest": "4c0e1af19224f8fc", "carrier": "digit words zero..nine", "deployment": "crystal parse -> exact algebra -> digit-word emission", "crystal_metric": {"r2": 0.99866}}
+    }
+  ],
+  "s3": {
+    "host": {
+      "name": "o1-state-frozen-a1",
+      "artifact": "../vendor/o1state/results/pos_ckpt.pt",
+      "sha256": "84f7ac90375668067f348421c581ca60cf3f27dbdb447ae13248dbcc85ea251c",
+      "arm": "A1",
+      "model": {"vocab_size": 5000, "mask_id": 5001, "d_model": 128, "n_layers": 2, "n_heads": 4, "d_head": 32, "seq_len": 64}
+    },
+    "vocabulary": {
+      "unknown_id": 5000,
+      "mask_id": 5001,
+      "tokens": {
+        "the": 0, "of": 1, "by": 13, "is": 14, "one": 31, "who": 42,
+        "two": 38, "three": 60, "where": 80, "four": 110, "five": 149,
+        "what": 165, "times": 209, "king": 261, "how": 376, "six": 183,
+        "seven": 370, "eight": 411, "france": 537, "nine": 650, "ten": 511,
+        "less": 405, "add": 4285, "plus": 3463, "divided": 1575, "why": 1880,
+        "remainder": 2385, "eleven": 2898, "twelve": 2520, "thirteen": 4358,
+        "fourteen": 4388, "fifteen": 3389, "sixteen": 3753, "zero": 4709
+      }
+    },
+    "verification": {"canonical_suite": "SHIP-v6", "arithmetic": "152/152", "route": "152/152", "text_negative": "30/30", "host_nll": 8.6656, "training_at_runtime": false}
+  }
+}

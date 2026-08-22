@@ -1,0 +1,2 @@
+include manifests/s3_ship_v6.json
+include manifests/crsa_router_v1.json

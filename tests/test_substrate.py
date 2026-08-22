@@ -35,6 +35,14 @@ class ExactService:
         return Result(ExecutionStatus.ABSTAINED, self.name, reason="weiß ich nicht")
 
 
+class MetadataService:
+    name = "test.metadata"
+    capabilities = frozenset({"metadata"})
+
+    def handle(self, request: Request) -> Result:
+        return Result(ExecutionStatus.OK, self.name, output=request.metadata.get("trace_id"))
+
+
 def _make_bank(root: Path) -> OrganBank:
     artifact = root / "arith.organ"
     artifact.write_bytes(b"exact-organ")
@@ -119,12 +127,25 @@ class DaemonTests(unittest.TestCase):
         result = daemon.request("poetry", "sonett")
         self.assertIs(result.status, ExecutionStatus.UNAVAILABLE)
 
+    def test_service_metadata_crosses_the_daemon_boundary(self) -> None:
+        daemon = LifeDaemon()
+        daemon.register(MetadataService())
+        result = daemon.request("metadata", "payload", metadata={"trace_id": "turn-7"})
+        self.assertEqual(result.output, "turn-7")
+
+    def test_duplicate_capability_owner_is_rejected(self) -> None:
+        daemon = LifeDaemon()
+        daemon.register(ExactService())
+        with self.assertRaisesRegex(ValueError, "already owned"):
+            daemon.register(ExactService())
+
     def test_port_roundtrip_without_daemon(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             port = LifeStatePort(Path(tmp) / "p.json")
             self.assertIsNone(port.load())
             port.save({"turns": 3})
             self.assertEqual(port.load(), {"turns": 3})
+            self.assertEqual(list(Path(tmp).glob(".p.json.*.tmp")), [])
 
 
 if __name__ == "__main__":

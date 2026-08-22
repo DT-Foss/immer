@@ -1,35 +1,32 @@
-"""Bridge to the vendored o1-state organism (`vendor/o1state`).
+"""Production bridge to IMMER's side-effect-free o1-state model.
 
 The life stream is a real StreamingNoPELM (byte-level, NoPE, stateful scan):
 every user message flows through the organism as experience, per-layer Z
 states carry the continuous life, and the whole being fits into one portable
-sidecar file. Originals stay untouched — this wraps the vendored copy.
+sidecar file.  The model implementation contains the canonical recurrence and
+checkpoint-compatible parameter names directly; no research script is imported.
 """
 
 from __future__ import annotations
 
-import sys
+import os
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Mapping
-
-_VENDOR_ROOT = Path(__file__).resolve().parents[4] / "vendor" / "o1state"
-
-
-def _vendor_paths() -> tuple[Path, Path]:
-    return _VENDOR_ROOT / "src", _VENDOR_ROOT / "reference"
 
 
 def is_available() -> bool:
     try:
         import torch  # noqa: F401
+        from .model import StreamingNoPELM  # noqa: F401
     except ImportError:
         return False
-    src, ref = _vendor_paths()
-    return (src / "streaming_train.py").is_file() and (ref / "moebius_scan_transformer_sqrt.py").is_file()
+    return True
 
 
 class O1StateStream:
-    """LifeStream implementation over the vendored organism primitive."""
+    """LifeStream implementation over the production organism primitive."""
 
     def __init__(
         self,
@@ -48,78 +45,106 @@ class O1StateStream:
             raise RuntimeError(
                 "the o1-state bridge needs torch; install immer with '.[neural]'"
             ) from exc
-        if not is_available():
-            raise RuntimeError("vendored o1-state sources missing under vendor/o1state/")
-        src, ref = _vendor_paths()
-        for path in (str(src), str(ref)):
-            if path not in sys.path:
-                sys.path.insert(0, path)
-        from streaming_train import StreamingNoPELM
+        from .model import StreamingNoPELM
 
         self.torch = torch
-        torch.manual_seed(seed)
-        self.model = StreamingNoPELM(
-            vocab_size=257,
-            mask_idx=256,
-            d_model=d_model,
-            n_layers=n_layers,
-            n_heads=n_heads,
-            d_head=d_head,
-            seq_len=seq_len,
-            dropout=0.0,
-            causal=True,
-        )
+        # fork_rng makes deterministic construction local to this organism;
+        # it does not perturb the application's ambient torch RNG stream.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            self.model = StreamingNoPELM(
+                vocab_size=257,
+                mask_idx=256,
+                d_model=d_model,
+                n_layers=n_layers,
+                n_heads=n_heads,
+                d_head=d_head,
+                seq_len=seq_len,
+                dropout=0.0,
+                causal=True,
+            )
         self.model.eval()
         self.seq_len = seq_len
         self.states: list[Any] = [None] * n_layers
         self.tokens = 0
         self.loss_ema: float | None = None
         self.sidecar = Path(sidecar).expanduser() if sidecar is not None else None
+        self._lock = threading.RLock()
 
     # -- life -------------------------------------------------------------
 
     def observe(self, text: str) -> None:
-        torch = self.torch
-        data = text.encode("utf-8") or b"\x00"
-        with torch.no_grad():
-            for i in range(0, len(data), self.seq_len):
-                chunk = data[i : i + self.seq_len]
-                x = torch.tensor(list(chunk), dtype=torch.long).unsqueeze(0)
-                logits, self.states = self.model(x, self.states)
-                loss = torch.nn.functional.cross_entropy(logits[0], x[0])
-                value = float(loss)
-                self.loss_ema = value if self.loss_ema is None else 0.99 * self.loss_ema + 0.01 * value
-                self.tokens += len(chunk)
+        with self._lock:
+            torch = self.torch
+            data = text.encode("utf-8") or b"\x00"
+            with torch.no_grad():
+                for i in range(0, len(data), self.seq_len):
+                    chunk = data[i : i + self.seq_len]
+                    x = torch.tensor(list(chunk), dtype=torch.long).unsqueeze(0)
+                    logits, self.states = self.model(x, self.states)
+                    loss = torch.nn.functional.cross_entropy(logits[0], x[0])
+                    value = float(loss)
+                    self.loss_ema = (
+                        value
+                        if self.loss_ema is None
+                        else 0.99 * self.loss_ema + 0.01 * value
+                    )
+                    self.tokens += len(chunk)
 
     # -- continuity -------------------------------------------------------
 
     def snapshot(self) -> Mapping[str, Any]:
-        document: dict[str, Any] = {"tokens": self.tokens, "loss_ema": self.loss_ema}
-        if self.sidecar is not None:
-            self._save_sidecar()
-            document["sidecar"] = self.sidecar.name
-        return document
+        with self._lock:
+            document: dict[str, Any] = {"tokens": self.tokens, "loss_ema": self.loss_ema}
+            if self.sidecar is not None:
+                self._save_sidecar()
+                document["sidecar"] = self.sidecar.name
+            return document
 
     def restore(self, state: Mapping[str, Any]) -> None:
-        self.tokens = int(state.get("tokens", 0))
-        ema = state.get("loss_ema")
-        self.loss_ema = float(ema) if ema is not None else None
-        if self.sidecar is not None and self.sidecar.is_file():
-            self._load_sidecar()
+        with self._lock:
+            self.tokens = int(state.get("tokens", 0))
+            ema = state.get("loss_ema")
+            self.loss_ema = float(ema) if ema is not None else None
+            if self.sidecar is not None and self.sidecar.is_file():
+                self._load_sidecar()
 
     def _save_sidecar(self) -> None:
         self.sidecar.parent.mkdir(parents=True, exist_ok=True)
-        self.torch.save(
-            {
-                "model": self.model.state_dict(),
-                "states": self.states,
-                "tokens": self.tokens,
-                "loss_ema": self.loss_ema,
-            },
-            self.sidecar,
+        fd, temporary = tempfile.mkstemp(
+            dir=self.sidecar.parent,
+            prefix=f".{self.sidecar.name}.",
+            suffix=".tmp",
         )
+        os.close(fd)
+        temporary_path = Path(temporary)
+        try:
+            self.torch.save(self._sidecar_payload(), temporary_path)
+            os.replace(temporary_path, self.sidecar)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     def _load_sidecar(self) -> None:
-        bundle = self.torch.load(self.sidecar, weights_only=False)
+        bundle = self.torch.load(self.sidecar, map_location="cpu", weights_only=True)
+        if not isinstance(bundle, Mapping):
+            raise ValueError(f"invalid o1-state sidecar: {self.sidecar}")
+        self._restore_sidecar_payload(bundle)
+
+    def _sidecar_payload(self) -> dict[str, Any]:
+        return {
+            "schema": "immer.o1-state-sidecar/v2",
+            "model": self.model.state_dict(),
+            "states": self.states,
+            "tokens": self.tokens,
+            "loss_ema": self.loss_ema,
+        }
+
+    def _restore_sidecar_payload(self, bundle: Mapping[str, Any]) -> None:
         self.model.load_state_dict(bundle["model"])
-        self.states = bundle["states"]
+        states = bundle.get("states")
+        if not isinstance(states, list) or len(states) != len(self.states):
+            raise ValueError("sidecar state count does not match the organism")
+        self.states = states
+        self.tokens = int(bundle.get("tokens", self.tokens))
+        ema = bundle.get("loss_ema", self.loss_ema)
+        self.loss_ema = float(ema) if ema is not None else None

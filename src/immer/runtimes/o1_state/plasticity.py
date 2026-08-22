@@ -6,14 +6,14 @@ gate): every chunk gets a loss; a rolling window defines the current
 trigger a gradient step. Sleep replays buffered surprising spans at low
 learning rate and clears the buffer — consolidation without drift.
 
-House rules honored: torch threads capped at 1 (comparable numbers across
-machines), one training job at a time.
+Benchmark harnesses may pin torch to one thread for comparable measurements.
+The reusable runtime deliberately leaves that process-global setting alone.
 """
 
 from __future__ import annotations
 
 from collections import deque
-from typing import Any
+from typing import Any, Mapping
 
 from .adapter import O1StateStream
 
@@ -30,15 +30,24 @@ class LearningStream(O1StateStream):
         sleep_lr: float = 1e-3,
         span_buffer: int = 32,
         min_observations: int = 4,
+        max_grad_norm: float = 5.0,
         **kwargs: Any,
     ) -> None:
+        if window < 1:
+            raise ValueError("window must be positive")
+        if not 0.0 <= quantile <= 1.0:
+            raise ValueError("quantile must be between 0 and 1")
+        if min_observations < 0:
+            raise ValueError("min_observations must be non-negative")
+        if max_grad_norm <= 0:
+            raise ValueError("max_grad_norm must be positive")
         super().__init__(**kwargs)
-        self.torch.set_num_threads(1)
         self.optimizer = self.torch.optim.SGD(self.model.parameters(), lr=lr)
         self.sleep_optimizer = self.torch.optim.SGD(self.model.parameters(), lr=sleep_lr)
         self.window = deque(maxlen=window)
         self.quantile = quantile
         self.min_observations = min_observations
+        self.max_grad_norm = max_grad_norm
         self.spans: deque[bytes] = deque(maxlen=span_buffer)
         self.surprises = 0
         self.updates = 0
@@ -47,42 +56,63 @@ class LearningStream(O1StateStream):
     # -- gated plasticity --------------------------------------------------
 
     def _is_surprising(self, loss: float) -> bool:
-        if len(self.window) < self.min_observations:
+        if not self.window or len(self.window) < self.min_observations:
             return False
         values = sorted(self.window)
         rank = int(self.quantile * (len(values) - 1))
         return loss > values[rank]
 
     def observe(self, text: str) -> None:
+        with self._lock:
+            self._observe_locked(text)
+
+    def _observe_locked(self, text: str) -> None:
         torch = self.torch
         data = text.encode("utf-8") or b"\x00"
-        with torch.no_grad():
-            pass  # gradient mode decided per chunk below
         for i in range(0, len(data), self.seq_len):
             chunk = data[i : i + self.seq_len]
             x = torch.tensor(list(chunk), dtype=torch.long).unsqueeze(0)
-            logits, self.states = self.model(x, self.states)
-            loss = torch.nn.functional.cross_entropy(logits[0], x[0])
-            value = loss.detach().item()
+            incoming = self._detached_states(self.states)
+
+            # POS canon: measure without a graph; only a surprising chunk is
+            # recomputed from the exact same incoming state with autograd.
+            with torch.no_grad():
+                logits, observed_states = self.model(x, incoming)
+                observed_loss = torch.nn.functional.cross_entropy(logits[0], x[0])
+            value = float(observed_loss)
             self.loss_ema = value if self.loss_ema is None else 0.99 * self.loss_ema + 0.01 * value
             self.tokens += len(chunk)
-            self.window.append(value)
-            if self._is_surprising(value):
+            surprising = self._is_surprising(value)
+            if surprising:
                 self.surprises += 1
                 self.spans.append(chunk)
-                self.optimizer.zero_grad()
+                logits, learned_states = self.model(x, incoming)
+                loss = torch.nn.functional.cross_entropy(logits[0], x[0])
+                self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 self.updates += 1
-                # states were computed pre-update; detach the carried life
-                self.states = [
-                    z.detach() if hasattr(z, "detach") else z for z in self.states
-                ]
+                self.states = self._detached_states(learned_states)
+            else:
+                self.states = self._detached_states(observed_states)
+            # The threshold is defined by previous chunks only.
+            self.window.append(value)
+
+    @staticmethod
+    def _detached_states(states: list[Any]) -> list[Any]:
+        return [state.detach() if hasattr(state, "detach") else state for state in states]
 
     # -- consolidation -----------------------------------------------------
 
     def sleep(self, *, epochs: int = 2) -> dict[str, int]:
         """Replay surprising spans at low LR, then clear the buffer."""
+        if epochs < 0:
+            raise ValueError("epochs must be non-negative")
+        with self._lock:
+            return self._sleep_locked(epochs)
+
+    def _sleep_locked(self, epochs: int) -> dict[str, int]:
         torch = self.torch
         replayed = 0
         if self.spans:
@@ -92,8 +122,9 @@ class LearningStream(O1StateStream):
                     x = torch.tensor(list(chunk), dtype=torch.long).unsqueeze(0)
                     logits, _ = self.model(x, None)
                     loss = torch.nn.functional.cross_entropy(logits[0], x[0])
-                    self.sleep_optimizer.zero_grad()
+                    self.sleep_optimizer.zero_grad(set_to_none=True)
                     loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.sleep_optimizer.step()
                     replayed += 1
             self.spans.clear()
@@ -103,11 +134,46 @@ class LearningStream(O1StateStream):
     # -- reporting ---------------------------------------------------------
 
     def metrics(self) -> dict[str, Any]:
-        return {
-            "tokens": self.tokens,
-            "loss_ema": self.loss_ema,
+        with self._lock:
+            return {
+                "tokens": self.tokens,
+                "loss_ema": self.loss_ema,
+                "surprises": self.surprises,
+                "updates": self.updates,
+                "sleeps": self.sleeps,
+                "span_buffer": len(self.spans),
+            }
+
+    # -- restart-safe plasticity --------------------------------------------
+
+    def _sidecar_payload(self) -> dict[str, Any]:
+        payload = super()._sidecar_payload()
+        payload["plasticity"] = {
+            "window": list(self.window),
+            "spans": list(self.spans),
             "surprises": self.surprises,
             "updates": self.updates,
             "sleeps": self.sleeps,
-            "span_buffer": len(self.spans),
+            "optimizer": self.optimizer.state_dict(),
+            "sleep_optimizer": self.sleep_optimizer.state_dict(),
         }
+        return payload
+
+    def _restore_sidecar_payload(self, bundle: Mapping[str, Any]) -> None:
+        super()._restore_sidecar_payload(bundle)
+        plasticity = bundle.get("plasticity")
+        if not isinstance(plasticity, Mapping):
+            return  # v1 sidecar: model/state continuity remains available
+        self.window.clear()
+        self.window.extend(float(value) for value in plasticity.get("window", ()))
+        self.spans.clear()
+        self.spans.extend(bytes(value) for value in plasticity.get("spans", ()))
+        self.surprises = int(plasticity.get("surprises", 0))
+        self.updates = int(plasticity.get("updates", 0))
+        self.sleeps = int(plasticity.get("sleeps", 0))
+        optimizer = plasticity.get("optimizer")
+        if isinstance(optimizer, Mapping):
+            self.optimizer.load_state_dict(dict(optimizer))
+        sleep_optimizer = plasticity.get("sleep_optimizer")
+        if isinstance(sleep_optimizer, Mapping):
+            self.sleep_optimizer.load_state_dict(dict(sleep_optimizer))

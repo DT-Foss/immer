@@ -1,70 +1,108 @@
-# HF-SHIP — das erste eigene Model auf Hugging Face
+# Hugging-Face-Export — technisch fertig, weiterhin der letzte Schritt
 
-Stand: 2026-08-21. Ziel: **DT-Foss' erstes HF-Model** — ehrlich, gemessen,
-klein. Nicht der 27B (nicht unserer), nicht ein Qwen-Klon. Unsere Artefakte:
+Stand: 2026-08-22. Der lokale Export ist implementiert. Er ist eine
+Release-Ausgabe nach dem Runtime-Akzeptanzlauf, keine Entwicklungsachse und
+kein Upload-Werkzeug.
 
-## Was geshipped wird (in dieser Reihenfolge)
-
-### Release 1 — `DT-Foss/immer-organism-v0` (das Lebewesen)
-
-Der o1-State-Organismus: 1,7M-StreamingNoPELM + Lebenszustand + Organ-Bank.
-
-```text
-immer-organism-v0/
-├── README.md            ← Model-Card (siehe unten, Pflicht auf HF)
-├── config.json          ← d_model/n_layers/seq_len/vocab (aus pos_ckpt)
-├── model.safetensors    ← Host-Gewichte aus pos_ckpt.pt konvertiert
-├── life_state.json      ← Stream-Position, Z-Spans, Ledger-Digest
-├── organs/
-│   ├── manifest.json    ← OrganBank-Format (name/capability/sha256) — bereits gebaut
-│   ├── organ_arith_dual.pt
-│   ├── organ_mul_log.pt
-│   └── organ_mod_kreis.pt
-└── immer_organism.py    ← Loader (ein File, torch-only, kein immer-Repo nötig)
-```
-
-**Warum das als Erstes:** klein (~80 MB), komplett unser, einzigartig
-(kein zweites Lebewesen mit Lebensstrom+Organen auf HF), alle Messanker
-vorhanden (twostep 1,000 · NLL bitgleich · 152/152).
-
-### Release 2 — `DT-Foss/immer` (die Runtime, pip-installierbar)
-
-`pip install immer` → `immer serve`. Repo existiert; vor Ship: Vendor aufräumen
-(O1_juli-Copyright-Header prüfen, LICENSE-Kette sauberstellen), pyproject
-finalisieren, CI grün.
-
-### Release 3 — `.causal`-Bibliothek als Dataset
-
-Die gewachsene Bibliothek (Span-Karten mit Herkunfts-Stempeln) als
-`DT-Foss/wesen-bibliothek` Dataset — wächst mit jedem Leben, Versionierung
-per Digest.
-
-## Was es noch braucht (Checkliste)
-
-1. **HF-Account + Token**: `huggingface.co` → Settings → Access Token (write);
-   lokal `pip install huggingface_hub && hf auth login`.
-2. **Konvertierung**: `pos_ckpt.pt` (74 MB, enthält Optimizer-Müll) →
-   reines state_dict → `safetensors.torch.save_file` (~7 MB schlank).
-   Skript: `scripts/export_hf.py` (zu bauen, ~50 Zeilen).
-3. **Model-Card Pflichtfelder**: Modellbeschreibung, Training (C4-Stream,
-   Surprise-Gate-Rezept, Token-Zahl), Intended Use + Limitierungen (ehrlich:
-   1,7M Params — kein Chat-Modell; es ist ein LEBEN mit Organen),
-   Metrics (NLL, twostep, 152/152), License (MIT/Apache-2.0 — O1_juli-Lizenz
-   erben), Citation (CITATION.cff existiert schon).
-4. **Reproducibility-Block**: Seed, Kadenz (batch/chunk/d_model), WT2-Vokabular-
-   Snapshot — ohne die ist der Upload tot weight drift.
-5. **Golden-Test im Loader**: `python immer_organism.py --verify` führt
-   twostep + NLL-Check aus und muss die Card-Zahlen reproduzieren.
-6. **Router-Artefakt-Lücke schließen** (Subagent-Befund): Router einmal
-   trainieren + persistieren, sonst ist Release 1 halb tot.
-
-## Der Weg (konkret, ~1 Session)
+## Offline erzeugen
 
 ```bash
-hf auth whoami                       # 1. Identität
-python scripts/export_hf.py          # 2. ckpt → safetensors + config + card
-hf upload repo DT-Foss/immer-organism-v0 ./dist/ --repo-type model   # 3.
+pip install -e '.[neural,export]'
+python -m immer doctor --deep
+python -m immer eval
+
+# Baut in einem Nachbar-Staging-Verzeichnis, verifiziert dort isoliert und
+# veröffentlicht erst danach atomar.
+python -m immer export-hf dist/immer-ship-v6
+
+# Gleichwertiger direkter Entrypoint:
+PYTHONPATH=src python scripts/export_hf_poc.py dist/immer-ship-v6
 ```
 
-Danach: Model-Card auf HF im Browser polieren, `imm0` als Nickname?
-(Nein — Name bleibt Sache von David.)
+Ein vorhandenes Ziel wird nicht angefasst. `--replace` verschiebt es zuerst
+nach `immer-ship-v6.backup` (bei Bedarf `.backup.1`, …), sodass die vorherigen
+Daten wiederherstellbar bleiben.
+
+## Erzeugter PoC
+
+```text
+immer-ship-v6/
+├── README.md                       # Model Card: license other / NOT CLEARED
+├── config.json                     # Architektur + hartes Upload-Gate
+├── model.safetensors               # nur arms.A1.model, ca. 6,9 MB
+├── s3_ship_v6.json                 # auf Bundle-Pfade rebasiert
+├── crsa_router_v1.json
+├── checksums.json                  # exakte Dateiliste + SHA-256
+├── requirements.txt
+├── verify.py                       # Digests + 152/152 + Router-Digest
+├── solve.py                        # S3 → bewachte FERTIG-Kaskade
+├── organs/
+│   ├── organ_dual_donor.pt         # bytegleich zum Original
+│   ├── organ_mul_donor.pt
+│   ├── organ_mod_kreis.pt
+│   └── organ_dezimal.pt
+└── runtime/immer/                  # eigenständige Package-Kopie, ohne pycache
+```
+
+Der 71-MB-Forschungscheckpoint wird nicht umetikettiert. Der Exporter lädt ihn
+mit `weights_only=True`, prüft zuerst seinen Manifest-SHA, entnimmt ausschließlich
+`arms.A1.model` und schreibt einen deterministischen Safetensors-State-Dict.
+Optimizer, andere Arme, Stream-Puffer, Pending State und RNG-Zustände bleiben
+draußen. Alle vier Organ-Dateien werden unverändert kopiert und erneut gegen
+ihre `ArtifactSpec`-Digests geprüft.
+
+## Automatischer Offline-Akzeptanzlauf
+
+Vor dem atomaren Publish startet der Exporter in seinem Staging-Verzeichnis:
+
+```bash
+python -I -B verify.py
+```
+
+Dabei werden `PYTHONPATH` und sämtliche `IMMER_*`-Overrides entfernt sowie die
+HF-/Transformers-Offlineflags gesetzt. Der Verifier:
+
+1. lehnt zusätzliche, fehlende, veränderte oder verlinkte Dateien ab;
+2. importiert IMMER ausschließlich aus `runtime/immer`;
+3. lädt den A1-only-Safetensors-State streng in den In-Package-Host;
+4. prüft 152/152 Antworten und 152/152 Organrouten ohne Training;
+5. vergleicht den semantischen Router-Digest
+   `561db8fc50ea029288f318eb9f7c206bd5c007757dbdd60843f1a03990efd819`.
+
+Danach kann derselbe Ordner ohne Checkout getestet werden:
+
+```bash
+cd dist/immer-ship-v6
+python -I -B verify.py
+python -I -B solve.py "three plus five is"
+```
+
+`solve.py` verifiziert zuerst die Bundle-Digests und verwendet danach wirklich
+`S3Arithmetic` plus `ExactCascade(S3, FertigSolver)`. FERTIG bleibt
+Verifier/Fallback und die Kaskade behält ihre bewachte Abstinenz.
+
+## Harte Publikationssperre: Lizenz
+
+Im Repository liegt ein `NOTICE.md`, aber keine Root-`LICENSE`. Das ist keine
+Lizenzgewährung. Deshalb tragen Model Card und Konfiguration absichtlich:
+
+```yaml
+license: other
+license_status: NOT_CLEARED
+public_upload_allowed: false
+```
+
+Weder Modul noch CLI enthalten Hub-, Login- oder Upload-Code. Öffentliche
+Veröffentlichung und Redistribution bleiben gesperrt, bis die Rechtekette für
+Hostgewichte, alle vier Organe, Runtime-Quellen und FERTIG schriftlich geklärt
+ist. Erst dann darf `public_upload_allowed` nach einer bewussten Releaseprüfung
+geändert und ein externes Uploadwerkzeug benutzt werden.
+
+## Was die Model Card bewusst nicht behauptet
+
+- kein allgemeines Reasoning- oder Chatmodell;
+- 152/152 ist die kanonische SHIP-v6-Arithmetiksuite, nicht GSM8K;
+- CRSA schlägt in der aktuellen Routermessung kausale Softmax nicht;
+- der statische Value-Sketch war mit 24 % gegen 32 % Placebo negativ und ist
+  nicht im Bundle;
+- der optionale FERTIG-Weltgraph wird nicht mitgeliefert.
