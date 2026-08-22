@@ -85,6 +85,13 @@ class FertigAdapterTests(unittest.TestCase):
                 "What is the weight of Harry, in kg?",
                 "74",
             ),
+            (
+                "Mira's sequence has value 3 at step 0. At each step, the next "
+                "value in Mira's sequence is 2 times the current value in Mira's "
+                "sequence plus 1. What is the cumulative sum of the values in "
+                "Mira's sequence from step 0 through step 4?",
+                "119",
+            ),
         )
         for question, expected in examples:
             with self.subTest(expected=expected):

@@ -248,6 +248,72 @@ _SCORE_MEAN = re.compile(
     re.IGNORECASE,
 )
 
+# A deliberately small recurrence language.  The three clauses are matched as
+# typed predicates and may appear in any sentence order; no keyword search or
+# fuzzy binding participates.  Requiring every owner occurrence makes the
+# recurrence basis explicit instead of resolving pronouns heuristically.
+_RECURRENCE_START = re.compile(
+    rf"^(?P<owner>{_NAME})\s*[\u2019']s\s+sequence\s+has\s+value\s+"
+    rf"(?P<value>{_SIGNED_NUMBER})\s+at\s+step\s+(?P<index>{_NUMBER})$",
+    re.IGNORECASE,
+)
+_RECURRENCE_AFFINE = re.compile(
+    rf"^At\s+each\s+step,\s+the\s+next\s+value\s+in\s+"
+    rf"(?P<next_owner>{_NAME})\s*[\u2019']s\s+sequence\s+(?:is|equals)\s+"
+    rf"(?P<factor>{_SIGNED_NUMBER})\s+times\s+the\s+current\s+value\s+in\s+"
+    rf"(?P<current_owner>{_NAME})\s*[\u2019']s\s+sequence\s+"
+    rf"(?P<offset_direction>plus|minus)\s+(?P<offset>{_NUMBER})$",
+    re.IGNORECASE,
+)
+_RECURRENCE_CURRENT_PERCENT = re.compile(
+    rf"^At\s+each\s+step,\s+the\s+next\s+value\s+in\s+"
+    rf"(?P<next_owner>{_NAME})\s*[\u2019']s\s+sequence\s+(?:is|equals)\s+"
+    rf"the\s+current\s+value\s+in\s+"
+    rf"(?P<base_owner>{_NAME})\s*[\u2019']s\s+sequence\s+plus\s+"
+    rf"(?P<percent>{_NUMBER})\s*%\s+of\s+the\s+current\s+value\s+in\s+"
+    rf"(?P<percent_owner>{_NAME})\s*[\u2019']s\s+sequence\s+"
+    rf"(?P<offset_direction>plus|minus)\s+(?P<offset>{_NUMBER})$",
+    re.IGNORECASE,
+)
+_RECURRENCE_ORIGINAL_PERCENT = re.compile(
+    rf"^At\s+each\s+step,\s+the\s+next\s+value\s+in\s+"
+    rf"(?P<next_owner>{_NAME})\s*[\u2019']s\s+sequence\s+(?:is|equals)\s+"
+    rf"the\s+current\s+value\s+in\s+"
+    rf"(?P<base_owner>{_NAME})\s*[\u2019']s\s+sequence\s+plus\s+"
+    rf"(?P<percent>{_NUMBER})\s*%\s+of\s+the\s+original\s+value\s+in\s+"
+    rf"(?P<percent_owner>{_NAME})\s*[\u2019']s\s+sequence\s+"
+    rf"(?P<offset_direction>plus|minus)\s+(?P<offset>{_NUMBER})$",
+    re.IGNORECASE,
+)
+_RECURRENCE_BARE_PERCENT = re.compile(
+    rf"^At\s+each\s+step,\s+the\s+next\s+value\s+in\s+"
+    rf"(?P<next_owner>{_NAME})\s*[\u2019']s\s+sequence\s+(?:is|equals)\s+"
+    rf"the\s+current\s+value\s+in\s+"
+    rf"(?P<base_owner>{_NAME})\s*[\u2019']s\s+sequence\s+plus\s+"
+    rf"(?P<percent>{_NUMBER})\s*%\s+"
+    rf"(?P<offset_direction>plus|minus)\s+(?P<offset>{_NUMBER})$",
+    re.IGNORECASE,
+)
+_RECURRENCE_VALUE_QUERY = re.compile(
+    rf"^What\s+is\s+the\s+value\s+in\s+(?P<owner>{_NAME})\s*[\u2019']s\s+"
+    rf"sequence\s+at\s+step\s+(?P<end>{_NUMBER})$",
+    re.IGNORECASE,
+)
+_RECURRENCE_CHANGE_QUERY = re.compile(
+    rf"^What\s+is\s+the\s+net\s+change\s+in\s+"
+    rf"(?P<owner>{_NAME})\s*[\u2019']s\s+sequence\s+from\s+step\s+"
+    rf"(?P<start>{_NUMBER})\s+to\s+step\s+(?P<end>{_NUMBER})$",
+    re.IGNORECASE,
+)
+_RECURRENCE_SUM_QUERY = re.compile(
+    rf"^What\s+is\s+the\s+cumulative\s+sum\s+of\s+the\s+values\s+in\s+"
+    rf"(?P<owner>{_NAME})\s*[\u2019']s\s+sequence\s+from\s+step\s+"
+    rf"(?P<start>{_NUMBER})\s+through\s+step\s+(?P<end>{_NUMBER})$",
+    re.IGNORECASE,
+)
+
+_MAX_RECURRENCE_STEPS = 64
+
 
 class ParseStatus(str, Enum):
     """Closed outcome set for structural parsing."""
@@ -416,6 +482,13 @@ def _signed_number(token: str) -> Fraction:
     if value.startswith("+"):
         value = value[1:]
     return _number(value)
+
+
+def _step_index(token: str) -> int:
+    value = _number(token)
+    if value.denominator != 1:
+        raise _Abort(ParseStatus.INVALID, "recurrence step indices must be integers")
+    return value.numerator
 
 
 def _same(*values: str) -> bool:
@@ -782,8 +855,228 @@ class StructuralParser:
         self.targets.append(target)
         return True
 
+    def _parse_recurrence(self) -> bool:
+        """Compile one closed finite affine recurrence into exact linear IR."""
+
+        clauses = _sentences(self.source)
+        starts: list[tuple[_Clause, re.Match[str]]] = []
+        rules: list[tuple[str, _Clause, re.Match[str]]] = []
+        queries: list[tuple[str, _Clause, re.Match[str]]] = []
+        matched_clause_count = 0
+
+        for clause in clauses:
+            text = clause.text.strip()
+            match = _RECURRENCE_START.fullmatch(text)
+            if match is not None:
+                starts.append((clause, match))
+                matched_clause_count += 1
+                continue
+
+            for kind, pattern in (
+                ("affine", _RECURRENCE_AFFINE),
+                ("current_percent", _RECURRENCE_CURRENT_PERCENT),
+                ("original_percent", _RECURRENCE_ORIGINAL_PERCENT),
+            ):
+                match = pattern.fullmatch(text)
+                if match is not None:
+                    rules.append((kind, clause, match))
+                    matched_clause_count += 1
+                    break
+            else:
+                match = _RECURRENCE_BARE_PERCENT.fullmatch(text)
+                if match is not None:
+                    raise _Abort(
+                        ParseStatus.AMBIGUOUS,
+                        "percentage recurrence must name current or original basis",
+                    )
+                for kind, pattern in (
+                    ("value", _RECURRENCE_VALUE_QUERY),
+                    ("change", _RECURRENCE_CHANGE_QUERY),
+                    ("sum", _RECURRENCE_SUM_QUERY),
+                ):
+                    match = pattern.fullmatch(text)
+                    if match is not None:
+                        queries.append((kind, clause, match))
+                        matched_clause_count += 1
+                        break
+
+        if matched_clause_count == 0:
+            return False
+        if matched_clause_count != len(clauses):
+            raise _Abort(
+                ParseStatus.UNSUPPORTED,
+                "recurrence contains a clause outside the closed grammar",
+            )
+        if len(starts) != 1 or len(rules) != 1 or len(queries) != 1:
+            status = (
+                ParseStatus.AMBIGUOUS
+                if any(len(group) > 1 for group in (starts, rules, queries))
+                else ParseStatus.UNSUPPORTED
+            )
+            raise _Abort(
+                status,
+                "recurrence requires exactly one start, rule, and target clause",
+            )
+
+        start_clause, start_match = starts[0]
+        rule_kind, rule_clause, rule_match = rules[0]
+        query_kind, query_clause, query_match = queries[0]
+        owner = start_match.group("owner")
+        rule_owner_groups = {
+            "affine": ("next_owner", "current_owner"),
+            "current_percent": ("next_owner", "base_owner", "percent_owner"),
+            "original_percent": ("next_owner", "base_owner", "percent_owner"),
+        }[rule_kind]
+        owners = (
+            owner,
+            *(rule_match.group(group) for group in rule_owner_groups),
+            query_match.group("owner"),
+        )
+        if not _same(*owners):
+            raise _Abort(ParseStatus.AMBIGUOUS, "recurrence owners do not agree")
+
+        start_index = _step_index(start_match.group("index"))
+        end_index = _step_index(query_match.group("end"))
+        if query_kind != "value":
+            query_start = _step_index(query_match.group("start"))
+            if query_start != start_index:
+                raise _Abort(
+                    ParseStatus.AMBIGUOUS,
+                    "recurrence target range does not start at the declared index",
+                )
+        if end_index < start_index:
+            raise _Abort(ParseStatus.INVALID, "recurrence target precedes its start")
+        step_count = end_index - start_index
+        if step_count > _MAX_RECURRENCE_STEPS:
+            raise _Abort(
+                ParseStatus.UNSUPPORTED,
+                f"recurrence exceeds {_MAX_RECURRENCE_STEPS} exact steps",
+            )
+
+        unit = Unit.scalar()
+        prefix = f"recurrence.{_entity(owner)}"
+        start_value = _signed_number(start_match.group("value"))
+        start_value_span = start_clause.group_span(start_match, "value", self.source)
+
+        def state(index: int, span: Span) -> Variable:
+            return self._variable(f"{prefix}.x[{index}]", unit, span=span)
+
+        states = [state(start_index, start_value_span)]
+        self._define(
+            states[0],
+            Assign(
+                states[0],
+                Quantity(start_value, unit, span=start_value_span),
+                span=start_clause.span(self.source),
+            ),
+        )
+
+        offset = _number(rule_match.group("offset"))
+        if rule_match.group("offset_direction").casefold() == "minus":
+            offset = -offset
+        offset_quantity = Quantity(
+            offset,
+            unit,
+            span=rule_clause.group_span(rule_match, "offset", self.source),
+        )
+        rule_span = rule_clause.span(self.source)
+
+        original_growth: Variable | None = None
+        if rule_kind == "original_percent":
+            percent = _number(rule_match.group("percent")) / 100
+            percent_span = rule_clause.group_span(rule_match, "percent", self.source)
+            original_growth = self._variable(
+                f"{prefix}.original_growth",
+                unit,
+                span=percent_span,
+            )
+            self._define(
+                original_growth,
+                Part(
+                    original_growth,
+                    states[0],
+                    percent,
+                    span=rule_span,
+                ),
+            )
+
+        for index in range(start_index, end_index):
+            current = states[-1]
+            following = state(index + 1, rule_span)
+            if rule_kind == "affine":
+                self._define(
+                    following,
+                    Affine(
+                        following,
+                        current,
+                        _signed_number(rule_match.group("factor")),
+                        offset_quantity,
+                        span=rule_span,
+                    ),
+                )
+            elif rule_kind == "current_percent":
+                percent = _number(rule_match.group("percent")) / 100
+                growth = self._variable(
+                    f"{prefix}.current_growth[{index}]",
+                    unit,
+                    span=rule_clause.group_span(rule_match, "percent", self.source),
+                )
+                self._define(
+                    growth,
+                    Part(growth, current, percent, span=rule_span),
+                )
+                self._define(
+                    following,
+                    Sum(
+                        following,
+                        (current, growth, offset_quantity),
+                        span=rule_span,
+                    ),
+                )
+            else:
+                assert original_growth is not None
+                self._define(
+                    following,
+                    Sum(
+                        following,
+                        (current, original_growth, offset_quantity),
+                        span=rule_span,
+                    ),
+                )
+            states.append(following)
+
+        if query_kind == "value":
+            target = states[-1]
+        elif query_kind == "change":
+            target = self._variable(
+                f"{prefix}.change[{start_index}:{end_index}]",
+                unit,
+                span=query_clause.span(self.source),
+            )
+            self._define(
+                target,
+                Balance(
+                    (target, states[0]),
+                    (states[-1],),
+                    span=query_clause.span(self.source),
+                ),
+            )
+        else:
+            target = self._variable(
+                f"{prefix}.sum[{start_index}:{end_index}]",
+                unit,
+                span=query_clause.span(self.source),
+            )
+            self._define(
+                target,
+                Sum(target, tuple(states), span=query_clause.span(self.source)),
+            )
+        self.targets.append(target)
+        return True
+
     def _parse_closed_family(self) -> bool:
         parsers = (
+            self._parse_recurrence,
             self._parse_direct_rate,
             self._parse_part_inventory,
             self._parse_original_length_part,

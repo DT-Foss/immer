@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import unittest
 from fractions import Fraction
+from itertools import permutations
 
 from immer.cognition.fertig.arithmetic_ir import (
+    Affine,
     Balance,
     Mean,
     Part,
     Rate,
     SolveStatus,
+    Sum,
     solve,
 )
 from immer.cognition.fertig.structural import ParseStatus, parse_structural_problem
@@ -381,6 +384,208 @@ class MeanStructuralParserTests(unittest.TestCase):
 
         self.assertEqual(result.status, ParseStatus.UNSUPPORTED)
         self.assertIsNone(result.problem)
+
+
+class RecurrenceStructuralParserTests(unittest.TestCase):
+    START = "Mira's sequence has value 3 at step 0"
+    RULE = (
+        "At each step, the next value in Mira's sequence is 2 times the "
+        "current value in Mira's sequence plus 1"
+    )
+
+    def test_value_change_and_inclusive_sum_are_distinct_certified_targets(
+        self,
+    ) -> None:
+        queries = {
+            "What is the value in Mira's sequence at step 4": 63,
+            "What is the net change in Mira's sequence from step 0 to step 4": 60,
+            (
+                "What is the cumulative sum of the values in Mira's sequence "
+                "from step 0 through step 4"
+            ): 119,
+        }
+
+        for query, expected in queries.items():
+            with self.subTest(query=query):
+                parsed, solution = _solve(f"{self.START}. {self.RULE}. {query}?")
+                self.assertEqual(solution.status, SolveStatus.UNIQUE)
+                self.assertEqual(solution.target_value, expected)
+                self.assertIsNotNone(solution.certificate)
+                assert solution.certificate is not None
+                self.assertTrue(solution.certificate.verified)
+                assert parsed.problem is not None
+                self.assertTrue(
+                    all(
+                        constraint.span is not None
+                        for constraint in parsed.problem.constraints
+                    )
+                )
+
+        parsed, _ = _solve(
+            f"{self.START}. {self.RULE}. "
+            "What is the value in Mira's sequence at step 4?"
+        )
+        assert parsed.problem is not None
+        self.assertEqual(
+            sum(
+                isinstance(constraint, Affine)
+                for constraint in parsed.problem.constraints
+            ),
+            4,
+        )
+
+    def test_current_and_original_percent_bases_produce_different_ir(self) -> None:
+        start = "Mira's sequence has value 10 at step 0"
+        query = "What is the value in Mira's sequence at step 2?"
+        current = (
+            "At each step, the next value in Mira's sequence is the current value "
+            "in Mira's sequence plus 10% of the current value in Mira's sequence "
+            "plus 2"
+        )
+        original = (
+            "At each step, the next value in Mira's sequence is the current value "
+            "in Mira's sequence plus 10% of the original value in Mira's sequence "
+            "plus 2"
+        )
+
+        current_parsed, current_solution = _solve(f"{start}. {current}. {query}")
+        original_parsed, original_solution = _solve(f"{start}. {original}. {query}")
+
+        self.assertEqual(current_solution.target_value, Fraction(163, 10))
+        self.assertEqual(original_solution.target_value, 16)
+        assert current_parsed.problem is not None
+        assert original_parsed.problem is not None
+        self.assertEqual(
+            sum(
+                isinstance(constraint, Part)
+                for constraint in current_parsed.problem.constraints
+            ),
+            2,
+        )
+        self.assertEqual(
+            sum(
+                isinstance(constraint, Part)
+                for constraint in original_parsed.problem.constraints
+            ),
+            1,
+        )
+        self.assertTrue(
+            any(
+                isinstance(constraint, Sum)
+                for constraint in current_parsed.problem.constraints
+            )
+        )
+
+    def test_generated_renames_and_number_perturbations_preserve_recurrence(
+        self,
+    ) -> None:
+        cases = (
+            ("Mira", 3, Fraction(2), 1, 0, 4),
+            ("Pavel", 5, Fraction(3, 2), -2, 2, 6),
+            ("Keiko", -4, Fraction(-1), 3, 7, 12),
+            ("Nora", 9, Fraction(1, 3), 0, 11, 14),
+        )
+
+        for owner, initial, factor, offset, first, last in cases:
+            factor_text = (
+                str(factor.numerator)
+                if factor.denominator == 1
+                else f"{factor.numerator}/{factor.denominator}"
+            )
+            direction = "plus" if offset >= 0 else "minus"
+            source = (
+                f"{owner}'s sequence has value {initial} at step {first}. "
+                f"At each step, the next value in {owner}'s sequence is "
+                f"{factor_text} times the current value in {owner}'s sequence "
+                f"{direction} {abs(offset)}. "
+                f"What is the value in {owner}'s sequence at step {last}?"
+            )
+            expected = Fraction(initial)
+            for _ in range(last - first):
+                expected = factor * expected + offset
+
+            with self.subTest(owner=owner, first=first, last=last):
+                self.assertEqual(_solve(source)[1].target_value, expected)
+
+    def test_all_sentence_orders_preserve_absolute_step_indexing(self) -> None:
+        clauses = (
+            "Pavel's sequence has value 4 at step 2.",
+            (
+                "At each step, the next value in Pavel's sequence equals 3/2 times "
+                "the current value in Pavel's sequence minus 1."
+            ),
+            "What is the value in Pavel's sequence at step 5?",
+        )
+
+        for order in permutations(clauses):
+            with self.subTest(order=order):
+                self.assertEqual(
+                    _solve(" ".join(order))[1].target_value,
+                    Fraction(35, 4),
+                )
+
+    def test_ambiguous_or_incomplete_recurrences_abstain(self) -> None:
+        cases = (
+            (
+                "Mira's sequence has value 3 at step 0. At each step, the next "
+                "value in Mira's sequence is 2 times the current value in Pavel's "
+                "sequence plus 1. What is the value in Mira's sequence at step 4?",
+                ParseStatus.AMBIGUOUS,
+            ),
+            (
+                "Mira's sequence has value 3 at step 0. At each step, the next "
+                "value in Mira's sequence is the current value in Mira's sequence "
+                "plus 10% plus 1. What is the value in Mira's sequence at step 4?",
+                ParseStatus.AMBIGUOUS,
+            ),
+            (
+                f"{self.START}. {self.RULE}. What is the net change in Mira's "
+                "sequence from step 1 to step 4?",
+                ParseStatus.AMBIGUOUS,
+            ),
+            (
+                f"{self.START}. {self.RULE}. What is the value in Pavel's "
+                "sequence at step 4?",
+                ParseStatus.AMBIGUOUS,
+            ),
+            (
+                f"{self.START}. {self.RULE}. What is the value in Mira's "
+                "sequence at step 1.5?",
+                ParseStatus.INVALID,
+            ),
+            (
+                "Mira's sequence has value 3 at step 5. At each step, the next "
+                "value in Mira's sequence is 2 times the current value in Mira's "
+                "sequence plus 1. What is the value in Mira's sequence at step 4?",
+                ParseStatus.INVALID,
+            ),
+            (
+                f"{self.START}. What is the value in Mira's sequence at step 4?",
+                ParseStatus.UNSUPPORTED,
+            ),
+            (
+                f"{self.START}. At each step, the next value in Mira's sequence "
+                "is 2 times the current value in Mira's sequence. What is the "
+                "value in Mira's sequence at step 4?",
+                ParseStatus.UNSUPPORTED,
+            ),
+            (
+                f"{self.START}. {self.RULE}. {self.RULE}. What is the value in "
+                "Mira's sequence at step 4?",
+                ParseStatus.AMBIGUOUS,
+            ),
+            (
+                f"{self.START}. {self.RULE}. What is the value in Mira's "
+                "sequence at step 65?",
+                ParseStatus.UNSUPPORTED,
+            ),
+        )
+
+        for source, expected in cases:
+            with self.subTest(source=source):
+                result = parse_structural_problem(source)
+                self.assertEqual(result.status, expected, result.reason)
+                self.assertIsNone(result.problem)
 
 
 class FailClosedStructuralParserTests(unittest.TestCase):
