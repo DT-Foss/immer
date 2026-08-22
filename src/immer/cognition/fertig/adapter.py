@@ -11,6 +11,43 @@ from types import ModuleType
 from typing import Iterator
 
 from ...contracts import ExecutionStatus, Request, Result
+from .arithmetic_ir import SolveStatus, solve as solve_arithmetic_ir
+from .structural import ParseStatus, parse_structural_problem
+
+
+class FertigStructuralError(RuntimeError):
+    """The closed structural frontend encountered invalid internal input."""
+
+
+def _format_fraction(value: object) -> str:
+    from fractions import Fraction
+
+    if not isinstance(value, Fraction):
+        raise FertigStructuralError("structural solver returned a non-Fraction target")
+    if value.denominator == 1:
+        return str(value.numerator)
+    return str(float(value))
+
+
+def _solve_structural(question: str) -> str | None:
+    parsed = parse_structural_problem(question)
+    if parsed.status is ParseStatus.INVALID:
+        raise FertigStructuralError(f"invalid structural parse: {parsed.reason}")
+    if not parsed.ok:
+        return None
+    assert parsed.problem is not None
+    solution = solve_arithmetic_ir(parsed.problem)
+    if solution.status is SolveStatus.INVALID:
+        raise FertigStructuralError(f"invalid arithmetic IR: {solution.reason}")
+    if not solution.unique:
+        return None
+    if (
+        solution.target_value is None
+        or solution.certificate is None
+        or not solution.certificate.verified
+    ):
+        raise FertigStructuralError("unique structural solution lacks a certificate")
+    return _format_fraction(solution.target_value)
 
 
 @contextmanager
@@ -57,7 +94,8 @@ class FertigSolver:
     def _solve(self, question: str):
         if self.root is not None:
             with _solver_from_checkout(self.root) as solver:
-                return solver.solve(question)
+                answer = solver.solve(question)
+            return answer if answer is not None else _solve_structural(question)
         # The vendored copy ships with immer and always wins over an
         # ambient installation — reproducibility beats environment luck.
         vendor = Path(__file__).resolve().parent / "_vendor"
@@ -67,25 +105,46 @@ class FertigSolver:
             try:
                 solver = importlib.import_module("fertig.solver")
             except ModuleNotFoundError as exc:
-                raise FileNotFoundError(f"broken vendored FERTIG under {vendor}") from exc
-            return solver.solve(question)
+                raise FileNotFoundError(
+                    f"broken vendored FERTIG under {vendor}"
+                ) from exc
+            answer = solver.solve(question)
+            return answer if answer is not None else _solve_structural(question)
         try:
             solver = importlib.import_module("fertig.solver")
         except ModuleNotFoundError as exc:
             raise FileNotFoundError(
                 "FERTIG is not installed, not vendored, and IMMER_FERTIG_ROOT is not configured"
             ) from exc
-        return solver.solve(question)
+        answer = solver.solve(question)
+        return answer if answer is not None else _solve_structural(question)
 
     def handle(self, request: Request) -> Result:
         if request.capability not in self.capabilities:
-            return Result(ExecutionStatus.REJECTED, self.name, reason="unsupported capability")
+            return Result(
+                ExecutionStatus.REJECTED, self.name, reason="unsupported capability"
+            )
         if not isinstance(request.payload, str) or not request.payload.strip():
-            return Result(ExecutionStatus.REJECTED, self.name, reason="exact_math payload must be non-empty text")
+            return Result(
+                ExecutionStatus.REJECTED,
+                self.name,
+                reason="exact_math payload must be non-empty text",
+            )
         try:
             answer = self._solve(request.payload)
         except FileNotFoundError as exc:
             return Result(ExecutionStatus.UNAVAILABLE, self.name, reason=str(exc))
+        except Exception as exc:
+            return Result(
+                ExecutionStatus.ERROR,
+                self.name,
+                reason=f"FERTIG solver failed: {type(exc).__name__}: {exc}",
+            )
         if answer is None:
-            return Result(ExecutionStatus.ABSTAINED, self.name, reason="FERTIG abstained")
+            return Result(
+                ExecutionStatus.ABSTAINED, self.name, reason="FERTIG abstained"
+            )
         return Result(ExecutionStatus.OK, self.name, output=answer)
+
+
+__all__ = ["FertigSolver", "FertigStructuralError"]

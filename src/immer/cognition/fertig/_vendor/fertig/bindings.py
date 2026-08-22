@@ -83,6 +83,10 @@ class BindingResult:
         return f"BindingResult(ok={self.ok}, answer={self.answer}, {self.reason})"
 
 
+class BindingParserError(RuntimeError):
+    """An internal binding defect, distinct from an evidence-based abstention."""
+
+
 # ---------------------------------------------------------------------------
 # Lexikon (geschlossene Klassen — keine Hardcoding auf Benchmarks)
 # ---------------------------------------------------------------------------
@@ -6547,7 +6551,7 @@ def _schuhe_zaehlen(
     sm = re.search(r"has\s+(\d+)\s+shoes?", low)
     ps = re.findall(r"(\d+)\s+(?:\w+\s+)?pairs?", low)
     gm = re.search(r"gets\s+rid\s+of\s+(\d+)", low)
-    if not (sm or ps or gm):
+    if not (sm and ps and gm):
         return None
     return (
         Fraction(sm.group(1)) + sum(Fraction(p) for p in ps) * 2 - Fraction(gm.group(1))
@@ -7550,7 +7554,7 @@ def _fahrrad_km(
         r"for\s+(\d+)",
         low,
     )
-    if not (m1 or ws or m2s):
+    if not (m1 and ws and m2s):
         return None
     a = Fraction(m1.group(1) or m1.group(3))
     b = Fraction(m1.group(2) or m1.group(4))
@@ -27677,6 +27681,26 @@ def _resolve(question: str) -> BindingResult:
     # Fall B': eine einzige qty desselben Objekts + sum-Ziel -> die Menge
     # selbst (die Frage fragt nur nach der Gesamtheit einer Teilmenge)
     if len(target_qty) == 1 and not ratios and tgt.op == "sum":
+        # A mentioned wage/rate is not itself the solution to a purchase-time
+        # question.  The old shortcut answered e.g. "$8/hour -> 8 hours" and
+        # "mows 4 times -> 4 times" without balancing costs and income.
+        money_time_target = (tgt.obj or "").rstrip("s") in {
+            "time",
+            "hour",
+            "day",
+            "week",
+            "month",
+            "year",
+        } and bool(
+            re.search(
+                r"\$|\bcosts?\b|\bpays?\b|\bearn(?:s|ed|ing)?\b|"
+                r"\bafford\b|\bpurchase\b|\bper\s+(?:hour|time)\b",
+                low,
+            )
+        )
+        if money_time_target:
+            res.reason = "Zeit-/Geldbilanz nicht strukturell bewiesen"
+            return res
         res.answer = _fmt(target_qty[0].value)
         res.ok = True
         res.reason = "einzelne gebundene Menge"
@@ -27728,8 +27752,10 @@ def bind(question: str) -> BindingResult:
     """Bindungs-Parser-Einstieg."""
     try:
         return _resolve(question)
-    except Exception:
-        return BindingResult(reason="Parser-Fehler (abstinent)")
+    except Exception as exc:
+        raise BindingParserError(
+            f"binding parser failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def solve(question: str) -> Optional[str]:

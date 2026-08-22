@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from immer.cognition.fertig import FertigSolver
 from immer.contracts import ExecutionStatus, Request
@@ -28,6 +29,7 @@ QUARANTINED_MATH_ROWS = (
     1272,
     1306,
 )
+FORMERLY_MASKED_BINDING_ERRORS = (210, 215, 299, 570, 1261, 1295)
 
 
 class FertigAdapterTests(unittest.TestCase):
@@ -61,6 +63,43 @@ class FertigAdapterTests(unittest.TestCase):
         self.assertEqual(result.status, ExecutionStatus.ABSTAINED)
         self.assertIsNone(result.output)
 
+    def test_structural_ir_only_promotes_exact_certified_legacy_abstentions(
+        self,
+    ) -> None:
+        solver = FertigSolver()
+        examples = (
+            (
+                "An eraser costs $2 and a pencil costs $3. "
+                "How much do 6 erasers and 8 pencils cost?",
+                "36",
+            ),
+            (
+                "Chenny is 10 years old. Alyana is 4 years younger than Chenny. "
+                "How old is Anne if she is 2 years older than Alyana?",
+                "8",
+            ),
+            (
+                "Martin's weight is 55 kg. Carl’s weight is 16 kg more than "
+                "Martin’s weight. Christian’s weight is 8 kg more than Carl’s "
+                "weight. Harry is 5 kg less than Christian’s weight. "
+                "What is the weight of Harry, in kg?",
+                "74",
+            ),
+        )
+        for question, expected in examples:
+            with self.subTest(expected=expected):
+                result = solver.handle(Request("exact_math", question))
+                self.assertEqual(result.status, ExecutionStatus.OK)
+                self.assertEqual(result.output, expected)
+
+    def test_internal_binding_exception_is_typed_error_not_abstention(self) -> None:
+        solver = FertigSolver()
+        solver.handle(Request("exact_math", "not a supported problem"))
+        with mock.patch("fertig.bindings._resolve", side_effect=RuntimeError("boom")):
+            result = solver.handle(Request("exact_math", "still unsupported"))
+        self.assertEqual(result.status, ExecutionStatus.ERROR)
+        self.assertIn("BindingParserError", result.reason)
+
     @unittest.skipUnless(GSM8K.is_file(), "vendored GSM8K split unavailable")
     def test_all_observed_unverified_math_failures_are_must_abstain(self) -> None:
         import pandas as pd
@@ -68,6 +107,20 @@ class FertigAdapterTests(unittest.TestCase):
         rows = pd.read_parquet(GSM8K)
         solver = FertigSolver()
         for index in QUARANTINED_MATH_ROWS:
+            with self.subTest(index=index):
+                result = solver.handle(
+                    Request("exact_math", str(rows.iloc[index]["question"]))
+                )
+                self.assertEqual(result.status, ExecutionStatus.ABSTAINED)
+                self.assertIsNone(result.output)
+
+    @unittest.skipUnless(GSM8K.is_file(), "vendored GSM8K split unavailable")
+    def test_formerly_masked_binding_handlers_totalize_without_guessing(self) -> None:
+        import pandas as pd
+
+        rows = pd.read_parquet(GSM8K)
+        solver = FertigSolver()
+        for index in FORMERLY_MASKED_BINDING_ERRORS:
             with self.subTest(index=index):
                 result = solver.handle(
                     Request("exact_math", str(rows.iloc[index]["question"]))
