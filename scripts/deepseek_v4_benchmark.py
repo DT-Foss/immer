@@ -32,7 +32,9 @@ from immer.runtimes.deepseek_v4 import (
     StreamedDeepSeekV4,
 )
 from immer.runtimes.deepseek_v4.benchmark import (
+    JOURNAL_GENESIS_SHA256,
     SCHEMA_VERSION,
+    BenchmarkContractError,
     BenchmarkProvenance,
     BenchmarkRun,
     BenchmarkTask,
@@ -47,7 +49,10 @@ from immer.runtimes.deepseek_v4.benchmark import (
     evaluate_gsm8k,
     evaluate_mmlu,
     extract_gsm8k_answer,
+    seal_journal_record,
+    strict_json_loads,
     summarize_paired_ablation,
+    verify_journal_record,
 )
 from immer.runtimes.deepseek_v4.encoding import encode_user_prompt
 from immer.runtimes.deepseek_v4.graft import DeepSeekV4CrsaGraft, GRAFT_MODES
@@ -57,7 +62,8 @@ ROOT = Path(__file__).resolve().parent.parent
 OFFICIAL_SOURCE = "deepseek-ai/DeepSeek-V4-Flash-0731"
 OFFICIAL_REVISION = "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
 DEFAULT_CACHE = ROOT / "artifacts" / "private" / "deepseek-v4-benchmark-cache"
-JOURNAL_SCHEMA = "immer.deepseek-v4-benchmark-journal/v1"
+JOURNAL_SCHEMA = "immer.deepseek-v4-benchmark-journal/v2"
+LEGACY_JOURNAL_SCHEMA = "immer.deepseek-v4-benchmark-journal/v1"
 REPORT_SCHEMA = "immer.deepseek-v4-benchmark-report/v1"
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 ASSISTANT_GENERATION_PREFIX = "Answer:"
@@ -137,16 +143,23 @@ def _atomic_write_json(path: Path, document: Mapping[str, Any]) -> None:
 
 
 class JsonlJournal:
-    """Append-only item ledger with safe recovery of one torn final write."""
+    """Canonical hash-chained ledger with safe torn-tail recovery."""
 
     def __init__(
         self,
         path: Path,
         *,
         header: Mapping[str, Any],
+        expected_keys: Sequence[tuple[str, str, int]],
         resume: bool,
     ) -> None:
         self.path = path.expanduser().resolve()
+        self.expected_keys = _validate_expected_keys(expected_keys)
+        expected_documents = [_key_document(key) for key in self.expected_keys]
+        if header.get("expected_item_keys") != expected_documents:
+            raise RunnerError(
+                "journal header does not contain the exact expected key plan"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
             if not resume:
@@ -155,16 +168,27 @@ class JsonlJournal:
             if not records or records[0].get("type") != "header":
                 raise RunnerError("journal has no valid header")
             existing = records[0]
+            if existing.get("schema") == LEGACY_JOURNAL_SCHEMA:
+                raise RunnerError(
+                    "legacy v1 journal has no integrity chain; start a new v2 journal"
+                )
             if existing.get("schema") != JOURNAL_SCHEMA:
                 raise RunnerError("journal header uses an unknown schema")
             if existing.get("signature") != header.get("signature"):
                 raise RunnerError("resume signature differs from the existing journal")
+            if existing.get("expected_item_keys") != expected_documents:
+                raise RunnerError("resume key plan differs from the existing journal")
             self.records = records
         else:
-            self.records = [dict(header)]
-            self._append_record(header, create=True)
+            sealed_header = seal_journal_record(
+                header,
+                sequence=0,
+                previous_sha256=JOURNAL_GENESIS_SHA256,
+            )
+            self.records = [sealed_header]
+            self._append_record(sealed_header, create=True)
         self.completed: dict[tuple[str, str, int], dict[str, Any]] = {}
-        for record in self.records[1:]:
+        for expected_index, record in enumerate(self.records[1:]):
             if record.get("type") != "item":
                 raise RunnerError("journal contains an unknown record type")
             if record.get("schema") != JOURNAL_SCHEMA:
@@ -172,6 +196,15 @@ class JsonlJournal:
             if record.get("signature") != header.get("signature"):
                 raise RunnerError("journal item signature differs from its header")
             key = _record_key(record)
+            _validate_item_identity(record, key)
+            if expected_index >= len(self.expected_keys):
+                raise RunnerError(f"journal contains unexpected item key: {key}")
+            expected_key = self.expected_keys[expected_index]
+            if key != expected_key:
+                raise RunnerError(
+                    "journal item key does not match the expected sequence: "
+                    f"expected {expected_key}, got {key}"
+                )
             if key in self.completed:
                 raise RunnerError(f"journal contains duplicate item key: {key}")
             self.completed[key] = record
@@ -180,13 +213,15 @@ class JsonlJournal:
         raw = self.path.read_bytes()
         records: list[dict[str, Any]] = []
         valid_bytes = 0
+        restore_final_newline = False
         lines = raw.splitlines(keepends=True)
         for index, line in enumerate(lines):
             if not line.strip():
-                valid_bytes += len(line)
-                continue
+                raise RunnerError(f"journal record {index + 1} is blank")
             try:
-                value = json.loads(line)
+                value = strict_json_loads(line)
+            except BenchmarkContractError as exc:
+                raise RunnerError(f"corrupt journal record {index + 1}: {exc}") from exc
             except (UnicodeError, json.JSONDecodeError) as exc:
                 torn_tail = index == len(lines) - 1 and not line.endswith(b"\n")
                 if not torn_tail:
@@ -198,8 +233,37 @@ class JsonlJournal:
                 break
             if not isinstance(value, dict):
                 raise RunnerError(f"journal record {index + 1} is not an object")
+            if not records and value.get("schema") == LEGACY_JOURNAL_SCHEMA:
+                raise RunnerError(
+                    "legacy v1 journal has no integrity chain; start a new v2 journal"
+                )
+            expected_encoding = canonical_json_bytes(value)
+            if line.endswith(b"\n"):
+                expected_encoding += b"\n"
+            if line != expected_encoding:
+                raise RunnerError(f"journal record {index + 1} is not canonical JSONL")
+            previous_sha256 = (
+                JOURNAL_GENESIS_SHA256
+                if not records
+                else str(records[-1]["record_sha256"])
+            )
+            try:
+                verify_journal_record(
+                    value,
+                    sequence=len(records),
+                    previous_sha256=previous_sha256,
+                )
+            except BenchmarkContractError as exc:
+                raise RunnerError(f"corrupt journal record {index + 1}: {exc}") from exc
             records.append(value)
             valid_bytes += len(line)
+            if index == len(lines) - 1 and not line.endswith(b"\n"):
+                restore_final_newline = True
+        if restore_final_newline:
+            with self.path.open("ab") as handle:
+                handle.write(b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
         return records
 
     def _append_record(
@@ -220,12 +284,55 @@ class JsonlJournal:
 
     def append_item(self, record: Mapping[str, Any]) -> None:
         key = _record_key(record)
+        _validate_item_identity(record, key)
         if key in self.completed:
             raise RunnerError(f"attempted to append completed item: {key}")
-        self._append_record(record)
-        copied = dict(record)
+        expected_index = len(self.completed)
+        if expected_index >= len(self.expected_keys):
+            raise RunnerError(f"attempted to append unexpected item: {key}")
+        expected_key = self.expected_keys[expected_index]
+        if key != expected_key:
+            raise RunnerError(
+                "attempted to append item outside the expected sequence: "
+                f"expected {expected_key}, got {key}"
+            )
+        copied = seal_journal_record(
+            record,
+            sequence=len(self.records),
+            previous_sha256=str(self.records[-1]["record_sha256"]),
+        )
+        self._append_record(copied)
         self.records.append(copied)
         self.completed[key] = copied
+
+    @property
+    def complete(self) -> bool:
+        return tuple(self.completed) == self.expected_keys
+
+
+def _key_document(key: tuple[str, str, int]) -> dict[str, Any]:
+    mode, item_id, seed = key
+    return {"mode": mode, "item_id": item_id, "seed": seed}
+
+
+def _validate_expected_keys(
+    keys: Sequence[tuple[str, str, int]],
+) -> tuple[tuple[str, str, int], ...]:
+    result: list[tuple[str, str, int]] = []
+    seen: set[tuple[str, str, int]] = set()
+    for index, raw_key in enumerate(keys):
+        try:
+            mode, item_id, seed = raw_key
+        except (TypeError, ValueError) as exc:
+            raise RunnerError(f"invalid expected journal key at index {index}") from exc
+        key = _record_key({"mode": mode, "item_id": item_id, "seed": seed})
+        if key in seen:
+            raise RunnerError(f"duplicate expected journal key: {key}")
+        result.append(key)
+        seen.add(key)
+    if not result:
+        raise RunnerError("journal requires at least one expected item key")
+    return tuple(result)
 
 
 def _record_key(record: Mapping[str, Any]) -> tuple[str, str, int]:
@@ -242,6 +349,22 @@ def _record_key(record: Mapping[str, Any]) -> tuple[str, str, int]:
         return mode, item_id, seed
     except (KeyError, TypeError, ValueError) as exc:
         raise RunnerError("journal item has an invalid key") from exc
+
+
+def _validate_item_identity(
+    record: Mapping[str, Any], key: tuple[str, str, int]
+) -> None:
+    mode, item_id, seed = key
+    item = record.get("item")
+    performance = record.get("performance")
+    if not isinstance(item, Mapping) or not isinstance(performance, Mapping):
+        raise RunnerError("journal item requires item and performance objects")
+    for label, inner in (("item", item), ("performance", performance)):
+        if inner.get("item_id") != item_id or inner.get("seed") != seed:
+            raise RunnerError(f"journal inner/outer {label} identity differs")
+    metadata = item.get("metadata")
+    if not isinstance(metadata, Mapping) or metadata.get("mode") != mode:
+        raise RunnerError("journal item mode differs from its outer item key")
 
 
 def _read_dataset(path: Path, *, maximum_bytes: int) -> list[dict[str, Any]]:
@@ -1261,15 +1384,29 @@ def _build_report(
                 cache_state=CacheState.UNCONTROLLED,
             )
         )
-    expected = len(selected_rows) * sum(len(_mode_seeds(mode, seeds)) for mode in modes)
+    expected_keys = tuple(
+        (mode, str(row["id"]), seed)
+        for mode in modes
+        for seed in _mode_seeds(mode, seeds)
+        for row in selected_rows
+    )
+    if expected_keys != journal.expected_keys:
+        raise RunnerError("report key plan differs from the authenticated journal")
+    expected = len(expected_keys)
     return {
         "schema": REPORT_SCHEMA,
         "contract_schema": SCHEMA_VERSION,
         "signature": header["signature"],
-        "status": "complete" if len(records) == expected else "incomplete",
+        "status": "complete" if journal.complete else "incomplete",
         "journal": str(journal.path),
         "expected_item_runs": expected,
         "completed_item_runs": len(records),
+        "journal_integrity": {
+            "schema": JOURNAL_SCHEMA,
+            "record_count": len(journal.records),
+            "tip_sha256": journal.records[-1]["record_sha256"],
+            "complete_expected_key_set": journal.complete,
+        },
         "modes": by_mode,
         "paired": paired,
         "seed_protocol": {
@@ -1528,7 +1665,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "cache_bytes": int(args.cache_budget_mb * 1024**2),
         },
     }
-    journal = JsonlJournal(Path(args.journal), header=header, resume=args.resume)
+    expected_keys = tuple(
+        (mode, str(row["id"]), seed)
+        for mode in modes
+        for seed in _mode_seeds(mode, seeds)
+        for row in selected_rows
+    )
+    header["expected_item_keys"] = [_key_document(key) for key in expected_keys]
+    journal = JsonlJournal(
+        Path(args.journal),
+        header=header,
+        expected_keys=expected_keys,
+        resume=args.resume,
+    )
 
     new_records = 0
     for mode in modes:
@@ -1578,6 +1727,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "new_item_runs": new_records,
         "completed_item_runs": report["completed_item_runs"],
         "expected_item_runs": report["expected_item_runs"],
+        "journal_tip_sha256": report["journal_integrity"]["tip_sha256"],
         "journal": str(Path(args.journal).expanduser().resolve()),
         "report": str(Path(args.output).expanduser().resolve()),
     }

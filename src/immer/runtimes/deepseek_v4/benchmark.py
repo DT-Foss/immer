@@ -9,6 +9,7 @@ row: errors stay in every denominator.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import re
@@ -22,6 +23,7 @@ import numpy as np
 
 
 SCHEMA_VERSION = "immer.deepseek_v4.benchmark/v1"
+JOURNAL_GENESIS_SHA256 = "0" * 64
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PINNED_REVISION = re.compile(r"[0-9a-fA-F]{40,64}")
 _GSM8K_NUMBER = re.compile(
@@ -93,6 +95,79 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 def canonical_digest(value: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def strict_json_loads(raw: str | bytes | bytearray) -> Any:
+    """Decode JSON while rejecting duplicate keys at every object depth."""
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise BenchmarkContractError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    return json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+
+
+def journal_record_digest(record: Mapping[str, Any]) -> str:
+    """Hash a journal record without its self-referential digest field."""
+
+    if not isinstance(record, Mapping):
+        raise BenchmarkContractError("journal record must be a mapping")
+    payload = dict(record)
+    payload.pop("record_sha256", None)
+    return canonical_digest(payload)
+
+
+def seal_journal_record(
+    record: Mapping[str, Any],
+    *,
+    sequence: int,
+    previous_sha256: str = JOURNAL_GENESIS_SHA256,
+) -> dict[str, Any]:
+    """Bind a canonical record to its exact position in an append-only chain."""
+
+    _require_count(sequence, "journal sequence")
+    _require_digest(previous_sha256, "journal previous sha256")
+    collisions = {"sequence", "previous_sha256", "record_sha256"}.intersection(record)
+    if collisions:
+        names = ", ".join(sorted(collisions))
+        raise BenchmarkContractError(
+            f"journal record already has integrity fields: {names}"
+        )
+    sealed = dict(record)
+    sealed["sequence"] = sequence
+    sealed["previous_sha256"] = previous_sha256
+    sealed["record_sha256"] = journal_record_digest(sealed)
+    return sealed
+
+
+def verify_journal_record(
+    record: Mapping[str, Any],
+    *,
+    sequence: int,
+    previous_sha256: str = JOURNAL_GENESIS_SHA256,
+) -> str:
+    """Verify chain position and content, returning the authenticated record hash."""
+
+    _require_count(sequence, "expected journal sequence")
+    _require_digest(previous_sha256, "expected journal previous sha256")
+    if record.get("sequence") != sequence:
+        raise BenchmarkContractError(
+            f"journal sequence mismatch: expected {sequence}, got {record.get('sequence')!r}"
+        )
+    if record.get("previous_sha256") != previous_sha256:
+        raise BenchmarkContractError(f"journal chain mismatch at sequence {sequence}")
+    claimed = record.get("record_sha256")
+    _require_digest(claimed, "journal record sha256")
+    actual = journal_record_digest(record)
+    if not hmac.compare_digest(claimed, actual):
+        raise BenchmarkContractError(
+            f"journal record hash mismatch at sequence {sequence}"
+        )
+    return claimed
 
 
 def dataset_digest(records: Iterable[Mapping[str, Any]]) -> str:

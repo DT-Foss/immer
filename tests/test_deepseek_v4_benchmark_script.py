@@ -58,6 +58,199 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             timeout=timeout,
         )
 
+    def _journal_fixture(
+        self,
+        work: Path,
+        keys: tuple[tuple[str, str, int], ...],
+    ):
+        module = _script_module()
+        header = {
+            "schema": module.JOURNAL_SCHEMA,
+            "type": "header",
+            "signature": "a" * 64,
+            "expected_item_keys": [module._key_document(key) for key in keys],
+        }
+        path = work / "integrity.jsonl"
+        journal = module.JsonlJournal(
+            path,
+            header=header,
+            expected_keys=keys,
+            resume=False,
+        )
+        return module, path, header, journal
+
+    @staticmethod
+    def _journal_item(
+        module,
+        key: tuple[str, str, int],
+        *,
+        inner_item_id: str | None = None,
+    ) -> dict[str, object]:
+        mode, item_id, seed = key
+        return {
+            "schema": module.JOURNAL_SCHEMA,
+            "type": "item",
+            "signature": "a" * 64,
+            "mode": mode,
+            "item_id": item_id,
+            "seed": seed,
+            "item": {
+                "item_id": item_id if inner_item_id is None else inner_item_id,
+                "seed": seed,
+                "predicted": 0,
+                "metadata": {"mode": mode},
+            },
+            "performance": {"item_id": item_id, "seed": seed},
+            "measurements": {},
+        }
+
+    def test_journal_v2_detects_result_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            key = ("off", "q0", 0)
+            module, path, header, journal = self._journal_fixture(
+                Path(temporary), (key,)
+            )
+            journal.append_item(self._journal_item(module, key))
+            records = [json.loads(line) for line in path.read_bytes().splitlines()]
+            records[1]["item"]["predicted"] = 1
+            path.write_bytes(b"".join(module._json_line(record) for record in records))
+
+            with self.assertRaisesRegex(module.RunnerError, "record hash mismatch"):
+                module.JsonlJournal(
+                    path,
+                    header=header,
+                    expected_keys=(key,),
+                    resume=True,
+                )
+
+    def test_journal_v2_rejects_foreign_inner_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            key = ("off", "q0", 0)
+            module, path, header, journal = self._journal_fixture(
+                Path(temporary), (key,)
+            )
+            foreign = self._journal_item(module, key, inner_item_id="foreign")
+            sealed = module.seal_journal_record(
+                foreign,
+                sequence=1,
+                previous_sha256=journal.records[0]["record_sha256"],
+            )
+            with path.open("ab") as handle:
+                handle.write(module._json_line(sealed))
+
+            with self.assertRaisesRegex(
+                module.RunnerError, "inner/outer item identity"
+            ):
+                module.JsonlJournal(
+                    path,
+                    header=header,
+                    expected_keys=(key,),
+                    resume=True,
+                )
+
+    def test_journal_v2_rejects_missing_key_replaced_by_foreign_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            first = ("off", "q0", 0)
+            missing = ("off", "q1", 0)
+            foreign = ("off", "not-in-dataset", 0)
+            module, path, header, journal = self._journal_fixture(
+                Path(temporary), (first, missing)
+            )
+            journal.append_item(self._journal_item(module, first))
+            replacement = module.seal_journal_record(
+                self._journal_item(module, foreign),
+                sequence=2,
+                previous_sha256=journal.records[-1]["record_sha256"],
+            )
+            with path.open("ab") as handle:
+                handle.write(module._json_line(replacement))
+
+            with self.assertRaisesRegex(module.RunnerError, "expected.*q1"):
+                module.JsonlJournal(
+                    path,
+                    header=header,
+                    expected_keys=(first, missing),
+                    resume=True,
+                )
+
+    def test_journal_v2_rejects_broken_hash_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            first = ("off", "q0", 0)
+            second = ("off", "q1", 0)
+            module, path, header, journal = self._journal_fixture(
+                Path(temporary), (first, second)
+            )
+            journal.append_item(self._journal_item(module, first))
+            broken = module.seal_journal_record(
+                self._journal_item(module, second),
+                sequence=2,
+                previous_sha256="f" * 64,
+            )
+            with path.open("ab") as handle:
+                handle.write(module._json_line(broken))
+
+            with self.assertRaisesRegex(module.RunnerError, "chain mismatch"):
+                module.JsonlJournal(
+                    path,
+                    header=header,
+                    expected_keys=(first, second),
+                    resume=True,
+                )
+
+    def test_journal_v2_rejects_duplicate_json_keys_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            key = ("off", "q0", 0)
+            module, path, header, _ = self._journal_fixture(Path(temporary), (key,))
+            raw = path.read_bytes()
+            needle = f'"schema":"{module.JOURNAL_SCHEMA}"'.encode()
+            duplicate = needle + b"," + needle
+            path.write_bytes(raw.replace(needle, duplicate, 1))
+
+            with self.assertRaisesRegex(module.RunnerError, "duplicate JSON key"):
+                module.JsonlJournal(
+                    path,
+                    header=header,
+                    expected_keys=(key,),
+                    resume=True,
+                )
+
+    def test_journal_v2_restores_complete_final_record_newline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            key = ("off", "q0", 0)
+            module, path, header, journal = self._journal_fixture(
+                Path(temporary), (key,)
+            )
+            journal.append_item(self._journal_item(module, key))
+            path.write_bytes(path.read_bytes().removesuffix(b"\n"))
+
+            resumed = module.JsonlJournal(
+                path,
+                header=header,
+                expected_keys=(key,),
+                resume=True,
+            )
+            self.assertTrue(resumed.complete)
+            self.assertTrue(path.read_bytes().endswith(b"\n"))
+
+    def test_journal_v1_resume_fails_with_explicit_migration_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            key = ("off", "q0", 0)
+            module, path, header, _ = self._journal_fixture(Path(temporary), (key,))
+            legacy = {
+                "schema": module.LEGACY_JOURNAL_SCHEMA,
+                "type": "header",
+                "signature": "a" * 64,
+            }
+            path.write_bytes(module._json_line(legacy))
+
+            with self.assertRaisesRegex(module.RunnerError, "legacy v1 journal"):
+                module.JsonlJournal(
+                    path,
+                    header=header,
+                    expected_keys=(key,),
+                    resume=True,
+                )
+
     def test_help_exposes_resume_modes_and_hard_budgets(self) -> None:
         result = self._run("--help")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -227,6 +420,23 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             )
             lines_before = journal.read_bytes().splitlines()
             self.assertEqual(len(lines_before), 9)
+            journal_rows = [json.loads(line) for line in lines_before]
+            self.assertEqual([row["sequence"] for row in journal_rows], list(range(9)))
+            self.assertEqual(journal_rows[0]["previous_sha256"], "0" * 64)
+            for previous, current in zip(journal_rows, journal_rows[1:]):
+                self.assertEqual(current["previous_sha256"], previous["record_sha256"])
+            self.assertEqual(
+                document["journal_integrity"],
+                {
+                    "schema": "immer.deepseek-v4-benchmark-journal/v2",
+                    "record_count": 9,
+                    "tip_sha256": journal_rows[-1]["record_sha256"],
+                    "complete_expected_key_set": True,
+                },
+            )
+            self.assertEqual(
+                receipt["journal_tip_sha256"], journal_rows[-1]["record_sha256"]
+            )
 
             resumed = self._run(*common, "--resume")
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
