@@ -48,6 +48,9 @@ injizierte Desktop-/Recorder-/Mutationspfade enden bewacht in Abstinenz.
 
 - **Frozen Exact-Pfad:** vier Organe, kein Runtime-Training, 152/152 Antworten
   und 152/152 Routen auf der kanonischen SHIP-v6-Suite.
+- **FERTIG-Vollsplit:** 1.060/1.319 GSM8K korrekt, 259 sichere Abstinenzen,
+  0 falsche und 0 Error-Outcomes. Der ungeprüfte Template-Fallback war 17/17
+  falsch und bleibt bis zu einem strukturierten Proof proposal-only.
 - **Eigene Attention:** fester CRSA-Mix `2 Local + 1 Balanced + 1 Free`,
   Steigung `0.8`, Diagonal-Debit `3`; Zukunftsmasse exakt null und Free-Head
   bitgleich zur kausalen Softmax.
@@ -63,19 +66,25 @@ injizierte Desktop-/Recorder-/Mutationspfade enden bewacht in Abstinenz.
 - **Cross-Model Least Squares:** negativ. Der alte Vorschlag, einen
   Sibling-Hidden-State in den Donor-Key-Raum zu projizieren, wird nicht als
   Selbstkalibrierung oder R17 wiederbelebt.
+- **Frontier-Decoder:** der gepinnte DeepSeek-V4-Flash-Hauptpfad läuft über
+  alle 43 Layer mit nativer komprimierter Sparse-Attention, FP8/FP4-MoE,
+  HyperConnections, globalem Head und stateful Decode. Der CRSA-Graft ist im
+  echten Hidden-State-Pfad aktiv; Qualitätsgleichstand ist noch nicht gezeigt.
 
 ## Hebel-Ranking
 
 1. **Lokale v0.7-Akzeptanz konservieren:** Frozen A1, vier Organe, Router,
    FERTIG-Guards, Artefakt-Digests und Wheel-Isolation gemeinsam golden halten.
-2. **Breiteren Router-Kontrast messen:** deduplizierter Fachsplit mit gleichem
+2. **DeepSeek-Inhaltsgate messen:** offizielles Prompt-Encoding und gepaarte
+   `off / CRSA / softmax / shuffle`-Items unter gleicher Byte-/Cachebilanz.
+3. **Breiteren Router-Kontrast messen:** deduplizierter Fachsplit mit gleichem
    Budget für CRSA, kausale Softmax, Roh-A1 und permutierte Labels.
-3. **WorldStream erst mit korrekter Zustandsverteilung neu öffnen:** echte
+4. **WorldStream erst mit korrekter Zustandsverteilung neu öffnen:** echte
    kontextuelle RMSNorm-Post-Attention-Zustände oder eine andere gemessene
    Invariante; Falsifikator vor Implementierung benennen.
-4. **R17 strikt anwenden:** trainieren → Invariante messen → Fit/R²
+5. **R17 strikt anwenden:** trainieren → Invariante messen → Fit/R²
    verifizieren → exakte Struktur. Kein Cross-Model-LS-Ersatz.
-5. **Hugging Face zuletzt:** erst nach lokalem Golden und geklärter Lizenzkette
+6. **Hugging Face zuletzt:** erst nach lokalem Golden und geklärter Lizenzkette
    exportieren oder hochladen.
 
 ## Offene Endpunkte aus dem Fundament

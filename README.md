@@ -121,6 +121,7 @@ der Free-Head ist bitgleich zur kausalen Softmax. Der Router-Report wird mit
 | FERTIG | `cognition/fertig/` | vendored; Grounding/Bindings/Skills/Verifier, Aktions-Gates geschlossen |
 | Lebensstrom | `runtimes/o1_state/` | persistent, surprise-gated, getrennt vom Frozen Host |
 | WorldStream | `knowledge/streamer.py` | lokaler/HF Range-Zugriff, kein Donor-Modell-Load |
+| DeepSeek-V4 Runtime | `runtimes/deepseek_v4/` | 43-Layer-Hauptdecoder aus gepinnten Ranges; native Sparse-Attention, FP8/FP4-MoE, stateful CRSA-Graft |
 | Daemon/Suite | `substrate/`, `suite.py` | atomare Zustände, Services, Metriken, Dashboard |
 | FLCA/QAD | externe kanonische Projekte | hier beschrieben, nicht als laufender IMMER-Kern ausgegeben |
 

@@ -69,7 +69,29 @@ Die Resultate in `results/router_v2_stage1.json` und
 Ein negatives Ergebnis darf nur durch ein neues, vorab benanntes Protokoll mit
 passendem Eingabeverteilungsmechanismus erneut geöffnet werden.
 
-## 4. Streaming-Verträge
+## 4. FERTIG-GSM8K-Vollsplit
+
+```bash
+PYTHONPATH=src python scripts/bench_gsm8k.py \
+  --failures-jsonl results/bench_gsm8k_failures.jsonl
+```
+
+Der vollständige vendorte Testsplit wird nicht auf Solve-Rate reduziert. Der
+Report enthält alle 1.319 Items, stabile IDs, Dataset-/Harness-Digests sowie
+die getrennte Partition `correct / abstained / incorrect / error`:
+
+| correct | abstained | incorrect | error | Coverage beantwortet |
+|---:|---:|---:|---:|---:|
+| 1.060 | 259 | 0 | 0 | 80,36 % |
+
+Ein erster Vollauf fand 17 falsche Antworten, sämtlich aus dem ungeprüften
+Operationsketten-Template-Fallback; dieser Pfad traf kein einziges Mal
+korrekt. Die Templates bleiben als Kandidaten-Instrument erhalten, sind aber
+ohne unabhängigen Strukturbeweis aus dem Unified-Answer-Pfad quarantäniert.
+Alle 17 Fälle sind `must_abstain`-Regressionen. Der harte Gate lautet weiterhin
+`incorrect + errors == 0`, nicht bloß hohe Accuracy auf beantworteten Fällen.
+
+## 5. Streaming-Verträge
 
 Die automatisierte Contract-Suite misst keine Modellqualität, sondern
 Sicherheits- und Ressourceninvarianten:
@@ -77,12 +99,38 @@ Sicherheits- und Ressourceninvarianten:
 - Budget wird vor dem Lesen reserviert und niemals überschritten;
 - lokale und HTTP-Ranges liefern exakt die angeforderte Bytezahl;
 - Cache-Resume bewegt null Quellbytes und prüft SHA-256;
+- der 12-GiB-Cache bleibt auch während atomarer Same-Key-Rewrites unter der
+  Grenze und erholt sich nach unterbrochenen Paar-Writes als Cache-Miss;
 - beschädigte Caches werden nicht still neu geholt;
 - BF16-Zeilen werden deterministisch dekodiert;
 - `rows_torch()` erzeugt einen gradientenfreien Tensor, ohne ein Donormodell
   zu konstruieren.
 
-## 5. Lebensstrom-Verträge
+## 6. DeepSeek-V4-Flash: lokaler Decoderstatus
+
+Der revisionsgebundene Hauptdecoder von
+`deepseek-ai/DeepSeek-V4-Flash-0731@7872f01b...` läuft lokal direkt aus den
+originalen Safetensors-Ranges. Der aktuelle Vertrag umfasst alle 43 Layer,
+FP8/FP4-QDQ, Hash- und Score-Routing, sechs aktive plus Shared Expert,
+HyperConnections, native Fenster-/Kompressor-/Indexer-Attention, globalen
+LM-Head und autoregressiven KV-Zustand. DSpark-MTP ist noch nicht im
+Ausführungspfad.
+
+Zwei abgeschlossene Integrationsmessungen auf M4/16 GB:
+
+| Lauf | Ausgabe | Layer-Forwards | Quellbytes | Zeit | Urteil |
+|---|---|---:|---:|---:|---|
+| Token-ID 0, Graft aus | `#` | 1 | 1,858 GB | 636,9 s | vollständiger Decoder-Smoke |
+| Token-ID 0, CRSA Layer 21, 2 Tokens | `# ` | 2 | 3,115 GB | 1.747,5 s | stateful Graft technisch aktiv |
+
+Der zweite Lauf hält 17,84 MB Attention-State und den Cache bei
+12.881.453.756 von 12.884.901.888 Bytes; 891 LRU-Evictions überschritten die
+Grenze nicht. Das ist noch kein Qualitäts- oder Frontier-Paritätsclaim: Die
+Eingabe war eine explizite Diagnose-ID. Ein offizieller Mehrtoken-Chatprompt
+und danach feste, gepaarte `off / CRSA / softmax / shuffle`-Items sind der
+nächste inhaltliche Gate.
+
+## 7. Lebensstrom-Verträge
 
 Die Tests des O1-Lebensstroms prüfen:
 
@@ -98,13 +146,14 @@ Das ist noch kein veröffentlichter Milliarden-Token-Loss-Report. NLL 8,6656
 bleibt ein historischer Host-Anker im SHIP-Manifest, nicht eine in diesem
 Akzeptanzlauf neu gemessene Sprachmodell-Qualität.
 
-## 6. Nächste belastbare Messungen
+## 8. Nächste belastbare Messungen
 
 1. Router auf einem größeren, nicht synthetisch eng getrennten Text/Math-Split,
    erneut CRSA gegen kausale Softmax und Label-Placebos.
 2. Lebenskurve mit fixem held-out Byte-Stream: NLL vor/nach Surprise-Updates,
    Post-Sleep-Delta und State-Größe über die Zeit.
-3. FERTIG-Systemsplit mit expliziten Familien: korrekte Antwort, sichere
-   Abstinenz, falsche Antwort. Falsche Antworten sind der harte Fehler.
+3. DeepSeek-V4 auf einem festen kleinen Qualitätssplit: offizielles Encoding,
+   kandidatengestütztes Scoring, vollständige Fehlerdenominatoren und gepaarte
+   Graft-Ablationen bei gleicher Cache-/Bytebilanz.
 4. WorldStream-Budgetkurve nur mit einem neuen, kontextuell korrekten
    Retrievalmechanismus; kein Revival des statischen Value-Sketches.

@@ -1,0 +1,1080 @@
+"""Bounded weight materialization for the streamed DeepSeek-V4 decoder."""
+
+from __future__ import annotations
+
+import gc
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass
+from collections.abc import Callable, Iterable
+from typing import Any
+
+import numpy as np
+
+from ...knowledge.streamer import TensorEncodingError, TensorSource
+from .quantization import (
+    dequantize_fp8_e4m3,
+    quantize_fp8_e4m3_parts,
+    unpack_fp4_e2m1,
+)
+
+
+class DeepSeekPagerError(RuntimeError):
+    """A checkpoint tensor cannot be executed by the bounded pager."""
+
+
+@dataclass(slots=True)
+class PagerMetrics:
+    linear_calls: int = 0
+    expert_calls: int = 0
+    coalesced_expert_calls: int = 0
+    expert_source_ranges: int = 0
+    embedding_rows: int = 0
+    head_rows: int = 0
+    logical_weight_bytes: int = 0
+    materialized_float_bytes: int = 0
+    materialized_scale_bytes: int = 0
+    peak_single_weight_bytes: int = 0
+    materialized_weight_releases: int = 0
+    release_boundaries: int = 0
+    mps_cache_purges: int = 0
+    block_scaled_linear_calls: int = 0
+    fp8_k128_tiles: int = 0
+    fp4_k32_tiles: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _CoalescedTensor:
+    name: str
+    dtype: str
+    shape: tuple[int, ...]
+    logical_bytes: int
+    payload: memoryview
+
+
+@dataclass(frozen=True, slots=True)
+class _CoalescedExpert:
+    tensors: dict[str, _CoalescedTensor]
+    source_ranges: int
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializedWeight:
+    """One decoded checkpoint matrix without prematurely applying MX scales."""
+
+    values: np.ndarray
+    scales: np.ndarray | None
+    storage_dtype: str
+    logical_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _QuantizedActivation:
+    """Decoded E4M3 values and the separate K128 activation scales."""
+
+    values: np.ndarray
+    scales: np.ndarray
+
+
+class DeepSeekWeightPager:
+    """Materialize one matrix at a time and immediately release it.
+
+    ``TensorSource`` owns provenance, transfer budgets, and the verified disk
+    cache.  This class owns only short-lived decoded matrices and compute.  It
+    therefore cannot accidentally retain a complete frontier checkpoint.
+    """
+
+    QUANTIZED_ACCUMULATION_POLICY = "mx-block-scaled-fp32/v1"
+
+    def __init__(
+        self,
+        source: TensorSource,
+        *,
+        device: str = "auto",
+        compute_dtype: str = "auto",
+        simulate_activation_quantization: bool = True,
+    ) -> None:
+        try:
+            import torch
+        except ImportError as exc:  # pragma: no cover - neural extra
+            raise DeepSeekPagerError("DeepSeek-V4 execution requires torch") from exc
+        self.torch = torch
+        self.source = source
+        if device == "auto":
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+        if device not in {"cpu", "mps"}:
+            raise ValueError("device must be 'auto', 'cpu', or 'mps'")
+        if device == "mps" and not torch.backends.mps.is_available():
+            raise DeepSeekPagerError("MPS was requested but is unavailable")
+        self.device = torch.device(device)
+        if compute_dtype == "auto":
+            # DeepSeek V4's published main decoder uses BF16 activations.
+            # Keep this invariant on the CPU reference path as well: silently
+            # promoting only CPU execution to FP32 changes routing boundaries
+            # and makes CPU/MPS parity evidence incomparable.
+            compute_dtype = "bfloat16"
+        try:
+            dtype = getattr(torch, compute_dtype)
+        except AttributeError as exc:
+            raise ValueError(
+                f"unsupported torch compute dtype: {compute_dtype}"
+            ) from exc
+        if dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+            raise ValueError("compute_dtype must be float16, bfloat16, or float32")
+        self.compute_dtype = dtype
+        self.simulate_activation_quantization = bool(simulate_activation_quantization)
+        self._stats = PagerMetrics()
+
+    @staticmethod
+    def _weight_name(prefix: str) -> str:
+        if not isinstance(prefix, str) or not prefix:
+            raise ValueError("weight prefix must be a non-empty string")
+        return prefix if prefix.endswith(".weight") else f"{prefix}.weight"
+
+    @staticmethod
+    def _payload_bytes(meta: dict[str, Any]) -> int:
+        begin, end = meta["offset_in_shard"]
+        return int(end) - int(begin)
+
+    @staticmethod
+    def _consecutive_runs(ids: Iterable[int]) -> list[tuple[int, int]]:
+        unique = sorted(set(int(value) for value in ids))
+        if not unique:
+            return []
+        runs: list[tuple[int, int]] = []
+        run_start = previous = unique[0]
+        for value in unique[1:]:
+            if value != previous + 1:
+                runs.append((run_start, previous + 1))
+                run_start = value
+            previous = value
+        runs.append((run_start, previous + 1))
+        return runs
+
+    @staticmethod
+    def _decode_coalesced_tensor(tensor: _CoalescedTensor) -> np.ndarray:
+        """Decode one safetensors payload already covered by a larger range."""
+
+        dtype = tensor.dtype
+        expected = int(np.prod(tensor.shape, dtype=np.int64))
+        if len(tensor.payload) != tensor.logical_bytes:
+            raise DeepSeekPagerError(
+                f"short coalesced payload for {tensor.name}: "
+                f"{len(tensor.payload)}/{tensor.logical_bytes} bytes"
+            )
+        if dtype == "I8":
+            values = np.frombuffer(tensor.payload, dtype=np.int8)
+        elif dtype in {"F8_E4M3", "F8_E4M3FN"}:
+            bits = np.frombuffer(tensor.payload, dtype=np.uint8)
+            invalid = np.flatnonzero((bits & np.uint8(0x7F)) == np.uint8(0x7F))
+            if invalid.size:
+                index = int(invalid[0])
+                raise TensorEncodingError(
+                    f"{tensor.name}: Reservierte/nicht-endliche {dtype}-Kodierung "
+                    f"0x{int(bits[index]):02X} bei Element {index}"
+                )
+            exponent = ((bits >> 3) & 0x0F).astype(np.int16)
+            mantissa = (bits & 0x07).astype(np.float32)
+            values = np.empty(bits.shape, dtype=np.float32)
+            subnormal = exponent == 0
+            values[subnormal] = np.ldexp(mantissa[subnormal], -9)
+            normal = ~subnormal
+            values[normal] = np.ldexp(
+                np.float32(1.0) + mantissa[normal] * np.float32(0.125),
+                exponent[normal] - 7,
+            )
+            values = np.copysign(
+                values,
+                np.where(bits & 0x80, np.float32(-1.0), np.float32(1.0)),
+            )
+        elif dtype == "F8_E8M0":
+            bits = np.frombuffer(tensor.payload, dtype=np.uint8)
+            invalid = np.flatnonzero(bits == np.uint8(0xFF))
+            if invalid.size:
+                index = int(invalid[0])
+                raise TensorEncodingError(
+                    f"{tensor.name}: Reservierte/nicht-endliche {dtype}-Kodierung "
+                    f"0xFF bei Element {index}"
+                )
+            values = np.ldexp(
+                np.ones(bits.shape, dtype=np.float32),
+                bits.astype(np.int16) - 127,
+            )
+        else:  # guarded by _coalesced_expert below
+            raise DeepSeekPagerError(
+                f"unsupported coalesced dtype {dtype!r} at {tensor.name}"
+            )
+        if values.size != expected:
+            raise DeepSeekPagerError(
+                f"coalesced shape mismatch for {tensor.name}: "
+                f"{values.size} values for {tensor.shape}"
+            )
+        return values.reshape(tensor.shape)
+
+    @staticmethod
+    def _coalesced_group_layout(
+        metas: list[dict[str, Any]],
+    ) -> tuple[str, int, int, list[dict[str, Any]]] | None:
+        """Return one exact adjacent source interval, or decline safely."""
+
+        if not metas:
+            return None
+        try:
+            shard = str(metas[0]["shard"])
+            data_start = int(metas[0]["data_start"])
+            ordered = sorted(metas, key=lambda meta: int(meta["offset_in_shard"][0]))
+            if not shard or data_start < 8:
+                return None
+            for meta in ordered:
+                offsets = meta["offset_in_shard"]
+                if (
+                    str(meta["shard"]) != shard
+                    or int(meta["data_start"]) != data_start
+                    or not isinstance(offsets, list)
+                    or len(offsets) != 2
+                    or int(offsets[1]) <= int(offsets[0])
+                ):
+                    return None
+            if any(
+                int(left["offset_in_shard"][1]) != int(right["offset_in_shard"][0])
+                for left, right in zip(ordered, ordered[1:], strict=False)
+            ):
+                return None
+            begin = int(ordered[0]["offset_in_shard"][0])
+            end = int(ordered[-1]["offset_in_shard"][1])
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
+        return shard, data_start + begin, end - begin, ordered
+
+    def _coalesced_expert(self, base: str) -> _CoalescedExpert | None:
+        """Fetch an official quantized expert in two adjacent source ranges.
+
+        Published V4 shards place ``w1/w2/w3`` next to one another and do the
+        same for their scales.  Synthetic sources and repacked checkpoints are
+        allowed to use any layout; those decline this optimization before a
+        range is read and retain the six-tensor path.
+        """
+
+        raw_bytes = getattr(self.source, "raw_bytes", None)
+        if not callable(raw_bytes):
+            return None
+        weight_names = [f"{base}.{role}.weight" for role in ("w1", "w2", "w3")]
+        try:
+            weight_metas = [self.source.find(name) for name in weight_names]
+        except (KeyError, TypeError, ValueError):
+            return None
+        weight_dtypes = {str(meta.get("dtype", "")).upper() for meta in weight_metas}
+        if len(weight_dtypes) != 1 or not weight_dtypes <= {
+            "I8",
+            "F8_E4M3",
+            "F8_E4M3FN",
+        }:
+            return None
+        scale_names = [name.removesuffix("weight") + "scale" for name in weight_names]
+        try:
+            scale_metas = [self.source.find(name) for name in scale_names]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if any(str(meta.get("dtype", "")).upper() != "F8_E8M0" for meta in scale_metas):
+            return None
+        layouts = [
+            self._coalesced_group_layout(scale_metas),
+            self._coalesced_group_layout(weight_metas),
+        ]
+        if any(layout is None for layout in layouts):
+            return None
+
+        tensors: dict[str, _CoalescedTensor] = {}
+        with self._priority_scope(f"{base}.w1.weight"):
+            for layout in layouts:
+                assert layout is not None
+                shard, absolute, length, ordered = layout
+                payload = raw_bytes(shard, absolute, length)
+                if len(payload) != length:
+                    raise DeepSeekPagerError(
+                        f"short coalesced source range for {base}: "
+                        f"{len(payload)}/{length} bytes"
+                    )
+                group_begin = int(ordered[0]["offset_in_shard"][0])
+                group_view = memoryview(payload)
+                for meta in ordered:
+                    begin, end = (int(value) for value in meta["offset_in_shard"])
+                    name = str(meta["name"])
+                    tensors[name] = _CoalescedTensor(
+                        name=name,
+                        dtype=str(meta["dtype"]).upper(),
+                        shape=tuple(int(value) for value in meta["shape"]),
+                        logical_bytes=end - begin,
+                        payload=group_view[begin - group_begin : end - group_begin],
+                    )
+        return _CoalescedExpert(tensors=tensors, source_ranges=2)
+
+    def _priority_scope(self, name: str, priority: int | None = None) -> Any:
+        callback = getattr(self.source, "cache_priority", None)
+        if not callable(callback):
+            return nullcontext()
+        if priority is None:
+            priority = 0 if ".ffn.experts." in name else 1
+        return callback(priority)
+
+    @staticmethod
+    def _decoded_float_array(value: Any, name: str) -> np.ndarray:
+        array = np.asarray(value)
+        if array.dtype.kind != "f":
+            raise DeepSeekPagerError(
+                f"decoded quantized tensor {name} must contain floating-point values"
+            )
+        result = np.ascontiguousarray(array, dtype=np.float32)
+        if not np.isfinite(result).all():
+            raise DeepSeekPagerError(f"decoded quantized tensor {name} is non-finite")
+        return result
+
+    @classmethod
+    def _encoded_weight_parts(
+        cls,
+        raw: Any,
+        scale: Any,
+        *,
+        storage_dtype: str,
+        weight_name: str,
+        logical_bytes: int,
+    ) -> _MaterializedWeight:
+        scales = cls._decoded_float_array(
+            scale, weight_name.removesuffix("weight") + "scale"
+        )
+        if scales.ndim != 2 or np.any(scales <= 0):
+            raise DeepSeekPagerError(
+                f"MX scale for {weight_name} must be a positive 2D matrix"
+            )
+        if storage_dtype in {"F8_E4M3", "F8_E4M3FN"}:
+            values = cls._decoded_float_array(raw, weight_name)
+            if values.ndim != 2:
+                raise DeepSeekPagerError(f"MXFP8 weight {weight_name} must be 2D")
+            expected = (
+                (values.shape[0] + 127) // 128,
+                (values.shape[1] + 127) // 128,
+            )
+        elif storage_dtype == "I8":
+            try:
+                values = unpack_fp4_e2m1(raw)
+            except (TypeError, ValueError) as exc:
+                raise DeepSeekPagerError(
+                    f"invalid packed MXFP4 weight {weight_name}: {exc}"
+                ) from exc
+            if values.ndim != 2:
+                raise DeepSeekPagerError(f"MXFP4 weight {weight_name} must be 2D")
+            expected = (values.shape[0], (values.shape[1] + 31) // 32)
+        else:  # pragma: no cover - callers guard the encoding
+            raise DeepSeekPagerError(
+                f"unsupported encoded weight dtype {storage_dtype!r} at {weight_name}"
+            )
+        if scales.shape != expected:
+            raise DeepSeekPagerError(
+                f"MX scale shape {scales.shape} for {weight_name} does not match {expected}"
+            )
+        return _MaterializedWeight(
+            values=np.ascontiguousarray(values, dtype=np.float32),
+            scales=scales,
+            storage_dtype=storage_dtype,
+            logical_bytes=logical_bytes,
+        )
+
+    def _materialize_weight(self, prefix: str) -> _MaterializedWeight:
+        weight_name = self._weight_name(prefix)
+        meta = self.source.find(weight_name)
+        storage_dtype = str(meta["dtype"]).upper()
+        logical_bytes = self._payload_bytes(meta)
+        with self._priority_scope(weight_name):
+            raw = self.source.tensor(weight_name)
+            if storage_dtype in {"F8_E4M3", "F8_E4M3FN"}:
+                scale_name = weight_name.removesuffix("weight") + "scale"
+                scale = self.source.tensor(scale_name)
+                logical_bytes += self._payload_bytes(self.source.find(scale_name))
+                weight = self._encoded_weight_parts(
+                    raw,
+                    scale,
+                    storage_dtype=storage_dtype,
+                    weight_name=weight_name,
+                    logical_bytes=logical_bytes,
+                )
+            elif storage_dtype == "I8":
+                scale_name = weight_name.removesuffix("weight") + "scale"
+                scale = self.source.tensor(scale_name)
+                logical_bytes += self._payload_bytes(self.source.find(scale_name))
+                weight = self._encoded_weight_parts(
+                    raw,
+                    scale,
+                    storage_dtype=storage_dtype,
+                    weight_name=weight_name,
+                    logical_bytes=logical_bytes,
+                )
+            elif storage_dtype in {"BF16", "F16", "F32"}:
+                values = np.ascontiguousarray(raw, dtype=np.float32)
+                if values.ndim != 2:
+                    raise DeepSeekPagerError(f"linear weight {weight_name} must be 2D")
+                weight = _MaterializedWeight(
+                    values=values,
+                    scales=None,
+                    storage_dtype=storage_dtype,
+                    logical_bytes=logical_bytes,
+                )
+            else:
+                raise DeepSeekPagerError(
+                    f"unsupported linear weight dtype {storage_dtype!r} at {weight_name}"
+                )
+        self._record_materialization(weight)
+        return weight
+
+    def _materialize_coalesced_weight(
+        self, payload: _CoalescedExpert, prefix: str
+    ) -> _MaterializedWeight:
+        weight_name = self._weight_name(prefix)
+        scale_name = weight_name.removesuffix("weight") + "scale"
+        try:
+            encoded_weight = payload.tensors[weight_name]
+            encoded_scale = payload.tensors[scale_name]
+        except KeyError as exc:  # pragma: no cover - layout builder owns this invariant
+            raise DeepSeekPagerError(
+                f"coalesced expert is missing {exc.args[0]!r}"
+            ) from exc
+        raw = self._decode_coalesced_tensor(encoded_weight)
+        scale = self._decode_coalesced_tensor(encoded_scale)
+        storage_dtype = encoded_weight.dtype
+        logical_bytes = encoded_weight.logical_bytes + encoded_scale.logical_bytes
+        weight = self._encoded_weight_parts(
+            raw,
+            scale,
+            storage_dtype=storage_dtype,
+            weight_name=weight_name,
+            logical_bytes=logical_bytes,
+        )
+        self._record_materialization(weight)
+        return weight
+
+    def _record_materialization(self, weight: _MaterializedWeight) -> None:
+        materialized = int(weight.values.nbytes)
+        self._stats.logical_weight_bytes += weight.logical_bytes
+        self._stats.materialized_float_bytes += materialized
+        if weight.scales is not None:
+            self._stats.materialized_scale_bytes += int(weight.scales.nbytes)
+        self._stats.peak_single_weight_bytes = max(
+            self._stats.peak_single_weight_bytes, materialized
+        )
+
+    @staticmethod
+    def _dequantize_materialized(weight: _MaterializedWeight) -> np.ndarray:
+        if weight.scales is None:
+            return weight.values
+        if weight.storage_dtype in {"F8_E4M3", "F8_E4M3FN"}:
+            return dequantize_fp8_e4m3(weight.values, weight.scales)
+        if weight.storage_dtype == "I8":
+            full_scale = np.repeat(weight.scales, 32, axis=1)[
+                :, : weight.values.shape[1]
+            ]
+            return np.ascontiguousarray(weight.values * full_scale, dtype=np.float32)
+        raise DeepSeekPagerError(
+            f"cannot dequantize unsupported weight dtype {weight.storage_dtype!r}"
+        )
+
+    def _prepare_linear_input(
+        self, x: Any, *, quantized: bool, compute_dtype: Any
+    ) -> Any:
+        torch = self.torch
+        if quantized:
+            cpu_x = np.ascontiguousarray(x.detach().to("cpu", torch.float32).numpy())
+            values, scales = quantize_fp8_e4m3_parts(cpu_x, block_size=128)
+            return _QuantizedActivation(values=values, scales=scales)
+        return x.to(self.device, dtype=compute_dtype)
+
+    def _block_scaled_linear(
+        self,
+        activation: _QuantizedActivation,
+        weight: _MaterializedWeight,
+        *,
+        result_dtype: Any,
+        result_device: Any,
+        row_start: int = 0,
+        row_stop: int | None = None,
+    ) -> Any:
+        """Execute the published MXFP8/MXFP4 reduction order exactly.
+
+        Raw E4M3/E2M1 values are multiplied first, each K-tile result is
+        scaled, and those scaled tiles are accumulated in FP32.  Scaling a
+        fully dequantized matrix in one BF16 GEMM is numerically different and
+        changes V4 logits after enough decoder layers.
+        """
+
+        torch = self.torch
+        if weight.scales is None or weight.storage_dtype not in {
+            "F8_E4M3",
+            "F8_E4M3FN",
+            "I8",
+        }:
+            raise DeepSeekPagerError("block-scaled GEMM requires an MX weight")
+        if (
+            activation.values.ndim < 1
+            or activation.values.shape[-1] != weight.values.shape[1]
+        ):
+            raise DeepSeekPagerError(
+                "quantized activation K dimension does not match checkpoint weight"
+            )
+        k = int(weight.values.shape[1])
+        if k % 128:
+            raise DeepSeekPagerError(
+                f"official MX activation quantizer requires K divisible by 128, got {k}"
+            )
+        n = int(weight.values.shape[0])
+        if row_stop is None:
+            row_stop = n
+        if not 0 <= row_start < row_stop <= n:
+            raise ValueError("weight row interval is outside the materialized matrix")
+
+        leading_shape = tuple(int(value) for value in activation.values.shape[:-1])
+        qx = torch.from_numpy(activation.values.reshape(-1, k)).to(
+            self.device, dtype=torch.float32
+        )
+        sx = torch.from_numpy(activation.scales.reshape(-1, k // 128)).to(
+            self.device, dtype=torch.float32
+        )
+        qw = torch.from_numpy(
+            np.ascontiguousarray(weight.values[row_start:row_stop])
+        ).to(self.device, dtype=torch.float32)
+        if weight.storage_dtype in {"F8_E4M3", "F8_E4M3FN"}:
+            row_groups = np.arange(row_start, row_stop, dtype=np.int64) // 128
+            selected_scales = np.ascontiguousarray(weight.scales[row_groups])
+            block_k = 128
+        else:
+            selected_scales = np.ascontiguousarray(weight.scales[row_start:row_stop])
+            block_k = 32
+        sw = torch.from_numpy(selected_scales).to(self.device, dtype=torch.float32)
+        accumulator = torch.zeros(
+            (qx.shape[0], row_stop - row_start),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        try:
+            for k_start in range(0, k, block_k):
+                k_stop = k_start + block_k
+                k_block = k_start // block_k
+                partial = torch.nn.functional.linear(
+                    qx[:, k_start:k_stop], qw[:, k_start:k_stop]
+                )
+                activation_block = k_start // 128
+                combined_scale = sx[:, activation_block, None] * sw[None, :, k_block]
+                accumulator.add_(partial * combined_scale)
+                if block_k == 128:
+                    self._stats.fp8_k128_tiles += 1
+                else:
+                    self._stats.fp4_k32_tiles += 1
+            result = accumulator.reshape(*leading_shape, row_stop - row_start)
+            result = result.to(dtype=result_dtype)
+            if result_device != self.device:
+                result = result.to(result_device)
+            self._stats.block_scaled_linear_calls += 1
+            return result
+        finally:
+            del accumulator
+            del qw
+            del sw
+            del qx
+            del sx
+
+    def _linear_materialized(
+        self,
+        compute_x: Any,
+        weight: _MaterializedWeight,
+        *,
+        quantized: bool,
+        result_dtype: Any,
+        result_device: Any,
+        compute_dtype: Any,
+    ) -> Any:
+        if quantized:
+            if not isinstance(compute_x, _QuantizedActivation):
+                raise DeepSeekPagerError(
+                    "exact quantized linear requires separate activation values/scales"
+                )
+            result = self._block_scaled_linear(
+                compute_x,
+                weight,
+                result_dtype=result_dtype,
+                result_device=result_device,
+            )
+            self._stats.linear_calls += 1
+            return result
+
+        torch = self.torch
+        dequantized = self._dequantize_materialized(weight)
+        compute_weight = torch.from_numpy(dequantized).to(
+            self.device, dtype=compute_dtype
+        )
+        try:
+            result = torch.nn.functional.linear(compute_x, compute_weight)
+            result = result.to(dtype=result_dtype)
+            if result_device != self.device:
+                result = result.to(result_device)
+            self._stats.linear_calls += 1
+            return result
+        finally:
+            del compute_weight
+            del dequantized
+
+    def _release_materialized_weight(self) -> None:
+        """Record an operation-local matrix release without flushing MPS.
+
+        Each caller deletes its decoded NumPy matrix and each compute helper
+        deletes the device tensor before reaching this hook.  PyTorch's MPS
+        caching allocator can therefore reuse those blocks within a decoder
+        layer.  Flushing here would turn every projection into a device-wide
+        synchronization; :meth:`release` owns that work at the explicit layer
+        boundary instead.
+        """
+
+        self._stats.materialized_weight_releases += 1
+
+    def _uses_mps_allocator(self) -> bool:
+        return self.device.type == "mps"
+
+    def _purge_mps_cache(self) -> bool:
+        """Purge the MPS allocator when supported, returning whether it ran."""
+
+        if not self._uses_mps_allocator():
+            return False
+        mps = getattr(self.torch, "mps", None)
+        empty_cache = getattr(mps, "empty_cache", None)
+        if not callable(empty_cache):
+            return False
+        empty_cache()
+        self._stats.mps_cache_purges += 1
+        return True
+
+    def linear(
+        self,
+        x: Any,
+        prefix: str,
+        *,
+        activation_quantization: bool | None = None,
+        output_dtype: Any | None = None,
+        compute_dtype: Any | None = None,
+    ) -> Any:
+        """Run one official checkpoint matrix and release it before returning."""
+
+        torch = self.torch
+        if not isinstance(x, torch.Tensor):
+            x = torch.as_tensor(x)
+        weight = self._materialize_weight(prefix)
+        should_quantize = (
+            self.simulate_activation_quantization
+            if activation_quantization is None
+            else bool(activation_quantization)
+        ) and weight.storage_dtype in {"F8_E4M3", "F8_E4M3FN", "I8"}
+        original_dtype = x.dtype
+        active_dtype = compute_dtype or self.compute_dtype
+        if active_dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+            raise ValueError(
+                "compute_dtype must be a torch floating-point compute dtype"
+            )
+        compute_x = self._prepare_linear_input(
+            x, quantized=should_quantize, compute_dtype=active_dtype
+        )
+        try:
+            return self._linear_materialized(
+                compute_x,
+                weight,
+                quantized=should_quantize,
+                result_dtype=output_dtype or original_dtype,
+                result_device=x.device,
+                compute_dtype=active_dtype,
+            )
+        finally:
+            del weight
+            self._release_materialized_weight()
+
+    def expert(
+        self,
+        x: Any,
+        base: str,
+        *,
+        route_weight: Any | None = None,
+        swiglu_limit: float = 0.0,
+    ) -> Any:
+        """Evaluate one SwiGLU expert with two source reads when possible.
+
+        The official immutable shard layout stores the three encoded weights
+        in one adjacent interval and the three scales in another.  They are
+        fetched together but decoded and moved to the compute device strictly
+        in execution order: ``w1``, ``w3``, then ``w2``.  The two up
+        projections consume the very same activation-QDQ tensor.
+        """
+
+        torch = self.torch
+        if not isinstance(x, torch.Tensor):
+            x = torch.as_tensor(x)
+        if not isinstance(base, str) or not base:
+            raise ValueError("expert base must be a non-empty string")
+        if not np.isfinite(float(swiglu_limit)) or float(swiglu_limit) < 0:
+            raise ValueError("swiglu_limit must be finite and non-negative")
+
+        payload = self._coalesced_expert(base)
+        if payload is None:
+            materialize = self._materialize_weight
+        else:
+
+            def materialize(prefix: str) -> _MaterializedWeight:
+                return self._materialize_coalesced_weight(payload, prefix)
+
+            self._stats.coalesced_expert_calls += 1
+            self._stats.expert_source_ranges += payload.source_ranges
+
+        quantized_dtypes = {"F8_E4M3", "F8_E4M3FN", "I8"}
+        original_dtype = x.dtype
+
+        gate_weight = materialize(f"{base}.w1")
+        gate_quantized = (
+            self.simulate_activation_quantization
+            and gate_weight.storage_dtype in quantized_dtypes
+        )
+        shared_input = self._prepare_linear_input(
+            x,
+            quantized=gate_quantized,
+            compute_dtype=self.compute_dtype,
+        )
+        try:
+            gate = self._linear_materialized(
+                shared_input,
+                gate_weight,
+                quantized=gate_quantized,
+                result_dtype=original_dtype,
+                result_device=x.device,
+                compute_dtype=self.compute_dtype,
+            ).float()
+        finally:
+            del gate_weight
+            self._release_materialized_weight()
+
+        up_weight = materialize(f"{base}.w3")
+        up_quantized = (
+            self.simulate_activation_quantization
+            and up_weight.storage_dtype in quantized_dtypes
+        )
+        up_input = (
+            shared_input
+            if up_quantized == gate_quantized
+            else self._prepare_linear_input(
+                x,
+                quantized=up_quantized,
+                compute_dtype=self.compute_dtype,
+            )
+        )
+        try:
+            up = self._linear_materialized(
+                up_input,
+                up_weight,
+                quantized=up_quantized,
+                result_dtype=original_dtype,
+                result_device=x.device,
+                compute_dtype=self.compute_dtype,
+            ).float()
+        finally:
+            del up_weight
+            self._release_materialized_weight()
+
+        limit = float(swiglu_limit)
+        if limit > 0:
+            up = torch.clamp(up, min=-limit, max=limit)
+            gate = torch.clamp(gate, max=limit)
+        hidden = torch.nn.functional.silu(gate) * up
+        if route_weight is not None:
+            hidden = hidden * route_weight
+        down_input = hidden.to(original_dtype)
+
+        down_weight = materialize(f"{base}.w2")
+        down_quantized = (
+            self.simulate_activation_quantization
+            and down_weight.storage_dtype in quantized_dtypes
+        )
+        compute_down = self._prepare_linear_input(
+            down_input,
+            quantized=down_quantized,
+            compute_dtype=self.compute_dtype,
+        )
+        try:
+            result = self._linear_materialized(
+                compute_down,
+                down_weight,
+                quantized=down_quantized,
+                result_dtype=original_dtype,
+                result_device=x.device,
+                compute_dtype=self.compute_dtype,
+            )
+        finally:
+            del down_weight
+            self._release_materialized_weight()
+        self._stats.expert_calls += 1
+        return result
+
+    def grouped_linear(
+        self,
+        x: Any,
+        prefix: str,
+        *,
+        groups: int,
+        activation_quantization: bool = False,
+        output_dtype: Any | None = None,
+    ) -> Any:
+        """Apply one independently parameterized matrix per group.
+
+        DeepSeek V4 stores ``wo_a`` as ``[groups * out, in]`` while its input
+        is ``[..., groups, in]``.  Treating that tensor as a dense linear would
+        mix groups and silently implement a different architecture.
+        """
+
+        torch = self.torch
+        if isinstance(groups, bool) or not isinstance(groups, int) or groups <= 0:
+            raise ValueError("groups must be a positive integer")
+        if not isinstance(x, torch.Tensor):
+            x = torch.as_tensor(x)
+        if x.ndim < 2 or x.shape[-2] != groups:
+            raise ValueError(f"grouped input must end in [{groups}, in_features]")
+        weight = self._materialize_weight(prefix)
+        try:
+            if weight.values.shape[0] % groups or weight.values.shape[1] != x.shape[-1]:
+                raise DeepSeekPagerError(
+                    f"grouped weight {weight.values.shape} is incompatible with "
+                    f"input {tuple(x.shape)}"
+                )
+            should_quantize = bool(
+                activation_quantization
+            ) and weight.storage_dtype in {
+                "F8_E4M3",
+                "F8_E4M3FN",
+                "I8",
+            }
+            original_dtype = x.dtype
+            out_per_group = weight.values.shape[0] // groups
+            if should_quantize:
+                outputs = []
+                for group in range(groups):
+                    prepared = self._prepare_linear_input(
+                        x[..., group, :],
+                        quantized=True,
+                        compute_dtype=self.compute_dtype,
+                    )
+                    outputs.append(
+                        self._block_scaled_linear(
+                            prepared,
+                            weight,
+                            row_start=group * out_per_group,
+                            row_stop=(group + 1) * out_per_group,
+                            result_dtype=output_dtype or original_dtype,
+                            result_device=x.device,
+                        )
+                    )
+                self._stats.linear_calls += 1
+                return torch.stack(outputs, dim=-2)
+
+            compute_x = x.to(self.device, dtype=self.compute_dtype)
+            dequantized = self._dequantize_materialized(weight)
+            compute_weight = torch.from_numpy(
+                dequantized.reshape(groups, out_per_group, dequantized.shape[1])
+            ).to(self.device, dtype=self.compute_dtype)
+            try:
+                result = torch.einsum("...gi,goi->...go", compute_x, compute_weight)
+                result = result.to(dtype=output_dtype or original_dtype)
+                if x.device != self.device:
+                    result = result.to(x.device)
+                self._stats.linear_calls += 1
+                return result
+            finally:
+                del compute_weight
+                del dequantized
+        finally:
+            del weight
+            self._release_materialized_weight()
+
+    def tensor_torch(
+        self,
+        name: str,
+        *,
+        dtype: Any | None = None,
+        device: str | Any | None = None,
+    ) -> Any:
+        """Load one small control tensor (norm/router/HC), never a quantized matrix."""
+
+        torch = self.torch
+        meta = self.source.find(name)
+        storage_dtype = str(meta["dtype"]).upper()
+        if storage_dtype in {"F8_E4M3", "F8_E4M3FN", "F8_E8M0"}:
+            raise DeepSeekPagerError(
+                f"tensor_torch() refuses unscaled float8 tensor {name}"
+            )
+        with self._priority_scope(name, 1):
+            array = self.source.tensor(name)
+        result = torch.from_numpy(np.ascontiguousarray(array))
+        target_device = self.device if device is None else torch.device(device)
+        if dtype is not None or target_device.type != "cpu":
+            result = result.to(device=target_device, dtype=dtype or result.dtype)
+        result.requires_grad_(False)
+        return result
+
+    def embedding(self, token_ids: Iterable[int], *, name: str = "embed.weight") -> Any:
+        """Read only requested embedding rows, coalescing consecutive token IDs."""
+
+        torch = self.torch
+        ids = [int(token_id) for token_id in token_ids]
+        meta = self.source.find(name)
+        if len(meta["shape"]) != 2:
+            raise DeepSeekPagerError(f"embedding tensor {name} must be 2D")
+        vocab = int(meta["shape"][0])
+        if any(token_id < 0 or token_id >= vocab for token_id in ids):
+            raise IndexError(f"embedding token outside [0, {vocab})")
+        if not ids:
+            return torch.empty((0, int(meta["shape"][1])), device=self.device)
+
+        runs = self._consecutive_runs(ids)
+        by_id: dict[int, np.ndarray] = {}
+        with self._priority_scope(name, 1):
+            for start, stop in runs:
+                rows = self.source.rows(name, start_row=start, n_rows=stop - start)
+                for offset, row in enumerate(rows):
+                    by_id[start + offset] = row
+        array = np.stack([by_id[token_id] for token_id in ids])
+        self._stats.embedding_rows += len(ids)
+        return torch.from_numpy(np.ascontiguousarray(array)).to(
+            self.device, dtype=self.compute_dtype
+        )
+
+    def candidate_logits(
+        self,
+        hidden: Any,
+        token_ids: Iterable[int],
+        *,
+        name: str = "head.weight",
+    ) -> Any:
+        """Score an explicit token set without materializing the 1 GiB LM head."""
+
+        torch = self.torch
+        ids = [int(token_id) for token_id in token_ids]
+        if not ids:
+            raise ValueError("candidate token IDs must not be empty")
+        meta = self.source.find(name)
+        if len(meta["shape"]) != 2:
+            raise DeepSeekPagerError(f"head tensor {name} must be 2D")
+        vocab = int(meta["shape"][0])
+        if any(token_id < 0 or token_id >= vocab for token_id in ids):
+            raise IndexError(f"candidate token outside [0, {vocab})")
+        by_id: dict[int, np.ndarray] = {}
+        with self._priority_scope(name, 1):
+            for start, stop in self._consecutive_runs(ids):
+                rows = self.source.rows(name, start_row=start, n_rows=stop - start)
+                for offset, row in enumerate(rows):
+                    by_id[start + offset] = row
+        rows = [by_id[token_id] for token_id in ids]
+        # ParallelHead stores checkpoint BF16 rows as FP32 parameters and
+        # explicitly evaluates ``F.linear(x.float(), weight)``.
+        weight = torch.from_numpy(np.ascontiguousarray(rows)).to(
+            self.device, dtype=torch.float32
+        )
+        x = hidden.to(self.device, dtype=torch.float32)
+        self._stats.head_rows += len(ids)
+        return torch.nn.functional.linear(x, weight)
+
+    def _stable_topk(self, values: Any, ids: Any, k: int) -> tuple[Any, Any]:
+        """Lexicographic top-k: larger logit first, lower token ID on ties."""
+
+        torch = self.torch
+        if values.shape != ids.shape or values.ndim < 1:
+            raise ValueError("stable top-k values/ids must have the same shape")
+        if not 0 < k <= values.shape[-1]:
+            raise ValueError("stable top-k k is outside the final dimension")
+        id_order = torch.argsort(ids, dim=-1, stable=True)
+        ordered_ids = torch.gather(ids, -1, id_order)
+        ordered_values = torch.gather(values, -1, id_order)
+        value_order = torch.argsort(
+            ordered_values, dim=-1, descending=True, stable=True
+        )[..., :k]
+        return (
+            torch.gather(ordered_values, -1, value_order),
+            torch.gather(ordered_ids, -1, value_order),
+        )
+
+    def topk_logits(
+        self,
+        hidden: Any,
+        *,
+        k: int = 1,
+        block_rows: int = 1024,
+        name: str = "head.weight",
+        progress: Callable[[dict[str, int]], None] | None = None,
+    ) -> tuple[Any, Any]:
+        """Scan the vocabulary head in bounded row blocks and return global top-k."""
+
+        torch = self.torch
+        if isinstance(k, bool) or not isinstance(k, int) or k <= 0:
+            raise ValueError("k must be a positive integer")
+        if (
+            isinstance(block_rows, bool)
+            or not isinstance(block_rows, int)
+            or block_rows <= 0
+        ):
+            raise ValueError("block_rows must be a positive integer")
+        meta = self.source.find(name)
+        vocab = int(meta["shape"][0])
+        if k > vocab:
+            raise ValueError("k exceeds vocabulary size")
+        # Match the published ParallelHead, which promotes both activation and
+        # BF16 checkpoint rows to FP32 before computing logits.
+        x = hidden.to(self.device, dtype=torch.float32)
+        best_values = None
+        best_ids = None
+        for start in range(0, vocab, block_rows):
+            count = min(block_rows, vocab - start)
+            with self._priority_scope(name, 1):
+                rows = self.source.rows(name, start_row=start, n_rows=count)
+            weight = torch.from_numpy(np.ascontiguousarray(rows)).to(
+                self.device, dtype=torch.float32
+            )
+            logits = torch.nn.functional.linear(x, weight)
+            local_k = min(k, count)
+            token_ids = torch.arange(
+                start, start + count, dtype=torch.long, device=logits.device
+            ).expand_as(logits)
+            values, indices = self._stable_topk(logits, token_ids, local_k)
+            if best_values is None:
+                best_values, best_ids = values, indices
+            else:
+                joined_values = torch.cat((best_values, values), dim=-1)
+                joined_ids = torch.cat((best_ids, indices), dim=-1)
+                best_values, best_ids = self._stable_topk(joined_values, joined_ids, k)
+            self._stats.head_rows += count
+            if progress is not None:
+                progress(
+                    {
+                        "start_row": start,
+                        "rows": count,
+                        "rows_done": start + count,
+                        "vocab_rows": vocab,
+                    }
+                )
+            del weight
+        assert best_values is not None and best_ids is not None
+        return best_values, best_ids
+
+    def release(self) -> None:
+        """Drop allocator caches at an explicit decoder-layer boundary."""
+
+        gc.collect()
+        self._stats.release_boundaries += 1
+        self._purge_mps_cache()
+
+    def metrics(self) -> dict[str, Any]:
+        source_metrics = self.source.metrics()
+        return {
+            **asdict(self._stats),
+            "device": str(self.device),
+            "compute_dtype": str(self.compute_dtype).removeprefix("torch."),
+            "quantized_accumulation_policy": self.QUANTIZED_ACCUMULATION_POLICY,
+            "source": source_metrics,
+        }
+
+
+__all__ = ["DeepSeekPagerError", "DeepSeekWeightPager", "PagerMetrics"]

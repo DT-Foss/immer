@@ -22,17 +22,30 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
   Installation.
 - [x] Abschließender A1-only-Offline-Export mit exakter Dateiliste,
   isoliertem 152/152-Selbsttest und hartem Lizenz-/Upload-Gate.
+- [x] Gepinnter DeepSeek-V4-Flash-Hauptdecoder aus Safetensors-Ranges:
+  43 Layer, native Sparse-Attention, FP8/FP4-MoE, HyperConnections,
+  globaler Head und stateful Decode unter 16-GB-RAM-/12-GiB-Cache-Grenzen.
+- [x] FERTIG-GSM8K-Vollsplit mit Item-Provenienz und hartem Wrong-Gate:
+  1.060 korrekt, 259 abstinent, 0 falsch, 0 Fehler.
 
 ## Jetzt
 
-### 1. Breiter Router-Kontrast
+### 1. DeepSeek-V4-Inhaltsgate
+
+Offiziell encodierte Mehrtoken-Prompts vollständig ausführen und danach einen
+kleinen festen Qualitätssplit mit kandidatengestütztem Scoring messen. Jeder
+Fall läuft gepaart als `off / CRSA / causal-softmax / shuffle`; Byte-, Request-,
+Zeit- und Cachebilanz gehören in denselben Report. Ein technischer Token-ID-
+Smoke ist kein Frontier-Qualitätsclaim.
+
+### 2. Breiter Router-Kontrast
 
 Der heutige Split zeigt Kontextsignal, aber keinen CRSA-Sieg gegen Softmax.
 Nächster zulässiger Versuch: größerer, fachlich gemischter, deduplizierter
 Split; gleicher Ridge-Budgetdeckel; CRSA, Softmax, Roh-A1 und permutierte
 Labels. Kein Rollen-Adaption-Claim ohne Stabilitätsmessung.
 
-### 2. Lebenskurve
+### 3. Lebenskurve
 
 Fixes held-out Byte-Set, Messpunkte über echte Lebenszeit:
 
@@ -42,13 +55,13 @@ Fixes held-out Byte-Set, Messpunkte über echte Lebenszeit:
 - Resume-Bitexaktheit;
 - Drift des Frozen-Exact-Pfads muss null bleiben.
 
-### 3. FERTIG-Evaluationsfamilien
+### 4. FERTIG-Evaluationsfamilien
 
-Nicht nur Solve-Rate messen. Pro Familie werden korrekt, abstinent und falsch
-gezählt. Mengenänderungen, mehrdeutige Bindings und Desktop-Requests sind harte
-Guard-Sets; falsche Antworten/Aktionsbehauptungen sind der Fehler.
+Der vollständige GSM8K-Basissplit ist jetzt so gemessen. Nächster Ausbau sind
+familienweise Guard-Sets für Mengenänderungen, mehrdeutige Bindings und
+Desktop-Requests; falsche Antworten/Aktionsbehauptungen bleiben der Fehler.
 
-### 4. Kontextuell korrekter WorldStream-Mechanismus
+### 5. Kontextuell korrekter WorldStream-Mechanismus
 
 Stage 1 zeigte Mid-Depth-Struktur, Stage 2 mit statischem Embedding-Mittel war
 schlechter als Placebo. Ein neuer Versuch braucht echte RMSNorm-te

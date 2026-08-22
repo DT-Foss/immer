@@ -6,7 +6,22 @@ IMMER connects research programs that solve different parts of the same system.
 
 Grounded neuro-symbolic cognition with a deterministic core, executable learned skills, constrained neural ranking, verification loops and process distillation.
 
-Current structure-solver milestone: **1056/1319 GSM8K = 80.06%, 0 incorrect full-test answers, 731 binding tests passing.**
+Current structure-solver milestone: **1060/1319 GSM8K = 80.36% coverage,
+259 safe abstentions, 0 incorrect and 0 error outcomes on the full test
+split.** The report retains every item and pins dataset, runner and solver-tree
+digests. An unverified operations-template fallback first produced 17/17
+wrong attempts; it is now proposal-only and those cases are `must_abstain`
+regressions.
+
+## DeepSeek-V4 range runtime
+
+The pinned 304B DeepSeek-V4-Flash checkpoint now executes through a local
+43-layer, stateful decoder without loading the checkpoint as a resident model.
+The path uses the original FP8/FP4 Safetensors, native compressed sparse
+attention, hash/score MoE routing, HyperConnections, a bounded 12 GiB verified
+range cache and the repository's fixed-role CRSA residual graft. Completed
+integration runs prove one full autoregressive pass and a two-pass CRSA decode;
+meaningful prompt quality and paired graft superiority remain open gates.
 
 ## Organ Grafting
 
