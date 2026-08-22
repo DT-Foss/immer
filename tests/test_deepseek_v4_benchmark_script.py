@@ -351,6 +351,19 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
                 document["attention_qat_policy"],
                 "v4-native-fp8-kv+fp4-hadamard-indexer/v1",
             )
+            self.assertEqual(
+                document["expert_prefetch_policy"],
+                "exact-router-one-ahead/v1",
+            )
+            self.assertEqual(
+                document["expert_prefetch_payload_limit_bytes"],
+                14 * 1024**2,
+            )
+            self.assertRegex(document["runtime_source_sha256"], r"^[0-9a-f]{64}$")
+            self.assertIn(
+                "immer/runtimes/deepseek_v4/benchmark.py",
+                {row["path"] for row in document["runtime_sources"]},
+            )
             self.assertEqual(document["budgets"]["cache_limit_bytes"], 8 * 1024**2)
             self.assertLessEqual(
                 document["budgets"]["source_used_bytes_this_process"],

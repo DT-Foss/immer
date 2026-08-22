@@ -41,6 +41,7 @@ from immer.runtimes.deepseek_v4 import (
     DeepSeekV4Config,
     DeepSeekWeightPager,
     StreamedDeepSeekV4,
+    runtime_source_manifest,
 )
 from immer.runtimes.deepseek_v4.graft import DeepSeekV4CrsaGraft
 
@@ -68,6 +69,17 @@ def _json_bytes(document: Any, *, pretty: bool = False) -> bytes:
         )
         + "\n"
     ).encode("utf-8")
+
+
+def _canonical_digest(document: Any) -> str:
+    encoded = json.dumps(
+        document,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _atomic_write_json(path: Path, document: Any) -> None:
@@ -267,9 +279,11 @@ def _provenance(
     source: Streamer,
     config_meta: dict[str, Any],
     config: DeepSeekV4Config,
+    pager: DeepSeekWeightPager,
 ) -> dict[str, Any]:
     metrics = source.metrics()
     stateful = args.command == "generate"
+    runtime_sources = runtime_source_manifest()
     return {
         "source": source_label,
         "revision": args.revision,
@@ -282,6 +296,27 @@ def _provenance(
         ),
         "budget_limit_bytes": int(source.budget.limit),
         "inventory_fingerprint": metrics.get("inventory_source_fingerprint"),
+        "runtime_source_sha256": _canonical_digest(runtime_sources),
+        "runtime_sources": runtime_sources,
+        "execution": {
+            "device": str(pager.device),
+            "compute_dtype": str(pager.compute_dtype).removeprefix("torch."),
+            "activation_quantization": bool(
+                pager.simulate_activation_quantization
+            ),
+            "quantized_accumulation_policy": (
+                DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
+            ),
+            "attention_qat_policy": StreamedDeepSeekV4.ATTENTION_QAT_POLICY,
+            "expert_prefetch_policy": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_POLICY
+                if pager.expert_prefetch_enabled
+                else "disabled"
+            ),
+            "expert_prefetch_payload_limit_bytes": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
+            ),
+        },
         "decoder": {
             "architecture": "DeepseekV4ForCausalLM",
             "execution_contract": (
@@ -335,6 +370,7 @@ def _runtime(
         device=args.device,
         compute_dtype=args.dtype,
         simulate_activation_quantization=not args.no_activation_quantization,
+        expert_prefetch=not args.no_expert_prefetch,
     )
     graft_mode = str(getattr(args, "graft_mode", "off"))
     graft = None
@@ -375,7 +411,9 @@ def _preflight(
         "status": "ok",
         "scope": "deepseek-v4-isolated-position-zero-layer-stack",
         "preflight": checks,
-        "provenance": _provenance(args, source_label, source, config_meta, config),
+        "provenance": _provenance(
+            args, source_label, source, config_meta, config, pager
+        ),
         "pager": pager.metrics(),
         "source_metrics": source.metrics(),
     }
@@ -471,7 +509,9 @@ def _one_token(
             "evidence": evidence_dict,
             "logits": logits,
         },
-        "provenance": _provenance(args, source_label, source, config_meta, config),
+        "provenance": _provenance(
+            args, source_label, source, config_meta, config, pager
+        ),
         "pager": pager.metrics(),
         "source_metrics": source.metrics(),
     }
@@ -646,7 +686,9 @@ def _generate(
             },
             "exact_cascade": cascade,
         },
-        "provenance": _provenance(args, source_label, source, config_meta, config),
+        "provenance": _provenance(
+            args, source_label, source, config_meta, config, pager
+        ),
         "pager": pager.metrics(),
         "source_metrics": source.metrics(),
     }
@@ -734,6 +776,11 @@ def _common_parser() -> argparse.ArgumentParser:
         "--no-activation-quantization",
         action="store_true",
         help="diagnostic ablation: skip simulated published activation FP8 Q/DQ",
+    )
+    common.add_argument(
+        "--no-expert-prefetch",
+        action="store_true",
+        help="diagnostic ablation: keep exact routed experts but load synchronously",
     )
     common.add_argument(
         "--sampled-experts",

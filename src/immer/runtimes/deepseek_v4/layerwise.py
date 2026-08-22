@@ -32,6 +32,7 @@ from safetensors.torch import save_file
 
 from .graft import DeepSeekV4CrsaGraft, GRAFT_MODES
 from .model import StreamedDeepSeekV4
+from .provenance import runtime_source_manifest
 
 
 LAYERWISE_SCHEMA = "immer.deepseek-v4-layerwise/v3"
@@ -43,16 +44,6 @@ OFFICIAL_MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash-0731"
 OFFICIAL_SOURCE_SAFE_BYTES = 160 * 1024**3
 MAX_MANIFEST_BYTES = 16 * 1024**2
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-_RUNTIME_SOURCE_FILES = (
-    "config.py",
-    "graft.py",
-    "kernels.py",
-    "layerwise.py",
-    "model.py",
-    "pager.py",
-    "quantization.py",
-    "stateful.py",
-)
 
 
 class LayerwiseError(RuntimeError):
@@ -87,18 +78,7 @@ def _sha256_file(path: Path) -> str:
 def _runtime_source_manifest() -> list[dict[str, str]]:
     """Fingerprint every local source file that can change layer execution."""
 
-    root = Path(__file__).resolve().parent
-    result: list[dict[str, str]] = []
-    for name in _RUNTIME_SOURCE_FILES:
-        path = root / name
-        _regular_file(path, "DeepSeek-V4 runtime source")
-        result.append(
-            {
-                "path": f"immer/runtimes/deepseek_v4/{name}",
-                "sha256": _sha256_file(path),
-            }
-        )
-    return result
+    return runtime_source_manifest(extra_files=("layerwise.py",))
 
 
 def _fsync_directory(path: Path) -> None:
@@ -841,6 +821,14 @@ class LayerwiseScorer:
                     model.pager.QUANTIZED_ACCUMULATION_POLICY
                 ),
                 "attention_qat_policy": model.ATTENTION_QAT_POLICY,
+                "expert_prefetch_policy": (
+                    model.pager.EXPERT_PREFETCH_POLICY
+                    if model.pager.expert_prefetch_enabled
+                    else "disabled"
+                ),
+                "expert_prefetch_payload_limit_bytes": (
+                    model.pager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
+                ),
                 "activation_dtype": "bfloat16",
                 "microbatch_size": microbatch_size,
                 "padding": padding,

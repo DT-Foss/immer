@@ -98,6 +98,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("auto", "cpu", "mps"), default="auto")
     parser.add_argument("--dtype", choices=("auto", "bfloat16"), default="auto")
     parser.add_argument("--no-activation-quantization", action="store_true")
+    parser.add_argument("--no-expert-prefetch", action="store_true")
     parser.add_argument("--microbatch-size", type=_positive_int, default=32)
     parser.add_argument(
         "--padding", choices=("right", "exact-length"), default="right"
@@ -315,6 +316,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         device=args.device,
         compute_dtype=args.dtype,
         simulate_activation_quantization=not args.no_activation_quantization,
+        expert_prefetch=not args.no_expert_prefetch,
     )
     model = StreamedDeepSeekV4(
         config,

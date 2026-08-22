@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import gc
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from collections.abc import Callable, Iterable
+import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -40,6 +43,16 @@ class PagerMetrics:
     block_scaled_linear_calls: int = 0
     fp8_k128_tiles: int = 0
     fp4_k32_tiles: int = 0
+    expert_prefetch_submitted: int = 0
+    expert_prefetch_consumed: int = 0
+    expert_prefetch_failures: int = 0
+    expert_prefetch_sync_fallbacks: int = 0
+    expert_prefetch_payload_bytes: int = 0
+    expert_prefetch_peak_bytes: int = 0
+    expert_prefetch_wait_ns: int = 0
+    expert_prefetch_ready_before_consume: int = 0
+    expert_prefetch_cancelled: int = 0
+    expert_prefetch_max_outstanding: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +68,32 @@ class _CoalescedTensor:
 class _CoalescedExpert:
     tensors: dict[str, _CoalescedTensor]
     source_ranges: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpertReadPlan:
+    base: str
+    layouts: tuple[
+        tuple[str, int, int, tuple[dict[str, Any], ...]], ...
+    ]
+    payload_bytes: int
+
+
+@dataclass(slots=True)
+class _ExpertPrefetch:
+    base: str
+    future: Future[_CoalescedExpert] | None
+    payload_bytes: int
+    consumed: bool = False
+
+
+@dataclass(slots=True)
+class _ExpertPayload:
+    base: str
+    expert: _CoalescedExpert | None
+    payload_bytes: int
+    consumed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +123,8 @@ class DeepSeekWeightPager:
     """
 
     QUANTIZED_ACCUMULATION_POLICY = "mx-block-scaled-fp32/v1"
+    EXPERT_PREFETCH_POLICY = "exact-router-one-ahead/v1"
+    EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES = 14 * 1024**2
 
     def __init__(
         self,
@@ -92,6 +133,7 @@ class DeepSeekWeightPager:
         device: str = "auto",
         compute_dtype: str = "auto",
         simulate_activation_quantization: bool = True,
+        expert_prefetch: bool = True,
     ) -> None:
         try:
             import torch
@@ -122,7 +164,13 @@ class DeepSeekWeightPager:
             raise ValueError("compute_dtype must be float16, bfloat16, or float32")
         self.compute_dtype = dtype
         self.simulate_activation_quantization = bool(simulate_activation_quantization)
+        self.expert_prefetch_enabled = bool(expert_prefetch)
         self._stats = PagerMetrics()
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_executor: ThreadPoolExecutor | None = None
+        self._outstanding_prefetch: _ExpertPrefetch | None = None
+        self._active_prefetch_payload: _ExpertPayload | None = None
+        self._draining_prefetch: Future[_CoalescedExpert] | None = None
 
     @staticmethod
     def _weight_name(prefix: str) -> str:
@@ -245,13 +293,12 @@ class DeepSeekWeightPager:
             return None
         return shard, data_start + begin, end - begin, ordered
 
-    def _coalesced_expert(self, base: str) -> _CoalescedExpert | None:
-        """Fetch an official quantized expert in two adjacent source ranges.
+    def _expert_plan(self, base: str) -> _ExpertReadPlan | None:
+        """Resolve an official expert's two ranges on the main thread.
 
         Published V4 shards place ``w1/w2/w3`` next to one another and do the
         same for their scales.  Synthetic sources and repacked checkpoints are
-        allowed to use any layout; those decline this optimization before a
-        range is read and retain the six-tensor path.
+        allowed to use any layout; those decline before any range is read.
         """
 
         raw_bytes = getattr(self.source, "raw_bytes", None)
@@ -283,15 +330,34 @@ class DeepSeekWeightPager:
         if any(layout is None for layout in layouts):
             return None
 
+        frozen_layouts = tuple(
+            (
+                layout[0],
+                layout[1],
+                layout[2],
+                tuple(dict(meta) for meta in layout[3]),
+            )
+            for layout in layouts
+            if layout is not None
+        )
+        payload_bytes = sum(layout[2] for layout in frozen_layouts)
+        return _ExpertReadPlan(
+            base=base,
+            layouts=frozen_layouts,
+            payload_bytes=payload_bytes,
+        )
+
+    def _read_expert_plan(self, plan: _ExpertReadPlan) -> _CoalescedExpert:
+        """Read one pre-resolved plan; safe for the single I/O worker."""
+
         tensors: dict[str, _CoalescedTensor] = {}
-        with self._priority_scope(f"{base}.w1.weight"):
-            for layout in layouts:
-                assert layout is not None
+        with self._priority_scope(f"{plan.base}.w1.weight"):
+            for layout in plan.layouts:
                 shard, absolute, length, ordered = layout
-                payload = raw_bytes(shard, absolute, length)
+                payload = self.source.raw_bytes(shard, absolute, length)
                 if len(payload) != length:
                     raise DeepSeekPagerError(
-                        f"short coalesced source range for {base}: "
+                        f"short coalesced source range for {plan.base}: "
                         f"{len(payload)}/{length} bytes"
                     )
                 group_begin = int(ordered[0]["offset_in_shard"][0])
@@ -306,7 +372,209 @@ class DeepSeekWeightPager:
                         logical_bytes=end - begin,
                         payload=group_view[begin - group_begin : end - group_begin],
                     )
-        return _CoalescedExpert(tensors=tensors, source_ranges=2)
+        return _CoalescedExpert(
+            tensors=tensors,
+            source_ranges=len(plan.layouts),
+            payload_bytes=plan.payload_bytes,
+        )
+
+    def _coalesced_expert(self, base: str) -> _CoalescedExpert | None:
+        """Synchronously fetch an adjacent expert or decline safely."""
+
+        plan = self._expert_plan(base)
+        return None if plan is None else self._read_expert_plan(plan)
+
+    def _prefetch_resident_bound(self, outstanding_bytes: int = 0) -> int:
+        active = self._active_prefetch_payload
+        return (active.payload_bytes if active is not None else 0) + int(
+            outstanding_bytes
+        )
+
+    def prefetch_expert(self, base: str) -> _ExpertPrefetch | None:
+        """Start one bounded exact expert read after the real router decides."""
+
+        if not self.expert_prefetch_enabled:
+            return None
+        if not isinstance(base, str) or not base:
+            raise ValueError("expert base must be a non-empty string")
+        with self._prefetch_lock:
+            draining = self._draining_prefetch
+            if draining is not None and not draining.done():
+                self._stats.expert_prefetch_sync_fallbacks += 1
+                return None
+            if draining is not None:
+                self._draining_prefetch = None
+        plan = self._expert_plan(base)
+        if (
+            plan is None
+            or plan.payload_bytes > self.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
+        ):
+            self._stats.expert_prefetch_sync_fallbacks += 1
+            return None
+        with self._prefetch_lock:
+            draining = self._draining_prefetch
+            if draining is not None and not draining.done():
+                self._stats.expert_prefetch_sync_fallbacks += 1
+                return None
+            if draining is not None:
+                self._draining_prefetch = None
+            if self._outstanding_prefetch is not None:
+                raise DeepSeekPagerError("expert prefetch already has an outstanding ticket")
+            if self._prefetch_executor is None:
+                self._prefetch_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="immer-v4-expert-prefetch",
+                )
+            future = self._prefetch_executor.submit(self._read_expert_plan, plan)
+            ticket = _ExpertPrefetch(
+                base=base,
+                future=future,
+                payload_bytes=plan.payload_bytes,
+            )
+            self._outstanding_prefetch = ticket
+            self._stats.expert_prefetch_submitted += 1
+            self._stats.expert_prefetch_payload_bytes += plan.payload_bytes
+            self._stats.expert_prefetch_max_outstanding = max(
+                self._stats.expert_prefetch_max_outstanding,
+                1,
+            )
+            self._stats.expert_prefetch_peak_bytes = max(
+                self._stats.expert_prefetch_peak_bytes,
+                self._prefetch_resident_bound(plan.payload_bytes),
+            )
+            return ticket
+
+    def consume_expert_prefetch(
+        self, ticket: _ExpertPrefetch, expected_base: str
+    ) -> _ExpertPayload:
+        """Consume one matching ticket without a second cache/source read."""
+
+        with self._prefetch_lock:
+            if ticket is not self._outstanding_prefetch or ticket.consumed:
+                raise DeepSeekPagerError("expert prefetch ticket is stale or consumed")
+            if ticket.base != expected_base:
+                raise DeepSeekPagerError("expert prefetch ticket base mismatch")
+            if self._active_prefetch_payload is not None:
+                raise DeepSeekPagerError("previous expert prefetch payload is still active")
+            future = ticket.future
+            if future is None:
+                raise DeepSeekPagerError("expert prefetch ticket has no future")
+            ready = future.done()
+        started = time.perf_counter_ns()
+        try:
+            expert = future.result()
+        except BaseException:
+            executor = None
+            with self._prefetch_lock:
+                ticket.consumed = True
+                ticket.future = None
+                if self._outstanding_prefetch is ticket:
+                    self._outstanding_prefetch = None
+                if self._draining_prefetch is None:
+                    executor = self._prefetch_executor
+                    self._prefetch_executor = None
+                self._stats.expert_prefetch_failures += 1
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        waited = time.perf_counter_ns() - started
+        payload = _ExpertPayload(
+            base=ticket.base,
+            expert=expert,
+            payload_bytes=ticket.payload_bytes,
+        )
+        with self._prefetch_lock:
+            if ticket is not self._outstanding_prefetch or ticket.consumed:
+                raise DeepSeekPagerError("expert prefetch ticket changed during consume")
+            ticket.consumed = True
+            ticket.future = None
+            self._outstanding_prefetch = None
+            self._active_prefetch_payload = payload
+            self._stats.expert_prefetch_consumed += 1
+            self._stats.expert_prefetch_wait_ns += waited
+            if ready:
+                self._stats.expert_prefetch_ready_before_consume += 1
+        return payload
+
+    def cancel_expert_prefetch(self, ticket: _ExpertPrefetch) -> None:
+        """Cancel a ticket without making exception unwinding wait on I/O."""
+
+        with self._prefetch_lock:
+            if ticket is not self._outstanding_prefetch or ticket.consumed:
+                raise DeepSeekPagerError("expert prefetch ticket is stale or consumed")
+            future = ticket.future
+            if future is None:
+                raise DeepSeekPagerError("expert prefetch ticket has no future")
+            ticket.consumed = True
+            self._stats.expert_prefetch_cancelled += 1
+            future.cancel()
+            ticket.future = None
+            self._outstanding_prefetch = None
+            draining = not future.done()
+            if draining:
+                if self._draining_prefetch is not None:
+                    raise DeepSeekPagerError("expert prefetch drain slot is occupied")
+                self._draining_prefetch = future
+        if draining:
+            future.add_done_callback(self._finish_cancelled_prefetch)
+        else:
+            try:
+                future.exception()
+            except BaseException:
+                pass
+
+    def _finish_cancelled_prefetch(self, future: Future[_CoalescedExpert]) -> None:
+        """Retire a detached I/O task and its one-worker executor."""
+
+        try:
+            future.exception()
+        except BaseException:
+            pass
+        executor = None
+        with self._prefetch_lock:
+            if self._draining_prefetch is future:
+                self._draining_prefetch = None
+                if self._outstanding_prefetch is None:
+                    executor = self._prefetch_executor
+                    self._prefetch_executor = None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _claim_expert_payload(
+        self, payload: _ExpertPayload, expected_base: str
+    ) -> _CoalescedExpert:
+        with self._prefetch_lock:
+            if payload is not self._active_prefetch_payload or payload.consumed:
+                raise DeepSeekPagerError("expert prefetch payload is stale or consumed")
+            if payload.base != expected_base:
+                payload.consumed = True
+                payload.expert = None
+                self._active_prefetch_payload = None
+                self._stats.expert_prefetch_cancelled += 1
+                raise DeepSeekPagerError("expert prefetch payload base mismatch")
+            expert = payload.expert
+            if expert is None:
+                raise DeepSeekPagerError("expert prefetch payload is empty")
+            payload.consumed = True
+        return expert
+
+    def discard_expert_payload(self, payload: _ExpertPayload) -> None:
+        """Release an unclaimed payload when planning the next read fails."""
+
+        with self._prefetch_lock:
+            if payload is not self._active_prefetch_payload or payload.consumed:
+                raise DeepSeekPagerError("expert prefetch payload is stale or consumed")
+            payload.consumed = True
+            payload.expert = None
+            self._active_prefetch_payload = None
+            self._stats.expert_prefetch_cancelled += 1
+
+    def _release_expert_payload(self, payload: _ExpertPayload) -> None:
+        with self._prefetch_lock:
+            if payload is not self._active_prefetch_payload or not payload.consumed:
+                raise DeepSeekPagerError("expert prefetch payload release is invalid")
+            payload.expert = None
+            self._active_prefetch_payload = None
 
     def _priority_scope(self, name: str, priority: int | None = None) -> Any:
         callback = getattr(self.source, "cache_priority", None)
@@ -696,6 +964,7 @@ class DeepSeekWeightPager:
         *,
         route_weight: Any | None = None,
         swiglu_limit: float = 0.0,
+        prefetched_payload: _ExpertPayload | None = None,
     ) -> Any:
         """Evaluate one SwiGLU expert with two source reads when possible.
 
@@ -714,7 +983,35 @@ class DeepSeekWeightPager:
         if not np.isfinite(float(swiglu_limit)) or float(swiglu_limit) < 0:
             raise ValueError("swiglu_limit must be finite and non-negative")
 
-        payload = self._coalesced_expert(base)
+        claimed_payload = prefetched_payload
+        payload = (
+            self._claim_expert_payload(claimed_payload, base)
+            if claimed_payload is not None
+            else self._coalesced_expert(base)
+        )
+        try:
+            result = self._expert_with_payload(
+                x,
+                base,
+                payload=payload,
+                route_weight=route_weight,
+                swiglu_limit=swiglu_limit,
+            )
+        finally:
+            if claimed_payload is not None:
+                self._release_expert_payload(claimed_payload)
+        return result
+
+    def _expert_with_payload(
+        self,
+        x: Any,
+        base: str,
+        *,
+        payload: _CoalescedExpert | None,
+        route_weight: Any | None,
+        swiglu_limit: float,
+    ) -> Any:
+        torch = self.torch
         if payload is None:
             materialize = self._materialize_weight
         else:
@@ -1062,17 +1359,46 @@ class DeepSeekWeightPager:
     def release(self) -> None:
         """Drop allocator caches at an explicit decoder-layer boundary."""
 
+        with self._prefetch_lock:
+            if self._outstanding_prefetch is not None:
+                raise DeepSeekPagerError(
+                    "cannot release pager with an outstanding expert prefetch"
+                )
+            if self._active_prefetch_payload is not None:
+                raise DeepSeekPagerError(
+                    "cannot release pager with an active expert prefetch payload"
+                )
+            draining = self._draining_prefetch
+            if draining is not None and draining.done():
+                self._draining_prefetch = None
+                draining = None
+            executor = self._prefetch_executor if draining is None else None
+            if draining is None:
+                self._prefetch_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
         gc.collect()
         self._stats.release_boundaries += 1
         self._purge_mps_cache()
 
     def metrics(self) -> dict[str, Any]:
         source_metrics = self.source.metrics()
+        with self._prefetch_lock:
+            draining = self._draining_prefetch is not None
         return {
             **asdict(self._stats),
             "device": str(self.device),
             "compute_dtype": str(self.compute_dtype).removeprefix("torch."),
             "quantized_accumulation_policy": self.QUANTIZED_ACCUMULATION_POLICY,
+            "expert_prefetch_policy": (
+                self.EXPERT_PREFETCH_POLICY
+                if self.expert_prefetch_enabled
+                else "disabled"
+            ),
+            "expert_prefetch_payload_limit_bytes": (
+                self.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
+            ),
+            "expert_prefetch_draining": draining,
             "source": source_metrics,
         }
 

@@ -30,6 +30,7 @@ from immer.runtimes.deepseek_v4 import (
     DeepSeekV4Config,
     DeepSeekWeightPager,
     StreamedDeepSeekV4,
+    runtime_source_manifest,
 )
 from immer.runtimes.deepseek_v4.benchmark import (
     JOURNAL_GENESIS_SHA256,
@@ -1435,6 +1436,12 @@ def _build_report(
         "candidate_tokenizations": header["candidate_tokenizations"],
         "quantized_accumulation_policy": header["quantized_accumulation_policy"],
         "attention_qat_policy": header["attention_qat_policy"],
+        "expert_prefetch_policy": header["expert_prefetch_policy"],
+        "expert_prefetch_payload_limit_bytes": header[
+            "expert_prefetch_payload_limit_bytes"
+        ],
+        "runtime_source_sha256": header["runtime_source_sha256"],
+        "runtime_sources": header["runtime_sources"],
         "budgets": {
             "source_limit_bytes_per_process": int(source.budget.limit),
             "source_used_bytes_this_process": int(source.bytes_moved()),
@@ -1504,6 +1511,7 @@ def _parser() -> argparse.ArgumentParser:
         "--dtype", choices=("auto", "float16", "bfloat16", "float32"), default="auto"
     )
     parser.add_argument("--no-activation-quantization", action="store_true")
+    parser.add_argument("--no-expert-prefetch", action="store_true")
     parser.add_argument("--batched-prefill", action="store_true")
     parser.add_argument("--graft-alpha", type=_nonnegative_float, default=0.05)
     parser.add_argument("--graft-layer", type=int, default=None)
@@ -1557,6 +1565,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         revision=canonical_digest(rows),
     )
     script_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    runtime_sources = runtime_source_manifest(extra_files=("benchmark.py",))
+    runtime_source_sha256 = canonical_digest(runtime_sources)
     provenance = BenchmarkProvenance(
         model_id=source_label,
         model_revision=args.revision,
@@ -1578,6 +1588,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
             ),
             "attention_qat_policy": StreamedDeepSeekV4.ATTENTION_QAT_POLICY,
+            "expert_prefetch_policy": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_POLICY
+                if not args.no_expert_prefetch
+                else "disabled"
+            ),
+            "expert_prefetch_payload_limit_bytes": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
+            ),
+            "runtime_source_sha256": runtime_source_sha256,
+            "runtime_sources": runtime_sources,
             "tokenizer_location": (
                 "pretokenized-token-ids/v1" if tokenizer is None else tokenizer.location
             ),
@@ -1614,6 +1634,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
         ),
         "attention_qat_policy": StreamedDeepSeekV4.ATTENTION_QAT_POLICY,
+        "expert_prefetch_policy": (
+            DeepSeekWeightPager.EXPERT_PREFETCH_POLICY
+            if not args.no_expert_prefetch
+            else "disabled"
+        ),
+        "expert_prefetch_payload_limit_bytes": (
+            DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
+        ),
+        "runtime_source_sha256": runtime_source_sha256,
+        "runtime_sources": runtime_sources,
         "device": args.device,
         "dtype": args.dtype,
         "head_block_rows": args.head_block_rows,
@@ -1633,6 +1663,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         device=args.device,
         compute_dtype=args.dtype,
         simulate_activation_quantization=not args.no_activation_quantization,
+        expert_prefetch=not args.no_expert_prefetch,
     )
     if args.preflight != "none":
         model = _model_for_mode(config, pager, args, "off", seeds[0])
@@ -1656,6 +1687,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
         ),
         "attention_qat_policy": StreamedDeepSeekV4.ATTENTION_QAT_POLICY,
+        "expert_prefetch_policy": (
+            DeepSeekWeightPager.EXPERT_PREFETCH_POLICY
+            if not args.no_expert_prefetch
+            else "disabled"
+        ),
+        "expert_prefetch_payload_limit_bytes": (
+            DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
+        ),
+        "runtime_source_sha256": runtime_source_sha256,
+        "runtime_sources": runtime_sources,
         "closed_set_gsm8k_is_noncanonical": (
             "gsm8k_closed_set_candidate_token_diagnostic" in benchmark_protocols
         ),

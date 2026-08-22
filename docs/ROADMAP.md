@@ -23,20 +23,29 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
 - [x] Abschließender A1-only-Offline-Export mit exakter Dateiliste,
   isoliertem 152/152-Selbsttest und hartem Lizenz-/Upload-Gate.
 - [x] Gepinnter DeepSeek-V4-Flash-Hauptdecoder aus Safetensors-Ranges:
-  43 Layer, native Sparse-Attention, FP8/FP4-MoE, HyperConnections,
-  globaler Head und stateful Decode unter 16-GB-RAM-/12-GiB-Cache-Grenzen.
+  43 Layer, native Sparse-Attention, exakte blockskalierte MXFP8/FP4-
+  Dekodierung mit FP32-Akkumulation, HyperConnections, globaler Head und
+  stateful Decode unter 16-GB-RAM-/12-GiB-Cache-Grenzen.
+- [x] DeepSeek-Layerwise-Proof-Schema v3 mit gebundener Runtime-Identität und
+  manipulationssichtbarem Hash-Chain-Journal v2.
+- [x] Exaktes Routed-Expert-Prefetch `exact-router-one-ahead/v1`: ein Worker,
+  ein ausstehendes Ticket, 14-MiB-Payloadgrenze und bitgleiche A/B-Ausgabe.
 - [x] FERTIG-GSM8K-Vollsplit mit Item-Provenienz und hartem Wrong-Gate:
   1.060 korrekt, 259 abstinent, 0 falsch, 0 Fehler.
+- [x] FERTIG-Grammatik für endliche affine Rekurrenzen mit exaktem
+  Fraction/RREF-Zertifikat; neue Fähigkeit bei unverändert 1.060/1.319 und
+  weiterhin 0 falschen Antworten.
 
 ## Jetzt
 
 ### 1. DeepSeek-V4-Inhaltsgate
 
-Offiziell encodierte Mehrtoken-Prompts vollständig ausführen und danach einen
-kleinen festen Qualitätssplit mit kandidatengestütztem Scoring messen. Jeder
-Fall läuft gepaart als `off / CRSA / causal-softmax / shuffle`; Byte-, Request-,
-Zeit- und Cachebilanz gehören in denselben Report. Ein technischer Token-ID-
-Smoke ist kein Frontier-Qualitätsclaim.
+Als nächstes läuft ein frischer, unverfälschter MMLU-`off`-Content-Gate mit
+offiziellem Encoding, festem Split und kandidatengestütztem Scoring. Der Lauf
+beginnt in einem neuen Proof-v3-Verzeichnis, schreibt Journal v2 und bindet
+Runtime, Revision, Items, Seeds, Bytes, Requests, Zeit und Cachebilanz. Erst
+wenn diese Baseline inhaltlich valide ist, folgen gepaarte CRSA-Ablationen.
+Token-Smokes und der Prefetch-Transportbenchmark sind keine Qualitätsclaims.
 
 ### 2. Breiter Router-Kontrast
 

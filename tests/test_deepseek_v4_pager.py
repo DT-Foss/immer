@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from unittest import mock
 
@@ -118,6 +119,75 @@ class _EncodedExpertSource:
         }
 
 
+class _MultiEncodedExpertSource:
+    """Combine independently adjacent experts behind one tensor source."""
+
+    def __init__(
+        self, bases: list[str], *, adjacent: bool = True, encoding: str = "fp4"
+    ) -> None:
+        self.children: dict[str, _EncodedExpertSource] = {}
+        self.meta: dict[str, dict] = {}
+        self.data: dict[str, np.ndarray] = {}
+        self.raw_calls: list[tuple[str, int, int]] = []
+        self.tensor_calls: list[str] = []
+        for index, base in enumerate(bases):
+            child = _EncodedExpertSource(base, encoding, adjacent=adjacent)
+            shard = f"expert-{index}.safetensors"
+            child.shard_name = shard
+            for name, record in child.meta.items():
+                updated = dict(record)
+                updated["shard"] = shard
+                self.meta[name] = updated
+            self.children[shard] = child
+            self.data.update(child.data)
+
+    def find(self, name: str) -> dict:
+        return dict(self.meta[name])
+
+    def tensor(self, name: str) -> np.ndarray:
+        self.tensor_calls.append(name)
+        return self.data[name].copy()
+
+    def raw_bytes(self, shard: str, offset: int, length: int) -> bytes:
+        self.raw_calls.append((shard, offset, length))
+        child = self.children[shard]
+        start = offset - child.data_start
+        return child.payload[start : start + length]
+
+    def metrics(self) -> dict:
+        return {
+            "network_or_source_body_bytes": sum(
+                length for _, _, length in self.raw_calls
+            )
+        }
+
+
+class _BlockingExpertSource(_MultiEncodedExpertSource):
+    def __init__(self, bases: list[str]) -> None:
+        super().__init__(bases)
+        self.blocked_shard: str | None = None
+        self.started = threading.Event()
+        self.release_read = threading.Event()
+        self.completed = threading.Event()
+        self.fail = False
+
+    def raw_bytes(self, shard: str, offset: int, length: int) -> bytes:
+        if shard == self.blocked_shard:
+            self.started.set()
+            if not self.release_read.wait(timeout=5):
+                raise RuntimeError("test did not release blocked expert read")
+            if self.fail:
+                raise RuntimeError("simulated expert prefetch failure")
+        result = super().raw_bytes(shard, offset, length)
+        if shard == self.blocked_shard:
+            blocked_calls = sum(
+                observed_shard == shard for observed_shard, _, _ in self.raw_calls
+            )
+            if blocked_calls == 2:
+                self.completed.set()
+        return result
+
+
 class DeepSeekV4PagerTests(unittest.TestCase):
     @staticmethod
     def _manual_expert(pager, x, base: str, route_weight=None):
@@ -226,6 +296,173 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         self.assertEqual(len(fallback_source.tensor_calls), 6)
         self.assertEqual(fallback_source.raw_calls, [])
         self.assertEqual(pager.metrics()["linear_calls"], 3)
+
+    def test_exact_prefetch_is_async_bounded_and_avoids_second_read(self) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+        from immer.runtimes.deepseek_v4.pager import DeepSeekPagerError
+
+        base = "layers.0.ffn.experts.7"
+        other = "layers.0.ffn.experts.8"
+        source = _BlockingExpertSource([base, other])
+        source.blocked_shard = "expert-0.safetensors"
+        pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="bfloat16")
+
+        ticket = pager.prefetch_expert(base)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertTrue(source.started.wait(timeout=2))
+        self.assertFalse(ticket.future.done())
+        with self.assertRaisesRegex(DeepSeekPagerError, "outstanding"):
+            pager.prefetch_expert(other)
+        source.release_read.set()
+
+        payload = pager.consume_expert_prefetch(ticket, base)
+        x = torch.zeros((1, 128), dtype=torch.bfloat16)
+        actual = pager.expert(x, base, prefetched_payload=payload)
+        self.assertTrue(torch.isfinite(actual).all())
+        self.assertEqual(len(source.raw_calls), 2)
+        with self.assertRaisesRegex(DeepSeekPagerError, "stale or consumed"):
+            pager.consume_expert_prefetch(ticket, base)
+        metrics = pager.metrics()
+        self.assertEqual(metrics["expert_prefetch_submitted"], 1)
+        self.assertEqual(metrics["expert_prefetch_consumed"], 1)
+        self.assertEqual(metrics["expert_prefetch_max_outstanding"], 1)
+        self.assertLessEqual(
+            metrics["expert_prefetch_peak_bytes"],
+            2 * pager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES,
+        )
+        pager.release()
+
+    def test_next_expert_read_starts_before_current_expert_compute(self) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        first = "layers.0.ffn.experts.7"
+        second = "layers.0.ffn.experts.8"
+        source = _BlockingExpertSource([first, second])
+        pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="bfloat16")
+        first_ticket = pager.prefetch_expert(first)
+        assert first_ticket is not None
+        first_payload = pager.consume_expert_prefetch(first_ticket, first)
+
+        source.blocked_shard = "expert-1.safetensors"
+        source.started.clear()
+        source.release_read.clear()
+        second_ticket = pager.prefetch_expert(second)
+        assert second_ticket is not None
+        linear = pager._linear_materialized
+        observed = threading.Event()
+
+        def assert_prefetch_started(*args, **kwargs):
+            self.assertTrue(source.started.wait(timeout=2))
+            observed.set()
+            source.release_read.set()
+            return linear(*args, **kwargs)
+
+        x = torch.zeros((1, 128), dtype=torch.bfloat16)
+        with mock.patch.object(
+            pager, "_linear_materialized", side_effect=assert_prefetch_started
+        ):
+            first_output = pager.expert(
+                x, first, prefetched_payload=first_payload
+            )
+        self.assertTrue(observed.is_set())
+        second_payload = pager.consume_expert_prefetch(second_ticket, second)
+        second_output = pager.expert(x, second, prefetched_payload=second_payload)
+        self.assertTrue(torch.equal(first_output, second_output))
+        self.assertEqual(len(source.raw_calls), 4)
+        self.assertEqual(pager.metrics()["expert_prefetch_peak_bytes"], 2 * 26112)
+        pager.release()
+
+    def test_prefetch_failure_clears_slot_and_fallback_stays_synchronous(self) -> None:
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        base = "layers.0.ffn.experts.7"
+        source = _BlockingExpertSource([base])
+        source.blocked_shard = "expert-0.safetensors"
+        source.fail = True
+        pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="bfloat16")
+        ticket = pager.prefetch_expert(base)
+        assert ticket is not None
+        source.release_read.set()
+        with self.assertRaisesRegex(RuntimeError, "simulated"):
+            pager.consume_expert_prefetch(ticket, base)
+
+        source.fail = False
+        source.blocked_shard = None
+        replacement = pager.prefetch_expert(base)
+        assert replacement is not None
+        payload = pager.consume_expert_prefetch(replacement, base)
+        pager.discard_expert_payload(payload)
+        self.assertEqual(pager.metrics()["expert_prefetch_failures"], 1)
+        pager.release()
+
+        fallback = DeepSeekWeightPager(
+            _MultiEncodedExpertSource([base], adjacent=False),
+            device="cpu",
+            compute_dtype="bfloat16",
+        )
+        self.assertIsNone(fallback.prefetch_expert(base))
+        self.assertEqual(fallback.metrics()["expert_prefetch_sync_fallbacks"], 1)
+        fallback.release()
+
+    def test_current_compute_failure_does_not_wait_for_blocked_next_read(self) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        first = "layers.0.ffn.experts.7"
+        second = "layers.0.ffn.experts.8"
+        source = _BlockingExpertSource([first, second])
+        pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="bfloat16")
+        first_ticket = pager.prefetch_expert(first)
+        assert first_ticket is not None
+        first_payload = pager.consume_expert_prefetch(first_ticket, first)
+
+        source.blocked_shard = "expert-1.safetensors"
+        source.started.clear()
+        source.release_read.clear()
+        next_ticket = pager.prefetch_expert(second)
+        assert next_ticket is not None
+        self.assertTrue(source.started.wait(timeout=2))
+        with (
+            mock.patch.object(
+                pager,
+                "_expert_with_payload",
+                side_effect=RuntimeError("simulated current compute failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "current compute"),
+        ):
+            pager.expert(
+                torch.zeros((1, 128), dtype=torch.bfloat16),
+                first,
+                prefetched_payload=first_payload,
+            )
+
+        cancellation_done = threading.Event()
+
+        def cancel() -> None:
+            pager.cancel_expert_prefetch(next_ticket)
+            cancellation_done.set()
+
+        cancellation = threading.Thread(target=cancel)
+        cancellation.start()
+        self.assertTrue(cancellation_done.wait(timeout=1))
+        cancellation.join(timeout=1)
+        self.assertFalse(cancellation.is_alive())
+        self.assertTrue(pager.metrics()["expert_prefetch_draining"])
+        self.assertIsNone(pager.prefetch_expert(first))
+
+        source.release_read.set()
+        self.assertTrue(source.completed.wait(timeout=2))
+        draining = pager._draining_prefetch
+        if draining is not None:
+            draining.result(timeout=2)
+        pager.release()
+        self.assertFalse(pager.metrics()["expert_prefetch_draining"])
 
     def test_coalesced_expert_rejects_reserved_float8_weight_and_scale_codes(
         self,

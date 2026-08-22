@@ -34,6 +34,7 @@ from .kernels import (
     sparse_attention,
 )
 from .pager import DeepSeekWeightPager
+from .provenance import runtime_source_manifest
 from .quantization import quantize_dequantize_fp4, quantize_dequantize_fp8
 from .snapshot import (
     DeepSeekV4SnapshotError,
@@ -564,8 +565,13 @@ class StreamedDeepSeekV4:
         if not isinstance(revision, str) or not revision:
             raise DeepSeekV4SnapshotError("tensor source revision identity is invalid")
         config = asdict(self.config)
+        runtime_sources = runtime_source_manifest()
         return {
-            "runtime": "immer.streamed-deepseek-v4/native-stateful-v1",
+            "runtime": {
+                "schema": "immer.streamed-deepseek-v4/native-stateful-v2",
+                "source_sha256": self._snapshot_digest(runtime_sources),
+                "sources": runtime_sources,
+            },
             "config": config,
             "config_sha256": self._snapshot_digest(config),
             "source": {
@@ -584,6 +590,14 @@ class StreamedDeepSeekV4:
                     self.pager.QUANTIZED_ACCUMULATION_POLICY
                 ),
                 "attention_qat_policy": self.ATTENTION_QAT_POLICY,
+                "expert_prefetch_policy": (
+                    self.pager.EXPERT_PREFETCH_POLICY
+                    if self.pager.expert_prefetch_enabled
+                    else "disabled"
+                ),
+                "expert_prefetch_payload_limit_bytes": (
+                    self.pager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
+                ),
                 "max_batch_size": self.max_batch_size,
                 "max_seq_len": self.max_seq_len,
                 "max_position_embeddings": self.config.max_position_embeddings,
@@ -1134,12 +1148,20 @@ class StreamedDeepSeekV4:
         )
         return self._route_experts_many(x, layer, token_ids)
 
-    def _expert(self, x: Any, base: str, route_weight: Any | None = None) -> Any:
+    def _expert(
+        self,
+        x: Any,
+        base: str,
+        route_weight: Any | None = None,
+        *,
+        prefetched_payload: Any | None = None,
+    ) -> Any:
         return self.pager.expert(
             x,
             base,
             route_weight=route_weight,
             swiglu_limit=self.config.swiglu_limit,
+            prefetched_payload=prefetched_payload,
         )
 
     def _moe_one(
@@ -1152,13 +1174,46 @@ class StreamedDeepSeekV4:
         # The official ModuleList loop visits expert IDs in ascending order.
         # FP32 accumulation is not associative, so preserve that order while
         # still selecting each expert's original routing-weight slot.
-        for slot, expert_id in sorted(enumerate(chosen), key=lambda item: item[1]):
-            expert = self._expert(
-                flat,
-                f"layers.{layer}.ffn.experts.{expert_id}",
-                weights[:, slot : slot + 1],
+        ordered = sorted(enumerate(chosen), key=lambda item: item[1])
+        pending = (
+            self.pager.prefetch_expert(
+                f"layers.{layer}.ffn.experts.{ordered[0][1]}"
             )
-            output += expert.float()
+            if ordered
+            else None
+        )
+        try:
+            for index, (slot, expert_id) in enumerate(ordered):
+                base = f"layers.{layer}.ffn.experts.{expert_id}"
+                payload = None
+                try:
+                    if pending is not None:
+                        current = pending
+                        pending = None
+                        payload = self.pager.consume_expert_prefetch(current, base)
+                    if payload is not None and index + 1 < len(ordered):
+                        next_id = ordered[index + 1][1]
+                        pending = self.pager.prefetch_expert(
+                            f"layers.{layer}.ffn.experts.{next_id}"
+                        )
+                    claimed = payload
+                    payload = None
+                    try:
+                        expert = self._expert(
+                            flat,
+                            base,
+                            weights[:, slot : slot + 1],
+                            prefetched_payload=claimed,
+                        )
+                    finally:
+                        del claimed
+                finally:
+                    if payload is not None:
+                        self.pager.discard_expert_payload(payload)
+                output += expert.float()
+        finally:
+            if pending is not None:
+                self.pager.cancel_expert_prefetch(pending)
         shared = self._expert(flat, f"layers.{layer}.ffn.shared_experts")
         output += shared.float()
         return output.to(x.dtype).reshape_as(x), chosen
@@ -1198,14 +1253,53 @@ class StreamedDeepSeekV4:
             selected_rows[int(row)] = choices
         # Match the official ModuleList traversal and scatter each token/expert
         # pair with its original top-k slot weight.
-        for expert_id in sorted({value for row in active_selected for value in row}):
-            rows, slots = self.torch.where(indices == expert_id)
-            expert = self._expert(
-                active.index_select(0, rows),
-                f"layers.{layer}.ffn.experts.{expert_id}",
-                weights[rows, slots].unsqueeze(-1),
+        ordered_experts = sorted(
+            {value for row in active_selected for value in row}
+        )
+        pending = (
+            self.pager.prefetch_expert(
+                f"layers.{layer}.ffn.experts.{ordered_experts[0]}"
             )
-            output.index_add_(0, active_rows.index_select(0, rows), expert.float())
+            if ordered_experts
+            else None
+        )
+        try:
+            for index, expert_id in enumerate(ordered_experts):
+                rows, slots = self.torch.where(indices == expert_id)
+                base = f"layers.{layer}.ffn.experts.{expert_id}"
+                payload = None
+                try:
+                    if pending is not None:
+                        current = pending
+                        pending = None
+                        payload = self.pager.consume_expert_prefetch(current, base)
+                    if payload is not None and index + 1 < len(ordered_experts):
+                        next_id = ordered_experts[index + 1]
+                        pending = self.pager.prefetch_expert(
+                            f"layers.{layer}.ffn.experts.{next_id}"
+                        )
+                    claimed = payload
+                    payload = None
+                    try:
+                        expert = self._expert(
+                            active.index_select(0, rows),
+                            base,
+                            weights[rows, slots].unsqueeze(-1),
+                            prefetched_payload=claimed,
+                        )
+                    finally:
+                        del claimed
+                finally:
+                    if payload is not None:
+                        self.pager.discard_expert_payload(payload)
+                output.index_add_(
+                    0,
+                    active_rows.index_select(0, rows),
+                    expert.float(),
+                )
+        finally:
+            if pending is not None:
+                self.pager.cancel_expert_prefetch(pending)
         shared = self._expert(active, f"layers.{layer}.ffn.shared_experts").float()
         output.index_add_(0, active_rows, shared)
         return output.to(x.dtype).reshape_as(x), tuple(selected_rows)

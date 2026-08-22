@@ -208,6 +208,7 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
             "--budget-mb",
             "--device",
             "--dtype",
+            "--no-expert-prefetch",
             "--top-k",
             "--head-block-rows",
             "--progress-jsonl",
@@ -286,6 +287,14 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
             self.assertTrue(report["preflight"]["exhaustive_experts"])
             self.assertGreater(report["preflight"]["required_tensors"], 40)
             self.assertTrue(report["provenance"]["revision_is_mutable"])
+            self.assertEqual(
+                report["provenance"]["execution"]["expert_prefetch_policy"],
+                "exact-router-one-ahead/v1",
+            )
+            self.assertRegex(
+                report["provenance"]["runtime_source_sha256"],
+                r"^[0-9a-f]{64}$",
+            )
             self.assertEqual(json.loads(preflight_output.read_text()), report)
             events = [
                 json.loads(line)["event"]
@@ -294,6 +303,48 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
             self.assertEqual(events[0], "run_start")
             self.assertIn("inventory_ready", events)
             self.assertEqual(events[-1], "run_complete")
+
+            synchronous = self._run(
+                "preflight",
+                *common,
+                "--no-expert-prefetch",
+                "--sampled-experts",
+            )
+            self.assertEqual(synchronous.returncode, 0, synchronous.stderr)
+            synchronous_report = json.loads(synchronous.stdout)
+            self.assertEqual(
+                synchronous_report["provenance"]["execution"][
+                    "expert_prefetch_policy"
+                ],
+                "disabled",
+            )
+            self.assertEqual(
+                synchronous_report["provenance"]["runtime_source_sha256"],
+                report["provenance"]["runtime_source_sha256"],
+            )
+
+            automatic = self._run(
+                "preflight",
+                "--source",
+                str(checkpoint),
+                "--revision",
+                "local-fixture-v1",
+                "--cache-dir",
+                str(cache),
+                "--budget-mb",
+                "4",
+                "--device",
+                "auto",
+                "--dtype",
+                "auto",
+                "--sampled-experts",
+            )
+            self.assertEqual(automatic.returncode, 0, automatic.stderr)
+            automatic_execution = json.loads(automatic.stdout)["provenance"][
+                "execution"
+            ]
+            self.assertIn(automatic_execution["device"], {"cpu", "mps"})
+            self.assertEqual(automatic_execution["compute_dtype"], "bfloat16")
 
             one_progress = work / "one.jsonl"
             one = self._run(

@@ -91,6 +91,11 @@ ohne unabhängigen Strukturbeweis aus dem Unified-Answer-Pfad quarantäniert.
 Alle 17 Fälle sind `must_abstain`-Regressionen. Der harte Gate lautet weiterhin
 `incorrect + errors == 0`, nicht bloß hohe Accuracy auf beantworteten Fällen.
 
+Zusätzlich beherrscht FERTIG nun endliche affine Rekurrenzen mit expliziten
+Indexgrenzen und exaktem Fraction/RREF-Zertifikat. Das ist eine neue
+strukturelle Fähigkeit; der Vollsplit wurde dadurch nicht nachoptimiert und
+bleibt bei 1.060/1.319 korrekt sowie 0 falschen Antworten.
+
 ## 5. Streaming-Verträge
 
 Die automatisierte Contract-Suite misst keine Modellqualität, sondern
@@ -111,10 +116,15 @@ Sicherheits- und Ressourceninvarianten:
 Der revisionsgebundene Hauptdecoder von
 `deepseek-ai/DeepSeek-V4-Flash-0731@7872f01b...` läuft lokal direkt aus den
 originalen Safetensors-Ranges. Der aktuelle Vertrag umfasst alle 43 Layer,
-FP8/FP4-QDQ, Hash- und Score-Routing, sechs aktive plus Shared Expert,
-HyperConnections, native Fenster-/Kompressor-/Indexer-Attention, globalen
-LM-Head und autoregressiven KV-Zustand. DSpark-MTP ist noch nicht im
-Ausführungspfad.
+exakte blockskalierte MXFP8/FP4-Dekodierung mit FP32-Akkumulation, Hash- und
+Score-Routing, sechs aktive plus Shared Expert, HyperConnections, native
+Fenster-/Kompressor-/Indexer-Attention, globalen LM-Head und autoregressiven
+KV-Zustand. DSpark-MTP ist noch nicht im Ausführungspfad.
+
+Layerwise Proof-Schema v3 bindet Modellrevision, Runtime-Quellen und Ergebnisse
+vor dem Resume. Das kanonische Journal v2 ist eine monotone Hash-Kette und
+weist Duplikate, Fremdeinträge, Mutation sowie gebrochene Verkettung ab; ein
+abgerissener letzter Datensatz ist deterministisch reparierbar.
 
 Zwei abgeschlossene Integrationsmessungen auf M4/16 GB:
 
@@ -125,10 +135,28 @@ Zwei abgeschlossene Integrationsmessungen auf M4/16 GB:
 
 Der zweite Lauf hält 17,84 MB Attention-State und den Cache bei
 12.881.453.756 von 12.884.901.888 Bytes; 891 LRU-Evictions überschritten die
-Grenze nicht. Das ist noch kein Qualitäts- oder Frontier-Paritätsclaim: Die
-Eingabe war eine explizite Diagnose-ID. Ein offizieller Mehrtoken-Chatprompt
-und danach feste, gepaarte `off / CRSA / softmax / shuffle`-Items sind der
-nächste inhaltliche Gate.
+Grenze nicht.
+
+Der konservative Expert-Prefetch `exact-router-one-ahead/v1` startet erst nach
+der offiziellen Routerentscheidung. Er erlaubt genau einen I/O-Worker, genau
+ein ausstehendes Ticket und höchstens 14 MiB je Payload. Ein offizielles,
+symmetrisch aufgewärmtes 2-Expert-A/B auf MPS/BF16 mit 20 alternierenden
+Trials ergab:
+
+| Modus | Zeit | Ausgabe | Prefetch-Peak |
+|---|---:|---|---:|
+| aus | 0,447971 s | Referenz | 0 B |
+| an | 0,409933 s | bitgleich | 26.738.688 B |
+
+Das entspricht 1,092790× beziehungsweise 8,49 % weniger mittlerer Latenz in
+diesem Warm-Cache-Transport-Mikrobenchmark. Der gemessene Quellbyte-Delta war
+null; alle Outputs hatten denselben SHA-256. Das versiegelte Rohresultat steht
+in `results/deepseek-v4-exact-prefetch-smoke.json`. Es ist ausdrücklich kein
+Qualitäts-, MMLU- oder Frontier-Paritätsbeleg.
+
+Der nächste inhaltliche Gate ist deshalb ein neuer, unverfälschter
+MMLU-`off`-Lauf mit offiziellem Encoding, festem Split, Proof-Schema v3 und
+Journal v2. Erst nach einer validen Baseline folgen gepaarte CRSA-Ablationen.
 
 ## 7. Lebensstrom-Verträge
 
@@ -148,12 +176,16 @@ Akzeptanzlauf neu gemessene Sprachmodell-Qualität.
 
 ## 8. Nächste belastbare Messungen
 
-1. Router auf einem größeren, nicht synthetisch eng getrennten Text/Math-Split,
+1. Frischer MMLU-`off`-Content-Gate mit offiziellem Encoding, festem Split,
+   vollständigen Fehlerdenominatoren, Proof-Schema v3 und Journal v2.
+2. Router auf einem größeren, nicht synthetisch eng getrennten Text/Math-Split,
    erneut CRSA gegen kausale Softmax und Label-Placebos.
-2. Lebenskurve mit fixem held-out Byte-Stream: NLL vor/nach Surprise-Updates,
+3. Lebenskurve mit fixem held-out Byte-Stream: NLL vor/nach Surprise-Updates,
    Post-Sleep-Delta und State-Größe über die Zeit.
-3. DeepSeek-V4 auf einem festen kleinen Qualitätssplit: offizielles Encoding,
-   kandidatengestütztes Scoring, vollständige Fehlerdenominatoren und gepaarte
-   Graft-Ablationen bei gleicher Cache-/Bytebilanz.
-4. WorldStream-Budgetkurve nur mit einem neuen, kontextuell korrekten
+4. Nach der validen `off`-Baseline gepaarte DeepSeek-Graft-Ablationen bei
+   gleicher Cache-/Bytebilanz.
+5. WorldStream-Budgetkurve nur mit einem neuen, kontextuell korrekten
    Retrievalmechanismus; kein Revival des statischen Value-Sketches.
+
+Ein Hugging-Face-Export kommt erst ganz am Ende nach lokalem Golden und
+geklärter Lizenzkette; er ist kein aktueller Benchmark-Fokus.

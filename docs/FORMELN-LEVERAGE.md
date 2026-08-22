@@ -17,6 +17,12 @@ gebundenen `TensorSource`: Header-Inventar, exakte 2D-Zeilenbereiche, hartes
 Bytebudget, atomaren Cache und SHA-geprüften Resume. Der Streamer instanziiert
 kein Donormodell und ist nicht heimlich mit dem Antwortpfad verbunden.
 
+Der DeepSeek-Hauptpfad nutzt dieselbe Selektivität jetzt konservativ als
+`exact-router-one-ahead/v1`: Erst der offizielle Router entscheidet, danach
+liest genau ein Worker mit genau einem ausstehenden Ticket den nächsten
+Routed Expert vor. Die Payloadgrenze beträgt 14 MiB; Reihenfolge, Werte und
+serielle FP32-Akkumulation bleiben unverändert.
+
 **NEGATIV als Retrieval-Mechanismus:** Statisches Embedding-Mittel
 → `gate_proj` → Value-Sketch erreichte 24 % gegen 32 % Placebo bei
 138,4 KB/Frage. Die Eingabe entspricht nicht den RMSNorm-ten
@@ -35,6 +41,10 @@ geschlossen; die Tensorquelle bleibt verwendbar.
 FERTIG besitzt dabei Grounding, Bindings, semantische Pläne, Skills und
 Verifikation. Bekannte unsichere Mengenänderungs-Fallbacks und nicht
 injizierte Desktop-/Recorder-/Mutationspfade enden bewacht in Abstinenz.
+Endliche affine Rekurrenzen `x_(i+1) = a*x_i + b` werden nun für explizite
+Start-/Endindizes, Endwert, Nettoänderung und inklusive Summe strukturell
+geparst und per exaktem Fraction/RREF-Zertifikat geprüft. Das ist eine neue
+Fähigkeit, keine nachträgliche Optimierung am GSM8K-Split.
 
 ## Skalen- und Tempo-Gesetze
 
@@ -51,6 +61,8 @@ injizierte Desktop-/Recorder-/Mutationspfade enden bewacht in Abstinenz.
 - **FERTIG-Vollsplit:** 1.060/1.319 GSM8K korrekt, 259 sichere Abstinenzen,
   0 falsche und 0 Error-Outcomes. Der ungeprüfte Template-Fallback war 17/17
   falsch und bleibt bis zu einem strukturierten Proof proposal-only.
+- **FERTIG-Rekurrenzen:** neue endliche affine Grammatik mit exaktem
+  Zertifikat; Vollsplit unverändert 1.060/1.319 bei 0 falschen Antworten.
 - **Eigene Attention:** fester CRSA-Mix `2 Local + 1 Balanced + 1 Free`,
   Steigung `0.8`, Diagonal-Debit `3`; Zukunftsmasse exakt null und Free-Head
   bitgleich zur kausalen Softmax.
@@ -67,16 +79,23 @@ injizierte Desktop-/Recorder-/Mutationspfade enden bewacht in Abstinenz.
   Sibling-Hidden-State in den Donor-Key-Raum zu projizieren, wird nicht als
   Selbstkalibrierung oder R17 wiederbelebt.
 - **Frontier-Decoder:** der gepinnte DeepSeek-V4-Flash-Hauptpfad läuft über
-  alle 43 Layer mit nativer komprimierter Sparse-Attention, FP8/FP4-MoE,
-  HyperConnections, globalem Head und stateful Decode. Der CRSA-Graft ist im
-  echten Hidden-State-Pfad aktiv; Qualitätsgleichstand ist noch nicht gezeigt.
+  alle 43 Layer mit nativer komprimierter Sparse-Attention, exakter
+  blockskalierter MXFP8/FP4-Dekodierung, FP32-Akkumulation, HyperConnections,
+  globalem Head und stateful Decode. Layerwise Proof-Schema v3 bindet die
+  Runtime; Journal v2 bildet eine kanonische Hash-Kette.
+- **Exakter Expert-Transport:** offizielles 2-Expert-MPS-BF16-A/B ist
+  bitgleich. Nach zwei symmetrischen Warmups und 20 alternierenden Trials:
+  0,447971 s ohne gegen 0,409933 s mit Prefetch, also 1,092790×, bei
+  26.738.688 B Peak und null neuen Quellbytes. Das belegt nur Transport-
+  Überlappung, nicht Modellqualität oder Frontier-Parität.
 
 ## Hebel-Ranking
 
 1. **Lokale v0.7-Akzeptanz konservieren:** Frozen A1, vier Organe, Router,
    FERTIG-Guards, Artefakt-Digests und Wheel-Isolation gemeinsam golden halten.
-2. **DeepSeek-Inhaltsgate messen:** offizielles Prompt-Encoding und gepaarte
-   `off / CRSA / softmax / shuffle`-Items unter gleicher Byte-/Cachebilanz.
+2. **DeepSeek-Inhaltsgate messen:** zuerst einen frischen MMLU-`off`-Lauf mit
+   offiziellem Encoding, festem Split, Proof-Schema v3 und Journal v2; erst
+   danach gepaarte Graft-Ablationen unter gleicher Byte-/Cachebilanz.
 3. **Breiteren Router-Kontrast messen:** deduplizierter Fachsplit mit gleichem
    Budget für CRSA, kausale Softmax, Roh-A1 und permutierte Labels.
 4. **WorldStream erst mit korrekter Zustandsverteilung neu öffnen:** echte
@@ -84,8 +103,8 @@ injizierte Desktop-/Recorder-/Mutationspfade enden bewacht in Abstinenz.
    Invariante; Falsifikator vor Implementierung benennen.
 5. **R17 strikt anwenden:** trainieren → Invariante messen → Fit/R²
    verifizieren → exakte Struktur. Kein Cross-Model-LS-Ersatz.
-6. **Hugging Face zuletzt:** erst nach lokalem Golden und geklärter Lizenzkette
-   exportieren oder hochladen.
+6. **Hugging Face ganz zuletzt:** erst wenn Runtime und Inhaltsgates lokal
+   golden sind und die Lizenzkette geklärt ist, exportieren oder hochladen.
 
 ## Offene Endpunkte aus dem Fundament
 

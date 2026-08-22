@@ -227,6 +227,10 @@ class LayerwiseScorerTests(unittest.TestCase):
                 execution["attention_qat_policy"],
                 "v4-native-fp8-kv+fp4-hadamard-indexer/v1",
             )
+            self.assertEqual(
+                execution["expert_prefetch_policy"],
+                "exact-router-one-ahead/v1",
+            )
             first.run()
 
             incompatible_model = _model(_source(), batch=2)
@@ -240,6 +244,11 @@ class LayerwiseScorerTests(unittest.TestCase):
             incompatible_attention.ATTENTION_QAT_POLICY = "diagnostic-no-qat/v0"
             with self.assertRaisesRegex(LayerwiseError, "identity differs"):
                 _scorer(incompatible_attention, run_dir).run(resume=True)
+
+            incompatible_prefetch = _model(_source(), batch=2)
+            incompatible_prefetch.pager.expert_prefetch_enabled = False
+            with self.assertRaisesRegex(LayerwiseError, "identity differs"):
+                _scorer(incompatible_prefetch, run_dir).run(resume=True)
 
     def test_non_bfloat16_compute_fails_before_creating_run_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

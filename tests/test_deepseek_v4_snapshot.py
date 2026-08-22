@@ -207,6 +207,14 @@ class DeepSeekV4SnapshotTests(unittest.TestCase):
             source.save_state(path)
             manifest = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(
+                manifest["body"]["identity"]["runtime"]["schema"],
+                "immer.streamed-deepseek-v4/native-stateful-v2",
+            )
+            self.assertRegex(
+                manifest["body"]["identity"]["runtime"]["source_sha256"],
+                r"^[0-9a-f]{64}$",
+            )
+            self.assertEqual(
                 manifest["body"]["identity"]["execution"][
                     "quantized_accumulation_policy"
                 ],
@@ -216,6 +224,17 @@ class DeepSeekV4SnapshotTests(unittest.TestCase):
                 manifest["body"]["identity"]["execution"]["attention_qat_policy"],
                 "v4-native-fp8-kv+fp4-hadamard-indexer/v1",
             )
+            self.assertEqual(
+                manifest["body"]["identity"]["execution"][
+                    "expert_prefetch_policy"
+                ],
+                "exact-router-one-ahead/v1",
+            )
+
+            incompatible_prefetch = self._compressed_model(4, graft=True)
+            incompatible_prefetch.pager.expert_prefetch_enabled = False
+            with self.assertRaisesRegex(DeepSeekV4SnapshotError, "identity mismatch"):
+                incompatible_prefetch.load_state(path)
 
             with self.assertRaisesRegex(DeepSeekV4SnapshotError, "identity mismatch"):
                 self._compressed_model(4, graft=False).load_state(path)

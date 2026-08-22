@@ -148,6 +148,36 @@ class _QuantizedTinyCheckpoint(_TinyCheckpoint):
             self.dtypes[scale_name] = "F8_E8M0"
 
 
+class _PrefetchQuantizedTinyCheckpoint(_QuantizedTinyCheckpoint):
+    """Quantized tiny model whose routed experts use adjacent raw ranges."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        from test_deepseek_v4_pager import _MultiEncodedExpertSource
+
+        bases = [f"layers.0.ffn.experts.{expert}" for expert in range(2)]
+        self.encoded_experts = _MultiEncodedExpertSource(bases)
+        self.data.update(self.encoded_experts.data)
+        self.data["layers.0.ffn.gate.tid2eid"] = np.tile(
+            np.asarray([[0, 1]], dtype=np.int64), (128, 1)
+        )
+
+    def find(self, name: str) -> dict:
+        if name in self.encoded_experts.meta:
+            return self.encoded_experts.find(name)
+        return super().find(name)
+
+    def raw_bytes(self, shard: str, offset: int, length: int) -> bytes:
+        return self.encoded_experts.raw_bytes(shard, offset, length)
+
+    def metrics(self) -> dict:
+        result = super().metrics()
+        result["network_or_source_body_bytes"] += self.encoded_experts.metrics()[
+            "network_or_source_body_bytes"
+        ]
+        return result
+
+
 class _CompressedTinyCheckpoint(_TinyCheckpoint):
     def __init__(
         self, *, random_weights: bool = False, compress_ratio: int = 4
@@ -259,6 +289,103 @@ def _config(compress_ratio: int = 0, *, n_layers: int = 1):
 
 
 class StreamedDeepSeekV4Tests(unittest.TestCase):
+    def test_exact_expert_prefetch_preserves_output_and_router_choices(self) -> None:
+        from dataclasses import replace
+
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager, StreamedDeepSeekV4
+
+        config = replace(_config(), n_activated_experts=2)
+
+        def execute(enabled: bool):
+            model = StreamedDeepSeekV4(
+                config,
+                DeepSeekWeightPager(
+                    _PrefetchQuantizedTinyCheckpoint(),
+                    device="cpu",
+                    compute_dtype="float32",
+                    expert_prefetch=enabled,
+                ),
+            )
+            hidden, evidence = model.hidden_one_token(7)
+            return hidden, evidence, model.pager.metrics()
+
+        expected, expected_evidence, off_metrics = execute(False)
+        actual, actual_evidence, on_metrics = execute(True)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(actual_evidence.selected_experts, ((0, 1),))
+        self.assertEqual(
+            actual_evidence.selected_experts,
+            expected_evidence.selected_experts,
+        )
+        self.assertEqual(off_metrics["expert_prefetch_policy"], "disabled")
+        self.assertEqual(
+            on_metrics["expert_prefetch_policy"],
+            "exact-router-one-ahead/v1",
+        )
+        self.assertEqual(on_metrics["expert_prefetch_submitted"], 2)
+        self.assertEqual(on_metrics["expert_prefetch_consumed"], 2)
+
+    def test_moe_failure_detaches_blocked_next_prefetch(self) -> None:
+        from dataclasses import replace
+        import threading
+        from unittest import mock
+
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager, StreamedDeepSeekV4
+        from test_deepseek_v4_pager import _BlockingExpertSource
+
+        bases = [f"layers.0.ffn.experts.{expert}" for expert in range(2)]
+        source = _PrefetchQuantizedTinyCheckpoint()
+        blocking = _BlockingExpertSource(bases)
+        blocking.blocked_shard = "expert-1.safetensors"
+        source.encoded_experts = blocking
+        source.data.update(blocking.data)
+        pager = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="float32",
+        )
+        model = StreamedDeepSeekV4(
+            replace(_config(), n_activated_experts=2),
+            pager,
+        )
+        finished = threading.Event()
+        raised: list[BaseException] = []
+
+        def fail_current(*_args, **_kwargs):
+            if not blocking.started.wait(timeout=2):
+                raise AssertionError("next expert prefetch did not start")
+            raise RuntimeError("simulated current expert failure")
+
+        def execute() -> None:
+            try:
+                with mock.patch.object(
+                    pager, "_expert_with_payload", side_effect=fail_current
+                ):
+                    model._moe_one(
+                        torch.zeros((1, 1, 4, 128), dtype=torch.float32),
+                        0,
+                        7,
+                    )
+            except BaseException as exc:
+                raised.append(exc)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=execute)
+        worker.start()
+        self.assertTrue(finished.wait(timeout=3))
+        self.assertEqual(len(raised), 1)
+        self.assertRegex(str(raised[0]), "current expert failure")
+        self.assertTrue(pager.metrics()["expert_prefetch_draining"])
+        blocking.release_read.set()
+        self.assertTrue(blocking.completed.wait(timeout=2))
+        worker.join(timeout=1)
+        pager.release()
+
     def test_one_token_executes_embed_hc_attention_moe_and_final_norm(self) -> None:
         import torch
 
