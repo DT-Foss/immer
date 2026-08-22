@@ -36,7 +36,6 @@ from ._hf_source import (
     BudgetExceeded,
     HFRangeReader,
     SourceNotFound,
-    bf16_rows_to_f32,
     scan_inventory,
 )
 
@@ -61,6 +60,10 @@ class InventoryValidationError(TensorSourceError):
     """A tensor inventory violates the safetensors source contract."""
 
 
+class TensorEncodingError(InventoryValidationError):
+    """A tensor payload contains a reserved or non-finite raw encoding."""
+
+
 @runtime_checkable
 class TensorSource(Protocol):
     """Small public contract consumed by retrieval and analysis code."""
@@ -68,6 +71,8 @@ class TensorSource(Protocol):
     def inventory(self, *, refresh: bool = False) -> dict[str, Any]: ...
 
     def find(self, name: str) -> dict[str, Any]: ...
+
+    def tensor(self, tensor_name: str) -> Any: ...
 
     def rows(
         self,
@@ -78,6 +83,10 @@ class TensorSource(Protocol):
     ) -> Any: ...
 
     def raw_bytes(self, shard: str, offset: int, length: int) -> bytes: ...
+
+    def cache_priority(self, priority: int) -> Any: ...
+
+    def clear_cache_priorities(self) -> None: ...
 
     def metrics(self) -> dict[str, Any]: ...
 
@@ -145,7 +154,9 @@ class LocalRangeReader:
         try:
             candidate.relative_to(self.root)
         except ValueError as exc:
-            raise RangeValidationError(f"Pfad verlaesst lokale Quelle: {filename!r}") from exc
+            raise RangeValidationError(
+                f"Pfad verlaesst lokale Quelle: {filename!r}"
+            ) from exc
         return candidate
 
     def file_size(self, filename: str) -> int:
@@ -250,6 +261,26 @@ def _default_cache_dir() -> Path:
     return base.resolve() / "immer" / "streamer"
 
 
+class _CacheCoordinator:
+    """Process-local serialization for readers sharing one exact cache root."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.key_locks: dict[str, threading.Lock] = {}
+
+
+_CACHE_COORDINATORS_LOCK = threading.Lock()
+_CACHE_COORDINATORS: dict[str, _CacheCoordinator] = {}
+
+
+def _cache_coordinator(cache_dir: Path | None) -> _CacheCoordinator | None:
+    if cache_dir is None:
+        return None
+    identity = os.fspath(cache_dir)
+    with _CACHE_COORDINATORS_LOCK:
+        return _CACHE_COORDINATORS.setdefault(identity, _CacheCoordinator())
+
+
 class _ContractReader:
     """Budget, cache and exact-range guard around any compatible reader."""
 
@@ -262,6 +293,7 @@ class _ContractReader:
         cache_dir: Path | None,
         *,
         max_metadata_bytes: int,
+        max_cache_bytes: int | None,
     ) -> None:
         self.upstream = upstream
         self.budget = budget
@@ -273,6 +305,16 @@ class _ContractReader:
             self.file_info = {}
             upstream.file_info = self.file_info
         self.cache_dir = cache_dir
+        self.max_cache_bytes = max_cache_bytes
+        if self.max_cache_bytes is not None and (
+            isinstance(self.max_cache_bytes, bool)
+            or not isinstance(self.max_cache_bytes, int)
+            or self.max_cache_bytes < 0
+        ):
+            raise ValueError(
+                "max_cache_bytes muss None oder eine nichtnegative Ganzzahl sein"
+            )
+        self._cache_coordinator = _cache_coordinator(cache_dir)
         self.max_metadata_bytes = int(max_metadata_bytes)
         if self.max_metadata_bytes <= 0:
             raise ValueError("max_metadata_bytes muss positiv sein")
@@ -291,8 +333,21 @@ class _ContractReader:
             "cache_bytes_written": 0,
             "cache_bytes_reused": 0,
             "cache_integrity_checks": 0,
+            "cache_bytes": 0,
+            "cache_evictions": 0,
+            "cache_evicted_bytes": 0,
+            "cache_write_skips_oversize": 0,
+            "cache_priority_promotions": 0,
+            "cache_recoveries": 0,
         }
         self._cache_bypass = threading.local()
+        self._cache_priority = threading.local()
+        # Residency hints belong to this reader. Sharing them through the
+        # process-wide coordinator would let one experiment silently bias the
+        # eviction order of a later independent Streamer on the same root.
+        self._cache_priorities: dict[str, int] = {}
+        if self.max_cache_bytes is not None:
+            self._enforce_cache_limit()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.upstream, name)
@@ -301,13 +356,33 @@ class _ContractReader:
         with self._lock:
             self._stats[field] += int(amount)
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | None]:
+        self._refresh_cache_bytes()
         with self._lock:
-            return dict(self._stats)
+            result: dict[str, int | None] = dict(self._stats)
+        result["cache_limit_bytes"] = self.max_cache_bytes
+        return result
 
     def _key_lock(self, key: str) -> threading.Lock:
+        if self._cache_coordinator is not None:
+            with self._cache_coordinator.lock:
+                return self._cache_coordinator.key_locks.setdefault(
+                    key, threading.Lock()
+                )
         with self._lock:
             return self._key_locks.setdefault(key, threading.Lock())
+
+    @contextmanager
+    def _locked_cache_key(self, key: str) -> Any:
+        lock = self._key_lock(key)
+        try:
+            with lock:
+                yield
+        finally:
+            # Run after releasing the current key. Concurrent active entries
+            # remain protected by their shared key locks.
+            if self.max_cache_bytes is not None:
+                self._enforce_cache_limit()
 
     @contextmanager
     def uncached(self) -> Any:
@@ -318,6 +393,42 @@ class _ContractReader:
             yield
         finally:
             self._cache_bypass.active = previous
+
+    @contextmanager
+    def cache_priority(self, priority: int) -> Any:
+        """Prefer retaining ranges touched inside this request-local scope."""
+
+        if isinstance(priority, bool) or not isinstance(priority, int) or priority < 0:
+            raise ValueError("cache priority must be a non-negative integer")
+        previous = int(getattr(self._cache_priority, "value", 0))
+        self._cache_priority.value = priority
+        try:
+            yield
+        finally:
+            self._cache_priority.value = previous
+
+    def _mark_priority(self, key: str) -> None:
+        coordinator = self._cache_coordinator
+        if coordinator is None:
+            return
+        priority = int(getattr(self._cache_priority, "value", 0))
+        with coordinator.lock:
+            previous = self._cache_priorities.get(key, 0)
+            if priority:
+                self._cache_priorities[key] = priority
+            else:
+                self._cache_priorities.pop(key, None)
+            if priority > previous:
+                self._bump("cache_priority_promotions")
+
+    def clear_cache_priorities(self) -> None:
+        """Start a new cache-admission request with no stale residency hints."""
+
+        coordinator = self._cache_coordinator
+        if coordinator is None:
+            return
+        with coordinator.lock:
+            self._cache_priorities.clear()
 
     def _reserve(self, amount: int, tag: str) -> None:
         amount = int(amount)
@@ -375,6 +486,134 @@ class _ContractReader:
         directory = self.cache_dir / ("ranges" if kind == "range" else "files")
         return directory / f"{key}.bin", directory / f"{key}.json"
 
+    def _cache_entries_locked(
+        self,
+    ) -> list[tuple[int, str, Path, Path, int]]:
+        """List complete owned cache pairs; caller holds the coordinator lock."""
+
+        if self.cache_dir is None:
+            return []
+        entries: list[tuple[int, str, Path, Path, int]] = []
+        for leaf in ("ranges", "files"):
+            directory = self.cache_dir / leaf
+            try:
+                children = tuple(directory.iterdir())
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # A cache measurement must never expand the deletion scope or
+                # make tensor reads fail merely because cache metadata is odd.
+                continue
+            for meta_path in children:
+                match = re.fullmatch(r"([0-9a-f]{64})\.json", meta_path.name)
+                if match is None or meta_path.is_symlink():
+                    continue
+                key = match.group(1)
+                blob_path = directory / f"{key}.bin"
+                if blob_path.is_symlink():
+                    continue
+                try:
+                    if not meta_path.is_file() or not blob_path.is_file():
+                        continue
+                    meta_stat = meta_path.stat()
+                    blob_stat = blob_path.stat()
+                except OSError:
+                    continue
+                size = int(meta_stat.st_size) + int(blob_stat.st_size)
+                entries.append(
+                    (int(meta_stat.st_mtime_ns), key, blob_path, meta_path, size)
+                )
+        return entries
+
+    def _record_cache_state(
+        self,
+        cache_bytes: int,
+        *,
+        evictions: int = 0,
+        evicted_bytes: int = 0,
+    ) -> None:
+        with self._lock:
+            self._stats["cache_bytes"] = int(cache_bytes)
+            self._stats["cache_evictions"] += int(evictions)
+            self._stats["cache_evicted_bytes"] += int(evicted_bytes)
+
+    def _refresh_cache_bytes(self) -> int:
+        coordinator = self._cache_coordinator
+        if coordinator is None:
+            self._record_cache_state(0)
+            return 0
+        with coordinator.lock:
+            total = sum(item[4] for item in self._cache_entries_locked())
+            self._record_cache_state(total)
+            return total
+
+    def _evict_locked(
+        self,
+        entries: list[tuple[int, str, Path, Path, int]],
+        total: int,
+        target: int,
+        *,
+        protected_keys: frozenset[str] = frozenset(),
+    ) -> tuple[int, int, int]:
+        """Evict verified complete LRU pairs below ``target`` bytes."""
+
+        coordinator = self._cache_coordinator
+        if coordinator is None:
+            return total, 0, 0
+        evictions = 0
+        evicted_bytes = 0
+        for _recency, key, blob_path, meta_path, size in sorted(
+            entries,
+            key=lambda item: (
+                self._cache_priorities.get(item[1], 0),
+                item[0],
+                item[1],
+            ),
+        ):
+            if total <= target:
+                break
+            active_lock = coordinator.key_locks.get(key)
+            if key in protected_keys or (
+                active_lock is not None and active_lock.locked()
+            ):
+                continue
+            try:
+                # Payload first: an exceptional partial cleanup can only leave
+                # the tiny metadata file behind, never the large tensor range.
+                blob_path.unlink()
+                meta_path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            total -= size
+            evictions += 1
+            evicted_bytes += size
+            self._cache_priorities.pop(key, None)
+        return total, evictions, evicted_bytes
+
+    def _enforce_cache_limit(self) -> None:
+        coordinator = self._cache_coordinator
+        if coordinator is None:
+            self._record_cache_state(0)
+            return
+        with coordinator.lock:
+            entries = self._cache_entries_locked()
+            total = sum(item[4] for item in entries)
+            evictions = 0
+            evicted_bytes = 0
+            if self.max_cache_bytes is not None and total > self.max_cache_bytes:
+                total, evictions, evicted_bytes = self._evict_locked(
+                    entries,
+                    total,
+                    self.max_cache_bytes,
+                )
+            self._record_cache_state(
+                total,
+                evictions=evictions,
+                evicted_bytes=evicted_bytes,
+            )
+
     def _load_cache(
         self,
         kind: str,
@@ -386,15 +625,36 @@ class _ContractReader:
         if paths is None or bool(getattr(self._cache_bypass, "active", False)):
             return None
         blob_path, meta_path = paths
+        pending_path = meta_path.with_suffix(".pending")
+        if pending_path.exists() or pending_path.is_symlink():
+            if pending_path.is_symlink() or not pending_path.is_file():
+                raise CacheIntegrityError(
+                    f"Cache-Transaktionsmarker ist ungueltig: {pending_path}"
+                )
+            # A zero-byte marker means the process stopped between the two
+            # atomic pair writes. Only this exact cache key is discarded; the
+            # source bytes are fetched and verified again below.
+            for partial in (blob_path, meta_path, pending_path):
+                try:
+                    partial.unlink()
+                except FileNotFoundError:
+                    pass
+            self._cache_priorities.pop(key, None)
+            self._bump("cache_recoveries")
+            return None
         if not blob_path.exists() and not meta_path.exists():
             return None
+        if blob_path.is_symlink() or meta_path.is_symlink():
+            raise CacheIntegrityError(f"Cache-Eintrag darf kein Symlink sein: {key}")
         if not blob_path.is_file() or not meta_path.is_file():
             raise CacheIntegrityError(f"Partieller Cache-Eintrag: {key}")
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise CacheIntegrityError(f"Cache-Metadaten unlesbar: {meta_path}") from exc
-        if meta.get("schema") != self._CACHE_SCHEMA or meta.get("contract") != dict(contract):
+        if meta.get("schema") != self._CACHE_SCHEMA or meta.get("contract") != dict(
+            contract
+        ):
             raise CacheIntegrityError(f"Cache-Contract stimmt nicht: {meta_path}")
         try:
             body = blob_path.read_bytes()
@@ -417,6 +677,13 @@ class _ContractReader:
         self._bump("cache_hits")
         self._bump("cache_bytes_reused", len(body))
         self._bump("cache_integrity_checks")
+        self._mark_priority(key)
+        try:
+            os.utime(meta_path, None, follow_symlinks=False)
+        except OSError:
+            # Recency is an optimization; verified cached bytes stay usable on
+            # read-only or unusually mounted cache directories.
+            pass
         return body
 
     def _write_cache(
@@ -430,6 +697,7 @@ class _ContractReader:
         if paths is None:
             return
         blob_path, meta_path = paths
+        pending_path = meta_path.with_suffix(".pending")
         meta = {
             "schema": self._CACHE_SCHEMA,
             "contract": dict(contract),
@@ -437,16 +705,104 @@ class _ContractReader:
             "size": len(body),
             "sha256": _sha256(body),
         }
-        _atomic_write(blob_path, body)
-        _atomic_write(meta_path, _canonical_json(meta))
+        encoded_meta = _canonical_json(meta)
+        entry_size = len(body) + len(encoded_meta)
+        coordinator = self._cache_coordinator
+        if coordinator is None:
+            return
+        if self.max_cache_bytes is None:
+            _atomic_write(pending_path, b"")
+            try:
+                _atomic_write(blob_path, body)
+                _atomic_write(meta_path, encoded_meta)
+            except BaseException:
+                for partial in (blob_path, meta_path, pending_path):
+                    try:
+                        partial.unlink()
+                    except FileNotFoundError:
+                        pass
+                raise
+            pending_path.unlink()
+            self._bump("cache_writes")
+            self._bump("cache_bytes_written", len(body))
+            self._mark_priority(key)
+            return
+
+        evictions = 0
+        evicted_bytes = 0
+        skipped = False
+        with coordinator.lock:
+            entries = self._cache_entries_locked()
+            total = sum(item[4] for item in entries)
+            current_size = next(
+                (item[4] for item in entries if item[1] == key),
+                0,
+            )
+            if self.max_cache_bytes is not None:
+                if entry_size > self.max_cache_bytes:
+                    skipped = True
+                else:
+                    # Make room before the atomic payload write. This prevents
+                    # one DeepSeek range from temporarily becoming persistent
+                    # cache growth beyond the configured hard limit.
+                    target = self.max_cache_bytes - entry_size + current_size
+                    total, evictions, evicted_bytes = self._evict_locked(
+                        entries,
+                        total,
+                        max(0, target),
+                        protected_keys=frozenset({key}),
+                    )
+                    if total - current_size + entry_size > self.max_cache_bytes:
+                        skipped = True
+            if not skipped:
+                # A same-key refresh cannot keep the old pair while staging
+                # the replacement: the temporary payload would exceed a cap
+                # sized for one entry. The key lock makes the remove+replace
+                # sequence invisible to other readers in this process, and a
+                # cache miss after a crash is safer than exceeding the bound.
+                _atomic_write(pending_path, b"")
+                try:
+                    for old_path in (blob_path, meta_path):
+                        try:
+                            old_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                    _atomic_write(blob_path, body)
+                    _atomic_write(meta_path, encoded_meta)
+                except BaseException:
+                    for partial in (blob_path, meta_path, pending_path):
+                        try:
+                            partial.unlink()
+                        except FileNotFoundError:
+                            pass
+                    total -= current_size
+                    self._cache_priorities.pop(key, None)
+                    self._record_cache_state(
+                        total,
+                        evictions=evictions,
+                        evicted_bytes=evicted_bytes,
+                    )
+                    raise
+                pending_path.unlink()
+                total = total - current_size + entry_size
+            self._record_cache_state(
+                total,
+                evictions=evictions,
+                evicted_bytes=evicted_bytes,
+            )
+
+        if skipped:
+            self._bump("cache_write_skips_oversize")
+            return
         self._bump("cache_writes")
         self._bump("cache_bytes_written", len(body))
+        self._mark_priority(key)
 
     def get_range(self, filename: str, start: int, end: int) -> bytes:
         start, end = _validate_inclusive_range(start, end)
         expected = end - start + 1
         key, contract = self._cache_key("range", filename, start, end)
-        with self._key_lock(key):
+        with self._locked_cache_key(key):
             cached = self._load_cache("range", key, contract, expected)
             if cached is not None:
                 return cached
@@ -508,7 +864,7 @@ class _ContractReader:
                 f"max_bytes muss in [1, {self.max_metadata_bytes}] liegen"
             )
         key, contract = self._cache_key("file", filename, None, None)
-        with self._key_lock(key):
+        with self._locked_cache_key(key):
             cached = self._load_cache("file", key, contract, None)
             if cached is not None:
                 if len(cached) > ceiling:
@@ -581,7 +937,9 @@ class _ContractReader:
             _missing_is_expected=True,
         )
 
-    def fetch_st_header(self, filename: str) -> tuple[dict[str, Any], int, dict[str, Any]]:
+    def fetch_st_header(
+        self, filename: str
+    ) -> tuple[dict[str, Any], int, dict[str, Any]]:
         first = self.get_range(filename, 0, 7)
         (header_length,) = struct.unpack("<Q", first)
         if not (0 < header_length <= min(64 * 1024 * 1024, self.max_metadata_bytes)):
@@ -596,7 +954,9 @@ class _ContractReader:
                 f"Safetensors-Header unlesbar bei {filename}"
             ) from exc
         if not isinstance(header, dict):
-            raise InventoryValidationError(f"Safetensors-Header ist kein Objekt: {filename}")
+            raise InventoryValidationError(
+                f"Safetensors-Header ist kein Objekt: {filename}"
+            )
         metadata = header.pop("__metadata__", None)
         info = self.file_info.setdefault(filename, {})
         info["header_len"] = header_length
@@ -619,6 +979,9 @@ class Streamer:
         "U16": 2,
         "BF16": 2,
         "F16": 2,
+        "F8_E4M3": 1,
+        "F8_E4M3FN": 1,
+        "F8_E8M0": 1,
         "I32": 4,
         "U32": 4,
         "F32": 4,
@@ -651,6 +1014,7 @@ class Streamer:
         cache_dir: str | os.PathLike[str] | None = None,
         use_cache: bool = True,
         max_metadata_bytes: int = 64 * 1024 * 1024,
+        max_cache_bytes: int | None = None,
         verbose: bool = False,
     ) -> None:
         if not isinstance(repo_id, str) or not repo_id.strip():
@@ -669,10 +1033,21 @@ class Streamer:
         self._cache_dir = resolved_cache if use_cache else None
         self._reader: _ContractReader | None = None
         self._inventory: dict[str, Any] | None = None
+        self._tensor_index: dict[str, dict[str, Any]] | None = None
+        self._tensor_index_inventory_id: int | None = None
         self._inventory_cache_hits = 0
         self._inventory_cache_writes = 0
         self._inventory_fingerprint: str | None = None
         self._max_metadata_bytes = int(max_metadata_bytes)
+        if max_cache_bytes is not None and (
+            isinstance(max_cache_bytes, bool)
+            or not isinstance(max_cache_bytes, int)
+            or max_cache_bytes < 0
+        ):
+            raise ValueError(
+                "max_cache_bytes muss None oder eine nichtnegative Ganzzahl sein"
+            )
+        self._max_cache_bytes = max_cache_bytes
         self.verbose = bool(verbose)
 
     @classmethod
@@ -685,6 +1060,7 @@ class Streamer:
         cache_dir: str | os.PathLike[str] | None = None,
         use_cache: bool = True,
         max_metadata_bytes: int = 64 * 1024 * 1024,
+        max_cache_bytes: int | None = None,
         verbose: bool = False,
     ) -> "Streamer":
         path = Path(root).expanduser().resolve()
@@ -698,6 +1074,7 @@ class Streamer:
             cache_dir=cache_dir,
             use_cache=use_cache,
             max_metadata_bytes=max_metadata_bytes,
+            max_cache_bytes=max_cache_bytes,
             verbose=verbose,
         )
 
@@ -716,6 +1093,7 @@ class Streamer:
                 self.budget,
                 self._cache_dir,
                 max_metadata_bytes=self._max_metadata_bytes,
+                max_cache_bytes=self._max_cache_bytes,
             )
         return self._reader
 
@@ -752,7 +1130,9 @@ class Streamer:
                     )
                 }
             )
-        return _sha256(_canonical_json(sorted(shards, key=lambda item: str(item["file"]))))
+        return _sha256(
+            _canonical_json(sorted(shards, key=lambda item: str(item["file"])))
+        )
 
     def _inventory_envelope(self, inventory: Mapping[str, Any]) -> dict[str, Any]:
         document = dict(inventory)
@@ -765,7 +1145,9 @@ class Streamer:
             "inventory": document,
         }
 
-    def _load_inventory_path(self, path: Path, *, allow_legacy: bool) -> dict[str, Any] | None:
+    def _load_inventory_path(
+        self, path: Path, *, allow_legacy: bool
+    ) -> dict[str, Any] | None:
         if not path.is_file():
             return None
         try:
@@ -773,8 +1155,13 @@ class Streamer:
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise CacheIntegrityError(f"Inventar-Cache unlesbar: {path}") from exc
         if isinstance(raw, Mapping) and raw.get("schema") == self._INVENTORY_SCHEMA:
-            if raw.get("repo_id") != self.repo_id or raw.get("revision") != self.revision:
-                raise CacheIntegrityError(f"Inventar-Cache gehoert zu anderer Quelle: {path}")
+            if (
+                raw.get("repo_id") != self.repo_id
+                or raw.get("revision") != self.revision
+            ):
+                raise CacheIntegrityError(
+                    f"Inventar-Cache gehoert zu anderer Quelle: {path}"
+                )
             document = raw.get("inventory")
             if not isinstance(document, Mapping):
                 raise CacheIntegrityError(f"Inventar-Payload fehlt: {path}")
@@ -783,7 +1170,9 @@ class Streamer:
                 raise CacheIntegrityError(f"Inventar-SHA256 stimmt nicht: {path}")
             fingerprint = self._source_fingerprint(document)
             if raw.get("source_fingerprint") != fingerprint:
-                raise CacheIntegrityError(f"Inventar-Quellfingerprint stimmt nicht: {path}")
+                raise CacheIntegrityError(
+                    f"Inventar-Quellfingerprint stimmt nicht: {path}"
+                )
         elif allow_legacy and isinstance(raw, Mapping):
             document = dict(raw)
         else:
@@ -846,7 +1235,10 @@ class Streamer:
                     info[key] = shard[key]
 
     def _validate_inventory(self, document: Mapping[str, Any]) -> None:
-        if document.get("repo") != self.repo_id or document.get("revision") != self.revision:
+        if (
+            document.get("repo") != self.repo_id
+            or document.get("revision") != self.revision
+        ):
             raise InventoryValidationError(
                 "Inventarquelle stimmt nicht mit repo_id/revision des Streamers ueberein"
             )
@@ -856,21 +1248,29 @@ class Streamer:
         seen: set[str] = set()
         for index, entry in enumerate(tensors):
             if not isinstance(entry, Mapping):
-                raise InventoryValidationError(f"Tensor-Eintrag {index} ist kein Objekt")
+                raise InventoryValidationError(
+                    f"Tensor-Eintrag {index} ist kein Objekt"
+                )
             name = entry.get("name")
             if not isinstance(name, str) or not name or name in seen:
-                raise InventoryValidationError(f"Ungueltiger/doppelter Tensorname: {name!r}")
+                raise InventoryValidationError(
+                    f"Ungueltiger/doppelter Tensorname: {name!r}"
+                )
             seen.add(name)
             shape = entry.get("shape")
             if not isinstance(shape, list) or any(
-                isinstance(dim, bool) or not isinstance(dim, int) or dim < 0 for dim in shape
+                isinstance(dim, bool) or not isinstance(dim, int) or dim < 0
+                for dim in shape
             ):
                 raise InventoryValidationError(f"Ungueltige Shape bei {name}")
             offsets = entry.get("offset_in_shard")
             if (
                 not isinstance(offsets, list)
                 or len(offsets) != 2
-                or any(isinstance(value, bool) or not isinstance(value, int) for value in offsets)
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in offsets
+                )
                 or offsets[0] < 0
                 or offsets[1] < offsets[0]
             ):
@@ -878,7 +1278,11 @@ class Streamer:
             if not isinstance(entry.get("shard"), str) or not entry["shard"]:
                 raise InventoryValidationError(f"Shard fehlt bei {name}")
             data_start = entry.get("data_start")
-            if isinstance(data_start, bool) or not isinstance(data_start, int) or data_start < 8:
+            if (
+                isinstance(data_start, bool)
+                or not isinstance(data_start, int)
+                or data_start < 8
+            ):
                 raise InventoryValidationError(f"data_start ungueltig bei {name}")
             dtype = str(entry.get("dtype", "")).upper()
             itemsize = self._ITEMSIZE.get(dtype)
@@ -900,7 +1304,9 @@ class Streamer:
         if not refresh and self._cache_dir is not None:
             cached = self._load_inventory_path(self._cache_path(), allow_legacy=False)
             if cached is None:
-                cached = self._load_inventory_path(self._legacy_cache_path(), allow_legacy=True)
+                cached = self._load_inventory_path(
+                    self._legacy_cache_path(), allow_legacy=True
+                )
                 if cached is not None:
                     self._write_inventory_cache(cached)
             if cached is not None:
@@ -924,7 +1330,9 @@ class Streamer:
                     time.sleep(2 * (attempt + 1))
         if candidate is None:
             if last is not None:
-                raise TensorSourceError(f"Inventar nach 3 Versuchen fehlgeschlagen: {last}") from last
+                raise TensorSourceError(
+                    f"Inventar nach 3 Versuchen fehlgeschlagen: {last}"
+                ) from last
             raise TensorSourceError("Inventar konnte nicht erstellt werden")
         self._inventory = candidate
         self._inventory_fingerprint = self._source_fingerprint(self._inventory)
@@ -939,10 +1347,132 @@ class Streamer:
     def find(self, name: str) -> dict[str, Any]:
         if not isinstance(name, str) or not name:
             raise ValueError("Tensorname muss ein nichtleerer String sein")
-        for entry in self.inventory().get("tensors", []):
-            if entry["name"] == name:
-                return dict(entry)
+        inventory = self.inventory()
+        if self._tensor_index is None or self._tensor_index_inventory_id != id(
+            inventory
+        ):
+            self._tensor_index = {
+                str(entry["name"]): dict(entry)
+                for entry in inventory.get("tensors", [])
+            }
+            self._tensor_index_inventory_id = id(inventory)
+        entry = self._tensor_index.get(name)
+        if entry is not None:
+            return dict(entry)
         raise KeyError(f"Tensor {name!r} nicht im Inventar von {self.repo_id}")
+
+    @classmethod
+    def _decode_payload(
+        cls,
+        raw: bytes,
+        dtype: str,
+        shape: tuple[int, ...],
+    ) -> Any:
+        """Decode one exact safetensors payload into an owned NumPy array."""
+        import numpy as np
+
+        dtype = str(dtype).upper()
+        itemsize = cls._ITEMSIZE.get(dtype)
+        if itemsize is None or (
+            dtype not in {"BF16", "F8_E4M3", "F8_E4M3FN", "F8_E8M0"}
+            and dtype not in cls._NUMPY_DTYPES
+        ):
+            raise RangeValidationError(
+                f"Nicht unterstuetztes safetensors-dtype {dtype!r}"
+            )
+        numel = 1
+        for dim in shape:
+            numel *= int(dim)
+        expected = numel * itemsize
+        if len(raw) != expected:
+            raise InventoryValidationError(
+                f"Tensor-Payload hat {len(raw)} statt {expected} Bytes fuer "
+                f"dtype={dtype}, shape={list(shape)}"
+            )
+
+        # Float8 weights are dequantized downstream under the assumption that
+        # every stored scale/value is finite.  Reject the reserved encodings in
+        # the raw payload instead of allowing a NaN to silently poison an
+        # activation.  ``find`` keeps this check allocation-free for the large
+        # streamed tensors while the minimum index makes the error stable when
+        # more than one invalid byte is present.
+        invalid_index = -1
+        if dtype in {"F8_E4M3", "F8_E4M3FN"}:
+            positive_nan = raw.find(b"\x7f")
+            negative_nan = raw.find(b"\xff")
+            present = (index for index in (positive_nan, negative_nan) if index >= 0)
+            invalid_index = min(present, default=-1)
+        elif dtype == "F8_E8M0":
+            invalid_index = raw.find(b"\xff")
+        if invalid_index >= 0:
+            raise TensorEncodingError(
+                f"Reservierte/nicht-endliche {dtype}-Kodierung "
+                f"0x{raw[invalid_index]:02X} bei Element {invalid_index}"
+            )
+
+        if dtype == "BF16":
+            words = np.frombuffer(raw, dtype="<u2").astype(np.uint32)
+            words <<= 16
+            decoded = words.view(np.float32)
+        elif dtype in {"F8_E4M3", "F8_E4M3FN"}:
+            bits = np.frombuffer(raw, dtype=np.uint8)
+            exponent = ((bits >> 3) & 0x0F).astype(np.int16)
+            mantissa = (bits & 0x07).astype(np.float32)
+            decoded = np.empty(bits.shape, dtype=np.float32)
+            subnormal = exponent == 0
+            decoded[subnormal] = np.ldexp(mantissa[subnormal], -9)
+            normal = ~subnormal
+            decoded[normal] = np.ldexp(
+                np.float32(1.0) + mantissa[normal] * np.float32(0.125),
+                exponent[normal] - 7,
+            )
+            signs = np.where(
+                bits & 0x80,
+                np.float32(-1.0),
+                np.float32(1.0),
+            )
+            decoded = np.copysign(decoded, signs)
+        elif dtype == "F8_E8M0":
+            bits = np.frombuffer(raw, dtype=np.uint8)
+            finite_bits = np.minimum(bits, np.uint8(0xFE))
+            decoded = np.ldexp(
+                np.ones(bits.shape, dtype=np.float32),
+                finite_bits.astype(np.int16) - 127,
+            )
+        else:
+            decoded = np.frombuffer(raw, dtype=np.dtype(cls._NUMPY_DTYPES[dtype]))
+        return decoded.reshape(shape).copy()
+
+    def tensor(self, tensor_name: str) -> Any:
+        """Read and decode one complete tensor with one exact payload range.
+
+        Standard safetensors dtypes retain their native NumPy dtype. BF16 and
+        OCP float8 encodings are returned as writable float32 arrays.
+        """
+        meta = self.find(tensor_name)
+        shape = tuple(int(dim) for dim in meta["shape"])
+        dtype = str(meta["dtype"]).upper()
+        itemsize = self._ITEMSIZE.get(dtype)
+        if itemsize is None or (
+            dtype not in {"BF16", "F8_E4M3", "F8_E4M3FN", "F8_E8M0"}
+            and dtype not in self._NUMPY_DTYPES
+        ):
+            raise RangeValidationError(
+                f"Nicht unterstuetztes safetensors-dtype {dtype!r}"
+            )
+        offset_begin, offset_end = (int(value) for value in meta["offset_in_shard"])
+        length = offset_end - offset_begin
+        expected = itemsize
+        for dim in shape:
+            expected *= dim
+        if length != expected:
+            raise InventoryValidationError(
+                f"Shape/Offset-Bytezahl stimmt bei {tensor_name} nicht: "
+                f"{expected} != {length}"
+            )
+        absolute = int(meta["data_start"]) + offset_begin
+        raw = self.raw_bytes(str(meta["shard"]), absolute, length)
+        return self._decode_payload(raw, dtype, shape)
 
     def rows(
         self,
@@ -956,8 +1486,6 @@ class Streamer:
         ``n_blocks`` remains accepted for compatibility. Exact retrieval is one
         contiguous range; stochastic block sampling belongs in analysis code.
         """
-        import numpy as np
-
         del n_blocks
         start_row = _validate_nonnegative_int(start_row, "start_row")
         n_rows = _validate_nonnegative_int(n_rows, "n_rows")
@@ -975,11 +1503,15 @@ class Streamer:
             )
         dtype = str(meta["dtype"]).upper()
         itemsize = self._ITEMSIZE.get(dtype)
-        if itemsize is None or (dtype != "BF16" and dtype not in self._NUMPY_DTYPES):
-            raise RangeValidationError(f"Nicht unterstuetztes safetensors-dtype {dtype!r}")
+        if itemsize is None or (
+            dtype not in {"BF16", "F8_E4M3", "F8_E4M3FN", "F8_E8M0"}
+            and dtype not in self._NUMPY_DTYPES
+        ):
+            raise RangeValidationError(
+                f"Nicht unterstuetztes safetensors-dtype {dtype!r}"
+            )
         if n_rows == 0:
-            result_dtype = np.float32 if dtype == "BF16" else np.dtype(self._NUMPY_DTYPES[dtype])
-            return np.empty((0, n_cols), dtype=result_dtype)
+            return self._decode_payload(b"", dtype, (0, n_cols))
 
         row_bytes = n_cols * itemsize
         offset_begin, offset_end = (int(value) for value in meta["offset_in_shard"])
@@ -991,13 +1523,7 @@ class Streamer:
             )
         absolute = int(meta["data_start"]) + relative
         raw = self.raw_bytes(str(meta["shard"]), absolute, length)
-        if dtype == "BF16":
-            decoded = bf16_rows_to_f32(
-                np.frombuffer(raw, dtype="<u2"), (n_rows, n_cols)
-            )
-            return np.ascontiguousarray(decoded, dtype=np.float32)
-        decoded = np.frombuffer(raw, dtype=np.dtype(self._NUMPY_DTYPES[dtype]))
-        return decoded.reshape(n_rows, n_cols).copy()
+        return self._decode_payload(raw, dtype, (n_rows, n_cols))
 
     def rows_torch(
         self,
@@ -1012,7 +1538,9 @@ class Streamer:
         try:
             import torch
         except ImportError as exc:  # pragma: no cover - optional dependency
-            raise TensorSourceError("rows_torch() braucht das optionale Paket torch") from exc
+            raise TensorSourceError(
+                "rows_torch() braucht das optionale Paket torch"
+            ) from exc
         array = self.rows(tensor_name, start_row=start_row, n_rows=n_rows)
         result = torch.from_numpy(array)
         if dtype is not None or str(device) != "cpu":
@@ -1041,6 +1569,18 @@ class Streamer:
         # requested length+1 bytes here.
         return self.reader.get_range(shard, offset, offset + length - 1)
 
+    @contextmanager
+    def cache_priority(self, priority: int) -> Any:
+        """Give ranges read in this scope a reader-local eviction priority."""
+
+        with self.reader.cache_priority(priority):
+            yield
+
+    def clear_cache_priorities(self) -> None:
+        """Clear admission hints before an independent model request."""
+
+        self.reader.clear_cache_priorities()
+
     def bytes_moved(self) -> int:
         """Network/local source body bytes; verified cache hits count as zero."""
         return int(self.budget.body)
@@ -1051,8 +1591,10 @@ class Streamer:
         return {
             "repo_id": self.repo_id,
             "revision": self.revision,
-            "revision_is_pinned": pinned_revision and not self.repo_id.startswith("local:"),
-            "revision_is_mutable": self.repo_id.startswith("local:") or not pinned_revision,
+            "revision_is_pinned": pinned_revision
+            and not self.repo_id.startswith("local:"),
+            "revision_is_mutable": self.repo_id.startswith("local:")
+            or not pinned_revision,
             "budget": self.budget.as_dict(),
             "network_or_source_body_bytes": int(self.budget.body),
             "inventory_cache_hits": int(self._inventory_cache_hits),

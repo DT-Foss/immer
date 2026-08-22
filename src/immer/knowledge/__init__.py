@@ -4,6 +4,7 @@ from .streamer import (
     InventoryValidationError,
     RangeValidationError,
     Streamer,
+    TensorEncodingError,
     TensorSource,
     TensorSourceError,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "InventoryValidationError",
     "RangeValidationError",
     "Streamer",
+    "TensorEncodingError",
     "TensorSource",
     "TensorSourceError",
 ]
