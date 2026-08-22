@@ -11,7 +11,11 @@ Current structure-solver milestone: **1060/1319 GSM8K = 80.36% coverage,
 split.** The report retains every item and pins dataset, runner and solver-tree
 digests. An unverified operations-template fallback first produced 17/17
 wrong attempts; it is now proposal-only and those cases are `must_abstain`
-regressions.
+regressions. A gold-label-free audit rejects the claim that all 259 are ready
+assignment problems: the structural path finds 144 unresolved pronoun/
+coreference cases and 115 unsupported grammar cases, with no already extracted
+exclusive slot contract. Matching remains admissible only after typed slot
+extraction and before the existing exact IR certificate.
 
 ## DeepSeek-V4 range runtime
 

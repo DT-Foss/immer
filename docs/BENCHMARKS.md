@@ -96,6 +96,33 @@ Indexgrenzen und exaktem Fraction/RREF-Zertifikat. Das ist eine neue
 strukturelle Fähigkeit; der Vollsplit wurde dadurch nicht nachoptimiert und
 bleibt bei 1.060/1.319 korrekt sowie 0 falschen Antworten.
 
+DeepSeeks Vorschlag, alle Abstinenzen direkt als Hungarian-Zuordnung zu
+behandeln, wurde gegen diese 259 Items geprüft. Die gold-label-freie Diagnose
+nutzt nur Frage und Parserzustand:
+
+```bash
+PYTHONPATH=src python3 scripts/fertig_abstention_audit.py
+```
+
+| Parserstufe | Diagnose | Fälle |
+|---|---|---:|
+| Legacy | kein Frageziel | 65 |
+| Legacy | keine zum Ziel passende Quantity | 171 |
+| Legacy | Relation unvollständig | 20 |
+| Legacy | bewusster Geld/Zeit-Guard | 3 |
+| Structural | Pronomen/Coreference nicht bewiesen | 144 |
+| Structural | Operationsgrammatik fehlt | 115 |
+
+Der aktuelle Parser extrahiert in keinem dieser Fälle bereits einen
+vollständigen Satz exklusiver Kandidaten/Slots. Die M-fache Replikation der
+DeepSeek-Demo erzeugt zudem unbegrenztes Many-to-one und zerfällt damit in
+unabhängige `argmin`-Entscheidungen. Sie ist kein globaler Bindungslöser.
+Matching darf erst hinter einer expliziten Slot-/Kapazitätssemantik und vor
+dem bestehenden Eindeutigkeits-/IR-Zertifikat wieder geöffnet werden.
+Der vollständige per-Item-Beleg steht versiegelt in
+`results/fertig-abstention-audit.json` (Report-SHA-256
+`9350ee0cc0736700982b886495e14767a2adce0d6ca793cb581aacaf62640414`).
+
 ## 5. Streaming-Verträge
 
 Die automatisierte Contract-Suite misst keine Modellqualität, sondern
@@ -206,8 +233,9 @@ Darum bleibt q3/Width 1 der Default und Adjacent-Pairs/Width 2 ein explizites
 Instrument, kein Produktions-Speedup. Die beiden zusätzlichen Belege stehen
 in `results/deepseek-v4-adjacent-range-warm-smoke.json` und
 `results/deepseek-v4-adjacent-range-network-smoke.json`. Als nächstes folgt
-der exakte FERTIG-Bindungskontrast; danach ein gepaarter `off`/CRSA-Inhaltslauf
-auf derselben Runtime-Identität.
+ein gepaarter `off`/CRSA-Inhaltslauf auf derselben Runtime-Identität; der
+vermeintliche FERTIG-Bindungskontrast ist durch die Abstention-Taxonomie
+ersetzt.
 
 ## 7. Lebensstrom-Verträge
 
@@ -227,16 +255,20 @@ Akzeptanzlauf neu gemessene Sprachmodell-Qualität.
 
 ## 8. Nächste belastbare Messungen
 
-1. Exakten Hungarian-Bindungslöser für FERTIG gegen die heutigen Abstinenzen
-   und einen Greedy-/Placebo-Kontrast messen; Wrong-Gate bleibt null.
+1. FERTIGs 144 Coreference-Fälle und 115 Grammar-Fälle getrennt erweitern;
+   jeder Vorschlag muss durch den bestehenden Fraction/RREF-Pfad und das
+   Wrong-Gate null. Matching nur auf explizit exklusiven Slots gegen
+   Greedy-/Placebo-Kontrast.
 2. Gepaarter `off`/CRSA-Content-Gate mit offiziellem Encoding, festem Split,
    vollständigen Fehlerdenominatoren und atomarem Proof-Schema v4.
 3. Router auf einem größeren, nicht synthetisch eng getrennten Text/Math-Split,
    erneut CRSA gegen kausale Softmax und Label-Placebos.
 4. Lebenskurve mit fixem held-out Byte-Stream: NLL vor/nach Surprise-Updates,
    Post-Sleep-Delta und State-Größe über die Zeit.
-5. WorldStream-Budgetkurve nur mit einem neuen, kontextuell korrekten
-   Retrievalmechanismus; kein Revival des statischen Value-Sketches.
+5. WorldStream nur mit einem neuen, kontextuell korrekten Mechanismus: echte
+   klassenkonditionierte Donor-Verteilungen auf Train, Held-out-KL/NLL und
+   Balanced Accuracy gegen All-Layer plus Label-Shuffles. Kein Revival des
+   statischen Value-Sketches und kein 18×-Claim aus KL/SNR.
 
 Ein Hugging-Face-Export kommt erst ganz am Ende nach lokalem Golden und
 geklärter Lizenzkette; er ist kein aktueller Benchmark-Fokus.

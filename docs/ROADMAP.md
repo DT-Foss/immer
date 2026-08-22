@@ -49,15 +49,22 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
 - [x] FERTIG-Grammatik für endliche affine Rekurrenzen mit exaktem
   Fraction/RREF-Zertifikat; neue Fähigkeit bei unverändert 1.060/1.319 und
   weiterhin 0 falschen Antworten.
+- [x] DeepSeek-Hungarian gegen alle 259 FERTIG-Abstinenzen auditiert: 144
+  Coreference-Scope, 115 Grammar-Scope und null bereits extrahierte exklusive
+  Assignment-Verträge; die replizierte Demo zerfällt in unabhängige Argmins.
 
 ## Jetzt
 
-### 1. FERTIG-Bindungslöser
+### 1. FERTIG-Strukturpfad
 
-Der Vollsplit hat 259 sichere Abstinenzen bei null falschen Antworten. Als
-nächster exakter Hebel wird die Zuordnung mehrdeutiger Bindungen als
-Minimum-Cost-Matching formuliert und gegen Greedy/Placebo gemessen. Hungarian
-darf nur neue zertifizierte Antworten öffnen; das Wrong-Gate bleibt null.
+Der Vollsplit hat 259 sichere Abstinenzen bei null falschen Antworten. Die
+nächste Arbeit teilt sich nun evidenzgemäß: Für 144 Coreference-Fälle werden
+Antezedenten fail-closed aufgelöst; 115 Fälle brauchen zuerst neue getypte
+Operationsgrammatik. Beide Wege müssen vollständig konsumierte numerische
+Klauseln in den vorhandenen Fraction/RREF-IR überführen. Minimum-Cost-Matching
+ist erst bei nachweislich exklusiven Slots zulässig; Greedy, Matching und
+permutiertes Placebo teilen dann dieselben Kandidaten und Kosten. Das
+Wrong-Gate bleibt null.
 
 ### 2. DeepSeek-V4-Inhaltsgate
 
@@ -94,7 +101,10 @@ Desktop-Requests; falsche Antworten/Aktionsbehauptungen bleiben der Fehler.
 Stage 1 zeigte Mid-Depth-Struktur, Stage 2 mit statischem Embedding-Mittel war
 schlechter als Placebo. Ein neuer Versuch braucht echte RMSNorm-te
 Post-Attention-Zustände oder eine andere gemessene Invariante. Cross-Model-LS
-ist bereits negativ und kein R17.
+ist bereits negativ und kein R17. Der externe „R25-18×“-PoC zählt ebenfalls
+nicht: Er erzeugt die Layerstruktur synthetisch und vergleicht KL mit SNR.
+Zulässig ist ein neuer klassenkonditionierter Donor-KL-Versuch nur mit vorab
+getrenntem Train/Held-out, gleicher Metrik, All-Layer-Arm und Label-Shuffles.
 
 ## Später
 

@@ -78,10 +78,26 @@ Originale zur Laufzeit zu importieren.
   sechs auf vier Envelopes ohne ein Zusatzbyte, ist aber cache-resident 3,06 %
   langsamer und kalt nur 1,014611× schneller bei 6/10 Paar-Wins. Width 2 wird
   deshalb nicht Default; Infrastruktur und Falsifikator bleiben erhalten.
-- Aus DeepSeeks Handoff bleiben exakte Ideen übrig: FERTIG-Hungarian und ein
-  LM-Head-Request-A/B. Möbius-/Sinkhorn-Shortcuts, PPM-Head-Ersetzung,
-  compute-paralleler Shared Expert und approximatives Cross-Layer-Recycling
-  bleiben ohne Gleichheits-/Memory-Beweis geschlossen.
+- DeepSeeks FERTIG-Hungarian ist gegen die echten 259 Abstinenzen geprüft und
+  als direkte Integration verworfen: 65 Fälle besitzen im Legacy-Parser kein
+  Frageziel, 171 kein zum Ziel passendes Quantity, 20 eine unvollständige
+  Relation und drei treffen einen bewussten Geld/Zeit-Guard. Der saubere
+  Structural-Pfad sieht 144 ungeklärte Pronomen/Coreference-Fälle und 115
+  fehlende Operationsgrammatiken. Die vorgeschlagene M-fache Entity-
+  Replikation zerfällt mathematisch in unabhängige Spalten-Argmins und schafft
+  keine globale Zuordnung. Hungarian bleibt nur für künftig explizit
+  extrahierte, exklusive Slots mit IR-/Eindeutigkeitszertifikat zulässig. Der
+  gold-label-freie Lauf ist mit allen 259 Item-Diagnosen und Parser-/Harness-
+  Hashes in `results/fertig-abstention-audit.json` versiegelt.
+- Ein exaktes LM-Head-Request-A/B bleibt aus dem Handoff prüfbar.
+  Der externe „R25-Format-Brücke“-PoC ist dagegen kein R25-/CRSA-Beleg: Er
+  baut die positive Mid-Depth-Struktur synthetisch ein und dividiert KL durch
+  SNR, sodass der behauptete 18×-Wert per Amplitudenskalierung frei beweglich
+  ist. Als neuer Versuch bleibt nur ein echter klassenkonditionierter
+  Donor-KL-Readout mit vorab getrenntem Train/Held-out und Label-Shuffles.
+  Möbius-/Sinkhorn-Shortcuts, PPM-Head-Ersetzung, compute-paralleler Shared
+  Expert und approximatives Cross-Layer-Recycling bleiben ohne Gleichheits-/
+  Memory-Beweis geschlossen.
 
 ### Deutung + nächste Frage
 

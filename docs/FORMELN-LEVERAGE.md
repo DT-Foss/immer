@@ -41,9 +41,21 @@ geschlossen; die Tensorquelle bleibt verwendbar.
 
 - **Verwertbar:** begrenztes Keep-alive ist deployt; exaktes Range-Coalescing
   ist als ausgeschaltetes Messinstrument implementiert; Cache-Admission und
-  -Identität wurden fail-closed verschärft. Der exakte Hungarian-Löser für
-  FERTIG und ein LM-Head-Request-A/B bleiben die nächsten überprüfbaren
-  Algorithmen.
+  -Identität wurden fail-closed verschärft. Ein exaktes LM-Head-Request-A/B
+  bleibt überprüfbar.
+- **Falsifiziert für den heutigen FERTIG-Pfad:** DeepSeeks M-fache Entity-
+  Replikation macht aus dem vermeintlich globalen Hungarian-Problem nur
+  unabhängige `argmin`-Entscheidungen pro Ziel. Die 259 Abstinenzen zerfallen
+  tatsächlich in 144 ungeklärte Pronomen/Coreference-Fälle und 115 fehlende
+  Structural-Grammatiken. Erst explizit extrahierte, exklusive Slots dürften
+  künftig per Minimum-Cost-Matching vorgeschlagen werden; Antwortfreigabe
+  verlangt weiterhin eindeutiges Fraction/RREF-Zertifikat.
+- **Nicht als R25-Evidenz verwertbar:** Der externe 18×-PoC erzeugt
+  Mid-Depth-Gaußprofile synthetisch und setzt KL zu SNR ins Verhältnis. Diese
+  dimensionsfremde Kennzahl lässt sich durch reine Amplitudenskalierung frei
+  bewegen. Der legitime neue Mechanismus wäre stattdessen ein auf echtem
+  Train-Split gebildetes `P(output | task-class)` als KL-Target, bewertet auf
+  Held-out gegen All-Layer und Label-Shuffles; er ist noch ungemessen.
 - **Bedingt:** Shared-Expert-I/O darf erst nach einem Resident-Peak-Beweis
   überlappen. Compute-Parallelisierung würde die heutige serielle
   Akkumulationssemantik ändern und ist deshalb kein kleiner Transportfix.
@@ -87,6 +99,10 @@ Fähigkeit, keine nachträgliche Optimierung am GSM8K-Split.
   falsch und bleibt bis zu einem strukturierten Proof proposal-only.
 - **FERTIG-Rekurrenzen:** neue endliche affine Grammatik mit exaktem
   Zertifikat; Vollsplit unverändert 1.060/1.319 bei 0 falschen Antworten.
+- **FERTIG-Abstention-Audit:** Legacy 65 fehlende Frageziele, 171 fehlende
+  Ziel-Quantities, 20 unvollständige Relationen und drei Geld/Zeit-Guards;
+  Structural 144 Coreference-Scope gegen 115 Grammar-Scope. Unter dem heute
+  extrahierten Vertrag existieren null belegte exklusive Assignment-Instanzen.
 - **Eigene Attention:** fester CRSA-Mix `2 Local + 1 Balanced + 1 Free`,
   Steigung `0.8`, Diagonal-Debit `3`; Zukunftsmasse exakt null und Free-Head
   bitgleich zur kausalen Softmax.
