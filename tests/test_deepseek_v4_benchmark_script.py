@@ -8,6 +8,7 @@ import sys
 import tempfile
 import types
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -42,6 +43,56 @@ def _script_module():
 
 
 class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
+    def test_free_generation_retains_the_decoded_completion(self) -> None:
+        module = _script_module()
+
+        @dataclass
+        class Evidence:
+            generated_token_ids: tuple[int, ...]
+
+        class Model:
+            def generate_greedy(self, prompt, **kwargs):
+                self.call = (prompt, kwargs)
+                return (41, 42), Evidence((41, 42))
+
+        class Tokenizer:
+            def decode(self, token_ids):
+                self.decoded = tuple(token_ids)
+                return "decoded answer 42"
+
+        model = Model()
+        tokenizer = Tokenizer()
+        plan = module.EvaluationPlan(
+            item_id="g0",
+            prompt_token_ids=(7, 8),
+            candidate_token_ids=None,
+            candidate_values=(),
+            benchmark_protocol="gsm8k_free_generation",
+            prompt_encoding="fixture",
+            prompt_protocol="fixture",
+            assistant_generation_prefix="Answer:",
+            candidate_surfaces=(),
+            candidate_tokenization="none",
+            rendered_prompt_sha256=None,
+        )
+        args = types.SimpleNamespace(
+            max_new_tokens=2,
+            batched_prefill=True,
+            eos_token_ids=(99,),
+            head_block_rows=128,
+        )
+
+        predicted, runtime = module._score_item(
+            model, object(), plan, tokenizer, args
+        )
+
+        self.assertEqual(predicted, "decoded answer 42")
+        self.assertEqual(runtime["completion"], predicted)
+        self.assertEqual(runtime["generation"]["generated_token_ids"], (41, 42))
+        self.assertEqual(tokenizer.decoded, (41, 42))
+        self.assertEqual(model.call[0], [[7, 8]])
+        self.assertFalse(model.call[1]["prefill_tokenwise"])
+
     def _run(
         self, *arguments: str, timeout: int = 180
     ) -> subprocess.CompletedProcess[str]:

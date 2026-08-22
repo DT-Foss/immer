@@ -1014,7 +1014,8 @@ def _score_item(
         eos_token_ids=args.eos_token_ids,
         head_block_rows=args.head_block_rows,
     )
-    return tokenizer.decode(generated), {
+    completion = tokenizer.decode(generated)
+    return completion, {
         "engine": "greedy_full_head",
         "benchmark_protocol": plan.benchmark_protocol,
         "prompt_encoding": plan.prompt_encoding,
@@ -1023,6 +1024,7 @@ def _score_item(
         "rendered_prompt_sha256": plan.rendered_prompt_sha256,
         "prompt_tokens": len(prompt),
         "candidate_tokenization": plan.candidate_tokenization,
+        "completion": completion,
         "generation": asdict(evidence),
     }
 
