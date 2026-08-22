@@ -1,8 +1,9 @@
-"""Small, dependency-free safetensors range source used by :mod:`streamer`.
+"""Safetensors range source with persistent HTTP connections.
 
-This module intentionally contains no model framework and imports NumPy only
-inside the BF16 conversion function.  It is production package code, not a
-bridge to the repository's research scripts.
+The primary transport uses ``requests.Session`` for HTTP/1.1 keep-alive so
+that a sequence of range reads reuses the same TCP/TLS connection.  When
+``requests`` is not installed the module falls back to the legacy
+``urllib``-only code path without changing any caller-facing behaviour.
 """
 
 from __future__ import annotations
@@ -19,6 +20,11 @@ import urllib.request
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Protocol
+
+try:
+    import requests as _requests
+except ImportError:  # pragma: no cover — optional dependency
+    _requests = None
 
 DEFAULT_ENDPOINT = "https://huggingface.co"
 DEFAULT_TIMEOUT_SECONDS = 180.0
@@ -103,8 +109,17 @@ class _BudgetLike(Protocol):
 
 
 def _response_overhead(response: Any) -> int:
-    """Stable approximation of request/status/header transfer overhead."""
-    status_line = f"HTTP/1.1 {getattr(response, 'status', 0)}\r\n"
+    """Stable approximation of request/status/header transfer overhead.
+
+    Works with both urllib's http.client.HTTPResponse (has ``.status`` and
+    ``.getheader()``-style headers) and requests.models.Response (has
+    ``.status_code`` and case-insensitive dict headers).
+    """
+    try:
+        status = int(getattr(response, "status_code", response.status))
+    except AttributeError:
+        status = 0
+    status_line = f"HTTP/1.1 {status}\r\n"
     response_headers = "".join(
         f"{key}: {value}\r\n" for key, value in response.headers.items()
     )
@@ -141,6 +156,7 @@ class HFRangeReader:
         endpoint: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         opener: Any | None = None,
+        session: Any | None = None,
     ) -> None:
         self.repo = repo
         self.rev = revision
@@ -149,7 +165,27 @@ class HFRangeReader:
             endpoint or os.environ.get("HF_ENDPOINT") or DEFAULT_ENDPOINT
         ).rstrip("/")
         self.timeout = float(timeout)
-        self.opener = opener or urllib.request.build_opener()
+        # When an explicit opener is passed we keep the urllib-only
+        # path so that existing callers are not broken.  New code gets a
+        # requests.Session with HTTP/1.1 keep-alive by default.
+        if opener is not None:
+            self.opener = opener
+            self._session = None
+        elif session is not None:
+            self._session = session
+            self.opener = None
+        elif _requests is not None:
+            self.opener = None
+            self._session = _requests.Session()
+            self._session.headers.update(
+                {
+                    "User-Agent": "immer-tensor-source/1.1",
+                    "Accept-Encoding": "identity",
+                }
+            )
+        else:
+            self.opener = urllib.request.build_opener()
+            self._session = None
         self.file_info: dict[str, dict[str, Any]] = {}
         self._cdn: dict[str, tuple[str, float]] = {}
         # Signed-URL state and the identity derived from its response must
@@ -217,7 +253,9 @@ class HFRangeReader:
         }
 
     def _remember_response(self, filename: str, response: Any) -> None:
-        final_url = str(response.geturl())
+        # Works with both requests.Response (has .url) and
+        # http.client.HTTPResponse (has .geturl()).
+        final_url = str(getattr(response, "url", None) or response.geturl())
         updates: dict[str, Any] = {
             "cdn_host": urllib.parse.urlparse(final_url).netloc,
         }
@@ -230,7 +268,7 @@ class HFRangeReader:
         content_range = response.headers.get("Content-Range", "")
         range_match = re.fullmatch(r"bytes \d+-\d+/(\d+|\*)", content_range)
         content_length = response.headers.get("Content-Length")
-        status_raw = getattr(response, "status", None)
+        status_raw = getattr(response, "status_code", None) or getattr(response, "status", None)
         status = int(status_raw if status_raw is not None else response.getcode())
         if range_match is not None and range_match.group(1) != "*":
             updates["size"] = int(range_match.group(1))
@@ -247,13 +285,50 @@ class HFRangeReader:
         for attempt in range(3):
             url = self._source_url(filename)
             used_cached_url = url != self.resolve_url(filename)
-            request = urllib.request.Request(
-                url, headers=self._headers(byte_range=byte_range)
-            )
+            headers = self._headers(byte_range=byte_range)
             try:
-                response = self.opener.open(request, timeout=self.timeout)
+                # When we have a requests.Session, use it.  When an explicit
+                # urllib opener was injected (backward compat), use that.
+                if self._session is not None:
+                    response = self._session.get(
+                        url,
+                        headers=headers,
+                        timeout=self.timeout,
+                        stream=True,
+                    )
+                else:
+                    request = urllib.request.Request(url, headers=headers)
+                    response = self.opener.open(request, timeout=self.timeout)
                 self._remember_response(filename, response)
                 return response
+            except (_requests.RequestException if _requests is not None else ()) as exc:
+                last = exc
+                if _requests is not None and isinstance(exc, _requests.HTTPError):
+                    resp = exc.response
+                    overhead = _response_overhead(resp)
+                    remaining = max(0, self.budget.limit - self.budget.total - overhead)
+                    body = resp.content[: min(64 * 1024, remaining)] if resp is not None else b""
+                    self.budget.charge(len(body), overhead, f"http-error:{filename}")
+                    if resp is not None and resp.status_code == 404:
+                        raise SourceNotFound(
+                            f"404: {filename} existiert nicht in {self.repo}@{self.rev}"
+                        ) from exc
+                    if resp is not None and resp.status_code in (401, 403):
+                        with self._lock:
+                            self._cdn.pop(filename, None)
+                        if used_cached_url and attempt < 2:
+                            continue
+                        raise SourceAccessDenied(
+                            f"{resp.status_code}: {self.repo}@{self.rev} ist privat/gated oder gesperrt"
+                        ) from exc
+                    if resp is not None and (resp.status_code == 429 or resp.status_code >= 500):
+                        if attempt < 2:
+                            time.sleep(2**attempt)
+                            continue
+                    raise SourceError(f"HTTP-Fehler beim Lesen von {filename}") from exc
+                if attempt < 2:
+                    time.sleep(2**attempt)
+                    continue
             except urllib.error.HTTPError as exc:
                 overhead = _response_overhead(exc)
                 remaining = max(0, self.budget.limit - self.budget.total - overhead)
@@ -291,8 +366,12 @@ class HFRangeReader:
         expected = end - start + 1
         response = self._open(filename, byte_range=(start, end))
         overhead = _response_overhead(response)
+        status = int(getattr(response, "status_code", None) or getattr(response, "status", response.getcode()))
+        # requests.Response already buffers; urllib needs explicit .read().
+        read_body = getattr(response, "content", None)
+        if read_body is None:
+            read_body = lambda size: response.read(size)  # noqa: E731
         try:
-            status = int(getattr(response, "status", response.getcode()))
             if status == 206:
                 content_range = response.headers.get("Content-Range", "")
                 match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)", content_range)
@@ -301,7 +380,7 @@ class HFRangeReader:
                     or int(match.group(1)) != start
                     or int(match.group(2)) != end
                 ):
-                    body = response.read(expected + 1)
+                    body = read_body(expected + 1) if callable(read_body) else read_body[: expected + 1]
                     self.budget.charge(
                         len(body), overhead, f"bad-range:{filename}:{start}"
                     )
@@ -312,14 +391,14 @@ class HFRangeReader:
                 if match.group(3) != "*":
                     self.update_file_info(filename, {"size": int(match.group(3))})
             elif status != 200 or start != 0:
-                body = response.read(expected + 1)
+                body = read_body(expected + 1) if callable(read_body) else read_body[: expected + 1]
                 self.budget.charge(
                     len(body), overhead, f"bad-status:{filename}:{start}"
                 )
                 raise SourceRangeError(
                     f"Server lieferte HTTP {status} statt einer exakten Range fuer {filename}"
                 )
-            body = response.read(expected + 1)
+            body = read_body(expected + 1) if callable(read_body) else read_body[: expected + 1]
             self.budget.charge(len(body), overhead, f"range:{filename}:{start}")
         finally:
             response.close()
@@ -355,8 +434,12 @@ class HFRangeReader:
             raise SourceRangeError(
                 f"{filename!r} ist {declared} Bytes gross; Grenze ist {max_bytes}"
             )
+        read_body = getattr(response, "content", None)
         try:
-            body = response.read(ceiling + (1 if ceiling < remaining else 0))
+            if read_body is not None:
+                body = read_body[: ceiling + 1]
+            else:
+                body = response.read(ceiling + (1 if ceiling < remaining else 0))
             self.budget.charge(len(body), overhead, f"file:{filename}")
         finally:
             response.close()
