@@ -13,6 +13,7 @@ from unittest import mock
 import numpy as np
 import torch
 
+import immer.runtimes.deepseek_v4.provenance as runtime_provenance
 from immer.runtimes.deepseek_v4 import (
     DeepSeekWeightPager,
     LayerwiseError,
@@ -229,9 +230,26 @@ class LayerwiseScorerTests(unittest.TestCase):
             )
             self.assertEqual(
                 execution["expert_prefetch_policy"],
-                "exact-router-one-ahead/v1",
+                "exact-router-window-2x3/v1",
             )
-            first.run()
+            self.assertEqual(
+                execution["expert_prefetch_transport_policy"],
+                "streamer-exact-range/v1",
+            )
+            self.assertEqual(execution["expert_prefetch_workers"], 2)
+            self.assertEqual(execution["expert_prefetch_max_outstanding"], 2)
+            self.assertEqual(execution["expert_prefetch_max_experts"], 3)
+            self.assertEqual(
+                execution["expert_prefetch_resident_limit_bytes"],
+                48 * 1024**2,
+            )
+            initial, *_ = first._load_or_initialize(resume=False)
+            activation = initial["body"]["state"]["checkpoints"][0]
+            self.assertEqual(
+                activation["schema"],
+                "immer.deepseek-v4-layerwise-activation/v4",
+            )
+            self.assertEqual(activation["version"], 4)
 
             incompatible_model = _model(_source(), batch=2)
             incompatible_model.pager.QUANTIZED_ACCUMULATION_POLICY = (
@@ -254,9 +272,7 @@ class LayerwiseScorerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary) / "not-created"
             source = _source()
-            pager = DeepSeekWeightPager(
-                source, device="cpu", compute_dtype="float32"
-            )
+            pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="float32")
             model = StreamedDeepSeekV4(
                 _config(), pager, max_batch_size=2, max_seq_len=16
             )
@@ -267,16 +283,70 @@ class LayerwiseScorerTests(unittest.TestCase):
     def test_resume_identity_binds_runtime_source_digest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary) / "run"
-            first = _scorer(_model(_source(), batch=2), run_dir)
-            self.assertRegex(first.identity["runtime"]["source_sha256"], r"^[0-9a-f]{64}$")
-            first.run()
 
-            changed = [{"path": "fixture.py", "sha256": "f" * 64}]
-            with mock.patch(
-                "immer.runtimes.deepseek_v4.layerwise._runtime_source_manifest",
-                return_value=changed,
+            def proof_scorer() -> LayerwiseScorer:
+                model = _model(_source(), batch=2)
+                model.pager.expert_prefetch_enabled = False
+                return _scorer(model, run_dir)
+
+            first = proof_scorer()
+            runtime = first.identity["runtime"]
+            self.assertEqual(runtime["schema"], "immer.deepseek-v4-layerwise/v4")
+            self.assertRegex(runtime["source_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(runtime["dependency_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(runtime["source_sha256"], _body_sha(runtime["sources"]))
+            self.assertEqual(
+                set(runtime["dependencies"]),
+                {"python", "torch", "numpy", "safetensors"},
+            )
+            self.assertEqual(
+                runtime["dependency_sha256"],
+                _body_sha(runtime["dependencies"]),
+            )
+            paths = {row["path"] for row in runtime["sources"]}
+            self.assertTrue(
+                {
+                    "immer/runtimes/deepseek_v4/__init__.py",
+                    "immer/runtimes/deepseek_v4/snapshot.py",
+                    "immer/knowledge/__init__.py",
+                    "immer/knowledge/streamer.py",
+                    "immer/knowledge/_hf_source.py",
+                    "scripts/deepseek_v4_layerwise.py",
+                }.issubset(paths)
+            )
+            first._load_or_initialize(resume=False)
+
+            original_sha256 = runtime_provenance._sha256_file
+            for suffix in (
+                "runtimes/deepseek_v4/__init__.py",
+                "runtimes/deepseek_v4/snapshot.py",
+                "knowledge/__init__.py",
+                "knowledge/streamer.py",
+                "knowledge/_hf_source.py",
+                "scripts/deepseek_v4_layerwise.py",
             ):
-                incompatible = _scorer(_model(_source(), batch=2), run_dir)
+                with self.subTest(mutated_source=suffix):
+
+                    def changed_hash(path, *, target=suffix):
+                        digest = original_sha256(path)
+                        return "f" * 64 if path.as_posix().endswith(target) else digest
+
+                    with mock.patch.object(
+                        runtime_provenance,
+                        "_sha256_file",
+                        side_effect=changed_hash,
+                    ):
+                        incompatible = proof_scorer()
+                    with self.assertRaisesRegex(LayerwiseError, "identity differs"):
+                        incompatible.run(resume=True)
+
+            changed_dependencies = dict(runtime["dependencies"])
+            changed_dependencies["torch"] += ".mutated"
+            with mock.patch(
+                "immer.runtimes.deepseek_v4.layerwise._runtime_dependency_versions",
+                return_value=changed_dependencies,
+            ):
+                incompatible = proof_scorer()
             with self.assertRaisesRegex(LayerwiseError, "identity differs"):
                 incompatible.run(resume=True)
 
@@ -378,12 +448,27 @@ class LayerwiseScorerTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary) / "run"
-            _scorer(_model(_source(), batch=2), run_dir).run()
+            scorer = _scorer(_model(_source(), batch=2), run_dir)
+            scorer._load_or_initialize(resume=False)
             manifest_path = run_dir / "manifest.json"
             manifest = json.loads(manifest_path.read_text())
             manifest["schema"] = "immer.deepseek-v4-layerwise/v1"
             manifest["version"] = 1
             manifest.pop("kind")
+            _write_json(manifest_path, manifest)
+
+            with self.assertRaisesRegex(LayerwiseError, "cannot prove"):
+                _scorer(_model(_source(), batch=2), run_dir).run(resume=True)
+
+    def test_v3_resume_is_rejected_by_v4_proof_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            scorer = _scorer(_model(_source(), batch=2), run_dir)
+            scorer._load_or_initialize(resume=False)
+            manifest_path = run_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["schema"] = "immer.deepseek-v4-layerwise/v3"
+            manifest["version"] = 3
             _write_json(manifest_path, manifest)
 
             with self.assertRaisesRegex(LayerwiseError, "cannot prove"):

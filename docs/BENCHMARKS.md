@@ -121,10 +121,14 @@ Score-Routing, sechs aktive plus Shared Expert, HyperConnections, native
 Fenster-/Kompressor-/Indexer-Attention, globalen LM-Head und autoregressiven
 KV-Zustand. DSpark-MTP ist noch nicht im Ausführungspfad.
 
-Layerwise Proof-Schema v3 bindet Modellrevision, Runtime-Quellen und Ergebnisse
-vor dem Resume. Das kanonische Journal v2 ist eine monotone Hash-Kette und
-weist Duplikate, Fremdeinträge, Mutation sowie gebrochene Verkettung ab; ein
-abgerissener letzter Datensatz ist deterministisch reparierbar.
+Layerwise Proof-Schema v4 bindet Modellrevision, alle DeepSeek-Laufzeitquellen,
+beide importierten Package-Exports, das konkrete Layerwise-CLI, Streamer,
+HF-Range-Reader, Snapshot sowie Python-/Torch-/NumPy-/Safetensors-Versionen vor
+dem Resume. Das kanonische Journal v2 ist eine monotone
+Hash-Kette des getrennten item-major Benchmark-Harnesses und weist dort
+Duplikate, Fremdeinträge, Mutation sowie gebrochene Verkettung ab; ein
+abgerissener letzter Datensatz ist deterministisch reparierbar. Layerwise
+selbst committet content-addressed BF16-Generationen über atomare Manifeste.
 
 Zwei abgeschlossene Integrationsmessungen auf M4/16 GB:
 
@@ -137,26 +141,32 @@ Der zweite Lauf hält 17,84 MB Attention-State und den Cache bei
 12.881.453.756 von 12.884.901.888 Bytes; 891 LRU-Evictions überschritten die
 Grenze nicht.
 
-Der konservative Expert-Prefetch `exact-router-one-ahead/v1` startet erst nach
-der offiziellen Routerentscheidung. Er erlaubt genau einen I/O-Worker, genau
-ein ausstehendes Ticket und höchstens 14 MiB je Payload. Ein offizielles,
-symmetrisch aufgewärmtes 2-Expert-A/B auf MPS/BF16 mit 20 alternierenden
-Trials ergab:
+Der konservative Expert-Prefetch `exact-router-window-2x3/v1` startet erst
+nach der offiziellen Routerentscheidung und plant alle ausgewählten Experts
+vor dem ersten Read. Er erlaubt zwei I/O-Worker, höchstens zwei Futures,
+drei residente/inflight Experts, 14 MiB pro Expert und 48 MiB insgesamt.
+Offizielle 3-Expert-A/Bs auf MPS/BF16 ergaben:
 
-| Modus | Zeit | Ausgabe | Prefetch-Peak |
-|---|---:|---|---:|
-| aus | 0,447971 s | Referenz | 0 B |
-| an | 0,409933 s | bitgleich | 26.738.688 B |
+| Cache/Trials | aus | Fenster an | Speedup | Ausgabe | Peak |
+|---|---:|---:|---:|---|---:|
+| warm, 20 | 0,548137 s | 0,464826 s | 1,179230× | bitgleich | 40.108.032 B |
+| aus, 8 | 6,452119 s | 6,321257 s | 1,020702× | bitgleich | 40.108.032 B |
 
-Das entspricht 1,092790× beziehungsweise 8,49 % weniger mittlerer Latenz in
-diesem Warm-Cache-Transport-Mikrobenchmark. Der gemessene Quellbyte-Delta war
-null; alle Outputs hatten denselben SHA-256. Das versiegelte Rohresultat steht
-in `results/deepseek-v4-exact-prefetch-smoke.json`. Es ist ausdrücklich kein
-Qualitäts-, MMLU- oder Frontier-Paritätsbeleg.
+Im No-Cache-Lauf sind das konservativ nur 2,03 % weniger mittlere Latenz bei
+320.864.256 gemessenen Quellbytes. Der Median liegt bei 6,482392 s gegen
+5,752504 s (1,126882×), aber ein 8,977372-s-Ausreißer im Fensterpfad zeigt,
+dass acht Netzwerk-Trials keinen stabilen Durchsatzclaim tragen. Alle Outputs
+eines Laufs hatten denselben SHA-256; Futures, Peak und Fehlerpfade blieben
+innerhalb ihrer Gates. Die versiegelten Rohresultate stehen in
+`results/deepseek-v4-exact-prefetch-window-smoke.json` und
+`results/deepseek-v4-exact-prefetch-window-network-smoke.json`. Das sind
+ausdrücklich keine Qualitäts-, MMLU- oder Frontier-Paritätsbelege; der reale
+Layerwise-Lauf entscheidet über den End-to-End-Nutzen.
 
 Der nächste inhaltliche Gate ist deshalb ein neuer, unverfälschter
-MMLU-`off`-Lauf mit offiziellem Encoding, festem Split, Proof-Schema v3 und
-Journal v2. Erst nach einer validen Baseline folgen gepaarte CRSA-Ablationen.
+MMLU-`off`-Lauf mit offiziellem Encoding, festem Split und atomarem
+Proof-Schema v4. Erst nach einer validen Baseline folgen gepaarte
+CRSA-Ablationen.
 
 ## 7. Lebensstrom-Verträge
 
@@ -177,7 +187,7 @@ Akzeptanzlauf neu gemessene Sprachmodell-Qualität.
 ## 8. Nächste belastbare Messungen
 
 1. Frischer MMLU-`off`-Content-Gate mit offiziellem Encoding, festem Split,
-   vollständigen Fehlerdenominatoren, Proof-Schema v3 und Journal v2.
+   vollständigen Fehlerdenominatoren und atomarem Proof-Schema v4.
 2. Router auf einem größeren, nicht synthetisch eng getrennten Text/Math-Split,
    erneut CRSA gegen kausale Softmax und Label-Placebos.
 3. Lebenskurve mit fixem held-out Byte-Stream: NLL vor/nach Surprise-Updates,

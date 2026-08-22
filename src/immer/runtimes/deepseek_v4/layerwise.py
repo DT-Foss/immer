@@ -32,12 +32,12 @@ from safetensors.torch import save_file
 
 from .graft import DeepSeekV4CrsaGraft, GRAFT_MODES
 from .model import StreamedDeepSeekV4
-from .provenance import runtime_source_manifest
+from .provenance import runtime_dependency_versions, runtime_source_manifest
 
 
-LAYERWISE_SCHEMA = "immer.deepseek-v4-layerwise/v3"
-LAYERWISE_VERSION = 3
-_ACTIVATION_SCHEMA = "immer.deepseek-v4-layerwise-activation/v3"
+LAYERWISE_SCHEMA = "immer.deepseek-v4-layerwise/v4"
+LAYERWISE_VERSION = 4
+_ACTIVATION_SCHEMA = "immer.deepseek-v4-layerwise-activation/v4"
 _MANIFEST_KIND = "manifest"
 _RESULT_KIND = "result"
 OFFICIAL_MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash-0731"
@@ -78,7 +78,16 @@ def _sha256_file(path: Path) -> str:
 def _runtime_source_manifest() -> list[dict[str, str]]:
     """Fingerprint every local source file that can change layer execution."""
 
-    return runtime_source_manifest(extra_files=("layerwise.py",))
+    return runtime_source_manifest(
+        extra_files=("layerwise.py",),
+        project_files=("scripts/deepseek_v4_layerwise.py",),
+    )
+
+
+def _runtime_dependency_versions() -> dict[str, str]:
+    """Fingerprint the interpreter and binary package environment."""
+
+    return runtime_dependency_versions()
 
 
 def _fsync_directory(path: Path) -> None:
@@ -790,11 +799,14 @@ class LayerwiseScorer:
         if not isinstance(fingerprint, str) or not fingerprint:
             raise LayerwiseError("source has no verified inventory fingerprint")
         runtime_sources = _runtime_source_manifest()
+        runtime_dependencies = _runtime_dependency_versions()
         self.identity = {
             "runtime": {
                 "schema": LAYERWISE_SCHEMA,
                 "source_sha256": _digest(runtime_sources),
                 "sources": runtime_sources,
+                "dependency_sha256": _digest(runtime_dependencies),
+                "dependencies": runtime_dependencies,
             },
             "model": {
                 "repo_id": str(
@@ -828,6 +840,19 @@ class LayerwiseScorer:
                 ),
                 "expert_prefetch_payload_limit_bytes": (
                     model.pager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
+                ),
+                "expert_prefetch_transport_policy": (
+                    model.pager.EXPERT_PREFETCH_TRANSPORT_POLICY
+                ),
+                "expert_prefetch_workers": model.pager.EXPERT_PREFETCH_WORKERS,
+                "expert_prefetch_max_outstanding": (
+                    model.pager.EXPERT_PREFETCH_MAX_OUTSTANDING
+                ),
+                "expert_prefetch_max_experts": (
+                    model.pager.EXPERT_PREFETCH_MAX_EXPERTS
+                ),
+                "expert_prefetch_resident_limit_bytes": (
+                    model.pager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
                 ),
                 "activation_dtype": "bfloat16",
                 "microbatch_size": microbatch_size,

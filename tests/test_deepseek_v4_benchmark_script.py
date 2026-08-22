@@ -353,15 +353,35 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             )
             self.assertEqual(
                 document["expert_prefetch_policy"],
-                "exact-router-one-ahead/v1",
+                "exact-router-window-2x3/v1",
             )
             self.assertEqual(
                 document["expert_prefetch_payload_limit_bytes"],
                 14 * 1024**2,
             )
+            self.assertEqual(
+                document["expert_prefetch_transport_policy"],
+                "streamer-exact-range/v1",
+            )
+            self.assertEqual(document["expert_prefetch_workers"], 2)
+            self.assertEqual(document["expert_prefetch_max_outstanding"], 2)
+            self.assertEqual(document["expert_prefetch_max_experts"], 3)
+            self.assertEqual(
+                document["expert_prefetch_resident_limit_bytes"],
+                48 * 1024**2,
+            )
             self.assertRegex(document["runtime_source_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(document["runtime_dependency_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                set(document["runtime_dependencies"]),
+                {"python", "torch", "numpy", "safetensors"},
+            )
             self.assertIn(
                 "immer/runtimes/deepseek_v4/benchmark.py",
+                {row["path"] for row in document["runtime_sources"]},
+            )
+            self.assertIn(
+                "immer/knowledge/streamer.py",
                 {row["path"] for row in document["runtime_sources"]},
             )
             self.assertEqual(document["budgets"]["cache_limit_bytes"], 8 * 1024**2)

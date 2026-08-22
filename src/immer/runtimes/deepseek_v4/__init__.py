@@ -22,7 +22,7 @@ from .quantization import (
     unpack_fp4_e2m1,
 )
 from .snapshot import DeepSeekV4SnapshotError, SnapshotLimits
-from .provenance import runtime_source_manifest
+from .provenance import runtime_dependency_versions, runtime_source_manifest
 from .layerwise import (
     LAYERWISE_SCHEMA,
     OFFICIAL_SOURCE_SAFE_BYTES,
@@ -54,6 +54,7 @@ __all__ = [
     "quantize_dequantize_fp4",
     "quantize_dequantize_fp8",
     "quantize_fp8_e4m3_parts",
+    "runtime_dependency_versions",
     "runtime_source_manifest",
     "unpack_fp4_e2m1",
 ]

@@ -8,11 +8,15 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
+from immer.knowledge import streamer as streamer_module
 from immer.knowledge.streamer import (
     ByteBudgetExceeded,
     CacheIntegrityError,
@@ -58,6 +62,29 @@ class _FakeOpener:
     def open(self, request, timeout):
         self.requests.append((request, timeout))
         return self.responses.pop(0)
+
+
+class _ParallelRangeReader:
+    range_overhead_reserve = 0
+
+    def __init__(self, on_read=None) -> None:
+        self.repo = "fixture"
+        self.rev = "pinned"
+        self.file_info: dict[str, dict] = {}
+        self.calls: list[tuple[str, int, int]] = []
+        self._calls_lock = threading.Lock()
+        self._on_read = on_read
+
+    def source_identity(self, filename: str) -> dict[str, str]:
+        return {}
+
+    def get_range(self, filename: str, start: int, end: int) -> bytes:
+        with self._calls_lock:
+            call_index = len(self.calls)
+            self.calls.append((filename, start, end))
+        if self._on_read is not None:
+            self._on_read(call_index, filename, start, end)
+        return bytes((start + offset) % 256 for offset in range(end - start + 1))
 
 
 def _write_fixture(root: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -118,6 +145,10 @@ class StreamerContractTests(unittest.TestCase):
         self.assertEqual(request.get_header("Range"), "bytes=2-5")
         self.assertEqual(reader.file_info["model.safetensors"]["size"], 10)
         self.assertEqual(reader.file_info["model.safetensors"]["cas_url_hash"], digest)
+        self.assertEqual(
+            reader.source_identity_snapshot("model.safetensors"),
+            {"cas_url_hash": digest, "etag": "fixture-etag", "size": "10"},
+        )
         self.assertEqual(reader.fetch_file_bounded("config.json", 16), b"{}")
         self.assertEqual(budget.body, 6)
 
@@ -137,6 +168,163 @@ class StreamerContractTests(unittest.TestCase):
         with self.assertRaises(SourceRangeError):
             reader.get_range("model.safetensors", 2, 5)
         self.assertEqual(budget.body, 4)
+
+    def test_hf_identity_snapshot_waits_for_complete_locked_update(self) -> None:
+        reader = HFRangeReader("org/repo")
+        filename = "model.safetensors"
+        reader.update_file_info(filename, {"etag": "old", "size": 1})
+        update_halfway = threading.Event()
+        finish_update = threading.Event()
+        snapshot_started = threading.Event()
+        snapshot_done = threading.Event()
+
+        def update_identity() -> None:
+            with reader._lock:
+                info = reader.file_info.setdefault(filename, {})
+                info["etag"] = "new"
+                update_halfway.set()
+                if not finish_update.wait(timeout=5):
+                    raise TimeoutError("identity update was not released")
+                info["size"] = 2
+
+        def take_snapshot() -> dict[str, str]:
+            snapshot_started.set()
+            try:
+                return reader.source_identity_snapshot(filename)
+            finally:
+                snapshot_done.set()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            update = pool.submit(update_identity)
+            self.assertTrue(update_halfway.wait(timeout=5))
+            snapshot = pool.submit(take_snapshot)
+            self.assertTrue(snapshot_started.wait(timeout=5))
+            self.assertFalse(snapshot_done.is_set())
+            finish_update.set()
+            update.result(timeout=5)
+            identity = snapshot.result(timeout=5)
+
+        self.assertEqual(identity, {"etag": "new", "size": "2"})
+        identity["etag"] = "mutated-copy"
+        self.assertEqual(reader.source_identity_snapshot(filename)["etag"], "new")
+
+    def test_cold_parallel_reader_initializes_once_and_shares_budget(self) -> None:
+        source = Streamer("org/repo", revision="pinned", use_cache=False)
+        real_contract_reader = streamer_module._ContractReader
+        constructor_entered = threading.Event()
+        release_constructor = threading.Event()
+        start = threading.Barrier(5)
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def construct(*args, **kwargs):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            constructor_entered.set()
+            if not release_constructor.wait(timeout=5):
+                raise TimeoutError("reader constructor was not released")
+            return real_contract_reader(*args, **kwargs)
+
+        def access_reader():
+            start.wait(timeout=5)
+            return source.reader
+
+        with mock.patch.object(
+            streamer_module,
+            "_ContractReader",
+            side_effect=construct,
+        ):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(access_reader) for _ in range(4)]
+                start.wait(timeout=5)
+                self.assertTrue(constructor_entered.wait(timeout=5))
+                release_constructor.set()
+                readers = [future.result(timeout=5) for future in futures]
+
+        self.assertEqual(calls, 1)
+        self.assertTrue(all(reader is readers[0] for reader in readers))
+        self.assertIs(readers[0].budget, source.budget)
+        self.assertIs(readers[0].upstream.budget, source.budget)
+
+    def test_prepare_parallel_reads_materializes_reader_inventory_and_index(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            root.mkdir()
+            _write_fixture(root)
+            source = Streamer.from_local(root, use_cache=False)
+
+            self.assertEqual(source.prepare_parallel_reads(), 2)
+            reader = source.reader
+            inventory = source.inventory()
+            self.assertEqual(source.prepare_parallel_reads(), 2)
+            self.assertIs(source.reader, reader)
+            self.assertIs(source.inventory(), inventory)
+            self.assertEqual(source.find("float.weight")["shape"], [4, 2])
+            self.assertIsNotNone(source._tensor_index)
+
+    def test_different_raw_keys_reach_upstream_concurrently(self) -> None:
+        upstream_barrier = threading.Barrier(2)
+
+        def meet_upstream(_index, _filename, _start, _end) -> None:
+            upstream_barrier.wait(timeout=5)
+
+        upstream = _ParallelRangeReader(meet_upstream)
+        source = Streamer(
+            "fixture",
+            revision="pinned",
+            reader=upstream,
+            use_cache=False,
+        )
+        _ = source.reader
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            left = pool.submit(source.raw_bytes, "weights.bin", 0, 4)
+            right = pool.submit(source.raw_bytes, "weights.bin", 16, 4)
+            self.assertEqual(left.result(timeout=5), bytes(range(4)))
+            self.assertEqual(right.result(timeout=5), bytes(range(16, 20)))
+
+        self.assertEqual(
+            set(upstream.calls),
+            {("weights.bin", 0, 3), ("weights.bin", 16, 19)},
+        )
+
+    def test_same_raw_key_is_single_flight_through_shared_cache(self) -> None:
+        first_upstream_read = threading.Event()
+        release_upstream = threading.Event()
+
+        def hold_first(index, _filename, _start, _end) -> None:
+            if index == 0:
+                first_upstream_read.set()
+                if not release_upstream.wait(timeout=5):
+                    raise TimeoutError("upstream read was not released")
+
+        upstream = _ParallelRangeReader(hold_first)
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Streamer(
+                "fixture",
+                revision="pinned",
+                reader=upstream,
+                cache_dir=Path(tmp) / "cache",
+            )
+            start = threading.Barrier(3)
+
+            def read_same_key() -> bytes:
+                start.wait(timeout=5)
+                return source.raw_bytes("weights.bin", 32, 8)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(read_same_key) for _ in range(2)]
+                start.wait(timeout=5)
+                self.assertTrue(first_upstream_read.wait(timeout=5))
+                release_upstream.set()
+                bodies = [future.result(timeout=5) for future in futures]
+
+            self.assertEqual(bodies, [bytes(range(32, 40))] * 2)
+            self.assertEqual(upstream.calls, [("weights.bin", 32, 39)])
+            self.assertEqual(source.metrics()["cache_misses"], 1)
+            self.assertEqual(source.metrics()["cache_hits"], 1)
 
     def test_wheel_style_import_has_no_repository_vendor_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -215,7 +403,10 @@ print("wheel-safe")
             self.assertEqual(metrics["optional_misses"], 1)
             self.assertTrue(metrics["revision_is_mutable"])
             # Header + selected rows, never the complete source/model payload.
-            self.assertLess(metrics["network_or_source_body_bytes"], (root / "model.safetensors").stat().st_size + f32.nbytes + bf32.nbytes)
+            self.assertLess(
+                metrics["network_or_source_body_bytes"],
+                (root / "model.safetensors").stat().st_size + f32.nbytes + bf32.nbytes,
+            )
             self.assertIsNotNone(metrics["inventory_source_fingerprint"])
 
     def test_refresh_bypasses_resume_cache(self) -> None:
@@ -276,7 +467,10 @@ print("wheel-safe")
             for meta_path in (cache / "ranges").glob("*.json"):
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 contract = meta["contract"]
-                if contract["start"] is not None and meta["size"] == 2 * f32.shape[1] * f32.itemsize:
+                if (
+                    contract["start"] is not None
+                    and meta["size"] == 2 * f32.shape[1] * f32.itemsize
+                ):
                     row_blob = meta_path.with_suffix(".bin")
                     break
             self.assertIsNotNone(row_blob)

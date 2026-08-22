@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import struct
@@ -289,11 +290,35 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
             self.assertTrue(report["provenance"]["revision_is_mutable"])
             self.assertEqual(
                 report["provenance"]["execution"]["expert_prefetch_policy"],
-                "exact-router-one-ahead/v1",
+                "exact-router-window-2x3/v1",
+            )
+            execution = report["provenance"]["execution"]
+            self.assertEqual(
+                execution["expert_prefetch_transport_policy"],
+                "streamer-exact-range/v1",
+            )
+            self.assertEqual(execution["expert_prefetch_workers"], 2)
+            self.assertEqual(execution["expert_prefetch_max_outstanding"], 2)
+            self.assertEqual(execution["expert_prefetch_max_experts"], 3)
+            self.assertEqual(
+                execution["expert_prefetch_resident_limit_bytes"],
+                48 * 1024**2,
             )
             self.assertRegex(
                 report["provenance"]["runtime_source_sha256"],
                 r"^[0-9a-f]{64}$",
+            )
+            self.assertEqual(
+                report["provenance"]["harness_sha256"],
+                hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),
+            )
+            self.assertRegex(
+                report["provenance"]["runtime_dependency_sha256"],
+                r"^[0-9a-f]{64}$",
+            )
+            self.assertEqual(
+                set(report["provenance"]["runtime_dependencies"]),
+                {"python", "torch", "numpy", "safetensors"},
             )
             self.assertEqual(json.loads(preflight_output.read_text()), report)
             events = [
@@ -313,9 +338,7 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
             self.assertEqual(synchronous.returncode, 0, synchronous.stderr)
             synchronous_report = json.loads(synchronous.stdout)
             self.assertEqual(
-                synchronous_report["provenance"]["execution"][
-                    "expert_prefetch_policy"
-                ],
+                synchronous_report["provenance"]["execution"]["expert_prefetch_policy"],
                 "disabled",
             )
             self.assertEqual(

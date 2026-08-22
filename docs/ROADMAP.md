@@ -26,10 +26,13 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
   43 Layer, native Sparse-Attention, exakte blockskalierte MXFP8/FP4-
   Dekodierung mit FP32-Akkumulation, HyperConnections, globaler Head und
   stateful Decode unter 16-GB-RAM-/12-GiB-Cache-Grenzen.
-- [x] DeepSeek-Layerwise-Proof-Schema v3 mit gebundener Runtime-Identität und
-  manipulationssichtbarem Hash-Chain-Journal v2.
-- [x] Exaktes Routed-Expert-Prefetch `exact-router-one-ahead/v1`: ein Worker,
-  ein ausstehendes Ticket, 14-MiB-Payloadgrenze und bitgleiche A/B-Ausgabe.
+- [x] DeepSeek-Layerwise-Proof-Schema v4 mit gebundener Modell-, Package-,
+  CLI-, Streamer-, HF-Range-, Snapshot- und Dependency-Identität; getrennt
+  davon ein manipulationssichtbares Hash-Chain-Journal v2 für item-major
+  Benchmarks.
+- [x] Exaktes Routed-Expert-Prefetch `exact-router-window-2x3/v1`: zwei
+  I/O-Worker, höchstens zwei Futures und drei residente/inflight Experts,
+  14 MiB pro Expert, 48 MiB Gesamtgrenze und bitgleiche A/B-Ausgabe.
 - [x] FERTIG-GSM8K-Vollsplit mit Item-Provenienz und hartem Wrong-Gate:
   1.060 korrekt, 259 abstinent, 0 falsch, 0 Fehler.
 - [x] FERTIG-Grammatik für endliche affine Rekurrenzen mit exaktem
@@ -42,8 +45,9 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
 
 Als nächstes läuft ein frischer, unverfälschter MMLU-`off`-Content-Gate mit
 offiziellem Encoding, festem Split und kandidatengestütztem Scoring. Der Lauf
-beginnt in einem neuen Proof-v3-Verzeichnis, schreibt Journal v2 und bindet
-Runtime, Revision, Items, Seeds, Bytes, Requests, Zeit und Cachebilanz. Erst
+beginnt in einem neuen Proof-v4-Verzeichnis und publiziert jede BF16-
+Aktivierungsgeneration samt Manifest atomar und content-addressed. Runtime,
+Dependencies, Revision, Items, Bytes, Zeit und Cachebilanz sind gebunden. Erst
 wenn diese Baseline inhaltlich valide ist, folgen gepaarte CRSA-Ablationen.
 Token-Smokes und der Prefetch-Transportbenchmark sind keine Qualitätsclaims.
 

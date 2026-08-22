@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -308,11 +309,22 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
                     expert_prefetch=enabled,
                 ),
             )
-            hidden, evidence = model.hidden_one_token(7)
-            return hidden, evidence, model.pager.metrics()
+            calls: list[str] = []
+            expert = model._expert
 
-        expected, expected_evidence, off_metrics = execute(False)
-        actual, actual_evidence, on_metrics = execute(True)
+            def traced_expert(x, base, *args, **kwargs):
+                if base.endswith("shared_experts"):
+                    self.assertIsNone(model.pager._active_prefetch_window)
+                    self.assertIsNone(model.pager._active_prefetch_payload)
+                calls.append(base)
+                return expert(x, base, *args, **kwargs)
+
+            with mock.patch.object(model, "_expert", side_effect=traced_expert):
+                hidden, evidence = model.hidden_one_token(7)
+            return hidden, evidence, model.pager.metrics(), calls
+
+        expected, expected_evidence, off_metrics, off_calls = execute(False)
+        actual, actual_evidence, on_metrics, on_calls = execute(True)
         self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(actual_evidence.selected_experts, ((0, 1),))
         self.assertEqual(
@@ -322,10 +334,144 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
         self.assertEqual(off_metrics["expert_prefetch_policy"], "disabled")
         self.assertEqual(
             on_metrics["expert_prefetch_policy"],
-            "exact-router-one-ahead/v1",
+            "exact-router-window-2x3/v1",
         )
         self.assertEqual(on_metrics["expert_prefetch_submitted"], 2)
         self.assertEqual(on_metrics["expert_prefetch_consumed"], 2)
+        self.assertEqual(on_calls, off_calls)
+        self.assertEqual(
+            on_calls,
+            [
+                "layers.0.ffn.experts.0",
+                "layers.0.ffn.experts.1",
+                "layers.0.ffn.shared_experts",
+            ],
+        )
+
+    def test_batched_moe_closes_window_before_shared_and_preserves_index_add(
+        self,
+    ) -> None:
+        from dataclasses import replace
+
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager, StreamedDeepSeekV4
+
+        config = replace(_config(), n_activated_experts=2)
+
+        def execute(enabled: bool):
+            model = StreamedDeepSeekV4(
+                config,
+                DeepSeekWeightPager(
+                    _PrefetchQuantizedTinyCheckpoint(),
+                    device="cpu",
+                    compute_dtype="float32",
+                    expert_prefetch=enabled,
+                ),
+            )
+            calls: list[str] = []
+            expert = model._expert
+
+            def traced_expert(x, base, *args, **kwargs):
+                if base.endswith("shared_experts"):
+                    self.assertIsNone(model.pager._active_prefetch_window)
+                    self.assertIsNone(model.pager._active_prefetch_payload)
+                calls.append(base)
+                return expert(x, base, *args, **kwargs)
+
+            with mock.patch.object(model, "_expert", side_effect=traced_expert):
+                hidden, selected = model._moe(
+                    torch.zeros((2, 128), dtype=torch.float32),
+                    0,
+                    torch.asarray([7, 7], dtype=torch.long),
+                )
+            return hidden, selected, calls
+
+        expected, expected_selected, expected_calls = execute(False)
+        actual, actual_selected, actual_calls = execute(True)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(actual_selected, expected_selected)
+        self.assertEqual(actual_calls, expected_calls)
+        self.assertEqual(
+            actual_calls,
+            [
+                "layers.0.ffn.experts.0",
+                "layers.0.ffn.experts.1",
+                "layers.0.ffn.shared_experts",
+            ],
+        )
+
+    def test_reverse_io_completion_keeps_serial_moe_bit_exact(self) -> None:
+        from dataclasses import replace
+        import threading
+
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager, StreamedDeepSeekV4
+        from test_deepseek_v4_pager import _WindowExpertSource
+
+        config = replace(_config(), n_activated_experts=2)
+        reference = StreamedDeepSeekV4(
+            config,
+            DeepSeekWeightPager(
+                _PrefetchQuantizedTinyCheckpoint(),
+                device="cpu",
+                compute_dtype="float32",
+            ),
+        )
+        expected, expected_evidence = reference.hidden_one_token(7)
+
+        bases = [f"layers.0.ffn.experts.{expert}" for expert in range(2)]
+        source = _PrefetchQuantizedTinyCheckpoint()
+        reverse = _WindowExpertSource(bases)
+        source.encoded_experts = reverse
+        source.data.update(reverse.data)
+        model = StreamedDeepSeekV4(
+            config,
+            DeepSeekWeightPager(source, device="cpu", compute_dtype="float32"),
+        )
+        finished = threading.Event()
+        results: list[tuple[object, object]] = []
+        raised: list[BaseException] = []
+        calls: list[str] = []
+        expert = model._expert
+
+        def traced_expert(x, base, *args, **kwargs):
+            calls.append(base)
+            return expert(x, base, *args, **kwargs)
+
+        def execute() -> None:
+            try:
+                with mock.patch.object(model, "_expert", side_effect=traced_expert):
+                    results.append(model.hidden_one_token(7))
+            except BaseException as exc:
+                raised.append(exc)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=execute)
+        worker.start()
+        self.assertTrue(reverse.started[bases[0]].wait(timeout=2))
+        self.assertTrue(reverse.started[bases[1]].wait(timeout=2))
+        reverse.release[bases[1]].set()
+        self.assertTrue(reverse.completed[bases[1]].wait(timeout=2))
+        self.assertFalse(finished.is_set())
+        reverse.release[bases[0]].set()
+        self.assertTrue(finished.wait(timeout=3))
+        worker.join(timeout=1)
+        self.assertEqual(raised, [])
+        self.assertEqual(len(results), 1)
+        actual, evidence = results[0]
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(evidence.selected_experts, expected_evidence.selected_experts)
+        self.assertEqual(
+            calls,
+            [
+                "layers.0.ffn.experts.0",
+                "layers.0.ffn.experts.1",
+                "layers.0.ffn.shared_experts",
+            ],
+        )
 
     def test_moe_failure_detaches_blocked_next_prefetch(self) -> None:
         from dataclasses import replace

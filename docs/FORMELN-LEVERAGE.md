@@ -18,10 +18,11 @@ Bytebudget, atomaren Cache und SHA-geprüften Resume. Der Streamer instanziiert
 kein Donormodell und ist nicht heimlich mit dem Antwortpfad verbunden.
 
 Der DeepSeek-Hauptpfad nutzt dieselbe Selektivität jetzt konservativ als
-`exact-router-one-ahead/v1`: Erst der offizielle Router entscheidet, danach
-liest genau ein Worker mit genau einem ausstehenden Ticket den nächsten
-Routed Expert vor. Die Payloadgrenze beträgt 14 MiB; Reihenfolge, Werte und
-serielle FP32-Akkumulation bleiben unverändert.
+`exact-router-window-2x3/v1`: Erst der offizielle Router entscheidet, danach
+lesen zwei Worker höchstens zwei vorab vollständig geplante Expert-Ranges
+parallel. Maximal drei Experts beziehungsweise 48 MiB Rohpayload sind
+resident/inflight, jeder einzelne bleibt unter 14 MiB. Konsumreihenfolge,
+Werte und serielle FP32-Akkumulation bleiben unverändert.
 
 **NEGATIV als Retrieval-Mechanismus:** Statisches Embedding-Mittel
 → `gate_proj` → Value-Sketch erreichte 24 % gegen 32 % Placebo bei
@@ -81,20 +82,26 @@ Fähigkeit, keine nachträgliche Optimierung am GSM8K-Split.
 - **Frontier-Decoder:** der gepinnte DeepSeek-V4-Flash-Hauptpfad läuft über
   alle 43 Layer mit nativer komprimierter Sparse-Attention, exakter
   blockskalierter MXFP8/FP4-Dekodierung, FP32-Akkumulation, HyperConnections,
-  globalem Head und stateful Decode. Layerwise Proof-Schema v3 bindet die
-  Runtime; Journal v2 bildet eine kanonische Hash-Kette.
-- **Exakter Expert-Transport:** offizielles 2-Expert-MPS-BF16-A/B ist
-  bitgleich. Nach zwei symmetrischen Warmups und 20 alternierenden Trials:
-  0,447971 s ohne gegen 0,409933 s mit Prefetch, also 1,092790×, bei
-  26.738.688 B Peak und null neuen Quellbytes. Das belegt nur Transport-
-  Überlappung, nicht Modellqualität oder Frontier-Parität.
+  globalem Head und stateful Decode. Layerwise Proof-Schema v4 bindet auch
+  Package-Exports, das konkrete CLI, Streamer, HF-Range-Reader, Snapshot und
+  Dependency-Versionen. Das getrennte item-major Journal v2 bildet eine
+  kanonische Hash-Kette.
+- **Exakter Expert-Transport:** offizielle 3-Expert-MPS-BF16-A/Bs sind
+  bitgleich. Warm, nach zwei symmetrischen Warmups und 20 alternierenden
+  Trials: 0,548137 s ohne gegen 0,464826 s mit Fenster, also 1,179230×.
+  Ohne Range-Cache, nach einem Warmup und 8 alternierenden Trials:
+  6,452119 s gegen 6,321257 s, also konservativ nur 1,020702×. Der Median
+  beträgt 1,126882×; ein 8,977372-s-Ausreißer macht die Netzwerkmessung noch
+  nicht stabil. Peak jeweils exakt 40.108.032 B. Das belegt exakte begrenzte
+  Transport-Überlappung, aber noch keinen stabilen End-to-End-Speedup,
+  Modellqualität oder Frontier-Parität.
 
 ## Hebel-Ranking
 
 1. **Lokale v0.7-Akzeptanz konservieren:** Frozen A1, vier Organe, Router,
    FERTIG-Guards, Artefakt-Digests und Wheel-Isolation gemeinsam golden halten.
 2. **DeepSeek-Inhaltsgate messen:** zuerst einen frischen MMLU-`off`-Lauf mit
-   offiziellem Encoding, festem Split, Proof-Schema v3 und Journal v2; erst
+   offiziellem Encoding, festem Split und atomarem Proof-Schema v4; erst
    danach gepaarte Graft-Ablationen unter gleicher Byte-/Cachebilanz.
 3. **Breiteren Router-Kontrast messen:** deduplizierter Fachsplit mit gleichem
    Budget für CRSA, kausale Softmax, Roh-A1 und permutierte Labels.

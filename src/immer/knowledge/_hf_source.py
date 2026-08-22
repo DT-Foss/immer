@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -104,9 +105,13 @@ class _BudgetLike(Protocol):
 def _response_overhead(response: Any) -> int:
     """Stable approximation of request/status/header transfer overhead."""
     status_line = f"HTTP/1.1 {getattr(response, 'status', 0)}\r\n"
-    response_headers = "".join(f"{key}: {value}\r\n" for key, value in response.headers.items())
-    return 64 + len(status_line.encode("latin-1", "replace")) + len(
-        response_headers.encode("latin-1", "replace")
+    response_headers = "".join(
+        f"{key}: {value}\r\n" for key, value in response.headers.items()
+    )
+    return (
+        64
+        + len(status_line.encode("latin-1", "replace"))
+        + len(response_headers.encode("latin-1", "replace"))
     )
 
 
@@ -140,12 +145,17 @@ class HFRangeReader:
         self.repo = repo
         self.rev = revision
         self.budget = budget or Budget(200.0)
-        self.endpoint = (endpoint or os.environ.get("HF_ENDPOINT") or DEFAULT_ENDPOINT).rstrip("/")
+        self.endpoint = (
+            endpoint or os.environ.get("HF_ENDPOINT") or DEFAULT_ENDPOINT
+        ).rstrip("/")
         self.timeout = float(timeout)
         self.opener = opener or urllib.request.build_opener()
         self.file_info: dict[str, dict[str, Any]] = {}
         self._cdn: dict[str, tuple[str, float]] = {}
-        self._lock = threading.Lock()
+        # Signed-URL state and the identity derived from its response must
+        # move together.  An RLock lets the small snapshot/update helpers be
+        # composed without serializing the network read itself.
+        self._lock = threading.RLock()
 
     def resolve_url(self, filename: str) -> str:
         repo = urllib.parse.quote(self.repo, safe="/")
@@ -172,26 +182,74 @@ class HFRangeReader:
                 return cached[0]
         return self.resolve_url(filename)
 
+    def update_file_info(
+        self,
+        filename: str,
+        values: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically merge and return one file's source metadata."""
+
+        with self._lock:
+            info = self.file_info.setdefault(filename, {})
+            info.update(values)
+            return dict(info)
+
+    def file_info_snapshot(self, filename: str) -> dict[str, Any]:
+        """Return a copy that cannot observe or cause a partial update."""
+
+        with self._lock:
+            return dict(self.file_info.get(filename, {}))
+
+    def source_identity_snapshot(self, filename: str) -> dict[str, str]:
+        """Return known remote identity without claiming a freshness check.
+
+        Unlike a local reader's authoritative ``source_identity()``, this is
+        only metadata observed on prior HTTP responses.  Keeping the names
+        distinct prevents an inventory resume from treating a remote snapshot
+        as a live local-file stat.
+        """
+
+        info = self.file_info_snapshot(filename)
+        return {
+            key: str(info[key])
+            for key in ("cas_url_hash", "etag", "size")
+            if info.get(key) is not None
+        }
+
     def _remember_response(self, filename: str, response: Any) -> None:
         final_url = str(response.geturl())
-        if final_url != self.resolve_url(filename):
-            with self._lock:
-                self._cdn[filename] = (final_url, _location_expiry(final_url))
-        info = self.file_info.setdefault(filename, {})
+        updates: dict[str, Any] = {
+            "cdn_host": urllib.parse.urlparse(final_url).netloc,
+        }
         etag = response.headers.get("ETag")
         if etag:
-            info["etag"] = etag
+            updates["etag"] = etag
         match = re.search(r"/([0-9a-f]{64})(?:\?|$)", final_url)
         if match:
-            info["cas_url_hash"] = match.group(1)
-        info["cdn_host"] = urllib.parse.urlparse(final_url).netloc
+            updates["cas_url_hash"] = match.group(1)
+        content_range = response.headers.get("Content-Range", "")
+        range_match = re.fullmatch(r"bytes \d+-\d+/(\d+|\*)", content_range)
+        content_length = response.headers.get("Content-Length")
+        status_raw = getattr(response, "status", None)
+        status = int(status_raw if status_raw is not None else response.getcode())
+        if range_match is not None and range_match.group(1) != "*":
+            updates["size"] = int(range_match.group(1))
+        elif status == 200 and content_length and content_length.isdigit():
+            updates["size"] = int(content_length)
+
+        with self._lock:
+            if final_url != self.resolve_url(filename):
+                self._cdn[filename] = (final_url, _location_expiry(final_url))
+            self.file_info.setdefault(filename, {}).update(updates)
 
     def _open(self, filename: str, *, byte_range: tuple[int, int] | None = None) -> Any:
         last: Exception | None = None
         for attempt in range(3):
             url = self._source_url(filename)
             used_cached_url = url != self.resolve_url(filename)
-            request = urllib.request.Request(url, headers=self._headers(byte_range=byte_range))
+            request = urllib.request.Request(
+                url, headers=self._headers(byte_range=byte_range)
+            )
             try:
                 response = self.opener.open(request, timeout=self.timeout)
                 self._remember_response(filename, response)
@@ -244,16 +302,20 @@ class HFRangeReader:
                     or int(match.group(2)) != end
                 ):
                     body = response.read(expected + 1)
-                    self.budget.charge(len(body), overhead, f"bad-range:{filename}:{start}")
+                    self.budget.charge(
+                        len(body), overhead, f"bad-range:{filename}:{start}"
+                    )
                     raise SourceRangeError(
                         f"Content-Range-Mismatch bei {filename}: erwartet {start}-{end}, "
                         f"bekommen {content_range!r}"
                     )
                 if match.group(3) != "*":
-                    self.file_info.setdefault(filename, {})["size"] = int(match.group(3))
+                    self.update_file_info(filename, {"size": int(match.group(3))})
             elif status != 200 or start != 0:
                 body = response.read(expected + 1)
-                self.budget.charge(len(body), overhead, f"bad-status:{filename}:{start}")
+                self.budget.charge(
+                    len(body), overhead, f"bad-status:{filename}:{start}"
+                )
                 raise SourceRangeError(
                     f"Server lieferte HTTP {status} statt einer exakten Range fuer {filename}"
                 )
@@ -266,7 +328,7 @@ class HFRangeReader:
                 f"Range {filename}[{start}-{end}] lieferte {len(body)}/{expected} Bytes"
             )
         if status == 200:
-            self.file_info.setdefault(filename, {})["size"] = len(body)
+            self.update_file_info(filename, {"size": len(body)})
         return body
 
     def fetch_file_bounded(self, filename: str, max_bytes: int) -> bytes:
@@ -279,7 +341,9 @@ class HFRangeReader:
             response.close()
             raise self.budget.exceeded_error(f"Kein Bytebudget fuer {filename!r}")
         declared_raw = response.headers.get("Content-Length")
-        declared = int(declared_raw) if declared_raw and declared_raw.isdigit() else None
+        declared = (
+            int(declared_raw) if declared_raw and declared_raw.isdigit() else None
+        )
         ceiling = min(int(max_bytes), remaining)
         if declared is not None and declared > ceiling:
             response.close()
@@ -306,7 +370,7 @@ class HFRangeReader:
             raise SourceRangeError(
                 f"Laenge von {filename!r} ist unbekannt und erreicht die harte Grenze {ceiling}"
             )
-        self.file_info.setdefault(filename, {})["size"] = len(body)
+        self.update_file_info(filename, {"size": len(body)})
         return body
 
     def fetch_file(self, filename: str) -> bytes:
@@ -388,7 +452,9 @@ def scan_inventory(reader: Any, budget: _BudgetLike) -> dict[str, Any]:
         shard_files = sorted({str(filename) for filename in weight_map.values()})
         inventory["index_bytes"] = len(index_raw)
         total_size = index.get("metadata", {}).get("total_size")
-        inventory["index_total_size"] = int(total_size) if total_size is not None else None
+        inventory["index_total_size"] = (
+            int(total_size) if total_size is not None else None
+        )
     except SourceNotFound:
         shard_files = ["model.safetensors"]
 
@@ -400,11 +466,15 @@ def scan_inventory(reader: Any, budget: _BudgetLike) -> dict[str, Any]:
             if not isinstance(entry, dict):
                 raise SourceError(f"Tensor-Metadaten fuer {name!r} sind ungueltig")
             try:
-                offset_begin, offset_end = (int(value) for value in entry["data_offsets"])
+                offset_begin, offset_end = (
+                    int(value) for value in entry["data_offsets"]
+                )
                 shape = [int(value) for value in entry["shape"]]
                 dtype = str(entry["dtype"])
             except (KeyError, TypeError, ValueError) as exc:
-                raise SourceError(f"Tensor-Metadaten fuer {name!r} sind unvollstaendig") from exc
+                raise SourceError(
+                    f"Tensor-Metadaten fuer {name!r} sind unvollstaendig"
+                ) from exc
             numel = math.prod(shape) if shape else 1
             byte_count = offset_end - offset_begin
             inventory["tensors"].append(

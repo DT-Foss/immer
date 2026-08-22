@@ -12,6 +12,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
+import immer.runtimes.deepseek_v4.provenance as runtime_provenance
 from immer.runtimes.deepseek_v4 import (
     DeepSeekV4SnapshotError,
     DeepSeekWeightPager,
@@ -203,16 +204,39 @@ class DeepSeekV4SnapshotTests(unittest.TestCase):
         with self._temporary_directory() as directory:
             path = Path(directory) / "identity.json"
             source = self._compressed_model(4, graft=True)
-            source.prefill([[2, 3, 5, 7]], tokenwise=False)
             source.save_state(path)
             manifest = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(
                 manifest["body"]["identity"]["runtime"]["schema"],
-                "immer.streamed-deepseek-v4/native-stateful-v2",
+                "immer.streamed-deepseek-v4/native-stateful-v3",
             )
+            runtime = manifest["body"]["identity"]["runtime"]
             self.assertRegex(
-                manifest["body"]["identity"]["runtime"]["source_sha256"],
+                runtime["source_sha256"],
                 r"^[0-9a-f]{64}$",
+            )
+            self.assertRegex(runtime["dependency_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                runtime["source_sha256"],
+                hashlib.sha256(_canonical(runtime["sources"])).hexdigest(),
+            )
+            self.assertEqual(
+                set(runtime["dependencies"]),
+                {"python", "torch", "numpy", "safetensors"},
+            )
+            self.assertEqual(
+                runtime["dependency_sha256"],
+                hashlib.sha256(_canonical(runtime["dependencies"])).hexdigest(),
+            )
+            paths = {row["path"] for row in runtime["sources"]}
+            self.assertTrue(
+                {
+                    "immer/runtimes/deepseek_v4/__init__.py",
+                    "immer/runtimes/deepseek_v4/snapshot.py",
+                    "immer/knowledge/__init__.py",
+                    "immer/knowledge/streamer.py",
+                    "immer/knowledge/_hf_source.py",
+                }.issubset(paths)
             )
             self.assertEqual(
                 manifest["body"]["identity"]["execution"][
@@ -225,10 +249,20 @@ class DeepSeekV4SnapshotTests(unittest.TestCase):
                 "v4-native-fp8-kv+fp4-hadamard-indexer/v1",
             )
             self.assertEqual(
-                manifest["body"]["identity"]["execution"][
-                    "expert_prefetch_policy"
-                ],
-                "exact-router-one-ahead/v1",
+                manifest["body"]["identity"]["execution"]["expert_prefetch_policy"],
+                "exact-router-window-2x3/v1",
+            )
+            execution = manifest["body"]["identity"]["execution"]
+            self.assertEqual(
+                execution["expert_prefetch_transport_policy"],
+                "streamer-exact-range/v1",
+            )
+            self.assertEqual(execution["expert_prefetch_workers"], 2)
+            self.assertEqual(execution["expert_prefetch_max_outstanding"], 2)
+            self.assertEqual(execution["expert_prefetch_max_experts"], 3)
+            self.assertEqual(
+                execution["expert_prefetch_resident_limit_bytes"],
+                48 * 1024**2,
             )
 
             incompatible_prefetch = self._compressed_model(4, graft=True)
@@ -251,6 +285,49 @@ class DeepSeekV4SnapshotTests(unittest.TestCase):
             incompatible_attention.ATTENTION_QAT_POLICY = "diagnostic-no-qat/v0"
             with self.assertRaisesRegex(DeepSeekV4SnapshotError, "identity mismatch"):
                 incompatible_attention.load_state(path)
+
+    def test_snapshot_resume_binds_source_hashes_and_dependency_versions(self) -> None:
+        with self._temporary_directory() as directory:
+            path = Path(directory) / "proof-envelope.json"
+            source = self._compressed_model(4)
+            source.save_state(path)
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            runtime = manifest["body"]["identity"]["runtime"]
+
+            original_sha256 = runtime_provenance._sha256_file
+            for suffix in (
+                "runtimes/deepseek_v4/__init__.py",
+                "runtimes/deepseek_v4/snapshot.py",
+                "knowledge/__init__.py",
+                "knowledge/streamer.py",
+                "knowledge/_hf_source.py",
+            ):
+                with self.subTest(mutated_source=suffix):
+
+                    def changed_hash(path, *, target=suffix):
+                        digest = original_sha256(path)
+                        return "f" * 64 if path.as_posix().endswith(target) else digest
+
+                    with patch.object(
+                        runtime_provenance,
+                        "_sha256_file",
+                        side_effect=changed_hash,
+                    ):
+                        with self.assertRaisesRegex(
+                            DeepSeekV4SnapshotError, "identity mismatch"
+                        ):
+                            self._compressed_model(4).load_state(path)
+
+            changed_dependencies = dict(runtime["dependencies"])
+            changed_dependencies["safetensors"] += ".mutated"
+            with patch(
+                "immer.runtimes.deepseek_v4.model.runtime_dependency_versions",
+                return_value=changed_dependencies,
+            ):
+                with self.assertRaisesRegex(
+                    DeepSeekV4SnapshotError, "identity mismatch"
+                ):
+                    self._compressed_model(4).load_state(path)
 
     def test_oversize_and_shape_bombs_are_rejected_before_restore(self) -> None:
         with self._temporary_directory() as directory:

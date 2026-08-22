@@ -30,6 +30,7 @@ from immer.runtimes.deepseek_v4 import (
     DeepSeekV4Config,
     DeepSeekWeightPager,
     StreamedDeepSeekV4,
+    runtime_dependency_versions,
     runtime_source_manifest,
 )
 from immer.runtimes.deepseek_v4.benchmark import (
@@ -1440,8 +1441,17 @@ def _build_report(
         "expert_prefetch_payload_limit_bytes": header[
             "expert_prefetch_payload_limit_bytes"
         ],
+        "expert_prefetch_transport_policy": header["expert_prefetch_transport_policy"],
+        "expert_prefetch_workers": header["expert_prefetch_workers"],
+        "expert_prefetch_max_outstanding": header["expert_prefetch_max_outstanding"],
+        "expert_prefetch_max_experts": header["expert_prefetch_max_experts"],
+        "expert_prefetch_resident_limit_bytes": header[
+            "expert_prefetch_resident_limit_bytes"
+        ],
         "runtime_source_sha256": header["runtime_source_sha256"],
         "runtime_sources": header["runtime_sources"],
+        "runtime_dependency_sha256": header["runtime_dependency_sha256"],
+        "runtime_dependencies": header["runtime_dependencies"],
         "budgets": {
             "source_limit_bytes_per_process": int(source.budget.limit),
             "source_used_bytes_this_process": int(source.bytes_moved()),
@@ -1567,6 +1577,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     script_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     runtime_sources = runtime_source_manifest(extra_files=("benchmark.py",))
     runtime_source_sha256 = canonical_digest(runtime_sources)
+    runtime_dependencies = runtime_dependency_versions()
+    runtime_dependency_sha256 = canonical_digest(runtime_dependencies)
     provenance = BenchmarkProvenance(
         model_id=source_label,
         model_revision=args.revision,
@@ -1596,8 +1608,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "expert_prefetch_payload_limit_bytes": (
                 DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
             ),
+            "expert_prefetch_transport_policy": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
+            ),
+            "expert_prefetch_workers": DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS,
+            "expert_prefetch_max_outstanding": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_MAX_OUTSTANDING
+            ),
+            "expert_prefetch_max_experts": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_MAX_EXPERTS
+            ),
+            "expert_prefetch_resident_limit_bytes": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+            ),
             "runtime_source_sha256": runtime_source_sha256,
             "runtime_sources": runtime_sources,
+            "runtime_dependency_sha256": runtime_dependency_sha256,
+            "runtime_dependencies": runtime_dependencies,
             "tokenizer_location": (
                 "pretokenized-token-ids/v1" if tokenizer is None else tokenizer.location
             ),
@@ -1642,8 +1669,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "expert_prefetch_payload_limit_bytes": (
             DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
         ),
+        "expert_prefetch_transport_policy": (
+            DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
+        ),
+        "expert_prefetch_workers": DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS,
+        "expert_prefetch_max_outstanding": (
+            DeepSeekWeightPager.EXPERT_PREFETCH_MAX_OUTSTANDING
+        ),
+        "expert_prefetch_max_experts": DeepSeekWeightPager.EXPERT_PREFETCH_MAX_EXPERTS,
+        "expert_prefetch_resident_limit_bytes": (
+            DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+        ),
         "runtime_source_sha256": runtime_source_sha256,
         "runtime_sources": runtime_sources,
+        "runtime_dependency_sha256": runtime_dependency_sha256,
+        "runtime_dependencies": runtime_dependencies,
         "device": args.device,
         "dtype": args.dtype,
         "head_block_rows": args.head_block_rows,
@@ -1695,8 +1735,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "expert_prefetch_payload_limit_bytes": (
             DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
         ),
+        "expert_prefetch_transport_policy": (
+            DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
+        ),
+        "expert_prefetch_workers": DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS,
+        "expert_prefetch_max_outstanding": (
+            DeepSeekWeightPager.EXPERT_PREFETCH_MAX_OUTSTANDING
+        ),
+        "expert_prefetch_max_experts": DeepSeekWeightPager.EXPERT_PREFETCH_MAX_EXPERTS,
+        "expert_prefetch_resident_limit_bytes": (
+            DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+        ),
         "runtime_source_sha256": runtime_source_sha256,
         "runtime_sources": runtime_sources,
+        "runtime_dependency_sha256": runtime_dependency_sha256,
+        "runtime_dependencies": runtime_dependencies,
         "closed_set_gsm8k_is_noncanonical": (
             "gsm8k_closed_set_candidate_token_diagnostic" in benchmark_protocols
         ),

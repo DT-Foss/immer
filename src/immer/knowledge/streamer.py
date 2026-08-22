@@ -68,6 +68,8 @@ class TensorEncodingError(InventoryValidationError):
 class TensorSource(Protocol):
     """Small public contract consumed by retrieval and analysis code."""
 
+    def prepare_parallel_reads(self) -> int: ...
+
     def inventory(self, *, refresh: bool = False) -> dict[str, Any]: ...
 
     def find(self, name: str) -> dict[str, Any]: ...
@@ -448,7 +450,35 @@ class _ContractReader:
             if self._reserved < 0:
                 self._reserved = 0
 
+    def update_file_info(
+        self,
+        filename: str,
+        values: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Merge source metadata through the upstream's synchronization API."""
+
+        update = getattr(self.upstream, "update_file_info", None)
+        if callable(update):
+            return dict(update(filename, values))
+        with self._lock:
+            info = self.file_info.setdefault(filename, {})
+            info.update(values)
+            return dict(info)
+
+    def file_info_snapshot(self, filename: str) -> dict[str, Any]:
+        snapshot = getattr(self.upstream, "file_info_snapshot", None)
+        if callable(snapshot):
+            return dict(snapshot(filename))
+        with self._lock:
+            return dict(self.file_info.get(filename, {}))
+
     def _identity(self, filename: str) -> dict[str, str]:
+        identity_snapshot = getattr(self.upstream, "source_identity_snapshot", None)
+        if callable(identity_snapshot):
+            return {
+                str(key): str(value)
+                for key, value in identity_snapshot(filename).items()
+            }
         current_identity = getattr(self.upstream, "source_identity", None)
         if callable(current_identity):
             try:
@@ -460,7 +490,7 @@ class _ContractReader:
                 raise CacheIntegrityError(
                     f"Cache-Quelldatei fehlt inzwischen: {filename}"
                 ) from exc
-        info = self.file_info.get(filename, {})
+        info = self.file_info_snapshot(filename)
         return {
             key: str(info[key])
             for key in ("cas_url_hash", "etag", "size")
@@ -958,12 +988,12 @@ class _ContractReader:
                 f"Safetensors-Header ist kein Objekt: {filename}"
             )
         metadata = header.pop("__metadata__", None)
-        info = self.file_info.setdefault(filename, {})
-        info["header_len"] = header_length
+        updates: dict[str, Any] = {"header_len": header_length}
         if isinstance(metadata, Mapping):
-            info["st_metadata"] = {
+            updates["st_metadata"] = {
                 str(key): str(value)[:200] for key, value in list(metadata.items())[:8]
             }
+        info = self.update_file_info(filename, updates)
         return header, 8 + header_length, info
 
 
@@ -1035,6 +1065,7 @@ class Streamer:
         self._inventory: dict[str, Any] | None = None
         self._tensor_index: dict[str, dict[str, Any]] | None = None
         self._tensor_index_inventory_id: int | None = None
+        self._state_lock = threading.RLock()
         self._inventory_cache_hits = 0
         self._inventory_cache_writes = 0
         self._inventory_fingerprint: str | None = None
@@ -1080,22 +1111,33 @@ class Streamer:
 
     @property
     def reader(self) -> _ContractReader:
-        if self._reader is None:
+        reader = self._reader
+        if reader is not None:
+            return reader
+        with self._state_lock:
+            reader = self._reader
+            if reader is not None:
+                return reader
             upstream = self._upstream
             if upstream is None:
-                upstream = HFRangeReader(self.repo_id, revision=self.revision)
+                upstream = HFRangeReader(
+                    self.repo_id,
+                    revision=self.revision,
+                    budget=self.budget,
+                )
             if hasattr(upstream, "repo"):
                 upstream.repo = self.repo_id
             if hasattr(upstream, "rev"):
                 upstream.rev = self.revision
-            self._reader = _ContractReader(
+            reader = _ContractReader(
                 upstream,
                 self.budget,
                 self._cache_dir,
                 max_metadata_bytes=self._max_metadata_bytes,
                 max_cache_bytes=self._max_cache_bytes,
             )
-        return self._reader
+            self._reader = reader
+            return reader
 
     def _cache_slug(self) -> str:
         readable = re.sub(r"[^A-Za-z0-9_-]+", "-", self.repo_id).strip("-")[:48]
@@ -1229,10 +1271,12 @@ class Streamer:
         for shard in inventory.get("shards", []):
             if not isinstance(shard, Mapping) or not isinstance(shard.get("file"), str):
                 continue
-            info = self.reader.file_info.setdefault(shard["file"], {})
+            values: dict[str, Any] = {}
             for key in ("size", "etag", "cas_url_hash", "header_len"):
                 if shard.get(key) is not None:
-                    info[key] = shard[key]
+                    values[key] = shard[key]
+            if values:
+                self.reader.update_file_info(shard["file"], values)
 
     def _validate_inventory(self, document: Mapping[str, Any]) -> None:
         if (
@@ -1299,6 +1343,10 @@ class Streamer:
 
     def inventory(self, *, refresh: bool = False) -> dict[str, Any]:
         """Return the header-only inventory, using a verified resume cache."""
+        with self._state_lock:
+            return self._inventory_locked(refresh=refresh)
+
+    def _inventory_locked(self, *, refresh: bool) -> dict[str, Any]:
         if self._inventory is not None and not refresh:
             return self._inventory
         if not refresh and self._cache_dir is not None:
@@ -1340,14 +1388,10 @@ class Streamer:
         self._write_inventory_cache(self._inventory)
         return self._inventory
 
-    def tensors(self) -> list[dict[str, Any]]:
-        """Return a shallow copy of all tensor metadata entries."""
-        return [dict(entry) for entry in self.inventory().get("tensors", [])]
-
-    def find(self, name: str) -> dict[str, Any]:
-        if not isinstance(name, str) or not name:
-            raise ValueError("Tensorname muss ein nichtleerer String sein")
-        inventory = self.inventory()
+    def _ensure_tensor_index_locked(
+        self,
+        inventory: Mapping[str, Any],
+    ) -> dict[str, dict[str, Any]]:
         if self._tensor_index is None or self._tensor_index_inventory_id != id(
             inventory
         ):
@@ -1356,7 +1400,34 @@ class Streamer:
                 for entry in inventory.get("tensors", [])
             }
             self._tensor_index_inventory_id = id(inventory)
-        entry = self._tensor_index.get(name)
+        return self._tensor_index
+
+    def prepare_parallel_reads(self) -> int:
+        """Materialize shared metadata before launching ``raw_bytes`` workers.
+
+        Call this on the owner/main thread, resolve tensor names there with
+        :meth:`find`, and give workers only exact shard/offset/length triples.
+        Workers then share one contract reader and one hard byte budget while
+        independent cache keys remain able to perform upstream I/O in parallel.
+
+        Returns the number of indexed tensors.
+        """
+
+        with self._state_lock:
+            self.reader
+            inventory = self._inventory_locked(refresh=False)
+            return len(self._ensure_tensor_index_locked(inventory))
+
+    def tensors(self) -> list[dict[str, Any]]:
+        """Return a shallow copy of all tensor metadata entries."""
+        return [dict(entry) for entry in self.inventory().get("tensors", [])]
+
+    def find(self, name: str) -> dict[str, Any]:
+        if not isinstance(name, str) or not name:
+            raise ValueError("Tensorname muss ein nichtleerer String sein")
+        with self._state_lock:
+            inventory = self._inventory_locked(refresh=False)
+            entry = self._ensure_tensor_index_locked(inventory).get(name)
         if entry is not None:
             return dict(entry)
         raise KeyError(f"Tensor {name!r} nicht im Inventar von {self.repo_id}")

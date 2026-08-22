@@ -41,6 +41,7 @@ from immer.runtimes.deepseek_v4 import (
     DeepSeekV4Config,
     DeepSeekWeightPager,
     StreamedDeepSeekV4,
+    runtime_dependency_versions,
     runtime_source_manifest,
 )
 from immer.runtimes.deepseek_v4.graft import DeepSeekV4CrsaGraft
@@ -284,7 +285,9 @@ def _provenance(
     metrics = source.metrics()
     stateful = args.command == "generate"
     runtime_sources = runtime_source_manifest()
+    runtime_dependencies = runtime_dependency_versions()
     return {
+        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "source": source_label,
         "revision": args.revision,
         "revision_is_pinned": bool(metrics.get("revision_is_pinned")),
@@ -298,12 +301,12 @@ def _provenance(
         "inventory_fingerprint": metrics.get("inventory_source_fingerprint"),
         "runtime_source_sha256": _canonical_digest(runtime_sources),
         "runtime_sources": runtime_sources,
+        "runtime_dependency_sha256": _canonical_digest(runtime_dependencies),
+        "runtime_dependencies": runtime_dependencies,
         "execution": {
             "device": str(pager.device),
             "compute_dtype": str(pager.compute_dtype).removeprefix("torch."),
-            "activation_quantization": bool(
-                pager.simulate_activation_quantization
-            ),
+            "activation_quantization": bool(pager.simulate_activation_quantization),
             "quantized_accumulation_policy": (
                 DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
             ),
@@ -315,6 +318,19 @@ def _provenance(
             ),
             "expert_prefetch_payload_limit_bytes": (
                 DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
+            ),
+            "expert_prefetch_transport_policy": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
+            ),
+            "expert_prefetch_workers": DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS,
+            "expert_prefetch_max_outstanding": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_MAX_OUTSTANDING
+            ),
+            "expert_prefetch_max_experts": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_MAX_EXPERTS
+            ),
+            "expert_prefetch_resident_limit_bytes": (
+                DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
             ),
         },
         "decoder": {

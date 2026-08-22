@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce the official two-expert DeepSeek-V4 exact-prefetch A/B.
+"""Reproduce an official DeepSeek-V4 exact-prefetch-window A/B.
 
 This is a bounded transport/latency microbenchmark, not a model-quality claim.
 It evaluates the same routed experts, input, routing weights, and serial FP32
@@ -29,6 +29,7 @@ from immer.knowledge import Streamer
 from immer.runtimes.deepseek_v4 import (
     DeepSeekV4Config,
     DeepSeekWeightPager,
+    runtime_dependency_versions,
     runtime_source_manifest,
 )
 
@@ -37,8 +38,8 @@ ROOT = Path(__file__).resolve().parent.parent
 OFFICIAL_SOURCE = "deepseek-ai/DeepSeek-V4-Flash-0731"
 OFFICIAL_REVISION = "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
 DEFAULT_CACHE = ROOT / "artifacts" / "private" / "deepseek-v4-cache"
-DEFAULT_OUTPUT = ROOT / "results" / "deepseek-v4-exact-prefetch-smoke.json"
-RESULT_SCHEMA = "immer.deepseek-v4-exact-prefetch-smoke/v1"
+DEFAULT_OUTPUT = ROOT / "results" / "deepseek-v4-exact-prefetch-window-smoke.json"
+RESULT_SCHEMA = "immer.deepseek-v4-exact-prefetch-smoke/v2"
 _PINNED_REVISION = re.compile(r"[0-9a-fA-F]{40,64}")
 _PREFETCH_COUNTERS = (
     "expert_calls",
@@ -161,18 +162,18 @@ def _bounded_rows(raw: str) -> int:
     return value
 
 
-def _parse_experts(raw: str) -> tuple[int, int]:
+def _parse_experts(raw: str) -> tuple[int, ...]:
     try:
         values = tuple(int(part.strip()) for part in raw.split(","))
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            "experts must be two comma-separated integers"
+            "experts must be comma-separated integers"
         ) from exc
-    if len(values) != 2 or any(value < 0 for value in values):
+    if len(values) < 2 or any(value < 0 for value in values):
         raise argparse.ArgumentTypeError(
-            "experts must be two comma-separated non-negative integers"
+            "experts must contain at least two non-negative integers"
         )
-    if values[0] == values[1]:
+    if len(set(values)) != len(values):
         raise argparse.ArgumentTypeError("experts must be distinct")
     return values
 
@@ -189,12 +190,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("auto", "cpu", "mps"), default="auto")
     parser.add_argument("--dtype", choices=("auto", "bfloat16"), default="auto")
     parser.add_argument("--layer", type=_nonnegative_int, default=3)
-    parser.add_argument("--experts", type=_parse_experts, default=(0, 1))
+    parser.add_argument("--experts", type=_parse_experts, default=(0, 1, 2))
     parser.add_argument("--route-weight", type=_positive_float, default=0.25)
     parser.add_argument("--rows", type=_bounded_rows, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup-rounds", type=_positive_int, default=1)
-    parser.add_argument("--trials", type=_positive_even_int, default=4)
+    parser.add_argument("--trials", type=_positive_even_int, default=20)
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     return parser
 
@@ -357,17 +358,15 @@ def _execute_experts(
         device=hidden.device,
     )
     output = torch.zeros_like(hidden, dtype=torch.float32)
-    pending = pager.prefetch_expert(bases[0]) if bases else None
+    window = pager.prefetch_expert_window(bases) if bases else None
     try:
-        for index, base in enumerate(bases):
-            payload = None
+        for base in bases:
+            payload = (
+                pager.consume_expert_window(window, base)
+                if window is not None
+                else None
+            )
             try:
-                if pending is not None:
-                    current = pending
-                    pending = None
-                    payload = pager.consume_expert_prefetch(current, base)
-                if payload is not None and index + 1 < len(bases):
-                    pending = pager.prefetch_expert(bases[index + 1])
                 claimed = payload
                 payload = None
                 try:
@@ -384,9 +383,12 @@ def _execute_experts(
                 if payload is not None:
                     pager.discard_expert_payload(payload)
             output += expert.float()
-    finally:
-        if pending is not None:
-            pager.cancel_expert_prefetch(pending)
+    except BaseException:
+        if window is not None and not window.closed:
+            pager.close_expert_window(window, cancel=True)
+        raise
+    if window is not None:
+        pager.close_expert_window(window)
     return output.to(hidden.dtype)
 
 
@@ -433,6 +435,15 @@ def _pager_projection(pager: DeepSeekWeightPager) -> dict[str, Any]:
         "expert_prefetch_policy": metrics["expert_prefetch_policy"],
         "expert_prefetch_payload_limit_bytes": int(
             metrics["expert_prefetch_payload_limit_bytes"]
+        ),
+        "expert_prefetch_transport_policy": metrics["expert_prefetch_transport_policy"],
+        "expert_prefetch_workers": int(metrics["expert_prefetch_workers"]),
+        "expert_prefetch_max_outstanding_limit": int(
+            metrics["expert_prefetch_max_outstanding_limit"]
+        ),
+        "expert_prefetch_max_experts": int(metrics["expert_prefetch_max_experts"]),
+        "expert_prefetch_resident_limit_bytes": int(
+            metrics["expert_prefetch_resident_limit_bytes"]
         ),
         "expert_prefetch_draining": bool(metrics["expert_prefetch_draining"]),
         "device": metrics["device"],
@@ -529,7 +540,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for value in expert_payload_bytes.values()
     ):
         raise SmokeError("selected expert exceeds the exact-prefetch payload limit")
-    expected_prefetch_peak = sum(expert_payload_bytes.values())
+    expected_prefetch_peak = max(
+        sum(expert_payload_bytes[base] for base in bases[start : start + 3])
+        for start in range(len(bases))
+    )
     source_metrics_before = source.metrics()
     body_before_warmup = int(source.bytes_moved())
 
@@ -607,11 +621,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             finite, value_equal, bit_equal = _assert_exact(
                 output, reference, label=f"trial {index} {mode}"
             )
-            expected_prefetch = 2 if mode == "on" else 0
+            expert_count = len(bases)
+            expected_prefetch = expert_count if mode == "on" else 0
             if (
-                delta["expert_calls"] != 2
-                or delta["coalesced_expert_calls"] != 2
-                or delta["expert_source_ranges"] != 4
+                delta["expert_calls"] != expert_count
+                or delta["coalesced_expert_calls"] != expert_count
+                or delta["expert_source_ranges"] != 2 * expert_count
                 or delta["expert_prefetch_submitted"] != expected_prefetch
                 or delta["expert_prefetch_consumed"] != expected_prefetch
                 or delta["expert_prefetch_failures"]
@@ -646,24 +661,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise SmokeError("exact prefetch worker is still draining after the run")
     if on_metrics["expert_prefetch_peak_bytes"] != expected_prefetch_peak:
         raise SmokeError(
-            "exact prefetch payload peak does not match the two selected experts"
+            "exact prefetch payload peak does not match the selected expert window"
         )
     summary = _summarize_trials(trials)
     runtime_sources = runtime_source_manifest()
+    runtime_dependencies = runtime_dependency_versions()
     harness_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     source_metrics_after = source.metrics()
     report = _seal_report(
         {
             "schema": RESULT_SCHEMA,
             "status": "ok",
-            "scope": "official_routed_expert_transport_latency_only",
+            "scope": "official_checkpoint_expert_transport_latency_only",
             "quality_or_end_to_end_performance_claim": False,
             "started_at": started_at,
             "finished_at": _utc_now(),
             "arguments": _arguments(args),
             "protocol": {
                 "trial_schedule": list(_trial_schedule(args.trials)),
-                "warmup_schedule": ["off", "on"],
+                "warmup_schedule": ["off", "on"] * args.warmup_rounds,
                 "same_input_for_all_executions": True,
                 "same_source_and_revision_for_both_modes": True,
                 "expert_execution_order": "ascending_official_modulelist_order",
@@ -696,6 +712,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "expert_payload_bytes": expert_payload_bytes,
                 "runtime_sources": runtime_sources,
                 "runtime_source_sha256": _canonical_digest(runtime_sources),
+                "runtime_dependencies": runtime_dependencies,
+                "runtime_dependency_sha256": _canonical_digest(runtime_dependencies),
                 "harness_sha256": harness_sha256,
                 "input_sha256": input_sha256,
                 "hardware": {
@@ -718,6 +736,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                     "expert_prefetch_payload_limit_bytes": (
                         DeepSeekWeightPager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
+                    ),
+                    "expert_prefetch_transport_policy": (
+                        DeepSeekWeightPager.EXPERT_PREFETCH_TRANSPORT_POLICY
+                    ),
+                    "expert_prefetch_workers": (
+                        DeepSeekWeightPager.EXPERT_PREFETCH_WORKERS
+                    ),
+                    "expert_prefetch_max_outstanding": (
+                        DeepSeekWeightPager.EXPERT_PREFETCH_MAX_OUTSTANDING
+                    ),
+                    "expert_prefetch_max_experts": (
+                        DeepSeekWeightPager.EXPERT_PREFETCH_MAX_EXPERTS
+                    ),
+                    "expert_prefetch_resident_limit_bytes": (
+                        DeepSeekWeightPager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
                     ),
                     "expected_prefetch_peak_bytes": expected_prefetch_peak,
                     "requested_experts": list(requested),

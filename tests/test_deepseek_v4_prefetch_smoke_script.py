@@ -30,15 +30,16 @@ class DeepSeekV4PrefetchSmokeScriptTests(unittest.TestCase):
         self.assertEqual(args.revision, smoke.OFFICIAL_REVISION)
         self.assertRegex(args.revision, r"^[0-9a-f]{40,64}$")
         self.assertEqual(args.layer, 3)
-        self.assertEqual(args.experts, (0, 1))
+        self.assertEqual(args.experts, (0, 1, 2))
+        self.assertEqual(args.trials, 20)
         self.assertEqual(args.route_weight, 0.25)
         self.assertEqual(smoke._trial_schedule(4), ("off", "on", "on", "off"))
         with self.assertRaisesRegex(smoke.SmokeError, "even"):
             smoke._trial_schedule(3)
 
     def test_expert_argument_rejects_duplicates_and_wrong_arity(self) -> None:
-        self.assertEqual(smoke._parse_experts("7,2"), (7, 2))
-        for raw in ("1", "1,1", "-1,2", "1,2,3", "x,2"):
+        self.assertEqual(smoke._parse_experts("7,2,9"), (7, 2, 9))
+        for raw in ("1", "1,1", "-1,2", "1,2,1", "x,2"):
             with self.subTest(raw=raw):
                 with self.assertRaises(Exception):
                     smoke._parse_experts(raw)
