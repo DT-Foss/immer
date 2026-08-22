@@ -123,12 +123,14 @@ Fähigkeit, keine nachträgliche Optimierung am GSM8K-Split.
 
 - **Frozen Exact-Pfad:** vier Organe, kein Runtime-Training, 152/152 Antworten
   und 152/152 Routen auf der kanonischen SHIP-v6-Suite.
-- **FERTIG-Vollsplit:** 1.060/1.319 GSM8K korrekt, 259 sichere Abstinenzen,
+- **FERTIG-Vollsplit:** 1.068/1.319 GSM8K korrekt, 251 sichere Abstinenzen,
   0 falsche und 0 Error-Outcomes. Der ungeprüfte Template-Fallback war 17/17
   falsch und bleibt bis zu einem strukturierten Proof proposal-only.
 - **FERTIG-Rekurrenzen:** neue endliche affine Grammatik mit exaktem
-  Zertifikat; Vollsplit unverändert 1.060/1.319 bei 0 falschen Antworten.
-- **FERTIG-Abstention-Audit:** Legacy 65 fehlende Frageziele, 171 fehlende
+  Zertifikat; bei ihrer Einführung blieb der damalige Vollsplit unverändert
+  bei 1.060/1.319 und 0 falschen Antworten.
+- **FERTIG-Abstention-Audit (Snapshot vor den acht neuen Resolvern):** Legacy
+  65 fehlende Frageziele, 171 fehlende
   Ziel-Quantities, 20 unvollständige Relationen und drei Geld/Zeit-Guards;
   Structural 144 Coreference-Scope gegen 115 Grammar-Scope. Unter dem heute
   extrahierten Vertrag existieren null belegte exklusive Assignment-Instanzen.

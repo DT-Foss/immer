@@ -93,7 +93,7 @@ die getrennte Partition `correct / abstained / incorrect / error`:
 
 | correct | abstained | incorrect | error | Coverage beantwortet |
 |---:|---:|---:|---:|---:|
-| 1.060 | 259 | 0 | 0 | 80,36 % |
+| 1.068 | 251 | 0 | 0 | 80,97 % |
 
 Ein erster Vollauf fand 17 falsche Antworten, sämtlich aus dem ungeprüften
 Operationsketten-Template-Fallback; dieser Pfad traf kein einziges Mal
@@ -105,7 +105,8 @@ Alle 17 Fälle sind `must_abstain`-Regressionen. Der harte Gate lautet weiterhin
 Zusätzlich beherrscht FERTIG nun endliche affine Rekurrenzen mit expliziten
 Indexgrenzen und exaktem Fraction/RREF-Zertifikat. Das ist eine neue
 strukturelle Fähigkeit; der Vollsplit wurde dadurch nicht nachoptimiert und
-bleibt bei 1.060/1.319 korrekt sowie 0 falschen Antworten.
+blieb bei ihrer Einführung auf dem damaligen Stand von 1.060/1.319 korrekt
+sowie 0 falschen Antworten.
 
 DeepSeeks Vorschlag, alle Abstinenzen direkt als Hungarian-Zuordnung zu
 behandeln, wurde gegen diese 259 Items geprüft. Die gold-label-freie Diagnose

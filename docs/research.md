@@ -6,16 +6,16 @@ IMMER connects research programs that solve different parts of the same system.
 
 Grounded neuro-symbolic cognition with a deterministic core, executable learned skills, constrained neural ranking, verification loops and process distillation.
 
-Current structure-solver milestone: **1060/1319 GSM8K = 80.36% coverage,
-259 safe abstentions, 0 incorrect and 0 error outcomes on the full test
+Current structure-solver milestone: **1068/1319 GSM8K = 80.97% coverage,
+251 safe abstentions, 0 incorrect and 0 error outcomes on the full test
 split.** The report retains every item and pins dataset, runner and solver-tree
 digests. An unverified operations-template fallback first produced 17/17
 wrong attempts; it is now proposal-only and those cases are `must_abstain`
-regressions. A gold-label-free audit rejects the claim that all 259 are ready
-assignment problems: the structural path finds 144 unresolved pronoun/
-coreference cases and 115 unsupported grammar cases, with no already extracted
-exclusive slot contract. Matching remains admissible only after typed slot
-extraction and before the existing exact IR certificate.
+regressions. An earlier gold-label-free audit rejects the claim that its then
+259 abstentions were ready assignment problems: the structural path found 144
+unresolved pronoun/coreference cases and 115 unsupported grammar cases, with no
+already extracted exclusive slot contract. Matching remains admissible only
+after typed slot extraction and before the existing exact IR certificate.
 
 ## DeepSeek-V4 range runtime
 

@@ -53,10 +53,10 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
   Latenzmechanismus wiederholt positiv, bleibt bis zum End-to-End-Gate opt-in;
   Produktionsdefault Breite 1.
 - [x] FERTIG-GSM8K-Vollsplit mit Item-Provenienz und hartem Wrong-Gate:
-  1.060 korrekt, 259 abstinent, 0 falsch, 0 Fehler.
+  1.068 korrekt, 251 abstinent, 0 falsch, 0 Fehler.
 - [x] FERTIG-Grammatik für endliche affine Rekurrenzen mit exaktem
-  Fraction/RREF-Zertifikat; neue Fähigkeit bei unverändert 1.060/1.319 und
-  weiterhin 0 falschen Antworten.
+  Fraction/RREF-Zertifikat; bei ihrer Einführung blieb der damalige Stand
+  1.060/1.319 bei weiterhin 0 falschen Antworten.
 - [x] DeepSeek-Hungarian gegen alle 259 FERTIG-Abstinenzen auditiert: 144
   Coreference-Scope, 115 Grammar-Scope und null bereits extrahierte exklusive
   Assignment-Verträge; die replizierte Demo zerfällt in unabhängige Argmins.

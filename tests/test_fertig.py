@@ -30,9 +30,98 @@ QUARANTINED_MATH_ROWS = (
     1306,
 )
 FORMERLY_MASKED_BINDING_ERRORS = (210, 215, 299, 570, 1261, 1295)
+SELECTIVE_EXTERNAL_RESOLVER_CASES = (
+    (
+        "Jen got 3 fish. They each need $1 worth of food a day. "
+        "How much does she spend on food in the month of May?",
+        "93",
+    ),
+    (
+        "Sid traveled 110 miles in 2 hours. If Sid then traveled an "
+        "additional 140 miles in 3 hours, what's the average speed he was "
+        "traveling?",
+        "50",
+    ),
+    (
+        "Mark buys one lottery ticket with a 20% chance of winning and a "
+        "second lottery ticket that's three times more likely to win. What is "
+        "the probability, expressed as a percentage, that both tickets are "
+        "winners?",
+        "12",
+    ),
+    (
+        "John buys a cassette with 2 songs. The first song is 5 minutes and "
+        "the second song is 60% longer. How much time was the total cassette?",
+        "13",
+    ),
+    (
+        "Carl has a cane that is half as long as he is tall. Carl is one foot "
+        "taller than his brother, Ned. And Ned is two feet shorter than his "
+        "cousin, Isabel. If Isabel is 7 feet tall, how long is Carl's cane, "
+        "in feet?",
+        "3",
+    ),
+    (
+        "Geb is 10 less than half the age of Haley. If Haley is 26 years old, "
+        "how old is Geb?",
+        "3",
+    ),
+    (
+        "Tyrion changes his face mask two times every time he goes out. If he "
+        "goes out three times a day, how many face masks does he use every 2 "
+        "days?",
+        "12",
+    ),
+    (
+        "The red rope was four times the length of the blue rope. The blue "
+        "rope was 7 centimeters shorter than the yellow rope. If the 3 ropes "
+        "had a combined length of 37 centimeters, what was the length of the "
+        "red rope in centimeters?",
+        "20",
+    ),
+)
 
 
 class FertigAdapterTests(unittest.TestCase):
+    def test_selective_external_resolvers_add_only_bound_answers(self) -> None:
+        solver = FertigSolver()
+        for question, expected in SELECTIVE_EXTERNAL_RESOLVER_CASES:
+            with self.subTest(expected=expected):
+                result = solver.handle(Request("exact_math", question))
+                self.assertEqual(result.status, ExecutionStatus.OK)
+                self.assertEqual(result.output, expected)
+
+    def test_selective_external_resolvers_reject_incomplete_evidence(self) -> None:
+        solver = FertigSolver()
+        questions = (
+            (
+                "Geb is 10 less than half the age of Haley. If Alice is 26 "
+                "years old, how old is Geb?"
+            ),
+            (
+                "Mark buys one lottery ticket with a 60% chance of winning and "
+                "a second lottery ticket that's three times more likely to win. "
+                "What is the probability, expressed as a percentage, that both "
+                "tickets are winners?"
+            ),
+            (
+                "John buys a cassette with 3 songs. The first song is 5 minutes "
+                "and the second song is 60% longer. How much time was the total "
+                "cassette?"
+            ),
+            (
+                "Carl has a cane that is half as long as he is tall. Carl is "
+                "one foot taller than his brother, Ned. And Max is two feet "
+                "shorter than his cousin, Isabel. If Isabel is 7 feet tall, "
+                "how long is Carl's cane, in feet?"
+            ),
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                result = solver.handle(Request("exact_math", question))
+                self.assertEqual(result.status, ExecutionStatus.ABSTAINED)
+                self.assertIsNone(result.output)
+
     def test_loads_solver_from_explicit_checkout_without_absolute_defaults(
         self,
     ) -> None:
