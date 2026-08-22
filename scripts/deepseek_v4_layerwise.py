@@ -96,9 +96,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-budget-gb", type=_nonnegative_float, default=12.0)
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--device", choices=("auto", "cpu", "mps"), default="auto")
-    parser.add_argument(
-        "--dtype", choices=("auto", "float16", "bfloat16", "float32"), default="auto"
-    )
+    parser.add_argument("--dtype", choices=("auto", "bfloat16"), default="auto")
     parser.add_argument("--no-activation-quantization", action="store_true")
     parser.add_argument("--microbatch-size", type=_positive_int, default=32)
     parser.add_argument(
@@ -272,15 +270,35 @@ def _modes(raw: str) -> tuple[str, ...]:
     return result
 
 
-def _accuracy(result: dict[str, Any]) -> None:
-    for mode in result.get("modes", {}).values():
+def _canonical_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _accuracy(result: Mapping[str, Any]) -> dict[str, dict[str, float | int]]:
+    summaries: dict[str, dict[str, float | int]] = {}
+    modes = result.get("modes", {})
+    if not isinstance(modes, Mapping):
+        return summaries
+    for name, mode in modes.items():
+        if not isinstance(name, str) or not isinstance(mode, Mapping):
+            continue
         rows = mode.get("items", [])
+        if not isinstance(rows, list):
+            continue
         correct = sum(row.get("predicted") == row.get("expected") for row in rows)
-        mode["summary"] = {
+        summaries[name] = {
             "total": len(rows),
             "correct": correct,
             "accuracy": correct / len(rows) if rows else 0.0,
         }
+    return summaries
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -344,11 +362,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             sys.stderr.flush()
 
     result = scorer.run(resume=args.resume, progress=progress)
-    _accuracy(result)
     return {
         "status": "complete",
         "source": source_label,
         "run_dir": str(Path(args.run_dir).expanduser().absolute()),
+        "result_body_sha256": _canonical_digest(result),
+        "summaries": _accuracy(result),
         "result": result,
     }
 

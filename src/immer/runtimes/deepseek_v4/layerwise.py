@@ -34,15 +34,25 @@ from .graft import DeepSeekV4CrsaGraft, GRAFT_MODES
 from .model import StreamedDeepSeekV4
 
 
-LAYERWISE_SCHEMA = "immer.deepseek-v4-layerwise/v2"
-LAYERWISE_VERSION = 2
-_ACTIVATION_SCHEMA = "immer.deepseek-v4-layerwise-activation/v2"
+LAYERWISE_SCHEMA = "immer.deepseek-v4-layerwise/v3"
+LAYERWISE_VERSION = 3
+_ACTIVATION_SCHEMA = "immer.deepseek-v4-layerwise-activation/v3"
 _MANIFEST_KIND = "manifest"
 _RESULT_KIND = "result"
 OFFICIAL_MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash-0731"
 OFFICIAL_SOURCE_SAFE_BYTES = 160 * 1024**3
 MAX_MANIFEST_BYTES = 16 * 1024**2
 _DIGEST = re.compile(r"[0-9a-f]{64}")
+_RUNTIME_SOURCE_FILES = (
+    "config.py",
+    "graft.py",
+    "kernels.py",
+    "layerwise.py",
+    "model.py",
+    "pager.py",
+    "quantization.py",
+    "stateful.py",
+)
 
 
 class LayerwiseError(RuntimeError):
@@ -72,6 +82,23 @@ def _sha256_file(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _runtime_source_manifest() -> list[dict[str, str]]:
+    """Fingerprint every local source file that can change layer execution."""
+
+    root = Path(__file__).resolve().parent
+    result: list[dict[str, str]] = []
+    for name in _RUNTIME_SOURCE_FILES:
+        path = root / name
+        _regular_file(path, "DeepSeek-V4 runtime source")
+        result.append(
+            {
+                "path": f"immer/runtimes/deepseek_v4/{name}",
+                "sha256": _sha256_file(path),
+            }
+        )
+    return result
 
 
 def _fsync_directory(path: Path) -> None:
@@ -360,6 +387,10 @@ def build_layerwise_plan(
 ) -> LayerwisePlan:
     """Calculate all disk and activation bounds without writing any file."""
 
+    if model.pager.compute_dtype is not torch.bfloat16:
+        raise LayerwiseError(
+            "layerwise activation checkpoints require bfloat16 compute"
+        )
     if not items:
         raise ValueError("layerwise scoring requires at least one item")
     if (
@@ -778,8 +809,13 @@ class LayerwiseScorer:
         fingerprint = source_metrics.get("inventory_source_fingerprint")
         if not isinstance(fingerprint, str) or not fingerprint:
             raise LayerwiseError("source has no verified inventory fingerprint")
+        runtime_sources = _runtime_source_manifest()
         self.identity = {
-            "runtime": LAYERWISE_SCHEMA,
+            "runtime": {
+                "schema": LAYERWISE_SCHEMA,
+                "source_sha256": _digest(runtime_sources),
+                "sources": runtime_sources,
+            },
             "model": {
                 "repo_id": str(
                     source_metrics.get("repo_id", getattr(source, "repo_id", "fixture"))
@@ -996,7 +1032,10 @@ class LayerwiseScorer:
 
     @staticmethod
     def _result_document(body: Mapping[str, Any]) -> dict[str, Any]:
-        materialized = dict(body)
+        # Canonical round-trip once so the validated return value is byte-model
+        # equivalent to the JSON body readers will load from disk (not merely
+        # a Python structure containing tuples that JSON later turns to lists).
+        materialized = json.loads(_canonical_json(body))
         return {
             "schema": LAYERWISE_SCHEMA,
             "version": LAYERWISE_VERSION,
@@ -1054,7 +1093,7 @@ class LayerwiseScorer:
             or body.get("identity") != self.identity
         ):
             raise LayerwiseError("completed result identity mismatch")
-        if body.get("plan") != manifest_plan:
+        if _canonical_json(body.get("plan")) != _canonical_json(manifest_plan):
             raise LayerwiseError("completed result plan does not match its manifest")
 
         candidate_union = sorted(
@@ -1161,7 +1200,8 @@ class LayerwiseScorer:
                 or manifest.get("version") != LAYERWISE_VERSION
             ):
                 raise LayerwiseError(
-                    "unsupported layerwise manifest; v1 runs cannot prove activation generation provenance"
+                    "unsupported legacy layerwise manifest; it cannot prove "
+                    "activation generation and runtime source provenance"
                 )
             if set(manifest) != {"schema", "version", "kind", "body", "body_sha256"}:
                 raise LayerwiseError("layerwise manifest envelope schema is invalid")

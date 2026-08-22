@@ -241,6 +241,36 @@ class LayerwiseScorerTests(unittest.TestCase):
             with self.assertRaisesRegex(LayerwiseError, "identity differs"):
                 _scorer(incompatible_attention, run_dir).run(resume=True)
 
+    def test_non_bfloat16_compute_fails_before_creating_run_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "not-created"
+            source = _source()
+            pager = DeepSeekWeightPager(
+                source, device="cpu", compute_dtype="float32"
+            )
+            model = StreamedDeepSeekV4(
+                _config(), pager, max_batch_size=2, max_seq_len=16
+            )
+            with self.assertRaisesRegex(LayerwiseError, "require bfloat16"):
+                _scorer(model, run_dir)
+            self.assertFalse(run_dir.exists())
+
+    def test_resume_identity_binds_runtime_source_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            first = _scorer(_model(_source(), batch=2), run_dir)
+            self.assertRegex(first.identity["runtime"]["source_sha256"], r"^[0-9a-f]{64}$")
+            first.run()
+
+            changed = [{"path": "fixture.py", "sha256": "f" * 64}]
+            with mock.patch(
+                "immer.runtimes.deepseek_v4.layerwise._runtime_source_manifest",
+                return_value=changed,
+            ):
+                incompatible = _scorer(_model(_source(), batch=2), run_dir)
+            with self.assertRaisesRegex(LayerwiseError, "identity differs"):
+                incompatible.run(resume=True)
+
     def test_resume_continues_after_a_committed_layer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary) / "run"
@@ -347,7 +377,7 @@ class LayerwiseScorerTests(unittest.TestCase):
             manifest.pop("kind")
             _write_json(manifest_path, manifest)
 
-            with self.assertRaisesRegex(LayerwiseError, "v1 runs cannot prove"):
+            with self.assertRaisesRegex(LayerwiseError, "cannot prove"):
                 _scorer(_model(_source(), batch=2), run_dir).run(resume=True)
 
     def test_completed_resume_rejects_tampered_result_hash(self) -> None:
