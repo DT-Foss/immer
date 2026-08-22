@@ -1,0 +1,16 @@
+{
+  "schema": "router.v2/stufe2",
+  "repo": "Qwen/Qwen3.8-27B",
+  "n": 50,
+  "accuracy_stufe2": 0.24,
+  "accuracy_placebo": 0.32,
+  "bytes_pro_frage_kb": 138.4,
+  "anteil_modell_pct": 0.0003,
+  "layer": [
+    18,
+    36,
+    45
+  ],
+  "top_neuronen": 32,
+  "sekunden": 97.0
+}

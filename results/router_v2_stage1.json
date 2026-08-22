@@ -1,0 +1,66 @@
+{
+  "schema": "router.v2/stufe1",
+  "repo": "Qwen/Qwen3.8-27B",
+  "seed": 42,
+  "neurons": 256,
+  "layers": {
+    "0": {
+      "separation_real": -0.00015,
+      "separation_placebo": 6e-05,
+      "signal_over_placebo": -0.00021,
+      "bytes_layer": 2868252,
+      "requests": 237
+    },
+    "9": {
+      "separation_real": -0.00062,
+      "separation_placebo": -0.00067,
+      "signal_over_placebo": 6e-05,
+      "bytes_layer": 2776092,
+      "requests": 242
+    },
+    "18": {
+      "separation_real": 0.00178,
+      "separation_placebo": 0.00027,
+      "signal_over_placebo": 0.00151,
+      "bytes_layer": 2776094,
+      "requests": 248
+    },
+    "27": {
+      "separation_real": 0.00099,
+      "separation_placebo": -4e-05,
+      "signal_over_placebo": 0.00103,
+      "bytes_layer": 2919452,
+      "requests": 238
+    },
+    "36": {
+      "separation_real": 0.00268,
+      "separation_placebo": 0.00128,
+      "signal_over_placebo": 0.0014,
+      "bytes_layer": 2898972,
+      "requests": 243
+    },
+    "45": {
+      "separation_real": 0.00181,
+      "separation_placebo": 0.00054,
+      "signal_over_placebo": 0.00128,
+      "bytes_layer": 2858014,
+      "requests": 240
+    },
+    "54": {
+      "separation_real": 0.0009,
+      "separation_placebo": -0.00015,
+      "signal_over_placebo": 0.00105,
+      "bytes_layer": 2868252,
+      "requests": 241
+    },
+    "63": {
+      "separation_real": 0.00129,
+      "separation_placebo": 0.00058,
+      "signal_over_placebo": 0.00071,
+      "bytes_layer": 2878492,
+      "requests": 242
+    }
+  },
+  "bytes_total": 37584932,
+  "sekunden": 869.3
+}
