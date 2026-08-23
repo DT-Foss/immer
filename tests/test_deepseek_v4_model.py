@@ -458,6 +458,8 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
         self.assertFalse(markov["expert_reservoir_active"])
         self.assertEqual(aggregate_metrics["expert_reservoir_submitted"], 2)
         self.assertEqual(aggregate_metrics["expert_reservoir_usable_hits"], 2)
+        self.assertEqual(aggregate_metrics["expert_calls"], baseline["expert_calls"])
+        self.assertGreater(markov["expert_calls"], baseline["expert_calls"])
         self.assertEqual(direct_scheduler["direct_plans"], 1)
         self.assertEqual(direct_scheduler["direct_bindings"], 2)
         self.assertEqual(aggregate_scheduler["aggregate_plans"], 1)
