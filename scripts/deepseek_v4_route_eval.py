@@ -62,6 +62,7 @@ OFFICIAL_CHECKPOINT = CheckpointIdentity(
 ROUTE_OBSERVATIONS_SCHEMA = "immer.deepseek-v4-route-observations/v1"
 REPORT_SCHEMA = "immer.deepseek-v4-route-eval/v1"
 HEADLINE_K = (1, 3, 6, 12, 24, 48, 96, 256)
+MICRO_WINDOW_ROWS = (1, 2, 4, 8, 16, 32, 64)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _OBSERVATION_FIELDS = frozenset(
     {
@@ -590,6 +591,95 @@ def _headline(
     }
 
 
+def _micro_window_sweep(
+    real_model: LayerMarkovExpertPredictor,
+    placebo_model: LayerMarkovExpertPredictor,
+    prompts: Sequence[PromptRouteObservation],
+    *,
+    alpha: float,
+    n_experts: int,
+) -> list[dict[str, Any]]:
+    """Measure row-local causal signal before full-layer aggregation erases it."""
+
+    sweep: list[dict[str, Any]] = []
+    for window_rows in MICRO_WINDOW_ROWS:
+        real_hits = 0
+        placebo_hits = 0
+        target_total = 0
+        predicted_total = 0
+        windows = 0
+        for prompt in prompts:
+            for source, target in prompt.consecutive_pairs():
+                pairs = [
+                    (source_row, target_row)
+                    for source_row, target_row in zip(
+                        source.rows,
+                        target.rows,
+                        strict=True,
+                    )
+                    if source_row and target_row
+                ]
+                for start in range(0, len(pairs), window_rows):
+                    chunk = pairs[start : start + window_rows]
+                    real_scores = [0.0] * n_experts
+                    placebo_scores = [0.0] * n_experts
+                    actual: set[int] = set()
+                    slots = 0
+                    for source_row, target_row in chunk:
+                        real = real_model.predict_distribution(
+                            source_layer=source.layer,
+                            current_row=source_row,
+                            alpha=alpha,
+                        ).scores
+                        placebo = placebo_model.predict_distribution(
+                            source_layer=source.layer,
+                            current_row=source_row,
+                            alpha=alpha,
+                        ).scores
+                        for expert in range(n_experts):
+                            real_scores[expert] += real[expert]
+                            placebo_scores[expert] += placebo[expert]
+                        actual.update(target_row)
+                        slots += len(source_row)
+                    if not chunk:
+                        continue
+                    k = min(n_experts, slots)
+                    real_top = set(
+                        sorted(
+                            range(n_experts),
+                            key=lambda expert: (-real_scores[expert], expert),
+                        )[:k]
+                    )
+                    placebo_top = set(
+                        sorted(
+                            range(n_experts),
+                            key=lambda expert: (-placebo_scores[expert], expert),
+                        )[:k]
+                    )
+                    real_hits += len(actual & real_top)
+                    placebo_hits += len(actual & placebo_top)
+                    target_total += len(actual)
+                    predicted_total += k
+                    windows += 1
+        if not windows or not target_total or not predicted_total:
+            raise RouteEvalError("micro-window sweep contains no evaluable routes")
+        real_recall = real_hits / target_total
+        placebo_recall = placebo_hits / target_total
+        sweep.append(
+            {
+                "delta_recall": real_recall - placebo_recall,
+                "k_mean": predicted_total / windows,
+                "placebo_recall": placebo_recall,
+                "real_precision": real_hits / predicted_total,
+                "real_recall": real_recall,
+                "target_union_mean": target_total / windows,
+                "window_rows": window_rows,
+                "windows": windows,
+            }
+        )
+    return sweep
+
+
 def build_report(
     sidecar_path: str | Path,
     *,
@@ -660,6 +750,13 @@ def build_report(
                 real_model, split.test, mode="passthrough", alpha=prior
             ),
         }
+        micro_window_sweep = _micro_window_sweep(
+            real_model,
+            placebo_model,
+            split.test,
+            alpha=prior,
+            n_experts=inventory,
+        )
     except RouteMarkovError as exc:
         raise RouteEvalError(str(exc)) from exc
 
@@ -674,6 +771,7 @@ def build_report(
             for name, evaluation in evaluations.items()
         },
         "headline": _headline(evaluations, inventory),
+        "micro_window_sweep": micro_window_sweep,
         "models": {
             "placebo_markov_snapshot_sha256": placebo_model.snapshot_sha256,
             "real_markov_snapshot_sha256": real_model.snapshot_sha256,
@@ -719,6 +817,7 @@ def write_report(path: str | Path, report: Mapping[str, Any]) -> None:
         "checkpoint",
         "evaluations",
         "headline",
+        "micro_window_sweep",
         "models",
         "protocol",
         "schema",

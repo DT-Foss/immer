@@ -193,6 +193,12 @@ class DeepSeekV4RouteEvalTests(unittest.TestCase):
             self.assertEqual(
                 report["headline"]["models"]["real_markov"]["Recall@1"], 1.0
             )
+            windows = report["micro_window_sweep"]
+            self.assertEqual(
+                [row["window_rows"] for row in windows],
+                [1, 2, 4, 8, 16, 32, 64],
+            )
+            self.assertGreater(windows[0]["real_recall"], windows[0]["placebo_recall"])
             self.assertFalse(_contains_forbidden_label_key(report))
             self.assertEqual(output.read_bytes(), _canonical(report))
             identity = {key: value for key, value in report.items() if key != "sha256"}
