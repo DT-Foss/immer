@@ -36,6 +36,7 @@ from immer.runtimes.deepseek_v4.route_markov import (
     apply_target_layer_placebo,
     build_target_layer_placebo,
     evaluate_k_sweep,
+    plan_micro_window_prefetch,
     split_prompt_observations,
 )
 from immer.runtimes.deepseek_v4.route_model import (
@@ -68,6 +69,7 @@ REPORT_SCHEMA = "immer.deepseek-v4-route-eval/v1"
 HEADLINE_K = (1, 3, 6, 12, 24, 48, 96, 256)
 MICRO_WINDOW_ROWS = (1, 2, 4, 8, 16, 32, 64)
 MICRO_WINDOW_K = (3, 6, 9, 12, 18, 24)
+AGGREGATE_VOTE_K = (3, 6, 9, 12, 18, 24, 48)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _OBSERVATION_FIELDS = frozenset(
     {
@@ -773,6 +775,89 @@ def _micro_window_k_sweep(
     return sweep
 
 
+def _aggregate_vote_sweep(
+    real_model: LayerMarkovExpertPredictor,
+    placebo_model: LayerMarkovExpertPredictor,
+    prompts: Sequence[PromptRouteObservation],
+    *,
+    alpha: float,
+    n_experts: int,
+) -> list[dict[str, Any]]:
+    """Price one large-prefill reservoir built from two-row local rank votes."""
+
+    widths = tuple(sorted({min(k, n_experts) for k in AGGREGATE_VOTE_K}))
+    accumulators = {
+        k: {"placebo_hits": 0, "real_hits": 0, "target_total": 0, "traces": 0}
+        for k in widths
+    }
+    for prompt in prompts:
+        for source, target in prompt.consecutive_pairs():
+            actual = {expert for row in target.rows for expert in row}
+            if not actual:
+                continue
+            for k in widths:
+                real = plan_micro_window_prefetch(
+                    real_model,
+                    source_layer=source.layer,
+                    current_rows=source.rows,
+                    window_rows=2,
+                    k=k,
+                    alpha=alpha,
+                )
+                placebo = plan_micro_window_prefetch(
+                    placebo_model,
+                    source_layer=source.layer,
+                    current_rows=source.rows,
+                    window_rows=2,
+                    k=k,
+                    alpha=alpha,
+                )
+                accumulator = accumulators[k]
+                accumulator["real_hits"] += len(
+                    actual.intersection(real.aggregate_candidates)
+                )
+                accumulator["placebo_hits"] += len(
+                    actual.intersection(placebo.aggregate_candidates)
+                )
+                accumulator["target_total"] += len(actual)
+                accumulator["traces"] += 1
+
+    sweep: list[dict[str, Any]] = []
+    for k in widths:
+        accumulator = accumulators[k]
+        traces = accumulator["traces"]
+        target_total = accumulator["target_total"]
+        predicted_total = traces * k
+        if not traces or not target_total:
+            raise RouteEvalError("aggregate-vote sweep has no routes")
+        real_hits = accumulator["real_hits"]
+        placebo_hits = accumulator["placebo_hits"]
+        real_recall = real_hits / target_total
+        placebo_recall = placebo_hits / target_total
+        sweep.append(
+            {
+                "delta_recall": real_recall - placebo_recall,
+                "k": k,
+                "placebo_expert_read_amplification": (
+                    predicted_total + target_total - placebo_hits
+                )
+                / target_total,
+                "placebo_precision": placebo_hits / predicted_total,
+                "placebo_recall": placebo_recall,
+                "real_expert_read_amplification": (
+                    predicted_total + target_total - real_hits
+                )
+                / target_total,
+                "real_precision": real_hits / predicted_total,
+                "real_recall": real_recall,
+                "target_union_mean": target_total / traces,
+                "traces": traces,
+                "vote_window_rows": 2,
+            }
+        )
+    return sweep
+
+
 def build_report(
     sidecar_path: str | Path,
     *,
@@ -858,6 +943,13 @@ def build_report(
             alpha=prior,
             n_experts=inventory,
         )
+        aggregate_vote_sweep = _aggregate_vote_sweep(
+            real_model,
+            placebo_model,
+            split.test,
+            alpha=prior,
+            n_experts=inventory,
+        )
     except RouteMarkovError as exc:
         raise RouteEvalError(str(exc)) from exc
 
@@ -866,6 +958,7 @@ def build_report(
     if len(evaluated_rows) != 1 or len(evaluated_ids) != 1:
         raise RouteEvalError("baseline evaluations did not use identical held-out rows")
     identity: dict[str, Any] = {
+        "aggregate_vote_sweep": aggregate_vote_sweep,
         "checkpoint": routes.checkpoint.as_record(),
         "evaluations": {
             name: _evaluation_record(evaluation)
@@ -927,6 +1020,7 @@ def write_report(path: str | Path, report: Mapping[str, Any]) -> None:
 
     if not isinstance(report, Mapping) or set(report) != {
         "checkpoint",
+        "aggregate_vote_sweep",
         "evaluations",
         "headline",
         "micro_window_sweep",

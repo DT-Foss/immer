@@ -260,6 +260,15 @@ class DeepSeekV4RouteEvalTests(unittest.TestCase):
                     for row in fixed_k
                 )
             )
+            aggregate = report["aggregate_vote_sweep"]
+            self.assertEqual([row["k"] for row in aggregate], [3, 4])
+            self.assertTrue(
+                all(
+                    row["real_expert_read_amplification"] >= 1.0
+                    and row["vote_window_rows"] == 2
+                    for row in aggregate
+                )
+            )
             self.assertFalse(_contains_forbidden_label_key(report))
             self.assertEqual(output.read_bytes(), _canonical(report))
             identity = {key: value for key, value in report.items() if key != "sha256"}
