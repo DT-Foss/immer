@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from .access_trace import AccessLeaf, AccessOperation
 from ._hf_source import (
     Budget,
     BudgetExceeded,
@@ -1352,6 +1353,7 @@ class Streamer:
         max_metadata_bytes: int = 64 * 1024 * 1024,
         max_cache_bytes: int | None = None,
         verbose: bool = False,
+        access_observer: Any | None = None,
     ) -> None:
         if not isinstance(repo_id, str) or not repo_id.strip():
             raise ValueError("repo_id muss ein nichtleerer String sein")
@@ -1386,6 +1388,15 @@ class Streamer:
             )
         self._max_cache_bytes = max_cache_bytes
         self.verbose = bool(verbose)
+        self._access_observer_lock = threading.Lock()
+        self._access_observer: Any | None = None
+        self._access_sequence = 0
+        self._access_observer_events = 0
+        self._access_observer_leaves = 0
+        self._access_observer_drops = 0
+        self._access_observer_errors = 0
+        if access_observer is not None:
+            self.set_access_observer(access_observer)
 
     @classmethod
     def from_local(
@@ -1399,6 +1410,7 @@ class Streamer:
         max_metadata_bytes: int = 64 * 1024 * 1024,
         max_cache_bytes: int | None = None,
         verbose: bool = False,
+        access_observer: Any | None = None,
     ) -> "Streamer":
         path = Path(root).expanduser().resolve()
         repo_id = f"local:{path}"
@@ -1413,6 +1425,7 @@ class Streamer:
             max_metadata_bytes=max_metadata_bytes,
             max_cache_bytes=max_cache_bytes,
             verbose=verbose,
+            access_observer=access_observer,
         )
 
     @property
@@ -1944,6 +1957,80 @@ class Streamer:
             f"reqs={self.budget.requests}, cache_hits={stats['cache_hits']})"
         )
 
+    def set_access_observer(
+        self,
+        observer: Any | None,
+        *,
+        prepare_identity: bool = True,
+    ) -> Any | None:
+        """Atomically replace the optional fail-open logical-range observer.
+
+        Enabling observation prepares the inventory once so every event can
+        carry a source fingerprint. This opt-in metadata step happens here,
+        never implicitly on the default model read path.
+        """
+
+        if observer is not None:
+            callback = getattr(observer, "observe", None)
+            if not callable(callback) and not callable(observer):
+                raise TypeError("access observer must be callable or expose observe()")
+            if prepare_identity:
+                self.inventory()
+        with self._access_observer_lock:
+            previous = self._access_observer
+            self._access_observer = observer
+        return previous
+
+    def _emit_access_operation(
+        self,
+        operation: str,
+        leaves: tuple[AccessLeaf, ...],
+        *,
+        source_requests: int,
+        source_bytes: int,
+        cache_hits: int | None,
+    ) -> None:
+        """Notify an observer without ever changing a successful read result."""
+
+        with self._access_observer_lock:
+            observer = self._access_observer
+            if observer is None:
+                return
+            fingerprint = self._inventory_fingerprint
+            if not isinstance(fingerprint, str):
+                self._access_observer_drops += 1
+                return
+            self._access_sequence += 1
+            sequence = self._access_sequence
+        try:
+            event = AccessOperation(
+                repo_id=self.repo_id,
+                revision=self.revision,
+                inventory_fingerprint=fingerprint,
+                operation=operation,
+                operation_sequence=sequence,
+                thread_id=threading.get_ident(),
+                thread_name=threading.current_thread().name,
+                leaves=leaves,
+                source_requests=source_requests,
+                source_bytes=source_bytes,
+                cache_hits=cache_hits,
+            )
+            callback = getattr(observer, "observe", None)
+            accepted = callback(event) if callable(callback) else observer(event)
+        except Exception:
+            # Ordinary instrumentation failures are fail-open. Process-control
+            # exceptions such as KeyboardInterrupt/SystemExit still propagate.
+            with self._access_observer_lock:
+                self._access_observer_errors += 1
+            return
+        with self._access_observer_lock:
+            if accepted is False:
+                self._access_observer_drops += 1
+            else:
+                self._access_observer_events += 1
+                self._access_observer_leaves += len(leaves)
+
     def raw_bytes(self, shard: str, offset: int, length: int) -> bytes:
         offset = _validate_nonnegative_int(offset, "offset")
         length = _validate_nonnegative_int(length, "length")
@@ -1953,7 +2040,21 @@ class Streamer:
             return b""
         # HFRangeReader uses an inclusive end. The old facade accidentally
         # requested length+1 bytes here.
-        return self.reader.get_range(shard, offset, offset + length - 1)
+        observer_enabled = self._access_observer is not None
+        before = self.budget.thread_charge_snapshot() if observer_enabled else None
+        body = self.reader.get_range(shard, offset, offset + length - 1)
+        if before is not None:
+            after = self.budget.thread_charge_snapshot()
+            source_bytes = after[0] - before[0]
+            source_requests = after[2] - before[2]
+            self._emit_access_operation(
+                "raw_bytes",
+                (AccessLeaf(shard, offset, length),),
+                source_requests=source_requests,
+                source_bytes=source_bytes,
+                cache_hits=1 if source_requests == 0 else 0,
+            )
+        return body
 
     def raw_bytes_many(
         self,
@@ -2003,11 +2104,23 @@ class Streamer:
             validated.append((offset, length))
         if not validated:
             return RawBytesManyResult((), 0, 0, 0)
-        return self.reader.get_ranges(
+        result = self.reader.get_ranges(
             shard,
             tuple(validated),
             resident_limit_bytes,
         )
+        leaves = tuple(
+            AccessLeaf(shard, offset, length) for offset, length in validated if length
+        )
+        if leaves and self._access_observer is not None:
+            self._emit_access_operation(
+                "raw_bytes_many",
+                leaves,
+                source_requests=result.source_requests,
+                source_bytes=result.source_bytes,
+                cache_hits=len(leaves) if result.source_requests == 0 else None,
+            )
+        return result
 
     @contextmanager
     def cache_priority(self, priority: int) -> Any:
@@ -2030,6 +2143,14 @@ class Streamer:
         transport_method = getattr(self.reader.upstream, "transport_metrics", None)
         transport = dict(transport_method()) if callable(transport_method) else {}
         pinned_revision = bool(re.fullmatch(r"[0-9a-fA-F]{40,64}", self.revision))
+        with self._access_observer_lock:
+            access_metrics = {
+                "access_observer_enabled": self._access_observer is not None,
+                "access_observer_events": self._access_observer_events,
+                "access_observer_leaves": self._access_observer_leaves,
+                "access_observer_drops": self._access_observer_drops,
+                "access_observer_errors": self._access_observer_errors,
+            }
         return {
             "repo_id": self.repo_id,
             "revision": self.revision,
@@ -2042,6 +2163,7 @@ class Streamer:
             "inventory_cache_hits": int(self._inventory_cache_hits),
             "inventory_cache_writes": int(self._inventory_cache_writes),
             "inventory_source_fingerprint": self._inventory_fingerprint,
+            **access_metrics,
             **transport,
             **reader_stats,
         }

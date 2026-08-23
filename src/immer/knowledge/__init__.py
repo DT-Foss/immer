@@ -1,3 +1,23 @@
+from .access_trace import (
+    AccessLeaf,
+    AccessObserver,
+    AccessOperation,
+    AccessTrace,
+    AccessTraceError,
+    AccessTraceIdentityError,
+    AccessTraceIntegrityError,
+    AccessTraceRecorder,
+    ReplayReceipt,
+    replay_access_trace,
+)
+from .livecausal import (
+    LazyGraph,
+    LiveCausalError,
+    LiveCausalIntegrityError,
+    LiveCausalValidationError,
+    LiveGraph,
+    LiveStore,
+)
 from .streamer import (
     ByteBudgetExceeded,
     CacheIntegrityError,
@@ -11,13 +31,29 @@ from .streamer import (
 )
 
 __all__ = [
+    "AccessLeaf",
+    "AccessObserver",
+    "AccessOperation",
+    "AccessTrace",
+    "AccessTraceError",
+    "AccessTraceIdentityError",
+    "AccessTraceIntegrityError",
+    "AccessTraceRecorder",
     "ByteBudgetExceeded",
     "CacheIntegrityError",
     "InventoryValidationError",
+    "LazyGraph",
+    "LiveCausalError",
+    "LiveCausalIntegrityError",
+    "LiveCausalValidationError",
+    "LiveGraph",
+    "LiveStore",
     "RawBytesManyResult",
     "RangeValidationError",
+    "ReplayReceipt",
     "Streamer",
     "TensorEncodingError",
     "TensorSource",
     "TensorSourceError",
+    "replay_access_trace",
 ]
