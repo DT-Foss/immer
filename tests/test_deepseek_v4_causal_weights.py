@@ -402,6 +402,125 @@ class CausalWeightMonorailTests(unittest.TestCase):
             pager.release()
             source.close()
 
+    def test_plan_cache_warm_hit_live_append_and_drop_invalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source_root = base / "source"
+            _write_expert_fixture(source_root, expert_ids=(0, 1, 2))
+            source = _source(source_root, base / "cache")
+            pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="bfloat16")
+            plans = pager.plan_expert_ranges(3, (0, 1, 2))
+            layout = CausalWeightLayoutIdentity.from_source(
+                source,
+                model=_LOGICAL_MODEL,
+            )
+            graph_root = base / "graph"
+            graph = LiveGraph(graph_root)
+            writer = LiveGraph(graph_root)
+            bind_causal_weight_plans(writer, layout, plans[:2])
+            reader = CausalWeightReader(graph, layout, source=source)
+            self.assertEqual(reader.resolve_expert_plans(3, (0, 1)), plans[:2])
+
+            original_revision = graph.store.revision
+            with (
+                mock.patch.object(
+                    graph.store,
+                    "revision",
+                    wraps=original_revision,
+                ) as revision,
+                mock.patch.object(
+                    graph,
+                    "query_base",
+                    side_effect=AssertionError("warm cache entered graph adjacency"),
+                ),
+                mock.patch.object(
+                    graph,
+                    "resolve_derivation",
+                    side_effect=AssertionError("warm cache resolved citations"),
+                ),
+                mock.patch.object(
+                    graph.store,
+                    "record",
+                    side_effect=AssertionError("warm cache read segment records"),
+                ),
+                mock.patch.object(
+                    source,
+                    "find",
+                    side_effect=AssertionError("warm cache used tensor metadata"),
+                ),
+            ):
+                self.assertEqual(
+                    reader.resolve_expert_plans(3, (1, 0, 1)),
+                    (plans[1], plans[0]),
+                )
+            revision.assert_called_once()
+            warm_metrics = reader.metrics()
+            self.assertEqual(warm_metrics["plan_cache_hits"], 2)
+            self.assertEqual(warm_metrics["plan_cache_misses"], 2)
+            self.assertEqual(warm_metrics["plan_cache_invalidations"], 0)
+
+            appended = bind_causal_weight_plans(writer, layout, (plans[2],))
+            self.assertEqual(
+                reader.resolve_expert_plans(3, (0, 1, 2)),
+                plans,
+            )
+            appended_metrics = reader.metrics()
+            self.assertEqual(appended_metrics["plan_cache_entries"], 3)
+            self.assertEqual(appended_metrics["plan_cache_invalidations"], 1)
+            self.assertEqual(appended_metrics["plan_cache_misses"], 5)
+
+            assert appended.appended_segment_sha256 is not None
+            writer.drop_segments((appended.appended_segment_sha256,))
+            with self.assertRaises(CausalWeightNotFoundError):
+                reader.resolve_expert_plans(3, (2,))
+            dropped_metrics = reader.metrics()
+            self.assertEqual(dropped_metrics["plan_cache_entries"], 0)
+            self.assertEqual(dropped_metrics["plan_cache_invalidations"], 2)
+            self.assertEqual(dropped_metrics["plan_cache_misses"], 6)
+            self.assertEqual(reader.resolve_expert_plans(3, (0,)), (plans[0],))
+            pager.release()
+            source.close()
+
+    def test_plan_cache_retries_if_revision_changes_during_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source_root = base / "source"
+            _write_expert_fixture(source_root, expert_ids=(0,))
+            source = _source(source_root, base / "cache")
+            pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="bfloat16")
+            (plan,) = pager.plan_expert_ranges(3, (0,))
+            layout = CausalWeightLayoutIdentity.from_source(
+                source,
+                model=_LOGICAL_MODEL,
+            )
+            graph_root = base / "graph"
+            reader_graph = LiveGraph(graph_root)
+            writer = LiveGraph(graph_root)
+            reader = CausalWeightReader(reader_graph, layout)
+            original_query = reader_graph.query_base
+            appended = False
+
+            def append_during_first_query(key):
+                nonlocal appended
+                if not appended:
+                    appended = True
+                    bind_causal_weight_plans(writer, layout, (plan,))
+                return original_query(key)
+
+            with mock.patch.object(
+                reader_graph,
+                "query_base",
+                side_effect=append_during_first_query,
+            ) as query:
+                self.assertEqual(reader.resolve_expert_plans(3, (0,)), (plan,))
+            self.assertGreaterEqual(query.call_count, 2)
+            metrics = reader.metrics()
+            self.assertEqual(metrics["plan_cache_entries"], 1)
+            self.assertEqual(metrics["plan_cache_invalidations"], 1)
+            self.assertEqual(metrics["plan_cache_misses"], 1)
+            pager.release()
+            source.close()
+
     def test_binding_replay_conflict_uint64_and_segment_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)

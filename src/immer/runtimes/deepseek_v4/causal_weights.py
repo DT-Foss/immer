@@ -45,6 +45,7 @@ _EXPERT_BASE = re.compile(r"layers\.(0|[1-9][0-9]*)\.ffn\.experts\.(0|[1-9][0-9]
 _DTYPE = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 _UINT64_MAX = (1 << 64) - 1
 _BINDING_LOCK_NAME = ".causal-weight-bindings.lock"
+_PLAN_CACHE_RESOLVE_RETRIES = 3
 _RECORD_KEYS = frozenset(
     (
         "layout_fingerprint",
@@ -840,6 +841,12 @@ class CausalWeightReader:
         self.graph = graph
         self.layout = layout
         self.source = source
+        self._plan_cache_lock = threading.RLock()
+        self._plan_cache_revision: tuple[int, str] | None = None
+        self._plan_cache: dict[tuple[int, int], OfficialExpertRangePlan] = {}
+        self._plan_cache_hits = 0
+        self._plan_cache_misses = 0
+        self._plan_cache_invalidations = 0
         self._metrics_lock = threading.Lock()
         self._read_calls = 0
         self._requested_bytes = 0
@@ -894,35 +901,97 @@ class CausalWeightReader:
         layer: int,
         expert_ids: Iterable[int],
     ) -> tuple[OfficialExpertRangePlan, ...]:
-        """Resolve arbitrary fanout using only direct edges and citations."""
+        """Resolve arbitrary fanout through a revision-bound immutable cache.
 
-        plans: list[OfficialExpertRangePlan] = []
-        for plan_layer, expert_id in self._requested_coordinates(layer, expert_ids):
-            matches: list[OfficialExpertRangePlan] = []
-            for stored_layout, plan, _citation in _direct_bindings(
-                self.graph,
-                self.layout.model,
-                layer=plan_layer,
-                expert_id=expert_id,
-            ):
-                if stored_layout.layout_fingerprint == self.layout.layout_fingerprint:
-                    if stored_layout != self.layout:
-                        raise CausalWeightIntegrityError(
-                            "stored layout identity is internally inconsistent"
-                        )
-                    matches.append(plan)
-            if not matches:
-                raise CausalWeightNotFoundError(
-                    "no causal range binding exists for "
-                    f"layer {plan_layer} expert {expert_id} in layout "
-                    f"{self.layout.layout_fingerprint}"
+        A warm hit performs exactly one manifest-revision check.  Misses are
+        resolved through direct graph edges and published only when a second
+        revision check proves that the observed graph snapshot stayed stable.
+        """
+
+        coordinates = self._requested_coordinates(layer, expert_ids)
+        if not coordinates:
+            return ()
+        with self._plan_cache_lock:
+            for _attempt in range(_PLAN_CACHE_RESOLVE_RETRIES):
+                revision = self.graph.store.revision()
+                self._adopt_plan_cache_revision(revision)
+                cached = {
+                    coordinate: self._plan_cache[coordinate]
+                    for coordinate in coordinates
+                    if coordinate in self._plan_cache
+                }
+                missing = tuple(
+                    coordinate for coordinate in coordinates if coordinate not in cached
                 )
-            if any(plan != matches[0] for plan in matches[1:]):
-                raise CausalWeightConflictError(
-                    "graph contains conflicting range plans for one layout/expert"
-                )
-            plans.append(matches[0])
-        return tuple(plans)
+                if not missing:
+                    self._plan_cache_hits += len(coordinates)
+                    return tuple(cached[coordinate] for coordinate in coordinates)
+
+                try:
+                    resolved = {
+                        coordinate: self._resolve_expert_plan_uncached(*coordinate)
+                        for coordinate in missing
+                    }
+                except Exception:
+                    after = self.graph.store.revision()
+                    if after != revision:
+                        self._adopt_plan_cache_revision(after)
+                        continue
+                    self._plan_cache_hits += len(cached)
+                    self._plan_cache_misses += len(missing)
+                    raise
+
+                after = self.graph.store.revision()
+                if after != revision:
+                    self._adopt_plan_cache_revision(after)
+                    continue
+                self._plan_cache.update(resolved)
+                self._plan_cache_hits += len(cached)
+                self._plan_cache_misses += len(missing)
+                return tuple(self._plan_cache[coordinate] for coordinate in coordinates)
+
+            self._plan_cache_misses += len(coordinates)
+            raise CausalWeightIntegrityError(
+                "causal graph revision changed during every bounded plan-cache retry"
+            )
+
+    def _adopt_plan_cache_revision(self, revision: tuple[int, str]) -> None:
+        if self._plan_cache_revision == revision:
+            return
+        if self._plan_cache_revision is not None:
+            self._plan_cache_invalidations += 1
+        self._plan_cache.clear()
+        self._plan_cache_revision = revision
+
+    def _resolve_expert_plan_uncached(
+        self,
+        layer: int,
+        expert_id: int,
+    ) -> OfficialExpertRangePlan:
+        matches: list[OfficialExpertRangePlan] = []
+        for stored_layout, plan, _citation in _direct_bindings(
+            self.graph,
+            self.layout.model,
+            layer=layer,
+            expert_id=expert_id,
+        ):
+            if stored_layout.layout_fingerprint == self.layout.layout_fingerprint:
+                if stored_layout != self.layout:
+                    raise CausalWeightIntegrityError(
+                        "stored layout identity is internally inconsistent"
+                    )
+                matches.append(plan)
+        if not matches:
+            raise CausalWeightNotFoundError(
+                "no causal range binding exists for "
+                f"layer {layer} expert {expert_id} in layout "
+                f"{self.layout.layout_fingerprint}"
+            )
+        if any(plan != matches[0] for plan in matches[1:]):
+            raise CausalWeightConflictError(
+                "graph contains conflicting range plans for one layout/expert"
+            )
+        return matches[0]
 
     def read_experts(
         self,
@@ -1038,6 +1107,20 @@ class CausalWeightReader:
     def metrics(self) -> dict[str, int | str]:
         """Return cumulative direct-range receipts for benchmark accounting."""
 
+        with self._plan_cache_lock:
+            cache_revision = self._plan_cache_revision
+            cache_metrics: dict[str, int | str] = {
+                "plan_cache_entries": len(self._plan_cache),
+                "plan_cache_hits": self._plan_cache_hits,
+                "plan_cache_invalidations": self._plan_cache_invalidations,
+                "plan_cache_misses": self._plan_cache_misses,
+                "plan_cache_revision_sequence": (
+                    -1 if cache_revision is None else cache_revision[0]
+                ),
+                "plan_cache_revision_sha256": (
+                    "" if cache_revision is None else cache_revision[1]
+                ),
+            }
         with self._metrics_lock:
             return {
                 "layout_fingerprint": self.layout.layout_fingerprint,
@@ -1046,6 +1129,7 @@ class CausalWeightReader:
                 "resident_bytes": self._resident_bytes,
                 "source_requests": self._source_requests,
                 "source_bytes": self._source_bytes,
+                **cache_metrics,
             }
 
 
