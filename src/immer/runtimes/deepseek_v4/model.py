@@ -123,7 +123,7 @@ class StreamedDeepSeekV4:
         route_prefetch_k: int | None = None,
         route_prefetch_alpha: float = 1.0,
         route_prefetch_direct_max_rows: int = 8,
-        route_prefetch_min_confidence: float = 0.0,
+        route_prefetch_min_confidence: float = 0.125,
     ) -> None:
         self.config = config
         self.pager = pager

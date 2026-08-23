@@ -259,7 +259,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--route-prefetch-min-confidence",
         type=_unit_float,
-        default=0.0,
+        default=0.125,
         help="normalized top-K mass above the uniform null required for direct windows",
     )
     parser.add_argument(
