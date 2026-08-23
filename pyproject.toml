@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-neural = ["torch>=2.5"]
+neural = ["torch>=2.5", "safetensors>=0.4", "tokenizers>=0.22"]
 mouth = ["torch>=2.5", "transformers>=4.45"]
 fertig-binary = ["msgpack>=1.0", "xxhash>=3.5"]
 export = ["safetensors>=0.4"]

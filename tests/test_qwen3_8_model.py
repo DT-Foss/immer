@@ -248,6 +248,30 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(resumed.rows, first.rows)
         self.assertEqual(resumed.evidence.layer_calls, 4)
 
+    def test_qwen_draft_verifier_accepts_both_published_stop_tokens(self) -> None:
+        from test_deepseek_v4_draft_verification import _FakeModel
+
+        model = _FakeModel((2, 99))
+        report = Qwen38DraftVerifier(model).verify(
+            [[1]],
+            [[2]],
+            eos_token_id=7,
+            eos_token_ids=(7, 99),
+        )
+
+        self.assertTrue(report.all_verified)
+        self.assertEqual(report.rows[0].target_token_ids, (2, 99))
+        self.assertTrue(report.rows[0].eos_verified)
+        self.assertIsNone(report.rows[0].first_mismatch_index)
+        self.assertEqual(report.evidence.schema, DRAFT_VERIFICATION_SCHEMA)
+
+        with self.assertRaisesRegex(ValueError, "exclude every"):
+            Qwen38DraftVerifier(_FakeModel((2, 7))).verify(
+                [[1]],
+                [[99]],
+                eos_token_ids=(7, 99),
+            )
+
     def test_qwen_crsa_sidecar_is_causal_and_energy_stable(self) -> None:
         torch.manual_seed(43)
         hidden = torch.randn(2, 7, self.config.dim)

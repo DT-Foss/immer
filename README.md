@@ -103,6 +103,11 @@ erste echte Layer benötigt 766.556.608 Quellbytes statt eines vollständigen
 ```bash
 PYTHONPATH=src python scripts/qwen38_stream_smoke.py --dry-run --budget-mb 64
 PYTHONPATH=src python scripts/qwen38_stream_smoke.py --layers 1 --budget-mb 1024
+
+# Acht lokale Qwen-Drafts für FERTIG-Abstentionen exakt tokenisieren und
+# anschließend gemeinsam in einem resumierbaren 64-Layer-Pass verifizieren.
+PYTHONPATH=src python scripts/qwen38_fertig_draft_verify.py --prepare-only
+PYTHONPATH=src python scripts/qwen38_fertig_draft_verify.py
 ```
 
 ## Gemessenes Urteil
