@@ -12,8 +12,11 @@ would stop after it.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+import hashlib
+import json
 import math
 import numbers
 import time
@@ -21,8 +24,11 @@ from typing import Any
 
 import torch
 
+from ...knowledge.access_trace import AccessTraceRecorder, canonical_tags
+
 
 DRAFT_VERIFICATION_SCHEMA = "immer.deepseek-v4-draft-verification/v2"
+ROUTE_OBSERVATION_SCHEMA = "immer.deepseek-v4-successful-route/v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +113,23 @@ class DraftVerificationResumeState:
     graft_applied: bool
 
 
+@dataclass(frozen=True, slots=True)
+class SuccessfulRouteObservation:
+    """Idempotent request/layer identity plus exact official router output."""
+
+    schema: str
+    observation_id: str
+    request_id: str
+    layer: int
+    selected_expert_ids: tuple[tuple[int, ...], ...]
+
+    @property
+    def flattened_expert_ids(self) -> tuple[int, ...]:
+        """Preserve every selection frequency while dropping only row nesting."""
+
+        return tuple(expert for row in self.selected_expert_ids for expert in row)
+
+
 def _metric_int(owner: Any, key: str) -> int:
     metrics = owner.metrics()
     raw = metrics.get(key, 0)
@@ -164,6 +187,73 @@ def _positive_int(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _access_scope(
+    recorder: AccessTraceRecorder | None,
+    request_tags: Mapping[str, Any],
+    **operation_tags: Any,
+) -> Any:
+    if recorder is None:
+        return nullcontext()
+    tags = dict(request_tags)
+    tags.update(operation_tags)
+    return recorder.scope(**tags)
+
+
+def _freeze_selected_experts(
+    selected: Any,
+    *,
+    n_routed_experts: int | None,
+) -> tuple[tuple[int, ...], ...]:
+    """Freeze official per-row selections without losing order or frequency."""
+
+    if isinstance(selected, (str, bytes)):
+        raise TypeError("selected experts must be nested integer rows")
+    try:
+        rows = tuple(selected)
+    except TypeError as exc:
+        raise TypeError("selected experts must be nested integer rows") from exc
+    frozen: list[tuple[int, ...]] = []
+    for row in rows:
+        if isinstance(row, (str, bytes)):
+            raise TypeError("selected experts must be nested integer rows")
+        try:
+            choices = tuple(_integer(expert, "selected experts") for expert in row)
+        except TypeError as exc:
+            raise TypeError("selected experts must be nested integer rows") from exc
+        if any(expert < 0 for expert in choices):
+            raise ValueError("selected expert ID must be non-negative")
+        if n_routed_experts is not None and any(
+            expert >= n_routed_experts for expert in choices
+        ):
+            raise ValueError("selected expert ID outside checkpoint inventory")
+        frozen.append(choices)
+    return tuple(frozen)
+
+
+def _route_request_id(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("route_request_id must be non-empty text")
+    normalized = value.strip()
+    if len(normalized.encode("utf-8")) > 512:
+        raise ValueError("route_request_id exceeds 512 UTF-8 bytes")
+    return normalized
+
+
+def _route_observation_id(request_id: str, layer: int) -> str:
+    document = {
+        "layer": layer,
+        "request_id": request_id,
+        "schema": ROUTE_OBSERVATION_SCHEMA,
+    }
+    encoded = json.dumps(
+        document,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"deepseek-v4-route:v1:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _transient_failure(error: Exception) -> bool:
@@ -266,12 +356,21 @@ class LayerwiseDraftVerifier:
         head_progress: Callable[[dict[str, int]], None] | None = None,
         resume_state: DraftVerificationResumeState | None = None,
         checkpoint: Callable[[DraftVerificationResumeState], None] | None = None,
+        access_recorder: AccessTraceRecorder | None = None,
+        access_tags: Mapping[str, Any] | None = None,
+        route_request_id: str | None = None,
+        route_observer: Callable[[SuccessfulRouteObservation], None] | None = None,
     ) -> DraftVerificationReport:
         """Compare supplied drafts with exact greedy V4 next-token targets.
 
         ``accepted_prefix_length`` counts draft tokens only.  When every draft
         token matches but the optional EOS does not, the full draft length is
         accepted while ``fully_verified`` is false.
+
+        ``access_recorder`` adds request-local scopes to the recorder already
+        installed on the model's tensor source. ``route_observer`` receives
+        an idempotent request/layer identity and the complete official per-row
+        expert selections. Duplicate IDs retain their empirical frequencies.
         """
 
         prompts = _rows(
@@ -305,6 +404,21 @@ class LayerwiseDraftVerifier:
             raise TypeError("progress must be callable or None")
         if checkpoint is not None and not callable(checkpoint):
             raise TypeError("checkpoint must be callable or None")
+        if access_recorder is not None and not isinstance(
+            access_recorder, AccessTraceRecorder
+        ):
+            raise TypeError("access_recorder must be an AccessTraceRecorder or None")
+        if access_tags is not None and access_recorder is None:
+            raise ValueError("access_tags require an access_recorder")
+        request_access_tags = dict(canonical_tags(access_tags))
+        if route_observer is not None and not callable(route_observer):
+            raise TypeError("route_observer must be callable or None")
+        if route_observer is None:
+            if route_request_id is not None:
+                raise ValueError("route_request_id requires a route_observer")
+            normalized_route_request_id = None
+        else:
+            normalized_route_request_id = _route_request_id(route_request_id)
 
         for row in prompts:
             if any(token < 0 or token >= vocab_size for token in row):
@@ -420,18 +534,33 @@ class LayerwiseDraftVerifier:
                     }
                 )
         else:
-            hidden = self.model.embed_batch(ids)
+            with _access_scope(
+                access_recorder,
+                request_access_tags,
+                phase="embed",
+                attempt=1,
+            ):
+                hidden = self.model.embed_batch(ids)
         try:
             for layer in range(first_layer, int(self.model.config.n_layers)):
                 retries = 0
                 while True:
                     try:
-                        next_hidden, _experts = self.model.forward_prefill_layer(
-                            hidden,
-                            ids,
+                        with _access_scope(
+                            access_recorder,
+                            request_access_tags,
+                            phase="layer",
                             layer=layer,
-                            token_mask=mask,
-                        )
+                            attempt=retries + 1,
+                        ):
+                            next_hidden, selected_experts = (
+                                self.model.forward_prefill_layer(
+                                    hidden,
+                                    ids,
+                                    layer=layer,
+                                    token_mask=mask,
+                                )
+                            )
                         break
                     except Exception as exc:
                         self.model.pager.release()
@@ -460,6 +589,31 @@ class LayerwiseDraftVerifier:
                         raise ValueError("graft changed the padded hidden shape")
                     graft_applied = True
                 self.model.pager.release()
+                # Deliberately after pager cleanup and outside the transport
+                # retry handler. The stable request/layer observation ID lets
+                # an append-only ledger deduplicate crash/replay delivery.
+                if route_observer is not None:
+                    assert normalized_route_request_id is not None
+                    official_selected = _freeze_selected_experts(
+                        selected_experts,
+                        n_routed_experts=getattr(
+                            self.model.config,
+                            "n_routed_experts",
+                            None,
+                        ),
+                    )
+                    route_observer(
+                        SuccessfulRouteObservation(
+                            schema=ROUTE_OBSERVATION_SCHEMA,
+                            observation_id=_route_observation_id(
+                                normalized_route_request_id,
+                                layer,
+                            ),
+                            request_id=normalized_route_request_id,
+                            layer=layer,
+                            selected_expert_ids=official_selected,
+                        )
+                    )
                 if checkpoint is not None:
                     checkpoint(
                         DraftVerificationResumeState(
@@ -487,7 +641,13 @@ class LayerwiseDraftVerifier:
                         }
                     )
 
-            final = self.model.finalize_hidden(hidden)
+            with _access_scope(
+                access_recorder,
+                request_access_tags,
+                phase="final_norm",
+                attempt=1,
+            ):
+                final = self.model.finalize_hidden(hidden)
             gathered: list[torch.Tensor] = []
             row_spans: list[tuple[int, int]] = []
             expected_rows: list[tuple[int, ...]] = []
@@ -504,12 +664,18 @@ class LayerwiseDraftVerifier:
             head_retries = 0
             while True:
                 try:
-                    _values, selected = self.model.pager.topk_logits(
-                        verification_hidden,
-                        k=1,
-                        block_rows=block_rows,
-                        progress=head_progress,
-                    )
+                    with _access_scope(
+                        access_recorder,
+                        request_access_tags,
+                        phase="head",
+                        attempt=head_retries + 1,
+                    ):
+                        _values, selected = self.model.pager.topk_logits(
+                            verification_hidden,
+                            k=1,
+                            block_rows=block_rows,
+                            progress=head_progress,
+                        )
                     break
                 except Exception as exc:
                     self.model.pager.release()
@@ -613,9 +779,11 @@ class LayerwiseDraftVerifier:
 
 __all__ = [
     "DRAFT_VERIFICATION_SCHEMA",
+    "ROUTE_OBSERVATION_SCHEMA",
     "DraftRowVerification",
     "DraftVerificationEvidence",
     "DraftVerificationReport",
     "DraftVerificationResumeState",
     "LayerwiseDraftVerifier",
+    "SuccessfulRouteObservation",
 ]

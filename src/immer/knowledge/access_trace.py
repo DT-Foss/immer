@@ -14,6 +14,7 @@ import re
 import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, TYPE_CHECKING, runtime_checkable
 
@@ -410,42 +411,35 @@ class AccessTraceRecorder:
             None if max_leaves is None else _positive_int(max_leaves, "max_leaves")
         )
         self._lock = threading.Lock()
-        self._local = threading.local()
+        self._scope_tags: ContextVar[tuple[tuple[str, Any], ...]] = ContextVar(
+            f"immer_access_trace_scope_{id(self)}",
+            default=(),
+        )
         self._operations: list[AccessOperation] = []
         self._leaves = 0
         self._source: tuple[str, str, str] | None = None
         self._dropped_capacity = 0
         self._dropped_identity = 0
 
-    def _scope_stack(self) -> list[tuple[tuple[str, Any], ...]]:
-        stack = getattr(self._local, "scope_stack", None)
-        if stack is None:
-            stack = []
-            self._local.scope_stack = stack
-        return stack
-
     @contextmanager
     def scope(self, **tags: Any) -> Iterator[AccessTraceRecorder]:
-        """Attach bounded JSON-scalar tags to observations on this thread."""
+        """Attach bounded tags to this request context and copied child contexts."""
 
         additions = canonical_tags(tags)
-        stack = self._scope_stack()
-        merged = dict(stack[-1]) if stack else {}
+        merged = dict(self._scope_tags.get())
         merged.update(additions)
         frozen = canonical_tags(merged)
-        stack.append(frozen)
+        token = self._scope_tags.set(frozen)
         try:
             yield self
         finally:
-            popped = stack.pop()
-            if popped is not frozen:  # pragma: no cover - internal invariant
-                raise RuntimeError("access trace scopes were not exited LIFO")
+            self._scope_tags.reset(token)
 
     def observe(self, operation: AccessOperation) -> bool:
-        tags = self._scope_stack()
+        tags = self._scope_tags.get()
         if tags:
             merged = dict(operation.tags)
-            merged.update(tags[-1])
+            merged.update(tags)
             operation = replace(operation, tags=canonical_tags(merged))
         source = (
             operation.repo_id,

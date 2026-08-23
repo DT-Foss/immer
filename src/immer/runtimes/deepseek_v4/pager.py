@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
+from contextvars import Context, copy_context
 from dataclasses import asdict, dataclass
 from collections.abc import Callable, Iterable
 import threading
@@ -140,6 +141,7 @@ class _ExpertPrefetchWindow:
     tickets: tuple[_ExpertPrefetch, ...]
     batches: tuple[_ExpertPrefetchBatch, ...]
     executor: ThreadPoolExecutor | None
+    submission_context: Context
     next_submit: int = 0
     next_consume: int = 0
     closed: bool = False
@@ -832,7 +834,16 @@ class DeepSeekWeightPager:
             )
             if resident_after > self.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES:
                 break
-            batch.future = executor.submit(self._read_expert_batch, batch.plan)
+            # ThreadPoolExecutor deliberately starts workers with an empty
+            # context. Capture each submission independently so request-local
+            # access-trace tags follow both initially queued and later sliding
+            # window reads without serializing or disabling prefetch.
+            context = window.submission_context.copy()
+            batch.future = executor.submit(
+                context.run,
+                self._read_expert_batch,
+                batch.plan,
+            )
             batch.submitted = True
             window.next_submit += 1
             self._stats.expert_prefetch_submitted += batch.remaining
@@ -901,6 +912,7 @@ class DeepSeekWeightPager:
             tickets=(),
             batches=batches,
             executor=executor,
+            submission_context=copy_context(),
         )
         batch_by_base = {
             expert.base: batch for batch in batches for expert in batch.plan.experts

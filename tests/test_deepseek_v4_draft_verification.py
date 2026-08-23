@@ -52,6 +52,7 @@ class _FakeModel:
         graft_layer=None,
         head_failures=0,
         head_error=None,
+        selected_by_layer=None,
     ):
         self.config = SimpleNamespace(
             n_layers=2,
@@ -71,6 +72,9 @@ class _FakeModel:
         self.layer_calls = []
         self.embedded = []
         self.reset_calls = 0
+        self.selected_by_layer = (
+            {} if selected_by_layer is None else dict(selected_by_layer)
+        )
 
     def reset_state(self, *, release=False):
         self.reset_calls += int(release)
@@ -95,7 +99,7 @@ class _FakeModel:
         self.layer_calls.append((layer, ids, mask))
         self.pager.values["linear_calls"] += 2
         self.pager.source.values["network_or_source_body_bytes"] += 10
-        return hidden, ()
+        return hidden, self.selected_by_layer.get(layer, ())
 
     def finalize_hidden(self, hidden):
         return hidden[:, :, 0]
@@ -114,8 +118,8 @@ class _FakeGraft:
 
 
 class _FlakyModel(_FakeModel):
-    def __init__(self, predictions):
-        super().__init__(predictions)
+    def __init__(self, predictions, *, selected_by_layer=None):
+        super().__init__(predictions, selected_by_layer=selected_by_layer)
         self.failures_remaining = 1
         self.attempts = []
 
@@ -293,6 +297,162 @@ class DeepSeekV4DraftVerificationTests(unittest.TestCase):
         self.assertTrue(torch.equal(model.attempts[0][2], model.attempts[1][2]))
         self.assertGreaterEqual(model.pager.releases, 4)
 
+    def test_access_scopes_cover_each_model_and_transport_attempt(self):
+        from immer.knowledge.access_trace import (
+            AccessLeaf,
+            AccessOperation,
+            AccessTraceRecorder,
+        )
+        from immer.runtimes.deepseek_v4.draft_verification import (
+            LayerwiseDraftVerifier,
+        )
+
+        recorder = AccessTraceRecorder()
+        sequence = 0
+
+        def emit(shard):
+            nonlocal sequence
+            sequence += 1
+            recorder.observe(
+                AccessOperation(
+                    repo_id="local:draft-trace-fixture",
+                    revision="fixture",
+                    inventory_fingerprint="1" * 64,
+                    operation="raw_bytes",
+                    operation_sequence=sequence,
+                    thread_id=0,
+                    thread_name="draft-test",
+                    leaves=(AccessLeaf(shard, sequence, 1),),
+                    source_requests=1,
+                    source_bytes=1,
+                    cache_hits=0,
+                )
+            )
+
+        model = _FlakyModel((2, 3))
+        model.pager.head_failures = 1
+        original_embed = model.embed_batch
+        original_layer = model.forward_prefill_layer
+        original_finalize = model.finalize_hidden
+        original_head = model.pager.topk_logits
+
+        def embed(*args, **kwargs):
+            emit("embed")
+            return original_embed(*args, **kwargs)
+
+        def layer(*args, **kwargs):
+            emit(f"layer-{kwargs['layer']}")
+            return original_layer(*args, **kwargs)
+
+        def finalize(*args, **kwargs):
+            emit("final-norm")
+            return original_finalize(*args, **kwargs)
+
+        def head(*args, **kwargs):
+            emit("head")
+            return original_head(*args, **kwargs)
+
+        model.embed_batch = embed
+        model.forward_prefill_layer = layer
+        model.finalize_hidden = finalize
+        model.pager.topk_logits = head
+        report = LayerwiseDraftVerifier(
+            model,
+            layer_retries=1,
+            head_retries=1,
+        ).verify(
+            [[1]],
+            [[2, 3]],
+            access_recorder=recorder,
+            access_tags={"request_id": "verify-9"},
+        )
+
+        self.assertTrue(report.all_verified)
+        observed = [
+            dict(operation.tags) for operation in recorder.snapshot().operations
+        ]
+        self.assertEqual(
+            observed,
+            [
+                {"attempt": 1, "phase": "embed", "request_id": "verify-9"},
+                {
+                    "attempt": 1,
+                    "layer": 0,
+                    "phase": "layer",
+                    "request_id": "verify-9",
+                },
+                {
+                    "attempt": 2,
+                    "layer": 0,
+                    "phase": "layer",
+                    "request_id": "verify-9",
+                },
+                {
+                    "attempt": 1,
+                    "layer": 1,
+                    "phase": "layer",
+                    "request_id": "verify-9",
+                },
+                {
+                    "attempt": 1,
+                    "phase": "final_norm",
+                    "request_id": "verify-9",
+                },
+                {"attempt": 1, "phase": "head", "request_id": "verify-9"},
+                {"attempt": 2, "phase": "head", "request_id": "verify-9"},
+            ],
+        )
+
+    def test_route_observer_is_success_only_exact_and_not_retry_wrapped(self):
+        from immer.runtimes.deepseek_v4.draft_verification import (
+            LayerwiseDraftVerifier,
+        )
+
+        selected = {
+            0: ((7, 2), (7, 7), ()),
+            1: ((4, 4), (), (4, 1)),
+        }
+        model = _FlakyModel((2, 3), selected_by_layer=selected)
+        observed = []
+        report = LayerwiseDraftVerifier(model, layer_retries=1).verify(
+            [[1]],
+            [[2, 3]],
+            route_request_id="route-request-3",
+            route_observer=observed.append,
+        )
+
+        self.assertTrue(report.all_verified)
+        self.assertEqual([event.layer for event in observed], [0, 1])
+        self.assertEqual(
+            [event.selected_expert_ids for event in observed],
+            [selected[0], selected[1]],
+        )
+        self.assertEqual(observed[0].flattened_expert_ids, (7, 2, 7, 7))
+        self.assertEqual(observed[0].request_id, "route-request-3")
+        self.assertNotEqual(observed[0].observation_id, observed[1].observation_id)
+        self.assertEqual(len(model.attempts), 3)
+
+        callback_attempts = []
+        no_model_failure = _FlakyModel((2,), selected_by_layer={0: ((3, 3),)})
+        no_model_failure.failures_remaining = 0
+
+        def callback(event):
+            callback_attempts.append(event)
+            raise TimeoutError("causal ledger unavailable")
+
+        with self.assertRaisesRegex(TimeoutError, "causal ledger"):
+            LayerwiseDraftVerifier(no_model_failure, layer_retries=3).verify(
+                [[1]],
+                [[2]],
+                route_request_id="callback-cleanup",
+                route_observer=callback,
+            )
+        self.assertEqual(len(callback_attempts), 1)
+        self.assertEqual(callback_attempts[0].layer, 0)
+        self.assertEqual(callback_attempts[0].selected_expert_ids, ((3, 3),))
+        self.assertEqual(len(no_model_failure.attempts), 1)
+        self.assertEqual(no_model_failure.pager.releases, 2)
+
     def test_one_rolling_state_resumes_at_the_next_layer_and_keeps_accounting(self):
         from immer.runtimes.deepseek_v4.draft_verification import (
             DraftVerificationResumeState,
@@ -308,12 +468,18 @@ class DeepSeekV4DraftVerificationTests(unittest.TestCase):
             captured.append(state)
             raise StopAfterCheckpoint
 
-        first = _FakeModel((2, 3))
+        first_routes = []
+        first = _FakeModel(
+            (2, 3),
+            selected_by_layer={0: ((8, 8), (3,))},
+        )
         with self.assertRaises(StopAfterCheckpoint):
             LayerwiseDraftVerifier(first).verify(
                 [[1]],
                 [[2, 3]],
                 checkpoint=stop,
+                route_request_id="resume-request-11",
+                route_observer=first_routes.append,
             )
         self.assertEqual(len(captured), 1)
         state = captured[0]
@@ -323,7 +489,15 @@ class DeepSeekV4DraftVerificationTests(unittest.TestCase):
         self.assertEqual(state.source_body_bytes, 10)
         self.assertEqual(state.linear_calls, 2)
 
-        resumed = _FakeModel((2, 3))
+        self.assertEqual(len(first_routes), 1)
+        self.assertEqual(first_routes[0].layer, 0)
+        self.assertEqual(first_routes[0].selected_expert_ids, ((8, 8), (3,)))
+
+        resumed_routes = []
+        resumed = _FakeModel(
+            (2, 3),
+            selected_by_layer={1: ((5,), (5, 1))},
+        )
         checkpoints = []
         progress = []
         report = LayerwiseDraftVerifier(resumed).verify(
@@ -332,6 +506,8 @@ class DeepSeekV4DraftVerificationTests(unittest.TestCase):
             resume_state=state,
             checkpoint=checkpoints.append,
             progress=progress.append,
+            route_request_id="resume-request-11",
+            route_observer=resumed_routes.append,
         )
         self.assertTrue(report.all_verified)
         self.assertEqual([row[0] for row in resumed.layer_calls], [1])
@@ -340,6 +516,31 @@ class DeepSeekV4DraftVerificationTests(unittest.TestCase):
         self.assertEqual(report.evidence.linear_calls, 5)
         self.assertEqual(checkpoints[-1].next_layer, 2)
         self.assertEqual(progress[0]["event"], "resume_loaded")
+        self.assertEqual(len(resumed_routes), 1)
+        self.assertEqual(resumed_routes[0].layer, 1)
+        self.assertEqual(resumed_routes[0].selected_expert_ids, ((5,), (5, 1)))
+
+        # Simulate a crash after durable route append but before the layer-1
+        # checkpoint: replaying the same resume boundary emits the same stable
+        # observation ID, allowing LiveCausal's append ledger to deduplicate it.
+        replayed_routes = []
+        replayed = _FakeModel(
+            (2, 3),
+            selected_by_layer={1: ((5,), (5, 1))},
+        )
+        replayed_report = LayerwiseDraftVerifier(replayed).verify(
+            [[1]],
+            [[2, 3]],
+            resume_state=state,
+            route_request_id="resume-request-11",
+            route_observer=replayed_routes.append,
+        )
+        self.assertTrue(replayed_report.all_verified)
+        self.assertEqual(len(replayed_routes), 1)
+        self.assertEqual(
+            replayed_routes[0].observation_id,
+            resumed_routes[0].observation_id,
+        )
 
     def test_retries_transient_head_failure_but_not_deterministic_layer_error(self):
         from immer.runtimes.deepseek_v4.draft_verification import (
@@ -420,6 +621,25 @@ class DeepSeekV4DraftVerificationTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "checkpoint"):
             LayerwiseDraftVerifier(_FakeModel((2,))).verify(
                 [[1]], [[2]], checkpoint=object()
+            )
+        with self.assertRaisesRegex(ValueError, "route_request_id"):
+            LayerwiseDraftVerifier(_FakeModel((2,))).verify(
+                [[1]],
+                [[2]],
+                route_observer=lambda _event: None,
+            )
+        with self.assertRaisesRegex(ValueError, "requires a route_observer"):
+            LayerwiseDraftVerifier(_FakeModel((2,))).verify(
+                [[1]],
+                [[2]],
+                route_request_id="unused-route",
+            )
+        with self.assertRaisesRegex(TypeError, "route_observer"):
+            LayerwiseDraftVerifier(_FakeModel((2,))).verify(
+                [[1]],
+                [[2]],
+                route_request_id="route",
+                route_observer=object(),
             )
 
     def test_accepts_integer_numpy_and_tensor_rows(self):

@@ -292,6 +292,40 @@ class _MultiEncodedExpertSource:
         }
 
 
+class _AccessTracingExpertSource(_MultiEncodedExpertSource):
+    """Emit Streamer-shaped observations from real prefetch worker reads."""
+
+    def __init__(self, bases, recorder) -> None:
+        super().__init__(bases)
+        self.recorder = recorder
+        self._access_sequence = 0
+        self._access_lock = threading.Lock()
+
+    def raw_bytes(self, shard: str, offset: int, length: int) -> bytes:
+        from immer.knowledge.access_trace import AccessLeaf, AccessOperation
+
+        payload = super().raw_bytes(shard, offset, length)
+        with self._access_lock:
+            self._access_sequence += 1
+            sequence = self._access_sequence
+        self.recorder.observe(
+            AccessOperation(
+                repo_id="local:pager-context-fixture",
+                revision="fixture",
+                inventory_fingerprint="0" * 64,
+                operation="raw_bytes",
+                operation_sequence=sequence,
+                thread_id=threading.get_ident(),
+                thread_name=threading.current_thread().name,
+                leaves=(AccessLeaf(shard, offset, length),),
+                source_requests=1,
+                source_bytes=length,
+                cache_hits=0,
+            )
+        )
+        return payload
+
+
 class _AdjacentBatchExpertSource:
     """Three experts where E0/E1 share exact physical range boundaries."""
 
@@ -729,6 +763,66 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         )
         self.assertEqual(metrics["expert_prefetch_max_experts"], 3)
         self.assertEqual(metrics["expert_prefetch_resident_limit_bytes"], 48 * 1024**2)
+        pager.release()
+
+    def test_prefetch_workers_inherit_access_trace_scope_for_every_submission(
+        self,
+    ) -> None:
+        from immer.knowledge.access_trace import AccessTraceRecorder
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        bases = [f"layers.11.ffn.experts.{value}" for value in range(4)]
+        recorder = AccessTraceRecorder()
+        source = _AccessTracingExpertSource(bases, recorder)
+        pager = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+        )
+
+        with recorder.scope(
+            request_id="request-7",
+            phase="layer",
+            layer=11,
+            attempt=2,
+        ):
+            window = pager.prefetch_expert_window(bases)
+            assert window is not None
+        # The fourth read is submitted only after consuming the first ticket.
+        # Consume under a conflicting scope to prove the window retains the
+        # opening request context across its full sliding lifecycle.
+        with recorder.scope(
+            request_id="wrong-consumer",
+            phase="outside-layer",
+            layer=99,
+            attempt=9,
+        ):
+            for base in bases:
+                payload = pager.consume_expert_window(window, base)
+                pager.discard_expert_payload(payload)
+            pager.close_expert_window(window)
+
+        trace = recorder.snapshot()
+        self.assertEqual(len(trace.operations), 2 * len(bases))
+        self.assertTrue(
+            all(
+                dict(operation.tags)
+                == {
+                    "attempt": 2,
+                    "layer": 11,
+                    "phase": "layer",
+                    "request_id": "request-7",
+                }
+                for operation in trace.operations
+            )
+        )
+        self.assertTrue(
+            all(
+                operation.thread_name.startswith("immer-v4-expert-prefetch")
+                for operation in trace.operations
+            )
+        )
+        self.assertEqual(pager.metrics()["expert_prefetch_submitted"], 4)
         pager.release()
 
     def test_prefetch_identity_tracks_disabled_q3_and_adjacent_modes(self) -> None:
