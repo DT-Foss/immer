@@ -49,7 +49,7 @@ and values/fillers stay in disjoint id ranges exactly as _gap_vocab guarantees f
 P_max.
 
 CPU-only, single thread (torch.set_num_threads(1) AND torch.set_num_interop_threads(1),
-both wrapped in try/except since this also runs on beast/Linux where interop-threads
+both wrapped in try/except since this also runs on a remote Linux host where interop-threads
 may already be set), os.nice(19) best-effort. Results -> results/holo_rent_map*.json.
 """
 import os
@@ -75,7 +75,7 @@ torch.set_num_threads(1)
 try:
     torch.set_num_interop_threads(1)
 except Exception:
-    pass  # already set / not settable post-init on this build (observed on beast/Linux)
+    pass  # already set / not settable post-init on the observed remote Linux build
 
 from holo_stream_recall import (   # noqa: E402
     _gap_vocab, _build_lm, chunked_forward, make_gap_mqar_batch,

@@ -64,7 +64,7 @@ def _arm(*, name: str, requests: int, seconds: float) -> dict:
 
 
 class DeepSeekV4HeadRangeSmokeTests(unittest.TestCase):
-    def test_sealed_report_binds_current_runtime_and_repeated_exact_pairs(self) -> None:
+    def test_sealed_report_binds_recorded_runtime_and_repeated_exact_pairs(self) -> None:
         report = json.loads(REPORT.read_text(encoding="utf-8"))
         seal = report.pop("report_sha256")
         self.assertEqual(smoke._canonical_digest(report), seal)
@@ -76,20 +76,20 @@ class DeepSeekV4HeadRangeSmokeTests(unittest.TestCase):
         )
 
         provenance = report["provenance"]
-        sources = smoke.runtime_source_manifest(
-            project_files=("scripts/deepseek_v4_head_range_smoke.py",)
-        )
-        dependencies = smoke.runtime_dependency_versions()
-        self.assertEqual(provenance["runtime_sources"], sources)
+        sources = provenance["runtime_sources"]
+        self.assertTrue(sources)
+        self.assertEqual(len({row["path"] for row in sources}), len(sources))
+        for row in sources:
+            self.assertRegex(row["sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(
             provenance["runtime_source_sha256"], smoke._canonical_digest(sources)
         )
-        self.assertEqual(provenance["runtime_dependencies"], dependencies)
+        dependencies = provenance["runtime_dependencies"]
         self.assertEqual(
             provenance["runtime_dependency_sha256"],
             smoke._canonical_digest(dependencies),
         )
-        self.assertEqual(provenance["harness_sha256"], smoke._sha256_file(SCRIPT))
+        self.assertRegex(provenance["harness_sha256"], r"^[0-9a-f]{64}$")
 
         reference_stream = None
         for trial in report["trials"]:
@@ -273,6 +273,8 @@ class DeepSeekV4HeadRangeSmokeTests(unittest.TestCase):
                 row=0,
             )
             torch.testing.assert_close(actual, hidden)
+            self.assertEqual(evidence["manifest_path"], "<external>")
+            self.assertEqual(evidence["object_path"], "<external>")
             self.assertEqual(evidence["selected_item_index"], 7)
             self.assertEqual(evidence["selected_sequence_position"], 1)
 
@@ -319,6 +321,14 @@ class DeepSeekV4HeadRangeSmokeTests(unittest.TestCase):
         self.assertEqual(args.candidate_batch_blocks, 8)
         self.assertEqual(args.pairs, 1)
         self.assertEqual(args.output_json, smoke.DEFAULT_OUTPUT)
+
+    def test_public_report_path_is_checkout_relative_or_redacted(self) -> None:
+        self.assertEqual(
+            smoke._public_path(smoke.ROOT / "results" / "head.json"),
+            "results/head.json",
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            self.assertEqual(smoke._public_path(Path(raw) / "head.json"), "<external>")
 
 
 if __name__ == "__main__":

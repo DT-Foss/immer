@@ -115,6 +115,11 @@ class QwenLocalBaselineTests(unittest.TestCase):
             self.assertEqual(report["summary"]["accuracy"], 7 / 8)
             self.assertEqual(len(report["items"]), 8)
             self.assertTrue(all(row["latency_seconds"] >= 0 for row in report["items"]))
+            self.assertEqual(report["model"]["path"], "<external-local-checkpoint>")
+            self.assertEqual(report["benchmark"]["source"], "results/bench_gsm8k.json")
+            unsealed = dict(report)
+            digest = unsealed.pop("report_sha256")
+            self.assertEqual(digest, baseline._canonical_digest(unsealed))
             self.assertEqual(json.loads(output.read_text(encoding="utf-8")), report)
 
     def test_one_generation_error_is_retained_in_the_denominator(self) -> None:
@@ -252,6 +257,20 @@ class QwenLocalBaselineTests(unittest.TestCase):
         self.assertEqual(payload["stop"], ["<|im_end|>", "<|endoftext|>"])
         self.assertTrue(payload["prompt"].endswith("<think>\n\n</think>\n\n"))
         self.assertIn("<|im_start|>user\n2+2?<|im_end|>", payload["prompt"])
+
+    def test_public_backend_location_never_serializes_machine_addresses(self) -> None:
+        self.assertEqual(
+            baseline._public_backend_location("http://127.0.0.1:8780/v1"),
+            "<loopback-openai-compatible>",
+        )
+        self.assertEqual(
+            baseline._public_backend_location("https://model.internal.example/v1"),
+            "<external-openai-compatible>",
+        )
+        self.assertEqual(
+            baseline._public_backend_location(str(baseline.ROOT / "models" / "qwen")),
+            "models/qwen",
+        )
 
 
 if __name__ == "__main__":

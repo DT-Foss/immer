@@ -34,7 +34,7 @@ Three orchestrated experiments (P38), selected with --exp {a,b,c}:
       Local (same machine) MUST be bit-identical: every per-chunk metric field
       (surprise, gate, loss) and the final heldout/digest must match exactly.
       This is the gate: F7's "checkpoint/resume is exact" claim, measured.
-      (The cross-architecture arm, Mac ARM -> beast x86, is orchestrated
+      (The cross-architecture arm, Mac ARM -> remote x86, is orchestrated
       separately over --resume + rsync; this file only proves the local gate
       and emits everything a cross-machine comparison needs: config, digest,
       heldout trajectory, WT-2 20k eval.)
@@ -111,7 +111,7 @@ interop, best-effort), CPU only, os.nice(19) best-effort. Every RNG state
 that can affect the trajectory (torch global RNG, numpy Generators used for
 sleep-pool mixing) is captured in the checkpoint. No Mac-specific paths —
 everything is relative to the invocation directory, so this also runs on
-beast (Linux) unchanged.
+the remote Linux host unchanged.
 
 Usage:
   python3 src/portable_organism.py --exp a --smoke
@@ -946,7 +946,7 @@ def exp_a(args):
         "heldout_delta_leg2_vs_control": round(heldout_delta, 8),
         "gate_bit_identical_local": bool(bit_identical),
         "verdict": None,
-        "note": "cross-architecture (Mac ARM -> beast x86) arm orchestrated separately "
+        "note": "cross-architecture (Mac ARM -> remote x86) arm orchestrated separately "
                 "via --resume + rsync; behavioral (not bit) equivalence is the claim there. "
                 "This local gate proves checkpoint/resume is exact bit-for-bit.",
     }
@@ -1259,7 +1259,7 @@ def _wait_for_snapshot(out_dir, chunk_n, timeout=None, poll=0.02):
     fixed constant: A has to stream chunk_n chunks before it can write this
     snapshot, and a chunk's cost scales with BATCH*CHUNK*D_MODEL. The old
     flat 120 s was calibrated on the toy cadence and expires mid-run at
-    production cadence on a slower machine — beast wrote snap_400 about a
+    production cadence on a slower machine — the remote host wrote snap_400 about a
     minute after the constant gave up, which looks like a hang and is not
     one. Floor of 120 s keeps toy-scale behaviour unchanged."""
     if timeout is None:
@@ -1573,7 +1573,7 @@ def build_argparser():
                           "-- P39 FINAL measured d=128 and the a/c ratios still failed (17.9x / "
                           "3.79x), because BATCH/CHUNK stayed at toy values. Chunk WEIGHT is the "
                           "axis that dominates the fixed overheads: see --batch/--chunk-size. "
-                          "Replaces the beast-only local-edit workaround; NEVER hand-edit the constant.")
+                          "Replaces the remote-only local-edit workaround; NEVER hand-edit the constant.")
     ap.add_argument("--batch", type=int, default=4,
                      help="chunks-in-flight batch B; 4 = the toy default every P38/P39 result ran "
                           "at, 8 = the width the 40h POS organism actually streamed. Together with "

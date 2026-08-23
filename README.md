@@ -1,202 +1,71 @@
 # IMMER
 
-IMMER ist die lokale Integrationsruntime für ein kleines, fortlaufendes
-System: Identität im O(1)-Strom, Wissen in einer externen Bibliothek, Können
-in SHA-adressierten Organen, Grounding durch FERTIG und kausales Routing durch
-die eigene CRSA-Attention. Die `.causal`-Schicht beschreibt die Verkabelung
-über lokale Gewichte; sie ist ein expliziter Inferenz- und Speicherpfad, kein
-stilles Umschreiben der Tensoren.
+**Research trial artifact for causalized local frontier inference.**
 
-Der derzeit belastbare PoC ist kein allgemeines Chatmodell. Er ist ein
-funktionierender, abstinenzfähiger Runtime-Pfad:
+IMMER studies a single question: how far can a local system push frontier-model
+weights when neural inference, deterministic verification, persistent state,
+and causal weight addressing are designed as one runtime?
 
-```text
-Anfrage
-  → explizite Grammatik
-  → Frozen A1
-  → CRSA: 2 Local + 1 Balanced + 1 bit-exakter Free Head
-  → gemessener Arithmetic/Text-Gate
-  → eines von vier kalten Organen
-  → exakter struktureller Readout
-  → FERTIG als Verifier/Fallback
-  → Antwort oder Abstinenz
-```
+The repository accompanies the research line around `.causal`, deterministic
+validation, Causal Prefix Sinkhorn Attention, and O(1)-state systems. It contains trial code,
+tests, and selected public receipts. Model weights, learned graphs, private
+traces, capability-transfer material, and deployment state remain outside the
+release surface.
 
-Der lernende Lebensstrom ist davon absichtlich getrennt. Kein Online-Update
-kann den eingefrorenen Exact-Pfad verändern.
+## Research focus
 
-## Lokal starten
+- **Causalized local weights.** Immutable tensor payloads are paired with an
+  appendable causal address graph inside one local model bundle.
+- **Frontier execution.** A complete DeepSeek-V4-Flash decoder runs from exact
+  weight ranges with authenticated layer-level resume.
+- **Grounded composition.** [FERTIG](https://github.com/DT-Foss/FERTIG)
+  supplies deterministic parsing, verification, and explicit abstention.
+- **Transport intelligence.** Label-free route observations support held-out
+  Markov and placebo studies while the model's official router remains
+  authoritative.
+- **Independent mechanisms.** IMMER includes its own Causal Prefix Sinkhorn
+  Attention line,
+  persistent O(1) state, and digest-bound exact capability organs.
 
-Python 3.11+ wird unterstützt. Die Gewichte liegen absichtlich nicht in Git;
-der Checkout enthält ihre Pfade und SHA-256-Digests.
+## Selected trial evidence
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e '.[neural]'
-
-# Bereits vorhandene Originalartefakte read-only als Quelle benutzen.
-# IMMER prüft alle fünf SHA-256-Werte und kopiert atomar in diesen Checkout.
-python -m immer artifacts import /pfad/zum/o1-state-checkout
-python -m immer artifacts verify
-
-# Der vollständige lokale Akzeptanzlauf.
-python -m immer doctor --deep
-python -m immer eval
-python -m immer solve "Was ist drei plus fünf?"
-```
-
-Sind die Artefakte in diesem Checkout schon vorhanden, meldet der Import nur
-`verified` und kopiert nichts. Ein vorhandenes Ziel mit falschem Digest wird
-ohne explizites `--replace` nicht angefasst.
-
-## Leben, FERTIG und Bibliothek
-
-```bash
-python -m immer serve
-# /state   /sleep   /say <text>   /quit
-# merke: <fakt>
-# was weißt du über <thema>?
-```
-
-`serve` registriert genau einen Besitzer für `exact_math`: die bewachte
-S3→FERTIG-Kaskade. FERTIG stellt zusätzlich Hilfe, Skillauflistung und einen
-optionalen `.causal`-Graph bereit:
-
-```bash
-export IMMER_FERTIG_GRAPH=/pfad/zur/welt.causal
-python -m immer serve --no-dashboard
-```
-
-Desktop-Ausführung, Aufnahme und Store-Mutationen sind ohne explizit
-injizierte Backends gesperrt. FERTIG erfindet an diesen Grenzen keine Aktion.
-Ein lokaler Qwen-Mund ist nur ein optionaler Chat-Fallback:
-
-```bash
-pip install -e '.[mouth]'
-python -m immer serve --local-brain
-```
-
-## Weltgewichte streamen, ohne das Modell zu laden
-
-Der WorldStream liest nur Safetensors-Header und explizite Zeilenbereiche. Ein
-hartes Bytebudget wird vor jedem Transfer geprüft; Resume-Caches sind atomar
-und SHA-verifiziert.
-
-```bash
-# Komplett offline
-python -m immer stream /pfad/zum/safetensors-ordner --local --budget-mb 20
-python -m immer stream /pfad/zum/safetensors-ordner --local \
-  --tensor model.layers.0.mlp.gate_proj.weight --start-row 0 --rows 8
-
-# Remote: für reproduzierbare Läufe immer einen Commit-Digest pinnen
-python -m immer stream ORG/MODEL --revision <commit-sha> --budget-mb 200
-```
-
-Dieser Streamer ist ein Instrument, nicht heimlich der Antwortpfad. Der frühere
-Shortcut „statisches Embedding-Mittel → Gate-Aktivierung → Value-Sketch“ war
-negativ und wird nicht wiederbelebt.
-
-Der aktuelle Donor-Pfad ist Qwen3.8-27B. Sein Textdecoder läuft mit IMMERs
-eigener Attention/DeltaNet-Mathematik direkt aus einem gepinnten Snapshot; der
-erste echte Layer benötigt 766.556.608 Quellbytes statt eines vollständigen
-53,79-GB-Modellloads:
-
-```bash
-PYTHONPATH=src python scripts/qwen38_stream_smoke.py --dry-run --budget-mb 64
-PYTHONPATH=src python scripts/qwen38_stream_smoke.py --layers 1 --budget-mb 1024
-
-# Acht lokale Qwen-Drafts für FERTIG-Abstentionen exakt tokenisieren und
-# anschließend gemeinsam in einem resumierbaren 64-Layer-Pass verifizieren.
-PYTHONPATH=src python scripts/qwen38_fertig_draft_verify.py --prepare-only
-PYTHONPATH=src python scripts/qwen38_fertig_draft_verify.py
-
-# Exakte FERTIG-Zertifikate haben Vorrang; vollständig BF16-verifizierte
-# Q3-Antworten heißen ausdrücklich nur model_verified.
-PYTHONPATH=src python scripts/qwen38_fertig_fusion_eval.py
-```
-
-## Gemessenes Urteil
-
-| Messung | Ergebnis | Zulässige Aussage |
+| Trial | Result | Scope |
 |---|---:|---|
-| Frozen SHIP-v6 | 152/152 Antworten, 152/152 Organrouten | Vier kalte Organe laufen ohne Runtime-Training |
-| CRSA-Kontextrouter | 182/182 Arithmetic+Text | Kontextsignal ist positiv und online einsetzbar |
-| Roh-A1-Ablation | balanced 0,983333 | CRSA-Residual verbessert diesen kleinen Split |
-| 32 Label-Placebos | Mittel 0,510328; Maximum 0,748026 | Der persistierte Head liegt klar über seinem Nullmodell |
-| kausale Softmax-Ablation | balanced 1,000 | Kein CRSA-spezifischer Vorteil gezeigt |
-| statischer Value-Sketch | 24 % vs Placebo 32 % | Negativ; falsche Eingabeverteilung, nicht deployt |
-| Qwen3.8/FERTIG-Fusionsslice | 7/8 beantwortet, 7 korrekt, 0 falsch, 1 quarantäniert | 5 exakte IR-Zertifikate + 2 BF16-verifizierte Modellantworten; kein allgemeiner Accuracy-Claim |
+| DeepSeek-V4 exact decoder | 43/43 layers complete | fixed exact layer-major integration run |
+| DeepSeek-V4 + FERTIG | 6/8 correct, 0 wrong | fixed eight-item GSM8K integration slice |
+| SHIP-v6 exact core | 152/152 answers and routes | frozen host plus four exact organs |
 
-Die CRSA-Rollen sind fest: zwei Local-, ein Balanced- und ein unveränderter
-Free-Head; Steigung `0.8`, Diagonal-Debit `3`. Zukünftige Masse ist exakt null,
-der Free-Head ist bitgleich zur kausalen Softmax. Der Router-Report wird mit
-`PYTHONPATH=src python scripts/crsa_route_eval.py` byte-identisch reproduziert.
+The public benchmark ledger states the exact corpus and measurement boundary
+for every released number: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-## Module und Grenzen
+## Paper context
 
-| Bereich | Pfad | Status |
-|---|---|---|
-| Exact-Cascade | `cognition/exact_cascade.py` | integriert; S3 zuerst, FERTIG verifier/fallback, sichere Abstinenz |
-| Frozen Host + Organe | `capabilities/s3_runtime.py` | integriert; fünf externe Blobs vollständig digest-geprüft |
-| Eigene Attention | `attention/crsa/`, `attention/router.py` | integriert und im Online-Gate aktiv |
-| FERTIG | `cognition/fertig/` | vendored; Grounding/Bindings/Skills/Verifier, Aktions-Gates geschlossen |
-| Lebensstrom | `runtimes/o1_state/` | persistent, surprise-gated, getrennt vom Frozen Host |
-| WorldStream | `knowledge/streamer.py` | lokaler/HF Range-Zugriff, kein Donor-Modell-Load |
-| Qwen3.8 Runtime | `runtimes/qwen3_8/` | eigener 64-Layer-Textdecoder; BF16-Range-Pager, Gated DeltaNet/Attention, Draft-Verifier und CRSA-Graft; gepinnter Preflight plus echter Layer 0 bestanden |
-| DeepSeek-V4 Runtime | `runtimes/deepseek_v4/` | pausierter Forschungszweig; sicherer Resume-Stand nach Layer 19 bleibt erhalten |
-| Daemon/Suite | `substrate/`, `suite.py` | atomare Zustände, Services, Metriken, Dashboard |
-| FLCA/QAD | externe kanonische Projekte | hier beschrieben, nicht als laufender IMMER-Kern ausgegeben |
+- David Tom Foss, **The `.causal` Format: Embedded Deterministic Inference for
+  Domain-Agnostic Knowledge Graph Amplification**, IEEE IRI 2026. Conference
+  record: [IEEE IRI session E2](https://davidtomfoss.com/service/iri2026-session-e2-nlp-sentiment-multimodal-reasoning/).
+- David Tom Foss, **Deterministic Validation for Reliable LLM-Based Causal
+  Knowledge Extraction**, ICECET 2026. Record:
+  [davidtomfoss.com](https://davidtomfoss.com/talks/deterministic-validation-llm-causal-extraction/).
+- Mathematical lineage and related peer-reviewed work:
+  [docs/research.md](docs/research.md).
 
-## Verifikation
+## Related repositories
 
-```bash
-PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests
-PYTHONPATH=src python -m compileall -q src scripts
-git diff --check
-```
+- [DT-Foss/FERTIG](https://github.com/DT-Foss/FERTIG)
+- [DT-Foss/o1-state](https://github.com/DT-Foss/o1-state)
+- [DT-Foss/dotcausal](https://github.com/DT-Foss/dotcausal)
 
-Die ausführliche Beweislage und die bekannten Negativergebnisse stehen in
-[`docs/RUNTIME-VERDICT.md`](docs/RUNTIME-VERDICT.md). Hugging Face ist erst der
-letzte Export nach lokalem Akzeptanzlauf und geklärter Lizenzkette; es ist
-nicht die Entwicklungsachse dieses Repositories.
+## Citation and release boundary
 
-## Quellen
+Citation metadata is recorded in [CITATION.cff](CITATION.cff). The current
+artifact version and public component map are recorded in
+[CHANGELOG.md](CHANGELOG.md) and [manifests/components.json](manifests/components.json).
 
-- [`DT-Foss/FERTIG`](https://github.com/DT-Foss/FERTIG) für den grounded
-  Solver- und Desktop-Strang.
-- [`DT-Foss/o1-state`](https://github.com/DT-Foss/o1-state) für den
-  O(1)-State-Strang und den externen Knowledge-Index.
-- [`DT-Foss/dotcausal`](https://github.com/DT-Foss/dotcausal) für die
-  `.causal`-Formatbasis.
-- [`docs/research.md`](docs/research.md) für die Primärquellen zu MoE,
-  DejaVu, Reservoir Computing, Markov-Routing und safetensors.
+The release boundary is source-selective. It excludes frontier weights,
+private datasets, learned route graphs, runtime traces, credentials, machine
+topology, and private capability-transfer mechanisms.
 
-## Offline-HF-Bundle — erst nach dem lokalen Lauf
+## Author
 
-Wenn `doctor --deep` und `eval` grün sind, erzeugt der letzte technische Schritt
-einen eigenständigen, HF-geformten Ordner und verifiziert ihn vor dem atomaren
-Publish nochmals isoliert:
-
-```bash
-pip install -e '.[neural,export]'
-python -m immer export-hf dist/immer-ship-v6
-cd dist/immer-ship-v6
-python -I -B verify.py
-python -I -B solve.py "three plus five is"
-```
-
-Das Bundle enthält nur den extrahierten A1-State als `model.safetensors`, vier
-bytegleiche Organe, den CRSA-Router, die S3→FERTIG-Kaskade und eine bereinigte
-Runtime-Kopie. `checksums.json` bindet die exakte Dateimenge. Ein vorhandenes
-Ziel wird ohne `--replace` nicht berührt; mit `--replace` bleibt es als
-wiederherstellbares `.backup` erhalten.
-
-Das ist ausdrücklich kein Upload: Model Card und Konfiguration tragen
-`license: other`, `license_status: NOT_CLEARED` und
-`public_upload_allowed: false`. Es gibt keinen Hub-, Login- oder Upload-Code.
-Details: [`docs/HF-SHIP.md`](docs/HF-SHIP.md).
-
-## Autor
-
-David Tom Foss · 2026
+[David Tom Foss](https://davidtomfoss.com/) ·
+[ORCID 0009-0004-0289-7154](https://orcid.org/0009-0004-0289-7154)

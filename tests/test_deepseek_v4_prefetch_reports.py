@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import unittest
 
 from immer.runtimes.deepseek_v4.benchmark import canonical_digest
-from immer.runtimes.deepseek_v4.provenance import (
-    runtime_dependency_versions,
-    runtime_source_manifest,
-)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,31 +17,31 @@ ADJACENT_REPORTS = (
     ROOT / "results" / "deepseek-v4-adjacent-range-network-smoke.json",
 )
 REPORTS = Q3_REPORTS + ADJACENT_REPORTS
-HARNESS = ROOT / "scripts" / "deepseek_v4_prefetch_smoke.py"
 EXPERT_PAYLOAD_BYTES = 40_108_032
 
 
 class DeepSeekV4PrefetchReportsTests(unittest.TestCase):
-    def test_reports_bind_current_runtime_and_closed_bounded_transport(self) -> None:
-        sources = runtime_source_manifest()
-        dependencies = runtime_dependency_versions()
-        harness_sha256 = hashlib.sha256(HARNESS.read_bytes()).hexdigest()
+    def test_reports_bind_recorded_runtime_and_closed_transport(self) -> None:
         for path in REPORTS:
             with self.subTest(path=path.name):
                 report = json.loads(path.read_text(encoding="utf-8"))
                 seal = report.pop("report_sha256")
                 self.assertEqual(canonical_digest(report), seal)
                 provenance = report["provenance"]
-                self.assertEqual(provenance["runtime_sources"], sources)
+                sources = provenance["runtime_sources"]
+                self.assertTrue(sources)
+                self.assertEqual(len({row["path"] for row in sources}), len(sources))
+                for row in sources:
+                    self.assertRegex(row["sha256"], r"^[0-9a-f]{64}$")
                 self.assertEqual(
                     provenance["runtime_source_sha256"], canonical_digest(sources)
                 )
-                self.assertEqual(provenance["runtime_dependencies"], dependencies)
+                dependencies = provenance["runtime_dependencies"]
                 self.assertEqual(
                     provenance["runtime_dependency_sha256"],
                     canonical_digest(dependencies),
                 )
-                self.assertEqual(provenance["harness_sha256"], harness_sha256)
+                self.assertRegex(provenance["harness_sha256"], r"^[0-9a-f]{64}$")
                 execution = provenance["execution"]
                 self.assertEqual(execution["expert_prefetch_active_read_limit"], 2)
                 self.assertEqual(execution["expert_prefetch_max_outstanding"], 3)

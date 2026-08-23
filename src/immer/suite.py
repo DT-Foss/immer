@@ -109,7 +109,7 @@ const CARDS = [
     ["span_buffer", s.gauges.span_buffer],
   ]],
   ["Gehirne", s => [
-    ["donor_27b", s.gauges.donor ? "✓ beast:8780" : "· offline", s.gauges.donor ? "ok" : "off"],
+    ["donor_27b", s.gauges.donor ? "✓ configured" : "· offline", s.gauges.donor ? "ok" : "off"],
     ["donor_modell", short(s.gauges.donor_modell)],
     ["lokal_fallback", s.gauges.lokal_gehirn ? "✓ geladen" : "aus", s.gauges.lokal_gehirn ? "warn" : "off"],
     ["fertig", "✓ vendored", "ok"],

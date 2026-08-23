@@ -53,9 +53,9 @@
         "version": 4
       },
       "manifest_body_sha256": "b4b4549583e08bf529e3108847528cae1653e52ad3e80240379c1afed90605b9",
-      "manifest_path": "/Users/bhkmie/immer/artifacts/private/deepseek-v4-mmlu-off-4-exact-v4-window2x3/manifest.json",
+      "manifest_path": "artifacts/private/deepseek-v4-mmlu-off-4-exact-v4-window2x3/manifest.json",
       "manifest_sha256": "2db5023b1053bb22a9c0759f578fd88fcd8678ef5fdaac2525e6c358928fd463",
-      "object_path": "/Users/bhkmie/immer/artifacts/private/deepseek-v4-mmlu-off-4-exact-v4-window2x3/objects/2cd7351fe1fcfddaf1b85bfc6ba0e196c5e3506cd892a4e9c8195c87d35f0570.safetensors",
+      "object_path": "artifacts/private/deepseek-v4-mmlu-off-4-exact-v4-window2x3/objects/2cd7351fe1fcfddaf1b85bfc6ba0e196c5e3506cd892a4e9c8195c87d35f0570.safetensors",
       "object_sha256": "2cd7351fe1fcfddaf1b85bfc6ba0e196c5e3506cd892a4e9c8195c87d35f0570",
       "selected_bucket": 0,
       "selected_bucket_row": 0,
@@ -64,7 +64,7 @@
     },
     "config": {
       "bytes": 1888,
-      "path": "/Users/bhkmie/immer/artifacts/private/deepseek-v4-reference/config.json",
+      "path": "artifacts/private/deepseek-v4-reference/config.json",
       "sha256": "6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023"
     },
     "execution": {
@@ -180,7 +180,6 @@
     ],
     "source": "deepseek-ai/DeepSeek-V4-Flash-0731"
   },
-  "report_sha256": "fb5927c5c626ca15d11ec98de7b310b30a9a55e46370fa15dc2dac6e4cedb4f4",
   "schema": "immer.deepseek-v4-head-range-smoke/v1",
   "started_at": "2026-08-22T18:53:09.492861+00:00",
   "status": "passed",
@@ -1096,5 +1095,6 @@
       "pair": 3
     }
   ],
-  "verdict": "exact LM-head transport-envelope mechanism proven; production default remains one leaf until repeated latency evidence"
+  "verdict": "exact LM-head transport-envelope mechanism proven; production default remains one leaf until repeated latency evidence",
+  "report_sha256": "f362435e2f84750332b55d4dbb05c97cff9b14a48312e30ee1c5250c9b3f8a90"
 }

@@ -23,13 +23,19 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Protocol, Sequence
 
-import requests as _requests
-
 DEFAULT_ENDPOINT = "https://huggingface.co"
 DEFAULT_TIMEOUT_SECONDS = 180.0
 DEFAULT_MAX_METADATA_BYTES = 64 * 1024 * 1024
 DEFAULT_HTTP_CONNECTIONS = 2
 MAX_ERROR_BODY_BYTES = 4 * 1024
+
+
+def _requests_api() -> Any:
+    """Load the remote transport only when an HTTP reader needs it."""
+
+    import requests
+
+    return requests
 
 
 class BudgetExceeded(Exception):
@@ -266,8 +272,9 @@ class HFRangeReader:
 
     @staticmethod
     def _new_session() -> Any:
-        session = _requests.Session()
-        adapter = _requests.adapters.HTTPAdapter(
+        requests = _requests_api()
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
             pool_connections=1,
             pool_maxsize=1,
             max_retries=0,
@@ -526,7 +533,7 @@ class HFRangeReader:
                     response.close()
                     raise
                 return response
-            except _requests.RequestException as exc:
+            except _requests_api().RequestException as exc:
                 if response is not None:
                     response.close()
                 last = exc

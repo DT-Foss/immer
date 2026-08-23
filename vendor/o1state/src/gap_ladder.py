@@ -479,7 +479,7 @@ def run_beacon_ladder(args):
             # write_and_carry(model, x_bg, None) call forwarded (NB, G) in ONE
             # pass, materializing O(G) per-token internals (logits, hidden,
             # S_re/S_im/Z_seq, drives, phases) -- ~25.6 GB at G=65536, the
-            # cause of BOTH beast OOM kills of the beacon half (a single
+            # cause of both remote-host OOM kills of the beacon half (a single
             # sub-30s allocation burst, invisible to a 30s RSS watchdog).
             # Chunked-carry is bit-exact for this operator family (F2), so
             # the cold control's semantics are unchanged.

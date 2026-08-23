@@ -1,9 +1,9 @@
 """s31_llama.py — S3.1-Sonden für Qwen3.8-27B via llama.cpp (CPU/GGUF).
 
-Standalone für beast: nutzt llama-cpp-python + unsloth GGUF (Q4_K_M).
+Standalone remote-host runner using llama-cpp-python + an Unsloth GGUF (Q4_K_M).
 Gleiche Aufgaben-Batterie wie s31_sonden_27b.py (transformers-Version).
 
-    python3 s31_llama.py --model /root/o1x_data/qwen38-27b-gguf/Qwen3.8-27B-Q4_K_M.gguf
+    python3 s31_llama.py --model "$MODEL_PATH"
 """
 from __future__ import annotations
 

@@ -9,6 +9,20 @@ build/
 *.egg-info/
 .DS_Store
 
+# Local-only inputs, credentials and cryptographic material
+kandidaten/
+.env*
+CREDENTIALS*
+credentials*
+id_rsa*
+id_ed25519*
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+
 *.pt
 *.pth
 *.safetensors
@@ -16,10 +30,29 @@ build/
 *.ckpt
 *.onnx
 *.npz
+*.bin
+*.mlpackage
 models/
 checkpoints/
 hf-cache/
+local-models/
+model-bundles/
+weights/
 artifacts/private/
+
+# Runtime route/access evidence stays next to the local run, never in Git
+**/access-trace-*.json
+**/access-trace-*.jsonl
+**/route-trace-*.json
+**/route-trace-*.jsonl
+**/causal-trace-*.json
+**/causal-trace-*.jsonl
+*.access-trace.json
+*.access-trace.jsonl
+*.route-trace.json
+*.route-trace.jsonl
+*.causal-trace.json
+*.causal-trace.jsonl
 
 # Modelle/Gewichte: lokal ja, Git nein (Manifest+SHA statt Blob)
 vendor/o1state/results/*.pt

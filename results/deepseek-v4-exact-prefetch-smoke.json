@@ -1,7 +1,7 @@
 {
   "arguments": {
     "cache_budget_gb": 12.0,
-    "cache_dir": "/Users/bhkmie/immer/artifacts/private/deepseek-v4-cache",
+    "cache_dir": "artifacts/private/deepseek-v4-cache",
     "config": null,
     "device": "mps",
     "dtype": "bfloat16",
@@ -11,7 +11,7 @@
     ],
     "layer": 3,
     "no_cache": false,
-    "output": "/Users/bhkmie/immer/results/deepseek-v4-exact-prefetch-smoke.json",
+    "output": "results/deepseek-v4-exact-prefetch-smoke.json",
     "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
     "route_weight": 0.25,
     "rows": 1,
@@ -388,14 +388,18 @@
       "python": "3.13.1",
       "torch": "2.9.1"
     },
-    "harness_sha256": "9cf900deb4ae115901a238ed8d6d0f1526df0dbcb0e4a68e70d1a64f84ac4857",
+    "harness_sha256": "450076ec758d798cf397b8ba691ab5989b66279891ada8cd1f8602a426cc19de",
     "input_sha256": "84c7541f9cb850a7bb8cfd3b041fc18bfe699afc3f126284cca86b24682475f0",
     "inventory_source_fingerprint": "61600c552f3e52ae382b3eca0370001905fc4e2ecdd2da5f3e66fa95809206c7",
     "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
     "revision_is_mutable": false,
     "revision_is_pinned": true,
-    "runtime_source_sha256": "bd9b049a1a4a3e87ec2170ffa49e502524b3a2193f8c6c2957d52bc24ce7772d",
+    "runtime_source_sha256": "10cedded318be8806a843e5b504ca651ad6eed240962f0ac8f3b10a12a0baa3d",
     "runtime_sources": [
+      {
+        "path": "immer/runtimes/deepseek_v4/__init__.py",
+        "sha256": "c19de2b58e4f2554b95fcddd9f965c0e6b43a60d094074e3d506a63ec2ef29de"
+      },
       {
         "path": "immer/runtimes/deepseek_v4/config.py",
         "sha256": "bc5d5b9951c30c2bfb0534816f668dc21c58a04df659672c5b608d6b19a700e4"
@@ -414,29 +418,52 @@
       },
       {
         "path": "immer/runtimes/deepseek_v4/model.py",
-        "sha256": "d9e491d6e4879925067efb0b95bca00bd225b9cbcd5479ecc9a63eba3f824cc9"
+        "sha256": "280c11d3e882de3d23c3cd3d5230776645bc02d976a831a99c79fa35559e3389"
       },
       {
         "path": "immer/runtimes/deepseek_v4/pager.py",
-        "sha256": "e1479124bf98a5d731a4fbc4f49f4b2ae827b79eed485ac957b5e5bce1f8624f"
+        "sha256": "4f0e1cf532ce8e705112d55992c13a734a71432534cc921cc0346da2334988d1"
       },
       {
         "path": "immer/runtimes/deepseek_v4/provenance.py",
-        "sha256": "15fe65ace4568740d4efd715df05de7290c5a60b0c08458384d8ee22e9e4e29b"
+        "sha256": "4a1b687dd7c140bde65eb3e5ef5bce66bc2875bed2b127b2abaaa11947fe0e88"
       },
       {
         "path": "immer/runtimes/deepseek_v4/quantization.py",
         "sha256": "97f1425b4760f4f5452c405b7ef32ae668152a197a2f463df8d6105447b308b3"
       },
       {
+        "path": "immer/runtimes/deepseek_v4/snapshot.py",
+        "sha256": "c2ba86691fae502787ed7d2ff34c1906cd61bff51e0939d953810b26fa65471c"
+      },
+      {
         "path": "immer/runtimes/deepseek_v4/stateful.py",
         "sha256": "77ab4cff7405dc1392c901ff5376371f822cee3bc4bc9ab8be22e44d6f2de6a2"
+      },
+      {
+        "path": "immer/knowledge/__init__.py",
+        "sha256": "f456516deb256373abc789982d96419a6c2f2a30038e22c1407fcc9033fdf6fe"
+      },
+      {
+        "path": "immer/knowledge/_hf_source.py",
+        "sha256": "fa54ddeb6b2bfce47598275637513b6ac02c15ccce94d970d80e88889c3724ff"
+      },
+      {
+        "path": "immer/knowledge/streamer.py",
+        "sha256": "52b898de3bf99d9e99f72f3cbde229eed712da1814449498ee265d8c66d294cc"
       }
     ],
-    "source": "deepseek-ai/DeepSeek-V4-Flash-0731"
+    "source": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "runtime_dependencies": {
+      "python": "3.13.1",
+      "torch": "2.9.1",
+      "numpy": "2.2.6",
+      "requests": "2.34.2",
+      "safetensors": "0.7.0"
+    },
+    "runtime_dependency_sha256": "35a9b482adfb022b61fc789bc086bfaf542c7cd8f7ac962998dbc8a01e12febb"
   },
   "quality_or_end_to_end_performance_claim": false,
-  "report_sha256": "502e51cc925fab278d85cffd1a98f14586668fa2f74de389943ef23917a8aa1e",
   "schema": "immer.deepseek-v4-exact-prefetch-smoke/v1",
   "scope": "official_routed_expert_transport_latency_only",
   "started_at": "2026-08-22T11:15:28.567054+00:00",
@@ -1044,5 +1071,6 @@
     ],
     "rounds": 2,
     "source_body_bytes_delta": 0
-  }
+  },
+  "report_sha256": "6c68612aaeee4e3273e2ffeb623ef7c43c1b985808d531d7464763598035c360"
 }

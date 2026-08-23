@@ -1,154 +1,61 @@
-# Runtime-Urteil
+# Runtime Verdict
 
-Stand: 2026-08-22. Dieses Dokument trennt laufenden Code, Messung,
-Negativergebnis und offene Grenze. Es ersetzt keine Zahl durch Architekturprosa.
+Release: 0.8.0 · 2026-08-23
 
-## Kompaktes Urteil
+## Verdict
 
-Der lokale Exact-PoC läuft end-to-end: Ein eingefrorener A1-Host, vier
-digest-geprüfte Organe, der feste CRSA-Rollenmix und FERTIG sind über genau
-einen `exact_math`-Besitzer verbunden. Der Pfad trainiert beim Start nichts,
-verifiziert Host und Organe vor dem Laden und enthält bekannte Fallback-Fehler
-durch Abstinenz.
+IMMER is a working local systems prototype with four proven execution planes:
 
-Die eigene Attention ist dabei real im Ausführungspfad, aber das Experiment
-zeigt nur einen positiven **Kontextrouter**, keinen spezifischen Vorsprung von
-CRSA gegenüber gewöhnlicher kausaler Softmax.
+1. a complete DeepSeek-V4-Flash decoder that reads exact Safetensors ranges;
+2. a causalized local bundle that joins immutable weights to append-only
+   LiveCausal routes;
+3. a deterministic FERTIG/SHIP path that answers or abstains under explicit
+   verification;
+4. a persistent O(1)-state life stream isolated from frozen execution.
 
-## Reproduzierbare Läufe
+The active engineering target is local causal weight transport. The graph and
+reader path are integrated and tested. The end-to-end local speed comparison
+is the remaining measurement gate.
 
-```bash
-PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests
-PYTHONPATH=src python -m immer doctor --deep
-PYTHONPATH=src python -m immer eval
-PYTHONPATH=src python scripts/crsa_route_eval.py \
-  --router-out /tmp/immer-crsa-router-repro.json
-cmp /tmp/immer-crsa-router-repro.json manifests/crsa_router_v1.json
-```
+## Proven in committed evidence
 
-Lokaler Akzeptanzstand:
+- DeepSeek completes all 43 layers on a fixed four-item MMLU slice and scores
+  3/4 in exact `off` mode.
+- FERTIG scores 1,073 correct, zero wrong, and 246 abstentions across all 1,319
+  GSM8K test rows.
+- SHIP-v6 scores 152/152 answers and 152/152 routes with four frozen organs.
+- The CRSA context router scores 182/182 on its fixed arithmetic/text corpus;
+  the causal-softmax ablation matches it.
+- The static Qwen value-sketch shortcut scores below placebo and is absent from
+  runtime routing.
+- Remote transport experiments prove bit-identical range batching and expose
+  the latency behavior of each transport policy.
 
-- SHIP-v6: 152/152 Antworten und 152/152 Routen;
-- Host: SHA-256
-  `84f7ac90375668067f348421c581ca60cf3f27dbdb447ae13248dbcc85ea251c`;
-- vier Organe: äußerer SHA-256 plus interner State-Digest geprüft;
-- Runtime-Training: keines;
-- CRSA-Routerzustand: semantischer Digest
-  `561db8fc50ea029288f318eb9f7c206bd5c007757dbdd60843f1a03990efd819`;
-- reproduzierte Routerdatei: byte-identisch zur committed Datei.
+See [`BENCHMARKS.md`](BENCHMARKS.md) for every receipt and scope sentence.
 
-Die 152 Fälle sind die kanonische SHIP-v6-Arithmetiksuite, nicht GSM8K und
-nicht 152 allgemeine Sprachaufgaben. Die 30 Textfenster gehören ausschließlich
-zur separaten Routermessung.
+## Implemented in the runtime
 
-## Feste CRSA-Struktur
+| Plane | Implementation | Runtime contract |
+|---|---|---|
+| DeepSeek V4 | `src/immer/runtimes/deepseek_v4/` | exact checkpoint math, layer-major execution, resume, generation |
+| LiveCausal | `src/immer/knowledge/livecausal.py` | append-only durable graph, lazy exact query, citations |
+| causal weights | `src/immer/runtimes/deepseek_v4/causal_weights.py` | checkpoint-bound semantic coordinate to exact local ranges |
+| Markov routing | `src/immer/runtimes/deepseek_v4/route_markov.py` | label-free next-layer expert distribution and placebo evaluation |
+| local range I/O | `src/immer/knowledge/streamer.py` | positional reads, integrity, accounting, optional cache |
+| exact cascade | `src/immer/cognition/exact_cascade.py` | S3 first, FERTIG verification/fallback, abstention |
+| Causal Prefix Sinkhorn Attention | `src/immer/attention/` | strict-causal Local/Balanced/Free roles |
+| life stream | `src/immer/runtimes/o1_state/` | persistent adaptive state separate from frozen paths |
 
-Der deployte Rollenmix wird nicht pro Anfrage neu erfunden:
+## Scope boundary
 
-```text
-Head 0  Local
-Head 1  Local
-Head 2  Balanced
-Head 3  Free = bit-exakte kausale Softmax
-slope = 0.8
-diagonal debit = 3
-```
+Version 0.8.0 establishes the architecture and its component-level proofs. A
+frontier-equivalent quality claim requires broad fixed benchmarks. A local
+causal speed claim requires the pending plain/real/placebo end-to-end report.
+The release states neither claim before those receipts exist.
 
-Gemessener Split nach Entfernung aller 48 überlappenden Arithmetikfälle aus
-der Kalibration:
+## Public release boundary
 
-| Feature/Control | Balanced Accuracy | Fehler |
-|---|---:|---:|
-| A1 + CRSA-Residual | 1,000000 | 0/182 |
-| Roh-A1 | 0,983333 | 1/182 |
-| A1 + kausale Softmax | 1,000000 | 0/182 |
-| 32 permutierte Label-Placebos | Mittel 0,510328; Max 0,748026 | — |
-
-Zusätzliche Invarianten:
-
-- Zukunftsmasse: exakt `0.0`;
-- Free-Head: bitgleich zur Referenz-Softmax;
-- Streaming- und stateless-A1-Features: maximale Abweichung `0.0`;
-- stateless Deployment: 182/182.
-
-Erlaubter Claim:
-`POSITIVE_CONTEXT_ROUTER__CRSA_NOT_UNIQUE_VS_SOFTMAX`.
-
-Nicht erlaubter Claim: CRSA sei in diesem Experiment besser als Softmax.
-
-## Organe und R17
-
-R17 bedeutet hier nicht „Sibling-Modell per Least Squares in den Donorraum
-projizieren“. Dieser Cross-Model-Weg war bereits negativ. Der gültige
-Kristallisationsschritt ist:
-
-```text
-trainieren
-  → Invariante messen
-  → Fit/R² als strukturellen Verifier benutzen
-  → exakte Struktur einsetzen
-```
-
-Das ist im Decimal-Organ direkt sichtbar: Der gelernte Carrier dekodiert die
-Ziffern, danach übernimmt die exakte Rekurrenz `h ← 10h + v`; Algebra und
-Digit-Word-Emission sind strukturell. Das Z3-Artefakt implementiert
-`(a + b) mod 3` und wird deshalb ausschließlich als `z3sum` veröffentlicht —
-nicht fälschlich als gewöhnlicher Modulo-Operator.
-
-## FERTIG-Grenze
-
-FERTIG besitzt Grounding, Bindings, semantische Pläne, Skills und Verifikation.
-S3 und FERTIG sind keine zwei konkurrierenden Registry-Besitzer; sie sind
-private Kinder der `ExactCascade`.
-
-Ein bekannter Fehler des isolierten FERTIG-Solvers war:
-
-```text
-John has 5 apples and buys 3 more. How many apples?
-```
-
-Der alte Fallback konnte `5` liefern. Die Kaskade prüft additive/subtraktive
-Mengenänderungen deterministisch und hält eine falsche oder mehrdeutige Antwort
-zurück. Desktop-, Recorder- und Mutationspfade benötigen explizit injizierte
-Backends; ohne diese endet FERTIG bei `needs_input`, nicht bei einer erfundenen
-Ausführung.
-
-## WorldStream
-
-Der Streamer kann Safetensors-Inventare und exakte 2D-Zeilenbereiche lokal
-oder per HTTP Range lesen. Sein Vertrag umfasst:
-
-- Preflight vor jedem Bytebudget-Charge, kein Überschwingen;
-- inklusive HTTP-Ranges ohne Off-by-one;
-- BF16→FP32 und lazy Torch-Bridge;
-- atomare Inventory-/Range-/File-Caches;
-- SHA-256-Prüfung bei Resume;
-- Cachekorruption als Fehler statt stiller Refetch;
-- kein Instanziieren des Donormodells.
-
-Er ist bewusst nicht automatisch mit dem Answer-Pfad verbunden. Das wäre nach
-dem negativen Value-Sketch-Experiment ein unbelegter Mechanismussprung.
-
-## Negative Ergebnisse bleiben negativ
-
-1. Statisches Embedding-Mittel → `gate_proj` → Value-Sketch:
-   24 % gegen 32 % Placebo bei 138 KB/Frage. Mechanismusdiagnose: Das statische
-   Mittel ist nicht die RMSNorm-te Post-Attention-Verteilung, die `gate_proj`
-   live sieht. Nicht deployt.
-2. Cross-Model-Least-Squares-Projektion als angebliches R17:
-   bereits unter Placebo; nicht wiederholt.
-3. CRSA-Spezifität auf dem neuen Router-Split:
-   nicht gezeigt, weil kausale Softmax bindet.
-
-## Noch offen
-
-- Die Routermessung braucht breitere, fachlich schwierigere Splits, bevor ein
-  CRSA-vs-Softmax-Claim erneut geprüft werden darf.
-- FERTIGs vollständiger Weltgraph ist extern und muss mit
-  `IMMER_FERTIG_GRAPH` explizit gesetzt werden.
-- FLCA und QAD sind externe kanonische Stränge, keine im heutigen Core
-  vorgetäuschten Laufzeitkomponenten.
-- Der lokale A1-only-Hugging-Face-Export ist checkout-isoliert golden
-  (152/152 Antworten und Routen). Ein öffentlicher Upload wartet weiterhin auf
-  die geklärte Lizenzkette. Ein fehlendes Root-`LICENSE` wird nicht durch eine
-  frei erfundene MIT/Apache-Angabe ersetzt.
+Public source includes algorithms, runtime contracts, tests, manifests, and
+small benchmark receipts. Model weights, caches, live causal graphs, private
+route traces, operational topology, credentials, and experimental transfer
+artifacts stay outside Git.

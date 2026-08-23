@@ -27,7 +27,9 @@ jobs:
 
           manifest = json.loads(Path("manifests/components.json").read_text())
           crsa = next(item for item in manifest["components"] if item["name"] == "CRSA")
-          expected = crsa["revision"].removeprefix("sha256:")
+          scheme, separator, expected = crsa["revision"].partition(":")
+          if separator != ":" or scheme not in {"sha256", "operator-sha256"}:
+              raise SystemExit(f"Unsupported CRSA revision: {crsa['revision']}")
           actual = hashlib.sha256(Path(crsa["integration"]).read_bytes()).hexdigest()
           if actual != expected:
               raise SystemExit(f"CRSA digest mismatch: {actual} != {expected}")

@@ -3,13 +3,13 @@
   "model": {
     "id": "qwen",
     "revision": "Qwen3.8-27B-Q3_K_M-no-think",
-    "path": "http://127.0.0.1:8780/v1",
+    "path": "<loopback-openai-compatible>",
     "backend": "openai-compatible",
     "load_seconds": 0.3475592089962447
   },
   "benchmark": {
     "name": "GSM8K fixed FERTIG abstentions",
-    "source": "/Users/bhkmie/immer/results/bench_gsm8k.json",
+    "source": "results/bench_gsm8k.json",
     "item_ids": [
       "gsm8k-test-0737-b673ac26d1268186",
       "gsm8k-test-0815-13fae6ff992c2157",
@@ -163,5 +163,6 @@
     "total_latency_seconds": 102.48792383501132,
     "mean_latency_seconds": 12.810990479376414,
     "median_latency_seconds": 12.135774062509881
-  }
+  },
+  "report_sha256": "e94a3658275632f93dc66c326df9bccf553a8c1bbaecfce677182d8b96f3c26e"
 }

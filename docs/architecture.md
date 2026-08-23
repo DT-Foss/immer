@@ -1,156 +1,130 @@
-# IMMER Architecture
+# Architecture
 
-IMMER verbindet getrennte Zuständigkeiten über kleine, typisierte Verträge.
-Der Produktionspfad ist absichtlich enger als die Forschungslandschaft.
+IMMER is a local runtime built from multiple execution planes. It composes
+immutable neural weights, an append-only causal control plane, deterministic capability
+organs, grounding, and persistent state behind explicit contracts.
 
-## 1. Laufzeitvertrag
-
-```text
-Request(capability, payload, metadata)
-  → ComponentRegistry (genau ein Besitzer je Capability)
-  → Component.handle(Request)
-  → Result(status, output, reason, evidence)
-```
-
-Gültige Stati sind explizit. `ABSTAINED` und `UNAVAILABLE` sind normale
-Ergebnisse; ein Fallback darf daraus keine scheinbar bestätigte Tatsache oder
-Aktion erfinden.
-
-## 2. Composition Root
-
-`CompositionRoot` ist die einzige Stelle, an der Policy-Komponenten verdrahtet
-werden:
+## System map
 
 ```text
-ExactCascade (einziger Registry-Besitzer von exact_math)
-├── S3Arithmetic
-│   ├── Frozen A1
-│   ├── FrozenA1CrsaRouter
-│   └── OrganBank mit vier Organen
-└── FertigSolver
-
-FertigGrounded (separate capability grounded_chat)
-LearningStream (separates, mutables Lebensobjekt)
+                              ┌─────────────────────┐
+request ──> composition root ─┤ ExactCascade        ├─> answer / abstain
+                              │ S3 organs + FERTIG  │
+                              └─────────────────────┘
+                                         │
+                                         │ exact verification
+                                         ▼
+                              ┌─────────────────────┐
+                              │ DeepSeek V4 runtime │
+                              │ 43-layer decoder    │
+                              └──────────┬──────────┘
+                                         │ official router selections
+                       ┌─────────────────┴─────────────────┐
+                       ▼                                   ▼
+             Markov transport hints              causal weight reader
+             label-free, advisory                exact local ranges
+                       │                                   │
+                       └─────────────────┬─────────────────┘
+                                         ▼
+                              causalized local bundle
+                              weights/ + causal/
 ```
 
-Der Lebensstrom wird nie in S3 injiziert. Das verhindert, dass Online-Lernen
-den Frozen-Host oder einen exakten Readout verändert.
+## 1. Immutable data plane
 
-## 3. Exact-Pfad
+The weight plane contains original Safetensors. IMMER reads headers, tensors,
+rows, and expert payloads by exact half-open byte range. Local reads use
+positional I/O; remote reads exist for acquisition and controlled experiments.
+Production execution targets local storage.
 
-```text
-Text
-  → enge, explizite Arithmetikgrammatik
-  → normalisierte A1-Tokenfolge
-  → kontextuelle Layer-0-Scan-Zustände
-  → fester CRSA-Rollenmix
-  → persistierter Ridge-Head: arithmetic oder text
-  → ausgewähltes kaltes Organ
-  → gelernter Carrier / Strukturverifier
-  → exakte Algebra oder Emission
-  → FERTIG-Verifikation/Fallback
-  → Antwort oder bewachte Abstinenz
-```
+Every range stays bound to the checkpoint repository, immutable revision, and
+layout fingerprint. A route built for one layout cannot silently address
+another.
 
-S3 gewinnt eine Meinungsverschiedenheit nur mit literalem
-`crystal_verified=True`. Liefert nur FERTIG eine Antwort, prüft die Kaskade die
-bekannte Familie additiver/subtraktiver Mengenänderungen deterministisch.
+## 2. LiveCausal control plane
 
-## 4. OrganBank und R17
+LiveCausal stores exact trigger-to-outcome relations in content-addressed,
+append-only segments. Its manifest is hash-chained and crash-recoverable.
+Queries load only the required graph neighborhood; no eager transitive closure
+is built at mount time.
 
-Ein Organmanifest trägt Name, Capability, algebraische Gruppe, Pfad, SHA-256
-und Kristallmetrik. Vor `torch.load(..., weights_only=True)` werden alle äußeren
-Digests geprüft; im Bundle wird zusätzlich der interne State-Digest geprüft.
+Within a causalized model bundle, LiveCausal maps semantic model coordinates
+to exact range plans. Appending knowledge changes the wiring, not the weights.
+The same local bundle therefore supports a stable tensor body and a growing
+address graph.
 
-Die vier deployten Organe sind:
+## 3. DeepSeek-V4-Flash runtime
 
-- `arith-dual` für den verifizierten kleinen Add/Sub-Carrier;
-- `mul-log` mit kristallisiertem Log-Readout;
-- `z3-circle` ausschließlich als Addition in `Z₃` (`z3sum`);
-- `decimal-crystal` mit `h ← 10h + v` und exakter Digit-Word-Emission.
+`src/immer/runtimes/deepseek_v4/` implements the checkpoint math directly:
 
-R17 ist der Übergang von gemessener Invariante zu exakter Struktur. Ein
-Cross-Model-Least-Squares-Shortcut gehört nicht dazu und ist negativ belegt.
+- checkpoint config and pinned provenance;
+- BF16/FP8/FP4 decoding;
+- MLA attention and routed/shared MoE execution;
+- exact expert paging;
+- layer-major scoring and authenticated resume;
+- stateful autoregressive generation;
+- FERTIG draft verification;
+- causal weight resolution;
+- label-free route learning and placebo evaluation.
 
-## 5. CRSA
+The layer stack is sequential because the transformer is sequential. The
+causal graph accelerates address resolution and transport planning; it does
+not replace the model's mathematics.
 
-Der Kern stellt exakt kausale Operatoren bereit. Im Online-Router ist der
-Rollenmix fest:
+## 4. Markov transport controller
 
-```text
-2 × Local
-1 × Balanced
-1 × Free (bit-exakte kausale Softmax)
-```
+DeepSeek's official router emits selected expert IDs for every active token
+row. IMMER records those rows without labels and estimates layer-to-layer
+transition distributions.
 
-Der gemessene Featurevektor ist `[raw_last | role_complete_last]`. Ein
-persistierter Ridge-Head entscheidet, ob die bereits grammatisch kanonisierte
-Anfrage den Organpfad betreten darf. Zukunftsmasse bleibt exakt null.
+For source layer \(\ell\), current expert \(i\), and candidate expert \(j\):
 
-Die aktuelle Messung belegt das Kontextsignal gegen Roh-A1 und
-Label-Placebos. Eine kausale-Softmax-Ablation erreicht jedoch denselben Score;
-darum gibt es keinen CRSA-spezifischen Überlegenheitsclaim.
+\[
+\hat P_\ell(j\mid i)=
+\frac{N_\ell(i,j)}{\sum_k N_\ell(i,k)}.
+\]
 
-## 6. FERTIG
+Token-row mixtures are aggregated into a full next-layer distribution. The
+runtime can evaluate any \(k\), compare against target-layer marginals and a
+label-preserving placebo, and convert ranked candidates into exact range
+plans. Official router output remains authoritative.
 
-FERTIG besitzt Grounding, Bindings, semantische Struktur, Pläne, Skills und
-Verifikation. Der geerdete Adapter ist lazy und verlangt einen expliziten
-State-Ordner. Ein `.causal`-Graph ist optional und wird nur über einen
-expliziten Pfad geöffnet.
+## 5. Exact execution plane
 
-Desktop, Aufnahme und mutierende Skill-Komposition sind Sicherheitsgrenzen:
-Ohne injizierten Backend/Recorder beziehungsweise `allow_mutations=True`
-liefert der Adapter `needs_input`.
+The `ExactCascade` owns exact arithmetic routing:
 
-## 7. Lebenssubstrat
+1. the frozen S3 host selects among four SHA-addressed organs;
+2. FERTIG verifies the result or handles a grounded fallback;
+3. contradictions and unsupported structures return abstention.
 
-```text
-EventBus        priorisierte Kanäle
-LifeDaemon      Strom, Dienste, Rack und Turn-Zähler
-LifeStatePort   atomare JSON-Snapshots über fsync + os.replace
-OrganRack       Mount nur nach Digestprüfung
-```
+No online learning step can mutate this path. This makes exact results usable
+as certificates around neural inference.
 
-`O1StateStream` trägt pro Layer einen konstant großen Z-Zustand. Der
-`LearningStream` misst Loss zunächst ohne Graph, rekonstruiert nur
-überraschende Chunks aus demselben detached Eingangszustand, clippt Gradienten
-und persistiert Modell, Optimizer, Zustände und Replay-Puffer.
+## 6. Causal Prefix Sinkhorn Attention
 
-## 8. Gedächtnis und Mund
+CRSA is IMMER's Causal Prefix Sinkhorn Attention mechanism. It assigns heads
+explicit causal roles:
 
-`intent.py` trennt TEACH, RECALL, MATH, STATUS und CHAT. `SpanStore` und
-`Library` halten gelehrte oder geerntete Karten außerhalb der Gewichte samt
-Herkunft. Für Chat kann ein lokales Qwen oder ein externer Donor konfiguriert
-werden; beide liegen hinter den exakten und geerdeten Pfaden.
+- **Local:** bounded recent context;
+- **Balanced:** prefix-mass-balanced Sinkhorn attention;
+- **Free:** ordinary causal softmax.
 
-Der Rat ist eine optionale BO3-Deliberation. Seine historische Qualität ist
-kein aktueller Core-Akzeptanzwert.
+The deployed role-complete program is two Local heads, one Balanced head, and
+one Free head. The Free head preserves unrestricted causal reach and is
+bit-exact with causal softmax for the same logits.
 
-## 9. WorldStream
+## 7. Persistent state
 
-Der Streamer ist ein separater TensorSource-Vertrag:
+The O(1)-state runtime maintains a separate life stream with surprise-gated
+updates, replay, and sleep consolidation. It can learn without rewriting the
+frozen exact host or the immutable frontier checkpoint.
 
-```text
-lokales Verzeichnis oder HF-Revision
-  → Header-only Inventar
-  → expliziter 2D-Tensor + Zeilenrange
-  → Preflight gegen hartes Bytebudget
-  → atomarer, SHA-geprüfter Resume-Cache
-  → NumPy oder lazy Torch-Bridge
-```
+## Invariants
 
-Er lädt kein Donormodell. Weil der statische Value-Sketch negativ war, ist der
-Streamer nicht automatisch mit dem Antwortpfad verbunden.
-
-## 10. Suite
-
-`Metrics` schreibt `status.json` atomar und hängt `metrics.jsonl` an. Das
-Dashboard bietet `/status` und eine lokale Übersicht. CLI, Dashboard und
-Daemon verwenden denselben Capability-Vertrag.
-
-## 11. Externe Ebenen
-
-FLCA und QAD bleiben kanonische externe Stränge. Sie werden in der
-Komponentenkarte als solche benannt, aber nicht als heute laufender IMMER-Core
-ausgegeben. Große Gewichte bleiben ebenfalls extern; IMMER verwaltet nur
-Manifeste, Digests und expliziten Import.
+- Weight bytes are immutable.
+- Graph appends are durable and independently verifiable.
+- Remote model sources require immutable revisions.
+- Every range read is identity-bound and byte-accounted.
+- Transport hints never change official router decisions.
+- Exact capability execution either returns a verified answer or abstains.
+- Private state and operational topology stay outside the public repository.

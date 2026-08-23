@@ -28,8 +28,10 @@ BF16 wird in numpy dekodiert (u16 << 16 → view float32).
 Resume: Output-JSON wird nach JEDEM Tensor atomar geschrieben; vorhandene
 Eintraege werden uebersprungen (--fresh setzt zurueck).
 
-Nur-Lesen fuer alle Quell-Ressourcen; geschrieben wird ausschliesslich
-nach mitGLM/results/.
+All source resources are read-only; the output target is explicit.
+
+    CASI_ENGINE_DIR="$CASI_ENGINE_DIR" python casi_tensor_map.py \
+      --model "$MODEL_SAFETENSORS" --output "$RESULT_JSON"
 """
 import argparse
 import hashlib
@@ -46,13 +48,6 @@ from datetime import datetime, timezone
 import numpy as np
 
 # ── Pfade (Defaults) ────────────────────────────────────────────────────────
-ST_FILE = ("/Volumes/INTENSO/KI Projekt/Qwen3.5-HCGM-Moonshots/source/"
-           "Qwen3.5-0.8B/model.safetensors-00001-of-00001.safetensors")
-ENGINE_DIR = ("/Users/bhkmie/Downloads/Forschung/Alte AI Projekte/"
-              "AI Fingerprintkram/casi-collapse")
-OUT_JSON = ("/Users/bhkmie/Downloads/Forschung/Alte AI Projekte/mitGLM/results/"
-            "e01_casi_tensor_map_qwen35_08b.json")
-
 SEED = 42
 MIN_SCORE_ELEMS = 4096      # bias-/norm-Vektoren darunter: nur zaehlen
 N_NULL = 5                  # Permutations-Nulls pro Tensor
@@ -60,14 +55,16 @@ MAX_ELEMS = 8_388_608       # Element-Deckel (8*2^20) — sonst deterministische
 MIN_ROWS = 100              # <100 Zeilen → transponieren (casi_nn-Konvention)
 T0 = time.time()
 
-# ── CASI-Engine: live_casiv2 importieren, sonst minimale Fallback-Impl. ─────
-sys.path.insert(0, ENGINE_DIR)
+# ── CASI engine: installed/explicit source, then the minimal fallback ──
+ENGINE_DIR = os.environ.get("CASI_ENGINE_DIR")
+if ENGINE_DIR:
+    sys.path.insert(0, os.path.abspath(os.path.expanduser(ENGINE_DIR)))
 ENGINE_SOURCE = None
 try:
     from live_casiv2 import (compute_fast_casi, compute_fast_profile,  # noqa: E402
                              CRYPTO_STRATEGY_NAMES, IMPL_STRATEGY_NAMES)
     import live_casiv2
-    ENGINE_SOURCE = f"live_casiv2 v{live_casiv2.__version__} @ {live_casiv2.__file__}"
+    ENGINE_SOURCE = f"live_casiv2 v{live_casiv2.__version__}"
     STRATEGY_NAMES = CRYPTO_STRATEGY_NAMES + IMPL_STRATEGY_NAMES
 except Exception as e:  # pragma: no cover — Fallback falls Import schiefgeht
     print(f"[WARN] live_casiv2 nicht importierbar ({e}) — nutze minimale Fallback-CASI.")
@@ -182,8 +179,6 @@ def load_tensor_f32(path, data_start, entry):
                    shape=(nbytes,))
     if dt == "BF16":
         u16 = mm.view(np.uint16)
-        # nur fuer die Analyse benoetigte Zeilen direkt aus dem memmap ziehen
-        rows = shape[0] if len(shape) >= 2 else None
         return u16, shape, "bf16"
     if dt == "F32":
         return mm.view(np.float32), shape, "f32"
@@ -438,21 +433,26 @@ def atomic_write_json(obj, path):
 
 def main():
     ap = argparse.ArgumentParser(description="E01 CASI-Tensor-Map")
+    ap.add_argument("--model", required=True, help="local Safetensors file")
+    ap.add_argument("--output", required=True, help="result JSON")
     ap.add_argument("--fresh", action="store_true", help="Vorhandenes Ergebnis ignorieren")
     ap.add_argument("--limit", type=int, default=0, help="Nur erste N Tensoren (Smoke-Test)")
     ap.add_argument("--gates-only", action="store_true", help="Nur Sanity-Gates ausfuehren")
     ap.add_argument("--filter", type=str, default="", help="Substring-Filter auf Tensornamen")
     args = ap.parse_args()
+    model_path = os.path.abspath(os.path.expanduser(args.model))
+    output_json = os.path.abspath(os.path.expanduser(args.output))
+    os.makedirs(os.path.dirname(output_json), exist_ok=True)
 
     print("=" * 78)
     print("E01: CASI-Wissenslandkarte — Qwen3.5-0.8B")
     print(f"  engine: {ENGINE_SOURCE}")
-    print(f"  model : {ST_FILE}")
+    print(f"  model : {model_path}")
     print(f"  seed={SEED}  n_null={N_NULL}  max_elems={MAX_ELEMS}")
     print("=" * 78)
 
     # 1) Header lesen (ohne Modell-RAM)
-    header, data_start = read_st_header(ST_FILE)
+    header, data_start = read_st_header(model_path)
     header.pop("__metadata__", None)
     print(f"Header: {len(header)} Tensoren, Daten ab Offset {data_start}")
 
@@ -468,14 +468,14 @@ def main():
         atomic_write_json({"experiment": "E01_casi_tensor_map", "aborted": True,
                            "sanity_gates": gates,
                            "runtime": {"finished": datetime.now(timezone.utc).isoformat()}},
-                          OUT_JSON)
+                          output_json)
         sys.exit(2)
 
     # 3) Resume / Vorhandenes Ergebnis laden
     results = None
-    if os.path.exists(OUT_JSON) and not args.fresh:
+    if os.path.exists(output_json) and not args.fresh:
         try:
-            with open(OUT_JSON) as f:
+            with open(output_json) as f:
                 results = json.load(f)
             print(f"\nResume: {len(results.get('tensors', []))} vorhandene Eintraege.")
         except Exception as e:
@@ -484,7 +484,10 @@ def main():
     if results is None:
         results = {
             "experiment": "E01_casi_tensor_map",
-            "model": {"path": ST_FILE, "size_bytes": os.path.getsize(ST_FILE)},
+            "model": {
+                "filename": os.path.basename(model_path),
+                "size_bytes": os.path.getsize(model_path),
+            },
             "engine": {"source": ENGINE_SOURCE, "mode": "fast (21 Byte-Level-Strategien)",
                        "strategies": STRATEGY_NAMES},
             "method": {
@@ -502,13 +505,21 @@ def main():
         # SHA einmalig streamen und cachen
         print("Berechne SHA256 (streaming) ...")
         t0 = time.time()
-        results["model"]["sha256"] = sha256_file(ST_FILE)
+        results["model"]["sha256"] = sha256_file(model_path)
         print(f"  sha256={results['model']['sha256']}  ({time.time()-t0:.1f}s)")
     else:
         # ggf. Gates des resumed Laufs aktualisieren
         results["sanity_gates"] = gates
         if "sha256" not in results.get("model", {}):
-            results["model"]["sha256"] = sha256_file(ST_FILE)
+            results["model"]["sha256"] = sha256_file(model_path)
+
+    results["model"].pop("path", None)
+    results["model"]["filename"] = os.path.basename(model_path)
+    results["engine"] = {
+        "source": ENGINE_SOURCE,
+        "mode": "fast (21 Byte-Level-Strategien)",
+        "strategies": STRATEGY_NAMES,
+    }
 
     results["sanity_gates"] = gates
     results.setdefault("runtime", {})
@@ -538,11 +549,11 @@ def main():
                              "layer": layer_index(name)}
             print(f"[{i+1:3d}/{len(names)}] {name}  -> nur gezaehlt ({cls}, numel={numel})")
             results["counts_only"] = counted
-            atomic_write_json(results, OUT_JSON)
+            atomic_write_json(results, output_json)
             continue
         t0 = time.time()
         try:
-            rec = score_tensor(name, entry, ST_FILE, data_start)
+            rec = score_tensor(name, entry, model_path, data_start)
         except Exception as e:
             rec = {"name": name, "tensor_class": cls, "shape": list(shape),
                    "dtype": entry["dtype"], "error": f"{type(e).__name__}: {e}"}
@@ -555,13 +566,13 @@ def main():
                   f"ratio={rec['ratio']:8.3f}  ({time.time()-t0:5.1f}s, "
                   f"rss={peak_rss_mb():.0f}MB peak)")
         results["runtime"]["last_tensor_at"] = datetime.now(timezone.utc).isoformat()
-        atomic_write_json(results, OUT_JSON)
+        atomic_write_json(results, output_json)
 
     results["counts_only"] = counted
     results["runtime"]["finished"] = datetime.now(timezone.utc).isoformat()
     results["runtime"]["seconds"] = round(time.time() - T0, 1)
     results["runtime"]["peak_rss_mb"] = round(peak_rss_mb(), 1)
-    atomic_write_json(results, OUT_JSON)
+    atomic_write_json(results, output_json)
 
     scored = results["tensors"]
     print("\n" + "=" * 78)
@@ -569,7 +580,7 @@ def main():
           f"{len(counted)} nur gezaehlt")
     print(f"Laufzeit {results['runtime']['seconds']}s, Peak-RSS "
           f"{results['runtime']['peak_rss_mb']} MB")
-    print(f"Output: {OUT_JSON}")
+    print(f"Output: {output_json}")
 
 
 if __name__ == "__main__":

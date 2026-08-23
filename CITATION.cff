@@ -1,10 +1,12 @@
 cff-version: 1.2.0
 title: "IMMER"
-message: "If you use IMMER, cite this repository and the canonical component revisions recorded in manifests/components.json."
+message: "Cite IMMER and the canonical component revisions recorded in manifests/components.json."
 type: software
 authors:
   - family-names: Foss
     given-names: David Tom
+    orcid: "https://orcid.org/0009-0004-0289-7154"
 repository-code: "https://github.com/DT-Foss/immer"
-version: "0.7.0"
-date-released: "2026-08-22"
+url: "https://davidtomfoss.com/"
+version: "0.8.0"
+date-released: "2026-08-23"

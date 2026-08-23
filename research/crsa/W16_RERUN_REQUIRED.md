@@ -19,11 +19,11 @@ The corrected runner now:
 Run in the original environment:
 
 ```bash
-PYTHONPATH=/path/to/w16-semigroup-fixed \
-python /path/to/w16-semigroup-fixed/w16/w16_twostep_organ_fixed.py \
-  --o1-root /Users/bhkmie/Documents/Forschung/O1_juli \
-  --donor-npz /path/to/donor_targets_twostep_pos_27b.npz \
-  --output /path/to/w16_twostep_fixed.json
+PYTHONPATH="$W16_SOURCE" \
+python "$W16_SOURCE/w16/w16_twostep_organ_fixed.py" \
+  --o1-root "$O1_ROOT" \
+  --donor-npz "$DONOR_NPZ" \
+  --output "$RESULT_JSON"
 ```
 
 The legitimate headline after rerun is `aggregate.end_to_end_held_unique_mean`.

@@ -29,7 +29,7 @@ from immer.cognition.fertig.structural import parse_structural_problem
 
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DRAFTS = ROOT / "results" / "qwen38_beast_baseline.json"
+DEFAULT_DRAFTS = ROOT / "results" / "qwen38_reference_baseline.json"
 DEFAULT_VERIFICATION = (
     ROOT / "artifacts" / "private" / "qwen3.8-fertig-draft-verify" / "result-off.json"
 )

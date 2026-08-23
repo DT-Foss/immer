@@ -39,16 +39,13 @@ import argparse
 import hashlib
 import json
 import math
-import sys
 import time
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from w3_komposition import O1  # noqa: E402  (setzt O1-Pfade, Pflicht)
-sys.path.insert(0, "/Users/bhkmie/self-verification_fable/neue attention")
-from operators import AttentionSpec, apply_attention  # noqa: E402
+from operators import AttentionSpec, apply_attention
 
 # ---- Generator-Material (identisch mit Davids synthetic.py) -------------
 _KEYS = tuple(range(10, 42))        # 32 unique keys

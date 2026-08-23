@@ -1,156 +1,92 @@
-# Research Map
+# Research Foundations
 
-IMMER connects research programs that solve different parts of the same system.
+IMMER joins five research lines: sparse expert computation, contextual
+sparsity, Causal Prefix Sinkhorn Attention, reservoir-style state, and deterministic causal
+knowledge execution.
 
-## FERTIG
+## David Tom Foss: causal knowledge and deterministic validation
 
-Grounded neuro-symbolic cognition with a deterministic core, executable learned skills, constrained neural ranking, verification loops and process distillation.
+- **The `.causal` Format: Embedded Deterministic Inference for Domain-Agnostic
+  Knowledge Graph Amplification.** IEEE IRI 2026 full research paper and oral
+  presentation. The official conference record is listed on
+  [David Tom Foss's site](https://davidtomfoss.com/) and in the
+  [IRI session record](https://davidtomfoss.com/service/iri2026-session-e2-nlp-sentiment-multimodal-reasoning/).
+- **Deterministic Validation for Reliable LLM-Based Causal Knowledge
+  Extraction.** Presented at ICECET 2026; the
+  [official paper and talk record](https://davidtomfoss.com/talks/deterministic-validation-llm-causal-extraction/)
+  describes deterministic validation of extracted causal relations.
+- The public implementation lineage is
+  [dotcausal](https://github.com/DT-Foss/dotcausal) →
+  [o1-state](https://github.com/DT-Foss/o1-state) → LiveCausal in IMMER.
 
-Current structure-solver milestone: **1073/1319 GSM8K = 81.35% coverage,
-246 safe abstentions, 0 incorrect and 0 error outcomes on the full test
-split.** The report retains every item and pins dataset, runner and solver-tree
-digests. An unverified operations-template fallback first produced 17/17
-wrong attempts; it is now proposal-only and those cases are `must_abstain`
-regressions. An earlier gold-label-free audit rejects the claim that its then
-259 abstentions were ready assignment problems: the structural path found 144
-unresolved pronoun/coreference cases and 115 unsupported grammar cases, with no
-already extracted exclusive slot contract. Matching remains admissible only
-after typed slot extraction and before the existing exact IR certificate.
+These works supply the central separation used here: immutable source data,
+explicit causal wiring, deterministic inference, and provenance-bearing
+results.
 
-## DeepSeek-V4 range runtime
+## Sparse mixture-of-experts
 
-The pinned 304B DeepSeek-V4-Flash checkpoint now executes through a local
-43-layer, stateful decoder without loading the checkpoint as a resident model.
-The path uses the original FP8/FP4 Safetensors, native compressed sparse
-attention, hash/score MoE routing, HyperConnections, a bounded 12 GiB verified
-range cache and the repository's fixed-role CRSA residual graft. Completed
-integration runs prove one full autoregressive pass and a two-pass CRSA decode;
-meaningful prompt quality and paired graft superiority remain open gates.
+- Noam Shazeer et al.,
+  [Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer](https://arxiv.org/abs/1701.06538),
+  2017. Foundational sparse MoE gating paper; preprint.
+- William Fedus, Barret Zoph, and Noam Shazeer,
+  [Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity](https://jmlr.org/papers/v23/21-0998.html),
+  JMLR 23, 2022. Peer-reviewed.
+- Nan Du et al.,
+  [GLaM: Efficient Scaling of Language Models with Mixture-of-Experts](https://proceedings.mlr.press/v162/du22c.html),
+  ICML 2022. Peer-reviewed.
 
-The exact LM-head transport now has four sealed alternating real-network
-pairs: unchanged 127 compute blocks were carried by 16 rather than 127
-physical range requests while every arm read 1,059,061,760 bytes. The full
-blockwise FP32 logit hash and top-k values/IDs are bit-identical. The candidate
-wins 4/4 pairs, with individual speedups from 1.375606× to 2.410811× and a
-paired median of 1.445790×; mean time is 211.5756 s versus 125.6880 s. This is
-repeated latency evidence, but transport width 1 remains the production
-default until the end-to-end content gate. The evidence is
-`results/deepseek-v4-head-range-network-smoke.json`.
+IMMER keeps the model's official MoE decision intact and learns the transport
+distribution around it.
 
-## DeepSeek handoff falsification
+## Contextual sparsity and routing
 
-The synthetic Wave3 demonstrations are not runtime evidence. T11 divides an
-already averaged parallel gradient by `N` again and gives the sequential arm
-privileged teacher intermediates; correcting the scaling leaves 5.19% rather
-than 98% error reduction without repairing the target asymmetry. The 3-zone
-router injects one synthetic `expert_quality` variable into gate norms and
-expert embeddings, then recovers it through its score and oracle. Decoupling
-leaves +4.67% over random and 36.66% of oracle; DeepSeek V4 has no matching
-expert embeddings and uses a different official hash/score route.
+- Zichang Liu et al.,
+  [Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time](https://arxiv.org/abs/2310.17157),
+  2023. **Preprint.** It predicts contextual sparsity without retraining the
+  base model.
+- P. Batorski et al.,
+  [MACRO: Markov Chain Routing of Transformer Layers](https://arxiv.org/abs/2608.05872),
+  2026. Preprint on Markov policies for layer routing.
 
-Only two handoff ideas remain open as measurements: a passive residual trace
-of the real HC-Sinkhorn recurrence, and a corrected per-head-temperature A/B
-confined to the CRSA graft with exact causal masks and a permuted placebo.
-Causal-adjusted Birkhoff quantities and offline ID/effective-rank estimates
-may diagnose but not control execution. Zeno scheduling, Replica-MoE, a live
-eta gate, Ginibre-Hurst control, mask recycling, SK1 and ID-based sizing remain
-NO-GO until a new real-data mechanism and falsifier exist.
+IMMER's Markov controller addresses a different layer of the stack: it predicts
+next-layer expert payloads for transport while official DeepSeek routing and
+all transformer layers remain unchanged.
 
-## Organ Grafting
+## Reservoir computing and persistent state
 
-`Organs, Not Weights` defines capability transplantation into a frozen living host.
+- D. Verstraeten et al.,
+  [An experimental unification of reservoir computing methods](https://www.sciencedirect.com/science/article/pii/S089360800700038X),
+  Neural Networks 20, 2007. Peer-reviewed.
+- Francis Wyffels, Benjamin Schrauwen, and Dirk Stroobandt,
+  [Stable Output Feedback in Reservoir Computing Using Ridge Regression](https://link.springer.com/chapter/10.1007/978-3-540-87536-9_83),
+  2008. Peer-reviewed conference chapter.
+- Daniel J. Gauthier et al.,
+  [Next generation reservoir computing](https://doi.org/10.1038/s41467-021-25801-2),
+  Nature Communications 12, 2021. Peer-reviewed.
 
-Measured anchors from v0.1:
+The O(1)-state branch uses a fixed recurrent substrate, controlled adaptation,
+and compact learned readouts while keeping frozen exact execution separate.
 
-- host: **1,713,673 parameters**, 909,676,544 streamed tokens;
-- donor: 27B, approximately **15,750×** larger;
-- structured organs: **5,732–14,625 parameters**;
-- host language NLL: **8.6656**, preserved through headline runs;
-- recurrent chain organ trained at length 2: **1.000 through length 12** after crystallization;
-- cold OrganBank Ship v6: **152/152 measured tasks**, **30/30 text routes**.
+## Attention and mathematical working drafts
 
-The central design rule is structure-first capability:
+The repository includes three working drafts:
 
-```text
-STRUCTURAL FORM + MAP + ROUTE GATE + CRYSTAL
-```
+- [`Causal_Prefix_Sinkhorn_Attention_v0.5_FULL.pdf`](../research/papers/Causal_Prefix_Sinkhorn_Attention_v0.5_FULL.pdf)
+- [`causal_prefix_sinkhorn_v0.4_polished.pdf`](../research/papers/causal_prefix_sinkhorn_v0.4_polished.pdf)
+Their release status is **research working draft**. The runtime evidence for
+CRSA is reported separately in
+[`BENCHMARKS.md`](BENCHMARKS.md).
 
-## Causal Prefix–Sinkhorn / CRSA
+## Storage format
 
-The v0.5 attention program establishes strict causal prefix-mass balancing and role-complete causal routing.
+- [safetensors](https://github.com/huggingface/safetensors) defines the safe,
+  zero-copy tensor container used by the immutable weight plane.
+- [dotcausal](https://github.com/DT-Foss/dotcausal) defines the public causal
+  knowledge-format line. IMMER's causalized model bundle is a directory that
+  combines unchanged Safetensors with a LiveCausal sidecar. The bundle is a
+  directory-level system object rather than a renamed tensor file.
 
-Measured anchors:
+## Author record
 
-- exact zero future gradient and support for the causal operator;
-- forced diagonal maximum at epsilon=0 and k=1;
-- lower-triangular bistochastic obstruction: exact row+column stochasticity collapses to identity;
-- k=1 remains the useful finite routing regime;
-- scale gains: **0.984, 1.106, 1.173, 1.182, 1.184 bpb** at widths 128, 256, 384, 512, 1024;
-- variable-lag unseen accuracy: **0.9293** for 2L+1B+1F→F versus **0.7745** softmax;
-- every tested free-head-preserving lag-48 program: **1.000**;
-- **69 automated tests** in the v0.5 program.
-
-CRSA treats attention heads as routing roles rather than interchangeable copies of one operator.
-
-## o1-state
-
-The persistent host contributes the O(1)-state organism: constant-memory streaming, surprise-gated plasticity, external indexed memory, sleep/consolidation and portable state.
-
-## FLCA
-
-FLCA contributes typed operator evidence, compilation, schedule/runtime lowering and replay.
-
-## QAD
-
-QAD contributes the deployment axis. In the Organ Grafting deployment experiment, host fake-quant int4 self-distillation moved NLL from PTQ 8.6671 to 8.6654 against fp32 8.6656 while the tested organ capability remained intact.
-
-## Primary References
-
-### Peer-reviewed
-
-- Nan Du, Yanping Huang, Andrew M. Dai, Simon Tong, Dmitry Lepikhin, Maxim
-  Krikun, Yuanzhong Xu, et al., 2022, [GLaM: Efficient Scaling of Language
-  Models with Mixture-of-Experts](https://proceedings.mlr.press/v162/du22c.html)
-  - large-scale sparse MoE language modeling with lower training cost than a
-    dense baseline.
-- William Fedus, Barret Zoph, Noam Shazeer, 2022, [Switch Transformers:
-  Scaling to Trillion Parameter Models with Simple and Efficient
-  Sparsity](https://jmlr.org/papers/v23/21-0998.html)
-  - simplifies MoE routing to one expert per token and lowers communication
-    cost.
-- Daniel J. Gauthier, Erin Bollt, et al., 2021, [Next generation reservoir
-  computing](https://doi.org/10.1038/s41467-021-25801-2)
-  - modern reservoir-computing framing with linear training on the readout.
-- D. Verstraeten, B. Schrauwen, M. D'Haene, D. Stroobandt, 2007, [An
-  experimental unification of reservoir computing methods](https://www.sciencedirect.com/science/article/pii/S089360800700038X)
-  - early unifying ESN/RC experimental reference.
-- Francis Wyffels, Benjamin Schrauwen, Dirk Stroobandt, 2008, [Stable Output
-  Feedback in Reservoir Computing Using Ridge Regression](https://link.springer.com/chapter/10.1007/978-3-540-87536-9_83)
-  - ridge-regression readout as a stable reservoir-training primitive.
-- Georg Holzmann, et al., 2010, [Echo state networks with filter neurons and a
-  delay&sum readout](https://www.sciencedirect.com/science/article/pii/S0893608009001580)
-  - ESN readout variants that keep the reservoir fixed and train the output
-    layer.
-
-### Preprints and specs
-
-- Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le,
-  Geoffrey Hinton, Jeff Dean, 2017, [Outrageously Large Neural Networks: The
-  Sparsely-Gated Mixture-of-Experts Layer](https://arxiv.org/abs/1701.06538)
-  - baseline sparse MoE routing with a learned gating network over many
-    experts.
-- Zichang Liu, Jue Wang, Tri Dao, Tianyi Zhou, Binhang Yuan, Zhao Song,
-  Anshumali Shrivastava, Ce Zhang, Yuandong Tian, Christopher Ré, et al.,
-  2023, [Deja Vu: Contextual Sparsity for Efficient LLMs at Inference
-  Time](https://arxiv.org/abs/2310.17157)
-  - contextual sparsity predictor for faster inference without retraining the
-    base model.
-- P. Batorski, et al., 2026, [MACRO: Markov Chain Routing of Transformer
-  Layers](https://arxiv.org/abs/2608.05872)
-  - Markov-policy baseline for layer routing with skip/repeat choices.
-- [safetensors/safetensors](https://github.com/safetensors/safetensors)
-  - safe, zero-copy tensor storage format; the format anchor for local range
-    loading.
-- [DT-Foss/dotcausal](https://github.com/DT-Foss/dotcausal)
-  - the `.causal` format repository and public reference for the causal graph
-    substrate.
+[David Tom Foss](https://davidtomfoss.com/) ·
+[ORCID 0009-0004-0289-7154](https://orcid.org/0009-0004-0289-7154)

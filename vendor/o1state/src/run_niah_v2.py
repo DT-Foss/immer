@@ -4,13 +4,13 @@ Drive the REAL Kamradt v2 NIAH runner with O1 as the provider.
 Real Paul Graham prose haystack, real single-needle task, real ExactMatch scoring, sweep over
 growing context lengths. O1 streams the haystack into its fact index and answers from it.
 
-Run:  PYTHONPATH=/Users/bhkmie/Documents/Forschung/O1/src python3 run_o1_niah.py
+Run:  python3 run_niah_v2.py --o1-src "$O1_SOURCE" \
+        --haystack "$NIAH_HAYSTACK" --out "$RESULT_JSON"
 """
-import os, sys, json, asyncio, time
-
-# O1 provider
-sys.path.insert(0, "/Users/bhkmie/Documents/Forschung/O1/src")
-from niah_o1_provider import O1Provider
+import asyncio
+import sys
+import time
+from pathlib import Path
 
 # v2 components (real)
 from needlehaystack.core.runner import Runner
@@ -30,19 +30,30 @@ def main():
     ap.add_argument("--task", default="single", choices=list(_TASKS))
     ap.add_argument("--lengths", default="1000,2000,4000,8000,16000,32000,64000,128000")
     ap.add_argument("--depths", default="0,25,50,75,100")
+    ap.add_argument(
+        "--o1-src",
+        type=Path,
+        help="optional source directory containing niah_o1_provider.py",
+    )
+    ap.add_argument("--haystack", type=Path, required=True)
     ap.add_argument("--out", default="results/o1_single_needle.jsonl")
     ap.add_argument("--concurrency", type=int, default=4)
     args = ap.parse_args()
+
+    if args.o1_src is not None:
+        sys.path.insert(0, str(args.o1_src.expanduser().resolve()))
+    from niah_o1_provider import O1Provider
 
     lengths = [int(x) for x in args.lengths.split(",")]
     depths = [float(x) for x in args.depths.split(",")]
 
     task = _TASKS[args.task]()                       # the v2 task, unmodified
     provider = O1Provider()
-    haystack = FilesHaystack(path="PaulGrahamEssays")   # real prose
+    haystack = FilesHaystack(path=str(args.haystack.expanduser().resolve()))
     sweep = Sweep(lengths=lengths, depths=depths, seeds=[None])
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    store = JsonlResultStore(args.out)
+    output = Path(args.out).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    store = JsonlResultStore(str(output))
 
     n_cells = len(lengths) * len(depths)
     print("=" * 78)
@@ -86,7 +97,7 @@ def main():
             vs = bylen[L]
             print(f"    {L:>8,}: {sum(vs)/len(vs)*100:5.1f}%  ({sum(1 for v in vs if v>=0.999)}/{len(vs)} perfect)")
         print("=" * 78)
-    print(f"\n→ {args.out}")
+    print(f"\n→ {output}")
 
 
 if __name__ == "__main__":

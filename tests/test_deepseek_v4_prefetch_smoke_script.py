@@ -135,6 +135,27 @@ class DeepSeekV4PrefetchSmokeScriptTests(unittest.TestCase):
                 smoke._atomic_write_json(link, report)
             self.assertEqual(foreign.read_text(encoding="utf-8"), "sentinel")
 
+    def test_public_report_paths_are_relative_or_redacted(self) -> None:
+        self.assertEqual(
+            smoke._public_path(smoke.ROOT / "results" / "report.json"),
+            "results/report.json",
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            args = smoke._parser().parse_args(
+                [
+                    "--source",
+                    f"local:{raw}",
+                    "--config",
+                    str(Path(raw) / "config.json"),
+                    "--output",
+                    str(Path(raw) / "report.json"),
+                ]
+            )
+            public = smoke._arguments(args)
+        self.assertEqual(public["source"], "local:<external>")
+        self.assertEqual(public["config"], "<external>")
+        self.assertEqual(public["output"], "<external>")
+
 
 if __name__ == "__main__":
     unittest.main()

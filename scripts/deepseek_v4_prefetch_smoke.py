@@ -80,6 +80,23 @@ def _canonical_digest(document: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _public_path(value: str | Path) -> str:
+    """Return a checkout-relative path or a non-identifying external marker."""
+
+    resolved = Path(value).expanduser().resolve()
+    try:
+        return resolved.relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        return "<external>"
+
+
+def _public_source(value: str) -> str:
+    if value.startswith("local:"):
+        location = _public_path(value.removeprefix("local:"))
+        return f"local:{location}"
+    return value
+
+
 def _seal_report(document: Mapping[str, Any]) -> dict[str, Any]:
     if "report_sha256" in document:
         raise SmokeError("report payload already contains report_sha256")
@@ -358,7 +375,7 @@ def _load_config(
     else:
         path = Path(args.config).expanduser().resolve()
         raw = path.read_bytes()
-        location = str(path)
+        location = _public_path(path)
     try:
         document = json.loads(raw)
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -584,7 +601,8 @@ def _arguments(args: argparse.Namespace) -> dict[str, Any]:
     result["experts"] = list(args.experts)
     for key in ("cache_dir", "config", "output"):
         if result.get(key) is not None:
-            result[key] = str(Path(result[key]).expanduser().resolve())
+            result[key] = _public_path(result[key])
+    result["source"] = _public_source(str(result["source"]))
     return result
 
 
@@ -872,7 +890,7 @@ def _run_with_source(
                 "reference_output_sha256": _tensor_digest(reference),
             },
             "provenance": {
-                "source": source_label,
+                "source": _public_source(source_label),
                 "revision": args.revision,
                 "revision_is_pinned": bool(
                     source_metrics_after.get("revision_is_pinned")
@@ -1000,7 +1018,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     receipt = {
         "schema": RESULT_SCHEMA,
         "status": report["status"],
-        "output": str(Path(args.output).expanduser().resolve()),
+        "output": _public_path(args.output),
         "report_sha256": report["report_sha256"],
         "bit_equal": report["exactness"]["all_outputs_bit_equal"],
         "baseline_mode": report["summary"]["baseline_mode"],

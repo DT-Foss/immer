@@ -1,18 +1,24 @@
 # Security
 
-Do not commit credentials, private traces, model caches or machine-specific secrets.
+immer treats weights, traces, credentials and machine topology as local data.
+Git excludes model bundles, private artifacts, route/access traces, environment
+files, credentials and private keys. The public-text regression test rejects
+absolute home/server paths, routable or VPN addresses, credential filenames and
+machine-specific paths in published benchmark reports.
 
-External FERTIG and OrganBank paths are configured explicitly at runtime.
-Frozen host and organ artifacts are accepted only after SHA-256 verification;
-PyTorch bundles are loaded with `weights_only=True` and organ states also carry
-an internal digest. `immer artifacts import` copies from an explicit source
-read-only, atomically, and refuses to overwrite a wrong destination by default.
+Every external harness path and remote endpoint is supplied at runtime. Public
+reports store repository paths relative to the checkout and replace external
+machine locations with a typed descriptor. Measurements, hashes and checkpoint
+identities remain intact.
 
-WorldStream uses exact single-range reads, preflights a hard byte budget and
-SHA-verifies resume-cache entries. Full weight-file reads are rejected. Pin a
-remote model revision to a commit digest; a cache hash cannot prove that a
-mutable `main` revision did not move.
+Frozen host and organ artifacts enter through `immer artifacts import`: explicit
+read-only source, SHA-256 verification, atomic installation and collision refusal.
+PyTorch state loads use `weights_only=True`; organ state carries its own digest.
 
-FERTIG desktop execution, recording and state mutation require explicit
-backend injection. A normal `serve`, `solve`, `doctor` or test run does not
-grant those capabilities.
+WorldStream performs exact range reads, enforces byte budgets and verifies every
+resume-cache leaf. Remote checkpoints are bound to immutable commit revisions.
+Full shard reads are rejected.
+
+FERTIG desktop execution, recording and state mutation exist only behind explicit
+backend injection. `serve`, `solve`, `doctor` and the test suite grant none of
+those capabilities.

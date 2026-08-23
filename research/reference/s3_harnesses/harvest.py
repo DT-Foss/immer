@@ -6,7 +6,7 @@ beliebige HF-Modelle und Organ-Kandidaten:
     python3 harvest.py --model Qwen/Qwen2.5-0.5B --task addition \
         --mlp-lo 16 --mlp-hi 24                # = S2-PoC (Regression)
     python3 harvest.py --model Qwen/Qwen3.8-27B --task arithmetic \
-        --mlp-lo 56 --mlp-hi 61 --dtype bf16   # S3-Kandidat (beast, 4-bit via MLX)
+        --mlp-lo 56 --mlp-hi 61 --dtype bf16   # S3 candidate (remote 4-bit MLX donor)
 
 Ablauf (identisch zu S2, bewiesen):
   1. Paare am Lese-Punkt: x = MLP-Eingang des ersten Organ-Layers,

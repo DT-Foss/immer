@@ -55,7 +55,13 @@ class CliTests(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("FERTIG", text)
         self.assertIn("CRSA", text)
+        self.assertIn("LiveCausal", text)
+        self.assertIn("CausalWeights", text)
+        self.assertIn("DeepSeekV4", text)
+        self.assertIn("MarkovRouter", text)
         self.assertIn("OrganBank", text)
+        self.assertNotIn("FLCA", text)
+        self.assertNotIn("QAD", text)
 
     def test_doctor_worldstream_does_not_depend_on_requests(self) -> None:
         original_import = builtins.__import__

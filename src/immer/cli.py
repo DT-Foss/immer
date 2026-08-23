@@ -13,13 +13,15 @@ from .substrate import LifeDaemon
 
 
 COMPONENTS = (
-    ("FERTIG", "grounded cognition, executable skills and exact solving", "vendored + runtime adapter"),
-    ("o1-state", "persistent O(1)-state host", "in-package canonical recurrence"),
-    ("OrganBank", "digest-addressed structured capabilities", "integrated artifact registry"),
-    ("CRSA", "causal Local/Balanced/Free attention routing", "integrated operators"),
-    ("WorldStream", "budgeted safetensors range access", "integrated local/HF tensor source"),
-    ("FLCA", "evidence-gated compilation and replay", "external canonical project"),
-    ("QAD", "precision-aware neural deployment", "external model/compiler project"),
+    ("FERTIG", "grounded deterministic execution and verification", "vendored + runtime adapter"),
+    ("CRSA", "Causal Prefix Sinkhorn Attention", "integrated operators"),
+    ("WorldStream", "exact local and pinned-remote Safetensors ranges", "integrated tensor source"),
+    ("LiveCausal", "append-only causal control plane", "integrated lazy graph"),
+    ("CausalWeights", "local weight bundle and exact causal range routes", "integrated DeepSeek pager path"),
+    ("DeepSeekV4", "complete 43-layer frontier decoder", "active local runtime"),
+    ("MarkovRouter", "label-free next-layer expert transport hints", "integrated evaluation path"),
+    ("OrganBank", "digest-addressed exact capabilities", "integrated artifact registry"),
+    ("o1-state", "persistent life stream outside frozen execution", "integrated runtime"),
 )
 
 def _s3_manifest(configured: str | Path | None = None) -> Path:

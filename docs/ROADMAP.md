@@ -1,161 +1,55 @@
-# Roadmap — Hebel nach Beweislage
+# Roadmap
 
-Stand: 2026-08-23. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
+Release line: 0.8.x · 2026-08-23
 
-## Erledigt
+The target is a local frontier runtime whose immutable weights are fully
+addressable through a growing causal control plane, with exact verification
+around every domain that supports it.
 
-- [x] Atomarer Bus/Daemon/State-Port und digest-geprüftes OrganRack.
-- [x] Persistenter O(1)-Lebensstrom mit Surprise-Gate, Replay und Sidecar.
-- [x] Einziger `exact_math`-Besitzer: bewachte S3→FERTIG-Kaskade.
-- [x] Frozen A1 plus vier SHIP-v6-Organe ohne Runtime-Training.
-- [x] Kristallisierter Dezimalpfad `h ← 10h + v`.
-- [x] Z3-Artefakt semantisch korrekt als `z3sum`, nicht als Modulo.
-- [x] Eigene CRSA-Attention als realer Online-Abstain-Gate.
-- [x] Kontext-Router mit Roh-A1-, Softmax- und 32 Label-Placebo-Kontrollen.
-- [x] FERTIG Grounded-Adapter mit Graph-/Skillpfad und geschlossenen
-  Desktop-/Recorder-/Mutationsgrenzen.
-- [x] Budgetierter WorldStream mit Offlinequelle, exakt begrenzten Ranges und
-  SHA-verifiziertem Resume.
-- [x] CLI-Endpunkte für `solve`, `serve`, `eval`, `doctor`, `artifacts`,
-  `organs` und `stream`.
-- [x] Wheel-Isolation mit paketierten Manifesten und 152/152 aus sauberer
-  Installation.
-- [x] Abschließender A1-only-Offline-Export mit exakter Dateiliste,
-  isoliertem 152/152-Selbsttest und hartem Lizenz-/Upload-Gate.
-- [x] Gepinnter DeepSeek-V4-Flash-Hauptdecoder aus Safetensors-Ranges:
-  43 Layer, native Sparse-Attention, exakte blockskalierte MXFP8/FP4-
-  Dekodierung mit FP32-Akkumulation, HyperConnections, globaler Head und
-  stateful Decode unter 16-GB-RAM-/12-GiB-Cache-Grenzen.
-- [x] DeepSeek-Layerwise-Proof-Schema v4 mit gebundener Modell-, Package-,
-  CLI-, Streamer-, HF-Range-, Snapshot- und Dependency-Identität; getrennt
-  davon ein manipulationssichtbares Hash-Chain-Journal v2 für item-major
-  Benchmarks.
-- [x] Exaktes Routed-Expert-Prefetch `exact-router-window-q3-a2/v2`: drei
-  sofort eingereihte Futures, höchstens zwei aktive I/O-Worker und drei
-  residente/inflight Experts, 14 MiB pro Expert, 48 MiB Gesamtgrenze und
-  bitgleiche A/B-Ausgabe.
-- [x] Erster vollständiger DeepSeek-Inhaltslauf: 43/43 Layer, vier feste
-  Geography-Items, `off` 3/4 korrekt; Resultat, Identität und finales
-  BF16-Objekt versiegelt an Commit `d0a1dc4`.
-- [x] Begrenzter Remote-Transport `requests-session-pool-2/v1`: zwei geleaste
-  Ein-Verbindungs-Sessions, bounded stream reads und deterministischer Close.
-  Das neuversiegelte q3/`off`-A/B bleibt bitidentisch, liefert wegen hoher
-  Netzvarianz aber keinen stabilen Speedup-Claim.
-- [x] Exaktes Multi-Range-Instrument mit Leaf-Cache-Reuse und
-  Adjacent-Pair-A/B: kalt 6→4 Envelopes ohne Zusatzbytes und 1,161604× im
-  Mittel über zehn Paare gegen q3; cache-resident 1,005050× neutral. Da der
-  direkte `off`/Pair-Kontrast fehlt, bleibt q3/Width 1 Default und Pair/Width 2
-  explizit aus.
-- [x] Reales exaktes LM-Head-A/B: unveränderte 127 Rechenblöcke, aber
-  127→16 physische Requests bei identischen 1.059.061.760 Byte sowie
-  bitidentischem vollständigem Logitstrom und Top-k. Vier alternierende Paare
-  gewinnt der Kandidat 4/4; gepaarter Median 1,445790×. Damit ist der
-  Latenzmechanismus wiederholt positiv, bleibt bis zum End-to-End-Gate opt-in;
-  Produktionsdefault Breite 1.
-- [x] FERTIG-GSM8K-Vollsplit mit Item-Provenienz und hartem Wrong-Gate:
-  1.073 korrekt, 246 abstinent, 0 falsch, 0 Fehler.
-- [x] FERTIG-Grammatik für endliche affine Rekurrenzen mit exaktem
-  Fraction/RREF-Zertifikat; bei ihrer Einführung blieb der damalige Stand
-  1.060/1.319 bei weiterhin 0 falschen Antworten.
-- [x] DeepSeek-Hungarian gegen alle 259 FERTIG-Abstinenzen auditiert: 144
-  Coreference-Scope, 115 Grammar-Scope und null bereits extrahierte exklusive
-  Assignment-Verträge; die replizierte Demo zerfällt in unabhängige Argmins.
-- [x] DeepSeek-Wave3 und Resthandoff auditiert: T11 nach doppelter `/N`-
-  Korrektur nur 5,19 % bei weiterhin privilegierten Zwischenzielen;
-  zirkulärer 3-Zonen-Router entkoppelt nur +4,67 % über Random und 36,66 % des
-  Oracle. Nur HC-Residualtrace und CRSA-Graft-only-Temperatur bleiben als
-  kontrollierte Messungen offen; Birkhoff/ID nur als Diagnostik.
+## Complete
 
-## Jetzt
+- [x] Full DeepSeek-V4-Flash checkpoint preflight and 43-layer decoder.
+- [x] Layer-major multi-item execution with authenticated resume.
+- [x] Exact local and pinned-remote Safetensors range readers.
+- [x] Bounded disk cache, integrity checks, byte receipts, and asynchronous
+  expert transport.
+- [x] LiveCausal append-only graph with lazy query, citations, tombstones,
+  crash recovery, and concurrent-reader refresh.
+- [x] Causalized local bundle mount: immutable `weights/` plus live `causal/`.
+- [x] Official expert routes bound to exact range plans and consumed by the
+  DeepSeek pager.
+- [x] Label-free token-row Markov predictor with full score distributions,
+  configurable \(k\), held-out prompt splits, and placebo evaluation.
+- [x] FERTIG exact cascade, structural IR, guarded fallbacks, and zero-wrong
+  GSM8K audit.
+- [x] Own strict-causal Local/Balanced/Free attention and frozen context router.
+- [x] Frozen SHIP-v6 host with four digest-addressed organs.
+- [x] O(1)-state life stream separated from frozen execution.
 
-### 1. FERTIG-Strukturpfad
+## Active
 
-Der Vollsplit hat 246 sichere Abstinenzen bei null falschen Antworten. Die
-nächste Arbeit folgt dem goldfreien Snapshot der damaligen 259 Abstinenzen:
-144 Coreference- und 115 Grammar-Fälle. Seit diesem Snapshot wurden dreizehn
-Fälle exakt geschlossen. Beide Wege müssen vollständig konsumierte numerische
-Klauseln in den vorhandenen Fraction/RREF-IR überführen. Das Wrong-Gate bleibt
-null.
+- [ ] Build a full local DeepSeek causal bundle from the pinned checkpoint and
+  populate all expert rails.
+- [ ] Run the first end-to-end local A/B/C: plain paging, learned causal
+  routing, and shuffled causal placebo on identical prompts.
+- [ ] Report Recall@\(k\), precision@\(k\), bytes requested, bytes resident,
+  cache churn, source wait, wall time, and output equality.
+- [ ] Adapt \(k\) and prefetch depth to observed bandwidth, memory pressure,
+  and transition entropy instead of fixing one global width.
+- [ ] Feed completed route observations back into LiveCausal during ordinary
+  inference and verify immediate reader visibility.
+- [ ] Extend the benchmark from integration slices to representative MMLU and
+  GSM8K cohorts with fixed dataset hashes.
+- [ ] Make DeepSeek the default neural component in the composition root after
+  the local causal A/B/C passes.
 
-### 2. Qwen3.8-Inhalts- und Fusionspfad
+## Release gates
 
-Der gepinnte BF16-Checkpoint ist mit eigener Attention und DeltaNet vollständig
-streambar. Auf dem festen Acht-Fälle-Slice sind fünf Antworten durch FERTIG-IR
-exakt zertifiziert, zwei weitere nur als vollständig BF16-verifizierte
-Q3-Drafts markiert und ein inkonsistenter Oberflächenfall quarantäniert: 7/8
-beantwortet, 7 korrekt, 0 falsch. Q4 zeigt auf allen drei früheren
-Q3/BF16-Divergenzen andere Argmaxe; Quantisierungsübereinstimmung ist daher kein
-Wahrheitsbeweis. Nächster Hebel ist breitere, goldfreie Text→IR-Abdeckung, nicht
-ein weiterer Modellwechsel.
-
-### 3. Breiter Router-Kontrast
-
-Der heutige Split zeigt Kontextsignal, aber keinen CRSA-Sieg gegen Softmax.
-Nächster zulässiger Versuch: größerer, fachlich gemischter, deduplizierter
-Split; gleicher Ridge-Budgetdeckel; CRSA, Softmax, Roh-A1 und permutierte
-Labels. Kein Rollen-Adaption-Claim ohne Stabilitätsmessung.
-
-### 4. Lebenskurve
-
-Fixes held-out Byte-Set, Messpunkte über echte Lebenszeit:
-
-- NLL vor/nach Surprise-Updates;
-- Post-Sleep-Delta;
-- State-/Sidecar-Größe;
-- Resume-Bitexaktheit;
-- Drift des Frozen-Exact-Pfads muss null bleiben.
-
-### 5. FERTIG-Evaluationsfamilien
-
-Der vollständige GSM8K-Basissplit ist jetzt so gemessen. Nächster Ausbau sind
-familienweise Guard-Sets für Mengenänderungen, mehrdeutige Bindings und
-Desktop-Requests; falsche Antworten/Aktionsbehauptungen bleiben der Fehler.
-
-### 6. Kontextuell korrekter WorldStream-Mechanismus
-
-Stage 1 zeigte Mid-Depth-Struktur, Stage 2 mit statischem Embedding-Mittel war
-schlechter als Placebo. Ein neuer Versuch braucht echte RMSNorm-te
-Post-Attention-Zustände oder eine andere gemessene Invariante. Cross-Model-LS
-ist bereits negativ und kein R17. Der externe „R25-18×“-PoC zählt ebenfalls
-nicht: Er erzeugt die Layerstruktur synthetisch und vergleicht KL mit SNR.
-Zulässig ist ein neuer klassenkonditionierter Donor-KL-Versuch nur mit vorab
-getrenntem Train/Held-out, gleicher Metrik, All-Layer-Arm und Label-Shuffles.
-
-### 7. Handoff-Messungen statt synthetischer Prozentwerte
-
-Zwei schmale Messungen bleiben zulässig:
-
-- passive Residuen-Spur des real ausgeführten HC-Sinkhorn-Kerns; ein späterer
-  Early-stop-Kontrast wäre approximativ und muss Zeit, Logit-Delta und
-  Entscheidungen gemeinsam berichten;
-- Per-Head-Temperatur ausschließlich im CRSA-Graft, mit exakter Kausalmaske
-  und permutiertem Placebo.
-
-Kausal angepasste Birkhoff-Größen und ID/effective rank dürfen offline
-diagnostizieren, aber keine Runtime steuern. Zeno-Schedule, Replica-MoE,
-Live-η-Gate, Ginibre-Hurst, Mask-Recycling, SK1 und ID-Dimensionierung bleiben
-NO-GO; dasselbe gilt für T11 und den 3-Zonen-Router aus Wave3.
-
-## Später
-
-- Der vollständige DeepSeek-V4-Stand bleibt resumierbar erhalten; neue
-  Inhaltsläufe erst nach einem Qwen-Kontrast, der einen klaren Mehrwert erwarten
-  lässt.
-- Donor-Ernte in `.causal`-Karten mit Herkunft und Revision.
-- Rat gegen Einzelhirn auf festem Split und gleicher Call-/Zeitbilanz.
-- Identitäts-Swap-Test bei weiterlaufendem State-Port.
-- FLCA-/QAD-Produkte nur über explizite Contracts integrieren.
-- Öffentlicher Hugging-Face-Upload erst nach schriftlich geklärter Lizenzkette;
-  der lokale Offline-Export ist bereits technisch golden.
-
-## Betriebsregeln
-
-1. Originale außerhalb dieses Ordners bleiben read-only.
-2. Jede neue Messung braucht Placebo oder klaren Kontrast.
-3. Negative Ergebnisse bleiben geschlossen, bis ein neuer Mechanismus samt
-   Falsifikator benannt ist.
-4. Frozen Host/Organe werden vor dem Laden vollständig gehasht.
-5. Strukturclaims folgen R17: Invariante messen, Fit als Verifier, exakte Form
-   einsetzen.
-6. Keine externe Mutation, Veröffentlichung oder Maschinenaktion als
-   Nebenwirkung eines lokalen Tests.
+- [ ] Reproduce every public result from a clean checkout.
+- [ ] Run the complete test suite with ResourceWarnings promoted to errors.
+- [ ] Verify every documentation link and every referenced repository path.
+- [ ] Build wheel and source distribution for version 0.8.0.
+- [ ] Scan the release tree for weights, caches, secrets, private traces,
+  machine topology, and experimental transfer material.
+- [ ] Produce the offline model bundle and its checksum allowlist.
+- [ ] Publish only after model and component licenses are explicitly cleared.

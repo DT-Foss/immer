@@ -1,4 +1,4 @@
-"""DonorBrain: the SOTA oracle on beast, spoken to over HTTP.
+"""DonorBrain: an explicitly configured remote model spoken to over HTTP.
 
 The resource law of this project: the resident organism stays tiny; the
 15 GB brain lives on the server and is called only when the cascade
@@ -16,11 +16,11 @@ from typing import Any
 
 from ...contracts import ExecutionStatus, Request, Result
 
-DEFAULT_DONOR = "http://127.0.0.1:8780/v1"  # via SSH-Tunnel auf beast; IMMER_DONOR_URL überschreibt
+DEFAULT_DONOR = "http://127.0.0.1:8780/v1"  # IMMER_DONOR_URL overrides this loopback endpoint.
 
 
 class DonorBrain:
-    """Chat capability backed by the 27B donor on beast."""
+    """Chat capability backed by an explicitly configured 27B donor."""
 
     def __init__(
         self,
@@ -40,7 +40,7 @@ class DonorBrain:
         self.persona = persona
         self.max_tokens = max_tokens
         self.name = name
-        self.model_id = f"Qwen3.8-27B@beast:{self.base_url}"
+        self.model_id = f"Qwen3.8-27B@remote:{self.base_url}"
 
     @property
     def capabilities(self) -> frozenset:
@@ -117,7 +117,7 @@ class DonorBrain:
 
 
 def build_council(base_url: str | None = None):
-    """The real rat: three donor roles sharing ONE loaded model on beast."""
+    """Three donor roles sharing one loaded remote model."""
     from ...council import Council
 
     return Council(

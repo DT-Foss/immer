@@ -15,6 +15,7 @@ import argparse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import hashlib
 import json
 import math
 import os
@@ -26,6 +27,7 @@ import tempfile
 import time
 from typing import Any, Protocol
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -58,6 +60,45 @@ _COMMIT = re.compile(r"[0-9a-fA-F]{40,64}")
 
 class CliError(RuntimeError):
     """The local benchmark contract could not be satisfied."""
+
+
+def _canonical_digest(document: Any) -> str:
+    payload = json.dumps(
+        document,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _seal_report(document: Mapping[str, Any]) -> dict[str, Any]:
+    if "report_sha256" in document:
+        raise CliError("report is already sealed")
+    sealed = dict(document)
+    sealed["report_sha256"] = _canonical_digest(sealed)
+    return sealed
+
+
+def _public_path(value: str | Path) -> str:
+    resolved = Path(value).expanduser().resolve()
+    try:
+        return resolved.relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        return "<external>"
+
+
+def _public_backend_location(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme in {"http", "https"} and parsed.hostname:
+        if parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+            return "<loopback-openai-compatible>"
+        return "<external-openai-compatible>"
+    location = _public_path(value)
+    return (
+        "<external-local-checkpoint>" if location == "<external>" else location
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -615,18 +656,18 @@ def run(
     latencies = [float(row["latency_seconds"]) for row in rows]
     parsed = counts["correct"] + counts["incorrect"]
     total = len(rows)
-    report = {
+    report = _seal_report({
         "schema": RESULT_SCHEMA,
         "model": {
             "id": backend.model_id,
             "revision": backend.model_revision,
-            "path": backend.model_path,
+            "path": _public_backend_location(backend.model_path),
             "backend": backend.backend_name,
             "load_seconds": backend.load_seconds,
         },
         "benchmark": {
             "name": "GSM8K historical FERTIG-abstention cohort",
-            "source": str(Path(args.benchmark).expanduser().resolve()),
+            "source": _public_path(args.benchmark),
             "item_ids": list(FIXED_ITEM_IDS),
         },
         "protocol": {
@@ -650,7 +691,7 @@ def run(
             "mean_latency_seconds": statistics.fmean(latencies),
             "median_latency_seconds": statistics.median(latencies),
         },
-    }
+    })
     output = _atomic_write_json(args.output, report)
     return report, output
 

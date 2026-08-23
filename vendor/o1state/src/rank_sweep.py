@@ -142,7 +142,7 @@ torch.backends.mps.is_available = lambda: False   # force CPU (repo convention)
 # (results/holographic_mqar.json, whose generating script also never set
 # num_threads). The anchor was measured in the multithread regime, so this
 # instrument must reproduce that regime, not a faster-but-different one.
-# Consequence for --cells stripe-parallelization on beast: each stripe process
+# Consequence for --cells stripe parallelization on a remote host: each process
 # now competes for its own multi-thread pool (torch default) rather than
 # pinning to 1 -- plan concurrent stripe COUNT accordingly (fewer parallel
 # processes than cores, not one process per core).

@@ -41,6 +41,7 @@ Gate-Selektivitaet, Zahlengeraden-Vergleich sub-only vs dual.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import random
 import re
@@ -60,10 +61,6 @@ from streaming_train import StreamingNoPELM  # noqa: E402
 HELD_SEED = 49
 TAU = 2.0
 S0 = 0.5
-SUB_NPZ = "/tmp/27b/subw/donor_targets_subw_27b.npz"
-ADD_NPZ = "/tmp/27b/addw10/donor_targets_addw10_27b.npz"
-
-
 def load_donor(path):
     """npz -> {(a,b): gemittelte Donor-Verteilung}, Kandidaten-Woerter."""
     npz = np.load(path, allow_pickle=True)
@@ -200,7 +197,12 @@ class DualShell(nn.Module):
         return out, st
 
 
-def main() -> None:
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(description="Run the dual-organ reference experiment.")
+    parser.add_argument("--sub-donor-npz", type=Path, required=True)
+    parser.add_argument("--add-donor-npz", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args(argv)
     t0 = time.time()
     print("lade WT-2 + Wesen …", flush=True)
     train_text, val_text = load_wikitext2()
@@ -217,8 +219,8 @@ def main() -> None:
     for p in host.parameters():
         p.requires_grad_(False)
 
-    sub_probs, sub_cw = load_donor(SUB_NPZ)
-    add_probs, add_cw = load_donor(ADD_NPZ)
+    sub_probs, sub_cw = load_donor(args.sub_donor_npz)
+    add_probs, add_cw = load_donor(args.add_donor_npz)
     sub_cids = [stoi[w] for w in sub_cw]
     add_cids = [stoi[w] for w in add_cw]
     sub_all, add_all = sorted(sub_probs), sorted(add_probs)
@@ -424,8 +426,10 @@ def main() -> None:
         "unmount_ok": un_ok,
         "runtime_s": round(time.time() - t0, 1),
     }
-    out = Path(__file__).parent / "w3_dual_organ.json"
-    json.dump(res, open(out, "w"), indent=1)
+    out = args.output.expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as handle:
+        json.dump(res, handle, indent=1)
     print(json.dumps(res, indent=1), flush=True)
     print(f"-> {out}", flush=True)
 

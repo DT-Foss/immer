@@ -118,6 +118,16 @@ def _canonical_digest(document: Any) -> str:
     return hashlib.sha256(_canonical_json_bytes(document)).hexdigest()
 
 
+def _public_path(value: str | Path) -> str:
+    """Return a checkout-relative path or a non-identifying external marker."""
+
+    resolved = Path(value).expanduser().resolve()
+    try:
+        return resolved.relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        return "<external>"
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -280,7 +290,7 @@ def _load_config(path: Path) -> tuple[DeepSeekV4Config, dict[str, Any]]:
     if not isinstance(document, Mapping):
         raise HeadSmokeError("config root must be an object")
     return DeepSeekV4Config.from_mapping(document), {
-        "path": str(source),
+        "path": _public_path(source),
         "bytes": len(raw),
         "sha256": hashlib.sha256(raw).hexdigest(),
     }
@@ -400,10 +410,10 @@ def _validate_manifest(
     ):
         raise HeadSmokeError("activation valid length is invalid")
     evidence = {
-        "manifest_path": str(manifest_path),
+        "manifest_path": _public_path(manifest_path),
         "manifest_sha256": _sha256_file(manifest_path),
         "manifest_body_sha256": document["body_sha256"],
-        "object_path": str(object_path),
+        "object_path": _public_path(object_path),
         "object_sha256": digest,
         "checkpoint": checkpoint,
         "selected_bucket": bucket,

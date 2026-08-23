@@ -309,7 +309,7 @@ def main() -> None:
     ap.add_argument("--task", default="add2",
                     choices=sorted(TASKS), help="Aufgaben-Sonde (gap_probe)")
     ap.add_argument("--donor-npz", default="",
-                    help="27B-Donor-Targets (beast, npz; Lese-Positions-Logits)")
+                    help="27B donor targets (NPZ read-position logits)")
     ap.add_argument("--donor-mlx", default="",
                     help="MLX-Donor (4-bit, z. B. mlx-community/Qwen2.5-7B-Instruct-4bit)")
     ap.add_argument("--lo", type=int, default=16,
