@@ -67,6 +67,7 @@ ROUTE_OBSERVATIONS_SCHEMA = "immer.deepseek-v4-route-observations/v1"
 REPORT_SCHEMA = "immer.deepseek-v4-route-eval/v1"
 HEADLINE_K = (1, 3, 6, 12, 24, 48, 96, 256)
 MICRO_WINDOW_ROWS = (1, 2, 4, 8, 16, 32, 64)
+MICRO_WINDOW_K = (3, 6, 9, 12, 18, 24)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _OBSERVATION_FIELDS = frozenset(
     {
@@ -672,6 +673,106 @@ def _micro_window_sweep(
     return sweep
 
 
+def _micro_window_k_sweep(
+    real_model: LayerMarkovExpertPredictor,
+    placebo_model: LayerMarkovExpertPredictor,
+    prompts: Sequence[PromptRouteObservation],
+    *,
+    alpha: float,
+    n_experts: int,
+) -> list[dict[str, Any]]:
+    """Measure fixed candidate budgets and their exact-read amplification."""
+
+    widths = tuple(sorted({min(k, n_experts) for k in MICRO_WINDOW_K}))
+    sweep: list[dict[str, Any]] = []
+    for window_rows in MICRO_WINDOW_ROWS[:4]:
+        accumulators = {
+            k: {
+                "placebo_hits": 0,
+                "predicted_total": 0,
+                "real_hits": 0,
+                "target_total": 0,
+                "windows": 0,
+            }
+            for k in widths
+        }
+        for prompt in prompts:
+            for source, target in prompt.consecutive_pairs():
+                pairs = [
+                    (source_row, target_row)
+                    for source_row, target_row in zip(
+                        source.rows,
+                        target.rows,
+                        strict=True,
+                    )
+                    if source_row and target_row
+                ]
+                for start in range(0, len(pairs), window_rows):
+                    chunk = pairs[start : start + window_rows]
+                    if not chunk:
+                        continue
+                    actual = {
+                        expert for _source, target_row in chunk for expert in target_row
+                    }
+                    current_rows = tuple(source_row for source_row, _target in chunk)
+                    real_ranking = real_model.predict_window_distribution(
+                        source_layer=source.layer,
+                        current_rows=current_rows,
+                        alpha=alpha,
+                    ).ranking
+                    placebo_ranking = placebo_model.predict_window_distribution(
+                        source_layer=source.layer,
+                        current_rows=current_rows,
+                        alpha=alpha,
+                    ).ranking
+                    for k in widths:
+                        accumulator = accumulators[k]
+                        accumulator["real_hits"] += len(
+                            actual.intersection(real_ranking[:k])
+                        )
+                        accumulator["placebo_hits"] += len(
+                            actual.intersection(placebo_ranking[:k])
+                        )
+                        accumulator["target_total"] += len(actual)
+                        accumulator["predicted_total"] += k
+                        accumulator["windows"] += 1
+        for k in widths:
+            accumulator = accumulators[k]
+            windows = accumulator["windows"]
+            target_total = accumulator["target_total"]
+            predicted_total = accumulator["predicted_total"]
+            if not windows or not target_total or not predicted_total:
+                raise RouteEvalError("fixed-K micro-window sweep has no routes")
+            real_hits = accumulator["real_hits"]
+            placebo_hits = accumulator["placebo_hits"]
+            real_recall = real_hits / target_total
+            placebo_recall = placebo_hits / target_total
+            # Every candidate is read speculatively; every uncovered exact
+            # expert is then read by the authoritative fallback. Routed expert
+            # shapes are identical, so counts are the byte-amplification proxy.
+            real_reads = predicted_total + target_total - real_hits
+            placebo_reads = predicted_total + target_total - placebo_hits
+            sweep.append(
+                {
+                    "delta_recall": real_recall - placebo_recall,
+                    "k": k,
+                    "placebo_expert_read_amplification": (placebo_reads / target_total),
+                    "placebo_precision": placebo_hits / predicted_total,
+                    "placebo_recall": placebo_recall,
+                    "real_expert_read_amplification": real_reads / target_total,
+                    "real_hits_mean": real_hits / windows,
+                    "real_misses_mean": (target_total - real_hits) / windows,
+                    "real_precision": real_hits / predicted_total,
+                    "real_recall": real_recall,
+                    "real_wasted_mean": (predicted_total - real_hits) / windows,
+                    "target_union_mean": target_total / windows,
+                    "window_rows": window_rows,
+                    "windows": windows,
+                }
+            )
+    return sweep
+
+
 def build_report(
     sidecar_path: str | Path,
     *,
@@ -750,6 +851,13 @@ def build_report(
             alpha=prior,
             n_experts=inventory,
         )
+        micro_window_k_sweep = _micro_window_k_sweep(
+            real_model,
+            placebo_model,
+            split.test,
+            alpha=prior,
+            n_experts=inventory,
+        )
     except RouteMarkovError as exc:
         raise RouteEvalError(str(exc)) from exc
 
@@ -765,6 +873,7 @@ def build_report(
         },
         "headline": _headline(evaluations, inventory),
         "micro_window_sweep": micro_window_sweep,
+        "micro_window_k_sweep": micro_window_k_sweep,
         "models": {
             "placebo_markov_snapshot_sha256": placebo_model.snapshot_sha256,
             "real_markov_snapshot_sha256": real_model.snapshot_sha256,
@@ -821,6 +930,7 @@ def write_report(path: str | Path, report: Mapping[str, Any]) -> None:
         "evaluations",
         "headline",
         "micro_window_sweep",
+        "micro_window_k_sweep",
         "models",
         "protocol",
         "schema",

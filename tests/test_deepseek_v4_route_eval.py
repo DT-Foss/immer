@@ -243,6 +243,23 @@ class DeepSeekV4RouteEvalTests(unittest.TestCase):
                 [1, 2, 4, 8, 16, 32, 64],
             )
             self.assertGreater(windows[0]["real_recall"], windows[0]["placebo_recall"])
+            fixed_k = report["micro_window_k_sweep"]
+            self.assertEqual(len(fixed_k), 8)
+            self.assertEqual(
+                sorted({row["window_rows"] for row in fixed_k}),
+                [1, 2, 4, 8],
+            )
+            self.assertEqual(
+                sorted({row["k"] for row in fixed_k}),
+                [3, 4],
+            )
+            self.assertTrue(
+                all(
+                    row["real_expert_read_amplification"] >= 1.0
+                    and row["placebo_expert_read_amplification"] >= 1.0
+                    for row in fixed_k
+                )
+            )
             self.assertFalse(_contains_forbidden_label_key(report))
             self.assertEqual(output.read_bytes(), _canonical(report))
             identity = {key: value for key, value in report.items() if key != "sha256"}
