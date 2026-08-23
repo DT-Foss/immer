@@ -347,6 +347,172 @@ class BalanceStructuralParserTests(unittest.TestCase):
         self.assertIsNone(result.problem)
 
 
+class ClosedSystemStructuralParserTests(unittest.TestCase):
+    RESOURCE = (
+        "Peter wants to make different sized ice cubes with 32 ounces of water. "
+        "He can make giant cubes that use 4 ounces per cube, medium cubes that "
+        "use 2 ounces, and small cubes that use 1/2 an ounce. If he makes 3 giant "
+        "cubes, 7 medium cubes, and 8 small cubes, how many ounces of water does "
+        "he have left?"
+    )
+    COMPONENTS = (
+        "Tanya makes a salt scrub from salt, oil, fragrance, citrus zest, and "
+        "sugar. She makes enough to fill a 10-ounce jar each time. She uses the "
+        "same amount of citrus zest as fragrance and the same amount of salt as "
+        "sugar. She uses twice as much oil as salt and twice as much salt as zest. "
+        "How many ounces of oil does she use?"
+    )
+    PERIODS = (
+        "In the first half of a soccer match, team A scores 4 goals while team B "
+        "scores 2 goals fewer than team A. In the second half, team A scores 1/4 "
+        "of the number of goals scored by team B, which scores 4 times the number "
+        "of goals it scored in the first half. What's the total number of goals "
+        "scored in the match?"
+    )
+
+    def assert_five_by_five_certificate(self, source: str, expected: Fraction) -> None:
+        parsed, solution = _solve(source)
+        self.assertEqual(solution.status, SolveStatus.UNIQUE)
+        self.assertEqual(solution.target_value, expected)
+        self.assertIsNotNone(solution.certificate)
+        assert solution.certificate is not None
+        self.assertTrue(solution.certificate.verified)
+        self.assertEqual(solution.certificate.rank, 5)
+        self.assertEqual(solution.certificate.variable_count, 5)
+        self.assertEqual(solution.certificate.equation_count, 5)
+        self.assertTrue(
+            all(residual.value == 0 for residual in solution.certificate.residuals)
+        )
+        assert parsed.problem is not None
+        self.assertEqual(len(parsed.problem.constraints), 5)
+
+    def test_three_qwen_disagreements_have_exact_symbolic_certificates(self) -> None:
+        for source, expected in (
+            (self.RESOURCE, Fraction(2)),
+            (self.COMPONENTS, Fraction(4)),
+            (self.PERIODS, Fraction(16)),
+        ):
+            with self.subTest(expected=expected):
+                self.assert_five_by_five_certificate(source, expected)
+
+    def test_resource_family_survives_renaming_and_number_perturbation(self) -> None:
+        source = (
+            "Keiko wants to make different sized wax blocks with 40 cups of wax. "
+            "She can make large blocks that use 3 cups per block, medium blocks "
+            "that use 2 cups, and small blocks that use 1 cup. If she makes 4 "
+            "large blocks, 5 medium blocks, and 6 small blocks, how many cups of "
+            "wax does she have left?"
+        )
+
+        self.assertEqual(_solve(source)[1].target_value, 12)
+
+    def test_component_family_resolves_one_unique_suffix_only(self) -> None:
+        source = (
+            "Mira makes a lotion from water, oil, wax, and scent. She makes enough "
+            "to fill an 18-ounce jar each time. She uses the same amount of scent "
+            "as wax. She uses twice as much oil as wax and 3 times as much water "
+            "as oil. How many ounces of water does she use?"
+        )
+
+        self.assertEqual(_solve(source)[1].target_value, Fraction(54, 5))
+
+    def test_component_equalities_get_distinct_functional_orientations(self) -> None:
+        source = (
+            "Mira makes a lotion from water, oil, wax, and scent. She makes enough "
+            "to fill an 18-ounce jar each time. She uses the same amount of scent "
+            "as wax and the same amount of scent as oil. She uses 3 times as much "
+            "water as oil. How many ounces of water does she use?"
+        )
+
+        self.assertEqual(_solve(source)[1].target_value, 9)
+
+    def test_period_family_keeps_team_and_period_scopes(self) -> None:
+        source = (
+            "In the first period of a hockey game, team Red scores 7 goals while "
+            "team Blue scores 3 goals fewer than team Red. In the second period, "
+            "team Red scores 1/2 of the number of goals scored by team Blue, which "
+            "scores 2 times the number of goals it scored in the first period. "
+            "What's the total number of goals scored in the game?"
+        )
+
+        self.assertEqual(_solve(source)[1].target_value, 23)
+
+    def test_resource_family_rejects_label_unit_and_numeric_drift(self) -> None:
+        sources = (
+            self.RESOURCE.replace("8 small cubes", "8 tiny cubes"),
+            self.RESOURCE.replace(
+                "medium cubes that use 2 ounces", "medium cubes that use 2 cups"
+            ),
+            self.RESOURCE.replace(
+                "If he makes 3 giant cubes",
+                "He discards 1 ounce. If he makes 3 giant cubes",
+            ),
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                result = parse_structural_problem(source)
+                self.assertFalse(result.ok, result)
+                self.assertIsNone(result.problem)
+
+    def test_component_family_rejects_unknown_duplicate_or_ambiguous_refs(self) -> None:
+        unknown = self.COMPONENTS.replace("ounces of oil", "ounces of cream")
+        duplicate = (
+            "Mira makes a lotion from water, oil, wax, and scent. She makes enough "
+            "to fill an 18-ounce jar each time. She uses the same amount of scent "
+            "as wax and the same amount of wax as scent. She uses twice as much oil "
+            "as wax. How many ounces of water does she use?"
+        )
+        ambiguous = (
+            "Nora makes a scrub from lemon zest, citrus zest, oil, and salt. She "
+            "makes enough to fill a 12-ounce jar each time. She uses the same "
+            "amount of zest as salt. She uses twice as much oil as salt and twice "
+            "as much lemon zest as oil. How many ounces of citrus zest does she use?"
+        )
+
+        for source in (unknown, duplicate, ambiguous):
+            with self.subTest(source=source):
+                result = parse_structural_problem(source)
+                self.assertEqual(result.status, ParseStatus.AMBIGUOUS, result.reason)
+                self.assertIsNone(result.problem)
+
+    def test_component_family_rejects_a_cycle_with_an_ungrounded_component(
+        self,
+    ) -> None:
+        source = (
+            "Mira makes a lotion from water, oil, wax, and scent. She makes enough "
+            "to fill an 18-ounce jar each time. She uses the same amount of water "
+            "as oil and the same amount of oil as wax. She uses twice as much "
+            "water as wax. How many ounces of scent does she use?"
+        )
+
+        result = parse_structural_problem(source)
+        self.assertEqual(result.status, ParseStatus.UNSUPPORTED, result.reason)
+        self.assertIsNone(result.problem)
+
+    def test_component_family_rejects_two_directed_scales_for_one_target(
+        self,
+    ) -> None:
+        source = (
+            "Mira makes a lotion from water, oil, wax, and scent. She makes enough "
+            "to fill an 18-ounce jar each time. She uses the same amount of scent "
+            "as wax. She uses twice as much water as oil and 3 times as much water "
+            "as wax. How many ounces of water does she use?"
+        )
+
+        result = parse_structural_problem(source)
+        self.assertEqual(result.status, ParseStatus.AMBIGUOUS, result.reason)
+        self.assertIsNone(result.problem)
+
+    def test_period_family_rejects_team_reference_drift(self) -> None:
+        result = parse_structural_problem(
+            self.PERIODS.replace("fewer than team A", "fewer than team C")
+        )
+
+        self.assertEqual(result.status, ParseStatus.AMBIGUOUS, result.reason)
+        self.assertIsNone(result.problem)
+
+
 class MeanStructuralParserTests(unittest.TestCase):
     def test_explicit_score_list_compiles_to_mean_constraint(self) -> None:
         source = (

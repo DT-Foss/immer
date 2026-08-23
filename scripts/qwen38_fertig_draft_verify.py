@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify fixed FERTIG abstention drafts with one streamed Qwen3.8 pass.
+"""Verify a historical FERTIG-abstention cohort with one Qwen3.8 pass.
 
 The committed local Q3 baseline supplies eight short answer candidates.  The
 official pinned BF16 checkpoint then teacher-forces all candidates together,
@@ -55,7 +55,9 @@ DEFAULT_BENCHMARK = ROOT / "results" / "bench_gsm8k.json"
 DEFAULT_DRAFTS = ROOT / "results" / "qwen38_beast_baseline.json"
 DEFAULT_RUN_DIR = ROOT / "artifacts" / "private" / "qwen3.8-fertig-draft-verify"
 DEFAULT_CACHE = ROOT / "artifacts" / "private" / "qwen3.8-cache"
-DEFAULT_TOKENIZER = ROOT / "artifacts" / "private" / "qwen3.8-reference" / "tokenizer.json"
+DEFAULT_TOKENIZER = (
+    ROOT / "artifacts" / "private" / "qwen3.8-reference" / "tokenizer.json"
+)
 TOKENIZER_CEILING = 32 * 1024**2
 OFFICIAL_TOKENIZER_SHA256 = (
     "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
@@ -368,8 +370,11 @@ def _prepare_drafts(
         if not isinstance(raw, Mapping) or raw.get("item_id") != item_id:
             raise CliError(f"Qwen baseline row {index} is out of order")
         benchmark_row = benchmark_rows.get(item_id)
-        if benchmark_row is None or benchmark_row.get("status") != "abstained":
-            raise CliError(f"fixed FERTIG abstention is unavailable: {item_id}")
+        if benchmark_row is None or benchmark_row.get("status") not in {
+            "abstained",
+            "correct",
+        }:
+            raise CliError(f"fixed historical cohort item is unavailable: {item_id}")
         question = benchmark_row.get("question")
         if not isinstance(question, str) or raw.get("question") != question:
             raise CliError(f"stale baseline question: {item_id}")
@@ -595,14 +600,15 @@ def _verify(
     prompts = tuple(row.prompt_token_ids for row in rows)
     drafts = tuple(row.draft_token_ids for row in rows)
     max_seq_len = max(
-        len(prompt) + len(draft)
-        for prompt, draft in zip(prompts, drafts, strict=True)
+        len(prompt) + len(draft) for prompt, draft in zip(prompts, drafts, strict=True)
     )
     resume_path = _resume_path(args)
     if args.restart and delete_resume(resume_path):
         _progress("resume_discarded", path=str(resume_path))
     runtime = _model_runtime if runtime_factory is None else runtime_factory
-    verifier_type = Qwen38DraftVerifier if verifier_factory is None else verifier_factory
+    verifier_type = (
+        Qwen38DraftVerifier if verifier_factory is None else verifier_factory
+    )
 
     def progress(event: Mapping[str, Any]) -> None:
         fields = dict(event)
@@ -631,7 +637,11 @@ def _verify(
         graft_contract = (
             None
             if args.mode == "off"
-            else {"mode": args.mode, "layer": args.graft_layer, "alpha": args.graft_alpha}
+            else {
+                "mode": args.mode,
+                "layer": args.graft_layer,
+                "alpha": args.graft_alpha,
+            }
         )
         identity = build_resume_identity(
             source_id=OFFICIAL_REPO_ID,
@@ -798,7 +808,8 @@ def run(
     result_path = (
         Path(args.result_json).expanduser().resolve()
         if args.result_json
-        else run_dir / ("inputs.json" if args.prepare_only else f"result-{args.mode}.json")
+        else run_dir
+        / ("inputs.json" if args.prepare_only else f"result-{args.mode}.json")
     )
     if args.prepare_only:
         result = _input_document(rows)

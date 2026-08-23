@@ -181,6 +181,30 @@ class FertigAdapterTests(unittest.TestCase):
                 "Mira's sequence from step 0 through step 4?",
                 "119",
             ),
+            (
+                "Peter wants to make different sized ice cubes with 32 ounces of "
+                "water. He can make giant cubes that use 4 ounces per cube, medium "
+                "cubes that use 2 ounces, and small cubes that use 1/2 an ounce. If "
+                "he makes 3 giant cubes, 7 medium cubes, and 8 small cubes, how many "
+                "ounces of water does he have left?",
+                "2",
+            ),
+            (
+                "Tanya makes a salt scrub from salt, oil, fragrance, citrus zest, "
+                "and sugar. She makes enough to fill a 10-ounce jar each time. She "
+                "uses the same amount of citrus zest as fragrance and the same "
+                "amount of salt as sugar. She uses twice as much oil as salt and "
+                "twice as much salt as zest. How many ounces of oil does she use?",
+                "4",
+            ),
+            (
+                "In the first half of a soccer match, team A scores 4 goals while "
+                "team B scores 2 goals fewer than team A. In the second half, team "
+                "A scores 1/4 of the number of goals scored by team B, which scores "
+                "4 times the number of goals it scored in the first half. What's "
+                "the total number of goals scored in the match?",
+                "16",
+            ),
         )
         for question, expected in examples:
             with self.subTest(expected=expected):

@@ -487,8 +487,8 @@ def _selected_items(
             raw = by_id[item_id]
         except KeyError as exc:
             raise CliError(f"fixed benchmark item is missing: {item_id}") from exc
-        if raw.get("status") != "abstained":
-            raise CliError(f"fixed item is no longer a FERTIG abstention: {item_id}")
+        if raw.get("status") not in {"abstained", "correct"}:
+            raise CliError(f"fixed historical cohort item is unusable: {item_id}")
         question = raw.get("question")
         if not isinstance(question, str) or not question.strip():
             raise CliError(f"fixed item has no question: {item_id}")

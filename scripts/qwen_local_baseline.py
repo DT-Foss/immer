@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a local Qwen model on eight fixed FERTIG abstentions.
+"""Run a local Qwen model on a fixed historical FERTIG-abstention cohort.
 
 The command is deliberately local-only: it resolves an already cached Hugging
 Face snapshot (or an explicit checkpoint directory) and never downloads model
@@ -126,6 +126,15 @@ def _parser() -> argparse.ArgumentParser:
         help="OpenAI-compatible /v1 endpoint (used by --backend openai)",
     )
     parser.add_argument(
+        "--openai-prompt-mode",
+        choices=("chat", "qwen3.8-no-thinking"),
+        default="chat",
+        help=(
+            "server-side chat templating or the pinned Qwen3.8 no-thinking "
+            "prompt sent through /completions"
+        ),
+    )
+    parser.add_argument(
         "--timeout",
         type=_positive_float,
         default=300.0,
@@ -176,7 +185,7 @@ def _read_json(path: str | Path, label: str) -> dict[str, Any]:
 
 
 def select_fixed_items(benchmark: str | Path) -> tuple[BenchmarkItem, ...]:
-    """Select the same eight report rows without importing another CLI script."""
+    """Select the same eight historical rows as FERTIG improves around them."""
 
     document = _read_json(benchmark, "FERTIG GSM8K report")
     raw_items = document.get("items")
@@ -197,8 +206,8 @@ def select_fixed_items(benchmark: str | Path) -> tuple[BenchmarkItem, ...]:
         raw = by_id.get(item_id)
         if raw is None:
             raise CliError(f"fixed benchmark item is missing: {item_id}")
-        if raw.get("status") != "abstained":
-            raise CliError(f"fixed item is no longer a FERTIG abstention: {item_id}")
+        if raw.get("status") not in {"abstained", "correct"}:
+            raise CliError(f"fixed historical cohort item is unusable: {item_id}")
         question = raw.get("question")
         if not isinstance(question, str) or not question.strip():
             raise CliError(f"fixed item has no question: {item_id}")
@@ -338,6 +347,7 @@ class OpenAIBackend:
         base_url: str,
         timeout: float,
         seed: int,
+        prompt_mode: str = "chat",
     ) -> None:
         endpoint = str(base_url).rstrip("/")
         if not endpoint.startswith(("http://", "https://")):
@@ -348,6 +358,9 @@ class OpenAIBackend:
         self.base_url = endpoint
         self.timeout = float(timeout)
         self.seed = seed
+        if prompt_mode not in {"chat", "qwen3.8-no-thinking"}:
+            raise CliError(f"unsupported OpenAI prompt mode: {prompt_mode}")
+        self.prompt_mode = prompt_mode
         started = time.perf_counter()
         try:
             with urllib.request.urlopen(
@@ -364,19 +377,36 @@ class OpenAIBackend:
         self.load_seconds = time.perf_counter() - started
 
     def generate(self, question: str, *, max_tokens: int) -> Generation:
-        payload = {
-            "model": self.model_id,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": question},
-            ],
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "seed": self.seed,
-            "stream": False,
-        }
+        if self.prompt_mode == "qwen3.8-no-thinking":
+            from immer.runtimes.qwen3_8.encoding import Qwen38Tokenizer
+
+            payload = {
+                "model": self.model_id,
+                "prompt": Qwen38Tokenizer.render_no_thinking_prompt(
+                    SYSTEM_PROMPT, question
+                ),
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "seed": self.seed,
+                "stream": False,
+                "stop": ["<|im_end|>", "<|endoftext|>"],
+            }
+            route = "completions"
+        else:
+            payload = {
+                "model": self.model_id,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": question},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "seed": self.seed,
+                "stream": False,
+            }
+            route = "chat/completions"
         request = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
+            f"{self.base_url}/{route}",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
@@ -403,8 +433,11 @@ class OpenAIBackend:
         choice = choices[0]
         if not isinstance(choice, Mapping):
             raise CliError("Qwen server returned an invalid first choice")
-        message = choice.get("message")
-        content = message.get("content") if isinstance(message, Mapping) else None
+        if self.prompt_mode == "qwen3.8-no-thinking":
+            content = choice.get("text")
+        else:
+            message = choice.get("message")
+            content = message.get("content") if isinstance(message, Mapping) else None
         if not isinstance(content, str):
             raise CliError("Qwen server response has no text content")
         if "</think>" in content:
@@ -493,10 +526,12 @@ def run(
     items = select_fixed_items(args.benchmark)
     if backend_factory is None:
         if args.backend == "mlx":
+
             def factory(parsed: argparse.Namespace) -> GenerationBackend:
                 return MlxBackend(parsed.model, parsed.revision, seed=parsed.seed)
 
         elif args.backend == "openai":
+
             def factory(parsed: argparse.Namespace) -> GenerationBackend:
                 return OpenAIBackend(
                     parsed.model,
@@ -504,6 +539,7 @@ def run(
                     base_url=parsed.base_url,
                     timeout=parsed.timeout,
                     seed=parsed.seed,
+                    prompt_mode=parsed.openai_prompt_mode,
                 )
 
         else:  # pragma: no cover - argparse owns the public boundary
@@ -589,13 +625,16 @@ def run(
             "load_seconds": backend.load_seconds,
         },
         "benchmark": {
-            "name": "GSM8K fixed FERTIG abstentions",
+            "name": "GSM8K historical FERTIG-abstention cohort",
             "source": str(Path(args.benchmark).expanduser().resolve()),
             "item_ids": list(FIXED_ITEM_IDS),
         },
         "protocol": {
             "system_prompt": SYSTEM_PROMPT,
             "backend": args.backend,
+            "openai_prompt_mode": (
+                args.openai_prompt_mode if args.backend == "openai" else None
+            ),
             "temperature": 0.0,
             "seed": args.seed,
             "max_tokens": args.max_tokens,

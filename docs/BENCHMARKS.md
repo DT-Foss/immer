@@ -93,7 +93,7 @@ die getrennte Partition `correct / abstained / incorrect / error`:
 
 | correct | abstained | incorrect | error | Coverage beantwortet |
 |---:|---:|---:|---:|---:|
-| 1.068 | 251 | 0 | 0 | 80,97 % |
+| 1.071 | 248 | 0 | 0 | 81,20 % |
 
 Ein erster Vollauf fand 17 falsche Antworten, sämtlich aus dem ungeprüften
 Operationsketten-Template-Fallback; dieser Pfad traf kein einziges Mal

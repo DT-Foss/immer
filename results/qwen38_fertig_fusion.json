@@ -1,0 +1,203 @@
+{
+  "schema": "immer.qwen3.8-fertig-fusion/v1",
+  "status": "complete",
+  "source": {
+    "checkpoint": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "draft_schema": "immer.qwen-local-fertig-baseline/v1",
+    "verification_schema": "immer.qwen3.8-fertig-draft-verification/v1"
+  },
+  "protocol": {
+    "decision_order": [
+      "exact_ir",
+      "model_verified",
+      "abstain"
+    ],
+    "gold_used_for_decisions": false,
+    "model_verified_is_exact": false,
+    "canonical_answer_prefix_tokens": 2
+  },
+  "items": [
+    {
+      "item_id": "gsm8k-test-0737-b673ac26d1268186",
+      "gold": "2",
+      "q3_answer": "1",
+      "q3_finish_reason": "stop",
+      "bf16_fully_verified": true,
+      "bf16_accepted_prefix_length": 3,
+      "exact": {
+        "parse_status": "parsed",
+        "parse_reason": "",
+        "solve_status": "unique",
+        "answer": "2",
+        "certificate": {
+          "rank": 5,
+          "variable_count": 5,
+          "equation_count": 5,
+          "zero_residuals": true
+        }
+      },
+      "decision": "exact_ir",
+      "accepted": true,
+      "answer": "2",
+      "correct": true
+    },
+    {
+      "item_id": "gsm8k-test-0815-13fae6ff992c2157",
+      "gold": "4",
+      "q3_answer": "4",
+      "q3_finish_reason": "stop",
+      "bf16_fully_verified": false,
+      "bf16_accepted_prefix_length": 2,
+      "exact": {
+        "parse_status": "parsed",
+        "parse_reason": "",
+        "solve_status": "unique",
+        "answer": "4",
+        "certificate": {
+          "rank": 5,
+          "variable_count": 5,
+          "equation_count": 5,
+          "zero_residuals": true
+        }
+      },
+      "decision": "exact_ir",
+      "accepted": true,
+      "answer": "4",
+      "correct": true
+    },
+    {
+      "item_id": "gsm8k-test-0857-fbb13bf06cc00a16",
+      "gold": "14000",
+      "q3_answer": "14000",
+      "q3_finish_reason": "stop",
+      "bf16_fully_verified": true,
+      "bf16_accepted_prefix_length": 7,
+      "exact": {
+        "parse_status": "unsupported",
+        "parse_reason": "unparsed numeric clause at 0:80",
+        "solve_status": null,
+        "answer": null,
+        "certificate": null
+      },
+      "decision": "model_verified",
+      "accepted": true,
+      "answer": "14000",
+      "correct": true
+    },
+    {
+      "item_id": "gsm8k-test-0901-5fbbe0d05836802d",
+      "gold": "1",
+      "q3_answer": "1",
+      "q3_finish_reason": "stop",
+      "bf16_fully_verified": true,
+      "bf16_accepted_prefix_length": 3,
+      "exact": {
+        "parse_status": "ambiguous",
+        "parse_reason": "numeric pronoun binding is not proven",
+        "solve_status": null,
+        "answer": null,
+        "certificate": null
+      },
+      "decision": "model_verified",
+      "accepted": true,
+      "answer": "1",
+      "correct": true
+    },
+    {
+      "item_id": "gsm8k-test-1032-e5873b4dd50866b6",
+      "gold": "450",
+      "q3_answer": "450",
+      "q3_finish_reason": "stop",
+      "bf16_fully_verified": true,
+      "bf16_accepted_prefix_length": 5,
+      "exact": {
+        "parse_status": "ambiguous",
+        "parse_reason": "numeric pronoun binding is not proven",
+        "solve_status": null,
+        "answer": null,
+        "certificate": null
+      },
+      "decision": "model_verified",
+      "accepted": true,
+      "answer": "450",
+      "correct": true
+    },
+    {
+      "item_id": "gsm8k-test-1042-d9ceeb071728fb0e",
+      "gold": "3",
+      "q3_answer": "-1",
+      "q3_finish_reason": "stop",
+      "bf16_fully_verified": false,
+      "bf16_accepted_prefix_length": 1,
+      "exact": {
+        "parse_status": "ambiguous",
+        "parse_reason": "numeric pronoun binding is not proven",
+        "solve_status": null,
+        "answer": null,
+        "certificate": null
+      },
+      "decision": "surface_quarantine",
+      "accepted": false,
+      "answer": null,
+      "correct": null
+    },
+    {
+      "item_id": "gsm8k-test-1175-3598411cca7939c2",
+      "gold": "16",
+      "q3_answer": "15",
+      "q3_finish_reason": "stop",
+      "bf16_fully_verified": false,
+      "bf16_accepted_prefix_length": 2,
+      "exact": {
+        "parse_status": "parsed",
+        "parse_reason": "",
+        "solve_status": "unique",
+        "answer": "16",
+        "certificate": {
+          "rank": 5,
+          "variable_count": 5,
+          "equation_count": 5,
+          "zero_residuals": true
+        }
+      },
+      "decision": "exact_ir",
+      "accepted": true,
+      "answer": "16",
+      "correct": true
+    },
+    {
+      "item_id": "gsm8k-test-1240-a316335b6f4ebc29",
+      "gold": "2",
+      "q3_answer": "2",
+      "q3_finish_reason": "stop",
+      "bf16_fully_verified": true,
+      "bf16_accepted_prefix_length": 3,
+      "exact": {
+        "parse_status": "ambiguous",
+        "parse_reason": "numeric pronoun binding is not proven",
+        "solve_status": null,
+        "answer": null,
+        "certificate": null
+      },
+      "decision": "model_verified",
+      "accepted": true,
+      "answer": "2",
+      "correct": true
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "exact_ir": 3,
+    "model_verified": 4,
+    "content_rejected": 0,
+    "surface_quarantine": 1,
+    "answered": 7,
+    "abstained": 1,
+    "correct": 7,
+    "wrong": 0,
+    "coverage": 0.875,
+    "overall_accuracy": 0.875,
+    "answered_accuracy": 1.0
+  }
+}

@@ -1,6 +1,6 @@
 # Roadmap — Hebel nach Beweislage
 
-Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
+Stand: 2026-08-23. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
 
 ## Erledigt
 
@@ -53,7 +53,7 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
   Latenzmechanismus wiederholt positiv, bleibt bis zum End-to-End-Gate opt-in;
   Produktionsdefault Breite 1.
 - [x] FERTIG-GSM8K-Vollsplit mit Item-Provenienz und hartem Wrong-Gate:
-  1.068 korrekt, 251 abstinent, 0 falsch, 0 Fehler.
+  1.071 korrekt, 248 abstinent, 0 falsch, 0 Fehler.
 - [x] FERTIG-Grammatik für endliche affine Rekurrenzen mit exaktem
   Fraction/RREF-Zertifikat; bei ihrer Einführung blieb der damalige Stand
   1.060/1.319 bei weiterhin 0 falschen Antworten.
@@ -70,24 +70,23 @@ Stand: 2026-08-22. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
 
 ### 1. FERTIG-Strukturpfad
 
-Der Vollsplit hat 259 sichere Abstinenzen bei null falschen Antworten. Die
-nächste Arbeit teilt sich nun evidenzgemäß: Für 144 Coreference-Fälle werden
-Antezedenten fail-closed aufgelöst; 115 Fälle brauchen zuerst neue getypte
-Operationsgrammatik. Beide Wege müssen vollständig konsumierte numerische
-Klauseln in den vorhandenen Fraction/RREF-IR überführen. Minimum-Cost-Matching
-ist erst bei nachweislich exklusiven Slots zulässig; Greedy, Matching und
-permutiertes Placebo teilen dann dieselben Kandidaten und Kosten. Das
-Wrong-Gate bleibt null.
+Der Vollsplit hat 248 sichere Abstinenzen bei null falschen Antworten. Die
+nächste Arbeit folgt dem goldfreien Snapshot der damaligen 259 Abstinenzen:
+144 Coreference- und 115 Grammar-Fälle. Seit diesem Snapshot wurden elf Fälle
+exakt geschlossen. Beide Wege müssen vollständig konsumierte numerische
+Klauseln in den vorhandenen Fraction/RREF-IR überführen. Das Wrong-Gate bleibt
+null.
 
-### 2. DeepSeek-V4-Inhaltsgate
+### 2. Qwen3.8-Inhalts- und Fusionspfad
 
-Die erste `off`-Baseline ist mit 3/4 korrekt positiv. Nach stabilem Transport
-folgt ein gepaarter `off`/CRSA-Lauf mit offiziellem Encoding, festem Split und
-kandidatengestütztem Scoring unter exakt derselben Runtime-Identität. Erst
-größere Splits dürfen einen Qualitäts- oder Ähnlichkeitsclaim tragen. Das
-LM-Head-Batching hat Exaktheit und vier wiederholte Zeitpaare bestanden, bleibt
-bis zu diesem End-to-End-Gate jedoch explizit opt-in; ein Produktionsdefault
-darf den Rechenblockpfad weiterhin nicht ändern.
+Der gepinnte BF16-Checkpoint ist mit eigener Attention und DeltaNet vollständig
+streambar. Auf dem festen Acht-Fälle-Slice sind drei Antworten durch FERTIG-IR
+exakt zertifiziert, vier weitere nur als vollständig BF16-verifizierte
+Q3-Drafts markiert und ein inkonsistenter Oberflächenfall quarantäniert: 7/8
+beantwortet, 7 korrekt, 0 falsch. Q4 zeigt auf allen drei früheren
+Q3/BF16-Divergenzen andere Argmaxe; Quantisierungsübereinstimmung ist daher kein
+Wahrheitsbeweis. Nächster Hebel ist breitere, goldfreie Text→IR-Abdeckung, nicht
+ein weiterer Modellwechsel.
 
 ### 3. Breiter Router-Kontrast
 
@@ -139,6 +138,9 @@ NO-GO; dasselbe gilt für T11 und den 3-Zonen-Router aus Wave3.
 
 ## Später
 
+- Der vollständige DeepSeek-V4-Stand bleibt resumierbar erhalten; neue
+  Inhaltsläufe erst nach einem Qwen-Kontrast, der einen klaren Mehrwert erwarten
+  lässt.
 - Donor-Ernte in `.causal`-Karten mit Herkunft und Revision.
 - Rat gegen Einzelhirn auf festem Split und gleicher Call-/Zeitbilanz.
 - Identitäts-Swap-Test bei weiterlaufendem State-Port.

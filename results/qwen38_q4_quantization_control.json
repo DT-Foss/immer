@@ -1,0 +1,97 @@
+{
+  "schema": "immer.qwen3.8-quantization-control/v1",
+  "status": "complete",
+  "models": {
+    "q3": "Qwen3.8-27B-Q3_K_M",
+    "q4": "Qwen3.8-27B-Q4_K_M",
+    "bf16": "Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+  },
+  "protocol": {
+    "prompt": "official Qwen3.8 no-thinking system/user prompt",
+    "endpoint": "/v1/completions",
+    "server_chat_template_bypassed": true,
+    "temperature": 0.0,
+    "seed": 0,
+    "max_tokens": 32,
+    "prompt_token_counts": [116, 116, 119, 115, 118, 114, 115, 118],
+    "purpose": "diagnose Q3 versus BF16 draft disagreements, not rank model quality"
+  },
+  "items": [
+    {
+      "item_id": "gsm8k-test-0737-b673ac26d1268186",
+      "gold": "2",
+      "q3": "1",
+      "q4": "1",
+      "q4_status": "incorrect",
+      "bf16_draft_fully_verified": true
+    },
+    {
+      "item_id": "gsm8k-test-0815-13fae6ff992c2157",
+      "gold": "4",
+      "q3": "4",
+      "q4": "2",
+      "q4_status": "incorrect",
+      "bf16_draft_fully_verified": false,
+      "bf16_first_mismatch_piece": "2"
+    },
+    {
+      "item_id": "gsm8k-test-0857-fbb13bf06cc00a16",
+      "gold": "14000",
+      "q3": "14000",
+      "q4": "14000",
+      "q4_status": "correct",
+      "bf16_draft_fully_verified": true
+    },
+    {
+      "item_id": "gsm8k-test-0901-5fbbe0d05836802d",
+      "gold": "1",
+      "q3": "1",
+      "q4": null,
+      "q4_status": "truncated",
+      "bf16_draft_fully_verified": true
+    },
+    {
+      "item_id": "gsm8k-test-1032-e5873b4dd50866b6",
+      "gold": "450",
+      "q3": "450",
+      "q4": "450",
+      "q4_status": "correct",
+      "bf16_draft_fully_verified": true
+    },
+    {
+      "item_id": "gsm8k-test-1042-d9ceeb071728fb0e",
+      "gold": "3",
+      "q3": "-1",
+      "q4": "4",
+      "q4_status": "incorrect",
+      "bf16_draft_fully_verified": false,
+      "bf16_first_mismatch_piece": " "
+    },
+    {
+      "item_id": "gsm8k-test-1175-3598411cca7939c2",
+      "gold": "16",
+      "q3": "15",
+      "q4": "18",
+      "q4_status": "incorrect",
+      "bf16_draft_fully_verified": false,
+      "bf16_first_mismatch_piece": "2"
+    },
+    {
+      "item_id": "gsm8k-test-1240-a316335b6f4ebc29",
+      "gold": "2",
+      "q3": "2",
+      "q4": null,
+      "q4_status": "truncated",
+      "bf16_draft_fully_verified": true
+    }
+  ],
+  "summary": {
+    "q4_correct": 2,
+    "q4_incorrect": 4,
+    "q4_truncated": 2,
+    "q3_bf16_rejections": 3,
+    "q3_bf16_rejections_that_flip_in_q4": 3,
+    "shared_wrong_q3_q4_bf16": 1,
+    "verdict": "QUANTIZATION_DIVERGENCE_CONFIRMED__MODEL_AGREEMENT_IS_NOT_TRUTH"
+  }
+}

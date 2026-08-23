@@ -248,6 +248,80 @@ _SCORE_MEAN = re.compile(
     re.IGNORECASE,
 )
 
+_MEASURE_WORD = r"ounces?|liters?|milliliters?|gallons?|cups?"
+_PRONOUN_WORD = r"he|she|they"
+_PHRASE = r"[A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*){0,4}"
+_LAZY_PHRASE = r"[A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*){0,4}?"
+_RESOURCE_USE_BALANCE = re.compile(
+    rf"^\s*(?P<owner>{_NAME})\s+wants\s+to\s+make\s+"
+    rf"(?P<intro>{_PHRASE})\s+with\s+(?P<total>{_NUMBER})\s+"
+    rf"(?P<total_unit>{_MEASURE_WORD})\s+of\s+(?P<material>{_PHRASE})\.\s+"
+    rf"(?P<rates_pronoun>{_PRONOUN_WORD})\s+can\s+make\s+"
+    rf"(?P<rates>.+?)\.\s+If\s+(?P<count_pronoun>{_PRONOUN_WORD})\s+"
+    rf"makes?\s+(?P<counts>.+?),\s+how\s+many\s+"
+    rf"(?P<query_unit>{_MEASURE_WORD})\s+of\s+(?P<query_material>{_PHRASE})\s+"
+    rf"does\s+(?P<query_pronoun>{_PRONOUN_WORD})\s+have\s+left\s*\?\s*$",
+    re.IGNORECASE,
+)
+_RESOURCE_RATE_TERM = re.compile(
+    rf"(?P<label>[A-Za-z][A-Za-z'\-]*)\s+"
+    rf"(?P<noun>{_SIMPLE_NOUN})\s+that\s+uses?\s+"
+    rf"(?P<rate>{_NUMBER})\s+(?:an?\s+)?(?P<unit>{_MEASURE_WORD})"
+    rf"(?:\s+per\s+(?P<per_noun>{_SIMPLE_NOUN}))?",
+    re.IGNORECASE,
+)
+_RESOURCE_COUNT_TERM = re.compile(
+    rf"(?P<count>{_NUMBER})\s+(?P<label>[A-Za-z][A-Za-z'\-]*)\s+"
+    rf"(?P<noun>{_SIMPLE_NOUN})",
+    re.IGNORECASE,
+)
+
+_COMPONENT_RATIO_SYSTEM = re.compile(
+    rf"^\s*(?P<owner>{_NAME})\s+makes\s+(?:a|an)\s+(?P<product>{_PHRASE})\s+"
+    rf"from\s+(?P<components>.+?)\.\s+"
+    rf"(?P<total_pronoun>{_PRONOUN_WORD})\s+makes\s+enough\s+to\s+fill\s+"
+    rf"(?:a|an)\s+(?P<total>{_NUMBER})\s*-\s*(?P<total_unit>{_MEASURE_WORD})\s+"
+    rf"(?P<container>{_SIMPLE_NOUN})\s+each\s+time\.\s+"
+    rf"(?P<equal_pronoun>{_PRONOUN_WORD})\s+uses\s+(?P<equalities>.+?)\.\s+"
+    rf"(?P<scale_pronoun>{_PRONOUN_WORD})\s+uses\s+(?P<scales>.+?)\.\s+"
+    rf"How\s+many\s+(?P<query_unit>{_MEASURE_WORD})\s+of\s+"
+    rf"(?P<target>{_PHRASE})\s+does\s+(?P<query_pronoun>{_PRONOUN_WORD})\s+"
+    rf"use\s*\?\s*$",
+    re.IGNORECASE,
+)
+_SAME_AMOUNT_TERM = re.compile(
+    rf"the\s+same\s+amount\s+of\s+(?P<target>{_PHRASE})\s+as\s+"
+    rf"(?P<source>{_PHRASE})(?=\s*(?:,|\band\b|$))",
+    re.IGNORECASE,
+)
+_SCALED_AMOUNT_TERM = re.compile(
+    rf"(?P<factor>twice|half|{_NUMBER}\s+times)\s+as\s+much\s+"
+    rf"(?P<target>{_LAZY_PHRASE})\s+as\s+(?P<source>{_PHRASE})"
+    rf"(?=\s*(?:,|\band\b|$))",
+    re.IGNORECASE,
+)
+
+_TEAM = r"team\s+(?:[A-Z]|[A-Za-z][A-Za-z'\-]*)"
+_PERIOD_SCORE_SYSTEM = re.compile(
+    rf"^\s*In\s+the\s+first\s+(?P<period>half|period|round)\s+of\s+"
+    rf"(?:a|the)\s+(?:[A-Za-z][A-Za-z'\-]*\s+){{0,3}}"
+    rf"(?P<event>match|game|contest),\s+(?P<a_first>{_TEAM})\s+scores\s+"
+    rf"(?P<a_value>{_NUMBER})\s+(?P<a_noun>{_SIMPLE_NOUN})\s+while\s+"
+    rf"(?P<b_first>{_TEAM})\s+scores\s+(?P<offset>{_NUMBER})\s+"
+    rf"(?P<offset_noun>{_SIMPLE_NOUN})\s+(?P<direction>fewer|more)\s+than\s+"
+    rf"(?P<a_reference>{_TEAM})\.\s+In\s+the\s+second\s+"
+    rf"(?P<second_period>half|period|round),\s+(?P<a_second>{_TEAM})\s+"
+    rf"scores\s+(?P<fraction>{_FRACTION_TEXT})\s+of\s+the\s+number\s+of\s+"
+    rf"(?P<fraction_noun>{_SIMPLE_NOUN})\s+scored\s+by\s+"
+    rf"(?P<b_second>{_TEAM}),\s+which\s+scores\s+(?P<scale>{_NUMBER})\s+"
+    rf"times\s+the\s+number\s+of\s+(?P<scale_noun>{_SIMPLE_NOUN})\s+it\s+"
+    rf"scored\s+in\s+the\s+first\s+(?P<reference_period>half|period|round)\.\s+"
+    rf"What(?:\s+is|'s)\s+the\s+total\s+number\s+of\s+"
+    rf"(?P<query_noun>{_SIMPLE_NOUN})\s+scored\s+in\s+the\s+"
+    rf"(?P<query_event>match|game|contest)\s*\?\s*$",
+    re.IGNORECASE,
+)
+
 # A deliberately small recurrence language.  The three clauses are matched as
 # typed predicates and may appear in any sentence order; no keyword search or
 # fuzzy binding participates.  Requiring every owner occurrence makes the
@@ -493,6 +567,61 @@ def _step_index(token: str) -> int:
 
 def _same(*values: str) -> bool:
     return len({_entity(value) for value in values}) == 1
+
+
+def _coordinated_matches(
+    text: str,
+    pattern: re.Pattern[str],
+    *,
+    label: str,
+    minimum: int = 2,
+) -> tuple[re.Match[str], ...]:
+    """Parse a comma/and list without silently dropping any surface text."""
+
+    matches: list[re.Match[str]] = []
+    cursor = 0
+    while cursor < len(text):
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        match = pattern.match(text, cursor)
+        if match is None:
+            raise _Abort(ParseStatus.UNSUPPORTED, f"unparsed {label} list")
+        matches.append(match)
+        cursor = match.end()
+        if cursor == len(text):
+            break
+        separator = re.match(r"\s*(?:,\s*(?:and\s+)?|and\s+)", text[cursor:], re.I)
+        if separator is None or separator.end() == 0:
+            raise _Abort(ParseStatus.UNSUPPORTED, f"unparsed {label} coordination")
+        cursor += separator.end()
+    if len(matches) < minimum:
+        raise _Abort(ParseStatus.UNSUPPORTED, f"{label} requires coordination")
+    return tuple(matches)
+
+
+def _coordinated_phrases(text: str, *, label: str) -> tuple[tuple[str, int, int], ...]:
+    pieces: list[tuple[str, int, int]] = []
+    cursor = 0
+    separator = re.compile(r"\s*(?:,\s*(?:and\s+)?|and\s+)", re.I)
+    for match in separator.finditer(text):
+        raw = text[cursor : match.start()]
+        left = cursor + len(raw) - len(raw.lstrip())
+        right = match.start() - len(raw) + len(raw.rstrip())
+        if right <= left:
+            raise _Abort(ParseStatus.UNSUPPORTED, f"empty {label} list item")
+        pieces.append((text[left:right], left, right))
+        cursor = match.end()
+    raw = text[cursor:]
+    left = cursor + len(raw) - len(raw.lstrip())
+    right = len(text) - len(raw) + len(raw.rstrip())
+    if right <= left:
+        raise _Abort(ParseStatus.UNSUPPORTED, f"empty {label} list item")
+    pieces.append((text[left:right], left, right))
+    if len(pieces) < 2 or any(
+        re.fullmatch(_PHRASE, item) is None for item, _, _ in pieces
+    ):
+        raise _Abort(ParseStatus.UNSUPPORTED, f"invalid {label} list")
+    return tuple(pieces)
 
 
 class StructuralParser:
@@ -817,6 +946,514 @@ class StructuralParser:
         self.targets.append(target)
         return True
 
+    def _parse_resource_use_balance(self) -> bool:
+        """Compile coordinated per-item use and a remaining resource balance."""
+
+        match = _RESOURCE_USE_BALANCE.fullmatch(self.source)
+        if match is None:
+            return False
+        if not _same(
+            match.group("rates_pronoun"),
+            match.group("count_pronoun"),
+            match.group("query_pronoun"),
+        ):
+            raise _Abort(ParseStatus.AMBIGUOUS, "resource pronouns do not agree")
+        if not _same(match.group("material"), match.group("query_material")):
+            raise _Abort(ParseStatus.AMBIGUOUS, "resource target does not agree")
+
+        total_unit_name = _singular(match.group("total_unit"))
+        if total_unit_name != _singular(match.group("query_unit")):
+            raise _Abort(ParseStatus.AMBIGUOUS, "resource units do not agree")
+
+        rate_matches = _coordinated_matches(
+            match.group("rates"), _RESOURCE_RATE_TERM, label="resource rates"
+        )
+        count_matches = _coordinated_matches(
+            match.group("counts"), _RESOURCE_COUNT_TERM, label="resource counts"
+        )
+        rate_labels = tuple(_entity(term.group("label")) for term in rate_matches)
+        count_labels = tuple(_entity(term.group("label")) for term in count_matches)
+        if len(set(rate_labels)) != len(rate_labels) or len(set(count_labels)) != len(
+            count_labels
+        ):
+            raise _Abort(ParseStatus.AMBIGUOUS, "duplicate resource size lacks scope")
+        if set(rate_labels) != set(count_labels):
+            raise _Abort(ParseStatus.AMBIGUOUS, "resource rate and count labels differ")
+
+        nouns = tuple(
+            _singular(term.group("noun")) for term in (*rate_matches, *count_matches)
+        )
+        if len(set(nouns)) != 1:
+            raise _Abort(ParseStatus.AMBIGUOUS, "resource item nouns do not agree")
+        item_noun = nouns[0]
+        if _singular(match.group("intro").split()[-1]) != item_noun:
+            raise _Abort(ParseStatus.AMBIGUOUS, "resource introduction item differs")
+
+        per_nouns = tuple(term.group("per_noun") for term in rate_matches)
+        if per_nouns[0] is None:
+            raise _Abort(ParseStatus.UNSUPPORTED, "first resource rate lacks a basis")
+        if any(
+            value is not None and _singular(value) != item_noun for value in per_nouns
+        ):
+            raise _Abort(ParseStatus.AMBIGUOUS, "resource rate bases do not agree")
+        if any(
+            _singular(term.group("unit")) != total_unit_name for term in rate_matches
+        ):
+            raise _Abort(ParseStatus.AMBIGUOUS, "resource rate units do not agree")
+
+        total_value = _number(match.group("total"))
+        rate_values = {
+            label: _number(term.group("rate"))
+            for label, term in zip(rate_labels, rate_matches, strict=True)
+        }
+        count_values = {
+            label: _number(term.group("count"))
+            for label, term in zip(count_labels, count_matches, strict=True)
+        }
+        if total_value <= 0 or any(value <= 0 for value in rate_values.values()):
+            raise _Abort(ParseStatus.INVALID, "resource quantities must be positive")
+        if any(value.denominator != 1 for value in count_values.values()):
+            raise _Abort(ParseStatus.INVALID, "resource item counts must be integers")
+        consumed = sum(
+            (rate_values[label] * count_values[label] for label in rate_labels),
+            Fraction(0),
+        )
+        if consumed > total_value:
+            raise _Abort(
+                ParseStatus.INVALID, "resource use exceeds the available total"
+            )
+
+        amount_unit = Unit.base("volume", symbol=total_unit_name)
+        item_unit = Unit.count(symbol=item_noun)
+        rate_start = match.start("rates")
+        count_start = match.start("counts")
+        counts_by_label = {_entity(term.group("label")): term for term in count_matches}
+        prefix = (
+            f"resource.{_entity(match.group('owner'))}."
+            f"{_entity(match.group('material'))}"
+        )
+        used: list[Variable] = []
+        whole_span = Span(match.start(), match.end(), self.source)
+        for label, rate_match in zip(rate_labels, rate_matches, strict=True):
+            count_match = counts_by_label[label]
+            count_span = Span(
+                count_start + count_match.start("count"),
+                count_start + count_match.end("count"),
+                self.source,
+            )
+            rate_span = Span(
+                rate_start + rate_match.start("rate"),
+                rate_start + rate_match.end("rate"),
+                self.source,
+            )
+            amount = self._variable(
+                f"{prefix}.used.{label}",
+                amount_unit,
+                span=Span(
+                    rate_start + rate_match.start(),
+                    rate_start + rate_match.end(),
+                    self.source,
+                ),
+            )
+            self._define(
+                amount,
+                Rate(
+                    amount,
+                    Quantity(rate_values[label], amount_unit / item_unit, rate_span),
+                    Quantity(count_values[label], item_unit, count_span),
+                    span=whole_span,
+                ),
+            )
+            used.append(amount)
+
+        total_used = self._variable(
+            f"{prefix}.used.total",
+            amount_unit,
+            span=self._match_span(match, "rates"),
+        )
+        self._define(total_used, Sum(total_used, tuple(used), span=whole_span))
+        left = self._variable(
+            f"{prefix}.left",
+            amount_unit,
+            span=self._match_span(match, "query_material"),
+        )
+        self._define(
+            left,
+            Balance(
+                (left, total_used),
+                (
+                    Quantity(
+                        total_value,
+                        amount_unit,
+                        span=self._match_span(match, "total"),
+                    ),
+                ),
+                span=whole_span,
+            ),
+        )
+        self.targets.append(left)
+        return True
+
+    def _parse_component_ratio_system(self) -> bool:
+        """Compile an exhaustive component list and its equality/ratio graph."""
+
+        match = _COMPONENT_RATIO_SYSTEM.fullmatch(self.source)
+        if match is None:
+            return False
+        if not _same(
+            match.group("total_pronoun"),
+            match.group("equal_pronoun"),
+            match.group("scale_pronoun"),
+            match.group("query_pronoun"),
+        ):
+            raise _Abort(ParseStatus.AMBIGUOUS, "recipe pronouns do not agree")
+        unit_name = _singular(match.group("total_unit"))
+        if unit_name != _singular(match.group("query_unit")):
+            raise _Abort(ParseStatus.AMBIGUOUS, "recipe units do not agree")
+
+        component_items = _coordinated_phrases(
+            match.group("components"), label="recipe components"
+        )
+        component_names = tuple(_entity(item) for item, _, _ in component_items)
+        if len(component_names) < 3:
+            raise _Abort(ParseStatus.UNSUPPORTED, "ratio system needs three components")
+        if len(set(component_names)) != len(component_names):
+            raise _Abort(
+                ParseStatus.AMBIGUOUS, "duplicate recipe component lacks scope"
+            )
+
+        def resolve(surface: str) -> str:
+            reference = _entity(surface)
+            if reference in component_names:
+                return reference
+            suffix_matches = tuple(
+                component
+                for component in component_names
+                if component.endswith(f" {reference}")
+            )
+            if len(suffix_matches) == 1:
+                return suffix_matches[0]
+            if len(suffix_matches) > 1:
+                raise _Abort(
+                    ParseStatus.AMBIGUOUS,
+                    f"ambiguous component suffix: {surface}",
+                )
+            raise _Abort(ParseStatus.AMBIGUOUS, f"unknown component: {surface}")
+
+        unit = Unit.base("volume", symbol=unit_name)
+        components_start = match.start("components")
+        prefix = (
+            f"recipe.{_entity(match.group('owner'))}.{_entity(match.group('product'))}"
+        )
+        variables = {
+            name: self._variable(
+                f"{prefix}.{name}",
+                unit,
+                span=Span(
+                    components_start + start,
+                    components_start + end,
+                    self.source,
+                ),
+            )
+            for name, (_, start, end) in zip(
+                component_names, component_items, strict=True
+            )
+        }
+
+        equalities = _coordinated_matches(
+            match.group("equalities"),
+            _SAME_AMOUNT_TERM,
+            label="recipe equalities",
+            minimum=1,
+        )
+        scales = _coordinated_matches(
+            match.group("scales"),
+            _SCALED_AMOUNT_TERM,
+            label="recipe scales",
+            minimum=1,
+        )
+        if len(equalities) + len(scales) != len(component_names) - 1:
+            raise _Abort(
+                ParseStatus.UNSUPPORTED,
+                "ratio graph is not a closed component tree",
+            )
+
+        seen_edges: set[frozenset[str]] = set()
+        whole_span = Span(match.start(), match.end(), self.source)
+
+        def relation_span(local: re.Match[str], group: str) -> Span:
+            base = match.start(group)
+            return Span(base + local.start(), base + local.end(), self.source)
+
+        equality_relations: list[tuple[str, str, Span]] = []
+        for equality in equalities:
+            named_target = resolve(equality.group("target"))
+            named_source = resolve(equality.group("source"))
+            edge = frozenset((named_target, named_source))
+            if len(edge) != 2 or edge in seen_edges:
+                raise _Abort(ParseStatus.AMBIGUOUS, "duplicate recipe relation")
+            seen_edges.add(edge)
+            equality_relations.append(
+                (
+                    named_target,
+                    named_source,
+                    relation_span(equality, "equalities"),
+                )
+            )
+
+        scale_relations: list[tuple[str, str, Fraction, Span]] = []
+        for scale_match in scales:
+            named_target = resolve(scale_match.group("target"))
+            named_source = resolve(scale_match.group("source"))
+            edge = frozenset((named_target, named_source))
+            if len(edge) != 2 or edge in seen_edges:
+                raise _Abort(ParseStatus.AMBIGUOUS, "duplicate recipe relation")
+            seen_edges.add(edge)
+            factor_text = scale_match.group("factor").casefold()
+            if factor_text == "twice":
+                factor = Fraction(2)
+            elif factor_text == "half":
+                factor = Fraction(1, 2)
+            else:
+                factor = _number(re.sub(r"(?i)\s+times$", "", factor_text))
+            if factor <= 0:
+                raise _Abort(ParseStatus.INVALID, "recipe scale must be positive")
+            scale_relations.append(
+                (
+                    named_target,
+                    named_source,
+                    factor,
+                    relation_span(scale_match, "scales"),
+                )
+            )
+
+        connected = {component_names[0]}
+        while True:
+            expanded = connected.union(
+                *(edge for edge in seen_edges if edge.intersection(connected))
+            )
+            if expanded == connected:
+                break
+            connected = expanded
+        if connected != set(component_names):
+            raise _Abort(ParseStatus.UNSUPPORTED, "ratio graph is disconnected")
+
+        # Scale clauses are directed.  Equalities are symmetric, so orient
+        # their forest through an exact edge-to-endpoint matching that leaves
+        # every IR variable with at most one functional definition.
+        for named_target, named_source, factor, span in scale_relations:
+            self._define(
+                variables[named_target],
+                Affine(
+                    variables[named_target],
+                    variables[named_source],
+                    factor,
+                    Quantity(0, unit, span=span),
+                    span=span,
+                ),
+            )
+
+        owner_by_component: dict[str, int] = {}
+        oriented_target: dict[int, str] = {}
+
+        def orient(edge_index: int, visited: set[str]) -> bool:
+            explicit_target, explicit_source, _ = equality_relations[edge_index]
+            for candidate in (explicit_target, explicit_source):
+                if (
+                    variables[candidate].name in self.definitions
+                    or candidate in visited
+                ):
+                    continue
+                visited.add(candidate)
+                previous = owner_by_component.get(candidate)
+                if previous is None or orient(previous, visited):
+                    owner_by_component[candidate] = edge_index
+                    oriented_target[edge_index] = candidate
+                    return True
+            return False
+
+        for edge_index in range(len(equality_relations)):
+            if not orient(edge_index, set()):
+                raise _Abort(
+                    ParseStatus.AMBIGUOUS,
+                    "recipe relations require multiple definitions of one component",
+                )
+        for edge_index, (left, right, span) in enumerate(equality_relations):
+            target = oriented_target[edge_index]
+            source = right if target == left else left
+            self._define(
+                variables[target],
+                Assign(variables[target], variables[source], span=span),
+            )
+
+        total_value = _number(match.group("total"))
+        if total_value <= 0:
+            raise _Abort(ParseStatus.INVALID, "recipe total must be positive")
+        self.constraints.append(
+            Sum(
+                Quantity(
+                    total_value,
+                    unit,
+                    span=self._match_span(match, "total"),
+                ),
+                tuple(variables.values()),
+                span=whole_span,
+            )
+        )
+        target_name = resolve(match.group("target"))
+        self.targets.append(variables[target_name])
+        return True
+
+    def _parse_period_score_system(self) -> bool:
+        """Compile two explicitly scoped periods and a total score target."""
+
+        match = _PERIOD_SCORE_SYSTEM.fullmatch(self.source)
+        if match is None:
+            return False
+        if not _same(match.group("event"), match.group("query_event")):
+            raise _Abort(ParseStatus.AMBIGUOUS, "score events do not agree")
+        if not _same(
+            match.group("period"),
+            match.group("second_period"),
+            match.group("reference_period"),
+        ):
+            raise _Abort(ParseStatus.AMBIGUOUS, "score periods do not agree")
+        if not _same(
+            match.group("a_first"),
+            match.group("a_reference"),
+            match.group("a_second"),
+        ):
+            raise _Abort(ParseStatus.AMBIGUOUS, "first score team references drift")
+        if not _same(match.group("b_first"), match.group("b_second")):
+            raise _Abort(ParseStatus.AMBIGUOUS, "second score team references drift")
+        if _same(match.group("a_first"), match.group("b_first")):
+            raise _Abort(ParseStatus.AMBIGUOUS, "score teams must be distinct")
+        nouns = tuple(
+            _singular(match.group(group))
+            for group in (
+                "a_noun",
+                "offset_noun",
+                "fraction_noun",
+                "scale_noun",
+                "query_noun",
+            )
+        )
+        if len(set(nouns)) != 1:
+            raise _Abort(ParseStatus.AMBIGUOUS, "score nouns do not agree")
+
+        first_a_value = _number(match.group("a_value"))
+        offset_value = _number(match.group("offset"))
+        scale = _number(match.group("scale"))
+        fraction = _fraction(match.group("fraction"))
+        if any(
+            value.denominator != 1 for value in (first_a_value, offset_value, scale)
+        ):
+            raise _Abort(
+                ParseStatus.INVALID, "score counts and multiplier must be integers"
+            )
+        if not 0 < fraction <= 1 or scale <= 0:
+            raise _Abort(ParseStatus.INVALID, "score ratios must be positive parts")
+
+        signed_offset = (
+            -offset_value
+            if match.group("direction").casefold() == "fewer"
+            else offset_value
+        )
+        first_b_value = first_a_value + signed_offset
+        second_b_value = scale * first_b_value
+        second_a_value = fraction * second_b_value
+        if any(
+            value < 0 or value.denominator != 1
+            for value in (
+                first_a_value,
+                first_b_value,
+                second_a_value,
+                second_b_value,
+            )
+        ):
+            raise _Abort(ParseStatus.INVALID, "score relations imply invalid counts")
+
+        noun = nouns[0]
+        unit = Unit.count(symbol=noun)
+        prefix = f"score.{_entity(match.group('event'))}"
+        first_a = self._variable(
+            f"{prefix}.{_entity(match.group('a_first'))}.first",
+            unit,
+            span=self._match_span(match, "a_first"),
+            count=True,
+        )
+        first_b = self._variable(
+            f"{prefix}.{_entity(match.group('b_first'))}.first",
+            unit,
+            span=self._match_span(match, "b_first"),
+            count=True,
+        )
+        second_a = self._variable(
+            f"{prefix}.{_entity(match.group('a_second'))}.second",
+            unit,
+            span=self._match_span(match, "a_second"),
+            count=True,
+        )
+        second_b = self._variable(
+            f"{prefix}.{_entity(match.group('b_second'))}.second",
+            unit,
+            span=self._match_span(match, "b_second"),
+            count=True,
+        )
+        total = self._variable(
+            f"{prefix}.total",
+            unit,
+            span=self._match_span(match, "query_noun"),
+            count=True,
+        )
+        whole_span = Span(match.start(), match.end(), self.source)
+        self._define(
+            first_a,
+            Assign(
+                first_a,
+                Quantity(
+                    first_a_value,
+                    unit,
+                    span=self._match_span(match, "a_value"),
+                ),
+                span=whole_span,
+            ),
+        )
+        self._define(
+            first_b,
+            Affine(
+                first_b,
+                first_a,
+                Fraction(1),
+                Quantity(
+                    signed_offset,
+                    unit,
+                    span=self._match_span(match, "offset"),
+                ),
+                span=whole_span,
+            ),
+        )
+        self._define(
+            second_b,
+            Affine(
+                second_b,
+                first_b,
+                scale,
+                Quantity(0, unit, span=self._match_span(match, "scale")),
+                span=whole_span,
+            ),
+        )
+        self._define(
+            second_a,
+            Part(second_a, second_b, fraction, span=whole_span),
+        )
+        self._define(
+            total,
+            Sum(total, (first_a, first_b, second_a, second_b), span=whole_span),
+        )
+        self.targets.append(total)
+        return True
+
     def _parse_score_mean(self) -> bool:
         match = _SCORE_MEAN.fullmatch(self.source)
         if match is None:
@@ -1076,6 +1713,9 @@ class StructuralParser:
 
     def _parse_closed_family(self) -> bool:
         parsers = (
+            self._parse_resource_use_balance,
+            self._parse_component_ratio_system,
+            self._parse_period_score_system,
             self._parse_recurrence,
             self._parse_direct_rate,
             self._parse_part_inventory,

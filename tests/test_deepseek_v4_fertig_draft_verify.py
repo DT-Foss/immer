@@ -104,7 +104,7 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
             {"role": "assistant", "content": "Answer:", "prefix": True},
         )
 
-    def test_fixed_abstentions_render_as_one_exact_83_token_batch(self) -> None:
+    def test_fixed_historical_cohort_renders_as_one_exact_83_token_batch(self) -> None:
         tokenizer = draft_verify.LocalTokenizer(draft_verify.DEFAULT_TOKENIZER)
         items = draft_verify._selected_items(draft_verify.DEFAULT_BENCHMARK, tokenizer)
         self.assertEqual(

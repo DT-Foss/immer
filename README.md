@@ -108,6 +108,10 @@ PYTHONPATH=src python scripts/qwen38_stream_smoke.py --layers 1 --budget-mb 1024
 # anschließend gemeinsam in einem resumierbaren 64-Layer-Pass verifizieren.
 PYTHONPATH=src python scripts/qwen38_fertig_draft_verify.py --prepare-only
 PYTHONPATH=src python scripts/qwen38_fertig_draft_verify.py
+
+# Exakte FERTIG-Zertifikate haben Vorrang; vollständig BF16-verifizierte
+# Q3-Antworten heißen ausdrücklich nur model_verified.
+PYTHONPATH=src python scripts/qwen38_fertig_fusion_eval.py
 ```
 
 ## Gemessenes Urteil
@@ -120,6 +124,7 @@ PYTHONPATH=src python scripts/qwen38_fertig_draft_verify.py
 | 32 Label-Placebos | Mittel 0,510328; Maximum 0,748026 | Der persistierte Head liegt klar über seinem Nullmodell |
 | kausale Softmax-Ablation | balanced 1,000 | Kein CRSA-spezifischer Vorteil gezeigt |
 | statischer Value-Sketch | 24 % vs Placebo 32 % | Negativ; falsche Eingabeverteilung, nicht deployt |
+| Qwen3.8/FERTIG-Fusionsslice | 7/8 beantwortet, 7 korrekt, 0 falsch, 1 quarantäniert | 3 exakte IR-Zertifikate + 4 BF16-verifizierte Modellantworten; kein allgemeiner Accuracy-Claim |
 
 Die CRSA-Rollen sind fest: zwei Local-, ein Balanced- und ein unveränderter
 Free-Head; Steigung `0.8`, Diagonal-Debit `3`. Zukünftige Masse ist exakt null,

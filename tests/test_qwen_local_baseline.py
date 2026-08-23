@@ -74,7 +74,7 @@ class QwenLocalBaselineTests(unittest.TestCase):
                     baseline._parser().parse_args(["--help"])
         self.assertEqual(caught.exception.code, 0)
 
-    def test_selects_the_exact_eight_fertig_abstentions(self) -> None:
+    def test_selects_the_exact_eight_historical_fertig_rows(self) -> None:
         items = baseline.select_fixed_items(baseline.DEFAULT_BENCHMARK)
         self.assertEqual(tuple(row.item_id for row in items), baseline.FIXED_ITEM_IDS)
         self.assertEqual(
@@ -189,9 +189,7 @@ class QwenLocalBaselineTests(unittest.TestCase):
                 {
                     "choices": [
                         {
-                            "message": {
-                                "content": "<think>private</think>\n\n#### 4"
-                            },
+                            "message": {"content": "<think>private</think>\n\n#### 4"},
                             "finish_reason": "stop",
                         }
                     ],
@@ -199,7 +197,9 @@ class QwenLocalBaselineTests(unittest.TestCase):
                 }
             )
 
-        with mock.patch.object(baseline.urllib.request, "urlopen", side_effect=open_url):
+        with mock.patch.object(
+            baseline.urllib.request, "urlopen", side_effect=open_url
+        ):
             backend = baseline.OpenAIBackend(
                 "qwen",
                 "Q3",
@@ -217,6 +217,41 @@ class QwenLocalBaselineTests(unittest.TestCase):
         self.assertEqual(payload["seed"], 7)
         self.assertEqual(payload["max_tokens"], 32)
         self.assertEqual(payload["messages"][1]["content"], "2+2?")
+
+    def test_openai_backend_can_bypass_server_chat_template(self) -> None:
+        requests = []
+
+        def open_url(request, timeout):
+            requests.append((request, timeout))
+            if isinstance(request, str):
+                return _UrlResponse({"object": "list", "data": []})
+            return _UrlResponse(
+                {
+                    "choices": [{"text": "#### 4", "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 17, "completion_tokens": 3},
+                }
+            )
+
+        with mock.patch.object(
+            baseline.urllib.request, "urlopen", side_effect=open_url
+        ):
+            backend = baseline.OpenAIBackend(
+                "qwen",
+                "Q4",
+                base_url="http://127.0.0.1:8780/v1",
+                timeout=30,
+                seed=0,
+                prompt_mode="qwen3.8-no-thinking",
+            )
+            generated = backend.generate("2+2?", max_tokens=32)
+
+        self.assertEqual(generated.text, "#### 4")
+        self.assertTrue(requests[1][0].full_url.endswith("/v1/completions"))
+        payload = json.loads(requests[1][0].data)
+        self.assertNotIn("messages", payload)
+        self.assertEqual(payload["stop"], ["<|im_end|>", "<|endoftext|>"])
+        self.assertTrue(payload["prompt"].endswith("<think>\n\n</think>\n\n"))
+        self.assertIn("<|im_start|>user\n2+2?<|im_end|>", payload["prompt"])
 
 
 if __name__ == "__main__":

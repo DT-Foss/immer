@@ -6,8 +6,8 @@ IMMER connects research programs that solve different parts of the same system.
 
 Grounded neuro-symbolic cognition with a deterministic core, executable learned skills, constrained neural ranking, verification loops and process distillation.
 
-Current structure-solver milestone: **1068/1319 GSM8K = 80.97% coverage,
-251 safe abstentions, 0 incorrect and 0 error outcomes on the full test
+Current structure-solver milestone: **1071/1319 GSM8K = 81.20% coverage,
+248 safe abstentions, 0 incorrect and 0 error outcomes on the full test
 split.** The report retains every item and pins dataset, runner and solver-tree
 digests. An unverified operations-template fallback first produced 17/17
 wrong attempts; it is now proposal-only and those cases are `must_abstain`
