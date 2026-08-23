@@ -17,7 +17,6 @@ import torch
 from immer.knowledge import AccessLeaf, AccessOperation, AccessTrace
 from immer.runtimes.deepseek_v4.causal_prefetch import RouteState
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "deepseek_v4_fertig_draft_verify.py"
 
@@ -776,6 +775,88 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
         model.reset_state.assert_called_once_with(release=True)
         pager.close.assert_called_once_with()
         source.close.assert_called_once_with()
+
+    def test_model_runtime_loads_checkpoint_bound_route_predictor(self) -> None:
+        args = draft_verify._parser().parse_args(
+            [
+                "--route-model",
+                "route-model.json",
+                "--route-model-role",
+                "placebo_markov",
+                "--route-prefetch-window-rows",
+                "4",
+                "--route-prefetch-k",
+                "6",
+                "--expert-reservoir-budget-mb",
+                "384",
+                "--expert-reservoir-workers",
+                "3",
+            ]
+        )
+        source = mock.Mock()
+        source.reader.fetch_file.return_value = b"{}"
+        config = SimpleNamespace()
+        pager = mock.Mock()
+        model = mock.Mock()
+        checkpoint = object()
+        predictor = SimpleNamespace(source_layers=(21, 22), snapshot_sha256="p" * 64)
+        artifact = SimpleNamespace(predictor=predictor, sha256="a" * 64)
+        with (
+            mock.patch.object(draft_verify, "Streamer", return_value=source),
+            mock.patch.object(
+                draft_verify.DeepSeekV4Config,
+                "from_mapping",
+                return_value=config,
+            ),
+            mock.patch.object(
+                draft_verify, "_checkpoint_identity", return_value=checkpoint
+            ),
+            mock.patch.object(
+                draft_verify,
+                "load_route_model_artifact",
+                return_value=artifact,
+            ) as load_model,
+            mock.patch.object(
+                draft_verify,
+                "DeepSeekWeightPager",
+                return_value=pager,
+            ) as pager_type,
+            mock.patch.object(
+                draft_verify,
+                "StreamedDeepSeekV4",
+                return_value=model,
+            ) as runtime_type,
+            mock.patch.object(draft_verify, "_progress"),
+        ):
+            with draft_verify._model_runtime(
+                args,
+                max_seq_len=177,
+                max_batch_size=8,
+            ):
+                pass
+
+        load_model.assert_called_once_with(
+            "route-model.json",
+            expected_checkpoint=checkpoint,
+            expected_role="placebo_markov",
+        )
+        self.assertEqual(
+            pager_type.call_args.kwargs["expert_reservoir_budget_bytes"],
+            384 * 1024**2,
+        )
+        self.assertEqual(pager_type.call_args.kwargs["expert_reservoir_workers"], 3)
+        runtime_type.assert_called_once_with(
+            config,
+            pager,
+            graft=None,
+            graft_layer=None,
+            max_batch_size=8,
+            max_seq_len=177,
+            route_predictor=predictor,
+            route_prefetch_window_rows=4,
+            route_prefetch_k=6,
+            route_prefetch_alpha=1.0,
+        )
 
     def test_fake_runtime_verifier_boundary_is_one_right_padded_pass(self) -> None:
         temporary = tempfile.TemporaryDirectory()

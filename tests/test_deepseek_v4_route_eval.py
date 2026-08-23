@@ -11,7 +11,6 @@ import unittest
 
 from immer.runtimes.deepseek_v4.draft_verification import _freeze_selected_experts
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "deepseek_v4_route_eval.py"
 
@@ -144,6 +143,51 @@ def _contains_forbidden_label_key(value) -> bool:
 
 
 class DeepSeekV4RouteEvalTests(unittest.TestCase):
+    def test_cli_writes_runtime_real_and_placebo_model_artifacts(self) -> None:
+        from immer.runtimes.deepseek_v4.route_model import load_route_model_artifact
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / "routes.json"
+            report = directory / "report.json"
+            real = directory / "real-model.json"
+            placebo = directory / "placebo-model.json"
+            _write(source, _fixture_document())
+
+            exit_code = route_eval.main(
+                [
+                    "--sidecar",
+                    str(source),
+                    "--output",
+                    str(report),
+                    "--n-experts",
+                    "4",
+                    "--real-model-output",
+                    str(real),
+                    "--placebo-model-output",
+                    str(placebo),
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            real_model = load_route_model_artifact(
+                real,
+                expected_role="real_markov",
+            )
+            placebo_model = load_route_model_artifact(
+                placebo,
+                expected_role="placebo_markov",
+            )
+            written_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(
+                real_model.predictor.snapshot_sha256,
+                written_report["models"]["real_markov_snapshot_sha256"],
+            )
+            self.assertEqual(
+                placebo_model.predictor.snapshot_sha256,
+                written_report["models"]["placebo_markov_snapshot_sha256"],
+            )
+
     def test_reconstructs_batch_major_rows_and_real_beats_placebo_end_to_end(
         self,
     ) -> None:
@@ -228,9 +272,9 @@ class DeepSeekV4RouteEvalTests(unittest.TestCase):
 
             repacked_checkpoint = copy.deepcopy(document)
             wrong_fingerprint = "f" * 64
-            repacked_checkpoint["checkpoint"]["inventory_fingerprint"] = (
-                wrong_fingerprint
-            )
+            repacked_checkpoint["checkpoint"][
+                "inventory_fingerprint"
+            ] = wrong_fingerprint
             for row in repacked_checkpoint["observations"]:
                 row["checkpoint"]["inventory_fingerprint"] = wrong_fingerprint
             identity = {

@@ -64,6 +64,20 @@ class PagerMetrics:
     expert_prefetch_cancelled: int = 0
     expert_prefetch_max_outstanding: int = 0
     expert_prefetch_batches_submitted: int = 0
+    expert_reservoir_submitted: int = 0
+    expert_reservoir_prediction_hits: int = 0
+    expert_reservoir_usable_hits: int = 0
+    expert_reservoir_misses: int = 0
+    expert_reservoir_wasted: int = 0
+    expert_reservoir_cancelled: int = 0
+    expert_reservoir_failures: int = 0
+    expert_reservoir_ready_hits: int = 0
+    expert_reservoir_wait_ns: int = 0
+    expert_reservoir_payload_bytes: int = 0
+    expert_reservoir_hit_payload_bytes: int = 0
+    expert_reservoir_wasted_payload_bytes: int = 0
+    expert_reservoir_source_requests: int = 0
+    expert_reservoir_source_bytes: int = 0
     expert_transport_envelopes: int = 0
     expert_transport_source_bytes: int = 0
     expert_range_requests_avoided: int = 0
@@ -229,6 +243,32 @@ class _ExpertPayload:
     consumed: bool = False
 
 
+@dataclass(slots=True)
+class _ExpertReservoirTicket:
+    base: str
+    plan: _ExpertReadPlan
+    future: Future[_CoalescedExpertBatch]
+    index: int
+    accounted: bool = False
+
+
+@dataclass(slots=True)
+class _ExpertReservoir:
+    bases: tuple[str, ...]
+    tickets: tuple[_ExpertReservoirTicket, ...]
+    executor: ThreadPoolExecutor
+    payload_bytes: int
+    closed: bool = False
+
+
+@dataclass(slots=True)
+class _ExpertReservoirPayload:
+    base: str
+    expert: _CoalescedExpert | None
+    payload_bytes: int
+    consumed: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class _MaterializedWeight:
     """One decoded checkpoint matrix without prematurely applying MX scales."""
@@ -268,6 +308,9 @@ class DeepSeekWeightPager:
     EXPERT_PREFETCH_MAX_EXPERTS = 3
     EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES = 48 * 1024**2
     EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES = 14 * 1024**2
+    EXPERT_RESERVOIR_POLICY = "markov-micro-window-exact-fallback/v1"
+    EXPERT_RESERVOIR_WORKERS = 4
+    EXPERT_RESERVOIR_DEFAULT_BUDGET_BYTES = 256 * 1024**2
     EXPERT_RANGE_COALESCE_DEFAULT_MAX_EXPERTS = 1
     EXPERT_RANGE_COALESCE_MAX_EXPERTS = 2
     EXPERT_RANGE_COALESCE_MAX_GAP_BYTES = 0
@@ -289,6 +332,8 @@ class DeepSeekWeightPager:
         simulate_activation_quantization: bool = True,
         expert_prefetch: bool = True,
         expert_range_coalesce_max_experts: int | None = None,
+        expert_reservoir_budget_bytes: int | None = None,
+        expert_reservoir_workers: int | None = None,
         causal_weight_reader: CausalExpertPlanResolver | None = None,
         causal_missing_fallback: bool = False,
     ) -> None:
@@ -337,6 +382,24 @@ class DeepSeekWeightPager:
                 "expert_range_coalesce_max_experts must be an integer in [1, 2]"
             )
         self.expert_range_coalesce_max_experts = expert_range_coalesce_max_experts
+        if expert_reservoir_budget_bytes is None:
+            expert_reservoir_budget_bytes = self.EXPERT_RESERVOIR_DEFAULT_BUDGET_BYTES
+        if (
+            isinstance(expert_reservoir_budget_bytes, bool)
+            or not isinstance(expert_reservoir_budget_bytes, int)
+            or expert_reservoir_budget_bytes < 1
+        ):
+            raise ValueError("expert_reservoir_budget_bytes must be positive")
+        if expert_reservoir_workers is None:
+            expert_reservoir_workers = self.EXPERT_RESERVOIR_WORKERS
+        if (
+            isinstance(expert_reservoir_workers, bool)
+            or not isinstance(expert_reservoir_workers, int)
+            or expert_reservoir_workers < 1
+        ):
+            raise ValueError("expert_reservoir_workers must be positive")
+        self.expert_reservoir_budget_bytes = expert_reservoir_budget_bytes
+        self.expert_reservoir_workers = expert_reservoir_workers
         self._stats = PagerMetrics()
         self._prefetch_lock = threading.Lock()
         self._prefetch_executor: ThreadPoolExecutor | None = None
@@ -344,6 +407,9 @@ class DeepSeekWeightPager:
         self._active_prefetch_payload: _ExpertPayload | None = None
         self._draining_prefetch: set[Future[_CoalescedExpertBatch]] = set()
         self._draining_executor: ThreadPoolExecutor | None = None
+        self._active_expert_reservoir: _ExpertReservoir | None = None
+        self._retired_expert_reservoirs: list[_ExpertReservoir] = []
+        self._expert_reservoir_executor: ThreadPoolExecutor | None = None
         self._causal_weight_reader: CausalExpertPlanResolver | None = None
         self._causal_missing_fallback = False
         self.attach_causal_weight_reader(
@@ -398,6 +464,8 @@ class DeepSeekWeightPager:
                 or self._active_prefetch_payload is not None
                 or self._draining_prefetch
                 or self._draining_executor is not None
+                or self._active_expert_reservoir is not None
+                or self._retired_expert_reservoirs
             ):
                 raise DeepSeekPagerError(
                     "cannot replace the causal weight reader during expert prefetch"
@@ -1640,6 +1708,254 @@ class DeepSeekWeightPager:
             # completes.  A layer release can reap it once that is immediate;
             # terminal close must join it before the TensorSource may close.
 
+    @staticmethod
+    def _reservoir_batch_plan(plan: _ExpertReadPlan) -> _ExpertBatchPlan:
+        return _ExpertBatchPlan(
+            experts=(plan,),
+            payload_bytes=plan.payload_bytes,
+            range_requests_avoided=0,
+        )
+
+    def _account_reservoir_result(
+        self,
+        ticket: _ExpertReservoirTicket,
+        result: _CoalescedExpertBatch,
+    ) -> None:
+        with self._prefetch_lock:
+            if ticket.accounted:
+                return
+            ticket.accounted = True
+            self._stats.expert_reservoir_source_requests += result.source_requests
+            self._stats.expert_reservoir_source_bytes += result.source_bytes
+
+    def _retire_reservoir(self, reservoir: _ExpertReservoir) -> None:
+        if all(ticket.future.done() for ticket in reservoir.tickets):
+            for ticket in reservoir.tickets:
+                try:
+                    result = ticket.future.result()
+                except BaseException:
+                    continue
+                self._account_reservoir_result(ticket, result)
+            return
+        with self._prefetch_lock:
+            self._retired_expert_reservoirs.append(reservoir)
+
+    def _reap_retired_reservoirs(self, *, wait: bool) -> None:
+        with self._prefetch_lock:
+            reservoirs = tuple(self._retired_expert_reservoirs)
+        for reservoir in reservoirs:
+            if not wait and any(
+                not ticket.future.done() for ticket in reservoir.tickets
+            ):
+                continue
+            for ticket in reservoir.tickets:
+                try:
+                    result = ticket.future.result()
+                except BaseException:
+                    continue
+                self._account_reservoir_result(ticket, result)
+            with self._prefetch_lock:
+                if reservoir in self._retired_expert_reservoirs:
+                    self._retired_expert_reservoirs.remove(reservoir)
+
+    def prefetch_expert_reservoir(
+        self, ordered_bases: Iterable[str]
+    ) -> _ExpertReservoir | None:
+        """Start ranked next-layer reads under a byte budget, not an expert cap."""
+
+        bases = tuple(ordered_bases)
+        if not bases or any(not isinstance(base, str) or not base for base in bases):
+            raise ValueError("reservoir bases must be a non-empty sequence of strings")
+        if len(set(bases)) != len(bases):
+            raise ValueError("reservoir bases must be unique")
+        with self._prefetch_lock:
+            if self._active_expert_reservoir is not None:
+                raise DeepSeekPagerError("an expert reservoir is already active")
+        self._reap_retired_reservoirs(wait=False)
+
+        plans: list[_ExpertReadPlan] = []
+        payload_bytes = 0
+        for base in bases:
+            plan = self._expert_plan(base)
+            if plan is None:
+                continue
+            candidate_bytes = payload_bytes + plan.payload_bytes
+            if candidate_bytes > self.expert_reservoir_budget_bytes:
+                break
+            plans.append(plan)
+            payload_bytes = candidate_bytes
+        if not plans:
+            return None
+
+        with self._prefetch_lock:
+            executor = self._expert_reservoir_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=self.expert_reservoir_workers,
+                    thread_name_prefix="immer-v4-expert-reservoir",
+                )
+                self._expert_reservoir_executor = executor
+        context = copy_context()
+        tickets: list[_ExpertReservoirTicket] = []
+        try:
+            for index, plan in enumerate(plans):
+                future = executor.submit(
+                    context.copy().run,
+                    self._read_expert_batch,
+                    self._reservoir_batch_plan(plan),
+                )
+                tickets.append(
+                    _ExpertReservoirTicket(
+                        base=plan.base,
+                        plan=plan,
+                        future=future,
+                        index=index,
+                    )
+                )
+        except BaseException:
+            for ticket in tickets:
+                ticket.future.cancel()
+            if tickets:
+                self._retire_reservoir(
+                    _ExpertReservoir(
+                        bases=tuple(ticket.base for ticket in tickets),
+                        tickets=tuple(tickets),
+                        executor=executor,
+                        payload_bytes=sum(
+                            ticket.plan.payload_bytes for ticket in tickets
+                        ),
+                        closed=True,
+                    )
+                )
+            raise
+        reservoir = _ExpertReservoir(
+            bases=tuple(plan.base for plan in plans),
+            tickets=tuple(tickets),
+            executor=executor,
+            payload_bytes=payload_bytes,
+        )
+        with self._prefetch_lock:
+            if self._active_expert_reservoir is not None:
+                for ticket in reservoir.tickets:
+                    ticket.future.cancel()
+                reservoir.closed = True
+                self._retired_expert_reservoirs.append(reservoir)
+                raise DeepSeekPagerError("an expert reservoir is already active")
+            self._active_expert_reservoir = reservoir
+            self._stats.expert_reservoir_submitted += len(tickets)
+            self._stats.expert_reservoir_payload_bytes += payload_bytes
+        return reservoir
+
+    def bind_expert_reservoir(
+        self,
+        reservoir: _ExpertReservoir,
+        exact_bases: Iterable[str],
+    ) -> dict[str, _ExpertReservoirPayload]:
+        """Bind predictions to exact demand and return only verified payload hits."""
+
+        bases = tuple(exact_bases)
+        if not bases or any(not isinstance(base, str) or not base for base in bases):
+            raise ValueError("exact bases must be a non-empty sequence of strings")
+        if len(set(bases)) != len(bases):
+            raise ValueError("exact bases must be unique")
+        with self._prefetch_lock:
+            if reservoir is not self._active_expert_reservoir or reservoir.closed:
+                raise DeepSeekPagerError("expert reservoir is stale or closed")
+            reservoir.closed = True
+            self._active_expert_reservoir = None
+
+        exact = set(bases)
+        predicted = {ticket.base for ticket in reservoir.tickets}
+        predicted_hits = exact & predicted
+        with self._prefetch_lock:
+            self._stats.expert_reservoir_prediction_hits += len(predicted_hits)
+            self._stats.expert_reservoir_misses += len(exact - predicted)
+
+        payloads: dict[str, _ExpertReservoirPayload] = {}
+        for ticket in reservoir.tickets:
+            if ticket.base not in exact:
+                cancelled = ticket.future.cancel()
+                with self._prefetch_lock:
+                    self._stats.expert_reservoir_wasted += 1
+                    self._stats.expert_reservoir_wasted_payload_bytes += (
+                        ticket.plan.payload_bytes
+                    )
+                    self._stats.expert_reservoir_cancelled += int(cancelled)
+                continue
+            ready = ticket.future.done()
+            started = time.perf_counter_ns()
+            try:
+                result = ticket.future.result()
+                expert = result.experts[ticket.base]
+            except BaseException:
+                with self._prefetch_lock:
+                    self._stats.expert_reservoir_failures += 1
+                    self._stats.expert_reservoir_misses += 1
+                continue
+            waited = time.perf_counter_ns() - started
+            self._account_reservoir_result(ticket, result)
+            payloads[ticket.base] = _ExpertReservoirPayload(
+                base=ticket.base,
+                expert=expert,
+                payload_bytes=ticket.plan.payload_bytes,
+            )
+            with self._prefetch_lock:
+                self._stats.expert_reservoir_usable_hits += 1
+                self._stats.expert_reservoir_wait_ns += waited
+                self._stats.expert_reservoir_hit_payload_bytes += (
+                    ticket.plan.payload_bytes
+                )
+                self._stats.expert_reservoir_ready_hits += int(ready)
+
+        self._retire_reservoir(reservoir)
+        return payloads
+
+    def cancel_expert_reservoir(self, reservoir: _ExpertReservoir) -> None:
+        """Cancel a prediction plan that cannot be aligned to the next block."""
+
+        with self._prefetch_lock:
+            if reservoir is not self._active_expert_reservoir or reservoir.closed:
+                raise DeepSeekPagerError("expert reservoir is stale or closed")
+            reservoir.closed = True
+            self._active_expert_reservoir = None
+        cancelled = 0
+        for ticket in reservoir.tickets:
+            cancelled += int(ticket.future.cancel())
+        with self._prefetch_lock:
+            self._stats.expert_reservoir_cancelled += cancelled
+        self._retire_reservoir(reservoir)
+
+    def _claim_reservoir_payload(
+        self,
+        payload: _ExpertReservoirPayload,
+        expected_base: str,
+    ) -> _CoalescedExpert:
+        with self._prefetch_lock:
+            if payload.consumed or payload.base != expected_base:
+                raise DeepSeekPagerError(
+                    "expert reservoir payload is stale or mismatched"
+                )
+            expert = payload.expert
+            if expert is None:
+                raise DeepSeekPagerError("expert reservoir payload is empty")
+            payload.consumed = True
+            return expert
+
+    def _release_reservoir_payload(self, payload: _ExpertReservoirPayload) -> None:
+        with self._prefetch_lock:
+            if not payload.consumed or payload.expert is None:
+                raise DeepSeekPagerError("expert reservoir payload release is invalid")
+            payload.expert = None
+
+    def discard_expert_reservoir_payload(
+        self, payload: _ExpertReservoirPayload
+    ) -> None:
+        with self._prefetch_lock:
+            if payload.consumed:
+                raise DeepSeekPagerError("expert reservoir payload is already consumed")
+            payload.consumed = True
+            payload.expert = None
+
     # Compatibility adapter for the standalone transport smoke and external
     # callers written against exact-router-one-ahead/v1.
     def prefetch_expert(self, base: str) -> _ExpertPrefetch | None:
@@ -2119,7 +2435,7 @@ class DeepSeekWeightPager:
         *,
         route_weight: Any | None = None,
         swiglu_limit: float = 0.0,
-        prefetched_payload: _ExpertPayload | None = None,
+        prefetched_payload: _ExpertPayload | _ExpertReservoirPayload | None = None,
     ) -> Any:
         """Evaluate one SwiGLU expert with two source reads when possible.
 
@@ -2139,11 +2455,14 @@ class DeepSeekWeightPager:
             raise ValueError("swiglu_limit must be finite and non-negative")
 
         claimed_payload = prefetched_payload
-        payload = (
-            self._claim_expert_payload(claimed_payload, base)
-            if claimed_payload is not None
-            else self._coalesced_expert(base)
-        )
+        if isinstance(claimed_payload, _ExpertPayload):
+            payload = self._claim_expert_payload(claimed_payload, base)
+        elif isinstance(claimed_payload, _ExpertReservoirPayload):
+            payload = self._claim_reservoir_payload(claimed_payload, base)
+        elif claimed_payload is None:
+            payload = self._coalesced_expert(base)
+        else:
+            raise TypeError("prefetched_payload is not owned by this pager")
         try:
             result = self._expert_with_payload(
                 x,
@@ -2153,12 +2472,15 @@ class DeepSeekWeightPager:
                 swiglu_limit=swiglu_limit,
             )
         finally:
-            if claimed_payload is not None:
+            if isinstance(claimed_payload, _ExpertPayload):
                 # The local expert view may pin a two-expert envelope. Drop it
                 # before retiring the batch so a refill cannot exceed the
                 # resident-byte proof while this frame still owns the buffer.
                 del payload
                 self._release_expert_payload(claimed_payload)
+            elif isinstance(claimed_payload, _ExpertReservoirPayload):
+                del payload
+                self._release_reservoir_payload(claimed_payload)
         return result
 
     def _expert_with_payload(
@@ -2635,6 +2957,7 @@ class DeepSeekWeightPager:
         executors = {owned for owned in (executor, draining_executor) if owned}
         for owned in executors:
             owned.shutdown(wait=True, cancel_futures=True)
+        self._reap_retired_reservoirs(wait=False)
         gc.collect()
         self._stats.release_boundaries += 1
         self._purge_mps_cache()
@@ -2651,6 +2974,10 @@ class DeepSeekWeightPager:
             window = self._active_prefetch_window
         if window is not None:
             self._cancel_expert_window(window)
+        with self._prefetch_lock:
+            reservoir = self._active_expert_reservoir
+        if reservoir is not None:
+            self.cancel_expert_reservoir(reservoir)
 
         while True:
             with self._prefetch_lock:
@@ -2672,12 +2999,20 @@ class DeepSeekWeightPager:
                 if self._draining_executor is executor:
                     self._draining_executor = None
 
+        self._reap_retired_reservoirs(wait=True)
+        with self._prefetch_lock:
+            reservoir_executor = self._expert_reservoir_executor
+            self._expert_reservoir_executor = None
+        if reservoir_executor is not None:
+            reservoir_executor.shutdown(wait=True, cancel_futures=True)
         self.release()
 
     def metrics(self) -> dict[str, Any]:
         source_metrics = self.source.metrics()
         with self._prefetch_lock:
             draining = bool(self._draining_prefetch)
+            reservoir_active = self._active_expert_reservoir is not None
+            reservoir_retired = len(self._retired_expert_reservoirs)
         return {
             **asdict(self._stats),
             "device": str(self.device),
@@ -2717,6 +3052,11 @@ class DeepSeekWeightPager:
                 self.EXPERT_RANGE_COALESCE_MAX_GAP_BYTES
             ),
             "expert_prefetch_draining": draining,
+            "expert_reservoir_policy": self.EXPERT_RESERVOIR_POLICY,
+            "expert_reservoir_budget_bytes": self.expert_reservoir_budget_bytes,
+            "expert_reservoir_workers": self.expert_reservoir_workers,
+            "expert_reservoir_active": reservoir_active,
+            "expert_reservoir_retired": reservoir_retired,
             "causal_weight_reader_attached": self._causal_weight_reader is not None,
             "causal_missing_fallback": self._causal_missing_fallback,
             "source": source_metrics,

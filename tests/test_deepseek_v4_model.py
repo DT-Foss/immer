@@ -179,6 +179,32 @@ class _PrefetchQuantizedTinyCheckpoint(_QuantizedTinyCheckpoint):
         return result
 
 
+class _TwoLayerPrefetchQuantizedTinyCheckpoint(_PrefetchQuantizedTinyCheckpoint):
+    """Two identical official blocks with raw-addressable routed experts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        from test_deepseek_v4_pager import _MultiEncodedExpertSource
+
+        for name, value in tuple(self.data.items()):
+            if not name.startswith("layers.0.") or ".ffn.experts." in name:
+                continue
+            cloned = name.replace("layers.0.", "layers.1.", 1)
+            self.data[cloned] = value.copy()
+            self.dtypes[cloned] = self.dtypes[name]
+        bases = [
+            f"layers.{layer}.ffn.experts.{expert}"
+            for layer in range(2)
+            for expert in range(2)
+        ]
+        self.encoded_experts = _MultiEncodedExpertSource(bases)
+        self.data.update(self.encoded_experts.data)
+        self.data["layers.1.ffn.gate.tid2eid"] = np.tile(
+            np.asarray([[0, 1]], dtype=np.int64), (128, 1)
+        )
+        self.dtypes["layers.1.ffn.gate.tid2eid"] = "I64"
+
+
 class _CompressedTinyCheckpoint(_TinyCheckpoint):
     def __init__(
         self, *, random_weights: bool = False, compress_ratio: int = 4
@@ -362,6 +388,66 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
                 "layers.0.ffn.shared_experts",
             ],
         )
+
+    def test_markov_micro_windows_are_bit_exact_and_feed_the_next_layer(self) -> None:
+        from dataclasses import replace
+
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager, StreamedDeepSeekV4
+        from immer.runtimes.deepseek_v4.route_markov import (
+            LayerMarkovExpertPredictor,
+            LayerTokenRoutes,
+            PromptRouteObservation,
+        )
+
+        config = replace(
+            _config(n_layers=2),
+            n_activated_experts=2,
+            n_hash_layers=2,
+        )
+        predictor = LayerMarkovExpertPredictor(n_experts=2)
+        predictor.observe(
+            PromptRouteObservation(
+                "training-route",
+                (
+                    LayerTokenRoutes(0, ((0, 1), (0, 1))),
+                    LayerTokenRoutes(1, ((0, 1), (0, 1))),
+                ),
+            )
+        )
+
+        def execute(with_predictor: bool):
+            pager = DeepSeekWeightPager(
+                _TwoLayerPrefetchQuantizedTinyCheckpoint(),
+                device="cpu",
+                compute_dtype="float32",
+                expert_prefetch=True,
+            )
+            model = StreamedDeepSeekV4(
+                config,
+                pager,
+                max_seq_len=8,
+                route_predictor=predictor if with_predictor else None,
+                route_prefetch_window_rows=2,
+            )
+            hidden, evidence = model.hidden_stateful([[7, 8, 9, 10]])
+            return hidden, evidence, pager.metrics()
+
+        expected, expected_evidence, baseline = execute(False)
+        actual, actual_evidence, markov = execute(True)
+
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(
+            actual_evidence.selected_experts,
+            expected_evidence.selected_experts,
+        )
+        self.assertEqual(markov["expert_reservoir_submitted"], 4)
+        self.assertEqual(markov["expert_reservoir_prediction_hits"], 4)
+        self.assertEqual(markov["expert_reservoir_usable_hits"], 4)
+        self.assertEqual(markov["expert_reservoir_misses"], 0)
+        self.assertFalse(markov["expert_reservoir_active"])
+        self.assertGreater(baseline["expert_prefetch_submitted"], 0)
 
     def test_batched_moe_closes_window_before_shared_and_preserves_index_add(
         self,

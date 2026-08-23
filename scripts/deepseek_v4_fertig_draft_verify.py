@@ -47,7 +47,10 @@ from immer.runtimes.deepseek_v4.draft_verification import (
 )
 from immer.runtimes.deepseek_v4.encoding import encode_user_prompt
 from immer.runtimes.deepseek_v4.stable_graft import DeepSeekV4StableCrsaGraft
-
+from immer.runtimes.deepseek_v4.route_model import (
+    RouteModelArtifactError,
+    load_route_model_artifact,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 OFFICIAL_SOURCE = "deepseek-ai/DeepSeek-V4-Flash-0731"
@@ -227,6 +230,36 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", choices=("auto", "bfloat16"), default="bfloat16")
     parser.add_argument("--no-activation-quantization", action="store_true")
     parser.add_argument("--no-expert-prefetch", action="store_true")
+    parser.add_argument(
+        "--route-model",
+        help="canonical real/placebo Markov model used only for exact prefetch",
+    )
+    parser.add_argument(
+        "--route-model-role",
+        choices=("real_markov", "placebo_markov"),
+        default="real_markov",
+    )
+    parser.add_argument(
+        "--route-prefetch-window-rows",
+        type=_positive_int,
+        default=2,
+    )
+    parser.add_argument("--route-prefetch-k", type=_positive_int)
+    parser.add_argument(
+        "--route-prefetch-alpha",
+        type=_positive_float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--expert-reservoir-budget-mb",
+        type=_positive_int,
+        default=256,
+    )
+    parser.add_argument(
+        "--expert-reservoir-workers",
+        type=_positive_int,
+        default=4,
+    )
     parser.add_argument("--head-block-rows", type=_positive_int, default=1024)
     parser.add_argument("--layer-retries", type=_nonnegative_int, default=2)
     parser.add_argument("--mode", choices=("off", "stable-crsa"), default="off")
@@ -1179,10 +1212,12 @@ def _prepare_drafts(
     items: Sequence[SelectedItem],
     tokenizer: LocalTokenizer,
     *,
-    fetcher: Callable[
-        [SelectedItem, LocalTokenizer, argparse.Namespace, str], dict[str, Any]
-    ]
-    | None = None,
+    fetcher: (
+        Callable[
+            [SelectedItem, LocalTokenizer, argparse.Namespace, str], dict[str, Any]
+        ]
+        | None
+    ) = None,
 ) -> tuple[dict[str, Any], ...]:
     run_dir = Path(args.run_dir).expanduser().resolve()
     draft_path = (
@@ -1267,12 +1302,28 @@ def _model_runtime(
         if not isinstance(config_document, Mapping):
             raise CliError("DeepSeek-V4 config root must be an object")
         config = DeepSeekV4Config.from_mapping(config_document)
+        route_predictor = None
+        route_model_sha256 = None
+        if args.route_model is not None:
+            checkpoint = _checkpoint_identity(source)
+            try:
+                artifact = load_route_model_artifact(
+                    args.route_model,
+                    expected_checkpoint=checkpoint,
+                    expected_role=args.route_model_role,
+                )
+            except (OSError, RouteModelArtifactError) as exc:
+                raise CliError("cannot load the checkpoint-bound route model") from exc
+            route_predictor = artifact.predictor
+            route_model_sha256 = artifact.sha256
         pager = DeepSeekWeightPager(
             source,
             device=args.device,
             compute_dtype=args.dtype,
             simulate_activation_quantization=not args.no_activation_quantization,
             expert_prefetch=not args.no_expert_prefetch,
+            expert_reservoir_budget_bytes=(args.expert_reservoir_budget_mb * 1024**2),
+            expert_reservoir_workers=args.expert_reservoir_workers,
         )
         graft = None
         graft_layer = None
@@ -1283,14 +1334,32 @@ def _model_runtime(
                 max_history=max_seq_len,
             )
             graft_layer = args.graft_layer
-        model = StreamedDeepSeekV4(
-            config,
-            pager,
-            graft=graft,
-            graft_layer=graft_layer,
-            max_batch_size=max_batch_size,
-            max_seq_len=max_seq_len,
-        )
+        model_kwargs: dict[str, Any] = {
+            "graft": graft,
+            "graft_layer": graft_layer,
+            "max_batch_size": max_batch_size,
+            "max_seq_len": max_seq_len,
+        }
+        if route_predictor is not None:
+            model_kwargs.update(
+                {
+                    "route_predictor": route_predictor,
+                    "route_prefetch_window_rows": args.route_prefetch_window_rows,
+                    "route_prefetch_k": args.route_prefetch_k,
+                    "route_prefetch_alpha": args.route_prefetch_alpha,
+                }
+            )
+        model = StreamedDeepSeekV4(config, pager, **model_kwargs)
+        if route_predictor is not None:
+            _progress(
+                "route_model_loaded",
+                path=str(Path(args.route_model).expanduser().resolve()),
+                role=args.route_model_role,
+                sha256=route_model_sha256,
+                source_layers=list(route_predictor.source_layers),
+                window_rows=args.route_prefetch_window_rows,
+                k=args.route_prefetch_k,
+            )
         yield model
     finally:
         active_error = sys.exc_info()[1]
@@ -1712,9 +1781,7 @@ def _verify_locally(
                     transition=(
                         None
                         if receipt is None
-                        else "appended"
-                        if receipt.appended
-                        else "replayed"
+                        else "appended" if receipt.appended else "replayed"
                     ),
                 )
 
@@ -1751,6 +1818,10 @@ def _verify_locally(
             route_request_id=(route_request_id if route_observer is not None else None),
             route_observer=route_observer,
         )
+        pager_metrics_method = getattr(model.pager, "metrics", None)
+        pager_metrics = (
+            pager_metrics_method() if callable(pager_metrics_method) else None
+        )
         instrumentation = {
             "access_trace": (
                 {"enabled": False}
@@ -1759,6 +1830,40 @@ def _verify_locally(
             ),
             "route_learning": route_metrics,
         }
+        if pager_metrics is not None:
+            route_predictor = getattr(model, "route_predictor", None)
+            instrumentation["route_prefetch"] = {
+                "enabled": route_predictor is not None,
+                "model_role": (
+                    args.route_model_role if route_predictor is not None else None
+                ),
+                "model_snapshot_sha256": (
+                    route_predictor.snapshot_sha256
+                    if route_predictor is not None
+                    else None
+                ),
+                "window_rows": (
+                    args.route_prefetch_window_rows
+                    if route_predictor is not None
+                    else None
+                ),
+                "k": args.route_prefetch_k if route_predictor is not None else None,
+                "alpha": (
+                    args.route_prefetch_alpha if route_predictor is not None else None
+                ),
+                "pager": {
+                    key: value
+                    for key, value in pager_metrics.items()
+                    if key.startswith("expert_prefetch_")
+                    or key.startswith("expert_reservoir_")
+                    or key
+                    in {
+                        "expert_transport_envelopes",
+                        "expert_transport_source_bytes",
+                        "expert_range_requests_avoided",
+                    }
+                },
+            }
         if route_metrics["enabled"]:
             route_metrics["active_segments"] = len(graph.store.segments())
             _progress("route_learning_complete", **route_metrics)

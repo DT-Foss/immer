@@ -15,12 +15,13 @@ import hashlib
 import json
 import math
 import random
+import re
 from typing import Any
-
 
 _SCHEMA = "deepseek-v4-token-row-markov-v1"
 _MODES = ("markov", "marginal", "passthrough")
 _UINT64_MAX = (1 << 64) - 1
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class RouteMarkovError(ValueError):
@@ -273,6 +274,76 @@ class ScoreDistribution:
         if width > len(self.scores):
             raise RouteMarkovError("k exceeds the expert inventory")
         return self.ranking[:width]
+
+
+@dataclass(frozen=True, slots=True)
+class MicroWindowPrediction:
+    """One ordered candidate set for consecutive active token rows."""
+
+    source_layer: int
+    target_layer: int
+    active_row_start: int
+    active_row_stop: int
+    candidate_experts: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        source = _integer(self.source_layer, "source_layer")
+        target = _integer(self.target_layer, "target_layer", minimum=1)
+        start = _integer(self.active_row_start, "active_row_start")
+        stop = _integer(self.active_row_stop, "active_row_stop", minimum=1)
+        if target != source + 1:
+            raise RouteMarkovError("micro-window target layer must be consecutive")
+        if stop <= start:
+            raise RouteMarkovError("micro-window active row interval is empty")
+        candidates = tuple(self.candidate_experts)
+        if not candidates or len(set(candidates)) != len(candidates):
+            raise RouteMarkovError(
+                "micro-window candidates must be non-empty and unique"
+            )
+        object.__setattr__(self, "source_layer", source)
+        object.__setattr__(self, "target_layer", target)
+        object.__setattr__(self, "active_row_start", start)
+        object.__setattr__(self, "active_row_stop", stop)
+        object.__setattr__(self, "candidate_experts", candidates)
+
+
+@dataclass(frozen=True, slots=True)
+class LayerMicroWindowPlan:
+    """Causal row-local expert candidates for the next decoder layer."""
+
+    source_layer: int
+    target_layer: int
+    active_rows: int
+    window_rows: int
+    windows: tuple[MicroWindowPrediction, ...]
+
+    def __post_init__(self) -> None:
+        source = _integer(self.source_layer, "source_layer")
+        target = _integer(self.target_layer, "target_layer", minimum=1)
+        active = _integer(self.active_rows, "active_rows", minimum=1)
+        width = _integer(self.window_rows, "window_rows", minimum=1)
+        windows = tuple(self.windows)
+        if target != source + 1 or not windows:
+            raise RouteMarkovError("micro-window plan has no consecutive target")
+        cursor = 0
+        for window in windows:
+            if not isinstance(window, MicroWindowPrediction):
+                raise RouteMarkovError("micro-window plan must contain predictions")
+            if (
+                window.source_layer != source
+                or window.target_layer != target
+                or window.active_row_start != cursor
+                or window.active_row_stop - window.active_row_start > width
+            ):
+                raise RouteMarkovError("micro-window plan lost active-row alignment")
+            cursor = window.active_row_stop
+        if cursor != active:
+            raise RouteMarkovError("micro-window plan does not cover every active row")
+        object.__setattr__(self, "source_layer", source)
+        object.__setattr__(self, "target_layer", target)
+        object.__setattr__(self, "active_rows", active)
+        object.__setattr__(self, "window_rows", width)
+        object.__setattr__(self, "windows", windows)
 
 
 class LayerMarkovExpertPredictor:
@@ -568,9 +639,192 @@ class LayerMarkovExpertPredictor:
             "schema": _SCHEMA,
         }
 
+    @classmethod
+    def from_snapshot(cls, snapshot: object) -> LayerMarkovExpertPredictor:
+        """Restore and fully validate one canonical sparse counter snapshot."""
+
+        if not isinstance(snapshot, dict) or set(snapshot) != {
+            "layers",
+            "n_experts",
+            "observations",
+            "schema",
+        }:
+            raise RouteMarkovError("Markov snapshot has unknown or missing fields")
+        if snapshot.get("schema") != _SCHEMA:
+            raise RouteMarkovError("Markov snapshot schema is unsupported")
+        n_experts = _integer(snapshot.get("n_experts"), "n_experts", minimum=1)
+        model = cls(n_experts=n_experts)
+
+        raw_layers = snapshot.get("layers")
+        if not isinstance(raw_layers, list):
+            raise RouteMarkovError("Markov snapshot layers must be a list")
+        prior_source_layer = -1
+        for raw_layer in raw_layers:
+            if not isinstance(raw_layer, dict) or set(raw_layer) != {
+                "source_layer",
+                "target_counts",
+                "target_rows",
+                "transitions",
+            }:
+                raise RouteMarkovError("Markov snapshot layer is invalid")
+            source_layer = _integer(raw_layer.get("source_layer"), "source_layer")
+            if source_layer <= prior_source_layer:
+                raise RouteMarkovError(
+                    "Markov snapshot source layers must be strictly increasing"
+                )
+            prior_source_layer = source_layer
+            target_layer = source_layer + 1
+            target_rows = _integer(raw_layer.get("target_rows"), "target_rows")
+
+            raw_transitions = raw_layer.get("transitions")
+            if not isinstance(raw_transitions, list):
+                raise RouteMarkovError("Markov snapshot transitions must be a list")
+            prior_transition: tuple[int, int] | None = None
+            matrix: array[int] | None = None
+            for raw_transition in raw_transitions:
+                if not isinstance(raw_transition, list) or len(raw_transition) != 3:
+                    raise RouteMarkovError("Markov snapshot transition is invalid")
+                source = _integer(raw_transition[0], "source expert")
+                target = _integer(raw_transition[1], "target expert")
+                count = _integer(raw_transition[2], "transition count", minimum=1)
+                model._validate_expert(source)
+                model._validate_expert(target)
+                coordinate = (source, target)
+                if prior_transition is not None and coordinate <= prior_transition:
+                    raise RouteMarkovError(
+                        "Markov snapshot transitions must be strictly increasing"
+                    )
+                if count > _UINT64_MAX:
+                    raise RouteMarkovError("Markov transition count exceeds uint64")
+                if matrix is None:
+                    matrix = model._matrix(source_layer)
+                matrix[source * n_experts + target] = count
+                prior_transition = coordinate
+
+            raw_counts = raw_layer.get("target_counts")
+            if not isinstance(raw_counts, list):
+                raise RouteMarkovError("Markov snapshot target counts must be a list")
+            prior_expert = -1
+            marginal: array[int] | None = None
+            for raw_count in raw_counts:
+                if not isinstance(raw_count, list) or len(raw_count) != 2:
+                    raise RouteMarkovError("Markov snapshot target count is invalid")
+                expert = _integer(raw_count[0], "target expert")
+                count = _integer(raw_count[1], "target count", minimum=1)
+                model._validate_expert(expert)
+                if expert <= prior_expert:
+                    raise RouteMarkovError(
+                        "Markov snapshot target counts must be strictly increasing"
+                    )
+                if count > target_rows or count > _UINT64_MAX:
+                    raise RouteMarkovError(
+                        "Markov snapshot target count exceeds its row total"
+                    )
+                if marginal is None:
+                    marginal = model._marginal(target_layer)
+                marginal[expert] = count
+                prior_expert = expert
+            if bool(raw_counts) != bool(target_rows):
+                raise RouteMarkovError(
+                    "Markov snapshot target counts and row total disagree"
+                )
+            if target_rows:
+                model._target_rows[target_layer] = target_rows
+            if not raw_transitions and not raw_counts:
+                raise RouteMarkovError("Markov snapshot layer contains no evidence")
+
+        raw_observations = snapshot.get("observations")
+        if not isinstance(raw_observations, list):
+            raise RouteMarkovError("Markov snapshot observations must be a list")
+        prior_observation = ""
+        for raw_observation in raw_observations:
+            if not isinstance(raw_observation, list) or len(raw_observation) != 2:
+                raise RouteMarkovError("Markov snapshot observation is invalid")
+            observation_id = _observation_id(raw_observation[0])
+            digest = raw_observation[1]
+            if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+                raise RouteMarkovError(
+                    "Markov snapshot observation digest must be SHA-256"
+                )
+            if observation_id <= prior_observation:
+                raise RouteMarkovError(
+                    "Markov snapshot observations must be strictly increasing"
+                )
+            model._observation_digests[observation_id] = digest
+            prior_observation = observation_id
+
+        if model.snapshot() != snapshot:
+            raise RouteMarkovError("Markov snapshot is not canonical")
+        return model
+
     @property
     def snapshot_sha256(self) -> str:
         return _sha256(self.snapshot())
+
+
+def plan_micro_window_prefetch(
+    predictor: LayerMarkovExpertPredictor,
+    *,
+    source_layer: int,
+    current_rows: Iterable[Iterable[int]],
+    window_rows: int = 2,
+    k: int | None = None,
+    alpha: float = 1.0,
+) -> LayerMicroWindowPlan:
+    """Convert row-local Markov distributions into an executable next-layer plan.
+
+    Empty padding rows are removed without changing the order of active rows.
+    With ``k=None`` each window predicts exactly as many candidates as it has
+    official source routing slots, matching the measured micro-window protocol.
+    """
+
+    if not isinstance(predictor, LayerMarkovExpertPredictor):
+        raise RouteMarkovError("predictor must be a LayerMarkovExpertPredictor")
+    layer = _integer(source_layer, "source_layer")
+    width = _integer(window_rows, "window_rows", minimum=1)
+    fixed_k = None if k is None else _integer(k, "k", minimum=1)
+    if fixed_k is not None and fixed_k > predictor.n_experts:
+        raise RouteMarkovError("k exceeds the expert inventory")
+    prior = _positive_float(alpha, "alpha")
+    if isinstance(current_rows, (str, bytes)):
+        raise RouteMarkovError("current_rows must contain expert rows")
+    try:
+        rows = tuple(tuple(row) for row in current_rows)
+    except TypeError as exc:
+        raise RouteMarkovError("current_rows must contain expert rows") from exc
+    active = tuple(row for row in rows if row)
+    if not active:
+        raise RouteMarkovError("current_rows must contain an active expert row")
+
+    windows: list[MicroWindowPrediction] = []
+    for start in range(0, len(active), width):
+        chunk = active[start : start + width]
+        candidate_count = (
+            min(predictor.n_experts, sum(len(row) for row in chunk))
+            if fixed_k is None
+            else fixed_k
+        )
+        distribution = predictor.predict_window_distribution(
+            source_layer=layer,
+            current_rows=chunk,
+            alpha=prior,
+        )
+        windows.append(
+            MicroWindowPrediction(
+                source_layer=layer,
+                target_layer=layer + 1,
+                active_row_start=start,
+                active_row_stop=start + len(chunk),
+                candidate_experts=distribution.top_k(candidate_count),
+            )
+        )
+    return LayerMicroWindowPlan(
+        source_layer=layer,
+        target_layer=layer + 1,
+        active_rows=len(active),
+        window_rows=width,
+        windows=tuple(windows),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1021,7 +1275,9 @@ __all__ = [
     "KSweepPoint",
     "LayerKSweep",
     "LayerMarkovExpertPredictor",
+    "LayerMicroWindowPlan",
     "LayerTokenRoutes",
+    "MicroWindowPrediction",
     "ObservationReceipt",
     "PlaceboAssignment",
     "PromptRouteObservation",
@@ -1033,5 +1289,6 @@ __all__ = [
     "build_target_layer_placebo",
     "evaluate_all_baselines",
     "evaluate_k_sweep",
+    "plan_micro_window_prefetch",
     "split_prompt_observations",
 ]

@@ -38,7 +38,11 @@ from immer.runtimes.deepseek_v4.route_markov import (
     evaluate_k_sweep,
     split_prompt_observations,
 )
-
+from immer.runtimes.deepseek_v4.route_model import (
+    RouteModelArtifactError,
+    build_route_model_artifact,
+    write_route_model_artifact,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SIDECAR = (
@@ -678,6 +682,7 @@ def build_report(
     placebo_seed: int = 29,
     alpha: float = 1.0,
     expected_checkpoint: CheckpointIdentity | None = None,
+    model_sink: dict[str, LayerMarkovExpertPredictor] | None = None,
 ) -> dict[str, Any]:
     """Run real/placebo/baseline K sweeps and return a canonical report."""
 
@@ -795,7 +800,17 @@ def build_report(
             "sha256": placebo.sha256,
         },
     }
-    return {**identity, "sha256": _sha256(identity)}
+    report = {**identity, "sha256": _sha256(identity)}
+    if model_sink is not None:
+        if model_sink:
+            raise RouteEvalError("model_sink must be empty")
+        model_sink.update(
+            {
+                "placebo_markov": placebo_model,
+                "real_markov": real_model,
+            }
+        )
+    return report
 
 
 def write_report(path: str | Path, report: Mapping[str, Any]) -> None:
@@ -857,11 +872,24 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--split-seed", type=_nonnegative_int, default=17)
     parser.add_argument("--placebo-seed", type=_nonnegative_int, default=29)
     parser.add_argument("--alpha", type=_positive_float, default=1.0)
+    parser.add_argument(
+        "--real-model-output",
+        help="write the trained real Markov predictor as a canonical artifact",
+    )
+    parser.add_argument(
+        "--placebo-model-output",
+        help="write the trained shuffled-target predictor as a canonical artifact",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    model_sink: dict[str, LayerMarkovExpertPredictor] | None = (
+        {}
+        if args.real_model_output is not None or args.placebo_model_output is not None
+        else None
+    )
     try:
         report = build_report(
             args.sidecar,
@@ -871,15 +899,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             split_seed=args.split_seed,
             placebo_seed=args.placebo_seed,
             alpha=args.alpha,
+            model_sink=model_sink,
         )
         write_report(args.output, report)
-    except RouteEvalError as exc:
+        model_outputs: dict[str, str] = {}
+        if model_sink is not None:
+            checkpoint_record = report["checkpoint"]
+            checkpoint = CheckpointIdentity(
+                repo_id=checkpoint_record["repo_id"],
+                revision=checkpoint_record["revision"],
+                inventory_fingerprint=checkpoint_record["inventory_fingerprint"],
+            )
+            metadata = {
+                "alpha": report["protocol"]["alpha"],
+                "evaluation_report_sha256": report["sha256"],
+                "placebo_seed": report["protocol"]["placebo_seed"],
+                "sidecar_sha256": report["sidecar"]["sha256"],
+                "split": report["split"],
+            }
+            for role, raw_path in (
+                ("real_markov", args.real_model_output),
+                ("placebo_markov", args.placebo_model_output),
+            ):
+                if raw_path is None:
+                    continue
+                artifact = build_route_model_artifact(
+                    model_sink[role],
+                    checkpoint=checkpoint,
+                    role=role,
+                    metadata=metadata,
+                )
+                write_route_model_artifact(raw_path, artifact)
+                model_outputs[role] = str(Path(raw_path).expanduser().resolve())
+    except (RouteEvalError, RouteModelArtifactError) as exc:
         raise SystemExit(f"route evaluation failed: {exc}") from exc
     headline = report["headline"]["models"]
     print(
         json.dumps(
             {
                 "headline": headline,
+                "model_outputs": model_outputs,
                 "output": str(Path(args.output).expanduser().resolve()),
                 "sha256": report["sha256"],
             },

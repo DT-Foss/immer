@@ -45,6 +45,20 @@ from .quantization import (
     unpack_fp4_e2m1,
 )
 from .snapshot import DeepSeekV4SnapshotError, SnapshotLimits
+from .route_markov import (
+    LayerMarkovExpertPredictor,
+    LayerMicroWindowPlan,
+    MicroWindowPrediction,
+    plan_micro_window_prefetch,
+)
+from .route_model import (
+    ROUTE_MODEL_SCHEMA,
+    RouteModelArtifact,
+    RouteModelArtifactError,
+    build_route_model_artifact,
+    load_route_model_artifact,
+    write_route_model_artifact,
+)
 from .provenance import runtime_dependency_versions, runtime_source_manifest
 from .layerwise import (
     LAYERWISE_SCHEMA,
@@ -81,22 +95,32 @@ __all__ = [
     "LayerwiseItem",
     "LayerwisePlan",
     "LayerwiseScorer",
+    "LayerMarkovExpertPredictor",
+    "LayerMicroWindowPlan",
     "LogicalModelIdentity",
     "OFFICIAL_SOURCE_SAFE_BYTES",
     "OneTokenEvidence",
     "OfficialExpertRangePlan",
+    "MicroWindowPrediction",
+    "ROUTE_MODEL_SCHEMA",
+    "RouteModelArtifact",
+    "RouteModelArtifactError",
     "StatefulEvidence",
     "StreamedDeepSeekV4",
     "SnapshotLimits",
     "build_layerwise_plan",
+    "build_route_model_artifact",
     "bind_causal_weight_plans",
     "dequantize_fp4_e2m1",
     "dequantize_fp8_e4m3",
     "quantize_dequantize_fp4",
     "quantize_dequantize_fp8",
     "quantize_fp8_e4m3_parts",
+    "plan_micro_window_prefetch",
+    "load_route_model_artifact",
     "runtime_dependency_versions",
     "runtime_source_manifest",
     "semantic_expert_key",
     "unpack_fp4_e2m1",
+    "write_route_model_artifact",
 ]

@@ -1767,6 +1767,90 @@ class DeepSeekV4PagerTests(unittest.TestCase):
             pager.consume_expert_prefetch(ticket, base)
         pager.release()
 
+    def test_markov_reservoir_reuses_hits_and_exactly_falls_back_for_misses(
+        self,
+    ) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        bases = [f"layers.1.ffn.experts.{expert}" for expert in range(3)]
+        source = _WindowExpertSource(bases)
+        for event in source.release.values():
+            event.set()
+        pager = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            expert_reservoir_workers=3,
+        )
+        reservoir = pager.prefetch_expert_reservoir((bases[2], bases[0]))
+        assert reservoir is not None
+        payloads = pager.bind_expert_reservoir(
+            reservoir,
+            (bases[0], bases[1]),
+        )
+
+        self.assertEqual(set(payloads), {bases[0]})
+        miss_window = pager.prefetch_expert_window((bases[1],))
+        assert miss_window is not None
+        hit = pager.expert(
+            torch.zeros((1, 128), dtype=torch.bfloat16),
+            bases[0],
+            prefetched_payload=payloads.pop(bases[0]),
+        )
+        miss_payload = pager.consume_expert_window(miss_window, bases[1])
+        miss = pager.expert(
+            torch.zeros((1, 128), dtype=torch.bfloat16),
+            bases[1],
+            prefetched_payload=miss_payload,
+        )
+        pager.close_expert_window(miss_window)
+        self.assertEqual(tuple(hit.shape), (1, 128))
+        self.assertEqual(tuple(miss.shape), (1, 128))
+        self.assertEqual(
+            sum(shard == "expert-0.safetensors" for shard, _, _ in source.raw_calls),
+            2,
+        )
+        metrics = pager.metrics()
+        self.assertEqual(metrics["expert_reservoir_prediction_hits"], 1)
+        self.assertEqual(metrics["expert_reservoir_usable_hits"], 1)
+        self.assertEqual(metrics["expert_reservoir_misses"], 1)
+        self.assertEqual(metrics["expert_reservoir_wasted"], 1)
+        self.assertFalse(metrics["expert_reservoir_active"])
+        pager.close()
+
+    def test_markov_reservoir_crosses_release_and_has_no_fixed_expert_cap(
+        self,
+    ) -> None:
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        bases = [f"layers.1.ffn.experts.{expert}" for expert in range(6)]
+        source = _WindowExpertSource(bases)
+        pager = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            expert_reservoir_workers=6,
+            expert_reservoir_budget_bytes=1024**3,
+        )
+        reservoir = pager.prefetch_expert_reservoir(bases)
+        assert reservoir is not None
+        self.assertTrue(all(event.wait(timeout=2) for event in source.started.values()))
+
+        # A decoder-layer release must not destroy next-layer predictions.
+        pager.release()
+        self.assertTrue(pager.metrics()["expert_reservoir_active"])
+        self.assertEqual(pager.metrics()["expert_reservoir_submitted"], 6)
+        for event in source.release.values():
+            event.set()
+        payloads = pager.bind_expert_reservoir(reservoir, bases)
+        self.assertEqual(set(payloads), set(bases))
+        self.assertEqual(pager.metrics()["expert_reservoir_usable_hits"], 6)
+        for payload in payloads.values():
+            pager.discard_expert_reservoir_payload(payload)
+        pager.close()
+
     def test_coalesced_expert_rejects_reserved_float8_weight_and_scale_codes(
         self,
     ) -> None:

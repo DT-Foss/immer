@@ -14,6 +14,7 @@ from immer.runtimes.deepseek_v4.route_markov import (
     build_target_layer_placebo,
     evaluate_all_baselines,
     evaluate_k_sweep,
+    plan_micro_window_prefetch,
     split_prompt_observations,
 )
 
@@ -160,6 +161,51 @@ class RouteMarkovTests(unittest.TestCase):
                 source_layer=0,
                 current_rows=((), []),
             )
+
+    def test_micro_window_plan_preserves_active_order_and_uses_slot_width(self) -> None:
+        model = LayerMarkovExpertPredictor(n_experts=8)
+        model.observe(
+            _observation(
+                "train",
+                [
+                    (3, [[0, 1], [2], [3, 4], [5]]),
+                    (4, [[6, 7], [5], [4, 3], [2]]),
+                ],
+            )
+        )
+
+        plan = plan_micro_window_prefetch(
+            model,
+            source_layer=3,
+            current_rows=([0, 1], [], [2], [3, 4], [5], []),
+            window_rows=2,
+        )
+
+        self.assertEqual(plan.source_layer, 3)
+        self.assertEqual(plan.target_layer, 4)
+        self.assertEqual(plan.active_rows, 4)
+        self.assertEqual(
+            [
+                (window.active_row_start, window.active_row_stop)
+                for window in plan.windows
+            ],
+            [(0, 2), (2, 4)],
+        )
+        self.assertEqual(len(plan.windows[0].candidate_experts), 3)
+        self.assertEqual(len(plan.windows[1].candidate_experts), 3)
+        self.assertEqual(plan.windows[0].candidate_experts[0], 5)
+        self.assertEqual(plan.windows[1].candidate_experts[0], 2)
+
+        fixed = plan_micro_window_prefetch(
+            model,
+            source_layer=3,
+            current_rows=([0], [1], [2]),
+            window_rows=2,
+            k=5,
+        )
+        self.assertTrue(
+            all(len(window.candidate_experts) == 5 for window in fixed.windows)
+        )
 
     def test_k_sweep_has_all_widths_and_exact_full_inventory_endpoint(self) -> None:
         model = LayerMarkovExpertPredictor(n_experts=4)
@@ -337,6 +383,33 @@ class RouteMarkovTests(unittest.TestCase):
         self.assertEqual(len(snapshot["layers"][0]["transitions"]), 2)
         self.assertEqual(json.loads(encoded), snapshot)
         self.assertEqual(model.snapshot_sha256, repeated.snapshot_sha256)
+
+        restored = LayerMarkovExpertPredictor.from_snapshot(snapshot)
+        self.assertEqual(restored.snapshot(), snapshot)
+        self.assertEqual(restored.snapshot_sha256, model.snapshot_sha256)
+        self.assertEqual(
+            restored.predict_distribution(source_layer=7, current_row=[1]).scores,
+            model.predict_distribution(source_layer=7, current_row=[1]).scores,
+        )
+
+    def test_snapshot_restore_rejects_noncanonical_or_inconsistent_counts(self) -> None:
+        model = LayerMarkovExpertPredictor(n_experts=4)
+        model.observe(_observation("persisted", [(0, [[1]]), (1, [[2]])]))
+        snapshot = model.snapshot()
+
+        reordered = copy.deepcopy(snapshot)
+        reordered["layers"][0]["transitions"].append([0, 0, 1])
+        with self.assertRaisesRegex(RouteMarkovError, "strictly increasing"):
+            LayerMarkovExpertPredictor.from_snapshot(reordered)
+
+        inconsistent = copy.deepcopy(snapshot)
+        inconsistent["layers"][0]["target_counts"][0][1] = 2
+        with self.assertRaisesRegex(RouteMarkovError, "row total"):
+            LayerMarkovExpertPredictor.from_snapshot(inconsistent)
+
+        unknown = {**snapshot, "future": True}
+        with self.assertRaisesRegex(RouteMarkovError, "unknown or missing"):
+            LayerMarkovExpertPredictor.from_snapshot(unknown)
 
     def test_real_vs_placebo_training_uses_shuffled_targets_and_real_sources(
         self,
