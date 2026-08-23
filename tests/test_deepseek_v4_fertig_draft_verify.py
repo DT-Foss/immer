@@ -12,6 +12,8 @@ import unittest
 from unittest import mock
 import urllib.error
 
+import torch
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "deepseek_v4_fertig_draft_verify.py"
@@ -83,7 +85,7 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
         )
         self.assertRegex(draft_verify.OFFICIAL_REVISION, r"^[0-9a-f]{40}$")
         self.assertEqual(args.max_draft_tokens, 128)
-        self.assertEqual(args.cache_budget_gb, 12.0)
+        self.assertEqual(args.cache_budget_gb, 6.0)
         self.assertEqual(args.source_budget_mb, 196608)
         self.assertEqual(args.device, "mps")
         self.assertEqual(args.dtype, "bfloat16")
@@ -120,6 +122,24 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
                 for row in items
             )
         )
+
+    def test_resume_identity_binds_the_resolved_device_not_auto(self) -> None:
+        args = draft_verify._parser().parse_args(["--device", "auto"])
+        cpu = draft_verify._resume_identity(
+            args,
+            ((1, 2),),
+            ((3,),),
+            resolved_device="cpu",
+            resolved_dtype="bfloat16",
+        )
+        mps = draft_verify._resume_identity(
+            args,
+            ((1, 2),),
+            ((3,),),
+            resolved_device="mps",
+            resolved_dtype="bfloat16",
+        )
+        self.assertNotEqual(cpu, mps)
 
     def test_http_retry_request_and_api_token_contract(self) -> None:
         item = draft_verify.SelectedItem(
@@ -327,6 +347,106 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
                 [],
             )
 
+    def test_resume_file_is_one_atomic_rolling_hidden_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args = draft_verify._parser().parse_args(["--run-dir", raw])
+            path = draft_verify._resume_path(args)
+            identity = draft_verify._resume_identity(
+                args,
+                ((1, 2),),
+                ((3,),),
+                resolved_device="cpu",
+                resolved_dtype="bfloat16",
+            )
+            first = draft_verify.DraftVerificationResumeState(
+                next_layer=1,
+                hidden=torch.ones((1, 3, 1, 2), dtype=torch.bfloat16),
+                layer_calls=1,
+                layer_retry_count=0,
+                source_body_bytes=10,
+                linear_calls=2,
+                seconds=1.5,
+                graft_applied=False,
+            )
+            second = draft_verify.DraftVerificationResumeState(
+                next_layer=2,
+                hidden=torch.full((1, 3, 1, 2), 2.0, dtype=torch.bfloat16),
+                layer_calls=2,
+                layer_retry_count=1,
+                source_body_bytes=20,
+                linear_calls=4,
+                seconds=3.0,
+                graft_applied=False,
+            )
+            draft_verify._write_resume(path, identity, first)
+            draft_verify._write_resume(path, identity, second)
+
+            self.assertEqual([entry.name for entry in root.iterdir()], [path.name])
+            loaded = draft_verify._load_resume(
+                path,
+                identity,
+                expected_shape=(1, 3, 1, 2),
+                expected_dtype="bfloat16",
+                n_layers=43,
+            )
+            assert loaded is not None
+            self.assertEqual(loaded.next_layer, 2)
+            self.assertEqual(loaded.layer_retry_count, 1)
+            self.assertTrue(torch.equal(loaded.hidden, second.hidden))
+            with self.assertRaisesRegex(draft_verify.CliError, "another run"):
+                draft_verify._load_resume(
+                    path,
+                    "0" * 64,
+                    expected_shape=(1, 3, 1, 2),
+                    expected_dtype="bfloat16",
+                    n_layers=43,
+                )
+            self.assertTrue(draft_verify._clear_resume(path))
+            self.assertFalse(path.exists())
+
+    def test_resume_disk_preflight_fails_before_the_layer_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args = draft_verify._parser().parse_args(
+                [
+                    "--run-dir",
+                    raw,
+                    "--cache-dir",
+                    str(root / "cache"),
+                    "--no-cache",
+                ]
+            )
+            path = draft_verify._resume_path(args)
+            with (
+                mock.patch.object(
+                    draft_verify.shutil,
+                    "disk_usage",
+                    return_value=SimpleNamespace(free=1),
+                ),
+                self.assertRaisesRegex(draft_verify.CliError, "insufficient free disk"),
+            ):
+                draft_verify._preflight_resume_disk(
+                    args,
+                    path,
+                    hidden_bytes=1024,
+                    current_cache_bytes=0,
+                )
+
+            enough = 1024**3
+            with mock.patch.object(
+                draft_verify.shutil,
+                "disk_usage",
+                return_value=SimpleNamespace(free=enough),
+            ):
+                result = draft_verify._preflight_resume_disk(
+                    args,
+                    path,
+                    hidden_bytes=1024,
+                    current_cache_bytes=0,
+                )
+            self.assertLess(result["required_bytes"], enough)
+
     def test_draft_only_writes_result_without_constructing_local_runtime(self) -> None:
         item = draft_verify.SelectedItem("a", "A", "2", "pa", (4,))
         draft = {
@@ -360,8 +480,18 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
             self.assertEqual(json.loads(result_path.read_text()), result)
 
     def test_fake_runtime_verifier_boundary_is_one_right_padded_pass(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
         args = draft_verify._parser().parse_args(
-            ["--max-draft-tokens", "12", "--head-block-rows", "64"]
+            [
+                "--max-draft-tokens",
+                "12",
+                "--head-block-rows",
+                "64",
+                "--run-dir",
+                temporary.name,
+                "--no-cache",
+            ]
         )
         items = (
             draft_verify.SelectedItem("a", "A", "1", "pa", (4, 5, 6)),
@@ -372,7 +502,14 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
             {"token_ids": [11]},
         )
         calls = []
-        fake_model = object()
+        fake_model = SimpleNamespace(
+            config=SimpleNamespace(hc_mult=1, dim=2, n_layers=43),
+            pager=SimpleNamespace(
+                compute_dtype=torch.bfloat16,
+                device=torch.device("cpu"),
+                source=SimpleNamespace(metrics=lambda: {"cache_bytes": 0}),
+            ),
+        )
         sentinel = object()
 
         @contextmanager
@@ -410,6 +547,8 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
         self.assertEqual(kwargs["padding_token_id"], 1)
         self.assertEqual(kwargs["max_draft_tokens"], 12)
         self.assertEqual(kwargs["head_block_rows"], 64)
+        self.assertIsNone(kwargs["resume_state"])
+        self.assertTrue(callable(kwargs["checkpoint"]))
         self.assertTrue(callable(kwargs["progress"]))
         self.assertTrue(callable(kwargs["head_progress"]))
         progress.assert_any_call("local_layer_complete", layer=1, layers=43)

@@ -57,11 +57,9 @@ class _AdjacentHeadSource:
         columns: int = 4,
         dtype: str = "BF16",
     ) -> None:
-        values = (
-            np.arange(vocab * columns, dtype=np.float32).reshape(vocab, columns)
-            / np.float32(16.0)
-            - np.float32(0.75)
-        )
+        values = np.arange(vocab * columns, dtype=np.float32).reshape(
+            vocab, columns
+        ) / np.float32(16.0) - np.float32(0.75)
         words = (values.view(np.uint32) >> 16).astype("<u2")
         self.payload = words.tobytes()
         decoded_words = np.frombuffer(self.payload, dtype="<u2").astype(np.uint32)
@@ -71,9 +69,7 @@ class _AdjacentHeadSource:
         self.data_start = 16
         self.shard = "head.safetensors"
         self.row_calls: list[tuple[str, int, int]] = []
-        self.batch_calls: list[
-            tuple[str, tuple[tuple[int, int], ...], int, int]
-        ] = []
+        self.batch_calls: list[tuple[str, tuple[tuple[int, int], ...], int, int]] = []
         self.envelopes: list[tuple[int, int]] = []
 
     def find(self, name: str) -> dict:
@@ -88,9 +84,7 @@ class _AdjacentHeadSource:
             "offset_in_shard": [0, len(self.payload)],
         }
 
-    def rows(
-        self, name: str, start_row: int = 0, n_rows: int = 8, **_
-    ) -> np.ndarray:
+    def rows(self, name: str, start_row: int = 0, n_rows: int = 8, **_) -> np.ndarray:
         self.row_calls.append((name, start_row, n_rows))
         return self.data[start_row : start_row + n_rows].copy()
 
@@ -105,9 +99,7 @@ class _AdjacentHeadSource:
         from immer.knowledge.streamer import RawBytesManyResult
 
         requested = tuple((int(offset), int(length)) for offset, length in ranges)
-        self.batch_calls.append(
-            (shard, requested, resident_limit_bytes, max_gap_bytes)
-        )
+        self.batch_calls.append((shard, requested, resident_limit_bytes, max_gap_bytes))
         if shard != self.shard or max_gap_bytes != 0:
             raise ValueError("invalid exact head request")
         ordered = sorted(enumerate(requested), key=lambda item: item[1][0])
@@ -131,9 +123,7 @@ class _AdjacentHeadSource:
             owner_view = memoryview(owner)
             for original in members:
                 offset, length = requested[original]
-                parts[original] = owner_view[
-                    offset - begin : offset - begin + length
-                ]
+                parts[original] = owner_view[offset - begin : offset - begin + length]
         if any(part is None for part in parts):
             raise AssertionError("head fixture omitted a range")
         return RawBytesManyResult(
@@ -145,9 +135,7 @@ class _AdjacentHeadSource:
 
     def metrics(self) -> dict:
         return {
-            "network_or_source_body_bytes": sum(
-                length for _, length in self.envelopes
-            )
+            "network_or_source_body_bytes": sum(length for _, length in self.envelopes)
         }
 
 
@@ -316,13 +304,9 @@ class _AdjacentBatchExpertSource:
         self.tensor_calls: list[str] = []
         self.meta: dict[str, dict] = {}
         self.data: dict[str, np.ndarray] = {}
-        children = [
-            _EncodedExpertSource(base, "fp4", adjacent=True) for base in bases
-        ]
+        children = [_EncodedExpertSource(base, "fp4", adjacent=True) for base in bases]
         self.data.update(
-            (name, value)
-            for child in children
-            for name, value in child.data.items()
+            (name, value) for child in children for name, value in child.data.items()
         )
 
         payload = bytearray()
@@ -343,9 +327,7 @@ class _AdjacentBatchExpertSource:
                 payload.extend(child.payload[group_begin:group_end])
                 for name in names:
                     record = dict(child.meta[name])
-                    begin, end = (
-                        int(value) for value in record["offset_in_shard"]
-                    )
+                    begin, end = (int(value) for value in record["offset_in_shard"])
                     record["shard"] = self.shard_name
                     record["data_start"] = self.data_start
                     record["offset_in_shard"] = [
@@ -362,9 +344,7 @@ class _AdjacentBatchExpertSource:
                 begin = min(
                     int(self.meta[name]["offset_in_shard"][0]) for name in names
                 )
-                end = max(
-                    int(self.meta[name]["offset_in_shard"][1]) for name in names
-                )
+                end = max(int(self.meta[name]["offset_in_shard"][1]) for name in names)
                 layouts.append((self.data_start + begin, end - begin))
             self.plan_ranges[base] = tuple(layouts)
 
@@ -770,9 +750,7 @@ class DeepSeekV4PagerTests(unittest.TestCase):
 
         q3 = DeepSeekWeightPager(source, device="cpu", compute_dtype="float32")
         self.assertEqual(q3.expert_prefetch_policy, "exact-router-window-q3-a2/v2")
-        self.assertEqual(
-            q3.expert_prefetch_transport_policy, "streamer-exact-range/v1"
-        )
+        self.assertEqual(q3.expert_prefetch_transport_policy, "streamer-exact-range/v1")
 
         adjacent = DeepSeekWeightPager(
             source,
@@ -980,9 +958,7 @@ class DeepSeekV4PagerTests(unittest.TestCase):
                 if kwargs.get("detached"):
                     callback_finished.set()
 
-        with mock.patch.object(
-            pager, "_finish_cancelled_prefetch", side_effect=finish
-        ):
+        with mock.patch.object(pager, "_finish_cancelled_prefetch", side_effect=finish):
             window = pager.prefetch_expert_window(bases)
             assert window is not None
             self.assertTrue(source.started[pair].wait(timeout=2))
@@ -1174,6 +1150,47 @@ class DeepSeekV4PagerTests(unittest.TestCase):
             future.result(timeout=2)
         self.assertFalse(pager.metrics()["expert_prefetch_draining"])
         pager.release()
+
+    def test_release_stays_fast_but_close_joins_draining_prefetch(self) -> None:
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        bases = [f"layers.0.ffn.experts.{value}" for value in range(2)]
+        source = _WindowExpertSource(bases)
+        source.fail.add(bases[0])
+        pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="bfloat16")
+        window = pager.prefetch_expert_window(bases)
+        assert window is not None
+        self.assertTrue(source.started[bases[0]].wait(timeout=2))
+        self.assertTrue(source.started[bases[1]].wait(timeout=2))
+        source.release[bases[0]].set()
+        with self.assertRaisesRegex(RuntimeError, "simulated read failure"):
+            pager.consume_expert_window(window, bases[0])
+        self.assertEqual(len(pager._draining_prefetch), 1)
+        executor = pager._draining_executor
+        self.assertIsNotNone(executor)
+
+        layer_released = threading.Event()
+        layer_release = threading.Thread(
+            target=lambda: (pager.release(), layer_released.set())
+        )
+        layer_release.start()
+        self.assertTrue(layer_released.wait(timeout=1))
+        layer_release.join(timeout=1)
+        self.assertFalse(layer_release.is_alive())
+        self.assertIs(pager._draining_executor, executor)
+
+        closed = threading.Event()
+        final_close = threading.Thread(target=lambda: (pager.close(), closed.set()))
+        final_close.start()
+        self.assertFalse(closed.wait(timeout=0.1))
+        source.release[bases[1]].set()
+        self.assertTrue(closed.wait(timeout=2))
+        final_close.join(timeout=1)
+        self.assertFalse(final_close.is_alive())
+        self.assertFalse(pager._draining_prefetch)
+        self.assertIsNone(pager._draining_executor)
+        assert executor is not None
+        self.assertTrue(all(not thread.is_alive() for thread in executor._threads))
 
     def test_single_prefetch_compatibility_avoids_second_read(self) -> None:
         import torch
@@ -1610,9 +1627,7 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         scalar_blocks: list[tuple[int, str]] = []
 
         def observe_scalar(start: int, logits) -> None:
-            digest = hashlib.sha256(
-                logits.detach().cpu().numpy().tobytes()
-            ).hexdigest()
+            digest = hashlib.sha256(logits.detach().cpu().numpy().tobytes()).hexdigest()
             scalar_blocks.append((start, digest))
 
         expected_values, expected_ids = scalar.topk_logits(
@@ -1629,9 +1644,7 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         batch_blocks: list[tuple[int, str]] = []
 
         def observe_batch(start: int, logits) -> None:
-            digest = hashlib.sha256(
-                logits.detach().cpu().numpy().tobytes()
-            ).hexdigest()
+            digest = hashlib.sha256(logits.detach().cpu().numpy().tobytes()).hexdigest()
             batch_blocks.append((start, digest))
 
         actual_values, actual_ids = batched.topk_logits(
@@ -1646,9 +1659,9 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         self.assertTrue(torch.equal(actual_ids, expected_ids))
         self.assertEqual(batch_blocks, scalar_blocks)
         self.assertEqual([start for start, _ in batch_blocks], list(range(8)))
-        self.assertEqual(scalar_source.row_calls, [
-            ("head.weight", row, 1) for row in range(8)
-        ])
+        self.assertEqual(
+            scalar_source.row_calls, [("head.weight", row, 1) for row in range(8)]
+        )
         self.assertEqual(batch_source.row_calls, [])
         self.assertEqual(len(batch_source.batch_calls), 1)
         shard, ranges, resident_limit, max_gap = batch_source.batch_calls[0]
@@ -1725,8 +1738,12 @@ class DeepSeekV4PagerTests(unittest.TestCase):
 
         self.assertEqual(
             source.row_calls,
-            [("head.weight", 0, 2), ("head.weight", 2, 2),
-             ("head.weight", 4, 2), ("head.weight", 6, 2)],
+            [
+                ("head.weight", 0, 2),
+                ("head.weight", 2, 2),
+                ("head.weight", 4, 2),
+                ("head.weight", 6, 2),
+            ],
         )
         self.assertEqual(source.batch_calls, [])
         metrics = pager.metrics()
@@ -1757,9 +1774,7 @@ class DeepSeekV4PagerTests(unittest.TestCase):
             [("head.weight", 0, 2), ("head.weight", 2, 2)],
         )
         self.assertEqual(missing_pager.metrics()["head_transport_fallbacks"], 1)
-        self.assertEqual(
-            missing_pager.metrics()["head_transport_fallback_leaves"], 2
-        )
+        self.assertEqual(missing_pager.metrics()["head_transport_fallback_leaves"], 2)
 
         unsupported = _AdjacentHeadSource(vocab=4, dtype="I8")
         unsupported_pager = DeepSeekWeightPager(

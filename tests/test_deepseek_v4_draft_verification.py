@@ -230,11 +230,15 @@ class DeepSeekV4DraftVerificationTests(unittest.TestCase):
         self.assertTrue(eos_only.eos_verified)
         self.assertTrue(eos_only.fully_verified)
 
-        wrong_prefix = LayerwiseDraftVerifier(_FakeModel((9, 3, 7))).verify(
-            [[1]],
-            [[2, 3]],
-            eos_token_id=7,
-        ).rows[0]
+        wrong_prefix = (
+            LayerwiseDraftVerifier(_FakeModel((9, 3, 7)))
+            .verify(
+                [[1]],
+                [[2, 3]],
+                eos_token_id=7,
+            )
+            .rows[0]
+        )
         self.assertEqual(wrong_prefix.accepted_prefix_length, 0)
         self.assertIsNone(wrong_prefix.eos_verified)
         self.assertFalse(wrong_prefix.fully_verified)
@@ -288,6 +292,54 @@ class DeepSeekV4DraftVerificationTests(unittest.TestCase):
         self.assertTrue(torch.equal(model.attempts[0][1], model.attempts[1][1]))
         self.assertTrue(torch.equal(model.attempts[0][2], model.attempts[1][2]))
         self.assertGreaterEqual(model.pager.releases, 4)
+
+    def test_one_rolling_state_resumes_at_the_next_layer_and_keeps_accounting(self):
+        from immer.runtimes.deepseek_v4.draft_verification import (
+            DraftVerificationResumeState,
+            LayerwiseDraftVerifier,
+        )
+
+        class StopAfterCheckpoint(RuntimeError):
+            pass
+
+        captured = []
+
+        def stop(state):
+            captured.append(state)
+            raise StopAfterCheckpoint
+
+        first = _FakeModel((2, 3))
+        with self.assertRaises(StopAfterCheckpoint):
+            LayerwiseDraftVerifier(first).verify(
+                [[1]],
+                [[2, 3]],
+                checkpoint=stop,
+            )
+        self.assertEqual(len(captured), 1)
+        state = captured[0]
+        self.assertIsInstance(state, DraftVerificationResumeState)
+        self.assertEqual(state.next_layer, 1)
+        self.assertEqual(state.layer_calls, 1)
+        self.assertEqual(state.source_body_bytes, 10)
+        self.assertEqual(state.linear_calls, 2)
+
+        resumed = _FakeModel((2, 3))
+        checkpoints = []
+        progress = []
+        report = LayerwiseDraftVerifier(resumed).verify(
+            [[1]],
+            [[2, 3]],
+            resume_state=state,
+            checkpoint=checkpoints.append,
+            progress=progress.append,
+        )
+        self.assertTrue(report.all_verified)
+        self.assertEqual([row[0] for row in resumed.layer_calls], [1])
+        self.assertEqual(report.evidence.layer_calls, 2)
+        self.assertEqual(report.evidence.source_body_bytes, 25)
+        self.assertEqual(report.evidence.linear_calls, 5)
+        self.assertEqual(checkpoints[-1].next_layer, 2)
+        self.assertEqual(progress[0]["event"], "resume_loaded")
 
     def test_retries_transient_head_failure_but_not_deterministic_layer_error(self):
         from immer.runtimes.deepseek_v4.draft_verification import (
@@ -364,6 +416,10 @@ class DeepSeekV4DraftVerificationTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "progress"):
             LayerwiseDraftVerifier(_FakeModel((2,))).verify(
                 [[1]], [[2]], progress=object()
+            )
+        with self.assertRaisesRegex(TypeError, "checkpoint"):
+            LayerwiseDraftVerifier(_FakeModel((2,))).verify(
+                [[1]], [[2]], checkpoint=object()
             )
 
     def test_accepts_integer_numpy_and_tensor_rows(self):

@@ -185,9 +185,7 @@ class DeepSeekWeightPager:
     QUANTIZED_ACCUMULATION_POLICY = "mx-block-scaled-fp32/v1"
     EXPERT_PREFETCH_POLICY = "exact-router-window-q3-a2/v2"
     EXPERT_PREFETCH_TRANSPORT_POLICY = "streamer-exact-range/v1"
-    EXPERT_PREFETCH_ADJACENT_POLICY = (
-        "exact-router-window-q3-a2-adjacent-pairs/v3"
-    )
+    EXPERT_PREFETCH_ADJACENT_POLICY = "exact-router-window-q3-a2-adjacent-pairs/v3"
     EXPERT_PREFETCH_ADJACENT_TRANSPORT_POLICY = (
         "streamer-exact-leaf-adjacent-envelope/v2"
     )
@@ -260,9 +258,7 @@ class DeepSeekWeightPager:
             raise ValueError(
                 "expert_range_coalesce_max_experts must be an integer in [1, 2]"
             )
-        self.expert_range_coalesce_max_experts = (
-            expert_range_coalesce_max_experts
-        )
+        self.expert_range_coalesce_max_experts = expert_range_coalesce_max_experts
         self._stats = PagerMetrics()
         self._prefetch_lock = threading.Lock()
         self._prefetch_executor: ThreadPoolExecutor | None = None
@@ -497,10 +493,7 @@ class DeepSeekWeightPager:
                 )
             tensors.append(
                 _CoalescedTensor(
-                    name=(
-                        f"{name}[{leaf.start_row}:"
-                        f"{leaf.start_row + leaf.count}]"
-                    ),
+                    name=(f"{name}[{leaf.start_row}:{leaf.start_row + leaf.count}]"),
                     dtype=dtype,
                     shape=(leaf.count, columns),
                     logical_bytes=leaf.length,
@@ -687,15 +680,11 @@ class DeepSeekWeightPager:
                     callable(raw_bytes_many)
                     and self.expert_range_coalesce_max_experts >= 2
                     and index + 1 < len(chunk)
-                    and self._plans_are_exactly_adjacent(
-                        chunk[index], chunk[index + 1]
-                    )
+                    and self._plans_are_exactly_adjacent(chunk[index], chunk[index + 1])
                 ):
                     width = 2
                 experts = chunk[index : index + width]
-                requests_avoided = (
-                    len(experts[0].layouts) if len(experts) == 2 else 0
-                )
+                requests_avoided = len(experts[0].layouts) if len(experts) == 2 else 0
                 plan = _ExpertBatchPlan(
                     experts=experts,
                     payload_bytes=sum(expert.payload_bytes for expert in experts),
@@ -711,9 +700,7 @@ class DeepSeekWeightPager:
                 index += width
         return tuple(batches)
 
-    def _read_expert_batch(
-        self, plan: _ExpertBatchPlan
-    ) -> _CoalescedExpertBatch:
+    def _read_expert_batch(self, plan: _ExpertBatchPlan) -> _CoalescedExpertBatch:
         """Read one or two planned experts through exact leaf-cache keys."""
 
         raw_bytes_many = getattr(self.source, "raw_bytes_many", None)
@@ -874,7 +861,7 @@ class DeepSeekWeightPager:
         if not self.expert_prefetch_enabled:
             return None
         with self._prefetch_lock:
-            if self._draining_prefetch:
+            if self._draining_prefetch or self._draining_executor is not None:
                 self._stats.expert_prefetch_sync_fallbacks += 1
                 return None
             if self._active_prefetch_window is not None:
@@ -895,9 +882,7 @@ class DeepSeekWeightPager:
         ) or any(
             sum(
                 plan.payload_bytes
-                for plan in plans[
-                    start : start + self.EXPERT_PREFETCH_MAX_EXPERTS
-                ]
+                for plan in plans[start : start + self.EXPERT_PREFETCH_MAX_EXPERTS]
             )
             > self.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
             for start in range(len(plans))
@@ -918,9 +903,7 @@ class DeepSeekWeightPager:
             executor=executor,
         )
         batch_by_base = {
-            expert.base: batch
-            for batch in batches
-            for expert in batch.plan.experts
+            expert.base: batch for batch in batches for expert in batch.plan.experts
         }
         tickets = tuple(
             _ExpertPrefetch(
@@ -934,25 +917,29 @@ class DeepSeekWeightPager:
             for index, plan in enumerate(frozen_plans)
         )
         window.tickets = tickets
+        declined = False
         try:
             with self._prefetch_lock:
-                if self._draining_prefetch:
+                if self._draining_prefetch or self._draining_executor is not None:
                     self._stats.expert_prefetch_sync_fallbacks += 1
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    return None
-                if self._active_prefetch_window is not None:
+                    declined = True
+                elif self._active_prefetch_window is not None:
                     raise DeepSeekPagerError("expert prefetch window is already active")
-                self._prefetch_executor = executor
-                self._active_prefetch_window = window
-                self._submit_window_reads_locked(window)
+                else:
+                    self._prefetch_executor = executor
+                    self._active_prefetch_window = window
+                    self._submit_window_reads_locked(window)
         except BaseException:
             with self._prefetch_lock:
                 if self._active_prefetch_window is window:
                     self._active_prefetch_window = None
                 if self._prefetch_executor is executor:
                     self._prefetch_executor = None
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
             raise
+        if declined:
+            executor.shutdown(wait=True, cancel_futures=True)
+            return None
         return window
 
     def consume_expert_window(
@@ -1037,9 +1024,7 @@ class DeepSeekWeightPager:
         batch.metrics_accounted = True
         self._stats.expert_transport_envelopes += result.source_requests
         self._stats.expert_transport_source_bytes += result.source_bytes
-        self._stats.expert_range_requests_avoided += (
-            batch.plan.range_requests_avoided
-        )
+        self._stats.expert_range_requests_avoided += batch.plan.range_requests_avoided
 
     def close_expert_window(
         self, window: _ExpertPrefetchWindow, *, cancel: bool = False
@@ -1070,13 +1055,11 @@ class DeepSeekWeightPager:
             if self._prefetch_executor is executor:
                 self._prefetch_executor = None
         if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
 
     def _cancel_expert_window(self, window: _ExpertPrefetchWindow) -> None:
         done: list[tuple[Future[_CoalescedExpertBatch], _ExpertPrefetchBatch]] = []
-        draining: list[
-            tuple[Future[_CoalescedExpertBatch], _ExpertPrefetchBatch]
-        ] = []
+        draining: list[tuple[Future[_CoalescedExpertBatch], _ExpertPrefetchBatch]] = []
         with self._prefetch_lock:
             if window is not self._active_prefetch_window or window.closed:
                 raise DeepSeekPagerError("expert prefetch window is stale or closed")
@@ -1116,7 +1099,7 @@ class DeepSeekWeightPager:
             if draining:
                 self._draining_executor = executor
         if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=not draining, cancel_futures=True)
         for future, batch in done:
             self._finish_cancelled_prefetch(future, batch, detached=False)
         for future, batch in draining:
@@ -1144,8 +1127,9 @@ class DeepSeekWeightPager:
                 self._account_expert_batch_result_locked(batch, result)
             if detached:
                 self._draining_prefetch.discard(future)
-            if not self._draining_prefetch:
-                self._draining_executor = None
+            # Keep ownership of the shut-down executor after its final future
+            # completes.  A layer release can reap it once that is immediate;
+            # terminal close must join it before the TensorSource may close.
 
     # Compatibility adapter for the standalone transport smoke and external
     # callers written against exact-router-one-ahead/v1.
@@ -1173,7 +1157,7 @@ class DeepSeekWeightPager:
             if self._prefetch_executor is executor:
                 self._prefetch_executor = None
         if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
         return payload
 
     def cancel_expert_prefetch(self, ticket: _ExpertPrefetch) -> None:
@@ -2064,18 +2048,14 @@ class DeepSeekWeightPager:
         if transport_range_batch_blocks == 1:
             for start, count in logical_leaves:
                 with self._priority_scope(name, 1):
-                    rows = self.source.rows(
-                        name, start_row=start, n_rows=count
-                    )
+                    rows = self.source.rows(name, start_row=start, n_rows=count)
                 consume_block(start, count, rows)
         elif head_layout is None:
             self._stats.head_transport_fallbacks += 1
             self._stats.head_transport_fallback_leaves += len(logical_leaves)
             for start, count in logical_leaves:
                 with self._priority_scope(name, 1):
-                    rows = self.source.rows(
-                        name, start_row=start, n_rows=count
-                    )
+                    rows = self.source.rows(name, start_row=start, n_rows=count)
                 consume_block(start, count, rows)
         else:
             shard, dtype, columns, leaves = head_layout
@@ -2097,7 +2077,9 @@ class DeepSeekWeightPager:
 
                 stop = index
                 resident_bytes = 0
-                while stop < len(leaves) and stop - index < transport_range_batch_blocks:
+                while (
+                    stop < len(leaves) and stop - index < transport_range_batch_blocks
+                ):
                     candidate_bytes = resident_bytes + leaves[stop].length
                     if candidate_bytes > self.HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES:
                         break
@@ -2133,11 +2115,55 @@ class DeepSeekWeightPager:
                 )
             executor = self._prefetch_executor
             self._prefetch_executor = None
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
+            # Failed reads deliberately drain in the background so one bad
+            # speculative fetch does not stall the current layer.  Reap its
+            # executor here only when every future has already retired.
+            draining_executor = (
+                None if self._draining_prefetch else self._draining_executor
+            )
+            if draining_executor is not None:
+                self._draining_executor = None
+        executors = {owned for owned in (executor, draining_executor) if owned}
+        for owned in executors:
+            owned.shutdown(wait=True, cancel_futures=True)
         gc.collect()
         self._stats.release_boundaries += 1
         self._purge_mps_cache()
+
+    def close(self) -> None:
+        """Terminally drain prefetch I/O before closing the tensor source.
+
+        Unlike :meth:`release`, this method may wait for a cancelled HTTP read.
+        Every future and its executor are joined outside ``_prefetch_lock`` so
+        source teardown cannot race a worker or deadlock its completion callback.
+        """
+
+        with self._prefetch_lock:
+            window = self._active_prefetch_window
+        if window is not None:
+            self._cancel_expert_window(window)
+
+        while True:
+            with self._prefetch_lock:
+                futures = tuple(self._draining_prefetch)
+                executor = self._draining_executor
+                if not futures and executor is None:
+                    break
+            for future in futures:
+                try:
+                    future.result()
+                except BaseException:
+                    pass
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+            with self._prefetch_lock:
+                for future in futures:
+                    if future.done():
+                        self._draining_prefetch.discard(future)
+                if self._draining_executor is executor:
+                    self._draining_executor = None
+
+        self.release()
 
     def metrics(self) -> dict[str, Any]:
         source_metrics = self.source.metrics()
@@ -2160,9 +2186,7 @@ class DeepSeekWeightPager:
             ),
             "head_transport_max_gap_bytes": self.HEAD_TRANSPORT_MAX_GAP_BYTES,
             "expert_prefetch_policy": self.expert_prefetch_policy,
-            "expert_prefetch_transport_policy": (
-                self.expert_prefetch_transport_policy
-            ),
+            "expert_prefetch_transport_policy": (self.expert_prefetch_transport_policy),
             "expert_prefetch_payload_limit_bytes": (
                 self.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
             ),

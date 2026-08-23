@@ -13,11 +13,13 @@ import argparse
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -32,7 +34,10 @@ from immer.runtimes.deepseek_v4 import (
     StreamedDeepSeekV4,
 )
 from immer.runtimes.deepseek_v4.benchmark import extract_gsm8k_answer
-from immer.runtimes.deepseek_v4.draft_verification import LayerwiseDraftVerifier
+from immer.runtimes.deepseek_v4.draft_verification import (
+    DraftVerificationResumeState,
+    LayerwiseDraftVerifier,
+)
 from immer.runtimes.deepseek_v4.encoding import encode_user_prompt
 from immer.runtimes.deepseek_v4.stable_graft import DeepSeekV4StableCrsaGraft
 
@@ -53,6 +58,7 @@ DEFAULT_RUN_DIR = ROOT / "artifacts" / "private" / "deepseek-v4-fertig-draft-ver
 DEFAULT_CACHE = ROOT / "artifacts" / "private" / "deepseek-v4-cache"
 DRAFT_SCHEMA = "immer.deepseek-v4-fertig-drafts/v1"
 RESULT_SCHEMA = "immer.deepseek-v4-fertig-draft-verification/v1"
+RESUME_SCHEMA = "immer.deepseek-v4-fertig-draft-resume/v1"
 FIXED_ITEM_IDS = (
     "gsm8k-test-0737-b673ac26d1268186",
     "gsm8k-test-0815-13fae6ff992c2157",
@@ -152,6 +158,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-dir", default=str(DEFAULT_RUN_DIR))
     parser.add_argument("--drafts-json")
     parser.add_argument("--result-json")
+    parser.add_argument("--resume-file")
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="discard the one rolling layer resume file before local verification",
+    )
     parser.add_argument("--refresh-drafts", action="store_true")
     parser.add_argument(
         "--draft-only",
@@ -164,7 +176,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-retries", type=_nonnegative_int, default=4)
     parser.add_argument("--max-draft-tokens", type=_positive_int, default=128)
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE))
-    parser.add_argument("--cache-budget-gb", type=_nonnegative_float, default=12.0)
+    parser.add_argument("--cache-budget-gb", type=_nonnegative_float, default=6.0)
     parser.add_argument("--source-budget-mb", type=_positive_int, default=196608)
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--device", choices=("auto", "cpu", "mps"), default="mps")
@@ -218,6 +230,237 @@ def _atomic_write_json(path: str | Path, document: Mapping[str, Any]) -> None:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _resume_path(args: argparse.Namespace) -> Path:
+    if args.resume_file:
+        return Path(args.resume_file).expanduser().resolve()
+    run_dir = Path(args.run_dir).expanduser().resolve()
+    return run_dir / f"resume-{args.mode}.safetensors"
+
+
+def _resume_identity(
+    args: argparse.Namespace,
+    prompts: Sequence[Sequence[int]],
+    drafts: Sequence[Sequence[int]],
+    *,
+    resolved_device: str,
+    resolved_dtype: str,
+) -> str:
+    payload = {
+        "schema": RESUME_SCHEMA,
+        "checkpoint": OFFICIAL_SOURCE,
+        "revision": OFFICIAL_REVISION,
+        "prompt_token_ids": [list(row) for row in prompts],
+        "draft_token_ids": [list(row) for row in drafts],
+        "eos_token_id": EOS_TOKEN_ID,
+        "padding_token_id": EOS_TOKEN_ID,
+        "device": resolved_device,
+        "dtype": resolved_dtype,
+        "activation_quantization": not args.no_activation_quantization,
+        "mode": args.mode,
+        "graft_layer": args.graft_layer if args.mode == "stable-crsa" else None,
+        "graft_alpha": args.graft_alpha if args.mode == "stable-crsa" else None,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _clear_resume(path: Path) -> bool:
+    if path.is_symlink():
+        raise CliError(f"resume path must not be a symlink: {path}")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise CliError(f"cannot remove rolling resume file: {path}") from exc
+    return True
+
+
+def _write_resume(
+    path: Path,
+    identity: str,
+    state: DraftVerificationResumeState,
+) -> None:
+    try:
+        from safetensors.torch import save_file
+    except ImportError as exc:
+        raise CliError("rolling resume requires safetensors") from exc
+
+    destination = path.expanduser().resolve()
+    if destination.is_symlink():
+        raise CliError(f"resume path must not be a symlink: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    hidden = state.hidden.detach().to(device="cpu").contiguous()
+    metadata = {
+        "schema": RESUME_SCHEMA,
+        "identity": identity,
+        "next_layer": str(state.next_layer),
+        "layer_calls": str(state.layer_calls),
+        "layer_retry_count": str(state.layer_retry_count),
+        "source_body_bytes": str(state.source_body_bytes),
+        "linear_calls": str(state.linear_calls),
+        "seconds": repr(float(state.seconds)),
+        "graft_applied": "1" if state.graft_applied else "0",
+        "dtype": str(hidden.dtype).removeprefix("torch."),
+    }
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".pending",
+        dir=destination.parent,
+    )
+    os.close(descriptor)
+    try:
+        save_file({"hidden": hidden}, temporary, metadata=metadata)
+        with open(temporary, "rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except Exception as exc:
+        raise CliError("cannot write rolling layer resume file") from exc
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _resume_int(metadata: Mapping[str, str], name: str) -> int:
+    raw = metadata.get(name)
+    try:
+        value = int(raw) if raw is not None else -1
+    except ValueError as exc:
+        raise CliError(f"resume metadata {name} is invalid") from exc
+    if value < 0:
+        raise CliError(f"resume metadata {name} is invalid")
+    return value
+
+
+def _resume_element_size(dtype: str) -> int:
+    element_size = {"bfloat16": 2, "float16": 2, "float32": 4}.get(dtype)
+    if element_size is None:
+        raise CliError(f"unsupported rolling resume dtype: {dtype}")
+    return element_size
+
+
+def _preflight_resume_disk(
+    args: argparse.Namespace,
+    resume_path: Path,
+    *,
+    hidden_bytes: int,
+    current_cache_bytes: int,
+) -> dict[str, int]:
+    resume_parent = resume_path.expanduser().resolve().parent
+    cache_root = Path(args.cache_dir).expanduser().resolve()
+    resume_parent.mkdir(parents=True, exist_ok=True)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    checkpoint_reserve = 2 * (hidden_bytes + 1024**2) + 512 * 1024**2
+    cache_limit = 0 if args.no_cache else int(args.cache_budget_gb * 1024**3)
+    cache_growth = max(0, cache_limit - current_cache_bytes)
+    resume_free = shutil.disk_usage(resume_parent).free
+    same_volume = os.stat(resume_parent).st_dev == os.stat(cache_root).st_dev
+    required = checkpoint_reserve + (cache_growth if same_volume else 0)
+    if resume_free < required:
+        raise CliError(
+            "insufficient free disk for rolling resume and bounded cache: "
+            f"need {required} bytes, have {resume_free}"
+        )
+    if not same_volume and cache_growth:
+        cache_free = shutil.disk_usage(cache_root).free
+        if cache_free < cache_growth:
+            raise CliError(
+                "insufficient free disk for bounded range cache: "
+                f"need {cache_growth} bytes, have {cache_free}"
+            )
+    return {
+        "free_bytes": resume_free,
+        "required_bytes": required,
+        "hidden_bytes": hidden_bytes,
+        "cache_growth_bytes": cache_growth,
+    }
+
+
+def _load_resume(
+    path: Path,
+    identity: str,
+    *,
+    expected_shape: Sequence[int],
+    expected_dtype: str,
+    n_layers: int,
+) -> DraftVerificationResumeState | None:
+    source = path.expanduser().resolve()
+    if not source.exists():
+        return None
+    if source.is_symlink() or not source.is_file():
+        raise CliError(f"resume path must be a regular file: {source}")
+    element_size = _resume_element_size(expected_dtype)
+    expected_bytes = math.prod(int(value) for value in expected_shape) * element_size
+    if source.stat().st_size > expected_bytes + 1024**2:
+        raise CliError("rolling resume file exceeds its hidden-state bound")
+    try:
+        from safetensors import safe_open
+
+        with safe_open(source, framework="pt", device="cpu") as handle:
+            if list(handle.keys()) != ["hidden"]:
+                raise CliError("rolling resume has unexpected tensors")
+            metadata = handle.metadata()
+            hidden = handle.get_tensor("hidden")
+    except CliError:
+        raise
+    except Exception as exc:
+        raise CliError("cannot decode rolling resume file; use --restart") from exc
+    required = {
+        "schema",
+        "identity",
+        "next_layer",
+        "layer_calls",
+        "layer_retry_count",
+        "source_body_bytes",
+        "linear_calls",
+        "seconds",
+        "graft_applied",
+        "dtype",
+    }
+    if (
+        not isinstance(metadata, dict)
+        or set(metadata) != required
+        or metadata.get("schema") != RESUME_SCHEMA
+    ):
+        raise CliError("rolling resume metadata schema is invalid")
+    if metadata.get("identity") != identity:
+        raise CliError("rolling resume belongs to another run; use --restart")
+    if tuple(hidden.shape) != tuple(int(value) for value in expected_shape):
+        raise CliError("rolling resume hidden shape is invalid")
+    observed_dtype = str(hidden.dtype).removeprefix("torch.")
+    if metadata.get("dtype") != observed_dtype or observed_dtype != expected_dtype:
+        raise CliError("rolling resume hidden dtype is invalid")
+    next_layer = _resume_int(metadata, "next_layer")
+    layer_calls = _resume_int(metadata, "layer_calls")
+    if not 1 <= next_layer <= n_layers or layer_calls != next_layer:
+        raise CliError("rolling resume layer boundary is invalid")
+    try:
+        seconds = float(metadata["seconds"])
+    except ValueError as exc:
+        raise CliError("rolling resume seconds are invalid") from exc
+    if not math.isfinite(seconds) or seconds < 0.0:
+        raise CliError("rolling resume seconds are invalid")
+    graft_raw = metadata.get("graft_applied")
+    if graft_raw not in {"0", "1"}:
+        raise CliError("rolling resume graft state is invalid")
+    return DraftVerificationResumeState(
+        next_layer=next_layer,
+        hidden=hidden,
+        layer_calls=layer_calls,
+        layer_retry_count=_resume_int(metadata, "layer_retry_count"),
+        source_body_bytes=_resume_int(metadata, "source_body_bytes"),
+        linear_calls=_resume_int(metadata, "linear_calls"),
+        seconds=seconds,
+        graft_applied=graft_raw == "1",
+    )
 
 
 def _selected_items(
@@ -684,17 +927,26 @@ def _model_runtime(args: argparse.Namespace, *, max_seq_len: int):
         )
         yield model
     finally:
+        active_error = sys.exc_info()[1]
+        cleanup_error: Exception | None = None
         if model is not None:
             try:
                 model.reset_state(release=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                cleanup_error = exc
         if pager is not None:
             try:
-                pager.release()
-            except Exception:
-                pass
-        source.close()
+                pager.close()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        try:
+            source.close()
+        except Exception as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        if active_error is None and cleanup_error is not None:
+            raise cleanup_error
 
 
 def _verify_locally(
@@ -711,6 +963,9 @@ def _verify_locally(
         len(prompt) + len(draft)
         for prompt, draft in zip(prompts, draft_ids, strict=True)
     )
+    resume_path = _resume_path(args)
+    if args.restart and _clear_resume(resume_path):
+        _progress("resume_discarded", path=str(resume_path))
     runtime = _model_runtime if runtime_factory is None else runtime_factory
     verifier_type = (
         LayerwiseDraftVerifier if verifier_factory is None else verifier_factory
@@ -727,6 +982,55 @@ def _verify_locally(
         _progress("head_progress", **fields)
 
     with runtime(args, max_seq_len=max_seq_len) as model:
+        expected_shape = (
+            len(prompts),
+            max_seq_len,
+            int(model.config.hc_mult),
+            int(model.config.dim),
+        )
+        resolved_device = str(model.pager.device)
+        expected_dtype = str(model.pager.compute_dtype).removeprefix("torch.")
+        resume_identity = _resume_identity(
+            args,
+            prompts,
+            draft_ids,
+            resolved_device=resolved_device,
+            resolved_dtype=expected_dtype,
+        )
+        raw_cache_bytes = model.pager.source.metrics().get("cache_bytes", 0)
+        current_cache_bytes = (
+            int(raw_cache_bytes)
+            if isinstance(raw_cache_bytes, (int, float))
+            and not isinstance(raw_cache_bytes, bool)
+            and raw_cache_bytes >= 0
+            else 0
+        )
+        hidden_bytes = math.prod(expected_shape) * _resume_element_size(expected_dtype)
+        disk = _preflight_resume_disk(
+            args,
+            resume_path,
+            hidden_bytes=hidden_bytes,
+            current_cache_bytes=current_cache_bytes,
+        )
+        _progress("resume_disk_preflight", **disk)
+        resume_state = _load_resume(
+            resume_path,
+            resume_identity,
+            expected_shape=expected_shape,
+            expected_dtype=expected_dtype,
+            n_layers=int(model.config.n_layers),
+        )
+        if resume_state is not None:
+            _progress(
+                "resume_reused",
+                path=str(resume_path),
+                next_layer=resume_state.next_layer,
+                layers=int(model.config.n_layers),
+            )
+
+        def checkpoint(state: DraftVerificationResumeState) -> None:
+            _write_resume(resume_path, resume_identity, state)
+
         verifier = verifier_type(model, layer_retries=args.layer_retries)
         return verifier.verify(
             prompts,
@@ -737,6 +1041,8 @@ def _verify_locally(
             head_block_rows=args.head_block_rows,
             progress=progress,
             head_progress=head_progress,
+            resume_state=resume_state,
+            checkpoint=checkpoint,
         )
 
 
@@ -897,6 +1203,19 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         result = _verification_result(args, items, drafts, tokenizer, report)
         _progress("local_verification_complete", **dict(result["summary"]))
     _atomic_write_json(result_path, result)
+    if not args.draft_only:
+        resume_path = _resume_path(args)
+        try:
+            removed = _clear_resume(resume_path)
+        except CliError as exc:
+            _progress(
+                "resume_cleanup_warning",
+                path=str(resume_path),
+                error=str(exc),
+            )
+        else:
+            if removed:
+                _progress("resume_removed", path=str(resume_path))
     return result, result_path
 
 

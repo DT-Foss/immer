@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
+import math
 import numbers
 import time
 from typing import Any
@@ -21,7 +22,7 @@ from typing import Any
 import torch
 
 
-DRAFT_VERIFICATION_SCHEMA = "immer.deepseek-v4-draft-verification/v1"
+DRAFT_VERIFICATION_SCHEMA = "immer.deepseek-v4-draft-verification/v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +91,20 @@ class DraftVerificationReport:
             "evidence": self.evidence.to_dict(),
             "all_verified": self.all_verified,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class DraftVerificationResumeState:
+    """One rolling hidden state from a completed decoder-layer boundary."""
+
+    next_layer: int
+    hidden: torch.Tensor
+    layer_calls: int
+    layer_retry_count: int
+    source_body_bytes: int
+    linear_calls: int
+    seconds: float
+    graft_applied: bool
 
 
 def _metric_int(owner: Any, key: str) -> int:
@@ -247,6 +262,8 @@ class LayerwiseDraftVerifier:
         head_block_rows: int = 1024,
         progress: Callable[[dict[str, Any]], None] | None = None,
         head_progress: Callable[[dict[str, int]], None] | None = None,
+        resume_state: DraftVerificationResumeState | None = None,
+        checkpoint: Callable[[DraftVerificationResumeState], None] | None = None,
     ) -> DraftVerificationReport:
         """Compare supplied drafts with exact greedy V4 next-token targets.
 
@@ -284,6 +301,8 @@ class LayerwiseDraftVerifier:
         block_rows = _positive_int(head_block_rows, "head_block_rows")
         if progress is not None and not callable(progress):
             raise TypeError("progress must be callable or None")
+        if checkpoint is not None and not callable(checkpoint):
+            raise TypeError("checkpoint must be callable or None")
 
         for row in prompts:
             if any(token < 0 or token >= vocab_size for token in row):
@@ -321,12 +340,74 @@ class LayerwiseDraftVerifier:
         start_bytes = _metric_int(source, "network_or_source_body_bytes")
         start_linears = _metric_int(self.model.pager, "linear_calls")
         started = time.perf_counter()
+        first_layer = 0
+        prior_source_bytes = 0
+        prior_linears = 0
+        prior_seconds = 0.0
         layer_calls = 0
         layer_retry_count = 0
         graft_applied = False
-        try:
+        expected_hidden_shape = (
+            batch,
+            padded_length,
+            int(self.model.config.hc_mult),
+            int(self.model.config.dim),
+        )
+        if resume_state is not None:
+            if not isinstance(resume_state, DraftVerificationResumeState):
+                raise TypeError("resume_state has the wrong type")
+            first_layer = resume_state.next_layer
+            if not 1 <= first_layer <= int(self.model.config.n_layers):
+                raise ValueError("resume next_layer is outside decoder boundaries")
+            if (
+                not isinstance(resume_state.hidden, torch.Tensor)
+                or tuple(resume_state.hidden.shape) != expected_hidden_shape
+                or not resume_state.hidden.is_floating_point()
+            ):
+                raise ValueError("resume hidden tensor has the wrong shape or dtype")
+            for name, value in (
+                ("layer_calls", resume_state.layer_calls),
+                ("layer_retry_count", resume_state.layer_retry_count),
+                ("source_body_bytes", resume_state.source_body_bytes),
+                ("linear_calls", resume_state.linear_calls),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(f"resume {name} must be a non-negative integer")
+            if resume_state.layer_calls != first_layer:
+                raise ValueError("resume layer_calls does not match next_layer")
+            if (
+                isinstance(resume_state.seconds, bool)
+                or not isinstance(resume_state.seconds, (int, float))
+                or not math.isfinite(float(resume_state.seconds))
+                or float(resume_state.seconds) < 0.0
+            ):
+                raise ValueError("resume seconds must be finite and non-negative")
+            expected_graft_applied = bool(
+                graft is not None
+                and graft_layer is not None
+                and first_layer > graft_layer
+            )
+            if bool(resume_state.graft_applied) != expected_graft_applied:
+                raise ValueError("resume graft state does not match the layer boundary")
+            hidden = resume_state.hidden
+            layer_calls = resume_state.layer_calls
+            layer_retry_count = resume_state.layer_retry_count
+            prior_source_bytes = resume_state.source_body_bytes
+            prior_linears = resume_state.linear_calls
+            prior_seconds = float(resume_state.seconds)
+            graft_applied = bool(resume_state.graft_applied)
+            if progress is not None:
+                progress(
+                    {
+                        "event": "resume_loaded",
+                        "next_layer": first_layer,
+                        "layers": int(self.model.config.n_layers),
+                    }
+                )
+        else:
             hidden = self.model.embed_batch(ids)
-            for layer in range(int(self.model.config.n_layers)):
+        try:
+            for layer in range(first_layer, int(self.model.config.n_layers)):
                 retries = 0
                 while True:
                     try:
@@ -339,10 +420,7 @@ class LayerwiseDraftVerifier:
                         break
                     except Exception as exc:
                         self.model.pager.release()
-                        if (
-                            not _transient_failure(exc)
-                            or retries >= self.layer_retries
-                        ):
+                        if not _transient_failure(exc) or retries >= self.layer_retries:
                             raise
                         retries += 1
                         if progress is not None:
@@ -363,16 +441,27 @@ class LayerwiseDraftVerifier:
                     hidden = grafted[0] if isinstance(grafted, tuple) else grafted
                     if not isinstance(hidden, torch.Tensor):
                         raise TypeError("graft.forward() must return a torch tensor")
-                    expected_shape = (
-                        batch,
-                        padded_length,
-                        int(self.model.config.hc_mult),
-                        int(self.model.config.dim),
-                    )
-                    if tuple(hidden.shape) != expected_shape:
+                    if tuple(hidden.shape) != expected_hidden_shape:
                         raise ValueError("graft changed the padded hidden shape")
                     graft_applied = True
                 self.model.pager.release()
+                if checkpoint is not None:
+                    checkpoint(
+                        DraftVerificationResumeState(
+                            next_layer=layer + 1,
+                            hidden=hidden,
+                            layer_calls=layer_calls,
+                            layer_retry_count=layer_retry_count,
+                            source_body_bytes=prior_source_bytes
+                            + _metric_int(source, "network_or_source_body_bytes")
+                            - start_bytes,
+                            linear_calls=prior_linears
+                            + _metric_int(self.model.pager, "linear_calls")
+                            - start_linears,
+                            seconds=prior_seconds + time.perf_counter() - started,
+                            graft_applied=graft_applied,
+                        )
+                    )
                 if progress is not None:
                     progress(
                         {
@@ -409,10 +498,7 @@ class LayerwiseDraftVerifier:
                     break
                 except Exception as exc:
                     self.model.pager.release()
-                    if (
-                        not _transient_failure(exc)
-                        or head_retries >= self.head_retries
-                    ):
+                    if not _transient_failure(exc) or head_retries >= self.head_retries:
                         raise
                     head_retries += 1
                     if progress is not None:
@@ -456,8 +542,7 @@ class LayerwiseDraftVerifier:
             )
             eos_verified = (
                 None
-                if eos is None
-                or (mismatch is not None and mismatch < len(draft))
+                if eos is None or (mismatch is not None and mismatch < len(draft))
                 else target[-1] == eos
             )
             rows.append(
@@ -501,9 +586,9 @@ class LayerwiseDraftVerifier:
             layer_retry_count=layer_retry_count,
             head_scans=1,
             head_retry_count=head_retries,
-            source_body_bytes=end_bytes - start_bytes,
-            linear_calls=end_linears - start_linears,
-            seconds=time.perf_counter() - started,
+            source_body_bytes=prior_source_bytes + end_bytes - start_bytes,
+            linear_calls=prior_linears + end_linears - start_linears,
+            seconds=prior_seconds + time.perf_counter() - started,
             graft_mode=graft_mode,
             graft_layer=graft_layer,
             graft_applied=graft_applied,
@@ -516,5 +601,6 @@ __all__ = [
     "DraftRowVerification",
     "DraftVerificationEvidence",
     "DraftVerificationReport",
+    "DraftVerificationResumeState",
     "LayerwiseDraftVerifier",
 ]
