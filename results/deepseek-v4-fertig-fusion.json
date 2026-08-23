@@ -1,0 +1,246 @@
+{
+  "schema": "immer.deepseek-v4-fertig-fusion/v1",
+  "status": "complete",
+  "source": {
+    "checkpoint": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+    "api_model": "deepseek-v4-flash",
+    "mode": "off",
+    "graft_layer": null,
+    "graft_alpha": null,
+    "draft_schema": "immer.deepseek-v4-fertig-drafts/v1",
+    "verification_schema": "immer.deepseek-v4-fertig-draft-verification/v1",
+    "benchmark_schema": "immer.benchmark/v1",
+    "benchmark_items_sha256": "438066d03655b602f0ea61a7aba7e1b94dda4a4854d6f6950c210e43e60c9b91"
+  },
+  "protocol": {
+    "decision_order": [
+      "semantic_ambiguity",
+      "exact_ir",
+      "model_verified",
+      "abstain"
+    ],
+    "gold_used_for_decisions": false,
+    "model_verified_is_exact": false,
+    "requires_complete_draft_and_eos": true
+  },
+  "items": [
+    {
+      "item_id": "gsm8k-test-0737-b673ac26d1268186",
+      "gold": "2",
+      "api_answer": "2",
+      "bf16_fully_verified": false,
+      "bf16_accepted_prefix_length": 3,
+      "semantic": {
+        "ambiguous": false,
+        "reason": null
+      },
+      "exact": {
+        "parse_status": "parsed",
+        "parse_reason": "",
+        "solve_status": "unique",
+        "answer": "2",
+        "certificate": {
+          "rank": 5,
+          "variable_count": 5,
+          "equation_count": 5,
+          "zero_residuals": true
+        }
+      },
+      "decision": "exact_ir",
+      "accepted": true,
+      "answer": "2",
+      "correct": true
+    },
+    {
+      "item_id": "gsm8k-test-0815-13fae6ff992c2157",
+      "gold": "4",
+      "api_answer": "4",
+      "bf16_fully_verified": false,
+      "bf16_accepted_prefix_length": 2,
+      "semantic": {
+        "ambiguous": false,
+        "reason": null
+      },
+      "exact": {
+        "parse_status": "parsed",
+        "parse_reason": "",
+        "solve_status": "unique",
+        "answer": "4",
+        "certificate": {
+          "rank": 5,
+          "variable_count": 5,
+          "equation_count": 5,
+          "zero_residuals": true
+        }
+      },
+      "decision": "exact_ir",
+      "accepted": true,
+      "answer": "4",
+      "correct": true
+    },
+    {
+      "item_id": "gsm8k-test-0857-fbb13bf06cc00a16",
+      "gold": "14000",
+      "api_answer": "26000",
+      "bf16_fully_verified": false,
+      "bf16_accepted_prefix_length": 1,
+      "semantic": {
+        "ambiguous": false,
+        "reason": null
+      },
+      "exact": {
+        "parse_status": "parsed",
+        "parse_reason": "",
+        "solve_status": "unique",
+        "answer": "14000",
+        "certificate": {
+          "rank": 3,
+          "variable_count": 3,
+          "equation_count": 3,
+          "zero_residuals": true
+        }
+      },
+      "decision": "exact_ir",
+      "accepted": true,
+      "answer": "14000",
+      "correct": true
+    },
+    {
+      "item_id": "gsm8k-test-0901-5fbbe0d05836802d",
+      "gold": "1",
+      "api_answer": "1",
+      "bf16_fully_verified": false,
+      "bf16_accepted_prefix_length": 1,
+      "semantic": {
+        "ambiguous": false,
+        "reason": null
+      },
+      "exact": {
+        "parse_status": "ambiguous",
+        "parse_reason": "numeric pronoun binding is not proven",
+        "solve_status": null,
+        "answer": null,
+        "certificate": null
+      },
+      "decision": "draft_rejected",
+      "accepted": false,
+      "answer": null,
+      "correct": null
+    },
+    {
+      "item_id": "gsm8k-test-1032-e5873b4dd50866b6",
+      "gold": "450",
+      "api_answer": "450",
+      "bf16_fully_verified": false,
+      "bf16_accepted_prefix_length": 14,
+      "semantic": {
+        "ambiguous": false,
+        "reason": null
+      },
+      "exact": {
+        "parse_status": "parsed",
+        "parse_reason": "",
+        "solve_status": "unique",
+        "answer": "450",
+        "certificate": {
+          "rank": 3,
+          "variable_count": 3,
+          "equation_count": 3,
+          "zero_residuals": true
+        }
+      },
+      "decision": "exact_ir",
+      "accepted": true,
+      "answer": "450",
+      "correct": true
+    },
+    {
+      "item_id": "gsm8k-test-1042-d9ceeb071728fb0e",
+      "gold": "3",
+      "api_answer": "3.5",
+      "bf16_fully_verified": false,
+      "bf16_accepted_prefix_length": 1,
+      "semantic": {
+        "ambiguous": true,
+        "reason": "mixed gain/loss events leave the denominator and sign convention of the requested average loss under-specified"
+      },
+      "exact": {
+        "parse_status": "ambiguous",
+        "parse_reason": "numeric pronoun binding is not proven",
+        "solve_status": null,
+        "answer": null,
+        "certificate": null
+      },
+      "decision": "semantic_ambiguity",
+      "accepted": false,
+      "answer": null,
+      "correct": null
+    },
+    {
+      "item_id": "gsm8k-test-1175-3598411cca7939c2",
+      "gold": "16",
+      "api_answer": "16",
+      "bf16_fully_verified": true,
+      "bf16_accepted_prefix_length": 137,
+      "semantic": {
+        "ambiguous": false,
+        "reason": null
+      },
+      "exact": {
+        "parse_status": "parsed",
+        "parse_reason": "",
+        "solve_status": "unique",
+        "answer": "16",
+        "certificate": {
+          "rank": 5,
+          "variable_count": 5,
+          "equation_count": 5,
+          "zero_residuals": true
+        }
+      },
+      "decision": "exact_ir",
+      "accepted": true,
+      "answer": "16",
+      "correct": true
+    },
+    {
+      "item_id": "gsm8k-test-1240-a316335b6f4ebc29",
+      "gold": "2",
+      "api_answer": "2",
+      "bf16_fully_verified": true,
+      "bf16_accepted_prefix_length": 136,
+      "semantic": {
+        "ambiguous": false,
+        "reason": null
+      },
+      "exact": {
+        "parse_status": "ambiguous",
+        "parse_reason": "numeric pronoun binding is not proven",
+        "solve_status": null,
+        "answer": null,
+        "certificate": null
+      },
+      "decision": "model_verified",
+      "accepted": true,
+      "answer": "2",
+      "correct": true
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "semantic_ambiguity": 1,
+    "exact_ir": 5,
+    "model_verified": 1,
+    "draft_rejected": 1,
+    "termination_rejected": 0,
+    "non_numeric_model_output": 0,
+    "answered": 6,
+    "abstained": 2,
+    "correct": 6,
+    "wrong": 0,
+    "coverage": 0.75,
+    "overall_accuracy": 0.75,
+    "answered_accuracy": 1.0
+  }
+}

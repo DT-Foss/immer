@@ -106,7 +106,10 @@ def _canonical_json_bytes(value: Any) -> bytes:
             value,
             sort_keys=True,
             separators=(",", ":"),
-            ensure_ascii=True,
+            # Match scripts/bench_gsm8k.py byte-for-byte. GSM8K report rows
+            # contain Unicode symbols (for example arrows), so escaping them
+            # would verify a different canonical document.
+            ensure_ascii=False,
             allow_nan=False,
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:

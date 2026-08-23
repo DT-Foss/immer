@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -144,6 +145,21 @@ def _documents(*pairs: tuple[dict, dict], mode: str = "off") -> tuple[dict, dict
 
 
 class DeepSeekV4FertigFusionTests(unittest.TestCase):
+    def test_benchmark_digest_matches_unicode_report_canonicalization(self):
+        items = [{"item_id": "unicode", "question": "A → B", "gold": "1"}]
+        expected = hashlib.sha256()
+        encoded = json.dumps(
+            items[0],
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        expected.update(len(encoded).to_bytes(8, "big"))
+        expected.update(encoded)
+        expected.update((1).to_bytes(8, "big"))
+        self.assertEqual(fusion._framed_digest(items), expected.hexdigest())
+
     def test_mixed_gain_loss_average_is_quarantined_before_model(self) -> None:
         question = (
             "On the first race, Lee lost $5. On the second race, Lee won $11. "
