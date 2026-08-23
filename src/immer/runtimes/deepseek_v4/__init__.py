@@ -6,6 +6,23 @@ the model math.  No complete checkpoint is required on disk or in memory.
 """
 
 from .config import DeepSeekV4Config
+from .causal_weights import (
+    CAUSAL_WEIGHT_BINDING_SCHEMA,
+    CausalWeightBindingReceipt,
+    CausalWeightConflictError,
+    CausalWeightError,
+    CausalWeightIdentityError,
+    CausalWeightIntegrityError,
+    CausalWeightLayoutIdentity,
+    CausalWeightLeaf,
+    CausalWeightNotFoundError,
+    CausalWeightReadReceipt,
+    CausalWeightReader,
+    ExpertBindingReceipt,
+    LogicalModelIdentity,
+    bind_causal_weight_plans,
+    semantic_expert_key,
+)
 from .pager import (
     DeepSeekWeightPager,
     ExpertSourceRange,
@@ -39,9 +56,21 @@ from .layerwise import (
 )
 
 __all__ = [
+    "CAUSAL_WEIGHT_BINDING_SCHEMA",
+    "CausalWeightBindingReceipt",
+    "CausalWeightConflictError",
+    "CausalWeightError",
+    "CausalWeightIdentityError",
+    "CausalWeightIntegrityError",
+    "CausalWeightLayoutIdentity",
+    "CausalWeightLeaf",
+    "CausalWeightNotFoundError",
+    "CausalWeightReadReceipt",
+    "CausalWeightReader",
     "DeepSeekV4Config",
     "DeepSeekV4SnapshotError",
     "DeepSeekWeightPager",
+    "ExpertBindingReceipt",
     "ExpertSourceRange",
     "ExpertTensorLayout",
     "GenerationEvidence",
@@ -50,6 +79,7 @@ __all__ = [
     "LayerwiseItem",
     "LayerwisePlan",
     "LayerwiseScorer",
+    "LogicalModelIdentity",
     "OFFICIAL_SOURCE_SAFE_BYTES",
     "OneTokenEvidence",
     "OfficialExpertRangePlan",
@@ -57,6 +87,7 @@ __all__ = [
     "StreamedDeepSeekV4",
     "SnapshotLimits",
     "build_layerwise_plan",
+    "bind_causal_weight_plans",
     "dequantize_fp4_e2m1",
     "dequantize_fp8_e4m3",
     "quantize_dequantize_fp4",
@@ -64,5 +95,6 @@ __all__ = [
     "quantize_fp8_e4m3_parts",
     "runtime_dependency_versions",
     "runtime_source_manifest",
+    "semantic_expert_key",
     "unpack_fp4_e2m1",
 ]
