@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Verify eight DeepSeek API drafts with one streamed V4 layer pass.
+"""Verify a DeepSeek API draft cohort with one streamed V4 layer pass.
 
 The API supplies complete GSM8K continuations cheaply.  The local checkpoint
 then checks every drafted next token (and the following EOS) in one right-
-padded layer-major pass.  This is a PoC runner, not a packaging or publishing
-command.
+padded layer-major pass.  The historical eight-item cohort remains the default;
+``--item-ids-json`` selects a larger ordered cohort.  This is a PoC runner, not
+a packaging or publishing command.
 """
 
 from __future__ import annotations
@@ -49,7 +50,6 @@ API_MODEL = "deepseek-v4-flash"
 API_BASE_URL = "https://api.deepseek.com/beta"
 ASSISTANT_PREFIX = "Answer:"
 EOS_TOKEN_ID = 1
-EXPECTED_PROMPT_TOKENS = 83
 DEFAULT_BENCHMARK = ROOT / "results" / "bench_gsm8k.json"
 DEFAULT_TOKENIZER = (
     ROOT / "artifacts" / "private" / "deepseek-v4-reference" / "tokenizer.json"
@@ -59,6 +59,7 @@ DEFAULT_CACHE = ROOT / "artifacts" / "private" / "deepseek-v4-cache"
 DRAFT_SCHEMA = "immer.deepseek-v4-fertig-drafts/v1"
 RESULT_SCHEMA = "immer.deepseek-v4-fertig-draft-verification/v1"
 RESUME_SCHEMA = "immer.deepseek-v4-fertig-draft-resume/v1"
+COHORT_SCHEMA = "immer.deepseek-v4-fertig-cohort/v1"
 FIXED_ITEM_IDS = (
     "gsm8k-test-0737-b673ac26d1268186",
     "gsm8k-test-0815-13fae6ff992c2157",
@@ -154,6 +155,13 @@ def _unit_float(raw: str) -> float:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark", default=str(DEFAULT_BENCHMARK))
+    parser.add_argument(
+        "--item-ids-json",
+        help=(
+            "JSON array of unique benchmark item IDs in verification order; "
+            "defaults to the historical fixed eight-item cohort"
+        ),
+    )
     parser.add_argument("--tokenizer-json", default=str(DEFAULT_TOKENIZER))
     parser.add_argument("--run-dir", default=str(DEFAULT_RUN_DIR))
     parser.add_argument("--drafts-json")
@@ -202,6 +210,56 @@ def _read_json(path: str | Path, label: str) -> dict[str, Any]:
     return document
 
 
+def _read_item_ids(path: str | Path | None) -> tuple[str, ...]:
+    if path is None:
+        return FIXED_ITEM_IDS
+    source = Path(path).expanduser().resolve()
+    try:
+        document = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CliError(f"cannot read item-ID manifest: {source}") from exc
+    if not isinstance(document, list):
+        raise CliError("item-ID manifest root must be an array")
+    if not document:
+        raise CliError("item-ID manifest must not be empty")
+    item_ids: list[str] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(document):
+        if not isinstance(raw, str) or not raw.strip() or raw != raw.strip():
+            raise CliError(
+                f"item-ID manifest entry {index} must be a non-empty trimmed string"
+            )
+        if raw in seen:
+            raise CliError(f"duplicate item ID in manifest: {raw}")
+        seen.add(raw)
+        item_ids.append(raw)
+    return tuple(item_ids)
+
+
+def _cohort_document(items: Sequence[SelectedItem]) -> dict[str, Any]:
+    rows = [
+        {
+            "item_id": item.item_id,
+            "question": item.question,
+            "gold": item.gold,
+            "prompt_token_ids": list(item.prompt_token_ids),
+        }
+        for item in items
+    ]
+    encoded = json.dumps(
+        {"schema": COHORT_SCHEMA, "items": rows},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "schema": COHORT_SCHEMA,
+        "identity": hashlib.sha256(encoded).hexdigest(),
+        "item_ids": [item.item_id for item in items],
+    }
+
+
 def _atomic_write_json(path: str | Path, document: Mapping[str, Any]) -> None:
     destination = Path(path).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -246,6 +304,7 @@ def _resume_identity(
     *,
     resolved_device: str,
     resolved_dtype: str,
+    cohort_identity: str | None = None,
 ) -> str:
     payload = {
         "schema": RESUME_SCHEMA,
@@ -262,6 +321,8 @@ def _resume_identity(
         "graft_layer": args.graft_layer if args.mode == "stable-crsa" else None,
         "graft_alpha": args.graft_alpha if args.mode == "stable-crsa" else None,
     }
+    if cohort_identity is not None:
+        payload["cohort_identity"] = cohort_identity
     encoded = json.dumps(
         payload,
         sort_keys=True,
@@ -388,6 +449,7 @@ def _load_resume(
     path: Path,
     identity: str,
     *,
+    legacy_identity: str | None = None,
     expected_shape: Sequence[int],
     expected_dtype: str,
     n_layers: int,
@@ -431,7 +493,7 @@ def _load_resume(
         or metadata.get("schema") != RESUME_SCHEMA
     ):
         raise CliError("rolling resume metadata schema is invalid")
-    if metadata.get("identity") != identity:
+    if metadata.get("identity") not in {identity, legacy_identity}:
         raise CliError("rolling resume belongs to another run; use --restart")
     if tuple(hidden.shape) != tuple(int(value) for value in expected_shape):
         raise CliError("rolling resume hidden shape is invalid")
@@ -466,7 +528,12 @@ def _load_resume(
 def _selected_items(
     benchmark: str | Path,
     tokenizer: LocalTokenizer,
+    item_ids: Sequence[str] = FIXED_ITEM_IDS,
 ) -> tuple[SelectedItem, ...]:
+    if not item_ids:
+        raise CliError("selected item cohort must not be empty")
+    if len(set(item_ids)) != len(item_ids):
+        raise CliError("selected item cohort contains duplicate IDs")
     document = _read_json(benchmark, "FERTIG GSM8K report")
     raw_rows = document.get("items")
     if not isinstance(raw_rows, list):
@@ -482,19 +549,19 @@ def _selected_items(
             by_id[item_id] = raw
 
     selected: list[SelectedItem] = []
-    for item_id in FIXED_ITEM_IDS:
+    for item_id in item_ids:
         try:
             raw = by_id[item_id]
         except KeyError as exc:
-            raise CliError(f"fixed benchmark item is missing: {item_id}") from exc
+            raise CliError(f"selected benchmark item is missing: {item_id}") from exc
         if raw.get("status") not in {"abstained", "correct"}:
-            raise CliError(f"fixed historical cohort item is unusable: {item_id}")
+            raise CliError(f"selected benchmark item is unusable: {item_id}")
         question = raw.get("question")
         if not isinstance(question, str) or not question.strip():
-            raise CliError(f"fixed item has no question: {item_id}")
+            raise CliError(f"selected item has no question: {item_id}")
         gold = extract_gsm8k_answer(raw.get("gold"))
         if gold is None:
-            raise CliError(f"fixed item has no numeric gold answer: {item_id}")
+            raise CliError(f"selected item has no numeric gold answer: {item_id}")
         prompt = (
             encode_user_prompt(
                 question,
@@ -504,11 +571,8 @@ def _selected_items(
             + ASSISTANT_PREFIX
         )
         prompt_ids = tokenizer.encode(prompt)
-        if len(prompt_ids) != EXPECTED_PROMPT_TOKENS:
-            raise CliError(
-                f"{item_id}: expected {EXPECTED_PROMPT_TOKENS} prompt tokens, "
-                f"got {len(prompt_ids)}"
-            )
+        if not prompt_ids:
+            raise CliError(f"selected item encoded to an empty prompt: {item_id}")
         selected.append(SelectedItem(item_id, question, gold, prompt, prompt_ids))
     return tuple(selected)
 
@@ -716,6 +780,7 @@ def _draft_document(
 ) -> dict[str, Any]:
     return {
         "schema": DRAFT_SCHEMA,
+        "cohort": _cohort_document(items),
         "protocol": {
             "model": API_MODEL,
             "assistant_prefix": ASSISTANT_PREFIX,
@@ -753,6 +818,14 @@ def _validate_draft_document(
 ) -> tuple[dict[str, Any], ...]:
     if document.get("schema") != DRAFT_SCHEMA:
         raise CliError("draft cache schema mismatch; use --refresh-drafts")
+    expected_cohort = _cohort_document(items)
+    cached_cohort = document.get("cohort")
+    is_legacy_fixed_cache = (
+        cached_cohort is None
+        and tuple(item.item_id for item in items) == FIXED_ITEM_IDS
+    )
+    if not is_legacy_fixed_cache and cached_cohort != expected_cohort:
+        raise CliError("draft cache cohort mismatch; use --refresh-drafts")
     protocol = document.get("protocol")
     expected_protocol = _draft_document((), (), max_draft_tokens=max_draft_tokens)[
         "protocol"
@@ -878,7 +951,12 @@ def _progress(event: str, **fields: Any) -> None:
 
 
 @contextmanager
-def _model_runtime(args: argparse.Namespace, *, max_seq_len: int):
+def _model_runtime(
+    args: argparse.Namespace,
+    *,
+    max_seq_len: int,
+    max_batch_size: int,
+):
     if _PINNED_REVISION.fullmatch(OFFICIAL_REVISION) is None:
         raise CliError("official checkpoint revision is not immutable")
     source = Streamer(
@@ -922,7 +1000,7 @@ def _model_runtime(args: argparse.Namespace, *, max_seq_len: int):
             pager,
             graft=graft,
             graft_layer=graft_layer,
-            max_batch_size=len(FIXED_ITEM_IDS),
+            max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
         )
         yield model
@@ -981,7 +1059,11 @@ def _verify_locally(
         fields.pop("event", None)
         _progress("head_progress", **fields)
 
-    with runtime(args, max_seq_len=max_seq_len) as model:
+    with runtime(
+        args,
+        max_seq_len=max_seq_len,
+        max_batch_size=len(items),
+    ) as model:
         expected_shape = (
             len(prompts),
             max_seq_len,
@@ -996,7 +1078,17 @@ def _verify_locally(
             draft_ids,
             resolved_device=resolved_device,
             resolved_dtype=expected_dtype,
+            cohort_identity=_cohort_document(items)["identity"],
         )
+        legacy_resume_identity = None
+        if tuple(item.item_id for item in items) == FIXED_ITEM_IDS:
+            legacy_resume_identity = _resume_identity(
+                args,
+                prompts,
+                draft_ids,
+                resolved_device=resolved_device,
+                resolved_dtype=expected_dtype,
+            )
         raw_cache_bytes = model.pager.source.metrics().get("cache_bytes", 0)
         current_cache_bytes = (
             int(raw_cache_bytes)
@@ -1016,6 +1108,7 @@ def _verify_locally(
         resume_state = _load_resume(
             resume_path,
             resume_identity,
+            legacy_identity=legacy_resume_identity,
             expected_shape=expected_shape,
             expected_dtype=expected_dtype,
             n_layers=int(model.config.n_layers),
@@ -1173,8 +1266,9 @@ def _verification_result(
 
 
 def run(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
+    item_ids = _read_item_ids(args.item_ids_json)
     tokenizer = LocalTokenizer(args.tokenizer_json)
-    items = _selected_items(args.benchmark, tokenizer)
+    items = _selected_items(args.benchmark, tokenizer, item_ids)
     drafts = _prepare_drafts(args, items, tokenizer)
     run_dir = Path(args.run_dir).expanduser().resolve()
     default_result_name = (

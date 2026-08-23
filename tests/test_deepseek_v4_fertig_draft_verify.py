@@ -93,6 +93,8 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
         self.assertEqual(args.graft_layer, 21)
         self.assertEqual(args.graft_alpha, 0.01)
         self.assertEqual(args.layer_retries, 2)
+        self.assertIsNone(args.item_ids_json)
+        self.assertEqual(draft_verify._read_item_ids(None), draft_verify.FIXED_ITEM_IDS)
         item = draft_verify.SelectedItem("q", "question", "2", "prompt", (4, 5))
         payload = draft_verify._request_payload(item, max_tokens=128)
         self.assertEqual(payload["model"], "deepseek-v4-flash")
@@ -123,6 +125,73 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
             )
         )
 
+    def test_selected_cohort_preserves_order_and_variable_prompt_lengths(self) -> None:
+        rows = [
+            {
+                "item_id": "short",
+                "status": "abstained",
+                "question": "Short?",
+                "gold": "#### 2",
+            },
+            {
+                "item_id": "long",
+                "status": "correct",
+                "question": "A substantially longer question?",
+                "gold": "#### 19",
+            },
+        ]
+        short_prompt = "rendered:Short?Answer:"
+        long_prompt = "rendered:A substantially longer question?Answer:"
+        tokenizer = _FakeTokenizer(
+            {
+                short_prompt: (10, 11),
+                long_prompt: tuple(range(20, 31)),
+            }
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            benchmark = Path(raw) / "benchmark.json"
+            benchmark.write_text(json.dumps({"items": rows}), encoding="utf-8")
+            with mock.patch.object(
+                draft_verify,
+                "encode_user_prompt",
+                side_effect=lambda question, **_kwargs: f"rendered:{question}",
+            ):
+                items = draft_verify._selected_items(
+                    benchmark,
+                    tokenizer,
+                    ("long", "short"),
+                )
+        self.assertEqual(tuple(item.item_id for item in items), ("long", "short"))
+        self.assertEqual(tuple(len(item.prompt_token_ids) for item in items), (11, 2))
+        self.assertEqual(items[0].prompt_token_ids, tuple(range(20, 31)))
+        self.assertEqual(items[1].prompt_token_ids, (10, 11))
+
+    def test_item_id_manifest_rejects_invalid_or_ambiguous_cohorts(self) -> None:
+        cases = (
+            ({}, "root must be an array"),
+            ([], "must not be empty"),
+            (["a", "a"], "duplicate item ID"),
+            (["a", 2], "entry 1"),
+            ([" a"], "trimmed string"),
+            ([""], "trimmed string"),
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            for index, (document, message) in enumerate(cases):
+                with self.subTest(document=document):
+                    path = root / f"manifest-{index}.json"
+                    path.write_text(json.dumps(document), encoding="utf-8")
+                    with self.assertRaisesRegex(draft_verify.CliError, message):
+                        draft_verify._read_item_ids(path)
+            malformed = root / "malformed.json"
+            malformed.write_text("[", encoding="utf-8")
+            with self.assertRaisesRegex(draft_verify.CliError, "cannot read"):
+                draft_verify._read_item_ids(malformed)
+
+            valid = root / "valid.json"
+            valid.write_text('["b", "a"]', encoding="utf-8")
+            self.assertEqual(draft_verify._read_item_ids(valid), ("b", "a"))
+
     def test_resume_identity_binds_the_resolved_device_not_auto(self) -> None:
         args = draft_verify._parser().parse_args(["--device", "auto"])
         cpu = draft_verify._resume_identity(
@@ -140,6 +209,28 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
             resolved_dtype="bfloat16",
         )
         self.assertNotEqual(cpu, mps)
+
+    def test_resume_identity_binds_ordered_cohort_identity(self) -> None:
+        args = draft_verify._parser().parse_args([])
+        common = {
+            "resolved_device": "mps",
+            "resolved_dtype": "bfloat16",
+        }
+        first = draft_verify._resume_identity(
+            args,
+            ((1, 2),),
+            ((3,),),
+            cohort_identity="a" * 64,
+            **common,
+        )
+        second = draft_verify._resume_identity(
+            args,
+            ((1, 2),),
+            ((3,),),
+            cohort_identity="b" * 64,
+            **common,
+        )
+        self.assertNotEqual(first, second)
 
     def test_http_retry_request_and_api_token_contract(self) -> None:
         item = draft_verify.SelectedItem(
@@ -313,7 +404,9 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
             run_dir = Path(raw)
             args = draft_verify._parser().parse_args(["--run-dir", str(run_dir)])
             document = draft_verify._draft_document(items, drafts, max_draft_tokens=128)
-            draft_verify._atomic_write_json(run_dir / "drafts.json", document)
+            legacy_document = dict(document)
+            legacy_document.pop("cohort")
+            draft_verify._atomic_write_json(run_dir / "drafts.json", legacy_document)
 
             def fail_fetch(*_args):
                 raise AssertionError("valid cache must avoid network")
@@ -327,6 +420,65 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
                 )
             self.assertEqual(
                 [row["item_id"] for row in reused], list(draft_verify.FIXED_ITEM_IDS)
+            )
+
+    def test_variable_draft_cache_requires_matching_cohort_identity(self) -> None:
+        items = (
+            draft_verify.SelectedItem("a", "A", "1", "pa", (4,)),
+            draft_verify.SelectedItem("b", "B", "2", "pb", (5, 6, 7)),
+        )
+        tokenizer = _FakeTokenizer(
+            {" 1": (101,), " 2": (102,)},
+            pieces={(101,): (" 1",), (102,): (" 2",)},
+        )
+        drafts = tuple(
+            {
+                "response_model": "deepseek-v4-flash",
+                "system_fingerprint": "fp_test",
+                "content": f" {item.gold}",
+                "token_ids": [100 + int(item.gold)],
+                "logprob_tokens": [f" {item.gold}"],
+                "logprob_token_count": 1,
+                "finish_reason": "stop",
+                "usage": {
+                    "prompt_tokens": len(item.prompt_token_ids),
+                    "completion_tokens": 1,
+                    "total_tokens": len(item.prompt_token_ids) + 1,
+                },
+            }
+            for item in items
+        )
+        document = draft_verify._draft_document(
+            items,
+            drafts,
+            max_draft_tokens=128,
+        )
+        validated = draft_verify._validate_draft_document(
+            document,
+            items,
+            tokenizer,
+            max_draft_tokens=128,
+        )
+        self.assertEqual(tuple(row["item_id"] for row in validated), ("a", "b"))
+
+        missing = dict(document)
+        missing.pop("cohort")
+        with self.assertRaisesRegex(draft_verify.CliError, "cohort mismatch"):
+            draft_verify._validate_draft_document(
+                missing,
+                items,
+                tokenizer,
+                max_draft_tokens=128,
+            )
+
+        stale = json.loads(json.dumps(document))
+        stale["cohort"]["identity"] = "0" * 64
+        with self.assertRaisesRegex(draft_verify.CliError, "cohort mismatch"):
+            draft_verify._validate_draft_document(
+                stale,
+                items,
+                tokenizer,
+                max_draft_tokens=128,
             )
 
     def test_atomic_json_replaces_complete_documents(self) -> None:
@@ -383,9 +535,18 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
             draft_verify._write_resume(path, identity, second)
 
             self.assertEqual([entry.name for entry in root.iterdir()], [path.name])
+            bound_identity = draft_verify._resume_identity(
+                args,
+                ((1, 2),),
+                ((3,),),
+                resolved_device="cpu",
+                resolved_dtype="bfloat16",
+                cohort_identity="a" * 64,
+            )
             loaded = draft_verify._load_resume(
                 path,
-                identity,
+                bound_identity,
+                legacy_identity=identity,
                 expected_shape=(1, 3, 1, 2),
                 expected_dtype="bfloat16",
                 n_layers=43,
@@ -479,6 +640,109 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
             self.assertEqual(result_path.name, "result-drafts.json")
             self.assertEqual(json.loads(result_path.read_text()), result)
 
+    def test_run_selects_the_ordered_manifest_before_draft_preparation(self) -> None:
+        items = (
+            draft_verify.SelectedItem("b", "B", "2", "pb", (5, 6)),
+            draft_verify.SelectedItem("a", "A", "1", "pa", (4,)),
+        )
+        drafts = (
+            {
+                "content": " 2",
+                "token_ids": [20],
+                "usage": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "total_tokens": 3,
+                },
+            },
+            {
+                "content": " 1",
+                "token_ids": [10],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        )
+        tokenizer = object()
+        with tempfile.TemporaryDirectory() as raw:
+            manifest = Path(raw) / "ids.json"
+            manifest.write_text('["b", "a"]', encoding="utf-8")
+            args = draft_verify._parser().parse_args(
+                [
+                    "--run-dir",
+                    raw,
+                    "--draft-only",
+                    "--item-ids-json",
+                    str(manifest),
+                ]
+            )
+            with (
+                mock.patch.object(
+                    draft_verify,
+                    "LocalTokenizer",
+                    return_value=tokenizer,
+                ),
+                mock.patch.object(
+                    draft_verify,
+                    "_selected_items",
+                    return_value=items,
+                ) as select,
+                mock.patch.object(
+                    draft_verify,
+                    "_prepare_drafts",
+                    return_value=drafts,
+                ),
+            ):
+                result, _ = draft_verify.run(args)
+        select.assert_called_once_with(args.benchmark, tokenizer, ("b", "a"))
+        self.assertEqual(result["summary"]["items"], 2)
+        self.assertEqual(result["summary"]["api_correct"], 2)
+
+    def test_model_runtime_uses_selected_cohort_as_max_batch_size(self) -> None:
+        args = draft_verify._parser().parse_args(["--no-cache"])
+        source = mock.Mock()
+        source.reader.fetch_file.return_value = b"{}"
+        config = SimpleNamespace()
+        pager = mock.Mock()
+        model = mock.Mock()
+        with (
+            mock.patch.object(draft_verify, "Streamer", return_value=source),
+            mock.patch.object(
+                draft_verify.DeepSeekV4Config,
+                "from_mapping",
+                return_value=config,
+            ),
+            mock.patch.object(
+                draft_verify,
+                "DeepSeekWeightPager",
+                return_value=pager,
+            ),
+            mock.patch.object(
+                draft_verify,
+                "StreamedDeepSeekV4",
+                return_value=model,
+            ) as runtime_type,
+        ):
+            with draft_verify._model_runtime(
+                args,
+                max_seq_len=177,
+                max_batch_size=23,
+            ) as yielded:
+                self.assertIs(yielded, model)
+        runtime_type.assert_called_once_with(
+            config,
+            pager,
+            graft=None,
+            graft_layer=None,
+            max_batch_size=23,
+            max_seq_len=177,
+        )
+        model.reset_state.assert_called_once_with(release=True)
+        pager.close.assert_called_once_with()
+        source.close.assert_called_once_with()
+
     def test_fake_runtime_verifier_boundary_is_one_right_padded_pass(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -513,8 +777,8 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
         sentinel = object()
 
         @contextmanager
-        def runtime_factory(received_args, *, max_seq_len):
-            calls.append(("runtime", received_args, max_seq_len))
+        def runtime_factory(received_args, *, max_seq_len, max_batch_size):
+            calls.append(("runtime", received_args, max_seq_len, max_batch_size))
             yield fake_model
 
         class FakeVerifier:
@@ -538,7 +802,7 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
                 verifier_factory=FakeVerifier,
             )
         self.assertIs(report, sentinel)
-        self.assertEqual(calls[0], ("runtime", args, 5))
+        self.assertEqual(calls[0], ("runtime", args, 5, 2))
         self.assertEqual(calls[1], ("verifier", fake_model, 2))
         self.assertEqual(calls[2][1], ((4, 5, 6), (7, 8)))
         self.assertEqual(calls[2][2], ((9, 10), (11,)))
