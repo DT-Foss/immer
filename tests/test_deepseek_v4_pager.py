@@ -1773,6 +1773,7 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         import torch
 
         from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+        from immer.runtimes.deepseek_v4.pager import DeepSeekPagerError
 
         bases = [f"layers.1.ffn.experts.{expert}" for expert in range(3)]
         source = _WindowExpertSource(bases)
@@ -1792,6 +1793,20 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         )
 
         self.assertEqual(set(payloads), {bases[0]})
+        foreign = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+        )
+        with self.assertRaisesRegex(
+            DeepSeekPagerError, "reservoir payload is stale or mismatched"
+        ):
+            foreign.expert(
+                torch.zeros((1, 128), dtype=torch.bfloat16),
+                bases[0],
+                prefetched_payload=payloads[bases[0]],
+            )
+        foreign.close()
         miss_window = pager.prefetch_expert_window((bases[1],))
         assert miss_window is not None
         hit = pager.expert(

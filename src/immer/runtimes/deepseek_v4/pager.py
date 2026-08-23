@@ -263,6 +263,7 @@ class _ExpertReservoir:
 
 @dataclass(slots=True)
 class _ExpertReservoirPayload:
+    owner: object
     base: str
     expert: _CoalescedExpert | None
     payload_bytes: int
@@ -410,6 +411,7 @@ class DeepSeekWeightPager:
         self._active_expert_reservoir: _ExpertReservoir | None = None
         self._retired_expert_reservoirs: list[_ExpertReservoir] = []
         self._expert_reservoir_executor: ThreadPoolExecutor | None = None
+        self._expert_reservoir_owner = object()
         self._causal_weight_reader: CausalExpertPlanResolver | None = None
         self._causal_missing_fallback = False
         self.attach_causal_weight_reader(
@@ -1895,6 +1897,7 @@ class DeepSeekWeightPager:
             waited = time.perf_counter_ns() - started
             self._account_reservoir_result(ticket, result)
             payloads[ticket.base] = _ExpertReservoirPayload(
+                owner=self._expert_reservoir_owner,
                 base=ticket.base,
                 expert=expert,
                 payload_bytes=ticket.plan.payload_bytes,
@@ -1931,7 +1934,11 @@ class DeepSeekWeightPager:
         expected_base: str,
     ) -> _CoalescedExpert:
         with self._prefetch_lock:
-            if payload.consumed or payload.base != expected_base:
+            if (
+                payload.owner is not self._expert_reservoir_owner
+                or payload.consumed
+                or payload.base != expected_base
+            ):
                 raise DeepSeekPagerError(
                     "expert reservoir payload is stale or mismatched"
                 )
@@ -1943,7 +1950,11 @@ class DeepSeekWeightPager:
 
     def _release_reservoir_payload(self, payload: _ExpertReservoirPayload) -> None:
         with self._prefetch_lock:
-            if not payload.consumed or payload.expert is None:
+            if (
+                payload.owner is not self._expert_reservoir_owner
+                or not payload.consumed
+                or payload.expert is None
+            ):
                 raise DeepSeekPagerError("expert reservoir payload release is invalid")
             payload.expert = None
 
@@ -1951,7 +1962,7 @@ class DeepSeekWeightPager:
         self, payload: _ExpertReservoirPayload
     ) -> None:
         with self._prefetch_lock:
-            if payload.consumed:
+            if payload.owner is not self._expert_reservoir_owner or payload.consumed:
                 raise DeepSeekPagerError("expert reservoir payload is already consumed")
             payload.consumed = True
             payload.expert = None
