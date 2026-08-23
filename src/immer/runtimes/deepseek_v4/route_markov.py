@@ -586,7 +586,6 @@ def split_prompt_observations(
             _sha256(
                 {
                     "observation_id": observation.observation_id,
-                    "payload_sha256": observation.payload_sha256,
                     "seed": normalized_seed,
                 }
             ),

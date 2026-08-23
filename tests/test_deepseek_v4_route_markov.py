@@ -209,6 +209,33 @@ class RouteMarkovTests(unittest.TestCase):
         self.assertEqual(len(first.test), 2)
         self.assertTrue(all(len(prompt.layers[0].rows) == 2 for prompt in first.test))
 
+        extended = tuple(
+            PromptRouteObservation(
+                observation_id=prompt.observation_id,
+                layers=prompt.layers
+                + (
+                    LayerTokenRoutes(
+                        prompt.layers[-1].layer + 1,
+                        prompt.layers[-1].rows,
+                    ),
+                ),
+            )
+            for prompt in prompts
+        )
+        extended_split = split_prompt_observations(
+            extended,
+            test_fraction=1 / 3,
+            seed=17,
+        )
+        self.assertEqual(
+            first_train,
+            {prompt.observation_id for prompt in extended_split.train},
+        )
+        self.assertEqual(
+            first_test,
+            {prompt.observation_id for prompt in extended_split.test},
+        )
+
     def test_placebo_is_deterministic_and_preserves_rows_sizes_and_marginals(
         self,
     ) -> None:
