@@ -12,6 +12,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import re
 from typing import Any
 
@@ -20,8 +21,9 @@ from immer.knowledge.livecausal import LiveGraph, segment_sha
 
 _PINNED_REVISION = re.compile(r"[0-9a-f]{40,64}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_SCHEMA = "deepseek-v4-expert-transition-v1"
+_SCHEMA = "deepseek-v4-expert-transition-v2"
 _HISTORY_LENGTH = 2
+_RANKING_MODES = frozenset(("presence_probability", "selection_mass"))
 
 
 class CausalPrefetchError(ValueError):
@@ -229,16 +231,50 @@ class RouteState:
 
 @dataclass(frozen=True, slots=True)
 class ExpertSupport:
-    """One empirical expert score; ``support / total`` is the only confidence."""
+    """Selection-mass and per-observation presence evidence for one expert."""
 
     expert_id: int
-    support: int
-    total: int
+    selection_support: int
+    selection_total: int
+    presence_support: int
+    observation_count: int
     cost: int
+    presence_alpha: float
+    presence_beta: float
+
+    @property
+    def support(self) -> int:
+        """Backward-compatible alias for selection-mass support."""
+
+        return self.selection_support
+
+    @property
+    def total(self) -> int:
+        """Backward-compatible alias for total selection mass."""
+
+        return self.selection_total
 
     @property
     def empirical_rate(self) -> float:
-        return self.support / self.total
+        """Backward-compatible alias for the empirical selection-mass rate."""
+
+        return self.selection_rate
+
+    @property
+    def selection_rate(self) -> float:
+        return self.selection_support / self.selection_total
+
+    @property
+    def empirical_presence_rate(self) -> float:
+        return self.presence_support / self.observation_count
+
+    @property
+    def presence_probability(self) -> float:
+        """Posterior mean under the configured Beta prior."""
+
+        return (self.presence_support + self.presence_alpha) / (
+            self.observation_count + self.presence_alpha + self.presence_beta
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,7 +285,15 @@ class PredictionResult:
     target_layer: int
     candidates: tuple[ExpertSupport, ...]
     distribution: tuple[ExpertSupport, ...]
-    total: int
+    selection_total: int
+    observation_count: int
+    ranking_mode: str
+
+    @property
+    def total(self) -> int:
+        """Backward-compatible alias for total selection mass."""
+
+        return self.selection_total
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,12 +413,13 @@ class CausalExpertTransitionController:
             records.append(
                 {
                     **common,
-                    "count": count,
                     "outcome_key": self._expert_outcome_key(
                         layer=target.layer,
                         expert_id=expert_id,
                     ),
+                    "presence_count": 1,
                     "record_type": "expert_transition",
+                    "selection_count": count,
                     "target_expert_id": expert_id,
                     "trigger_key": source.key,
                 }
@@ -432,12 +477,38 @@ class CausalExpertTransitionController:
         *,
         top_k: int,
         expert_costs: Mapping[int, int] | None = None,
+        ranking_mode: str = "selection_mass",
+        presence_alpha: float = 1.0,
+        presence_beta: float = 1.0,
     ) -> PredictionResult:
-        """Rank every direct edge without entering bounded multi-hop inference."""
+        """Rank every direct edge without entering bounded multi-hop inference.
+
+        ``selection_mass`` preserves the router-token frequency ordering.
+        ``presence_probability`` ranks the Beta-smoothed probability that an
+        expert appears at least once in an observation, so repeated selections
+        of one expert within a request do not masquerade as broader presence.
+        """
 
         self._validate_state(source)
         if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
             raise CausalPrefetchError("top_k must be a positive integer")
+        if ranking_mode not in _RANKING_MODES:
+            choices = ", ".join(sorted(_RANKING_MODES))
+            raise CausalPrefetchError(f"ranking_mode must be one of: {choices}")
+        priors: list[float] = []
+        for value, label in (
+            (presence_alpha, "presence_alpha"),
+            (presence_beta, "presence_beta"),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise CausalPrefetchError(f"{label} must be a finite positive number")
+            priors.append(float(value))
+        alpha, beta = priors
         costs: dict[int, int] = {}
         if expert_costs is not None:
             if not isinstance(expert_costs, Mapping):
@@ -456,18 +527,22 @@ class CausalExpertTransitionController:
 
         edges = self.graph.query_base(source.key)
 
-        support: Counter[int] = Counter()
+        selection_support: Counter[int] = Counter()
+        observations: set[str] = set()
+        expert_observations: dict[int, set[str]] = {}
+        seen_records: set[tuple[str, int]] = set()
         for edge in edges:
             if edge.get("kind") != "base":
                 continue
             records = self.graph.resolve_derivation(edge.get("derivation", ()))
             for record in records:
-                if (
-                    record.get("schema") != _SCHEMA
-                    or record.get("record_type") != "expert_transition"
-                ):
+                if record.get("schema") != _SCHEMA:
                     raise CausalPrefetchError(
-                        "route key resolved to an incompatible causal record"
+                        "route key resolved to an incompatible causal record schema"
+                    )
+                if record.get("record_type") != "expert_transition":
+                    raise CausalPrefetchError(
+                        "route key resolved to an incompatible causal record type"
                     )
                 if record.get("checkpoint") != self.checkpoint.as_record():
                     raise CheckpointMismatchError(
@@ -487,28 +562,67 @@ class CausalExpertTransitionController:
                     record.get("target_expert_id"),
                     n_routed_experts=self.n_routed_experts,
                 )
-                count = record.get("count")
+                count = record.get("selection_count")
                 if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-                    raise CausalPrefetchError("stored transition count is invalid")
+                    raise CausalPrefetchError(
+                        "stored transition selection count is invalid"
+                    )
+                if record.get("presence_count") != 1:
+                    raise CausalPrefetchError(
+                        "stored transition presence count is invalid"
+                    )
+                observation_id = record.get("observation_id")
+                if (
+                    not isinstance(observation_id, str)
+                    or not observation_id
+                    or observation_id != observation_id.strip()
+                ):
+                    raise CausalPrefetchError(
+                        "stored transition observation_id is invalid"
+                    )
+                record_identity = (observation_id, expert)
+                if record_identity in seen_records:
+                    raise CausalPrefetchError(
+                        "duplicate expert evidence exists for one observation"
+                    )
+                seen_records.add(record_identity)
                 if edge.get("to_key") != self._expert_outcome_key(
                     layer=source.layer + 1, expert_id=expert
                 ):
                     raise CausalPrefetchError(
                         "stored transition outcome key is invalid"
                     )
-                support[expert] += count
+                selection_support[expert] += count
+                observations.add(observation_id)
+                expert_observations.setdefault(expert, set()).add(observation_id)
 
-        total = sum(support.values())
+        selection_total = sum(selection_support.values())
+        observation_count = len(observations)
+        if ranking_mode == "selection_mass":
+
+            def rank_score(expert: int) -> float:
+                return float(selection_support[expert])
+        else:
+
+            def rank_score(expert: int) -> float:
+                return (len(expert_observations[expert]) + alpha) / (
+                    observation_count + alpha + beta
+                )
+
         ranked = sorted(
-            support,
-            key=lambda expert: (-support[expert], costs.get(expert, 0), expert),
+            selection_support,
+            key=lambda expert: (-rank_score(expert), costs.get(expert, 0), expert),
         )
         distribution = tuple(
             ExpertSupport(
                 expert_id=expert,
-                support=support[expert],
-                total=total,
+                selection_support=selection_support[expert],
+                selection_total=selection_total,
+                presence_support=len(expert_observations[expert]),
+                observation_count=observation_count,
                 cost=costs.get(expert, 0),
+                presence_alpha=alpha,
+                presence_beta=beta,
             )
             for expert in ranked
         )
@@ -517,7 +631,9 @@ class CausalExpertTransitionController:
             target_layer=source.layer + 1,
             candidates=distribution[:top_k],
             distribution=distribution,
-            total=total,
+            selection_total=selection_total,
+            observation_count=observation_count,
+            ranking_mode=ranking_mode,
         )
 
     def push_route(

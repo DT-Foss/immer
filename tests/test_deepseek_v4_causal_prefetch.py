@@ -85,6 +85,9 @@ class CausalPrefetchTests(unittest.TestCase):
         )
 
         self.assertEqual(prediction.total, 8)
+        self.assertEqual(prediction.selection_total, 8)
+        self.assertEqual(prediction.observation_count, 2)
+        self.assertEqual(prediction.ranking_mode, "selection_mass")
         self.assertEqual([row.expert_id for row in prediction.candidates], [3, 2, 4])
         self.assertEqual(
             [(row.support, row.total) for row in prediction.candidates],
@@ -92,6 +95,9 @@ class CausalPrefetchTests(unittest.TestCase):
         )
         self.assertEqual(prediction.distribution, prediction.candidates)
         self.assertEqual(prediction.candidates[0].empirical_rate, 3 / 8)
+        self.assertEqual(prediction.candidates[0].selection_rate, 3 / 8)
+        self.assertEqual(prediction.candidates[0].presence_support, 2)
+        self.assertEqual(prediction.candidates[0].empirical_presence_rate, 1.0)
 
         narrow = self.controller.predict(source, top_k=1)
         self.assertEqual(len(narrow.candidates), 1)
@@ -215,6 +221,106 @@ class CausalPrefetchTests(unittest.TestCase):
             [row.expert_id for row in prediction.candidates],
             [2, 3],
         )
+        self.assertEqual(prediction.observation_count, 1)
+
+    def test_presence_ranking_does_not_confuse_repeated_token_mass_with_presence(
+        self,
+    ) -> None:
+        source = self.state(8, [1, 1])
+        self.controller.observe_transition(
+            source,
+            self.state(9, [2] * 8 + [3]),
+            observation_id="presence:first",
+        )
+        self.controller.observe_transition(
+            source,
+            self.state(9, [3]),
+            observation_id="presence:second",
+        )
+
+        mass = self.controller.predict(source, top_k=16)
+        presence = self.controller.predict(
+            source,
+            top_k=16,
+            ranking_mode="presence_probability",
+            presence_alpha=2,
+            presence_beta=3,
+        )
+
+        self.assertEqual([row.expert_id for row in mass.distribution], [2, 3])
+        self.assertEqual([row.expert_id for row in presence.distribution], [3, 2])
+        self.assertEqual(len(presence.candidates), 2)
+        by_expert = {row.expert_id: row for row in presence.distribution}
+        self.assertEqual(by_expert[2].selection_support, 8)
+        self.assertEqual(by_expert[2].presence_support, 1)
+        self.assertEqual(by_expert[3].selection_support, 2)
+        self.assertEqual(by_expert[3].presence_support, 2)
+        self.assertEqual(by_expert[2].selection_total, 10)
+        self.assertEqual(by_expert[2].observation_count, 2)
+        self.assertAlmostEqual(by_expert[2].presence_probability, 3 / 7)
+        self.assertAlmostEqual(by_expert[3].presence_probability, 4 / 7)
+
+        different_prior = self.controller.predict(
+            source,
+            top_k=16,
+            ranking_mode="presence_probability",
+            presence_alpha=4,
+            presence_beta=6,
+        )
+        different = {row.expert_id: row for row in different_prior.distribution}
+        self.assertAlmostEqual(different[2].presence_probability, 5 / 12)
+        self.assertAlmostEqual(different[3].presence_probability, 6 / 12)
+
+    def test_presence_ties_use_cost_then_expert_id_deterministically(self) -> None:
+        source = self.state(13, [1])
+        self.controller.observe_transition(
+            source,
+            self.state(14, [2, 3, 4]),
+            observation_id="presence-tie",
+        )
+
+        prediction = self.controller.predict(
+            source,
+            top_k=2,
+            expert_costs={2: 5, 3: 1, 4: 1},
+            ranking_mode="presence_probability",
+        )
+
+        self.assertEqual([row.expert_id for row in prediction.candidates], [3, 4])
+        self.assertEqual(
+            [row.expert_id for row in prediction.distribution],
+            [3, 4, 2],
+        )
+
+    def test_presence_prior_and_ranking_mode_are_validated(self) -> None:
+        source = self.state(1, [1])
+        for keyword, value in (
+            ("presence_alpha", 0),
+            ("presence_alpha", float("nan")),
+            ("presence_beta", -1),
+            ("presence_beta", True),
+        ):
+            with self.subTest(keyword=keyword, value=value):
+                with self.assertRaisesRegex(CausalPrefetchError, keyword):
+                    self.controller.predict(source, top_k=1, **{keyword: value})
+        with self.assertRaisesRegex(CausalPrefetchError, "ranking_mode"):
+            self.controller.predict(source, top_k=1, ranking_mode="thumb-in-mouth")
+
+    def test_legacy_transition_schema_fails_clearly(self) -> None:
+        source = self.state(15, [1])
+        self.graph.append_segment(
+            [
+                {
+                    "outcome_key": "legacy:expert",
+                    "record_type": "expert_transition",
+                    "schema": "deepseek-v4-expert-transition-v1",
+                    "trigger_key": source.key,
+                }
+            ]
+        )
+
+        with self.assertRaisesRegex(CausalPrefetchError, "incompatible.*schema"):
+            self.controller.predict(source, top_k=1)
 
     def test_fixed_history_observes_only_consecutive_routes(self) -> None:
         first = self.state(10, [1, 2])
