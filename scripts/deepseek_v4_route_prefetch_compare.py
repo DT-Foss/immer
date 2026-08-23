@@ -14,7 +14,7 @@ import tempfile
 from typing import Any
 
 RESULT_SCHEMA = "immer.deepseek-v4-fertig-draft-verification/v1"
-REPORT_SCHEMA = "immer.deepseek-v4-route-prefetch-comparison/v1"
+REPORT_SCHEMA = "immer.deepseek-v4-route-prefetch-comparison/v2"
 
 
 class CompareError(RuntimeError):
@@ -110,6 +110,47 @@ def _counter(metrics: Mapping[str, Any], name: str) -> int:
     return value
 
 
+def _shared_prefix(path: str | os.PathLike[str] | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    try:
+        from safetensors import safe_open
+    except ImportError as exc:  # pragma: no cover - runtime dependency
+        raise CompareError("shared-prefix subtraction requires safetensors") from exc
+    source = Path(path).expanduser().resolve()
+    try:
+        with safe_open(source, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata()
+    except Exception as exc:
+        raise CompareError(f"cannot read shared-prefix resume: {source}") from exc
+    if not isinstance(metadata, Mapping):
+        raise CompareError("shared-prefix resume has no metadata")
+
+    def integer(name: str) -> int:
+        raw = metadata.get(name)
+        try:
+            value = int(raw) if raw is not None else -1
+        except (TypeError, ValueError) as exc:
+            raise CompareError(f"shared-prefix {name} is invalid") from exc
+        if value < 0:
+            raise CompareError(f"shared-prefix {name} is invalid")
+        return value
+
+    raw_seconds = metadata.get("seconds")
+    try:
+        seconds = float(raw_seconds) if raw_seconds is not None else -1.0
+    except (TypeError, ValueError) as exc:
+        raise CompareError("shared-prefix seconds are invalid") from exc
+    if not math.isfinite(seconds) or seconds < 0:
+        raise CompareError("shared-prefix seconds are invalid")
+    return {
+        "linear_calls": integer("linear_calls"),
+        "next_layer": integer("next_layer"),
+        "seconds": seconds,
+        "source_body_bytes": integer("source_body_bytes"),
+    }
+
+
 def _arm_record(
     document: Mapping[str, Any],
     *,
@@ -188,6 +229,8 @@ def build_report(
     baseline_path: str | os.PathLike[str],
     real_path: str | os.PathLike[str],
     placebo_path: str | os.PathLike[str],
+    *,
+    shared_prefix_resume: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Prove output identity, then compare only transport and timing evidence."""
 
@@ -218,6 +261,17 @@ def build_report(
     if arms["real_markov"]["route_config"] != arms["placebo_markov"]["route_config"]:
         raise CompareError("real and placebo route-prefetch settings differ")
     baseline = arms["baseline"]
+    prefix = _shared_prefix(shared_prefix_resume)
+    if prefix is not None:
+        for name, arm in arms.items():
+            suffix_seconds = float(arm["seconds"]) - float(prefix["seconds"])
+            suffix_bytes = int(arm["source_body_bytes"]) - int(
+                prefix["source_body_bytes"]
+            )
+            if suffix_seconds < 0 or suffix_bytes < 0:
+                raise CompareError(f"{name} precedes the shared-prefix receipt")
+            arm["suffix_seconds"] = suffix_seconds
+            arm["suffix_source_body_bytes"] = suffix_bytes
 
     def contrast(arm: Mapping[str, Any]) -> dict[str, float | int | None]:
         seconds = float(arm["seconds"])
@@ -230,6 +284,28 @@ def build_report(
             "source_body_bytes_delta": source_bytes - baseline_bytes,
             "source_body_bytes_ratio": (
                 source_bytes / baseline_bytes if baseline_bytes else None
+            ),
+            "suffix_seconds_delta": (
+                None
+                if prefix is None
+                else float(arm["suffix_seconds"]) - float(baseline["suffix_seconds"])
+            ),
+            "suffix_seconds_ratio": (
+                None
+                if prefix is None or not float(baseline["suffix_seconds"])
+                else float(arm["suffix_seconds"]) / float(baseline["suffix_seconds"])
+            ),
+            "suffix_source_body_bytes_delta": (
+                None
+                if prefix is None
+                else int(arm["suffix_source_body_bytes"])
+                - int(baseline["suffix_source_body_bytes"])
+            ),
+            "suffix_source_body_bytes_ratio": (
+                None
+                if prefix is None or not int(baseline["suffix_source_body_bytes"])
+                else int(arm["suffix_source_body_bytes"])
+                / int(baseline["suffix_source_body_bytes"])
             ),
         }
 
@@ -247,10 +323,37 @@ def build_report(
                     int(arms["real_markov"]["source_body_bytes"])
                     - int(arms["placebo_markov"]["source_body_bytes"])
                 ),
+                "suffix_seconds_delta": (
+                    None
+                    if prefix is None
+                    else float(arms["real_markov"]["suffix_seconds"])
+                    - float(arms["placebo_markov"]["suffix_seconds"])
+                ),
+                "suffix_seconds_ratio": (
+                    None
+                    if prefix is None
+                    or not float(arms["placebo_markov"]["suffix_seconds"])
+                    else float(arms["real_markov"]["suffix_seconds"])
+                    / float(arms["placebo_markov"]["suffix_seconds"])
+                ),
+                "suffix_source_body_bytes_delta": (
+                    None
+                    if prefix is None
+                    else int(arms["real_markov"]["suffix_source_body_bytes"])
+                    - int(arms["placebo_markov"]["suffix_source_body_bytes"])
+                ),
+                "suffix_source_body_bytes_ratio": (
+                    None
+                    if prefix is None
+                    or not int(arms["placebo_markov"]["suffix_source_body_bytes"])
+                    else int(arms["real_markov"]["suffix_source_body_bytes"])
+                    / int(arms["placebo_markov"]["suffix_source_body_bytes"])
+                ),
             },
         },
         "invariant_sha256": _sha256(invariant),
         "schema": REPORT_SCHEMA,
+        "shared_prefix": prefix,
     }
     return {**identity, "sha256": _sha256(identity)}
 
@@ -282,6 +385,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--real", required=True)
     parser.add_argument("--placebo", required=True)
+    parser.add_argument("--shared-prefix-resume")
     parser.add_argument("--output", required=True)
     return parser
 
@@ -289,7 +393,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        report = build_report(args.baseline, args.real, args.placebo)
+        report = build_report(
+            args.baseline,
+            args.real,
+            args.placebo,
+            shared_prefix_resume=args.shared_prefix_resume,
+        )
         write_report(args.output, report)
     except CompareError as exc:
         raise SystemExit(f"route-prefetch comparison failed: {exc}") from exc

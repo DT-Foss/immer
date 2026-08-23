@@ -8,6 +8,9 @@ import sys
 import tempfile
 import unittest
 
+import numpy as np
+from safetensors.numpy import save_file
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "deepseek_v4_route_prefetch_compare.py"
 
@@ -75,6 +78,17 @@ class RoutePrefetchCompareTests(unittest.TestCase):
             real = directory / "real.json"
             placebo = directory / "placebo.json"
             output = directory / "comparison.json"
+            prefix = directory / "prefix.safetensors"
+            save_file(
+                {"hidden": np.zeros(1, dtype=np.float32)},
+                prefix,
+                metadata={
+                    "linear_calls": "20",
+                    "next_layer": "21",
+                    "seconds": "2.0",
+                    "source_body_bytes": "100",
+                },
+            )
             legacy_baseline = _result(enabled=False, role=None, seconds=10, body=1000)
             legacy_baseline.pop("instrumentation")
             _write(baseline, legacy_baseline)
@@ -87,11 +101,26 @@ class RoutePrefetchCompareTests(unittest.TestCase):
                 _result(enabled=True, role="placebo_markov", seconds=9, body=950),
             )
 
-            report = compare.build_report(baseline, real, placebo)
+            report = compare.build_report(
+                baseline,
+                real,
+                placebo,
+                shared_prefix_resume=prefix,
+            )
             compare.write_report(output, report)
 
             self.assertEqual(
                 report["contrasts"]["real_vs_baseline"]["seconds_ratio"], 0.7
+            )
+            self.assertEqual(
+                report["contrasts"]["real_vs_baseline"]["suffix_seconds_ratio"],
+                5 / 8,
+            )
+            self.assertEqual(
+                report["contrasts"]["real_vs_baseline"][
+                    "suffix_source_body_bytes_ratio"
+                ],
+                700 / 900,
             )
             self.assertEqual(
                 report["contrasts"]["real_vs_placebo"]["source_body_bytes_delta"],
