@@ -883,7 +883,7 @@ def _confidence_gate_sweep(
     """Apply the SituationMemory confidence rule to two-row direct windows."""
 
     widths = tuple(sorted({min(k, n_experts) for k in CONFIDENCE_K}))
-    rows: dict[int, list[tuple[Any, Any, set[int]]]] = {k: [] for k in widths}
+    rows: dict[int, list[tuple[float, int, float, int, int]]] = {k: [] for k in widths}
     for prompt in prompts:
         for source, target in prompt.consecutive_pairs():
             pairs = [
@@ -914,12 +914,22 @@ def _confidence_gate_sweep(
                     alpha=alpha,
                 )
                 for k in widths:
-                    rows[k].append((real_distribution, placebo_distribution, actual))
+                    real_top = set(real_distribution.top_k(k))
+                    placebo_top = set(placebo_distribution.top_k(k))
+                    rows[k].append(
+                        (
+                            real_distribution.top_k_confidence(k),
+                            len(actual.intersection(real_top)),
+                            placebo_distribution.top_k_confidence(k),
+                            len(actual.intersection(placebo_top)),
+                            len(actual),
+                        )
+                    )
 
     sweep: list[dict[str, Any]] = []
     for k in widths:
         evidence = rows[k]
-        target_total = sum(len(actual) for _real, _placebo, actual in evidence)
+        target_total = sum(row[4] for row in evidence)
         if not evidence or not target_total:
             raise RouteEvalError("confidence-gate sweep has no routes")
         for threshold in CONFIDENCE_THRESHOLDS:
@@ -927,12 +937,20 @@ def _confidence_gate_sweep(
                 "real": {"hits": 0, "predicted": 0, "selected": 0},
                 "placebo": {"hits": 0, "predicted": 0, "selected": 0},
             }
-            for real, placebo, actual in evidence:
-                for name, distribution in (("real", real), ("placebo", placebo)):
-                    if distribution.top_k_confidence(k) < threshold:
+            for (
+                real_confidence,
+                real_hits,
+                placebo_confidence,
+                placebo_hits,
+                _,
+            ) in evidence:
+                for name, confidence, hits in (
+                    ("real", real_confidence, real_hits),
+                    ("placebo", placebo_confidence, placebo_hits),
+                ):
+                    if confidence < threshold:
                         continue
-                    top = set(distribution.top_k(k))
-                    metrics[name]["hits"] += len(actual.intersection(top))
+                    metrics[name]["hits"] += hits
                     metrics[name]["predicted"] += k
                     metrics[name]["selected"] += 1
             record: dict[str, Any] = {"k": k, "threshold": threshold}
