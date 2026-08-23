@@ -23,6 +23,9 @@ All notable changes to IMMER are recorded here.
 - Added label-free token-row Markov routing, full expert distributions,
   configurable top-k evaluation, prompt-held-out splits, target-marginal
   baselines, and label-preserving placebos.
+- Executed Markov hints through byte-budgeted expert reservoirs with measured
+  confidence gating, direct decode windows, deduplicated large-prefill vote
+  aggregation, exact miss fallback, and bit-identical three-arm comparison.
 - Added FERTIG draft verification and exact/model fusion receipts for fixed
   integration cohorts.
 - Rebuilt public documentation around the local causal architecture and
