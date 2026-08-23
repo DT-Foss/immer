@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - the runtime target is macOS/Linux.
     fcntl = None  # type: ignore[assignment]
 
 from immer.knowledge.livecausal import LiveGraph
-from immer.knowledge.streamer import TensorSource
+from immer.knowledge.streamer import Streamer, TensorSource
 
 from .pager import (
     ExpertSourceRange,
@@ -1133,6 +1133,126 @@ class CausalWeightReader:
             }
 
 
+class CausalWeightMount:
+    """Open one local ``weights/`` + persistent ``causal/`` model bundle.
+
+    Weight files stay in place and are read by local ``pread`` ranges with no
+    disk payload cache.  The sibling causal directory stores only the durable
+    address graph and can be appended while this mount is alive.
+    """
+
+    WEIGHTS_DIRECTORY = "weights"
+    CAUSAL_DIRECTORY = "causal"
+
+    def __init__(
+        self,
+        root: str | os.PathLike[str],
+        model: LogicalModelIdentity,
+        *,
+        budget_mb: float = 200.0,
+        max_metadata_bytes: int = 64 * 1024 * 1024,
+        max_open_files: int | None = 64,
+        verbose: bool = False,
+    ) -> None:
+        if not isinstance(model, LogicalModelIdentity):
+            raise TypeError("model must be a LogicalModelIdentity")
+        bundle_root = Path(root).expanduser().absolute()
+        weights_root = bundle_root / self.WEIGHTS_DIRECTORY
+        causal_root = bundle_root / self.CAUSAL_DIRECTORY
+        self._require_plain_directory(bundle_root, "causal bundle root")
+        self._require_plain_directory(weights_root, "causal bundle weights root")
+        self._require_plain_directory(causal_root, "causal bundle graph root")
+
+        source = Streamer.from_local(
+            weights_root,
+            budget_mb=budget_mb,
+            use_cache=False,
+            max_metadata_bytes=max_metadata_bytes,
+            max_open_files=max_open_files,
+            verbose=verbose,
+        )
+        try:
+            layout = CausalWeightLayoutIdentity.from_source(source, model=model)
+            graph = LiveGraph(causal_root)
+            reader = CausalWeightReader(graph, layout, source=source)
+        except Exception:
+            source.close()
+            raise
+
+        self.root = bundle_root
+        self.weights_root = weights_root
+        self.causal_root = causal_root
+        self.model = model
+        self.source = source
+        self.layout = layout
+        self.graph = graph
+        self.reader = reader
+        self._closed = False
+
+    @staticmethod
+    def _require_plain_directory(path: Path, label: str) -> None:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise CausalWeightIntegrityError(f"{label} is missing: {path}") from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise CausalWeightIntegrityError(
+                f"{label} must be a non-symlink directory: {path}"
+            )
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise CausalWeightError("causal weight mount is closed")
+
+    def bind_plans(
+        self,
+        plans: Iterable[OfficialExpertRangePlan],
+    ) -> CausalWeightBindingReceipt:
+        self._require_open()
+        return bind_causal_weight_plans(self.graph, self.layout, plans)
+
+    def resolve_expert_plans(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+    ) -> tuple[OfficialExpertRangePlan, ...]:
+        self._require_open()
+        return self.reader.resolve_expert_plans(layer, expert_ids)
+
+    def read_experts(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+        *,
+        resident_limit_bytes: int | None = None,
+    ) -> CausalWeightReadReceipt:
+        self._require_open()
+        return self.reader.read_experts(
+            layer,
+            expert_ids,
+            resident_limit_bytes=resident_limit_bytes,
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            self.source.close()
+        finally:
+            self._closed = True
+
+    def __enter__(self) -> CausalWeightMount:
+        self._require_open()
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self.close()
+
+
 __all__ = [
     "CAUSAL_WEIGHT_BINDING_SCHEMA",
     "CausalWeightBindingReceipt",
@@ -1142,6 +1262,7 @@ __all__ = [
     "CausalWeightIntegrityError",
     "CausalWeightLayoutIdentity",
     "CausalWeightLeaf",
+    "CausalWeightMount",
     "CausalWeightNotFoundError",
     "CausalWeightReadReceipt",
     "CausalWeightReader",

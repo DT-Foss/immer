@@ -12,6 +12,7 @@ from unittest import mock
 
 from immer.knowledge.livecausal import LiveCausalIntegrityError, LiveGraph
 from immer.knowledge.streamer import Streamer
+from immer.runtimes.deepseek_v4 import CausalWeightMount
 from immer.runtimes.deepseek_v4.causal_weights import (
     CausalWeightConflictError,
     CausalWeightError,
@@ -125,6 +126,111 @@ def _shift_plan(plan: OfficialExpertRangePlan, amount: int) -> OfficialExpertRan
 
 
 class CausalWeightMonorailTests(unittest.TestCase):
+    def test_local_bundle_mount_persists_graph_and_keeps_logical_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            bundle = base / "model.causal"
+            weights = bundle / "weights"
+            causal = bundle / "causal"
+            bundle.mkdir()
+            causal.mkdir()
+            _write_expert_fixture(weights, expert_ids=(0, 1, 2))
+            shard = weights / "model.safetensors"
+            weight_bytes = shard.read_bytes()
+            weight_stat = shard.stat()
+
+            mounted = CausalWeightMount(
+                bundle,
+                _LOGICAL_MODEL,
+                budget_mb=16,
+                max_open_files=2,
+            )
+            with mounted as first:
+                self.assertEqual(first.root, bundle.absolute())
+                self.assertTrue(first.source.repo_id.startswith("local:"))
+                self.assertNotEqual(first.source.repo_id, _LOGICAL_MODEL.repo_id)
+                self.assertEqual(
+                    first.source.metrics()["transport_fd_max_open_files"],
+                    2,
+                )
+                self.assertEqual(first.model, _LOGICAL_MODEL)
+                self.assertEqual(first.layout.model, _LOGICAL_MODEL)
+                pager = DeepSeekWeightPager(
+                    first.source,
+                    device="cpu",
+                    compute_dtype="bfloat16",
+                )
+                plans = pager.plan_expert_ranges(3, (0, 1, 2))
+                first.bind_plans(plans[:2])
+                self.assertEqual(first.resolve_expert_plans(3, (0, 1)), plans[:2])
+                first.bind_plans(plans[2:])
+                self.assertEqual(first.resolve_expert_plans(3, (0, 1, 2)), plans)
+                read = first.read_experts(3, (2, 0))
+                self.assertEqual(read.plans, (plans[2], plans[0]))
+                self.assertEqual(len(first.graph.store.segments()), 2)
+                layout_fingerprint = first.layout.layout_fingerprint
+                pager.release()
+
+            self.assertTrue(mounted.closed)
+            with self.assertRaises(CausalWeightError):
+                mounted.resolve_expert_plans(3, (0,))
+            mounted.close()
+
+            with CausalWeightMount(
+                bundle,
+                _LOGICAL_MODEL,
+                budget_mb=16,
+                max_open_files=2,
+            ) as remounted:
+                self.assertEqual(
+                    remounted.layout.layout_fingerprint, layout_fingerprint
+                )
+                self.assertEqual(remounted.layout.model, _LOGICAL_MODEL)
+                self.assertEqual(remounted.resolve_expert_plans(3, (0, 1, 2)), plans)
+                self.assertEqual(len(remounted.graph.store.segments()), 2)
+                semantic_key = semantic_expert_key(
+                    _LOGICAL_MODEL,
+                    layer=3,
+                    expert_id=2,
+                )
+                self.assertEqual(len(remounted.graph.query_base(semantic_key)), 1)
+
+            self.assertEqual(shard.read_bytes(), weight_bytes)
+            after = shard.stat()
+            self.assertEqual(after.st_ino, weight_stat.st_ino)
+            self.assertEqual(after.st_size, weight_stat.st_size)
+            self.assertEqual(after.st_mtime_ns, weight_stat.st_mtime_ns)
+
+    def test_local_bundle_mount_rejects_symlinked_or_incomplete_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            real = base / "real"
+            real.mkdir()
+            (real / "causal").mkdir()
+            _write_expert_fixture(real / "weights", expert_ids=(0,))
+            linked_bundle = base / "model.causal"
+            linked_bundle.symlink_to(real, target_is_directory=True)
+            with self.assertRaises(CausalWeightIntegrityError):
+                CausalWeightMount(linked_bundle, _LOGICAL_MODEL)
+
+            incomplete = base / "incomplete.causal"
+            incomplete.mkdir()
+            _write_expert_fixture(incomplete / "weights", expert_ids=(0,))
+            with self.assertRaises(CausalWeightIntegrityError):
+                CausalWeightMount(incomplete, _LOGICAL_MODEL)
+
+            external_weights = base / "external-weights"
+            _write_expert_fixture(external_weights, expert_ids=(0,))
+            linked_weights_bundle = base / "linked-weights.causal"
+            linked_weights_bundle.mkdir()
+            (linked_weights_bundle / "causal").mkdir()
+            (linked_weights_bundle / "weights").symlink_to(
+                external_weights,
+                target_is_directory=True,
+            )
+            with self.assertRaises(CausalWeightIntegrityError):
+                CausalWeightMount(linked_weights_bundle, _LOGICAL_MODEL)
+
     def test_bound_plans_resolve_and_read_without_metadata_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
