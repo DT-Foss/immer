@@ -139,6 +139,12 @@ class RoutePrefetchCompareTests(unittest.TestCase):
             with self.assertRaisesRegex(compare.CompareError, "role"):
                 compare.build_report(baseline, real, placebo)
 
+            fixed["instrumentation"]["route_prefetch"]["model_role"] = "real_markov"
+            fixed["instrumentation"]["route_prefetch"]["k"] = 3
+            _write(real, fixed)
+            with self.assertRaisesRegex(compare.CompareError, "settings differ"):
+                compare.build_report(baseline, real, placebo)
+
 
 if __name__ == "__main__":
     unittest.main()

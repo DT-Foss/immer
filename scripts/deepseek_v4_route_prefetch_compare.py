@@ -153,6 +153,17 @@ def _arm_record(
         "legacy_baseline_instrumentation": legacy_baseline,
         "model_role": expected_role,
         "model_snapshot_sha256": route.get("model_snapshot_sha256"),
+        "route_config": {
+            key: route.get(key)
+            for key in (
+                "alpha",
+                "direct_max_rows",
+                "k",
+                "min_confidence",
+                "window_rows",
+            )
+        },
+        "scheduler": route.get("scheduler"),
         "seconds": seconds,
         "source_body_bytes": source_bytes,
         "pager": dict(pager),
@@ -204,6 +215,8 @@ def build_report(
             expected_role="placebo_markov",
         ),
     }
+    if arms["real_markov"]["route_config"] != arms["placebo_markov"]["route_config"]:
+        raise CompareError("real and placebo route-prefetch settings differ")
     baseline = arms["baseline"]
 
     def contrast(arm: Mapping[str, Any]) -> dict[str, float | int | None]:
