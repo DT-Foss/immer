@@ -275,6 +275,19 @@ class ScoreDistribution:
             raise RouteMarkovError("k exceeds the expert inventory")
         return self.ranking[:width]
 
+    def top_k_confidence(self, k: int) -> float:
+        """Return top-K mass above the uniform null on a normalized 0..1 scale."""
+
+        width = _integer(k, "k", minimum=1)
+        if width > len(self.scores):
+            raise RouteMarkovError("k exceeds the expert inventory")
+        if width == len(self.scores):
+            return 0.0
+        uniform_mass = width / len(self.scores)
+        observed_mass = sum(self.scores[expert] for expert in self.ranking[:width])
+        confidence = (observed_mass - uniform_mass) / (1.0 - uniform_mass)
+        return min(1.0, max(0.0, confidence))
+
 
 @dataclass(frozen=True, slots=True)
 class MicroWindowPrediction:
@@ -285,6 +298,7 @@ class MicroWindowPrediction:
     active_row_start: int
     active_row_stop: int
     candidate_experts: tuple[int, ...]
+    confidence: float
 
     def __post_init__(self) -> None:
         source = _integer(self.source_layer, "source_layer")
@@ -300,11 +314,20 @@ class MicroWindowPrediction:
             raise RouteMarkovError(
                 "micro-window candidates must be non-empty and unique"
             )
+        confidence = self.confidence
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not math.isfinite(confidence)
+            or not 0 <= confidence <= 1
+        ):
+            raise RouteMarkovError("micro-window confidence must be inside [0, 1]")
         object.__setattr__(self, "source_layer", source)
         object.__setattr__(self, "target_layer", target)
         object.__setattr__(self, "active_row_start", start)
         object.__setattr__(self, "active_row_stop", stop)
         object.__setattr__(self, "candidate_experts", candidates)
+        object.__setattr__(self, "confidence", float(confidence))
 
 
 @dataclass(frozen=True, slots=True)
@@ -830,6 +853,7 @@ def plan_micro_window_prefetch(
                 active_row_start=start,
                 active_row_stop=start + len(chunk),
                 candidate_experts=candidates,
+                confidence=distribution.top_k_confidence(candidate_count),
             )
         )
         # Rank-local reciprocal votes retain repeated causal micro-window

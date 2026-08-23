@@ -112,6 +112,8 @@ class RouteMarkovTests(unittest.TestCase):
         self.assertEqual(len(distribution.top_k(256)), 256)
         self.assertAlmostEqual(sum(distribution.scores), 1.0)
         self.assertTrue(all(score == 1 / 256 for score in distribution.scores))
+        self.assertEqual(distribution.top_k_confidence(6), 0.0)
+        self.assertEqual(distribution.top_k_confidence(256), 0.0)
         with self.assertRaisesRegex(RouteMarkovError, "exceeds"):
             distribution.top_k(257)
 
@@ -195,6 +197,7 @@ class RouteMarkovTests(unittest.TestCase):
         self.assertEqual(len(plan.windows[1].candidate_experts), 3)
         self.assertEqual(plan.windows[0].candidate_experts[0], 5)
         self.assertEqual(plan.windows[1].candidate_experts[0], 2)
+        self.assertTrue(all(window.confidence > 0 for window in plan.windows))
         self.assertEqual(len(plan.aggregate_candidates), 3)
         self.assertTrue(
             set(plan.aggregate_candidates).issubset(

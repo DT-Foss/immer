@@ -257,6 +257,12 @@ def _parser() -> argparse.ArgumentParser:
         help="larger prefills aggregate local votes and execute each expert once",
     )
     parser.add_argument(
+        "--route-prefetch-min-confidence",
+        type=_unit_float,
+        default=0.0,
+        help="normalized top-K mass above the uniform null required for direct windows",
+    )
+    parser.add_argument(
         "--expert-reservoir-budget-mb",
         type=_positive_int,
         default=256,
@@ -1356,6 +1362,9 @@ def _model_runtime(
                     "route_prefetch_direct_max_rows": (
                         args.route_prefetch_direct_max_rows
                     ),
+                    "route_prefetch_min_confidence": (
+                        args.route_prefetch_min_confidence
+                    ),
                 }
             )
         model = StreamedDeepSeekV4(config, pager, **model_kwargs)
@@ -1369,6 +1378,7 @@ def _model_runtime(
                 window_rows=args.route_prefetch_window_rows,
                 k=args.route_prefetch_k,
                 direct_max_rows=args.route_prefetch_direct_max_rows,
+                min_confidence=args.route_prefetch_min_confidence,
             )
         yield model
     finally:
@@ -1863,6 +1873,11 @@ def _verify_locally(
                 ),
                 "direct_max_rows": (
                     args.route_prefetch_direct_max_rows
+                    if route_predictor is not None
+                    else None
+                ),
+                "min_confidence": (
+                    args.route_prefetch_min_confidence
                     if route_predictor is not None
                     else None
                 ),

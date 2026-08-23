@@ -70,6 +70,20 @@ HEADLINE_K = (1, 3, 6, 12, 24, 48, 96, 256)
 MICRO_WINDOW_ROWS = (1, 2, 4, 8, 16, 32, 64)
 MICRO_WINDOW_K = (3, 6, 9, 12, 18, 24)
 AGGREGATE_VOTE_K = (3, 6, 9, 12, 18, 24, 48)
+CONFIDENCE_K = (3, 6)
+CONFIDENCE_THRESHOLDS = (
+    0.0,
+    0.05,
+    0.075,
+    0.1,
+    0.125,
+    0.15,
+    0.175,
+    0.2,
+    0.225,
+    0.25,
+    0.3,
+)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _OBSERVATION_FIELDS = frozenset(
     {
@@ -858,6 +872,85 @@ def _aggregate_vote_sweep(
     return sweep
 
 
+def _confidence_gate_sweep(
+    real_model: LayerMarkovExpertPredictor,
+    placebo_model: LayerMarkovExpertPredictor,
+    prompts: Sequence[PromptRouteObservation],
+    *,
+    alpha: float,
+    n_experts: int,
+) -> list[dict[str, Any]]:
+    """Apply the SituationMemory confidence rule to two-row direct windows."""
+
+    widths = tuple(sorted({min(k, n_experts) for k in CONFIDENCE_K}))
+    rows: dict[int, list[tuple[Any, Any, set[int]]]] = {k: [] for k in widths}
+    for prompt in prompts:
+        for source, target in prompt.consecutive_pairs():
+            pairs = [
+                (source_row, target_row)
+                for source_row, target_row in zip(
+                    source.rows,
+                    target.rows,
+                    strict=True,
+                )
+                if source_row and target_row
+            ]
+            for start in range(0, len(pairs), 2):
+                chunk = pairs[start : start + 2]
+                if not chunk:
+                    continue
+                current_rows = tuple(source_row for source_row, _target in chunk)
+                actual = {
+                    expert for _source, target_row in chunk for expert in target_row
+                }
+                real_distribution = real_model.predict_window_distribution(
+                    source_layer=source.layer,
+                    current_rows=current_rows,
+                    alpha=alpha,
+                )
+                placebo_distribution = placebo_model.predict_window_distribution(
+                    source_layer=source.layer,
+                    current_rows=current_rows,
+                    alpha=alpha,
+                )
+                for k in widths:
+                    rows[k].append((real_distribution, placebo_distribution, actual))
+
+    sweep: list[dict[str, Any]] = []
+    for k in widths:
+        evidence = rows[k]
+        target_total = sum(len(actual) for _real, _placebo, actual in evidence)
+        if not evidence or not target_total:
+            raise RouteEvalError("confidence-gate sweep has no routes")
+        for threshold in CONFIDENCE_THRESHOLDS:
+            metrics: dict[str, dict[str, int]] = {
+                "real": {"hits": 0, "predicted": 0, "selected": 0},
+                "placebo": {"hits": 0, "predicted": 0, "selected": 0},
+            }
+            for real, placebo, actual in evidence:
+                for name, distribution in (("real", real), ("placebo", placebo)):
+                    if distribution.top_k_confidence(k) < threshold:
+                        continue
+                    top = set(distribution.top_k(k))
+                    metrics[name]["hits"] += len(actual.intersection(top))
+                    metrics[name]["predicted"] += k
+                    metrics[name]["selected"] += 1
+            record: dict[str, Any] = {"k": k, "threshold": threshold}
+            for name in ("real", "placebo"):
+                arm = metrics[name]
+                hits = arm["hits"]
+                predicted = arm["predicted"]
+                record[f"{name}_window_fraction"] = arm["selected"] / len(evidence)
+                record[f"{name}_recall"] = hits / target_total
+                record[f"{name}_precision"] = hits / predicted if predicted else None
+                record[f"{name}_expert_read_amplification"] = (
+                    predicted + target_total - hits
+                ) / target_total
+            record["delta_recall"] = record["real_recall"] - record["placebo_recall"]
+            sweep.append(record)
+    return sweep
+
+
 def build_report(
     sidecar_path: str | Path,
     *,
@@ -950,6 +1043,13 @@ def build_report(
             alpha=prior,
             n_experts=inventory,
         )
+        confidence_gate_sweep = _confidence_gate_sweep(
+            real_model,
+            placebo_model,
+            split.test,
+            alpha=prior,
+            n_experts=inventory,
+        )
     except RouteMarkovError as exc:
         raise RouteEvalError(str(exc)) from exc
 
@@ -960,6 +1060,7 @@ def build_report(
     identity: dict[str, Any] = {
         "aggregate_vote_sweep": aggregate_vote_sweep,
         "checkpoint": routes.checkpoint.as_record(),
+        "confidence_gate_sweep": confidence_gate_sweep,
         "evaluations": {
             name: _evaluation_record(evaluation)
             for name, evaluation in evaluations.items()
@@ -1020,6 +1121,7 @@ def write_report(path: str | Path, report: Mapping[str, Any]) -> None:
 
     if not isinstance(report, Mapping) or set(report) != {
         "checkpoint",
+        "confidence_gate_sweep",
         "aggregate_vote_sweep",
         "evaluations",
         "headline",

@@ -417,7 +417,12 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
             )
         )
 
-        def execute(with_predictor: bool, *, direct_max_rows: int = 8):
+        def execute(
+            with_predictor: bool,
+            *,
+            direct_max_rows: int = 8,
+            min_confidence: float = 0.0,
+        ):
             pager = DeepSeekWeightPager(
                 _TwoLayerPrefetchQuantizedTinyCheckpoint(),
                 device="cpu",
@@ -431,6 +436,7 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
                 route_predictor=predictor if with_predictor else None,
                 route_prefetch_window_rows=2,
                 route_prefetch_direct_max_rows=direct_max_rows,
+                route_prefetch_min_confidence=min_confidence,
             )
             hidden, evidence = model.hidden_stateful([[7, 8, 9, 10]])
             return hidden, evidence, pager.metrics(), model.route_prefetch_metrics()
@@ -439,6 +445,9 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
         actual, actual_evidence, markov, direct_scheduler = execute(True)
         aggregated, aggregated_evidence, aggregate_metrics, aggregate_scheduler = (
             execute(True, direct_max_rows=2)
+        )
+        skipped, skipped_evidence, skipped_metrics, skipped_scheduler = execute(
+            True, min_confidence=1.0
         )
 
         self.assertTrue(torch.equal(actual, expected))
@@ -449,6 +458,11 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
         self.assertTrue(torch.equal(aggregated, expected))
         self.assertEqual(
             aggregated_evidence.selected_experts,
+            expected_evidence.selected_experts,
+        )
+        self.assertTrue(torch.equal(skipped, expected))
+        self.assertEqual(
+            skipped_evidence.selected_experts,
             expected_evidence.selected_experts,
         )
         self.assertEqual(markov["expert_reservoir_submitted"], 4)
@@ -464,6 +478,8 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
         self.assertEqual(direct_scheduler["direct_bindings"], 2)
         self.assertEqual(aggregate_scheduler["aggregate_plans"], 1)
         self.assertEqual(aggregate_scheduler["aggregate_bindings"], 1)
+        self.assertEqual(skipped_metrics["expert_reservoir_submitted"], 0)
+        self.assertEqual(skipped_scheduler["confidence_skips"], 2)
         self.assertFalse(baseline_scheduler["enabled"])
         self.assertGreater(baseline["expert_prefetch_submitted"], 0)
 

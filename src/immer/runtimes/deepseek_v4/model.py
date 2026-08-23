@@ -123,6 +123,7 @@ class StreamedDeepSeekV4:
         route_prefetch_k: int | None = None,
         route_prefetch_alpha: float = 1.0,
         route_prefetch_direct_max_rows: int = 8,
+        route_prefetch_min_confidence: float = 0.0,
     ) -> None:
         self.config = config
         self.pager = pager
@@ -182,11 +183,19 @@ class StreamedDeepSeekV4:
             or route_prefetch_direct_max_rows < 1
         ):
             raise ValueError("route_prefetch_direct_max_rows must be positive")
+        if (
+            isinstance(route_prefetch_min_confidence, bool)
+            or not isinstance(route_prefetch_min_confidence, (int, float))
+            or not math.isfinite(route_prefetch_min_confidence)
+            or not 0 <= route_prefetch_min_confidence <= 1
+        ):
+            raise ValueError("route_prefetch_min_confidence must be inside [0, 1]")
         self.route_predictor = route_predictor
         self.route_prefetch_window_rows = route_prefetch_window_rows
         self.route_prefetch_k = route_prefetch_k
         self.route_prefetch_alpha = float(route_prefetch_alpha)
         self.route_prefetch_direct_max_rows = route_prefetch_direct_max_rows
+        self.route_prefetch_min_confidence = float(route_prefetch_min_confidence)
         self._route_prefetch_plan: LayerMicroWindowPlan | None = None
         self._route_prefetch_window_index = 0
         self._route_prefetch_reservoir: Any | None = None
@@ -196,6 +205,7 @@ class StreamedDeepSeekV4:
             "aggregate_plans": 0,
             "direct_bindings": 0,
             "direct_plans": 0,
+            "confidence_skips": 0,
             "plans": 0,
         }
         self._attention_states: list[NativeAttentionState | None] = [
@@ -617,6 +627,7 @@ class StreamedDeepSeekV4:
             "snapshot_sha256": predictor.snapshot_sha256,
             "window_rows": self.route_prefetch_window_rows,
             "direct_max_rows": self.route_prefetch_direct_max_rows,
+            "min_confidence": self.route_prefetch_min_confidence,
         }
 
     def _snapshot_identity(self) -> dict[str, Any]:
@@ -1299,12 +1310,16 @@ class StreamedDeepSeekV4:
         plan = self._route_prefetch_plan
         if plan is None or self._route_prefetch_window_index >= len(plan.windows):
             return False
+        window = plan.windows[self._route_prefetch_window_index]
+        if (
+            not self._route_prefetch_aggregate
+            and window.confidence < self.route_prefetch_min_confidence
+        ):
+            return False
         bases = (
             self._route_aggregate_bases(plan)
             if self._route_prefetch_aggregate
-            else self._route_window_bases(
-                plan.windows[self._route_prefetch_window_index]
-            )
+            else self._route_window_bases(window)
         )
         reservoir = self.pager.prefetch_expert_reservoir(bases)
         if reservoir is None:
@@ -1369,7 +1384,7 @@ class StreamedDeepSeekV4:
         plan = self._route_prefetch_plan
         index = self._route_prefetch_window_index
         reservoir = self._route_prefetch_reservoir
-        if plan is None or reservoir is None or index >= len(plan.windows):
+        if plan is None or index >= len(plan.windows):
             return {}, self.pager.prefetch_expert_window(exact_bases)
         window = plan.windows[index]
         aligned = plan.target_layer == layer and (
@@ -1382,14 +1397,18 @@ class StreamedDeepSeekV4:
             self._cancel_route_prefetch()
             return {}, self.pager.prefetch_expert_window(exact_bases)
 
-        payloads = self.pager.bind_expert_reservoir(reservoir, exact_bases)
-        binding_metric = (
-            "aggregate_bindings"
-            if self._route_prefetch_aggregate
-            else "direct_bindings"
-        )
-        self._route_prefetch_stats[binding_metric] += 1
-        self._route_prefetch_reservoir = None
+        if reservoir is None:
+            payloads: dict[str, Any] = {}
+            self._route_prefetch_stats["confidence_skips"] += 1
+        else:
+            payloads = self.pager.bind_expert_reservoir(reservoir, exact_bases)
+            binding_metric = (
+                "aggregate_bindings"
+                if self._route_prefetch_aggregate
+                else "direct_bindings"
+            )
+            self._route_prefetch_stats[binding_metric] += 1
+            self._route_prefetch_reservoir = None
         self._route_prefetch_window_index += 1
         misses = tuple(base for base in exact_bases if base not in payloads)
         exact_window = self.pager.prefetch_expert_window(misses) if misses else None
@@ -1419,6 +1438,7 @@ class StreamedDeepSeekV4:
             "direct_max_rows": self.route_prefetch_direct_max_rows,
             "enabled": self.route_predictor is not None,
             "k": self.route_prefetch_k,
+            "min_confidence": self.route_prefetch_min_confidence,
             "window_rows": self.route_prefetch_window_rows,
         }
 
