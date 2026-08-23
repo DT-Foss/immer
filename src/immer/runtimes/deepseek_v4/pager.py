@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import gc
+import math
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from contextvars import Context, copy_context
 from dataclasses import asdict, dataclass
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 import re
 import threading
 import time
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -67,6 +68,11 @@ class PagerMetrics:
     expert_transport_source_bytes: int = 0
     expert_range_requests_avoided: int = 0
     expert_range_gap_bytes: int = 0
+    causal_expert_plan_resolves: int = 0
+    causal_expert_plan_hits: int = 0
+    causal_expert_plan_misses: int = 0
+    causal_expert_plan_fallbacks: int = 0
+    causal_expert_plan_invalid: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +120,23 @@ class OfficialExpertRangePlan:
     expert_id: int
     ranges: tuple[ExpertSourceRange, ...]
     payload_bytes: int
+
+
+class CausalExpertPlanResolver(Protocol):
+    """Duck contract for a causal expert-address plane.
+
+    The protocol deliberately lives beside the pager plan types.  A concrete
+    causal graph reader may import those types without the pager importing the
+    graph module back and creating a runtime cycle.  Missing bindings use
+    ``KeyError``; integrity/layout failures must use another exception and are
+    always fail-closed by the pager.
+    """
+
+    def resolve_expert_plans(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+    ) -> tuple[OfficialExpertRangePlan, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +289,8 @@ class DeepSeekWeightPager:
         simulate_activation_quantization: bool = True,
         expert_prefetch: bool = True,
         expert_range_coalesce_max_experts: int | None = None,
+        causal_weight_reader: CausalExpertPlanResolver | None = None,
+        causal_missing_fallback: bool = False,
     ) -> None:
         try:
             import torch
@@ -319,6 +344,66 @@ class DeepSeekWeightPager:
         self._active_prefetch_payload: _ExpertPayload | None = None
         self._draining_prefetch: set[Future[_CoalescedExpertBatch]] = set()
         self._draining_executor: ThreadPoolExecutor | None = None
+        self._causal_weight_reader: CausalExpertPlanResolver | None = None
+        self._causal_missing_fallback = False
+        self.attach_causal_weight_reader(
+            causal_weight_reader,
+            fallback_on_missing=causal_missing_fallback,
+        )
+
+    def attach_causal_weight_reader(
+        self,
+        reader: CausalExpertPlanResolver | None,
+        *,
+        fallback_on_missing: bool = False,
+    ) -> None:
+        """Attach or detach the routed-expert causal address plane.
+
+        Once attached, canonical routed experts are resolved exclusively from
+        stored absolute ranges and tensor offsets.  A missing binding fails
+        closed unless ``fallback_on_missing`` is explicitly enabled; malformed
+        or conflicting bindings never fall back to tensor-name discovery.
+        Shared/dense experts are outside this routed-address contract and keep
+        their normal checkpoint metadata path.
+        """
+
+        if not isinstance(fallback_on_missing, bool):
+            raise ValueError("fallback_on_missing must be a boolean")
+        if reader is None:
+            if fallback_on_missing:
+                raise ValueError("missing fallback requires an attached reader")
+        else:
+            if not callable(getattr(reader, "resolve_expert_plans", None)):
+                raise TypeError(
+                    "causal weight reader must implement resolve_expert_plans"
+                )
+            layout = getattr(reader, "layout", None)
+            expected_fingerprint = getattr(layout, "layout_fingerprint", None)
+            reader_source = getattr(reader, "source", None)
+            if expected_fingerprint and reader_source is not self.source:
+                source_metrics = getattr(self.source, "metrics", None)
+                snapshot = source_metrics() if callable(source_metrics) else None
+                observed_fingerprint = (
+                    snapshot.get("inventory_source_fingerprint")
+                    if isinstance(snapshot, Mapping)
+                    else None
+                )
+                if observed_fingerprint != expected_fingerprint:
+                    raise DeepSeekPagerError(
+                        "causal weight reader layout does not match the pager source"
+                    )
+        with self._prefetch_lock:
+            if (
+                self._active_prefetch_window is not None
+                or self._active_prefetch_payload is not None
+                or self._draining_prefetch
+                or self._draining_executor is not None
+            ):
+                raise DeepSeekPagerError(
+                    "cannot replace the causal weight reader during expert prefetch"
+                )
+            self._causal_weight_reader = reader
+            self._causal_missing_fallback = fallback_on_missing
 
     @property
     def expert_prefetch_policy(self) -> str:
@@ -615,6 +700,59 @@ class DeepSeekWeightPager:
         raw_bytes = getattr(self.source, "raw_bytes", None)
         if require_payload_reader and not callable(raw_bytes):
             return None
+        match = self._OFFICIAL_EXPERT_BASE.fullmatch(base)
+        reader = self._causal_weight_reader
+        if reader is not None and match is not None:
+            layer, expert_id = int(match.group(1)), int(match.group(2))
+            self._stats.causal_expert_plan_resolves += 1
+            try:
+                resolved = reader.resolve_expert_plans(layer, (expert_id,))
+            except KeyError as exc:
+                self._stats.causal_expert_plan_misses += 1
+                if self._causal_missing_fallback:
+                    self._stats.causal_expert_plan_fallbacks += 1
+                    return self._source_expert_plan(base)
+                raise DeepSeekPagerError(
+                    f"causal weight binding is missing for {base}"
+                ) from exc
+            except Exception as exc:
+                self._stats.causal_expert_plan_invalid += 1
+                raise DeepSeekPagerError(
+                    f"causal weight resolution failed for {base}"
+                ) from exc
+            if not isinstance(resolved, tuple):
+                self._stats.causal_expert_plan_invalid += 1
+                raise DeepSeekPagerError(
+                    f"causal weight resolver returned a non-tuple for {base}"
+                )
+            if not resolved:
+                self._stats.causal_expert_plan_misses += 1
+                if self._causal_missing_fallback:
+                    self._stats.causal_expert_plan_fallbacks += 1
+                    return self._source_expert_plan(base)
+                raise DeepSeekPagerError(f"causal weight binding is missing for {base}")
+            if len(resolved) != 1:
+                self._stats.causal_expert_plan_invalid += 1
+                raise DeepSeekPagerError(
+                    f"causal weight resolver returned {len(resolved)} plans for {base}"
+                )
+            try:
+                plan = self._private_expert_plan(
+                    resolved[0],
+                    base=base,
+                    layer=layer,
+                    expert_id=expert_id,
+                )
+            except DeepSeekPagerError:
+                self._stats.causal_expert_plan_invalid += 1
+                raise
+            self._stats.causal_expert_plan_hits += 1
+            return plan
+        return self._source_expert_plan(base)
+
+    def _source_expert_plan(self, base: str) -> _ExpertReadPlan | None:
+        """Discover one expert through safetensors metadata when no rail applies."""
+
         weight_names = [f"{base}.{role}.weight" for role in ("w1", "w2", "w3")]
         try:
             weight_metas = [self.source.find(name) for name in weight_names]
@@ -658,6 +796,171 @@ class DeepSeekWeightPager:
             payload_bytes=payload_bytes,
         )
 
+    @staticmethod
+    def _private_expert_plan(
+        public: OfficialExpertRangePlan,
+        *,
+        base: str,
+        layer: int,
+        expert_id: int,
+    ) -> _ExpertReadPlan:
+        """Validate and lower one stored causal plan without metadata lookup."""
+
+        if not isinstance(public, OfficialExpertRangePlan):
+            raise DeepSeekPagerError(
+                f"causal weight resolver returned an unsupported plan for {base}"
+            )
+        if (public.base, public.layer, public.expert_id) != (base, layer, expert_id):
+            raise DeepSeekPagerError(
+                f"causal weight plan coordinates do not match {base}"
+            )
+        if not isinstance(public.ranges, tuple) or len(public.ranges) != 2:
+            raise DeepSeekPagerError(
+                f"causal weight plan for {base} must contain scale and weight ranges"
+            )
+
+        expected_groups = (
+            tuple(f"{base}.{role}.scale" for role in ("w1", "w2", "w3")),
+            tuple(f"{base}.{role}.weight" for role in ("w1", "w2", "w3")),
+        )
+        layouts: list[tuple[str, int, int, tuple[dict[str, Any], ...]]] = []
+        observed_weight_dtypes: set[str] = set()
+        payload_bytes = 0
+        for range_index, (source_range, expected_names) in enumerate(
+            zip(public.ranges, expected_groups, strict=True)
+        ):
+            if not isinstance(source_range, ExpertSourceRange):
+                raise DeepSeekPagerError(
+                    f"causal weight range {range_index} for {base} is invalid"
+                )
+            shard = source_range.shard
+            absolute = source_range.absolute_offset
+            length = source_range.length
+            if not isinstance(shard, str) or not shard:
+                raise DeepSeekPagerError(
+                    f"causal weight range {range_index} for {base} has no shard"
+                )
+            if (
+                isinstance(absolute, bool)
+                or not isinstance(absolute, int)
+                or absolute < 8
+                or isinstance(length, bool)
+                or not isinstance(length, int)
+                or length <= 0
+            ):
+                raise DeepSeekPagerError(
+                    f"causal weight range {range_index} for {base} is invalid"
+                )
+            tensors = source_range.tensors
+            if (
+                not isinstance(tensors, tuple)
+                or any(not isinstance(tensor, ExpertTensorLayout) for tensor in tensors)
+                or len({tensor.name for tensor in tensors}) != len(expected_names)
+                or {tensor.name for tensor in tensors} != set(expected_names)
+            ):
+                raise DeepSeekPagerError(
+                    f"causal weight tensor membership is invalid for {base} "
+                    f"range {range_index}"
+                )
+
+            metas: list[dict[str, Any]] = []
+            cursor = 0
+            # Tensor tuple order is physical offset order, not role order.  A
+            # local repack may place w2 before w1 while preserving the same
+            # names, exact offsets, and decoded computation.
+            for tensor in tensors:
+                tensor_length = tensor.length
+                range_offset = tensor.range_offset
+                tensor_absolute = tensor.absolute_offset
+                shape = tensor.shape
+                dtype = tensor.dtype
+                if (
+                    isinstance(tensor_length, bool)
+                    or not isinstance(tensor_length, int)
+                    or tensor_length <= 0
+                    or isinstance(range_offset, bool)
+                    or not isinstance(range_offset, int)
+                    or range_offset != cursor
+                    or isinstance(tensor_absolute, bool)
+                    or not isinstance(tensor_absolute, int)
+                    or tensor_absolute != absolute + range_offset
+                ):
+                    raise DeepSeekPagerError(
+                        f"causal weight tensor offsets are invalid for {tensor.name}"
+                    )
+                if (
+                    not isinstance(shape, tuple)
+                    or not shape
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value <= 0
+                        for value in shape
+                    )
+                ):
+                    raise DeepSeekPagerError(
+                        f"causal weight tensor shape is invalid for {tensor.name}"
+                    )
+                if not isinstance(dtype, str):
+                    raise DeepSeekPagerError(
+                        f"causal weight tensor dtype is invalid for {tensor.name}"
+                    )
+                dtype = dtype.upper()
+                if range_index == 0:
+                    if dtype != "F8_E8M0":
+                        raise DeepSeekPagerError(
+                            f"causal weight scale dtype is invalid for {tensor.name}"
+                        )
+                else:
+                    observed_weight_dtypes.add(dtype)
+                    if dtype not in {"I8", "F8_E4M3", "F8_E4M3FN"}:
+                        raise DeepSeekPagerError(
+                            f"causal weight dtype is invalid for {tensor.name}"
+                        )
+                expected_length = math.prod(shape)
+                if tensor_length != expected_length:
+                    raise DeepSeekPagerError(
+                        f"causal weight byte length is invalid for {tensor.name}"
+                    )
+                end = range_offset + tensor_length
+                if end > length:
+                    raise DeepSeekPagerError(
+                        f"causal weight tensor exceeds its range for {tensor.name}"
+                    )
+                metas.append(
+                    {
+                        "name": tensor.name,
+                        "dtype": dtype,
+                        "shape": list(shape),
+                        "shard": shard,
+                        # These synthetic metadata coordinates reproduce the
+                        # exact stored absolutes; no safetensors header lookup
+                        # participates in lowering or decoding.
+                        "data_start": absolute,
+                        "offset_in_shard": [range_offset, end],
+                    }
+                )
+                cursor = end
+            if cursor != length:
+                raise DeepSeekPagerError(
+                    f"causal weight tensors do not exactly cover range {range_index} "
+                    f"for {base}"
+                )
+            payload_bytes += length
+            layouts.append((shard, absolute, length, tuple(metas)))
+
+        if len(observed_weight_dtypes) != 1:
+            raise DeepSeekPagerError(f"causal weight encodings disagree within {base}")
+        if public.payload_bytes != payload_bytes:
+            raise DeepSeekPagerError(
+                f"causal weight payload total is invalid for {base}"
+            )
+        return _ExpertReadPlan(
+            base=base,
+            layouts=tuple(layouts),
+            payload_bytes=payload_bytes,
+        )
+
     @classmethod
     def _parse_official_expert_base(cls, base: str) -> tuple[int, int]:
         if not isinstance(base, str):
@@ -665,8 +968,7 @@ class DeepSeekWeightPager:
         match = cls._OFFICIAL_EXPERT_BASE.fullmatch(base)
         if match is None:
             raise ValueError(
-                "expert base must be canonical "
-                "'layers.<layer>.ffn.experts.<expert_id>'"
+                "expert base must be canonical 'layers.<layer>.ffn.experts.<expert_id>'"
             )
         return int(match.group(1)), int(match.group(2))
 
@@ -2415,11 +2717,14 @@ class DeepSeekWeightPager:
                 self.EXPERT_RANGE_COALESCE_MAX_GAP_BYTES
             ),
             "expert_prefetch_draining": draining,
+            "causal_weight_reader_attached": self._causal_weight_reader is not None,
+            "causal_missing_fallback": self._causal_missing_fallback,
             "source": source_metrics,
         }
 
 
 __all__ = [
+    "CausalExpertPlanResolver",
     "DeepSeekPagerError",
     "DeepSeekWeightPager",
     "ExpertSourceRange",

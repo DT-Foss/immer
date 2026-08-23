@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -636,7 +638,9 @@ class DeepSeekV4PagerTests(unittest.TestCase):
 
         self.assertGreater(len(plans), pager.EXPERT_PREFETCH_MAX_EXPERTS)
         self.assertEqual([plan.base for plan in plans], bases)
-        self.assertTrue(all(isinstance(plan, OfficialExpertRangePlan) for plan in plans))
+        self.assertTrue(
+            all(isinstance(plan, OfficialExpertRangePlan) for plan in plans)
+        )
         self.assertTrue(
             all(
                 isinstance(source_range, ExpertSourceRange)
@@ -685,9 +689,13 @@ class DeepSeekV4PagerTests(unittest.TestCase):
             expected_payload_bytes += expected_length
             self.assertEqual(source_range.shard, source.shard_name)
             self.assertEqual(source_range.absolute_offset, expected_offset)
-            self.assertEqual(source_range.absolute_end, expected_offset + expected_length)
+            self.assertEqual(
+                source_range.absolute_end, expected_offset + expected_length
+            )
             self.assertEqual(source_range.length, expected_length)
-            self.assertEqual(tuple(tensor.name for tensor in source_range.tensors), names)
+            self.assertEqual(
+                tuple(tensor.name for tensor in source_range.tensors), names
+            )
             for tensor, meta in zip(source_range.tensors, metas, strict=True):
                 begin, end = (int(value) for value in meta["offset_in_shard"])
                 absolute = source.data_start + begin
@@ -733,6 +741,317 @@ class DeepSeekV4PagerTests(unittest.TestCase):
         find.assert_not_called()
         self.assertEqual(source.raw_calls, [])
         self.assertEqual(source.tensor_calls, [])
+        pager.release()
+
+    def test_causal_reader_is_the_live_routed_expert_address_path(self) -> None:
+        import torch
+
+        from immer.knowledge.livecausal import LiveGraph
+        from immer.runtimes.deepseek_v4 import (
+            CausalWeightLayoutIdentity,
+            CausalWeightReader,
+            DeepSeekWeightPager,
+            LogicalModelIdentity,
+            bind_causal_weight_plans,
+        )
+
+        bases = [f"layers.3.ffn.experts.{expert_id}" for expert_id in (4, 9)]
+        source = _MultiEncodedExpertSource(bases)
+        bootstrap = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+        )
+        plans = bootstrap.plan_expert_ranges(bases)
+        x = torch.linspace(-0.01, 0.01, 128, dtype=torch.bfloat16)[None, :]
+        route_weights = (
+            torch.asarray([[0.25]], dtype=torch.float32),
+            torch.asarray([[0.75]], dtype=torch.float32),
+        )
+        expected = tuple(
+            bootstrap.expert(
+                x,
+                base,
+                route_weight=route_weight,
+                swiglu_limit=10.0,
+            )
+            for base, route_weight in zip(bases, route_weights, strict=True)
+        )
+
+        fingerprint = "d" * 64
+        original_metrics = source.metrics
+        source.metrics = lambda: {
+            **original_metrics(),
+            "inventory_source_fingerprint": fingerprint,
+        }
+        layout = CausalWeightLayoutIdentity(
+            model=LogicalModelIdentity(
+                repo_id="deepseek-ai/DeepSeek-V4-Flash",
+                revision="fixture-revision",
+            ),
+            layout_fingerprint=fingerprint,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            writer = LiveGraph(temporary)
+            bind_causal_weight_plans(writer, layout, plans[:1])
+
+            # Remount the durable graph before attaching it to the pager.  The
+            # second binding is appended later through the original writer and
+            # becomes usable without rebuilding either pager or reader.
+            reader = CausalWeightReader(
+                LiveGraph(temporary),
+                layout,
+                source=source,
+            )
+            causal = DeepSeekWeightPager(
+                source,
+                device="cpu",
+                compute_dtype="bfloat16",
+            )
+            causal.attach_causal_weight_reader(reader)
+
+            original_find = source.find
+
+            def reject_routed_expert_discovery(name: str) -> dict:
+                if name.startswith("layers.3.ffn.experts."):
+                    raise AssertionError("routed expert re-entered source.find")
+                return original_find(name)
+
+            with mock.patch.object(
+                source,
+                "find",
+                side_effect=reject_routed_expert_discovery,
+            ) as find:
+                actual_first = causal.expert(
+                    x,
+                    bases[0],
+                    route_weight=route_weights[0],
+                    swiglu_limit=10.0,
+                )
+                bind_causal_weight_plans(writer, layout, plans[1:])
+                actual_second = causal.expert(
+                    x,
+                    bases[1],
+                    route_weight=route_weights[1],
+                    swiglu_limit=10.0,
+                )
+
+            torch.testing.assert_close(actual_first, expected[0], atol=0, rtol=0)
+            torch.testing.assert_close(actual_second, expected[1], atol=0, rtol=0)
+            self.assertEqual(tuple(plan.expert_id for plan in plans), (4, 9))
+            find.assert_not_called()
+            metrics = causal.metrics()
+            self.assertTrue(metrics["causal_weight_reader_attached"])
+            self.assertFalse(metrics["causal_missing_fallback"])
+            self.assertEqual(metrics["causal_expert_plan_resolves"], 2)
+            self.assertEqual(metrics["causal_expert_plan_hits"], 2)
+            self.assertEqual(metrics["causal_expert_plan_misses"], 0)
+            self.assertEqual(metrics["causal_expert_plan_fallbacks"], 0)
+            self.assertGreaterEqual(reader.metrics()["plan_cache_invalidations"], 1)
+            causal.release()
+        bootstrap.release()
+
+    def test_causal_missing_binding_fails_closed_unless_explicitly_enabled(
+        self,
+    ) -> None:
+        import torch
+
+        from immer.knowledge.livecausal import LiveGraph
+        from immer.runtimes.deepseek_v4 import (
+            CausalWeightLayoutIdentity,
+            CausalWeightReader,
+            DeepSeekWeightPager,
+            LogicalModelIdentity,
+        )
+        from immer.runtimes.deepseek_v4.pager import DeepSeekPagerError
+
+        base = "layers.3.ffn.experts.2"
+        source = _EncodedExpertSource(base, "fp4", adjacent=True)
+        layout = CausalWeightLayoutIdentity(
+            model=LogicalModelIdentity("fixture/model", "fixture-revision"),
+            layout_fingerprint="e" * 64,
+        )
+        original_metrics = source.metrics
+        source.metrics = lambda: {
+            **original_metrics(),
+            "inventory_source_fingerprint": layout.layout_fingerprint,
+        }
+        x = torch.zeros((1, 128), dtype=torch.bfloat16)
+        with tempfile.TemporaryDirectory() as temporary:
+            reader = CausalWeightReader(
+                LiveGraph(temporary),
+                layout,
+                source=source,
+            )
+            strict = DeepSeekWeightPager(
+                source,
+                device="cpu",
+                compute_dtype="bfloat16",
+                causal_weight_reader=reader,
+            )
+            with mock.patch.object(
+                source,
+                "find",
+                side_effect=AssertionError("strict causal miss searched metadata"),
+            ) as strict_find:
+                with self.assertRaisesRegex(
+                    DeepSeekPagerError,
+                    "causal weight binding is missing",
+                ):
+                    strict.expert(x, base, swiglu_limit=10.0)
+            strict_find.assert_not_called()
+            self.assertEqual(strict.metrics()["causal_expert_plan_misses"], 1)
+            self.assertEqual(strict.metrics()["causal_expert_plan_fallbacks"], 0)
+
+            fallback = DeepSeekWeightPager(
+                source,
+                device="cpu",
+                compute_dtype="bfloat16",
+                causal_weight_reader=reader,
+                causal_missing_fallback=True,
+            )
+            find = mock.Mock(wraps=source.find)
+            source.find = find
+            output = fallback.expert(x, base, swiglu_limit=10.0)
+            self.assertEqual(tuple(output.shape), (1, 128))
+            self.assertEqual(find.call_count, 6)
+            fallback_metrics = fallback.metrics()
+            self.assertEqual(fallback_metrics["causal_expert_plan_misses"], 1)
+            self.assertEqual(fallback_metrics["causal_expert_plan_fallbacks"], 1)
+            strict.release()
+            fallback.release()
+
+    def test_causal_plan_preserves_valid_repacked_physical_tensor_order(self) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        base = "layers.5.ffn.experts.8"
+        source = _EncodedExpertSource(base, "fp4", adjacent=True)
+        bootstrap = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+        )
+        (plan,) = bootstrap.plan_expert_ranges((base,))
+        x = torch.linspace(-0.01, 0.01, 128, dtype=torch.bfloat16)[None, :]
+        expected = bootstrap.expert(x, base, swiglu_limit=10.0)
+
+        repacked_ranges = []
+        for source_range in plan.ranges:
+            original_slots = source_range.tensors
+            role_order = (
+                original_slots[1],
+                original_slots[0],
+                original_slots[2],
+            )
+            repacked_ranges.append(
+                replace(
+                    source_range,
+                    tensors=tuple(
+                        replace(
+                            tensor,
+                            absolute_offset=(
+                                source_range.absolute_offset + slot.range_offset
+                            ),
+                            range_offset=slot.range_offset,
+                        )
+                        for tensor, slot in zip(
+                            role_order,
+                            original_slots,
+                            strict=True,
+                        )
+                    ),
+                )
+            )
+        repacked = replace(plan, ranges=tuple(repacked_ranges))
+
+        class _RepackedResolver:
+            def resolve_expert_plans(self, _layer, _expert_ids):
+                return (repacked,)
+
+        pager = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            causal_weight_reader=_RepackedResolver(),
+        )
+        with mock.patch.object(
+            source,
+            "find",
+            side_effect=AssertionError("valid causal repack searched metadata"),
+        ) as find:
+            actual = pager.expert(x, base, swiglu_limit=10.0)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        find.assert_not_called()
+        self.assertEqual(pager.metrics()["causal_expert_plan_hits"], 1)
+        bootstrap.release()
+        pager.release()
+
+    def test_causal_bad_layout_never_falls_back_to_metadata_discovery(self) -> None:
+        import torch
+
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+        from immer.runtimes.deepseek_v4.pager import DeepSeekPagerError
+
+        base = "layers.6.ffn.experts.1"
+        source = _EncodedExpertSource(base, "fp4", adjacent=True)
+        bootstrap = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+        )
+        (plan,) = bootstrap.plan_expert_ranges((base,))
+        first_range = plan.ranges[0]
+        first_tensor = first_range.tensors[0]
+        corrupt = replace(
+            plan,
+            ranges=(
+                replace(
+                    first_range,
+                    tensors=(
+                        replace(
+                            first_tensor,
+                            absolute_offset=first_tensor.absolute_offset + 1,
+                            range_offset=1,
+                        ),
+                        *first_range.tensors[1:],
+                    ),
+                ),
+                plan.ranges[1],
+            ),
+        )
+
+        class _CorruptResolver:
+            def resolve_expert_plans(self, _layer, _expert_ids):
+                return (corrupt,)
+
+        pager = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            causal_weight_reader=_CorruptResolver(),
+            causal_missing_fallback=True,
+        )
+        with mock.patch.object(
+            source,
+            "find",
+            side_effect=AssertionError("invalid causal layout searched metadata"),
+        ) as find:
+            with self.assertRaisesRegex(
+                DeepSeekPagerError,
+                "tensor offsets are invalid",
+            ):
+                pager.expert(
+                    torch.zeros((1, 128), dtype=torch.bfloat16),
+                    base,
+                    swiglu_limit=10.0,
+                )
+        find.assert_not_called()
+        metrics = pager.metrics()
+        self.assertEqual(metrics["causal_expert_plan_invalid"], 1)
+        self.assertEqual(metrics["causal_expert_plan_fallbacks"], 0)
+        bootstrap.release()
         pager.release()
 
     def test_fp4_routed_expert_coalesces_to_two_ranges_with_exact_parity(
