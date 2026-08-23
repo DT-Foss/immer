@@ -126,6 +126,11 @@ class RouteMarkovTests(unittest.TestCase):
         markov = model.predict_distribution(source_layer=0, current_row=[0], alpha=1)
         marginal = model.marginal_distribution(target_layer=1, alpha=1)
         passthrough = model.passthrough_distribution(source_layer=0, current_row=[0, 3])
+        window = model.predict_window_distribution(
+            source_layer=0,
+            current_rows=([0], [], [3]),
+            alpha=1,
+        )
 
         self.assertEqual(markov.ranking[0], 2)
         self.assertEqual(marginal.ranking[:2], (2, 4))
@@ -133,6 +138,28 @@ class RouteMarkovTests(unittest.TestCase):
         self.assertEqual(len(markov.scores), 5)
         self.assertEqual(len(marginal.scores), 5)
         self.assertEqual(len(passthrough.scores), 5)
+        expected_window = tuple(
+            (
+                model.predict_distribution(
+                    source_layer=0,
+                    current_row=[0],
+                    alpha=1,
+                ).scores[index]
+                + model.predict_distribution(
+                    source_layer=0,
+                    current_row=[3],
+                    alpha=1,
+                ).scores[index]
+            )
+            / 2
+            for index in range(5)
+        )
+        self.assertEqual(window.scores, expected_window)
+        with self.assertRaisesRegex(RouteMarkovError, "active expert row"):
+            model.predict_window_distribution(
+                source_layer=0,
+                current_rows=((), []),
+            )
 
     def test_k_sweep_has_all_widths_and_exact_full_inventory_endpoint(self) -> None:
         model = LayerMarkovExpertPredictor(n_experts=4)

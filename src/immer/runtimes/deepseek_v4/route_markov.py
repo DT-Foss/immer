@@ -467,6 +467,44 @@ class LayerMarkovExpertPredictor:
             scores=scores,
         )
 
+    def predict_window_distribution(
+        self,
+        *,
+        source_layer: int,
+        current_rows: Iterable[Iterable[int]],
+        alpha: float = 1.0,
+    ) -> ScoreDistribution:
+        """Average full expert scores across one causal token micro-window."""
+
+        if isinstance(current_rows, (str, bytes)):
+            raise RouteMarkovError("current_rows must contain expert rows")
+        try:
+            rows = tuple(tuple(row) for row in current_rows)
+        except TypeError as exc:
+            raise RouteMarkovError("current_rows must contain expert rows") from exc
+        active = tuple(row for row in rows if row)
+        if not active:
+            raise RouteMarkovError("current_rows must contain an active expert row")
+        distributions = tuple(
+            self.predict_distribution(
+                source_layer=source_layer,
+                current_row=row,
+                alpha=alpha,
+            )
+            for row in active
+        )
+        scale = 1.0 / len(distributions)
+        scores = tuple(
+            sum(distribution.scores[expert] for distribution in distributions) * scale
+            for expert in range(self.n_experts)
+        )
+        return ScoreDistribution(
+            mode="markov",
+            source_layer=distributions[0].source_layer,
+            target_layer=distributions[0].target_layer,
+            scores=scores,
+        )
+
     def passthrough_distribution(
         self,
         *,

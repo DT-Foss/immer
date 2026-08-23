@@ -621,40 +621,28 @@ def _micro_window_sweep(
                 ]
                 for start in range(0, len(pairs), window_rows):
                     chunk = pairs[start : start + window_rows]
-                    real_scores = [0.0] * n_experts
-                    placebo_scores = [0.0] * n_experts
                     actual: set[int] = set()
                     slots = 0
                     for source_row, target_row in chunk:
-                        real = real_model.predict_distribution(
-                            source_layer=source.layer,
-                            current_row=source_row,
-                            alpha=alpha,
-                        ).scores
-                        placebo = placebo_model.predict_distribution(
-                            source_layer=source.layer,
-                            current_row=source_row,
-                            alpha=alpha,
-                        ).scores
-                        for expert in range(n_experts):
-                            real_scores[expert] += real[expert]
-                            placebo_scores[expert] += placebo[expert]
                         actual.update(target_row)
                         slots += len(source_row)
                     if not chunk:
                         continue
                     k = min(n_experts, slots)
+                    current_rows = tuple(source_row for source_row, _target in chunk)
                     real_top = set(
-                        sorted(
-                            range(n_experts),
-                            key=lambda expert: (-real_scores[expert], expert),
-                        )[:k]
+                        real_model.predict_window_distribution(
+                            source_layer=source.layer,
+                            current_rows=current_rows,
+                            alpha=alpha,
+                        ).top_k(k)
                     )
                     placebo_top = set(
-                        sorted(
-                            range(n_experts),
-                            key=lambda expert: (-placebo_scores[expert], expert),
-                        )[:k]
+                        placebo_model.predict_window_distribution(
+                            source_layer=source.layer,
+                            current_rows=current_rows,
+                            alpha=alpha,
+                        ).top_k(k)
                     )
                     real_hits += len(actual & real_top)
                     placebo_hits += len(actual & placebo_top)
