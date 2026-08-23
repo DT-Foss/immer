@@ -6,7 +6,12 @@ the model math.  No complete checkpoint is required on disk or in memory.
 """
 
 from .config import DeepSeekV4Config
-from .pager import DeepSeekWeightPager
+from .pager import (
+    DeepSeekWeightPager,
+    ExpertSourceRange,
+    ExpertTensorLayout,
+    OfficialExpertRangePlan,
+)
 from .model import (
     GenerationEvidence,
     OneTokenEvidence,
@@ -37,6 +42,8 @@ __all__ = [
     "DeepSeekV4Config",
     "DeepSeekV4SnapshotError",
     "DeepSeekWeightPager",
+    "ExpertSourceRange",
+    "ExpertTensorLayout",
     "GenerationEvidence",
     "LAYERWISE_SCHEMA",
     "LayerwiseError",
@@ -45,6 +52,7 @@ __all__ = [
     "LayerwiseScorer",
     "OFFICIAL_SOURCE_SAFE_BYTES",
     "OneTokenEvidence",
+    "OfficialExpertRangePlan",
     "StatefulEvidence",
     "StreamedDeepSeekV4",
     "SnapshotLimits",

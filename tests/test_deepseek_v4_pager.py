@@ -596,6 +596,145 @@ class DeepSeekV4PagerTests(unittest.TestCase):
             hidden = hidden * route_weight
         return pager.linear(hidden.to(x.dtype), f"{base}.w2")
 
+    def test_public_expert_range_plans_have_unbounded_fanout_and_zero_payload_io(
+        self,
+    ) -> None:
+        from dataclasses import FrozenInstanceError
+
+        from immer.runtimes.deepseek_v4 import (
+            DeepSeekWeightPager,
+            ExpertSourceRange,
+            ExpertTensorLayout,
+            OfficialExpertRangePlan,
+        )
+
+        bases = [f"layers.17.ffn.experts.{value}" for value in range(8)]
+        source = _MultiEncodedExpertSource(bases)
+        source.raw_bytes_many = mock.Mock(
+            side_effect=AssertionError("metadata planning must not read payloads")
+        )
+        pager = DeepSeekWeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+        )
+        with (
+            mock.patch.object(
+                pager,
+                "prefetch_expert_window",
+                side_effect=AssertionError("metadata planning must not prefetch"),
+            ) as prefetch_window,
+            mock.patch.object(
+                pager,
+                "prefetch_expert",
+                side_effect=AssertionError("metadata planning must not prefetch"),
+            ) as prefetch_one,
+        ):
+            plans = pager.plan_expert_ranges(
+                base for base in (*bases, bases[3], bases[0])
+            )
+
+        self.assertGreater(len(plans), pager.EXPERT_PREFETCH_MAX_EXPERTS)
+        self.assertEqual([plan.base for plan in plans], bases)
+        self.assertTrue(all(isinstance(plan, OfficialExpertRangePlan) for plan in plans))
+        self.assertTrue(
+            all(
+                isinstance(source_range, ExpertSourceRange)
+                and all(
+                    isinstance(tensor, ExpertTensorLayout)
+                    for tensor in source_range.tensors
+                )
+                for plan in plans
+                for source_range in plan.ranges
+            )
+        )
+        self.assertEqual(source.raw_calls, [])
+        self.assertEqual(source.tensor_calls, [])
+        source.raw_bytes_many.assert_not_called()
+        prefetch_window.assert_not_called()
+        prefetch_one.assert_not_called()
+        with self.assertRaises(FrozenInstanceError):
+            plans[0].payload_bytes = 0
+        pager.release()
+
+    def test_public_expert_range_plan_preserves_exact_tensor_layouts(self) -> None:
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        base = "layers.9.ffn.experts.23"
+        source = _EncodedExpertSource(base, "fp4", adjacent=True)
+        # Planning is metadata-only even when the source has no payload-reader
+        # capability at all.
+        source.raw_bytes = None
+        pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="bfloat16")
+        (plan,) = pager.plan_expert_ranges((base,))
+
+        self.assertEqual((plan.base, plan.layer, plan.expert_id), (base, 9, 23))
+        self.assertEqual(len(plan.ranges), 2)
+        expected_payload_bytes = 0
+        for source_range, group in zip(
+            plan.ranges,
+            ("scale", "weight"),
+            strict=True,
+        ):
+            names = tuple(f"{base}.{role}.{group}" for role in ("w1", "w2", "w3"))
+            metas = tuple(source.meta[name] for name in names)
+            begins = tuple(int(meta["offset_in_shard"][0]) for meta in metas)
+            ends = tuple(int(meta["offset_in_shard"][1]) for meta in metas)
+            expected_offset = source.data_start + min(begins)
+            expected_length = max(ends) - min(begins)
+            expected_payload_bytes += expected_length
+            self.assertEqual(source_range.shard, source.shard_name)
+            self.assertEqual(source_range.absolute_offset, expected_offset)
+            self.assertEqual(source_range.absolute_end, expected_offset + expected_length)
+            self.assertEqual(source_range.length, expected_length)
+            self.assertEqual(tuple(tensor.name for tensor in source_range.tensors), names)
+            for tensor, meta in zip(source_range.tensors, metas, strict=True):
+                begin, end = (int(value) for value in meta["offset_in_shard"])
+                absolute = source.data_start + begin
+                self.assertEqual(tensor.dtype, str(meta["dtype"]).upper())
+                self.assertEqual(tensor.shape, tuple(meta["shape"]))
+                self.assertEqual(tensor.absolute_offset, absolute)
+                self.assertEqual(tensor.absolute_end, source.data_start + end)
+                self.assertEqual(tensor.length, end - begin)
+                self.assertEqual(tensor.range_offset, absolute - expected_offset)
+        self.assertEqual(plan.payload_bytes, expected_payload_bytes)
+        self.assertEqual(source.tensor_calls, [])
+        pager.release()
+
+    def test_public_expert_range_plans_accept_layer_ids_and_reject_bad_routing(
+        self,
+    ) -> None:
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager
+
+        ids = [5, 2, 7]
+        bases = [f"layers.4.ffn.experts.{expert_id}" for expert_id in ids]
+        source = _MultiEncodedExpertSource(bases)
+        pager = DeepSeekWeightPager(source, device="cpu", compute_dtype="bfloat16")
+        plans = pager.plan_expert_ranges(4, (value for value in (5, 2, 5, 7)))
+        self.assertEqual([plan.expert_id for plan in plans], ids)
+        self.assertEqual([plan.base for plan in plans], bases)
+        self.assertEqual(plans, pager.plan_expert_ranges(bases))
+
+        find = mock.Mock(wraps=source.find)
+        source.find = find
+        bad_calls = (
+            lambda: pager.plan_expert_ranges(
+                ("layers.4.ffn.experts.5", "layers.5.ffn.experts.2")
+            ),
+            lambda: pager.plan_expert_ranges(("layers.4.ffn.shared_experts.0",)),
+            lambda: pager.plan_expert_ranges(("layers.04.ffn.experts.5",)),
+            lambda: pager.plan_expert_ranges(-1, (5,)),
+            lambda: pager.plan_expert_ranges(4, (True,)),
+            lambda: pager.plan_expert_ranges(4, (-1,)),
+        )
+        for bad_call in bad_calls:
+            with self.subTest(call=bad_call), self.assertRaises(ValueError):
+                bad_call()
+        find.assert_not_called()
+        self.assertEqual(source.raw_calls, [])
+        self.assertEqual(source.tensor_calls, [])
+        pager.release()
+
     def test_fp4_routed_expert_coalesces_to_two_ranges_with_exact_parity(
         self,
     ) -> None:

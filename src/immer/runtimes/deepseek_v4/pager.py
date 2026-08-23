@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from contextvars import Context, copy_context
 from dataclasses import asdict, dataclass
 from collections.abc import Callable, Iterable
+import re
 import threading
 import time
 from typing import Any
@@ -66,6 +67,53 @@ class PagerMetrics:
     expert_transport_source_bytes: int = 0
     expert_range_requests_avoided: int = 0
     expert_range_gap_bytes: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ExpertTensorLayout:
+    """One tensor leaf inside an exact expert source range.
+
+    ``absolute_offset`` addresses the shard file, not the safetensors data
+    section.  The leaf occupies the half-open interval
+    ``[absolute_offset, absolute_end)``; ``range_offset`` addresses the same
+    leaf relative to its enclosing :class:`ExpertSourceRange`.
+    """
+
+    name: str
+    dtype: str
+    shape: tuple[int, ...]
+    absolute_offset: int
+    length: int
+    range_offset: int
+
+    @property
+    def absolute_end(self) -> int:
+        return self.absolute_offset + self.length
+
+
+@dataclass(frozen=True, slots=True)
+class ExpertSourceRange:
+    """One contiguous, exact half-open shard range for an official expert."""
+
+    shard: str
+    absolute_offset: int
+    length: int
+    tensors: tuple[ExpertTensorLayout, ...]
+
+    @property
+    def absolute_end(self) -> int:
+        return self.absolute_offset + self.length
+
+
+@dataclass(frozen=True, slots=True)
+class OfficialExpertRangePlan:
+    """Immutable metadata-only byte plan for one official routed expert."""
+
+    base: str
+    layer: int
+    expert_id: int
+    ranges: tuple[ExpertSourceRange, ...]
+    payload_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +253,9 @@ class DeepSeekWeightPager:
     HEAD_TRANSPORT_MAX_RANGE_BATCH_BLOCKS = 8
     HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES = 64 * 1024**2
     HEAD_TRANSPORT_MAX_GAP_BYTES = 0
+    _OFFICIAL_EXPERT_BASE = re.compile(
+        r"^layers\.(0|[1-9][0-9]*)\.ffn\.experts\.(0|[1-9][0-9]*)$"
+    )
 
     def __init__(
         self,
@@ -546,16 +597,23 @@ class DeepSeekWeightPager:
             return None
         return shard, data_start + begin, end - begin, ordered
 
-    def _expert_plan(self, base: str) -> _ExpertReadPlan | None:
+    def _expert_plan(
+        self,
+        base: str,
+        *,
+        require_payload_reader: bool = True,
+    ) -> _ExpertReadPlan | None:
         """Resolve an official expert's two ranges on the main thread.
 
         Published V4 shards place ``w1/w2/w3`` next to one another and do the
         same for their scales.  Synthetic sources and repacked checkpoints are
         allowed to use any layout; those decline before any range is read.
+        Metadata-only callers may disable the payload-capability check while
+        retaining exactly the same layout validation.
         """
 
         raw_bytes = getattr(self.source, "raw_bytes", None)
-        if not callable(raw_bytes):
+        if require_payload_reader and not callable(raw_bytes):
             return None
         weight_names = [f"{base}.{role}.weight" for role in ("w1", "w2", "w3")]
         try:
@@ -599,6 +657,143 @@ class DeepSeekWeightPager:
             layouts=frozen_layouts,
             payload_bytes=payload_bytes,
         )
+
+    @classmethod
+    def _parse_official_expert_base(cls, base: str) -> tuple[int, int]:
+        if not isinstance(base, str):
+            raise ValueError("expert bases must be strings")
+        match = cls._OFFICIAL_EXPERT_BASE.fullmatch(base)
+        if match is None:
+            raise ValueError(
+                "expert base must be canonical "
+                "'layers.<layer>.ffn.experts.<expert_id>'"
+            )
+        return int(match.group(1)), int(match.group(2))
+
+    @staticmethod
+    def _validate_expert_coordinate(value: Any, *, name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+        return value
+
+    @staticmethod
+    def _public_expert_plan(
+        plan: _ExpertReadPlan,
+        *,
+        layer: int,
+        expert_id: int,
+    ) -> OfficialExpertRangePlan:
+        ranges: list[ExpertSourceRange] = []
+        for shard, absolute, length, metas in plan.layouts:
+            tensors: list[ExpertTensorLayout] = []
+            for meta in metas:
+                begin, end = (int(value) for value in meta["offset_in_shard"])
+                tensor_absolute = int(meta["data_start"]) + begin
+                tensors.append(
+                    ExpertTensorLayout(
+                        name=str(meta["name"]),
+                        dtype=str(meta["dtype"]).upper(),
+                        shape=tuple(int(value) for value in meta["shape"]),
+                        absolute_offset=tensor_absolute,
+                        length=end - begin,
+                        range_offset=tensor_absolute - absolute,
+                    )
+                )
+            ranges.append(
+                ExpertSourceRange(
+                    shard=shard,
+                    absolute_offset=absolute,
+                    length=length,
+                    tensors=tuple(tensors),
+                )
+            )
+        return OfficialExpertRangePlan(
+            base=plan.base,
+            layer=layer,
+            expert_id=expert_id,
+            ranges=tuple(ranges),
+            payload_bytes=plan.payload_bytes,
+        )
+
+    def plan_expert_ranges(
+        self,
+        expert_bases_or_layer: Iterable[str] | int,
+        expert_ids: Iterable[int] | None = None,
+    ) -> tuple[OfficialExpertRangePlan, ...]:
+        """Project exact official-expert layouts without reading payload bytes.
+
+        Pass either an iterable of canonical expert bases or ``(layer,
+        expert_ids)`` as the two arguments.  Inputs are materialized once,
+        deduplicated in first-seen order, and have no fanout, top-k, cache, or
+        executor-window limit.  A base iterable spanning decoder layers is
+        rejected because one plan set represents one router decision.
+
+        This method calls ``TensorSource.find`` for checkpoint metadata only;
+        it never calls ``raw_bytes``, ``raw_bytes_many``, tensor decoding, or
+        prefetch APIs.  On a cold ``Streamer``, ``find`` may load or prepare the
+        inventory, so latency-sensitive callers should prepare the inventory
+        before entering the model hot path.
+        """
+
+        coordinates: list[tuple[str, int, int]] = []
+        if expert_ids is None:
+            if isinstance(expert_bases_or_layer, (str, bytes)) or isinstance(
+                expert_bases_or_layer, int
+            ):
+                raise ValueError(
+                    "pass an iterable of expert bases, or layer plus expert_ids"
+                )
+            seen_bases: set[str] = set()
+            for base in expert_bases_or_layer:
+                layer, expert_id = self._parse_official_expert_base(base)
+                if base in seen_bases:
+                    continue
+                seen_bases.add(base)
+                coordinates.append((base, layer, expert_id))
+            layers = {layer for _, layer, _ in coordinates}
+            if len(layers) > 1:
+                raise ValueError("expert bases must all belong to the same layer")
+        else:
+            layer = self._validate_expert_coordinate(
+                expert_bases_or_layer,
+                name="layer",
+            )
+            if isinstance(expert_ids, (str, bytes)):
+                raise ValueError("expert_ids must be an iterable of integers")
+            seen_ids: set[int] = set()
+            for raw_expert_id in expert_ids:
+                expert_id = self._validate_expert_coordinate(
+                    raw_expert_id,
+                    name="expert_id",
+                )
+                if expert_id in seen_ids:
+                    continue
+                seen_ids.add(expert_id)
+                coordinates.append(
+                    (
+                        f"layers.{layer}.ffn.experts.{expert_id}",
+                        layer,
+                        expert_id,
+                    )
+                )
+
+        public: list[OfficialExpertRangePlan] = []
+        for base, layer, expert_id in coordinates:
+            plan = self._expert_plan(base, require_payload_reader=False)
+            if plan is None:
+                raise DeepSeekPagerError(
+                    f"cannot form an exact metadata range plan for {base}; "
+                    "the expert is missing or its official adjacent "
+                    "weight/scale layout is unavailable"
+                )
+            public.append(
+                self._public_expert_plan(
+                    plan,
+                    layer=layer,
+                    expert_id=expert_id,
+                )
+            )
+        return tuple(public)
 
     def _read_expert_plan(self, plan: _ExpertReadPlan) -> _CoalescedExpert:
         """Read one pre-resolved plan without any metadata/source discovery."""
@@ -2224,4 +2419,11 @@ class DeepSeekWeightPager:
         }
 
 
-__all__ = ["DeepSeekPagerError", "DeepSeekWeightPager", "PagerMetrics"]
+__all__ = [
+    "DeepSeekPagerError",
+    "DeepSeekWeightPager",
+    "ExpertSourceRange",
+    "ExpertTensorLayout",
+    "OfficialExpertRangePlan",
+    "PagerMetrics",
+]
