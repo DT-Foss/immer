@@ -205,6 +205,23 @@ class FertigAdapterTests(unittest.TestCase):
                 "the total number of goals scored in the match?",
                 "16",
             ),
+            (
+                "Grandpa loves to eat jelly beans, but how many jelly beans he can "
+                "eat depends on the size of the beans. It takes 75 large jelly "
+                "beans to fill Grandpa up. He can eat twice as many medium-sized "
+                "beans as large beans. And eating 3 small beans is the same as "
+                "eating 1 medium-sized bean. How many small beans can Grandpa eat?",
+                "450",
+            ),
+            (
+                "The amount of water passing through a river at one point in time "
+                "is 4000 gallons. After a day of heavy rain, the amount of water "
+                "passing through the river doubles at the same point. If the volume "
+                "of water passing through the river at that point increases by "
+                "6000 gallons on the third day, calculate the total amount of water "
+                "passing through the river at that point.",
+                "14000",
+            ),
         )
         for question, expected in examples:
             with self.subTest(expected=expected):

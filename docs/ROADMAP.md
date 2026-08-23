@@ -53,7 +53,7 @@ Stand: 2026-08-23. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
   Latenzmechanismus wiederholt positiv, bleibt bis zum End-to-End-Gate opt-in;
   Produktionsdefault Breite 1.
 - [x] FERTIG-GSM8K-Vollsplit mit Item-Provenienz und hartem Wrong-Gate:
-  1.071 korrekt, 248 abstinent, 0 falsch, 0 Fehler.
+  1.073 korrekt, 246 abstinent, 0 falsch, 0 Fehler.
 - [x] FERTIG-Grammatik für endliche affine Rekurrenzen mit exaktem
   Fraction/RREF-Zertifikat; bei ihrer Einführung blieb der damalige Stand
   1.060/1.319 bei weiterhin 0 falschen Antworten.
@@ -70,18 +70,18 @@ Stand: 2026-08-23. Reihenfolge bedeutet Abhängigkeit, nicht Marketingwert.
 
 ### 1. FERTIG-Strukturpfad
 
-Der Vollsplit hat 248 sichere Abstinenzen bei null falschen Antworten. Die
+Der Vollsplit hat 246 sichere Abstinenzen bei null falschen Antworten. Die
 nächste Arbeit folgt dem goldfreien Snapshot der damaligen 259 Abstinenzen:
-144 Coreference- und 115 Grammar-Fälle. Seit diesem Snapshot wurden elf Fälle
-exakt geschlossen. Beide Wege müssen vollständig konsumierte numerische
+144 Coreference- und 115 Grammar-Fälle. Seit diesem Snapshot wurden dreizehn
+Fälle exakt geschlossen. Beide Wege müssen vollständig konsumierte numerische
 Klauseln in den vorhandenen Fraction/RREF-IR überführen. Das Wrong-Gate bleibt
 null.
 
 ### 2. Qwen3.8-Inhalts- und Fusionspfad
 
 Der gepinnte BF16-Checkpoint ist mit eigener Attention und DeltaNet vollständig
-streambar. Auf dem festen Acht-Fälle-Slice sind drei Antworten durch FERTIG-IR
-exakt zertifiziert, vier weitere nur als vollständig BF16-verifizierte
+streambar. Auf dem festen Acht-Fälle-Slice sind fünf Antworten durch FERTIG-IR
+exakt zertifiziert, zwei weitere nur als vollständig BF16-verifizierte
 Q3-Drafts markiert und ein inkonsistenter Oberflächenfall quarantäniert: 7/8
 beantwortet, 7 korrekt, 0 falsch. Q4 zeigt auf allen drei früheren
 Q3/BF16-Divergenzen andere Argmaxe; Quantisierungsübereinstimmung ist daher kein

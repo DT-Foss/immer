@@ -513,6 +513,102 @@ class ClosedSystemStructuralParserTests(unittest.TestCase):
         self.assertIsNone(result.problem)
 
 
+class NaturalChainStructuralParserTests(unittest.TestCase):
+    SATIETY = (
+        "Grandpa loves to eat jelly beans, but how many jelly beans he can eat "
+        "depends on the size of the beans. It takes 75 large jelly beans to fill "
+        "Grandpa up. He can eat twice as many medium-sized beans as large beans. "
+        "And eating 3 small beans is the same as eating 1 medium-sized bean. How "
+        "many small beans can Grandpa eat?"
+    )
+    FLOW = (
+        "The amount of water passing through a river at one point in time is 4000 "
+        "gallons. After a day of heavy rain, the amount of water passing through "
+        "the river doubles at the same point. If the volume of water passing "
+        "through the river at that point increases by 6000 gallons on the third "
+        "day, calculate the total amount of water passing through the river at "
+        "that point."
+    )
+
+    def assert_rank_three(self, source: str, expected: Fraction) -> None:
+        parsed, solution = _solve(source)
+        self.assertEqual(solution.status, SolveStatus.UNIQUE)
+        self.assertEqual(solution.target_value, expected)
+        self.assertIsNotNone(solution.certificate)
+        assert solution.certificate is not None
+        self.assertTrue(solution.certificate.verified)
+        self.assertEqual(solution.certificate.rank, 3)
+        self.assertEqual(solution.certificate.variable_count, 3)
+        self.assertEqual(solution.certificate.equation_count, 3)
+        assert parsed.problem is not None
+        self.assertEqual(len(parsed.problem.constraints), 3)
+
+    def test_qwen_scale_and_timeline_rows_gain_exact_certificates(self) -> None:
+        for source, expected in (
+            (self.SATIETY, Fraction(450)),
+            (self.FLOW, Fraction(14000)),
+        ):
+            with self.subTest(expected=expected):
+                self.assert_rank_three(source, expected)
+
+    def test_satiety_chain_survives_renaming_and_ratio_perturbation(self) -> None:
+        source = (
+            "Grandmother loves to eat candy pieces, but how many candy pieces she can eat "
+            "depends on the size of the pieces. It takes 40 jumbo candy pieces to "
+            "fill Grandmother up. She can eat 3 times as many regular pieces as jumbo "
+            "pieces. And eating 2 tiny pieces is the same as eating 1 regular "
+            "piece. How many tiny pieces can Grandmother eat?"
+        )
+
+        self.assertEqual(_solve(source)[1].target_value, 240)
+
+    def test_flow_chain_survives_material_channel_and_number_renaming(self) -> None:
+        source = (
+            "The amount of oil passing through a pipe at one point in time is 120 "
+            "liters. After a day of maintenance, the amount of oil passing through "
+            "the pipe triples at the same point. If the volume of oil passing "
+            "through the pipe at that point increases by 30 liters on the third "
+            "day, calculate the total amount of oil passing through the pipe at "
+            "that point."
+        )
+
+        self.assertEqual(_solve(source)[1].target_value, 390)
+
+    def test_satiety_chain_rejects_owner_label_noun_and_fractional_drift(self) -> None:
+        sources = (
+            self.SATIETY.replace("fill Grandpa up", "fill Pavel up"),
+            self.SATIETY.replace("he can eat", "she can eat").replace(
+                "He can eat", "She can eat"
+            ),
+            self.SATIETY.replace("he can eat", "they can eat").replace(
+                "He can eat", "They can eat"
+            ),
+            self.SATIETY.replace("as large beans", "as tiny beans"),
+            self.SATIETY.replace("1 medium-sized bean", "1 medium-sized berry"),
+            self.SATIETY.replace("1 medium-sized bean", "4 medium-sized beans"),
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                result = parse_structural_problem(source)
+                self.assertFalse(result.ok, result)
+                self.assertIsNone(result.problem)
+
+    def test_flow_chain_rejects_material_channel_unit_and_timeline_drift(self) -> None:
+        sources = (
+            self.FLOW.replace("volume of water", "volume of oil"),
+            self.FLOW.replace("through the river doubles", "through the pipe doubles"),
+            self.FLOW.replace("6000 gallons", "6000 liters"),
+            self.FLOW.replace("on the third day", "on the third week"),
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                result = parse_structural_problem(source)
+                self.assertEqual(result.status, ParseStatus.AMBIGUOUS, result.reason)
+                self.assertIsNone(result.problem)
+
+
 class MeanStructuralParserTests(unittest.TestCase):
     def test_explicit_score_list_compiles_to_mean_constraint(self) -> None:
         source = (

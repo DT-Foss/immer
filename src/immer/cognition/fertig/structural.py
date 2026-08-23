@@ -151,6 +151,34 @@ _WORD_FRACTIONS = {
     "ninth": Fraction(1, 9),
     "tenth": Fraction(1, 10),
 }
+_MASCULINE_OWNER_WORDS = frozenset(
+    {
+        "boy",
+        "brother",
+        "dad",
+        "father",
+        "grandfather",
+        "grandpa",
+        "husband",
+        "man",
+        "son",
+        "uncle",
+    }
+)
+_FEMININE_OWNER_WORDS = frozenset(
+    {
+        "aunt",
+        "daughter",
+        "girl",
+        "grandma",
+        "grandmother",
+        "mother",
+        "mom",
+        "sister",
+        "wife",
+        "woman",
+    }
+)
 _TIME_UNITS = {
     "second": Unit("second", (("time", 1),), Fraction(1)),
     "minute": Unit("minute", (("time", 1),), Fraction(60)),
@@ -319,6 +347,50 @@ _PERIOD_SCORE_SYSTEM = re.compile(
     rf"What(?:\s+is|'s)\s+the\s+total\s+number\s+of\s+"
     rf"(?P<query_noun>{_SIMPLE_NOUN})\s+scored\s+in\s+the\s+"
     rf"(?P<query_event>match|game|contest)\s*\?\s*$",
+    re.IGNORECASE,
+)
+
+_SIZE_LABEL = r"[A-Za-z][A-Za-z'\-]*"
+_SATIETY_EQUIVALENCE_CHAIN = re.compile(
+    rf"^\s*(?P<owner>{_NAME})\s+loves\s+to\s+eat\s+"
+    rf"(?P<intro_item>{_PHRASE}),\s+but\s+how\s+many\s+"
+    rf"(?P<intro_repeat>{_PHRASE})\s+(?P<intro_pronoun>he|she|they)\s+can\s+"
+    rf"eat\s+depends\s+on\s+the\s+size\s+of\s+the\s+"
+    rf"(?P<size_item>{_PHRASE})\.\s+It\s+takes\s+(?P<base_count>{_NUMBER})\s+"
+    rf"(?P<base_label>{_SIZE_LABEL})\s+(?P<base_item>{_PHRASE})\s+to\s+fill\s+"
+    rf"(?P<fill_owner>{_NAME})\s+up\.\s+"
+    rf"(?P<scale_pronoun>he|she|they)\s+can\s+eat\s+"
+    rf"(?P<scale>twice|{_NUMBER}\s+times)\s+as\s+many\s+"
+    rf"(?P<scaled_label>{_SIZE_LABEL})\s+(?P<scaled_item>{_PHRASE})\s+as\s+"
+    rf"(?P<scale_source_label>{_SIZE_LABEL})\s+"
+    rf"(?P<scale_source_item>{_PHRASE})\.\s+"
+    rf"(?:And\s+)?eating\s+(?P<equivalent_target_count>{_NUMBER})\s+"
+    rf"(?P<equivalent_target_label>{_SIZE_LABEL})\s+"
+    rf"(?P<equivalent_target_item>{_PHRASE})\s+is\s+the\s+same\s+as\s+"
+    rf"eating\s+(?P<equivalent_source_count>{_NUMBER})\s+"
+    rf"(?P<equivalent_source_label>{_SIZE_LABEL})\s+"
+    rf"(?P<equivalent_source_item>{_PHRASE})\.\s+How\s+many\s+"
+    rf"(?P<query_label>{_SIZE_LABEL})\s+(?P<query_item>{_PHRASE})\s+can\s+"
+    rf"(?P<query_owner>{_NAME})\s+eat\s*\?\s*$",
+    re.IGNORECASE,
+)
+
+_FLOW_TIMELINE = re.compile(
+    rf"^\s*The\s+amount\s+of\s+(?P<initial_material>{_PHRASE})\s+passing\s+"
+    rf"through\s+(?:a|an|the)\s+(?P<initial_channel>{_PHRASE})\s+at\s+"
+    rf"(?P<initial_location>{_PHRASE})\s+is\s+(?P<initial>{_NUMBER})\s+"
+    rf"(?P<initial_unit>{_MEASURE_WORD})\.\s+After\s+(?:a|one)\s+"
+    rf"(?P<elapsed_unit>{_TIME_WORD})\s+of\s+(?P<event>{_PHRASE}),\s+the\s+"
+    rf"amount\s+of\s+(?P<scaled_material>{_PHRASE})\s+passing\s+through\s+"
+    rf"the\s+(?P<scaled_channel>{_PHRASE})\s+"
+    rf"(?P<multiplier>doubles|triples|quadruples)\s+at\s+the\s+same\s+point\.\s+"
+    rf"If\s+the\s+volume\s+of\s+(?P<increment_material>{_PHRASE})\s+passing\s+"
+    rf"through\s+the\s+(?P<increment_channel>{_PHRASE})\s+at\s+that\s+point\s+"
+    rf"increases\s+by\s+(?P<increment>{_NUMBER})\s+"
+    rf"(?P<increment_unit>{_MEASURE_WORD})\s+on\s+the\s+third\s+"
+    rf"(?P<third_unit>{_TIME_WORD}),\s+calculate\s+the\s+total\s+amount\s+of\s+"
+    rf"(?P<query_material>{_PHRASE})\s+passing\s+through\s+the\s+"
+    rf"(?P<query_channel>{_PHRASE})\s+at\s+that\s+point\s*\.\s*$",
     re.IGNORECASE,
 )
 
@@ -567,6 +639,35 @@ def _step_index(token: str) -> int:
 
 def _same(*values: str) -> bool:
     return len({_entity(value) for value in values}) == 1
+
+
+def _same_item_family(*values: str) -> bool:
+    """Require exact noun identity or one unambiguous compound-noun suffix."""
+
+    normalized = tuple(_singular(value) for value in values)
+    canonical = max(normalized, key=lambda value: (len(value.split()), len(value)))
+    return all(
+        value == canonical or canonical.endswith(f" {value}") for value in normalized
+    )
+
+
+def _pronouns_match_explicit_owner(owner: str, *pronouns: str) -> bool:
+    normalized = {_entity(pronoun) for pronoun in pronouns}
+    if len(normalized) != 1:
+        return False
+    pronoun = next(iter(normalized))
+    if pronoun == "they":
+        return False
+    owner_words = frozenset(re.findall(r"[a-z]+", _entity(owner)))
+    if pronoun == "he":
+        return bool(owner_words & _MASCULINE_OWNER_WORDS) and not bool(
+            owner_words & _FEMININE_OWNER_WORDS
+        )
+    if pronoun == "she":
+        return bool(owner_words & _FEMININE_OWNER_WORDS) and not bool(
+            owner_words & _MASCULINE_OWNER_WORDS
+        )
+    return False
 
 
 def _coordinated_matches(
@@ -1454,6 +1555,246 @@ class StructuralParser:
         self.targets.append(total)
         return True
 
+    def _parse_satiety_equivalence_chain(self) -> bool:
+        """Compile category counts linked by one scale and one equivalence."""
+
+        match = _SATIETY_EQUIVALENCE_CHAIN.fullmatch(self.source)
+        if match is None:
+            return False
+        if not _same(
+            match.group("owner"), match.group("fill_owner"), match.group("query_owner")
+        ):
+            raise _Abort(ParseStatus.AMBIGUOUS, "satiety owners do not agree")
+        if not _pronouns_match_explicit_owner(
+            match.group("owner"),
+            match.group("intro_pronoun"),
+            match.group("scale_pronoun"),
+        ):
+            raise _Abort(
+                ParseStatus.AMBIGUOUS,
+                "satiety pronouns are not bound to an explicit owner role",
+            )
+
+        item_groups = (
+            "intro_item",
+            "intro_repeat",
+            "size_item",
+            "base_item",
+            "scaled_item",
+            "scale_source_item",
+            "equivalent_target_item",
+            "equivalent_source_item",
+            "query_item",
+        )
+        item_surfaces = tuple(match.group(group) for group in item_groups)
+        if not _same_item_family(*item_surfaces):
+            raise _Abort(ParseStatus.AMBIGUOUS, "satiety item nouns do not agree")
+        canonical_item = _singular(
+            max(item_surfaces, key=lambda value: (len(value.split()), len(value)))
+        )
+
+        base_label = _entity(match.group("base_label"))
+        scaled_label = _entity(match.group("scaled_label"))
+        target_label = _entity(match.group("equivalent_target_label"))
+        if not _same(match.group("base_label"), match.group("scale_source_label")):
+            raise _Abort(ParseStatus.AMBIGUOUS, "satiety scale basis is not explicit")
+        if not _same(
+            match.group("scaled_label"), match.group("equivalent_source_label")
+        ):
+            raise _Abort(
+                ParseStatus.AMBIGUOUS, "satiety equivalence source is not explicit"
+            )
+        if not _same(
+            match.group("equivalent_target_label"), match.group("query_label")
+        ):
+            raise _Abort(ParseStatus.AMBIGUOUS, "satiety target is not explicit")
+        if len({base_label, scaled_label, target_label}) != 3:
+            raise _Abort(ParseStatus.AMBIGUOUS, "satiety categories must be distinct")
+
+        base_count = _number(match.group("base_count"))
+        scale_text = match.group("scale").casefold()
+        scale = (
+            Fraction(2)
+            if scale_text == "twice"
+            else _number(re.sub(r"(?i)\s+times$", "", scale_text))
+        )
+        target_equivalent = _number(match.group("equivalent_target_count"))
+        source_equivalent = _number(match.group("equivalent_source_count"))
+        if (
+            any(
+                value <= 0 or value.denominator != 1
+                for value in (base_count, target_equivalent, source_equivalent)
+            )
+            or scale <= 0
+        ):
+            raise _Abort(
+                ParseStatus.INVALID,
+                "satiety counts must be positive integers and scale positive",
+            )
+        final_count = base_count * scale * target_equivalent / source_equivalent
+        if final_count.denominator != 1:
+            raise _Abort(
+                ParseStatus.INVALID, "satiety chain implies a fractional count"
+            )
+
+        unit = Unit.count(symbol=canonical_item)
+        prefix = f"satiety.{_entity(match.group('owner'))}.{canonical_item}"
+        base = self._variable(
+            f"{prefix}.{base_label}",
+            unit,
+            span=self._match_span(match, "base_label"),
+            count=True,
+        )
+        scaled = self._variable(
+            f"{prefix}.{scaled_label}",
+            unit,
+            span=self._match_span(match, "scaled_label"),
+            count=True,
+        )
+        target = self._variable(
+            f"{prefix}.{target_label}",
+            unit,
+            span=self._match_span(match, "query_label"),
+            count=True,
+        )
+        whole_span = Span(match.start(), match.end(), self.source)
+        self._define(
+            base,
+            Assign(
+                base,
+                Quantity(
+                    base_count,
+                    unit,
+                    span=self._match_span(match, "base_count"),
+                ),
+                span=whole_span,
+            ),
+        )
+        self._define(
+            scaled,
+            Affine(
+                scaled,
+                base,
+                scale,
+                Quantity(0, unit, span=self._match_span(match, "scale")),
+                span=whole_span,
+            ),
+        )
+        self._define(
+            target,
+            Affine(
+                target,
+                scaled,
+                target_equivalent / source_equivalent,
+                Quantity(
+                    0,
+                    unit,
+                    span=self._match_span(match, "equivalent_target_count"),
+                ),
+                span=whole_span,
+            ),
+        )
+        self.targets.append(target)
+        return True
+
+    def _parse_flow_timeline(self) -> bool:
+        """Compile one explicitly ordered multiply-then-increment state chain."""
+
+        match = _FLOW_TIMELINE.fullmatch(self.source)
+        if match is None:
+            return False
+        if not _same(
+            match.group("initial_material"),
+            match.group("scaled_material"),
+            match.group("increment_material"),
+            match.group("query_material"),
+        ):
+            raise _Abort(ParseStatus.AMBIGUOUS, "flow materials do not agree")
+        if not _same(
+            match.group("initial_channel"),
+            match.group("scaled_channel"),
+            match.group("increment_channel"),
+            match.group("query_channel"),
+        ):
+            raise _Abort(ParseStatus.AMBIGUOUS, "flow channels do not agree")
+        unit_name = _singular(match.group("initial_unit"))
+        if unit_name != _singular(match.group("increment_unit")):
+            raise _Abort(ParseStatus.AMBIGUOUS, "flow units do not agree")
+        if _singular(match.group("elapsed_unit")) != _singular(
+            match.group("third_unit")
+        ):
+            raise _Abort(ParseStatus.AMBIGUOUS, "flow timeline units do not agree")
+
+        multiplier = {
+            "doubles": Fraction(2),
+            "triples": Fraction(3),
+            "quadruples": Fraction(4),
+        }[match.group("multiplier").casefold()]
+        initial_value = _number(match.group("initial"))
+        increment_value = _number(match.group("increment"))
+        if initial_value <= 0:
+            raise _Abort(ParseStatus.INVALID, "initial flow must be positive")
+
+        unit = Unit.base("volume", symbol=unit_name)
+        prefix = (
+            f"flow.{_entity(match.group('initial_material'))}."
+            f"{_entity(match.group('initial_channel'))}"
+        )
+        initial = self._variable(
+            f"{prefix}.initial",
+            unit,
+            span=self._match_span(match, "initial"),
+        )
+        after_event = self._variable(
+            f"{prefix}.after_event",
+            unit,
+            span=self._match_span(match, "multiplier"),
+        )
+        final = self._variable(
+            f"{prefix}.final",
+            unit,
+            span=self._match_span(match, "query_material"),
+        )
+        whole_span = Span(match.start(), match.end(), self.source)
+        self._define(
+            initial,
+            Assign(
+                initial,
+                Quantity(
+                    initial_value,
+                    unit,
+                    span=self._match_span(match, "initial"),
+                ),
+                span=whole_span,
+            ),
+        )
+        self._define(
+            after_event,
+            Affine(
+                after_event,
+                initial,
+                multiplier,
+                Quantity(0, unit, span=self._match_span(match, "multiplier")),
+                span=whole_span,
+            ),
+        )
+        self._define(
+            final,
+            Affine(
+                final,
+                after_event,
+                Fraction(1),
+                Quantity(
+                    increment_value,
+                    unit,
+                    span=self._match_span(match, "increment"),
+                ),
+                span=whole_span,
+            ),
+        )
+        self.targets.append(final)
+        return True
+
     def _parse_score_mean(self) -> bool:
         match = _SCORE_MEAN.fullmatch(self.source)
         if match is None:
@@ -1716,6 +2057,8 @@ class StructuralParser:
             self._parse_resource_use_balance,
             self._parse_component_ratio_system,
             self._parse_period_score_system,
+            self._parse_satiety_equivalence_chain,
+            self._parse_flow_timeline,
             self._parse_recurrence,
             self._parse_direct_rate,
             self._parse_part_inventory,

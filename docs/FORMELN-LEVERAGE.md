@@ -123,7 +123,7 @@ Fähigkeit, keine nachträgliche Optimierung am GSM8K-Split.
 
 - **Frozen Exact-Pfad:** vier Organe, kein Runtime-Training, 152/152 Antworten
   und 152/152 Routen auf der kanonischen SHIP-v6-Suite.
-- **FERTIG-Vollsplit:** 1.071/1.319 GSM8K korrekt, 248 sichere Abstinenzen,
+- **FERTIG-Vollsplit:** 1.073/1.319 GSM8K korrekt, 246 sichere Abstinenzen,
   0 falsche und 0 Error-Outcomes. Der ungeprüfte Template-Fallback war 17/17
   falsch und bleibt bis zu einem strukturierten Proof proposal-only.
 - **FERTIG-Rekurrenzen:** neue endliche affine Grammatik mit exaktem
