@@ -417,7 +417,7 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
             )
         )
 
-        def execute(with_predictor: bool):
+        def execute(with_predictor: bool, *, direct_max_rows: int = 8):
             pager = DeepSeekWeightPager(
                 _TwoLayerPrefetchQuantizedTinyCheckpoint(),
                 device="cpu",
@@ -430,16 +430,25 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
                 max_seq_len=8,
                 route_predictor=predictor if with_predictor else None,
                 route_prefetch_window_rows=2,
+                route_prefetch_direct_max_rows=direct_max_rows,
             )
             hidden, evidence = model.hidden_stateful([[7, 8, 9, 10]])
-            return hidden, evidence, pager.metrics()
+            return hidden, evidence, pager.metrics(), model.route_prefetch_metrics()
 
-        expected, expected_evidence, baseline = execute(False)
-        actual, actual_evidence, markov = execute(True)
+        expected, expected_evidence, baseline, baseline_scheduler = execute(False)
+        actual, actual_evidence, markov, direct_scheduler = execute(True)
+        aggregated, aggregated_evidence, aggregate_metrics, aggregate_scheduler = (
+            execute(True, direct_max_rows=2)
+        )
 
         self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(
             actual_evidence.selected_experts,
+            expected_evidence.selected_experts,
+        )
+        self.assertTrue(torch.equal(aggregated, expected))
+        self.assertEqual(
+            aggregated_evidence.selected_experts,
             expected_evidence.selected_experts,
         )
         self.assertEqual(markov["expert_reservoir_submitted"], 4)
@@ -447,6 +456,13 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
         self.assertEqual(markov["expert_reservoir_usable_hits"], 4)
         self.assertEqual(markov["expert_reservoir_misses"], 0)
         self.assertFalse(markov["expert_reservoir_active"])
+        self.assertEqual(aggregate_metrics["expert_reservoir_submitted"], 2)
+        self.assertEqual(aggregate_metrics["expert_reservoir_usable_hits"], 2)
+        self.assertEqual(direct_scheduler["direct_plans"], 1)
+        self.assertEqual(direct_scheduler["direct_bindings"], 2)
+        self.assertEqual(aggregate_scheduler["aggregate_plans"], 1)
+        self.assertEqual(aggregate_scheduler["aggregate_bindings"], 1)
+        self.assertFalse(baseline_scheduler["enabled"])
         self.assertGreater(baseline["expert_prefetch_submitted"], 0)
 
     def test_batched_moe_closes_window_before_shared_and_preserves_index_add(

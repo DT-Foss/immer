@@ -316,6 +316,7 @@ class LayerMicroWindowPlan:
     active_rows: int
     window_rows: int
     windows: tuple[MicroWindowPrediction, ...]
+    aggregate_candidates: tuple[int, ...]
 
     def __post_init__(self) -> None:
         source = _integer(self.source_layer, "source_layer")
@@ -323,6 +324,7 @@ class LayerMicroWindowPlan:
         active = _integer(self.active_rows, "active_rows", minimum=1)
         width = _integer(self.window_rows, "window_rows", minimum=1)
         windows = tuple(self.windows)
+        aggregate = tuple(self.aggregate_candidates)
         if target != source + 1 or not windows:
             raise RouteMarkovError("micro-window plan has no consecutive target")
         cursor = 0
@@ -339,11 +341,21 @@ class LayerMicroWindowPlan:
             cursor = window.active_row_stop
         if cursor != active:
             raise RouteMarkovError("micro-window plan does not cover every active row")
+        if not aggregate or len(set(aggregate)) != len(aggregate):
+            raise RouteMarkovError(
+                "micro-window aggregate candidates must be non-empty and unique"
+            )
+        window_candidates = {
+            expert for window in windows for expert in window.candidate_experts
+        }
+        if any(expert not in window_candidates for expert in aggregate):
+            raise RouteMarkovError("micro-window aggregate contains an unranked expert")
         object.__setattr__(self, "source_layer", source)
         object.__setattr__(self, "target_layer", target)
         object.__setattr__(self, "active_rows", active)
         object.__setattr__(self, "window_rows", width)
         object.__setattr__(self, "windows", windows)
+        object.__setattr__(self, "aggregate_candidates", aggregate)
 
 
 class LayerMarkovExpertPredictor:
@@ -797,6 +809,7 @@ def plan_micro_window_prefetch(
         raise RouteMarkovError("current_rows must contain an active expert row")
 
     windows: list[MicroWindowPrediction] = []
+    aggregate_scores = [0.0] * predictor.n_experts
     for start in range(0, len(active), width):
         chunk = active[start : start + width]
         candidate_count = (
@@ -809,21 +822,34 @@ def plan_micro_window_prefetch(
             current_rows=chunk,
             alpha=prior,
         )
+        candidates = distribution.top_k(candidate_count)
         windows.append(
             MicroWindowPrediction(
                 source_layer=layer,
                 target_layer=layer + 1,
                 active_row_start=start,
                 active_row_stop=start + len(chunk),
-                candidate_experts=distribution.top_k(candidate_count),
+                candidate_experts=candidates,
             )
         )
+        # Rank-local reciprocal votes retain repeated causal micro-window
+        # evidence without averaging the full dense distributions into noise.
+        for rank, expert in enumerate(candidates):
+            aggregate_scores[expert] += 1.0 / (rank + 1)
+    aggregate_k = fixed_k or max(len(window.candidate_experts) for window in windows)
+    aggregate_candidates = tuple(
+        sorted(
+            (expert for expert, score in enumerate(aggregate_scores) if score),
+            key=lambda expert: (-aggregate_scores[expert], expert),
+        )[:aggregate_k]
+    )
     return LayerMicroWindowPlan(
         source_layer=layer,
         target_layer=layer + 1,
         active_rows=len(active),
         window_rows=width,
         windows=tuple(windows),
+        aggregate_candidates=aggregate_candidates,
     )
 
 

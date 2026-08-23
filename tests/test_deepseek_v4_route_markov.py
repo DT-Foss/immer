@@ -195,6 +195,16 @@ class RouteMarkovTests(unittest.TestCase):
         self.assertEqual(len(plan.windows[1].candidate_experts), 3)
         self.assertEqual(plan.windows[0].candidate_experts[0], 5)
         self.assertEqual(plan.windows[1].candidate_experts[0], 2)
+        self.assertEqual(len(plan.aggregate_candidates), 3)
+        self.assertTrue(
+            set(plan.aggregate_candidates).issubset(
+                {
+                    expert
+                    for window in plan.windows
+                    for expert in window.candidate_experts
+                }
+            )
+        )
 
         fixed = plan_micro_window_prefetch(
             model,
@@ -206,6 +216,7 @@ class RouteMarkovTests(unittest.TestCase):
         self.assertTrue(
             all(len(window.candidate_experts) == 5 for window in fixed.windows)
         )
+        self.assertEqual(len(fixed.aggregate_candidates), 5)
 
     def test_k_sweep_has_all_widths_and_exact_full_inventory_endpoint(self) -> None:
         model = LayerMarkovExpertPredictor(n_experts=4)

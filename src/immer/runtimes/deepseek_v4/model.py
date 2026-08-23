@@ -122,6 +122,7 @@ class StreamedDeepSeekV4:
         route_prefetch_window_rows: int = 2,
         route_prefetch_k: int | None = None,
         route_prefetch_alpha: float = 1.0,
+        route_prefetch_direct_max_rows: int = 8,
     ) -> None:
         self.config = config
         self.pager = pager
@@ -175,13 +176,28 @@ class StreamedDeepSeekV4:
             or route_prefetch_alpha <= 0
         ):
             raise ValueError("route_prefetch_alpha must be finite and positive")
+        if (
+            isinstance(route_prefetch_direct_max_rows, bool)
+            or not isinstance(route_prefetch_direct_max_rows, int)
+            or route_prefetch_direct_max_rows < 1
+        ):
+            raise ValueError("route_prefetch_direct_max_rows must be positive")
         self.route_predictor = route_predictor
         self.route_prefetch_window_rows = route_prefetch_window_rows
         self.route_prefetch_k = route_prefetch_k
         self.route_prefetch_alpha = float(route_prefetch_alpha)
+        self.route_prefetch_direct_max_rows = route_prefetch_direct_max_rows
         self._route_prefetch_plan: LayerMicroWindowPlan | None = None
         self._route_prefetch_window_index = 0
         self._route_prefetch_reservoir: Any | None = None
+        self._route_prefetch_aggregate = False
+        self._route_prefetch_stats = {
+            "aggregate_bindings": 0,
+            "aggregate_plans": 0,
+            "direct_bindings": 0,
+            "direct_plans": 0,
+            "plans": 0,
+        }
         self._attention_states: list[NativeAttentionState | None] = [
             None for _ in range(config.n_layers)
         ]
@@ -600,6 +616,7 @@ class StreamedDeepSeekV4:
             "kind": "token-row-markov",
             "snapshot_sha256": predictor.snapshot_sha256,
             "window_rows": self.route_prefetch_window_rows,
+            "direct_max_rows": self.route_prefetch_direct_max_rows,
         }
 
     def _snapshot_identity(self) -> dict[str, Any]:
@@ -1262,6 +1279,13 @@ class StreamedDeepSeekV4:
             for expert_id in window.candidate_experts
         )
 
+    @staticmethod
+    def _route_aggregate_bases(plan: LayerMicroWindowPlan) -> tuple[str, ...]:
+        return tuple(
+            f"layers.{plan.target_layer}.ffn.experts.{expert_id}"
+            for expert_id in plan.aggregate_candidates
+        )
+
     def _cancel_route_prefetch(self) -> None:
         reservoir = self._route_prefetch_reservoir
         if reservoir is not None:
@@ -1269,15 +1293,20 @@ class StreamedDeepSeekV4:
         self._route_prefetch_plan = None
         self._route_prefetch_window_index = 0
         self._route_prefetch_reservoir = None
+        self._route_prefetch_aggregate = False
 
     def _start_route_prefetch_window(self) -> bool:
         plan = self._route_prefetch_plan
         if plan is None or self._route_prefetch_window_index >= len(plan.windows):
             return False
-        window = plan.windows[self._route_prefetch_window_index]
-        reservoir = self.pager.prefetch_expert_reservoir(
-            self._route_window_bases(window)
+        bases = (
+            self._route_aggregate_bases(plan)
+            if self._route_prefetch_aggregate
+            else self._route_window_bases(
+                plan.windows[self._route_prefetch_window_index]
+            )
         )
+        reservoir = self.pager.prefetch_expert_reservoir(bases)
         if reservoir is None:
             self._route_prefetch_plan = None
             self._route_prefetch_window_index = 0
@@ -1310,6 +1339,14 @@ class StreamedDeepSeekV4:
             alpha=self.route_prefetch_alpha,
         )
         self._route_prefetch_window_index = 0
+        self._route_prefetch_aggregate = (
+            self._route_prefetch_plan.active_rows > self.route_prefetch_direct_max_rows
+        )
+        self._route_prefetch_stats["plans"] += 1
+        plan_metric = (
+            "aggregate_plans" if self._route_prefetch_aggregate else "direct_plans"
+        )
+        self._route_prefetch_stats[plan_metric] += 1
         self._start_route_prefetch_window()
 
     def _route_prefetch_matches(self, *, layer: int, active_rows: int) -> bool:
@@ -1335,30 +1372,55 @@ class StreamedDeepSeekV4:
         if plan is None or reservoir is None or index >= len(plan.windows):
             return {}, self.pager.prefetch_expert_window(exact_bases)
         window = plan.windows[index]
-        if (
-            window.target_layer != layer
-            or window.active_row_start != active_row_start
-            or window.active_row_stop != active_row_stop
-        ):
+        aligned = plan.target_layer == layer and (
+            active_row_start == 0 and active_row_stop == plan.active_rows
+            if self._route_prefetch_aggregate
+            else window.active_row_start == active_row_start
+            and window.active_row_stop == active_row_stop
+        )
+        if not aligned:
             self._cancel_route_prefetch()
             return {}, self.pager.prefetch_expert_window(exact_bases)
 
         payloads = self.pager.bind_expert_reservoir(reservoir, exact_bases)
+        binding_metric = (
+            "aggregate_bindings"
+            if self._route_prefetch_aggregate
+            else "direct_bindings"
+        )
+        self._route_prefetch_stats[binding_metric] += 1
         self._route_prefetch_reservoir = None
         self._route_prefetch_window_index += 1
         misses = tuple(base for base in exact_bases if base not in payloads)
         exact_window = self.pager.prefetch_expert_window(misses) if misses else None
-        if self._route_prefetch_window_index < len(plan.windows):
+        if (
+            not self._route_prefetch_aggregate
+            and self._route_prefetch_window_index < len(plan.windows)
+        ):
             self._start_route_prefetch_window()
         else:
             self._route_prefetch_plan = None
             self._route_prefetch_window_index = 0
+            self._route_prefetch_aggregate = False
         return payloads, exact_window
 
     def _discard_route_payloads(self, payloads: dict[str, Any]) -> None:
         for payload in payloads.values():
             self.pager.discard_expert_reservoir_payload(payload)
         payloads.clear()
+
+    def route_prefetch_metrics(self) -> dict[str, Any]:
+        """Return scheduler counters beside the pager's exact I/O receipts."""
+
+        return {
+            **self._route_prefetch_stats,
+            "active": self._route_prefetch_plan is not None,
+            "alpha": self.route_prefetch_alpha,
+            "direct_max_rows": self.route_prefetch_direct_max_rows,
+            "enabled": self.route_predictor is not None,
+            "k": self.route_prefetch_k,
+            "window_rows": self.route_prefetch_window_rows,
+        }
 
     def _moe_one(
         self, x: Any, layer: int, token_id: int
@@ -1471,7 +1533,7 @@ class StreamedDeepSeekV4:
             layer=layer,
             active_rows=len(active_selected),
         )
-        if use_route_plan:
+        if use_route_plan and not self._route_prefetch_aggregate:
             assert self._route_prefetch_plan is not None
             row_windows = tuple(
                 (window.active_row_start, window.active_row_stop)

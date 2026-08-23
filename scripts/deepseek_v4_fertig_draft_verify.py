@@ -251,6 +251,12 @@ def _parser() -> argparse.ArgumentParser:
         default=1.0,
     )
     parser.add_argument(
+        "--route-prefetch-direct-max-rows",
+        type=_positive_int,
+        default=8,
+        help="larger prefills aggregate local votes and execute each expert once",
+    )
+    parser.add_argument(
         "--expert-reservoir-budget-mb",
         type=_positive_int,
         default=256,
@@ -1347,6 +1353,9 @@ def _model_runtime(
                     "route_prefetch_window_rows": args.route_prefetch_window_rows,
                     "route_prefetch_k": args.route_prefetch_k,
                     "route_prefetch_alpha": args.route_prefetch_alpha,
+                    "route_prefetch_direct_max_rows": (
+                        args.route_prefetch_direct_max_rows
+                    ),
                 }
             )
         model = StreamedDeepSeekV4(config, pager, **model_kwargs)
@@ -1359,6 +1368,7 @@ def _model_runtime(
                 source_layers=list(route_predictor.source_layers),
                 window_rows=args.route_prefetch_window_rows,
                 k=args.route_prefetch_k,
+                direct_max_rows=args.route_prefetch_direct_max_rows,
             )
         yield model
     finally:
@@ -1851,6 +1861,11 @@ def _verify_locally(
                 "alpha": (
                     args.route_prefetch_alpha if route_predictor is not None else None
                 ),
+                "direct_max_rows": (
+                    args.route_prefetch_direct_max_rows
+                    if route_predictor is not None
+                    else None
+                ),
                 "pager": {
                     key: value
                     for key, value in pager_metrics.items()
@@ -1863,6 +1878,11 @@ def _verify_locally(
                         "expert_range_requests_avoided",
                     }
                 },
+                "scheduler": (
+                    model.route_prefetch_metrics()
+                    if callable(getattr(model, "route_prefetch_metrics", None))
+                    else None
+                ),
             }
         if route_metrics["enabled"]:
             route_metrics["active_segments"] = len(graph.store.segments())

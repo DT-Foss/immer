@@ -856,6 +856,7 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
             route_prefetch_window_rows=4,
             route_prefetch_k=6,
             route_prefetch_alpha=1.0,
+            route_prefetch_direct_max_rows=8,
         )
 
     def test_fake_runtime_verifier_boundary_is_one_right_padded_pass(self) -> None:
