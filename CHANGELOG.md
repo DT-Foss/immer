@@ -3,6 +3,23 @@
 Alle Änderungen an IMMER. Jeder Eintrag endet mit Deutung + nächster Frage —
 nie mit der nackten Zahl.
 
+## [0.7.1] — 2026-08-23 — Quellenkarte verdichtet, Graph/Weights sauber getrennt
+
+- Die öffentliche README nennt den `.causal`-Pfad jetzt explizit als
+  Wiring-/Inferenzschicht über lokalen Gewichten statt als stillen
+  Tensor-Umschreiber.
+- `docs/research.md` trägt jetzt die Primärquellen für MoE-Routing,
+  DejaVu/kontextuelle Sparsity, Reservoir Computing, Markov-Routing und
+  safetensors in einem klar getrennten Abschnitt.
+- Die Repo-Verweise auf `DT-Foss/FERTIG`, `DT-Foss/o1-state` und
+  `DT-Foss/dotcausal` sind jetzt direkt aus der README erreichbar.
+
+### Deutung + nächste Frage
+
+Die Oberfläche ist jetzt schärfer: lokales Gewicht, externe Quelle, explizite
+Verkabelung. Die nächste Frage ist nicht mehr, wo die Linien verlaufen,
+sondern welche davon als Nächstes golden verdichtet werden.
+
 ## [0.7.0] — 2026-08-22 — Der lokale Pfad läuft; Verpackung kommt zuletzt
 
 **Ziel:** Die vorhandenen Mechanismen zu einem reproduzierbaren lokalen

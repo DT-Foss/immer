@@ -103,3 +103,54 @@ FLCA contributes typed operator evidence, compilation, schedule/runtime lowering
 ## QAD
 
 QAD contributes the deployment axis. In the Organ Grafting deployment experiment, host fake-quant int4 self-distillation moved NLL from PTQ 8.6671 to 8.6654 against fp32 8.6656 while the tested organ capability remained intact.
+
+## Primary References
+
+### Peer-reviewed
+
+- Nan Du, Yanping Huang, Andrew M. Dai, Simon Tong, Dmitry Lepikhin, Maxim
+  Krikun, Yuanzhong Xu, et al., 2022, [GLaM: Efficient Scaling of Language
+  Models with Mixture-of-Experts](https://proceedings.mlr.press/v162/du22c.html)
+  - large-scale sparse MoE language modeling with lower training cost than a
+    dense baseline.
+- William Fedus, Barret Zoph, Noam Shazeer, 2022, [Switch Transformers:
+  Scaling to Trillion Parameter Models with Simple and Efficient
+  Sparsity](https://jmlr.org/papers/v23/21-0998.html)
+  - simplifies MoE routing to one expert per token and lowers communication
+    cost.
+- Daniel J. Gauthier, Erin Bollt, et al., 2021, [Next generation reservoir
+  computing](https://doi.org/10.1038/s41467-021-25801-2)
+  - modern reservoir-computing framing with linear training on the readout.
+- D. Verstraeten, B. Schrauwen, M. D'Haene, D. Stroobandt, 2007, [An
+  experimental unification of reservoir computing methods](https://www.sciencedirect.com/science/article/pii/S089360800700038X)
+  - early unifying ESN/RC experimental reference.
+- Francis Wyffels, Benjamin Schrauwen, Dirk Stroobandt, 2008, [Stable Output
+  Feedback in Reservoir Computing Using Ridge Regression](https://link.springer.com/chapter/10.1007/978-3-540-87536-9_83)
+  - ridge-regression readout as a stable reservoir-training primitive.
+- Georg Holzmann, et al., 2010, [Echo state networks with filter neurons and a
+  delay&sum readout](https://www.sciencedirect.com/science/article/pii/S0893608009001580)
+  - ESN readout variants that keep the reservoir fixed and train the output
+    layer.
+
+### Preprints and specs
+
+- Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le,
+  Geoffrey Hinton, Jeff Dean, 2017, [Outrageously Large Neural Networks: The
+  Sparsely-Gated Mixture-of-Experts Layer](https://arxiv.org/abs/1701.06538)
+  - baseline sparse MoE routing with a learned gating network over many
+    experts.
+- Zichang Liu, Jue Wang, Tri Dao, Tianyi Zhou, Binhang Yuan, Zhao Song,
+  Anshumali Shrivastava, Ce Zhang, Yuandong Tian, Christopher Ré, et al.,
+  2023, [Deja Vu: Contextual Sparsity for Efficient LLMs at Inference
+  Time](https://arxiv.org/abs/2310.17157)
+  - contextual sparsity predictor for faster inference without retraining the
+    base model.
+- P. Batorski, et al., 2026, [MACRO: Markov Chain Routing of Transformer
+  Layers](https://arxiv.org/abs/2608.05872)
+  - Markov-policy baseline for layer routing with skip/repeat choices.
+- [safetensors/safetensors](https://github.com/safetensors/safetensors)
+  - safe, zero-copy tensor storage format; the format anchor for local range
+    loading.
+- [DT-Foss/dotcausal](https://github.com/DT-Foss/dotcausal)
+  - the `.causal` format repository and public reference for the causal graph
+    substrate.

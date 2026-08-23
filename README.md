@@ -3,7 +3,9 @@
 IMMER ist die lokale Integrationsruntime für ein kleines, fortlaufendes
 System: Identität im O(1)-Strom, Wissen in einer externen Bibliothek, Können
 in SHA-adressierten Organen, Grounding durch FERTIG und kausales Routing durch
-die eigene CRSA-Attention.
+die eigene CRSA-Attention. Die `.causal`-Schicht beschreibt die Verkabelung
+über lokale Gewichte; sie ist ein expliziter Inferenz- und Speicherpfad, kein
+stilles Umschreiben der Tensoren.
 
 Der derzeit belastbare PoC ist kein allgemeines Chatmodell. Er ist ein
 funktionierender, abstinenzfähiger Runtime-Pfad:
@@ -158,6 +160,17 @@ Die ausführliche Beweislage und die bekannten Negativergebnisse stehen in
 [`docs/RUNTIME-VERDICT.md`](docs/RUNTIME-VERDICT.md). Hugging Face ist erst der
 letzte Export nach lokalem Akzeptanzlauf und geklärter Lizenzkette; es ist
 nicht die Entwicklungsachse dieses Repositories.
+
+## Quellen
+
+- [`DT-Foss/FERTIG`](https://github.com/DT-Foss/FERTIG) für den grounded
+  Solver- und Desktop-Strang.
+- [`DT-Foss/o1-state`](https://github.com/DT-Foss/o1-state) für den
+  O(1)-State-Strang und den externen Knowledge-Index.
+- [`DT-Foss/dotcausal`](https://github.com/DT-Foss/dotcausal) für die
+  `.causal`-Formatbasis.
+- [`docs/research.md`](docs/research.md) für die Primärquellen zu MoE,
+  DejaVu, Reservoir Computing, Markov-Routing und safetensors.
 
 ## Offline-HF-Bundle — erst nach dem lokalen Lauf
 
