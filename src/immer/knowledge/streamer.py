@@ -22,10 +22,12 @@ import hashlib
 import json
 import os
 import re
+import stat as stat_module
 import struct
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -180,6 +182,34 @@ class HardByteBudget(Budget):
                     self._reserved_bytes = 0
                     raise RuntimeError("Budget-Reservierung ist untergelaufen")
 
+    @contextmanager
+    def exact_reservation_or_reuse(self, amount: int, tag: str) -> Any:
+        """Preflight ``amount`` unless this thread already owns enough budget.
+
+        Local transports use this at their I/O boundary. A direct reader call
+        gets its own hard reservation; the contract wrapper already owns one,
+        so the nested transport reuses that receipt instead of reserving the
+        same bytes twice.
+        """
+
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+            raise ValueError("Budget-Reservierung darf nicht negativ sein")
+        stack = self._reservation_stack()
+        receipt = stack[-1] if stack else None
+        if receipt is not None:
+            with self._charge_lock:
+                remaining = int(receipt["remaining"])
+                if amount > remaining:
+                    self.rejected_charges += 1
+                    raise ByteBudgetExceeded(
+                        f"Aktive Budget-Reservierung reicht vor I/O nicht fuer "
+                        f"{tag!r}: {amount}/{remaining} Bytes"
+                    )
+            yield receipt
+            return
+        with self.reservation(amount, tag) as owned_receipt:
+            yield owned_receipt
+
     def charge(self, body: int, overhead: int, tag: str) -> None:
         body = int(body)
         overhead = int(overhead)
@@ -227,9 +257,57 @@ class HardByteBudget(Budget):
         return result
 
 
-class LocalRangeReader:
-    """Offline inclusive-range reader for a directory of source files."""
+@dataclass(frozen=True, slots=True)
+class _LocalFileIdentity:
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
 
+    @classmethod
+    def from_stat(cls, result: os.stat_result) -> "_LocalFileIdentity":
+        return cls(
+            device=int(result.st_dev),
+            inode=int(result.st_ino),
+            size=int(result.st_size),
+            mtime_ns=int(result.st_mtime_ns),
+            ctime_ns=int(result.st_ctime_ns),
+        )
+
+    @property
+    def etag(self) -> str:
+        return (
+            f"local-{self.device:x}-{self.inode:x}-{self.size:x}-"
+            f"{self.mtime_ns:x}-{self.ctime_ns:x}"
+        )
+
+
+@dataclass(slots=True)
+class _LocalFDEntry:
+    key: str
+    fd: int
+    identity: _LocalFileIdentity
+    active_leases: int = 0
+    retired: bool = False
+
+
+class _LocalFileSizeChanged(RangeValidationError):
+    """A metadata file changed size between reservation and ``pread``."""
+
+
+class LocalRangeReader:
+    """Offline inclusive-range reader backed by persistent ``pread`` FDs.
+
+    File descriptors are shared safely between threads because ``os.pread``
+    has no mutable file cursor. The cache is a deterministic LRU and can be
+    configured per source; ``None`` deliberately means unbounded residency.
+    Every lookup revalidates the path's inode and size, so an atomic shard
+    replacement retires the old descriptor before another result is returned.
+    """
+
+    DEFAULT_MAX_OPEN_FILES = 64
+    _MAX_REPLACEMENT_RETRIES = 4
     range_overhead_reserve = 0
     transport_policy = "local-range/v1"
     transport_connection_limit = 0
@@ -241,95 +319,428 @@ class LocalRangeReader:
         repo_id: str | None = None,
         revision: str = "local",
         budget: HardByteBudget | None = None,
+        max_open_files: int | None = DEFAULT_MAX_OPEN_FILES,
     ) -> None:
-        self.root = Path(root).expanduser().resolve()
-        if not self.root.is_dir():
-            raise FileNotFoundError(f"Lokale Tensorquelle fehlt: {self.root}")
+        if max_open_files is not None and (
+            isinstance(max_open_files, bool)
+            or not isinstance(max_open_files, int)
+            or max_open_files <= 0
+        ):
+            raise ValueError("max_open_files muss None oder eine positive Zahl sein")
+        if not hasattr(os, "pread"):
+            raise RuntimeError("Lokale Range-Reads benoetigen os.pread")
+
+        root_flags = os.O_RDONLY
+        root_flags |= int(getattr(os, "O_CLOEXEC", 0))
+        root_flags |= int(getattr(os, "O_DIRECTORY", 0))
+        root_flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        configured_root = Path(root).expanduser()
+        try:
+            configured_stat = configured_root.lstat()
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"Lokale Tensorquelle fehlt: {configured_root}"
+            ) from exc
+        if stat_module.S_ISLNK(configured_stat.st_mode):
+            raise RangeValidationError(
+                f"Lokale Tensorquelle darf kein Symlink sein: {configured_root}"
+            )
+        if not stat_module.S_ISDIR(configured_stat.st_mode):
+            raise FileNotFoundError(f"Lokale Tensorquelle fehlt: {configured_root}")
+        try:
+            root_fd = os.open(configured_root, root_flags)
+        except OSError as exc:
+            raise RangeValidationError(
+                f"Lokale Tensorquelle ist nicht sicher lesbar: {configured_root}"
+            ) from exc
+        try:
+            opened_stat = os.fstat(root_fd)
+            resolved_root = configured_root.resolve(strict=True)
+            resolved_stat = resolved_root.stat()
+            if not stat_module.S_ISDIR(opened_stat.st_mode) or (
+                int(opened_stat.st_dev), int(opened_stat.st_ino)
+            ) != (int(resolved_stat.st_dev), int(resolved_stat.st_ino)):
+                raise RangeValidationError(
+                    f"Lokale Tensorquelle wurde beim Oeffnen ersetzt: {configured_root}"
+                )
+        except Exception:
+            os.close(root_fd)
+            raise
+        self.root = resolved_root
+        self._root_fd = root_fd
         self.repo = repo_id or f"local:{self.root}"
         self.rev = revision
         self.budget = budget or HardByteBudget(200.0)
         self.file_info: dict[str, dict[str, Any]] = {}
+        self.max_open_files = max_open_files
+        self._condition = threading.Condition(threading.RLock())
+        self._fd_cache: OrderedDict[str, _LocalFDEntry] = OrderedDict()
+        self._retired_entries: list[_LocalFDEntry] = []
+        self._open_data_fds = 0
+        self._active_leases = 0
+        self._peak_active_leases = 0
+        self._peak_open_data_fds = 0
+        self._fd_opens = 0
+        self._fd_reuses = 0
+        self._fd_closes = 0
+        self._fd_reopens = 0
+        self._fd_evictions = 0
+        self._fd_waits = 0
+        self._closed = False
 
-    def _path(self, filename: str) -> Path:
+    @staticmethod
+    def _normalise_filename(filename: str) -> tuple[str, tuple[str, ...]]:
         if not isinstance(filename, str) or not filename or "\x00" in filename:
             raise RangeValidationError("Dateiname muss ein nichtleerer String sein")
-        candidate = (self.root / filename).resolve()
-        try:
-            candidate.relative_to(self.root)
-        except ValueError as exc:
+        relative = Path(filename)
+        if relative.is_absolute() or any(part == ".." for part in relative.parts):
+            raise RangeValidationError(f"Pfad verlaesst lokale Quelle: {filename!r}")
+        parts = tuple(part for part in relative.parts if part not in ("", "."))
+        if not parts:
             raise RangeValidationError(
-                f"Pfad verlaesst lokale Quelle: {filename!r}"
+                "Dateiname darf nicht auf das Quellverzeichnis zeigen"
+            )
+        return "/".join(parts), parts
+
+    def _open_parent_locked(self, parts: tuple[str, ...]) -> tuple[int, bool]:
+        """Open every parent beneath ``root`` without following symlinks."""
+
+        current = self._root_fd
+        owned = False
+        flags = os.O_RDONLY
+        flags |= int(getattr(os, "O_CLOEXEC", 0))
+        flags |= int(getattr(os, "O_DIRECTORY", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        try:
+            for component in parts[:-1]:
+                following = os.open(component, flags, dir_fd=current)
+                if owned:
+                    os.close(current)
+                current = following
+                owned = True
+        except OSError as exc:
+            if owned:
+                os.close(current)
+            raise RangeValidationError(
+                f"Unsicherer oder unlesbarer lokaler Quellpfad: {'/'.join(parts)!r}"
             ) from exc
-        return candidate
+        return current, owned
+
+    def _stat_locked(self, key: str, parts: tuple[str, ...]) -> _LocalFileIdentity:
+        parent_fd, owned = self._open_parent_locked(parts)
+        try:
+            try:
+                result = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(f"Quelldatei fehlt: {key}") from exc
+            except OSError as exc:
+                raise RangeValidationError(
+                    f"Lokale Quelldatei ist nicht sicher lesbar: {key!r}"
+                ) from exc
+        finally:
+            if owned:
+                os.close(parent_fd)
+        if not stat_module.S_ISREG(result.st_mode):
+            raise RangeValidationError(
+                f"Lokale Quelldatei muss regulaer und symlinkfrei sein: {key!r}"
+            )
+        return _LocalFileIdentity.from_stat(result)
+
+    def _open_current_locked(
+        self,
+        key: str,
+        parts: tuple[str, ...],
+        expected: _LocalFileIdentity,
+    ) -> tuple[int, _LocalFileIdentity]:
+        flags = os.O_RDONLY | int(getattr(os, "O_CLOEXEC", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        parent_fd, owned = self._open_parent_locked(parts)
+        descriptor = -1
+        try:
+            try:
+                descriptor = os.open(parts[-1], flags, dir_fd=parent_fd)
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(f"Quelldatei fehlt: {key}") from exc
+            except OSError as exc:
+                raise RangeValidationError(
+                    f"Lokale Quelldatei ist nicht sicher lesbar: {key!r}"
+                ) from exc
+            opened_stat = os.fstat(descriptor)
+            if not stat_module.S_ISREG(opened_stat.st_mode):
+                raise RangeValidationError(
+                    f"Lokale Quelldatei muss regulaer sein: {key!r}"
+                )
+            opened = _LocalFileIdentity.from_stat(opened_stat)
+            current = self._stat_locked(key, parts)
+            if opened != current or opened != expected:
+                raise RangeValidationError(
+                    f"Lokale Quelldatei wurde beim Oeffnen ersetzt: {key!r}"
+                )
+            return descriptor, opened
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        finally:
+            if owned:
+                os.close(parent_fd)
+
+    def _close_entry_locked(self, entry: _LocalFDEntry) -> None:
+        if entry.fd < 0:
+            return
+        os.close(entry.fd)
+        entry.fd = -1
+        self._open_data_fds -= 1
+        self._fd_closes += 1
+        try:
+            self._retired_entries.remove(entry)
+        except ValueError:
+            pass
+
+    def _retire_entry_locked(self, entry: _LocalFDEntry) -> None:
+        cached = self._fd_cache.get(entry.key)
+        if cached is entry:
+            del self._fd_cache[entry.key]
+        if entry.retired:
+            return
+        entry.retired = True
+        if entry.active_leases:
+            self._retired_entries.append(entry)
+        else:
+            self._close_entry_locked(entry)
+
+    def _evict_one_locked(self) -> bool:
+        for _key, entry in tuple(self._fd_cache.items()):
+            if entry.active_leases:
+                continue
+            self._retire_entry_locked(entry)
+            self._fd_evictions += 1
+            return True
+        return False
+
+    def _lease_entry(self, key: str, parts: tuple[str, ...]) -> _LocalFDEntry:
+        with self._condition:
+            while True:
+                if self._closed:
+                    raise RuntimeError("Lokaler Range-Reader ist geschlossen")
+                current = self._stat_locked(key, parts)
+                cached = self._fd_cache.get(key)
+                if cached is not None and cached.identity == current:
+                    self._fd_cache.move_to_end(key)
+                    cached.active_leases += 1
+                    self._active_leases += 1
+                    self._peak_active_leases = max(
+                        self._peak_active_leases, self._active_leases
+                    )
+                    self._fd_reuses += 1
+                    return cached
+                if cached is not None:
+                    self._fd_reopens += 1
+                    self._retire_entry_locked(cached)
+
+                if (
+                    self.max_open_files is not None
+                    and self._open_data_fds >= self.max_open_files
+                ):
+                    if self._evict_one_locked():
+                        continue
+                    self._fd_waits += 1
+                    self._condition.wait()
+                    continue
+
+                try:
+                    descriptor, opened = self._open_current_locked(key, parts, current)
+                except RangeValidationError:
+                    # An atomic replace between stat/open is expected to be
+                    # transient. Retry a bounded number in the read loop.
+                    raise
+                entry = _LocalFDEntry(key=key, fd=descriptor, identity=opened)
+                entry.active_leases = 1
+                self._fd_cache[key] = entry
+                self._open_data_fds += 1
+                self._active_leases += 1
+                self._fd_opens += 1
+                self._peak_open_data_fds = max(
+                    self._peak_open_data_fds, self._open_data_fds
+                )
+                self._peak_active_leases = max(
+                    self._peak_active_leases, self._active_leases
+                )
+                return entry
+
+    def _release_entry(self, entry: _LocalFDEntry) -> None:
+        with self._condition:
+            entry.active_leases -= 1
+            self._active_leases -= 1
+            if entry.active_leases < 0 or self._active_leases < 0:
+                raise RuntimeError("Lokale FD-Lease ist untergelaufen")
+            if entry.retired and not entry.active_leases:
+                self._close_entry_locked(entry)
+            self._condition.notify_all()
+
+    def _read_stable(
+        self,
+        key: str,
+        parts: tuple[str, ...],
+        start: int,
+        length: int | None,
+        *,
+        expected_file_size: int | None = None,
+    ) -> tuple[bytes, _LocalFileIdentity]:
+        last_error: Exception | None = None
+        for _attempt in range(self._MAX_REPLACEMENT_RETRIES):
+            try:
+                entry = self._lease_entry(key, parts)
+            except RangeValidationError as exc:
+                last_error = exc
+                continue
+            try:
+                if (
+                    expected_file_size is not None
+                    and entry.identity.size != expected_file_size
+                ):
+                    raise _LocalFileSizeChanged(
+                        f"Lokale Quelldatei aenderte ihre Groesse vor dem Lesen: "
+                        f"{key!r} ({expected_file_size} -> {entry.identity.size})"
+                    )
+                read_length = entry.identity.size if length is None else length
+                if start + read_length > entry.identity.size:
+                    raise RangeValidationError(
+                        f"Range ausserhalb {key}: [{start}, {start + read_length - 1}] "
+                        f"bei {entry.identity.size} Bytes"
+                    )
+                body = os.pread(entry.fd, read_length, start)
+                with self._condition:
+                    current = self._stat_locked(key, parts)
+                    stable = current == entry.identity
+                    if not stable:
+                        self._fd_reopens += 1
+                        self._retire_entry_locked(entry)
+                if not stable:
+                    last_error = RangeValidationError(
+                        f"Lokale Quelldatei wurde beim Lesen ersetzt: {key!r}"
+                    )
+                    continue
+                if len(body) != read_length:
+                    raise RangeValidationError(
+                        f"Kurzer lokaler Read {key}: {len(body)}/{read_length} Bytes"
+                    )
+                return body, entry.identity
+            finally:
+                self._release_entry(entry)
+        raise RangeValidationError(
+            f"Lokale Quelldatei aenderte sich wiederholt beim Lesen: {key!r}"
+        ) from last_error
+
+    def _remember(self, key: str, identity: _LocalFileIdentity) -> None:
+        with self._condition:
+            self.file_info.setdefault(key, {}).update(
+                {"size": identity.size, "etag": identity.etag}
+            )
 
     def file_size(self, filename: str) -> int:
-        path = self._path(filename)
-        try:
-            return int(path.stat().st_size)
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(f"Quelldatei fehlt: {filename}") from exc
+        key, parts = self._normalise_filename(filename)
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("Lokaler Range-Reader ist geschlossen")
+            return self._stat_locked(key, parts).size
 
     def source_identity(self, filename: str) -> dict[str, str]:
-        """Return the current cheap local identity used to reject stale caches."""
+        """Return inode-bound local identity used to reject stale caches."""
 
-        path = self._path(filename)
-        try:
-            stat = path.stat()
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(f"Quelldatei fehlt: {filename}") from exc
-        return {
-            "size": str(int(stat.st_size)),
-            "etag": f"local-{stat.st_size:x}-{stat.st_mtime_ns:x}",
-        }
-
-    def _remember(self, filename: str, path: Path) -> None:
-        identity = self.source_identity(filename)
-        self.file_info.setdefault(filename, {}).update(
-            {"size": int(identity["size"]), "etag": identity["etag"]}
-        )
+        key, parts = self._normalise_filename(filename)
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("Lokaler Range-Reader ist geschlossen")
+            identity = self._stat_locked(key, parts)
+        return {"size": str(identity.size), "etag": identity.etag}
 
     def get_range(self, filename: str, start: int, end: int) -> bytes:
         start, end = _validate_inclusive_range(start, end)
-        path = self._path(filename)
-        size = self.file_size(filename)
-        if end >= size:
-            raise RangeValidationError(
-                f"Range ausserhalb {filename}: [{start}, {end}] bei {size} Bytes"
-            )
+        key, parts = self._normalise_filename(filename)
         length = end - start + 1
-        with path.open("rb") as handle:
-            handle.seek(start)
-            body = handle.read(length)
-        if len(body) != length:
-            raise RangeValidationError(
-                f"Kurzer lokaler Read {filename}: {len(body)}/{length} Bytes"
-            )
-        self.budget.charge(length, 0, f"local-range:{filename}:{start}")
-        self._remember(filename, path)
+        tag = f"local-range:{key}:{start}"
+        with self.budget.exact_reservation_or_reuse(length, tag):
+            body, identity = self._read_stable(key, parts, start, length)
+            self.budget.charge(length, 0, tag)
+        self._remember(key, identity)
         return body
 
     def fetch_file(self, filename: str) -> bytes:
-        path = self._path(filename)
-        body = path.read_bytes()
-        self.budget.charge(len(body), 0, f"local-file:{filename}")
-        self._remember(filename, path)
-        return body
+        key, parts = self._normalise_filename(filename)
+        last_error: Exception | None = None
+        for _attempt in range(self._MAX_REPLACEMENT_RETRIES):
+            with self._condition:
+                if self._closed:
+                    raise RuntimeError("Lokaler Range-Reader ist geschlossen")
+                reserved_size = self._stat_locked(key, parts).size
+            tag = f"local-file:{key}"
+            try:
+                with self.budget.exact_reservation_or_reuse(reserved_size, tag):
+                    body, identity = self._read_stable(
+                        key,
+                        parts,
+                        0,
+                        reserved_size,
+                        expected_file_size=reserved_size,
+                    )
+                    self.budget.charge(reserved_size, 0, tag)
+            except _LocalFileSizeChanged as exc:
+                last_error = exc
+                continue
+            self._remember(key, identity)
+            return body
+        raise RangeValidationError(
+            f"Lokale Quelldatei aenderte wiederholt ihre Groesse: {key!r}"
+        ) from last_error
 
     def transport_metrics(self) -> dict[str, Any]:
-        return {
-            "transport_policy": self.transport_policy,
-            "transport_connection_limit": self.transport_connection_limit,
-            "transport_active_lease_limit": 0,
-            "transport_requests": int(self.budget.requests),
-            "transport_retries": 0,
-            "transport_active_leases": 0,
-            "transport_peak_leases": 0,
-            "transport_connection_objects_seen": 0,
-            "transport_closed": False,
-        }
+        with self._condition:
+            return {
+                "transport_policy": self.transport_policy,
+                "transport_connection_limit": self.transport_connection_limit,
+                "transport_active_lease_limit": 0,
+                "transport_requests": int(self.budget.requests),
+                "transport_retries": 0,
+                "transport_active_leases": self._active_leases,
+                "transport_peak_leases": self._peak_active_leases,
+                "transport_connection_objects_seen": 0,
+                "transport_fd_max_open_files": self.max_open_files,
+                "transport_fd_open_files": self._open_data_fds,
+                "transport_fd_peak_open_files": self._peak_open_data_fds,
+                "transport_fd_opens": self._fd_opens,
+                "transport_fd_reuses": self._fd_reuses,
+                "transport_fd_closes": self._fd_closes,
+                "transport_fd_reopens": self._fd_reopens,
+                "transport_fd_evictions": self._fd_evictions,
+                "transport_fd_waits": self._fd_waits,
+                "transport_closed": self._closed,
+            }
 
     def close(self) -> None:
-        """Match the remote reader lifecycle; local files are per-call."""
+        """Wait for active ``pread`` calls and close every persistent FD."""
+
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            while self._active_leases:
+                self._condition.wait()
+            for entry in tuple(self._fd_cache.values()):
+                self._retire_entry_locked(entry)
+            for entry in tuple(self._retired_entries):
+                self._close_entry_locked(entry)
+            self._fd_cache.clear()
+            if self._root_fd >= 0:
+                os.close(self._root_fd)
+                self._root_fd = -1
+            self._condition.notify_all()
+
+    def __enter__(self) -> "LocalRangeReader":
+        return self
+
+    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
+        self.close()
 
 
 def _validate_nonnegative_int(value: Any, label: str) -> int:
@@ -1409,24 +1820,31 @@ class Streamer:
         use_cache: bool = True,
         max_metadata_bytes: int = 64 * 1024 * 1024,
         max_cache_bytes: int | None = None,
+        max_open_files: int | None = LocalRangeReader.DEFAULT_MAX_OPEN_FILES,
         verbose: bool = False,
         access_observer: Any | None = None,
     ) -> "Streamer":
-        path = Path(root).expanduser().resolve()
-        repo_id = f"local:{path}"
-        local = LocalRangeReader(path, repo_id=repo_id, revision=revision)
-        return cls(
-            repo_id,
+        local = LocalRangeReader(
+            Path(root).expanduser(),
             revision=revision,
-            budget_mb=budget_mb,
-            reader=local,
-            cache_dir=cache_dir,
-            use_cache=use_cache,
-            max_metadata_bytes=max_metadata_bytes,
-            max_cache_bytes=max_cache_bytes,
-            verbose=verbose,
-            access_observer=access_observer,
+            max_open_files=max_open_files,
         )
+        try:
+            return cls(
+                local.repo,
+                revision=revision,
+                budget_mb=budget_mb,
+                reader=local,
+                cache_dir=cache_dir,
+                use_cache=use_cache,
+                max_metadata_bytes=max_metadata_bytes,
+                max_cache_bytes=max_cache_bytes,
+                verbose=verbose,
+                access_observer=access_observer,
+            )
+        except Exception:
+            local.close()
+            raise
 
     @property
     def reader(self) -> _ContractReader:
