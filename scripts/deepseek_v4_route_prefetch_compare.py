@@ -117,9 +117,19 @@ def _arm_record(
     expected_role: str | None,
 ) -> dict[str, Any]:
     instrumentation = document.get("instrumentation")
-    if not isinstance(instrumentation, Mapping):
-        raise CompareError("runtime result lacks route-prefetch instrumentation")
-    route = instrumentation.get("route_prefetch")
+    route = (
+        instrumentation.get("route_prefetch")
+        if isinstance(instrumentation, Mapping)
+        else None
+    )
+    legacy_baseline = route is None and not expected_enabled
+    if legacy_baseline:
+        route = {
+            "enabled": False,
+            "model_role": None,
+            "model_snapshot_sha256": None,
+            "pager": {},
+        }
     if not isinstance(route, Mapping) or route.get("enabled") is not expected_enabled:
         raise CompareError("route-prefetch arm enablement does not match")
     if route.get("model_role") != expected_role:
@@ -140,6 +150,7 @@ def _arm_record(
     if usable_hits > prediction_hits or prediction_hits > submitted:
         raise CompareError("route reservoir hit counters are inconsistent")
     return {
+        "legacy_baseline_instrumentation": legacy_baseline,
         "model_role": expected_role,
         "model_snapshot_sha256": route.get("model_snapshot_sha256"),
         "seconds": seconds,

@@ -75,7 +75,9 @@ class RoutePrefetchCompareTests(unittest.TestCase):
             real = directory / "real.json"
             placebo = directory / "placebo.json"
             output = directory / "comparison.json"
-            _write(baseline, _result(enabled=False, role=None, seconds=10, body=1000))
+            legacy_baseline = _result(enabled=False, role=None, seconds=10, body=1000)
+            legacy_baseline.pop("instrumentation")
+            _write(baseline, legacy_baseline)
             _write(
                 real,
                 _result(enabled=True, role="real_markov", seconds=7, body=800),
@@ -98,6 +100,9 @@ class RoutePrefetchCompareTests(unittest.TestCase):
             self.assertEqual(
                 report["arms"]["real_markov"]["reservoir"]["demand_coverage"],
                 2 / 3,
+            )
+            self.assertTrue(
+                report["arms"]["baseline"]["legacy_baseline_instrumentation"]
             )
             self.assertEqual(
                 output.read_bytes(),
