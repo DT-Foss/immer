@@ -1,0 +1,112 @@
+{
+  "schema": "immer.qwen3.8-stream-smoke/v1",
+  "source": {
+    "repo": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+  },
+  "protocol": {
+    "token_ids": [
+      248044
+    ],
+    "requested_layers": 1,
+    "dry_run": false,
+    "text_only": true,
+    "vision": false,
+    "mtp": false,
+    "weight_order": "one BF16 matrix at a time"
+  },
+  "preflight": {
+    "required_tensors": 851,
+    "required_payload_bytes": 53791996928,
+    "layers": 64,
+    "linear_attention_layers": 48,
+    "full_attention_layers": 16,
+    "vision_excluded": true,
+    "mtp_excluded": true
+  },
+  "execution": {
+    "completed_layers": 1,
+    "seconds": 54.01060295799107,
+    "source_body_bytes": 766556608,
+    "pager": {
+      "repo_id": "Qwen/Qwen3.8-27B",
+      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "revision_is_pinned": true,
+      "revision_is_mutable": false,
+      "budget": {
+        "limit_bytes": 1073741824,
+        "bytes_total": 766568284,
+        "bytes_body": 766556608,
+        "bytes_overhead_approx": 11676,
+        "http_requests": 15,
+        "rejected_charges": 0
+      },
+      "network_or_source_body_bytes": 766556608,
+      "inventory_cache_hits": 1,
+      "inventory_cache_writes": 0,
+      "inventory_source_fingerprint": "ad46a48f49c75b301f029a1d48ad9171e157629d9245ffb5c893724a3265879f",
+      "transport_policy": "requests-session-pool-2/v1",
+      "transport_connection_limit": 2,
+      "transport_active_lease_limit": 2,
+      "transport_requests": 15,
+      "transport_retries": 0,
+      "transport_active_leases": 0,
+      "transport_peak_leases": 1,
+      "transport_connection_objects_seen": 2,
+      "transport_closed": false,
+      "range_logical_leaves": 15,
+      "range_logical_leaf_bytes": 766556608,
+      "range_requests": 15,
+      "range_bytes_requested": 766556608,
+      "range_source_requests": 15,
+      "range_source_bytes": 766556608,
+      "file_requests": 0,
+      "failed_requests": 0,
+      "optional_misses": 0,
+      "cache_hits": 0,
+      "cache_misses": 15,
+      "cache_writes": 15,
+      "cache_bytes_written": 766556608,
+      "cache_bytes_reused": 0,
+      "cache_integrity_checks": 0,
+      "cache_bytes": 766845458,
+      "cache_evictions": 0,
+      "cache_evicted_bytes": 0,
+      "cache_write_skips_oversize": 0,
+      "cache_priority_promotions": 0,
+      "cache_recoveries": 0,
+      "cache_limit_bytes": 1073741824,
+      "tensor_reads": 14,
+      "row_reads": 1,
+      "linear_calls": 8,
+      "embedding_rows": 1,
+      "head_rows": 0,
+      "logical_weight_bytes": 766556608,
+      "materialized_tensor_bytes": 766577280,
+      "peak_planned_resident_bytes": 356515840,
+      "materialized_weight_releases": 8,
+      "release_boundaries": 1,
+      "mps_cache_purges": 1,
+      "device": "mps",
+      "compute_dtype": "bfloat16",
+      "max_resident_bytes": 402653184,
+      "weight_cache_policy": "one-shot-bf16-exact-range/v1",
+      "source_identity": "official-pinned",
+      "closed": false
+    },
+    "activation": {
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "device": "mps:0",
+      "all_finite": true,
+      "rms": 1.1581147909164429,
+      "mean": 0.009593432769179344,
+      "min": -4.4375,
+      "max": 60.5
+    }
+  }
+}

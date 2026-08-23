@@ -1523,6 +1523,15 @@ class Streamer:
                 )
         elif allow_legacy and isinstance(raw, Mapping):
             document = dict(raw)
+            # The historical cache path was keyed only by the repository
+            # slug.  A mutable ``main`` scan can therefore sit next to a
+            # pinned snapshot.  It is not corruption; it is simply not a
+            # cache candidate for this source and must be rescanned.
+            if (
+                document.get("repo") != self.repo_id
+                or document.get("revision") != self.revision
+            ):
+                return None
         else:
             raise CacheIntegrityError(f"Unbekanntes Inventar-Cacheformat: {path}")
         self._validate_inventory(document)

@@ -86,6 +86,7 @@ class DeepSeekV4StableCrsaGraft(DeepSeekV4CrsaGraft):
     """Cosine-routed, per-head energy-preserving CRSA graft."""
 
     policy = STABLE_GRAFT_POLICY
+    evidence_schema = STABLE_GRAFT_EVIDENCE_SCHEMA
 
     def __init__(self, *args: Any, rms_eps: float = 1e-6, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -163,7 +164,7 @@ class DeepSeekV4StableCrsaGraft(DeepSeekV4CrsaGraft):
         head_dim = width // self.heads if width % self.heads == 0 else 0
         rms = _cpu_rms(hidden)
         return StableGraftEvidence(
-            schema=STABLE_GRAFT_EVIDENCE_SCHEMA,
+            schema=self.evidence_schema,
             policy=self.policy,
             mode=mode,
             operator="off" if mode == "off" else "identity(alpha=0)",
@@ -283,7 +284,7 @@ class DeepSeekV4StableCrsaGraft(DeepSeekV4CrsaGraft):
             / target_rms.clamp_min(self.rms_eps)
         )
         evidence = StableGraftEvidence(
-            schema=STABLE_GRAFT_EVIDENCE_SCHEMA,
+            schema=self.evidence_schema,
             policy=self.policy,
             mode=selected,
             operator={

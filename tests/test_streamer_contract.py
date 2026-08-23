@@ -1019,6 +1019,29 @@ print("wheel-safe")
                 second.inventory()
             self.assertEqual(second.bytes_moved(), 0)
 
+    def test_mismatched_legacy_inventory_is_ignored_for_pinned_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = Path(tmp) / "legacy.json"
+            legacy.write_text(
+                json.dumps(
+                    {
+                        "repo": "org/repo",
+                        "revision": "main",
+                        "shards": [],
+                        "tensors": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source = Streamer(
+                "org/repo",
+                revision="pinned-commit",
+                cache_dir=Path(tmp) / "cache",
+            )
+
+            self.assertIsNone(source._load_inventory_path(legacy, allow_legacy=True))
+            self.assertEqual(source.metrics()["inventory_cache_hits"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

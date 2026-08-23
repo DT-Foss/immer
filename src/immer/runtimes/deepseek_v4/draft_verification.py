@@ -199,6 +199,8 @@ def _transient_failure(error: Exception) -> bool:
 class LayerwiseDraftVerifier:
     """Verify a batch of draft continuations with one layer-major prefill."""
 
+    evidence_schema = DRAFT_VERIFICATION_SCHEMA
+
     def __init__(
         self,
         model: Any,
@@ -347,12 +349,25 @@ class LayerwiseDraftVerifier:
         layer_calls = 0
         layer_retry_count = 0
         graft_applied = False
-        expected_hidden_shape = (
-            batch,
-            padded_length,
-            int(self.model.config.hc_mult),
-            int(self.model.config.dim),
-        )
+        hidden_shape = getattr(self.model, "prefill_hidden_shape", None)
+        if callable(hidden_shape):
+            expected_hidden_shape = tuple(hidden_shape(batch, padded_length))
+        else:
+            # Backwards-compatible V4 contract.  Other streamed decoders can
+            # expose ``prefill_hidden_shape`` and reuse the transport/retry/
+            # rolling-checkpoint machinery without pretending to have hyper
+            # connections.
+            expected_hidden_shape = (
+                batch,
+                padded_length,
+                int(self.model.config.hc_mult),
+                int(self.model.config.dim),
+            )
+        if not expected_hidden_shape or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in expected_hidden_shape
+        ):
+            raise ValueError("model returned an invalid prefill hidden shape")
         if resume_state is not None:
             if not isinstance(resume_state, DraftVerificationResumeState):
                 raise TypeError("resume_state has the wrong type")
@@ -573,7 +588,7 @@ class LayerwiseDraftVerifier:
         end_bytes = _metric_int(source, "network_or_source_body_bytes")
         end_linears = _metric_int(self.model.pager, "linear_calls")
         evidence = DraftVerificationEvidence(
-            schema=DRAFT_VERIFICATION_SCHEMA,
+            schema=self.evidence_schema,
             batch_size=batch,
             prompt_lengths=tuple(len(row) for row in prompts),
             draft_lengths=tuple(len(row) for row in drafts),

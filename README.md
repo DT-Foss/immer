@@ -95,6 +95,16 @@ Dieser Streamer ist ein Instrument, nicht heimlich der Antwortpfad. Der frühere
 Shortcut „statisches Embedding-Mittel → Gate-Aktivierung → Value-Sketch“ war
 negativ und wird nicht wiederbelebt.
 
+Der aktuelle Donor-Pfad ist Qwen3.8-27B. Sein Textdecoder läuft mit IMMERs
+eigener Attention/DeltaNet-Mathematik direkt aus einem gepinnten Snapshot; der
+erste echte Layer benötigt 766.556.608 Quellbytes statt eines vollständigen
+53,79-GB-Modellloads:
+
+```bash
+PYTHONPATH=src python scripts/qwen38_stream_smoke.py --dry-run --budget-mb 64
+PYTHONPATH=src python scripts/qwen38_stream_smoke.py --layers 1 --budget-mb 1024
+```
+
 ## Gemessenes Urteil
 
 | Messung | Ergebnis | Zulässige Aussage |
@@ -121,7 +131,8 @@ der Free-Head ist bitgleich zur kausalen Softmax. Der Router-Report wird mit
 | FERTIG | `cognition/fertig/` | vendored; Grounding/Bindings/Skills/Verifier, Aktions-Gates geschlossen |
 | Lebensstrom | `runtimes/o1_state/` | persistent, surprise-gated, getrennt vom Frozen Host |
 | WorldStream | `knowledge/streamer.py` | lokaler/HF Range-Zugriff, kein Donor-Modell-Load |
-| DeepSeek-V4 Runtime | `runtimes/deepseek_v4/` | 43-Layer-Hauptdecoder aus gepinnten Ranges; native Sparse-Attention, FP8/FP4-MoE, stateful CRSA-Graft |
+| Qwen3.8 Runtime | `runtimes/qwen3_8/` | eigener 64-Layer-Textdecoder; BF16-Range-Pager, Gated DeltaNet/Attention, Draft-Verifier und CRSA-Graft; gepinnter Preflight plus echter Layer 0 bestanden |
+| DeepSeek-V4 Runtime | `runtimes/deepseek_v4/` | pausierter Forschungszweig; sicherer Resume-Stand nach Layer 19 bleibt erhalten |
 | Daemon/Suite | `substrate/`, `suite.py` | atomare Zustände, Services, Metriken, Dashboard |
 | FLCA/QAD | externe kanonische Projekte | hier beschrieben, nicht als laufender IMMER-Kern ausgegeben |
 
