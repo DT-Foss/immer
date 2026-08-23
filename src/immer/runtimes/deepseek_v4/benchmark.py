@@ -26,10 +26,11 @@ SCHEMA_VERSION = "immer.deepseek_v4.benchmark/v1"
 JOURNAL_GENESIS_SHA256 = "0" * 64
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PINNED_REVISION = re.compile(r"[0-9a-fA-F]{40,64}")
-_GSM8K_NUMBER = re.compile(
-    r"(?<![A-Za-z0-9.])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)"
-    r"(?:\.\d+)?(?:[eE][-+]?\d+)?(?![A-Za-z0-9]|\.\d)"
-)
+_GSM8K_LITERAL = r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?"
+_GSM8K_NUMBER = re.compile(rf"(?<![A-Za-z0-9.]){_GSM8K_LITERAL}(?![A-Za-z0-9]|\.\d)")
+_GSM8K_CURRENCY = re.compile(rf"[$€£]\s*({_GSM8K_LITERAL})(?![A-Za-z0-9]|\.\d)")
+_GSM8K_BOXED = re.compile(r"\\boxed\s*\{\s*([^{}]+?)\s*\}")
+_MARKDOWN_STRONG = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 
 
 class BenchmarkContractError(ValueError):
@@ -425,18 +426,8 @@ def evaluate_mmlu(
     )
 
 
-def extract_gsm8k_answer(text: Any) -> str | None:
-    """Return the canonical final decimal answer used by GSM8K exact match."""
-
-    if text is None:
-        return None
-    raw = str(text).strip()
-    has_final_marker = "####" in raw
-    final = raw.rsplit("####", 1)[-1] if has_final_marker else raw
-    matches = _GSM8K_NUMBER.findall(final)
-    if not matches:
-        return None
-    literal = matches[-1].replace(",", "")
+def _canonical_gsm8k_number(literal: str) -> str | None:
+    literal = literal.replace(",", "")
     try:
         value = Decimal(literal)
     except InvalidOperation:
@@ -449,6 +440,49 @@ def extract_gsm8k_answer(text: Any) -> str | None:
     if "." in normalized:
         normalized = normalized.rstrip("0").rstrip(".")
     return normalized
+
+
+def _gsm8k_number(region: str, *, first: bool = False) -> str | None:
+    matches = _GSM8K_NUMBER.findall(region)
+    if not matches:
+        return None
+    return _canonical_gsm8k_number(matches[0] if first else matches[-1])
+
+
+def _terminal_answer_number(region: str) -> str | None:
+    currency = _GSM8K_CURRENCY.findall(region)
+    if currency:
+        return _canonical_gsm8k_number(currency[-1])
+    return _gsm8k_number(region, first="=" not in region)
+
+
+def extract_gsm8k_answer(text: Any) -> str | None:
+    """Return the canonical final decimal answer used by GSM8K exact match.
+
+    Explicit dataset markers and terminal model answer spans outrank the last
+    number in free text.  This avoids reading a trailing duration or unit count
+    as the answer in conclusions such as ``**earns $120 in 2 weeks**``.
+    """
+
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if "####" in raw:
+        return _gsm8k_number(raw.rsplit("####", 1)[-1])
+
+    boxed = _GSM8K_BOXED.findall(raw)
+    if boxed:
+        answer = _gsm8k_number(boxed[-1])
+        if answer is not None:
+            return answer
+
+    strong = tuple(_MARKDOWN_STRONG.finditer(raw))
+    if strong and not raw[strong[-1].end() :].strip():
+        answer = _terminal_answer_number(strong[-1].group(1))
+        if answer is not None:
+            return answer
+
+    return _gsm8k_number(raw)
 
 
 def evaluate_gsm8k(

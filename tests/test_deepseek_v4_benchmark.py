@@ -140,6 +140,22 @@ class OutcomeEvaluatorTests(unittest.TestCase):
         self.assertEqual(extract_gsm8k_answer("work 10 then #### 1,200.00"), "1200")
         self.assertEqual(extract_gsm8k_answer("therefore -0.000"), "0")
         self.assertEqual(extract_gsm8k_answer("therefore 42."), "42")
+        self.assertEqual(
+            extract_gsm8k_answer("30 cars. **Josh makes $120 in 2 weeks.**"),
+            "120",
+        )
+        self.assertEqual(
+            extract_gsm8k_answer("work. **Answer: 10 + 5 = 15.**"),
+            "15",
+        )
+        self.assertEqual(
+            extract_gsm8k_answer("work. **$30 * 4 = $120 in 2 weeks.**"),
+            "120",
+        )
+        self.assertEqual(
+            extract_gsm8k_answer(r"work: 6 * 7. Therefore \boxed{42}"),
+            "42",
+        )
         result = evaluate_gsm8k("g1", "#### 42", "6 * 7 = 42", seed=9)
         self.assertTrue(result.correct)
         self.assertEqual(result.predicted, "42")
