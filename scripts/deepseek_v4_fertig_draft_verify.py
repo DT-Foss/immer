@@ -28,16 +28,22 @@ from typing import Any
 import urllib.error
 import urllib.request
 
-from immer.knowledge import Streamer
+from immer.knowledge import AccessTraceRecorder, LiveGraph, Streamer
 from immer.runtimes.deepseek_v4 import (
     DeepSeekV4Config,
     DeepSeekWeightPager,
     StreamedDeepSeekV4,
 )
+from immer.runtimes.deepseek_v4.causal_prefetch import (
+    CausalExpertTransitionController,
+    CheckpointIdentity,
+)
 from immer.runtimes.deepseek_v4.benchmark import extract_gsm8k_answer
 from immer.runtimes.deepseek_v4.draft_verification import (
     DraftVerificationResumeState,
     LayerwiseDraftVerifier,
+    ROUTE_OBSERVATION_SCHEMA,
+    SuccessfulRouteObservation,
 )
 from immer.runtimes.deepseek_v4.encoding import encode_user_prompt
 from immer.runtimes.deepseek_v4.stable_graft import DeepSeekV4StableCrsaGraft
@@ -60,6 +66,8 @@ DRAFT_SCHEMA = "immer.deepseek-v4-fertig-drafts/v1"
 RESULT_SCHEMA = "immer.deepseek-v4-fertig-draft-verification/v1"
 RESUME_SCHEMA = "immer.deepseek-v4-fertig-draft-resume/v1"
 COHORT_SCHEMA = "immer.deepseek-v4-fertig-cohort/v1"
+ROUTE_RUN_SCHEMA = "immer.deepseek-v4-fertig-route-run/v1"
+ROUTE_OBSERVATIONS_SCHEMA = "immer.deepseek-v4-route-observations/v1"
 FIXED_ITEM_IDS = (
     "gsm8k-test-0737-b673ac26d1268186",
     "gsm8k-test-0815-13fae6ff992c2157",
@@ -167,6 +175,34 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--drafts-json")
     parser.add_argument("--result-json")
     parser.add_argument("--resume-file")
+    parser.add_argument(
+        "--access-trace-json",
+        help=(
+            "canonical exact-range access trace; defaults to "
+            "RUN_DIR/access-trace-MODE.json"
+        ),
+    )
+    parser.add_argument(
+        "--route-graph-dir",
+        help="append-only LiveCausal route graph; defaults to RUN_DIR/route-graph",
+    )
+    parser.add_argument(
+        "--route-observations-json",
+        help=(
+            "canonical token-row router observations; defaults to "
+            "RUN_DIR/route-observations-MODE.json"
+        ),
+    )
+    parser.add_argument(
+        "--no-access-trace",
+        action="store_true",
+        help="disable complete exact-range recording for this verification pass",
+    )
+    parser.add_argument(
+        "--no-route-learning",
+        action="store_true",
+        help="disable label-free official-router transition observations",
+    )
     parser.add_argument(
         "--restart",
         action="store_true",
@@ -288,6 +324,256 @@ def _atomic_write_json(path: str | Path, document: Mapping[str, Any]) -> None:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _atomic_write_bytes(path: str | Path, body: bytes) -> None:
+    """Atomically replace one exact byte document without re-encoding it."""
+
+    destination = Path(path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=destination.parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _access_trace_path(args: argparse.Namespace) -> Path:
+    if args.access_trace_json:
+        return Path(args.access_trace_json).expanduser().resolve()
+    return Path(args.run_dir).expanduser().resolve() / f"access-trace-{args.mode}.json"
+
+
+def _route_graph_path(args: argparse.Namespace) -> Path:
+    if args.route_graph_dir:
+        return Path(args.route_graph_dir).expanduser().resolve()
+    return Path(args.run_dir).expanduser().resolve() / "route-graph"
+
+
+def _route_observations_path(args: argparse.Namespace) -> Path:
+    if args.route_observations_json:
+        return Path(args.route_observations_json).expanduser().resolve()
+    return (
+        Path(args.run_dir).expanduser().resolve()
+        / f"route-observations-{args.mode}.json"
+    )
+
+
+def _canonical_json_bytes(document: Any) -> bytes:
+    return json.dumps(
+        document,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _route_observations_document(
+    checkpoint: CheckpointIdentity,
+    observations: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    rows = sorted(
+        (dict(row) for row in observations.values()),
+        key=lambda row: (
+            str(row["request_id"]),
+            int(row["layer"]),
+            str(row["observation_id"]),
+        ),
+    )
+    identity = {
+        "checkpoint": checkpoint.as_record(),
+        "observations": rows,
+        "schema": ROUTE_OBSERVATIONS_SCHEMA,
+    }
+    return {
+        **identity,
+        "sha256": hashlib.sha256(_canonical_json_bytes(identity)).hexdigest(),
+    }
+
+
+def _validated_route_observation(
+    raw: Any,
+    *,
+    checkpoint: CheckpointIdentity,
+) -> dict[str, Any]:
+    fields = {
+        "checkpoint",
+        "execution_feature_digest",
+        "layer",
+        "observation_id",
+        "observation_schema",
+        "request_id",
+        "row_layout",
+        "selected_expert_ids",
+    }
+    if not isinstance(raw, Mapping) or set(raw) != fields:
+        raise CliError("route observation has unknown or missing fields")
+    if raw.get("checkpoint") != checkpoint.as_record():
+        raise CliError("route observation belongs to another checkpoint")
+    execution_digest = raw.get("execution_feature_digest")
+    if (
+        not isinstance(execution_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", execution_digest) is None
+    ):
+        raise CliError("route observation execution digest is invalid")
+    layer = raw.get("layer")
+    if isinstance(layer, bool) or not isinstance(layer, int) or layer < 0:
+        raise CliError("route observation layer is invalid")
+    for field in ("observation_id", "request_id"):
+        value = raw.get(field)
+        if not isinstance(value, str) or not value.strip() or value != value.strip():
+            raise CliError(f"route observation {field} is invalid")
+    if raw.get("observation_schema") != ROUTE_OBSERVATION_SCHEMA:
+        raise CliError("route observation source schema is invalid")
+    layout = raw.get("row_layout")
+    if not isinstance(layout, Mapping) or set(layout) != {
+        "active_lengths",
+        "batch_size",
+        "order",
+        "padded_length",
+        "sequence_digests",
+        "selected_rows",
+    }:
+        raise CliError("route observation row layout is invalid")
+    batch_size = layout.get("batch_size")
+    padded_length = layout.get("padded_length")
+    selected_rows = layout.get("selected_rows")
+    for value, label in (
+        (batch_size, "batch_size"),
+        (padded_length, "padded_length"),
+        (selected_rows, "selected_rows"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise CliError(f"route observation {label} is invalid")
+    if layout.get("order") != "batch-major-right-padded":
+        raise CliError("route observation row order is invalid")
+    active_lengths = layout.get("active_lengths")
+    if (
+        not isinstance(active_lengths, list)
+        or len(active_lengths) != batch_size
+        or any(
+            isinstance(length, bool)
+            or not isinstance(length, int)
+            or not 1 <= length <= padded_length
+            for length in active_lengths
+        )
+    ):
+        raise CliError("route observation active lengths are invalid")
+    if selected_rows != batch_size * padded_length:
+        raise CliError("route observation selected-row count is invalid")
+    sequence_digests = layout.get("sequence_digests")
+    if (
+        not isinstance(sequence_digests, list)
+        or len(sequence_digests) != batch_size
+        or any(
+            not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for digest in sequence_digests
+        )
+    ):
+        raise CliError("route observation sequence digests are invalid")
+    selected = raw.get("selected_expert_ids")
+    if not isinstance(selected, list) or len(selected) != selected_rows:
+        raise CliError("route observation selected expert rows are invalid")
+    normalized_selected: list[list[int]] = []
+    for row in selected:
+        if not isinstance(row, list) or any(
+            isinstance(expert, bool) or not isinstance(expert, int) or expert < 0
+            for expert in row
+        ):
+            raise CliError("route observation selected expert row is invalid")
+        normalized_selected.append(list(row))
+    return {
+        "checkpoint": checkpoint.as_record(),
+        "execution_feature_digest": execution_digest,
+        "layer": layer,
+        "observation_id": raw["observation_id"],
+        "observation_schema": ROUTE_OBSERVATION_SCHEMA,
+        "request_id": raw["request_id"],
+        "row_layout": {
+            "active_lengths": list(active_lengths),
+            "batch_size": batch_size,
+            "order": "batch-major-right-padded",
+            "padded_length": padded_length,
+            "sequence_digests": list(sequence_digests),
+            "selected_rows": selected_rows,
+        },
+        "selected_expert_ids": normalized_selected,
+    }
+
+
+def _load_route_observations(
+    path: Path,
+    checkpoint: CheckpointIdentity,
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    if not path.exists():
+        return {}, None
+    if path.is_symlink() or not path.is_file():
+        raise CliError(f"route observation sidecar must be a regular file: {path}")
+    try:
+        encoded = path.read_bytes()
+        document = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CliError(f"cannot read route observation sidecar: {path}") from exc
+    if not isinstance(document, Mapping) or set(document) != {
+        "checkpoint",
+        "observations",
+        "schema",
+        "sha256",
+    }:
+        raise CliError("route observation sidecar schema is invalid")
+    if document.get("schema") != ROUTE_OBSERVATIONS_SCHEMA:
+        raise CliError("route observation sidecar schema is unsupported")
+    if document.get("checkpoint") != checkpoint.as_record():
+        raise CliError("route observation sidecar belongs to another checkpoint")
+    raw_rows = document.get("observations")
+    if not isinstance(raw_rows, list):
+        raise CliError("route observation sidecar rows are invalid")
+    observations: dict[str, dict[str, Any]] = {}
+    for raw in raw_rows:
+        row = _validated_route_observation(raw, checkpoint=checkpoint)
+        observation_id = str(row["observation_id"])
+        if observation_id in observations:
+            raise CliError("route observation sidecar contains duplicate IDs")
+        observations[observation_id] = row
+    expected = _route_observations_document(checkpoint, observations)
+    if document.get("sha256") != expected["sha256"]:
+        raise CliError("route observation sidecar SHA-256 mismatch")
+    if encoded != _canonical_json_bytes(expected):
+        raise CliError("route observation sidecar is not canonical JSON")
+    return observations, str(expected["sha256"])
+
+
+def _merge_route_observation(
+    path: Path,
+    checkpoint: CheckpointIdentity,
+    observation: Mapping[str, Any],
+) -> tuple[bool, str, int]:
+    observations, prior_sha = _load_route_observations(path, checkpoint)
+    normalized = _validated_route_observation(
+        observation,
+        checkpoint=checkpoint,
+    )
+    observation_id = str(normalized["observation_id"])
+    prior = observations.get(observation_id)
+    if prior is not None:
+        if prior != normalized:
+            raise CliError(
+                "route observation ID is already bound to different token rows"
+            )
+        assert prior_sha is not None
+        return False, prior_sha, len(observations)
+    observations[observation_id] = normalized
+    document = _route_observations_document(checkpoint, observations)
+    _atomic_write_bytes(path, _canonical_json_bytes(document))
+    return True, str(document["sha256"]), len(observations)
 
 
 def _resume_path(args: argparse.Namespace) -> Path:
@@ -956,6 +1242,7 @@ def _model_runtime(
     *,
     max_seq_len: int,
     max_batch_size: int,
+    access_recorder: AccessTraceRecorder | None = None,
 ):
     if _PINNED_REVISION.fullmatch(OFFICIAL_REVISION) is None:
         raise CliError("official checkpoint revision is not immutable")
@@ -967,6 +1254,7 @@ def _model_runtime(
         use_cache=not args.no_cache,
         max_cache_bytes=int(args.cache_budget_gb * 1024**3),
         verbose=False,
+        access_observer=access_recorder,
     )
     pager: DeepSeekWeightPager | None = None
     model: StreamedDeepSeekV4 | None = None
@@ -1027,6 +1315,154 @@ def _model_runtime(
             raise cleanup_error
 
 
+def _route_execution_digest(
+    args: argparse.Namespace,
+    *,
+    resolved_device: str,
+    resolved_dtype: str,
+) -> str:
+    """Separate route evidence by execution mode without using answer labels."""
+
+    if not isinstance(resolved_device, str) or not resolved_device:
+        raise CliError("resolved route device is invalid")
+    if not isinstance(resolved_dtype, str) or not resolved_dtype:
+        raise CliError("resolved route dtype is invalid")
+    payload = {
+        "activation_quantization": not args.no_activation_quantization,
+        "device": resolved_device,
+        "dtype": resolved_dtype,
+        "graft_alpha": args.graft_alpha if args.mode == "stable-crsa" else None,
+        "graft_layer": args.graft_layer if args.mode == "stable-crsa" else None,
+        "mode": args.mode,
+        "schema": ROUTE_RUN_SCHEMA,
+    }
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _route_request_identity(
+    prompts: Sequence[Sequence[int]],
+    drafts: Sequence[Sequence[int]],
+    *,
+    execution_feature_digest: str,
+) -> str:
+    """Bind a route sequence to model inputs/config, never benchmark labels."""
+
+    if re.fullmatch(r"[0-9a-f]{64}", execution_feature_digest) is None:
+        raise CliError("route request execution digest is invalid")
+    payload = {
+        "checkpoint": OFFICIAL_SOURCE,
+        "draft_token_ids": [list(row) for row in drafts],
+        "execution_feature_digest": execution_feature_digest,
+        "prompt_token_ids": [list(row) for row in prompts],
+        "revision": OFFICIAL_REVISION,
+        "schema": ROUTE_RUN_SCHEMA,
+    }
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"draft-verify-v1:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _route_sequence_digests(
+    checkpoint: CheckpointIdentity,
+    execution_feature_digest: str,
+    prompts: Sequence[Sequence[int]],
+    drafts: Sequence[Sequence[int]],
+) -> tuple[str, ...]:
+    """Stable label-free sequence keys independent of cohort composition/order."""
+
+    if len(prompts) != len(drafts):
+        raise CliError("route sequence prompt/draft row counts differ")
+    digests: list[str] = []
+    for prompt, draft in zip(prompts, drafts, strict=True):
+        identity = {
+            "checkpoint": checkpoint.as_record(),
+            "draft_token_ids": list(draft),
+            "execution_feature_digest": execution_feature_digest,
+            "prompt_token_ids": list(prompt),
+            "schema": ROUTE_RUN_SCHEMA,
+        }
+        digests.append(hashlib.sha256(_canonical_json_bytes(identity)).hexdigest())
+    return tuple(digests)
+
+
+def _checkpoint_identity(source: Any) -> CheckpointIdentity:
+    """Read the exact immutable inventory identity used by the tensor source."""
+
+    source.inventory()
+    fingerprint = source.metrics().get("inventory_source_fingerprint")
+    if not isinstance(fingerprint, str):
+        raise CliError("DeepSeek-V4 inventory fingerprint is unavailable")
+    try:
+        return CheckpointIdentity(
+            repo_id=OFFICIAL_SOURCE,
+            revision=OFFICIAL_REVISION,
+            inventory_fingerprint=fingerprint,
+        )
+    except ValueError as exc:
+        raise CliError("DeepSeek-V4 inventory identity is invalid") from exc
+
+
+def _finalize_access_trace(
+    args: argparse.Namespace,
+    recorder: AccessTraceRecorder,
+    source: Any,
+) -> dict[str, Any]:
+    """Seal a complete canonical trace only after verification returned."""
+
+    recorder_metrics = recorder.metrics()
+    source_metrics = source.metrics()
+    dropped = int(recorder_metrics["dropped_capacity"]) + int(
+        recorder_metrics["dropped_identity"]
+    )
+    observer_drops = int(source_metrics.get("access_observer_drops", 0) or 0)
+    observer_errors = int(source_metrics.get("access_observer_errors", 0) or 0)
+    if dropped or observer_drops or observer_errors:
+        raise CliError(
+            "exact access trace is incomplete: "
+            f"recorder_drops={dropped}, observer_drops={observer_drops}, "
+            f"observer_errors={observer_errors}"
+        )
+    try:
+        trace = recorder.snapshot()
+    except ValueError as exc:
+        raise CliError("exact access trace contains no streamed ranges") from exc
+    trace.verify()
+    destination = _access_trace_path(args)
+    encoded = trace.to_bytes()
+    _atomic_write_bytes(destination, encoded)
+    logical_bytes = sum(
+        leaf.length for operation in trace.operations for leaf in operation.leaves
+    )
+    result = {
+        "enabled": True,
+        "path": str(destination),
+        "schema": trace.schema,
+        "sha256": trace.sha256,
+        "bytes": len(encoded),
+        "operations": int(recorder_metrics["operations"]),
+        "leaves": int(recorder_metrics["leaves"]),
+        "logical_range_bytes": logical_bytes,
+        "dropped_capacity": 0,
+        "dropped_identity": 0,
+        "observer_drops": 0,
+        "observer_errors": 0,
+    }
+    _progress("access_trace_written", **result)
+    return result
+
+
 def _verify_locally(
     args: argparse.Namespace,
     items: Sequence[SelectedItem],
@@ -1034,13 +1470,14 @@ def _verify_locally(
     *,
     runtime_factory: Callable[..., Any] | None = None,
     verifier_factory: Callable[..., Any] | None = None,
-) -> Any:
+) -> tuple[Any, dict[str, Any]]:
     prompts = tuple(item.prompt_token_ids for item in items)
     draft_ids = tuple(tuple(int(token) for token in row["token_ids"]) for row in drafts)
-    max_seq_len = max(
+    active_lengths = tuple(
         len(prompt) + len(draft)
         for prompt, draft in zip(prompts, draft_ids, strict=True)
     )
+    max_seq_len = max(active_lengths)
     resume_path = _resume_path(args)
     if args.restart and _clear_resume(resume_path):
         _progress("resume_discarded", path=str(resume_path))
@@ -1048,6 +1485,9 @@ def _verify_locally(
     verifier_type = (
         LayerwiseDraftVerifier if verifier_factory is None else verifier_factory
     )
+    # Complete by default: replay windows may be configured later, but the
+    # evidence recorder itself has no global operation/leaf capacity.
+    access_recorder = None if args.no_access_trace else AccessTraceRecorder()
 
     def progress(row: Mapping[str, Any]) -> None:
         fields = dict(row)
@@ -1063,6 +1503,7 @@ def _verify_locally(
         args,
         max_seq_len=max_seq_len,
         max_batch_size=len(items),
+        access_recorder=access_recorder,
     ) as model:
         expected_shape = (
             len(prompts),
@@ -1121,11 +1562,169 @@ def _verify_locally(
                 layers=int(model.config.n_layers),
             )
 
+        execution_digest = _route_execution_digest(
+            args,
+            resolved_device=resolved_device,
+            resolved_dtype=expected_dtype,
+        )
+        route_request_id = _route_request_identity(
+            prompts,
+            draft_ids,
+            execution_feature_digest=execution_digest,
+        )
+        route_metrics: dict[str, Any]
+        route_observer: Callable[[SuccessfulRouteObservation], None] | None = None
+        if args.no_route_learning:
+            route_metrics = {"enabled": False}
+        else:
+            checkpoint_identity = _checkpoint_identity(model.pager.source)
+            graph_path = _route_graph_path(args)
+            observations_path = _route_observations_path(args)
+            existing_observations, existing_observations_sha = _load_route_observations(
+                observations_path, checkpoint_identity
+            )
+            graph = LiveGraph(graph_path)
+            controller = CausalExpertTransitionController(
+                graph,
+                checkpoint_identity,
+                n_routed_experts=int(getattr(model.config, "n_routed_experts", 256)),
+            )
+            sequence_digests = _route_sequence_digests(
+                checkpoint_identity,
+                execution_digest,
+                prompts,
+                draft_ids,
+            )
+            route_metrics = {
+                "enabled": True,
+                "path": str(graph_path),
+                "schema": ROUTE_RUN_SCHEMA,
+                "checkpoint": checkpoint_identity.as_record(),
+                "request_id": route_request_id,
+                "execution_feature_digest": execution_digest,
+                "observations": 0,
+                "routed_states": 0,
+                "transitions": 0,
+                "segments_appended": 0,
+                "segments_replayed": 0,
+                "sequence_start_layer": None,
+                "observation_sidecar": {
+                    "path": str(observations_path),
+                    "sha256": existing_observations_sha,
+                    "total_observations": len(existing_observations),
+                    "appended": 0,
+                    "replayed": 0,
+                },
+            }
+            _progress(
+                "route_learning_ready",
+                path=str(graph_path),
+                observations_path=str(observations_path),
+                existing_observations=len(existing_observations),
+                request_id=route_request_id,
+                checkpoint=checkpoint_identity.as_record(),
+            )
+
+            def observe_route(observation: SuccessfulRouteObservation) -> None:
+                if not isinstance(observation, SuccessfulRouteObservation):
+                    raise TypeError(
+                        "route observer requires SuccessfulRouteObservation"
+                    )
+                if observation.request_id != route_request_id:
+                    raise CliError("route observation request identity changed")
+                sidecar_record = {
+                    "checkpoint": checkpoint_identity.as_record(),
+                    "execution_feature_digest": execution_digest,
+                    "layer": observation.layer,
+                    "observation_id": observation.observation_id,
+                    "observation_schema": observation.schema,
+                    "request_id": observation.request_id,
+                    "row_layout": {
+                        "active_lengths": list(active_lengths),
+                        "batch_size": len(active_lengths),
+                        "order": "batch-major-right-padded",
+                        "padded_length": max_seq_len,
+                        "sequence_digests": list(sequence_digests),
+                        "selected_rows": len(observation.selected_expert_ids),
+                    },
+                    "selected_expert_ids": [
+                        list(row) for row in observation.selected_expert_ids
+                    ],
+                }
+                # Validate the lossless row layout before mutating either the
+                # append-only aggregate or the canonical observation sidecar.
+                _validated_route_observation(
+                    sidecar_record,
+                    checkpoint=checkpoint_identity,
+                )
+                route_metrics["observations"] += 1
+                selected = observation.flattened_expert_ids
+                if not selected:
+                    controller.clear_history()
+                    state = None
+                    receipt = None
+                else:
+                    state = controller.route_state(
+                        layer=observation.layer,
+                        selected_expert_ids=selected,
+                        prompt_feature_digest=execution_digest,
+                    )
+                    if route_metrics["sequence_start_layer"] is None:
+                        route_metrics["sequence_start_layer"] = observation.layer
+                    route_metrics["routed_states"] += 1
+                    previous = controller.history[-1] if controller.history else None
+                    if previous is not None and state.layer == previous.layer + 1:
+                        receipt = controller.push_route(
+                            state,
+                            observation_id=observation.observation_id,
+                            provenance={
+                                "mode": args.mode,
+                                "observation_schema": observation.schema,
+                                "runner_schema": ROUTE_RUN_SCHEMA,
+                            },
+                        )
+                    else:
+                        controller.push_route(state)
+                        receipt = None
+                if receipt is not None:
+                    route_metrics["transitions"] += 1
+                    metric = (
+                        "segments_appended" if receipt.appended else "segments_replayed"
+                    )
+                    route_metrics[metric] += 1
+                sidecar_appended, sidecar_sha, sidecar_total = _merge_route_observation(
+                    observations_path,
+                    checkpoint_identity,
+                    sidecar_record,
+                )
+                sidecar_metrics = route_metrics["observation_sidecar"]
+                sidecar_metrics["appended" if sidecar_appended else "replayed"] += 1
+                sidecar_metrics["sha256"] = sidecar_sha
+                sidecar_metrics["total_observations"] = sidecar_total
+                _progress(
+                    "route_observation",
+                    layer=observation.layer,
+                    routed=state is not None,
+                    selections=len(selected),
+                    unique_experts=(0 if state is None else len(state.expert_counts)),
+                    sidecar=("appended" if sidecar_appended else "replayed"),
+                    sidecar_sha256=sidecar_sha,
+                    transition=(
+                        None
+                        if receipt is None
+                        else "appended"
+                        if receipt.appended
+                        else "replayed"
+                    ),
+                )
+
+            route_observer = observe_route
+
         def checkpoint(state: DraftVerificationResumeState) -> None:
             _write_resume(resume_path, resume_identity, state)
 
         verifier = verifier_type(model, layer_retries=args.layer_retries)
-        return verifier.verify(
+        report = verifier.verify(
             prompts,
             draft_ids,
             eos_token_id=EOS_TOKEN_ID,
@@ -1136,7 +1735,34 @@ def _verify_locally(
             head_progress=head_progress,
             resume_state=resume_state,
             checkpoint=checkpoint,
+            access_recorder=access_recorder,
+            access_tags=(
+                None
+                if access_recorder is None
+                else {
+                    "mode": args.mode,
+                    "request_id": route_request_id,
+                    "resume_start_layer": (
+                        resume_state.next_layer if resume_state is not None else 0
+                    ),
+                    "runner": "deepseek_v4_fertig_draft_verify",
+                }
+            ),
+            route_request_id=(route_request_id if route_observer is not None else None),
+            route_observer=route_observer,
         )
+        instrumentation = {
+            "access_trace": (
+                {"enabled": False}
+                if access_recorder is None
+                else _finalize_access_trace(args, access_recorder, model.pager.source)
+            ),
+            "route_learning": route_metrics,
+        }
+        if route_metrics["enabled"]:
+            route_metrics["active_segments"] = len(graph.store.segments())
+            _progress("route_learning_complete", **route_metrics)
+        return report, instrumentation
 
 
 def _api_summary(
@@ -1169,6 +1795,8 @@ def _verification_result(
     drafts: Sequence[Mapping[str, Any]],
     tokenizer: LocalTokenizer,
     report: Any,
+    *,
+    instrumentation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if len(report.rows) != len(items):
         raise CliError("local verifier returned the wrong row count")
@@ -1261,6 +1889,14 @@ def _verification_result(
             },
         },
         "evidence": evidence,
+        "instrumentation": (
+            dict(instrumentation)
+            if instrumentation is not None
+            else {
+                "access_trace": {"enabled": False},
+                "route_learning": {"enabled": False},
+            }
+        ),
         "items": rows,
     }
 
@@ -1293,8 +1929,15 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         }
     else:
         _progress("local_verification_start", rows=len(items), mode=args.mode)
-        report = _verify_locally(args, items, drafts)
-        result = _verification_result(args, items, drafts, tokenizer, report)
+        report, instrumentation = _verify_locally(args, items, drafts)
+        result = _verification_result(
+            args,
+            items,
+            drafts,
+            tokenizer,
+            report,
+            instrumentation=instrumentation,
+        )
         _progress("local_verification_complete", **dict(result["summary"]))
     _atomic_write_json(result_path, result)
     if not args.draft_only:

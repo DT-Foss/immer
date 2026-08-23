@@ -14,6 +14,9 @@ import urllib.error
 
 import torch
 
+from immer.knowledge import AccessLeaf, AccessOperation, AccessTrace
+from immer.runtimes.deepseek_v4.causal_prefetch import RouteState
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "deepseek_v4_fertig_draft_verify.py"
@@ -94,6 +97,23 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
         self.assertEqual(args.graft_alpha, 0.01)
         self.assertEqual(args.layer_retries, 2)
         self.assertIsNone(args.item_ids_json)
+        self.assertIsNone(args.access_trace_json)
+        self.assertIsNone(args.route_graph_dir)
+        self.assertIsNone(args.route_observations_json)
+        self.assertFalse(args.no_access_trace)
+        self.assertFalse(args.no_route_learning)
+        self.assertEqual(
+            draft_verify._access_trace_path(args),
+            draft_verify.DEFAULT_RUN_DIR / "access-trace-off.json",
+        )
+        self.assertEqual(
+            draft_verify._route_graph_path(args),
+            draft_verify.DEFAULT_RUN_DIR / "route-graph",
+        )
+        self.assertEqual(
+            draft_verify._route_observations_path(args),
+            draft_verify.DEFAULT_RUN_DIR / "route-observations-off.json",
+        )
         self.assertEqual(draft_verify._read_item_ids(None), draft_verify.FIXED_ITEM_IDS)
         item = draft_verify.SelectedItem("q", "question", "2", "prompt", (4, 5))
         payload = draft_verify._request_payload(item, max_tokens=128)
@@ -702,13 +722,16 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
 
     def test_model_runtime_uses_selected_cohort_as_max_batch_size(self) -> None:
         args = draft_verify._parser().parse_args(["--no-cache"])
+        recorder = draft_verify.AccessTraceRecorder()
         source = mock.Mock()
         source.reader.fetch_file.return_value = b"{}"
         config = SimpleNamespace()
         pager = mock.Mock()
         model = mock.Mock()
         with (
-            mock.patch.object(draft_verify, "Streamer", return_value=source),
+            mock.patch.object(
+                draft_verify, "Streamer", return_value=source
+            ) as source_type,
             mock.patch.object(
                 draft_verify.DeepSeekV4Config,
                 "from_mapping",
@@ -729,8 +752,19 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
                 args,
                 max_seq_len=177,
                 max_batch_size=23,
+                access_recorder=recorder,
             ) as yielded:
                 self.assertIs(yielded, model)
+        source_type.assert_called_once_with(
+            draft_verify.OFFICIAL_SOURCE,
+            revision=draft_verify.OFFICIAL_REVISION,
+            budget_mb=args.source_budget_mb,
+            cache_dir=Path(args.cache_dir).expanduser().resolve(),
+            use_cache=False,
+            max_cache_bytes=int(args.cache_budget_gb * 1024**3),
+            verbose=False,
+            access_observer=recorder,
+        )
         runtime_type.assert_called_once_with(
             config,
             pager,
@@ -758,27 +792,56 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
             ]
         )
         items = (
-            draft_verify.SelectedItem("a", "A", "1", "pa", (4, 5, 6)),
-            draft_verify.SelectedItem("b", "B", "2", "pb", (7, 8)),
+            draft_verify.SelectedItem("a", "A", "PRIVATE_LABEL_A", "pa", (4, 5, 6)),
+            draft_verify.SelectedItem("b", "B", "PRIVATE_LABEL_B", "pb", (7, 8)),
         )
         drafts = (
             {"token_ids": [9, 10]},
             {"token_ids": [11]},
         )
         calls = []
+        inventory_fingerprint = "a" * 64
+        source = SimpleNamespace(
+            inventory=lambda: {},
+            metrics=lambda: {
+                "cache_bytes": 0,
+                "inventory_source_fingerprint": inventory_fingerprint,
+                "access_observer_drops": 0,
+                "access_observer_errors": 0,
+            },
+        )
         fake_model = SimpleNamespace(
-            config=SimpleNamespace(hc_mult=1, dim=2, n_layers=43),
+            config=SimpleNamespace(
+                hc_mult=1,
+                dim=2,
+                n_layers=43,
+                n_routed_experts=256,
+            ),
             pager=SimpleNamespace(
                 compute_dtype=torch.bfloat16,
                 device=torch.device("cpu"),
-                source=SimpleNamespace(metrics=lambda: {"cache_bytes": 0}),
+                source=source,
             ),
         )
         sentinel = object()
 
         @contextmanager
-        def runtime_factory(received_args, *, max_seq_len, max_batch_size):
-            calls.append(("runtime", received_args, max_seq_len, max_batch_size))
+        def runtime_factory(
+            received_args,
+            *,
+            max_seq_len,
+            max_batch_size,
+            access_recorder,
+        ):
+            calls.append(
+                (
+                    "runtime",
+                    received_args,
+                    max_seq_len,
+                    max_batch_size,
+                    access_recorder,
+                )
+            )
             yield fake_model
 
         class FakeVerifier:
@@ -787,6 +850,65 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
 
             def verify(self, prompts, draft_ids, **kwargs):
                 calls.append(("verify", prompts, draft_ids, kwargs))
+                recorder = kwargs["access_recorder"]
+                with recorder.scope(**kwargs["access_tags"]):
+                    self.assert_trace_recorded = recorder.observe(
+                        AccessOperation(
+                            repo_id=draft_verify.OFFICIAL_SOURCE,
+                            revision=draft_verify.OFFICIAL_REVISION,
+                            inventory_fingerprint=inventory_fingerprint,
+                            operation="raw_bytes",
+                            operation_sequence=1,
+                            thread_id=1,
+                            thread_name="fake-verifier",
+                            leaves=(AccessLeaf("model.safetensors", 32, 16),),
+                            source_requests=1,
+                            source_bytes=16,
+                            cache_hits=0,
+                        )
+                    )
+                request_id = kwargs["route_request_id"]
+                observer = kwargs["route_observer"]
+                observer(
+                    draft_verify.SuccessfulRouteObservation(
+                        schema="immer.deepseek-v4-successful-route/v1",
+                        observation_id=f"{request_id}:layer-3",
+                        request_id=request_id,
+                        layer=3,
+                        selected_expert_ids=(
+                            (1, 1),
+                            (2,),
+                            (1,),
+                            (3,),
+                            (3,),
+                            (2,),
+                            (2,),
+                            (1,),
+                            (),
+                            (),
+                        ),
+                    )
+                )
+                observer(
+                    draft_verify.SuccessfulRouteObservation(
+                        schema="immer.deepseek-v4-successful-route/v1",
+                        observation_id=f"{request_id}:layer-4",
+                        request_id=request_id,
+                        layer=4,
+                        selected_expert_ids=(
+                            (4, 4),
+                            (5,),
+                            (4,),
+                            (6,),
+                            (6,),
+                            (5,),
+                            (5,),
+                            (4,),
+                            (),
+                            (),
+                        ),
+                    )
+                )
                 kwargs["progress"](
                     {"event": "layer_complete", "layer": 1, "layers": 43}
                 )
@@ -794,7 +916,7 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
                 return sentinel
 
         with mock.patch.object(draft_verify, "_progress") as progress:
-            report = draft_verify._verify_locally(
+            report, instrumentation = draft_verify._verify_locally(
                 args,
                 items,
                 drafts,
@@ -802,7 +924,8 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
                 verifier_factory=FakeVerifier,
             )
         self.assertIs(report, sentinel)
-        self.assertEqual(calls[0], ("runtime", args, 5, 2))
+        self.assertEqual(calls[0][:4], ("runtime", args, 5, 2))
+        self.assertIsInstance(calls[0][4], draft_verify.AccessTraceRecorder)
         self.assertEqual(calls[1], ("verifier", fake_model, 2))
         self.assertEqual(calls[2][1], ((4, 5, 6), (7, 8)))
         self.assertEqual(calls[2][2], ((9, 10), (11,)))
@@ -815,8 +938,485 @@ class DeepSeekV4FertigDraftVerifyTests(unittest.TestCase):
         self.assertTrue(callable(kwargs["checkpoint"]))
         self.assertTrue(callable(kwargs["progress"]))
         self.assertTrue(callable(kwargs["head_progress"]))
+        self.assertIs(kwargs["access_recorder"], calls[0][4])
+        self.assertEqual(
+            kwargs["access_tags"]["runner"],
+            "deepseek_v4_fertig_draft_verify",
+        )
+        self.assertRegex(kwargs["route_request_id"], r"^draft-verify-v1:[0-9a-f]{64}$")
+        self.assertTrue(callable(kwargs["route_observer"]))
+        access = instrumentation["access_trace"]
+        self.assertTrue(access["enabled"])
+        self.assertEqual(access["operations"], 1)
+        trace_path = Path(access["path"])
+        trace = AccessTrace.from_bytes(trace_path.read_bytes())
+        self.assertEqual(trace.to_bytes(), trace_path.read_bytes())
+        self.assertEqual(
+            dict(trace.operations[0].tags)["request_id"],
+            kwargs["route_request_id"],
+        )
+        route = instrumentation["route_learning"]
+        self.assertTrue(route["enabled"])
+        self.assertEqual(route["observations"], 2)
+        self.assertEqual(route["routed_states"], 2)
+        self.assertEqual(route["transitions"], 1)
+        self.assertEqual(route["segments_appended"], 1)
+        sidecar_metrics = route["observation_sidecar"]
+        self.assertEqual(sidecar_metrics["appended"], 2)
+        self.assertEqual(sidecar_metrics["replayed"], 0)
+        sidecar_path = Path(sidecar_metrics["path"])
+        sidecar_bytes = sidecar_path.read_bytes()
+        sidecar = json.loads(sidecar_bytes)
+        self.assertEqual(
+            sidecar_bytes,
+            draft_verify._canonical_json_bytes(sidecar),
+        )
+        self.assertEqual(
+            sidecar["sha256"],
+            sidecar_metrics["sha256"],
+        )
+        self.assertEqual(len(sidecar["observations"]), 2)
+        first_observation = sidecar["observations"][0]
+        expected_sequence_digests = draft_verify._route_sequence_digests(
+            draft_verify.CheckpointIdentity(
+                draft_verify.OFFICIAL_SOURCE,
+                draft_verify.OFFICIAL_REVISION,
+                inventory_fingerprint,
+            ),
+            draft_verify._route_execution_digest(
+                args,
+                resolved_device="cpu",
+                resolved_dtype="bfloat16",
+            ),
+            ((4, 5, 6), (7, 8)),
+            ((9, 10), (11,)),
+        )
+        self.assertEqual(
+            first_observation["row_layout"],
+            {
+                "active_lengths": [5, 3],
+                "batch_size": 2,
+                "order": "batch-major-right-padded",
+                "padded_length": 5,
+                "sequence_digests": list(expected_sequence_digests),
+                "selected_rows": 10,
+            },
+        )
+        self.assertEqual(
+            first_observation["selected_expert_ids"],
+            [
+                [1, 1],
+                [2],
+                [1],
+                [3],
+                [3],
+                [2],
+                [2],
+                [1],
+                [],
+                [],
+            ],
+        )
+        route_bytes = b"".join(
+            path.read_bytes()
+            for path in Path(route["path"]).rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn(b"PRIVATE_LABEL_A", route_bytes)
+        self.assertNotIn(b"PRIVATE_LABEL_B", route_bytes)
+        self.assertNotIn(b"PRIVATE_LABEL_A", sidecar_bytes)
+        self.assertNotIn(b"PRIVATE_LABEL_B", sidecar_bytes)
         progress.assert_any_call("local_layer_complete", layer=1, layers=43)
         progress.assert_any_call("head_progress", rows_done=1024, vocab_rows=100000)
+
+    def test_instrumentation_can_be_disabled_without_changing_verifier_math(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            args = draft_verify._parser().parse_args(
+                [
+                    "--run-dir",
+                    raw,
+                    "--no-cache",
+                    "--no-access-trace",
+                    "--no-route-learning",
+                ]
+            )
+            items = (draft_verify.SelectedItem("a", "A", "999", "pa", (4, 5)),)
+            drafts = ({"token_ids": [6]},)
+            model = SimpleNamespace(
+                config=SimpleNamespace(hc_mult=1, dim=2, n_layers=43),
+                pager=SimpleNamespace(
+                    compute_dtype=torch.bfloat16,
+                    device=torch.device("cpu"),
+                    source=SimpleNamespace(metrics=lambda: {"cache_bytes": 0}),
+                ),
+            )
+            sentinel = object()
+
+            @contextmanager
+            def runtime_factory(
+                _args,
+                *,
+                max_seq_len,
+                max_batch_size,
+                access_recorder,
+            ):
+                self.assertEqual((max_seq_len, max_batch_size), (3, 1))
+                self.assertIsNone(access_recorder)
+                yield model
+
+            class FakeVerifier:
+                def __init__(self, _model, *, layer_retries):
+                    if layer_retries != 2:
+                        raise AssertionError(layer_retries)
+
+                def verify(self, _prompts, _drafts, **kwargs):
+                    if kwargs["access_recorder"] is not None:
+                        raise AssertionError("access recorder was not disabled")
+                    if kwargs["access_tags"] is not None:
+                        raise AssertionError("access tags were not disabled")
+                    if kwargs["route_request_id"] is not None:
+                        raise AssertionError("route request was not disabled")
+                    if kwargs["route_observer"] is not None:
+                        raise AssertionError("route observer was not disabled")
+                    return sentinel
+
+            with mock.patch.object(draft_verify, "_progress"):
+                report, instrumentation = draft_verify._verify_locally(
+                    args,
+                    items,
+                    drafts,
+                    runtime_factory=runtime_factory,
+                    verifier_factory=FakeVerifier,
+                )
+            self.assertIs(report, sentinel)
+            self.assertEqual(
+                instrumentation,
+                {
+                    "access_trace": {"enabled": False},
+                    "route_learning": {"enabled": False},
+                },
+            )
+            self.assertFalse(draft_verify._access_trace_path(args).exists())
+            self.assertFalse(draft_verify._route_graph_path(args).exists())
+            self.assertFalse(draft_verify._route_observations_path(args).exists())
+
+    def test_route_request_identity_uses_inputs_but_not_benchmark_labels(self) -> None:
+        args = draft_verify._parser().parse_args([])
+        first = draft_verify.SelectedItem("q", "Q", "secret-a", "p", (4, 5))
+        second = draft_verify.SelectedItem("q", "Q", "secret-b", "p", (4, 5))
+        self.assertNotEqual(
+            draft_verify._cohort_document((first,))["identity"],
+            draft_verify._cohort_document((second,))["identity"],
+        )
+        common = {
+            "execution_feature_digest": draft_verify._route_execution_digest(
+                args,
+                resolved_device="cpu",
+                resolved_dtype="bfloat16",
+            ),
+        }
+        route_id = draft_verify._route_request_identity(
+            (first.prompt_token_ids,),
+            ((8, 9),),
+            **common,
+        )
+        self.assertEqual(
+            route_id,
+            draft_verify._route_request_identity(
+                (second.prompt_token_ids,),
+                ((8, 9),),
+                **common,
+            ),
+        )
+        self.assertNotEqual(
+            route_id,
+            draft_verify._route_request_identity(
+                (second.prompt_token_ids,),
+                ((8, 10),),
+                **common,
+            ),
+        )
+        checkpoint = draft_verify.CheckpointIdentity(
+            draft_verify.OFFICIAL_SOURCE,
+            draft_verify.OFFICIAL_REVISION,
+            "e" * 64,
+        )
+        execution_digest = draft_verify._route_execution_digest(
+            args,
+            resolved_device="cpu",
+            resolved_dtype="bfloat16",
+        )
+        solo = draft_verify._route_sequence_digests(
+            checkpoint,
+            execution_digest,
+            ((4, 5),),
+            ((8, 9),),
+        )
+        recomposed = draft_verify._route_sequence_digests(
+            checkpoint,
+            execution_digest,
+            ((77,), (4, 5)),
+            ((88,), (8, 9)),
+        )
+        self.assertEqual(solo[0], recomposed[1])
+        self.assertNotEqual(solo[0], recomposed[0])
+        other_execution = draft_verify._route_execution_digest(
+            args,
+            resolved_device="mps",
+            resolved_dtype="bfloat16",
+        )
+        self.assertNotEqual(execution_digest, other_execution)
+        self.assertNotEqual(
+            solo[0],
+            draft_verify._route_sequence_digests(
+                checkpoint,
+                other_execution,
+                ((4, 5),),
+                ((8, 9),),
+            )[0],
+        )
+
+    def test_route_execution_regimes_have_distinct_digests_and_state_keys(self) -> None:
+        quantized = draft_verify._parser().parse_args([])
+        unquantized = draft_verify._parser().parse_args(
+            ["--no-activation-quantization"]
+        )
+        regimes = (
+            (quantized, "cpu", "bfloat16"),
+            (quantized, "mps", "bfloat16"),
+            (quantized, "cpu", "float32"),
+            (unquantized, "cpu", "bfloat16"),
+        )
+        digests = tuple(
+            draft_verify._route_execution_digest(
+                args,
+                resolved_device=device,
+                resolved_dtype=dtype,
+            )
+            for args, device, dtype in regimes
+        )
+        self.assertEqual(len(set(digests)), len(regimes))
+
+        checkpoint = draft_verify.CheckpointIdentity(
+            draft_verify.OFFICIAL_SOURCE,
+            draft_verify.OFFICIAL_REVISION,
+            "1" * 64,
+        )
+        states = tuple(
+            RouteState.from_selected(
+                checkpoint,
+                layer=21,
+                selected_expert_ids=(7, 7, 9),
+                prompt_feature_digest=digest,
+                n_routed_experts=256,
+            )
+            for digest in digests
+        )
+        self.assertEqual(len({state.key for state in states}), len(regimes))
+        request_ids = {
+            draft_verify._route_request_identity(
+                ((4, 5),),
+                ((8, 9),),
+                execution_feature_digest=digest,
+            )
+            for digest in digests
+        }
+        self.assertEqual(len(request_ids), len(regimes))
+        sequence_ids = {
+            draft_verify._route_sequence_digests(
+                checkpoint,
+                digest,
+                ((4, 5),),
+                ((8, 9),),
+            )[0]
+            for digest in digests
+        }
+        self.assertEqual(len(sequence_ids), len(regimes))
+
+    def test_route_observation_sidecar_is_crash_idempotent_and_conflict_safe(
+        self,
+    ) -> None:
+        checkpoint = draft_verify.CheckpointIdentity(
+            draft_verify.OFFICIAL_SOURCE,
+            draft_verify.OFFICIAL_REVISION,
+            "b" * 64,
+        )
+        record = {
+            "checkpoint": checkpoint.as_record(),
+            "execution_feature_digest": "c" * 64,
+            "layer": 21,
+            "observation_id": "request-x-layer-21",
+            "observation_schema": "immer.deepseek-v4-successful-route/v1",
+            "request_id": "request-x",
+            "row_layout": {
+                "active_lengths": [2],
+                "batch_size": 1,
+                "order": "batch-major-right-padded",
+                "padded_length": 2,
+                "sequence_digests": ["d" * 64],
+                "selected_rows": 2,
+            },
+            "selected_expert_ids": [[9, 9, 3], []],
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "routes.json"
+            first = draft_verify._merge_route_observation(
+                path,
+                checkpoint,
+                record,
+            )
+            body = path.read_bytes()
+            replay = draft_verify._merge_route_observation(
+                path,
+                checkpoint,
+                record,
+            )
+            self.assertEqual(first, (True, first[1], 1))
+            self.assertEqual(replay, (False, first[1], 1))
+            self.assertEqual(path.read_bytes(), body)
+            observations, sha = draft_verify._load_route_observations(
+                path,
+                checkpoint,
+            )
+            self.assertEqual(sha, first[1])
+            self.assertEqual(
+                observations["request-x-layer-21"]["selected_expert_ids"],
+                [[9, 9, 3], []],
+            )
+
+            conflicting = json.loads(json.dumps(record))
+            conflicting["selected_expert_ids"][0] = [8]
+            with self.assertRaisesRegex(draft_verify.CliError, "different token rows"):
+                draft_verify._merge_route_observation(
+                    path,
+                    checkpoint,
+                    conflicting,
+                )
+            self.assertEqual(path.read_bytes(), body)
+
+    def test_mid_layer_resume_starts_new_route_sequence_and_replays_cleanly(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            args = draft_verify._parser().parse_args(
+                ["--run-dir", raw, "--no-cache", "--no-access-trace"]
+            )
+            items = (draft_verify.SelectedItem("a", "A", "7", "pa", (4,)),)
+            drafts = ({"token_ids": [5]},)
+            fingerprint = "f" * 64
+            source = SimpleNamespace(
+                inventory=lambda: {},
+                metrics=lambda: {
+                    "cache_bytes": 0,
+                    "inventory_source_fingerprint": fingerprint,
+                },
+            )
+            model = SimpleNamespace(
+                config=SimpleNamespace(
+                    hc_mult=1,
+                    dim=2,
+                    n_layers=43,
+                    n_routed_experts=256,
+                ),
+                pager=SimpleNamespace(
+                    compute_dtype=torch.bfloat16,
+                    device=torch.device("cpu"),
+                    source=source,
+                ),
+            )
+            resume = draft_verify.DraftVerificationResumeState(
+                next_layer=21,
+                hidden=torch.zeros((1, 2, 1, 2), dtype=torch.bfloat16),
+                layer_calls=21,
+                layer_retry_count=0,
+                source_body_bytes=123,
+                linear_calls=456,
+                seconds=7.0,
+                graft_applied=False,
+            )
+            sentinel = object()
+
+            @contextmanager
+            def runtime_factory(
+                _args,
+                *,
+                max_seq_len,
+                max_batch_size,
+                access_recorder,
+            ):
+                self.assertEqual((max_seq_len, max_batch_size), (2, 1))
+                self.assertIsNone(access_recorder)
+                yield model
+
+            class FakeVerifier:
+                def __init__(self, _model, *, layer_retries):
+                    if layer_retries != 2:
+                        raise AssertionError(layer_retries)
+
+                def verify(self, _prompts, _drafts, **kwargs):
+                    if kwargs["resume_state"].next_layer != 21:
+                        raise AssertionError("wrong resume boundary")
+                    request_id = kwargs["route_request_id"]
+                    for layer, rows in (
+                        (21, ((1, 2), (2,))),
+                        (22, ((3, 3), (4,))),
+                    ):
+                        kwargs["route_observer"](
+                            draft_verify.SuccessfulRouteObservation(
+                                schema="immer.deepseek-v4-successful-route/v1",
+                                observation_id=f"{request_id}:layer-{layer}",
+                                request_id=request_id,
+                                layer=layer,
+                                selected_expert_ids=rows,
+                            )
+                        )
+                    return sentinel
+
+            run_metrics = []
+            for _attempt in range(2):
+                with (
+                    mock.patch.object(
+                        draft_verify,
+                        "_load_resume",
+                        return_value=resume,
+                    ),
+                    mock.patch.object(draft_verify, "_progress"),
+                ):
+                    report, instrumentation = draft_verify._verify_locally(
+                        args,
+                        items,
+                        drafts,
+                        runtime_factory=runtime_factory,
+                        verifier_factory=FakeVerifier,
+                    )
+                self.assertIs(report, sentinel)
+                run_metrics.append(instrumentation["route_learning"])
+
+            first, replayed = run_metrics
+            self.assertEqual(first["sequence_start_layer"], 21)
+            self.assertEqual(first["transitions"], 1)
+            self.assertEqual(first["segments_appended"], 1)
+            self.assertEqual(replayed["segments_appended"], 0)
+            self.assertEqual(replayed["segments_replayed"], 1)
+            self.assertEqual(
+                replayed["observation_sidecar"]["replayed"],
+                2,
+            )
+            sidecar = json.loads(
+                draft_verify._route_observations_path(args).read_bytes()
+            )
+            self.assertEqual(
+                [row["layer"] for row in sidecar["observations"]],
+                [21, 22],
+            )
+            graph_bytes = b"".join(
+                path.read_bytes()
+                for path in draft_verify._route_graph_path(args).rglob("*.seg")
+            )
+            self.assertNotIn(b'"target_layer":21', graph_bytes)
+            self.assertIn(b'"target_layer":22', graph_bytes)
 
     def test_result_reports_content_eos_accuracy_and_traffic(self) -> None:
         args = draft_verify._parser().parse_args([])
