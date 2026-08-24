@@ -51,11 +51,12 @@ class Qwen38SnapshotTests(unittest.TestCase):
         graft: bool = False,
         max_seq_len: int = 32,
         max_resident_bytes: int = 2 * 1024**2,
+        device: str = "cpu",
     ) -> StreamedQwen38:
         source = Streamer.from_local(self.root, budget_mb=20, use_cache=False)
         pager = Qwen38WeightPager(
             source,
-            device="cpu",
+            device=device,
             compute_dtype=dtype,
             max_resident_bytes=max_resident_bytes,
         )
@@ -97,6 +98,28 @@ class Qwen38SnapshotTests(unittest.TestCase):
         manifest = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(manifest["schema"], QWEN38_SNAPSHOT_SCHEMA)
         self.assertEqual(manifest["body"]["state"]["state_batch_size"], 1)
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
+    def test_mps_indexed_state_round_trip_matches_indexless_pager_device(self) -> None:
+        prompt = [[1, 4, 9]]
+        next_token = [[7]]
+        uninterrupted = self._model(dtype="bfloat16", device="mps")
+        uninterrupted.prefill(prompt)
+        expected, _ = uninterrupted.decode(next_token)
+
+        path = self.root / "mps-prefix.json"
+        saved = self._model(dtype="bfloat16", device="mps")
+        saved.prefill(prompt)
+        receipt = saved.save_state(path)
+        self.assertEqual(receipt["next_position"], 3)
+        self.assertTrue(
+            all(state.conv.device.type == "mps" for state in saved._layer_states[:3])
+        )
+
+        restored = self._model(dtype="bfloat16", device="mps")
+        restored.load_state(path)
+        actual, _ = restored.decode(next_token)
+        self.assertTrue(torch.equal(actual, expected))
 
     def test_crsa_history_round_trip_continues_bit_exactly(self) -> None:
         prompt = [[1, 4, 9]]

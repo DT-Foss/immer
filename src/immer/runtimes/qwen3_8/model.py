@@ -184,6 +184,15 @@ class StreamedQwen38:
             total += self._graft_history.numel() * self._graft_history.element_size()
         return total
 
+    def _on_pager_device(self, tensor: torch.Tensor) -> bool:
+        """Match PyTorch's resolved device against a possibly indexless target."""
+
+        target = self.pager.device
+        actual = tensor.device
+        return actual.type == target.type and (
+            target.index is None or actual.index == target.index
+        )
+
     @staticmethod
     def _snapshot_digest(value: Any) -> str:
         try:
@@ -354,7 +363,7 @@ class StreamedQwen38:
                     )
                 if (
                     state.key.dtype != self.pager.compute_dtype
-                    or state.key.device != self.pager.device
+                    or not self._on_pager_device(state.key)
                 ):
                     raise Qwen38SnapshotError(
                         f"full-attention layer {layer} state dtype/device is inconsistent"
@@ -403,9 +412,9 @@ class StreamedQwen38:
                     )
                 if (
                     state.conv.dtype != self.pager.compute_dtype
-                    or state.conv.device != self.pager.device
+                    or not self._on_pager_device(state.conv)
                     or state.recurrent.dtype != torch.float32
-                    or state.recurrent.device != self.pager.device
+                    or not self._on_pager_device(state.recurrent)
                 ):
                     raise Qwen38SnapshotError(
                         f"linear-attention layer {layer} state dtype/device is inconsistent"
@@ -434,7 +443,7 @@ class StreamedQwen38:
                 raise Qwen38SnapshotError("graft history shape/cursor is inconsistent")
             if (
                 self._graft_history.dtype != self.pager.compute_dtype
-                or self._graft_history.device != self.pager.device
+                or not self._on_pager_device(self._graft_history)
             ):
                 raise Qwen38SnapshotError("graft history dtype/device is inconsistent")
             graft_history_name = "state.graft_history"

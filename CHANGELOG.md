@@ -68,6 +68,9 @@ All notable changes to IMMER are recorded here.
   stateful prefix publication, transport-neutral continuation restore, exact
   per-arm access traces, hidden dtype/shape/hash invariants, inventory-versus-
   causal execution, and strict remote/local timing comparison.
+- Fixed Qwen continuation admission on Apple MPS: indexless pager device
+  `mps` now correctly accepts resolved tensor device `mps:0`, with an actual
+  MPS BF16 save/restore/decode regression test.
 - Rebuilt public documentation around the local causal architecture and
   separated public source from weights, state, traces, and operations.
 
