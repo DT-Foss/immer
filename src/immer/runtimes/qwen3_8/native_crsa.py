@@ -21,7 +21,11 @@ NATIVE_HEAD_CRSA_FREE_HEADS = tuple(
 )
 # Final Qwen probabilities use BF16.  Half one BF16 relative ULP is the tight
 # dtype-independent row-mass bound after summing the stored values in FP32.
-NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE = 2.0**-8
+# The routed matrix is consumed in the model's BF16 probability dtype.  One
+# BF16 epsilon is the smallest portable bound that covers the accumulated row
+# sum of real 109-token Qwen attention while still rejecting percent-scale
+# receipt drift.
+NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE = 2.0**-7
 
 
 def _real(value: object, name: str, *, maximum: float | None = None) -> float:
@@ -31,7 +35,9 @@ def _real(value: object, name: str, *, maximum: float | None = None) -> float:
     if not math.isfinite(result) or result < 0.0:
         raise ValueError(f"{name} must be finite and non-negative")
     if maximum is not None and result > maximum:
-        raise ValueError(f"{name} must be no greater than {maximum:g}")
+        raise ValueError(
+            f"{name} must be no greater than {maximum:g}, got {result:.17g}"
+        )
     return result
 
 
