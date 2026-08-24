@@ -1225,6 +1225,33 @@ def _branch_input_identity(inputs: Mapping[str, Any]) -> dict[str, Any]:
     return dict(inputs)
 
 
+def _branch_source_budget_preflight(
+    args: argparse.Namespace,
+    verification: Mapping[str, Any] | None,
+    *,
+    items: int,
+) -> None:
+    """Reject a cumulative source budget that cannot cover the sealed bound."""
+
+    if verification is None or "checkpoint_bytes" not in verification:
+        return
+    checkpoint_bytes = verification["checkpoint_bytes"]
+    if (
+        isinstance(checkpoint_bytes, bool)
+        or not isinstance(checkpoint_bytes, int)
+        or checkpoint_bytes <= 0
+    ):
+        raise QwenDirectDecodeError("verified checkpoint byte count is invalid")
+    passes = items * (1 + int(args.max_new_tokens))
+    required = checkpoint_bytes * passes
+    available = int(args.source_budget_mb) * 1024**2
+    if available < required:
+        raise QwenDirectDecodeError(
+            "branch source budget is below the sealed worst-case bound: "
+            f"{available}/{required} bytes for {passes} full passes"
+        )
+
+
 def generate_arm(
     args: argparse.Namespace,
     *,
@@ -1276,6 +1303,15 @@ def generate_arm(
     ):
         _cleanup(runtime, model)
         raise QwenDirectDecodeError("branch runtime attachment differs from contract")
+    try:
+        _branch_source_budget_preflight(
+            args,
+            runtime.verification,
+            items=len(prompts),
+        )
+    except Exception:
+        _cleanup(runtime, model)
+        raise
     started = time.perf_counter()
     source_start = _source_metric(model.pager.source, "network_or_source_body_bytes")
     items: list[dict[str, Any]] = []
@@ -1310,7 +1346,8 @@ def generate_arm(
                 )
             except Exception as exc:
                 raise QwenDirectDecodeError(
-                    f"generation failed for {source_row['item_id']}"
+                    f"generation failed for {source_row['item_id']}: "
+                    f"{type(exc).__name__}: {exc}"
                 ) from exc
             generated_ids = tuple(int(token) for token in generated)
             if not generated_ids:

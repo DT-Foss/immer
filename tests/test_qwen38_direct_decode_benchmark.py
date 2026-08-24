@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import copy
 from contextlib import redirect_stderr
 import importlib.util
@@ -624,6 +625,15 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
     def test_free_generation_compare_and_transition_evaluation_fail_closed(
         self,
     ) -> None:
+        with self.assertRaisesRegex(
+            benchmark.QwenDirectDecodeError, "sealed worst-case bound"
+        ):
+            benchmark._branch_source_budget_preflight(
+                argparse.Namespace(source_budget_mb=1, max_new_tokens=3),
+                {"checkpoint_bytes": 300_000},
+                items=2,
+            )
+
         with tempfile.TemporaryDirectory(
             prefix=".qwen-branch-generation-test-", dir=Path.cwd()
         ) as temporary:
