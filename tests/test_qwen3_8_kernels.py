@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError, replace
 import math
 import unittest
 
@@ -226,6 +227,217 @@ class Qwen38KernelTests(unittest.TestCase):
             query_gate, changed_key, changed_value, **kwargs
         )
         torch.testing.assert_close(changed[:, :3], whole[:, :3])
+
+    def test_native_head_crsa_selects_one_head_per_gqa_group_and_seals_evidence(
+        self,
+    ) -> None:
+        from immer.runtimes.qwen3_8.native_crsa import (
+            NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA,
+            NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE,
+            Qwen38NativeHeadCrsa,
+        )
+
+        torch.manual_seed(79)
+        logits = torch.randn(2, 24, 6, 6, dtype=torch.float64)
+        allowed = torch.ones(6, 6, dtype=torch.bool).tril()
+        allowed = allowed & torch.tensor([True, True, True, True, True, False])
+        base = torch.softmax(logits.masked_fill(~allowed, -torch.inf), dim=-1)
+        base = base.masked_fill(~allowed, 0.0)
+        intervention = Qwen38NativeHeadCrsa(alpha=0.2)
+
+        routed, usage, evidence = intervention.route(
+            logits,
+            base,
+            query_start=0,
+            allowed=allowed,
+            prior_log_usage=None,
+        )
+        free = tuple(
+            head for head in range(24) if head not in intervention.head_indices
+        )
+        self.assertTrue(torch.equal(routed[:, free], base[:, free]))
+        self.assertTrue(
+            any(
+                not torch.equal(routed[:, head], base[:, head])
+                for head in intervention.head_indices
+            )
+        )
+        self.assertEqual(tuple(usage.shape), (2, 4, 6))
+        self.assertEqual(evidence.schema, NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA)
+        self.assertEqual(evidence.selected_query_heads, (2, 8, 14, 20))
+        self.assertEqual(evidence.selected_kv_heads, (0, 1, 2, 3))
+        self.assertEqual(evidence.alpha_per_head, (0.2, 0.2, 0.2, 0.2))
+        self.assertEqual(evidence.free_heads, free)
+        self.assertEqual(evidence.free_head_max_abs_error, 0.0)
+        self.assertEqual(evidence.future_weight_max_abs, 0.0)
+        self.assertFalse(evidence.identity)
+
+        with self.assertRaises(FrozenInstanceError):
+            evidence.layer = 3  # type: ignore[misc]
+        with self.assertRaisesRegex(ValueError, "strictly causal"):
+            replace(evidence, future_weight_max_abs=0.1)
+        with self.assertRaisesRegex(ValueError, "bit-exact"):
+            replace(evidence, free_head_max_abs_error=0.1)
+        with self.assertRaisesRegex(ValueError, "no greater"):
+            replace(evidence, row_sum_max_error=0.019)
+        with self.assertRaisesRegex(ValueError, "no greater"):
+            replace(
+                evidence,
+                row_sum_max_error=NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE + 1e-7,
+            )
+        payload = evidence.to_dict()
+        payload["selected_query_heads"][0] = 0
+        self.assertEqual(evidence.selected_query_heads, (2, 8, 14, 20))
+
+        identity = Qwen38NativeHeadCrsa(alpha=0.0)
+        identical, identity_usage, identity_evidence = identity.route(
+            logits,
+            base,
+            query_start=0,
+            allowed=allowed,
+            prior_log_usage=None,
+        )
+        self.assertIs(identical, base)
+        self.assertEqual(identical.data_ptr(), base.data_ptr())
+        self.assertIsNone(identity_usage)
+        self.assertTrue(identity_evidence.identity)
+
+        bf16_logits = logits.to(torch.bfloat16)
+        bf16_base = torch.softmax(
+            bf16_logits.masked_fill(~allowed, torch.finfo(torch.bfloat16).min),
+            dim=-1,
+            dtype=torch.float32,
+        ).to(torch.bfloat16)
+        bf16_base = bf16_base.masked_fill(~allowed, 0.0)
+        _, _, bf16_evidence = Qwen38NativeHeadCrsa(alpha=0.01).route(
+            bf16_logits,
+            bf16_base,
+            query_start=0,
+            allowed=allowed,
+            prior_log_usage=None,
+        )
+        self.assertLessEqual(
+            bf16_evidence.row_sum_max_error,
+            NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE,
+        )
+
+    def test_native_full_attention_streaming_matches_one_shot_and_alpha_zero(
+        self,
+    ) -> None:
+        from immer.runtimes.qwen3_8.kernels import full_attention_core
+        from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
+        torch.manual_seed(83)
+        batch, sequence, heads, kv_heads, width = 2, 6, 24, 4, 4
+        query_gate = torch.randn(batch, sequence, 2 * heads * width)
+        key = torch.randn(batch, sequence, kv_heads * width)
+        value = torch.randn(batch, sequence, kv_heads * width)
+        q_norm = torch.randn(width) * 0.05
+        k_norm = torch.randn(width) * 0.05
+        common = dict(
+            q_norm_weight=q_norm,
+            k_norm_weight=k_norm,
+            num_attention_heads=heads,
+            num_key_value_heads=kv_heads,
+            head_dim=width,
+            rotary_dim=2,
+            rope_theta=1_000.0,
+        )
+        baseline, baseline_state = full_attention_core(query_gate, key, value, **common)
+        identity_rows = []
+        identity, identity_state = full_attention_core(
+            query_gate,
+            key,
+            value,
+            native_head_crsa=Qwen38NativeHeadCrsa(alpha=0.0),
+            native_head_crsa_observer=identity_rows.append,
+            **common,
+        )
+        self.assertTrue(torch.equal(identity, baseline))
+        self.assertTrue(torch.equal(identity_state.key, baseline_state.key))
+        self.assertTrue(torch.equal(identity_state.value, baseline_state.value))
+        self.assertIsNone(identity_state.crsa_log_usage)
+        self.assertTrue(identity_rows[0].identity)
+
+        intervention = Qwen38NativeHeadCrsa(alpha=0.15)
+        observed = []
+        whole, whole_state = full_attention_core(
+            query_gate,
+            key,
+            value,
+            native_head_crsa=intervention,
+            native_head_crsa_observer=observed.append,
+            **common,
+        )
+        prefix, prefix_state = full_attention_core(
+            query_gate[:, :3],
+            key[:, :3],
+            value[:, :3],
+            native_head_crsa=intervention,
+            native_head_crsa_observer=observed.append,
+            **common,
+        )
+        suffix, split_state = full_attention_core(
+            query_gate[:, 3:],
+            key[:, 3:],
+            value[:, 3:],
+            state=prefix_state,
+            native_head_crsa=intervention,
+            native_head_crsa_observer=observed.append,
+            **common,
+        )
+        torch.testing.assert_close(
+            torch.cat((prefix, suffix), dim=1), whole, rtol=2e-6, atol=2e-6
+        )
+        torch.testing.assert_close(split_state.key, whole_state.key)
+        torch.testing.assert_close(split_state.value, whole_state.value)
+        torch.testing.assert_close(
+            split_state.crsa_log_usage,
+            whole_state.crsa_log_usage,
+            rtol=2e-6,
+            atol=2e-6,
+        )
+
+        token_outputs = []
+        token_state = None
+        for position in range(sequence):
+            output, token_state = full_attention_core(
+                query_gate[:, position : position + 1],
+                key[:, position : position + 1],
+                value[:, position : position + 1],
+                state=token_state,
+                native_head_crsa=intervention,
+                **common,
+            )
+            token_outputs.append(output)
+        torch.testing.assert_close(
+            torch.cat(token_outputs, dim=1), whole, rtol=2e-6, atol=2e-6
+        )
+        torch.testing.assert_close(
+            token_state.crsa_log_usage,
+            whole_state.crsa_log_usage,
+            rtol=2e-6,
+            atol=2e-6,
+        )
+        self.assertEqual(
+            [(row.query_start, row.history_length_after) for row in observed],
+            [(0, 6), (0, 3), (3, 6)],
+        )
+
+        padded_rows = []
+        key_valid = torch.ones(batch, sequence, dtype=torch.bool)
+        key_valid[1, -1] = False
+        _, padded_state = full_attention_core(
+            query_gate,
+            key,
+            value,
+            attention_mask=key_valid,
+            native_head_crsa=intervention,
+            native_head_crsa_observer=padded_rows.append,
+            **common,
+        )
+        self.assertTrue(torch.isneginf(padded_state.crsa_log_usage[1, :, -1]).all())
+        self.assertEqual(padded_rows[0].future_weight_max_abs, 0.0)
 
     def test_causal_depthwise_conv_matches_scalar_and_continuation(self) -> None:
         from immer.runtimes.qwen3_8.kernels import causal_depthwise_conv

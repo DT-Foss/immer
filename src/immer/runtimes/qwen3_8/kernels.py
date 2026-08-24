@@ -24,6 +24,8 @@ import math
 import torch
 import torch.nn.functional as F
 
+from .native_crsa import NativeHeadCrsaEvidence, Qwen38NativeHeadCrsa
+
 
 __all__ = [
     "AttentionState",
@@ -77,10 +79,11 @@ def _same_device_dtype(reference: torch.Tensor, value: torch.Tensor, name: str) 
 
 @dataclass(frozen=True, slots=True)
 class AttentionState:
-    """Persistent full-attention KV state."""
+    """Persistent full-attention KV state and optional native CRSA usage."""
 
     key: torch.Tensor
     value: torch.Tensor
+    crsa_log_usage: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         key = _floating_tensor(self.key, "key", ndim=4)
@@ -91,6 +94,30 @@ class AttentionState:
                 f"{tuple(value.shape)}"
             )
         _same_device_dtype(key, value, "value")
+        if self.crsa_log_usage is not None:
+            usage = _floating_tensor(self.crsa_log_usage, "crsa_log_usage", ndim=3)
+            expected = (key.shape[0], 4, key.shape[2])
+            if tuple(usage.shape) != expected:
+                raise ValueError(
+                    f"crsa_log_usage state shape must be {expected}, got "
+                    f"{tuple(usage.shape)}"
+                )
+            if usage.device != key.device:
+                raise ValueError("crsa_log_usage must be on the KV-state device")
+            expected_dtype = (
+                torch.float32
+                if key.dtype in {torch.float16, torch.bfloat16}
+                else key.dtype
+            )
+            if usage.dtype != expected_dtype:
+                raise ValueError(
+                    f"crsa_log_usage must have dtype {expected_dtype}, got "
+                    f"{usage.dtype}"
+                )
+            if bool((torch.isnan(usage) | torch.isposinf(usage)).any().item()):
+                raise ValueError(
+                    "crsa_log_usage may contain only finite values or -inf"
+                )
 
     @property
     def length(self) -> int:
@@ -481,6 +508,8 @@ def full_attention_core(
     position_ids: torch.Tensor | None = None,
     state: AttentionState | None = None,
     attention_mask: torch.Tensor | None = None,
+    native_head_crsa: Qwen38NativeHeadCrsa | None = None,
+    native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None] | None = None,
     rope_theta: float = 10_000_000.0,
     rotary_dim: int | None = None,
     partial_rotary_factor: float = 0.25,
@@ -501,6 +530,17 @@ def full_attention_core(
     heads = _positive_int(num_attention_heads, "num_attention_heads")
     kv_heads = _positive_int(num_key_value_heads, "num_key_value_heads")
     width = _positive_int(head_dim, "head_dim")
+    if native_head_crsa is not None and not isinstance(
+        native_head_crsa, Qwen38NativeHeadCrsa
+    ):
+        raise TypeError("native_head_crsa must be a Qwen38NativeHeadCrsa or None")
+    if native_head_crsa_observer is not None:
+        if native_head_crsa is None:
+            raise ValueError(
+                "native_head_crsa_observer requires an active native_head_crsa hook"
+            )
+        if not callable(native_head_crsa_observer):
+            raise TypeError("native_head_crsa_observer must be callable or None")
     if heads % kv_heads:
         raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
     if (
@@ -545,6 +585,11 @@ def full_attention_core(
         _same_device_dtype(key, state.key, "state.key")
         _same_device_dtype(value, state.value, "state.value")
         past_length = state.length
+        needs_usage = native_head_crsa is not None and native_head_crsa.active
+        if needs_usage != (state.crsa_log_usage is not None):
+            raise ValueError(
+                "attention state CRSA usage does not match the native intervention"
+            )
 
     if rotary_dim is None:
         factor = _positive_float(partial_rotary_factor, "partial_rotary_factor")
@@ -597,7 +642,6 @@ def full_attention_core(
     if state is not None:
         key = torch.cat((state.key, key), dim=2)
         value = torch.cat((state.value, value), dim=2)
-    next_state = AttentionState(key=key, value=value)
     key_length = key.shape[2]
 
     repetitions = heads // kv_heads
@@ -607,8 +651,9 @@ def full_attention_core(
     query_index = torch.arange(sequence_length, device=scores.device)[:, None]
     key_index = torch.arange(key_length, device=scores.device)[None, :]
     causal = key_index <= (past_length + query_index)
+    allowed = causal.reshape(1, 1, sequence_length, key_length)
     scores = scores.masked_fill(
-        ~causal.reshape(1, 1, sequence_length, key_length),
+        ~allowed,
         torch.finfo(scores.dtype).min,
     )
 
@@ -623,11 +668,39 @@ def full_attention_core(
         if mask.device != scores.device:
             raise ValueError("attention_mask must be on the same device as projections")
         if is_validity_mask or not mask.is_floating_point():
-            scores = scores.masked_fill(~mask.bool(), torch.finfo(scores.dtype).min)
+            validity = mask.bool()
+            scores = scores.masked_fill(~validity, torch.finfo(scores.dtype).min)
+            if native_head_crsa is not None:
+                allowed = allowed & validity
         else:
             scores = scores + mask.to(dtype=scores.dtype)
+            if native_head_crsa is not None:
+                if bool((torch.isnan(mask) | torch.isposinf(mask)).any().item()):
+                    raise ValueError(
+                        "floating attention_mask may not contain NaN or +inf"
+                    )
+                allowed = allowed & ~torch.isneginf(mask)
+                scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
 
     probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    next_log_usage = None
+    if native_head_crsa is not None:
+        if native_head_crsa.active:
+            probabilities = probabilities.masked_fill(~allowed, 0.0)
+        probabilities, next_log_usage, evidence = native_head_crsa.route(
+            scores,
+            probabilities,
+            query_start=past_length,
+            allowed=allowed,
+            prior_log_usage=(None if state is None else state.crsa_log_usage),
+        )
+        if native_head_crsa_observer is not None:
+            native_head_crsa_observer(evidence)
+    next_state = AttentionState(
+        key=key,
+        value=value,
+        crsa_log_usage=next_log_usage,
+    )
     output = torch.matmul(probabilities, repeated_value)
     output = output.transpose(1, 2).contiguous()
     output = output * torch.sigmoid(gate)

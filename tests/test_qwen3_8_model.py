@@ -78,6 +78,23 @@ def _tiny_config() -> Qwen38Config:
     )
 
 
+def _native_tiny_config(*, full_attention_interval: int = 4) -> Qwen38Config:
+    mapping = _tiny_config_mapping()
+    mapping["num_hidden_layers"] = 28
+    mapping["full_attention_interval"] = full_attention_interval
+    mapping["layer_types"] = [
+        (
+            "full_attention"
+            if (layer + 1) % full_attention_interval == 0
+            else "linear_attention"
+        )
+        for layer in range(28)
+    ]
+    mapping["num_attention_heads"] = 24
+    mapping["num_key_value_heads"] = 4
+    return Qwen38Config.from_mapping(mapping, require_official=False)
+
+
 def _matrix(rows: int, columns: int, generator: torch.Generator) -> torch.Tensor:
     return (0.04 * torch.randn(rows, columns, generator=generator)).to(torch.bfloat16)
 
@@ -508,6 +525,133 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(batched_evidence[0].graft_history_tokens, 4)
         self.assertEqual(token_evidence[-1].graft_history_tokens, 4)
         self.assertGreater(model.state_bytes, self.model.state_bytes)
+
+
+class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.config = _native_tiny_config()
+        save_file(_tiny_weights(self.config), self.root / "model.safetensors")
+        self.source = Streamer.from_local(self.root, budget_mb=20, use_cache=False)
+        self.pager = Qwen38WeightPager(
+            self.source,
+            device="cpu",
+            compute_dtype="float32",
+            max_resident_bytes=2 * 1024**2,
+        )
+        self.observed = []
+        self.intervention = Qwen38NativeHeadCrsa(alpha=0.1)
+        self.model = StreamedQwen38(
+            self.config,
+            self.pager,
+            native_head_crsa=self.intervention,
+            native_head_crsa_observer=self.observed.append,
+            max_batch_size=2,
+            max_seq_len=16,
+        )
+
+    def tearDown(self) -> None:
+        self.pager.close()
+        self.source.close()
+        self.temporary.cleanup()
+
+    def test_native_layer27_streaming_history_reset_and_poison_are_transactional(
+        self,
+    ) -> None:
+        token_ids = torch.tensor([[1, 4, 9, 7]])
+        one_shot, prefill_evidence = self.model.forward_prefill(token_ids)
+        self.assertEqual(prefill_evidence.linear_calls, 217)
+
+        self.observed.clear()
+        self.model.prefill(token_ids[:, :3])
+        state = self.model._layer_states[27]
+        self.assertIsInstance(state, AttentionState)
+        self.assertEqual(tuple(state.crsa_log_usage.shape), (1, 4, 3))
+        usage_bytes = state.crsa_log_usage.numel() * state.crsa_log_usage.element_size()
+        self.assertGreaterEqual(self.model.state_bytes, usage_bytes)
+        decoded, _ = self.model.decode(token_ids[:, 3:])
+        torch.testing.assert_close(decoded, one_shot[:, -1:], rtol=2e-5, atol=2e-6)
+        state = self.model._layer_states[27]
+        self.assertEqual(tuple(state.crsa_log_usage.shape), (1, 4, 4))
+        self.assertEqual(
+            [(row.query_start, row.history_length_after) for row in self.observed],
+            [(0, 3), (3, 4)],
+        )
+
+        self.model.reset_state()
+        tokenwise, _ = self.model.prefill(token_ids, tokenwise=True, reset=False)
+        torch.testing.assert_close(tokenwise, one_shot, rtol=2e-5, atol=2e-6)
+        self.assertEqual(
+            tuple(self.model._layer_states[27].crsa_log_usage.shape),
+            (1, 4, 4),
+        )
+        self.model.reset_state()
+        self.assertEqual(self.model.state_bytes, 0)
+
+        self.model.prefill(token_ids[:, :2], reset=False)
+        original_mlp = self.model._mlp
+        observed_before_failure = tuple(self.observed)
+
+        def fail_after_native(hidden, *, layer):
+            if layer == 27:
+                raise RuntimeError("native transaction failure")
+            return original_mlp(hidden, layer=layer)
+
+        with mock.patch.object(self.model, "_mlp", side_effect=fail_after_native):
+            with self.assertRaisesRegex(RuntimeError, "native transaction failure"):
+                self.model.decode(token_ids[:, 2:3])
+        self.assertTrue(self.model.state_poisoned)
+        self.assertEqual(self.model.state_bytes, 0)
+        self.assertIsNone(self.model._layer_states[27])
+        self.assertEqual(tuple(self.observed), observed_before_failure)
+        self.model.reset_state()
+        self.assertFalse(self.model.state_poisoned)
+
+        def failing_observer(_row):
+            raise RuntimeError("observer failure")
+
+        self.model.native_head_crsa_observer = failing_observer
+        with self.assertWarnsRegex(RuntimeWarning, "observer failed after commit"):
+            committed, _ = self.model.prefill([[1]], reset=False)
+        self.assertEqual(tuple(committed.shape), (1, 1, self.config.dim))
+        self.assertEqual(self.model.next_position, 1)
+        self.assertGreater(self.model.state_bytes, 0)
+        self.assertFalse(self.model.state_poisoned)
+
+    def test_native_intervention_validates_layer_layout_and_excludes_hidden_graft(
+        self,
+    ) -> None:
+        from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
+        with self.assertRaisesRegex(ValueError, "only for layer 27"):
+            Qwen38NativeHeadCrsa(layer=3)
+        invalid_config = _native_tiny_config(full_attention_interval=5)
+        with self.assertRaisesRegex(ValueError, "full-attention layer"):
+            StreamedQwen38(
+                invalid_config,
+                self.pager,
+                native_head_crsa=self.intervention,
+                max_seq_len=16,
+            )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            StreamedQwen38(
+                self.config,
+                self.pager,
+                graft=Qwen38StableCrsaGraft(mode="crsa", alpha=0.1),
+                graft_layer=1,
+                native_head_crsa=self.intervention,
+                max_seq_len=16,
+            )
+        with self.assertRaisesRegex(ValueError, "requires native_head_crsa"):
+            StreamedQwen38(
+                self.config,
+                self.pager,
+                native_head_crsa_observer=self.observed.append,
+                max_seq_len=16,
+            )
 
 
 if __name__ == "__main__":

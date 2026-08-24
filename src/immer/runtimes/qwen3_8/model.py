@@ -17,6 +17,7 @@ import math
 import os
 import time
 from typing import Any
+import warnings
 
 import torch
 
@@ -30,6 +31,7 @@ from .kernels import (
     rms_norm,
     swiglu,
 )
+from .native_crsa import NativeHeadCrsaEvidence, Qwen38NativeHeadCrsa
 from .pager import Qwen38WeightPager
 from .provenance import runtime_dependency_versions, runtime_source_manifest
 from .snapshot import (
@@ -115,6 +117,9 @@ class StreamedQwen38:
         graft: Any | None = None,
         graft_layer: int | None = None,
         delta_probe: Callable[[int, DeltaNetProbe], None] | None = None,
+        native_head_crsa: Qwen38NativeHeadCrsa | None = None,
+        native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None]
+        | None = None,
         max_batch_size: int = 8,
         max_seq_len: int = 4096,
     ) -> None:
@@ -136,6 +141,10 @@ class StreamedQwen38:
             raise ValueError("max_seq_len must be a positive integer")
         if max_seq_len > config.max_position_embeddings:
             raise ValueError("max_seq_len exceeds the checkpoint context bound")
+        if graft is not None and native_head_crsa is not None:
+            raise ValueError(
+                "hidden graft and native Head-CRSA intervention are mutually exclusive"
+            )
         if graft_layer is not None and (
             isinstance(graft_layer, bool)
             or not isinstance(graft_layer, int)
@@ -146,12 +155,41 @@ class StreamedQwen38:
             raise ValueError("an active graft requires graft_layer")
         if delta_probe is not None and not callable(delta_probe):
             raise TypeError("delta_probe must be callable")
+        if native_head_crsa is not None and not isinstance(
+            native_head_crsa, Qwen38NativeHeadCrsa
+        ):
+            raise TypeError("native_head_crsa must be a Qwen38NativeHeadCrsa or None")
+        if native_head_crsa_observer is not None:
+            if native_head_crsa is None:
+                raise ValueError("native_head_crsa_observer requires native_head_crsa")
+            if not callable(native_head_crsa_observer):
+                raise TypeError("native_head_crsa_observer must be callable or None")
+        if native_head_crsa is not None:
+            layer = native_head_crsa.layer
+            if layer >= config.n_layers or not config.is_full_attention(layer):
+                raise ValueError(
+                    "native Head-CRSA layer 27 must be a checkpoint full-attention layer"
+                )
+            if config.n_heads != 24 or config.n_kv_heads != 4:
+                raise ValueError(
+                    "native Head-CRSA requires the validated 24-query/4-KV GQA layout"
+                )
+            group_width = config.n_heads // config.n_kv_heads
+            mapped = tuple(
+                index // group_width for index in native_head_crsa.head_indices
+            )
+            if mapped != native_head_crsa.selected_kv_heads:
+                raise ValueError(
+                    "native Head-CRSA must select one query head from every GQA group"
+                )
 
         self.config = config
         self.pager = pager
         self.graft = graft
         self.graft_layer = graft_layer
         self.delta_probe = delta_probe
+        self.native_head_crsa = native_head_crsa
+        self.native_head_crsa_observer = native_head_crsa_observer
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self._layer_states: list[LayerState | None] = [
@@ -180,6 +218,8 @@ class StreamedQwen38:
         for state in self._layer_states:
             if isinstance(state, AttentionState):
                 tensors = (state.key, state.value)
+                if state.crsa_log_usage is not None:
+                    tensors = (*tensors, state.crsa_log_usage)
             elif isinstance(state, DeltaNetState):
                 tensors = (state.conv, state.recurrent)
             else:
@@ -213,6 +253,12 @@ class StreamedQwen38:
                 "runtime identity cannot be represented as canonical JSON"
             ) from exc
         return hashlib.sha256(encoded).hexdigest()
+
+    def _reject_native_head_crsa_snapshot(self) -> None:
+        if self.native_head_crsa is not None and self.native_head_crsa.active:
+            raise Qwen38SnapshotError(
+                "native Head-CRSA continuation snapshots are unsupported in this tranche"
+            )
 
     def _graft_snapshot_identity(self) -> dict[str, Any]:
         if self.graft is None:
@@ -260,6 +306,7 @@ class StreamedQwen38:
         }
 
     def _snapshot_identity(self, *, transport_neutral: bool = False) -> dict[str, Any]:
+        self._reject_native_head_crsa_snapshot()
         source = self.pager.source
         source.inventory()
         metrics = source.metrics()
@@ -326,6 +373,7 @@ class StreamedQwen38:
     def _snapshot_model_state(
         self,
     ) -> tuple[dict[str, Any], dict[str, SnapshotTensor]]:
+        self._reject_native_head_crsa_snapshot()
         if not 0 <= self._next_position <= self.max_seq_len:
             raise Qwen38SnapshotError("model cursor exceeds its context bound")
         if self._state_poisoned and self._next_position:
@@ -355,6 +403,10 @@ class StreamedQwen38:
                 if not isinstance(state, AttentionState):
                     raise Qwen38SnapshotError(
                         f"full-attention layer {layer} has the wrong state type"
+                    )
+                if state.crsa_log_usage is not None:
+                    raise Qwen38SnapshotError(
+                        "native Head-CRSA usage cannot be written by this snapshot schema"
                     )
                 expected = (
                     batch,
@@ -494,6 +546,7 @@ class StreamedQwen38:
     ) -> dict[str, Any]:
         """Atomically save every native Qwen continuation tensor."""
 
+        self._reject_native_head_crsa_snapshot()
         if not isinstance(transport_neutral, bool):
             raise TypeError("transport_neutral must be a boolean")
         limits = self._snapshot_limits(max_bytes, max_tensors)
@@ -534,6 +587,7 @@ class StreamedQwen38:
     ) -> dict[str, Any]:
         """Transactionally restore a bounded native Qwen continuation."""
 
+        self._reject_native_head_crsa_snapshot()
         if not isinstance(transport_neutral, bool):
             raise TypeError("transport_neutral must be a boolean")
         limits = self._snapshot_limits(max_bytes, max_tensors)
@@ -863,6 +917,8 @@ class StreamedQwen38:
         token_mask: torch.Tensor | None,
         state: AttentionState | None = None,
         start_pos: int = 0,
+        native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None]
+        | None = None,
     ) -> tuple[torch.Tensor, AttentionState]:
         base = f"model.language_model.layers.{layer}.self_attn"
         projected_query_gate = self.pager.linear(hidden, f"{base}.q_proj")
@@ -881,6 +937,12 @@ class StreamedQwen38:
             .expand(hidden.shape[0], -1)
         )
         try:
+            native_head_crsa = (
+                self.native_head_crsa
+                if self.native_head_crsa is not None
+                and layer == self.native_head_crsa.layer
+                else None
+            )
             mixed, next_state = full_attention_core(
                 projected_query_gate,
                 projected_key,
@@ -893,6 +955,10 @@ class StreamedQwen38:
                 position_ids=positions,
                 state=state,
                 attention_mask=token_mask,
+                native_head_crsa=native_head_crsa,
+                native_head_crsa_observer=(
+                    native_head_crsa_observer if native_head_crsa is not None else None
+                ),
                 rope_theta=self.config.rope_theta,
                 rotary_dim=self.config.rotary_dim,
                 mrope_section=self.config.mrope_section,
@@ -970,6 +1036,8 @@ class StreamedQwen38:
         state: LayerState | None,
         start_pos: int,
         stateful: bool,
+        native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None]
+        | None = None,
     ) -> tuple[torch.Tensor, LayerState | None]:
         """Apply one block and return its staged continuation state."""
 
@@ -985,6 +1053,7 @@ class StreamedQwen38:
                 token_mask=None if stateful else token_mask,
                 state=state,
                 start_pos=start_pos,
+                native_head_crsa_observer=native_head_crsa_observer,
             )
         else:
             if state is not None and not isinstance(state, DeltaNetState):
@@ -1013,6 +1082,8 @@ class StreamedQwen38:
         *,
         layer: int,
         token_mask: Any | None = None,
+        _native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None]
+        | None = None,
     ) -> tuple[torch.Tensor, None]:
         """Apply one independent Qwen block, preserving exact prefix outputs."""
 
@@ -1029,6 +1100,14 @@ class StreamedQwen38:
         mask = self._prefix_mask(token_mask, ids)
         x = hidden.to(device=self.pager.device, dtype=self.pager.compute_dtype)
 
+        staged_native_evidence: list[NativeHeadCrsaEvidence] | None = (
+            [] if _native_head_crsa_observer is None else None
+        )
+        native_observer = (
+            staged_native_evidence.append
+            if staged_native_evidence is not None
+            else _native_head_crsa_observer
+        )
         x, _state = self._forward_layer(
             x,
             layer=layer,
@@ -1036,7 +1115,10 @@ class StreamedQwen38:
             state=None,
             start_pos=0,
             stateful=False,
+            native_head_crsa_observer=native_observer,
         )
+        if staged_native_evidence is not None:
+            self._emit_native_head_crsa_evidence(staged_native_evidence)
         return x, None
 
     def finalize_hidden(self, hidden: Any) -> torch.Tensor:
@@ -1051,6 +1133,29 @@ class StreamedQwen38:
         return (
             "off" if self.graft is None else str(getattr(self.graft, "mode", "active"))
         )
+
+    def _emit_native_head_crsa_evidence(
+        self, rows: Iterable[NativeHeadCrsaEvidence]
+    ) -> None:
+        observer = self.native_head_crsa_observer
+        if observer is None:
+            return
+        for row in tuple(rows):
+            try:
+                observer(row)
+            except Exception as exc:
+                try:
+                    warnings.warn(
+                        "native Head-CRSA observer failed after commit: "
+                        f"{type(exc).__name__}: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                except Exception:
+                    # Warning filters may promote warnings to exceptions; a
+                    # passive evidence sink must still never roll back or mask
+                    # an already committed model forward.
+                    pass
 
     def _apply_graft_stateful(
         self,
@@ -1156,6 +1261,16 @@ class StreamedQwen38:
                         raise Qwen38RuntimeError(
                             f"full-attention layer {layer} cursor disagrees with model state"
                         )
+                    expects_usage = (
+                        self.native_head_crsa is not None
+                        and self.native_head_crsa.active
+                        and layer == self.native_head_crsa.layer
+                    )
+                    if expects_usage != (state.crsa_log_usage is not None):
+                        raise Qwen38RuntimeError(
+                            f"full-attention layer {layer} CRSA history disagrees "
+                            "with model configuration"
+                        )
                 elif not isinstance(state, DeltaNetState):
                     raise Qwen38RuntimeError(
                         f"linear-attention layer {layer} has the wrong state type"
@@ -1169,6 +1284,7 @@ class StreamedQwen38:
         mask = torch.ones_like(ids, dtype=torch.bool, device=self.pager.device)
         staged: list[LayerState] = []
         staged_history = self._graft_history
+        staged_native_evidence: list[NativeHeadCrsaEvidence] = []
         try:
             for layer in range(self.config.n_layers):
                 layer_started = time.perf_counter()
@@ -1180,6 +1296,7 @@ class StreamedQwen38:
                     state=self._layer_states[layer],
                     start_pos=start_pos,
                     stateful=True,
+                    native_head_crsa_observer=staged_native_evidence.append,
                 )
                 if next_state is None:  # pragma: no cover - stateful contract above.
                     raise Qwen38RuntimeError("stateful layer returned no continuation")
@@ -1244,6 +1361,7 @@ class StreamedQwen38:
                 0 if self._graft_history is None else int(self._graft_history.shape[1])
             ),
         )
+        self._emit_native_head_crsa_evidence(staged_native_evidence)
         return hidden, evidence
 
     def prefill(
@@ -1414,13 +1532,18 @@ class StreamedQwen38:
         start_linears = self._metric(self.pager, "linear_calls")
         hidden = self.embed_batch(ids)
         graft_applied = False
+        staged_native_evidence: list[NativeHeadCrsaEvidence] = []
         mode = (
             "off" if self.graft is None else str(getattr(self.graft, "mode", "active"))
         )
         try:
             for layer in range(self.config.n_layers):
                 hidden, _ = self.forward_prefill_layer(
-                    hidden, ids, layer=layer, token_mask=mask
+                    hidden,
+                    ids,
+                    layer=layer,
+                    token_mask=mask,
+                    _native_head_crsa_observer=staged_native_evidence.append,
                 )
                 if self.graft is not None and layer == self.graft_layer:
                     grafted = self.graft.forward(hidden)
@@ -1447,6 +1570,7 @@ class StreamedQwen38:
             graft_layer=self.graft_layer,
             graft_applied=graft_applied,
         )
+        self._emit_native_head_crsa_evidence(staged_native_evidence)
         return final, evidence
 
     def checkpoint_preflight(self) -> dict[str, Any]:

@@ -16,6 +16,7 @@ _QWEN_RUNTIME_FILES = (
     "graft.py",
     "kernels.py",
     "model.py",
+    "native_crsa.py",
     "pager.py",
     "provenance.py",
     "snapshot.py",

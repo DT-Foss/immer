@@ -26,7 +26,13 @@ class AttentionSpec:
 
     def label(self) -> str:
         p: list[str] = []
-        if self.kind in {"prefix", "prefix_log", "raps", "reservoir_prefix", "geometric_prefix"}:
+        if self.kind in {
+            "prefix",
+            "prefix_log",
+            "raps",
+            "reservoir_prefix",
+            "geometric_prefix",
+        }:
             p.append(f"a={self.alpha:g}")
         if self.kind == "quad_route" and self.alpha != 1.0:
             p.append(f"a={self.alpha:g}")
@@ -39,40 +45,57 @@ class AttentionSpec:
         if self.kind == "dual_route":
             p.extend((f"lh={self.local_heads}", f"s={self.slope:g}"))
         if self.kind == "slg":
-            p.extend((f"sh={self.self_heads}", f"lh={self.local_heads}", f"s={self.slope:g}"))
+            p.extend(
+                (f"sh={self.self_heads}", f"lh={self.local_heads}", f"s={self.slope:g}")
+            )
         if self.kind == "quad_route":
-            p.extend((f"sh={self.self_heads}", f"lh={self.local_heads}", f"bh={self.balanced_heads}", f"s={self.slope:g}"))
+            p.extend(
+                (
+                    f"sh={self.self_heads}",
+                    f"lh={self.local_heads}",
+                    f"bh={self.balanced_heads}",
+                    f"s={self.slope:g}",
+                )
+            )
         if self.kind == "reservoir_prefix":
             p.append(f"rho={self.reservoir_logit:g}")
         if self.kind == "adaptive_route":
             p.extend((f"s={self.slope:g}", f"ff={self.free_floor:g}"))
         if self.kind == "adaptive_specialists":
-            p.extend((
-                f"fh={self.free_heads}",
-                f"s={self.slope:g}",
-                f"si={self.specialist_init}",
-                f"is={self.init_strength:g}",
-            ))
+            p.extend(
+                (
+                    f"fh={self.free_heads}",
+                    f"s={self.slope:g}",
+                    f"si={self.specialist_init}",
+                    f"is={self.init_strength:g}",
+                )
+            )
         if self.kind == "anchor_residual":
-            p.extend((
-                f"fh={self.free_heads}",
-                f"s={self.slope:g}",
-                f"ap={self.anchor_pattern}",
-                f"ab={self.adapt_budget:g}",
-            ))
+            p.extend(
+                (
+                    f"fh={self.free_heads}",
+                    f"s={self.slope:g}",
+                    f"ap={self.anchor_pattern}",
+                    f"ab={self.adapt_budget:g}",
+                )
+            )
         if self.kind == "marginal_residual":
-            p.extend((
-                f"fh={self.free_heads}",
-                f"s={self.slope:g}",
-                f"ab={self.adapt_budget:g}",
-            ))
+            p.extend(
+                (
+                    f"fh={self.free_heads}",
+                    f"s={self.slope:g}",
+                    f"ab={self.adapt_budget:g}",
+                )
+            )
         if self.kind == "q_residual":
-            p.extend((
-                f"fh={self.free_heads}",
-                f"s={self.slope:g}",
-                f"is={self.init_strength:g}",
-                f"ab={self.adapt_budget:g}",
-            ))
+            p.extend(
+                (
+                    f"fh={self.free_heads}",
+                    f"s={self.slope:g}",
+                    f"is={self.init_strength:g}",
+                    f"ab={self.adapt_budget:g}",
+                )
+            )
         return self.kind if not p else f"{self.kind}[{','.join(p)}]"
 
 
@@ -94,13 +117,17 @@ def _masked_logits(logits: Tensor, mask: Tensor) -> Tensor:
 
 def _base(logits: Tensor) -> tuple[Tensor, Tensor]:
     mask = _validate_logits(logits)
-    weights = torch.softmax(_masked_logits(logits, mask), dim=-1).masked_fill(~mask, 0.0)
+    weights = torch.softmax(_masked_logits(logits, mask), dim=-1).masked_fill(
+        ~mask, 0.0
+    )
     return weights, mask
 
 
 def _log_base(logits: Tensor) -> tuple[Tensor, Tensor]:
     mask = _validate_logits(logits)
-    return torch.log_softmax(_masked_logits(logits, mask), dim=-1).masked_fill(~mask, -torch.inf), mask
+    return torch.log_softmax(_masked_logits(logits, mask), dim=-1).masked_fill(
+        ~mask, -torch.inf
+    ), mask
 
 
 def _row_normalize(raw: Tensor, mask: Tensor) -> Tensor:
@@ -110,7 +137,9 @@ def _row_normalize(raw: Tensor, mask: Tensor) -> Tensor:
     return (raw / total).masked_fill(~mask, 0.0)
 
 
-def _debit_log_diagonal(log_weights: Tensor, debit: float, *, preserve_first: bool = True) -> Tensor:
+def _debit_log_diagonal(
+    log_weights: Tensor, debit: float, *, preserve_first: bool = True
+) -> Tensor:
     if debit <= 0:
         return log_weights
     t = log_weights.shape[-1]
@@ -128,7 +157,8 @@ def _debit_probability(weights: Tensor, debit: float, mask: Tensor) -> Tensor:
     t = weights.shape[-1]
     eye = torch.eye(t, dtype=torch.bool, device=weights.device).view(1, 1, t, t)
     raw = torch.where(eye, weights * math.exp(-float(debit)), weights)
-    raw = raw.clone(); raw[..., 0, 0] = weights[..., 0, 0]
+    raw = raw.clone()
+    raw[..., 0, 0] = weights[..., 0, 0]
     return _row_normalize(raw, mask)
 
 
@@ -145,17 +175,169 @@ def prefix_log(logits: Tensor, spec: AttentionSpec) -> Tensor:
     log_base, mask = _log_base(logits)
     log_usage = torch.logcumsumexp(log_base, dim=-2)
     if spec.eps > 0:
-        log_eps = torch.as_tensor(math.log(float(spec.eps)), dtype=logits.dtype, device=logits.device)
+        log_eps = torch.as_tensor(
+            math.log(float(spec.eps)), dtype=logits.dtype, device=logits.device
+        )
         log_usage = torch.logaddexp(log_usage, log_eps)
     safe_base = torch.where(mask, log_base, torch.zeros_like(log_base))
     safe_usage = torch.where(mask, log_usage, torch.zeros_like(log_usage))
-    log_raw = (safe_base - float(spec.alpha) * safe_usage).masked_fill(~mask, -torch.inf)
+    log_raw = (safe_base - float(spec.alpha) * safe_usage).masked_fill(
+        ~mask, -torch.inf
+    )
     t = logits.shape[-1]
     eye = torch.eye(t, dtype=torch.bool, device=logits.device).view(1, 1, t, t)
     log_raw = torch.where(eye, log_raw + 8.0 * torch.finfo(logits.dtype).eps, log_raw)
     log_raw = _debit_log_diagonal(log_raw, spec.diagonal_debit)
     return torch.softmax(log_raw, -1).masked_fill(~mask, 0.0)
 
+
+def streaming_prefix_log(
+    logits: Tensor,
+    spec: AttentionSpec,
+    *,
+    query_start: int,
+    prior_log_usage: Tensor | None,
+    allowed: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Apply Prefix-Sinkhorn to a rectangular streaming query block.
+
+    ``prior_log_usage`` stores the log cumulative *causal-softmax* mass from
+    every query preceding ``query_start``.  Keeping that state is what makes a
+    ``[B, H, 1, past+1]`` decode step equivalent to the corresponding row of a
+    one-shot square call.  The returned usage is the raw cumulative mass (the
+    optional epsilon belongs only to the balancing denominator), ready for the
+    next contiguous block.
+
+    ``allowed`` is an explicit boolean support mask.  It is applied with
+    ``-inf`` before either softmax, so masked logits have exactly zero mass and
+    exactly zero gradient.  The diagonal is resolved in absolute coordinates;
+    for a block beginning at ``query_start``, local row ``r`` debits key
+    ``query_start + r``.
+    """
+
+    if logits.ndim != 4:
+        raise ValueError("expected [batch, heads, query, key] logits")
+    if not logits.is_floating_point():
+        raise TypeError("logits must be floating point")
+    if (
+        isinstance(query_start, bool)
+        or not isinstance(query_start, int)
+        or query_start < 0
+    ):
+        raise ValueError("query_start must be a non-negative integer")
+    batch, heads, query_length, key_length = logits.shape
+    if min(batch, heads, query_length, key_length) < 1:
+        raise ValueError("logits dimensions must be non-empty")
+    if key_length != query_start + query_length:
+        raise ValueError(
+            "key length must equal query_start + query length for contiguous streaming"
+        )
+    if not isinstance(allowed, Tensor):
+        raise TypeError("allowed must be a torch tensor")
+    if allowed.dtype != torch.bool:
+        raise TypeError("allowed must be boolean")
+    if allowed.device != logits.device:
+        raise ValueError("allowed must be on the logits device")
+    try:
+        support = torch.broadcast_to(allowed, logits.shape)
+    except RuntimeError as exc:
+        raise ValueError("allowed must broadcast to the logits shape") from exc
+    if bool((~support.any(dim=-1)).any().item()):
+        raise ValueError("every query row must allow at least one key")
+
+    if not isinstance(spec, AttentionSpec):
+        raise TypeError("spec must be an AttentionSpec")
+    if spec.kind not in {"prefix_log", "raps"}:
+        raise ValueError("streaming_prefix_log requires kind='prefix_log' or 'raps'")
+    for value, name in (
+        (spec.alpha, "alpha"),
+        (spec.eps, "eps"),
+        (spec.diagonal_debit, "diagonal_debit"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{name} must be a real number")
+        if not math.isfinite(float(value)) or float(value) < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+
+    if prior_log_usage is None:
+        if query_start:
+            raise ValueError("prior_log_usage is required after query_start zero")
+        prior = torch.full(
+            (batch, heads, key_length),
+            -torch.inf,
+            dtype=logits.dtype,
+            device=logits.device,
+        )
+    else:
+        if not isinstance(prior_log_usage, Tensor):
+            raise TypeError("prior_log_usage must be a torch tensor or None")
+        if not prior_log_usage.is_floating_point():
+            raise TypeError("prior_log_usage must be floating point")
+        expected = (batch, heads, query_start)
+        if tuple(prior_log_usage.shape) != expected:
+            raise ValueError(
+                f"prior_log_usage must have shape {expected}, got "
+                f"{tuple(prior_log_usage.shape)}"
+            )
+        if prior_log_usage.device != logits.device:
+            raise ValueError("prior_log_usage must be on the logits device")
+        if prior_log_usage.dtype != logits.dtype:
+            raise ValueError("prior_log_usage must have the logits dtype")
+        if bool(
+            (torch.isnan(prior_log_usage) | torch.isposinf(prior_log_usage))
+            .any()
+            .item()
+        ):
+            raise ValueError("prior_log_usage may contain only finite values or -inf")
+        extension = torch.full(
+            (batch, heads, query_length),
+            -torch.inf,
+            dtype=logits.dtype,
+            device=logits.device,
+        )
+        prior = torch.cat((prior_log_usage, extension), dim=-1)
+
+    log_base = torch.log_softmax(logits.masked_fill(~support, -torch.inf), dim=-1)
+    log_base = log_base.masked_fill(~support, -torch.inf)
+    block_log_usage = torch.logcumsumexp(log_base, dim=-2)
+    raw_log_usage = torch.logaddexp(prior.unsqueeze(-2), block_log_usage)
+    denominator_log_usage = raw_log_usage
+    if spec.eps > 0:
+        log_eps = torch.as_tensor(
+            math.log(float(spec.eps)), dtype=logits.dtype, device=logits.device
+        )
+        denominator_log_usage = torch.logaddexp(denominator_log_usage, log_eps)
+
+    safe_base = torch.where(support, log_base, torch.zeros_like(log_base))
+    safe_usage = torch.where(
+        support, denominator_log_usage, torch.zeros_like(denominator_log_usage)
+    )
+    log_raw = (safe_base - float(spec.alpha) * safe_usage).masked_fill(
+        ~support, -torch.inf
+    )
+
+    query_index = query_start + torch.arange(query_length, device=logits.device)
+    key_index = torch.arange(key_length, device=logits.device)
+    diagonal = (query_index[:, None] == key_index[None, :]).reshape(
+        1, 1, query_length, key_length
+    )
+    log_raw = torch.where(
+        diagonal,
+        log_raw + 8.0 * torch.finfo(logits.dtype).eps,
+        log_raw,
+    )
+    if spec.diagonal_debit > 0:
+        debit_diagonal = diagonal
+        if query_start == 0:
+            debit_diagonal = debit_diagonal.clone()
+            debit_diagonal[..., 0, 0] = False
+        log_raw = torch.where(
+            debit_diagonal,
+            log_raw - float(spec.diagonal_debit),
+            log_raw,
+        )
+    weights = torch.softmax(log_raw, dim=-1).masked_fill(~support, 0.0)
+    return weights, raw_log_usage[..., -1, :]
 
 
 def geometric_prefix_log(logits: Tensor, spec: AttentionSpec) -> Tensor:
@@ -177,15 +359,20 @@ def geometric_prefix_log(logits: Tensor, spec: AttentionSpec) -> Tensor:
     log_decay = math.log(decay)
     log_usage = torch.logcumsumexp(log_base - row * log_decay, dim=-2) + row * log_decay
     if spec.eps > 0:
-        log_eps = torch.as_tensor(math.log(float(spec.eps)), dtype=logits.dtype, device=logits.device)
+        log_eps = torch.as_tensor(
+            math.log(float(spec.eps)), dtype=logits.dtype, device=logits.device
+        )
         log_usage = torch.logaddexp(log_usage, log_eps)
     safe_base = torch.where(mask, log_base, torch.zeros_like(log_base))
     safe_usage = torch.where(mask, log_usage, torch.zeros_like(log_usage))
-    log_raw = (safe_base - float(spec.alpha) * safe_usage).masked_fill(~mask, -torch.inf)
+    log_raw = (safe_base - float(spec.alpha) * safe_usage).masked_fill(
+        ~mask, -torch.inf
+    )
     eye = torch.eye(t, dtype=torch.bool, device=logits.device).view(1, 1, t, t)
     log_raw = torch.where(eye, log_raw + 8.0 * torch.finfo(logits.dtype).eps, log_raw)
     log_raw = _debit_log_diagonal(log_raw, spec.diagonal_debit)
     return torch.softmax(log_raw, -1).masked_fill(~mask, 0.0)
+
 
 def reservoir_prefix(logits: Tensor, spec: AttentionSpec) -> Tensor:
     """Prefix balancing with an explicit null reservoir.
@@ -195,26 +382,39 @@ def reservoir_prefix(logits: Tensor, spec: AttentionSpec) -> Tensor:
     """
     mask = _validate_logits(logits)
     masked = _masked_logits(logits, mask)
-    rho = torch.full((*logits.shape[:-1], 1), float(spec.reservoir_logit), dtype=logits.dtype, device=logits.device)
+    rho = torch.full(
+        (*logits.shape[:-1], 1),
+        float(spec.reservoir_logit),
+        dtype=logits.dtype,
+        device=logits.device,
+    )
     log_z = torch.logsumexp(torch.cat((masked, rho), dim=-1), dim=-1, keepdim=True)
     log_base = (masked - log_z).masked_fill(~mask, -torch.inf)
     log_reservoir = rho - log_z
     log_usage = torch.logcumsumexp(log_base, dim=-2)
     if spec.eps > 0:
-        log_eps = torch.as_tensor(math.log(float(spec.eps)), dtype=logits.dtype, device=logits.device)
+        log_eps = torch.as_tensor(
+            math.log(float(spec.eps)), dtype=logits.dtype, device=logits.device
+        )
         log_usage = torch.logaddexp(log_usage, log_eps)
     safe_base = torch.where(mask, log_base, torch.zeros_like(log_base))
     safe_usage = torch.where(mask, log_usage, torch.zeros_like(log_usage))
-    log_raw = (safe_base - float(spec.alpha) * safe_usage).masked_fill(~mask, -torch.inf)
+    log_raw = (safe_base - float(spec.alpha) * safe_usage).masked_fill(
+        ~mask, -torch.inf
+    )
     t = logits.shape[-1]
     eye = torch.eye(t, dtype=torch.bool, device=logits.device).view(1, 1, t, t)
     log_raw = torch.where(eye, log_raw + 8.0 * torch.finfo(logits.dtype).eps, log_raw)
     log_raw = _debit_log_diagonal(log_raw, spec.diagonal_debit)
-    normalizer = torch.logsumexp(torch.cat((log_raw, log_reservoir), dim=-1), dim=-1, keepdim=True)
+    normalizer = torch.logsumexp(
+        torch.cat((log_raw, log_reservoir), dim=-1), dim=-1, keepdim=True
+    )
     return torch.exp(log_raw - normalizer).masked_fill(~mask, 0.0)
 
 
-def recency_attention(logits: Tensor, slope: float, *, exclude_self: bool = False) -> Tensor:
+def recency_attention(
+    logits: Tensor, slope: float, *, exclude_self: bool = False
+) -> Tensor:
     mask = _validate_logits(logits)
     t = logits.shape[-1]
     q = torch.arange(t, device=logits.device).view(t, 1)
@@ -225,12 +425,18 @@ def recency_attention(logits: Tensor, slope: float, *, exclude_self: bool = Fals
         allowed = torch.ones(t, t, dtype=torch.bool, device=logits.device).tril(-1)
         allowed[0, 0] = True
     biased = logits - float(slope) * age
-    return torch.softmax(biased.masked_fill(~allowed, -torch.inf), -1).masked_fill(~allowed, 0.0)
+    return torch.softmax(biased.masked_fill(~allowed, -torch.inf), -1).masked_fill(
+        ~allowed, 0.0
+    )
 
 
 def identity_attention(logits: Tensor) -> Tensor:
     t = logits.shape[-1]
-    return torch.eye(t, dtype=logits.dtype, device=logits.device).view(1, 1, t, t).expand(logits.shape[0], logits.shape[1], t, t)
+    return (
+        torch.eye(t, dtype=logits.dtype, device=logits.device)
+        .view(1, 1, t, t)
+        .expand(logits.shape[0], logits.shape[1], t, t)
+    )
 
 
 def adaptive_route_attention(
@@ -259,7 +465,9 @@ def adaptive_route_attention(
     local_route = recency_attention(logits, spec.slope, exclude_self=True)
     balanced_route = prefix_log(logits, replace(spec, kind="raps"))
     free_route = _base(logits)[0]
-    branches = torch.stack((self_route, local_route, balanced_route, free_route), dim=-2)
+    branches = torch.stack(
+        (self_route, local_route, balanced_route, free_route), dim=-2
+    )
 
     effective = (1.0 - float(spec.free_floor)) * gate_probs
     effective = effective.clone()
@@ -358,11 +566,14 @@ def anchor_residual_attention(
     effective = (1.0 - budget) * anchor + budget * gate_probs
 
     specialist_logits = logits[:, :specialist_heads]
-    branches = torch.stack((
-        identity_attention(specialist_logits),
-        recency_attention(specialist_logits, spec.slope, exclude_self=True),
-        prefix_log(specialist_logits, replace(spec, kind="raps")),
-    ), dim=-2)
+    branches = torch.stack(
+        (
+            identity_attention(specialist_logits),
+            recency_attention(specialist_logits, spec.slope, exclude_self=True),
+            prefix_log(specialist_logits, replace(spec, kind="raps")),
+        ),
+        dim=-2,
+    )
     specialist = (branches * effective.unsqueeze(-1)).sum(dim=-2)
     free = _base(logits[:, specialist_heads:])[0]
     weights = torch.cat((specialist, free), dim=1)
@@ -499,14 +710,21 @@ def apply_attention(logits: Tensor, spec: AttentionSpec) -> Tensor:
         return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
     if spec.kind == "slg":
         h = logits.shape[1]
-        if spec.self_heads < 0 or spec.local_heads < 0 or spec.self_heads + spec.local_heads > h:
+        if (
+            spec.self_heads < 0
+            or spec.local_heads < 0
+            or spec.self_heads + spec.local_heads > h
+        ):
             raise ValueError("self_heads + local_heads out of range")
-        a = spec.self_heads; b = a + spec.local_heads
+        a = spec.self_heads
+        b = a + spec.local_heads
         parts = []
         if a:
             parts.append(identity_attention(logits[:, :a]))
         if b > a:
-            parts.append(recency_attention(logits[:, a:b], spec.slope, exclude_self=True))
+            parts.append(
+                recency_attention(logits[:, a:b], spec.slope, exclude_self=True)
+            )
         if b < h:
             parts.append(prefix_log(logits[:, b:], replace(spec, kind="prefix_log")))
         return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
@@ -522,7 +740,9 @@ def apply_attention(logits: Tensor, spec: AttentionSpec) -> Tensor:
         if a:
             parts.append(identity_attention(logits[:, :a]))
         if b > a:
-            parts.append(recency_attention(logits[:, a:b], spec.slope, exclude_self=True))
+            parts.append(
+                recency_attention(logits[:, a:b], spec.slope, exclude_self=True)
+            )
         if c > b:
             balanced_spec = replace(spec, kind="geometric_prefix")
             parts.append(geometric_prefix_log(logits[:, b:c], balanced_spec))
@@ -541,7 +761,9 @@ def role_complete_attention(logits: Tensor, spec: AttentionSpec) -> Tensor:
     h = logits.shape[1]
     counts = (spec.local_heads, spec.balanced_heads, spec.free_heads)
     if any(n < 0 for n in counts) or sum(counts) != h:
-        raise ValueError("local_heads + balanced_heads + free_heads must equal the head count")
+        raise ValueError(
+            "local_heads + balanced_heads + free_heads must equal the head count"
+        )
     a = spec.local_heads
     b = a + spec.balanced_heads
     parts: list[Tensor] = []

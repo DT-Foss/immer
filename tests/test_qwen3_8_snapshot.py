@@ -18,6 +18,7 @@ from immer.runtimes.deepseek_v4.snapshot import (
 from immer.runtimes.qwen3_8 import (
     QWEN38_SNAPSHOT_SCHEMA,
     Qwen38RuntimeError,
+    Qwen38NativeHeadCrsa,
     Qwen38SnapshotError,
     Qwen38StableCrsaGraft,
     Qwen38WeightPager,
@@ -25,7 +26,7 @@ from immer.runtimes.qwen3_8 import (
 )
 from immer.runtimes.qwen3_8.provenance import runtime_source_manifest
 
-from test_qwen3_8_model import _tiny_config, _tiny_weights
+from test_qwen3_8_model import _native_tiny_config, _tiny_config, _tiny_weights
 
 
 class Qwen38SnapshotTests(unittest.TestCase):
@@ -272,6 +273,68 @@ class Qwen38SnapshotTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(DeepSeekV4SnapshotError, "unsupported.*schema"):
             read_snapshot(path, expected_identity=identity)
+
+    def test_native_head_crsa_snapshots_refuse_before_io_and_bind_source(self) -> None:
+        source = Streamer.from_local(self.root, budget_mb=20, use_cache=False)
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="float32",
+            max_resident_bytes=2 * 1024**2,
+        )
+        self.resources.append((pager, source))
+        model = StreamedQwen38(
+            _native_tiny_config(),
+            pager,
+            native_head_crsa=Qwen38NativeHeadCrsa(),
+            max_seq_len=16,
+        )
+        path = self.root / "native-refused.json"
+        with self.assertRaisesRegex(
+            Qwen38SnapshotError, "native Head-CRSA.*unsupported"
+        ):
+            model.save_state(path)
+        self.assertFalse(path.exists())
+        with self.assertRaisesRegex(
+            Qwen38SnapshotError, "native Head-CRSA.*unsupported"
+        ):
+            model.load_state(path)
+
+        runtime_paths = {
+            row["path"] for row in runtime_source_manifest(include_transport=False)
+        }
+        self.assertIn("immer/runtimes/qwen3_8/native_crsa.py", runtime_paths)
+
+        native_root = self.root / "native-alpha-zero"
+        native_root.mkdir()
+        config = _native_tiny_config()
+        save_file(_tiny_weights(config), native_root / "model.safetensors")
+        identity_source = Streamer.from_local(
+            native_root, budget_mb=20, use_cache=False
+        )
+        identity_pager = Qwen38WeightPager(
+            identity_source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=2 * 1024**2,
+        )
+        self.resources.append((identity_pager, identity_source))
+        alpha_zero = StreamedQwen38(
+            config,
+            identity_pager,
+            native_head_crsa=Qwen38NativeHeadCrsa(alpha=0.0),
+            max_seq_len=16,
+        )
+        off = StreamedQwen38(config, identity_pager, max_seq_len=16)
+        prompt = [[1, 4, 9]]
+        alpha_zero.prefill(prompt)
+        identity_path = self.root / "native-alpha-zero.json"
+        receipt = alpha_zero.save_state(identity_path)
+        self.assertEqual(receipt["tensor_count"], 56)
+        off.load_state(identity_path)
+        expected, _ = alpha_zero.decode([[7]])
+        actual, _ = off.decode([[7]])
+        self.assertTrue(torch.equal(actual, expected))
 
 
 if __name__ == "__main__":

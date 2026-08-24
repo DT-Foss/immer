@@ -32,6 +32,16 @@ from .model import (
     StatefulEvidence,
     StreamedQwen38,
 )
+from .native_crsa import (
+    NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA,
+    NATIVE_HEAD_CRSA_FREE_HEADS,
+    NATIVE_HEAD_CRSA_KV_HEADS,
+    NATIVE_HEAD_CRSA_LAYER,
+    NATIVE_HEAD_CRSA_QUERY_HEADS,
+    NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE,
+    NativeHeadCrsaEvidence,
+    Qwen38NativeHeadCrsa,
+)
 from .pager import Qwen38PagerError, Qwen38WeightPager
 from .probe import (
     DELTANET_COMPARISON_SCHEMA,
@@ -61,6 +71,13 @@ __all__ = [
     "IM_END_TOKEN_ID",
     "IM_START_TOKEN_ID",
     "LogicalModelIdentity",
+    "NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA",
+    "NATIVE_HEAD_CRSA_FREE_HEADS",
+    "NATIVE_HEAD_CRSA_KV_HEADS",
+    "NATIVE_HEAD_CRSA_LAYER",
+    "NATIVE_HEAD_CRSA_QUERY_HEADS",
+    "NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE",
+    "NativeHeadCrsaEvidence",
     "OFFICIAL_REPO_ID",
     "OFFICIAL_REVISION",
     "PrefillEvidence",
@@ -70,6 +87,7 @@ __all__ = [
     "Qwen38DraftVerifier",
     "Qwen38DeltaNetProbeError",
     "Qwen38EncodingError",
+    "Qwen38NativeHeadCrsa",
     "Qwen38PagerError",
     "Qwen38RuntimeError",
     "Qwen38SnapshotError",
