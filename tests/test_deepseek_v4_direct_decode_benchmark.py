@@ -193,6 +193,7 @@ class DirectDecodeBenchmarkTests(unittest.TestCase):
             with (
                 mock.patch.object(benchmark, "_build_source", return_value=Source()),
                 mock.patch.object(benchmark, "_load_config", return_value=config),
+                redirect_stderr(io.StringIO()),
             ):
                 prepared = benchmark.prepare_prefix(prepare_args)
             self.assertEqual(prepared["arm"], "prepare")
@@ -217,6 +218,7 @@ class DirectDecodeBenchmarkTests(unittest.TestCase):
             with (
                 mock.patch.object(benchmark, "_build_source", return_value=Source()),
                 mock.patch.object(benchmark, "_load_config", return_value=config),
+                redirect_stderr(io.StringIO()),
             ):
                 decoded = benchmark.decode_arm(decode_args)
             self.assertEqual(decoded["arm"], "baseline")
