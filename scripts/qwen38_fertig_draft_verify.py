@@ -71,6 +71,7 @@ OFFICIAL_TOKENIZER_SHA256 = (
 RESULT_SCHEMA = "immer.qwen3.8-fertig-draft-verification/v1"
 TRACE_CHECKPOINT_SCHEMA = "immer.qwen3.8-trace-resume-pair/v1"
 INPUT_SCHEMA = "immer.qwen3.8-fertig-draft-inputs/v1"
+PREFIX_FORK_SCHEMA = "immer.qwen3.8-fertig-prefix-fork/v1"
 BASELINE_SCHEMA = "immer.qwen-local-fertig-baseline/v1"
 BASELINE_MODEL_REVISION = "Qwen3.8-27B-Q3_K_M-no-think"
 BASELINE_SYSTEM_PROMPT = (
@@ -179,6 +180,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-dir", default=str(DEFAULT_RUN_DIR))
     parser.add_argument("--result-json")
     parser.add_argument("--access-trace-json")
+    parser.add_argument(
+        "--fork-off-trace-json",
+        help="paired off-mode trace checkpoint to fork exactly at the graft layer",
+    )
     parser.add_argument("--resume-file")
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE))
     parser.add_argument("--causal-bundle")
@@ -201,6 +206,11 @@ def _parser() -> argparse.ArgumentParser:
         "--prepare-only",
         action="store_true",
         help="validate and tokenize the fixed drafts without opening model weights",
+    )
+    parser.add_argument(
+        "--fork-only",
+        action="store_true",
+        help="create a candidate checkpoint from an off prefix and stop",
     )
     parser.add_argument(
         "--offline-tokenizer",
@@ -521,6 +531,82 @@ def _write_trace_checkpoint(
         "resume_sha256": resume_sha,
         "sha256": trace.sha256,
         "source_body_bytes": int(state.source_body_bytes),
+    }
+
+
+def _fork_trace_checkpoint_at_graft(
+    off_trace_path: Path,
+    candidate_trace_path: Path,
+    *,
+    off_identity: str,
+    candidate_identity: str,
+    expected_shape: Sequence[int],
+    expected_dtype: str,
+    n_layers: int,
+    graft_layer: int,
+) -> dict[str, Any]:
+    """Rebind an authenticated common prefix at the first changed layer."""
+
+    if graft_layer <= 0 or graft_layer >= n_layers:
+        raise CliError("prefix fork graft layer must be inside the decoder")
+    if off_trace_path == candidate_trace_path:
+        raise CliError("prefix fork source and candidate trace paths must differ")
+    candidate_manifest = _trace_checkpoint_manifest(candidate_trace_path)
+    if any(
+        path.exists() or path.is_symlink()
+        for path in (candidate_trace_path, candidate_manifest)
+    ):
+        raise CliError("candidate trace checkpoint already exists; use --restart")
+    pair = _load_trace_checkpoint(off_trace_path, off_identity)
+    if pair is None:
+        raise CliError("off prefix trace checkpoint is unavailable")
+    if pair.next_layer != graft_layer:
+        raise CliError(
+            "off prefix checkpoint must stop exactly at the candidate graft layer"
+        )
+    state = load_resume(
+        pair.resume_path,
+        off_identity,
+        expected_shape=expected_shape,
+        expected_dtype=expected_dtype,
+        n_layers=n_layers,
+        active_graft_layer=None,
+    )
+    if state is None:
+        raise CliError("off prefix resume payload is unavailable")
+    if (
+        state.next_layer != graft_layer
+        or state.graft_applied
+        or state.source_body_bytes != pair.source_body_bytes
+    ):
+        raise CliError("off prefix state does not prove an ungrafted boundary")
+    recorder = AccessTraceRecorder(initial_trace=pair.trace)
+    receipt = _write_trace_checkpoint(
+        recorder,
+        candidate_trace_path,
+        candidate_identity,
+        state,
+        expected_shape=expected_shape,
+        expected_dtype=expected_dtype,
+        n_layers=n_layers,
+        active_graft_layer=graft_layer,
+    )
+    cloned = _load_trace_checkpoint(candidate_trace_path, candidate_identity)
+    if (
+        cloned is None
+        or cloned.next_layer != graft_layer
+        or cloned.source_body_bytes != pair.source_body_bytes
+        or cloned.trace.sha256 != pair.trace.sha256
+    ):
+        raise CliError("candidate prefix fork failed post-write verification")
+    return {
+        **receipt,
+        "fork_layer": graft_layer,
+        "inherited_model_seconds": float(state.seconds),
+        "off_resume_identity": off_identity,
+        "candidate_resume_identity": candidate_identity,
+        "off_trace_sha256": pair.trace.sha256,
+        "candidate_trace_sha256": cloned.trace.sha256,
     }
 
 
@@ -998,6 +1084,101 @@ def _model_runtime(
             raise cleanup_error
 
 
+def _fork_off_prefix(
+    args: argparse.Namespace,
+    rows: Sequence[PreparedDraft],
+    *,
+    runtime_factory: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    if args.mode != "stable-crsa" or args.graft_layer <= 0:
+        raise CliError("prefix forking requires stable-crsa at a positive layer")
+    if not args.fork_off_trace_json or not args.access_trace_json:
+        raise CliError("prefix forking requires off and candidate trace paths")
+    off_trace_path = Path(args.fork_off_trace_json).expanduser().resolve()
+    candidate_trace_path = Path(args.access_trace_json).expanduser().resolve()
+    if args.restart:
+        _discard_trace_checkpoint(candidate_trace_path)
+
+    prompts = tuple(row.prompt_token_ids for row in rows)
+    drafts = tuple(row.draft_token_ids for row in rows)
+    max_seq_len = max(
+        len(prompt) + len(draft) for prompt, draft in zip(prompts, drafts, strict=True)
+    )
+    runtime = _model_runtime if runtime_factory is None else runtime_factory
+    with runtime(
+        args,
+        max_batch_size=len(rows),
+        max_seq_len=max_seq_len,
+    ) as model:
+        expected_shape = tuple(model.prefill_hidden_shape(len(rows), max_seq_len))
+        expected_dtype = str(model.pager.compute_dtype).removeprefix("torch.")
+        execution_contract = {
+            "device": str(model.pager.device),
+            "dtype": expected_dtype,
+            "padding_token_id": END_OF_TEXT_TOKEN_ID,
+            "eos_token_id": IM_END_TOKEN_ID,
+            "accepted_eos_token_ids": [IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID],
+        }
+        off_identity = build_resume_identity(
+            source_id=OFFICIAL_REPO_ID,
+            source_revision=OFFICIAL_REVISION,
+            prompt_token_ids=prompts,
+            draft_token_ids=drafts,
+            execution_contract=execution_contract,
+            graft_contract=None,
+        )
+        graft_contract = {
+            "mode": args.mode,
+            "layer": args.graft_layer,
+            "alpha": args.graft_alpha,
+        }
+        candidate_identity = build_resume_identity(
+            source_id=OFFICIAL_REPO_ID,
+            source_revision=OFFICIAL_REVISION,
+            prompt_token_ids=prompts,
+            draft_token_ids=drafts,
+            execution_contract=execution_contract,
+            graft_contract=graft_contract,
+        )
+        receipt = _fork_trace_checkpoint_at_graft(
+            off_trace_path,
+            candidate_trace_path,
+            off_identity=off_identity,
+            candidate_identity=candidate_identity,
+            expected_shape=expected_shape,
+            expected_dtype=expected_dtype,
+            n_layers=int(model.config.n_layers),
+            graft_layer=args.graft_layer,
+        )
+    document: dict[str, Any] = {
+        "schema": PREFIX_FORK_SCHEMA,
+        "status": "ready",
+        "source": {
+            "checkpoint": OFFICIAL_REPO_ID,
+            "revision": OFFICIAL_REVISION,
+            "verification": getattr(args, "_source_verification", None),
+        },
+        "protocol": {
+            "batch_size": len(rows),
+            "item_ids": [row.item_id for row in rows],
+            "off_mode": "off",
+            "candidate_mode": args.mode,
+            "graft_layer": args.graft_layer,
+            "graft_alpha": args.graft_alpha,
+            "fork_invariant": "off and candidate math are identical before graft_layer",
+        },
+        "fork": receipt,
+        "summary": {
+            "items": len(rows),
+            "fork_layer": args.graft_layer,
+            "inherited_model_seconds": receipt["inherited_model_seconds"],
+            "inherited_source_body_bytes": receipt["source_body_bytes"],
+        },
+    }
+    document["report_sha256"] = hashlib.sha256(_canonical_json(document)).hexdigest()
+    return document
+
+
 def _cache_disk_preflight(args: argparse.Namespace) -> dict[str, int]:
     if args.causal_bundle is not None:
         bundle = Path(args.causal_bundle).expanduser().resolve()
@@ -1348,6 +1529,10 @@ def run(
     runtime_factory: Callable[..., Any] | None = None,
     verifier_factory: Callable[..., Any] | None = None,
 ) -> tuple[dict[str, Any], Path]:
+    if args.prepare_only and args.fork_only:
+        raise CliError("--prepare-only and --fork-only are mutually exclusive")
+    if args.fork_only and not args.dynamic_cohort:
+        raise CliError("prefix forking requires an explicit dynamic cohort")
     tokenizer_path = _resolve_tokenizer_path(args)
     tokenizer = tokenizer_factory(tokenizer_path)
     item_ids = _cohort_item_ids(
@@ -1366,10 +1551,22 @@ def run(
         Path(args.result_json).expanduser().resolve()
         if args.result_json
         else run_dir
-        / ("inputs.json" if args.prepare_only else f"result-{args.mode}.json")
+        / (
+            "inputs.json"
+            if args.prepare_only
+            else "prefix-fork.json"
+            if args.fork_only
+            else f"result-{args.mode}.json"
+        )
     )
     if args.prepare_only:
         result = _input_document(rows)
+    elif args.fork_only:
+        result = _fork_off_prefix(
+            args,
+            rows,
+            runtime_factory=runtime_factory,
+        )
     else:
         _progress("local_verification_start", rows=len(rows), mode=args.mode)
         report = _verify(
@@ -1380,7 +1577,7 @@ def run(
         )
         result = _result_document(args, rows, tokenizer, report)
     output = _atomic_write_json(result_path, result)
-    if not args.prepare_only:
+    if not args.prepare_only and not args.fork_only:
         try:
             trace_path = _access_trace_path(args)
             removed = (

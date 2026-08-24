@@ -656,6 +656,96 @@ class Qwen38FertigDraftVerifyTests(unittest.TestCase):
             self.assertFalse(checkpoint.resume_path.exists())
             self.assertFalse(checkpoint.trace_path.exists())
 
+    def test_off_prefix_forks_exactly_at_the_candidate_graft_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            off_trace = root / "off.json"
+            candidate_trace = root / "candidate.json"
+            off_identity = "a" * 64
+            candidate_identity = "b" * 64
+            recorder = AccessTraceRecorder()
+            recorder.observe(
+                AccessOperation(
+                    repo_id=verify_script.OFFICIAL_REPO_ID,
+                    revision=verify_script.OFFICIAL_REVISION,
+                    inventory_fingerprint="c" * 64,
+                    operation="raw_bytes",
+                    operation_sequence=1,
+                    thread_id=1,
+                    thread_name="test",
+                    leaves=(AccessLeaf("model.safetensors", 0, 32),),
+                    source_requests=1,
+                    source_bytes=32,
+                    cache_hits=0,
+                )
+            )
+            state = verify_script.DraftVerificationResumeState(
+                next_layer=27,
+                hidden=torch.zeros(2, 3, 4),
+                layer_calls=27,
+                layer_retry_count=0,
+                source_body_bytes=32,
+                linear_calls=210,
+                seconds=123.5,
+                graft_applied=False,
+            )
+            verify_script._write_trace_checkpoint(
+                recorder,
+                off_trace,
+                off_identity,
+                state,
+                expected_shape=(2, 3, 4),
+                expected_dtype="float32",
+                n_layers=64,
+                active_graft_layer=None,
+            )
+
+            receipt = verify_script._fork_trace_checkpoint_at_graft(
+                off_trace,
+                candidate_trace,
+                off_identity=off_identity,
+                candidate_identity=candidate_identity,
+                expected_shape=(2, 3, 4),
+                expected_dtype="float32",
+                n_layers=64,
+                graft_layer=27,
+            )
+
+            self.assertEqual(receipt["fork_layer"], 27)
+            self.assertEqual(receipt["inherited_model_seconds"], 123.5)
+            self.assertEqual(
+                receipt["off_trace_sha256"], receipt["candidate_trace_sha256"]
+            )
+            pair = verify_script._load_trace_checkpoint(
+                candidate_trace, candidate_identity
+            )
+            self.assertIsNotNone(pair)
+            assert pair is not None
+            cloned = verify_script.load_resume(
+                pair.resume_path,
+                candidate_identity,
+                expected_shape=(2, 3, 4),
+                expected_dtype="float32",
+                n_layers=64,
+                active_graft_layer=27,
+            )
+            self.assertIsNotNone(cloned)
+            assert cloned is not None
+            self.assertEqual(cloned.next_layer, 27)
+            self.assertFalse(cloned.graft_applied)
+
+            with self.assertRaisesRegex(verify_script.CliError, "exactly"):
+                verify_script._fork_trace_checkpoint_at_graft(
+                    off_trace,
+                    root / "wrong-boundary.json",
+                    off_identity=off_identity,
+                    candidate_identity="d" * 64,
+                    expected_shape=(2, 3, 4),
+                    expected_dtype="float32",
+                    n_layers=64,
+                    graft_layer=26,
+                )
+
     def test_trace_resume_pair_rejects_stale_identity_and_crash_mixing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

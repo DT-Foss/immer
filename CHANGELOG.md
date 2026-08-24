@@ -30,6 +30,9 @@ All notable changes to IMMER are recorded here.
 - Added a fail-closed paired `off`/CRSA comparator that requires identical
   checkpoint, causal bundle, cohort, prompts, and drafts, and treats new
   agreement with wrong drafts as an unsafe regression rather than quality.
+- Added authenticated common-prefix forking at the exact CRSA graft boundary.
+  The candidate inherits the off arm's hidden state, complete causal trace,
+  source bytes, and model time, then recomputes every changed layer.
 
 ## [0.8.0] — 2026-08-23
 
