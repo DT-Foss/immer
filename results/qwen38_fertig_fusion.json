@@ -10,11 +10,11 @@
   "protocol": {
     "decision_order": [
       "exact_ir",
-      "model_verified",
       "abstain"
     ],
     "gold_used_for_decisions": false,
     "model_verified_is_exact": false,
+    "model_agreement_can_answer": false,
     "canonical_answer_prefix_tokens": 2
   },
   "items": [
@@ -31,10 +31,12 @@
         "solve_status": "unique",
         "answer": "2",
         "certificate": {
+          "kind": "fraction_rref/v1",
           "rank": 5,
           "variable_count": 5,
           "equation_count": 5,
-          "zero_residuals": true
+          "zero_residuals": true,
+          "verified": true
         }
       },
       "decision": "exact_ir",
@@ -55,10 +57,12 @@
         "solve_status": "unique",
         "answer": "4",
         "certificate": {
+          "kind": "fraction_rref/v1",
           "rank": 5,
           "variable_count": 5,
           "equation_count": 5,
-          "zero_residuals": true
+          "zero_residuals": true,
+          "verified": true
         }
       },
       "decision": "exact_ir",
@@ -79,10 +83,12 @@
         "solve_status": "unique",
         "answer": "14000",
         "certificate": {
+          "kind": "fraction_rref/v1",
           "rank": 3,
           "variable_count": 3,
           "equation_count": 3,
-          "zero_residuals": true
+          "zero_residuals": true,
+          "verified": true
         }
       },
       "decision": "exact_ir",
@@ -104,10 +110,10 @@
         "answer": null,
         "certificate": null
       },
-      "decision": "model_verified",
-      "accepted": true,
-      "answer": "1",
-      "correct": true
+      "decision": "model_agreement_quarantine",
+      "accepted": false,
+      "answer": null,
+      "correct": null
     },
     {
       "item_id": "gsm8k-test-1032-e5873b4dd50866b6",
@@ -122,10 +128,12 @@
         "solve_status": "unique",
         "answer": "450",
         "certificate": {
+          "kind": "fraction_rref/v1",
           "rank": 3,
           "variable_count": 3,
           "equation_count": 3,
-          "zero_residuals": true
+          "zero_residuals": true,
+          "verified": true
         }
       },
       "decision": "exact_ir",
@@ -165,10 +173,12 @@
         "solve_status": "unique",
         "answer": "16",
         "certificate": {
+          "kind": "fraction_rref/v1",
           "rank": 5,
           "variable_count": 5,
           "equation_count": 5,
-          "zero_residuals": true
+          "zero_residuals": true,
+          "verified": true
         }
       },
       "decision": "exact_ir",
@@ -190,24 +200,25 @@
         "answer": null,
         "certificate": null
       },
-      "decision": "model_verified",
-      "accepted": true,
-      "answer": "2",
-      "correct": true
+      "decision": "model_agreement_quarantine",
+      "accepted": false,
+      "answer": null,
+      "correct": null
     }
   ],
   "summary": {
     "total": 8,
     "exact_ir": 5,
-    "model_verified": 2,
+    "model_verified": 0,
+    "model_agreement_quarantine": 2,
     "content_rejected": 0,
     "surface_quarantine": 1,
-    "answered": 7,
-    "abstained": 1,
-    "correct": 7,
+    "answered": 5,
+    "abstained": 3,
+    "correct": 5,
     "wrong": 0,
-    "coverage": 0.875,
-    "overall_accuracy": 0.875,
+    "coverage": 0.625,
+    "overall_accuracy": 0.625,
     "answered_accuracy": 1.0
   }
 }

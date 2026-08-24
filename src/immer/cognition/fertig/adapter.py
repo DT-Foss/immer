@@ -12,6 +12,7 @@ from typing import Iterator
 
 from ...contracts import ExecutionStatus, Request, Result
 from .arithmetic_ir import SolveStatus, solve as solve_arithmetic_ir
+from .formula_certificates import solve_guarded_formula
 from .structural import ParseStatus, parse_structural_problem
 
 
@@ -29,24 +30,29 @@ def _format_fraction(value: object) -> str:
     return str(float(value))
 
 
-def _solve_structural(question: str) -> str | None:
+def _solve_certified(question: str) -> str | None:
+    formula = solve_guarded_formula(question)
     parsed = parse_structural_problem(question)
     if parsed.status is ParseStatus.INVALID:
         raise FertigStructuralError(f"invalid structural parse: {parsed.reason}")
     if not parsed.ok:
-        return None
+        return _format_fraction(formula.answer) if formula is not None else None
     assert parsed.problem is not None
     solution = solve_arithmetic_ir(parsed.problem)
     if solution.status is SolveStatus.INVALID:
         raise FertigStructuralError(f"invalid arithmetic IR: {solution.reason}")
     if not solution.unique:
-        return None
+        return _format_fraction(formula.answer) if formula is not None else None
     if (
         solution.target_value is None
         or solution.certificate is None
         or not solution.certificate.verified
     ):
         raise FertigStructuralError("unique structural solution lacks a certificate")
+    if formula is not None and formula.answer != solution.target_value:
+        raise FertigStructuralError(
+            "independent exact certificates disagree on the target value"
+        )
     return _format_fraction(solution.target_value)
 
 
@@ -92,10 +98,13 @@ class FertigSolver:
         self.root = Path(configured).expanduser().resolve() if configured else None
 
     def _solve(self, question: str):
+        certified = _solve_certified(question)
+        if certified is not None:
+            return certified
         if self.root is not None:
             with _solver_from_checkout(self.root) as solver:
                 answer = solver.solve(question)
-            return answer if answer is not None else _solve_structural(question)
+            return answer
         # The vendored copy ships with immer and always wins over an
         # ambient installation — reproducibility beats environment luck.
         vendor = Path(__file__).resolve().parent / "_vendor"
@@ -108,16 +117,14 @@ class FertigSolver:
                 raise FileNotFoundError(
                     f"broken vendored FERTIG under {vendor}"
                 ) from exc
-            answer = solver.solve(question)
-            return answer if answer is not None else _solve_structural(question)
+            return solver.solve(question)
         try:
             solver = importlib.import_module("fertig.solver")
         except ModuleNotFoundError as exc:
             raise FileNotFoundError(
                 "FERTIG is not installed, not vendored, and IMMER_FERTIG_ROOT is not configured"
             ) from exc
-        answer = solver.solve(question)
-        return answer if answer is not None else _solve_structural(question)
+        return solver.solve(question)
 
     def handle(self, request: Request) -> Result:
         if request.capability not in self.capabilities:

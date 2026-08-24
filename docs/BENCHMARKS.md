@@ -12,10 +12,10 @@ execution.
 | Benchmark | Result | Scope | Evidence |
 |---|---:|---|---|
 | SHIP-v6 exact suite | 152/152 answers; 152/152 routes | frozen host plus four exact organs | `manifests/s3_ship_v6.json`; `python -m immer eval` |
-| FERTIG GSM8K | 1,073 correct; 0 wrong; 246 abstentions; 81.35% coverage | all 1,319 GSM8K test rows, strict zero-wrong scoring | [`results/bench_gsm8k.json`](../results/bench_gsm8k.json) |
+| FERTIG GSM8K | 1,089 correct; 0 wrong; 230 abstentions; 82.56% coverage | all 1,319 GSM8K test rows, certificate-first and strict zero-wrong scoring | [`results/bench_gsm8k.json`](../results/bench_gsm8k.json) |
 | DeepSeek V4 MMLU | 3/4 correct; 43/43 layers complete | exact `off` mode on one fixed four-item high-school-geography slice | [`results/deepseek-v4-mmlu-off-4-exact-v4-window2x3-receipt.json`](../results/deepseek-v4-mmlu-off-4-exact-v4-window2x3-receipt.json) |
 | DeepSeek V4 + FERTIG | 6/8 correct; 0 wrong; 2 abstentions | fixed eight-item GSM8K failure slice; five exact certificates plus one model-verified answer | [`results/deepseek-v4-fertig-fusion.json`](../results/deepseek-v4-fertig-fusion.json) |
-| Qwen3.8 + FERTIG | 7/8 correct; 0 wrong; 1 quarantine | fixed eight-item GSM8K failure slice | [`results/qwen38_fertig_fusion.json`](../results/qwen38_fertig_fusion.json) |
+| Qwen3.8 + FERTIG | 5/8 exact; 0 wrong; 3 quarantined | fixed eight-item GSM8K failure slice; model agreement cannot answer without an independent certificate | [`results/qwen38_fertig_fusion.json`](../results/qwen38_fertig_fusion.json) |
 
 The four-item and eight-item rows are integration slices. Their claims stop at
 those exact item sets.

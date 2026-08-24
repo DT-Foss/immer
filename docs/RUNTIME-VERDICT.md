@@ -21,8 +21,9 @@ is the remaining measurement gate.
 
 - DeepSeek completes all 43 layers on a fixed four-item MMLU slice and scores
   3/4 in exact `off` mode.
-- FERTIG scores 1,073 correct, zero wrong, and 246 abstentions across all 1,319
-  GSM8K test rows.
+- FERTIG scores 1,089 correct, zero wrong, and 230 abstentions across all 1,319
+  GSM8K test rows. Guarded formula certificates now precede structural IR and
+  the legacy solver path.
 - SHIP-v6 scores 152/152 answers and 152/152 routes with four frozen organs.
 - The CRSA context router scores 182/182 on its fixed arithmetic/text corpus;
   the causal-softmax ablation matches it.

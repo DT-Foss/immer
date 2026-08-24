@@ -724,17 +724,30 @@ def _prepare_drafts(
     raw_rows = document.get("items")
     if not isinstance(raw_rows, list) or len(raw_rows) != len(item_ids):
         raise CliError("Qwen baseline item count mismatch")
+    if tuple(item_ids) == FIXED_ITEM_IDS:
+        allowed_statuses = {"abstained", "correct"}
+    else:
+        benchmark_contract = document.get("benchmark")
+        selection = (
+            benchmark_contract.get("selection")
+            if isinstance(benchmark_contract, Mapping)
+            else None
+        )
+        cohort = selection.get("cohort") if isinstance(selection, Mapping) else None
+        if cohort == "abstained":
+            allowed_statuses = {"abstained"}
+        elif cohort == "eligible":
+            allowed_statuses = {"abstained", "correct"}
+        else:
+            raise CliError("dynamic baseline cohort selection is invalid")
 
     prepared: list[PreparedDraft] = []
     for index, (item_id, raw) in enumerate(zip(item_ids, raw_rows, strict=True)):
         if not isinstance(raw, Mapping) or raw.get("item_id") != item_id:
             raise CliError(f"Qwen baseline row {index} is out of order")
         benchmark_row = benchmark_rows.get(item_id)
-        if benchmark_row is None or benchmark_row.get("status") not in {
-            "abstained",
-            "correct",
-        }:
-            raise CliError(f"fixed historical cohort item is unavailable: {item_id}")
+        if benchmark_row is None or benchmark_row.get("status") not in allowed_statuses:
+            raise CliError(f"benchmark item violates cohort status: {item_id}")
         question = benchmark_row.get("question")
         if not isinstance(question, str) or raw.get("question") != question:
             raise CliError(f"stale baseline question: {item_id}")

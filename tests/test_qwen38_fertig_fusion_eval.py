@@ -89,7 +89,9 @@ class Qwen38FertigFusionTests(unittest.TestCase):
         self.assertTrue(row["correct"])
         self.assertTrue(row["exact"]["certificate"]["zero_residuals"])
 
-    def test_verified_model_answer_is_never_labeled_exact(self) -> None:
+    def test_model_agreement_quarantines_by_default_and_legacy_is_explicit(
+        self,
+    ) -> None:
         question = "Which unsupported symbolic answer should be surfaced?"
         drafts = {
             "schema": fusion.BASELINE_SCHEMA,
@@ -103,7 +105,19 @@ class Qwen38FertigFusionTests(unittest.TestCase):
             ],
         }
 
-        row = fusion.fuse_documents(drafts, verification)["items"][0]
+        safe = fusion.fuse_documents(drafts, verification)
+        row = safe["items"][0]
+        self.assertEqual(row["decision"], "model_agreement_quarantine")
+        self.assertIsNone(row["answer"])
+        self.assertFalse(row["accepted"])
+        self.assertFalse(safe["protocol"]["model_agreement_can_answer"])
+
+        legacy = fusion.fuse_documents(
+            drafts,
+            verification,
+            allow_model_verified=True,
+        )
+        row = legacy["items"][0]
         self.assertEqual(row["decision"], "model_verified")
         self.assertEqual(row["answer"], "7")
         self.assertIsNone(row["exact"]["answer"])
@@ -156,7 +170,9 @@ class Qwen38FertigFusionTests(unittest.TestCase):
             ],
         }
 
-        row = fusion.fuse_documents(drafts, verification)["items"][0]
+        row = fusion.fuse_documents(drafts, verification, allow_model_verified=True)[
+            "items"
+        ][0]
         self.assertEqual(row["decision"], "model_verified")
         self.assertEqual(row["answer"], "1/3")
         self.assertTrue(row["correct"])
@@ -228,6 +244,9 @@ class Qwen38FertigFusionTests(unittest.TestCase):
         self.assertEqual(result["status"], "complete")
         self.assertFalse(result["protocol"]["gold_used_for_decisions"])
         self.assertFalse(result["protocol"]["model_verified_is_exact"])
+        self.assertFalse(result["protocol"]["model_agreement_can_answer"])
+        self.assertEqual(result["summary"]["wrong"], 0)
+        self.assertEqual(result["summary"]["answered"], 0)
 
 
 if __name__ == "__main__":

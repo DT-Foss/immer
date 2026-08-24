@@ -33,7 +33,7 @@ EVAL_PATH = ROOT / "evals" / "gsm8k_test.parquet"
 RESULTS_DIR = ROOT / "results"
 DEFAULT_OUTPUT_PATH = RESULTS_DIR / "bench_gsm8k.json"
 SCHEMA = "immer.benchmark/v1"
-REPORT_REVISION = 2
+REPORT_REVISION = 3
 
 
 def gold_number(answer_field: str) -> float | None:
@@ -138,7 +138,8 @@ def harness_provenance() -> dict[str, Any]:
     }
     solver_name = (
         "immer.cognition.fertig.FertigSolver "
-        "(bindings->semantic; optional explicit rules; math templates proposal-only), "
+        "(guarded formulas->structural IR->bindings->semantic; "
+        "optional explicit rules; math templates proposal-only), "
         "no neural net"
     )
     return {
@@ -148,7 +149,13 @@ def harness_provenance() -> dict[str, Any]:
         "runner_sha256": runner_sha256,
         "solver": solver_name,
         "admission_policy": {
-            "answer_engines": ["bindings", "semantic", "explicit_rules_if_supplied"],
+            "answer_engines": [
+                "guarded_formula_certificates",
+                "structural_fraction_rref",
+                "bindings",
+                "semantic",
+                "explicit_rules_if_supplied",
+            ],
             "proposal_only": ["math_templates"],
             "hard_gate": "incorrect + errors == 0",
         },

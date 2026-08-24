@@ -4,9 +4,10 @@
 The decision order is intentionally asymmetric:
 
 1. an exact, full-rank Fraction/RREF certificate wins;
-2. otherwise a stopped Q3 answer may be surfaced as ``model_verified`` only
-   when the streamed BF16 checkpoint accepted its complete content and EOS;
-3. every other row abstains.
+2. Q3/BF16 agreement remains recorded evidence but abstains without an
+   independent exact certificate;
+3. ``--allow-model-verified`` reproduces the historical diagnostic policy but
+   is never the default publication policy.
 
 Gold answers are read only after the decision is fixed and are used solely for
 evaluation.  Model agreement is never renamed to mathematical correctness.
@@ -25,6 +26,7 @@ import tempfile
 from typing import Any
 
 from immer.cognition.fertig.arithmetic_ir import SolveStatus, solve
+from immer.cognition.fertig.formula_certificates import solve_guarded_formula
 from immer.cognition.fertig.structural import parse_structural_problem
 
 
@@ -49,6 +51,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--drafts", default=str(DEFAULT_DRAFTS))
     parser.add_argument("--verification", default=str(DEFAULT_VERIFICATION))
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
+    parser.add_argument(
+        "--allow-model-verified",
+        action="store_true",
+        help="diagnostic legacy policy; allows model agreement to answer",
+    )
     return parser
 
 
@@ -129,6 +136,7 @@ def _format_fraction(value: Fraction) -> str:
 
 
 def _exact_evidence(question: str) -> dict[str, Any]:
+    formula = solve_guarded_formula(question)
     parsed = parse_structural_problem(question)
     evidence: dict[str, Any] = {
         "parse_status": parsed.status.value,
@@ -138,11 +146,21 @@ def _exact_evidence(question: str) -> dict[str, Any]:
         "certificate": None,
     }
     if not parsed.ok:
+        if formula is None:
+            return evidence
+        evidence["solve_status"] = SolveStatus.UNIQUE.value
+        evidence["answer"] = _format_fraction(formula.answer)
+        evidence["certificate"] = formula.certificate.to_dict()
         return evidence
     assert parsed.problem is not None
     solution = solve(parsed.problem)
     evidence["solve_status"] = solution.status.value
     if solution.status is not SolveStatus.UNIQUE:
+        if formula is None:
+            return evidence
+        evidence["solve_status"] = SolveStatus.UNIQUE.value
+        evidence["answer"] = _format_fraction(formula.answer)
+        evidence["certificate"] = formula.certificate.to_dict()
         return evidence
     if (
         solution.target_value is None
@@ -150,19 +168,33 @@ def _exact_evidence(question: str) -> dict[str, Any]:
         or not solution.certificate.verified
     ):
         raise CliError("unique arithmetic solution lacks a verified certificate")
+    if formula is not None and formula.answer != solution.target_value:
+        raise CliError("independent exact certificates disagree")
     certificate = solution.certificate
+    zero_residuals = all(row.value == 0 for row in certificate.residuals)
+    if (
+        certificate.rank != certificate.variable_count
+        or certificate.equation_count < certificate.variable_count
+        or not zero_residuals
+    ):
+        raise CliError("verified arithmetic certificate is not full-rank and exact")
     evidence["answer"] = _format_fraction(solution.target_value)
     evidence["certificate"] = {
+        "kind": "fraction_rref/v1",
         "rank": certificate.rank,
         "variable_count": certificate.variable_count,
         "equation_count": certificate.equation_count,
-        "zero_residuals": all(row.value == 0 for row in certificate.residuals),
+        "zero_residuals": zero_residuals,
+        "verified": True,
     }
     return evidence
 
 
 def fuse_documents(
-    drafts: Mapping[str, Any], verification: Mapping[str, Any]
+    drafts: Mapping[str, Any],
+    verification: Mapping[str, Any],
+    *,
+    allow_model_verified: bool = False,
 ) -> dict[str, Any]:
     """Return a gold-label-independent decision followed by evaluation fields."""
 
@@ -234,10 +266,19 @@ def fuse_documents(
             fully_verified
             and q3_answer is not None
             and draft.get("finish_reason") == "stop"
+            and allow_model_verified
         ):
             decision = "model_verified"
             answer = q3_answer
             accepted = True
+        elif (
+            fully_verified
+            and q3_answer is not None
+            and draft.get("finish_reason") == "stop"
+        ):
+            decision = "model_agreement_quarantine"
+            answer = None
+            accepted = False
         else:
             answer = None
             accepted = False
@@ -277,6 +318,7 @@ def fuse_documents(
         for decision in (
             "exact_ir",
             "model_verified",
+            "model_agreement_quarantine",
             "content_rejected",
             "surface_quarantine",
         )
@@ -302,9 +344,14 @@ def fuse_documents(
         "status": "complete",
         "source": source,
         "protocol": {
-            "decision_order": ["exact_ir", "model_verified", "abstain"],
+            "decision_order": (
+                ["exact_ir", "model_verified", "abstain"]
+                if allow_model_verified
+                else ["exact_ir", "abstain"]
+            ),
             "gold_used_for_decisions": False,
             "model_verified_is_exact": False,
+            "model_agreement_can_answer": allow_model_verified,
             "canonical_answer_prefix_tokens": CANONICAL_ANSWER_PREFIX_TOKENS,
         },
         "items": rows,
@@ -356,6 +403,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = fuse_documents(
             _read_json(args.drafts, "Q3 baseline"),
             _read_json(args.verification, "BF16 verification"),
+            allow_model_verified=bool(args.allow_model_verified),
         )
         output = _atomic_write_json(args.output, report)
     except CliError as exc:

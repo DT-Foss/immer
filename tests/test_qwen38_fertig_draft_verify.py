@@ -250,6 +250,20 @@ class Qwen38FertigDraftVerifyTests(unittest.TestCase):
                 verify_script.FIXED_ITEM_IDS,
             )
 
+            benchmark_document = json.loads(benchmark.read_text(encoding="utf-8"))
+            benchmark_document["items"][0]["status"] = "correct"
+            benchmark.write_text(json.dumps(benchmark_document), encoding="utf-8")
+            with self.assertRaisesRegex(verify_script.CliError, "cohort status"):
+                verify_script._prepare_drafts(
+                    benchmark,
+                    drafts,
+                    _ByteTokenizer(tokenizer_path),
+                    max_draft_tokens=32,
+                    item_ids=selected,
+                )
+            benchmark_document["items"][0]["status"] = "abstained"
+            benchmark.write_text(json.dumps(benchmark_document), encoding="utf-8")
+
             document["benchmark"]["item_ids"] = [item_ids[0], item_ids[0], item_ids[2]]
             seal()
             drafts.write_text(json.dumps(document), encoding="utf-8")

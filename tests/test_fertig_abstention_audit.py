@@ -81,7 +81,9 @@ def _benchmark(*, wrong: bool = False):
 
 
 class FertigAbstentionAuditTests(unittest.TestCase):
-    def test_legacy_categories_are_closed_and_extract_only_contract_fields(self) -> None:
+    def test_legacy_categories_are_closed_and_extract_only_contract_fields(
+        self,
+    ) -> None:
         fixtures = (
             (
                 _binding("kein Frageziel", target_ok=False),
@@ -158,30 +160,20 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         with self.assertRaisesRegex(audit.AuditError, "unrecognized"):
             audit.classify_structural_parse(_parse("unsupported", "unknown"))
 
-    def test_report_is_deterministic_complete_gold_free_and_zero_hungarian(self) -> None:
+    def test_report_is_deterministic_complete_gold_free_and_zero_hungarian(
+        self,
+    ) -> None:
         benchmark = _benchmark()
         legacy_results = {
             "question 1": _binding("kein Frageziel", target_ok=False),
-            "question 2": _binding(
-                "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
-            ),
-            "question 3": _binding(
-                "Bindung unvollständig: 2 qty, 0 ratio, op=diff"
-            ),
-            "question 4": _binding(
-                "Zeit-/Geldbilanz nicht strukturell bewiesen"
-            ),
+            "question 2": _binding("Bindung unvollständig: 0 qty, 0 ratio, op=sum"),
+            "question 3": _binding("Bindung unvollständig: 2 qty, 0 ratio, op=diff"),
+            "question 4": _binding("Zeit-/Geldbilanz nicht strukturell bewiesen"),
         }
         structural_results = {
-            "question 1": _parse(
-                "ambiguous", "numeric pronoun binding is not proven"
-            ),
-            "question 2": _parse(
-                "ambiguous", "question pronoun binding is not proven"
-            ),
-            "question 3": _parse(
-                "unsupported", "unparsed numeric clause at 0:10"
-            ),
+            "question 1": _parse("ambiguous", "numeric pronoun binding is not proven"),
+            "question 2": _parse("ambiguous", "question pronoun binding is not proven"),
+            "question 3": _parse("unsupported", "unparsed numeric clause at 0:10"),
             "question 4": _parse("unsupported", "unsupported target at 4:14"),
         }
         legacy_calls: list[str] = []
@@ -207,10 +199,13 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first["audited_abstentions"], 4)
         self.assertEqual(first["baseline_partition"]["n"], 5)
-        self.assertEqual(first["classification_counts"]["scope"], {
-            "potential_coreference_scope": 2,
-            "grammar_scope": 2,
-        })
+        self.assertEqual(
+            first["classification_counts"]["scope"],
+            {
+                "potential_coreference_scope": 2,
+                "grammar_scope": 2,
+            },
+        )
         self.assertEqual(
             first["hungarian_verdict"]["directly_eligible_exclusive_instances"],
             0,
@@ -219,9 +214,7 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(len(first["items"]), 4)
         self.assertTrue(all("gold" not in item for item in first["items"]))
         self.assertEqual(legacy_calls, [f"question {i}" for i in range(1, 5)] * 2)
-        self.assertEqual(
-            structural_calls, [f"question {i}" for i in range(1, 5)] * 2
-        )
+        self.assertEqual(structural_calls, [f"question {i}" for i in range(1, 5)] * 2)
         unsealed = dict(first)
         observed_digest = unsealed.pop("report_sha256")
         self.assertEqual(
@@ -229,7 +222,9 @@ class FertigAbstentionAuditTests(unittest.TestCase):
             audit._sha256_bytes(audit._canonical_json_bytes(unsealed)),
         )
 
-    def test_benchmark_validation_rejects_partition_and_wrong_gate_defects(self) -> None:
+    def test_benchmark_validation_rejects_partition_and_wrong_gate_defects(
+        self,
+    ) -> None:
         items, counts = audit.validate_benchmark_report(_benchmark())
         self.assertEqual(len(items), 5)
         self.assertEqual(counts["abstained"], 4)
@@ -260,24 +255,24 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(
             audit.CURRENT_LEGACY_COUNTS,
             {
-                "target_parse_failed": 65,
-                "target_evidence_missing": 171,
-                "relation_incomplete": 20,
-                "equation_guard": 3,
+                "target_parse_failed": 57,
+                "target_evidence_missing": 154,
+                "relation_incomplete": 18,
+                "equation_guard": 1,
             },
         )
         self.assertEqual(
             audit.CURRENT_STRUCTURAL_COUNTS,
             {
-                "numeric_pronoun_ambiguous": 140,
+                "numeric_pronoun_ambiguous": 127,
                 "question_pronoun_ambiguous": 4,
-                "numeric_clause_unsupported": 111,
+                "numeric_clause_unsupported": 95,
                 "target_unsupported": 4,
             },
         )
         self.assertEqual(
             audit.CURRENT_SCOPE_COUNTS,
-            {"potential_coreference_scope": 144, "grammar_scope": 115},
+            {"potential_coreference_scope": 131, "grammar_scope": 99},
         )
         with self.assertRaisesRegex(audit.AuditError, "evidence drifted"):
             audit._validate_current_evidence(
@@ -286,8 +281,8 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                         "legacy": audit.CURRENT_LEGACY_COUNTS,
                         "structural": audit.CURRENT_STRUCTURAL_COUNTS,
                         "scope": {
-                            "potential_coreference_scope": 143,
-                            "grammar_scope": 116,
+                            "potential_coreference_scope": 130,
+                            "grammar_scope": 100,
                         },
                     }
                 }

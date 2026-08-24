@@ -11,8 +11,6 @@ from immer.contracts import ExecutionStatus, Request
 ROOT = Path(__file__).resolve().parent.parent
 GSM8K = ROOT / "evals" / "gsm8k_test.parquet"
 QUARANTINED_MATH_ROWS = (
-    216,
-    485,
     682,
     963,
     1012,
@@ -29,7 +27,25 @@ QUARANTINED_MATH_ROWS = (
     1272,
     1306,
 )
-FORMERLY_MASKED_BINDING_ERRORS = (210, 215, 299, 570, 1261, 1295)
+FORMERLY_MASKED_BINDING_ERRORS = (570, 1261, 1295)
+GUARDED_FORMULA_ROWS = {
+    53: "40",
+    128: "880",
+    210: "10",
+    215: "44",
+    216: "220",
+    296: "3",
+    299: "31800",
+    317: "12",
+    320: "8",
+    331: "8400",
+    391: "15",
+    462: "71",
+    482: "26",
+    485: "220",
+    489: "-10",
+    541: "50",
+}
 SELECTIVE_EXTERNAL_RESOLVER_CASES = (
     (
         "Jen got 3 fish. They each need $1 worth of food a day. "
@@ -83,6 +99,20 @@ SELECTIVE_EXTERNAL_RESOLVER_CASES = (
 
 
 class FertigAdapterTests(unittest.TestCase):
+    def test_guarded_formula_certificate_precedes_legacy_solver(self) -> None:
+        question = (
+            "Janeth borrowed $2000 and promised to return it with an additional "
+            "10% of the amount. If she is going to pay $165 a month for 12 months, "
+            "how much will be Janeth's remaining balance by then?"
+        )
+        solver = FertigSolver()
+        solver.handle(Request("exact_math", "not a supported problem"))
+        with mock.patch("fertig.solver.solve", return_value="999") as legacy:
+            result = solver.handle(Request("exact_math", question))
+        self.assertEqual(result.status, ExecutionStatus.OK)
+        self.assertEqual(result.output, "220")
+        legacy.assert_not_called()
+
     def test_selective_external_resolvers_add_only_bound_answers(self) -> None:
         solver = FertigSolver()
         for question, expected in SELECTIVE_EXTERNAL_RESOLVER_CASES:
@@ -236,6 +266,20 @@ class FertigAdapterTests(unittest.TestCase):
             result = solver.handle(Request("exact_math", "still unsupported"))
         self.assertEqual(result.status, ExecutionStatus.ERROR)
         self.assertIn("BindingParserError", result.reason)
+
+    @unittest.skipUnless(GSM8K.is_file(), "vendored GSM8K split unavailable")
+    def test_guarded_formula_rows_are_now_exactly_certified(self) -> None:
+        import pandas as pd
+
+        rows = pd.read_parquet(GSM8K)
+        solver = FertigSolver()
+        for index, expected in GUARDED_FORMULA_ROWS.items():
+            with self.subTest(index=index):
+                result = solver.handle(
+                    Request("exact_math", str(rows.iloc[index]["question"]))
+                )
+                self.assertEqual(result.status, ExecutionStatus.OK)
+                self.assertEqual(result.output, expected)
 
     @unittest.skipUnless(GSM8K.is_file(), "vendored GSM8K split unavailable")
     def test_all_observed_unverified_math_failures_are_must_abstain(self) -> None:

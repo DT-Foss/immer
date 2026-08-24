@@ -2,6 +2,27 @@
 
 All notable changes to IMMER are recorded here.
 
+## [Unreleased] — 2026-08-24
+
+### Certificate-first Qwen/FERTIG fusion
+
+- Added 16 full-string guarded formula families with exact `Fraction`
+  recomputation, complete numeric-literal coverage, source spans, and
+  SHA-256-bound certificates.
+- Moved guarded formulas and structural Fraction/RREF ahead of the legacy
+  FERTIG solver, including an explicit conflict gate between independent exact
+  certificates.
+- Raised full GSM8K coverage from 81.35% to 82.56%: 1,089 correct, zero wrong,
+  and 230 abstentions across all 1,319 test rows.
+- Rejected Q3/BF16 checkpoint agreement as an answer certificate after a
+  16-item hard cohort exposed six shared wrong answers. Model agreement now
+  quarantines by default; the legacy policy is available only as an explicit
+  diagnostic switch.
+- Completed the hard cohort with 16/16 exact answers, zero wrong, and 100%
+  coverage. Gold labels enter only after each answer or abstention is fixed.
+- Enforced dynamic-cohort status semantics, sealed-report integrity, and the
+  shared 64-item producer/consumer limit.
+
 ## [0.8.0] — 2026-08-23
 
 ### Causalized local frontier runtime

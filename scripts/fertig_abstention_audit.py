@@ -1,8 +1,8 @@
 """Gold-label-free audit of the sealed FERTIG GSM8K abstentions.
 
 The benchmark report is the admission boundary: this script validates its
-complete outcome partition, then re-runs only the 259 baseline-abstained
-questions through the vendored legacy binder and the closed structural parser.
+complete outcome partition, then re-runs every baseline-abstained question
+through the vendored legacy binder and the closed structural parser.
 Gold answers and predictions are deliberately never read by the classifier.
 
     PYTHONPATH=src python3 scripts/fertig_abstention_audit.py
@@ -33,7 +33,7 @@ LEGACY_BINDINGS_PATH = VENDOR_ROOT / "fertig" / "bindings.py"
 STRUCTURAL_PATH = ROOT / "src" / "immer" / "cognition" / "fertig" / "structural.py"
 
 SCHEMA = "immer.fertig-abstention-audit/v1"
-REPORT_REVISION = 1
+REPORT_REVISION = 2
 ALLOWED_STATUSES = ("correct", "abstained", "incorrect", "error")
 LEGACY_CATEGORIES = (
     "target_parse_failed",
@@ -48,20 +48,20 @@ STRUCTURAL_CATEGORIES = (
     "target_unsupported",
 )
 CURRENT_LEGACY_COUNTS = {
-    "target_parse_failed": 65,
-    "target_evidence_missing": 171,
-    "relation_incomplete": 20,
-    "equation_guard": 3,
+    "target_parse_failed": 57,
+    "target_evidence_missing": 154,
+    "relation_incomplete": 18,
+    "equation_guard": 1,
 }
 CURRENT_STRUCTURAL_COUNTS = {
-    "numeric_pronoun_ambiguous": 140,
+    "numeric_pronoun_ambiguous": 127,
     "question_pronoun_ambiguous": 4,
-    "numeric_clause_unsupported": 111,
+    "numeric_clause_unsupported": 95,
     "target_unsupported": 4,
 }
 CURRENT_SCOPE_COUNTS = {
-    "potential_coreference_scope": 144,
-    "grammar_scope": 115,
+    "potential_coreference_scope": 131,
+    "grammar_scope": 99,
 }
 _INCOMPLETE_BINDING = re.compile(
     r"^Bindung unvollständig: (?P<qty>\d+) qty, "
@@ -367,8 +367,7 @@ def build_audit_report(
             raise AuditError(f"{name} classifications are not a complete partition")
 
     eligible = sum(
-        bool(item["hungarian_exclusive_assignment_eligible"])
-        for item in audited_items
+        bool(item["hungarian_exclusive_assignment_eligible"]) for item in audited_items
     )
     document: dict[str, Any] = {
         "schema": SCHEMA,
@@ -520,7 +519,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-evidence-drift",
         action="store_true",
-        help="do not require the sealed current 65/171/20/3 and 140/4/111/4 counts",
+        help="do not require the committed evidence-count seal",
     )
     return parser
 
