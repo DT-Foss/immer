@@ -28,6 +28,7 @@ from .arithmetic_ir import (
     Sum,
     Unit,
     Variable,
+    variables_in_constraint,
 )
 
 
@@ -2450,7 +2451,7 @@ class StructuralParser:
         mentioned = {
             variable
             for constraint in self.constraints
-            for variable in _constraint_variables(constraint)
+            for variable in variables_in_constraint(constraint)
         }
         if target not in mentioned:
             raise _Abort(ParseStatus.UNSUPPORTED, "target has no structural evidence")
@@ -2458,31 +2459,6 @@ class StructuralParser:
             tuple(self.variables.values()), tuple(self.constraints), target
         )
         return ParseResult(ParseStatus.PARSED, problem)
-
-
-def _constraint_variables(constraint: object) -> tuple[Variable, ...]:
-    values: list[Variable] = []
-    for name in (
-        "target",
-        "source",
-        "amount",
-        "rate",
-        "duration",
-        "total",
-        "terms",
-        "part",
-        "whole",
-        "left",
-        "right",
-        "mean",
-        "values",
-    ):
-        item = getattr(constraint, name, None)
-        if isinstance(item, Variable):
-            values.append(item)
-        elif isinstance(item, tuple):
-            values.extend(value for value in item if isinstance(value, Variable))
-    return tuple(values)
 
 
 def parse_structural_problem(source: str) -> ParseResult:

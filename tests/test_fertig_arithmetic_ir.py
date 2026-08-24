@@ -18,6 +18,7 @@ from immer.cognition.fertig.arithmetic_ir import (
     Term,
     Unit,
     Variable,
+    variables_in_constraint,
     solve,
 )
 
@@ -205,6 +206,19 @@ class ArithmeticIRTests(unittest.TestCase):
 
         self.assertIs(result.status, SolveStatus.UNIQUE)
         self.assertEqual(result.target_value, 14)
+
+    def test_constraint_variables_unwrap_weighted_terms(self) -> None:
+        left = Variable("left", MONEY)
+        right = Variable("right", MONEY)
+        constraint = Balance(
+            (Term(left, 3), q(2, MONEY)),
+            (Term(right, -2),),
+        )
+
+        self.assertEqual(
+            variables_in_constraint(constraint),
+            (left, right),
+        )
 
     def test_variable_renaming_does_not_change_answer(self) -> None:
         def run(prefix: str) -> Fraction | None:

@@ -483,7 +483,9 @@ def _constraint_row(constraint: Constraint, index: int) -> _Row:
     raise _InvalidIR(f"unsupported constraint type: {type(constraint).__name__}")
 
 
-def _variables_in_constraint(constraint: Constraint) -> frozenset[str]:
+def variables_in_constraint(constraint: Constraint) -> tuple[Variable, ...]:
+    """Return every variable referenced by one constraint, including terms."""
+
     atoms: list[Atom] = []
     if isinstance(constraint, Assign):
         atoms = [constraint.target, constraint.value]
@@ -504,7 +506,17 @@ def _variables_in_constraint(constraint: Constraint) -> frozenset[str]:
         atoms = [constraint.mean, *(_term_parts(term)[0] for term in constraint.values)]
     else:
         raise _InvalidIR(f"unsupported constraint type: {type(constraint).__name__}")
-    return frozenset(atom.name for atom in atoms if isinstance(atom, Variable))
+    by_name: dict[str, Variable] = {}
+    for atom in atoms:
+        if isinstance(atom, Variable):
+            previous = by_name.setdefault(atom.name, atom)
+            if previous != atom:
+                raise _InvalidIR(f"conflicting variable definitions for {atom.name}")
+    return tuple(by_name.values())
+
+
+def _variables_in_constraint(constraint: Constraint) -> frozenset[str]:
+    return frozenset(variable.name for variable in variables_in_constraint(constraint))
 
 
 def _target_component(
@@ -693,5 +705,6 @@ __all__ = [
     "Term",
     "Unit",
     "Variable",
+    "variables_in_constraint",
     "solve",
 ]
