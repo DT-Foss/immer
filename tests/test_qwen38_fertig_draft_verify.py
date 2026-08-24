@@ -746,6 +746,128 @@ class Qwen38FertigDraftVerifyTests(unittest.TestCase):
                     graft_layer=26,
                 )
 
+    def test_prefix_fork_document_binds_inputs_identity_and_inherited_cost(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            off_trace = root / "off.json"
+            candidate_trace = root / "candidate.json"
+            row = verify_script.PreparedDraft(
+                item_id="fixture",
+                question="fixture?",
+                gold="7",
+                text="#### 7",
+                answer="7",
+                candidate_correct=True,
+                candidate_status="correct",
+                finish_reason="stop",
+                prompt_token_ids=(10, 11),
+                draft_token_ids=(12,),
+            )
+            execution_contract = {
+                "device": "cpu",
+                "dtype": "float32",
+                "padding_token_id": verify_script.END_OF_TEXT_TOKEN_ID,
+                "eos_token_id": verify_script.IM_END_TOKEN_ID,
+                "accepted_eos_token_ids": [
+                    verify_script.IM_END_TOKEN_ID,
+                    verify_script.END_OF_TEXT_TOKEN_ID,
+                ],
+            }
+            off_identity = verify_script.build_resume_identity(
+                source_id=verify_script.OFFICIAL_REPO_ID,
+                source_revision=verify_script.OFFICIAL_REVISION,
+                prompt_token_ids=(row.prompt_token_ids,),
+                draft_token_ids=(row.draft_token_ids,),
+                execution_contract=execution_contract,
+                graft_contract=None,
+            )
+            recorder = AccessTraceRecorder()
+            recorder.observe(
+                AccessOperation(
+                    repo_id=verify_script.OFFICIAL_REPO_ID,
+                    revision=verify_script.OFFICIAL_REVISION,
+                    inventory_fingerprint="e" * 64,
+                    operation="raw_bytes",
+                    operation_sequence=1,
+                    thread_id=1,
+                    thread_name="test",
+                    leaves=(AccessLeaf("model.safetensors", 0, 8),),
+                    source_requests=1,
+                    source_bytes=8,
+                    cache_hits=0,
+                )
+            )
+            verify_script._write_trace_checkpoint(
+                recorder,
+                off_trace,
+                off_identity,
+                verify_script.DraftVerificationResumeState(
+                    next_layer=27,
+                    hidden=torch.zeros(1, 3, 4),
+                    layer_calls=27,
+                    layer_retry_count=0,
+                    source_body_bytes=8,
+                    linear_calls=210,
+                    seconds=55.0,
+                    graft_applied=False,
+                ),
+                expected_shape=(1, 3, 4),
+                expected_dtype="float32",
+                n_layers=64,
+                active_graft_layer=None,
+            )
+            args = verify_script._parser().parse_args(
+                [
+                    "--mode",
+                    "stable-crsa",
+                    "--graft-layer",
+                    "27",
+                    "--graft-alpha",
+                    "0.01",
+                    "--fork-off-trace-json",
+                    str(off_trace),
+                    "--access-trace-json",
+                    str(candidate_trace),
+                    "--device",
+                    "cpu",
+                    "--dtype",
+                    "float32",
+                ]
+            )
+            model = SimpleNamespace(
+                config=SimpleNamespace(n_layers=64),
+                pager=SimpleNamespace(
+                    device=torch.device("cpu"), compute_dtype=torch.float32
+                ),
+                prefill_hidden_shape=lambda batch, sequence: (batch, sequence, 4),
+            )
+
+            @contextmanager
+            def runtime(received_args, *, max_batch_size, max_seq_len):
+                self.assertEqual((max_batch_size, max_seq_len), (1, 3))
+                received_args._source_verification = {"kind": "fixture"}
+                yield model
+
+            document = verify_script._fork_off_prefix(
+                args,
+                (row,),
+                runtime_factory=runtime,
+            )
+
+            self.assertEqual(document["schema"], verify_script.PREFIX_FORK_SCHEMA)
+            self.assertEqual(document["status"], "ready")
+            self.assertEqual(document["summary"]["fork_layer"], 27)
+            self.assertEqual(document["summary"]["inherited_model_seconds"], 55.0)
+            self.assertEqual(document["protocol"]["item_ids"], ["fixture"])
+            unsealed = dict(document)
+            observed = unsealed.pop("report_sha256")
+            self.assertEqual(
+                observed,
+                hashlib.sha256(verify_script._canonical_json(unsealed)).hexdigest(),
+            )
+
     def test_trace_resume_pair_rejects_stale_identity_and_crash_mixing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
