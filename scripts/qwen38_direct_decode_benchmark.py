@@ -28,11 +28,12 @@ from immer.runtimes.qwen3_8 import (
     DELTANET_PROBE_SCHEMA,
     DeltaNetProbeRecorder,
     LogicalModelIdentity,
+    Qwen38BundleError,
     Qwen38Config,
     Qwen38WeightPager,
     StreamedQwen38,
     build_probe_document,
-    tensor_range_plan_from_source,
+    verify_qwen38_causal_mount,
     verify_probe_document,
 )
 
@@ -299,68 +300,15 @@ def _verify_local_payload(
     }
 
 
-def _verify_causal_mount(mount: CausalWeightMount) -> dict[str, Any]:
-    manifest = _strict_json(mount.root / "bundle.json")
-    if (
-        manifest.get("schema") != "immer.qwen3.8-complete-causal-bundle/v1"
-        or set(manifest) != {"body", "schema", "sha256"}
-        or not isinstance(manifest.get("body"), Mapping)
-        or manifest.get("sha256") != _sha256(manifest["body"])
-    ):
-        raise QwenDirectDecodeError("causal bundle manifest is invalid")
-    body = manifest["body"]
-    manifest_weights_layout = body.get("weights_layout", "nested/v1")
-    mounted_weights_layout = f"{mount.weights_layout}/v1"
-    if (
-        body.get("checkpoint_complete") is not True
-        or body.get("layout_fingerprint") != mount.layout.layout_fingerprint
-        or body.get("logical_model") != mount.model.as_record()
-        or manifest_weights_layout != mounted_weights_layout
-    ):
-        raise QwenDirectDecodeError("causal bundle completeness identity is invalid")
-    inventory, fingerprint = _pinned_inventory(
-        str(mount.weights_root / "inventory.pinned.json"),
-        repo_id=mount.model.repo_id,
-        revision=mount.model.revision,
-    )
-    assert inventory is not None and fingerprint is not None
-    payload = _verify_local_payload(mount.weights_root, inventory)
-    config_path = mount.weights_root / "config.json"
-    if (
-        not config_path.is_file()
-        or config_path.is_symlink()
-        or _sha256_file(config_path) != body.get("config_sha256")
-    ):
-        raise QwenDirectDecodeError("causal bundle config receipt is invalid")
-    index_path = mount.weights_root / "model.safetensors.index.json"
-    if body.get("index_sha256") is None:
-        if index_path.exists() or index_path.is_symlink():
-            raise QwenDirectDecodeError("causal bundle has an unexpected index")
-    elif (
-        not index_path.is_file()
-        or index_path.is_symlink()
-        or _sha256_file(index_path) != body.get("index_sha256")
-    ):
-        raise QwenDirectDecodeError("causal bundle index receipt is invalid")
-    if payload["checkpoint_bytes"] != body.get("checkpoint_bytes") or body.get(
-        "tensor_bindings"
-    ) != len(inventory.get("tensors", ())):
-        raise QwenDirectDecodeError("causal bundle payload receipt is invalid")
-    for row in inventory.get("tensors", ()):
-        plan = tensor_range_plan_from_source(mount.source, str(row["name"]))
-        if mount.resolve_tensor_plan(plan.name) != plan:
-            raise QwenDirectDecodeError(f"causal tensor plan differs: {plan.name}")
-    revision = mount.graph.store.revision()
-    if body.get("graph_revision") != [revision[0], revision[1]]:
-        raise QwenDirectDecodeError("causal bundle graph revision differs")
-    return {
-        **payload,
-        "graph_revision": [revision[0], revision[1]],
-        "kind": "complete-causal-bundle/v1",
-        "manifest_sha256": manifest["sha256"],
-        "tensor_bindings": body["tensor_bindings"],
-        "weights_layout": manifest_weights_layout,
-    }
+def _verify_causal_mount(
+    mount: CausalWeightMount, *, require_official_config: bool = True
+) -> dict[str, Any]:
+    try:
+        return verify_qwen38_causal_mount(
+            mount, require_official_config=require_official_config
+        )
+    except Qwen38BundleError as exc:
+        raise QwenDirectDecodeError(str(exc)) from exc
 
 
 def _build_source(
@@ -373,7 +321,10 @@ def _build_source(
             budget_mb=args.source_budget_mb,
         )
         try:
-            verification = _verify_causal_mount(mount)
+            verification = _verify_causal_mount(
+                mount,
+                require_official_config=getattr(args, "_require_official", True),
+            )
             mount.source.set_access_observer(recorder)
             return RuntimeSource(mount.source, mount, verification)
         except Exception:

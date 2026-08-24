@@ -21,6 +21,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import time
 from typing import Any
 import urllib.error
 import urllib.request
@@ -30,12 +31,16 @@ from immer.runtimes.deepseek_v4.benchmark import extract_gsm8k_answer
 from immer.runtimes.qwen3_8 import (
     OFFICIAL_REPO_ID,
     OFFICIAL_REVISION,
+    CausalWeightMount,
+    LogicalModelIdentity,
+    Qwen38BundleError,
     Qwen38Config,
     Qwen38DraftVerifier,
     Qwen38StableCrsaGraft,
     Qwen38Tokenizer,
     Qwen38WeightPager,
     StreamedQwen38,
+    verify_qwen38_causal_mount,
 )
 from immer.runtimes.qwen3_8.encoding import (
     END_OF_TEXT_TOKEN_ID,
@@ -167,6 +172,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--access-trace-json")
     parser.add_argument("--resume-file")
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE))
+    parser.add_argument("--causal-bundle")
     parser.add_argument("--cache-budget-gb", type=_nonnegative_float, default=1.0)
     parser.add_argument("--source-budget-mb", type=_positive_int, default=65536)
     parser.add_argument("--device", choices=("auto", "cpu", "mps"), default="mps")
@@ -777,14 +783,41 @@ def _model_runtime(
     max_batch_size: int,
     max_seq_len: int,
 ) -> Iterator[StreamedQwen38]:
-    source = Streamer(
-        OFFICIAL_REPO_ID,
-        revision=OFFICIAL_REVISION,
-        budget_mb=args.source_budget_mb,
-        cache_dir=Path(args.cache_dir).expanduser().resolve(),
-        max_cache_bytes=int(args.cache_budget_gb * 1024**3),
-        verbose=False,
-    )
+    mount: CausalWeightMount | None = None
+    if args.causal_bundle is None:
+        source = Streamer(
+            OFFICIAL_REPO_ID,
+            revision=OFFICIAL_REVISION,
+            budget_mb=args.source_budget_mb,
+            cache_dir=Path(args.cache_dir).expanduser().resolve(),
+            max_cache_bytes=int(args.cache_budget_gb * 1024**3),
+            verbose=False,
+        )
+        source_verification: dict[str, Any] = {"kind": "remote-pinned-range-source/v1"}
+    else:
+        mount = CausalWeightMount(
+            Path(args.causal_bundle).expanduser().resolve(),
+            LogicalModelIdentity(OFFICIAL_REPO_ID, OFFICIAL_REVISION),
+            budget_mb=args.source_budget_mb,
+        )
+        source = mount.source
+        verification_started = time.perf_counter()
+        try:
+            source_verification = verify_qwen38_causal_mount(
+                mount,
+                require_official_config=getattr(args, "_require_official", True),
+            )
+        except Qwen38BundleError as exc:
+            mount.close()
+            raise CliError(f"causal bundle verification failed: {exc}") from exc
+        except Exception:
+            mount.close()
+            raise
+        source_verification = {
+            **source_verification,
+            "seconds": time.perf_counter() - verification_started,
+        }
+    setattr(args, "_source_verification", source_verification)
     pager: Qwen38WeightPager | None = None
     model: StreamedQwen38 | None = None
     try:
@@ -801,6 +834,7 @@ def _model_runtime(
             device=args.device,
             compute_dtype=args.dtype,
             require_source_identity=True,
+            causal_tensor_reader=None if mount is None else mount.tensor_reader,
         )
         graft = None
         graft_layer = None
@@ -836,7 +870,10 @@ def _model_runtime(
                 if cleanup_error is None:
                     cleanup_error = exc
         try:
-            source.close()
+            if mount is None:
+                source.close()
+            else:
+                mount.close()
         except Exception as exc:
             if cleanup_error is None:
                 cleanup_error = exc
@@ -845,6 +882,10 @@ def _model_runtime(
 
 
 def _cache_disk_preflight(args: argparse.Namespace) -> dict[str, int]:
+    if args.causal_bundle is not None:
+        bundle = Path(args.causal_bundle).expanduser().resolve()
+        free = shutil.disk_usage(bundle).free
+        return {"cache_bytes": 0, "cache_growth_bytes": 0, "free_bytes": free}
     cache = Path(args.cache_dir).expanduser().resolve()
     cache.mkdir(parents=True, exist_ok=True)
     current = sum(
@@ -1138,6 +1179,7 @@ def _result_document(
             "checkpoint": OFFICIAL_REPO_ID,
             "revision": OFFICIAL_REVISION,
             "drafts": str(Path(args.drafts_json).expanduser().resolve()),
+            "verification": getattr(args, "_source_verification", None),
         },
         "protocol": {
             "batch_size": total,

@@ -89,6 +89,10 @@ All notable changes to IMMER are recorded here.
   nine passive per-layer signals, authenticated prefix/decode probe artifacts,
   and pooled-sample Cohen-d maps now calibrate graft placement from contextual
   model states without changing inference output.
+- Promoted complete Qwen bundle verification into the runtime library and
+  connected the FERTIG draft benchmark to nested or flat causal bundles. Local
+  quality arms now re-hash every payload shard, replay every tensor binding,
+  and execute through the causal tensor reader instead of HF transport.
 - Rebuilt public documentation around the local causal architecture and
   separated public source from weights, state, traces, and operations.
 

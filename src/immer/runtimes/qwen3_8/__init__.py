@@ -14,6 +14,7 @@ from .config import (
     Qwen38Config,
     Qwen38ConfigError,
 )
+from .bundle import Qwen38BundleError, verify_qwen38_causal_mount
 from .draft_verification import Qwen38DraftVerifier
 from .encoding import (
     END_OF_TEXT_TOKEN_ID,
@@ -65,6 +66,7 @@ __all__ = [
     "PrefillEvidence",
     "Qwen38Config",
     "Qwen38ConfigError",
+    "Qwen38BundleError",
     "Qwen38DraftVerifier",
     "Qwen38DeltaNetProbeError",
     "Qwen38EncodingError",
@@ -83,4 +85,5 @@ __all__ = [
     "compare_probe_documents",
     "tensor_range_plan_from_source",
     "verify_probe_document",
+    "verify_qwen38_causal_mount",
 ]

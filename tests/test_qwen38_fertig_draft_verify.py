@@ -308,6 +308,95 @@ class Qwen38FertigDraftVerifyTests(unittest.TestCase):
                 prior_source_bytes=1024**2 + 1,
             )
 
+    def test_causal_runtime_fully_verifies_and_attaches_tensor_reader(self) -> None:
+        args = verify_script._parser().parse_args(
+            [
+                "--causal-bundle",
+                "/fixture/model.causal",
+                "--device",
+                "cpu",
+                "--dtype",
+                "float32",
+            ]
+        )
+        args._require_official = False
+        tensor_reader = object()
+        source = SimpleNamespace(
+            reader=SimpleNamespace(fetch_file=lambda _name: b"{}"),
+        )
+        mount = SimpleNamespace(
+            source=source,
+            tensor_reader=tensor_reader,
+            close=mock.Mock(),
+        )
+        config = SimpleNamespace(n_layers=4)
+        pager = SimpleNamespace(close=mock.Mock())
+        model = SimpleNamespace(
+            checkpoint_preflight=mock.Mock(),
+            reset_state=mock.Mock(),
+        )
+
+        with (
+            mock.patch.object(
+                verify_script, "CausalWeightMount", return_value=mount
+            ) as mount_type,
+            mock.patch.object(
+                verify_script,
+                "verify_qwen38_causal_mount",
+                return_value={"kind": "complete-causal-bundle/v1"},
+            ) as verify,
+            mock.patch.object(
+                verify_script.Qwen38Config,
+                "from_mapping",
+                return_value=config,
+            ),
+            mock.patch.object(
+                verify_script, "Qwen38WeightPager", return_value=pager
+            ) as pager_type,
+            mock.patch.object(
+                verify_script, "StreamedQwen38", return_value=model
+            ) as model_type,
+        ):
+            with verify_script._model_runtime(
+                args, max_batch_size=8, max_seq_len=32
+            ) as observed:
+                self.assertIs(observed, model)
+
+        mount_type.assert_called_once()
+        verify.assert_called_once_with(mount, require_official_config=False)
+        self.assertIs(
+            pager_type.call_args.kwargs["causal_tensor_reader"], tensor_reader
+        )
+        self.assertIs(model_type.call_args.args[1], pager)
+        self.assertEqual(args._source_verification["kind"], "complete-causal-bundle/v1")
+        self.assertGreaterEqual(args._source_verification["seconds"], 0.0)
+        model.checkpoint_preflight.assert_called_once_with()
+        model.reset_state.assert_called_once_with(release=True)
+        pager.close.assert_called_once_with()
+        mount.close.assert_called_once_with()
+
+    def test_causal_runtime_preflight_never_creates_an_hf_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "must-not-exist"
+            args = verify_script._parser().parse_args(
+                [
+                    "--causal-bundle",
+                    str(root),
+                    "--cache-dir",
+                    str(cache),
+                    "--cache-budget-gb",
+                    "10",
+                ]
+            )
+
+            report = verify_script._cache_disk_preflight(args)
+
+            self.assertEqual(report["cache_bytes"], 0)
+            self.assertEqual(report["cache_growth_bytes"], 0)
+            self.assertGreater(report["free_bytes"], 0)
+            self.assertFalse(cache.exists())
+
     def test_verify_checkpoints_and_publishes_resumable_access_trace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
