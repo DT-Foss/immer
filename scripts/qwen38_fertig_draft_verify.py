@@ -679,6 +679,9 @@ def _cohort_item_ids(
         or selection.get("limit") != len(raw_ids)
     ):
         raise CliError("dynamic baseline cohort contract is invalid")
+    offset = selection.get("offset", 0)
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise CliError("dynamic baseline cohort offset is invalid")
     item_ids = tuple(raw_ids)
     if any(not isinstance(item_id, str) or not item_id for item_id in item_ids):
         raise CliError("dynamic baseline item ID is invalid")
@@ -728,22 +731,33 @@ def _prepare_drafts(
     raw_rows = document.get("items")
     if not isinstance(raw_rows, list) or len(raw_rows) != len(item_ids):
         raise CliError("Qwen baseline item count mismatch")
-    if tuple(item_ids) == FIXED_ITEM_IDS:
-        allowed_statuses = {"abstained", "correct"}
-    else:
-        benchmark_contract = document.get("benchmark")
-        selection = (
-            benchmark_contract.get("selection")
-            if isinstance(benchmark_contract, Mapping)
-            else None
-        )
-        cohort = selection.get("cohort") if isinstance(selection, Mapping) else None
+    benchmark_contract = document.get("benchmark")
+    selection = (
+        benchmark_contract.get("selection")
+        if isinstance(benchmark_contract, Mapping)
+        else None
+    )
+    cohort = selection.get("cohort") if isinstance(selection, Mapping) else None
+    if cohort in {"abstained", "eligible"}:
         if cohort == "abstained":
             allowed_statuses = {"abstained"}
-        elif cohort == "eligible":
-            allowed_statuses = {"abstained", "correct"}
         else:
-            raise CliError("dynamic baseline cohort selection is invalid")
+            allowed_statuses = {"abstained", "correct"}
+        offset = selection.get("offset", 0)
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise CliError("dynamic baseline cohort offset is invalid")
+        eligible_ids = tuple(
+            str(raw["item_id"])
+            for raw in benchmark_rows.values()
+            if raw.get("status") in allowed_statuses
+        )
+        expected_ids = eligible_ids[offset : offset + len(item_ids)]
+        if tuple(item_ids) != expected_ids:
+            raise CliError("dynamic baseline cohort selection mismatch")
+    elif tuple(item_ids) == FIXED_ITEM_IDS:
+        allowed_statuses = {"abstained", "correct"}
+    else:
+        raise CliError("dynamic baseline cohort selection is invalid")
 
     prepared: list[PreparedDraft] = []
     for index, (item_id, raw) in enumerate(zip(item_ids, raw_rows, strict=True)):
