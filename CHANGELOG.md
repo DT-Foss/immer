@@ -54,6 +54,11 @@ All notable changes to IMMER are recorded here.
 - Connected `Qwen38WeightPager` to the causal tensor reader. Dense prefill,
   row-paged LM-head scans, and stateful greedy generation now execute without
   tensor metadata discovery and remain bit-identical to the inventory path.
+- Added the complete Qwen causal-bundle builder: every shard is size- and
+  SHA-256-verified against the pinned inventory before tensor bindings are
+  published; resumable staging, config/index validation, full graph replay,
+  post-copy verification, and atomic promotion prevent sparse holes or partial
+  checkpoints from becoming executable model bytes.
 - Rebuilt public documentation around the local causal architecture and
   separated public source from weights, state, traces, and operations.
 

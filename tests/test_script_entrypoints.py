@@ -19,6 +19,7 @@ SCRIPTS = (
     "router_v2_stage2.py",
     "poc_mmlu_stream.py",
     "bench_gsm8k.py",
+    "qwen38_causal_bundle.py",
 )
 FORBIDDEN_RESEARCH_IMPORTS = (
     "vendor/mitglm",
