@@ -40,11 +40,12 @@ from immer.runtimes.qwen3_8 import (
     Qwen38Config,
     tensor_range_plan_from_source,
 )
+from immer.knowledge import Streamer
 
 
 ROOT = Path(__file__).resolve().parent.parent
 OFFICIAL_INVENTORY_FINGERPRINT = (
-    "ad46a48f49c75b301f029a1d48ad9171e157629d9245ffb5c893724a3265879f"
+    "8446f49a8ab8b696ede33a072f03be0dd253baf4f624e688e25b27ae843e022d"
 )
 DEFAULT_INVENTORY = (
     ROOT
@@ -512,16 +513,73 @@ def _load_inventory(
     return inventory, fingerprint, document
 
 
+def refresh_inventory(
+    output: Path,
+    *,
+    repo_id: str = OFFICIAL_REPO_ID,
+    revision: str = OFFICIAL_REVISION,
+    budget_mb: int = 64,
+) -> dict[str, Any]:
+    """Rescan pinned headers while preserving Xet and payload identities."""
+
+    source = Streamer(
+        repo_id,
+        revision=revision,
+        budget_mb=budget_mb,
+        use_cache=False,
+        verbose=False,
+    )
+    try:
+        inventory = source.inventory()
+    finally:
+        source.close()
+    if inventory.get("repo") != repo_id or inventory.get("revision") != revision:
+        raise QwenCausalBundleError("refreshed inventory identity is invalid")
+    shards = inventory.get("shards")
+    if not isinstance(shards, list) or not shards:
+        raise QwenCausalBundleError("refreshed inventory has no shards")
+    for shard in shards:
+        if not isinstance(shard, Mapping):
+            raise QwenCausalBundleError("refreshed shard entry is invalid")
+        name = str(shard.get("file"))
+        if _expected_shard_digest(shard) is None:
+            raise QwenCausalBundleError(
+                f"refreshed shard lacks payload SHA-256: {name}"
+            )
+        if shard.get("repo_commit") != revision:
+            raise QwenCausalBundleError(
+                f"refreshed shard commit differs from revision: {name}"
+            )
+    fingerprint = Streamer._source_fingerprint(inventory)
+    document = {
+        "inventory": inventory,
+        "inventory_sha256": _sha256_bytes(_canonical(inventory)),
+        "repo_id": repo_id,
+        "revision": revision,
+        "schema": "immer.tensor-inventory-cache/v1",
+        "source_fingerprint": fingerprint,
+    }
+    target = output.expanduser().absolute()
+    _atomic_bytes(target, _canonical(document) + b"\n")
+    return {
+        "inventory": str(target),
+        "inventory_sha256": document["inventory_sha256"],
+        "shards": len(shards),
+        "source_fingerprint": fingerprint,
+        "tensors": len(inventory.get("tensors", ())),
+    }
+
+
 def _expected_shard_digest(shard: Mapping[str, Any]) -> str | None:
     values: set[str] = set()
-    for raw in (shard.get("etag"), shard.get("cas_url_hash")):
+    for raw in (shard.get("payload_sha256"), shard.get("linked_etag")):
         if raw is None:
             continue
         value = str(raw).strip().strip('"').lower()
         if _SHA256.fullmatch(value):
             values.add(value)
     if len(values) > 1:
-        raise QwenCausalBundleError("shard ETag and CAS digest disagree")
+        raise QwenCausalBundleError("shard payload SHA-256 identities disagree")
     return next(iter(values), None)
 
 
@@ -757,7 +815,7 @@ def verify_bundle(
         expected_size = int(shard["size"])
         expected_digest = _expected_shard_digest(shard)
         if require_remote_hashes and expected_digest is None:
-            raise QwenCausalBundleError(f"shard lacks remote SHA-256: {name}")
+            raise QwenCausalBundleError(f"shard lacks payload SHA-256: {name}")
         digest = _sha256_file(path)
         if (
             receipt is None
@@ -855,7 +913,7 @@ def _build_bundle_locked(
         name = str(shard["file"])
         expected_digest = _expected_shard_digest(shard)
         if require_remote_hashes and expected_digest is None:
-            raise QwenCausalBundleError(f"shard lacks remote SHA-256: {name}")
+            raise QwenCausalBundleError(f"shard lacks payload SHA-256: {name}")
         shard_receipts.append(
             _copy_verified_shard(
                 source_root / name,
@@ -1013,7 +1071,7 @@ def adopt_bundle(
             expected_size = int(shard["size"])
             expected_digest = _expected_shard_digest(shard)
             if require_remote_hashes and expected_digest is None:
-                raise QwenCausalBundleError(f"shard lacks remote SHA-256: {name}")
+                raise QwenCausalBundleError(f"shard lacks payload SHA-256: {name}")
             digest = _sha256_file(path)
             if metadata.st_size != expected_size or (
                 expected_digest is not None and digest != expected_digest
@@ -1160,7 +1218,7 @@ def fetch_adopt_bundle(
                 name = str(shard["file"])
                 digest = _expected_shard_digest(shard)
                 if digest is None:
-                    raise QwenCausalBundleError(f"shard lacks remote SHA-256: {name}")
+                    raise QwenCausalBundleError(f"shard lacks payload SHA-256: {name}")
                 receipts.append(
                     _download_verified_file(
                         active_session,
@@ -1245,6 +1303,9 @@ def fetch_adopt_bundle(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    refresh = subparsers.add_parser("refresh-inventory")
+    refresh.add_argument("--output", default=str(DEFAULT_INVENTORY))
+    refresh.add_argument("--budget-mb", type=int, default=64)
     build = subparsers.add_parser("build")
     build.add_argument("--source", required=True)
     build.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
@@ -1268,7 +1329,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        if args.command == "build":
+        if args.command == "refresh-inventory":
+            if args.budget_mb <= 0:
+                raise QwenCausalBundleError("inventory budget must be positive")
+            result = refresh_inventory(Path(args.output), budget_mb=args.budget_mb)
+        elif args.command == "build":
             result = build_bundle(
                 Path(args.source),
                 Path(args.inventory),

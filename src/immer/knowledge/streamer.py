@@ -818,6 +818,14 @@ class _ContractReader:
     """Budget, cache and exact-range guard around any compatible reader."""
 
     _CACHE_SCHEMA = "immer.range-cache/v1"
+    _SOURCE_IDENTITY_EXTENSION_KEYS = frozenset(
+        {
+            "linked_etag",
+            "payload_sha256",
+            "repo_commit",
+            "xet_hash",
+        }
+    )
 
     def __init__(
         self,
@@ -1026,7 +1034,15 @@ class _ContractReader:
         info = self.file_info_snapshot(filename)
         return {
             key: str(info[key])
-            for key in ("cas_url_hash", "etag", "size")
+            for key in (
+                "cas_url_hash",
+                "etag",
+                "linked_etag",
+                "payload_sha256",
+                "repo_commit",
+                "size",
+                "xet_hash",
+            )
             if info.get(key) is not None
         }
 
@@ -1042,6 +1058,23 @@ class _ContractReader:
             "end": end,
         }
         return _sha256(_canonical_json(contract)), contract
+
+    @classmethod
+    def _source_identity_compatible(
+        cls,
+        known: Mapping[str, str],
+        cached: Mapping[str, Any],
+    ) -> bool:
+        """Accept an older identity only when it lacks new strengthening fields."""
+
+        if dict(known) == dict(cached):
+            return True
+        if not set(cached).issubset(known):
+            return False
+        missing = set(known).difference(cached)
+        if not missing.issubset(cls._SOURCE_IDENTITY_EXTENSION_KEYS):
+            return False
+        return all(str(known[key]) == str(value) for key, value in cached.items())
 
     def _cache_paths(self, kind: str, key: str) -> tuple[Path, Path] | None:
         if self.cache_dir is None:
@@ -1238,7 +1271,7 @@ class _ContractReader:
                 raise CacheIntegrityError(
                     f"Quellidentitaet fehlt im Cache-Eintrag: {blob_path}"
                 )
-            if known_identity != dict(cached_identity):
+            if not self._source_identity_compatible(known_identity, cached_identity):
                 raise CacheIntegrityError(
                     f"Quellidentitaet fuer Cache-Eintrag hat sich geaendert: {blob_path}"
                 )
@@ -1972,19 +2005,26 @@ class Streamer:
         for raw in inventory.get("shards", []):
             if not isinstance(raw, Mapping):
                 continue
-            shards.append(
-                {
-                    key: raw.get(key)
-                    for key in (
-                        "file",
-                        "size",
-                        "etag",
-                        "cas_url_hash",
-                        "header_len",
-                        "data_start",
-                    )
-                }
-            )
+            row = {
+                key: raw.get(key)
+                for key in (
+                    "file",
+                    "size",
+                    "etag",
+                    "cas_url_hash",
+                    "header_len",
+                    "data_start",
+                )
+            }
+            for key in (
+                "linked_etag",
+                "payload_sha256",
+                "repo_commit",
+                "xet_hash",
+            ):
+                if raw.get(key) is not None:
+                    row[key] = raw[key]
+            shards.append(row)
         return _sha256(
             _canonical_json(sorted(shards, key=lambda item: str(item["file"])))
         )
@@ -2094,7 +2134,16 @@ class Streamer:
             if not isinstance(shard, Mapping) or not isinstance(shard.get("file"), str):
                 continue
             values: dict[str, Any] = {}
-            for key in ("size", "etag", "cas_url_hash", "header_len"):
+            for key in (
+                "size",
+                "etag",
+                "cas_url_hash",
+                "header_len",
+                "linked_etag",
+                "payload_sha256",
+                "repo_commit",
+                "xet_hash",
+            ):
                 if shard.get(key) is not None:
                     values[key] = shard[key]
             if values:

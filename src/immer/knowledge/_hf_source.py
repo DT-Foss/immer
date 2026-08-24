@@ -28,6 +28,7 @@ DEFAULT_TIMEOUT_SECONDS = 180.0
 DEFAULT_MAX_METADATA_BYTES = 64 * 1024 * 1024
 DEFAULT_HTTP_CONNECTIONS = 2
 MAX_ERROR_BODY_BYTES = 4 * 1024
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _requests_api() -> Any:
@@ -168,6 +169,13 @@ def _location_expiry(url: str) -> float:
         return time.time() + 900
 
 
+def _etag_sha256(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.removeprefix("W/").strip().strip('"').lower()
+    return normalized if _SHA256.fullmatch(normalized) is not None else None
+
+
 class _LeasedResponse:
     """Return one session lease exactly once when a response is closed."""
 
@@ -235,7 +243,9 @@ class HFRangeReader:
             supplied = (
                 (session,)
                 if session is not None
-                else tuple(sessions) if sessions is not None else ()
+                else tuple(sessions)
+                if sessions is not None
+                else ()
             )
             if supplied and not 1 <= len(supplied) <= DEFAULT_HTTP_CONNECTIONS:
                 raise ValueError("persistent session count must be one or two")
@@ -297,7 +307,9 @@ class HFRangeReader:
         try:
             session = pool.get(timeout=self.timeout)
         except queue.Empty as exc:
-            raise SourceError("timed out waiting for a persistent HTTP session") from exc
+            raise SourceError(
+                "timed out waiting for a persistent HTTP session"
+            ) from exc
         with self._lock:
             if self._closed:
                 session.close()
@@ -350,7 +362,9 @@ class HFRangeReader:
             if self._closed:
                 return
             if self._transport_active_leases:
-                raise SourceError("cannot close HTTP range reader with active responses")
+                raise SourceError(
+                    "cannot close HTTP range reader with active responses"
+                )
             self._closed = True
         for session in self._sessions:
             session.close()
@@ -410,7 +424,15 @@ class HFRangeReader:
         info = self.file_info_snapshot(filename)
         return {
             key: str(info[key])
-            for key in ("cas_url_hash", "etag", "size")
+            for key in (
+                "cas_url_hash",
+                "etag",
+                "linked_etag",
+                "payload_sha256",
+                "repo_commit",
+                "size",
+                "xet_hash",
+            )
             if info.get(key) is not None
         }
 
@@ -422,9 +444,36 @@ class HFRangeReader:
         etag = response.headers.get("ETag")
         if etag:
             updates["etag"] = etag
+        chain = tuple(getattr(response, "history", ()) or ()) + (response,)
+        for candidate in chain:
+            headers = getattr(candidate, "headers", {})
+            linked = _etag_sha256(headers.get("X-Linked-ETag"))
+            if linked is not None:
+                updates["linked_etag"] = linked
+                updates["payload_sha256"] = linked
+            xet_hash = _etag_sha256(headers.get("X-Xet-Hash"))
+            if xet_hash is not None:
+                updates["xet_hash"] = xet_hash
+            repo_commit = headers.get("X-Repo-Commit")
+            if isinstance(repo_commit, str) and re.fullmatch(
+                r"[0-9a-fA-F]{40,64}", repo_commit
+            ):
+                updates["repo_commit"] = repo_commit.lower()
+            linked_size = headers.get("X-Linked-Size")
+            if isinstance(linked_size, str) and linked_size.isdigit():
+                updates["size"] = int(linked_size)
         match = re.search(r"/([0-9a-f]{64})(?:\?|$)", final_url)
         if match:
             updates["cas_url_hash"] = match.group(1)
+        known = self.file_info_snapshot(filename)
+        if (
+            "payload_sha256" not in updates
+            and "xet_hash" not in updates
+            and known.get("xet_hash") is None
+        ):
+            payload = _etag_sha256(etag) or updates.get("cas_url_hash")
+            if payload is not None:
+                updates["payload_sha256"] = payload
         content_range = response.headers.get("Content-Range", "")
         range_match = re.fullmatch(r"bytes \d+-\d+/(\d+|\*)", content_range)
         content_length = response.headers.get("Content-Length")
@@ -802,6 +851,10 @@ def scan_inventory(reader: Any, budget: _BudgetLike) -> dict[str, Any]:
                 "size": info.get("size"),
                 "etag": info.get("etag"),
                 "cas_url_hash": info.get("cas_url_hash"),
+                "linked_etag": info.get("linked_etag"),
+                "payload_sha256": info.get("payload_sha256"),
+                "repo_commit": info.get("repo_commit"),
+                "xet_hash": info.get("xet_hash"),
                 "cdn_host": info.get("cdn_host"),
                 "st_metadata": info.get("st_metadata"),
             }

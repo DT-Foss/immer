@@ -124,6 +124,8 @@ def _fixture(root: Path) -> tuple[Path, Path, str]:
     digest = _sha256(source_root / "model.safetensors")
     inventory["shards"][0]["etag"] = f'"{digest}"'
     inventory["shards"][0]["cas_url_hash"] = digest
+    inventory["shards"][0]["linked_etag"] = digest
+    inventory["shards"][0]["payload_sha256"] = digest
     fingerprint = Streamer._source_fingerprint(inventory)
     document = {
         "inventory": inventory,
@@ -141,6 +143,82 @@ def _fixture(root: Path) -> tuple[Path, Path, str]:
 
 
 class QwenCausalBundleTests(unittest.TestCase):
+    def test_refresh_inventory_separates_payload_and_xet_identity(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-inventory-refresh-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            _source, inventory_path, fingerprint = _fixture(root)
+            inventory = json.loads(inventory_path.read_text())["inventory"]
+            shard = inventory["shards"][0]
+            shard["repo_commit"] = REVISION
+            shard["xet_hash"] = "f" * 64
+            closed = []
+
+            class FakeStreamer:
+                def __init__(self, *_args, **_kwargs) -> None:
+                    pass
+
+                def inventory(self):
+                    return json.loads(json.dumps(inventory))
+
+                def close(self) -> None:
+                    closed.append(True)
+
+                _source_fingerprint = staticmethod(Streamer._source_fingerprint)
+
+            output = root / "refreshed.json"
+            with mock.patch.object(bundle_script, "Streamer", FakeStreamer):
+                result = bundle_script.refresh_inventory(
+                    output,
+                    repo_id=REPO_ID,
+                    revision=REVISION,
+                )
+
+            document = json.loads(output.read_text())
+            self.assertEqual(closed, [True])
+            self.assertEqual(result["shards"], 1)
+            self.assertEqual(result["tensors"], 56)
+            self.assertNotEqual(result["source_fingerprint"], fingerprint)
+            self.assertEqual(
+                document["inventory"]["shards"][0]["payload_sha256"],
+                shard["payload_sha256"],
+            )
+            self.assertEqual(document["inventory"]["shards"][0]["xet_hash"], "f" * 64)
+
+    def test_builder_refuses_xet_identity_as_payload_digest(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-xet-not-payload-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            source, inventory_path, _fingerprint = _fixture(root)
+            document = json.loads(inventory_path.read_text())
+            shard = document["inventory"]["shards"][0]
+            shard.pop("payload_sha256")
+            shard.pop("linked_etag")
+            document["inventory_sha256"] = hashlib.sha256(
+                bundle_script._canonical(document["inventory"])
+            ).hexdigest()
+            document["source_fingerprint"] = Streamer._source_fingerprint(
+                document["inventory"]
+            )
+            inventory_path.write_bytes(bundle_script._canonical(document) + b"\n")
+
+            with self.assertRaisesRegex(
+                bundle_script.QwenCausalBundleError,
+                "lacks payload SHA-256",
+            ):
+                bundle_script.build_bundle(
+                    source,
+                    inventory_path,
+                    root / "model.causal",
+                    repo_id=REPO_ID,
+                    revision=REVISION,
+                    expected_fingerprint=document["source_fingerprint"],
+                    require_official=False,
+                    require_remote_hashes=True,
+                )
+
     def test_build_verify_mount_and_execute_complete_fixture(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix=".qwen-bundle-test-", dir=Path.cwd()

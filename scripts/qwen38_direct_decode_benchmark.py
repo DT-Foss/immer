@@ -236,14 +236,14 @@ def _sha256_file(path: Path) -> str:
 
 def _expected_shard_digest(shard: Mapping[str, Any]) -> str:
     values: set[str] = set()
-    for raw in (shard.get("etag"), shard.get("cas_url_hash")):
+    for raw in (shard.get("payload_sha256"), shard.get("linked_etag")):
         if raw is None:
             continue
         value = str(raw).strip().strip('"').lower()
         if re.fullmatch(r"[0-9a-f]{64}", value):
             values.add(value)
     if len(values) != 1:
-        raise QwenDirectDecodeError("local shard lacks one unambiguous SHA-256")
+        raise QwenDirectDecodeError("local shard lacks one unambiguous payload SHA-256")
     return next(iter(values))
 
 

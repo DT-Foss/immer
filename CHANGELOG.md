@@ -69,6 +69,10 @@ All notable changes to IMMER are recorded here.
 - Added pinned `fetch-adopt` provisioning: official shards download directly
   into their final `weights/` tree with exact range resume, crash-safe partial
   recovery, full SHA-256 verification, and zero-copy causal adoption.
+- Corrected Hugging Face Xet identity handling: the CDN/Xet file ID remains a
+  transport pin while `X-Linked-ETag` supplies the reconstructed payload
+  SHA-256. Inventory refresh, local adoption, and downloads now bind both and
+  never mistake an Xet ID for a shard-byte digest.
 - Made Qwen layer-major verification emit complete resumable access traces.
   Content-addressed trace and hidden-resume files commit through one hashed
   pair manifest, resumed traces renumber new operations canonically,

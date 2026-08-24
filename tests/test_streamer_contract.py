@@ -78,11 +78,13 @@ class _FakeRequestsResponse:
         status: int,
         headers: dict[str, str],
         url: str = "https://cdn.example/file",
+        history: list["_FakeRequestsResponse"] | None = None,
     ) -> None:
         self.raw = io.BytesIO(body)
         self.status_code = status
         self.headers = headers
         self.url = url
+        self.history = [] if history is None else history
         self.closed = False
 
     def close(self) -> None:
@@ -157,7 +159,9 @@ def _write_fixture(root: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 class StreamerContractTests(unittest.TestCase):
-    def test_default_requests_transport_enforces_two_single_connection_pools(self) -> None:
+    def test_default_requests_transport_enforces_two_single_connection_pools(
+        self,
+    ) -> None:
         reader = HFRangeReader(
             "org/repo",
             budget=Streamer("fixture", budget_mb=2, use_cache=False).budget,
@@ -302,7 +306,9 @@ class StreamerContractTests(unittest.TestCase):
             )
 
         metrics = reader.transport_metrics()
-        self.assertEqual(metrics["transport_policy"], "requests-injected-session-leases-2/v1")
+        self.assertEqual(
+            metrics["transport_policy"], "requests-injected-session-leases-2/v1"
+        )
         self.assertEqual(metrics["transport_connection_limit"], 0)
         self.assertEqual(metrics["transport_active_lease_limit"], 2)
         self.assertEqual(metrics["transport_peak_leases"], 2)
@@ -343,10 +349,72 @@ class StreamerContractTests(unittest.TestCase):
         self.assertEqual(reader.file_info["model.safetensors"]["cas_url_hash"], digest)
         self.assertEqual(
             reader.source_identity_snapshot("model.safetensors"),
-            {"cas_url_hash": digest, "etag": "fixture-etag", "size": "10"},
+            {
+                "cas_url_hash": digest,
+                "etag": "fixture-etag",
+                "payload_sha256": digest,
+                "size": "10",
+            },
         )
         self.assertEqual(reader.fetch_file_bounded("config.json", 16), b"{}")
         self.assertEqual(budget.body, 6)
+
+    def test_xet_redirect_preserves_raw_payload_sha_separately(self) -> None:
+        payload_sha = "b" * 64
+        xet_hash = "a" * 64
+        commit = "c" * 40
+        redirect = _FakeRequestsResponse(
+            b"",
+            status=302,
+            headers={
+                "X-Linked-ETag": f'"{payload_sha}"',
+                "X-Linked-Size": "1",
+                "X-Repo-Commit": commit,
+                "X-Xet-Hash": xet_hash,
+            },
+        )
+        final = _FakeRequestsResponse(
+            b"x",
+            status=206,
+            headers={
+                "Content-Range": "bytes 0-0/1",
+                "ETag": f'"{xet_hash}"',
+            },
+            url=f"https://cdn.example/{xet_hash}?Expires=4102444800",
+            history=[redirect],
+        )
+        cached_final = _FakeRequestsResponse(
+            b"x",
+            status=206,
+            headers={
+                "Content-Range": "bytes 0-0/1",
+                "ETag": f'"{xet_hash}"',
+            },
+            url=f"https://cdn.example/{xet_hash}?Expires=4102444800",
+        )
+        session = _FakeRequestsSession([final, cached_final])
+        reader = HFRangeReader(
+            "org/repo",
+            revision=commit,
+            budget=Streamer("fixture", budget_mb=1, use_cache=False).budget,
+            session=session,
+        )
+
+        self.assertEqual(reader.get_range("model.safetensors", 0, 0), b"x")
+        identity = reader.source_identity_snapshot("model.safetensors")
+        self.assertEqual(identity["payload_sha256"], payload_sha)
+        self.assertEqual(identity["linked_etag"], payload_sha)
+        self.assertEqual(identity["xet_hash"], xet_hash)
+        self.assertEqual(identity["cas_url_hash"], xet_hash)
+        self.assertEqual(identity["repo_commit"], commit)
+        self.assertEqual(identity["etag"], f'"{xet_hash}"')
+        self.assertEqual(identity["size"], "1")
+        self.assertEqual(reader.get_range("model.safetensors", 0, 0), b"x")
+        self.assertEqual(
+            reader.source_identity_snapshot("model.safetensors")["payload_sha256"],
+            payload_sha,
+        )
+        reader.close()
 
     def test_packaged_hf_reader_rejects_mismatched_content_range(self) -> None:
         opener = _FakeOpener(
@@ -638,9 +706,7 @@ class StreamerContractTests(unittest.TestCase):
                 reader=upstream,
                 cache_dir=Path(tmp) / "cache",
             )
-            self.assertEqual(
-                source.raw_bytes("weights.bin", 0, 4), bytes(range(4))
-            )
+            self.assertEqual(source.raw_bytes("weights.bin", 0, 4), bytes(range(4)))
             upstream.calls.clear()
 
             result = source.raw_bytes_many(
@@ -966,6 +1032,32 @@ print("wheel-safe")
             with self.assertRaisesRegex(CacheIntegrityError, "Quellidentitaet fehlt"):
                 resumed.raw_bytes("model.safetensors", 0, 8)
             self.assertEqual(resumed.bytes_moved(), 0)
+
+    def test_range_cache_identity_upgrade_accepts_only_strengthening_fields(
+        self,
+    ) -> None:
+        old = {
+            "cas_url_hash": "a" * 64,
+            "etag": '"' + "a" * 64 + '"',
+            "size": "10",
+        }
+        upgraded = {
+            **old,
+            "linked_etag": "b" * 64,
+            "payload_sha256": "b" * 64,
+            "repo_commit": "c" * 40,
+            "xet_hash": "a" * 64,
+        }
+        contract = streamer_module._ContractReader
+        self.assertTrue(contract._source_identity_compatible(upgraded, old))
+        self.assertFalse(
+            contract._source_identity_compatible(
+                {**upgraded, "etag": '"' + "d" * 64 + '"'}, old
+            )
+        )
+        self.assertFalse(
+            contract._source_identity_compatible(old, {**old, "unknown": "value"})
+        )
 
     def test_budget_is_preflighted_and_never_overshoots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
