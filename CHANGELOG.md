@@ -26,6 +26,8 @@ All notable changes to IMMER are recorded here.
 - Executed Markov hints through byte-budgeted expert reservoirs with measured
   confidence gating, direct decode windows, deduplicated large-prefill vote
   aggregation, exact miss fallback, and bit-identical three-arm comparison.
+- Added transport-neutral, model-math-bound KV snapshots and a contextual
+  shared-prefix decode benchmark for strict baseline/real/placebo TPOT arms.
 - Added FERTIG draft verification and exact/model fusion receipts for fixed
   integration cohorts.
 - Rebuilt public documentation around the local causal architecture and
