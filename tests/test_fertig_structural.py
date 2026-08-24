@@ -3,9 +3,11 @@ from __future__ import annotations
 import unittest
 from fractions import Fraction
 from itertools import permutations
+from unittest import mock
 
 from immer.cognition.fertig.arithmetic_ir import (
     Affine,
+    Assign,
     Balance,
     Mean,
     Part,
@@ -130,6 +132,160 @@ class AffineStructuralParserTests(unittest.TestCase):
         self.assertEqual(solution.target_value, 74)
         assert parsed.problem is not None
         self.assertEqual(parsed.problem.target.unit.dimensions, (("mass", 1),))
+
+
+class ConservativeCoreferenceStructuralParserTests(unittest.TestCase):
+    def assert_ambiguous(self, source: str, reason: str) -> None:
+        parsed = parse_structural_problem(source)
+        self.assertEqual(parsed.status, ParseStatus.AMBIGUOUS, parsed.reason)
+        self.assertEqual(parsed.reason, reason)
+        self.assertIsNone(parsed.problem)
+
+    def test_unique_object_pronoun_keeps_exact_ir_and_numeric_provenance(
+        self,
+    ) -> None:
+        source = (
+            "Lina has 10 shells. Omar has 4 fewer shells than her. "
+            "How many shells does Omar have?"
+        )
+
+        parsed, solution = _solve(source)
+
+        self.assertEqual(parsed.reason, "")
+        self.assertIs(solution.status, SolveStatus.UNIQUE)
+        self.assertEqual(solution.target_value, 6)
+        self.assertIsNotNone(solution.certificate)
+        assert solution.certificate is not None
+        self.assertTrue(solution.certificate.verified)
+        assert parsed.problem is not None
+        assignment, comparison = parsed.problem.constraints
+        self.assertIsInstance(assignment, Assign)
+        self.assertIsInstance(comparison, Affine)
+        assert isinstance(assignment, Assign)
+        assert isinstance(comparison, Affine)
+        self.assertEqual(comparison.source, assignment.target)
+        assert comparison.source.span is not None
+        self.assertEqual(
+            source[comparison.source.span.start : comparison.source.span.end],
+            "Lina",
+        )
+        assert assignment.value.span is not None
+        assert comparison.offset.span is not None
+        assert comparison.span is not None
+        self.assertEqual(
+            source[assignment.value.span.start : assignment.value.span.end], "10"
+        )
+        self.assertEqual(
+            source[comparison.offset.span.start : comparison.offset.span.end], "4"
+        )
+        self.assertEqual(
+            source[comparison.span.start : comparison.span.end],
+            "Omar has 4 fewer shells than her",
+        )
+
+    def test_question_pronoun_is_safe_with_one_typed_prior_entity(self) -> None:
+        source = "Lina has 10 shells. How many shells does he have?"
+
+        parsed, solution = _solve(source)
+
+        self.assertEqual(parsed.reason, "")
+        self.assertEqual(solution.target_value, 10)
+        self.assertIsNotNone(solution.certificate)
+        assert solution.certificate is not None
+        self.assertTrue(solution.certificate.verified)
+        assert parsed.problem is not None
+        assert parsed.problem.target.span is not None
+        self.assertEqual(
+            source[parsed.problem.target.span.start : parsed.problem.target.span.end],
+            "Lina",
+        )
+
+    def test_harmless_nonnumeric_pronoun_prose_is_ignored(self) -> None:
+        source = "Lina has 10 shells. She smiles. How many shells does Lina have?"
+
+        parsed, solution = _solve(source)
+
+        self.assertEqual(parsed.reason, "")
+        self.assertEqual(solution.target_value, 10)
+        self.assertIsNotNone(solution.certificate)
+        assert solution.certificate is not None
+        self.assertTrue(solution.certificate.verified)
+
+    def test_unsupported_numeric_pronoun_declaration_remains_ambiguous(self) -> None:
+        self.assert_ambiguous(
+            "Lina has 10 shells. She has 4 shells. How many shells does Lina have?",
+            "numeric pronoun binding is not proven",
+        )
+
+    def test_object_pronoun_does_not_use_name_or_gender_heuristics(self) -> None:
+        source = (
+            "Omar has 10 shells. Lina has 4 fewer shells than her. "
+            "How many shells does Lina have?"
+        )
+
+        self.assertEqual(_solve(source)[1].target_value, 6)
+
+    def test_object_pronoun_abstains_unless_one_scoped_antecedent_remains(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "Lina has 10 shells. Nia has 8 shells. "
+                "Omar has 4 fewer shells than her. "
+                "How many shells does Omar have?"
+            ),
+            ("Omar has 4 fewer shells than her. How many shells does Omar have?"),
+            (
+                "Lina has 10 marbles. Omar has 4 fewer shells than her. "
+                "How many shells does Omar have?"
+            ),
+            (
+                "Lina has 10 shells. Omar has 4 fewer shells than them. "
+                "How many shells does Omar have?"
+            ),
+        )
+
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_ambiguous(source, "numeric pronoun binding is not proven")
+
+    def test_question_pronoun_abstains_with_multiple_or_future_candidates(
+        self,
+    ) -> None:
+        cases = (
+            ("Lina has 10 shells. Omar has 4 shells. How many shells does she have?"),
+            "Lina has 10 shells. How many shells do they have?",
+            "How many shells does she have? Lina has 10 shells.",
+        )
+
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_ambiguous(source, "question pronoun binding is not proven")
+
+    def test_pronoun_role_mismatch_is_not_coerced(self) -> None:
+        self.assert_ambiguous(
+            "Lina has 10 shells. Omar has 4 fewer shells than she. "
+            "How many shells does Omar have?",
+            "numeric pronoun binding is not proven",
+        )
+        self.assert_ambiguous(
+            "Lina has 10 shells. How many shells does her have?",
+            "question pronoun binding is not proven",
+        )
+
+    def test_ambiguous_pronoun_keeps_primary_parser_authority(self) -> None:
+        source = (
+            "Lina has 10 shells. Nia has 8 shells. "
+            "Omar has 4 fewer shells than her. "
+            "How many shells does Omar have?"
+        )
+
+        with mock.patch(
+            "immer.cognition.fertig.structural.compile_clauses"
+        ) as compiler:
+            self.assert_ambiguous(source, "numeric pronoun binding is not proven")
+
+        compiler.assert_not_called()
 
 
 class LedgerStructuralParserTests(unittest.TestCase):

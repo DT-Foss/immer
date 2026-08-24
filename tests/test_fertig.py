@@ -126,6 +126,17 @@ class FertigAdapterTests(unittest.TestCase):
         self.assertEqual(result.status, ExecutionStatus.OK)
         self.assertEqual(result.output, "38")
 
+    def test_conservative_coreference_reaches_public_exact_solver(self) -> None:
+        question = (
+            "Lina has 10 shells. Omar has 4 fewer shells than her. "
+            "How many shells does Omar have?"
+        )
+
+        result = FertigSolver().handle(Request("exact_math", question))
+
+        self.assertEqual(result.status, ExecutionStatus.OK)
+        self.assertEqual(result.output, "6")
+
     def test_guarded_formula_certificate_precedes_legacy_solver(self) -> None:
         question = (
             "Janeth borrowed $2000 and promised to return it with an additional "

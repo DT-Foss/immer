@@ -30,7 +30,7 @@ from .arithmetic_ir import (
     Variable,
     variables_in_constraint,
 )
-from .clause_compiler import compile_clauses
+from .clause_compiler import SymbolKey, compile_clauses
 
 
 _UNICODE_FRACTIONS = {
@@ -58,9 +58,12 @@ _MONEY = rf"(?:\$\s*{_NUMBER}|{_NUMBER}\s*(?:dollars?|USD))"
 _NAME = r"(?-i:[A-Z][A-Za-z'\-]*(?:\s+[A-Z][A-Za-z'\-]*)*)"
 _NOUN = r"[A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*){0,3}"
 _PRONOUN = re.compile(
-    r"\b(?:he|she|they|them|him|her|his|their|it|its|this|that|these|those)\b",
+    r"\b(?:he|she|they|them|him|her|his|their|it|its|this|that|these|those|"
+    r"himself|herself|itself|themselves)\b",
     re.IGNORECASE,
 )
+_SUBJECT_PRONOUN = r"(?:he|she|it|they)"
+_OBJECT_PRONOUN = r"(?:him|her|it|them)"
 _NUMERIC = re.compile(rf"(?<![\w])(?:{_MONEY}|{_NUMBER})(?![\w])", re.IGNORECASE)
 
 _AGE_ASSIGN = re.compile(
@@ -104,6 +107,12 @@ _COUNT_AFFINE = re.compile(
     rf"(?P<noun>{_NOUN}?)\s+than\s+(?P<source>{_NAME})$",
     re.IGNORECASE,
 )
+_COUNT_AFFINE_PRONOUN_SOURCE = re.compile(
+    rf"^(?P<target>{_NAME})\s+(?:has|had|owns?|keeps?)\s+"
+    rf"(?P<offset>{_NUMBER})\s+(?P<direction>more|fewer)\s+"
+    rf"(?P<noun>{_NOUN}?)\s+than\s+(?P<source_pronoun>{_OBJECT_PRONOUN})$",
+    re.IGNORECASE,
+)
 _SCALE_AFFINE = re.compile(
     rf"^(?P<target>{_NAME})\s+(?:has|had|owns?|keeps?)\s+"
     rf"(?P<scale>{_NUMBER})\s+times\s+as\s+many\s+(?P<noun>{_NOUN})\s+"
@@ -127,6 +136,12 @@ _WEIGHT_QUERY = re.compile(
 _COUNT_QUERY = re.compile(
     rf"^how\s+many\s+(?P<noun>{_NOUN}?)\s+(?:does|did)\s+"
     rf"(?P<entity>{_NAME})\s+(?:have|own|keep)$",
+    re.IGNORECASE,
+)
+_COUNT_PRONOUN_QUERY = re.compile(
+    rf"^how\s+many\s+(?P<noun>{_NOUN}?)\s+"
+    rf"(?P<auxiliary>do|does|did)\s+"
+    rf"(?P<entity_pronoun>{_SUBJECT_PRONOUN})\s+(?:have|own|keep)$",
     re.IGNORECASE,
 )
 _LEDGER_QUERY = re.compile(
@@ -508,6 +523,98 @@ class _Abort(Exception):
         self.reason = reason
 
 
+@dataclass(frozen=True, slots=True)
+class _ActiveReferent:
+    """One explicitly named entity in one typed semantic scope."""
+
+    symbol: SymbolKey
+    variable: Variable
+    span: Span
+    number: str
+
+
+class _ActiveReferentLedger:
+    """Conservative, document-local antecedents for typed pronoun positions.
+
+    Entries are keyed by :class:`SymbolKey`, so a count of shells can never be
+    reused as a count of marbles.  Resolution is based only on grammatical
+    number, role, source order, and caller-supplied binding exclusions.  Names
+    and pronouns carry no inferred gender semantics.
+    """
+
+    _SINGULAR_BY_ROLE = {
+        "subject": frozenset({"he", "she", "it"}),
+        "object": frozenset({"him", "her", "it"}),
+    }
+    _PLURAL_BY_ROLE = {
+        "subject": frozenset({"they"}),
+        "object": frozenset({"them"}),
+    }
+
+    def __init__(self) -> None:
+        self._entries: dict[SymbolKey, _ActiveReferent] = {}
+
+    def register(
+        self,
+        symbol: SymbolKey,
+        variable: Variable,
+        span: Span,
+        *,
+        number: str = "singular",
+    ) -> None:
+        if number not in {"singular", "plural"}:
+            raise ValueError("referent number must be singular or plural")
+        previous = self._entries.get(symbol)
+        if previous is not None:
+            if previous.variable != variable or previous.number != number:
+                raise _Abort(
+                    ParseStatus.AMBIGUOUS,
+                    "explicit referent has conflicting structural identity",
+                )
+            # Keep the first explicit mention.  A later repetition must not turn
+            # a forward reference into a retrospectively available antecedent.
+            return
+        self._entries[symbol] = _ActiveReferent(symbol, variable, span, number)
+
+    def resolve(
+        self,
+        pronoun: str,
+        expected: SymbolKey,
+        expected_unit: Unit,
+        pronoun_span: Span,
+        *,
+        role: str,
+        excluded: frozenset[SymbolKey] = frozenset(),
+    ) -> Variable | None:
+        normalized = _entity(pronoun)
+        singular = self._SINGULAR_BY_ROLE.get(role)
+        plural = self._PLURAL_BY_ROLE.get(role)
+        if singular is None or plural is None:
+            raise ValueError(f"unsupported pronoun role: {role}")
+        if normalized in singular:
+            number = "singular"
+        elif normalized in plural:
+            number = "plural"
+        else:
+            return None
+
+        candidates = tuple(
+            entry.variable
+            for entry in self._entries.values()
+            if entry.number == number
+            and entry.span.end <= pronoun_span.start
+            and entry.symbol not in excluded
+            and entry.symbol.property == expected.property
+            and entry.symbol.item == expected.item
+            and entry.symbol.scope == expected.scope
+            and entry.symbol.state == expected.state
+            and entry.variable.unit.compatible(expected_unit)
+        )
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
+
+
 def _sentences(source: str) -> tuple[_Clause, ...]:
     """Split prose without treating decimal points as sentence boundaries."""
 
@@ -737,6 +844,7 @@ class StructuralParser:
         self.targets: list[Variable] = []
         self.price_variables: dict[str, Variable] = {}
         self.definitions: set[str] = set()
+        self.referents = _ActiveReferentLedger()
 
     def _variable(
         self,
@@ -769,6 +877,49 @@ class StructuralParser:
 
     def _property_name(self, entity: str, property_name: str) -> str:
         return f"{_entity(entity)}.{property_name}"
+
+    def _count_symbol(self, entity: str, item: str) -> SymbolKey:
+        return SymbolKey(_entity(entity), "count", item, "collection", "current")
+
+    def _register_named_count(
+        self,
+        entity: str,
+        item: str,
+        variable: Variable,
+        span: Span,
+    ) -> SymbolKey:
+        symbol = self._count_symbol(entity, item)
+        self.referents.register(symbol, variable, span)
+        return symbol
+
+    def _resolve_typed_pronoun(
+        self,
+        pronoun: str,
+        item: str,
+        unit: Unit,
+        span: Span,
+        *,
+        role: str,
+        excluded: frozenset[SymbolKey] = frozenset(),
+        question: bool = False,
+    ) -> Variable:
+        expected = self._count_symbol("pronoun", item)
+        variable = self.referents.resolve(
+            pronoun,
+            expected,
+            unit,
+            span,
+            role=role,
+            excluded=excluded,
+        )
+        if variable is None:
+            reason = (
+                "question pronoun binding is not proven"
+                if question
+                else "numeric pronoun binding is not proven"
+            )
+            raise _Abort(ParseStatus.AMBIGUOUS, reason)
+        return variable
 
     def _define(self, target: Variable, constraint: object) -> None:
         if target.name in self.definitions:
@@ -2071,9 +2222,50 @@ class StructuralParser:
         )
         return any(parser() for parser in parsers)
 
+    def _parse_pronominal_declaration(self, clause: _Clause) -> bool:
+        """Parse only typed object-pronoun relations with a unique antecedent."""
+
+        text = clause.text.strip()
+
+        match = _COUNT_AFFINE_PRONOUN_SOURCE.fullmatch(text)
+        if match:
+            noun = _singular(match.group("noun"))
+            unit = Unit.count(symbol=noun)
+            target_span = clause.group_span(match, "target", self.source)
+            target = self._variable(
+                self._property_name(match.group("target"), noun),
+                unit,
+                span=target_span,
+                count=True,
+            )
+            target_symbol = self._register_named_count(
+                match.group("target"), noun, target, target_span
+            )
+            # A non-reflexive comparative object cannot denote this clause's
+            # subject; that reading would require a reflexive surface form.
+            source = self._resolve_typed_pronoun(
+                match.group("source_pronoun"),
+                noun,
+                unit,
+                clause.group_span(match, "source_pronoun", self.source),
+                role="object",
+                excluded=frozenset({target_symbol}),
+            )
+            offset = self._quantity(match, "offset", clause, unit)
+            if match.group("direction").casefold() == "fewer":
+                offset = Quantity(-offset.value, unit, span=offset.span)
+            self._define(
+                target, Affine(target, source, 1, offset, span=clause.span(self.source))
+            )
+            return True
+
+        raise _Abort(ParseStatus.AMBIGUOUS, "numeric pronoun binding is not proven")
+
     def _parse_declaration(self, clause: _Clause) -> bool:
         text = clause.text.strip()
-        if _PRONOUN.search(text):
+        if _COUNT_AFFINE_PRONOUN_SOURCE.fullmatch(text):
+            return self._parse_pronominal_declaration(clause)
+        if _PRONOUN.search(text) and _NUMERIC.search(text):
             raise _Abort(ParseStatus.AMBIGUOUS, "numeric pronoun binding is not proven")
 
         # Coordination is a grammar operation: accept it only when every
@@ -2187,11 +2379,15 @@ class StructuralParser:
             # exotic object name merely because its affine base is malformed.
             noun = _singular(match.group("noun"))
             unit = Unit.count(symbol=noun)
+            entity_span = clause.group_span(match, "entity", self.source)
             variable = self._variable(
                 self._property_name(match.group("entity"), noun),
                 unit,
-                span=clause.group_span(match, "entity", self.source),
+                span=entity_span,
                 count=True,
+            )
+            self._register_named_count(
+                match.group("entity"), noun, variable, entity_span
             )
             self._define(
                 variable,
@@ -2207,18 +2403,22 @@ class StructuralParser:
         if match:
             noun = _singular(match.group("noun"))
             unit = Unit.count(symbol=noun)
+            target_span = clause.group_span(match, "target", self.source)
             target = self._variable(
                 self._property_name(match.group("target"), noun),
                 unit,
-                span=clause.group_span(match, "target", self.source),
+                span=target_span,
                 count=True,
             )
+            source_span = clause.group_span(match, "source", self.source)
             source = self._variable(
                 self._property_name(match.group("source"), noun),
                 unit,
-                span=clause.group_span(match, "source", self.source),
+                span=source_span,
                 count=True,
             )
+            self._register_named_count(match.group("target"), noun, target, target_span)
+            self._register_named_count(match.group("source"), noun, source, source_span)
             offset = self._quantity(match, "offset", clause, unit)
             if match.group("direction").casefold() == "fewer":
                 offset = Quantity(-offset.value, unit, span=offset.span)
@@ -2231,18 +2431,22 @@ class StructuralParser:
         if match:
             noun = _singular(match.group("noun"))
             unit = Unit.count(symbol=noun)
+            target_span = clause.group_span(match, "target", self.source)
             target = self._variable(
                 self._property_name(match.group("target"), noun),
                 unit,
-                span=clause.group_span(match, "target", self.source),
+                span=target_span,
                 count=True,
             )
+            source_span = clause.group_span(match, "source", self.source)
             source = self._variable(
                 self._property_name(match.group("source"), noun),
                 unit,
-                span=clause.group_span(match, "source", self.source),
+                span=source_span,
                 count=True,
             )
+            self._register_named_count(match.group("target"), noun, target, target_span)
+            self._register_named_count(match.group("source"), noun, source, source_span)
             scale = _number(match.group("scale"))
             self._define(
                 target,
@@ -2283,6 +2487,44 @@ class StructuralParser:
             return True
         return False
 
+    def _parse_pronominal_question(self, clause: _Clause) -> bool:
+        """Bind a typed singular question target only when it is unique."""
+
+        text = clause.text.strip()
+
+        match = _COUNT_PRONOUN_QUERY.fullmatch(text)
+        if match:
+            pronoun = _entity(match.group("entity_pronoun"))
+            auxiliary = _entity(match.group("auxiliary"))
+            expected_auxiliaries = (
+                {"do", "did"}
+                if pronoun == "they"
+                else {
+                    "does",
+                    "did",
+                }
+            )
+            if auxiliary not in expected_auxiliaries:
+                raise _Abort(
+                    ParseStatus.AMBIGUOUS,
+                    "question pronoun binding is not proven",
+                )
+            noun = _singular(match.group("noun"))
+            unit = Unit.count(symbol=noun)
+            self.targets.append(
+                self._resolve_typed_pronoun(
+                    match.group("entity_pronoun"),
+                    noun,
+                    unit,
+                    clause.group_span(match, "entity_pronoun", self.source),
+                    role="subject",
+                    question=True,
+                )
+            )
+            return True
+
+        raise _Abort(ParseStatus.AMBIGUOUS, "question pronoun binding is not proven")
+
     def _parse_question(self, clause: _Clause) -> bool:
         text = clause.text.strip()
 
@@ -2309,9 +2551,7 @@ class StructuralParser:
             return True
 
         if _PRONOUN.search(text):
-            raise _Abort(
-                ParseStatus.AMBIGUOUS, "question pronoun binding is not proven"
-            )
+            return self._parse_pronominal_question(clause)
 
         match = _AGE_QUERY.fullmatch(text)
         if match:
