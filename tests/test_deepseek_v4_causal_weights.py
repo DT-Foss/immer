@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from immer.knowledge.livecausal import LiveCausalIntegrityError, LiveGraph
-from immer.knowledge.streamer import Streamer
+from immer.knowledge.streamer import InventoryValidationError, Streamer
 from immer.runtimes.deepseek_v4 import CausalWeightMount
 from immer.runtimes.deepseek_v4.causal_weights import (
     CausalWeightConflictError,
@@ -126,6 +126,59 @@ def _shift_plan(plan: OfficialExpertRangePlan, amount: int) -> OfficialExpertRan
 
 
 class CausalWeightMonorailTests(unittest.TestCase):
+    def test_pinned_remote_inventory_requires_exact_local_tensor_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            weights = base / "weights"
+            _write_expert_fixture(weights, expert_ids=(0, 1))
+            initial = Streamer.from_local(
+                weights,
+                repo_id=_LOGICAL_MODEL.repo_id,
+                revision=_LOGICAL_MODEL.revision,
+                use_cache=False,
+                budget_mb=16,
+            )
+            try:
+                pinned = json.loads(json.dumps(initial.inventory()))
+            finally:
+                initial.close()
+            for index, shard in enumerate(pinned["shards"]):
+                shard["etag"] = f"remote-etag-{index}"
+                shard["cas_url_hash"] = f"{index + 1:064x}"
+            fingerprint = Streamer._source_fingerprint(pinned)
+
+            adopted = Streamer.from_local(
+                weights,
+                repo_id=_LOGICAL_MODEL.repo_id,
+                revision=_LOGICAL_MODEL.revision,
+                pinned_inventory=pinned,
+                pinned_fingerprint=fingerprint,
+                use_cache=False,
+                budget_mb=16,
+            )
+            try:
+                self.assertEqual(
+                    adopted.metrics()["inventory_source_fingerprint"], fingerprint
+                )
+                self.assertEqual(
+                    adopted.tensor("layers.3.ffn.experts.0.w1.weight").tolist(),
+                    [0, 1, 2, 3, 4],
+                )
+            finally:
+                adopted.close()
+
+            incompatible = json.loads(json.dumps(pinned))
+            incompatible["tensors"][0]["shape"] = [999]
+            with self.assertRaisesRegex(InventoryValidationError, "layout|Shape"):
+                Streamer.from_local(
+                    weights,
+                    repo_id=_LOGICAL_MODEL.repo_id,
+                    revision=_LOGICAL_MODEL.revision,
+                    pinned_inventory=incompatible,
+                    use_cache=False,
+                    budget_mb=16,
+                )
+
     def test_local_bundle_mount_persists_graph_and_keeps_logical_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -147,8 +200,8 @@ class CausalWeightMonorailTests(unittest.TestCase):
             )
             with mounted as first:
                 self.assertEqual(first.root, bundle.absolute())
-                self.assertTrue(first.source.repo_id.startswith("local:"))
-                self.assertNotEqual(first.source.repo_id, _LOGICAL_MODEL.repo_id)
+                self.assertEqual(first.source.repo_id, _LOGICAL_MODEL.repo_id)
+                self.assertEqual(first.source.revision, _LOGICAL_MODEL.revision)
                 self.assertEqual(
                     first.source.metrics()["transport_fd_max_open_files"],
                     2,

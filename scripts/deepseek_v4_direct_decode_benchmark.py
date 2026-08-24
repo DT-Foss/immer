@@ -192,7 +192,26 @@ def _build_source(
     if local is not None:
         if not local.is_dir():
             raise DirectDecodeError(f"local source directory does not exist: {local}")
-        return Streamer.from_local(local, **common)
+        pinned_inventory = None
+        pinned_fingerprint = None
+        pinned_path = local / "inventory.pinned.json"
+        if pinned_path.is_file():
+            pinned = _strict_json(pinned_path)
+            if (
+                not isinstance(pinned, Mapping)
+                or not isinstance(pinned.get("inventory"), Mapping)
+                or not isinstance(pinned.get("source_fingerprint"), str)
+            ):
+                raise DirectDecodeError("local pinned inventory is invalid")
+            pinned_inventory = pinned["inventory"]
+            pinned_fingerprint = pinned["source_fingerprint"]
+        return Streamer.from_local(
+            local,
+            repo_id=args.logical_repo_id,
+            pinned_inventory=pinned_inventory,
+            pinned_fingerprint=pinned_fingerprint,
+            **common,
+        )
     return Streamer(args.source, **common)
 
 

@@ -228,8 +228,10 @@ class HardByteBudget(Budget):
                     f"Budget-Charge fuer {tag!r} uebersteigt die vorab "
                     f"reservierten Bytes: {amount}/{receipt['remaining']}"
                 )
-            attempted = self.total + self._reserved_bytes + (
-                0 if receipt is not None else amount
+            attempted = (
+                self.total
+                + self._reserved_bytes
+                + (0 if receipt is not None else amount)
             )
             if attempted > self.limit:
                 self.rejected_charges += 1
@@ -358,7 +360,8 @@ class LocalRangeReader:
             resolved_root = configured_root.resolve(strict=True)
             resolved_stat = resolved_root.stat()
             if not stat_module.S_ISDIR(opened_stat.st_mode) or (
-                int(opened_stat.st_dev), int(opened_stat.st_ino)
+                int(opened_stat.st_dev),
+                int(opened_stat.st_ino),
             ) != (int(resolved_stat.st_dev), int(resolved_stat.st_ino)):
                 raise RangeValidationError(
                     f"Lokale Tensorquelle wurde beim Oeffnen ersetzt: {configured_root}"
@@ -1398,9 +1401,7 @@ class _ContractReader:
                         )
                     charged_body = int(receipt["body"])
                     if charged_body == 0:
-                        self.budget.charge(
-                            len(body), 0, f"range:{filename}:{start}"
-                        )
+                        self.budget.charge(len(body), 0, f"range:{filename}:{start}")
                     elif charged_body < len(body):
                         raise RangeValidationError(
                             f"Reader verbuchte fuer {filename} weniger als die gelieferte Bytezahl"
@@ -1483,9 +1484,7 @@ class _ContractReader:
         with self._locked_cache_keys(item[2] for item in ordered_leaves):
             misses: list[tuple[int, int, str, dict[str, Any]]] = []
             for start, end, key, contract in ordered_leaves:
-                cached = self._load_cache(
-                    "range", key, contract, end - start + 1
-                )
+                cached = self._load_cache("range", key, contract, end - start + 1)
                 if cached is None:
                     self._bump("cache_misses")
                     misses.append((start, end, key, contract))
@@ -1510,9 +1509,7 @@ class _ContractReader:
                     8192 if isinstance(self.upstream, HFRangeReader) else 0,
                 )
             )
-            planned_source_bytes = sum(
-                end - start + 1 for start, end, _ in envelopes
-            )
+            planned_source_bytes = sum(end - start + 1 for start, end, _ in envelopes)
             reserve = planned_source_bytes + len(envelopes) * max(0, overhead)
             with self.budget.reservation(
                 reserve, f"ranges:{filename}:{len(envelopes)}"
@@ -1534,9 +1531,7 @@ class _ContractReader:
                                 f"Range {filename}[{envelope_start}:{envelope_end}] "
                                 f"lieferte {len(body)} statt {expected} Bytes"
                             )
-                        charged_body = (
-                            int(receipt["body"]) - before_receipt_body
-                        )
+                        charged_body = int(receipt["body"]) - before_receipt_body
                         if charged_body == 0:
                             self.budget.charge(
                                 len(body),
@@ -1548,9 +1543,7 @@ class _ContractReader:
                                 f"Reader verbuchte fuer {filename} weniger als "
                                 "die gelieferte Bytezahl"
                             )
-                        physical_body = (
-                            int(receipt["body"]) - before_receipt_body
-                        )
+                        physical_body = int(receipt["body"]) - before_receipt_body
                         self._bump("range_source_bytes", physical_body)
                         source_bytes += physical_body
                     except Exception:
@@ -1637,9 +1630,7 @@ class _ContractReader:
                     if known_size is None:
                         body = bytes(self.upstream.fetch_file(filename))
                     else:
-                        with self.budget.reservation(
-                            known_size, f"file:{filename}"
-                        ):
+                        with self.budget.reservation(known_size, f"file:{filename}"):
                             body = bytes(self.upstream.fetch_file(filename))
                 if len(body) > ceiling:
                     raise RangeValidationError(
@@ -1814,6 +1805,9 @@ class Streamer:
         cls,
         root: str | os.PathLike[str],
         *,
+        repo_id: str | None = None,
+        pinned_inventory: Mapping[str, Any] | None = None,
+        pinned_fingerprint: str | None = None,
         revision: str = "local",
         budget_mb: float = 200.0,
         cache_dir: str | os.PathLike[str] | None = None,
@@ -1826,11 +1820,12 @@ class Streamer:
     ) -> "Streamer":
         local = LocalRangeReader(
             Path(root).expanduser(),
+            repo_id=repo_id,
             revision=revision,
             max_open_files=max_open_files,
         )
         try:
-            return cls(
+            source = cls(
                 local.repo,
                 revision=revision,
                 budget_mb=budget_mb,
@@ -1842,9 +1837,90 @@ class Streamer:
                 verbose=verbose,
                 access_observer=access_observer,
             )
+            if pinned_inventory is not None:
+                source.adopt_pinned_inventory(
+                    pinned_inventory,
+                    expected_fingerprint=pinned_fingerprint,
+                )
+            elif pinned_fingerprint is not None:
+                raise ValueError(
+                    "pinned_fingerprint requires a pinned_inventory document"
+                )
+            return source
         except Exception:
             local.close()
             raise
+
+    @staticmethod
+    def _inventory_layout_projection(inventory: Mapping[str, Any]) -> dict[str, Any]:
+        shards = [
+            {
+                key: shard.get(key)
+                for key in ("data_start", "file", "header_len", "size")
+            }
+            for shard in inventory.get("shards", ())
+            if isinstance(shard, Mapping)
+        ]
+        tensors = [
+            {
+                key: tensor.get(key)
+                for key in (
+                    "data_start",
+                    "dtype",
+                    "name",
+                    "offset_in_shard",
+                    "shape",
+                    "shard",
+                )
+            }
+            for tensor in inventory.get("tensors", ())
+            if isinstance(tensor, Mapping)
+        ]
+        return {
+            "shards": sorted(shards, key=lambda row: str(row["file"])),
+            "tensors": sorted(tensors, key=lambda row: str(row["name"])),
+        }
+
+    def adopt_pinned_inventory(
+        self,
+        inventory: Mapping[str, Any],
+        *,
+        expected_fingerprint: str | None = None,
+    ) -> str:
+        """Adopt remote shard identity only after exact local-layout equality.
+
+        Local filesystem ETags/inodes deliberately differ from the immutable
+        remote source. Tensor names, dtypes, shapes, shard sizes, headers, data
+        starts, and byte offsets must still match exactly before the pinned
+        CAS/ETag fingerprint can become the source identity.
+        """
+
+        if not isinstance(inventory, Mapping):
+            raise TypeError("pinned_inventory must be a mapping")
+        try:
+            pinned = json.loads(_canonical_json(dict(inventory)).decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:  # pragma: no cover
+            raise InventoryValidationError("pinned inventory is not JSON") from exc
+        self._validate_inventory(pinned)
+        local = scan_inventory(self.reader, budget=self.budget)
+        self._validate_inventory(local)
+        if self._inventory_layout_projection(
+            local
+        ) != self._inventory_layout_projection(pinned):
+            raise InventoryValidationError(
+                "local tensor layout does not match the pinned inventory"
+            )
+        fingerprint = self._source_fingerprint(pinned)
+        if expected_fingerprint is not None and fingerprint != expected_fingerprint:
+            raise InventoryValidationError(
+                "pinned inventory fingerprint does not match the expected identity"
+            )
+        with self._state_lock:
+            self._inventory = pinned
+            self._inventory_fingerprint = fingerprint
+            self._tensor_index = None
+            self._tensor_index_inventory_id = None
+        return fingerprint
 
     @property
     def reader(self) -> _ContractReader:

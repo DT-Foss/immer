@@ -117,6 +117,26 @@ class LocalPreadRangeReaderTests(unittest.TestCase):
             finally:
                 source.close()
 
+    def test_local_streamer_can_carry_an_explicit_logical_model_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.joinpath("weights.bin").write_bytes(b"0123456789abcdef")
+            source = Streamer.from_local(
+                root,
+                repo_id="deepseek-ai/DeepSeek-V4-Flash-0731",
+                revision="a" * 40,
+                use_cache=False,
+            )
+            try:
+                metrics = source.metrics()
+                self.assertEqual(
+                    metrics["repo_id"], "deepseek-ai/DeepSeek-V4-Flash-0731"
+                )
+                self.assertEqual(metrics["revision"], "a" * 40)
+                self.assertEqual(source.raw_bytes("weights.bin", 0, 4), b"0123")
+            finally:
+                source.close()
+
     def test_direct_fetch_re_reserves_after_growth_before_pread(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

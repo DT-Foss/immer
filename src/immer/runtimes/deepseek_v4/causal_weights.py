@@ -38,7 +38,6 @@ from .pager import (
     OfficialExpertRangePlan,
 )
 
-
 CAUSAL_WEIGHT_BINDING_SCHEMA = "causal-weight-binding/v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _EXPERT_BASE = re.compile(r"layers\.(0|[1-9][0-9]*)\.ffn\.experts\.(0|[1-9][0-9]*)\Z")
@@ -1163,8 +1162,34 @@ class CausalWeightMount:
         self._require_plain_directory(weights_root, "causal bundle weights root")
         self._require_plain_directory(causal_root, "causal bundle graph root")
 
+        pinned_inventory = None
+        pinned_fingerprint = None
+        pinned_path = weights_root / "inventory.pinned.json"
+        if pinned_path.exists():
+            try:
+                pinned_document = json.loads(pinned_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise CausalWeightIntegrityError(
+                    "causal bundle pinned inventory is unreadable"
+                ) from exc
+            if (
+                not isinstance(pinned_document, Mapping)
+                or pinned_document.get("schema") != "immer.tensor-inventory-cache/v1"
+                or not isinstance(pinned_document.get("inventory"), Mapping)
+                or not isinstance(pinned_document.get("source_fingerprint"), str)
+            ):
+                raise CausalWeightIntegrityError(
+                    "causal bundle pinned inventory schema is invalid"
+                )
+            pinned_inventory = pinned_document["inventory"]
+            pinned_fingerprint = pinned_document["source_fingerprint"]
+
         source = Streamer.from_local(
             weights_root,
+            repo_id=model.repo_id,
+            revision=model.revision,
+            pinned_inventory=pinned_inventory,
+            pinned_fingerprint=pinned_fingerprint,
             budget_mb=budget_mb,
             use_cache=False,
             max_metadata_bytes=max_metadata_bytes,
