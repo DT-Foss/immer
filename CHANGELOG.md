@@ -48,6 +48,12 @@ All notable changes to IMMER are recorded here.
   schema, checkpoint layout, config, math runtime, dependencies, and graft;
   the content-addressed payload is verified before bounded transactional
   restore.
+- Generalized the causal weight graph from DeepSeek expert coordinates to
+  immutable tensor coordinates with live-append bindings, revision-bound plan
+  caches, exact subrange reads, conflict detection, and tombstone invalidation.
+- Connected `Qwen38WeightPager` to the causal tensor reader. Dense prefill,
+  row-paged LM-head scans, and stateful greedy generation now execute without
+  tensor metadata discovery and remain bit-identical to the inventory path.
 - Rebuilt public documentation around the local causal architecture and
   separated public source from weights, state, traces, and operations.
 

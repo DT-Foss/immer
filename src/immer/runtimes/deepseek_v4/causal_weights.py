@@ -39,9 +39,29 @@ from .pager import (
 )
 
 CAUSAL_WEIGHT_BINDING_SCHEMA = "causal-weight-binding/v1"
+CAUSAL_TENSOR_BINDING_SCHEMA = "causal-tensor-binding/v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _EXPERT_BASE = re.compile(r"layers\.(0|[1-9][0-9]*)\.ffn\.experts\.(0|[1-9][0-9]*)\Z")
 _DTYPE = re.compile(r"[A-Z][A-Z0-9_]*\Z")
+_TENSOR_DTYPE_BYTES = {
+    "BF16": 2,
+    "BOOL": 1,
+    "F16": 2,
+    "F32": 4,
+    "F64": 8,
+    "F8_E4M3": 1,
+    "F8_E4M3FN": 1,
+    "F8_E5M2": 1,
+    "F8_E8M0": 1,
+    "I8": 1,
+    "I16": 2,
+    "I32": 4,
+    "I64": 8,
+    "U8": 1,
+    "U16": 2,
+    "U32": 4,
+    "U64": 8,
+}
 _UINT64_MAX = (1 << 64) - 1
 _BINDING_LOCK_NAME = ".causal-weight-bindings.lock"
 _PLAN_CACHE_RESOLVE_RETRIES = 3
@@ -364,6 +384,55 @@ class CausalWeightReadReceipt:
     source_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class TensorRangePlan:
+    """One exact tensor coordinate in an immutable Safetensors layout."""
+
+    name: str
+    dtype: str
+    shape: tuple[int, ...]
+    shard: str
+    absolute_offset: int
+    length: int
+
+    @property
+    def absolute_end(self) -> int:
+        return self.absolute_offset + self.length
+
+
+@dataclass(frozen=True, slots=True)
+class TensorBindingReceipt:
+    """Graph citation created or reused for one tensor coordinate."""
+
+    name: str
+    segment_sha256: str
+    record_index: int
+    appended: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CausalTensorBindingReceipt:
+    """Receipt for one arbitrary tensor-binding batch."""
+
+    layout: CausalWeightLayoutIdentity
+    bindings: tuple[TensorBindingReceipt, ...]
+    appended_segment_sha256: str | None
+
+    @property
+    def appended_count(self) -> int:
+        return sum(receipt.appended for receipt in self.bindings)
+
+
+@dataclass(frozen=True, slots=True)
+class CausalTensorReadReceipt:
+    """One graph-resolved exact tensor subrange and its immutable bytes."""
+
+    plan: TensorRangePlan
+    relative_offset: int
+    length: int
+    part: memoryview
+
+
 def semantic_expert_key(
     model: LogicalModelIdentity,
     *,
@@ -380,6 +449,107 @@ def semantic_expert_key(
         "logical_model": model.as_record(),
     }
     return f"semantic-expert:v1:{_digest(coordinate)}"
+
+
+def semantic_tensor_key(model: LogicalModelIdentity, *, name: str) -> str:
+    """Return the layout-independent key for one checkpoint tensor."""
+
+    if not isinstance(model, LogicalModelIdentity):
+        raise CausalWeightError("model must be a LogicalModelIdentity")
+    coordinate = {
+        "logical_model": model.as_record(),
+        "name": _text(name, "tensor name", maximum=4096),
+    }
+    return f"semantic-tensor:v1:{_digest(coordinate)}"
+
+
+def _normalize_tensor_plan(plan: TensorRangePlan) -> TensorRangePlan:
+    if not isinstance(plan, TensorRangePlan):
+        raise CausalWeightError("tensor plans must contain TensorRangePlan values")
+    name = _text(plan.name, "tensor name", maximum=4096)
+    dtype = _text(plan.dtype, "tensor dtype", maximum=64).upper()
+    if _DTYPE.fullmatch(dtype) is None or dtype not in _TENSOR_DTYPE_BYTES:
+        raise CausalWeightError("tensor dtype is invalid")
+    if not isinstance(plan.shape, tuple) or len(plan.shape) > 16:
+        raise CausalWeightError("tensor shape must be a bounded tuple")
+    shape = tuple(
+        _uint64(value, "tensor shape dimension", positive=True) for value in plan.shape
+    )
+    shard = _safe_shard(plan.shard)
+    absolute_offset = _uint64(plan.absolute_offset, "tensor absolute_offset")
+    length = _uint64(plan.length, "tensor length", positive=True)
+    if absolute_offset > _UINT64_MAX - length:
+        raise CausalWeightError("tensor range exceeds unsigned 64-bit coordinates")
+    elements = 1
+    for dimension in shape:
+        if elements > _UINT64_MAX // dimension:
+            raise CausalWeightError("tensor shape exceeds unsigned 64-bit elements")
+        elements *= dimension
+    expected_length = elements * _TENSOR_DTYPE_BYTES[dtype]
+    if expected_length > _UINT64_MAX or length != expected_length:
+        raise CausalWeightError("tensor range length disagrees with dtype and shape")
+    return TensorRangePlan(
+        name=name,
+        dtype=dtype,
+        shape=shape,
+        shard=shard,
+        absolute_offset=absolute_offset,
+        length=length,
+    )
+
+
+def tensor_range_plan_from_source(
+    source: TensorSource,
+    name: str,
+) -> TensorRangePlan:
+    """Resolve one tensor through verified inventory metadata for graph binding."""
+
+    tensor_name = _text(name, "tensor name", maximum=4096)
+    find = getattr(source, "find", None)
+    if not callable(find):
+        raise CausalWeightError("tensor source must implement find")
+    try:
+        meta = find(tensor_name)
+    except Exception as exc:
+        if isinstance(exc, KeyError):
+            raise
+        raise CausalWeightError(f"cannot resolve tensor {tensor_name!r}") from exc
+    if not isinstance(meta, Mapping):
+        raise CausalWeightIntegrityError("tensor metadata is invalid")
+    offsets = meta.get("offset_in_shard")
+    if not isinstance(offsets, (list, tuple)) or len(offsets) != 2:
+        raise CausalWeightIntegrityError("tensor shard offsets are invalid")
+    begin, end = offsets
+    data_start = meta.get("data_start")
+    if (
+        isinstance(begin, bool)
+        or not isinstance(begin, int)
+        or isinstance(end, bool)
+        or not isinstance(end, int)
+        or isinstance(data_start, bool)
+        or not isinstance(data_start, int)
+        or begin < 0
+        or end <= begin
+        or data_start < 0
+    ):
+        raise CausalWeightIntegrityError("tensor byte coordinates are invalid")
+    raw_shape = meta.get("shape")
+    if not isinstance(raw_shape, (list, tuple)):
+        raise CausalWeightIntegrityError("tensor shape metadata is invalid")
+    try:
+        plan = TensorRangePlan(
+            name=tensor_name,
+            dtype=str(meta.get("dtype", "")),
+            shape=tuple(raw_shape),
+            shard=meta.get("shard"),
+            absolute_offset=data_start + begin,
+            length=end - begin,
+        )
+        return _normalize_tensor_plan(plan)
+    except (CausalWeightError, TypeError, ValueError) as exc:
+        if isinstance(exc, CausalWeightIntegrityError):
+            raise
+        raise CausalWeightIntegrityError("tensor metadata plan is invalid") from exc
 
 
 def _plan_record(plan: OfficialExpertRangePlan) -> dict[str, Any]:
@@ -823,6 +993,231 @@ def bind_causal_weight_plans(
         return _bind_normalized_plans(graph, layout, ordered)
 
 
+def _tensor_plan_record(plan: TensorRangePlan) -> dict[str, Any]:
+    return {
+        "absolute_offset": plan.absolute_offset,
+        "dtype": plan.dtype,
+        "length": plan.length,
+        "name": plan.name,
+        "shape": list(plan.shape),
+        "shard": plan.shard,
+    }
+
+
+def _tensor_plan_from_record(value: object) -> TensorRangePlan:
+    if not isinstance(value, Mapping) or set(value) != {
+        "absolute_offset",
+        "dtype",
+        "length",
+        "name",
+        "shape",
+        "shard",
+    }:
+        raise CausalWeightIntegrityError("tensor binding plan schema is invalid")
+    shape = value.get("shape")
+    if not isinstance(shape, list):
+        raise CausalWeightIntegrityError("tensor binding shape must be a list")
+    try:
+        return _normalize_tensor_plan(
+            TensorRangePlan(
+                name=value.get("name"),
+                dtype=value.get("dtype"),
+                shape=tuple(shape),
+                shard=value.get("shard"),
+                absolute_offset=value.get("absolute_offset"),
+                length=value.get("length"),
+            )
+        )
+    except (CausalWeightError, TypeError, ValueError) as exc:
+        if isinstance(exc, CausalWeightIntegrityError):
+            raise
+        raise CausalWeightIntegrityError("stored tensor plan is invalid") from exc
+
+
+def _tensor_range_plan_key(
+    layout: CausalWeightLayoutIdentity,
+    plan: TensorRangePlan,
+) -> str:
+    identity = {
+        "layout": layout.as_record(),
+        "plan_sha256": _digest(_tensor_plan_record(plan)),
+    }
+    return f"tensor-range-plan:v1:{_digest(identity)}"
+
+
+def _tensor_binding_record(
+    layout: CausalWeightLayoutIdentity,
+    plan: TensorRangePlan,
+) -> dict[str, Any]:
+    plan_record = _tensor_plan_record(plan)
+    return {
+        "layout_fingerprint": layout.layout_fingerprint,
+        "logical_model": layout.model.as_record(),
+        "outcome_key": _tensor_range_plan_key(layout, plan),
+        "plan": plan_record,
+        "plan_sha256": _digest(plan_record),
+        "record_type": "tensor_range_plan",
+        "schema": CAUSAL_TENSOR_BINDING_SCHEMA,
+        "trigger_key": semantic_tensor_key(layout.model, name=plan.name),
+    }
+
+
+def _parse_tensor_binding_record(
+    record: object,
+) -> tuple[CausalWeightLayoutIdentity, TensorRangePlan]:
+    if not isinstance(record, Mapping) or set(record) != _RECORD_KEYS:
+        raise CausalWeightIntegrityError("causal tensor record schema is invalid")
+    if (
+        record.get("schema") != CAUSAL_TENSOR_BINDING_SCHEMA
+        or record.get("record_type") != "tensor_range_plan"
+    ):
+        raise CausalWeightIntegrityError("causal tensor record type is invalid")
+    layout = _identity_from_record(record)
+    plan = _tensor_plan_from_record(record.get("plan"))
+    plan_record = _tensor_plan_record(plan)
+    if record.get("plan_sha256") != _digest(plan_record):
+        raise CausalWeightIntegrityError("tensor binding plan digest is invalid")
+    if record.get("trigger_key") != semantic_tensor_key(
+        layout.model, name=plan.name
+    ) or record.get("outcome_key") != _tensor_range_plan_key(layout, plan):
+        raise CausalWeightIntegrityError("tensor binding graph keys are invalid")
+    return layout, plan
+
+
+def _direct_tensor_bindings(
+    graph: LiveGraph,
+    model: LogicalModelIdentity,
+    *,
+    name: str,
+) -> list[tuple[CausalWeightLayoutIdentity, TensorRangePlan, list[Any]]]:
+    trigger = semantic_tensor_key(model, name=name)
+    resolved: list[tuple[CausalWeightLayoutIdentity, TensorRangePlan, list[Any]]] = []
+    for edge in graph.query_base(trigger):
+        if (
+            edge.get("kind") != "base"
+            or edge.get("depth") != 1
+            or edge.get("from_key") != trigger
+        ):
+            raise CausalWeightIntegrityError("direct tensor binding edge is invalid")
+        derivation = edge.get("derivation")
+        records = graph.resolve_derivation(derivation)
+        if not records:
+            raise CausalWeightIntegrityError("direct tensor binding has no citation")
+        if not isinstance(derivation, list) or len(derivation) != len(records):
+            raise CausalWeightIntegrityError(
+                "direct tensor binding citations are invalid"
+            )
+        for citation, record in zip(derivation, records, strict=True):
+            layout, plan = _parse_tensor_binding_record(record)
+            if layout.model != model or plan.name != name:
+                raise CausalWeightIntegrityError(
+                    "tensor binding resolved under the wrong semantic key"
+                )
+            if edge.get("to_key") != _tensor_range_plan_key(layout, plan):
+                raise CausalWeightIntegrityError(
+                    "tensor binding outcome edge is invalid"
+                )
+            resolved.append((layout, plan, list(citation)))
+    return resolved
+
+
+def _bind_normalized_tensor_plans(
+    graph: LiveGraph,
+    layout: CausalWeightLayoutIdentity,
+    ordered: list[TensorRangePlan],
+) -> CausalTensorBindingReceipt:
+    existing_citations: dict[str, list[Any]] = {}
+    missing: list[TensorRangePlan] = []
+    for plan in ordered:
+        matching: list[list[Any]] = []
+        for stored_layout, stored_plan, citation in _direct_tensor_bindings(
+            graph,
+            layout.model,
+            name=plan.name,
+        ):
+            if stored_layout.layout_fingerprint != layout.layout_fingerprint:
+                continue
+            if stored_layout != layout or stored_plan != plan:
+                raise CausalWeightConflictError(
+                    "layout already binds this tensor to a different range plan"
+                )
+            matching.append(citation)
+        if matching:
+            existing_citations[plan.name] = sorted(
+                matching,
+                key=lambda pair: (str(pair[0]), int(pair[1])),
+            )[0]
+        else:
+            missing.append(plan)
+
+    appended_sha: str | None = None
+    appended_citations: dict[str, list[Any]] = {}
+    if missing:
+        appended_sha = graph.append_segment(
+            [_tensor_binding_record(layout, plan) for plan in missing]
+        )
+        appended_citations = {
+            plan.name: [appended_sha, index] for index, plan in enumerate(missing)
+        }
+
+    receipts: list[TensorBindingReceipt] = []
+    for plan in ordered:
+        appended = plan.name in appended_citations
+        citation = (
+            appended_citations[plan.name] if appended else existing_citations[plan.name]
+        )
+        receipts.append(
+            TensorBindingReceipt(
+                name=plan.name,
+                segment_sha256=str(citation[0]),
+                record_index=int(citation[1]),
+                appended=appended,
+            )
+        )
+    return CausalTensorBindingReceipt(
+        layout=layout,
+        bindings=tuple(receipts),
+        appended_segment_sha256=appended_sha,
+    )
+
+
+def bind_causal_tensor_plans(
+    graph: LiveGraph,
+    layout: CausalWeightLayoutIdentity,
+    plans: Iterable[TensorRangePlan],
+) -> CausalTensorBindingReceipt:
+    """Append exact tensor coordinates with idempotency and conflict checks.
+
+    This low-level call authenticates coordinates, not physical coverage. A
+    bundle builder must prove every planned byte is materialized before it
+    publishes the binding; sparse holes must never be admitted as payload.
+    """
+
+    if not isinstance(graph, LiveGraph):
+        raise TypeError("graph must be a LiveGraph")
+    if not isinstance(layout, CausalWeightLayoutIdentity):
+        raise TypeError("layout must be a CausalWeightLayoutIdentity")
+    try:
+        raw_plans = tuple(plans)
+    except TypeError as exc:
+        raise CausalWeightError("tensor plans must be iterable") from exc
+    ordered: list[TensorRangePlan] = []
+    by_name: dict[str, TensorRangePlan] = {}
+    for raw_plan in raw_plans:
+        plan = _normalize_tensor_plan(raw_plan)
+        prior = by_name.get(plan.name)
+        if prior is not None:
+            if prior != plan:
+                raise CausalWeightConflictError(
+                    "one binding batch contains conflicting plans for a tensor"
+                )
+            continue
+        by_name[plan.name] = plan
+        ordered.append(plan)
+    with _binding_transaction(graph):
+        return _bind_normalized_tensor_plans(graph, layout, ordered)
+
+
 class CausalWeightReader:
     """Resolve and read exact expert ranges without tensor-name discovery."""
 
@@ -1132,6 +1527,187 @@ class CausalWeightReader:
             }
 
 
+class CausalTensorReader:
+    """Resolve dense tensor coordinates through revision-bound causal rails."""
+
+    def __init__(
+        self,
+        graph: LiveGraph,
+        layout: CausalWeightLayoutIdentity,
+        *,
+        source: TensorSource | None = None,
+    ) -> None:
+        if not isinstance(graph, LiveGraph):
+            raise TypeError("graph must be a LiveGraph")
+        if not isinstance(layout, CausalWeightLayoutIdentity):
+            raise TypeError("layout must be a CausalWeightLayoutIdentity")
+        self.graph = graph
+        self.layout = layout
+        self.source = source
+        self._plan_cache_lock = threading.RLock()
+        self._plan_cache_revision: tuple[int, str] | None = None
+        self._plan_cache: dict[str, TensorRangePlan] = {}
+        self._plan_cache_hits = 0
+        self._plan_cache_misses = 0
+        self._plan_cache_invalidations = 0
+        self._metrics_lock = threading.Lock()
+        self._read_calls = 0
+        self._requested_bytes = 0
+        if source is not None:
+            self._validate_source_identity()
+
+    def _validate_source_identity(self) -> None:
+        source = self.source
+        if source is None:
+            raise CausalWeightIdentityError("no tensor source is attached")
+        metrics = getattr(source, "metrics", None)
+        if not callable(metrics):
+            raise CausalWeightIdentityError("tensor source has no metrics identity")
+        snapshot = metrics()
+        if not isinstance(snapshot, Mapping):
+            raise CausalWeightIdentityError("tensor source metrics are invalid")
+        if snapshot.get("inventory_source_fingerprint") != (
+            self.layout.layout_fingerprint
+        ):
+            raise CausalWeightIdentityError(
+                "mounted tensor layout identity does not match causal bindings"
+            )
+
+    def _adopt_plan_cache_revision(self, revision: tuple[int, str]) -> None:
+        if self._plan_cache_revision == revision:
+            return
+        if self._plan_cache_revision is not None:
+            self._plan_cache_invalidations += 1
+        self._plan_cache.clear()
+        self._plan_cache_revision = revision
+
+    def _resolve_tensor_plan_uncached(self, name: str) -> TensorRangePlan:
+        matches: list[TensorRangePlan] = []
+        for stored_layout, plan, _citation in _direct_tensor_bindings(
+            self.graph,
+            self.layout.model,
+            name=name,
+        ):
+            if stored_layout.layout_fingerprint == self.layout.layout_fingerprint:
+                if stored_layout != self.layout:
+                    raise CausalWeightIntegrityError(
+                        "stored tensor layout identity is internally inconsistent"
+                    )
+                matches.append(plan)
+        if not matches:
+            raise CausalWeightNotFoundError(
+                f"no causal tensor binding exists for {name!r} in layout "
+                f"{self.layout.layout_fingerprint}"
+            )
+        if any(plan != matches[0] for plan in matches[1:]):
+            raise CausalWeightConflictError(
+                "graph contains conflicting tensor plans for one layout"
+            )
+        return matches[0]
+
+    def resolve_tensor_plan(self, name: str) -> TensorRangePlan:
+        """Resolve one tensor with one warm graph-revision check."""
+
+        tensor_name = _text(name, "tensor name", maximum=4096)
+        with self._plan_cache_lock:
+            for _attempt in range(_PLAN_CACHE_RESOLVE_RETRIES):
+                revision = self.graph.store.revision()
+                self._adopt_plan_cache_revision(revision)
+                cached = self._plan_cache.get(tensor_name)
+                if cached is not None:
+                    self._plan_cache_hits += 1
+                    return cached
+                try:
+                    resolved = self._resolve_tensor_plan_uncached(tensor_name)
+                except Exception:
+                    after = self.graph.store.revision()
+                    if after != revision:
+                        self._adopt_plan_cache_revision(after)
+                        continue
+                    self._plan_cache_misses += 1
+                    raise
+                after = self.graph.store.revision()
+                if after != revision:
+                    self._adopt_plan_cache_revision(after)
+                    continue
+                self._plan_cache[tensor_name] = resolved
+                self._plan_cache_misses += 1
+                return resolved
+            self._plan_cache_misses += 1
+            raise CausalWeightIntegrityError(
+                "causal graph revision changed during every tensor-plan retry"
+            )
+
+    def read_tensor_range(
+        self,
+        name: str,
+        *,
+        relative_offset: int = 0,
+        length: int | None = None,
+    ) -> CausalTensorReadReceipt:
+        """Read one exact tensor subrange after graph resolution."""
+
+        self._validate_source_identity()
+        assert self.source is not None
+        plan = self.resolve_tensor_plan(name)
+        offset = _uint64(relative_offset, "relative_offset")
+        resolved_length = plan.length - offset if length is None else length
+        resolved_length = _uint64(
+            resolved_length,
+            "length",
+            positive=True,
+        )
+        if offset > plan.length or resolved_length > plan.length - offset:
+            raise CausalWeightError("tensor subrange exceeds its bound plan")
+        raw_bytes = getattr(self.source, "raw_bytes", None)
+        if not callable(raw_bytes):
+            raise CausalWeightError("attached tensor source must implement raw_bytes")
+        raw = raw_bytes(
+            plan.shard,
+            plan.absolute_offset + offset,
+            resolved_length,
+        )
+        try:
+            part = raw if isinstance(raw, memoryview) else memoryview(raw)
+        except TypeError as exc:
+            raise CausalWeightIntegrityError(
+                "tensor source returned a non-buffer payload"
+            ) from exc
+        if not part.readonly or len(part) != resolved_length:
+            raise CausalWeightIntegrityError(
+                "tensor source returned a mutable or short payload"
+            )
+        receipt = CausalTensorReadReceipt(
+            plan=plan,
+            relative_offset=offset,
+            length=resolved_length,
+            part=part,
+        )
+        with self._metrics_lock:
+            self._read_calls += 1
+            self._requested_bytes += resolved_length
+        return receipt
+
+    def metrics(self) -> dict[str, int | str]:
+        with self._plan_cache_lock:
+            revision = self._plan_cache_revision
+            cache = {
+                "plan_cache_entries": len(self._plan_cache),
+                "plan_cache_hits": self._plan_cache_hits,
+                "plan_cache_invalidations": self._plan_cache_invalidations,
+                "plan_cache_misses": self._plan_cache_misses,
+                "plan_cache_revision_sequence": -1 if revision is None else revision[0],
+                "plan_cache_revision_sha256": "" if revision is None else revision[1],
+            }
+        with self._metrics_lock:
+            return {
+                "layout_fingerprint": self.layout.layout_fingerprint,
+                "read_calls": self._read_calls,
+                "requested_bytes": self._requested_bytes,
+                **cache,
+            }
+
+
 class CausalWeightMount:
     """Open one local ``weights/`` + persistent ``causal/`` model bundle.
 
@@ -1200,6 +1776,7 @@ class CausalWeightMount:
             layout = CausalWeightLayoutIdentity.from_source(source, model=model)
             graph = LiveGraph(causal_root)
             reader = CausalWeightReader(graph, layout, source=source)
+            tensor_reader = CausalTensorReader(graph, layout, source=source)
         except Exception:
             source.close()
             raise
@@ -1212,6 +1789,7 @@ class CausalWeightMount:
         self.layout = layout
         self.graph = graph
         self.reader = reader
+        self.tensor_reader = tensor_reader
         self._closed = False
 
     @staticmethod
@@ -1240,6 +1818,13 @@ class CausalWeightMount:
         self._require_open()
         return bind_causal_weight_plans(self.graph, self.layout, plans)
 
+    def bind_tensor_plans(
+        self,
+        plans: Iterable[TensorRangePlan],
+    ) -> CausalTensorBindingReceipt:
+        self._require_open()
+        return bind_causal_tensor_plans(self.graph, self.layout, plans)
+
     def resolve_expert_plans(
         self,
         layer: int,
@@ -1262,6 +1847,24 @@ class CausalWeightMount:
             resident_limit_bytes=resident_limit_bytes,
         )
 
+    def resolve_tensor_plan(self, name: str) -> TensorRangePlan:
+        self._require_open()
+        return self.tensor_reader.resolve_tensor_plan(name)
+
+    def read_tensor_range(
+        self,
+        name: str,
+        *,
+        relative_offset: int = 0,
+        length: int | None = None,
+    ) -> CausalTensorReadReceipt:
+        self._require_open()
+        return self.tensor_reader.read_tensor_range(
+            name,
+            relative_offset=relative_offset,
+            length=length,
+        )
+
     def close(self) -> None:
         if self._closed:
             return
@@ -1279,7 +1882,11 @@ class CausalWeightMount:
 
 
 __all__ = [
+    "CAUSAL_TENSOR_BINDING_SCHEMA",
     "CAUSAL_WEIGHT_BINDING_SCHEMA",
+    "CausalTensorBindingReceipt",
+    "CausalTensorReadReceipt",
+    "CausalTensorReader",
     "CausalWeightBindingReceipt",
     "CausalWeightConflictError",
     "CausalWeightError",
@@ -1293,6 +1900,11 @@ __all__ = [
     "CausalWeightReader",
     "ExpertBindingReceipt",
     "LogicalModelIdentity",
+    "TensorBindingReceipt",
+    "TensorRangePlan",
+    "bind_causal_tensor_plans",
     "bind_causal_weight_plans",
     "semantic_expert_key",
+    "semantic_tensor_key",
+    "tensor_range_plan_from_source",
 ]

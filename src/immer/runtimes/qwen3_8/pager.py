@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
+from ..deepseek_v4.causal_weights import CausalTensorReader
 from .config import validate_source_identity
 
 
@@ -70,6 +71,7 @@ class Qwen38WeightPager:
         max_resident_bytes: int = DEFAULT_MAX_RESIDENT_BYTES,
         close_source: bool = False,
         require_source_identity: bool = False,
+        causal_tensor_reader: CausalTensorReader | None = None,
     ) -> None:
         try:
             import torch
@@ -103,6 +105,11 @@ class Qwen38WeightPager:
             raise ValueError("close_source must be a boolean")
         if not isinstance(require_source_identity, bool):
             raise ValueError("require_source_identity must be a boolean")
+        if causal_tensor_reader is not None:
+            if not isinstance(causal_tensor_reader, CausalTensorReader):
+                raise TypeError("causal_tensor_reader must be a CausalTensorReader")
+            if causal_tensor_reader.source is not source:
+                raise ValueError("causal tensor reader must own this exact source")
 
         self.torch = torch
         self.source = source
@@ -110,6 +117,7 @@ class Qwen38WeightPager:
         self.compute_dtype = dtype
         self.max_resident_bytes = max_resident_bytes
         self.close_source = close_source
+        self.causal_tensor_reader = causal_tensor_reader
         self.source_identity = validate_source_identity(
             getattr(source, "repo_id", None),
             getattr(source, "revision", None),
@@ -176,12 +184,22 @@ class Qwen38WeightPager:
         return planned
 
     def _layout(self, name: str) -> _TensorLayout:
-        try:
-            meta = self.source.find(name)
-        except KeyError:
-            raise
-        except Exception as exc:
-            raise Qwen38PagerError(f"cannot resolve tensor {name!r}") from exc
+        if self.causal_tensor_reader is not None:
+            plan = self.causal_tensor_reader.resolve_tensor_plan(name)
+            meta = {
+                "data_start": 0,
+                "dtype": plan.dtype,
+                "offset_in_shard": (plan.absolute_offset, plan.absolute_end),
+                "shape": plan.shape,
+                "shard": plan.shard,
+            }
+        else:
+            try:
+                meta = self.source.find(name)
+            except KeyError:
+                raise
+            except Exception as exc:
+                raise Qwen38PagerError(f"cannot resolve tensor {name!r}") from exc
         dtype = str(meta.get("dtype", "")).upper()
         if dtype != "BF16":
             raise Qwen38PagerError(
@@ -288,7 +306,22 @@ class Qwen38WeightPager:
             target_dtype=dtype,
             label=name,
         )
-        raw = self.source.raw_bytes(layout.shard, layout.absolute, layout.payload_bytes)
+        if self.causal_tensor_reader is None:
+            raw = self.source.raw_bytes(
+                layout.shard, layout.absolute, layout.payload_bytes
+            )
+        else:
+            receipt = self.causal_tensor_reader.read_tensor_range(
+                name,
+                length=layout.payload_bytes,
+            )
+            if (
+                receipt.plan.shard != layout.shard
+                or receipt.plan.absolute_offset != layout.absolute
+                or receipt.length != layout.payload_bytes
+            ):
+                raise Qwen38PagerError("causal tensor receipt disagrees with layout")
+            raw = receipt.part
         result = self._decode_bf16(
             raw,
             shape=layout.shape,
@@ -335,11 +368,29 @@ class Qwen38WeightPager:
             target_dtype=dtype,
             label=f"{name}[{start_row}:{start_row + n_rows}]",
         )
-        raw = self.source.raw_bytes(
-            layout.shard,
-            layout.absolute + start_row * row_bytes,
-            payload_bytes,
-        )
+        relative_offset = start_row * row_bytes
+        if self.causal_tensor_reader is None:
+            raw = self.source.raw_bytes(
+                layout.shard,
+                layout.absolute + relative_offset,
+                payload_bytes,
+            )
+        else:
+            receipt = self.causal_tensor_reader.read_tensor_range(
+                name,
+                relative_offset=relative_offset,
+                length=payload_bytes,
+            )
+            if (
+                receipt.plan.shard != layout.shard
+                or receipt.plan.absolute_offset != layout.absolute
+                or receipt.relative_offset != relative_offset
+                or receipt.length != payload_bytes
+            ):
+                raise Qwen38PagerError(
+                    "causal tensor row receipt disagrees with layout"
+                )
+            raw = receipt.part
         result = self._decode_bf16(
             raw,
             shape=(n_rows, columns),
@@ -575,9 +626,7 @@ class Qwen38WeightPager:
                     continue
                 merged_values = self.torch.cat((best_values, values), dim=-1)
                 merged_ids = self.torch.cat((best_ids, indices), dim=-1)
-                best_values, best_ids = self._stable_topk(
-                    merged_values, merged_ids, k
-                )
+                best_values, best_ids = self._stable_topk(merged_values, merged_ids, k)
                 if progress is not None:
                     progress(
                         {
@@ -645,10 +694,22 @@ class Qwen38WeightPager:
         source_metrics = (
             dict(source_metrics_method()) if callable(source_metrics_method) else {}
         )
+        causal_metrics = (
+            {}
+            if self.causal_tensor_reader is None
+            else {
+                f"causal_tensor_{key}": value
+                for key, value in self.causal_tensor_reader.metrics().items()
+            }
+        )
         with self._lock:
             return {
                 **source_metrics,
                 **asdict(self._stats),
+                **causal_metrics,
+                "causal_tensor_reader_attached": (
+                    self.causal_tensor_reader is not None
+                ),
                 "device": self.resolved_device,
                 "compute_dtype": self.resolved_dtype,
                 "max_resident_bytes": self.max_resident_bytes,

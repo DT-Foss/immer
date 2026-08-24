@@ -40,6 +40,13 @@ _SHARED_RUNTIME_FILES = (
     ),
 )
 
+_SHARED_TRANSPORT_FILES = (
+    (
+        "immer/runtimes/deepseek_v4/causal_weights.py",
+        "runtimes/deepseek_v4/causal_weights.py",
+    ),
+)
+
 _RUNTIME_DISTRIBUTIONS = (
     "torch",
     "numpy",
@@ -72,6 +79,10 @@ def runtime_source_manifest(*, include_transport: bool = True) -> list[dict[str,
         for logical_path, relative_path in _SHARED_RUNTIME_FILES
     )
     if include_transport:
+        sources.extend(
+            (logical_path, immer_root / relative_path)
+            for logical_path, relative_path in _SHARED_TRANSPORT_FILES
+        )
         sources.extend(
             (f"immer/{name}", immer_root / name) for name in _TENSOR_SOURCE_FILES
         )

@@ -14,6 +14,7 @@ from immer.knowledge.livecausal import LiveCausalIntegrityError, LiveGraph
 from immer.knowledge.streamer import InventoryValidationError, Streamer
 from immer.runtimes.deepseek_v4 import CausalWeightMount
 from immer.runtimes.deepseek_v4.causal_weights import (
+    CausalTensorReader,
     CausalWeightConflictError,
     CausalWeightError,
     CausalWeightIdentityError,
@@ -22,8 +23,11 @@ from immer.runtimes.deepseek_v4.causal_weights import (
     CausalWeightNotFoundError,
     CausalWeightReader,
     LogicalModelIdentity,
+    bind_causal_tensor_plans,
     bind_causal_weight_plans,
     semantic_expert_key,
+    semantic_tensor_key,
+    tensor_range_plan_from_source,
 )
 from immer.runtimes.deepseek_v4.pager import (
     DeepSeekWeightPager,
@@ -126,6 +130,42 @@ def _shift_plan(plan: OfficialExpertRangePlan, amount: int) -> OfficialExpertRan
 
 
 class CausalWeightMonorailTests(unittest.TestCase):
+    def test_generic_tensor_rail_reads_deepseek_layout_without_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source_root = base / "source"
+            _write_expert_fixture(source_root, expert_ids=(0,), prefix_bytes=7)
+            source = _source(source_root, base / "cache")
+            layout = CausalWeightLayoutIdentity.from_source(
+                source, model=_LOGICAL_MODEL
+            )
+            graph = LiveGraph(base / "graph")
+            names = (
+                "packing.marker",
+                "layers.3.ffn.experts.0.w1.weight",
+            )
+            plans = tuple(tensor_range_plan_from_source(source, name) for name in names)
+            receipt = bind_causal_tensor_plans(graph, layout, plans)
+            self.assertEqual(receipt.appended_count, 2)
+            reader = CausalTensorReader(graph, layout, source=source)
+            expected = source.raw_bytes(plans[1].shard, plans[1].absolute_offset + 1, 3)
+            with mock.patch.object(
+                source,
+                "find",
+                side_effect=AssertionError("tensor rail used inventory discovery"),
+            ):
+                resolved = reader.resolve_tensor_plan(names[0])
+                read = reader.read_tensor_range(names[1], relative_offset=1, length=3)
+            self.assertEqual(resolved, plans[0])
+            self.assertEqual(bytes(read.part), bytes(expected))
+            self.assertEqual(
+                len(
+                    graph.query_base(semantic_tensor_key(_LOGICAL_MODEL, name=names[1]))
+                ),
+                1,
+            )
+            source.close()
+
     def test_pinned_remote_inventory_requires_exact_local_tensor_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)

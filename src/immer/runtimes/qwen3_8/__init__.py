@@ -1,5 +1,13 @@
 """Pinned, text-only, range-streamed Qwen3.8 runtime."""
 
+from ..deepseek_v4.causal_weights import (
+    CausalTensorReader,
+    CausalWeightMount,
+    LogicalModelIdentity,
+    TensorRangePlan,
+    bind_causal_tensor_plans,
+    tensor_range_plan_from_source,
+)
 from .config import (
     OFFICIAL_REPO_ID,
     OFFICIAL_REVISION,
@@ -29,11 +37,14 @@ from .snapshot import QWEN38_SNAPSHOT_SCHEMA, Qwen38SnapshotError
 
 __all__ = [
     "AttentionState",
+    "CausalTensorReader",
+    "CausalWeightMount",
     "DeltaNetState",
     "END_OF_TEXT_TOKEN_ID",
     "GenerationEvidence",
     "IM_END_TOKEN_ID",
     "IM_START_TOKEN_ID",
+    "LogicalModelIdentity",
     "OFFICIAL_REPO_ID",
     "OFFICIAL_REVISION",
     "PrefillEvidence",
@@ -50,4 +61,7 @@ __all__ = [
     "QWEN38_SNAPSHOT_SCHEMA",
     "StatefulEvidence",
     "StreamedQwen38",
+    "TensorRangePlan",
+    "bind_causal_tensor_plans",
+    "tensor_range_plan_from_source",
 ]

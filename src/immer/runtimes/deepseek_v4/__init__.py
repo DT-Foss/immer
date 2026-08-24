@@ -7,7 +7,11 @@ the model math.  No complete checkpoint is required on disk or in memory.
 
 from .config import DeepSeekV4Config
 from .causal_weights import (
+    CAUSAL_TENSOR_BINDING_SCHEMA,
     CAUSAL_WEIGHT_BINDING_SCHEMA,
+    CausalTensorBindingReceipt,
+    CausalTensorReadReceipt,
+    CausalTensorReader,
     CausalWeightBindingReceipt,
     CausalWeightConflictError,
     CausalWeightError,
@@ -21,8 +25,13 @@ from .causal_weights import (
     CausalWeightReader,
     ExpertBindingReceipt,
     LogicalModelIdentity,
+    TensorBindingReceipt,
+    TensorRangePlan,
+    bind_causal_tensor_plans,
     bind_causal_weight_plans,
     semantic_expert_key,
+    semantic_tensor_key,
+    tensor_range_plan_from_source,
 )
 from .pager import (
     DeepSeekWeightPager,
@@ -71,7 +80,11 @@ from .layerwise import (
 )
 
 __all__ = [
+    "CAUSAL_TENSOR_BINDING_SCHEMA",
     "CAUSAL_WEIGHT_BINDING_SCHEMA",
+    "CausalTensorBindingReceipt",
+    "CausalTensorReadReceipt",
+    "CausalTensorReader",
     "CausalWeightBindingReceipt",
     "CausalWeightConflictError",
     "CausalWeightError",
@@ -108,9 +121,12 @@ __all__ = [
     "StatefulEvidence",
     "StreamedDeepSeekV4",
     "SnapshotLimits",
+    "TensorBindingReceipt",
+    "TensorRangePlan",
     "build_layerwise_plan",
     "build_route_model_artifact",
     "bind_causal_weight_plans",
+    "bind_causal_tensor_plans",
     "dequantize_fp4_e2m1",
     "dequantize_fp8_e4m3",
     "quantize_dequantize_fp4",
@@ -121,6 +137,8 @@ __all__ = [
     "runtime_dependency_versions",
     "runtime_source_manifest",
     "semantic_expert_key",
+    "semantic_tensor_key",
+    "tensor_range_plan_from_source",
     "unpack_fp4_e2m1",
     "write_route_model_artifact",
 ]
