@@ -25,7 +25,7 @@ from typing import Any
 import urllib.error
 import urllib.request
 
-from immer.knowledge import Streamer
+from immer.knowledge import AccessTrace, AccessTraceRecorder, Streamer
 from immer.runtimes.deepseek_v4.benchmark import extract_gsm8k_answer
 from immer.runtimes.qwen3_8 import (
     OFFICIAL_REPO_ID,
@@ -41,6 +41,7 @@ from immer.runtimes.qwen3_8.encoding import (
     END_OF_TEXT_TOKEN_ID,
     IM_END_TOKEN_ID,
 )
+from immer.runtimes.qwen3_8.draft_verification import DraftVerificationResumeState
 from immer.runtimes.qwen3_8.resume import (
     build_resume_identity,
     delete_resume,
@@ -63,6 +64,7 @@ OFFICIAL_TOKENIZER_SHA256 = (
     "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
 )
 RESULT_SCHEMA = "immer.qwen3.8-fertig-draft-verification/v1"
+TRACE_CHECKPOINT_SCHEMA = "immer.qwen3.8-trace-resume-pair/v1"
 INPUT_SCHEMA = "immer.qwen3.8-fertig-draft-inputs/v1"
 BASELINE_SCHEMA = "immer.qwen-local-fertig-baseline/v1"
 BASELINE_MODEL_REVISION = "Qwen3.8-27B-Q3_K_M-no-think"
@@ -110,6 +112,16 @@ class PreparedDraft:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class TraceResumeCheckpoint:
+    manifest: Path
+    resume_path: Path
+    trace_path: Path
+    trace: AccessTrace
+    next_layer: int
+    source_body_bytes: int
+
+
 def _positive_int(raw: str) -> int:
     value = int(raw)
     if value <= 0:
@@ -152,6 +164,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer-json")
     parser.add_argument("--run-dir", default=str(DEFAULT_RUN_DIR))
     parser.add_argument("--result-json")
+    parser.add_argument("--access-trace-json")
     parser.add_argument("--resume-file")
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE))
     parser.add_argument("--cache-budget-gb", type=_nonnegative_float, default=1.0)
@@ -236,6 +249,288 @@ def _atomic_write_json(path: str | Path, document: Mapping[str, Any]) -> Path:
     except (TypeError, ValueError) as exc:
         raise CliError("result contains non-serializable data") from exc
     return _atomic_write_bytes(Path(path), body)
+
+
+def _access_trace_path(args: argparse.Namespace) -> Path | None:
+    raw = getattr(args, "access_trace_json", None)
+    return None if raw is None else Path(raw).expanduser().resolve()
+
+
+def _discard_access_trace(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise CliError(f"cannot inspect access trace: {path}") from exc
+    if path.is_symlink() or not path.is_file() or metadata.st_nlink < 1:
+        raise CliError("access trace must be a non-symlink regular file")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise CliError(f"cannot discard access trace: {path}") from exc
+    return True
+
+
+def _canonical_json(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise CliError("trace checkpoint metadata is not canonical JSON") from exc
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024**2):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _trace_checkpoint_manifest(trace_path: Path) -> Path:
+    return trace_path.with_name(f".{trace_path.name}.checkpoint.json")
+
+
+def _checkpoint_content_path(
+    trace_path: Path, kind: str, digest: str, suffix: str
+) -> Path:
+    return trace_path.with_name(f".{trace_path.stem}.{kind}.{digest}{suffix}")
+
+
+def _publish_content(path: Path, value: bytes, digest: str) -> Path:
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file() or _sha256_file(path) != digest:
+            raise CliError(f"trace checkpoint content collision: {path}")
+        return path
+    written = _atomic_write_bytes(path, value)
+    if _sha256_file(written) != digest:
+        raise CliError("published trace checkpoint content SHA-256 mismatch")
+    return written
+
+
+def _strict_checkpoint_document(path: Path) -> dict[str, Any]:
+    document = _read_json(path, "trace checkpoint manifest")
+    if set(document) != {"body", "schema", "sha256"}:
+        raise CliError("trace checkpoint manifest schema is invalid")
+    if document.get("schema") != TRACE_CHECKPOINT_SCHEMA:
+        raise CliError("trace checkpoint manifest type is invalid")
+    body = document.get("body")
+    if (
+        not isinstance(body, dict)
+        or document.get("sha256") != hashlib.sha256(_canonical_json(body)).hexdigest()
+    ):
+        raise CliError("trace checkpoint manifest SHA-256 mismatch")
+    return document
+
+
+def _checkpoint_member(parent: Path, raw: object, suffix: str) -> Path:
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or Path(raw).name != raw
+        or not raw.endswith(suffix)
+    ):
+        raise CliError("trace checkpoint member path is unsafe")
+    path = parent / raw
+    if path.is_symlink() or not path.is_file():
+        raise CliError("trace checkpoint member is missing or non-regular")
+    return path
+
+
+def _load_trace_checkpoint(
+    trace_path: Path,
+    identity: str,
+) -> TraceResumeCheckpoint | None:
+    manifest = _trace_checkpoint_manifest(trace_path)
+    if not manifest.exists() and not manifest.is_symlink():
+        return None
+    if manifest.is_symlink() or not manifest.is_file():
+        raise CliError("trace checkpoint manifest must be a regular file")
+    document = _strict_checkpoint_document(manifest)
+    body = document["body"]
+    if body.get("schema") != TRACE_CHECKPOINT_SCHEMA:
+        raise CliError("trace checkpoint authenticated schema is invalid")
+    if body.get("resume_identity") != identity:
+        raise CliError("trace checkpoint belongs to another run identity")
+    next_layer = body.get("next_layer")
+    source_body_bytes = body.get("source_body_bytes")
+    if (
+        isinstance(next_layer, bool)
+        or not isinstance(next_layer, int)
+        or next_layer < 1
+        or isinstance(source_body_bytes, bool)
+        or not isinstance(source_body_bytes, int)
+        or source_body_bytes < 0
+    ):
+        raise CliError("trace checkpoint counters are invalid")
+    resume = body.get("resume")
+    trace_record = body.get("trace")
+    if not isinstance(resume, Mapping) or set(resume) != {"file", "sha256"}:
+        raise CliError("trace checkpoint resume descriptor is invalid")
+    if not isinstance(trace_record, Mapping) or set(trace_record) != {
+        "file",
+        "file_sha256",
+        "trace_sha256",
+    }:
+        raise CliError("trace checkpoint trace descriptor is invalid")
+    resume_path = _checkpoint_member(
+        manifest.parent, resume.get("file"), ".safetensors"
+    )
+    content_trace = _checkpoint_member(
+        manifest.parent, trace_record.get("file"), ".json"
+    )
+    if _sha256_file(resume_path) != resume.get("sha256"):
+        raise CliError("trace checkpoint resume SHA-256 mismatch")
+    encoded_trace = content_trace.read_bytes()
+    if hashlib.sha256(encoded_trace).hexdigest() != trace_record.get("file_sha256"):
+        raise CliError("trace checkpoint trace SHA-256 mismatch")
+    trace = AccessTrace.from_bytes(encoded_trace)
+    if trace.sha256 != trace_record.get("trace_sha256"):
+        raise CliError("trace checkpoint canonical trace identity mismatch")
+    return TraceResumeCheckpoint(
+        manifest=manifest,
+        resume_path=resume_path,
+        trace_path=content_trace,
+        trace=trace,
+        next_layer=next_layer,
+        source_body_bytes=source_body_bytes,
+    )
+
+
+def _write_trace_checkpoint(
+    recorder: AccessTraceRecorder,
+    trace_path: Path,
+    identity: str,
+    state: DraftVerificationResumeState,
+    *,
+    expected_shape: Sequence[int],
+    expected_dtype: str,
+    n_layers: int,
+    active_graft_layer: int | None,
+) -> dict[str, Any]:
+    prior = _load_trace_checkpoint(trace_path, identity)
+    metrics = recorder.metrics()
+    if metrics["dropped_capacity"] or metrics["dropped_identity"]:
+        raise CliError("access trace recorder dropped operations")
+    trace = recorder.snapshot()
+    trace.verify()
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{trace_path.stem}.resume.",
+        suffix=".pending",
+        dir=trace_path.parent,
+    )
+    os.close(descriptor)
+    os.unlink(temporary)
+    temporary_path = Path(temporary)
+    try:
+        write_resume(
+            temporary_path,
+            identity,
+            state,
+            expected_shape=expected_shape,
+            expected_dtype=expected_dtype,
+            n_layers=n_layers,
+            active_graft_layer=active_graft_layer,
+        )
+        resume_bytes = temporary_path.read_bytes()
+        resume_sha = hashlib.sha256(resume_bytes).hexdigest()
+        resume_path = _checkpoint_content_path(
+            trace_path, "resume", resume_sha, ".safetensors"
+        )
+        _publish_content(resume_path, resume_bytes, resume_sha)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    trace_encoded = trace.to_bytes()
+    trace_file_sha = hashlib.sha256(trace_encoded).hexdigest()
+    trace_path_content = _checkpoint_content_path(
+        trace_path, "trace", trace_file_sha, ".json"
+    )
+    _publish_content(trace_path_content, trace_encoded, trace_file_sha)
+    _fsync_directory(trace_path.parent)
+    body = {
+        "next_layer": int(state.next_layer),
+        "resume": {"file": resume_path.name, "sha256": resume_sha},
+        "resume_identity": identity,
+        "schema": TRACE_CHECKPOINT_SCHEMA,
+        "source_body_bytes": int(state.source_body_bytes),
+        "trace": {
+            "file": trace_path_content.name,
+            "file_sha256": trace_file_sha,
+            "trace_sha256": trace.sha256,
+        },
+    }
+    document = {
+        "body": body,
+        "schema": TRACE_CHECKPOINT_SCHEMA,
+        "sha256": hashlib.sha256(_canonical_json(body)).hexdigest(),
+    }
+    manifest = _trace_checkpoint_manifest(trace_path)
+    _atomic_write_bytes(manifest, _canonical_json(document) + b"\n")
+    _fsync_directory(trace_path.parent)
+    _atomic_write_bytes(trace_path, trace_encoded)
+    _fsync_directory(trace_path.parent)
+    if prior is not None:
+        for obsolete in (prior.resume_path, prior.trace_path):
+            if obsolete not in {resume_path, trace_path_content}:
+                try:
+                    obsolete.unlink()
+                except OSError:
+                    pass
+    return {
+        "inventory_fingerprint": trace.inventory_fingerprint,
+        "leaves": metrics["leaves"],
+        "next_layer": int(state.next_layer),
+        "operations": metrics["operations"],
+        "path": str(trace_path),
+        "resume_sha256": resume_sha,
+        "sha256": trace.sha256,
+        "source_body_bytes": int(state.source_body_bytes),
+    }
+
+
+def _discard_trace_checkpoint(trace_path: Path, *, keep_public: bool = False) -> bool:
+    manifest = _trace_checkpoint_manifest(trace_path)
+    if not manifest.exists() and not manifest.is_symlink():
+        return False if keep_public else _discard_access_trace(trace_path)
+    if manifest.is_symlink() or not manifest.is_file():
+        raise CliError("trace checkpoint manifest must be a regular file")
+    document = _strict_checkpoint_document(manifest)
+    body = document["body"]
+    members: list[Path] = []
+    for key, suffix in (("resume", ".safetensors"), ("trace", ".json")):
+        descriptor = body.get(key)
+        if not isinstance(descriptor, Mapping):
+            raise CliError("trace checkpoint descriptor is invalid")
+        members.append(
+            _checkpoint_member(manifest.parent, descriptor.get("file"), suffix)
+        )
+    if not keep_public:
+        _discard_access_trace(trace_path)
+    for member in members:
+        member.unlink()
+    manifest.unlink()
+    return True
 
 
 def _progress(event: str, **fields: Any) -> None:
@@ -603,8 +898,12 @@ def _verify(
         len(prompt) + len(draft) for prompt, draft in zip(prompts, drafts, strict=True)
     )
     resume_path = _resume_path(args)
-    if args.restart and delete_resume(resume_path):
-        _progress("resume_discarded", path=str(resume_path))
+    trace_path = _access_trace_path(args)
+    if args.restart:
+        if trace_path is not None and _discard_trace_checkpoint(trace_path):
+            _progress("access_trace_checkpoint_discarded", path=str(trace_path))
+        if delete_resume(resume_path):
+            _progress("resume_discarded", path=str(resume_path))
     runtime = _model_runtime if runtime_factory is None else runtime_factory
     verifier_type = (
         Qwen38DraftVerifier if verifier_factory is None else verifier_factory
@@ -651,27 +950,66 @@ def _verify(
             execution_contract=execution_contract,
             graft_contract=graft_contract,
         )
+        pair = (
+            None if trace_path is None else _load_trace_checkpoint(trace_path, identity)
+        )
+        if (
+            trace_path is not None
+            and pair is not None
+            and (resume_path.exists() or resume_path.is_symlink())
+        ):
+            raise CliError("paired trace and legacy resume both exist; use --restart")
+        if (
+            trace_path is not None
+            and pair is None
+            and (
+                resume_path.exists()
+                or resume_path.is_symlink()
+                or trace_path.exists()
+                or trace_path.is_symlink()
+            )
+        ):
+            raise CliError("unpaired access trace/resume state exists; use --restart")
+        active_resume_path = resume_path if pair is None else pair.resume_path
+        recorder = (
+            None
+            if trace_path is None
+            else AccessTraceRecorder(initial_trace=None if pair is None else pair.trace)
+        )
+        if recorder is not None:
+            set_observer = getattr(model.pager.source, "set_access_observer", None)
+            if not callable(set_observer):
+                raise CliError("runtime source cannot attach an access recorder")
+            set_observer(recorder)
         _progress("cache_disk_preflight", **_cache_disk_preflight(args))
         _progress(
             "resume_disk_preflight",
             **preflight_resume_disk(
-                resume_path,
+                active_resume_path,
                 expected_shape=expected_shape,
                 expected_dtype=expected_dtype,
             ),
         )
         resume = load_resume(
-            resume_path,
+            active_resume_path,
             identity,
             expected_shape=expected_shape,
             expected_dtype=expected_dtype,
             n_layers=int(model.config.n_layers),
             active_graft_layer=(args.graft_layer if args.mode != "off" else None),
         )
+        if pair is not None:
+            if resume is None:
+                raise CliError("trace checkpoint resume payload is missing")
+            if (
+                int(resume.next_layer) != pair.next_layer
+                or int(resume.source_body_bytes) != pair.source_body_bytes
+            ):
+                raise CliError("trace checkpoint and resume counters disagree")
         if resume is not None:
             _progress(
                 "resume_reused",
-                path=str(resume_path),
+                path=str(active_resume_path),
                 next_layer=resume.next_layer,
                 layers=int(model.config.n_layers),
             )
@@ -684,23 +1022,50 @@ def _verify(
             ),
         )
 
+        last_checkpoint_state: DraftVerificationResumeState | None = resume
+
         def checkpoint(state: Any) -> None:
-            write_resume(
-                resume_path,
-                identity,
-                state,
-                expected_shape=expected_shape,
-                expected_dtype=expected_dtype,
-                n_layers=int(model.config.n_layers),
-                active_graft_layer=(args.graft_layer if args.mode != "off" else None),
-            )
+            nonlocal last_checkpoint_state
+            if not isinstance(state, DraftVerificationResumeState):
+                raise CliError("verifier checkpoint state has the wrong type")
+            last_checkpoint_state = state
+            if trace_path is None:
+                write_resume(
+                    resume_path,
+                    identity,
+                    state,
+                    expected_shape=expected_shape,
+                    expected_dtype=expected_dtype,
+                    n_layers=int(model.config.n_layers),
+                    active_graft_layer=(
+                        args.graft_layer if args.mode != "off" else None
+                    ),
+                )
+            else:
+                assert isinstance(recorder, AccessTraceRecorder)
+                setattr(
+                    args,
+                    "_access_trace_receipt",
+                    _write_trace_checkpoint(
+                        recorder,
+                        trace_path,
+                        identity,
+                        state,
+                        expected_shape=expected_shape,
+                        expected_dtype=expected_dtype,
+                        n_layers=int(model.config.n_layers),
+                        active_graft_layer=(
+                            args.graft_layer if args.mode != "off" else None
+                        ),
+                    ),
+                )
 
         verifier = verifier_type(
             model,
             layer_retries=args.layer_retries,
             head_retries=args.head_retries,
         )
-        return verifier.verify(
+        report = verifier.verify(
             prompts,
             drafts,
             eos_token_id=IM_END_TOKEN_ID,
@@ -713,6 +1078,27 @@ def _verify(
             resume_state=resume,
             checkpoint=checkpoint,
         )
+        if trace_path is not None:
+            if last_checkpoint_state is None:
+                raise CliError("verifier produced no paired resume checkpoint")
+            assert isinstance(recorder, AccessTraceRecorder)
+            setattr(
+                args,
+                "_access_trace_receipt",
+                _write_trace_checkpoint(
+                    recorder,
+                    trace_path,
+                    identity,
+                    last_checkpoint_state,
+                    expected_shape=expected_shape,
+                    expected_dtype=expected_dtype,
+                    n_layers=int(model.config.n_layers),
+                    active_graft_layer=(
+                        args.graft_layer if args.mode != "off" else None
+                    ),
+                ),
+            )
+        return report
 
 
 def _result_document(
@@ -777,6 +1163,7 @@ def _result_document(
             "verified_end_to_end_accuracy": verified_correct / total,
         },
         "traffic": {
+            "access_trace": getattr(args, "_access_trace_receipt", None),
             "source_body_bytes": evidence.get("source_body_bytes"),
             "linear_calls": evidence.get("linear_calls"),
             "layer_calls": evidence.get("layer_calls"),
@@ -825,12 +1212,24 @@ def run(
     output = _atomic_write_json(result_path, result)
     if not args.prepare_only:
         try:
-            removed = delete_resume(_resume_path(args))
+            trace_path = _access_trace_path(args)
+            removed = (
+                delete_resume(_resume_path(args))
+                if trace_path is None
+                else _discard_trace_checkpoint(trace_path, keep_public=True)
+            )
         except Exception as exc:
             _progress("resume_cleanup_warning", error=f"{type(exc).__name__}: {exc}")
         else:
             if removed:
-                _progress("resume_removed", path=str(_resume_path(args)))
+                _progress(
+                    "resume_removed",
+                    path=(
+                        str(_resume_path(args))
+                        if trace_path is None
+                        else str(_trace_checkpoint_manifest(trace_path))
+                    ),
+                )
         _progress("local_verification_complete", **dict(result["summary"]))
     return result, output
 

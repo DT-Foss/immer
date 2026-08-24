@@ -401,6 +401,7 @@ class AccessTraceRecorder:
         *,
         max_operations: int | None = None,
         max_leaves: int | None = None,
+        initial_trace: AccessTrace | None = None,
     ) -> None:
         self.max_operations = (
             None
@@ -415,9 +416,38 @@ class AccessTraceRecorder:
             f"immer_access_trace_scope_{id(self)}",
             default=(),
         )
-        self._operations: list[AccessOperation] = []
-        self._leaves = 0
-        self._source: tuple[str, str, str] | None = None
+        if initial_trace is not None:
+            if not isinstance(initial_trace, AccessTrace):
+                raise TypeError("initial_trace must be an AccessTrace")
+            initial_trace.verify()
+        initial_operations = () if initial_trace is None else initial_trace.operations
+        initial_leaves = sum(len(operation.leaves) for operation in initial_operations)
+        if self.max_operations is not None and len(initial_operations) > (
+            self.max_operations
+        ):
+            raise AccessTraceIntegrityError(
+                "initial trace exceeds recorder operation capacity"
+            )
+        if self.max_leaves is not None and initial_leaves > self.max_leaves:
+            raise AccessTraceIntegrityError(
+                "initial trace exceeds recorder leaf capacity"
+            )
+        self._operations: list[AccessOperation] = list(initial_operations)
+        self._leaves = initial_leaves
+        self._source: tuple[str, str, str] | None = (
+            None
+            if initial_trace is None
+            else (
+                initial_trace.repo_id,
+                initial_trace.revision,
+                initial_trace.inventory_fingerprint,
+            )
+        )
+        self._sequence_offset = (
+            0
+            if not initial_operations
+            else max(operation.operation_sequence for operation in initial_operations)
+        )
         self._dropped_capacity = 0
         self._dropped_identity = 0
 
@@ -436,6 +466,13 @@ class AccessTraceRecorder:
             self._scope_tags.reset(token)
 
     def observe(self, operation: AccessOperation) -> bool:
+        if self._sequence_offset:
+            operation = replace(
+                operation,
+                operation_sequence=(
+                    operation.operation_sequence + self._sequence_offset
+                ),
+            )
         tags = self._scope_tags.get()
         if tags:
             merged = dict(operation.tags)

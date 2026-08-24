@@ -59,6 +59,11 @@ All notable changes to IMMER are recorded here.
   published; resumable staging, config/index validation, full graph replay,
   post-copy verification, and atomic promotion prevent sparse holes or partial
   checkpoints from becoming executable model bytes.
+- Made Qwen layer-major verification emit complete resumable access traces.
+  Content-addressed trace and hidden-resume files commit through one hashed
+  pair manifest, resumed traces renumber new operations canonically,
+  identity/capacity drops fail the run, and the final result cites its exact
+  trace digest and coverage.
 - Rebuilt public documentation around the local causal architecture and
   separated public source from weights, state, traces, and operations.
 

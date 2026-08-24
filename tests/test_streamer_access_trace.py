@@ -285,6 +285,64 @@ class StreamerAccessTraceTests(unittest.TestCase):
             self.assertEqual(limited.metrics()["operations"], 1)
             self.assertEqual(limited.metrics()["dropped_capacity"], 1)
 
+    def test_recorder_resumes_canonical_trace_with_renumbered_operations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "source"
+            first, _second = _fixture(root)
+            original_recorder = AccessTraceRecorder()
+            original = Streamer.from_local(
+                root,
+                cache_dir=base / "first-cache",
+                access_observer=original_recorder,
+            )
+            original.raw_bytes("a.safetensors", first, 2)
+            original.raw_bytes("a.safetensors", first + 2, 2)
+            first_trace = original_recorder.snapshot()
+
+            resumed_recorder = AccessTraceRecorder(initial_trace=first_trace)
+            resumed = Streamer.from_local(
+                root,
+                cache_dir=base / "second-cache",
+                access_observer=resumed_recorder,
+            )
+            resumed.raw_bytes("a.safetensors", first + 4, 2)
+            combined = resumed_recorder.snapshot()
+
+            self.assertEqual(len(combined.operations), 3)
+            self.assertEqual(
+                [row.operation_sequence for row in combined.operations], [1, 2, 3]
+            )
+            self.assertEqual(combined.operations[:2], first_trace.operations)
+            self.assertEqual(resumed_recorder.metrics()["dropped_identity"], 0)
+            self.assertEqual(AccessTrace.from_bytes(combined.to_bytes()), combined)
+
+    def test_resumed_recorder_capacity_and_identity_stay_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "source"
+            first, _second = _fixture(root)
+            recorder = AccessTraceRecorder()
+            source = Streamer.from_local(root, access_observer=recorder)
+            source.raw_bytes("a.safetensors", first, 2)
+            source.raw_bytes("a.safetensors", first + 2, 2)
+            trace = recorder.snapshot()
+
+            with self.assertRaisesRegex(
+                AccessTraceIntegrityError, "operation capacity"
+            ):
+                AccessTraceRecorder(max_operations=1, initial_trace=trace)
+
+            resumed = AccessTraceRecorder(initial_trace=trace)
+            different = Streamer.from_local(
+                root,
+                revision="different",
+                access_observer=resumed,
+            )
+            different.raw_bytes("a.safetensors", first, 2)
+            self.assertEqual(resumed.metrics()["dropped_identity"], 1)
+            self.assertEqual(resumed.snapshot(), trace)
+
     def test_exact_replay_warms_scalar_leaf_and_budget_decline_is_explicit(
         self,
     ) -> None:
