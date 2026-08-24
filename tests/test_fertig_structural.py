@@ -26,6 +26,23 @@ def _solve(text: str):
 
 
 class AffineStructuralParserTests(unittest.TestCase):
+    def test_clause_compiler_promotes_general_affine_total_system(self) -> None:
+        source = (
+            "Becca, Smendrick, and PJ have collections of Magic Cards. "
+            "There is a total of 341 cards. "
+            "Becca has 12 more than Smendrick, and Smendrick has 3 times the "
+            "amount of cards that PJ has. How many cards does Becca have?"
+        )
+
+        parsed, solution = _solve(source)
+
+        self.assertEqual(parsed.reason, "evidence-closed clause compiler")
+        self.assertIs(solution.status, SolveStatus.UNIQUE)
+        self.assertEqual(solution.target_value, 153)
+        self.assertIsNotNone(solution.certificate)
+        assert solution.certificate is not None
+        self.assertTrue(solution.certificate.verified)
+
     def test_age_relation_is_exact_and_keeps_source_evidence(self) -> None:
         source = (
             "Chenny is 10 years old. "

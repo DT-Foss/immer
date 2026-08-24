@@ -99,6 +99,19 @@ SELECTIVE_EXTERNAL_RESOLVER_CASES = (
 
 
 class FertigAdapterTests(unittest.TestCase):
+    def test_clause_compiler_reaches_the_normal_exact_solver_path(self) -> None:
+        question = (
+            "Becca, Smendrick, and PJ have collections of Magic Cards. "
+            "There is a total of 341 cards. "
+            "Becca has 12 more than Smendrick, and Smendrick has 3 times the "
+            "amount of cards that PJ has. How many cards does Becca have?"
+        )
+
+        result = FertigSolver().handle(Request("exact_math", question))
+
+        self.assertEqual(result.status, ExecutionStatus.OK)
+        self.assertEqual(result.output, "153")
+
     def test_guarded_formula_certificate_precedes_legacy_solver(self) -> None:
         question = (
             "Janeth borrowed $2000 and promised to return it with an additional "

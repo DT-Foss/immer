@@ -30,6 +30,7 @@ from .arithmetic_ir import (
     Variable,
     variables_in_constraint,
 )
+from .clause_compiler import compile_clauses
 
 
 _UNICODE_FRACTIONS = {
@@ -2464,7 +2465,17 @@ class StructuralParser:
 def parse_structural_problem(source: str) -> ParseResult:
     """Parse *source* without ever returning a partial numeric graph."""
 
-    return StructuralParser(source).parse()
+    primary = StructuralParser(source).parse()
+    if primary.ok or primary.status is not ParseStatus.UNSUPPORTED:
+        return primary
+    compiled = compile_clauses(source)
+    if not compiled.ok or compiled.problem is None:
+        return primary
+    return ParseResult(
+        ParseStatus.PARSED,
+        compiled.problem,
+        reason="evidence-closed clause compiler",
+    )
 
 
 __all__ = [

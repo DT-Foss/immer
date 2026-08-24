@@ -33,6 +33,10 @@ All notable changes to IMMER are recorded here.
 - Added authenticated common-prefix forking at the exact CRSA graft boundary.
   The candidate inherits the off arm's hidden state, complete causal trace,
   source bytes, and model time, then recomputes every changed layer.
+- Added an evidence-closed local clause compiler foundation with typed entity,
+  item, scope, state, numeric-span, relation, and target records. Its first
+  general family lowers affine count systems to the existing exact IR without
+  overriding prior ambiguity or invalidity decisions.
 
 ## [0.8.0] — 2026-08-23
 
