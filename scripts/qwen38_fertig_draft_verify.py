@@ -99,8 +99,10 @@ class PreparedDraft:
     question: str
     gold: str
     text: str
-    answer: str
-    candidate_correct: bool
+    answer: str | None
+    candidate_correct: bool | None
+    candidate_status: str
+    finish_reason: str
     prompt_token_ids: tuple[int, ...]
     draft_token_ids: tuple[int, ...]
 
@@ -112,6 +114,8 @@ class PreparedDraft:
             "text": self.text,
             "answer": self.answer,
             "candidate_correct": self.candidate_correct,
+            "candidate_status": self.candidate_status,
+            "finish_reason": self.finish_reason,
             "prompt_token_ids": list(self.prompt_token_ids),
             "draft_token_ids": list(self.draft_token_ids),
         }
@@ -718,7 +722,7 @@ def _prepare_drafts(
         raise CliError("Qwen baseline prompt contract mismatch")
     summary = document.get("summary")
     if not isinstance(summary, Mapping) or any(
-        summary.get(name) != 0 for name in ("truncated", "unparseable", "error")
+        summary.get(name) != 0 for name in ("unparseable", "error")
     ):
         raise CliError("Qwen baseline contains incomplete candidates")
     raw_rows = document.get("items")
@@ -758,15 +762,31 @@ def _prepare_drafts(
         if not isinstance(text, str) or not text:
             raise CliError(f"baseline candidate has no text: {item_id}")
         answer = extract_gsm8k_answer(text)
-        if answer is None or raw.get("predicted") != answer:
+        if raw.get("predicted") != answer:
             raise CliError(f"baseline candidate answer mismatch: {item_id}")
-        correct = answer == gold
-        expected_status = "correct" if correct else "incorrect"
-        if (
-            raw.get("status") != expected_status
-            or raw.get("correct") is not correct
-            or raw.get("finish_reason") != "stop"
-        ):
+        candidate_status = raw.get("status")
+        finish_reason = raw.get("finish_reason")
+        if candidate_status in {"correct", "incorrect"}:
+            if answer is None:
+                raise CliError(f"completed baseline candidate has no answer: {item_id}")
+            candidate_correct: bool | None = answer == gold
+            expected_status = "correct" if candidate_correct else "incorrect"
+            valid_status = (
+                candidate_status == expected_status
+                and raw.get("correct") is candidate_correct
+                and finish_reason == "stop"
+            )
+        elif candidate_status == "truncated":
+            candidate_correct = None
+            valid_status = raw.get("correct") is None and finish_reason in {
+                "length",
+                "max_length",
+                "max_tokens",
+            }
+        else:
+            valid_status = False
+            candidate_correct = None
+        if not valid_status:
             raise CliError(f"baseline candidate status mismatch: {item_id}")
 
         prompt_text = tokenizer.render_no_thinking_prompt(
@@ -780,6 +800,8 @@ def _prepare_drafts(
         draft_ids = combined_ids[len(prompt_ids) :]
         if not draft_ids or len(draft_ids) > max_draft_tokens:
             raise CliError(f"baseline candidate violates the draft bound: {item_id}")
+        if candidate_status == "truncated" and len(draft_ids) != max_draft_tokens:
+            raise CliError(f"baseline truncation violates the draft bound: {item_id}")
         if IM_END_TOKEN_ID in draft_ids or END_OF_TEXT_TOKEN_ID in draft_ids:
             raise CliError(f"baseline candidate contains a stop token: {item_id}")
         if raw.get("prompt_tokens") != len(prompt_ids):
@@ -795,16 +817,21 @@ def _prepare_drafts(
                 gold=gold,
                 text=text,
                 answer=answer,
-                candidate_correct=correct,
+                candidate_correct=candidate_correct,
+                candidate_status=str(candidate_status),
+                finish_reason=str(finish_reason),
                 prompt_token_ids=prompt_ids,
                 draft_token_ids=draft_ids,
             )
         )
-    correct_count = sum(row.candidate_correct for row in prepared)
+    correct_count = sum(row.candidate_correct is True for row in prepared)
+    incorrect_count = sum(row.candidate_correct is False for row in prepared)
+    truncated_count = sum(row.candidate_status == "truncated" for row in prepared)
     if (
         summary.get("total") != len(prepared)
         or summary.get("correct") != correct_count
-        or summary.get("incorrect") != len(prepared) - correct_count
+        or summary.get("incorrect") != incorrect_count
+        or summary.get("truncated") != truncated_count
         or summary.get("accuracy") != correct_count / len(prepared)
     ):
         raise CliError("Qwen baseline summary does not match its candidate rows")
@@ -813,7 +840,8 @@ def _prepare_drafts(
 
 def _input_document(rows: Sequence[PreparedDraft]) -> dict[str, Any]:
     lengths = [len(row.prompt_token_ids) + len(row.draft_token_ids) for row in rows]
-    candidate_correct = sum(row.candidate_correct for row in rows)
+    candidate_correct = sum(row.candidate_correct is True for row in rows)
+    candidate_incomplete = sum(row.candidate_correct is None for row in rows)
     return {
         "schema": INPUT_SCHEMA,
         "source": {
@@ -837,6 +865,7 @@ def _input_document(rows: Sequence[PreparedDraft]) -> dict[str, Any]:
             "items": len(rows),
             "candidate_correct": candidate_correct,
             "candidate_accuracy": candidate_correct / len(rows),
+            "candidate_incomplete": candidate_incomplete,
             "max_combined_tokens": max(lengths),
             "verification_rows": sum(len(row.draft_token_ids) + 1 for row in rows),
         },
@@ -1232,7 +1261,9 @@ def _result_document(
         content_verified += bool(verified.draft_verified)
         eos_verified += verified.eos_verified is True
         fully_verified += bool(verified.fully_verified)
-        verified_correct += bool(verified.fully_verified and prepared.candidate_correct)
+        verified_correct += bool(
+            verified.fully_verified and prepared.candidate_correct is True
+        )
         items.append(
             {
                 **prepared.to_dict(),
@@ -1244,7 +1275,8 @@ def _result_document(
             }
         )
     total = len(rows)
-    candidate_correct = sum(row.candidate_correct for row in rows)
+    candidate_correct = sum(row.candidate_correct is True for row in rows)
+    candidate_incomplete = sum(row.candidate_correct is None for row in rows)
     evidence = report.evidence.to_dict()
     return {
         "schema": RESULT_SCHEMA,
@@ -1271,6 +1303,7 @@ def _result_document(
         "summary": {
             "candidate_correct": candidate_correct,
             "candidate_accuracy": candidate_correct / total,
+            "candidate_incomplete": candidate_incomplete,
             "content_verified": content_verified,
             "eos_verified": eos_verified,
             "fully_verified": fully_verified,

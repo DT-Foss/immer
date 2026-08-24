@@ -22,6 +22,9 @@ All notable changes to IMMER are recorded here.
   coverage. Gold labels enter only after each answer or abstention is fixed.
 - Enforced dynamic-cohort status semantics, sealed-report integrity, and the
   shared 64-item producer/consumer limit.
+- Preserved bounded truncated drafts through teacher-forced verification as
+  explicitly incomplete, non-answer candidates instead of dropping their
+  preselected cohort rows.
 
 ## [0.8.0] — 2026-08-23
 

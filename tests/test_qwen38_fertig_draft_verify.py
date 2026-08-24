@@ -167,15 +167,46 @@ class Qwen38FertigDraftVerifyTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(output.read_text(encoding="utf-8")), result)
 
-    def test_baseline_truncation_or_token_count_mismatch_fails_closed(self) -> None:
+    def test_baseline_truncation_is_preserved_but_cannot_be_an_answer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             tokenizer_path, benchmark, drafts = _write_fixture(root)
             tokenizer = _ByteTokenizer(tokenizer_path)
             document = json.loads(drafts.read_text(encoding="utf-8"))
+            partial = "x" * 32
+            document["items"][0].update(
+                {
+                    "predicted": None,
+                    "correct": None,
+                    "status": "truncated",
+                    "completion_tokens": 32,
+                    "finish_reason": "length",
+                    "text": partial,
+                }
+            )
+            document["summary"]["correct"] = 7
             document["summary"]["truncated"] = 1
+            document["summary"]["accuracy"] = 7 / 8
             drafts.write_text(json.dumps(document), encoding="utf-8")
-            with self.assertRaisesRegex(verify_script.CliError, "incomplete"):
+            rows = verify_script._prepare_drafts(
+                benchmark,
+                drafts,
+                tokenizer,
+                max_draft_tokens=32,
+            )
+            self.assertEqual(rows[0].candidate_status, "truncated")
+            self.assertIsNone(rows[0].answer)
+            self.assertIsNone(rows[0].candidate_correct)
+            self.assertEqual(rows[0].finish_reason, "length")
+
+            inputs = verify_script._input_document(rows)
+            self.assertEqual(inputs["summary"]["candidate_correct"], 7)
+            self.assertEqual(inputs["summary"]["candidate_incomplete"], 1)
+
+            document["items"][0]["text"] = partial[:-1]
+            document["items"][0]["completion_tokens"] = 31
+            drafts.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(verify_script.CliError, "truncation"):
                 verify_script._prepare_drafts(
                     benchmark,
                     drafts,
@@ -183,7 +214,8 @@ class Qwen38FertigDraftVerifyTests(unittest.TestCase):
                     max_draft_tokens=32,
                 )
 
-            document["summary"]["truncated"] = 0
+            document["items"][0]["text"] = partial
+            document["items"][0]["completion_tokens"] = 32
             document["items"][0]["prompt_tokens"] += 1
             drafts.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(verify_script.CliError, "prompt token"):
