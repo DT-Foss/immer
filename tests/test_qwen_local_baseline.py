@@ -88,11 +88,13 @@ class QwenLocalBaselineTests(unittest.TestCase):
             baseline.DEFAULT_BENCHMARK,
             cohort="abstained",
             limit=16,
+            offset=0,
         )
         benchmark = json.loads(Path(baseline.DEFAULT_BENCHMARK).read_text())
-        expected = [
+        expected_all = [
             row["item_id"] for row in benchmark["items"] if row["status"] == "abstained"
-        ][:16]
+        ]
+        expected = expected_all[:16]
         self.assertEqual([row.item_id for row in items], expected)
         self.assertEqual(len({row.item_id for row in items}), 16)
         with self.assertRaisesRegex(baseline.CliError, "explicit --limit"):
@@ -100,18 +102,42 @@ class QwenLocalBaselineTests(unittest.TestCase):
                 baseline.DEFAULT_BENCHMARK,
                 cohort="abstained",
                 limit=None,
+                offset=0,
             )
         with self.assertRaisesRegex(baseline.CliError, "does not accept"):
             baseline.select_items(
                 baseline.DEFAULT_BENCHMARK,
                 cohort="fixed",
                 limit=8,
+                offset=0,
             )
         with self.assertRaisesRegex(baseline.CliError, "must not exceed 64"):
             baseline.select_items(
                 baseline.DEFAULT_BENCHMARK,
                 cohort="abstained",
                 limit=65,
+                offset=0,
+            )
+
+        holdout = baseline.select_items(
+            baseline.DEFAULT_BENCHMARK,
+            cohort="abstained",
+            limit=16,
+            offset=16,
+        )
+        self.assertEqual(
+            [row.item_id for row in holdout],
+            expected_all[16:32],
+        )
+        self.assertTrue(
+            {row.item_id for row in items}.isdisjoint(row.item_id for row in holdout)
+        )
+        with self.assertRaisesRegex(baseline.CliError, "offset"):
+            baseline.select_items(
+                baseline.DEFAULT_BENCHMARK,
+                cohort="fixed",
+                limit=None,
+                offset=1,
             )
 
     def test_numeric_extraction_is_canonical_and_uses_final_marker(self) -> None:

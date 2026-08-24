@@ -25,6 +25,8 @@ All notable changes to IMMER are recorded here.
 - Preserved bounded truncated drafts through teacher-forced verification as
   explicitly incomplete, non-answer candidates instead of dropping their
   preselected cohort rows.
+- Added sealed dynamic-cohort offsets so development and holdout slices remain
+  explicitly disjoint while earlier FERTIG abstentions become certified.
 
 ## [0.8.0] — 2026-08-23
 

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Run a local Qwen model on a fixed historical FERTIG-abstention cohort.
+"""Run a local Qwen model on sealed FERTIG evaluation cohorts.
 
 The command is deliberately local-only: it resolves an already cached Hugging
 Face snapshot (or an explicit checkpoint directory) and never downloads model
 files.  MLX is imported only after the benchmark and checkpoint contracts have
 been validated, so ``--help`` and unit tests do not require an MLX runtime.
+
+Dynamic cohorts carry an explicit offset and limit so development and holdout
+slices remain disjoint while FERTIG turns earlier abstentions into proofs.
 
     PYTHONPATH=src python3 scripts/qwen_local_baseline.py
 """
@@ -191,6 +194,12 @@ def _parser() -> argparse.ArgumentParser:
         default="fixed",
     )
     parser.add_argument("--limit", type=_positive_int)
+    parser.add_argument(
+        "--offset",
+        type=_nonnegative_int,
+        default=0,
+        help="zero-based offset within a dynamic benchmark cohort",
+    )
     parser.add_argument("--max-tokens", type=_positive_int, default=32)
     parser.add_argument("--seed", type=_nonnegative_int, default=0)
     return parser
@@ -232,7 +241,7 @@ def _read_json(path: str | Path, label: str) -> dict[str, Any]:
 def select_fixed_items(benchmark: str | Path) -> tuple[BenchmarkItem, ...]:
     """Select the same eight historical rows as FERTIG improves around them."""
 
-    return select_items(benchmark, cohort="fixed", limit=None)
+    return select_items(benchmark, cohort="fixed", limit=None, offset=0)
 
 
 def select_items(
@@ -240,6 +249,7 @@ def select_items(
     *,
     cohort: str,
     limit: int | None,
+    offset: int = 0,
 ) -> tuple[BenchmarkItem, ...]:
     """Select a deterministic fixed or benchmark-ordered evaluation cohort."""
 
@@ -251,8 +261,10 @@ def select_items(
         raise CliError("cohort limit must be a positive integer")
     if limit is not None and limit > 64:
         raise CliError("dynamic cohort limit must not exceed 64")
-    if cohort == "fixed" and limit is not None:
-        raise CliError("the fixed cohort does not accept --limit")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise CliError("cohort offset must be a non-negative integer")
+    if cohort == "fixed" and (limit is not None or offset != 0):
+        raise CliError("the fixed cohort does not accept --limit or --offset")
     if cohort != "fixed" and limit is None:
         raise CliError("dynamic cohorts require an explicit --limit")
 
@@ -275,16 +287,19 @@ def select_items(
         item_ids = FIXED_ITEM_IDS
     else:
         allowed = {"abstained"} if cohort == "abstained" else {"abstained", "correct"}
-        item_ids = tuple(
+        eligible_ids = tuple(
             str(raw["item_id"])
             for raw in raw_items
             if isinstance(raw, Mapping)
             and isinstance(raw.get("item_id"), str)
             and raw.get("status") in allowed
-        )[:limit]
+        )
+        assert limit is not None
+        item_ids = eligible_ids[offset : offset + limit]
         if len(item_ids) != limit:
             raise CliError(
-                f"benchmark has only {len(item_ids)} usable rows for {cohort} limit {limit}"
+                f"benchmark cannot satisfy {cohort} offset {offset} and limit {limit}; "
+                f"only {len(eligible_ids)} usable rows exist"
             )
 
     selected: list[BenchmarkItem] = []
@@ -609,7 +624,12 @@ def run(
     backend_factory: Callable[[argparse.Namespace], GenerationBackend] | None = None,
     clock: Callable[[], float] = time.perf_counter,
 ) -> tuple[dict[str, Any], Path]:
-    items = select_items(args.benchmark, cohort=args.cohort, limit=args.limit)
+    items = select_items(
+        args.benchmark,
+        cohort=args.cohort,
+        limit=args.limit,
+        offset=args.offset,
+    )
     if backend_factory is None:
         if args.backend == "mlx":
 
@@ -715,7 +735,11 @@ def run(
                 "name": f"GSM8K FERTIG {args.cohort} cohort",
                 "source": _public_path(args.benchmark),
                 "item_ids": [item.item_id for item in items],
-                "selection": {"cohort": args.cohort, "limit": args.limit},
+                "selection": {
+                    "cohort": args.cohort,
+                    "offset": args.offset,
+                    "limit": args.limit,
+                },
             },
             "protocol": {
                 "system_prompt": SYSTEM_PROMPT,
