@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -269,6 +270,46 @@ class QwenCausalBundleTests(unittest.TestCase):
             self.assertTrue(output.is_dir())
             self.assertEqual(tuple(output.iterdir()), ())
             self.assertTrue(root.joinpath(".model.causal.building").is_dir())
+
+    def test_adopt_verifies_and_causalizes_weights_without_copying_them(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-bundle-adopt-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            source, inventory, fingerprint = _fixture(root)
+            bundle = root / "adopted.causal"
+            weights = bundle / "weights"
+            shutil.copytree(source, weights)
+            shard = weights / "model.safetensors"
+            before = shard.stat()
+            before_bytes = shard.read_bytes()
+
+            result = bundle_script.adopt_bundle(
+                bundle,
+                inventory,
+                repo_id=REPO_ID,
+                revision=REVISION,
+                expected_fingerprint=fingerprint,
+                require_official=False,
+            )
+            self.assertTrue(result["adopted"])
+            self.assertFalse(result["resumed"])
+            self.assertTrue(bundle.joinpath("causal").is_dir())
+            self.assertTrue(bundle.joinpath("bundle.json").is_file())
+            after = shard.stat()
+            self.assertEqual(after.st_ino, before.st_ino)
+            self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+            self.assertEqual(shard.read_bytes(), before_bytes)
+
+            replay = bundle_script.adopt_bundle(
+                bundle,
+                inventory,
+                repo_id=REPO_ID,
+                revision=REVISION,
+                expected_fingerprint=fingerprint,
+                require_official=False,
+            )
+            self.assertTrue(replay["resumed"])
 
     def test_parser_requires_explicit_subcommand(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

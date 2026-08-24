@@ -135,6 +135,29 @@ def _atomic_bytes(path: Path, value: bytes) -> None:
             os.unlink(temporary)
 
 
+def _atomic_new_bytes(path: Path, value: bytes) -> None:
+    """Publish a new regular file without replacing any late-created target."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".pending", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise QwenCausalBundleError(
+                f"bundle manifest appeared during adoption: {path}"
+            ) from exc
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def _regular_file(path: Path, label: str) -> os.stat_result:
     try:
         metadata = path.lstat()
@@ -380,22 +403,42 @@ def _copy_metadata(
     *,
     require_official: bool,
 ) -> dict[str, str | None]:
+    config, index, receipt = _validated_metadata(
+        source,
+        inventory,
+        require_official=require_official,
+    )
+    _atomic_bytes(weights / "config.json", config)
+    if index is not None:
+        _atomic_bytes(weights / "model.safetensors.index.json", index)
+    return receipt
+
+
+def _validated_metadata(
+    source: Path,
+    inventory: Mapping[str, Any],
+    *,
+    require_official: bool,
+) -> tuple[bytes, bytes | None, dict[str, str | None]]:
     config_path = source / "config.json"
     config = _validate_config_bytes(
         _read_regular_bytes(config_path, "checkpoint config"),
         require_official=require_official,
     )
-    _atomic_bytes(weights / "config.json", config)
 
     index_sha: str | None = None
+    index: bytes | None = None
     index_path = source / "model.safetensors.index.json"
     if len(inventory.get("shards", ())) > 1 or index_path.exists():
         index = _validate_index_bytes(
             _read_regular_bytes(index_path, "checkpoint index"), inventory
         )
-        _atomic_bytes(weights / index_path.name, index)
         index_sha = _sha256_bytes(index)
-    return {"config_sha256": _sha256_bytes(config), "index_sha256": index_sha}
+    receipt = {
+        "config_sha256": _sha256_bytes(config),
+        "index_sha256": index_sha,
+    }
+    return config, index, receipt
 
 
 def _manifest(path: Path) -> dict[str, Any]:
@@ -680,6 +723,132 @@ def build_bundle(
         )
 
 
+def adopt_bundle(
+    bundle: Path,
+    inventory_path: Path,
+    *,
+    repo_id: str = OFFICIAL_REPO_ID,
+    revision: str = OFFICIAL_REVISION,
+    expected_fingerprint: str | None = OFFICIAL_INVENTORY_FINGERPRINT,
+    require_official: bool = True,
+    require_remote_hashes: bool = True,
+) -> dict[str, Any]:
+    """Causalize a complete ``bundle/weights`` tree without copying shards."""
+
+    root = bundle.expanduser().absolute()
+    parent = root.parent
+    _plain_directory(parent, "bundle parent")
+    with _bundle_parent_lock(parent):
+        _plain_directory(root, "bundle root")
+        weights = root / "weights"
+        _plain_directory(weights, "bundle weights")
+        causal = root / "causal"
+        if causal.exists() or causal.is_symlink():
+            _plain_directory(causal, "bundle graph")
+        else:
+            causal.mkdir()
+        manifest_path = root / "bundle.json"
+        if manifest_path.exists() or manifest_path.is_symlink():
+            verified = verify_bundle(
+                root,
+                require_remote_hashes=require_remote_hashes,
+                expected_repo_id=repo_id,
+                expected_revision=revision,
+                expected_fingerprint=expected_fingerprint,
+                require_official=require_official,
+            )
+            return {**verified, "adopted": True, "resumed": True}
+
+        inventory, fingerprint, pinned = _load_inventory(
+            inventory_path.expanduser().absolute(),
+            repo_id=repo_id,
+            revision=revision,
+            expected_fingerprint=expected_fingerprint,
+        )
+        shard_receipts: list[dict[str, Any]] = []
+        checkpoint_bytes = 0
+        for shard in inventory.get("shards", ()):
+            name = str(shard["file"])
+            path = weights / name
+            metadata = _regular_file(path, "adopted checkpoint shard")
+            expected_size = int(shard["size"])
+            expected_digest = _expected_shard_digest(shard)
+            if require_remote_hashes and expected_digest is None:
+                raise QwenCausalBundleError(f"shard lacks remote SHA-256: {name}")
+            digest = _sha256_file(path)
+            if metadata.st_size != expected_size or (
+                expected_digest is not None and digest != expected_digest
+            ):
+                raise QwenCausalBundleError(
+                    f"adopted checkpoint shard verification failed: {name}"
+                )
+            shard_receipts.append(
+                {
+                    "adopted": True,
+                    "file": name,
+                    "reused": True,
+                    "sha256": digest,
+                    "size": expected_size,
+                }
+            )
+            checkpoint_bytes += expected_size
+
+        _config, _index, metadata = _validated_metadata(
+            weights,
+            inventory,
+            require_official=require_official,
+        )
+        _atomic_bytes(
+            weights / "inventory.pinned.json",
+            _canonical(pinned) + b"\n",
+        )
+        identity = LogicalModelIdentity(repo_id, revision)
+        with CausalWeightMount(root, identity, budget_mb=64) as mount:
+            if mount.layout.layout_fingerprint != fingerprint:
+                raise QwenCausalBundleError("adopted layout fingerprint changed")
+            plans = tuple(
+                tensor_range_plan_from_source(mount.source, str(row["name"]))
+                for row in inventory.get("tensors", ())
+            )
+            receipt = mount.bind_tensor_plans(plans)
+            if receipt.appended_count not in (0, len(plans)):
+                raise QwenCausalBundleError("adopted graph has partial tensor bindings")
+            for plan in plans:
+                if mount.resolve_tensor_plan(plan.name) != plan:
+                    raise QwenCausalBundleError(
+                        f"adopted tensor binding mismatch: {plan.name}"
+                    )
+            graph_revision = mount.graph.store.revision()
+
+        body = {
+            "checkpoint_bytes": checkpoint_bytes,
+            "checkpoint_complete": True,
+            "config_sha256": metadata["config_sha256"],
+            "graph_revision": [graph_revision[0], graph_revision[1]],
+            "index_sha256": metadata["index_sha256"],
+            "inventory_sha256": pinned["inventory_sha256"],
+            "layout_fingerprint": fingerprint,
+            "logical_model": {"repo_id": repo_id, "revision": revision},
+            "shards": sorted(shard_receipts, key=lambda row: str(row["file"])),
+            "tensor_bindings": len(plans),
+        }
+        document = {
+            "body": body,
+            "schema": BUNDLE_SCHEMA,
+            "sha256": _sha256_bytes(_canonical(body)),
+        }
+        _atomic_new_bytes(manifest_path, _canonical(document) + b"\n")
+        verified = verify_bundle(
+            root,
+            require_remote_hashes=require_remote_hashes,
+            expected_repo_id=repo_id,
+            expected_revision=revision,
+            expected_fingerprint=fingerprint,
+            require_official=require_official,
+        )
+        return {**verified, "adopted": True, "resumed": False}
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -688,6 +857,9 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
     build.add_argument("--output", required=True)
     build.add_argument("--resume", action="store_true")
+    adopt = subparsers.add_parser("adopt")
+    adopt.add_argument("--bundle", required=True)
+    adopt.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
     verify = subparsers.add_parser("verify")
     verify.add_argument("--bundle", required=True)
     return parser
@@ -703,6 +875,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 Path(args.output),
                 resume=args.resume,
             )
+        elif args.command == "adopt":
+            result = adopt_bundle(Path(args.bundle), Path(args.inventory))
         else:
             result = verify_bundle(Path(args.bundle))
     except QwenCausalBundleError as exc:

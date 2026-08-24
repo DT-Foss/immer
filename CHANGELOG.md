@@ -59,6 +59,9 @@ All notable changes to IMMER are recorded here.
   published; resumable staging, config/index validation, full graph replay,
   post-copy verification, and atomic promotion prevent sparse holes or partial
   checkpoints from becoming executable model bytes.
+- Added in-place bundle adoption for storage-constrained deployments: an
+  existing complete `weights/` tree is fully re-hashed and causalized beside
+  the unchanged shards, eliminating the second 55.6-GB checkpoint copy.
 - Made Qwen layer-major verification emit complete resumable access traces.
   Content-addressed trace and hidden-resume files commit through one hashed
   pair manifest, resumed traces renumber new operations canonically,
