@@ -27,6 +27,9 @@ All notable changes to IMMER are recorded here.
   preselected cohort rows.
 - Added sealed dynamic-cohort offsets so development and holdout slices remain
   explicitly disjoint while earlier FERTIG abstentions become certified.
+- Added a fail-closed paired `off`/CRSA comparator that requires identical
+  checkpoint, causal bundle, cohort, prompts, and drafts, and treats new
+  agreement with wrong drafts as an unsafe regression rather than quality.
 
 ## [0.8.0] — 2026-08-23
 

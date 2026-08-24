@@ -21,6 +21,7 @@ SCRIPTS = (
     "bench_gsm8k.py",
     "qwen38_causal_bundle.py",
     "qwen38_direct_decode_benchmark.py",
+    "qwen38_fertig_arm_compare.py",
 )
 FORBIDDEN_RESEARCH_IMPORTS = (
     "vendor/mitglm",
@@ -111,9 +112,7 @@ class ScriptEntrypointTests(unittest.TestCase):
                 self.assertEqual(sorted(source.calls), [(1, 2), (4, 1), (7, 1)])
 
     def test_stage2_is_still_explicitly_falsified(self) -> None:
-        source = (ROOT / "scripts" / "router_v2_stage2.py").read_text(
-            encoding="utf-8"
-        )
+        source = (ROOT / "scripts" / "router_v2_stage2.py").read_text(encoding="utf-8")
         self.assertIn('METHOD_VERDICT = "NEGATIVE_METHOD_FALSIFIED"', source)
         self.assertIn('"eligible_as_runtime_router": False', source)
 
