@@ -54,6 +54,14 @@ def _arm(name: str, *, seconds: float, body: int, hidden: str = "h" * 64):
         },
         "hidden_sha256": hidden,
         "input_sha256": "i" * 64,
+        "layers": [
+            {
+                "layer": layer,
+                "seconds": seconds / 43,
+                "source_body_bytes": body // 43,
+            }
+            for layer in range(43)
+        ],
         "pager": {
             "expert_prefetch_wait_ns": int(seconds * 100),
             "expert_reservoir_failures": 0,
@@ -128,6 +136,10 @@ class DirectDecodeBenchmarkTests(unittest.TestCase):
             self.assertEqual(
                 report["contrasts"]["real_vs_placebo"]["seconds_ratio"],
                 7 / 8,
+            )
+            self.assertAlmostEqual(
+                report["contrasts"]["real_vs_baseline"]["causal_layer_seconds_ratio"],
+                0.7,
             )
             self.assertEqual(report["arms"]["real_markov"]["reservoir_hits"], 1)
 
@@ -225,6 +237,48 @@ class DirectDecodeBenchmarkTests(unittest.TestCase):
             self.assertEqual(decoded["evidence"]["context_mode"], "decode")
             self.assertTrue(decoded["snapshot"]["restore"]["transport_neutral"])
             self.assertRegex(decoded["hidden_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_replicated_comparison_pairs_opposite_execution_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            cycles = (
+                {
+                    "baseline": _arm("baseline", seconds=10.0, body=1000),
+                    "real": _arm("real_markov", seconds=7.0, body=800),
+                    "placebo": _arm("placebo_markov", seconds=8.0, body=900),
+                },
+                {
+                    "baseline": _arm("baseline", seconds=12.0, body=1000),
+                    "real": _arm("real_markov", seconds=9.0, body=800),
+                    "placebo": _arm("placebo_markov", seconds=8.0, body=900),
+                },
+            )
+            paths = {arm: [] for arm in ("baseline", "real", "placebo")}
+            for index, cycle in enumerate(cycles):
+                for arm, document in cycle.items():
+                    path = directory / f"{arm}-{index}.json"
+                    benchmark._write_json(path, document)
+                    paths[arm].append(str(path))
+            args = type(
+                "Args",
+                (),
+                {
+                    "baseline": paths["baseline"],
+                    "real": paths["real"],
+                    "placebo": paths["placebo"],
+                },
+            )()
+
+            report = benchmark.compare_replicates(args)
+            self.assertEqual(report["cycle_count"], 2)
+            self.assertEqual(
+                report["paired"]["real_vs_placebo"]["seconds_deltas"],
+                [-1.0, 1.0],
+            )
+            self.assertEqual(
+                report["paired"]["real_vs_placebo"]["seconds_mean_delta"],
+                0.0,
+            )
 
     def test_parser_requires_explicit_subcommand(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

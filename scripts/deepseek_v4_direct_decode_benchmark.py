@@ -42,6 +42,9 @@ DEFAULT_CACHE = ROOT / "artifacts" / "private" / "deepseek-v4-cache"
 INPUT_SCHEMA = "immer.deepseek-v4-direct-decode-input/v1"
 RESULT_SCHEMA = "immer.deepseek-v4-direct-decode/v1"
 COMPARISON_SCHEMA = "immer.deepseek-v4-direct-decode-comparison/v1"
+REPLICATED_COMPARISON_SCHEMA = (
+    "immer.deepseek-v4-direct-decode-replicated-comparison/v1"
+)
 
 
 class DirectDecodeError(RuntimeError):
@@ -295,7 +298,7 @@ def _result(identity: Mapping[str, Any]) -> dict[str, Any]:
     return {**dict(identity), "sha256": _sha256(identity)}
 
 
-def _progress(arm: str):
+def _progress(arm: str, sink: list[dict[str, Any]] | None = None):
     def emit(row: Mapping[str, Any]) -> None:
         experts = row.get("experts")
         flattened = (
@@ -312,6 +315,8 @@ def _progress(arm: str):
             "source_body_bytes": row.get("source_body_bytes"),
             "unique_experts": len(set(flattened)),
         }
+        if sink is not None:
+            sink.append(record)
         print(json.dumps(record, sort_keys=True), file=sys.stderr, flush=True)
 
     return emit
@@ -332,6 +337,7 @@ def prepare_prefix(args: argparse.Namespace) -> dict[str, Any]:
         model = _model(args, source, config, route_predictor=None)
         before = _source_bytes(source)
         started = time.perf_counter()
+        layer_receipts: list[dict[str, Any]] = []
         scope = (
             recorder.scope(phase="shared_prefix", arm="prepare")
             if recorder is not None
@@ -339,7 +345,9 @@ def prepare_prefix(args: argparse.Namespace) -> dict[str, Any]:
         )
         with scope:
             hidden, evidence = model.prefill(
-                [prefix], tokenwise=False, progress=_progress("prepare")
+                [prefix],
+                tokenwise=False,
+                progress=_progress("prepare", layer_receipts),
             )
         seconds = time.perf_counter() - started
         after = _source_bytes(source)
@@ -351,6 +359,7 @@ def prepare_prefix(args: argparse.Namespace) -> dict[str, Any]:
             "evidence": asdict(evidence[0]),
             "hidden_sha256": _tensor_sha256(hidden),
             "input_sha256": inputs["sha256"],
+            "layers": layer_receipts,
             "pager": model.pager.metrics(),
             "schema": RESULT_SCHEMA,
             "seconds": seconds,
@@ -401,6 +410,7 @@ def decode_arm(args: argparse.Namespace) -> dict[str, Any]:
             raise DirectDecodeError("shared prefix cursor does not match decode input")
         before = _source_bytes(source)
         started = time.perf_counter()
+        layer_receipts: list[dict[str, Any]] = []
         scope = (
             recorder.scope(phase="decode", arm=role)
             if recorder is not None
@@ -408,7 +418,8 @@ def decode_arm(args: argparse.Namespace) -> dict[str, Any]:
         )
         with scope:
             hidden, evidence = model.decode(
-                [[int(inputs["decode_token_id"])]], progress=_progress(role)
+                [[int(inputs["decode_token_id"])]],
+                progress=_progress(role, layer_receipts),
             )
         seconds = time.perf_counter() - started
         after = _source_bytes(source)
@@ -419,6 +430,7 @@ def decode_arm(args: argparse.Namespace) -> dict[str, Any]:
             "evidence": asdict(evidence),
             "hidden_sha256": _tensor_sha256(hidden),
             "input_sha256": inputs["sha256"],
+            "layers": layer_receipts,
             "pager": model.pager.metrics(),
             "route_model_artifact_sha256": artifact_sha256,
             "route_prefetch": model.route_prefetch_metrics(),
@@ -498,24 +510,90 @@ def compare_arms(args: argparse.Namespace) -> dict[str, Any]:
         pager = document.get("pager")
         if not isinstance(pager, Mapping):
             raise DirectDecodeError("decode result lacks pager metrics")
+        route = document.get("route_prefetch")
+        if not isinstance(route, Mapping):
+            raise DirectDecodeError("decode result lacks route scheduler metrics")
+        raw_layers = document.get("layers", [])
+        if not isinstance(raw_layers, list):
+            raise DirectDecodeError("decode layer receipts must be a list")
+        if raw_layers:
+            layer_ids = [
+                row.get("layer") for row in raw_layers if isinstance(row, Mapping)
+            ]
+            if layer_ids != list(range(len(raw_layers))):
+                raise DirectDecodeError(
+                    "decode layer receipts are incomplete or unordered"
+                )
+            causal_rows = [row for row in raw_layers if int(row["layer"]) >= 22]
+            causal_seconds: float | None = sum(
+                float(row["seconds"]) for row in causal_rows
+            )
+            causal_bytes: int | None = sum(
+                int(row["source_body_bytes"]) for row in causal_rows
+            )
+        else:
+            causal_seconds = None
+            causal_bytes = None
         arms[name] = {
+            "causal_layer_seconds": causal_seconds,
+            "causal_layer_source_body_bytes": causal_bytes,
+            "confidence_skips": int(route.get("confidence_skips", 0)),
+            "direct_bindings": int(route.get("direct_bindings", 0)),
             "expert_prefetch_wait_ns": int(pager.get("expert_prefetch_wait_ns", 0)),
             "reservoir_failures": int(pager.get("expert_reservoir_failures", 0)),
+            "reservoir_hit_payload_bytes": int(
+                pager.get("expert_reservoir_hit_payload_bytes", 0)
+            ),
             "reservoir_hits": int(pager.get("expert_reservoir_usable_hits", 0)),
             "reservoir_misses": int(pager.get("expert_reservoir_misses", 0)),
+            "reservoir_payload_bytes": int(
+                pager.get("expert_reservoir_payload_bytes", 0)
+            ),
             "reservoir_ready_hits": int(pager.get("expert_reservoir_ready_hits", 0)),
+            "reservoir_source_bytes": int(
+                pager.get("expert_reservoir_source_bytes", 0)
+            ),
             "reservoir_submitted": int(pager.get("expert_reservoir_submitted", 0)),
             "reservoir_wait_ns": int(pager.get("expert_reservoir_wait_ns", 0)),
             "reservoir_wasted": int(pager.get("expert_reservoir_wasted", 0)),
+            "reservoir_wasted_payload_bytes": int(
+                pager.get("expert_reservoir_wasted_payload_bytes", 0)
+            ),
             "seconds": float(document["seconds"]),
             "source_body_bytes": int(document["source_body_bytes"]),
             "trace_sha256": document.get("trace", {}).get("sha256"),
         }
+        submitted = arms[name]["reservoir_submitted"]
+        hits = arms[name]["reservoir_hits"]
+        misses = arms[name]["reservoir_misses"]
+        arms[name]["reservoir_precision"] = hits / submitted if submitted else None
+        arms[name]["reservoir_demand_coverage"] = (
+            hits / (hits + misses) if hits + misses else None
+        )
 
     baseline = arms["baseline"]
 
     def contrast(arm: Mapping[str, Any]) -> dict[str, Any]:
+        causal_seconds = arm["causal_layer_seconds"]
+        baseline_causal_seconds = baseline["causal_layer_seconds"]
+        causal_bytes = arm["causal_layer_source_body_bytes"]
+        baseline_causal_bytes = baseline["causal_layer_source_body_bytes"]
         return {
+            "causal_layer_seconds_delta": (
+                None
+                if causal_seconds is None or baseline_causal_seconds is None
+                else float(causal_seconds) - float(baseline_causal_seconds)
+            ),
+            "causal_layer_seconds_ratio": (
+                None
+                if causal_seconds is None or baseline_causal_seconds in (None, 0)
+                else float(causal_seconds) / float(baseline_causal_seconds)
+            ),
+            "causal_layer_source_body_bytes_delta": (
+                None
+                if causal_bytes is None or baseline_causal_bytes is None
+                else int(causal_bytes) - int(baseline_causal_bytes)
+            ),
             "seconds_delta": float(arm["seconds"]) - float(baseline["seconds"]),
             "seconds_ratio": (
                 float(arm["seconds"]) / float(baseline["seconds"])
@@ -537,6 +615,20 @@ def compare_arms(args: argparse.Namespace) -> dict[str, Any]:
             "placebo_vs_baseline": contrast(arms["placebo_markov"]),
             "real_vs_baseline": contrast(arms["real_markov"]),
             "real_vs_placebo": {
+                "causal_layer_seconds_delta": (
+                    None
+                    if arms["real_markov"]["causal_layer_seconds"] is None
+                    or arms["placebo_markov"]["causal_layer_seconds"] is None
+                    else arms["real_markov"]["causal_layer_seconds"]
+                    - arms["placebo_markov"]["causal_layer_seconds"]
+                ),
+                "causal_layer_seconds_ratio": (
+                    None
+                    if arms["real_markov"]["causal_layer_seconds"] is None
+                    or not arms["placebo_markov"]["causal_layer_seconds"]
+                    else arms["real_markov"]["causal_layer_seconds"]
+                    / arms["placebo_markov"]["causal_layer_seconds"]
+                ),
                 "seconds_delta": arms["real_markov"]["seconds"]
                 - arms["placebo_markov"]["seconds"],
                 "seconds_ratio": (
@@ -550,6 +642,94 @@ def compare_arms(args: argparse.Namespace) -> dict[str, Any]:
         },
         "invariant_sha256": _sha256(expected),
         "schema": COMPARISON_SCHEMA,
+    }
+    return _result(identity)
+
+
+def compare_replicates(args: argparse.Namespace) -> dict[str, Any]:
+    paths = (tuple(args.baseline), tuple(args.real), tuple(args.placebo))
+    if len({len(values) for values in paths}) != 1 or len(paths[0]) < 2:
+        raise DirectDecodeError(
+            "replicated comparison requires two or more matched three-arm cycles"
+        )
+    cycles = [
+        compare_arms(argparse.Namespace(baseline=baseline, real=real, placebo=placebo))
+        for baseline, real, placebo in zip(*paths, strict=True)
+    ]
+    invariant_sha256 = {cycle["invariant_sha256"] for cycle in cycles}
+    if len(invariant_sha256) != 1:
+        raise DirectDecodeError("replicated cycles do not share output identity")
+
+    arms: dict[str, Any] = {}
+    for arm in ("baseline", "real_markov", "placebo_markov"):
+        rows = [cycle["arms"][arm] for cycle in cycles]
+        stable_metrics = {
+            key: {row[key] for row in rows}
+            for key in (
+                "confidence_skips",
+                "direct_bindings",
+                "reservoir_hits",
+                "reservoir_misses",
+                "reservoir_submitted",
+                "reservoir_wasted",
+            )
+        }
+        if any(len(values) != 1 for values in stable_metrics.values()):
+            raise DirectDecodeError(f"{arm} route counters changed across cycles")
+        causal_seconds = [
+            row["causal_layer_seconds"]
+            for row in rows
+            if row["causal_layer_seconds"] is not None
+        ]
+        arms[arm] = {
+            "causal_layer_seconds": causal_seconds,
+            "causal_layer_seconds_mean": (
+                sum(causal_seconds) / len(causal_seconds) if causal_seconds else None
+            ),
+            "route_counters": {
+                key: next(iter(values)) for key, values in stable_metrics.items()
+            },
+            "seconds": [row["seconds"] for row in rows],
+            "seconds_mean": sum(row["seconds"] for row in rows) / len(rows),
+            "source_body_bytes": [row["source_body_bytes"] for row in rows],
+            "source_body_bytes_mean": sum(row["source_body_bytes"] for row in rows)
+            / len(rows),
+        }
+
+    paired: dict[str, Any] = {}
+    for name, left, right in (
+        ("real_vs_baseline", "real_markov", "baseline"),
+        ("placebo_vs_baseline", "placebo_markov", "baseline"),
+        ("real_vs_placebo", "real_markov", "placebo_markov"),
+    ):
+        deltas = [
+            cycles[index]["arms"][left]["seconds"]
+            - cycles[index]["arms"][right]["seconds"]
+            for index in range(len(cycles))
+        ]
+        paired[name] = {
+            "seconds_deltas": deltas,
+            "seconds_mean_delta": sum(deltas) / len(deltas),
+            "seconds_mean_ratio": (
+                arms[left]["seconds_mean"] / arms[right]["seconds_mean"]
+                if arms[right]["seconds_mean"]
+                else None
+            ),
+        }
+
+    identity = {
+        "arms": arms,
+        "cycle_count": len(cycles),
+        "cycles": [
+            {
+                "contrasts": cycle["contrasts"],
+                "sha256": cycle["sha256"],
+            }
+            for cycle in cycles
+        ],
+        "invariant_sha256": next(iter(invariant_sha256)),
+        "paired": paired,
+        "schema": REPLICATED_COMPARISON_SCHEMA,
     }
     return _result(identity)
 
@@ -625,6 +805,13 @@ def _parser() -> argparse.ArgumentParser:
     compare.add_argument("--placebo", required=True)
     compare.add_argument("--output", required=True)
     compare.set_defaults(handler=compare_arms)
+
+    replicated = subparsers.add_parser("compare-replicates")
+    replicated.add_argument("--baseline", action="append", required=True)
+    replicated.add_argument("--real", action="append", required=True)
+    replicated.add_argument("--placebo", action="append", required=True)
+    replicated.add_argument("--output", required=True)
+    replicated.set_defaults(handler=compare_replicates)
     return parser
 
 
