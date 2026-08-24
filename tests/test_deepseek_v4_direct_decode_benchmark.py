@@ -4,6 +4,7 @@ import copy
 from contextlib import redirect_stderr
 import importlib.util
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -203,7 +204,11 @@ class DirectDecodeBenchmarkTests(unittest.TestCase):
                 ]
             )
             with (
-                mock.patch.object(benchmark, "_build_source", return_value=Source()),
+                mock.patch.object(
+                    benchmark,
+                    "_build_source",
+                    return_value=benchmark.RuntimeSource(Source()),
+                ),
                 mock.patch.object(benchmark, "_load_config", return_value=config),
                 redirect_stderr(io.StringIO()),
             ):
@@ -228,7 +233,11 @@ class DirectDecodeBenchmarkTests(unittest.TestCase):
                 ]
             )
             with (
-                mock.patch.object(benchmark, "_build_source", return_value=Source()),
+                mock.patch.object(
+                    benchmark,
+                    "_build_source",
+                    return_value=benchmark.RuntimeSource(Source()),
+                ),
                 mock.patch.object(benchmark, "_load_config", return_value=config),
                 redirect_stderr(io.StringIO()),
             ):
@@ -279,6 +288,65 @@ class DirectDecodeBenchmarkTests(unittest.TestCase):
                 report["paired"]["real_vs_placebo"]["seconds_mean_delta"],
                 0.0,
             )
+
+    def test_snapshot_rebind_allows_only_audited_streamer_hash_drift(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            directory = Path(temporary)
+            source_path = directory / "source.json"
+            target_path = directory / "rebound.json"
+            model = benchmark.StreamedDeepSeekV4(
+                _config(0),
+                benchmark.DeepSeekWeightPager(
+                    _TwoLayerPrefetchQuantizedTinyCheckpoint(),
+                    device="cpu",
+                    compute_dtype="float32",
+                ),
+                max_seq_len=8,
+            )
+            model.prefill([[2, 3, 5, 7]], tokenwise=False)
+            model.save_state(source_path, transport_neutral=True)
+            document = json.loads(source_path.read_text(encoding="utf-8"))
+            current = copy.deepcopy(document["body"]["identity"])
+            streamer = next(
+                row
+                for row in current["runtime"]["sources"]
+                if row["path"] == "immer/knowledge/streamer.py"
+            )
+            streamer["sha256"] = "f" * 64
+            current["runtime"]["source_sha256"] = benchmark._sha256(
+                current["runtime"]["sources"]
+            )
+
+            receipt = benchmark.rebind_transport_snapshot(
+                source_path,
+                target_path,
+                current_identity=current,
+            )
+            self.assertEqual(
+                receipt["changed_source_paths"], ["immer/knowledge/streamer.py"]
+            )
+            benchmark.read_snapshot(target_path, expected_identity=current)
+
+            forbidden = copy.deepcopy(current)
+            model_source = next(
+                row
+                for row in forbidden["runtime"]["sources"]
+                if row["path"] == "immer/runtimes/deepseek_v4/model.py"
+            )
+            model_source["sha256"] = "e" * 64
+            forbidden["runtime"]["source_sha256"] = benchmark._sha256(
+                forbidden["runtime"]["sources"]
+            )
+            with self.assertRaisesRegex(
+                benchmark.DirectDecodeError, "outside audited|transport-only"
+            ):
+                benchmark.rebind_transport_snapshot(
+                    source_path,
+                    directory / "forbidden.json",
+                    current_identity=forbidden,
+                )
+            model.reset_state(release=True)
+            model.pager.close()
 
     def test_parser_requires_explicit_subcommand(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

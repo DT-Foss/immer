@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
@@ -25,8 +25,10 @@ from typing import Any
 
 from immer.knowledge import AccessTraceRecorder, Streamer
 from immer.runtimes.deepseek_v4 import (
+    CausalWeightMount,
     DeepSeekV4Config,
     DeepSeekWeightPager,
+    LogicalModelIdentity,
     StreamedDeepSeekV4,
 )
 from immer.runtimes.deepseek_v4.causal_prefetch import CheckpointIdentity
@@ -34,6 +36,7 @@ from immer.runtimes.deepseek_v4.route_model import (
     RouteModelArtifactError,
     load_route_model_artifact,
 )
+from immer.runtimes.deepseek_v4.snapshot import read_snapshot
 
 ROOT = Path(__file__).resolve().parent.parent
 OFFICIAL_SOURCE = "deepseek-ai/DeepSeek-V4-Flash-0731"
@@ -49,6 +52,18 @@ REPLICATED_COMPARISON_SCHEMA = (
 
 class DirectDecodeError(RuntimeError):
     """A shared-prefix decode benchmark contract was violated."""
+
+
+@dataclass(slots=True)
+class RuntimeSource:
+    source: Streamer
+    mount: CausalWeightMount | None = None
+
+    def close(self) -> None:
+        if self.mount is not None:
+            self.mount.close()
+        else:
+            self.source.close()
 
 
 def _canonical(value: object) -> bytes:
@@ -178,7 +193,23 @@ def _local_source_path(value: str) -> Path | None:
 def _build_source(
     args: argparse.Namespace,
     recorder: AccessTraceRecorder | None,
-) -> Streamer:
+) -> RuntimeSource:
+    if args.causal_bundle is not None:
+        model = LogicalModelIdentity(
+            repo_id=args.logical_repo_id,
+            revision=args.revision,
+        )
+        try:
+            mount = CausalWeightMount(
+                args.causal_bundle,
+                model,
+                budget_mb=args.budget_mb,
+            )
+        except Exception as exc:
+            raise DirectDecodeError("cannot mount local causal bundle") from exc
+        if recorder is not None:
+            mount.source.set_access_observer(recorder)
+        return RuntimeSource(mount.source, mount)
     common = {
         "revision": args.revision,
         "budget_mb": args.budget_mb,
@@ -205,14 +236,16 @@ def _build_source(
                 raise DirectDecodeError("local pinned inventory is invalid")
             pinned_inventory = pinned["inventory"]
             pinned_fingerprint = pinned["source_fingerprint"]
-        return Streamer.from_local(
-            local,
-            repo_id=args.logical_repo_id,
-            pinned_inventory=pinned_inventory,
-            pinned_fingerprint=pinned_fingerprint,
-            **common,
+        return RuntimeSource(
+            Streamer.from_local(
+                local,
+                repo_id=args.logical_repo_id,
+                pinned_inventory=pinned_inventory,
+                pinned_fingerprint=pinned_fingerprint,
+                **common,
+            )
         )
-    return Streamer(args.source, **common)
+    return RuntimeSource(Streamer(args.source, **common))
 
 
 def _load_config(source: Streamer) -> DeepSeekV4Config:
@@ -247,6 +280,7 @@ def _model(
     config: DeepSeekV4Config,
     *,
     route_predictor: Any | None,
+    causal_reader: Any | None,
 ) -> StreamedDeepSeekV4:
     pager = DeepSeekWeightPager(
         source,
@@ -256,6 +290,7 @@ def _model(
         expert_prefetch=not args.no_expert_prefetch,
         expert_reservoir_budget_bytes=args.expert_reservoir_budget_mb * 1024**2,
         expert_reservoir_workers=args.expert_reservoir_workers,
+        causal_weight_reader=causal_reader,
     )
     kwargs: dict[str, Any] = {}
     if route_predictor is not None:
@@ -317,6 +352,86 @@ def _result(identity: Mapping[str, Any]) -> dict[str, Any]:
     return {**dict(identity), "sha256": _sha256(identity)}
 
 
+def rebind_transport_snapshot(
+    source_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+    *,
+    current_identity: Mapping[str, Any],
+    allowed_source_paths: frozenset[str] = frozenset({"immer/knowledge/streamer.py"}),
+) -> dict[str, Any]:
+    """Reseal a verified neutral snapshot after audited transport-only drift."""
+
+    source = Path(source_path).expanduser().resolve()
+    target = Path(output_path).expanduser().resolve()
+    if target.exists() or target.is_symlink():
+        raise DirectDecodeError(f"rebound snapshot already exists: {target}")
+    if target.parent != source.parent:
+        raise DirectDecodeError("rebound snapshot must stay beside its NPZ payload")
+    document = _strict_json(source)
+    if not isinstance(document, dict) or set(document) != {
+        "body",
+        "body_sha256",
+        "schema",
+        "version",
+    }:
+        raise DirectDecodeError("snapshot manifest schema is invalid")
+    body = document.get("body")
+    if not isinstance(body, dict) or document.get("body_sha256") != _sha256(body):
+        raise DirectDecodeError("snapshot manifest body digest does not match")
+    stored_identity = body.get("identity")
+    if not isinstance(stored_identity, Mapping):
+        raise DirectDecodeError("snapshot identity is invalid")
+    # This verifies payload SHA, tensor SHA/dtype/shape/finite policies, and the
+    # original identity before any new manifest is published.
+    read_snapshot(source, expected_identity=stored_identity)
+
+    stored = json.loads(_canonical(dict(stored_identity)).decode("utf-8"))
+    current = json.loads(_canonical(dict(current_identity)).decode("utf-8"))
+    try:
+        if (
+            stored["execution"].get("transport_scope") != "neutral/v1"
+            or current["execution"].get("transport_scope") != "neutral/v1"
+        ):
+            raise DirectDecodeError("only transport-neutral snapshots can be rebound")
+        stored_runtime = stored["runtime"]
+        current_runtime = current["runtime"]
+        if stored_runtime["source_sha256"] != _sha256(stored_runtime["sources"]):
+            raise DirectDecodeError("stored runtime source digest is invalid")
+        old_by_path = {row["path"]: row for row in stored_runtime["sources"]}
+        new_by_path = {row["path"]: row for row in current_runtime["sources"]}
+        if set(old_by_path) != set(new_by_path):
+            raise DirectDecodeError("runtime source path inventory changed")
+        changed = {
+            path for path in old_by_path if old_by_path[path] != new_by_path[path]
+        }
+        if not changed or not changed.issubset(allowed_source_paths):
+            raise DirectDecodeError(
+                "snapshot changes are not the audited transport-only source set"
+            )
+        stored_runtime["sources"] = [
+            new_by_path[row["path"]] if row["path"] in changed else row
+            for row in stored_runtime["sources"]
+        ]
+        stored_runtime["source_sha256"] = _sha256(stored_runtime["sources"])
+    except (KeyError, TypeError) as exc:
+        raise DirectDecodeError("snapshot runtime identity is malformed") from exc
+    if _canonical(stored) != _canonical(current):
+        raise DirectDecodeError("snapshot differs outside audited transport sources")
+
+    rebound = json.loads(_canonical(document).decode("utf-8"))
+    rebound["body"]["identity"] = current
+    rebound["body_sha256"] = _sha256(rebound["body"])
+    _atomic_bytes(target, _canonical(rebound) + b"\n")
+    read_snapshot(target, expected_identity=current)
+    return {
+        "allowed_source_paths": sorted(allowed_source_paths),
+        "changed_source_paths": sorted(changed),
+        "manifest": str(target),
+        "manifest_body_sha256": rebound["body_sha256"],
+        "payload_sha256": rebound["body"]["payload"]["sha256"],
+    }
+
+
 def _progress(arm: str, sink: list[dict[str, Any]] | None = None):
     def emit(row: Mapping[str, Any]) -> None:
         experts = row.get("experts")
@@ -347,13 +462,22 @@ def prepare_prefix(args: argparse.Namespace) -> dict[str, Any]:
     if len(prefix) >= args.max_seq_len:
         raise DirectDecodeError("prefix leaves no room for the decode token")
     recorder = None if args.no_access_trace else AccessTraceRecorder()
-    source = _build_source(args, recorder)
+    runtime_source = _build_source(args, recorder)
+    source = runtime_source.source
     model: StreamedDeepSeekV4 | None = None
     try:
         config = _load_config(source)
         if max((*prefix, int(inputs["decode_token_id"]))) >= config.vocab_size:
             raise DirectDecodeError("decode input exceeds checkpoint vocabulary")
-        model = _model(args, source, config, route_predictor=None)
+        model = _model(
+            args,
+            source,
+            config,
+            route_predictor=None,
+            causal_reader=(
+                None if runtime_source.mount is None else runtime_source.mount.reader
+            ),
+        )
         before = _source_bytes(source)
         started = time.perf_counter()
         layer_receipts: list[dict[str, Any]] = []
@@ -394,7 +518,7 @@ def prepare_prefix(args: argparse.Namespace) -> dict[str, Any]:
         if model is not None:
             model.reset_state(release=True)
             model.pager.close()
-        source.close()
+        runtime_source.close()
 
 
 def decode_arm(args: argparse.Namespace) -> dict[str, Any]:
@@ -403,7 +527,8 @@ def decode_arm(args: argparse.Namespace) -> dict[str, Any]:
     if len(prefix) >= args.max_seq_len:
         raise DirectDecodeError("prefix leaves no room for the decode token")
     recorder = None if args.no_access_trace else AccessTraceRecorder()
-    source = _build_source(args, recorder)
+    runtime_source = _build_source(args, recorder)
+    source = runtime_source.source
     model: StreamedDeepSeekV4 | None = None
     try:
         config = _load_config(source)
@@ -423,7 +548,15 @@ def decode_arm(args: argparse.Namespace) -> dict[str, Any]:
             predictor = artifact.predictor
             artifact_sha256 = artifact.sha256
             role = args.route_model_role
-        model = _model(args, source, config, route_predictor=predictor)
+        model = _model(
+            args,
+            source,
+            config,
+            route_predictor=predictor,
+            causal_reader=(
+                None if runtime_source.mount is None else runtime_source.mount.reader
+            ),
+        )
         restored = model.load_state(args.snapshot, transport_neutral=True)
         if model.next_position != len(prefix):
             raise DirectDecodeError("shared prefix cursor does not match decode input")
@@ -467,7 +600,7 @@ def decode_arm(args: argparse.Namespace) -> dict[str, Any]:
         if model is not None:
             model.reset_state(release=True)
             model.pager.close()
-        source.close()
+        runtime_source.close()
 
 
 def _load_result(path: str | os.PathLike[str], expected_arm: str) -> dict[str, Any]:
@@ -781,6 +914,7 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--access-trace")
     parser.add_argument("--no-access-trace", action="store_true")
     parser.add_argument("--source", default=OFFICIAL_SOURCE)
+    parser.add_argument("--causal-bundle")
     parser.add_argument("--logical-repo-id", default=OFFICIAL_SOURCE)
     parser.add_argument("--revision", default=OFFICIAL_REVISION)
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE))

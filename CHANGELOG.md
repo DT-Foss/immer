@@ -28,6 +28,12 @@ All notable changes to IMMER are recorded here.
   aggregation, exact miss fallback, and bit-identical three-arm comparison.
 - Added transport-neutral, model-math-bound KV snapshots and a contextual
   shared-prefix decode benchmark for strict baseline/real/placebo TPOT arms.
+- Built trace-complete sparse causal bundles with byte-identical Safetensors
+  coordinates, exact reconstructed headers, pinned inventory identity, and
+  fail-closed bindings for every fully materialized expert.
+- Executed shared-prefix decode directly through the local causal reader with
+  bit-identical hidden states: about 53 seconds locally versus 121 seconds from
+  a warm remote range cache and 1,100+ seconds from cold remote transport.
 - Added FERTIG draft verification and exact/model fusion receipts for fixed
   integration cohorts.
 - Rebuilt public documentation around the local causal architecture and
