@@ -23,6 +23,9 @@ import stat
 import sys
 import tempfile
 from typing import Any
+from urllib.parse import quote
+
+import requests
 
 try:
     import fcntl
@@ -52,6 +55,7 @@ DEFAULT_INVENTORY = (
     / "Qwen-Qwen3-8-27B-5a5baa00ed547aaa.json"
 )
 BUNDLE_SCHEMA = "immer.qwen3.8-complete-causal-bundle/v1"
+DOWNLOAD_SCHEMA = "immer.qwen3.8-pinned-download/v1"
 BUNDLE_HEADROOM_BYTES = 64 * 1024**2
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -254,6 +258,219 @@ def _rename_no_replace(source: Path, target: Path) -> None:
         raise QwenCausalBundleError(
             f"bundle promotion refused target: {os.strerror(error)}"
         )
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _resolve_url(repo_id: str, revision: str, filename: str) -> str:
+    if Path(filename).name != filename:
+        raise QwenCausalBundleError("download filename is unsafe")
+    return (
+        "https://huggingface.co/"
+        f"{quote(repo_id, safe='/')}/resolve/{quote(revision, safe='')}/"
+        f"{quote(filename, safe='')}?download=true"
+    )
+
+
+def _hash_prefix(path: Path) -> tuple[Any, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(4 * 1024**2):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest, size
+
+
+def _download_verified_file(
+    session: requests.Session,
+    url: str,
+    target: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    resume: bool,
+) -> dict[str, Any]:
+    if target.exists() or target.is_symlink():
+        metadata = _regular_file(target, "downloaded checkpoint shard")
+        if metadata.st_size != expected_size or _sha256_file(target) != (
+            expected_sha256
+        ):
+            raise QwenCausalBundleError(f"downloaded shard is corrupt: {target.name}")
+        return {
+            "file": target.name,
+            "resumed_from": expected_size,
+            "reused": True,
+            "sha256": expected_sha256,
+            "size": expected_size,
+        }
+
+    partial = target.with_name(f".{target.name}.partial")
+    if partial.exists() or partial.is_symlink():
+        if not resume:
+            raise QwenCausalBundleError(
+                f"partial download exists; use --resume: {partial.name}"
+            )
+        metadata = _regular_file(partial, "partial checkpoint shard")
+        digest, offset = _hash_prefix(partial)
+        if offset == expected_size and digest.hexdigest() == expected_sha256:
+            try:
+                os.link(partial, target, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise QwenCausalBundleError(
+                    f"download target appeared during promotion: {target.name}"
+                ) from exc
+            partial.unlink()
+            _fsync_directory(target.parent)
+            return {
+                "file": target.name,
+                "resumed_from": expected_size,
+                "reused": False,
+                "sha256": expected_sha256,
+                "size": expected_size,
+            }
+        if offset >= expected_size:
+            partial.unlink()
+            digest = hashlib.sha256()
+            offset = 0
+    else:
+        digest = hashlib.sha256()
+        offset = 0
+    start_offset = offset
+    may_restart_from_zero = offset > 0
+
+    while True:
+        headers = {"User-Agent": "IMMER-Qwen-Causal-Bundle/1"}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+        try:
+            response = session.get(
+                url,
+                headers=headers,
+                stream=True,
+                timeout=(30, 180),
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            raise QwenCausalBundleError(
+                f"checkpoint download failed: {target.name}"
+            ) from exc
+        exceeded_size = False
+        with response:
+            content_range = response.headers.get("Content-Range", "")
+            if offset:
+                if response.status_code != 206 or not content_range.startswith(
+                    f"bytes {offset}-"
+                ):
+                    raise QwenCausalBundleError(
+                        f"server refused exact resume range for {target.name}"
+                    )
+            elif response.status_code == 206:
+                if not content_range.startswith("bytes 0-"):
+                    raise QwenCausalBundleError(
+                        f"server returned shifted initial range for {target.name}"
+                    )
+            elif response.status_code != 200:
+                raise QwenCausalBundleError(
+                    f"checkpoint download HTTP {response.status_code}: {target.name}"
+                )
+            mode = "ab" if offset else "xb"
+            try:
+                with partial.open(mode) as handle:
+                    for chunk in response.iter_content(chunk_size=4 * 1024**2):
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+                        digest.update(chunk)
+                        offset += len(chunk)
+                        if offset > expected_size:
+                            exceeded_size = True
+                            break
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError as exc:
+                raise QwenCausalBundleError(
+                    f"cannot write checkpoint download: {target.name}"
+                ) from exc
+        if (
+            not exceeded_size
+            and offset == expected_size
+            and digest.hexdigest() == expected_sha256
+        ):
+            break
+        if may_restart_from_zero:
+            partial.unlink()
+            digest = hashlib.sha256()
+            offset = 0
+            start_offset = 0
+            may_restart_from_zero = False
+            continue
+        if exceeded_size or offset >= expected_size:
+            partial.unlink(missing_ok=True)
+        raise QwenCausalBundleError(
+            f"checkpoint download SHA-256 mismatch: {target.name}"
+        )
+    try:
+        os.link(partial, target, follow_symlinks=False)
+    except FileExistsError as exc:
+        raise QwenCausalBundleError(
+            f"download target appeared during promotion: {target.name}"
+        ) from exc
+    partial.unlink()
+    _fsync_directory(target.parent)
+    return {
+        "file": target.name,
+        "resumed_from": start_offset,
+        "reused": False,
+        "sha256": expected_sha256,
+        "size": expected_size,
+    }
+
+
+def _download_small_file(
+    session: requests.Session,
+    url: str,
+    *,
+    label: str,
+    max_bytes: int = 64 * 1024**2,
+) -> bytes:
+    try:
+        response = session.get(
+            url,
+            headers={"User-Agent": "IMMER-Qwen-Causal-Bundle/1"},
+            stream=True,
+            timeout=(30, 180),
+            allow_redirects=True,
+        )
+    except requests.RequestException as exc:
+        raise QwenCausalBundleError(f"cannot download {label}") from exc
+    chunks: list[bytes] = []
+    total = 0
+    with response:
+        if response.status_code != 200:
+            raise QwenCausalBundleError(
+                f"{label} download returned HTTP {response.status_code}"
+            )
+        for chunk in response.iter_content(chunk_size=1024**2):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise QwenCausalBundleError(f"{label} exceeds its download bound")
+    if not chunks:
+        raise QwenCausalBundleError(f"{label} download is empty")
+    return b"".join(chunks)
 
 
 def _plain_directory(path: Path, label: str) -> None:
@@ -849,6 +1066,149 @@ def adopt_bundle(
         return {**verified, "adopted": True, "resumed": False}
 
 
+def fetch_adopt_bundle(
+    bundle: Path,
+    inventory_path: Path,
+    *,
+    repo_id: str = OFFICIAL_REPO_ID,
+    revision: str = OFFICIAL_REVISION,
+    expected_fingerprint: str | None = OFFICIAL_INVENTORY_FINGERPRINT,
+    require_official: bool = True,
+    resume: bool = True,
+    session: requests.Session | None = None,
+) -> dict[str, Any]:
+    """Download one pinned checkpoint copy directly, then adopt it in place."""
+
+    root = bundle.expanduser().absolute()
+    root.parent.mkdir(parents=True, exist_ok=True)
+    _plain_directory(root.parent, "bundle parent")
+    inventory, fingerprint, _pinned = _load_inventory(
+        inventory_path.expanduser().absolute(),
+        repo_id=repo_id,
+        revision=revision,
+        expected_fingerprint=expected_fingerprint,
+    )
+    owns_session = session is None
+    active_session = requests.Session() if session is None else session
+    try:
+        with _bundle_parent_lock(root.parent):
+            if root.exists() or root.is_symlink():
+                _plain_directory(root, "download bundle root")
+            else:
+                root.mkdir()
+            weights = root / "weights"
+            if weights.exists() or weights.is_symlink():
+                _plain_directory(weights, "download bundle weights")
+            else:
+                weights.mkdir()
+
+            remaining = 0
+            for shard in inventory.get("shards", ()):
+                name = str(shard["file"])
+                target = weights / name
+                if target.is_file() and not target.is_symlink():
+                    continue
+                partial = target.with_name(f".{target.name}.partial")
+                partial_bytes = (
+                    partial.stat().st_size
+                    if partial.is_file() and not partial.is_symlink()
+                    else 0
+                )
+                remaining += max(0, int(shard["size"]) - partial_bytes)
+            free = shutil.disk_usage(root.parent).free
+            if free < remaining + BUNDLE_HEADROOM_BYTES:
+                raise QwenCausalBundleError(
+                    f"download needs {remaining + BUNDLE_HEADROOM_BYTES} free bytes, "
+                    f"found {free}"
+                )
+
+            receipts: list[dict[str, Any]] = []
+            for shard in inventory.get("shards", ()):
+                name = str(shard["file"])
+                digest = _expected_shard_digest(shard)
+                if digest is None:
+                    raise QwenCausalBundleError(f"shard lacks remote SHA-256: {name}")
+                receipts.append(
+                    _download_verified_file(
+                        active_session,
+                        _resolve_url(repo_id, revision, name),
+                        weights / name,
+                        expected_size=int(shard["size"]),
+                        expected_sha256=digest,
+                        resume=resume,
+                    )
+                )
+
+            config_path = weights / "config.json"
+            if config_path.exists() or config_path.is_symlink():
+                config = _validate_config_bytes(
+                    _read_regular_bytes(config_path, "downloaded config"),
+                    require_official=require_official,
+                )
+            else:
+                config = _validate_config_bytes(
+                    _download_small_file(
+                        active_session,
+                        _resolve_url(repo_id, revision, "config.json"),
+                        label="checkpoint config",
+                    ),
+                    require_official=require_official,
+                )
+                _atomic_new_bytes(config_path, config)
+
+            index: bytes | None = None
+            if len(inventory.get("shards", ())) > 1:
+                index_path = weights / "model.safetensors.index.json"
+                if index_path.exists() or index_path.is_symlink():
+                    index = _validate_index_bytes(
+                        _read_regular_bytes(index_path, "downloaded checkpoint index"),
+                        inventory,
+                    )
+                else:
+                    index = _validate_index_bytes(
+                        _download_small_file(
+                            active_session,
+                            _resolve_url(
+                                repo_id, revision, "model.safetensors.index.json"
+                            ),
+                            label="checkpoint index",
+                        ),
+                        inventory,
+                    )
+                    _atomic_new_bytes(index_path, index)
+
+            body = {
+                "config_sha256": _sha256_bytes(config),
+                "index_sha256": None if index is None else _sha256_bytes(index),
+                "layout_fingerprint": fingerprint,
+                "logical_model": {"repo_id": repo_id, "revision": revision},
+                "shards": sorted(receipts, key=lambda row: str(row["file"])),
+            }
+            download = {
+                "body": body,
+                "schema": DOWNLOAD_SCHEMA,
+                "sha256": _sha256_bytes(_canonical(body)),
+            }
+            _atomic_bytes(
+                weights / "download.json",
+                _canonical(download) + b"\n",
+            )
+    finally:
+        if owns_session:
+            active_session.close()
+
+    adopted = adopt_bundle(
+        root,
+        inventory_path,
+        repo_id=repo_id,
+        revision=revision,
+        expected_fingerprint=fingerprint,
+        require_official=require_official,
+        require_remote_hashes=True,
+    )
+    return {**adopted, "download_sha256": download["sha256"]}
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -860,6 +1220,10 @@ def _parser() -> argparse.ArgumentParser:
     adopt = subparsers.add_parser("adopt")
     adopt.add_argument("--bundle", required=True)
     adopt.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
+    fetch = subparsers.add_parser("fetch-adopt")
+    fetch.add_argument("--bundle", required=True)
+    fetch.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
+    fetch.add_argument("--no-resume", action="store_true")
     verify = subparsers.add_parser("verify")
     verify.add_argument("--bundle", required=True)
     return parser
@@ -877,6 +1241,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "adopt":
             result = adopt_bundle(Path(args.bundle), Path(args.inventory))
+        elif args.command == "fetch-adopt":
+            result = fetch_adopt_bundle(
+                Path(args.bundle),
+                Path(args.inventory),
+                resume=not args.no_resume,
+            )
         else:
             result = verify_bundle(Path(args.bundle))
     except QwenCausalBundleError as exc:

@@ -62,6 +62,9 @@ All notable changes to IMMER are recorded here.
 - Added in-place bundle adoption for storage-constrained deployments: an
   existing complete `weights/` tree is fully re-hashed and causalized beside
   the unchanged shards, eliminating the second 55.6-GB checkpoint copy.
+- Added pinned `fetch-adopt` provisioning: official shards download directly
+  into their final `weights/` tree with exact range resume, crash-safe partial
+  recovery, full SHA-256 verification, and zero-copy causal adoption.
 - Made Qwen layer-major verification emit complete resumable access traces.
   Content-addressed trace and hidden-resume files commit through one hashed
   pair manifest, resumed traces renumber new operations canonically,

@@ -51,6 +51,49 @@ def _load_script():
 bundle_script = _load_script()
 
 
+class _Response:
+    def __init__(self, data: bytes, *, status: int, headers: dict[str, str]) -> None:
+        self.data = data
+        self.status_code = status
+        self.headers = headers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        pass
+
+    def iter_content(self, chunk_size: int):
+        for start in range(0, len(self.data), chunk_size):
+            yield self.data[start : start + chunk_size]
+
+
+class _Session:
+    def __init__(self, files: dict[str, bytes], *, honor_range: bool = True) -> None:
+        self.files = files
+        self.honor_range = honor_range
+        self.calls: list[tuple[str, dict[str, str]]] = []
+
+    def get(self, url: str, *, headers: dict[str, str], **_kwargs):
+        name = url.split("?", 1)[0].rsplit("/", 1)[-1]
+        data = self.files[name]
+        self.calls.append((name, dict(headers)))
+        raw_range = headers.get("Range")
+        if raw_range and self.honor_range:
+            offset = int(raw_range.removeprefix("bytes=").removesuffix("-"))
+            return _Response(
+                data[offset:],
+                status=206,
+                headers={
+                    "Content-Range": f"bytes {offset}-{len(data) - 1}/{len(data)}"
+                },
+            )
+        return _Response(data, status=200, headers={})
+
+    def close(self) -> None:
+        pass
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -310,6 +353,181 @@ class QwenCausalBundleTests(unittest.TestCase):
                 require_official=False,
             )
             self.assertTrue(replay["resumed"])
+
+    def test_fetch_resumes_directly_into_weights_and_adopts_once(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-bundle-fetch-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            source, inventory, fingerprint = _fixture(root)
+            shard_bytes = source.joinpath("model.safetensors").read_bytes()
+            config_bytes = source.joinpath("config.json").read_bytes()
+            bundle = root / "fetched.causal"
+            weights = bundle / "weights"
+            weights.mkdir(parents=True)
+            partial = weights / ".model.safetensors.partial"
+            split = len(shard_bytes) // 2
+            partial.write_bytes(shard_bytes[:split])
+            session = _Session(
+                {
+                    "config.json": config_bytes,
+                    "model.safetensors": shard_bytes,
+                }
+            )
+
+            result = bundle_script.fetch_adopt_bundle(
+                bundle,
+                inventory,
+                repo_id=REPO_ID,
+                revision=REVISION,
+                expected_fingerprint=fingerprint,
+                require_official=False,
+                session=session,
+            )
+            self.assertTrue(result["adopted"])
+            self.assertEqual(
+                weights.joinpath("model.safetensors").read_bytes(), shard_bytes
+            )
+            self.assertFalse(partial.exists())
+            range_calls = [
+                headers["Range"]
+                for name, headers in session.calls
+                if name == "model.safetensors"
+            ]
+            self.assertEqual(range_calls, [f"bytes={split}-"])
+            self.assertTrue(weights.joinpath("download.json").is_file())
+            self.assertTrue(bundle.joinpath("bundle.json").is_file())
+
+            replay_session = _Session({})
+            replay = bundle_script.fetch_adopt_bundle(
+                bundle,
+                inventory,
+                repo_id=REPO_ID,
+                revision=REVISION,
+                expected_fingerprint=fingerprint,
+                require_official=False,
+                session=replay_session,
+            )
+            self.assertTrue(replay["resumed"])
+            self.assertEqual(replay_session.calls, [])
+
+    def test_fetch_refuses_server_that_ignores_resume_range(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-bundle-range-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            payload = b"0123456789"
+            target = root / "model.safetensors"
+            partial = root / ".model.safetensors.partial"
+            partial.write_bytes(payload[:4])
+            session = _Session(
+                {"model.safetensors": payload},
+                honor_range=False,
+            )
+            with self.assertRaisesRegex(
+                bundle_script.QwenCausalBundleError,
+                "refused exact resume range",
+            ):
+                bundle_script._download_verified_file(
+                    session,
+                    "https://example.invalid/model.safetensors",
+                    target,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    resume=True,
+                )
+            self.assertEqual(partial.read_bytes(), payload[:4])
+            self.assertFalse(target.exists())
+
+    def test_fetch_promotes_complete_verified_partial_without_http(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-bundle-complete-partial-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            payload = b"complete pinned shard"
+            target = root / "model.safetensors"
+            partial = root / ".model.safetensors.partial"
+            partial.write_bytes(payload)
+            session = _Session({})
+
+            receipt = bundle_script._download_verified_file(
+                session,
+                "https://example.invalid/model.safetensors",
+                target,
+                expected_size=len(payload),
+                expected_sha256=hashlib.sha256(payload).hexdigest(),
+                resume=True,
+            )
+
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertFalse(partial.exists())
+            self.assertEqual(session.calls, [])
+            self.assertEqual(receipt["resumed_from"], len(payload))
+
+    def test_fetch_recovers_corrupt_partial_by_restarting_once(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-bundle-corrupt-partial-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            payload = b"0123456789"
+            target = root / "model.safetensors"
+            partial = root / ".model.safetensors.partial"
+            partial.write_bytes(b"xxxx")
+            session = _Session({"model.safetensors": payload})
+
+            receipt = bundle_script._download_verified_file(
+                session,
+                "https://example.invalid/model.safetensors",
+                target,
+                expected_size=len(payload),
+                expected_sha256=hashlib.sha256(payload).hexdigest(),
+                resume=True,
+            )
+
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertFalse(partial.exists())
+            self.assertEqual(
+                session.calls,
+                [
+                    ("model.safetensors", {
+                        "Range": "bytes=4-",
+                        "User-Agent": "IMMER-Qwen-Causal-Bundle/1",
+                    }),
+                    ("model.safetensors", {
+                        "User-Agent": "IMMER-Qwen-Causal-Bundle/1"
+                    }),
+                ],
+            )
+            self.assertEqual(receipt["resumed_from"], 0)
+
+    def test_fetch_refuses_shifted_initial_partial_response(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-bundle-shifted-range-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            payload = b"0123456789"
+            target = root / "model.safetensors"
+            session = mock.Mock()
+            session.get.return_value = _Response(
+                payload[1:],
+                status=206,
+                headers={"Content-Range": "bytes 1-9/10"},
+            )
+
+            with self.assertRaisesRegex(
+                bundle_script.QwenCausalBundleError,
+                "shifted initial range",
+            ):
+                bundle_script._download_verified_file(
+                    session,
+                    "https://example.invalid/model.safetensors",
+                    target,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    resume=True,
+                )
+            self.assertFalse(target.exists())
+            self.assertFalse(root.joinpath(".model.safetensors.partial").exists())
 
     def test_parser_requires_explicit_subcommand(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
