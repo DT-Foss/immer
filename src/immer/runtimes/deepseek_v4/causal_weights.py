@@ -1709,11 +1709,12 @@ class CausalTensorReader:
 
 
 class CausalWeightMount:
-    """Open one local ``weights/`` + persistent ``causal/`` model bundle.
+    """Open a nested or in-place local causal model bundle.
 
-    Weight files stay in place and are read by local ``pread`` ranges with no
-    disk payload cache.  The sibling causal directory stores only the durable
-    address graph and can be appended while this mount is alive.
+    Nested bundles keep checkpoint files in ``weights/``. Flat bundles implant
+    ``causal/`` and their authenticated manifest directly beside an existing
+    checkpoint. Weight files stay in place and are read by local ``pread``
+    ranges with no disk payload cache.
     """
 
     WEIGHTS_DIRECTORY = "weights"
@@ -1728,13 +1729,16 @@ class CausalWeightMount:
         max_metadata_bytes: int = 64 * 1024 * 1024,
         max_open_files: int | None = 64,
         verbose: bool = False,
+        weights_layout: str = "auto",
     ) -> None:
         if not isinstance(model, LogicalModelIdentity):
             raise TypeError("model must be a LogicalModelIdentity")
         bundle_root = Path(root).expanduser().absolute()
-        weights_root = bundle_root / self.WEIGHTS_DIRECTORY
-        causal_root = bundle_root / self.CAUSAL_DIRECTORY
         self._require_plain_directory(bundle_root, "causal bundle root")
+        resolved_layout, weights_root = self._resolve_weights_root(
+            bundle_root, weights_layout
+        )
+        causal_root = bundle_root / self.CAUSAL_DIRECTORY
         self._require_plain_directory(weights_root, "causal bundle weights root")
         self._require_plain_directory(causal_root, "causal bundle graph root")
 
@@ -1783,6 +1787,7 @@ class CausalWeightMount:
 
         self.root = bundle_root
         self.weights_root = weights_root
+        self.weights_layout = resolved_layout
         self.causal_root = causal_root
         self.model = model
         self.source = source
@@ -1802,6 +1807,52 @@ class CausalWeightMount:
             raise CausalWeightIntegrityError(
                 f"{label} must be a non-symlink directory: {path}"
             )
+
+    @classmethod
+    def _resolve_weights_root(
+        cls, bundle_root: Path, weights_layout: str
+    ) -> tuple[str, Path]:
+        if weights_layout not in ("auto", "flat", "nested"):
+            raise ValueError("weights_layout must be auto, flat, or nested")
+        if weights_layout == "flat":
+            return "flat", bundle_root
+        nested = bundle_root / cls.WEIGHTS_DIRECTORY
+        if weights_layout == "nested" or nested.exists() or nested.is_symlink():
+            return "nested", nested
+        manifest = bundle_root / "bundle.json"
+        if not manifest.exists() and not manifest.is_symlink():
+            return "nested", nested
+        try:
+            metadata = manifest.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise CausalWeightIntegrityError(
+                    "flat causal bundle manifest must be a regular file"
+                )
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+        except CausalWeightIntegrityError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise CausalWeightIntegrityError(
+                "causal bundle weights root is missing and no flat manifest exists"
+            ) from exc
+        body = document.get("body") if isinstance(document, Mapping) else None
+        if (
+            not isinstance(document, Mapping)
+            or set(document) != {"body", "schema", "sha256"}
+            or not isinstance(body, Mapping)
+            or document.get("sha256") != _digest(body)
+        ):
+            raise CausalWeightIntegrityError(
+                "causal bundle manifest identity is invalid"
+            )
+        layout = body.get("weights_layout", "nested/v1")
+        if layout == "nested/v1":
+            return "nested", nested
+        if layout != "flat/v1":
+            raise CausalWeightIntegrityError(
+                "causal bundle manifest weights layout is invalid"
+            )
+        return "flat", bundle_root
 
     @property
     def closed(self) -> bool:

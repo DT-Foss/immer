@@ -309,10 +309,13 @@ def _verify_causal_mount(mount: CausalWeightMount) -> dict[str, Any]:
     ):
         raise QwenDirectDecodeError("causal bundle manifest is invalid")
     body = manifest["body"]
+    manifest_weights_layout = body.get("weights_layout", "nested/v1")
+    mounted_weights_layout = f"{mount.weights_layout}/v1"
     if (
         body.get("checkpoint_complete") is not True
         or body.get("layout_fingerprint") != mount.layout.layout_fingerprint
         or body.get("logical_model") != mount.model.as_record()
+        or manifest_weights_layout != mounted_weights_layout
     ):
         raise QwenDirectDecodeError("causal bundle completeness identity is invalid")
     inventory, fingerprint = _pinned_inventory(
@@ -356,6 +359,7 @@ def _verify_causal_mount(mount: CausalWeightMount) -> dict[str, Any]:
         "kind": "complete-causal-bundle/v1",
         "manifest_sha256": manifest["sha256"],
         "tensor_bindings": body["tensor_bindings"],
+        "weights_layout": manifest_weights_layout,
     }
 
 

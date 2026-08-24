@@ -354,6 +354,101 @@ class QwenCausalBundleTests(unittest.TestCase):
             )
             self.assertTrue(replay["resumed"])
 
+    def test_flat_adopt_implants_graph_without_moving_or_aliasing_weights(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-bundle-flat-adopt-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            checkpoint, inventory, fingerprint = _fixture(root)
+            shard = checkpoint / "model.safetensors"
+            config = checkpoint / "config.json"
+            shard_before = shard.stat()
+            config_before = config.stat()
+            shard_bytes = shard.read_bytes()
+
+            result = bundle_script.adopt_bundle(
+                checkpoint,
+                inventory,
+                repo_id=REPO_ID,
+                revision=REVISION,
+                expected_fingerprint=fingerprint,
+                require_official=False,
+                weights_layout="flat",
+            )
+
+            self.assertTrue(result["adopted"])
+            self.assertEqual(result["weights_layout"], "flat/v1")
+            self.assertFalse(checkpoint.joinpath("weights").exists())
+            self.assertTrue(checkpoint.joinpath("causal").is_dir())
+            self.assertTrue(checkpoint.joinpath("bundle.json").is_file())
+            self.assertTrue(checkpoint.joinpath("inventory.pinned.json").is_file())
+            self.assertEqual(shard.stat().st_ino, shard_before.st_ino)
+            self.assertEqual(shard.stat().st_mtime_ns, shard_before.st_mtime_ns)
+            self.assertEqual(config.stat().st_ino, config_before.st_ino)
+            self.assertEqual(config.stat().st_mtime_ns, config_before.st_mtime_ns)
+            self.assertEqual(shard.read_bytes(), shard_bytes)
+
+            identity = LogicalModelIdentity(REPO_ID, REVISION)
+            with CausalWeightMount(checkpoint, identity, budget_mb=20) as mount:
+                self.assertEqual(mount.weights_layout, "flat")
+                self.assertEqual(mount.weights_root, checkpoint.absolute())
+                pager = Qwen38WeightPager(
+                    mount.source,
+                    device="cpu",
+                    compute_dtype="bfloat16",
+                    max_resident_bytes=2 * 1024**2,
+                    causal_tensor_reader=mount.tensor_reader,
+                )
+                try:
+                    model = StreamedQwen38(
+                        _tiny_config(), pager, max_batch_size=1, max_seq_len=16
+                    )
+                    hidden, _evidence = model.prefill([[1, 4, 9]])
+                    self.assertTrue(torch.isfinite(hidden).all())
+                finally:
+                    pager.close()
+
+            replay = bundle_script.adopt_bundle(
+                checkpoint,
+                inventory,
+                repo_id=REPO_ID,
+                revision=REVISION,
+                expected_fingerprint=fingerprint,
+                require_official=False,
+                weights_layout="flat",
+            )
+            self.assertTrue(replay["resumed"])
+
+    def test_flat_adopt_rejects_bad_weights_before_publishing_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-bundle-flat-invalid-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            checkpoint, inventory, fingerprint = _fixture(root)
+            shard = checkpoint / "model.safetensors"
+            with shard.open("r+b") as handle:
+                handle.seek(-1, 2)
+                value = handle.read(1)
+                handle.seek(-1, 2)
+                handle.write(bytes([value[0] ^ 0xFF]))
+
+            with self.assertRaisesRegex(
+                bundle_script.QwenCausalBundleError,
+                "shard verification failed",
+            ):
+                bundle_script.adopt_bundle(
+                    checkpoint,
+                    inventory,
+                    repo_id=REPO_ID,
+                    revision=REVISION,
+                    expected_fingerprint=fingerprint,
+                    require_official=False,
+                    weights_layout="flat",
+                )
+            self.assertFalse(checkpoint.joinpath("causal").exists())
+            self.assertFalse(checkpoint.joinpath("bundle.json").exists())
+            self.assertFalse(checkpoint.joinpath("inventory.pinned.json").exists())
+
     def test_fetch_resumes_directly_into_weights_and_adopts_once(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix=".qwen-bundle-fetch-test-", dir=Path.cwd()
@@ -489,13 +584,14 @@ class QwenCausalBundleTests(unittest.TestCase):
             self.assertEqual(
                 session.calls,
                 [
-                    ("model.safetensors", {
-                        "Range": "bytes=4-",
-                        "User-Agent": "IMMER-Qwen-Causal-Bundle/1",
-                    }),
-                    ("model.safetensors", {
-                        "User-Agent": "IMMER-Qwen-Causal-Bundle/1"
-                    }),
+                    (
+                        "model.safetensors",
+                        {
+                            "Range": "bytes=4-",
+                            "User-Agent": "IMMER-Qwen-Causal-Bundle/1",
+                        },
+                    ),
+                    ("model.safetensors", {"User-Agent": "IMMER-Qwen-Causal-Bundle/1"}),
                 ],
             )
             self.assertEqual(receipt["resumed_from"], 0)

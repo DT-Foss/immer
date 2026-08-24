@@ -62,6 +62,10 @@ All notable changes to IMMER are recorded here.
 - Added in-place bundle adoption for storage-constrained deployments: an
   existing complete `weights/` tree is fully re-hashed and causalized beside
   the unchanged shards, eliminating the second 55.6-GB checkpoint copy.
+- Added flat in-place adoption for checkpoint directories that already hold
+  the shards: the authenticated inventory, manifest, and append-only causal
+  rail are implanted beside the original files without copying, moving,
+  hardlinking, or changing any weight inode or byte.
 - Added pinned `fetch-adopt` provisioning: official shards download directly
   into their final `weights/` tree with exact range resume, crash-safe partial
   recovery, full SHA-256 verification, and zero-copy causal adoption.

@@ -202,7 +202,31 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 causal = benchmark.decode_arm(causal_args)
             benchmark._write_json(causal_args.output, causal)
 
+            bundle_script.adopt_bundle(
+                source,
+                inventory_source,
+                repo_id=REPO_ID,
+                revision=REVISION,
+                expected_fingerprint=fingerprint,
+                require_official=False,
+                weights_layout="flat",
+            )
+            flat_args = _runtime_args(
+                "decode",
+                direct_input=direct_input,
+                snapshot=snapshot,
+                output=root / "decode-causal-flat.json",
+                trace=root / "trace-causal-flat.json",
+                bundle=source,
+                prefix_result=Path(prepare_args.output),
+                delta_probe=root / "probe-decode-causal-flat.json",
+            )
+            with redirect_stderr(io.StringIO()):
+                flat = benchmark.decode_arm(flat_args)
+            benchmark._write_json(flat_args.output, flat)
+
             self.assertEqual(causal["hidden_sha256"], baseline["hidden_sha256"])
+            self.assertEqual(flat["hidden_sha256"], baseline["hidden_sha256"])
             self.assertEqual(
                 causal["snapshot"]["payload_sha256"],
                 baseline["snapshot"]["payload_sha256"],
@@ -213,6 +237,7 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 causal["source_verification"]["kind"],
                 "complete-causal-bundle/v1",
             )
+            self.assertEqual(flat["source_verification"]["weights_layout"], "flat/v1")
             decode_probe = verify_probe_document(
                 json.loads(Path(causal_args.delta_probe).read_text(encoding="utf-8"))
             )
@@ -223,6 +248,9 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 causal["delta_probe"]["sha256"], baseline["delta_probe"]["sha256"]
             )
             self.assertEqual(
+                flat["delta_probe"]["sha256"], baseline["delta_probe"]["sha256"]
+            )
+            self.assertEqual(
                 baseline["source_verification"]["kind"],
                 "complete-local-shards/v1",
             )
@@ -230,6 +258,7 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 prepare_args.access_trace,
                 baseline_args.access_trace,
                 causal_args.access_trace,
+                flat_args.access_trace,
             ):
                 AccessTrace.from_bytes(Path(path).read_bytes()).verify()
 

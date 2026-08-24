@@ -56,6 +56,8 @@ DEFAULT_INVENTORY = (
 )
 BUNDLE_SCHEMA = "immer.qwen3.8-complete-causal-bundle/v1"
 DOWNLOAD_SCHEMA = "immer.qwen3.8-pinned-download/v1"
+NESTED_WEIGHTS_LAYOUT = "nested/v1"
+FLAT_WEIGHTS_LAYOUT = "flat/v1"
 BUNDLE_HEADROOM_BYTES = 64 * 1024**2
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -676,6 +678,15 @@ def _manifest(path: Path) -> dict[str, Any]:
     return document
 
 
+def _weights_root(root: Path, body: Mapping[str, Any]) -> tuple[Path, str]:
+    layout = body.get("weights_layout", NESTED_WEIGHTS_LAYOUT)
+    if layout == NESTED_WEIGHTS_LAYOUT:
+        return root / "weights", NESTED_WEIGHTS_LAYOUT
+    if layout == FLAT_WEIGHTS_LAYOUT:
+        return root, FLAT_WEIGHTS_LAYOUT
+    raise QwenCausalBundleError("bundle weights layout is invalid")
+
+
 def verify_bundle(
     bundle: Path,
     *,
@@ -687,10 +698,11 @@ def verify_bundle(
 ) -> dict[str, Any]:
     root = bundle.expanduser().absolute()
     _plain_directory(root, "bundle root")
-    _plain_directory(root / "weights", "bundle weights")
     _plain_directory(root / "causal", "bundle graph")
     document = _manifest(root / "bundle.json")
     body = document["body"]
+    weights, weights_layout = _weights_root(root, body)
+    _plain_directory(weights, "bundle weights")
     model = body.get("logical_model")
     if not isinstance(model, Mapping) or set(model) != {"repo_id", "revision"}:
         raise QwenCausalBundleError("bundle logical model identity is invalid")
@@ -704,21 +716,21 @@ def verify_bundle(
     ):
         raise QwenCausalBundleError("bundle layout fingerprint is not expected")
     inventory, fingerprint, _pinned = _load_inventory(
-        root / "weights" / "inventory.pinned.json",
+        weights / "inventory.pinned.json",
         repo_id=str(model["repo_id"]),
         revision=str(model["revision"]),
         expected_fingerprint=str(body.get("layout_fingerprint")),
     )
     if body.get("inventory_sha256") != _pinned.get("inventory_sha256"):
         raise QwenCausalBundleError("bundle inventory receipt is invalid")
-    config_path = root / "weights" / "config.json"
+    config_path = weights / "config.json"
     config = _validate_config_bytes(
         _read_regular_bytes(config_path, "bundle config"),
         require_official=require_official,
     )
     if _sha256_bytes(config) != body.get("config_sha256"):
         raise QwenCausalBundleError("bundle config SHA-256 mismatch")
-    index_path = root / "weights" / "model.safetensors.index.json"
+    index_path = weights / "model.safetensors.index.json"
     if body.get("index_sha256") is None:
         if index_path.exists() or index_path.is_symlink():
             raise QwenCausalBundleError("unexpected bundle checkpoint index")
@@ -740,7 +752,7 @@ def verify_bundle(
     for shard in inventory.get("shards", ()):
         name = str(shard["file"])
         receipt = by_name.get(name)
-        path = root / "weights" / name
+        path = weights / name
         metadata = _regular_file(path, "bundle shard")
         expected_size = int(shard["size"])
         expected_digest = _expected_shard_digest(shard)
@@ -783,6 +795,7 @@ def verify_bundle(
         "layout_fingerprint": fingerprint,
         "sha256": document["sha256"],
         "tensor_bindings": len(plans),
+        "weights_layout": weights_layout,
     }
 
 
@@ -892,6 +905,7 @@ def _build_bundle_locked(
         "logical_model": {"repo_id": repo_id, "revision": revision},
         "shards": sorted(shard_receipts, key=lambda row: str(row["file"])),
         "tensor_bindings": len(plans),
+        "weights_layout": NESTED_WEIGHTS_LAYOUT,
     }
     document = {
         "body": body,
@@ -949,23 +963,24 @@ def adopt_bundle(
     expected_fingerprint: str | None = OFFICIAL_INVENTORY_FINGERPRINT,
     require_official: bool = True,
     require_remote_hashes: bool = True,
+    weights_layout: str = "nested",
 ) -> dict[str, Any]:
-    """Causalize a complete ``bundle/weights`` tree without copying shards."""
+    """Causalize complete nested or in-place weights without copying shards."""
+
+    if weights_layout not in ("flat", "nested"):
+        raise ValueError("weights_layout must be flat or nested")
 
     root = bundle.expanduser().absolute()
     parent = root.parent
     _plain_directory(parent, "bundle parent")
     with _bundle_parent_lock(parent):
         _plain_directory(root, "bundle root")
-        weights = root / "weights"
+        weights = root if weights_layout == "flat" else root / "weights"
         _plain_directory(weights, "bundle weights")
         causal = root / "causal"
-        if causal.exists() or causal.is_symlink():
-            _plain_directory(causal, "bundle graph")
-        else:
-            causal.mkdir()
         manifest_path = root / "bundle.json"
         if manifest_path.exists() or manifest_path.is_symlink():
+            _plain_directory(causal, "bundle graph")
             verified = verify_bundle(
                 root,
                 require_remote_hashes=require_remote_hashes,
@@ -974,6 +989,13 @@ def adopt_bundle(
                 expected_fingerprint=expected_fingerprint,
                 require_official=require_official,
             )
+            expected_layout = (
+                FLAT_WEIGHTS_LAYOUT
+                if weights_layout == "flat"
+                else NESTED_WEIGHTS_LAYOUT
+            )
+            if verified.get("weights_layout") != expected_layout:
+                raise QwenCausalBundleError("existing bundle weights layout differs")
             return {**verified, "adopted": True, "resumed": True}
 
         inventory, fingerprint, pinned = _load_inventory(
@@ -1015,12 +1037,18 @@ def adopt_bundle(
             inventory,
             require_official=require_official,
         )
+        if causal.exists() or causal.is_symlink():
+            _plain_directory(causal, "bundle graph")
+        else:
+            causal.mkdir()
         _atomic_bytes(
             weights / "inventory.pinned.json",
             _canonical(pinned) + b"\n",
         )
         identity = LogicalModelIdentity(repo_id, revision)
-        with CausalWeightMount(root, identity, budget_mb=64) as mount:
+        with CausalWeightMount(
+            root, identity, budget_mb=64, weights_layout=weights_layout
+        ) as mount:
             if mount.layout.layout_fingerprint != fingerprint:
                 raise QwenCausalBundleError("adopted layout fingerprint changed")
             plans = tuple(
@@ -1048,6 +1076,11 @@ def adopt_bundle(
             "logical_model": {"repo_id": repo_id, "revision": revision},
             "shards": sorted(shard_receipts, key=lambda row: str(row["file"])),
             "tensor_bindings": len(plans),
+            "weights_layout": (
+                FLAT_WEIGHTS_LAYOUT
+                if weights_layout == "flat"
+                else NESTED_WEIGHTS_LAYOUT
+            ),
         }
         document = {
             "body": body,
@@ -1220,6 +1253,9 @@ def _parser() -> argparse.ArgumentParser:
     adopt = subparsers.add_parser("adopt")
     adopt.add_argument("--bundle", required=True)
     adopt.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
+    flat = subparsers.add_parser("adopt-flat")
+    flat.add_argument("--checkpoint", required=True)
+    flat.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
     fetch = subparsers.add_parser("fetch-adopt")
     fetch.add_argument("--bundle", required=True)
     fetch.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
@@ -1241,6 +1277,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "adopt":
             result = adopt_bundle(Path(args.bundle), Path(args.inventory))
+        elif args.command == "adopt-flat":
+            result = adopt_bundle(
+                Path(args.checkpoint),
+                Path(args.inventory),
+                weights_layout="flat",
+            )
         elif args.command == "fetch-adopt":
             result = fetch_adopt_bundle(
                 Path(args.bundle),
