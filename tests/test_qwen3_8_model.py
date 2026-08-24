@@ -207,6 +207,71 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(evidence.linear_calls, 31)
         self.assertGreater(evidence.source_body_bytes, 0)
 
+    def test_deltanet_probe_is_passive_and_covers_every_linear_layer(self) -> None:
+        token_ids = torch.tensor([[1, 4, 9]])
+        baseline, _ = self.model.forward_prefill(token_ids)
+        records = []
+        probed = StreamedQwen38(
+            self.config,
+            self.pager,
+            delta_probe=lambda layer, row: records.append((layer, row)),
+            max_batch_size=3,
+            max_seq_len=32,
+        )
+
+        observed, _ = probed.forward_prefill(token_ids)
+
+        torch.testing.assert_close(observed, baseline, rtol=0.0, atol=0.0)
+        self.assertEqual([layer for layer, _row in records], [0, 1, 2])
+        self.assertEqual(
+            set(records[0][1].__dataclass_fields__),
+            {
+                "beta_mean",
+                "beta_std",
+                "decay_mean",
+                "decay_std",
+                "conv_norm",
+                "q_norm",
+                "k_norm",
+                "v_norm",
+                "delta_norm",
+            },
+        )
+        for _layer, row in records:
+            values = torch.tensor(
+                [getattr(row, name) for name in row.__dataclass_fields__]
+            )
+            self.assertTrue(torch.isfinite(values).all())
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
+    def test_deltanet_probe_reductions_run_from_mps_without_changing_output(
+        self,
+    ) -> None:
+        pager = Qwen38WeightPager(
+            self.source,
+            device="mps",
+            compute_dtype="bfloat16",
+            max_resident_bytes=2 * 1024**2,
+        )
+        records = []
+        try:
+            baseline = StreamedQwen38(
+                self.config, pager, max_batch_size=1, max_seq_len=32
+            )
+            expected, _ = baseline.forward_prefill([[1, 4, 9]])
+            probed = StreamedQwen38(
+                self.config,
+                pager,
+                delta_probe=lambda layer, row: records.append((layer, row)),
+                max_batch_size=1,
+                max_seq_len=32,
+            )
+            actual, _ = probed.forward_prefill([[1, 4, 9]])
+            torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+            self.assertEqual([layer for layer, _row in records], [0, 1, 2])
+        finally:
+            pager.close()
+
     def test_stateful_prefill_matches_independent_and_tokenwise_execution(self) -> None:
         token_ids = torch.tensor([[1, 4, 9, 7]])
         independent, _ = self.model.forward_prefill(token_ids)

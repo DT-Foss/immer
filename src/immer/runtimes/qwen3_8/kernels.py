@@ -17,9 +17,9 @@ Tensor conventions follow the official Qwen3.5 implementation:
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import math
-from typing import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 __all__ = [
     "AttentionState",
+    "DeltaNetProbe",
     "DeltaNetState",
     "apply_rotary_pos_emb",
     "causal_depthwise_conv",
@@ -110,6 +111,67 @@ class DeltaNetState:
             raise ValueError("conv and recurrent states must have the same batch size")
         if conv.device != recurrent.device:
             raise ValueError("conv and recurrent states must be on the same device")
+
+
+@dataclass(frozen=True, slots=True)
+class DeltaNetProbe:
+    """Read-only Qwen DeltaNet component measurements for one layer pass.
+
+    These are the nine component statistics measured on the original 27B
+    probe run.  Probe collection never changes the tensors used by inference.
+    """
+
+    beta_mean: float
+    beta_std: float
+    decay_mean: float
+    decay_std: float
+    conv_norm: float
+    q_norm: float
+    k_norm: float
+    v_norm: float
+    delta_norm: float
+
+    def __post_init__(self) -> None:
+        for name in self.__dataclass_fields__:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{name} must be a real number")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+
+
+def _probe_mean_vector_norm(value: torch.Tensor, width: int) -> float:
+    """Match the legacy float64 probe reduction with bounded host blocks."""
+
+    flat = value.detach().reshape(-1, width)
+    if flat.shape[0] == 0:
+        raise ValueError("probe tensor must not be empty")
+    total = 0.0
+    for start in range(0, flat.shape[0], 256):
+        block = flat[start : start + 256].to(device="cpu").to(dtype=torch.float64)
+        total += float(torch.linalg.vector_norm(block, dim=-1).sum().item())
+    return total / flat.shape[0]
+
+
+def _probe_mean_sample_std(value: torch.Tensor) -> tuple[float, float]:
+    """Return the float64 mean and sample standard deviation (ddof=1)."""
+
+    flat = value.detach().reshape(-1)
+    count = int(flat.numel())
+    if count == 0:
+        raise ValueError("probe tensor must not be empty")
+    total = 0.0
+    for start in range(0, count, 1_048_576):
+        block = flat[start : start + 1_048_576].to(device="cpu").to(dtype=torch.float64)
+        total += float(block.sum().item())
+    mean = total / count
+    if count == 1:
+        return mean, 0.0
+    squared = 0.0
+    for start in range(0, count, 1_048_576):
+        block = flat[start : start + 1_048_576].to(device="cpu").to(dtype=torch.float64)
+        squared += float((block - mean).square().sum().item())
+    return mean, math.sqrt(squared / (count - 1))
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -663,6 +725,7 @@ def recurrent_gated_delta_rule(
     *,
     initial_state: torch.Tensor | None = None,
     l2_norm_eps: float = 1e-6,
+    _probe_delta_norms: list[float] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the official causal recurrent gated-delta inference rule.
 
@@ -716,6 +779,8 @@ def recurrent_gated_delta_rule(
         recurrent = recurrent * decay[:, index].exp()[..., None, None]
         remembered_value = (recurrent * k_t.unsqueeze(-1)).sum(dim=-2)
         delta = (v_t - remembered_value) * step[:, index].unsqueeze(-1)
+        if _probe_delta_norms is not None:
+            _probe_delta_norms.append(_probe_mean_vector_norm(delta, delta.shape[-1]))
         recurrent = recurrent + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
         outputs.append((recurrent * q_t.unsqueeze(-1)).sum(dim=-2))
 
@@ -740,6 +805,7 @@ def gated_delta_net_core(
     state: DeltaNetState | None = None,
     conv1d_bias: torch.Tensor | None = None,
     rms_norm_eps: float = 1e-6,
+    probe: Callable[[DeltaNetProbe], None] | None = None,
 ) -> tuple[torch.Tensor, DeltaNetState]:
     """Run Qwen3.5 Gated DeltaNet from individually streamed projections.
 
@@ -801,6 +867,8 @@ def gated_delta_net_core(
     query = query.reshape(batch_size, sequence_length, key_heads, key_width)
     key = key.reshape(batch_size, sequence_length, key_heads, key_width)
     value = value.reshape(batch_size, sequence_length, value_heads, value_width)
+    raw_query = query
+    raw_key = key
 
     beta = b.sigmoid()
     a_log = _floating_tensor(A_log, "A_log", ndim=1)
@@ -815,6 +883,7 @@ def gated_delta_net_core(
     if repetitions > 1:
         query = query.repeat_interleave(repetitions, dim=2)
         key = key.repeat_interleave(repetitions, dim=2)
+    probe_delta_norms: list[float] | None = [] if probe is not None else None
     core_output, next_recurrent = recurrent_gated_delta_rule(
         query,
         key,
@@ -822,7 +891,28 @@ def gated_delta_net_core(
         log_decay,
         beta,
         initial_state=previous_recurrent,
+        _probe_delta_norms=probe_delta_norms,
     )
+
+    if probe is not None:
+        if not probe_delta_norms:
+            raise RuntimeError("DeltaNet probe captured no recurrent updates")
+        beta_mean, beta_std = _probe_mean_sample_std(beta)
+        decay = log_decay.exp()
+        decay_mean, decay_std = _probe_mean_sample_std(decay)
+        probe(
+            DeltaNetProbe(
+                beta_mean=beta_mean,
+                beta_std=beta_std,
+                decay_mean=decay_mean,
+                decay_std=decay_std,
+                conv_norm=_probe_mean_vector_norm(mixed, mixed.shape[-1]),
+                q_norm=_probe_mean_vector_norm(raw_query, key_features),
+                k_norm=_probe_mean_vector_norm(raw_key, key_features),
+                v_norm=_probe_mean_vector_norm(value, value_width),
+                delta_norm=math.fsum(probe_delta_norms) / len(probe_delta_norms),
+            )
+        )
 
     core_output = core_output.reshape(-1, value_width)
     z = z.reshape(-1, value_width)

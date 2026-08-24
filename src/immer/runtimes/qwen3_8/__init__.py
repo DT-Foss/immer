@@ -23,7 +23,7 @@ from .encoding import (
     Qwen38Tokenizer,
 )
 from .graft import Qwen38StableCrsaGraft
-from .kernels import AttentionState, DeltaNetState
+from .kernels import AttentionState, DeltaNetProbe, DeltaNetState
 from .model import (
     GenerationEvidence,
     PrefillEvidence,
@@ -32,6 +32,16 @@ from .model import (
     StreamedQwen38,
 )
 from .pager import Qwen38PagerError, Qwen38WeightPager
+from .probe import (
+    DELTANET_COMPARISON_SCHEMA,
+    DELTANET_COMPONENTS,
+    DELTANET_PROBE_SCHEMA,
+    DeltaNetProbeRecorder,
+    Qwen38DeltaNetProbeError,
+    build_probe_document,
+    compare_probe_documents,
+    verify_probe_document,
+)
 from .snapshot import QWEN38_SNAPSHOT_SCHEMA, Qwen38SnapshotError
 
 
@@ -40,6 +50,11 @@ __all__ = [
     "CausalTensorReader",
     "CausalWeightMount",
     "DeltaNetState",
+    "DeltaNetProbe",
+    "DeltaNetProbeRecorder",
+    "DELTANET_COMPARISON_SCHEMA",
+    "DELTANET_COMPONENTS",
+    "DELTANET_PROBE_SCHEMA",
     "END_OF_TEXT_TOKEN_ID",
     "GenerationEvidence",
     "IM_END_TOKEN_ID",
@@ -51,6 +66,7 @@ __all__ = [
     "Qwen38Config",
     "Qwen38ConfigError",
     "Qwen38DraftVerifier",
+    "Qwen38DeltaNetProbeError",
     "Qwen38EncodingError",
     "Qwen38PagerError",
     "Qwen38RuntimeError",
@@ -63,5 +79,8 @@ __all__ = [
     "StreamedQwen38",
     "TensorRangePlan",
     "bind_causal_tensor_plans",
+    "build_probe_document",
+    "compare_probe_documents",
     "tensor_range_plan_from_source",
+    "verify_probe_document",
 ]

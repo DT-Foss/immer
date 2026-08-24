@@ -25,11 +25,15 @@ from immer.runtimes.qwen3_8 import (
     OFFICIAL_REPO_ID,
     OFFICIAL_REVISION,
     CausalWeightMount,
+    DELTANET_PROBE_SCHEMA,
+    DeltaNetProbeRecorder,
     LogicalModelIdentity,
     Qwen38Config,
     Qwen38WeightPager,
     StreamedQwen38,
+    build_probe_document,
     tensor_range_plan_from_source,
+    verify_probe_document,
 )
 
 
@@ -411,6 +415,7 @@ def _build_source(
 def _runtime(
     args: argparse.Namespace,
     recorder: AccessTraceRecorder,
+    delta_probe: DeltaNetProbeRecorder | None = None,
 ) -> tuple[RuntimeSource, StreamedQwen38]:
     runtime = _build_source(args, recorder)
     pager: Qwen38WeightPager | None = None
@@ -436,6 +441,7 @@ def _runtime(
         model = StreamedQwen38(
             config,
             pager,
+            delta_probe=delta_probe,
             max_batch_size=1,
             max_seq_len=args.max_seq_len,
         )
@@ -482,6 +488,43 @@ def _checkpoint(model: StreamedQwen38) -> dict[str, str]:
     }
 
 
+def _delta_probe_receipt(
+    args: argparse.Namespace,
+    recorder: DeltaNetProbeRecorder | None,
+    *,
+    checkpoint: Mapping[str, Any],
+    context_mode: str,
+    start_pos: int,
+    end_pos: int,
+    inputs: Mapping[str, Any],
+    hidden_sha256: str,
+) -> dict[str, Any] | None:
+    path = getattr(args, "delta_probe", None)
+    if path is None:
+        if recorder is not None:  # pragma: no cover - internal contract.
+            raise QwenDirectDecodeError("unused DeltaNet probe recorder")
+        return None
+    if recorder is None:  # pragma: no cover - internal contract.
+        raise QwenDirectDecodeError("DeltaNet probe recorder is missing")
+    document = build_probe_document(
+        recorder,
+        checkpoint=checkpoint,
+        context_mode=context_mode,
+        start_pos=start_pos,
+        end_pos=end_pos,
+        item_id=str(inputs["item_id"]),
+        input_sha256=str(inputs["sha256"]),
+        hidden_sha256=hidden_sha256,
+    )
+    output = _atomic_bytes(path, _canonical(document) + b"\n")
+    return {
+        "path": str(output),
+        "records": len(document["body"]["records"]),
+        "schema": DELTANET_PROBE_SCHEMA,
+        "sha256": document["sha256"],
+    }
+
+
 def _cleanup(runtime: RuntimeSource, model: StreamedQwen38) -> None:
     active_error = sys.exc_info()[1]
     cleanup_error: Exception | None = None
@@ -505,7 +548,8 @@ def prepare_prefix(args: argparse.Namespace) -> dict[str, Any]:
     if len(prefix) >= args.max_seq_len:
         raise QwenDirectDecodeError("prefix leaves no room for decode")
     recorder = AccessTraceRecorder()
-    runtime, model = _runtime(args, recorder)
+    delta_probe = DeltaNetProbeRecorder() if args.delta_probe is not None else None
+    runtime, model = _runtime(args, recorder, delta_probe)
     try:
         if max((*prefix, int(inputs["decode_token_id"]))) >= model.config.vocab_size:
             raise QwenDirectDecodeError("input token exceeds checkpoint vocabulary")
@@ -514,12 +558,24 @@ def prepare_prefix(args: argparse.Namespace) -> dict[str, Any]:
         )
         snapshot = model.save_state(args.snapshot, transport_neutral=True)
         trace = _trace_receipt(recorder, args.access_trace)
+        checkpoint = _checkpoint(model)
+        hidden_sha256 = _hidden_sha256(hidden)
+        probe_receipt = _delta_probe_receipt(
+            args,
+            delta_probe,
+            checkpoint=checkpoint,
+            context_mode="prefill",
+            start_pos=0,
+            end_pos=len(prefix),
+            inputs=inputs,
+            hidden_sha256=hidden_sha256,
+        )
         identity = {
-            "checkpoint": _checkpoint(model),
+            "checkpoint": checkpoint,
             "evidence": [asdict(row) for row in evidence],
             "hidden_dtype": str(hidden.dtype).removeprefix("torch."),
             "hidden_shape": list(hidden.shape),
-            "hidden_sha256": _hidden_sha256(hidden),
+            "hidden_sha256": hidden_sha256,
             "input_sha256": inputs["sha256"],
             "pager": model.pager.metrics(),
             "schema": PREFIX_SCHEMA,
@@ -527,6 +583,8 @@ def prepare_prefix(args: argparse.Namespace) -> dict[str, Any]:
             "source_verification": runtime.verification,
             "trace": trace,
         }
+        if probe_receipt is not None:
+            identity["delta_probe"] = probe_receipt
         return _result(identity)
     finally:
         _cleanup(runtime, model)
@@ -542,7 +600,8 @@ def decode_arm(args: argparse.Namespace) -> dict[str, Any]:
         raise QwenDirectDecodeError("prefix result belongs to another snapshot")
     prefix = inputs["prefix_token_ids"]
     recorder = AccessTraceRecorder()
-    runtime, model = _runtime(args, recorder)
+    delta_probe = DeltaNetProbeRecorder() if args.delta_probe is not None else None
+    runtime, model = _runtime(args, recorder, delta_probe)
     try:
         restore_started = time.perf_counter()
         restored = model.load_state(args.snapshot, transport_neutral=True)
@@ -558,12 +617,23 @@ def decode_arm(args: argparse.Namespace) -> dict[str, Any]:
             [[int(inputs["decode_token_id"])]], progress=_progress
         )
         trace = _trace_receipt(recorder, args.access_trace)
+        hidden_sha256 = _hidden_sha256(hidden)
+        probe_receipt = _delta_probe_receipt(
+            args,
+            delta_probe,
+            checkpoint=checkpoint,
+            context_mode="decode",
+            start_pos=len(prefix),
+            end_pos=len(prefix) + 1,
+            inputs=inputs,
+            hidden_sha256=hidden_sha256,
+        )
         identity = {
             "checkpoint": checkpoint,
             "evidence": asdict(evidence),
             "hidden_dtype": str(hidden.dtype).removeprefix("torch."),
             "hidden_shape": list(hidden.shape),
-            "hidden_sha256": _hidden_sha256(hidden),
+            "hidden_sha256": hidden_sha256,
             "input_sha256": inputs["sha256"],
             "pager": model.pager.metrics(),
             "restore_seconds": restore_seconds,
@@ -572,6 +642,8 @@ def decode_arm(args: argparse.Namespace) -> dict[str, Any]:
             "source_verification": runtime.verification,
             "trace": trace,
         }
+        if probe_receipt is not None:
+            identity["delta_probe"] = probe_receipt
         return _result(identity)
     finally:
         _cleanup(runtime, model)
@@ -587,6 +659,38 @@ def _load_result(path: str, schema: str) -> dict[str, Any]:
     return document
 
 
+def _verified_delta_probe(
+    result: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    receipt = result.get("delta_probe")
+    if receipt is None:
+        return None
+    if not isinstance(receipt, Mapping) or set(receipt) != {
+        "path",
+        "records",
+        "schema",
+        "sha256",
+    }:
+        raise QwenDirectDecodeError("DeltaNet probe receipt is invalid")
+    if receipt.get("schema") != DELTANET_PROBE_SCHEMA:
+        raise QwenDirectDecodeError("DeltaNet probe receipt schema is invalid")
+    try:
+        document = verify_probe_document(_strict_json(str(receipt["path"])))
+    except Exception as exc:
+        raise QwenDirectDecodeError("DeltaNet probe artifact is invalid") from exc
+    body = document["body"]
+    if (
+        document["sha256"] != receipt.get("sha256")
+        or len(body["records"]) != receipt.get("records")
+        or body["checkpoint"] != result.get("checkpoint")
+        or body["input_sha256"] != result.get("input_sha256")
+        or body["hidden_sha256"] != result.get("hidden_sha256")
+        or body["context_mode"] != "decode"
+    ):
+        raise QwenDirectDecodeError("DeltaNet probe/result identity differs")
+    return document
+
+
 def compare(args: argparse.Namespace) -> dict[str, Any]:
     remote = _load_result(args.remote, DECODE_SCHEMA)
     local = _load_result(args.local, DECODE_SCHEMA)
@@ -598,6 +702,15 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
             raise QwenDirectDecodeError(f"remote/local checkpoint {key} differs")
     if remote["snapshot"]["payload_sha256"] != local["snapshot"]["payload_sha256"]:
         raise QwenDirectDecodeError("remote/local snapshot payload differs")
+    remote_probe = _verified_delta_probe(remote)
+    local_probe = _verified_delta_probe(local)
+    if (remote_probe is None) != (local_probe is None):
+        raise QwenDirectDecodeError("remote/local DeltaNet instrumentation differs")
+    probe_sha256 = None
+    if remote_probe is not None and local_probe is not None:
+        if remote_probe["sha256"] != local_probe["sha256"]:
+            raise QwenDirectDecodeError("remote/local DeltaNet probes differ")
+        probe_sha256 = remote_probe["sha256"]
     remote_seconds = float(remote["evidence"]["seconds"])
     local_seconds = float(local["evidence"]["seconds"])
     if (
@@ -612,6 +725,7 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
         "hidden_dtype": remote["hidden_dtype"],
         "hidden_shape": remote["hidden_shape"],
         "input_sha256": remote["input_sha256"],
+        "delta_probe_sha256": probe_sha256,
         "local": {
             "result_sha256": local["sha256"],
             "seconds": local_seconds,
@@ -648,6 +762,7 @@ def _runtime_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--snapshot", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--access-trace", required=True)
+    parser.add_argument("--delta-probe")
     parser.add_argument("--source", default=OFFICIAL_REPO_ID)
     parser.add_argument("--causal-bundle")
     parser.add_argument("--logical-repo-id", default=OFFICIAL_REPO_ID)

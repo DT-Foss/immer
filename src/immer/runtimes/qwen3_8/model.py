@@ -23,6 +23,7 @@ import torch
 from .config import Qwen38Config
 from .kernels import (
     AttentionState,
+    DeltaNetProbe,
     DeltaNetState,
     full_attention_core,
     gated_delta_net_core,
@@ -113,6 +114,7 @@ class StreamedQwen38:
         *,
         graft: Any | None = None,
         graft_layer: int | None = None,
+        delta_probe: Callable[[int, DeltaNetProbe], None] | None = None,
         max_batch_size: int = 8,
         max_seq_len: int = 4096,
     ) -> None:
@@ -142,11 +144,14 @@ class StreamedQwen38:
             raise ValueError("graft_layer outside decoder depth")
         if graft is not None and graft_layer is None:
             raise ValueError("an active graft requires graft_layer")
+        if delta_probe is not None and not callable(delta_probe):
+            raise TypeError("delta_probe must be callable")
 
         self.config = config
         self.pager = pager
         self.graft = graft
         self.graft_layer = graft_layer
+        self.delta_probe = delta_probe
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self._layer_states: list[LayerState | None] = [
@@ -919,6 +924,11 @@ class StreamedQwen38:
         dt_bias = self._control(f"{base}.dt_bias")
         norm_weight = self._control(f"{base}.norm.weight", dtype=hidden.dtype)
         try:
+            probe = (
+                None
+                if self.delta_probe is None
+                else lambda row: self.delta_probe(layer, row)
+            )
             mixed, next_state = gated_delta_net_core(
                 projected_qkv,
                 projected_z,
@@ -934,6 +944,7 @@ class StreamedQwen38:
                 value_head_dim=self.config.linear_value_head_dim,
                 state=state,
                 rms_norm_eps=self.config.rms_norm_eps,
+                probe=probe,
             )
         finally:
             del projected_qkv, projected_z, projected_b, projected_a

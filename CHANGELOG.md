@@ -77,6 +77,10 @@ All notable changes to IMMER are recorded here.
 - Fixed Qwen continuation admission on Apple MPS: indexless pager device
   `mps` now correctly accepts resolved tensor device `mps:0`, with an actual
   MPS BF16 save/restore/decode regression test.
+- Ported the measured Qwen3.8-27B DeltaNet instrument into the exact runtime:
+  nine passive per-layer signals, authenticated prefix/decode probe artifacts,
+  and pooled-sample Cohen-d maps now calibrate graft placement from contextual
+  model states without changing inference output.
 - Rebuilt public documentation around the local causal architecture and
   separated public source from weights, state, traces, and operations.
 

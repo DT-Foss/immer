@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 from immer.knowledge import AccessTrace
+from immer.runtimes.qwen3_8 import verify_probe_document
 
 from test_qwen38_causal_bundle import (
     REPO_ID,
@@ -49,6 +50,7 @@ def _runtime_args(
     inventory: Path | None = None,
     bundle: Path | None = None,
     prefix_result: Path | None = None,
+    delta_probe: Path | None = None,
 ):
     argv = [
         command,
@@ -83,6 +85,8 @@ def _runtime_args(
         argv.extend(("--causal-bundle", str(bundle)))
     if prefix_result is not None:
         argv.extend(("--prefix-result", str(prefix_result)))
+    if delta_probe is not None:
+        argv.extend(("--delta-probe", str(delta_probe)))
     args = benchmark._parser().parse_args(argv)
     args._require_official = False
     return args
@@ -126,12 +130,21 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 trace=root / "trace-prefix.json",
                 source=bundle / "weights",
                 inventory=pinned,
+                delta_probe=root / "probe-prefix.json",
             )
             with redirect_stderr(io.StringIO()):
                 prefix = benchmark.prepare_prefix(prepare_args)
             benchmark._write_json(prepare_args.output, prefix)
             self.assertEqual(prefix["schema"], benchmark.PREFIX_SCHEMA)
             self.assertEqual(prefix["snapshot"]["next_position"], 3)
+            prefix_probe = verify_probe_document(
+                json.loads(Path(prepare_args.delta_probe).read_text(encoding="utf-8"))
+            )
+            self.assertEqual(prefix["delta_probe"]["records"], 3)
+            self.assertEqual(prefix_probe["body"]["context_mode"], "prefill")
+            self.assertEqual(
+                prefix_probe["body"]["hidden_sha256"], prefix["hidden_sha256"]
+            )
 
             wrong_input = root / "wrong-input.json"
             benchmark._write_json(
@@ -169,6 +182,7 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 source=bundle / "weights",
                 inventory=pinned,
                 prefix_result=Path(prepare_args.output),
+                delta_probe=root / "probe-decode-inventory.json",
             )
             with redirect_stderr(io.StringIO()):
                 baseline = benchmark.decode_arm(baseline_args)
@@ -182,6 +196,7 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 trace=root / "trace-causal.json",
                 bundle=bundle,
                 prefix_result=Path(prepare_args.output),
+                delta_probe=root / "probe-decode-causal.json",
             )
             with redirect_stderr(io.StringIO()):
                 causal = benchmark.decode_arm(causal_args)
@@ -198,6 +213,15 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 causal["source_verification"]["kind"],
                 "complete-causal-bundle/v1",
             )
+            decode_probe = verify_probe_document(
+                json.loads(Path(causal_args.delta_probe).read_text(encoding="utf-8"))
+            )
+            self.assertEqual(causal["delta_probe"]["records"], 3)
+            self.assertEqual(decode_probe["body"]["context_mode"], "decode")
+            self.assertEqual(decode_probe["body"]["start_pos"], 3)
+            self.assertEqual(
+                causal["delta_probe"]["sha256"], baseline["delta_probe"]["sha256"]
+            )
             self.assertEqual(
                 baseline["source_verification"]["kind"],
                 "complete-local-shards/v1",
@@ -208,6 +232,31 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 causal_args.access_trace,
             ):
                 AccessTrace.from_bytes(Path(path).read_bytes()).verify()
+
+            uninstrumented_path = root / "decode-causal-uninstrumented.json"
+            uninstrumented = benchmark._result(
+                {
+                    key: value
+                    for key, value in causal.items()
+                    if key not in {"delta_probe", "sha256"}
+                }
+            )
+            benchmark._write_json(uninstrumented_path, uninstrumented)
+            unfair_args = benchmark._parser().parse_args(
+                [
+                    "compare",
+                    "--remote",
+                    str(baseline_args.output),
+                    "--local",
+                    str(uninstrumented_path),
+                    "--output",
+                    str(root / "unfair-comparison.json"),
+                ]
+            )
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "instrumentation differs"
+            ):
+                benchmark.compare(unfair_args)
 
             compare_args = benchmark._parser().parse_args(
                 [
@@ -223,6 +272,9 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
             comparison = benchmark.compare(compare_args)
             self.assertEqual(comparison["schema"], benchmark.COMPARISON_SCHEMA)
             self.assertEqual(comparison["hidden_sha256"], baseline["hidden_sha256"])
+            self.assertEqual(
+                comparison["delta_probe_sha256"], baseline["delta_probe"]["sha256"]
+            )
             self.assertGreater(comparison["speedup_remote_over_local"], 0.0)
 
     def test_local_source_rejects_payload_tamper_despite_matching_layout(self) -> None:
