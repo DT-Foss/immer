@@ -164,7 +164,21 @@ def _json_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _read_manifest(path: Path, limits: SnapshotLimits) -> dict[str, Any]:
+def _snapshot_schema(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 256
+        or "\x00" in value
+    ):
+        raise DeepSeekV4SnapshotError("snapshot schema identity is invalid")
+    return value
+
+
+def _read_manifest(
+    path: Path, limits: SnapshotLimits, *, schema: str
+) -> dict[str, Any]:
     try:
         with _open_regular_read(path, "manifest") as stream:
             size = os.fstat(stream.fileno()).st_size
@@ -189,8 +203,6 @@ def _read_manifest(path: Path, limits: SnapshotLimits) -> dict[str, Any]:
         raise DeepSeekV4SnapshotError("cannot decode snapshot manifest") from exc
     if not isinstance(document, dict):
         raise DeepSeekV4SnapshotError("snapshot manifest root must be an object")
-    if document.get("schema") != SNAPSHOT_SCHEMA:
-        raise DeepSeekV4SnapshotError("unsupported snapshot schema")
     if document.get("version") != SNAPSHOT_VERSION:
         raise DeepSeekV4SnapshotError("unsupported snapshot version")
     body = document.get("body")
@@ -202,6 +214,16 @@ def _read_manifest(path: Path, limits: SnapshotLimits) -> dict[str, Any]:
     actual = _sha256_bytes(_canonical_json(body))
     if actual != expected:
         raise DeepSeekV4SnapshotError("snapshot manifest body SHA-256 mismatch")
+    # Schema is duplicated inside the authenticated body.  Legacy DeepSeek-V4
+    # manifests predate that field and remain readable only under their
+    # original schema; every newly written or non-DeepSeek schema is bound by
+    # the body digest and cannot be relabelled by editing the outer document.
+    body_schema = body.get("schema")
+    if body_schema is None:
+        if schema != SNAPSHOT_SCHEMA or document.get("schema") != SNAPSHOT_SCHEMA:
+            raise DeepSeekV4SnapshotError("unsupported snapshot schema")
+    elif body_schema != schema or document.get("schema") != schema:
+        raise DeepSeekV4SnapshotError("unsupported snapshot schema")
     return document
 
 
@@ -282,10 +304,12 @@ def write_snapshot(
     state: Mapping[str, Any],
     tensors: Mapping[str, SnapshotTensor],
     limits: SnapshotLimits | None = None,
+    schema: str = SNAPSHOT_SCHEMA,
 ) -> dict[str, Any]:
     """Atomically publish a verified JSON + NPZ continuation snapshot."""
 
     active_limits = SnapshotLimits() if limits is None else limits
+    active_schema = _snapshot_schema(schema)
     target = _absolute_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     _reject_nonregular_existing(target, "manifest")
@@ -330,6 +354,7 @@ def write_snapshot(
     body = {
         "byte_order": sys.byteorder,
         "identity": dict(identity),
+        "schema": active_schema,
         "state": dict(state),
         "tensors": descriptors,
         "tensor_count": len(descriptors),
@@ -389,7 +414,7 @@ def write_snapshot(
         body_bytes = _canonical_json(body)
         body_sha = _sha256_bytes(body_bytes)
         document = {
-            "schema": SNAPSHOT_SCHEMA,
+            "schema": active_schema,
             "version": SNAPSHOT_VERSION,
             "body_sha256": body_sha,
             "body": body,
@@ -418,7 +443,7 @@ def write_snapshot(
         raise
 
     return {
-        "schema": SNAPSHOT_SCHEMA,
+        "schema": active_schema,
         "version": SNAPSHOT_VERSION,
         "manifest": str(target),
         "manifest_body_sha256": body_sha,
@@ -609,10 +634,12 @@ def read_snapshot(
     limits: SnapshotLimits | None = None,
     resident_bytes: int = 0,
     max_restore_peak_bytes: int | None = None,
+    schema: str = SNAPSHOT_SCHEMA,
 ) -> LoadedSnapshot:
     """Verify and load a continuation snapshot without pickle."""
 
     active_limits = SnapshotLimits() if limits is None else limits
+    active_schema = _snapshot_schema(schema)
     if (
         isinstance(resident_bytes, bool)
         or not isinstance(resident_bytes, int)
@@ -626,7 +653,7 @@ def read_snapshot(
     ):
         raise ValueError("max_restore_peak_bytes must be a positive integer")
     target = _absolute_path(path)
-    document = _read_manifest(target, active_limits)
+    document = _read_manifest(target, active_limits, schema=active_schema)
     body = document["body"]
     if body.get("byte_order") != sys.byteorder:
         raise DeepSeekV4SnapshotError("snapshot byte order does not match this runtime")
@@ -750,7 +777,7 @@ def read_snapshot(
             ) from exc
 
     summary = {
-        "schema": SNAPSHOT_SCHEMA,
+        "schema": active_schema,
         "version": SNAPSHOT_VERSION,
         "manifest": str(target),
         "manifest_body_sha256": document["body_sha256"],

@@ -43,6 +43,11 @@ All notable changes to IMMER are recorded here.
 - Proved batched prefill, tokenwise prefill, and continuation decode are
   bit-identical in the checkpoint's BF16 execution mode on the executable
   model fixture.
+- Added authenticated Qwen continuation snapshots for every KV, DeltaNet,
+  cursor, batch, and CRSA-history state. The pickle-free manifest binds its
+  schema, checkpoint layout, config, math runtime, dependencies, and graft;
+  the content-addressed payload is verified before bounded transactional
+  restore.
 - Rebuilt public documentation around the local causal architecture and
   separated public source from weights, state, traces, and operations.
 

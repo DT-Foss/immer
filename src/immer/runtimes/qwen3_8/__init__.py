@@ -24,6 +24,7 @@ from .model import (
     StreamedQwen38,
 )
 from .pager import Qwen38PagerError, Qwen38WeightPager
+from .snapshot import QWEN38_SNAPSHOT_SCHEMA, Qwen38SnapshotError
 
 
 __all__ = [
@@ -42,9 +43,11 @@ __all__ = [
     "Qwen38EncodingError",
     "Qwen38PagerError",
     "Qwen38RuntimeError",
+    "Qwen38SnapshotError",
     "Qwen38StableCrsaGraft",
     "Qwen38Tokenizer",
     "Qwen38WeightPager",
+    "QWEN38_SNAPSHOT_SCHEMA",
     "StatefulEvidence",
     "StreamedQwen38",
 ]

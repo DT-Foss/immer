@@ -206,6 +206,30 @@ class DeepSeekV4SnapshotTests(unittest.TestCase):
         self.assertEqual(loaded.tensors["activation"].dtype, torch.bfloat16)
         self.assertTrue(torch.equal(loaded.tensors["activation"], values))
 
+    def test_legacy_deepseek_manifest_without_body_schema_remains_readable(
+        self,
+    ) -> None:
+        identity = {"fixture": "legacy-deepseek-schema"}
+        with self._temporary_directory() as directory:
+            path = Path(directory) / "legacy.json"
+            write_snapshot(
+                path,
+                identity=identity,
+                state={"next_position": 1},
+                tensors={"state": SnapshotTensor(torch.ones(1))},
+            )
+            document = json.loads(path.read_text(encoding="utf-8"))
+            document["body"].pop("schema")
+            document["body_sha256"] = hashlib.sha256(
+                _canonical(document["body"])
+            ).hexdigest()
+            path.write_text(
+                json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            loaded = read_snapshot(path, expected_identity=identity)
+        self.assertTrue(torch.equal(loaded.tensors["state"], torch.ones(1)))
+
     def test_ratio128_partial_compressor_state_continues_bit_exactly(self) -> None:
         prompt = [[2, 5, 8, 12, 19]]
         uninterrupted = self._compressed_model(128)

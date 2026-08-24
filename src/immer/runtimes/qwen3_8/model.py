@@ -10,7 +10,11 @@ path.  MTP can later draft tokens, but it must never alter base-model parity.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
+import hashlib
+import json
+import math
+import os
 import time
 from typing import Any
 
@@ -26,6 +30,14 @@ from .kernels import (
     swiglu,
 )
 from .pager import Qwen38WeightPager
+from .provenance import runtime_dependency_versions, runtime_source_manifest
+from .snapshot import (
+    Qwen38SnapshotError,
+    SnapshotLimits,
+    SnapshotTensor,
+    read_qwen38_snapshot,
+    write_qwen38_snapshot,
+)
 
 
 class Qwen38RuntimeError(RuntimeError):
@@ -171,6 +183,590 @@ class StreamedQwen38:
         if self._graft_history is not None:
             total += self._graft_history.numel() * self._graft_history.element_size()
         return total
+
+    @staticmethod
+    def _snapshot_digest(value: Any) -> str:
+        try:
+            encoded = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise Qwen38SnapshotError(
+                "runtime identity cannot be represented as canonical JSON"
+            ) from exc
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _graft_snapshot_identity(self) -> dict[str, Any]:
+        if self.graft is None:
+            return {"kind": "none", "layer": self.graft_layer}
+        graft = self.graft
+        state_dict = getattr(graft, "state_dict", None)
+        if callable(state_dict) and state_dict():
+            raise Qwen38SnapshotError(
+                "continuation snapshots support only parameter-free grafts"
+            )
+        required = (
+            "mode",
+            "alpha",
+            "heads",
+            "max_history",
+            "shuffle_seed",
+            "spec",
+        )
+        if any(not hasattr(graft, name) for name in required):
+            raise Qwen38SnapshotError(
+                "graft lacks the complete serialisable identity contract"
+            )
+        spec = getattr(graft, "spec")
+        if not is_dataclass(spec):
+            raise Qwen38SnapshotError("graft AttentionSpec is not a dataclass")
+        alpha = float(getattr(graft, "alpha"))
+        if not math.isfinite(alpha):
+            raise Qwen38SnapshotError("graft alpha must be finite")
+        rms_eps = getattr(graft, "rms_eps", None)
+        if rms_eps is not None and (
+            not math.isfinite(float(rms_eps)) or float(rms_eps) <= 0.0
+        ):
+            raise Qwen38SnapshotError("graft rms_eps must be finite and positive")
+        return {
+            "kind": f"{type(graft).__module__}.{type(graft).__qualname__}",
+            "layer": self.graft_layer,
+            "mode": str(getattr(graft, "mode")),
+            "alpha": alpha,
+            "heads": int(getattr(graft, "heads")),
+            "max_history": int(getattr(graft, "max_history")),
+            "shuffle_seed": int(getattr(graft, "shuffle_seed")),
+            "attention_spec": asdict(spec),
+            "rms_eps": None if rms_eps is None else float(rms_eps),
+            "policy": str(getattr(graft, "policy", "unreported")),
+        }
+
+    def _snapshot_identity(self, *, transport_neutral: bool = False) -> dict[str, Any]:
+        source = self.pager.source
+        source.inventory()
+        metrics = source.metrics()
+        fingerprint = metrics.get("inventory_source_fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise Qwen38SnapshotError(
+                "tensor source has no verified inventory fingerprint"
+            )
+        source_kind = f"{type(source).__module__}.{type(source).__qualname__}"
+        repo_id = metrics.get("repo_id", getattr(source, "repo_id", source_kind))
+        revision = metrics.get("revision", getattr(source, "revision", "fixture"))
+        if not isinstance(repo_id, str) or not repo_id:
+            raise Qwen38SnapshotError("tensor source repo identity is invalid")
+        if not isinstance(revision, str) or not revision:
+            raise Qwen38SnapshotError("tensor source revision identity is invalid")
+        config = asdict(self.config)
+        runtime_sources = runtime_source_manifest(
+            include_transport=not transport_neutral
+        )
+        dependencies = runtime_dependency_versions()
+        math_execution = {
+            "device": str(self.pager.device),
+            "compute_dtype": str(self.pager.compute_dtype).removeprefix("torch."),
+            "max_batch_size": self.max_batch_size,
+            "max_seq_len": self.max_seq_len,
+            "max_position_embeddings": self.config.max_position_embeddings,
+            "state_policy": "native-kv+deltanet-transactional/v1",
+        }
+        transport_execution = {
+            "source_kind": source_kind,
+            "source_transport_policy": str(
+                metrics.get("transport_policy", "unreported")
+            ),
+            "source_transport_connection_limit": int(
+                metrics.get("transport_connection_limit", 0)
+            ),
+            "pager_max_resident_bytes": self.pager.max_resident_bytes,
+            "pager_weight_cache_policy": self.pager.WEIGHT_CACHE_POLICY,
+        }
+        execution = (
+            {**math_execution, "transport_scope": "neutral/v1"}
+            if transport_neutral
+            else {**math_execution, **transport_execution}
+        )
+        return {
+            "runtime": {
+                "schema": "immer.streamed-qwen3.8/native-stateful-v1",
+                "source_sha256": self._snapshot_digest(runtime_sources),
+                "sources": runtime_sources,
+                "dependency_sha256": self._snapshot_digest(dependencies),
+                "dependencies": dependencies,
+            },
+            "config": config,
+            "config_sha256": self._snapshot_digest(config),
+            "source": {
+                "repo_id": repo_id,
+                "revision": revision,
+                "inventory_fingerprint": fingerprint,
+            },
+            "execution": execution,
+            "graft": self._graft_snapshot_identity(),
+        }
+
+    def _snapshot_model_state(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, SnapshotTensor]]:
+        if not 0 <= self._next_position <= self.max_seq_len:
+            raise Qwen38SnapshotError("model cursor exceeds its context bound")
+        if self._state_poisoned and self._next_position:
+            raise Qwen38SnapshotError("poisoned model has a non-zero cursor")
+        if self._next_position == 0:
+            if self._state_batch_size is not None or any(
+                state is not None for state in self._layer_states
+            ):
+                raise Qwen38SnapshotError("zero-cursor model retains layer state")
+            if self._graft_history is not None:
+                raise Qwen38SnapshotError("zero-cursor model retains graft history")
+        elif (
+            self._state_batch_size is None
+            or not 1 <= self._state_batch_size <= self.max_batch_size
+            or any(state is None for state in self._layer_states)
+        ):
+            raise Qwen38SnapshotError("active model has incomplete batch/layer state")
+
+        tensors: dict[str, SnapshotTensor] = {}
+        layers: list[dict[str, Any]] = []
+        batch = self._state_batch_size
+        for layer, state in enumerate(self._layer_states):
+            if state is None:
+                continue
+            prefix = f"state.layer_{layer:03d}"
+            if self.config.is_full_attention(layer):
+                if not isinstance(state, AttentionState):
+                    raise Qwen38SnapshotError(
+                        f"full-attention layer {layer} has the wrong state type"
+                    )
+                expected = (
+                    batch,
+                    self.config.n_kv_heads,
+                    self._next_position,
+                    self.config.head_dim,
+                )
+                if tuple(state.key.shape) != expected:
+                    raise Qwen38SnapshotError(
+                        f"full-attention layer {layer} state shape is inconsistent"
+                    )
+                if (
+                    state.key.dtype != self.pager.compute_dtype
+                    or state.key.device != self.pager.device
+                ):
+                    raise Qwen38SnapshotError(
+                        f"full-attention layer {layer} state dtype/device is inconsistent"
+                    )
+                key_name = f"{prefix}.key"
+                value_name = f"{prefix}.value"
+                tensors[key_name] = SnapshotTensor(state.key)
+                tensors[value_name] = SnapshotTensor(state.value)
+                layers.append(
+                    {
+                        "kind": "full_attention",
+                        "layer": layer,
+                        "key": key_name,
+                        "value": value_name,
+                    }
+                )
+            else:
+                if not isinstance(state, DeltaNetState):
+                    raise Qwen38SnapshotError(
+                        f"linear-attention layer {layer} has the wrong state type"
+                    )
+                key_features = (
+                    self.config.linear_num_key_heads * self.config.linear_key_head_dim
+                )
+                value_features = (
+                    self.config.linear_num_value_heads
+                    * self.config.linear_value_head_dim
+                )
+                conv_shape = (
+                    batch,
+                    2 * key_features + value_features,
+                    self.config.linear_conv_kernel_dim,
+                )
+                recurrent_shape = (
+                    batch,
+                    self.config.linear_num_value_heads,
+                    self.config.linear_key_head_dim,
+                    self.config.linear_value_head_dim,
+                )
+                if (
+                    tuple(state.conv.shape) != conv_shape
+                    or tuple(state.recurrent.shape) != recurrent_shape
+                ):
+                    raise Qwen38SnapshotError(
+                        f"linear-attention layer {layer} state shape is inconsistent"
+                    )
+                if (
+                    state.conv.dtype != self.pager.compute_dtype
+                    or state.conv.device != self.pager.device
+                    or state.recurrent.dtype != torch.float32
+                    or state.recurrent.device != self.pager.device
+                ):
+                    raise Qwen38SnapshotError(
+                        f"linear-attention layer {layer} state dtype/device is inconsistent"
+                    )
+                conv_name = f"{prefix}.conv"
+                recurrent_name = f"{prefix}.recurrent"
+                tensors[conv_name] = SnapshotTensor(state.conv)
+                tensors[recurrent_name] = SnapshotTensor(state.recurrent)
+                layers.append(
+                    {
+                        "kind": "linear_attention",
+                        "layer": layer,
+                        "conv": conv_name,
+                        "recurrent": recurrent_name,
+                    }
+                )
+
+        graft_history_name = None
+        if self._graft_history is not None:
+            expected = (
+                batch,
+                self._next_position,
+                self.config.dim,
+            )
+            if tuple(self._graft_history.shape) != expected:
+                raise Qwen38SnapshotError("graft history shape/cursor is inconsistent")
+            if (
+                self._graft_history.dtype != self.pager.compute_dtype
+                or self._graft_history.device != self.pager.device
+            ):
+                raise Qwen38SnapshotError("graft history dtype/device is inconsistent")
+            graft_history_name = "state.graft_history"
+            tensors[graft_history_name] = SnapshotTensor(self._graft_history)
+        graft_identity = self._graft_snapshot_identity()
+        graft_active = (
+            graft_identity.get("kind") != "none"
+            and graft_identity.get("layer") is not None
+            and graft_identity.get("mode") != "off"
+            and float(graft_identity.get("alpha", 0.0)) != 0.0
+        )
+        if self._next_position and graft_active != (graft_history_name is not None):
+            raise Qwen38SnapshotError(
+                "active graft and graft-history presence are inconsistent"
+            )
+        if self._state_poisoned and (layers or tensors):
+            raise Qwen38SnapshotError("poisoned model retains continuation tensors")
+        return (
+            {
+                "next_position": self._next_position,
+                "state_poisoned": self._state_poisoned,
+                "state_batch_size": self._state_batch_size,
+                "max_batch_size": self.max_batch_size,
+                "max_seq_len": self.max_seq_len,
+                "max_position_embeddings": self.config.max_position_embeddings,
+                "graft_history": graft_history_name,
+                "attention_layers": layers,
+            },
+            tensors,
+        )
+
+    @staticmethod
+    def _snapshot_limits(max_bytes: int, max_tensors: int) -> SnapshotLimits:
+        return SnapshotLimits(max_bytes=max_bytes, max_tensors=max_tensors)
+
+    def save_state(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        max_bytes: int = 2 * 1024**3,
+        max_tensors: int = 2048,
+        transport_neutral: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically save every native Qwen continuation tensor."""
+
+        if not isinstance(transport_neutral, bool):
+            raise TypeError("transport_neutral must be a boolean")
+        limits = self._snapshot_limits(max_bytes, max_tensors)
+        state, tensors = self._snapshot_model_state()
+        result = write_qwen38_snapshot(
+            path,
+            identity=self._snapshot_identity(transport_neutral=transport_neutral),
+            state=state,
+            tensors=tensors,
+            limits=limits,
+        )
+        return {
+            **result,
+            "next_position": self._next_position,
+            "state_poisoned": self._state_poisoned,
+            "transport_neutral": transport_neutral,
+        }
+
+    @staticmethod
+    def _snapshot_state_int(value: Any, name: str, *, maximum: int) -> int:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > maximum
+        ):
+            raise Qwen38SnapshotError(f"snapshot {name} is outside its bound")
+        return value
+
+    def load_state(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        max_bytes: int = 2 * 1024**3,
+        max_tensors: int = 2048,
+        max_restore_peak_bytes: int = 4 * 1024**3,
+        transport_neutral: bool = False,
+    ) -> dict[str, Any]:
+        """Transactionally restore a bounded native Qwen continuation."""
+
+        if not isinstance(transport_neutral, bool):
+            raise TypeError("transport_neutral must be a boolean")
+        limits = self._snapshot_limits(max_bytes, max_tensors)
+        loaded = read_qwen38_snapshot(
+            path,
+            expected_identity=self._snapshot_identity(
+                transport_neutral=transport_neutral
+            ),
+            limits=limits,
+            resident_bytes=self.state_bytes,
+            max_restore_peak_bytes=max_restore_peak_bytes,
+        )
+        state = loaded.state
+        expected_state_keys = {
+            "attention_layers",
+            "graft_history",
+            "max_batch_size",
+            "max_position_embeddings",
+            "max_seq_len",
+            "next_position",
+            "state_batch_size",
+            "state_poisoned",
+        }
+        if set(state) != expected_state_keys:
+            raise Qwen38SnapshotError("snapshot model-state schema is invalid")
+        next_position = self._snapshot_state_int(
+            state.get("next_position"),
+            "next_position",
+            maximum=self.max_seq_len,
+        )
+        poisoned = state.get("state_poisoned")
+        if not isinstance(poisoned, bool):
+            raise Qwen38SnapshotError("snapshot poison latch must be boolean")
+        if poisoned and next_position:
+            raise Qwen38SnapshotError("poisoned snapshot has a non-zero cursor")
+        if any(
+            state.get(key) != value
+            for key, value in {
+                "max_batch_size": self.max_batch_size,
+                "max_seq_len": self.max_seq_len,
+                "max_position_embeddings": self.config.max_position_embeddings,
+            }.items()
+        ):
+            raise Qwen38SnapshotError("snapshot model bounds do not match runtime")
+        raw_batch = state.get("state_batch_size")
+        if next_position:
+            batch = self._snapshot_state_int(
+                raw_batch, "state_batch_size", maximum=self.max_batch_size
+            )
+            if batch == 0:
+                raise Qwen38SnapshotError("active snapshot batch size must be positive")
+        else:
+            if raw_batch is not None:
+                raise Qwen38SnapshotError(
+                    "zero-cursor snapshot retains batch ownership"
+                )
+            batch = None
+
+        raw_layers = state.get("attention_layers")
+        if not isinstance(raw_layers, list) or len(raw_layers) > self.config.n_layers:
+            raise Qwen38SnapshotError("snapshot attention-layer table is invalid")
+        by_layer: dict[int, dict[str, Any]] = {}
+        referenced: set[str] = set()
+        for row in raw_layers:
+            if not isinstance(row, dict):
+                raise Qwen38SnapshotError("snapshot attention-layer row is invalid")
+            layer = row.get("layer")
+            if (
+                isinstance(layer, bool)
+                or not isinstance(layer, int)
+                or not 0 <= layer < self.config.n_layers
+                or layer in by_layer
+            ):
+                raise Qwen38SnapshotError(
+                    "snapshot layer index is invalid or duplicate"
+                )
+            expected_kind = (
+                "full_attention"
+                if self.config.is_full_attention(layer)
+                else "linear_attention"
+            )
+            expected_keys = (
+                {"kind", "layer", "key", "value"}
+                if expected_kind == "full_attention"
+                else {"kind", "layer", "conv", "recurrent"}
+            )
+            if set(row) != expected_keys or row.get("kind") != expected_kind:
+                raise Qwen38SnapshotError("snapshot layer-state role is invalid")
+            names = (
+                (row.get("key"), row.get("value"))
+                if expected_kind == "full_attention"
+                else (row.get("conv"), row.get("recurrent"))
+            )
+            expected_names = (
+                (f"state.layer_{layer:03d}.key", f"state.layer_{layer:03d}.value")
+                if expected_kind == "full_attention"
+                else (
+                    f"state.layer_{layer:03d}.conv",
+                    f"state.layer_{layer:03d}.recurrent",
+                )
+            )
+            if names != expected_names:
+                raise Qwen38SnapshotError("snapshot tensor role name is invalid")
+            referenced.update(expected_names)
+            by_layer[layer] = row
+        if next_position and len(by_layer) != self.config.n_layers:
+            raise Qwen38SnapshotError(
+                "active snapshot omits one or more decoder-layer states"
+            )
+        if not next_position and by_layer:
+            raise Qwen38SnapshotError("zero-cursor snapshot retains layer state")
+
+        history_name = state.get("graft_history")
+        if history_name is not None:
+            if history_name != "state.graft_history":
+                raise Qwen38SnapshotError("snapshot graft-history role is invalid")
+            referenced.add(history_name)
+        if referenced != set(loaded.tensors):
+            raise Qwen38SnapshotError(
+                "snapshot contains missing or unreferenced tensor payloads"
+            )
+        descriptors = {
+            row.get("name"): row
+            for row in loaded.manifest["body"].get("tensors", [])
+            if isinstance(row, dict)
+        }
+        for name, tensor in loaded.tensors.items():
+            descriptor = descriptors.get(name)
+            if (
+                not isinstance(descriptor, dict)
+                or descriptor.get("finite_policy") != "finite"
+            ):
+                raise Qwen38SnapshotError("snapshot tensor finite policy is invalid")
+            expected_dtype = (
+                torch.float32
+                if name.endswith(".recurrent")
+                else self.pager.compute_dtype
+            )
+            if tensor.dtype != expected_dtype:
+                raise Qwen38SnapshotError(
+                    f"snapshot tensor {name!r} has the wrong state dtype"
+                )
+
+        graft_identity = self._graft_snapshot_identity()
+        graft_active = (
+            graft_identity.get("kind") != "none"
+            and graft_identity.get("layer") is not None
+            and graft_identity.get("mode") != "off"
+            and float(graft_identity.get("alpha", 0.0)) != 0.0
+        )
+        if next_position and graft_active != (history_name is not None):
+            raise Qwen38SnapshotError(
+                "active graft and graft-history presence are inconsistent"
+            )
+        if poisoned and (by_layer or history_name is not None):
+            raise Qwen38SnapshotError("poisoned snapshot retains continuation state")
+
+        new_states: list[LayerState | None] = [
+            None for _ in range(self.config.n_layers)
+        ]
+        history_device: torch.Tensor | None = None
+        try:
+            for layer in sorted(by_layer):
+                row = by_layer[layer]
+                if self.config.is_full_attention(layer):
+                    key = loaded.tensors.pop(row["key"])
+                    value = loaded.tensors.pop(row["value"])
+                    expected = (
+                        batch,
+                        self.config.n_kv_heads,
+                        next_position,
+                        self.config.head_dim,
+                    )
+                    if tuple(key.shape) != expected or tuple(value.shape) != expected:
+                        raise Qwen38SnapshotError(
+                            f"full-attention layer {layer} tensor shape is invalid"
+                        )
+                    key_device = key.to(device=self.pager.device).detach()
+                    del key
+                    value_device = value.to(device=self.pager.device).detach()
+                    del value
+                    new_states[layer] = AttentionState(
+                        key=key_device,
+                        value=value_device,
+                    )
+                else:
+                    conv = loaded.tensors.pop(row["conv"])
+                    recurrent = loaded.tensors.pop(row["recurrent"])
+                    key_features = (
+                        self.config.linear_num_key_heads
+                        * self.config.linear_key_head_dim
+                    )
+                    value_features = (
+                        self.config.linear_num_value_heads
+                        * self.config.linear_value_head_dim
+                    )
+                    if tuple(conv.shape) != (
+                        batch,
+                        2 * key_features + value_features,
+                        self.config.linear_conv_kernel_dim,
+                    ) or tuple(recurrent.shape) != (
+                        batch,
+                        self.config.linear_num_value_heads,
+                        self.config.linear_key_head_dim,
+                        self.config.linear_value_head_dim,
+                    ):
+                        raise Qwen38SnapshotError(
+                            f"linear-attention layer {layer} tensor shape is invalid"
+                        )
+                    conv_device = conv.to(device=self.pager.device).detach()
+                    del conv
+                    recurrent_device = recurrent.to(device=self.pager.device).detach()
+                    del recurrent
+                    new_states[layer] = DeltaNetState(
+                        conv=conv_device,
+                        recurrent=recurrent_device,
+                    )
+            if history_name is not None:
+                history = loaded.tensors.pop(history_name)
+                if tuple(history.shape) != (batch, next_position, self.config.dim):
+                    raise Qwen38SnapshotError(
+                        "snapshot graft history shape/cursor is inconsistent"
+                    )
+                history_device = history.to(device=self.pager.device).detach()
+                del history
+            if loaded.tensors:
+                raise Qwen38SnapshotError(
+                    "snapshot tensor ownership transfer is incomplete"
+                )
+        except Qwen38SnapshotError:
+            raise
+        except Exception as exc:
+            raise Qwen38SnapshotError(
+                "snapshot layer state is structurally inconsistent"
+            ) from exc
+
+        self._layer_states = new_states
+        self._next_position = next_position
+        self._state_batch_size = batch
+        self._state_poisoned = poisoned
+        self._graft_history = history_device
+        return {
+            **loaded.summary,
+            "next_position": next_position,
+            "state_poisoned": poisoned,
+            "transport_neutral": transport_neutral,
+        }
 
     def prefill_hidden_shape(self, batch: int, sequence: int) -> tuple[int, int, int]:
         """Return the rolling-resume activation shape for this decoder."""
