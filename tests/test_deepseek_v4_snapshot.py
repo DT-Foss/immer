@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from dataclasses import replace
 from pathlib import Path
 import struct
 import tempfile
@@ -26,10 +27,16 @@ from immer.runtimes.deepseek_v4.snapshot import (
     read_snapshot,
     write_snapshot,
 )
+from immer.runtimes.deepseek_v4.route_markov import (
+    LayerMarkovExpertPredictor,
+    LayerTokenRoutes,
+    PromptRouteObservation,
+)
 
 from test_deepseek_v4_model import (
     _CompressedTinyCheckpoint,
     _QuantizedTinyCheckpoint,
+    _TwoLayerPrefetchQuantizedTinyCheckpoint,
     _config,
 )
 
@@ -112,6 +119,77 @@ class DeepSeekV4SnapshotTests(unittest.TestCase):
 
             actual, _ = restored.decode(next_token)
             torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    def test_transport_neutral_prefix_restores_across_exact_prefetch_arms(self) -> None:
+        config = replace(
+            _config(0, n_layers=2),
+            n_activated_experts=2,
+            n_hash_layers=2,
+        )
+        predictor = LayerMarkovExpertPredictor(n_experts=2)
+        predictor.observe(
+            PromptRouteObservation(
+                "shared-prefix-training",
+                (
+                    LayerTokenRoutes(0, ((0, 1), (0, 1))),
+                    LayerTokenRoutes(1, ((0, 1), (0, 1))),
+                ),
+            )
+        )
+
+        def model(
+            *,
+            route_predictor=None,
+            expert_prefetch: bool = True,
+            activation_quantization: bool = True,
+        ) -> StreamedDeepSeekV4:
+            return StreamedDeepSeekV4(
+                config,
+                DeepSeekWeightPager(
+                    _TwoLayerPrefetchQuantizedTinyCheckpoint(),
+                    device="cpu",
+                    compute_dtype="float32",
+                    expert_prefetch=expert_prefetch,
+                    simulate_activation_quantization=activation_quantization,
+                ),
+                max_seq_len=8,
+                route_predictor=route_predictor,
+                route_prefetch_k=1,
+                route_prefetch_min_confidence=0.0,
+            )
+
+        with self._temporary_directory() as directory:
+            path = Path(directory) / "shared-prefix.json"
+            source = model()
+            source.prefill([[7, 8, 9, 10]], tokenwise=False)
+            saved = source.save_state(path, transport_neutral=True)
+            self.assertTrue(saved["transport_neutral"])
+
+            baseline = model(expert_prefetch=False)
+            full_identity_target = model(route_predictor=predictor)
+            with self.assertRaisesRegex(DeepSeekV4SnapshotError, "identity mismatch"):
+                full_identity_target.load_state(path)
+
+            baseline_loaded = baseline.load_state(path, transport_neutral=True)
+            real = model(route_predictor=predictor)
+            real_loaded = real.load_state(path, transport_neutral=True)
+            self.assertTrue(baseline_loaded["transport_neutral"])
+            self.assertTrue(real_loaded["transport_neutral"])
+
+            different_math = model(activation_quantization=False)
+            with self.assertRaisesRegex(DeepSeekV4SnapshotError, "identity mismatch"):
+                different_math.load_state(path, transport_neutral=True)
+
+            expected, expected_evidence = baseline.decode([[11]])
+            actual, actual_evidence = real.decode([[11]])
+            torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+            self.assertEqual(
+                actual_evidence.selected_experts,
+                expected_evidence.selected_experts,
+            )
+            self.assertEqual(real.route_prefetch_metrics()["direct_bindings"], 1)
+            self.assertEqual(real.pager.metrics()["expert_reservoir_submitted"], 1)
+            self.assertEqual(real.pager.metrics()["expert_reservoir_usable_hits"], 1)
 
     def test_bfloat16_raw_storage_round_trips_without_dtype_narrowing(self) -> None:
         values = torch.tensor([[1.0, -2.5, 0.125, 65_536.0]], dtype=torch.bfloat16)

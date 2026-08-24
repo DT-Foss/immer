@@ -630,7 +630,7 @@ class StreamedDeepSeekV4:
             "min_confidence": self.route_prefetch_min_confidence,
         }
 
-    def _snapshot_identity(self) -> dict[str, Any]:
+    def _snapshot_identity(self, *, transport_neutral: bool = False) -> dict[str, Any]:
         source = self.pager.source
         # Inventory acquisition is metadata-only and establishes the immutable
         # source fingerprint before any continuation can be published/loaded.
@@ -651,6 +651,59 @@ class StreamedDeepSeekV4:
         config = asdict(self.config)
         runtime_sources = runtime_source_manifest()
         runtime_dependencies = runtime_dependency_versions()
+        math_execution = {
+            "device": str(self.pager.device),
+            "compute_dtype": str(self.pager.compute_dtype).removeprefix("torch."),
+            "simulate_activation_quantization": bool(
+                self.pager.simulate_activation_quantization
+            ),
+            "quantized_accumulation_policy": self.pager.QUANTIZED_ACCUMULATION_POLICY,
+            "attention_qat_policy": self.ATTENTION_QAT_POLICY,
+            "max_batch_size": self.max_batch_size,
+            "max_seq_len": self.max_seq_len,
+            "max_position_embeddings": self.config.max_position_embeddings,
+        }
+        transport_execution = {
+            "expert_prefetch_policy": self.pager.expert_prefetch_policy,
+            "expert_prefetch_payload_limit_bytes": (
+                self.pager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
+            ),
+            "expert_prefetch_transport_policy": (
+                self.pager.expert_prefetch_transport_policy
+            ),
+            "expert_prefetch_workers": self.pager.EXPERT_PREFETCH_WORKERS,
+            "expert_prefetch_active_read_limit": (
+                self.pager.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
+            ),
+            "expert_prefetch_max_outstanding": (
+                self.pager.EXPERT_PREFETCH_MAX_OUTSTANDING
+            ),
+            "expert_prefetch_max_experts": self.pager.EXPERT_PREFETCH_MAX_EXPERTS,
+            "expert_prefetch_resident_limit_bytes": (
+                self.pager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
+            ),
+            "expert_range_coalesce_max_experts": (
+                self.pager.expert_range_coalesce_max_experts
+            ),
+            "expert_range_coalesce_max_gap_bytes": (
+                self.pager.EXPERT_RANGE_COALESCE_MAX_GAP_BYTES
+            ),
+            "expert_reservoir_policy": self.pager.EXPERT_RESERVOIR_POLICY,
+            "expert_reservoir_budget_bytes": self.pager.expert_reservoir_budget_bytes,
+            "expert_reservoir_workers": self.pager.expert_reservoir_workers,
+            "route_prefetch": self._route_prefetch_snapshot_identity(),
+            "source_transport_policy": str(
+                metrics.get("transport_policy", "unreported")
+            ),
+            "source_transport_connection_limit": int(
+                metrics.get("transport_connection_limit", 0)
+            ),
+        }
+        execution = (
+            {**math_execution, "transport_scope": "neutral/v1"}
+            if transport_neutral
+            else {**math_execution, **transport_execution}
+        )
         return {
             "runtime": {
                 "schema": "immer.streamed-deepseek-v4/native-stateful-v3",
@@ -667,56 +720,7 @@ class StreamedDeepSeekV4:
                 "revision": revision,
                 "inventory_fingerprint": fingerprint,
             },
-            "execution": {
-                "device": str(self.pager.device),
-                "compute_dtype": str(self.pager.compute_dtype).removeprefix("torch."),
-                "simulate_activation_quantization": bool(
-                    self.pager.simulate_activation_quantization
-                ),
-                "quantized_accumulation_policy": (
-                    self.pager.QUANTIZED_ACCUMULATION_POLICY
-                ),
-                "attention_qat_policy": self.ATTENTION_QAT_POLICY,
-                "expert_prefetch_policy": self.pager.expert_prefetch_policy,
-                "expert_prefetch_payload_limit_bytes": (
-                    self.pager.EXPERT_PREFETCH_PAYLOAD_LIMIT_BYTES
-                ),
-                "expert_prefetch_transport_policy": (
-                    self.pager.expert_prefetch_transport_policy
-                ),
-                "expert_prefetch_workers": self.pager.EXPERT_PREFETCH_WORKERS,
-                "expert_prefetch_active_read_limit": (
-                    self.pager.EXPERT_PREFETCH_ACTIVE_READ_LIMIT
-                ),
-                "expert_prefetch_max_outstanding": (
-                    self.pager.EXPERT_PREFETCH_MAX_OUTSTANDING
-                ),
-                "expert_prefetch_max_experts": (self.pager.EXPERT_PREFETCH_MAX_EXPERTS),
-                "expert_prefetch_resident_limit_bytes": (
-                    self.pager.EXPERT_PREFETCH_RESIDENT_LIMIT_BYTES
-                ),
-                "expert_range_coalesce_max_experts": (
-                    self.pager.expert_range_coalesce_max_experts
-                ),
-                "expert_range_coalesce_max_gap_bytes": (
-                    self.pager.EXPERT_RANGE_COALESCE_MAX_GAP_BYTES
-                ),
-                "expert_reservoir_policy": self.pager.EXPERT_RESERVOIR_POLICY,
-                "expert_reservoir_budget_bytes": (
-                    self.pager.expert_reservoir_budget_bytes
-                ),
-                "expert_reservoir_workers": self.pager.expert_reservoir_workers,
-                "route_prefetch": self._route_prefetch_snapshot_identity(),
-                "source_transport_policy": str(
-                    metrics.get("transport_policy", "unreported")
-                ),
-                "source_transport_connection_limit": int(
-                    metrics.get("transport_connection_limit", 0)
-                ),
-                "max_batch_size": self.max_batch_size,
-                "max_seq_len": self.max_seq_len,
-                "max_position_embeddings": self.config.max_position_embeddings,
-            },
+            "execution": execution,
             "graft": self._graft_snapshot_identity(),
         }
 
@@ -813,6 +817,7 @@ class StreamedDeepSeekV4:
         *,
         max_bytes: int = 2 * 1024**3,
         max_tensors: int = 2048,
+        transport_neutral: bool = False,
     ) -> dict[str, Any]:
         """Atomically save the exact native decoder continuation state.
 
@@ -821,11 +826,13 @@ class StreamedDeepSeekV4:
         pickle or executable objects.
         """
 
+        if not isinstance(transport_neutral, bool):
+            raise TypeError("transport_neutral must be a boolean")
         limits = self._snapshot_limits(max_bytes, max_tensors)
         state, tensors = self._snapshot_model_state()
         result = write_snapshot(
             path,
-            identity=self._snapshot_identity(),
+            identity=self._snapshot_identity(transport_neutral=transport_neutral),
             state=state,
             tensors=tensors,
             limits=limits,
@@ -834,6 +841,7 @@ class StreamedDeepSeekV4:
             **result,
             "next_position": self._next_position,
             "state_poisoned": self._state_poisoned,
+            "transport_neutral": transport_neutral,
         }
 
     @staticmethod
@@ -859,6 +867,7 @@ class StreamedDeepSeekV4:
         max_bytes: int = 2 * 1024**3,
         max_tensors: int = 2048,
         max_restore_peak_bytes: int = 4 * 1024**3,
+        transport_neutral: bool = False,
     ) -> dict[str, Any]:
         """Transactionally restore a bounded native decoder continuation.
 
@@ -867,6 +876,8 @@ class StreamedDeepSeekV4:
         Admission is decided from verified headers before tensor allocation.
         """
 
+        if not isinstance(transport_neutral, bool):
+            raise TypeError("transport_neutral must be a boolean")
         limits = self._snapshot_limits(max_bytes, max_tensors)
         resident_bytes = self.attention_state_bytes
         if self._graft_history is not None:
@@ -875,7 +886,9 @@ class StreamedDeepSeekV4:
             )
         loaded = read_snapshot(
             path,
-            expected_identity=self._snapshot_identity(),
+            expected_identity=self._snapshot_identity(
+                transport_neutral=transport_neutral
+            ),
             limits=limits,
             resident_bytes=resident_bytes,
             max_restore_peak_bytes=max_restore_peak_bytes,
@@ -1103,6 +1116,7 @@ class StreamedDeepSeekV4:
             **loaded.summary,
             "next_position": next_position,
             "state_poisoned": poisoned,
+            "transport_neutral": transport_neutral,
         }
 
     def _attention(self, x: Any, layer: int, start_pos: int) -> Any:
