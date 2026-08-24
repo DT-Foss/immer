@@ -64,6 +64,10 @@ All notable changes to IMMER are recorded here.
   pair manifest, resumed traces renumber new operations canonically,
   identity/capacity drops fail the run, and the final result cites its exact
   trace digest and coverage.
+- Added the Qwen shared-prefix direct-decode benchmark: input selection,
+  stateful prefix publication, transport-neutral continuation restore, exact
+  per-arm access traces, hidden dtype/shape/hash invariants, inventory-versus-
+  causal execution, and strict remote/local timing comparison.
 - Rebuilt public documentation around the local causal architecture and
   separated public source from weights, state, traces, and operations.
 

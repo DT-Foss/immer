@@ -20,6 +20,7 @@ SCRIPTS = (
     "poc_mmlu_stream.py",
     "bench_gsm8k.py",
     "qwen38_causal_bundle.py",
+    "qwen38_direct_decode_benchmark.py",
 )
 FORBIDDEN_RESEARCH_IMPORTS = (
     "vendor/mitglm",
