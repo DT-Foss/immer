@@ -74,6 +74,35 @@ def _branch_tokenizer(path: Path) -> tuple[int, int]:
     return int(im_end), int(end_of_text)
 
 
+def _answer_branch_tokenizer(path: Path) -> tuple[int, int]:
+    from tokenizers import AddedToken, Regex, Tokenizer
+    from tokenizers.decoders import Fuse
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Split
+
+    vocab = {
+        "[UNK]": 0,
+        **{str(index): index for index in range(1, 27)},
+        "####": 27,
+        " ": 28,
+    }
+    tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Split(Regex(r"####| "), behavior="isolated")
+    tokenizer.decoder = Fuse()
+    tokenizer.add_special_tokens(
+        [
+            AddedToken("<|endoftext|>", special=True),
+            AddedToken("<|im_start|>", special=True),
+            AddedToken("<|im_end|>", special=True),
+        ]
+    )
+    tokenizer.save(str(path))
+    end_of_text = tokenizer.token_to_id("<|endoftext|>")
+    im_end = tokenizer.token_to_id("<|im_end|>")
+    assert end_of_text is not None and im_end is not None
+    return int(im_end), int(end_of_text)
+
+
 def _native_fixture(root: Path) -> tuple[Path, Path]:
     source_root = root / "native-source"
     source_root.mkdir()
@@ -127,6 +156,8 @@ def _prepared_branch_source(
     *,
     eos: tuple[int, int],
     gold: tuple[str, ...] = ("1", "2"),
+    system_prompt: str = "fixture",
+    thinking: bool = False,
 ) -> dict:
     item_ids = [f"dev-{index}" for index in range(len(gold))]
     document = {
@@ -144,8 +175,8 @@ def _prepared_branch_source(
             "accepted_eos_token_ids": list(eos),
             "batch_size": len(item_ids),
             "item_ids": item_ids,
-            "system_prompt": "fixture",
-            "thinking": False,
+            "system_prompt": system_prompt,
+            "thinking": thinking,
         },
         "schema": benchmark.FERTIG_INPUT_SCHEMA,
         "source": {"checkpoint": REPO_ID, "revision": REVISION},
@@ -182,6 +213,34 @@ def _select_branch(
     )
     args._require_official = False
     selected = benchmark.select_branch_cohort(args)
+    benchmark._write_json(output, selected)
+    return selected
+
+
+def _select_answer_branch(
+    source: Path,
+    tokenizer: Path,
+    output: Path,
+    *,
+    limit: int = 1,
+):
+    args = benchmark._parser().parse_args(
+        [
+            "select-answer-branch-cohort",
+            "--inputs",
+            str(source),
+            "--inputs-sha256",
+            benchmark._sha256_file(source),
+            "--tokenizer-json",
+            str(tokenizer),
+            "--limit",
+            str(limit),
+            "--output",
+            str(output),
+        ]
+    )
+    args._require_official = False
+    selected = benchmark.select_answer_branch_cohort(args)
     benchmark._write_json(output, selected)
     return selected
 
@@ -1388,6 +1447,197 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 ):
                     benchmark.evaluate_generated_triad(invalid_native_args)
                 gold_open.assert_not_called()
+
+    def test_fixed_answer_prefix_input_generates_only_the_numeric_value(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-answer-prefix-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            source_weights, inventory = _native_fixture(root)
+            tokenizer_path = root / "tokenizer.json"
+            eos = _answer_branch_tokenizer(tokenizer_path)
+            source = root / "sealed-answer-dev.json"
+            source_document = _prepared_branch_source(
+                source,
+                eos=eos,
+                gold=("1",),
+                system_prompt=benchmark.ANSWER_OUTPUT_INSTRUCTION,
+                thinking=False,
+            )
+            answer_input_path = root / "answer-input.json"
+            selected = _select_answer_branch(source, tokenizer_path, answer_input_path)
+            self.assertEqual(selected["schema"], benchmark.BRANCH_INPUT_SCHEMA_V3)
+            prefix = selected["protocol"]["generation_prefix"]
+            self.assertEqual(prefix["literal"], "#### ")
+            self.assertTrue(prefix["label_free"])
+            self.assertTrue(prefix["prefix_is_part_of_sealed_prompt"])
+            self.assertEqual(prefix["teacher_forced_tokens_after_prompt"], 0)
+            self.assertEqual(
+                tuple(prefix["token_ids"]),
+                benchmark.Qwen38Tokenizer(
+                    tokenizer_path, require_official=False
+                ).encode("#### "),
+            )
+            self.assertEqual(prefix["token_ids"], [27, 28])
+            self.assertEqual(
+                benchmark.Qwen38Tokenizer(
+                    tokenizer_path, require_official=False
+                ).decode(prefix["token_ids"]),
+                "#### ",
+            )
+            self.assertEqual(
+                benchmark.OFFICIAL_ANSWER_GENERATION_PREFIX_TOKEN_IDS,
+                (794, 220),
+            )
+            item = selected["items"][0]
+            self.assertEqual(item["source_prompt_token_ids"], [1, 4])
+            self.assertEqual(
+                item["effective_prompt_token_ids"],
+                [1, 4, *prefix["token_ids"]],
+            )
+            self.assertEqual(benchmark._load_branch_input(answer_input_path), selected)
+
+            legacy_path = root / "legacy-input.json"
+            legacy = _select_branch(source, tokenizer_path, legacy_path, limit=1)
+            self.assertEqual(legacy["schema"], benchmark.BRANCH_INPUT_SCHEMA)
+            self.assertEqual(legacy["items"][0]["prompt_token_ids"], [1, 4])
+
+            observed_prompts: list[tuple[int, ...]] = []
+
+            def runtime_factory(*factory_args, **factory_kwargs):
+                runtime, model = benchmark._runtime(*factory_args, **factory_kwargs)
+                original_generate = model.generate_greedy
+
+                def recording_generate(prompt_token_ids, **generate_kwargs):
+                    observed_prompts.append(tuple(prompt_token_ids[0]))
+                    return original_generate(prompt_token_ids, **generate_kwargs)
+
+                def fixed_topk(_hidden, *, k, block_rows, progress=None):
+                    del k, block_rows
+                    if progress is not None:
+                        progress(
+                            {
+                                "rows_done": model.config.vocab_size,
+                                "vocab_rows": model.config.vocab_size,
+                            }
+                        )
+                    return (
+                        torch.tensor([[1.0]], device=model.pager.device),
+                        torch.tensor([[1]], device=model.pager.device),
+                    )
+
+                model.generate_greedy = recording_generate
+                model.pager.topk_logits = fixed_topk
+                return runtime, model
+
+            result_path = root / "answer-off.json"
+            generation_args = _branch_generation_args(
+                branch_input=answer_input_path,
+                tokenizer=tokenizer_path,
+                output=result_path,
+                trace=root / "answer-trace.json",
+                source=source_weights,
+                inventory=inventory,
+                cache=root / "answer-cache",
+                mode="native-crsa",
+            )
+            generation_args.max_new_tokens = 1
+            with redirect_stderr(io.StringIO()):
+                result = benchmark.generate_arm(
+                    generation_args, runtime_factory=runtime_factory
+                )
+            benchmark._write_json(result_path, result)
+            self.assertEqual(result["schema"], benchmark.NATIVE_BRANCH_RESULT_SCHEMA)
+            self.assertEqual(
+                observed_prompts, [tuple(item["effective_prompt_token_ids"])]
+            )
+            generated = result["items"][0]
+            self.assertEqual(generated["generated_text"], "1")
+            self.assertNotIn("####", generated["generated_text"])
+            self.assertEqual(generated["parsed_numeric_answer"], "1")
+            self.assertEqual(benchmark._load_native_branch_result(result_path), result)
+            doubled = copy.deepcopy(result)
+            doubled["items"][0]["generated_text"] = "#### 1"
+            doubled["items"][0]["parsed_numeric_answer"] = "1"
+            _reseal(doubled)
+            doubled_path = root / "answer-doubled-prefix.json"
+            benchmark._write_json(doubled_path, doubled)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "re-emits the sealed #### prefix"
+            ):
+                benchmark._load_native_branch_result(doubled_path)
+            _rows, targets = benchmark._gold_rows_for_branch(source_document, result)
+            self.assertEqual(targets, {"dev-0": "1"})
+
+            def assert_tamper_rejected(name: str, mutate) -> None:
+                document = copy.deepcopy(selected)
+                mutate(document)
+                _reseal(document)
+                path = root / f"answer-tamper-{name}.json"
+                benchmark._write_json(path, document)
+                with self.assertRaises(benchmark.QwenDirectDecodeError):
+                    benchmark._load_branch_input(path)
+
+            assert_tamper_rejected(
+                "literal",
+                lambda document: document["protocol"]["generation_prefix"].update(
+                    {"literal": "### "}
+                ),
+            )
+            assert_tamper_rejected(
+                "tokens",
+                lambda document: document["protocol"]["generation_prefix"][
+                    "token_ids"
+                ].__setitem__(0, 1),
+            )
+            assert_tamper_rejected(
+                "source-prompt",
+                lambda document: document["items"][0][
+                    "source_prompt_token_ids"
+                ].__setitem__(0, 2),
+            )
+            assert_tamper_rejected(
+                "effective-prompt",
+                lambda document: document["items"][0][
+                    "effective_prompt_token_ids"
+                ].__setitem__(0, 2),
+            )
+
+            thinking_source = root / "thinking-source.json"
+            _prepared_branch_source(
+                thinking_source,
+                eos=eos,
+                gold=("1",),
+                system_prompt=benchmark.ANSWER_OUTPUT_INSTRUCTION,
+                thinking=True,
+            )
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "disable thinking"
+            ):
+                _select_answer_branch(
+                    thinking_source,
+                    tokenizer_path,
+                    root / "thinking-never.json",
+                )
+
+            vague_source = root / "vague-source.json"
+            _prepared_branch_source(
+                vague_source,
+                eos=eos,
+                gold=("1",),
+                system_prompt="Return a numeric answer.",
+                thinking=False,
+            )
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "explicit ####"
+            ):
+                _select_answer_branch(
+                    vague_source,
+                    tokenizer_path,
+                    root / "vague-never.json",
+                )
 
 
 if __name__ == "__main__":

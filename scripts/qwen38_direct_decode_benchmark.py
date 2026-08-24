@@ -65,6 +65,7 @@ DECODE_SCHEMA = "immer.qwen3.8-direct-decode/v1"
 COMPARISON_SCHEMA = "immer.qwen3.8-direct-decode-comparison/v1"
 FERTIG_INPUT_SCHEMA = "immer.qwen3.8-fertig-draft-inputs/v1"
 BRANCH_INPUT_SCHEMA = "immer.qwen3.8-generation-branch-input/v2"
+BRANCH_INPUT_SCHEMA_V3 = "immer.qwen3.8-generation-branch-input/v3"
 BRANCH_RESULT_SCHEMA = "immer.qwen3.8-generation-branch-arm/v2"
 BRANCH_COMPARISON_SCHEMA = "immer.qwen3.8-generation-branch-comparison/v2"
 BRANCH_EVALUATION_SCHEMA = "immer.qwen3.8-generation-branch-evaluation/v2"
@@ -84,6 +85,14 @@ BRANCH_TRIAD_EVALUATION_SCHEMA = TRIAD_EVALUATION_SCHEMA
 NATIVE_CRSA_ALPHA = 0.01
 NATIVE_CRSA_BALANCE_ALPHA = 1.0
 NATIVE_CRSA_DIAGONAL_DEBIT = 3.0
+
+ANSWER_GENERATION_PREFIX_LITERAL = "#### "
+ANSWER_GENERATION_PREFIX_KIND = "fixed-answer-value-prefix/v1"
+OFFICIAL_ANSWER_GENERATION_PREFIX_TOKEN_IDS = (794, 220)
+ANSWER_OUTPUT_INSTRUCTION = (
+    "Solve the math problem internally. Return only #### followed by the numeric "
+    "answer. Do not show work."
+)
 
 _SEAL_FIELDS = ("sha256", "report_sha256", "document_sha256")
 _FORBIDDEN_BRANCH_INPUT_KEYS = frozenset(
@@ -480,6 +489,152 @@ def select_branch_cohort(
     return _result(identity)
 
 
+def _validate_answer_source_protocol(projection: Mapping[str, Any]) -> None:
+    protocol = projection.get("protocol")
+    system_prompt = (
+        protocol.get("system_prompt") if isinstance(protocol, Mapping) else None
+    )
+    instruction = system_prompt.lower() if isinstance(system_prompt, str) else ""
+    if (
+        not isinstance(protocol, Mapping)
+        or protocol.get("thinking") is not False
+        or not system_prompt
+        or "return" not in instruction
+        or "####" not in system_prompt
+        or "answer" not in instruction
+    ):
+        raise QwenDirectDecodeError(
+            "answer branch source must disable thinking and use the explicit #### "
+            "output instruction"
+        )
+
+
+def _answer_generation_prefix(
+    tokenizer: Qwen38Tokenizer,
+    tokenizer_identity: Mapping[str, Any],
+) -> tuple[int, ...]:
+    try:
+        token_ids = tokenizer.encode(ANSWER_GENERATION_PREFIX_LITERAL)
+    except Exception as exc:
+        raise QwenDirectDecodeError(
+            "answer generation prefix cannot be encoded"
+        ) from exc
+    if not token_ids:
+        raise QwenDirectDecodeError("answer generation prefix encoded to no tokens")
+    vocab_size = int(tokenizer_identity["vocab_size"])
+    if max(token_ids) >= vocab_size:
+        raise QwenDirectDecodeError(
+            "answer generation prefix exceeds tokenizer vocabulary"
+        )
+    try:
+        decoded = tokenizer.decode(token_ids)
+    except Exception as exc:
+        raise QwenDirectDecodeError(
+            "answer generation prefix cannot be decoded"
+        ) from exc
+    if decoded != ANSWER_GENERATION_PREFIX_LITERAL:
+        raise QwenDirectDecodeError(
+            "answer generation prefix does not round-trip through pinned tokenizer"
+        )
+    if tokenizer_identity.get("require_official") is True and token_ids != (
+        OFFICIAL_ANSWER_GENERATION_PREFIX_TOKEN_IDS
+    ):
+        raise QwenDirectDecodeError(
+            "official answer generation prefix must encode to [794, 220]"
+        )
+    return token_ids
+
+
+def _answer_generation_prefix_record(token_ids: Sequence[int]) -> dict[str, Any]:
+    return {
+        "kind": ANSWER_GENERATION_PREFIX_KIND,
+        "label_free": True,
+        "literal": ANSWER_GENERATION_PREFIX_LITERAL,
+        "prefix_is_part_of_sealed_prompt": True,
+        "teacher_forced_tokens_after_prompt": 0,
+        "token_ids": list(token_ids),
+    }
+
+
+def select_answer_branch_cohort(
+    args: argparse.Namespace,
+    *,
+    tokenizer_factory: Callable[..., Qwen38Tokenizer] = Qwen38Tokenizer,
+) -> dict[str, Any]:
+    """Seal value-generation prompts with the one fixed label-free prefix."""
+
+    document, raw_file_sha256 = _externally_sealed_json(
+        args.inputs,
+        args.inputs_sha256,
+        "answer branch source input",
+    )
+    projection = _source_contract_projection(document)
+    _validate_answer_source_protocol(projection)
+    rows = projection["items"]
+    offset = int(args.offset)
+    limit = int(args.limit)
+    if offset + limit > len(rows):
+        raise QwenDirectDecodeError("answer branch cohort slice exceeds source rows")
+    selected = rows[offset : offset + limit]
+    tokenizer, tokenizer_identity = _tokenizer_record(
+        args.tokenizer_json,
+        require_official=getattr(args, "_require_official", True),
+        tokenizer_factory=tokenizer_factory,
+    )
+    prefix = _answer_generation_prefix(tokenizer, tokenizer_identity)
+    eos = projection["protocol"]["accepted_eos_token_ids"]
+    controls = tokenizer_identity["control_token_ids"]
+    if set(eos) != {controls["im_end"], controls["end_of_text"]}:
+        raise QwenDirectDecodeError("source EOS set differs from tokenizer identity")
+    vocab_size = int(tokenizer_identity["vocab_size"])
+    items: list[dict[str, Any]] = []
+    for row in selected:
+        source_prompt = list(row["prompt_token_ids"])
+        effective_prompt = [*source_prompt, *prefix]
+        if max(effective_prompt) >= vocab_size:
+            raise QwenDirectDecodeError(
+                "answer branch prompt exceeds tokenizer vocabulary"
+            )
+        items.append(
+            {
+                "effective_prompt_token_ids": effective_prompt,
+                "item_id": row["item_id"],
+                "source_prompt_token_ids": source_prompt,
+            }
+        )
+    identity = {
+        "items": items,
+        "protocol": {
+            "accepted_eos_token_ids": eos,
+            "execution_mode": "serial_items/shared_weight_pager",
+            "generation_prefix": _answer_generation_prefix_record(prefix),
+            "independent_prefills": True,
+            "teacher_forced_tokens_after_prompt": 0,
+        },
+        "schema": BRANCH_INPUT_SCHEMA_V3,
+        "selection": {
+            "item_ids": [row["item_id"] for row in selected],
+            "kind": "ordered-slice/v1",
+            "limit": limit,
+            "offset": offset,
+            "source_items": len(rows),
+        },
+        "source": {
+            "checkpoint": projection["source"]["checkpoint"],
+            "contract_sha256": _sha256(projection),
+            "raw_file_sha256": raw_file_sha256,
+            "revision": projection["source"]["revision"],
+            "schema": FERTIG_INPUT_SCHEMA,
+            "seal_kind": EXTERNAL_RAW_SEAL_KIND,
+        },
+        "status": "sealed",
+        "tokenizer": tokenizer_identity,
+    }
+    if _contains_forbidden_branch_input_key(identity):  # pragma: no cover
+        raise QwenDirectDecodeError("answer branch cohort contains forbidden fields")
+    return _result(identity)
+
+
 def _validate_branch_input_document(document: dict[str, Any]) -> dict[str, Any]:
     required = {
         "items",
@@ -608,8 +763,147 @@ def _validate_branch_input_document(document: dict[str, Any]) -> dict[str, Any]:
     return document
 
 
+def _answer_branch_v2_projection(document: Mapping[str, Any]) -> dict[str, Any]:
+    projected = {key: value for key, value in document.items() if key != "sha256"}
+    projected["items"] = [
+        {
+            "item_id": row["item_id"],
+            "prompt_token_ids": row["effective_prompt_token_ids"],
+        }
+        for row in document["items"]
+    ]
+    projected["protocol"] = {
+        key: value
+        for key, value in document["protocol"].items()
+        if key != "generation_prefix"
+    }
+    projected["schema"] = BRANCH_INPUT_SCHEMA
+    return _result(projected)
+
+
+def _validate_answer_branch_input_document(
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "items",
+        "protocol",
+        "schema",
+        "selection",
+        "sha256",
+        "source",
+        "status",
+        "tokenizer",
+    }
+    if set(document) != required or document.get("schema") != BRANCH_INPUT_SCHEMA_V3:
+        raise QwenDirectDecodeError("answer branch input schema is invalid")
+    _verify_document_seal(document, "answer branch input")
+    if document.get("status") != "sealed":
+        raise QwenDirectDecodeError("answer branch input is not sealed")
+    if _contains_forbidden_branch_input_key(document):
+        raise QwenDirectDecodeError(
+            "answer branch input contains label or draft fields"
+        )
+    protocol = document.get("protocol")
+    tokenizer = document.get("tokenizer")
+    rows = document.get("items")
+    if (
+        not isinstance(protocol, Mapping)
+        or not isinstance(tokenizer, Mapping)
+        or not isinstance(rows, list)
+    ):
+        raise QwenDirectDecodeError("answer branch input structure is invalid")
+    if set(protocol) != {
+        "accepted_eos_token_ids",
+        "execution_mode",
+        "generation_prefix",
+        "independent_prefills",
+        "teacher_forced_tokens_after_prompt",
+    }:
+        raise QwenDirectDecodeError("answer branch generation protocol is invalid")
+    prefix = protocol.get("generation_prefix")
+    if not isinstance(prefix, Mapping) or set(prefix) != {
+        "kind",
+        "label_free",
+        "literal",
+        "prefix_is_part_of_sealed_prompt",
+        "teacher_forced_tokens_after_prompt",
+        "token_ids",
+    }:
+        raise QwenDirectDecodeError("answer generation prefix record is invalid")
+    prefix_tokens = _token_rows(
+        prefix.get("token_ids"), "answer generation prefix tokens"
+    )
+    if (
+        prefix.get("kind") != ANSWER_GENERATION_PREFIX_KIND
+        or prefix.get("literal") != ANSWER_GENERATION_PREFIX_LITERAL
+        or prefix.get("label_free") is not True
+        or prefix.get("prefix_is_part_of_sealed_prompt") is not True
+        or prefix.get("teacher_forced_tokens_after_prompt") != 0
+        or protocol.get("teacher_forced_tokens_after_prompt") != 0
+    ):
+        raise QwenDirectDecodeError("answer generation prefix contract is invalid")
+    if tokenizer.get("require_official") is True and prefix_tokens != (
+        OFFICIAL_ANSWER_GENERATION_PREFIX_TOKEN_IDS
+    ):
+        raise QwenDirectDecodeError("official answer generation prefix IDs are invalid")
+    selection = document.get("selection")
+    item_ids = selection.get("item_ids") if isinstance(selection, Mapping) else None
+    vocab_size = tokenizer.get("vocab_size")
+    if (
+        not isinstance(item_ids, list)
+        or not isinstance(vocab_size, int)
+        or isinstance(vocab_size, bool)
+        or vocab_size < 1
+        or len(rows) != len(item_ids)
+    ):
+        raise QwenDirectDecodeError("answer branch item identity is invalid")
+    seen: set[str] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != {
+            "effective_prompt_token_ids",
+            "item_id",
+            "source_prompt_token_ids",
+        }:
+            raise QwenDirectDecodeError("answer branch item schema is invalid")
+        item_id = row.get("item_id")
+        if (
+            not isinstance(item_id, str)
+            or not item_id
+            or item_id in seen
+            or item_id != item_ids[index]
+        ):
+            raise QwenDirectDecodeError(
+                "answer branch item order or identity is invalid"
+            )
+        source_prompt = _token_rows(
+            row.get("source_prompt_token_ids"), f"source prompt {item_id}"
+        )
+        effective_prompt = _token_rows(
+            row.get("effective_prompt_token_ids"), f"effective prompt {item_id}"
+        )
+        if effective_prompt != (*source_prompt, *prefix_tokens):
+            raise QwenDirectDecodeError(
+                "answer branch effective prompt does not equal source prompt plus prefix"
+            )
+        if max(effective_prompt) >= vocab_size:
+            raise QwenDirectDecodeError(
+                "answer branch prompt exceeds tokenizer vocabulary"
+            )
+        seen.add(item_id)
+    _validate_branch_input_document(_answer_branch_v2_projection(document))
+    return document
+
+
+def _validate_branch_input(document: dict[str, Any]) -> dict[str, Any]:
+    if document.get("schema") == BRANCH_INPUT_SCHEMA:
+        return _validate_branch_input_document(document)
+    if document.get("schema") == BRANCH_INPUT_SCHEMA_V3:
+        return _validate_answer_branch_input_document(document)
+    raise QwenDirectDecodeError("branch input schema is invalid")
+
+
 def _load_branch_input(path: str | os.PathLike[str]) -> dict[str, Any]:
-    return _validate_branch_input_document(_strict_json(path))
+    return _validate_branch_input(_strict_json(path))
 
 
 def _load_input(path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -1369,8 +1663,23 @@ def generate_arm(
     if tokenizer_identity != inputs["tokenizer"]:
         raise QwenDirectDecodeError("generation tokenizer differs from branch input")
     tokenizer = _tokenizer
+    answer_input = inputs["schema"] == BRANCH_INPUT_SCHEMA_V3
+    if answer_input:
+        encoded_prefix = _answer_generation_prefix(tokenizer, tokenizer_identity)
+        sealed_prefix = tuple(inputs["protocol"]["generation_prefix"]["token_ids"])
+        if encoded_prefix != sealed_prefix:
+            raise QwenDirectDecodeError(
+                "answer generation prefix differs from pinned tokenizer"
+            )
     prompts = [
-        _token_rows(row["prompt_token_ids"], f"prompt {row['item_id']}")
+        _token_rows(
+            (
+                row["effective_prompt_token_ids"]
+                if answer_input
+                else row["prompt_token_ids"]
+            ),
+            f"prompt {row['item_id']}",
+        )
         for row in inputs["items"]
     ]
     max_prompt = max(len(prompt) for prompt in prompts)
@@ -1501,6 +1810,13 @@ def generate_arm(
             eos_token_id = generated_ids[-1] if stopped else None
             if stopped != (generated_ids[-1] in eos):
                 raise QwenDirectDecodeError("runtime EOS evidence is inconsistent")
+            if answer_input and "####" in text:
+                raise QwenDirectDecodeError(
+                    "answer branch generated text re-emits the sealed #### prefix"
+                )
+            parsed_text = (
+                f"{ANSWER_GENERATION_PREFIX_LITERAL}{text}" if answer_input else text
+            )
             item = {
                 "context_mode": evidence.context_mode,
                 "eos_token_id": eos_token_id,
@@ -1513,7 +1829,7 @@ def generate_arm(
                 "head_scans": completed_scans,
                 "item_id": str(source_row["item_id"]),
                 "linear_calls": int(evidence.linear_calls),
-                "parsed_numeric_answer": extract_gsm8k_answer(text),
+                "parsed_numeric_answer": extract_gsm8k_answer(parsed_text),
                 "prefill_mode": evidence.prefill_mode,
                 "prompt_token_ids": list(prompt),
                 "seconds": float(evidence.seconds),
@@ -1758,7 +2074,8 @@ def _validate_branch_result_document(document: dict[str, Any]) -> dict[str, Any]
     input_identity = document.get("input")
     if not isinstance(input_identity, dict):
         raise QwenDirectDecodeError("branch input identity is invalid")
-    _validate_branch_input_document(input_identity)
+    _validate_branch_input(input_identity)
+    answer_input = input_identity["schema"] == BRANCH_INPUT_SCHEMA_V3
     if (
         checkpoint["repo_id"] != input_identity["source"]["checkpoint"]
         or checkpoint["revision"] != input_identity["source"]["revision"]
@@ -1906,10 +2223,13 @@ def _validate_branch_result_document(document: dict[str, Any]) -> dict[str, Any]
         if row.get("item_id") != item_ids[index]:
             raise QwenDirectDecodeError("branch generated item order differs")
         prompt = _token_rows(row.get("prompt_token_ids"), "generated prompt")
-        if (
-            row["item_id"] != input_identity["items"][index]["item_id"]
-            or list(prompt) != input_identity["items"][index]["prompt_token_ids"]
-        ):
+        sealed_item = input_identity["items"][index]
+        sealed_prompt = (
+            sealed_item["effective_prompt_token_ids"]
+            if answer_input
+            else sealed_item["prompt_token_ids"]
+        )
+        if row["item_id"] != sealed_item["item_id"] or list(prompt) != sealed_prompt:
             raise QwenDirectDecodeError(
                 "branch result prompt differs from sealed input"
             )
@@ -1923,9 +2243,18 @@ def _validate_branch_result_document(document: dict[str, Any]) -> dict[str, Any]
         if row.get("token_chain_sha256") != _token_chain_sha256(prompt, generated):
             raise QwenDirectDecodeError("branch token-chain digest mismatch")
         text = row.get("generated_text")
+        if answer_input and isinstance(text, str) and "####" in text:
+            raise QwenDirectDecodeError(
+                "answer branch generated text re-emits the sealed #### prefix"
+            )
+        parsed_text = (
+            f"{ANSWER_GENERATION_PREFIX_LITERAL}{text}"
+            if answer_input and isinstance(text, str)
+            else text
+        )
         if not isinstance(text, str) or row.get(
             "parsed_numeric_answer"
-        ) != extract_gsm8k_answer(text):
+        ) != extract_gsm8k_answer(parsed_text):
             raise QwenDirectDecodeError("branch parsed numeric answer is inconsistent")
         stopped = row.get("stopped_on_eos")
         if not isinstance(stopped, bool):
@@ -2571,11 +2900,34 @@ def _gold_rows_for_branch(
     expected_items = projection["items"][
         selection["offset"] : selection["offset"] + selection["limit"]
     ]
-    if (
-        selection["source_items"] != len(projection["items"])
-        or off["input"]["items"] != expected_items
-    ):
-        raise QwenDirectDecodeError("sealed branch selection differs from label source")
+    if off["input"]["schema"] == BRANCH_INPUT_SCHEMA:
+        if (
+            selection["source_items"] != len(projection["items"])
+            or off["input"]["items"] != expected_items
+        ):
+            raise QwenDirectDecodeError(
+                "sealed branch selection differs from label source"
+            )
+    else:
+        _validate_answer_source_protocol(projection)
+        prefix = tuple(off["input"]["protocol"]["generation_prefix"]["token_ids"])
+        sealed_items = off["input"]["items"]
+        if selection["source_items"] != len(projection["items"]) or len(
+            sealed_items
+        ) != len(expected_items):
+            raise QwenDirectDecodeError(
+                "sealed answer branch selection differs from label source"
+            )
+        for sealed, expected in zip(sealed_items, expected_items, strict=True):
+            source_prompt = list(expected["prompt_token_ids"])
+            if (
+                sealed["item_id"] != expected["item_id"]
+                or sealed["source_prompt_token_ids"] != source_prompt
+                or sealed["effective_prompt_token_ids"] != [*source_prompt, *prefix]
+            ):
+                raise QwenDirectDecodeError(
+                    "sealed answer prompts differ from label source"
+                )
     selection_ids = selection["item_ids"]
     by_id = {row["item_id"]: row for row in _source_rows(source)}
     rows: list[Mapping[str, Any]] = []
@@ -2998,6 +3350,16 @@ def _parser() -> argparse.ArgumentParser:
     branch_select.add_argument("--limit", type=_positive_int, default=8)
     branch_select.add_argument("--output", required=True)
     branch_select.set_defaults(handler=select_branch_cohort)
+    answer_branch_select = subparsers.add_parser(
+        "select-answer-branch-cohort", aliases=("select-answer-branch-input",)
+    )
+    answer_branch_select.add_argument("--inputs", "--source-input", required=True)
+    answer_branch_select.add_argument("--inputs-sha256", required=True)
+    answer_branch_select.add_argument("--tokenizer-json", required=True)
+    answer_branch_select.add_argument("--offset", type=_nonnegative_int, default=0)
+    answer_branch_select.add_argument("--limit", type=_positive_int, default=8)
+    answer_branch_select.add_argument("--output", required=True)
+    answer_branch_select.set_defaults(handler=select_answer_branch_cohort)
     branch_generate = subparsers.add_parser("generate-arm")
     _branch_runtime_arguments(branch_generate)
     branch_generate.set_defaults(handler=generate_arm)
