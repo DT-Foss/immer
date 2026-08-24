@@ -36,6 +36,13 @@ All notable changes to IMMER are recorded here.
   a warm remote range cache and 1,100+ seconds from cold remote transport.
 - Added FERTIG draft verification and exact/model fusion receipts for fixed
   integration cohorts.
+- Completed Qwen3.8 stateful execution: all full-attention KV and DeltaNet
+  recurrent/convolution states now persist across prefill and decode, failed
+  forwards poison and clear partial state, CRSA history continues causally,
+  and streamed greedy generation leaves a fully resumable cursor.
+- Proved batched prefill, tokenwise prefill, and continuation decode are
+  bit-identical in the checkpoint's BF16 execution mode on the executable
+  model fixture.
 - Rebuilt public documentation around the local causal architecture and
   separated public source from weights, state, traces, and operations.
 

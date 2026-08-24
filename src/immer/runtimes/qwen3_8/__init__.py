@@ -16,7 +16,13 @@ from .encoding import (
 )
 from .graft import Qwen38StableCrsaGraft
 from .kernels import AttentionState, DeltaNetState
-from .model import PrefillEvidence, Qwen38RuntimeError, StreamedQwen38
+from .model import (
+    GenerationEvidence,
+    PrefillEvidence,
+    Qwen38RuntimeError,
+    StatefulEvidence,
+    StreamedQwen38,
+)
 from .pager import Qwen38PagerError, Qwen38WeightPager
 
 
@@ -24,6 +30,7 @@ __all__ = [
     "AttentionState",
     "DeltaNetState",
     "END_OF_TEXT_TOKEN_ID",
+    "GenerationEvidence",
     "IM_END_TOKEN_ID",
     "IM_START_TOKEN_ID",
     "OFFICIAL_REPO_ID",
@@ -38,5 +45,6 @@ __all__ = [
     "Qwen38StableCrsaGraft",
     "Qwen38Tokenizer",
     "Qwen38WeightPager",
+    "StatefulEvidence",
     "StreamedQwen38",
 ]
