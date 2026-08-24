@@ -6,14 +6,16 @@ whole benchmark prompt.  Every digit-based numeric surface is entered in an
 evidence ledger and a problem is returned only when each surface is consumed by
 exactly one accepted relation.
 
-The initial complete family covers count assignments, additive and scalar
-entity relations, explicit totals, and one explicit target.  Unsupported or
-ambiguous language produces a typed abstention result rather than partial IR.
+The complete families cover affine entity counts and typed rate ledgers.  A
+rate ledger binds local unit-price declarations to local acquisitions, lowers
+each price-times-quantity line through :class:`~arithmetic_ir.Rate`, and sums
+the line amounts into one explicit cost target.  Unsupported or ambiguous
+language produces a typed abstention result rather than partial IR.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from fractions import Fraction
@@ -27,6 +29,7 @@ from .arithmetic_ir import (
     Constraint,
     Problem,
     Quantity,
+    Rate,
     Span,
     Sum,
     Unit,
@@ -127,7 +130,27 @@ class NumericMention:
         return self.span.source[self.span.start : self.span.end]
 
 
-RelationArgument = SymbolKey | Fraction | str | tuple[SymbolKey, ...]
+@dataclass(frozen=True, slots=True)
+class RateScope:
+    """Lexically attested scope shared by one local block of unit prices."""
+
+    group: str | None
+    label: str | None
+    venue: str | None
+    span: Span = field(compare=False, hash=False)
+
+    def __post_init__(self) -> None:
+        if self.group is not None and not self.group.strip():
+            raise ValueError("rate-scope group must be non-empty when present")
+        if self.label is not None and not self.label.strip():
+            raise ValueError("rate-scope label must be non-empty when present")
+        if self.venue is not None and not self.venue.strip():
+            raise ValueError("rate-scope venue must be non-empty when present")
+        if not isinstance(self.span, Span):
+            raise TypeError("rate-scope span must be a Span")
+
+
+RelationArgument = SymbolKey | RateScope | Fraction | str | tuple[SymbolKey, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,6 +407,42 @@ def _item_head(item: str) -> str:
     return item.rsplit(" ", 1)[-1]
 
 
+def _normal_unit(raw: str) -> str:
+    words = re.findall(_WORD, raw.casefold())
+    if len(words) != 1:
+        raise ValueError("rate unit must be one explicit unit word")
+    return _singular_word(words[0])
+
+
+_GENERIC_RATE_CONTEXT_WORDS = {
+    "downtown",
+    "large",
+    "local",
+    "nearby",
+    "neighborhood",
+    "new",
+    "old",
+    "small",
+}
+
+
+def _rate_context_group(raw: str) -> str | None:
+    """Return only the explicit noun immediately modifying a venue."""
+
+    words = re.findall(_WORD, raw.casefold())
+    if not words:
+        return None
+    candidate = _singular_word(words[-1])
+    if candidate in _GENERIC_RATE_CONTEXT_WORDS:
+        return None
+    return candidate
+
+
+def _rate_context_label(raw: str) -> str | None:
+    words = re.findall(_WORD, raw.casefold())
+    return " ".join(words) or None
+
+
 def _sentences(source: str) -> tuple[_Clause, ...]:
     clauses: list[_Clause] = []
     start = 0
@@ -468,6 +527,30 @@ def _split_coordinated(clause: _Clause, source: str) -> tuple[_Clause, ...]:
     return tuple(pieces)
 
 
+_CONDITIONAL_QUESTION = re.compile(
+    r"^if\s+(?P<fact>.+),\s*(?P<question>how\s+much\b.+)$",
+    re.IGNORECASE,
+)
+
+
+def _split_conditional_question(clause: _Clause, source: str) -> tuple[_Clause, ...]:
+    """Split a local ``If <fact>, <target>?`` without parsing either side."""
+
+    if not clause.question:
+        return (clause,)
+    match = _CONDITIONAL_QUESTION.fullmatch(clause.text)
+    if match is None:
+        return (clause,)
+    fact_start = clause.start + match.start("fact")
+    fact_end = clause.start + match.end("fact")
+    target_start = clause.start + match.start("question")
+    target_end = clause.start + match.end("question")
+    return (
+        _Clause(source[fact_start:fact_end], fact_start, fact_end, False),
+        _Clause(source[target_start:target_end], target_start, target_end, True),
+    )
+
+
 _ENTITY_SCOPE = re.compile(
     rf"^(?P<owners>{_NAME_LIST})\s+(?:all\s+)?(?:have|own)\s+"
     rf"(?:(?:a|their)\s+)?(?:(?:collections?|sets?)\s+of\s+)?"
@@ -545,6 +628,58 @@ _TARGET_NUMBER = re.compile(
     rf"(?:that\s+)?(?P<owner>{_NAME})\s+(?:has|owns|holds|keeps)$",
     re.IGNORECASE,
 )
+_RATE_CONTEXT_PREFIX = re.compile(
+    r"^at\s+(?:the\s+)?(?P<label>[^,]{0,100}?)"
+    r"(?P<venue>\b(?:orchard|market|store|shop))\s*,\s*",
+    re.IGNORECASE,
+)
+_RATE_PICK_INTRO = re.compile(
+    r"^(?:you|customers?|shoppers?)\s+could\s+(?:pick|buy)\s+"
+    r"(?:(?:your|their)\s+own\s+)?",
+    re.IGNORECASE,
+)
+_RATE_TERM = re.compile(
+    rf"(?<![A-Za-z'\-’])(?!and\b)"
+    rf"(?P<item>{_WORD}(?:\s+{_WORD}){{0,2}}?)\s+"
+    r"(?:for|(?:were|was|are|is)(?:\s+priced\s+at)?|"
+    r"(?:costs?|sells?)(?:\s+for)?)\s+"
+    rf"(?:\$\s*(?P<price>{_NUMBER})|"
+    rf"(?P<price_words>{_NUMBER})\s+dollars?)\s+per\s+"
+    rf"(?P<unit>{_WORD})",
+    re.IGNORECASE,
+)
+_ACQUISITION = re.compile(
+    rf"^(?P<buyer>{_NAME})\s+(?:picked|bought|purchased)\s+"
+    r"(?P<terms>.+)$",
+    re.IGNORECASE,
+)
+_ACQUISITION_TERM = re.compile(
+    rf"(?P<quantity>{_NUMBER})\s+(?P<unit>{_WORD})\s+of\s+"
+    rf"(?P<item>{_WORD}(?:\s+{_WORD}){{0,2}}?)"
+    r"(?=\s*(?:,|\band\b|$))",
+    re.IGNORECASE,
+)
+_COST_TARGET = re.compile(
+    rf"^how\s+much(?:\s+money)?\s+did\s+"
+    rf"(?P<owner>he|she|they|{_NAME})\s+spend\s+(?:on|for)\s+"
+    rf"(?P<item>{_NOUN})$",
+    re.IGNORECASE,
+)
+
+
+def _is_complete_list(text: str, matches: tuple[re.Match[str], ...]) -> bool:
+    if not matches:
+        return False
+    cursor = 0
+    for index, match in enumerate(matches):
+        gap = text[cursor : match.start()]
+        if index == 0:
+            if gap.strip():
+                return False
+        elif re.fullmatch(r"\s*(?:,|,?\s+and)\s*", gap, re.IGNORECASE) is None:
+            return False
+        cursor = match.end()
+    return not text[cursor:].strip()
 
 
 class ClauseCompiler:
@@ -570,7 +705,11 @@ class ClauseCompiler:
                 CompileStatus.INVALID, "source contains an invalid number"
             )
         try:
-            clauses = _sentences(self.source)
+            clauses = tuple(
+                piece
+                for clause in _sentences(self.source)
+                for piece in _split_conditional_question(clause, self.source)
+            )
             if not clauses:
                 raise _CompileAbort(CompileStatus.INVALID, "source has no clauses")
             self._discover_entity_scopes(clauses)
@@ -578,39 +717,58 @@ class ClauseCompiler:
                 if clause.key in self._scope_clause_keys:
                     continue
                 if clause.question:
-                    target = self._parse_target(clause)
-                    if target is None:
+                    targets = tuple(
+                        target
+                        for target in (
+                            self._parse_target(clause),
+                            self._parse_cost_target(clause),
+                        )
+                        if target is not None
+                    )
+                    if not targets:
                         raise _CompileAbort(
                             CompileStatus.UNSUPPORTED,
                             f"unsupported target at {clause.start}:{clause.end}",
                             clause.span(self.source),
                         )
-                    self.targets.append(target)
+                    if len(targets) != 1:
+                        raise _CompileAbort(
+                            CompileStatus.AMBIGUOUS,
+                            f"target has {len(targets)} interpretations",
+                            clause.span(self.source),
+                        )
+                    self.targets.append(targets[0])
                     continue
-                candidates = tuple(
-                    relation
-                    for relation in (
-                        self._parse_assignment(clause),
-                        self._parse_additive(clause),
-                        self._parse_scaled(clause),
-                        self._parse_divided(clause),
-                        self._parse_total(clause),
-                    )
-                    if relation is not None
-                )
-                if not candidates:
+                candidate_sets: list[tuple[Relation, ...]] = []
+                for relation in (
+                    self._parse_assignment(clause),
+                    self._parse_additive(clause),
+                    self._parse_scaled(clause),
+                    self._parse_divided(clause),
+                    self._parse_total(clause),
+                ):
+                    if relation is not None:
+                        candidate_sets.append((relation,))
+                for relations in (
+                    self._parse_rate_declarations(clause),
+                    self._parse_acquisition(clause),
+                ):
+                    if relations is not None:
+                        candidate_sets.append(relations)
+                if not candidate_sets:
                     raise _CompileAbort(
                         CompileStatus.UNSUPPORTED,
                         f"unsupported clause at {clause.start}:{clause.end}",
                         clause.span(self.source),
                     )
-                if len(candidates) != 1:
+                if len(candidate_sets) != 1:
                     raise _CompileAbort(
                         CompileStatus.AMBIGUOUS,
-                        f"clause has {len(candidates)} interpretations",
+                        f"clause has {len(candidate_sets)} interpretations",
                         clause.span(self.source),
                     )
-                self._accept(candidates[0])
+                for relation in candidate_sets[0]:
+                    self._accept(relation)
 
             if len(self.targets) != 1:
                 status = (
@@ -737,6 +895,16 @@ class ClauseCompiler:
                 CompileStatus.INVALID,
                 f"numeric group {group!r} does not match the evidence ledger",
                 clause.span(self.source),
+            )
+        return mention
+
+    def _mention_at(self, start: int, end: int, evidence_span: Span) -> NumericMention:
+        mention = self.ledger.mention_at(start, end)
+        if mention is None:
+            raise _CompileAbort(
+                CompileStatus.INVALID,
+                "numeric term does not match the evidence ledger",
+                evidence_span,
             )
         return mention
 
@@ -956,6 +1124,147 @@ class ClauseCompiler:
         owner = self._owner(match.group("owner"), clause, allow_new=not self._scopes)
         return TargetRelation(self._symbol(owner, item), clause.span(self.source))
 
+    def _parse_rate_declarations(self, clause: _Clause) -> tuple[Relation, ...] | None:
+        body_offset = 0
+        context = _RATE_CONTEXT_PREFIX.match(clause.text)
+        group: str | None = None
+        label: str | None = None
+        venue: str | None = None
+        if context is not None:
+            body_offset = context.end()
+            group = _rate_context_group(context.group("label"))
+            label = _rate_context_label(context.group("label"))
+            venue = _singular_word(context.group("venue"))
+        body = clause.text[body_offset:]
+        intro = _RATE_PICK_INTRO.match(body)
+        if intro is not None:
+            body_offset += intro.end()
+            body = clause.text[body_offset:]
+        matches = tuple(_RATE_TERM.finditer(body))
+        if not _is_complete_list(body, matches):
+            return None
+
+        scope_end = clause.start + (
+            context.end() if context is not None else clause.end
+        )
+        scope = RateScope(
+            group,
+            label,
+            venue,
+            Span(clause.start, scope_end, self.source),
+        )
+
+        relations: list[Relation] = []
+        seen: set[str] = set()
+        for match in matches:
+            term_start = clause.start + body_offset + match.start()
+            term_end = clause.start + body_offset + match.end()
+            term_span = Span(term_start, term_end, self.source)
+            item = self._resolve_item(match.group("item"), clause)
+            if item in seen:
+                raise _CompileAbort(
+                    CompileStatus.AMBIGUOUS,
+                    f"duplicate unit price for {item}",
+                    term_span,
+                )
+            seen.add(item)
+            price_group = "price" if match.group("price") is not None else "price_words"
+            price_start = clause.start + body_offset + match.start(price_group)
+            price_end = clause.start + body_offset + match.end(price_group)
+            mention = self._mention_at(price_start, price_end, term_span)
+            if mention.value <= 0:
+                raise _CompileAbort(
+                    CompileStatus.INVALID,
+                    "unit prices must be positive",
+                    term_span,
+                )
+            unit = _normal_unit(match.group("unit"))
+            symbol = SymbolKey("vendor", "unit_price", item, "purchase", "offered")
+            relations.append(
+                Relation(
+                    "unit_rate",
+                    (symbol, mention.value, unit, "USD", scope),
+                    term_span,
+                    (mention,),
+                )
+            )
+        return tuple(relations)
+
+    def _parse_acquisition(self, clause: _Clause) -> tuple[Relation, ...] | None:
+        match = _ACQUISITION.fullmatch(clause.text)
+        if match is None:
+            return None
+        terms = match.group("terms")
+        term_matches = tuple(_ACQUISITION_TERM.finditer(terms))
+        if not _is_complete_list(terms, term_matches):
+            return None
+        buyer = self._owner(match.group("buyer"), clause, allow_new=not self._scopes)
+        terms_start = clause.start + match.start("terms")
+        relations: list[Relation] = []
+        seen: set[str] = set()
+        for term_match in term_matches:
+            term_start = terms_start + term_match.start()
+            term_end = terms_start + term_match.end()
+            term_span = Span(term_start, term_end, self.source)
+            item = self._resolve_item(term_match.group("item"), clause)
+            if item in seen:
+                raise _CompileAbort(
+                    CompileStatus.AMBIGUOUS,
+                    f"duplicate acquisition item {item}",
+                    term_span,
+                )
+            seen.add(item)
+            quantity_start = terms_start + term_match.start("quantity")
+            quantity_end = terms_start + term_match.end("quantity")
+            mention = self._mention_at(quantity_start, quantity_end, term_span)
+            if mention.value < 0:
+                raise _CompileAbort(
+                    CompileStatus.INVALID,
+                    "acquisition quantities must be non-negative",
+                    term_span,
+                )
+            unit = _normal_unit(term_match.group("unit"))
+            symbol = SymbolKey(buyer, "quantity", item, "purchase", "acquired")
+            relations.append(
+                Relation(
+                    "acquire",
+                    (symbol, mention.value, unit),
+                    term_span,
+                    (mention,),
+                )
+            )
+        return tuple(relations)
+
+    def _parse_cost_target(self, clause: _Clause) -> TargetRelation | None:
+        match = _COST_TARGET.fullmatch(clause.text)
+        if match is None:
+            return None
+        buyers = {
+            _as_symbol(relation.args[0]).owner
+            for relation in self.relations
+            if relation.kind == "acquire"
+        }
+        raw_owner = match.group("owner")
+        if raw_owner.casefold() in {"he", "she", "they"}:
+            if len(buyers) != 1:
+                raise _CompileAbort(
+                    CompileStatus.AMBIGUOUS,
+                    "cost-target pronoun requires one local acquisition buyer",
+                    clause.span(self.source),
+                )
+            owner = next(iter(buyers))
+        else:
+            owner = self._owner(raw_owner, clause, allow_new=not self._scopes)
+            if buyers and owner not in buyers:
+                raise _CompileAbort(
+                    CompileStatus.AMBIGUOUS,
+                    "cost target does not match the acquisition buyer",
+                    clause.span(self.source),
+                )
+        item = _normal_item(match.group("item"))
+        symbol = SymbolKey(owner, "cost", item, "purchase", "total")
+        return TargetRelation(symbol, clause.span(self.source))
+
     def _accept(self, relation: Relation) -> None:
         for mention in relation.numeric_mentions:
             if not self.ledger.consume(mention, consumer=relation.kind):
@@ -1010,6 +1319,14 @@ class ClauseCompiler:
     def _lower(
         self, relations: tuple[Relation, ...], target: TargetRelation
     ) -> Problem:
+        if target.symbol.property == "cost":
+            return self._lower_rate_ledger(relations, target)
+        if any(relation.kind in {"unit_rate", "acquire"} for relation in relations):
+            raise _CompileAbort(
+                CompileStatus.AMBIGUOUS,
+                "affine and rate-ledger families cannot share one target",
+                target.span,
+            )
         referenced: set[SymbolKey] = set()
         for relation in relations:
             if relation.kind == "assign":
@@ -1083,6 +1400,171 @@ class ClauseCompiler:
             tuple(variables.values()), tuple(constraints), variables[target.symbol]
         )
 
+    def _lower_rate_ledger(
+        self, relations: tuple[Relation, ...], target: TargetRelation
+    ) -> Problem:
+        allowed = {"unit_rate", "acquire"}
+        unexpected = tuple(
+            relation for relation in relations if relation.kind not in allowed
+        )
+        if unexpected:
+            raise _CompileAbort(
+                CompileStatus.AMBIGUOUS,
+                "rate ledger contains relations from another family",
+                unexpected[0].span,
+            )
+
+        rates: dict[str, Relation] = {}
+        acquisitions: dict[str, Relation] = {}
+        for relation in relations:
+            symbol = _as_symbol(relation.args[0])
+            destination = rates if relation.kind == "unit_rate" else acquisitions
+            if symbol.item in destination:
+                label = "unit price" if relation.kind == "unit_rate" else "acquisition"
+                raise _CompileAbort(
+                    CompileStatus.AMBIGUOUS,
+                    f"duplicate {label} for {symbol.item}",
+                    relation.span,
+                )
+            destination[symbol.item] = relation
+
+        if not rates or not acquisitions:
+            raise _CompileAbort(
+                CompileStatus.UNSUPPORTED,
+                "rate ledger requires local prices and acquisitions",
+                target.span,
+            )
+        missing_prices = sorted(acquisitions.keys() - rates.keys())
+        missing_quantities = sorted(rates.keys() - acquisitions.keys())
+        if missing_prices:
+            raise _CompileAbort(
+                CompileStatus.UNSUPPORTED,
+                f"missing unit price for {', '.join(missing_prices)}",
+                acquisitions[missing_prices[0]].span,
+            )
+        if missing_quantities:
+            raise _CompileAbort(
+                CompileStatus.UNSUPPORTED,
+                f"missing acquisition quantity for {', '.join(missing_quantities)}",
+                rates[missing_quantities[0]].span,
+            )
+
+        buyers = {
+            _as_symbol(relation.args[0]).owner for relation in acquisitions.values()
+        }
+        if buyers != {target.symbol.owner}:
+            raise _CompileAbort(
+                CompileStatus.AMBIGUOUS,
+                "all acquisition terms must match the explicit cost target owner",
+                target.span,
+            )
+
+        currencies = {_as_text(relation.args[3]) for relation in rates.values()}
+        if len(currencies) != 1:
+            raise _CompileAbort(
+                CompileStatus.INVALID,
+                "rate ledger contains incompatible currencies",
+                target.span,
+            )
+        currency = next(iter(currencies))
+        scopes = {_as_rate_scope(relation.args[4]) for relation in rates.values()}
+        if len(scopes) != 1:
+            raise _CompileAbort(
+                CompileStatus.AMBIGUOUS,
+                "unit prices come from multiple local rate scopes",
+                target.span,
+            )
+        scope = next(iter(scopes))
+        scope_spans = {
+            (scope_value.span.start, scope_value.span.end)
+            for scope_value in (
+                _as_rate_scope(relation.args[4]) for relation in rates.values()
+            )
+        }
+        if len(scope_spans) > 1 and scope.label is None:
+            raise _CompileAbort(
+                CompileStatus.AMBIGUOUS,
+                "unlabelled price declarations cannot span multiple clauses",
+                target.span,
+            )
+        target_item = target.symbol.item
+        exact_item_target = target_item in rates
+        group_target = scope.group == target_item
+        if exact_item_target and group_target and len(rates) > 1:
+            raise _CompileAbort(
+                CompileStatus.AMBIGUOUS,
+                "cost target names both a line item and the enclosing rate group",
+                target.span,
+            )
+        if not exact_item_target and not group_target:
+            raise _CompileAbort(
+                CompileStatus.AMBIGUOUS,
+                "cost target item is not bound to a line item or explicit rate group",
+                target.span,
+            )
+        money_unit = Unit.base("money", symbol=currency)
+        variables: list[Variable] = []
+        constraints: list[Constraint] = []
+        contributions: dict[str, Variable] = {}
+
+        for item in sorted(rates):
+            rate_relation = rates[item]
+            acquisition = acquisitions[item]
+            rate_unit_text = _as_text(rate_relation.args[2])
+            quantity_unit_text = _as_text(acquisition.args[2])
+            if rate_unit_text != quantity_unit_text:
+                raise _CompileAbort(
+                    CompileStatus.INVALID,
+                    f"incompatible units for {item}: "
+                    f"{rate_unit_text} and {quantity_unit_text}",
+                    acquisition.span,
+                )
+            measure_unit = Unit.base(f"measure:{rate_unit_text}", symbol=rate_unit_text)
+            price_unit = money_unit / measure_unit
+            price_symbol = _as_symbol(rate_relation.args[0])
+            price_variable = Variable(price_symbol.variable_name, price_unit)
+            contribution_symbol = (
+                target.symbol
+                if exact_item_target and item == target_item
+                else SymbolKey(
+                    target.symbol.owner,
+                    "cost",
+                    item,
+                    "purchase",
+                    "line_item",
+                )
+            )
+            contribution = Variable(contribution_symbol.variable_name, money_unit)
+            variables.extend((price_variable, contribution))
+            contributions[item] = contribution
+            constraints.append(
+                Assign(
+                    price_variable,
+                    Quantity(_as_fraction(rate_relation.args[1]), price_unit),
+                    span=rate_relation.span,
+                )
+            )
+            constraints.append(
+                Rate(
+                    contribution,
+                    price_variable,
+                    Quantity(_as_fraction(acquisition.args[1]), measure_unit),
+                    span=acquisition.span,
+                )
+            )
+
+        if exact_item_target:
+            return Problem(
+                tuple(variables),
+                tuple(constraints),
+                contributions[target_item],
+            )
+
+        total = Variable(target.symbol.variable_name, money_unit)
+        variables.append(total)
+        constraints.append(Sum(total, tuple(contributions.values()), span=target.span))
+        return Problem(tuple(variables), tuple(constraints), total)
+
     def _diagnostics(
         self,
         status: CompileStatus,
@@ -1143,8 +1625,14 @@ def _as_text(value: object) -> str:
     return value
 
 
+def _as_rate_scope(value: object) -> RateScope:
+    if not isinstance(value, RateScope):
+        raise TypeError("relation argument must be a RateScope")
+    return value
+
+
 def compile_clauses(source: str) -> CompileResult:
-    """Compile an evidence-closed affine entity problem from local clauses."""
+    """Compile one evidence-closed supported problem from local clauses."""
 
     if not isinstance(source, str):
         diagnostics = CompileDiagnostics(

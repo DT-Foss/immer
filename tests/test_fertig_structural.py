@@ -43,6 +43,24 @@ class AffineStructuralParserTests(unittest.TestCase):
         assert solution.certificate is not None
         self.assertTrue(solution.certificate.verified)
 
+    def test_clause_compiler_promotes_typed_rate_ledger(self) -> None:
+        source = (
+            "At the local Pick Your Own fruit orchard, you could pick your own "
+            "peaches for $2.00 per pound, plums were $1.00 per pound and "
+            "apricots were $3.00 per pound. If Winston picked 6 pounds of "
+            "peaches, 8 pounds of plums and 6 pounds of apricots, how much did "
+            "he spend on fruit?"
+        )
+
+        parsed, solution = _solve(source)
+
+        self.assertEqual(parsed.reason, "evidence-closed clause compiler")
+        self.assertIs(solution.status, SolveStatus.UNIQUE)
+        self.assertEqual(solution.target_value, 38)
+        self.assertIsNotNone(solution.certificate)
+        assert solution.certificate is not None
+        self.assertTrue(solution.certificate.verified)
+
     def test_age_relation_is_exact_and_keeps_source_evidence(self) -> None:
         source = (
             "Chenny is 10 years old. "

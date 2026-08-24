@@ -112,6 +112,20 @@ class FertigAdapterTests(unittest.TestCase):
         self.assertEqual(result.status, ExecutionStatus.OK)
         self.assertEqual(result.output, "153")
 
+    def test_rate_ledger_reaches_the_public_exact_solver_path(self) -> None:
+        question = (
+            "At the local Pick Your Own fruit orchard, you could pick your own "
+            "peaches for $2.00 per pound, plums were $1.00 per pound and "
+            "apricots were $3.00 per pound. If Winston picked 6 pounds of "
+            "peaches, 8 pounds of plums and 6 pounds of apricots, how much did "
+            "he spend on fruit?"
+        )
+
+        result = FertigSolver().handle(Request("exact_math", question))
+
+        self.assertEqual(result.status, ExecutionStatus.OK)
+        self.assertEqual(result.output, "38")
+
     def test_guarded_formula_certificate_precedes_legacy_solver(self) -> None:
         question = (
             "Janeth borrowed $2000 and promised to return it with an additional "
