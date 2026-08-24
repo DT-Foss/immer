@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Benchmark one Qwen3.8 decode token from an authenticated shared prefix."""
+"""Benchmark Qwen3.8 transport parity and sealed free-generation branches.
+
+The original v1 commands benchmark one teacher-forced decode token.  The
+separate branch commands below select a gold-free cohort, run genuine greedy
+autoregressive generation, compare sealed off/CRSA arms, and only then admit a
+separate label-bearing source for transition evaluation.
+"""
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -20,8 +26,11 @@ from typing import Any
 
 import torch
 
-from immer.knowledge import AccessTraceRecorder, Streamer
+from immer.knowledge import AccessTrace, AccessTraceRecorder, Streamer
+from immer.runtimes.deepseek_v4.benchmark import extract_gsm8k_answer
 from immer.runtimes.qwen3_8 import (
+    END_OF_TEXT_TOKEN_ID,
+    IM_END_TOKEN_ID,
     OFFICIAL_REPO_ID,
     OFFICIAL_REVISION,
     CausalWeightMount,
@@ -30,6 +39,8 @@ from immer.runtimes.qwen3_8 import (
     LogicalModelIdentity,
     Qwen38BundleError,
     Qwen38Config,
+    Qwen38StableCrsaGraft,
+    Qwen38Tokenizer,
     Qwen38WeightPager,
     StreamedQwen38,
     build_probe_document,
@@ -45,6 +56,26 @@ PREFIX_SCHEMA = "immer.qwen3.8-direct-prefix/v1"
 DECODE_SCHEMA = "immer.qwen3.8-direct-decode/v1"
 COMPARISON_SCHEMA = "immer.qwen3.8-direct-decode-comparison/v1"
 FERTIG_INPUT_SCHEMA = "immer.qwen3.8-fertig-draft-inputs/v1"
+BRANCH_INPUT_SCHEMA = "immer.qwen3.8-generation-branch-input/v2"
+BRANCH_RESULT_SCHEMA = "immer.qwen3.8-generation-branch-arm/v2"
+BRANCH_COMPARISON_SCHEMA = "immer.qwen3.8-generation-branch-comparison/v2"
+BRANCH_EVALUATION_SCHEMA = "immer.qwen3.8-generation-branch-evaluation/v2"
+TOKEN_CHAIN_SCHEMA = "immer.qwen3.8-autoregressive-token-chain/v1"
+EXTERNAL_RAW_SEAL_KIND = "external-raw-file-sha256/v1"
+
+_SEAL_FIELDS = ("sha256", "report_sha256", "document_sha256")
+_FORBIDDEN_BRANCH_INPUT_KEYS = frozenset(
+    {
+        "answer",
+        "candidate_correct",
+        "correct",
+        "correctness",
+        "decode_token_id",
+        "draft_token_ids",
+        "gold",
+        "predicted",
+    }
+)
 
 
 class QwenDirectDecodeError(RuntimeError):
@@ -105,6 +136,40 @@ def _strict_json(path: str | os.PathLike[str]) -> dict[str, Any]:
     return document
 
 
+def _externally_sealed_json(
+    path: str | os.PathLike[str], expected_sha256: object, label: str
+) -> tuple[dict[str, Any], str]:
+    """Read one file once, authenticate its raw bytes, then parse strict JSON."""
+
+    expected = _digest_string(expected_sha256, f"{label} expected raw file")
+    source = Path(path).expanduser().resolve()
+
+    def pairs(entries: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in entries:
+            if key in result:
+                raise QwenDirectDecodeError(f"duplicate JSON key: {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        raw = source.read_bytes()
+    except OSError as exc:
+        raise QwenDirectDecodeError(f"cannot read {label}: {source}") from exc
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual != expected:
+        raise QwenDirectDecodeError(f"{label} raw file SHA-256 mismatch")
+    try:
+        document = json.loads(raw, object_pairs_hook=pairs)
+    except QwenDirectDecodeError:
+        raise
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise QwenDirectDecodeError(f"cannot read JSON: {source}") from exc
+    if not isinstance(document, dict):
+        raise QwenDirectDecodeError("JSON root must be an object")
+    return document, actual
+
+
 def _atomic_bytes(path: str | os.PathLike[str], value: bytes) -> Path:
     target = Path(path).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -131,6 +196,68 @@ def _result(identity: Mapping[str, Any]) -> dict[str, Any]:
     return {**dict(identity), "sha256": _sha256(identity)}
 
 
+def _verify_document_seal(document: Mapping[str, Any], label: str) -> tuple[str, str]:
+    present = [name for name in _SEAL_FIELDS if name in document]
+    if len(present) != 1:
+        raise QwenDirectDecodeError(f"{label} must have one canonical document seal")
+    field = present[0]
+    claimed = document.get(field)
+    if not isinstance(claimed, str) or not re.fullmatch(r"[0-9a-f]{64}", claimed):
+        raise QwenDirectDecodeError(f"{label} document seal is invalid")
+    unsealed = dict(document)
+    del unsealed[field]
+    if claimed != _sha256(unsealed):
+        raise QwenDirectDecodeError(f"{label} document seal mismatch")
+    return field, claimed
+
+
+def _contains_forbidden_branch_input_key(value: object) -> bool:
+    if isinstance(value, Mapping):
+        for raw_key, child in value.items():
+            key = str(raw_key).strip().lower()
+            if key in _FORBIDDEN_BRANCH_INPUT_KEYS:
+                return True
+            if _contains_forbidden_branch_input_key(child):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_forbidden_branch_input_key(child) for child in value)
+    return False
+
+
+def _nonnegative_count(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise QwenDirectDecodeError(f"{label} must be a non-negative integer")
+    return value
+
+
+def _finite_nonnegative(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise QwenDirectDecodeError(f"{label} must be numeric")
+    result = float(value)
+    if not math.isfinite(result) or result < 0.0:
+        raise QwenDirectDecodeError(f"{label} must be finite and non-negative")
+    return result
+
+
+def _digest_string(value: object, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise QwenDirectDecodeError(f"{label} must be a SHA-256 digest")
+    return value
+
+
+def _token_chain_sha256(
+    prompt_token_ids: Sequence[int], generated_token_ids: Sequence[int]
+) -> str:
+    return _sha256(
+        {
+            "generated_token_ids": list(generated_token_ids),
+            "prompt_length": len(prompt_token_ids),
+            "prompt_token_ids": list(prompt_token_ids),
+            "schema": TOKEN_CHAIN_SCHEMA,
+        }
+    )
+
+
 def _hidden_sha256(hidden: torch.Tensor) -> str:
     cpu = hidden.detach().to(device="cpu").contiguous()
     return hashlib.sha256(cpu.view(torch.uint8).numpy().tobytes()).hexdigest()
@@ -145,6 +272,322 @@ def _token_rows(value: object, label: str) -> tuple[int, ...]:
             raise QwenDirectDecodeError(f"{label} contains an invalid token")
         tokens.append(raw)
     return tuple(tokens)
+
+
+def _source_rows(document: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    if document.get("schema") != FERTIG_INPUT_SCHEMA:
+        raise QwenDirectDecodeError("branch source input schema is invalid")
+    source = document.get("source")
+    protocol = document.get("protocol")
+    raw_rows = document.get("items")
+    if (
+        not isinstance(source, Mapping)
+        or not isinstance(protocol, Mapping)
+        or not isinstance(raw_rows, list)
+        or not raw_rows
+    ):
+        raise QwenDirectDecodeError("branch source input structure is invalid")
+    checkpoint = source.get("checkpoint")
+    revision = source.get("revision")
+    if not isinstance(checkpoint, str) or not checkpoint:
+        raise QwenDirectDecodeError("branch source checkpoint is invalid")
+    if not isinstance(revision, str) or not revision:
+        raise QwenDirectDecodeError("branch source revision is invalid")
+    rows: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(raw_rows):
+        if not isinstance(raw, Mapping):
+            raise QwenDirectDecodeError(f"branch source row {index} is not an object")
+        item_id = raw.get("item_id")
+        if not isinstance(item_id, str) or not item_id or item_id in seen:
+            raise QwenDirectDecodeError(
+                "branch source item IDs are invalid or duplicated"
+            )
+        _token_rows(raw.get("prompt_token_ids"), f"source prompt {item_id}")
+        seen.add(item_id)
+        rows.append(raw)
+    batch_size = protocol.get("batch_size")
+    if batch_size is not None and batch_size != len(rows):
+        raise QwenDirectDecodeError("branch source batch size is inconsistent")
+    protocol_ids = protocol.get("item_ids")
+    if protocol_ids is not None and protocol_ids != [row["item_id"] for row in rows]:
+        raise QwenDirectDecodeError("branch source item order is inconsistent")
+    return tuple(rows)
+
+
+def _source_contract_projection(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Project only generation inputs; labels cannot influence this digest."""
+
+    rows = _source_rows(document)
+    source = document["source"]
+    protocol = document["protocol"]
+    eos = _token_rows(protocol.get("accepted_eos_token_ids"), "accepted_eos_token_ids")
+    if len(set(eos)) != len(eos):
+        raise QwenDirectDecodeError("accepted EOS token IDs are duplicated")
+    return {
+        "items": [
+            {
+                "item_id": str(row["item_id"]),
+                "prompt_token_ids": list(
+                    _token_rows(row["prompt_token_ids"], "prompt_token_ids")
+                ),
+            }
+            for row in rows
+        ],
+        "protocol": {
+            "accepted_eos_token_ids": list(eos),
+            "system_prompt": protocol.get("system_prompt"),
+            "thinking": protocol.get("thinking"),
+        },
+        "schema": FERTIG_INPUT_SCHEMA,
+        "source": {
+            "checkpoint": source["checkpoint"],
+            "revision": source["revision"],
+        },
+    }
+
+
+def _tokenizer_record(
+    path: str | os.PathLike[str],
+    *,
+    require_official: bool,
+    tokenizer_factory: Callable[..., Qwen38Tokenizer] = Qwen38Tokenizer,
+) -> tuple[Qwen38Tokenizer, dict[str, Any]]:
+    source = Path(path).expanduser().resolve()
+    try:
+        metadata = source.lstat()
+    except OSError as exc:
+        raise QwenDirectDecodeError("tokenizer JSON is missing") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise QwenDirectDecodeError("tokenizer JSON must be a plain regular file")
+    try:
+        tokenizer = tokenizer_factory(source, require_official=require_official)
+        vocab_size = int(tokenizer.backend.get_vocab_size(with_added_tokens=True))
+        end_of_text = tokenizer.backend.token_to_id("<|endoftext|>")
+        im_end = tokenizer.backend.token_to_id("<|im_end|>")
+    except Exception as exc:
+        raise QwenDirectDecodeError("tokenizer identity cannot be verified") from exc
+    if (
+        vocab_size < 1
+        or isinstance(end_of_text, bool)
+        or not isinstance(end_of_text, int)
+        or isinstance(im_end, bool)
+        or not isinstance(im_end, int)
+    ):
+        raise QwenDirectDecodeError("tokenizer control-token identity is invalid")
+    if require_official and (
+        end_of_text != END_OF_TEXT_TOKEN_ID or im_end != IM_END_TOKEN_ID
+    ):
+        raise QwenDirectDecodeError("tokenizer control-token IDs are not official")
+    record = {
+        "control_token_ids": {
+            "end_of_text": end_of_text,
+            "im_end": im_end,
+        },
+        "kind": "tokenizers-json/v1",
+        "require_official": require_official,
+        "sha256": _sha256_file(source),
+        "size_bytes": metadata.st_size,
+        "vocab_size": vocab_size,
+    }
+    return tokenizer, record
+
+
+def select_branch_cohort(
+    args: argparse.Namespace,
+    *,
+    tokenizer_factory: Callable[..., Qwen38Tokenizer] = Qwen38Tokenizer,
+) -> dict[str, Any]:
+    """Seal an ordered, label-free generation cohort from one sealed Dev input."""
+
+    document, raw_file_sha256 = _externally_sealed_json(
+        args.inputs,
+        args.inputs_sha256,
+        "branch source input",
+    )
+    projection = _source_contract_projection(document)
+    rows = projection["items"]
+    offset = int(args.offset)
+    limit = int(args.limit)
+    if offset + limit > len(rows):
+        raise QwenDirectDecodeError("branch cohort slice exceeds source rows")
+    selected = rows[offset : offset + limit]
+    tokenizer, tokenizer_identity = _tokenizer_record(
+        args.tokenizer_json,
+        require_official=getattr(args, "_require_official", True),
+        tokenizer_factory=tokenizer_factory,
+    )
+    del tokenizer
+    eos = projection["protocol"]["accepted_eos_token_ids"]
+    controls = tokenizer_identity["control_token_ids"]
+    if set(eos) != {controls["im_end"], controls["end_of_text"]}:
+        raise QwenDirectDecodeError("source EOS set differs from tokenizer identity")
+    vocab_size = int(tokenizer_identity["vocab_size"])
+    for row in selected:
+        if max(row["prompt_token_ids"]) >= vocab_size:
+            raise QwenDirectDecodeError("branch prompt exceeds tokenizer vocabulary")
+    identity = {
+        "items": selected,
+        "protocol": {
+            "accepted_eos_token_ids": eos,
+            "execution_mode": "serial_items/shared_weight_pager",
+            "independent_prefills": True,
+            "teacher_forced_tokens_after_prompt": 0,
+        },
+        "schema": BRANCH_INPUT_SCHEMA,
+        "selection": {
+            "item_ids": [row["item_id"] for row in selected],
+            "kind": "ordered-slice/v1",
+            "limit": limit,
+            "offset": offset,
+            "source_items": len(rows),
+        },
+        "source": {
+            "checkpoint": projection["source"]["checkpoint"],
+            "contract_sha256": _sha256(projection),
+            "raw_file_sha256": raw_file_sha256,
+            "revision": projection["source"]["revision"],
+            "schema": FERTIG_INPUT_SCHEMA,
+            "seal_kind": EXTERNAL_RAW_SEAL_KIND,
+        },
+        "status": "sealed",
+        "tokenizer": tokenizer_identity,
+    }
+    if _contains_forbidden_branch_input_key(identity):  # pragma: no cover
+        raise QwenDirectDecodeError("branch cohort contains forbidden label fields")
+    return _result(identity)
+
+
+def _validate_branch_input_document(document: dict[str, Any]) -> dict[str, Any]:
+    required = {
+        "items",
+        "protocol",
+        "schema",
+        "selection",
+        "sha256",
+        "source",
+        "status",
+        "tokenizer",
+    }
+    if set(document) != required or document.get("schema") != BRANCH_INPUT_SCHEMA:
+        raise QwenDirectDecodeError("branch input schema is invalid")
+    _verify_document_seal(document, "branch input")
+    if document.get("status") != "sealed":
+        raise QwenDirectDecodeError("branch input is not sealed")
+    if _contains_forbidden_branch_input_key(document):
+        raise QwenDirectDecodeError("branch input contains label or draft fields")
+    source = document.get("source")
+    selection = document.get("selection")
+    protocol = document.get("protocol")
+    tokenizer = document.get("tokenizer")
+    rows = document.get("items")
+    if not all(
+        isinstance(value, Mapping) for value in (source, selection, protocol, tokenizer)
+    ) or not isinstance(rows, list):
+        raise QwenDirectDecodeError("branch input structure is invalid")
+    if set(source) != {
+        "checkpoint",
+        "contract_sha256",
+        "raw_file_sha256",
+        "revision",
+        "schema",
+        "seal_kind",
+    }:
+        raise QwenDirectDecodeError("branch input source identity is invalid")
+    if (
+        source.get("schema") != FERTIG_INPUT_SCHEMA
+        or source.get("seal_kind") != EXTERNAL_RAW_SEAL_KIND
+        or not isinstance(source.get("checkpoint"), str)
+        or not source["checkpoint"]
+        or not isinstance(source.get("revision"), str)
+        or not source["revision"]
+    ):
+        raise QwenDirectDecodeError("branch input source contract is invalid")
+    _digest_string(source.get("contract_sha256"), "source contract")
+    _digest_string(source.get("raw_file_sha256"), "source raw file")
+    if (
+        set(selection)
+        != {
+            "item_ids",
+            "kind",
+            "limit",
+            "offset",
+            "source_items",
+        }
+        or selection.get("kind") != "ordered-slice/v1"
+    ):
+        raise QwenDirectDecodeError("branch selection contract is invalid")
+    offset = _nonnegative_count(selection.get("offset"), "selection offset")
+    limit = _nonnegative_count(selection.get("limit"), "selection limit")
+    source_items = _nonnegative_count(
+        selection.get("source_items"), "source item count"
+    )
+    if limit < 1 or len(rows) != limit or offset + limit > source_items:
+        raise QwenDirectDecodeError("branch selection bounds are invalid")
+    item_ids = selection.get("item_ids")
+    if not isinstance(item_ids, list) or len(item_ids) != limit:
+        raise QwenDirectDecodeError("branch selection item IDs are invalid")
+    if set(protocol) != {
+        "accepted_eos_token_ids",
+        "execution_mode",
+        "independent_prefills",
+        "teacher_forced_tokens_after_prompt",
+    }:
+        raise QwenDirectDecodeError("branch generation protocol is invalid")
+    eos = _token_rows(protocol.get("accepted_eos_token_ids"), "accepted EOS IDs")
+    if (
+        len(set(eos)) != len(eos)
+        or protocol.get("execution_mode") != "serial_items/shared_weight_pager"
+        or protocol.get("independent_prefills") is not True
+        or protocol.get("teacher_forced_tokens_after_prompt") != 0
+    ):
+        raise QwenDirectDecodeError("branch generation protocol is inconsistent")
+    tokenizer_required = {
+        "control_token_ids",
+        "kind",
+        "require_official",
+        "sha256",
+        "size_bytes",
+        "vocab_size",
+    }
+    if (
+        set(tokenizer) != tokenizer_required
+        or tokenizer.get("kind") != "tokenizers-json/v1"
+    ):
+        raise QwenDirectDecodeError("branch tokenizer identity is invalid")
+    _digest_string(tokenizer.get("sha256"), "tokenizer")
+    vocab_size = _nonnegative_count(tokenizer.get("vocab_size"), "tokenizer vocabulary")
+    _nonnegative_count(tokenizer.get("size_bytes"), "tokenizer size")
+    controls = tokenizer.get("control_token_ids")
+    if (
+        vocab_size < 1
+        or not isinstance(tokenizer.get("require_official"), bool)
+        or not isinstance(controls, Mapping)
+        or set(controls) != {"end_of_text", "im_end"}
+        or set(eos) != {controls.get("end_of_text"), controls.get("im_end")}
+    ):
+        raise QwenDirectDecodeError("branch tokenizer control tokens are invalid")
+    seen: set[str] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != {"item_id", "prompt_token_ids"}:
+            raise QwenDirectDecodeError("branch item schema is invalid")
+        item_id = row.get("item_id")
+        if (
+            not isinstance(item_id, str)
+            or not item_id
+            or item_id in seen
+            or item_id != item_ids[index]
+        ):
+            raise QwenDirectDecodeError("branch item order or identity is invalid")
+        tokens = _token_rows(row.get("prompt_token_ids"), f"prompt {item_id}")
+        if max(tokens) >= vocab_size:
+            raise QwenDirectDecodeError("branch prompt exceeds tokenizer vocabulary")
+        seen.add(item_id)
+    return document
+
+
+def _load_branch_input(path: str | os.PathLike[str]) -> dict[str, Any]:
+    return _validate_branch_input_document(_strict_json(path))
 
 
 def _load_input(path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -371,6 +814,10 @@ def _runtime(
     args: argparse.Namespace,
     recorder: AccessTraceRecorder,
     delta_probe: DeltaNetProbeRecorder | None = None,
+    *,
+    graft: Qwen38StableCrsaGraft | None = None,
+    graft_layer: int | None = None,
+    max_batch_size: int = 1,
 ) -> tuple[RuntimeSource, StreamedQwen38]:
     runtime = _build_source(args, recorder)
     pager: Qwen38WeightPager | None = None
@@ -396,8 +843,10 @@ def _runtime(
         model = StreamedQwen38(
             config,
             pager,
+            graft=graft,
+            graft_layer=graft_layer,
             delta_probe=delta_probe,
-            max_batch_size=1,
+            max_batch_size=max_batch_size,
             max_seq_len=args.max_seq_len,
         )
         model.checkpoint_preflight()
@@ -698,6 +1147,940 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
     return _result(identity)
 
 
+def _build_graft(
+    args: argparse.Namespace,
+) -> tuple[Qwen38StableCrsaGraft | None, int | None, dict[str, Any]]:
+    mode = str(args.mode)
+    if mode == "off":
+        return (
+            None,
+            None,
+            {
+                "alpha": 0.0,
+                "arm_mode": "off",
+                "attention_spec": None,
+                "evidence_schema": None,
+                "heads": None,
+                "implementation": "none",
+                "layer": None,
+                "learned_parameters": 0,
+                "max_history": None,
+                "operator_mode": "off",
+                "policy": "no-graft/v1",
+                "rms_eps": None,
+                "shuffle_seed": None,
+                "stateful_history": False,
+                "strict_causal": True,
+                "uses_a1_ridge": False,
+            },
+        )
+    if mode != "stable-crsa":
+        raise QwenDirectDecodeError("branch mode must be off or stable-crsa")
+    try:
+        graft = Qwen38StableCrsaGraft(
+            mode="crsa",
+            alpha=args.graft_alpha,
+            max_history=args.graft_max_history,
+            rms_eps=args.graft_rms_eps,
+        )
+    except (TypeError, ValueError) as exc:
+        raise QwenDirectDecodeError(
+            "stable CRSA graft configuration is invalid"
+        ) from exc
+    layer = int(args.graft_layer)
+    identity = {
+        "alpha": graft.alpha,
+        "arm_mode": "stable-crsa",
+        "attention_spec": asdict(graft.spec),
+        "evidence_schema": graft.evidence_schema,
+        "heads": graft.heads,
+        "implementation": ("immer.runtimes.qwen3_8.Qwen38StableCrsaGraft"),
+        "layer": layer,
+        "learned_parameters": sum(
+            int(parameter.numel()) for parameter in graft.parameters()
+        ),
+        "max_history": graft.max_history,
+        "operator_mode": graft.mode,
+        "policy": graft.policy,
+        "rms_eps": graft.rms_eps,
+        "shuffle_seed": graft.shuffle_seed,
+        "stateful_history": True,
+        "strict_causal": True,
+        "uses_a1_ridge": False,
+    }
+    return graft, layer, identity
+
+
+def _source_metric(source: object, name: str) -> int:
+    metrics_method = getattr(source, "metrics", None)
+    metrics = dict(metrics_method()) if callable(metrics_method) else {}
+    value = metrics.get(name, 0)
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _branch_input_identity(inputs: Mapping[str, Any]) -> dict[str, Any]:
+    # The complete projection is small and contains no labels or draft tokens.
+    # Keeping it here lets later stages recompute its seal and bind every prompt
+    # rather than trusting an opaque input digest supplied by the arm producer.
+    return dict(inputs)
+
+
+def generate_arm(
+    args: argparse.Namespace,
+    *,
+    runtime_factory: Callable[..., tuple[RuntimeSource, StreamedQwen38]] | None = None,
+    tokenizer_factory: Callable[..., Qwen38Tokenizer] = Qwen38Tokenizer,
+) -> dict[str, Any]:
+    """Generate every selected item exactly once with one shared weight pager."""
+
+    inputs = _load_branch_input(args.input)
+    if (
+        args.logical_repo_id != inputs["source"]["checkpoint"]
+        or args.revision != inputs["source"]["revision"]
+    ):
+        raise QwenDirectDecodeError(
+            "requested checkpoint/revision differs from branch input"
+        )
+    _tokenizer, tokenizer_identity = _tokenizer_record(
+        args.tokenizer_json,
+        require_official=getattr(args, "_require_official", True),
+        tokenizer_factory=tokenizer_factory,
+    )
+    if tokenizer_identity != inputs["tokenizer"]:
+        raise QwenDirectDecodeError("generation tokenizer differs from branch input")
+    tokenizer = _tokenizer
+    prompts = [
+        _token_rows(row["prompt_token_ids"], f"prompt {row['item_id']}")
+        for row in inputs["items"]
+    ]
+    max_prompt = max(len(prompt) for prompt in prompts)
+    if max_prompt + args.max_new_tokens > args.max_seq_len:
+        raise QwenDirectDecodeError("generation bound exceeds max_seq_len")
+    graft, graft_layer, graft_identity = _build_graft(args)
+    if graft is not None and args.graft_max_history < max_prompt + args.max_new_tokens:
+        raise QwenDirectDecodeError("graft max_history is below the generation bound")
+    recorder = AccessTraceRecorder()
+    factory = _runtime if runtime_factory is None else runtime_factory
+    runtime, model = factory(
+        args,
+        recorder,
+        graft=graft,
+        graft_layer=graft_layer,
+        max_batch_size=1,
+    )
+    if (
+        model.graft is not graft
+        or model.graft_layer != graft_layer
+        or model.max_batch_size != 1
+        or model.max_seq_len != args.max_seq_len
+    ):
+        _cleanup(runtime, model)
+        raise QwenDirectDecodeError("branch runtime attachment differs from contract")
+    started = time.perf_counter()
+    source_start = _source_metric(model.pager.source, "network_or_source_body_bytes")
+    items: list[dict[str, Any]] = []
+    try:
+        eos = tuple(
+            int(value) for value in inputs["protocol"]["accepted_eos_token_ids"]
+        )
+        if (
+            max((*eos, *(token for prompt in prompts for token in prompt)))
+            >= model.config.vocab_size
+        ):
+            raise QwenDirectDecodeError("branch token exceeds checkpoint vocabulary")
+        for source_row, prompt in zip(inputs["items"], prompts, strict=True):
+            head_blocks = 0
+            completed_scans = 0
+
+            def head_progress(event: Mapping[str, int]) -> None:
+                nonlocal completed_scans, head_blocks
+                head_blocks += 1
+                if event.get("rows_done") == event.get("vocab_rows"):
+                    completed_scans += 1
+
+            try:
+                generated, evidence = model.generate_greedy(
+                    [prompt],
+                    max_new_tokens=args.max_new_tokens,
+                    prefill_tokenwise=False,
+                    eos_token_ids=eos,
+                    head_block_rows=args.head_block_rows,
+                    progress=_progress,
+                    head_progress=head_progress,
+                )
+            except Exception as exc:
+                raise QwenDirectDecodeError(
+                    f"generation failed for {source_row['item_id']}"
+                ) from exc
+            generated_ids = tuple(int(token) for token in generated)
+            if not generated_ids:
+                raise QwenDirectDecodeError("greedy generation emitted no token")
+            if tuple(evidence.prompt_token_ids) != prompt:
+                raise QwenDirectDecodeError("runtime changed the selected prompt")
+            if tuple(evidence.generated_token_ids) != generated_ids:
+                raise QwenDirectDecodeError("runtime generation evidence differs")
+            if (
+                evidence.context_mode != "stateful_autoregressive"
+                or evidence.stateful_cache is not True
+                or evidence.general_generation is not True
+            ):
+                raise QwenDirectDecodeError(
+                    "runtime did not perform general generation"
+                )
+            if completed_scans != len(generated_ids):
+                raise QwenDirectDecodeError("LM-head scan accounting is incomplete")
+            text = tokenizer.decode(generated_ids)
+            stopped = bool(evidence.stopped_on_eos)
+            finish_reason = "stop" if stopped else "length"
+            eos_token_id = generated_ids[-1] if stopped else None
+            if stopped != (generated_ids[-1] in eos):
+                raise QwenDirectDecodeError("runtime EOS evidence is inconsistent")
+            items.append(
+                {
+                    "context_mode": evidence.context_mode,
+                    "eos_token_id": eos_token_id,
+                    "finish_reason": finish_reason,
+                    "forward_passes": int(evidence.forward_passes),
+                    "general_generation": bool(evidence.general_generation),
+                    "generated_text": text,
+                    "generated_token_ids": list(generated_ids),
+                    "head_scan_blocks": head_blocks,
+                    "head_scans": completed_scans,
+                    "item_id": str(source_row["item_id"]),
+                    "linear_calls": int(evidence.linear_calls),
+                    "parsed_numeric_answer": extract_gsm8k_answer(text),
+                    "prefill_mode": evidence.prefill_mode,
+                    "prompt_token_ids": list(prompt),
+                    "seconds": float(evidence.seconds),
+                    "source_body_bytes": int(evidence.source_body_bytes),
+                    "state_bytes": int(evidence.state_bytes),
+                    "stateful_autoregressive": bool(evidence.stateful_cache),
+                    "stopped_on_eos": stopped,
+                    "token_chain_sha256": _token_chain_sha256(prompt, generated_ids),
+                }
+            )
+        checkpoint = _checkpoint(model)
+        if (
+            checkpoint["repo_id"] != inputs["source"]["checkpoint"]
+            or checkpoint["revision"] != inputs["source"]["revision"]
+        ):
+            raise QwenDirectDecodeError("runtime checkpoint differs from branch input")
+        trace = _trace_receipt(recorder, args.access_trace)
+        wall_seconds = time.perf_counter() - started
+        generation = {
+            "algorithm": "exact-greedy/v1",
+            "eos_token_ids": list(eos),
+            "general_generation": True,
+            "head_block_rows": args.head_block_rows,
+            "max_new_tokens": args.max_new_tokens,
+            "max_seq_len": args.max_seq_len,
+            "prefill_mode": "batched-per-item",
+            "stateful_autoregressive": True,
+            "teacher_forced_tokens_after_prompt": 0,
+            "temperature": 0.0,
+        }
+        execution = {
+            "checkpoint_layers": int(model.config.n_layers),
+            "cohort_size": len(items),
+            "device": str(model.pager.device),
+            "dtype": str(model.pager.compute_dtype).removeprefix("torch."),
+            "execution_mode": "serial_items/shared_weight_pager",
+            "independent_prefills": len(items),
+            "max_batch_size": 1,
+            "runtime_instances": 1,
+            "shared_weight_pager": True,
+        }
+        traffic = {
+            "access_trace": trace,
+            "access_trace_sha256": trace["sha256"],
+            "forward_passes": sum(row["forward_passes"] for row in items),
+            "generation_seconds": sum(row["seconds"] for row in items),
+            "head_scan_blocks": sum(row["head_scan_blocks"] for row in items),
+            "head_scans": sum(row["head_scans"] for row in items),
+            "linear_calls": sum(row["linear_calls"] for row in items),
+            "runtime_source_body_bytes": (
+                _source_metric(model.pager.source, "network_or_source_body_bytes")
+                - source_start
+            ),
+            "source_body_bytes": sum(row["source_body_bytes"] for row in items),
+            "wall_seconds": wall_seconds,
+        }
+        identity = {
+            "arm": str(args.mode),
+            "bundle": dict(runtime.verification or {}),
+            "checkpoint": checkpoint,
+            "execution": execution,
+            "generation": generation,
+            "graft": graft_identity,
+            "input": _branch_input_identity(inputs),
+            "items": items,
+            "schema": BRANCH_RESULT_SCHEMA,
+            "status": "sealed",
+            "tokenizer": tokenizer_identity,
+            "traffic": traffic,
+        }
+        return _result(identity)
+    finally:
+        _cleanup(runtime, model)
+
+
+def _verify_access_trace_receipt(receipt: object) -> None:
+    if not isinstance(receipt, Mapping) or set(receipt) != {
+        "inventory_fingerprint",
+        "leaves",
+        "operations",
+        "path",
+        "sha256",
+    }:
+        raise QwenDirectDecodeError("branch access-trace receipt is invalid")
+    _digest_string(receipt.get("sha256"), "access trace")
+    if not isinstance(receipt.get("inventory_fingerprint"), str):
+        raise QwenDirectDecodeError("branch access-trace inventory is invalid")
+    leaves = _nonnegative_count(receipt.get("leaves"), "access-trace leaves")
+    operations = _nonnegative_count(
+        receipt.get("operations"), "access-trace operations"
+    )
+    try:
+        trace = AccessTrace.from_bytes(Path(str(receipt["path"])).read_bytes())
+        trace.verify()
+    except Exception as exc:
+        raise QwenDirectDecodeError("branch access-trace artifact is invalid") from exc
+    if (
+        trace.sha256 != receipt["sha256"]
+        or trace.inventory_fingerprint != receipt["inventory_fingerprint"]
+        or len(trace.operations) != operations
+        or sum(len(operation.leaves) for operation in trace.operations) != leaves
+    ):
+        raise QwenDirectDecodeError("branch access-trace receipt differs from artifact")
+
+
+def _validate_graft_identity(graft: object, arm: str) -> Mapping[str, Any]:
+    required = {
+        "alpha",
+        "arm_mode",
+        "attention_spec",
+        "evidence_schema",
+        "heads",
+        "implementation",
+        "layer",
+        "learned_parameters",
+        "max_history",
+        "operator_mode",
+        "policy",
+        "rms_eps",
+        "shuffle_seed",
+        "stateful_history",
+        "strict_causal",
+        "uses_a1_ridge",
+    }
+    if not isinstance(graft, Mapping) or set(graft) != required:
+        raise QwenDirectDecodeError("branch graft identity is invalid")
+    if graft.get("arm_mode") != arm:
+        raise QwenDirectDecodeError("branch arm/graft mode differs")
+    if arm == "off":
+        if graft != _build_graft(argparse.Namespace(mode="off"))[2]:
+            raise QwenDirectDecodeError("off arm graft identity is not inert")
+        return graft
+    if arm != "stable-crsa":
+        raise QwenDirectDecodeError("branch arm mode is invalid")
+    if (
+        graft.get("implementation") != "immer.runtimes.qwen3_8.Qwen38StableCrsaGraft"
+        or graft.get("operator_mode") != "crsa"
+        or graft.get("stateful_history") is not True
+        or graft.get("strict_causal") is not True
+        or graft.get("uses_a1_ridge") is not False
+        or graft.get("learned_parameters") != 0
+        or not isinstance(graft.get("attention_spec"), Mapping)
+        or graft["attention_spec"].get("kind") != "role_complete"
+        or graft.get("heads") != 4
+    ):
+        raise QwenDirectDecodeError("stable CRSA graft identity is incomplete")
+    for name in ("layer", "max_history"):
+        if isinstance(graft.get(name), bool) or not isinstance(graft.get(name), int):
+            raise QwenDirectDecodeError(f"stable CRSA {name} is invalid")
+    if graft["layer"] < 0 or graft["max_history"] < 1:
+        raise QwenDirectDecodeError("stable CRSA layer/history bound is invalid")
+    alpha = _finite_nonnegative(graft.get("alpha"), "stable CRSA alpha")
+    if alpha > 1.0:
+        raise QwenDirectDecodeError("stable CRSA alpha must be in [0, 1]")
+    rms_eps = _finite_nonnegative(graft.get("rms_eps"), "stable CRSA RMS epsilon")
+    if rms_eps <= 0.0:
+        raise QwenDirectDecodeError("stable CRSA RMS epsilon must be positive")
+    expected = _build_graft(
+        argparse.Namespace(
+            graft_alpha=alpha,
+            graft_layer=graft["layer"],
+            graft_max_history=graft["max_history"],
+            graft_rms_eps=rms_eps,
+            mode="stable-crsa",
+        )
+    )[2]
+    if graft != expected:
+        raise QwenDirectDecodeError("stable CRSA graft identity is not canonical")
+    return graft
+
+
+def _load_branch_result(path: str | os.PathLike[str]) -> dict[str, Any]:
+    document = _strict_json(path)
+    required = {
+        "arm",
+        "bundle",
+        "checkpoint",
+        "execution",
+        "generation",
+        "graft",
+        "input",
+        "items",
+        "schema",
+        "sha256",
+        "status",
+        "tokenizer",
+        "traffic",
+    }
+    if set(document) != required or document.get("schema") != BRANCH_RESULT_SCHEMA:
+        raise QwenDirectDecodeError("branch result schema is invalid")
+    _verify_document_seal(document, "branch result")
+    if document.get("status") != "sealed":
+        raise QwenDirectDecodeError("branch result is not sealed")
+    arm = document.get("arm")
+    if not isinstance(arm, str):
+        raise QwenDirectDecodeError("branch result arm is invalid")
+    _validate_graft_identity(document.get("graft"), arm)
+    checkpoint = document.get("checkpoint")
+    if not isinstance(checkpoint, Mapping) or set(checkpoint) != {
+        "inventory_fingerprint",
+        "repo_id",
+        "revision",
+    }:
+        raise QwenDirectDecodeError("branch checkpoint identity is invalid")
+    for name in checkpoint:
+        if not isinstance(checkpoint[name], str) or not checkpoint[name]:
+            raise QwenDirectDecodeError("branch checkpoint identity is invalid")
+    if not isinstance(document.get("bundle"), Mapping):
+        raise QwenDirectDecodeError("branch bundle identity is invalid")
+    if not isinstance(document["bundle"].get("kind"), str):
+        raise QwenDirectDecodeError("branch bundle kind is invalid")
+    input_identity = document.get("input")
+    if not isinstance(input_identity, dict):
+        raise QwenDirectDecodeError("branch input identity is invalid")
+    _validate_branch_input_document(input_identity)
+    if (
+        checkpoint["repo_id"] != input_identity["source"]["checkpoint"]
+        or checkpoint["revision"] != input_identity["source"]["revision"]
+    ):
+        raise QwenDirectDecodeError("branch checkpoint differs from sealed input")
+    generation = document.get("generation")
+    generation_required = {
+        "algorithm",
+        "eos_token_ids",
+        "general_generation",
+        "head_block_rows",
+        "max_new_tokens",
+        "max_seq_len",
+        "prefill_mode",
+        "stateful_autoregressive",
+        "teacher_forced_tokens_after_prompt",
+        "temperature",
+    }
+    if not isinstance(generation, Mapping) or set(generation) != generation_required:
+        raise QwenDirectDecodeError("branch generation identity is invalid")
+    eos = _token_rows(generation.get("eos_token_ids"), "generation EOS IDs")
+    max_new_tokens = _nonnegative_count(
+        generation.get("max_new_tokens"), "max_new_tokens"
+    )
+    if (
+        max_new_tokens < 1
+        or generation.get("algorithm") != "exact-greedy/v1"
+        or generation.get("general_generation") is not True
+        or generation.get("stateful_autoregressive") is not True
+        or generation.get("teacher_forced_tokens_after_prompt") != 0
+        or generation.get("temperature") != 0.0
+        or generation.get("prefill_mode") != "batched-per-item"
+    ):
+        raise QwenDirectDecodeError("branch generation contract is inconsistent")
+    if list(eos) != input_identity["protocol"]["accepted_eos_token_ids"]:
+        raise QwenDirectDecodeError("branch generation EOS set differs from input")
+    if (
+        _nonnegative_count(generation.get("head_block_rows"), "head block rows") < 1
+        or _nonnegative_count(generation.get("max_seq_len"), "max sequence length") < 1
+    ):
+        raise QwenDirectDecodeError("branch generation bounds must be positive")
+    execution = document.get("execution")
+    if not isinstance(execution, Mapping) or set(execution) != {
+        "checkpoint_layers",
+        "cohort_size",
+        "device",
+        "dtype",
+        "execution_mode",
+        "independent_prefills",
+        "max_batch_size",
+        "runtime_instances",
+        "shared_weight_pager",
+    }:
+        raise QwenDirectDecodeError("branch execution identity is invalid")
+    rows = document.get("items")
+    if not isinstance(rows, list) or not rows:
+        raise QwenDirectDecodeError("branch result contains no items")
+    if (
+        isinstance(execution.get("checkpoint_layers"), bool)
+        or not isinstance(execution.get("checkpoint_layers"), int)
+        or execution["checkpoint_layers"] < 1
+        or execution.get("cohort_size") != len(rows)
+        or execution.get("independent_prefills") != len(rows)
+        or execution.get("max_batch_size") != 1
+        or execution.get("runtime_instances") != 1
+        or execution.get("shared_weight_pager") is not True
+        or execution.get("execution_mode") != "serial_items/shared_weight_pager"
+        or not isinstance(execution.get("device"), str)
+        or not execution["device"]
+        or not isinstance(execution.get("dtype"), str)
+        or not execution["dtype"]
+    ):
+        raise QwenDirectDecodeError("branch execution accounting is inconsistent")
+    if (
+        arm == "stable-crsa"
+        and document["graft"]["layer"] >= execution["checkpoint_layers"]
+    ):
+        raise QwenDirectDecodeError("stable CRSA layer exceeds checkpoint depth")
+    item_ids = input_identity["selection"]["item_ids"]
+    if (
+        not isinstance(item_ids, list)
+        or len(item_ids) != len(rows)
+        or any(not isinstance(item_id, str) or not item_id for item_id in item_ids)
+        or len(set(item_ids)) != len(item_ids)
+    ):
+        raise QwenDirectDecodeError("branch result item identity is invalid")
+    tokenizer = document.get("tokenizer")
+    if not isinstance(tokenizer, Mapping) or set(tokenizer) != {
+        "control_token_ids",
+        "kind",
+        "require_official",
+        "sha256",
+        "size_bytes",
+        "vocab_size",
+    }:
+        raise QwenDirectDecodeError("branch result tokenizer identity is invalid")
+    _digest_string(tokenizer.get("sha256"), "branch result tokenizer")
+    tokenizer_vocab = _nonnegative_count(
+        tokenizer.get("vocab_size"), "branch result tokenizer vocabulary"
+    )
+    _nonnegative_count(tokenizer.get("size_bytes"), "branch result tokenizer size")
+    controls = tokenizer.get("control_token_ids")
+    if (
+        tokenizer.get("kind") != "tokenizers-json/v1"
+        or not isinstance(tokenizer.get("require_official"), bool)
+        or tokenizer_vocab < 1
+        or not isinstance(controls, Mapping)
+        or set(controls) != {"end_of_text", "im_end"}
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < tokenizer_vocab
+            for value in controls.values()
+        )
+        or set(eos) != set(controls.values())
+    ):
+        raise QwenDirectDecodeError("branch result tokenizer contract is invalid")
+    if tokenizer != input_identity["tokenizer"]:
+        raise QwenDirectDecodeError("branch result tokenizer differs from sealed input")
+    row_required = {
+        "context_mode",
+        "eos_token_id",
+        "finish_reason",
+        "forward_passes",
+        "general_generation",
+        "generated_text",
+        "generated_token_ids",
+        "head_scan_blocks",
+        "head_scans",
+        "item_id",
+        "linear_calls",
+        "parsed_numeric_answer",
+        "prefill_mode",
+        "prompt_token_ids",
+        "seconds",
+        "source_body_bytes",
+        "state_bytes",
+        "stateful_autoregressive",
+        "stopped_on_eos",
+        "token_chain_sha256",
+    }
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != row_required:
+            raise QwenDirectDecodeError("branch generated item schema is invalid")
+        if row.get("item_id") != item_ids[index]:
+            raise QwenDirectDecodeError("branch generated item order differs")
+        prompt = _token_rows(row.get("prompt_token_ids"), "generated prompt")
+        if (
+            row["item_id"] != input_identity["items"][index]["item_id"]
+            or list(prompt) != input_identity["items"][index]["prompt_token_ids"]
+        ):
+            raise QwenDirectDecodeError(
+                "branch result prompt differs from sealed input"
+            )
+        generated = _token_rows(row.get("generated_token_ids"), "generated tokens")
+        if (
+            len(generated) > max_new_tokens
+            or max((*prompt, *generated)) >= tokenizer_vocab
+            or len(prompt) + len(generated) > generation["max_seq_len"]
+        ):
+            raise QwenDirectDecodeError("branch generated token bound was exceeded")
+        if row.get("token_chain_sha256") != _token_chain_sha256(prompt, generated):
+            raise QwenDirectDecodeError("branch token-chain digest mismatch")
+        text = row.get("generated_text")
+        if not isinstance(text, str) or row.get(
+            "parsed_numeric_answer"
+        ) != extract_gsm8k_answer(text):
+            raise QwenDirectDecodeError("branch parsed numeric answer is inconsistent")
+        stopped = row.get("stopped_on_eos")
+        if not isinstance(stopped, bool):
+            raise QwenDirectDecodeError("branch EOS state is invalid")
+        if stopped:
+            if (
+                row.get("finish_reason") != "stop"
+                or row.get("eos_token_id") != generated[-1]
+                or generated[-1] not in eos
+            ):
+                raise QwenDirectDecodeError("branch EOS finish evidence is invalid")
+        elif (
+            row.get("finish_reason") != "length"
+            or row.get("eos_token_id") is not None
+            or len(generated) != max_new_tokens
+        ):
+            raise QwenDirectDecodeError("branch length finish evidence is invalid")
+        if (
+            row.get("context_mode") != "stateful_autoregressive"
+            or row.get("general_generation") is not True
+            or row.get("stateful_autoregressive") is not True
+            or row.get("prefill_mode") != "batched"
+            or row.get("forward_passes") != len(generated) + 1
+            or row.get("head_scans") != len(generated)
+        ):
+            raise QwenDirectDecodeError("branch autoregressive evidence is invalid")
+        for name in (
+            "forward_passes",
+            "head_scan_blocks",
+            "head_scans",
+            "linear_calls",
+            "source_body_bytes",
+            "state_bytes",
+        ):
+            _nonnegative_count(row.get(name), f"branch item {name}")
+        _finite_nonnegative(row.get("seconds"), "branch item seconds")
+    if arm == "stable-crsa" and document["graft"]["max_history"] < max(
+        len(row["prompt_token_ids"]) + max_new_tokens for row in rows
+    ):
+        raise QwenDirectDecodeError("stable CRSA history bound is too small")
+    traffic = document.get("traffic")
+    traffic_required = {
+        "access_trace",
+        "access_trace_sha256",
+        "forward_passes",
+        "generation_seconds",
+        "head_scan_blocks",
+        "head_scans",
+        "linear_calls",
+        "runtime_source_body_bytes",
+        "source_body_bytes",
+        "wall_seconds",
+    }
+    if not isinstance(traffic, Mapping) or set(traffic) != traffic_required:
+        raise QwenDirectDecodeError("branch traffic evidence is invalid")
+    _verify_access_trace_receipt(traffic.get("access_trace"))
+    if traffic.get("access_trace_sha256") != traffic["access_trace"]["sha256"]:
+        raise QwenDirectDecodeError("branch access-trace digest is inconsistent")
+    sums = {
+        "forward_passes": sum(row["forward_passes"] for row in rows),
+        "generation_seconds": sum(row["seconds"] for row in rows),
+        "head_scan_blocks": sum(row["head_scan_blocks"] for row in rows),
+        "head_scans": sum(row["head_scans"] for row in rows),
+        "linear_calls": sum(row["linear_calls"] for row in rows),
+        "source_body_bytes": sum(row["source_body_bytes"] for row in rows),
+    }
+    for name, expected in sums.items():
+        if traffic.get(name) != expected:
+            raise QwenDirectDecodeError(f"branch traffic field {name} is inconsistent")
+    _nonnegative_count(traffic.get("runtime_source_body_bytes"), "runtime source bytes")
+    _finite_nonnegative(traffic.get("wall_seconds"), "branch wall seconds")
+    if traffic["wall_seconds"] < traffic["generation_seconds"]:
+        raise QwenDirectDecodeError("branch wall timing is below model timing")
+    return document
+
+
+def _paired_identity(
+    off: Mapping[str, Any], candidate: Mapping[str, Any]
+) -> dict[str, Any]:
+    fields = ("checkpoint", "bundle", "input", "tokenizer", "generation", "execution")
+    identity = {name: off[name] for name in fields}
+    for name in fields:
+        if candidate[name] != identity[name]:
+            raise QwenDirectDecodeError(f"generated arm {name} identity differs")
+    return identity
+
+
+def _first_divergence(left: Sequence[int], right: Sequence[int]) -> int | None:
+    common = min(len(left), len(right))
+    for index in range(common):
+        if left[index] != right[index]:
+            return index
+    return None if len(left) == len(right) else common
+
+
+def _compare_branch_documents(
+    off: Mapping[str, Any], candidate: Mapping[str, Any]
+) -> dict[str, Any]:
+    if off.get("arm") != "off" or candidate.get("arm") != "stable-crsa":
+        raise QwenDirectDecodeError("comparison requires off and stable-crsa arms")
+    identity = _paired_identity(off, candidate)
+    off_rows = off["items"]
+    candidate_rows = candidate["items"]
+    if len(off_rows) != len(candidate_rows):  # identity normally catches this.
+        raise QwenDirectDecodeError("generated arm item counts differ")
+    items: list[dict[str, Any]] = []
+    divergences = 0
+    parsed_answer_changes = 0
+    for off_row, candidate_row in zip(off_rows, candidate_rows, strict=True):
+        if (
+            off_row["item_id"] != candidate_row["item_id"]
+            or off_row["prompt_token_ids"] != candidate_row["prompt_token_ids"]
+        ):
+            raise QwenDirectDecodeError("generated arm item or prompt identity differs")
+        off_tokens = off_row["generated_token_ids"]
+        candidate_tokens = candidate_row["generated_token_ids"]
+        first = _first_divergence(off_tokens, candidate_tokens)
+        diverged = first is not None
+        divergences += diverged
+        answer_changed = (
+            off_row["parsed_numeric_answer"] != candidate_row["parsed_numeric_answer"]
+        )
+        parsed_answer_changes += answer_changed
+        items.append(
+            {
+                "candidate_finish_reason": candidate_row["finish_reason"],
+                "candidate_generated_text": candidate_row["generated_text"],
+                "candidate_generated_token_ids": candidate_tokens,
+                "candidate_parsed_numeric_answer": candidate_row[
+                    "parsed_numeric_answer"
+                ],
+                "candidate_token_chain_sha256": candidate_row["token_chain_sha256"],
+                "diverged": diverged,
+                "first_divergence_index": first,
+                "item_id": off_row["item_id"],
+                "off_finish_reason": off_row["finish_reason"],
+                "off_generated_text": off_row["generated_text"],
+                "off_generated_token_ids": off_tokens,
+                "off_parsed_numeric_answer": off_row["parsed_numeric_answer"],
+                "off_token_chain_sha256": off_row["token_chain_sha256"],
+                "parsed_answer_changed": answer_changed,
+            }
+        )
+    identity_document = {
+        "candidate": {
+            "graft": candidate["graft"],
+            "result_sha256": candidate["sha256"],
+            "traffic": candidate["traffic"],
+        },
+        "comparison": {
+            "branch_effect_observed": divergences > 0,
+            "diverged_items": divergences,
+            "items": len(items),
+            "parsed_answer_changes": parsed_answer_changes,
+            "verdict": "diverged" if divergences else "no_divergence",
+        },
+        "identity": identity,
+        "items": items,
+        "off": {
+            "graft": off["graft"],
+            "result_sha256": off["sha256"],
+            "traffic": off["traffic"],
+        },
+        "schema": BRANCH_COMPARISON_SCHEMA,
+        "status": "sealed",
+    }
+    return _result(identity_document)
+
+
+def compare_generated_arms(args: argparse.Namespace) -> dict[str, Any]:
+    return _compare_branch_documents(
+        _load_branch_result(args.off),
+        _load_branch_result(args.candidate),
+    )
+
+
+def _load_branch_comparison(path: str | os.PathLike[str]) -> dict[str, Any]:
+    document = _strict_json(path)
+    if (
+        document.get("schema") != BRANCH_COMPARISON_SCHEMA
+        or document.get("status") != "sealed"
+        or set(document)
+        != {
+            "candidate",
+            "comparison",
+            "identity",
+            "items",
+            "off",
+            "schema",
+            "sha256",
+            "status",
+        }
+    ):
+        raise QwenDirectDecodeError("branch comparison schema is invalid")
+    _verify_document_seal(document, "branch comparison")
+    return document
+
+
+def _gold_rows_for_branch(
+    source: Mapping[str, Any],
+    off: Mapping[str, Any],
+) -> tuple[list[Mapping[str, Any]], dict[str, str]]:
+    projection = _source_contract_projection(source)
+    if _sha256(projection) != off["input"]["source"]["contract_sha256"]:
+        raise QwenDirectDecodeError("label source generation contract differs")
+    selection = off["input"]["selection"]
+    expected_items = projection["items"][
+        selection["offset"] : selection["offset"] + selection["limit"]
+    ]
+    if (
+        selection["source_items"] != len(projection["items"])
+        or off["input"]["items"] != expected_items
+    ):
+        raise QwenDirectDecodeError("sealed branch selection differs from label source")
+    selection_ids = selection["item_ids"]
+    by_id = {row["item_id"]: row for row in _source_rows(source)}
+    rows: list[Mapping[str, Any]] = []
+    targets: dict[str, str] = {}
+    for item_id in selection_ids:
+        raw = by_id.get(item_id)
+        if raw is None:
+            raise QwenDirectDecodeError("label source is missing a selected item")
+        target = extract_gsm8k_answer(raw.get("gold"))
+        if target is None:
+            raise QwenDirectDecodeError(
+                "label source contains an invalid numeric target"
+            )
+        rows.append(raw)
+        targets[item_id] = target
+    return rows, targets
+
+
+def evaluate_generated_arms(args: argparse.Namespace) -> dict[str, Any]:
+    """Evaluate only after both arm and optional comparison seals are admitted."""
+
+    # Ordering is part of the protocol: do not open the label source above here.
+    off = _load_branch_result(args.off)
+    candidate = _load_branch_result(args.candidate)
+    expected_comparison = _compare_branch_documents(off, candidate)
+    comparison_path = getattr(args, "comparison", None)
+    if comparison_path is not None:
+        comparison = _load_branch_comparison(comparison_path)
+        if comparison != expected_comparison:
+            raise QwenDirectDecodeError("comparison does not bind the admitted arms")
+    else:
+        comparison = expected_comparison
+
+    expected_source_sha256 = _digest_string(
+        args.gold_source_sha256, "label source externally pinned raw file"
+    )
+    if expected_source_sha256 != off["input"]["source"]["raw_file_sha256"]:
+        raise QwenDirectDecodeError(
+            "label source external SHA-256 differs from sealed branch input"
+        )
+    source, source_raw_sha256 = _externally_sealed_json(
+        args.gold_source,
+        expected_source_sha256,
+        "label source",
+    )
+    _source_rows(source)
+    _rows, targets = _gold_rows_for_branch(source, off)
+    items: list[dict[str, Any]] = []
+    counts = {
+        "correct_to_correct": 0,
+        "correct_to_wrong": 0,
+        "wrong_to_correct": 0,
+        "wrong_to_wrong": 0,
+    }
+    for off_row, candidate_row in zip(off["items"], candidate["items"], strict=True):
+        item_id = off_row["item_id"]
+        target = targets[item_id]
+        off_correct = off_row["parsed_numeric_answer"] == target
+        candidate_correct = candidate_row["parsed_numeric_answer"] == target
+        if off_correct and candidate_correct:
+            transition = "correct_to_correct"
+        elif off_correct:
+            transition = "correct_to_wrong"
+        elif candidate_correct:
+            transition = "wrong_to_correct"
+        else:
+            transition = "wrong_to_wrong"
+        counts[transition] += 1
+        items.append(
+            {
+                "candidate_correct": candidate_correct,
+                "candidate_parsed_numeric_answer": candidate_row[
+                    "parsed_numeric_answer"
+                ],
+                "gold": target,
+                "item_id": item_id,
+                "off_correct": off_correct,
+                "off_parsed_numeric_answer": off_row["parsed_numeric_answer"],
+                "sequence_diverged": (
+                    off_row["generated_token_ids"]
+                    != candidate_row["generated_token_ids"]
+                ),
+                "transition": transition,
+                "unsafe": transition == "correct_to_wrong",
+            }
+        )
+    total = len(items)
+    off_correct_count = counts["correct_to_correct"] + counts["correct_to_wrong"]
+    candidate_correct_count = counts["correct_to_correct"] + counts["wrong_to_correct"]
+    net = candidate_correct_count - off_correct_count
+    if counts["correct_to_wrong"]:
+        verdict = "unsafe"
+    elif net > 0:
+        verdict = "improved"
+    elif net < 0:
+        verdict = "regressed"
+    else:
+        verdict = "neutral"
+    identity = {
+        "comparison_sha256": comparison["sha256"],
+        "items": items,
+        "protocol": {
+            "arm_seals_admitted_before_label_source": True,
+            "comparison_admitted_before_label_source": True,
+            "generation_was_label_free": True,
+            "transition_rule": "canonical-numeric-exact-match/v1",
+        },
+        "schema": BRANCH_EVALUATION_SCHEMA,
+        "source": {
+            "contract_sha256": off["input"]["source"]["contract_sha256"],
+            "raw_file_sha256": source_raw_sha256,
+            "schema": source["schema"],
+            "seal_kind": EXTERNAL_RAW_SEAL_KIND,
+        },
+        "status": "sealed",
+        "summary": {
+            **counts,
+            "candidate_accuracy": candidate_correct_count / total,
+            "candidate_correct": candidate_correct_count,
+            "net_accuracy_delta": net / total,
+            "net_correct_delta": net,
+            "off_accuracy": off_correct_count / total,
+            "off_correct": off_correct_count,
+            "quality_success": (
+                counts["wrong_to_correct"] > 0
+                and net > 0
+                and counts["correct_to_wrong"] == 0
+            ),
+            "total": total,
+            "unsafe_correct_to_wrong": counts["correct_to_wrong"],
+            "verdict": verdict,
+        },
+    }
+    return _result(identity)
+
+
 def _positive_int(raw: str) -> int:
     value = int(raw)
     if value < 1:
@@ -709,6 +2092,20 @@ def _positive_float(raw: str) -> float:
     value = float(raw)
     if not math.isfinite(value) or value <= 0:
         raise argparse.ArgumentTypeError("must be positive")
+    return value
+
+
+def _nonnegative_int(raw: str) -> int:
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return value
+
+
+def _unit_float(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError("must be between zero and one")
     return value
 
 
@@ -734,6 +2131,34 @@ def _runtime_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _branch_runtime_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--tokenizer-json", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--access-trace", required=True)
+    parser.add_argument("--source", default=OFFICIAL_REPO_ID)
+    parser.add_argument("--causal-bundle")
+    parser.add_argument("--logical-repo-id", default=OFFICIAL_REPO_ID)
+    parser.add_argument("--revision", default=OFFICIAL_REVISION)
+    parser.add_argument("--pinned-inventory")
+    parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE))
+    parser.add_argument("--max-cache-gb", type=_positive_float, default=1.0)
+    parser.add_argument("--source-budget-mb", type=_positive_int, default=65536)
+    parser.add_argument("--max-resident-mb", type=_positive_int, default=384)
+    parser.add_argument("--max-seq-len", type=_positive_int, default=256)
+    parser.add_argument("--max-new-tokens", type=_positive_int, default=32)
+    parser.add_argument("--head-block-rows", type=_positive_int, default=8192)
+    parser.add_argument("--device", choices=("cpu", "mps"), default="mps")
+    parser.add_argument(
+        "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16"
+    )
+    parser.add_argument("--mode", choices=("off", "stable-crsa"), required=True)
+    parser.add_argument("--graft-layer", type=_nonnegative_int, default=27)
+    parser.add_argument("--graft-alpha", type=_unit_float, default=0.01)
+    parser.add_argument("--graft-max-history", type=_positive_int, default=256)
+    parser.add_argument("--graft-rms-eps", type=_positive_float, default=1e-6)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -754,6 +2179,36 @@ def _parser() -> argparse.ArgumentParser:
     comparison.add_argument("--local", required=True)
     comparison.add_argument("--output", required=True)
     comparison.set_defaults(handler=compare)
+    branch_select = subparsers.add_parser(
+        "select-branch-cohort", aliases=("select-branch-input",)
+    )
+    branch_select.add_argument("--inputs", "--source-input", required=True)
+    branch_select.add_argument("--inputs-sha256", required=True)
+    branch_select.add_argument("--tokenizer-json", required=True)
+    branch_select.add_argument("--offset", type=_nonnegative_int, default=0)
+    branch_select.add_argument("--limit", type=_positive_int, default=8)
+    branch_select.add_argument("--output", required=True)
+    branch_select.set_defaults(handler=select_branch_cohort)
+    branch_generate = subparsers.add_parser("generate-arm")
+    _branch_runtime_arguments(branch_generate)
+    branch_generate.set_defaults(handler=generate_arm)
+    branch_compare = subparsers.add_parser(
+        "compare-generated-arms", aliases=("compare-branches",)
+    )
+    branch_compare.add_argument("--off", required=True)
+    branch_compare.add_argument("--candidate", required=True)
+    branch_compare.add_argument("--output", required=True)
+    branch_compare.set_defaults(handler=compare_generated_arms)
+    branch_evaluate = subparsers.add_parser(
+        "evaluate-generated-arms", aliases=("evaluate-branches",)
+    )
+    branch_evaluate.add_argument("--off", required=True)
+    branch_evaluate.add_argument("--candidate", required=True)
+    branch_evaluate.add_argument("--comparison")
+    branch_evaluate.add_argument("--gold-source", "--source-input", required=True)
+    branch_evaluate.add_argument("--gold-source-sha256", required=True)
+    branch_evaluate.add_argument("--output", required=True)
+    branch_evaluate.set_defaults(handler=evaluate_generated_arms)
     return parser
 
 
