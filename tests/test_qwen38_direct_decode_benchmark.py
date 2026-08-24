@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 from contextlib import redirect_stderr
+import hashlib
 import importlib.util
 import io
 import json
@@ -10,9 +11,19 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
-from immer.knowledge import AccessTrace
+from safetensors.torch import save_file
+import torch
+
+from immer.knowledge import AccessTrace, Streamer
 from immer.runtimes.qwen3_8 import verify_probe_document
+
+from test_qwen3_8_model import (
+    _native_tiny_config,
+    _tiny_config_mapping,
+    _tiny_weights,
+)
 
 from test_qwen38_causal_bundle import (
     REPO_ID,
@@ -61,6 +72,54 @@ def _branch_tokenizer(path: Path) -> tuple[int, int]:
     im_end = tokenizer.token_to_id("<|im_end|>")
     assert end_of_text is not None and im_end is not None
     return int(im_end), int(end_of_text)
+
+
+def _native_fixture(root: Path) -> tuple[Path, Path]:
+    source_root = root / "native-source"
+    source_root.mkdir()
+    config = _native_tiny_config()
+    mapping = _tiny_config_mapping()
+    mapping["num_hidden_layers"] = 28
+    mapping["layer_types"] = [
+        "full_attention" if (layer + 1) % 4 == 0 else "linear_attention"
+        for layer in range(28)
+    ]
+    mapping["num_attention_heads"] = 24
+    mapping["num_key_value_heads"] = 4
+    save_file(_tiny_weights(config), source_root / "model.safetensors")
+    source_root.joinpath("config.json").write_text(
+        json.dumps(mapping, separators=(",", ":")), encoding="utf-8"
+    )
+    source = Streamer.from_local(
+        source_root,
+        repo_id=REPO_ID,
+        revision=REVISION,
+        use_cache=False,
+        budget_mb=20,
+    )
+    try:
+        inventory = json.loads(json.dumps(source.inventory()))
+    finally:
+        source.close()
+    digest = benchmark._sha256_file(source_root / "model.safetensors")
+    inventory["shards"][0]["etag"] = f'"{digest}"'
+    inventory["shards"][0]["cas_url_hash"] = digest
+    inventory["shards"][0]["linked_etag"] = digest
+    inventory["shards"][0]["payload_sha256"] = digest
+    fingerprint = Streamer._source_fingerprint(inventory)
+    document = {
+        "inventory": inventory,
+        "inventory_sha256": hashlib.sha256(
+            bundle_script._canonical(inventory)
+        ).hexdigest(),
+        "repo_id": REPO_ID,
+        "revision": REVISION,
+        "schema": "immer.tensor-inventory-cache/v1",
+        "source_fingerprint": fingerprint,
+    }
+    inventory_path = root / "native-inventory.json"
+    inventory_path.write_bytes(bundle_script._canonical(document) + b"\n")
+    return source_root, inventory_path
 
 
 def _prepared_branch_source(
@@ -918,6 +977,417 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
             self.assertEqual(evaluation["summary"]["unsafe_correct_to_wrong"], 1)
             self.assertEqual(evaluation["summary"]["verdict"], "unsafe")
             self.assertFalse(evaluation["summary"]["quality_success"])
+
+    def test_native_generation_v3_evidence_and_generated_triad_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-native-triad-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            source_weights, inventory = _native_fixture(root)
+            tokenizer = root / "tokenizer.json"
+            eos = _branch_tokenizer(tokenizer)
+            source = root / "sealed-dev.json"
+            _prepared_branch_source(source, eos=eos)
+            branch_input = root / "branch-input.json"
+            _select_branch(source, tokenizer, branch_input)
+
+            contaminated_args = _branch_generation_args(
+                branch_input=branch_input,
+                tokenizer=tokenizer,
+                output=root / "contaminated-off.json",
+                trace=root / "contaminated-off-trace.json",
+                source=source_weights,
+                inventory=inventory,
+                cache=root / "cache-contaminated-off",
+                mode="off",
+            )
+            contaminated_args.max_new_tokens = 1
+
+            def contaminated_factory(*factory_args, **factory_kwargs):
+                runtime, model = benchmark._runtime(*factory_args, **factory_kwargs)
+                model.native_head_crsa = benchmark.Qwen38NativeHeadCrsa()
+                model.native_head_crsa_observer = lambda _row: None
+                return runtime, model
+
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "runtime attachment differs"
+            ):
+                benchmark.generate_arm(
+                    contaminated_args, runtime_factory=contaminated_factory
+                )
+
+            captures: list[dict] = []
+
+            def runtime_factory(*factory_args, **factory_kwargs):
+                runtime, model = benchmark._runtime(*factory_args, **factory_kwargs)
+                capture = {
+                    "graft": factory_kwargs.get("graft"),
+                    "native_head_crsa": factory_kwargs.get("native_head_crsa"),
+                    "observer": factory_kwargs.get("native_head_crsa_observer"),
+                    "usage": [],
+                }
+                original_generate = model.generate_greedy
+
+                def recording_generate(*generate_args, **generate_kwargs):
+                    result = original_generate(*generate_args, **generate_kwargs)
+                    state = model._layer_states[27]
+                    capture["usage"].append(
+                        (tuple(state.crsa_log_usage.shape), state.crsa_log_usage.dtype)
+                    )
+                    return result
+
+                model.generate_greedy = recording_generate
+                captures.append(capture)
+                return runtime, model
+
+            native_path = root / "native.json"
+            native_args = _branch_generation_args(
+                branch_input=branch_input,
+                tokenizer=tokenizer,
+                output=native_path,
+                trace=root / "native-trace.json",
+                source=source_weights,
+                inventory=inventory,
+                cache=root / "cache-native",
+                mode="native-crsa",
+            )
+            native_args.max_new_tokens = 1
+            self.assertEqual(
+                (
+                    native_args.native_alpha,
+                    native_args.native_balance_alpha,
+                    native_args.native_diagonal_debit,
+                ),
+                (0.01, 1.0, 3.0),
+            )
+            invalid_config = copy.copy(native_args)
+            invalid_config.native_alpha = 0.02
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "requires alpha=0.01"
+            ):
+                benchmark._build_native_intervention(invalid_config)
+            with redirect_stderr(io.StringIO()):
+                native = benchmark.generate_arm(
+                    native_args, runtime_factory=runtime_factory
+                )
+            benchmark._write_json(native_path, native)
+            self.assertEqual(native["schema"], benchmark.NATIVE_BRANCH_RESULT_SCHEMA)
+            self.assertNotIn("graft", native)
+            self.assertEqual(native["intervention"]["kind"], "native-head-crsa")
+            self.assertEqual(
+                native["intervention"]["config"],
+                {
+                    "alpha": 0.01,
+                    "balance_alpha": 1.0,
+                    "diagonal_debit": 3.0,
+                    "head_indices": [2, 8, 14, 20],
+                    "layer": 27,
+                },
+            )
+            self.assertEqual(len(captures), 1)
+            self.assertIsNone(captures[0]["graft"])
+            self.assertIsInstance(
+                captures[0]["native_head_crsa"], benchmark.Qwen38NativeHeadCrsa
+            )
+            self.assertTrue(callable(captures[0]["observer"]))
+            self.assertEqual(
+                captures[0]["usage"],
+                [((1, 4, 3), torch.float32), ((1, 4, 3), torch.float32)],
+            )
+            for row in native["items"]:
+                receipts = row["intervention_evidence"]
+                self.assertEqual(
+                    row["intervention_evidence_sha256"],
+                    benchmark._sha256(receipts),
+                )
+                self.assertEqual(len(receipts), row["forward_passes"])
+                self.assertEqual(row["forward_passes"], 2)
+                self.assertEqual(
+                    [receipt["query_start"] for receipt in receipts], [0, 2]
+                )
+                self.assertEqual(
+                    [receipt["history_length_after"] for receipt in receipts],
+                    [2, 3],
+                )
+                self.assertTrue(all(receipt["layer"] == 27 for receipt in receipts))
+                self.assertTrue(
+                    all(
+                        receipt["selected_query_heads"] == [2, 8, 14, 20]
+                        and receipt["selected_kv_heads"] == [0, 1, 2, 3]
+                        and len(receipt["free_heads"]) == 20
+                        for receipt in receipts
+                    )
+                )
+            self.assertEqual(benchmark._load_native_branch_result(native_path), native)
+
+            def tampered_path(name: str, mutate) -> Path:
+                document = copy.deepcopy(native)
+                mutate(document)
+                _reseal(document)
+                path = root / f"tampered-{name}.json"
+                benchmark._write_json(path, document)
+                return path
+
+            unsealed = copy.deepcopy(native)
+            unsealed["items"][0]["generated_text"] = "#### 999"
+            unsealed_path = root / "tampered-outer-seal.json"
+            benchmark._write_json(unsealed_path, unsealed)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "document seal mismatch"
+            ):
+                benchmark._load_native_branch_result(unsealed_path)
+
+            def drift_source_identity(document):
+                document["input"]["items"][0]["prompt_token_ids"][0] = 2
+
+            source_tamper = tampered_path("source", drift_source_identity)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "branch input.*seal mismatch"
+            ):
+                benchmark._load_native_branch_result(source_tamper)
+
+            dropped = tampered_path(
+                "count",
+                lambda document: document["items"][0]["intervention_evidence"].pop(),
+            )
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "count differs"
+            ):
+                benchmark._load_native_branch_result(dropped)
+
+            def swap_evidence(document):
+                rows = document["items"][0]["intervention_evidence"]
+                rows[0], rows[1] = rows[1], rows[0]
+
+            swapped = tampered_path("reordered", swap_evidence)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "history chain"
+            ):
+                benchmark._load_native_branch_result(swapped)
+
+            def drift_history(document):
+                document["items"][0]["intervention_evidence"][1]["query_start"] += 1
+
+            drifted = tampered_path("history", drift_history)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "evidence.*invalid|history chain"
+            ):
+                benchmark._load_native_branch_result(drifted)
+
+            def drift_config(document):
+                document["intervention"]["config"]["alpha"] = 0.02
+
+            config_tamper = tampered_path("config", drift_config)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "intervention identity"
+            ):
+                benchmark._load_native_branch_result(config_tamper)
+
+            def drift_free_heads(document):
+                document["items"][0]["intervention_evidence"][0]["free_heads"][0] = 2
+
+            heads_tamper = tampered_path("heads", drift_free_heads)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "evidence is invalid"
+            ):
+                benchmark._load_native_branch_result(heads_tamper)
+
+            def drift_tolerance(document):
+                document["items"][0]["intervention_evidence"][0][
+                    "row_sum_max_error"
+                ] = benchmark.NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE + 1e-7
+
+            tolerance_tamper = tampered_path("tolerance", drift_tolerance)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "evidence is invalid"
+            ):
+                benchmark._load_native_branch_result(tolerance_tamper)
+
+            def drift_future_mass(document):
+                document["items"][0]["intervention_evidence"][0][
+                    "future_weight_max_abs"
+                ] = 1e-9
+
+            future_tamper = tampered_path("future", drift_future_mass)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "evidence is invalid"
+            ):
+                benchmark._load_native_branch_result(future_tamper)
+
+            def drift_mean_l1(document):
+                document["items"][0]["intervention_evidence"][0][
+                    "mean_l1_probability_delta_per_head"
+                ][0] = 1.5
+
+            mean_l1_tamper = tampered_path("mean-l1", drift_mean_l1)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "evidence digest mismatch"
+            ):
+                benchmark._load_native_branch_result(mean_l1_tamper)
+
+            def drift_argmax(document):
+                receipt = document["items"][0]["intervention_evidence"][0]
+                current = receipt["argmax_changed_queries_per_head"][0]
+                receipt["argmax_changed_queries_per_head"][0] = 0 if current != 0 else 1
+
+            argmax_tamper = tampered_path("argmax", drift_argmax)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "evidence digest mismatch"
+            ):
+                benchmark._load_native_branch_result(argmax_tamper)
+
+            def drift_token_chain(document):
+                document["items"][0]["token_chain_sha256"] = "f" * 64
+
+            token_tamper = tampered_path("token-chain", drift_token_chain)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "token-chain digest"
+            ):
+                benchmark._load_native_branch_result(token_tamper)
+
+            def drift_trace(document):
+                document["traffic"]["access_trace"]["sha256"] = "f" * 64
+                document["traffic"]["access_trace_sha256"] = "f" * 64
+
+            trace_tamper = tampered_path("trace", drift_trace)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "trace.*differs|trace artifact"
+            ):
+                benchmark._load_native_branch_result(trace_tamper)
+
+            native_eval = copy.deepcopy(native)
+            _rewrite_generated_answer(native_eval, 0, tokens=[1], text="#### 1")
+            _rewrite_generated_answer(native_eval, 1, tokens=[2], text="#### 2")
+            off = benchmark._native_v2_common_projection(native_eval)
+            _rewrite_generated_answer(off, 0, tokens=[3], text="#### 3")
+            stable = copy.deepcopy(off)
+            stable["arm"] = "stable-crsa"
+            stable["graft"] = benchmark._build_graft(
+                argparse.Namespace(
+                    mode="stable-crsa",
+                    graft_alpha=0.1,
+                    graft_layer=2,
+                    graft_max_history=12,
+                    graft_rms_eps=1e-6,
+                )
+            )[2]
+            _rewrite_generated_answer(stable, 0, tokens=[1], text="#### 1")
+            off_path = root / "triad-off.json"
+            stable_path = root / "triad-stable.json"
+            native_eval_path = root / "triad-native.json"
+            benchmark._write_json(off_path, off)
+            benchmark._write_json(stable_path, stable)
+            benchmark._write_json(native_eval_path, native_eval)
+            self.assertEqual(benchmark._load_branch_result(off_path), off)
+            self.assertEqual(benchmark._load_branch_result(stable_path), stable)
+            self.assertEqual(
+                benchmark._load_native_branch_result(native_eval_path), native_eval
+            )
+            legacy_pair_args = benchmark._parser().parse_args(
+                [
+                    "compare-generated-arms",
+                    "--off",
+                    str(off_path),
+                    "--candidate",
+                    str(native_eval_path),
+                    "--output",
+                    str(root / "legacy-native-rejected.json"),
+                ]
+            )
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "branch result schema"
+            ):
+                benchmark.compare_generated_arms(legacy_pair_args)
+
+            compare_args = benchmark._parser().parse_args(
+                [
+                    "compare-generated-triad",
+                    "--off",
+                    str(off_path),
+                    "--stable-crsa",
+                    str(stable_path),
+                    "--native-crsa",
+                    str(native_eval_path),
+                    "--output",
+                    str(root / "triad.json"),
+                ]
+            )
+            triad = benchmark.compare_generated_triad(compare_args)
+            triad_path = Path(compare_args.output)
+            benchmark._write_json(triad_path, triad)
+            self.assertEqual(triad["schema"], benchmark.TRIAD_COMPARISON_SCHEMA)
+            self.assertEqual(
+                set(triad["arm_seals"]),
+                {
+                    "off",
+                    "stable_crsa",
+                    "native_crsa",
+                },
+            )
+            self.assertEqual(triad["comparisons"]["off_vs_hidden"]["diverged_items"], 1)
+            self.assertEqual(
+                triad["comparisons"]["off_vs_native"]["parsed_answer_changes"],
+                1,
+            )
+
+            evaluate_args = benchmark._parser().parse_args(
+                [
+                    "evaluate-generated-triad",
+                    "--off",
+                    str(off_path),
+                    "--hidden",
+                    str(stable_path),
+                    "--native",
+                    str(native_eval_path),
+                    "--triad",
+                    str(triad_path),
+                    "--gold-source",
+                    str(source),
+                    "--gold-source-sha256",
+                    benchmark._sha256_file(source),
+                    "--output",
+                    str(root / "triad-evaluation.json"),
+                ]
+            )
+            evaluation = benchmark.evaluate_generated_triad(evaluate_args)
+            self.assertEqual(evaluation["schema"], benchmark.TRIAD_EVALUATION_SCHEMA)
+            self.assertEqual(evaluation["summary"]["hidden"]["wrong_to_correct"], 1)
+            self.assertEqual(evaluation["summary"]["native"]["wrong_to_correct"], 1)
+            self.assertEqual(evaluation["summary"]["native"]["correct_to_wrong"], 0)
+            self.assertEqual(evaluation["summary"]["native"]["net_correct_delta"], 1)
+            self.assertTrue(evaluation["summary"]["native"]["quality_success"])
+
+            unsealed_triad = copy.deepcopy(triad)
+            unsealed_triad["comparisons"]["off_vs_native"]["diverged_items"] = 0
+            unsealed_path = root / "unsealed-triad.json"
+            benchmark._write_json(unsealed_path, unsealed_triad)
+            blocked_args = copy.copy(evaluate_args)
+            blocked_args.triad = str(unsealed_path)
+            with mock.patch.object(
+                benchmark,
+                "_externally_sealed_json",
+                side_effect=AssertionError("gold opened too early"),
+            ) as gold_open:
+                with self.assertRaisesRegex(
+                    benchmark.QwenDirectDecodeError, "seal mismatch"
+                ):
+                    benchmark.evaluate_generated_triad(blocked_args)
+                gold_open.assert_not_called()
+
+            invalid_native_args = copy.copy(evaluate_args)
+            invalid_native_args.native = str(dropped)
+            with mock.patch.object(
+                benchmark,
+                "_externally_sealed_json",
+                side_effect=AssertionError("gold opened too early"),
+            ) as gold_open:
+                with self.assertRaisesRegex(
+                    benchmark.QwenDirectDecodeError, "count differs"
+                ):
+                    benchmark.evaluate_generated_triad(invalid_native_args)
+                gold_open.assert_not_called()
 
 
 if __name__ == "__main__":

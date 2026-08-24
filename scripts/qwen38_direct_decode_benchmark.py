@@ -31,14 +31,22 @@ from immer.runtimes.deepseek_v4.benchmark import extract_gsm8k_answer
 from immer.runtimes.qwen3_8 import (
     END_OF_TEXT_TOKEN_ID,
     IM_END_TOKEN_ID,
+    NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA,
+    NATIVE_HEAD_CRSA_FREE_HEADS,
+    NATIVE_HEAD_CRSA_KV_HEADS,
+    NATIVE_HEAD_CRSA_LAYER,
+    NATIVE_HEAD_CRSA_QUERY_HEADS,
+    NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE,
     OFFICIAL_REPO_ID,
     OFFICIAL_REVISION,
     CausalWeightMount,
     DELTANET_PROBE_SCHEMA,
     DeltaNetProbeRecorder,
     LogicalModelIdentity,
+    NativeHeadCrsaEvidence,
     Qwen38BundleError,
     Qwen38Config,
+    Qwen38NativeHeadCrsa,
     Qwen38StableCrsaGraft,
     Qwen38Tokenizer,
     Qwen38WeightPager,
@@ -60,8 +68,22 @@ BRANCH_INPUT_SCHEMA = "immer.qwen3.8-generation-branch-input/v2"
 BRANCH_RESULT_SCHEMA = "immer.qwen3.8-generation-branch-arm/v2"
 BRANCH_COMPARISON_SCHEMA = "immer.qwen3.8-generation-branch-comparison/v2"
 BRANCH_EVALUATION_SCHEMA = "immer.qwen3.8-generation-branch-evaluation/v2"
+NATIVE_BRANCH_RESULT_SCHEMA = "immer.qwen3.8-generation-branch-arm/v3"
+TRIAD_COMPARISON_SCHEMA = "immer.qwen3.8-generation-branch-comparison/v3"
+TRIAD_EVALUATION_SCHEMA = "immer.qwen3.8-generation-branch-evaluation/v3"
 TOKEN_CHAIN_SCHEMA = "immer.qwen3.8-autoregressive-token-chain/v1"
 EXTERNAL_RAW_SEAL_KIND = "external-raw-file-sha256/v1"
+
+# Explicit aliases make the additive schema generation unambiguous while the
+# historic BRANCH_* constants remain byte-compatible v2 identities.
+BRANCH_RESULT_SCHEMA_V3 = NATIVE_BRANCH_RESULT_SCHEMA
+BRANCH_RESULT_V3_SCHEMA = NATIVE_BRANCH_RESULT_SCHEMA
+BRANCH_TRIAD_COMPARISON_SCHEMA = TRIAD_COMPARISON_SCHEMA
+BRANCH_TRIAD_EVALUATION_SCHEMA = TRIAD_EVALUATION_SCHEMA
+
+NATIVE_CRSA_ALPHA = 0.01
+NATIVE_CRSA_BALANCE_ALPHA = 1.0
+NATIVE_CRSA_DIAGONAL_DEBIT = 3.0
 
 _SEAL_FIELDS = ("sha256", "report_sha256", "document_sha256")
 _FORBIDDEN_BRANCH_INPUT_KEYS = frozenset(
@@ -817,6 +839,8 @@ def _runtime(
     *,
     graft: Qwen38StableCrsaGraft | None = None,
     graft_layer: int | None = None,
+    native_head_crsa: Qwen38NativeHeadCrsa | None = None,
+    native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None] | None = None,
     max_batch_size: int = 1,
 ) -> tuple[RuntimeSource, StreamedQwen38]:
     runtime = _build_source(args, recorder)
@@ -846,6 +870,8 @@ def _runtime(
             graft=graft,
             graft_layer=graft_layer,
             delta_probe=delta_probe,
+            native_head_crsa=native_head_crsa,
+            native_head_crsa_observer=native_head_crsa_observer,
             max_batch_size=max_batch_size,
             max_seq_len=args.max_seq_len,
         )
@@ -1211,6 +1237,73 @@ def _build_graft(
     return graft, layer, identity
 
 
+def _native_intervention_identity(
+    intervention: Qwen38NativeHeadCrsa,
+) -> dict[str, Any]:
+    return {
+        "config": {
+            "alpha": intervention.alpha,
+            "balance_alpha": intervention.balance_alpha,
+            "diagonal_debit": intervention.diagonal_debit,
+            "head_indices": list(intervention.head_indices),
+            "layer": intervention.layer,
+        },
+        "evidence": {
+            "free_heads": list(NATIVE_HEAD_CRSA_FREE_HEADS),
+            "row_sum_max_error_tolerance": NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE,
+            "schema": intervention.evidence_schema,
+            "selected_kv_heads": list(intervention.selected_kv_heads),
+        },
+        "implementation": "immer.runtimes.qwen3_8.Qwen38NativeHeadCrsa",
+        "kind": "native-head-crsa",
+        "learned_parameters": 0,
+        "policy": "selected-head-probability-residual/prefix-log/v1",
+        "stateful_history": True,
+        "strict_causal": True,
+        "usage_state": "per-selected-head-prefix-log/v1",
+    }
+
+
+def _build_native_intervention(
+    args: argparse.Namespace,
+) -> tuple[Qwen38NativeHeadCrsa, dict[str, Any]]:
+    try:
+        values = (
+            float(getattr(args, "native_alpha", NATIVE_CRSA_ALPHA)),
+            float(getattr(args, "native_balance_alpha", NATIVE_CRSA_BALANCE_ALPHA)),
+            float(getattr(args, "native_diagonal_debit", NATIVE_CRSA_DIAGONAL_DEBIT)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise QwenDirectDecodeError(
+            "native CRSA intervention configuration is invalid"
+        ) from exc
+    if values != (
+        NATIVE_CRSA_ALPHA,
+        NATIVE_CRSA_BALANCE_ALPHA,
+        NATIVE_CRSA_DIAGONAL_DEBIT,
+    ):
+        raise QwenDirectDecodeError(
+            "native CRSA arm requires alpha=0.01, balance_alpha=1, diagonal_debit=3"
+        )
+    try:
+        intervention = Qwen38NativeHeadCrsa(
+            alpha=values[0],
+            balance_alpha=values[1],
+            diagonal_debit=values[2],
+        )
+    except (TypeError, ValueError) as exc:  # pragma: no cover - constants above.
+        raise QwenDirectDecodeError(
+            "native CRSA intervention configuration is invalid"
+        ) from exc
+    if (
+        intervention.layer != NATIVE_HEAD_CRSA_LAYER
+        or intervention.head_indices != NATIVE_HEAD_CRSA_QUERY_HEADS
+        or intervention.selected_kv_heads != NATIVE_HEAD_CRSA_KV_HEADS
+    ):
+        raise QwenDirectDecodeError("native CRSA fixed head mapping is invalid")
+    return intervention, _native_intervention_identity(intervention)
+
+
 def _source_metric(source: object, name: str) -> int:
     metrics_method = getattr(source, "metrics", None)
     metrics = dict(metrics_method()) if callable(metrics_method) else {}
@@ -1283,24 +1376,59 @@ def generate_arm(
     max_prompt = max(len(prompt) for prompt in prompts)
     if max_prompt + args.max_new_tokens > args.max_seq_len:
         raise QwenDirectDecodeError("generation bound exceeds max_seq_len")
-    graft, graft_layer, graft_identity = _build_graft(args)
+    native_mode = str(args.mode) == "native-crsa"
+    native_evidence: list[NativeHeadCrsaEvidence] = []
+    native_observer = native_evidence.append if native_mode else None
+    intervention: Qwen38NativeHeadCrsa | None = None
+    intervention_identity: dict[str, Any] | None = None
+    if native_mode:
+        intervention, intervention_identity = _build_native_intervention(args)
+        graft = None
+        graft_layer = None
+        graft_identity = None
+    else:
+        graft, graft_layer, graft_identity = _build_graft(args)
     if graft is not None and args.graft_max_history < max_prompt + args.max_new_tokens:
         raise QwenDirectDecodeError("graft max_history is below the generation bound")
     recorder = AccessTraceRecorder()
     factory = _runtime if runtime_factory is None else runtime_factory
-    runtime, model = factory(
-        args,
-        recorder,
-        graft=graft,
-        graft_layer=graft_layer,
-        max_batch_size=1,
+    if native_mode:
+        runtime, model = factory(
+            args,
+            recorder,
+            graft=None,
+            graft_layer=None,
+            native_head_crsa=intervention,
+            native_head_crsa_observer=native_observer,
+            max_batch_size=1,
+        )
+    else:
+        runtime, model = factory(
+            args,
+            recorder,
+            graft=graft,
+            graft_layer=graft_layer,
+            max_batch_size=1,
+        )
+    attachment_valid = (
+        model.graft is graft
+        and model.graft_layer == graft_layer
+        and model.max_batch_size == 1
+        and model.max_seq_len == args.max_seq_len
     )
-    if (
-        model.graft is not graft
-        or model.graft_layer != graft_layer
-        or model.max_batch_size != 1
-        or model.max_seq_len != args.max_seq_len
-    ):
+    if native_mode:
+        attachment_valid = (
+            attachment_valid
+            and getattr(model, "native_head_crsa", None) is intervention
+            and getattr(model, "native_head_crsa_observer", None) is native_observer
+        )
+    else:
+        attachment_valid = (
+            attachment_valid
+            and getattr(model, "native_head_crsa", None) is None
+            and getattr(model, "native_head_crsa_observer", None) is None
+        )
+    if not attachment_valid:
         _cleanup(runtime, model)
         raise QwenDirectDecodeError("branch runtime attachment differs from contract")
     try:
@@ -1325,6 +1453,7 @@ def generate_arm(
         ):
             raise QwenDirectDecodeError("branch token exceeds checkpoint vocabulary")
         for source_row, prompt in zip(inputs["items"], prompts, strict=True):
+            native_evidence_start = len(native_evidence)
             head_blocks = 0
             completed_scans = 0
 
@@ -1372,30 +1501,38 @@ def generate_arm(
             eos_token_id = generated_ids[-1] if stopped else None
             if stopped != (generated_ids[-1] in eos):
                 raise QwenDirectDecodeError("runtime EOS evidence is inconsistent")
-            items.append(
-                {
-                    "context_mode": evidence.context_mode,
-                    "eos_token_id": eos_token_id,
-                    "finish_reason": finish_reason,
-                    "forward_passes": int(evidence.forward_passes),
-                    "general_generation": bool(evidence.general_generation),
-                    "generated_text": text,
-                    "generated_token_ids": list(generated_ids),
-                    "head_scan_blocks": head_blocks,
-                    "head_scans": completed_scans,
-                    "item_id": str(source_row["item_id"]),
-                    "linear_calls": int(evidence.linear_calls),
-                    "parsed_numeric_answer": extract_gsm8k_answer(text),
-                    "prefill_mode": evidence.prefill_mode,
-                    "prompt_token_ids": list(prompt),
-                    "seconds": float(evidence.seconds),
-                    "source_body_bytes": int(evidence.source_body_bytes),
-                    "state_bytes": int(evidence.state_bytes),
-                    "stateful_autoregressive": bool(evidence.stateful_cache),
-                    "stopped_on_eos": stopped,
-                    "token_chain_sha256": _token_chain_sha256(prompt, generated_ids),
-                }
-            )
+            item = {
+                "context_mode": evidence.context_mode,
+                "eos_token_id": eos_token_id,
+                "finish_reason": finish_reason,
+                "forward_passes": int(evidence.forward_passes),
+                "general_generation": bool(evidence.general_generation),
+                "generated_text": text,
+                "generated_token_ids": list(generated_ids),
+                "head_scan_blocks": head_blocks,
+                "head_scans": completed_scans,
+                "item_id": str(source_row["item_id"]),
+                "linear_calls": int(evidence.linear_calls),
+                "parsed_numeric_answer": extract_gsm8k_answer(text),
+                "prefill_mode": evidence.prefill_mode,
+                "prompt_token_ids": list(prompt),
+                "seconds": float(evidence.seconds),
+                "source_body_bytes": int(evidence.source_body_bytes),
+                "state_bytes": int(evidence.state_bytes),
+                "stateful_autoregressive": bool(evidence.stateful_cache),
+                "stopped_on_eos": stopped,
+                "token_chain_sha256": _token_chain_sha256(prompt, generated_ids),
+            }
+            if native_mode:
+                committed = native_evidence[native_evidence_start:]
+                if len(committed) != int(evidence.forward_passes):
+                    raise QwenDirectDecodeError(
+                        "native CRSA evidence count differs from committed forwards"
+                    )
+                evidence_rows = [row.to_dict() for row in committed]
+                item["intervention_evidence"] = evidence_rows
+                item["intervention_evidence_sha256"] = _sha256(evidence_rows)
+            items.append(item)
         checkpoint = _checkpoint(model)
         if (
             checkpoint["repo_id"] != inputs["source"]["checkpoint"]
@@ -1442,6 +1579,24 @@ def generate_arm(
             "source_body_bytes": sum(row["source_body_bytes"] for row in items),
             "wall_seconds": wall_seconds,
         }
+        if native_mode:
+            identity = {
+                "arm": "native-crsa",
+                "bundle": dict(runtime.verification or {}),
+                "checkpoint": checkpoint,
+                "execution": execution,
+                "generation": generation,
+                "input": _branch_input_identity(inputs),
+                "intervention": intervention_identity,
+                "items": items,
+                "schema": NATIVE_BRANCH_RESULT_SCHEMA,
+                "status": "sealed",
+                "tokenizer": tokenizer_identity,
+                "traffic": traffic,
+            }
+            result = _result(identity)
+            _validate_native_branch_result_document(result)
+            return result
         identity = {
             "arm": str(args.mode),
             "bundle": dict(runtime.verification or {}),
@@ -1558,7 +1713,10 @@ def _validate_graft_identity(graft: object, arm: str) -> Mapping[str, Any]:
 
 
 def _load_branch_result(path: str | os.PathLike[str]) -> dict[str, Any]:
-    document = _strict_json(path)
+    return _validate_branch_result_document(_strict_json(path))
+
+
+def _validate_branch_result_document(document: dict[str, Any]) -> dict[str, Any]:
     required = {
         "arm",
         "bundle",
@@ -1844,6 +2002,194 @@ def _load_branch_result(path: str | os.PathLike[str]) -> dict[str, Any]:
     return document
 
 
+def _validate_native_intervention_identity(
+    value: object,
+) -> Mapping[str, Any]:
+    expected = _build_native_intervention(
+        argparse.Namespace(
+            native_alpha=NATIVE_CRSA_ALPHA,
+            native_balance_alpha=NATIVE_CRSA_BALANCE_ALPHA,
+            native_diagonal_debit=NATIVE_CRSA_DIAGONAL_DEBIT,
+        )
+    )[1]
+    if not isinstance(value, Mapping) or _canonical(dict(value)) != _canonical(
+        expected
+    ):
+        raise QwenDirectDecodeError("native CRSA intervention identity is invalid")
+    return value
+
+
+def _native_evidence_from_mapping(
+    value: object,
+    *,
+    item_id: str,
+) -> NativeHeadCrsaEvidence:
+    required = {
+        "alpha_per_head",
+        "argmax_changed_queries_per_head",
+        "free_head_max_abs_error",
+        "free_heads",
+        "future_weight_max_abs",
+        "history_length_after",
+        "history_length_before",
+        "identity",
+        "key_length",
+        "layer",
+        "mean_l1_probability_delta_per_head",
+        "query_length",
+        "query_start",
+        "row_sum_max_error",
+        "schema",
+        "selected_kv_heads",
+        "selected_query_heads",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise QwenDirectDecodeError(
+            f"native CRSA evidence schema is invalid for {item_id}"
+        )
+    payload = dict(value)
+    for name in (
+        "alpha_per_head",
+        "argmax_changed_queries_per_head",
+        "free_heads",
+        "mean_l1_probability_delta_per_head",
+        "selected_kv_heads",
+        "selected_query_heads",
+    ):
+        raw = payload[name]
+        if not isinstance(raw, list):
+            raise QwenDirectDecodeError(
+                f"native CRSA evidence tuple field {name} is invalid for {item_id}"
+            )
+        payload[name] = tuple(raw)
+    try:
+        evidence = NativeHeadCrsaEvidence(**payload)
+    except (TypeError, ValueError) as exc:
+        raise QwenDirectDecodeError(
+            f"native CRSA evidence is invalid for {item_id}: {exc}"
+        ) from exc
+    if _canonical(evidence.to_dict()) != _canonical(dict(value)):
+        raise QwenDirectDecodeError(
+            f"native CRSA evidence is not canonical for {item_id}"
+        )
+    return evidence
+
+
+def _validate_native_evidence_chain(row: Mapping[str, Any]) -> None:
+    item_id = str(row["item_id"])
+    raw_rows = row.get("intervention_evidence")
+    evidence_sha256 = _digest_string(
+        row.get("intervention_evidence_sha256"),
+        f"native CRSA evidence for {item_id}",
+    )
+    if not isinstance(raw_rows, list) or len(raw_rows) != row["forward_passes"]:
+        raise QwenDirectDecodeError(
+            f"native CRSA evidence count differs from forward passes for {item_id}"
+        )
+    prompt_length = len(row["prompt_token_ids"])
+    for index, raw in enumerate(raw_rows):
+        evidence = _native_evidence_from_mapping(raw, item_id=item_id)
+        query_start = 0 if index == 0 else prompt_length + index - 1
+        query_length = prompt_length if index == 0 else 1
+        key_length = query_start + query_length
+        if (
+            evidence.schema != NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA
+            or evidence.layer != NATIVE_HEAD_CRSA_LAYER
+            or evidence.selected_query_heads != NATIVE_HEAD_CRSA_QUERY_HEADS
+            or evidence.selected_kv_heads != NATIVE_HEAD_CRSA_KV_HEADS
+            or evidence.free_heads != NATIVE_HEAD_CRSA_FREE_HEADS
+            or evidence.alpha_per_head
+            != (NATIVE_CRSA_ALPHA,) * len(NATIVE_HEAD_CRSA_QUERY_HEADS)
+            or evidence.free_head_max_abs_error != 0.0
+            or evidence.future_weight_max_abs != 0.0
+            or evidence.row_sum_max_error > NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE
+            or evidence.identity is not False
+        ):
+            raise QwenDirectDecodeError(
+                f"native CRSA evidence identity differs for {item_id}"
+            )
+        if (
+            evidence.query_start != query_start
+            or evidence.query_length != query_length
+            or evidence.key_length != key_length
+            or evidence.history_length_before != query_start
+            or evidence.history_length_after != key_length
+        ):
+            raise QwenDirectDecodeError(
+                f"native CRSA evidence history chain is invalid for {item_id}"
+            )
+        if any(
+            changed > query_length
+            for changed in evidence.argmax_changed_queries_per_head
+        ):
+            raise QwenDirectDecodeError(
+                f"native CRSA argmax evidence exceeds query count for {item_id}"
+            )
+    if evidence_sha256 != _sha256(raw_rows):
+        raise QwenDirectDecodeError(
+            f"native CRSA evidence digest mismatch for {item_id}"
+        )
+
+
+def _native_v2_common_projection(document: Mapping[str, Any]) -> dict[str, Any]:
+    projected = {key: value for key, value in document.items() if key != "sha256"}
+    projected.pop("intervention", None)
+    projected["arm"] = "off"
+    projected["graft"] = _build_graft(argparse.Namespace(mode="off"))[2]
+    projected["items"] = [
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"intervention_evidence", "intervention_evidence_sha256"}
+        }
+        for row in document["items"]
+    ]
+    projected["schema"] = BRANCH_RESULT_SCHEMA
+    return _result(projected)
+
+
+def _validate_native_branch_result_document(
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "arm",
+        "bundle",
+        "checkpoint",
+        "execution",
+        "generation",
+        "input",
+        "intervention",
+        "items",
+        "schema",
+        "sha256",
+        "status",
+        "tokenizer",
+        "traffic",
+    }
+    if (
+        set(document) != required
+        or document.get("schema") != NATIVE_BRANCH_RESULT_SCHEMA
+        or document.get("arm") != "native-crsa"
+        or document.get("status") != "sealed"
+        or not isinstance(document.get("items"), list)
+        or any(not isinstance(row, Mapping) for row in document.get("items", ()))
+    ):
+        raise QwenDirectDecodeError("native branch result schema is invalid")
+    _verify_document_seal(document, "native branch result")
+    _validate_native_intervention_identity(document.get("intervention"))
+    _validate_branch_result_document(_native_v2_common_projection(document))
+    layers = document["execution"]["checkpoint_layers"]
+    if layers <= NATIVE_HEAD_CRSA_LAYER:
+        raise QwenDirectDecodeError("native CRSA layer exceeds checkpoint depth")
+    for row in document["items"]:
+        _validate_native_evidence_chain(row)
+    return document
+
+
+def _load_native_branch_result(path: str | os.PathLike[str]) -> dict[str, Any]:
+    return _validate_native_branch_result_document(_strict_json(path))
+
+
 def _paired_identity(
     off: Mapping[str, Any], candidate: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1963,6 +2309,254 @@ def _load_branch_comparison(path: str | os.PathLike[str]) -> dict[str, Any]:
     ):
         raise QwenDirectDecodeError("branch comparison schema is invalid")
     _verify_document_seal(document, "branch comparison")
+    return document
+
+
+def _triad_pair_report(
+    off: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    arm: str,
+) -> dict[str, Any]:
+    if len(off["items"]) != len(candidate["items"]):
+        raise QwenDirectDecodeError("generated triad item counts differ")
+    items: list[dict[str, Any]] = []
+    divergences = 0
+    answer_changes = 0
+    for off_row, candidate_row in zip(off["items"], candidate["items"], strict=True):
+        if (
+            off_row["item_id"] != candidate_row["item_id"]
+            or off_row["prompt_token_ids"] != candidate_row["prompt_token_ids"]
+        ):
+            raise QwenDirectDecodeError(
+                "generated triad item or prompt identity differs"
+            )
+        first = _first_divergence(
+            off_row["generated_token_ids"], candidate_row["generated_token_ids"]
+        )
+        diverged = first is not None
+        answer_changed = (
+            off_row["parsed_numeric_answer"] != candidate_row["parsed_numeric_answer"]
+        )
+        divergences += diverged
+        answer_changes += answer_changed
+        items.append(
+            {
+                "candidate_parsed_numeric_answer": candidate_row[
+                    "parsed_numeric_answer"
+                ],
+                "candidate_token_chain_sha256": candidate_row["token_chain_sha256"],
+                "diverged": diverged,
+                "first_divergence_index": first,
+                "item_id": off_row["item_id"],
+                "off_parsed_numeric_answer": off_row["parsed_numeric_answer"],
+                "off_token_chain_sha256": off_row["token_chain_sha256"],
+                "parsed_answer_changed": answer_changed,
+            }
+        )
+    return {
+        "arm": arm,
+        "branch_effect_observed": divergences > 0,
+        "diverged_items": divergences,
+        "items": items,
+        "parsed_answer_changes": answer_changes,
+        "total": len(items),
+        "verdict": "diverged" if divergences else "no_divergence",
+    }
+
+
+def _compare_generated_triad_documents(
+    off: Mapping[str, Any],
+    stable: Mapping[str, Any],
+    native: Mapping[str, Any],
+) -> dict[str, Any]:
+    if (
+        off.get("arm") != "off"
+        or stable.get("arm") != "stable-crsa"
+        or native.get("arm") != "native-crsa"
+    ):
+        raise QwenDirectDecodeError(
+            "triad comparison requires off, stable-crsa, and native-crsa arms"
+        )
+    identity = _paired_identity(off, stable)
+    for name, value in _paired_identity(off, native).items():
+        if identity[name] != value:  # pragma: no cover - pair checks already bind.
+            raise QwenDirectDecodeError(f"generated triad {name} identity differs")
+    document = {
+        "arm_seals": {
+            "native_crsa": native["sha256"],
+            "off": off["sha256"],
+            "stable_crsa": stable["sha256"],
+        },
+        "arms": {
+            "native_crsa": {
+                "intervention": native["intervention"],
+                "traffic": native["traffic"],
+            },
+            "off": {"graft": off["graft"], "traffic": off["traffic"]},
+            "stable_crsa": {
+                "graft": stable["graft"],
+                "traffic": stable["traffic"],
+            },
+        },
+        "comparisons": {
+            "off_vs_hidden": _triad_pair_report(off, stable, arm="stable-crsa"),
+            "off_vs_native": _triad_pair_report(off, native, arm="native-crsa"),
+        },
+        "identity": identity,
+        "schema": TRIAD_COMPARISON_SCHEMA,
+        "status": "sealed",
+    }
+    return _result(document)
+
+
+def compare_generated_triad(args: argparse.Namespace) -> dict[str, Any]:
+    return _compare_generated_triad_documents(
+        _load_branch_result(args.off),
+        _load_branch_result(args.stable),
+        _load_native_branch_result(args.native),
+    )
+
+
+def _validate_triad_pair_report(
+    value: object,
+    *,
+    arm: str,
+    item_ids: Sequence[str],
+) -> None:
+    required = {
+        "arm",
+        "branch_effect_observed",
+        "diverged_items",
+        "items",
+        "parsed_answer_changes",
+        "total",
+        "verdict",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise QwenDirectDecodeError("generated triad pair report is invalid")
+    rows = value.get("items")
+    total = _nonnegative_count(value.get("total"), "generated triad pair total")
+    divergences = _nonnegative_count(
+        value.get("diverged_items"), "generated triad divergences"
+    )
+    answer_changes = _nonnegative_count(
+        value.get("parsed_answer_changes"), "generated triad answer changes"
+    )
+    if (
+        value.get("arm") != arm
+        or not isinstance(rows, list)
+        or total != len(rows)
+        or total != len(item_ids)
+        or divergences > total
+        or answer_changes > total
+        or value.get("branch_effect_observed") is not (divergences > 0)
+        or value.get("verdict") != ("diverged" if divergences else "no_divergence")
+    ):
+        raise QwenDirectDecodeError("generated triad pair accounting is invalid")
+    counted_divergences = 0
+    counted_changes = 0
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != {
+            "candidate_parsed_numeric_answer",
+            "candidate_token_chain_sha256",
+            "diverged",
+            "first_divergence_index",
+            "item_id",
+            "off_parsed_numeric_answer",
+            "off_token_chain_sha256",
+            "parsed_answer_changed",
+        }:
+            raise QwenDirectDecodeError("generated triad pair item is invalid")
+        first = row.get("first_divergence_index")
+        if first is not None:
+            _nonnegative_count(first, "generated triad first divergence")
+        if (
+            row.get("item_id") != item_ids[index]
+            or not isinstance(row.get("diverged"), bool)
+            or not isinstance(row.get("parsed_answer_changed"), bool)
+            or row["diverged"] is not (first is not None)
+        ):
+            raise QwenDirectDecodeError("generated triad pair item is inconsistent")
+        _digest_string(row.get("candidate_token_chain_sha256"), "candidate chain")
+        _digest_string(row.get("off_token_chain_sha256"), "off chain")
+        counted_divergences += row["diverged"]
+        counted_changes += row["parsed_answer_changed"]
+    if counted_divergences != divergences or counted_changes != answer_changes:
+        raise QwenDirectDecodeError("generated triad pair counts are inconsistent")
+
+
+def _load_generated_triad_comparison(
+    path: str | os.PathLike[str],
+) -> dict[str, Any]:
+    document = _strict_json(path)
+    if (
+        set(document)
+        != {
+            "arm_seals",
+            "arms",
+            "comparisons",
+            "identity",
+            "schema",
+            "sha256",
+            "status",
+        }
+        or document.get("schema") != TRIAD_COMPARISON_SCHEMA
+        or document.get("status") != "sealed"
+    ):
+        raise QwenDirectDecodeError("generated triad comparison schema is invalid")
+    _verify_document_seal(document, "generated triad comparison")
+    seals = document.get("arm_seals")
+    if not isinstance(seals, Mapping) or set(seals) != {
+        "native_crsa",
+        "off",
+        "stable_crsa",
+    }:
+        raise QwenDirectDecodeError("generated triad arm seals are invalid")
+    for name, value in seals.items():
+        _digest_string(value, f"generated triad {name} arm")
+    arms = document.get("arms")
+    comparisons = document.get("comparisons")
+    identity = document.get("identity")
+    if (
+        not isinstance(arms, Mapping)
+        or set(arms) != {"native_crsa", "off", "stable_crsa"}
+        or not isinstance(comparisons, Mapping)
+        or set(comparisons) != {"off_vs_hidden", "off_vs_native"}
+        or not isinstance(identity, Mapping)
+        or set(identity)
+        != {"bundle", "checkpoint", "execution", "generation", "input", "tokenizer"}
+    ):
+        raise QwenDirectDecodeError("generated triad identity is invalid")
+    if (
+        not isinstance(arms["off"], Mapping)
+        or set(arms["off"]) != {"graft", "traffic"}
+        or not isinstance(arms["stable_crsa"], Mapping)
+        or set(arms["stable_crsa"]) != {"graft", "traffic"}
+        or not isinstance(arms["native_crsa"], Mapping)
+        or set(arms["native_crsa"]) != {"intervention", "traffic"}
+    ):
+        raise QwenDirectDecodeError("generated triad arm identity is invalid")
+    _validate_graft_identity(arms["off"].get("graft"), "off")
+    _validate_graft_identity(arms["stable_crsa"].get("graft"), "stable-crsa")
+    _validate_native_intervention_identity(arms["native_crsa"].get("intervention"))
+    input_identity = identity.get("input")
+    if not isinstance(input_identity, Mapping):
+        raise QwenDirectDecodeError("generated triad input identity is invalid")
+    selection = input_identity.get("selection")
+    if not isinstance(selection, Mapping):
+        raise QwenDirectDecodeError("generated triad selection identity is invalid")
+    item_ids = selection.get("item_ids")
+    if not isinstance(item_ids, list) or any(
+        not isinstance(item_id, str) or not item_id for item_id in item_ids
+    ):
+        raise QwenDirectDecodeError("generated triad item identity is invalid")
+    _validate_triad_pair_report(
+        comparisons["off_vs_hidden"], arm="stable-crsa", item_ids=item_ids
+    )
+    _validate_triad_pair_report(
+        comparisons["off_vs_native"], arm="native-crsa", item_ids=item_ids
+    )
     return document
 
 
@@ -2118,6 +2712,164 @@ def evaluate_generated_arms(args: argparse.Namespace) -> dict[str, Any]:
     return _result(identity)
 
 
+def _transition_against_off(*, off_correct: bool, candidate_correct: bool) -> str:
+    if off_correct and candidate_correct:
+        return "correct_to_correct"
+    if off_correct:
+        return "correct_to_wrong"
+    if candidate_correct:
+        return "wrong_to_correct"
+    return "wrong_to_wrong"
+
+
+def _triad_transition_summary(
+    counts: Mapping[str, int],
+    *,
+    total: int,
+    off_correct: int,
+) -> dict[str, Any]:
+    candidate_correct = counts["correct_to_correct"] + counts["wrong_to_correct"]
+    net = candidate_correct - off_correct
+    if counts["correct_to_wrong"]:
+        verdict = "unsafe"
+    elif net > 0:
+        verdict = "improved"
+    elif net < 0:
+        verdict = "regressed"
+    else:
+        verdict = "neutral"
+    return {
+        **dict(counts),
+        "accuracy": candidate_correct / total,
+        "correct": candidate_correct,
+        "net_accuracy_delta": net / total,
+        "net_correct_delta": net,
+        "quality_success": (
+            counts["wrong_to_correct"] > 0
+            and net > 0
+            and counts["correct_to_wrong"] == 0
+        ),
+        "unsafe_correct_to_wrong": counts["correct_to_wrong"],
+        "verdict": verdict,
+    }
+
+
+def evaluate_generated_triad(args: argparse.Namespace) -> dict[str, Any]:
+    """Admit three arm seals and the exact triad seal before opening gold."""
+
+    # The order is a security property: no label-bearing bytes are opened until
+    # all result documents and the recomputed triad comparison are admitted.
+    off = _load_branch_result(args.off)
+    stable = _load_branch_result(args.stable)
+    native = _load_native_branch_result(args.native)
+    expected_triad = _compare_generated_triad_documents(off, stable, native)
+    triad_path = getattr(args, "triad", None)
+    if triad_path is None:
+        raise QwenDirectDecodeError("sealed generated triad comparison is required")
+    triad = _load_generated_triad_comparison(triad_path)
+    if _canonical(triad) != _canonical(expected_triad):
+        raise QwenDirectDecodeError("triad comparison does not bind admitted arms")
+
+    expected_source_sha256 = _digest_string(
+        args.gold_source_sha256, "label source externally pinned raw file"
+    )
+    if expected_source_sha256 != off["input"]["source"]["raw_file_sha256"]:
+        raise QwenDirectDecodeError(
+            "label source external SHA-256 differs from sealed branch input"
+        )
+    source, source_raw_sha256 = _externally_sealed_json(
+        args.gold_source,
+        expected_source_sha256,
+        "label source",
+    )
+    _source_rows(source)
+    _rows, targets = _gold_rows_for_branch(source, off)
+    transitions = (
+        "correct_to_correct",
+        "correct_to_wrong",
+        "wrong_to_correct",
+        "wrong_to_wrong",
+    )
+    hidden_counts = {name: 0 for name in transitions}
+    native_counts = {name: 0 for name in transitions}
+    items: list[dict[str, Any]] = []
+    off_correct_count = 0
+    for off_row, hidden_row, native_row in zip(
+        off["items"], stable["items"], native["items"], strict=True
+    ):
+        item_id = off_row["item_id"]
+        target = targets[item_id]
+        off_correct = off_row["parsed_numeric_answer"] == target
+        hidden_correct = hidden_row["parsed_numeric_answer"] == target
+        native_correct = native_row["parsed_numeric_answer"] == target
+        off_correct_count += off_correct
+        hidden_transition = _transition_against_off(
+            off_correct=off_correct, candidate_correct=hidden_correct
+        )
+        native_transition = _transition_against_off(
+            off_correct=off_correct, candidate_correct=native_correct
+        )
+        hidden_counts[hidden_transition] += 1
+        native_counts[native_transition] += 1
+        items.append(
+            {
+                "gold": target,
+                "hidden_correct": hidden_correct,
+                "hidden_parsed_numeric_answer": hidden_row["parsed_numeric_answer"],
+                "hidden_sequence_diverged": (
+                    off_row["generated_token_ids"] != hidden_row["generated_token_ids"]
+                ),
+                "hidden_transition": hidden_transition,
+                "hidden_unsafe": hidden_transition == "correct_to_wrong",
+                "item_id": item_id,
+                "native_correct": native_correct,
+                "native_parsed_numeric_answer": native_row["parsed_numeric_answer"],
+                "native_sequence_diverged": (
+                    off_row["generated_token_ids"] != native_row["generated_token_ids"]
+                ),
+                "native_transition": native_transition,
+                "native_unsafe": native_transition == "correct_to_wrong",
+                "off_correct": off_correct,
+                "off_parsed_numeric_answer": off_row["parsed_numeric_answer"],
+            }
+        )
+    total = len(items)
+    hidden_summary = _triad_transition_summary(
+        hidden_counts, total=total, off_correct=off_correct_count
+    )
+    native_summary = _triad_transition_summary(
+        native_counts, total=total, off_correct=off_correct_count
+    )
+    return _result(
+        {
+            "arm_seals": dict(triad["arm_seals"]),
+            "items": items,
+            "protocol": {
+                "all_arm_seals_admitted_before_label_source": True,
+                "generation_was_label_free": True,
+                "transition_rule": "canonical-numeric-exact-match/v1",
+                "triad_seal_admitted_before_label_source": True,
+            },
+            "schema": TRIAD_EVALUATION_SCHEMA,
+            "source": {
+                "contract_sha256": off["input"]["source"]["contract_sha256"],
+                "raw_file_sha256": source_raw_sha256,
+                "schema": source["schema"],
+                "seal_kind": EXTERNAL_RAW_SEAL_KIND,
+            },
+            "status": "sealed",
+            "summary": {
+                "hidden": hidden_summary,
+                "native": native_summary,
+                "off_accuracy": off_correct_count / total,
+                "off_correct": off_correct_count,
+                "total": total,
+            },
+            "triad_sha256": triad["sha256"],
+        }
+    )
+
+
 def _positive_int(raw: str) -> int:
     value = int(raw)
     if value < 1:
@@ -2129,6 +2881,13 @@ def _positive_float(raw: str) -> float:
     value = float(raw)
     if not math.isfinite(value) or value <= 0:
         raise argparse.ArgumentTypeError("must be positive")
+    return value
+
+
+def _nonnegative_float(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("must be finite and non-negative")
     return value
 
 
@@ -2189,11 +2948,24 @@ def _branch_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16"
     )
-    parser.add_argument("--mode", choices=("off", "stable-crsa"), required=True)
+    parser.add_argument(
+        "--mode", choices=("off", "stable-crsa", "native-crsa"), required=True
+    )
     parser.add_argument("--graft-layer", type=_nonnegative_int, default=27)
     parser.add_argument("--graft-alpha", type=_unit_float, default=0.01)
     parser.add_argument("--graft-max-history", type=_positive_int, default=256)
     parser.add_argument("--graft-rms-eps", type=_positive_float, default=1e-6)
+    parser.add_argument("--native-alpha", type=_unit_float, default=NATIVE_CRSA_ALPHA)
+    parser.add_argument(
+        "--native-balance-alpha",
+        type=_nonnegative_float,
+        default=NATIVE_CRSA_BALANCE_ALPHA,
+    )
+    parser.add_argument(
+        "--native-diagonal-debit",
+        type=_nonnegative_float,
+        default=NATIVE_CRSA_DIAGONAL_DEBIT,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2246,6 +3018,37 @@ def _parser() -> argparse.ArgumentParser:
     branch_evaluate.add_argument("--gold-source-sha256", required=True)
     branch_evaluate.add_argument("--output", required=True)
     branch_evaluate.set_defaults(handler=evaluate_generated_arms)
+    triad_compare = subparsers.add_parser("compare-generated-triad")
+    triad_compare.add_argument("--off", required=True)
+    triad_compare.add_argument(
+        "--stable",
+        "--hidden",
+        "--stable-crsa",
+        dest="stable",
+        required=True,
+    )
+    triad_compare.add_argument(
+        "--native", "--native-crsa", dest="native", required=True
+    )
+    triad_compare.add_argument("--output", required=True)
+    triad_compare.set_defaults(handler=compare_generated_triad)
+    triad_evaluate = subparsers.add_parser("evaluate-generated-triad")
+    triad_evaluate.add_argument("--off", required=True)
+    triad_evaluate.add_argument(
+        "--stable",
+        "--hidden",
+        "--stable-crsa",
+        dest="stable",
+        required=True,
+    )
+    triad_evaluate.add_argument(
+        "--native", "--native-crsa", dest="native", required=True
+    )
+    triad_evaluate.add_argument("--triad", "--comparison", dest="triad", required=True)
+    triad_evaluate.add_argument("--gold-source", "--source-input", required=True)
+    triad_evaluate.add_argument("--gold-source-sha256", required=True)
+    triad_evaluate.add_argument("--output", required=True)
+    triad_evaluate.set_defaults(handler=evaluate_generated_triad)
     return parser
 
 
