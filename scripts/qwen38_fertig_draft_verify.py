@@ -166,6 +166,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark", default=str(DEFAULT_BENCHMARK))
     parser.add_argument("--drafts-json", default=str(DEFAULT_DRAFTS))
+    parser.add_argument(
+        "--dynamic-cohort",
+        action="store_true",
+        help="use the explicitly ordered cohort sealed by the baseline report",
+    )
     parser.add_argument("--tokenizer-json")
     parser.add_argument("--run-dir", default=str(DEFAULT_RUN_DIR))
     parser.add_argument("--result-json")
@@ -630,12 +635,66 @@ def _benchmark_rows(path: str | Path) -> dict[str, Mapping[str, Any]]:
     return indexed
 
 
+def _cohort_item_ids(
+    drafts_json: str | Path,
+    *,
+    dynamic: bool,
+) -> tuple[str, ...]:
+    if not dynamic:
+        return FIXED_ITEM_IDS
+    document = _read_json(drafts_json, "Qwen local baseline")
+    if document.get("schema") != BASELINE_SCHEMA:
+        raise CliError("Qwen baseline schema mismatch")
+    claimed = document.get("report_sha256")
+    unsealed = dict(document)
+    unsealed.pop("report_sha256", None)
+    try:
+        actual = hashlib.sha256(
+            json.dumps(
+                unsealed,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    except (TypeError, ValueError) as exc:
+        raise CliError("dynamic baseline report is not canonical JSON") from exc
+    if not isinstance(claimed, str) or claimed != actual:
+        raise CliError("dynamic baseline report seal is invalid")
+    benchmark = document.get("benchmark")
+    if not isinstance(benchmark, Mapping):
+        raise CliError("dynamic baseline benchmark identity is missing")
+    raw_ids = benchmark.get("item_ids")
+    selection = benchmark.get("selection")
+    if (
+        not isinstance(raw_ids, list)
+        or not 1 <= len(raw_ids) <= 64
+        or not isinstance(selection, Mapping)
+        or selection.get("cohort") not in {"abstained", "eligible"}
+        or selection.get("limit") != len(raw_ids)
+    ):
+        raise CliError("dynamic baseline cohort contract is invalid")
+    item_ids = tuple(raw_ids)
+    if any(not isinstance(item_id, str) or not item_id for item_id in item_ids):
+        raise CliError("dynamic baseline item ID is invalid")
+    if len(set(item_ids)) != len(item_ids):
+        raise CliError("dynamic baseline item IDs are duplicated")
+    rows = document.get("items")
+    if not isinstance(rows, list) or [
+        row.get("item_id") if isinstance(row, Mapping) else None for row in rows
+    ] != list(item_ids):
+        raise CliError("dynamic baseline rows do not match their cohort order")
+    return item_ids
+
+
 def _prepare_drafts(
     benchmark: str | Path,
     drafts_json: str | Path,
     tokenizer: Qwen38Tokenizer,
     *,
     max_draft_tokens: int,
+    item_ids: Sequence[str] = FIXED_ITEM_IDS,
 ) -> tuple[PreparedDraft, ...]:
     benchmark_rows = _benchmark_rows(benchmark)
     document = _read_json(drafts_json, "Qwen local baseline")
@@ -663,11 +722,11 @@ def _prepare_drafts(
     ):
         raise CliError("Qwen baseline contains incomplete candidates")
     raw_rows = document.get("items")
-    if not isinstance(raw_rows, list) or len(raw_rows) != len(FIXED_ITEM_IDS):
+    if not isinstance(raw_rows, list) or len(raw_rows) != len(item_ids):
         raise CliError("Qwen baseline item count mismatch")
 
     prepared: list[PreparedDraft] = []
-    for index, (item_id, raw) in enumerate(zip(FIXED_ITEM_IDS, raw_rows, strict=True)):
+    for index, (item_id, raw) in enumerate(zip(item_ids, raw_rows, strict=True)):
         if not isinstance(raw, Mapping) or raw.get("item_id") != item_id:
             raise CliError(f"Qwen baseline row {index} is out of order")
         benchmark_row = benchmark_rows.get(item_id)
@@ -758,6 +817,8 @@ def _input_document(rows: Sequence[PreparedDraft]) -> dict[str, Any]:
             "eos_token_id": IM_END_TOKEN_ID,
             "accepted_eos_token_ids": [IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID],
             "weight_order": "layer-major, one BF16 matrix at a time",
+            "dynamic_cohort": tuple(row.item_id for row in rows) != FIXED_ITEM_IDS,
+            "item_ids": [row.item_id for row in rows],
         },
         "summary": {
             "items": len(rows),
@@ -1191,6 +1252,8 @@ def _result_document(
             "graft_layer": args.graft_layer if args.mode != "off" else None,
             "graft_alpha": args.graft_alpha if args.mode != "off" else None,
             "weight_order": "layer-major, one BF16 matrix at a time",
+            "dynamic_cohort": bool(args.dynamic_cohort),
+            "item_ids": [row.item_id for row in rows],
         },
         "summary": {
             "candidate_correct": candidate_correct,
@@ -1227,11 +1290,16 @@ def run(
 ) -> tuple[dict[str, Any], Path]:
     tokenizer_path = _resolve_tokenizer_path(args)
     tokenizer = tokenizer_factory(tokenizer_path)
+    item_ids = _cohort_item_ids(
+        args.drafts_json,
+        dynamic=bool(args.dynamic_cohort),
+    )
     rows = _prepare_drafts(
         args.benchmark,
         args.drafts_json,
         tokenizer,
         max_draft_tokens=args.max_draft_tokens,
+        item_ids=item_ids,
     )
     run_dir = Path(args.run_dir).expanduser().resolve()
     result_path = (

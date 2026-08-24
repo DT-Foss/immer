@@ -83,6 +83,37 @@ class QwenLocalBaselineTests(unittest.TestCase):
         )
         self.assertEqual(len({row.question for row in items}), 8)
 
+    def test_selects_deterministic_dynamic_abstention_cohort(self) -> None:
+        items = baseline.select_items(
+            baseline.DEFAULT_BENCHMARK,
+            cohort="abstained",
+            limit=16,
+        )
+        benchmark = json.loads(Path(baseline.DEFAULT_BENCHMARK).read_text())
+        expected = [
+            row["item_id"] for row in benchmark["items"] if row["status"] == "abstained"
+        ][:16]
+        self.assertEqual([row.item_id for row in items], expected)
+        self.assertEqual(len({row.item_id for row in items}), 16)
+        with self.assertRaisesRegex(baseline.CliError, "explicit --limit"):
+            baseline.select_items(
+                baseline.DEFAULT_BENCHMARK,
+                cohort="abstained",
+                limit=None,
+            )
+        with self.assertRaisesRegex(baseline.CliError, "does not accept"):
+            baseline.select_items(
+                baseline.DEFAULT_BENCHMARK,
+                cohort="fixed",
+                limit=8,
+            )
+        with self.assertRaisesRegex(baseline.CliError, "must not exceed 64"):
+            baseline.select_items(
+                baseline.DEFAULT_BENCHMARK,
+                cohort="abstained",
+                limit=65,
+            )
+
     def test_numeric_extraction_is_canonical_and_uses_final_marker(self) -> None:
         cases = {
             "work 2 + 3 = 5\n#### 14,000.00": "14000",

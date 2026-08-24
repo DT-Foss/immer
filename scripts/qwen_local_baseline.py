@@ -96,9 +96,7 @@ def _public_backend_location(value: str) -> str:
             return "<loopback-openai-compatible>"
         return "<external-openai-compatible>"
     location = _public_path(value)
-    return (
-        "<external-local-checkpoint>" if location == "<external>" else location
-    )
+    return "<external-local-checkpoint>" if location == "<external>" else location
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +185,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--benchmark", default=str(DEFAULT_BENCHMARK))
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
+    parser.add_argument(
+        "--cohort",
+        choices=("fixed", "abstained", "eligible"),
+        default="fixed",
+    )
+    parser.add_argument("--limit", type=_positive_int)
     parser.add_argument("--max-tokens", type=_positive_int, default=32)
     parser.add_argument("--seed", type=_nonnegative_int, default=0)
     return parser
@@ -228,6 +232,30 @@ def _read_json(path: str | Path, label: str) -> dict[str, Any]:
 def select_fixed_items(benchmark: str | Path) -> tuple[BenchmarkItem, ...]:
     """Select the same eight historical rows as FERTIG improves around them."""
 
+    return select_items(benchmark, cohort="fixed", limit=None)
+
+
+def select_items(
+    benchmark: str | Path,
+    *,
+    cohort: str,
+    limit: int | None,
+) -> tuple[BenchmarkItem, ...]:
+    """Select a deterministic fixed or benchmark-ordered evaluation cohort."""
+
+    if cohort not in ("fixed", "abstained", "eligible"):
+        raise CliError(f"unsupported benchmark cohort: {cohort}")
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
+    ):
+        raise CliError("cohort limit must be a positive integer")
+    if limit is not None and limit > 64:
+        raise CliError("dynamic cohort limit must not exceed 64")
+    if cohort == "fixed" and limit is not None:
+        raise CliError("the fixed cohort does not accept --limit")
+    if cohort != "fixed" and limit is None:
+        raise CliError("dynamic cohorts require an explicit --limit")
+
     document = _read_json(benchmark, "FERTIG GSM8K report")
     raw_items = document.get("items")
     if not isinstance(raw_items, list):
@@ -242,19 +270,36 @@ def select_fixed_items(benchmark: str | Path) -> tuple[BenchmarkItem, ...]:
                 raise CliError(f"duplicate benchmark item: {item_id}")
             by_id[item_id] = raw
 
+    item_ids: Sequence[str]
+    if cohort == "fixed":
+        item_ids = FIXED_ITEM_IDS
+    else:
+        allowed = {"abstained"} if cohort == "abstained" else {"abstained", "correct"}
+        item_ids = tuple(
+            str(raw["item_id"])
+            for raw in raw_items
+            if isinstance(raw, Mapping)
+            and isinstance(raw.get("item_id"), str)
+            and raw.get("status") in allowed
+        )[:limit]
+        if len(item_ids) != limit:
+            raise CliError(
+                f"benchmark has only {len(item_ids)} usable rows for {cohort} limit {limit}"
+            )
+
     selected: list[BenchmarkItem] = []
-    for item_id in FIXED_ITEM_IDS:
+    for item_id in item_ids:
         raw = by_id.get(item_id)
         if raw is None:
-            raise CliError(f"fixed benchmark item is missing: {item_id}")
+            raise CliError(f"benchmark cohort item is missing: {item_id}")
         if raw.get("status") not in {"abstained", "correct"}:
-            raise CliError(f"fixed historical cohort item is unusable: {item_id}")
+            raise CliError(f"benchmark cohort item is unusable: {item_id}")
         question = raw.get("question")
         if not isinstance(question, str) or not question.strip():
-            raise CliError(f"fixed item has no question: {item_id}")
+            raise CliError(f"cohort item has no question: {item_id}")
         gold = extract_numeric_answer(raw.get("gold"))
         if gold is None:
-            raise CliError(f"fixed item has no numeric gold answer: {item_id}")
+            raise CliError(f"cohort item has no numeric gold answer: {item_id}")
         selected.append(BenchmarkItem(item_id, question, gold))
     return tuple(selected)
 
@@ -564,7 +609,7 @@ def run(
     backend_factory: Callable[[argparse.Namespace], GenerationBackend] | None = None,
     clock: Callable[[], float] = time.perf_counter,
 ) -> tuple[dict[str, Any], Path]:
-    items = select_fixed_items(args.benchmark)
+    items = select_items(args.benchmark, cohort=args.cohort, limit=args.limit)
     if backend_factory is None:
         if args.backend == "mlx":
 
@@ -656,42 +701,45 @@ def run(
     latencies = [float(row["latency_seconds"]) for row in rows]
     parsed = counts["correct"] + counts["incorrect"]
     total = len(rows)
-    report = _seal_report({
-        "schema": RESULT_SCHEMA,
-        "model": {
-            "id": backend.model_id,
-            "revision": backend.model_revision,
-            "path": _public_backend_location(backend.model_path),
-            "backend": backend.backend_name,
-            "load_seconds": backend.load_seconds,
-        },
-        "benchmark": {
-            "name": "GSM8K historical FERTIG-abstention cohort",
-            "source": _public_path(args.benchmark),
-            "item_ids": list(FIXED_ITEM_IDS),
-        },
-        "protocol": {
-            "system_prompt": SYSTEM_PROMPT,
-            "backend": args.backend,
-            "openai_prompt_mode": (
-                args.openai_prompt_mode if args.backend == "openai" else None
-            ),
-            "temperature": 0.0,
-            "seed": args.seed,
-            "max_tokens": args.max_tokens,
-            "answer_extraction": "last numeric value after final #### marker",
-        },
-        "items": rows,
-        "summary": {
-            "total": total,
-            **counts,
-            "accuracy": counts["correct"] / total,
-            "parsed_accuracy": counts["correct"] / parsed if parsed else None,
-            "total_latency_seconds": sum(latencies),
-            "mean_latency_seconds": statistics.fmean(latencies),
-            "median_latency_seconds": statistics.median(latencies),
-        },
-    })
+    report = _seal_report(
+        {
+            "schema": RESULT_SCHEMA,
+            "model": {
+                "id": backend.model_id,
+                "revision": backend.model_revision,
+                "path": _public_backend_location(backend.model_path),
+                "backend": backend.backend_name,
+                "load_seconds": backend.load_seconds,
+            },
+            "benchmark": {
+                "name": f"GSM8K FERTIG {args.cohort} cohort",
+                "source": _public_path(args.benchmark),
+                "item_ids": [item.item_id for item in items],
+                "selection": {"cohort": args.cohort, "limit": args.limit},
+            },
+            "protocol": {
+                "system_prompt": SYSTEM_PROMPT,
+                "backend": args.backend,
+                "openai_prompt_mode": (
+                    args.openai_prompt_mode if args.backend == "openai" else None
+                ),
+                "temperature": 0.0,
+                "seed": args.seed,
+                "max_tokens": args.max_tokens,
+                "answer_extraction": "last numeric value after final #### marker",
+            },
+            "items": rows,
+            "summary": {
+                "total": total,
+                **counts,
+                "accuracy": counts["correct"] / total,
+                "parsed_accuracy": counts["correct"] / parsed if parsed else None,
+                "total_latency_seconds": sum(latencies),
+                "mean_latency_seconds": statistics.fmean(latencies),
+                "median_latency_seconds": statistics.median(latencies),
+            },
+        }
+    )
     output = _atomic_write_json(args.output, report)
     return report, output
 

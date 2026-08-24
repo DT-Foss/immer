@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -192,6 +193,68 @@ class Qwen38FertigDraftVerifyTests(unittest.TestCase):
                     tokenizer,
                     max_draft_tokens=32,
                 )
+
+    def test_dynamic_cohort_is_explicit_ordered_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tokenizer_path, benchmark, drafts = _write_fixture(root)
+            document = json.loads(drafts.read_text(encoding="utf-8"))
+            rows = document["items"][:3]
+            item_ids = [row["item_id"] for row in rows]
+            document["items"] = rows
+            document["benchmark"] = {
+                "item_ids": item_ids,
+                "selection": {
+                    "cohort": "abstained",
+                    "limit": 3,
+                },
+            }
+            correct = sum(bool(row["correct"]) for row in rows)
+            document["summary"].update(
+                {
+                    "total": 3,
+                    "correct": correct,
+                    "incorrect": 3 - correct,
+                    "accuracy": correct / 3,
+                }
+            )
+
+            def seal() -> None:
+                document.pop("report_sha256", None)
+                document["report_sha256"] = hashlib.sha256(
+                    json.dumps(
+                        document,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+
+            seal()
+            drafts.write_text(json.dumps(document), encoding="utf-8")
+
+            selected = verify_script._cohort_item_ids(drafts, dynamic=True)
+            prepared = verify_script._prepare_drafts(
+                benchmark,
+                drafts,
+                _ByteTokenizer(tokenizer_path),
+                max_draft_tokens=32,
+                item_ids=selected,
+            )
+
+            self.assertEqual(selected, tuple(item_ids))
+            self.assertEqual([row.item_id for row in prepared], item_ids)
+            self.assertEqual(
+                verify_script._cohort_item_ids(drafts, dynamic=False),
+                verify_script.FIXED_ITEM_IDS,
+            )
+
+            document["benchmark"]["item_ids"] = [item_ids[0], item_ids[0], item_ids[2]]
+            seal()
+            drafts.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(verify_script.CliError, "duplicated"):
+                verify_script._cohort_item_ids(drafts, dynamic=True)
 
     def test_verify_passes_exact_padding_stop_set_and_native_resume_shape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
