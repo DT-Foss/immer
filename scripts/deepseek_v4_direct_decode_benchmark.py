@@ -18,6 +18,7 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 from typing import Any
@@ -294,6 +295,28 @@ def _result(identity: Mapping[str, Any]) -> dict[str, Any]:
     return {**dict(identity), "sha256": _sha256(identity)}
 
 
+def _progress(arm: str):
+    def emit(row: Mapping[str, Any]) -> None:
+        experts = row.get("experts")
+        flattened = (
+            [expert for selected in experts for expert in selected]
+            if isinstance(experts, list)
+            else []
+        )
+        record = {
+            "arm": arm,
+            "event": "layer_complete",
+            "layer": row.get("layer"),
+            "layers": row.get("layers"),
+            "seconds": row.get("seconds"),
+            "source_body_bytes": row.get("source_body_bytes"),
+            "unique_experts": len(set(flattened)),
+        }
+        print(json.dumps(record, sort_keys=True), file=sys.stderr, flush=True)
+
+    return emit
+
+
 def prepare_prefix(args: argparse.Namespace) -> dict[str, Any]:
     inputs = load_input_document(args.input)
     prefix = tuple(int(value) for value in inputs["prefix_token_ids"])
@@ -315,7 +338,9 @@ def prepare_prefix(args: argparse.Namespace) -> dict[str, Any]:
             else nullcontext()
         )
         with scope:
-            hidden, evidence = model.prefill([prefix], tokenwise=False)
+            hidden, evidence = model.prefill(
+                [prefix], tokenwise=False, progress=_progress("prepare")
+            )
         seconds = time.perf_counter() - started
         after = _source_bytes(source)
         snapshot = model.save_state(args.snapshot, transport_neutral=True)
@@ -382,7 +407,9 @@ def decode_arm(args: argparse.Namespace) -> dict[str, Any]:
             else nullcontext()
         )
         with scope:
-            hidden, evidence = model.decode([[int(inputs["decode_token_id"])]])
+            hidden, evidence = model.decode(
+                [[int(inputs["decode_token_id"])]], progress=_progress(role)
+            )
         seconds = time.perf_counter() - started
         after = _source_bytes(source)
         trace = _trace_receipt(recorder, args.access_trace)
