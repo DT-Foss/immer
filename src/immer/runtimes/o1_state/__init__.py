@@ -1,4 +1,4 @@
-"""Persistent O1 state and bounded model-cartography scheduling."""
+"""Persistent O1 state and resumable model-cartography scheduling."""
 
 from .cartographer import (
     CartographyBudget,
