@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import gc
+import os
+from pathlib import Path
 import sys
 import threading
 import warnings
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from typing import Any, Iterable
 
 from ..deepseek_v4.causal_weights import CausalTensorReader
@@ -16,6 +19,96 @@ from .config import validate_source_identity
 
 class Qwen38PagerError(RuntimeError):
     """A checkpoint tensor cannot be materialized within the pager contract."""
+
+
+def _linux_current_rss_bytes() -> int | None:
+    statm = Path("/proc/self/statm")
+    try:
+        fields = statm.read_text(encoding="ascii").split()
+        resident_pages = int(fields[1])
+        page_bytes = int(os.sysconf("SC_PAGE_SIZE"))
+        if resident_pages >= 0 and page_bytes > 0:
+            return resident_pages * page_bytes
+    except (IndexError, OSError, ValueError):
+        return None
+    return None
+
+
+@lru_cache(maxsize=1)
+def _darwin_rss_reader() -> Callable[[], int | None] | None:
+    """Bind Darwin's current-RSS proc_pidinfo call once per process."""
+
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+
+        class ProcTaskInfo(ctypes.Structure):
+            _fields_ = (
+                ("pti_virtual_size", ctypes.c_uint64),
+                ("pti_resident_size", ctypes.c_uint64),
+                ("pti_total_user", ctypes.c_uint64),
+                ("pti_total_system", ctypes.c_uint64),
+                ("pti_threads_user", ctypes.c_uint64),
+                ("pti_threads_system", ctypes.c_uint64),
+                ("pti_policy", ctypes.c_int32),
+                ("pti_faults", ctypes.c_int32),
+                ("pti_pageins", ctypes.c_int32),
+                ("pti_cow_faults", ctypes.c_int32),
+                ("pti_messages_sent", ctypes.c_int32),
+                ("pti_messages_received", ctypes.c_int32),
+                ("pti_syscalls_mach", ctypes.c_int32),
+                ("pti_syscalls_unix", ctypes.c_int32),
+                ("pti_csw", ctypes.c_int32),
+                ("pti_threadnum", ctypes.c_int32),
+                ("pti_numrunning", ctypes.c_int32),
+                ("pti_priority", ctypes.c_int32),
+            )
+
+        proc_pidinfo = ctypes.CDLL(
+            "/usr/lib/libproc.dylib",
+            use_errno=True,
+        ).proc_pidinfo
+        proc_pidinfo.argtypes = (
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        )
+        proc_pidinfo.restype = ctypes.c_int
+        expected = ctypes.sizeof(ProcTaskInfo)
+    except (AttributeError, OSError):
+        return None
+
+    def read() -> int | None:
+        info = ProcTaskInfo()
+        received = proc_pidinfo(
+            os.getpid(),
+            4,  # PROC_PIDTASKINFO
+            0,
+            ctypes.byref(info),
+            expected,
+        )
+        rss = int(info.pti_resident_size)
+        return rss if received == expected and rss >= 0 else None
+
+    return read
+
+
+def _darwin_current_rss_bytes() -> int | None:
+    reader = _darwin_rss_reader()
+    return None if reader is None else reader()
+
+
+def _process_rss_bytes() -> int | None:
+    """Return current RSS only; historical peak counters are never accepted."""
+
+    if sys.platform == "darwin":
+        return _darwin_current_rss_bytes()
+    if sys.platform.startswith("linux"):
+        return _linux_current_rss_bytes()
+    return None
 
 
 @dataclass(slots=True)
@@ -30,7 +123,18 @@ class PagerMetrics:
     peak_planned_resident_bytes: int = 0
     materialized_weight_releases: int = 0
     release_boundaries: int = 0
+    gc_policy_boundaries: int = 0
     mps_cache_purges: int = 0
+    gc_collections: int = 0
+    gc_collections_skipped: int = 0
+    gc_collections_forced: int = 0
+    gc_collections_pressure: int = 0
+    gc_collections_interval: int = 0
+    gc_collections_fail_closed: int = 0
+    gc_objects_collected: int = 0
+    gc_rss_measurement_failures: int = 0
+    gc_last_observed_rss_bytes: int = 0
+    gc_peak_observed_rss_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +166,9 @@ class Qwen38WeightPager:
 
     DEFAULT_MAX_RESIDENT_BYTES = 384 * 1024**2
     DEFAULT_HEAD_BLOCK_ROWS = 2048
-    WEIGHT_CACHE_POLICY = "one-shot-qwen35-exact-range/v2"
+    DEFAULT_GC_INTERVAL_BOUNDARIES = 256
+    DEFAULT_GC_RSS_HEADROOM_BYTES = 1024**3
+    WEIGHT_CACHE_POLICY = "one-shot-qwen35-exact-range/v3"
 
     def __init__(
         self,
@@ -71,6 +177,8 @@ class Qwen38WeightPager:
         device: str = "auto",
         compute_dtype: str = "auto",
         max_resident_bytes: int = DEFAULT_MAX_RESIDENT_BYTES,
+        gc_interval_boundaries: int = DEFAULT_GC_INTERVAL_BOUNDARIES,
+        gc_rss_limit_bytes: int | None = None,
         close_source: bool = False,
         require_source_identity: bool = False,
         causal_tensor_reader: CausalTensorReader | None = None,
@@ -105,6 +213,18 @@ class Qwen38WeightPager:
             raise ValueError("max_resident_bytes must be a positive integer")
         if not isinstance(close_source, bool):
             raise ValueError("close_source must be a boolean")
+        if (
+            isinstance(gc_interval_boundaries, bool)
+            or not isinstance(gc_interval_boundaries, int)
+            or gc_interval_boundaries <= 0
+        ):
+            raise ValueError("gc_interval_boundaries must be a positive integer")
+        if gc_rss_limit_bytes is not None and (
+            isinstance(gc_rss_limit_bytes, bool)
+            or not isinstance(gc_rss_limit_bytes, int)
+            or gc_rss_limit_bytes <= 0
+        ):
+            raise ValueError("gc_rss_limit_bytes must be a positive integer or None")
         if not isinstance(require_source_identity, bool):
             raise ValueError("require_source_identity must be a boolean")
         if causal_tensor_reader is not None:
@@ -118,6 +238,19 @@ class Qwen38WeightPager:
         self.device = torch.device(device)
         self.compute_dtype = dtype
         self.max_resident_bytes = max_resident_bytes
+        self.gc_interval_boundaries = gc_interval_boundaries
+        initial_rss = _process_rss_bytes() if gc_rss_limit_bytes is None else None
+        if gc_rss_limit_bytes is None:
+            rss_headroom = max(
+                self.DEFAULT_GC_RSS_HEADROOM_BYTES,
+                2 * max_resident_bytes,
+            )
+            gc_rss_limit_bytes = (
+                rss_headroom
+                if initial_rss is None
+                else initial_rss + rss_headroom
+            )
+        self.gc_rss_limit_bytes = gc_rss_limit_bytes
         self.close_source = close_source
         self.causal_tensor_reader = causal_tensor_reader
         self.source_identity = validate_source_identity(
@@ -126,6 +259,9 @@ class Qwen38WeightPager:
             require_identity=require_source_identity,
         )
         self._stats = PagerMetrics()
+        if initial_rss is not None:
+            self._stats.gc_last_observed_rss_bytes = initial_rss
+            self._stats.gc_peak_observed_rss_bytes = initial_rss
         self._lock = threading.RLock()
         self._closed = False
 
@@ -761,21 +897,61 @@ class Qwen38WeightPager:
             self.torch.gather(ordered_ids, -1, value_order),
         )
 
-    def _release_locked(self) -> None:
-        gc.collect()
+    def _collect_locked(self, kind: str) -> None:
+        collected = gc.collect()
+        self._stats.gc_collections += 1
+        self._stats.gc_objects_collected += max(0, int(collected))
+        if kind == "forced":
+            self._stats.gc_collections_forced += 1
+        elif kind == "pressure":
+            self._stats.gc_collections_pressure += 1
+        elif kind == "interval":
+            self._stats.gc_collections_interval += 1
+        elif kind == "fail_closed":
+            self._stats.gc_collections_fail_closed += 1
+        else:  # pragma: no cover - private call contract.
+            raise AssertionError(f"unknown GC collection kind: {kind}")
+
+    def _release_locked(self, *, force_gc: bool) -> None:
         self._stats.release_boundaries += 1
+        if force_gc:
+            self._collect_locked("forced")
+        else:
+            self._stats.gc_policy_boundaries += 1
+            rss = _process_rss_bytes()
+            if rss is None:
+                self._stats.gc_rss_measurement_failures += 1
+                self._collect_locked("fail_closed")
+            else:
+                self._stats.gc_last_observed_rss_bytes = rss
+                self._stats.gc_peak_observed_rss_bytes = max(
+                    self._stats.gc_peak_observed_rss_bytes,
+                    rss,
+                )
+                if rss >= self.gc_rss_limit_bytes:
+                    self._collect_locked("pressure")
+                elif (
+                    self._stats.gc_policy_boundaries
+                    % self.gc_interval_boundaries
+                    == 0
+                ):
+                    self._collect_locked("interval")
+                else:
+                    self._stats.gc_collections_skipped += 1
         if self.device.type == "mps":
             empty_cache = getattr(getattr(self.torch, "mps", None), "empty_cache", None)
             if callable(empty_cache):
                 empty_cache()
                 self._stats.mps_cache_purges += 1
 
-    def release(self) -> None:
-        """Drop allocator caches at an explicit decoder-layer boundary."""
+    def release(self, *, force_gc: bool = False) -> None:
+        """Release one boundary and collect only under the configured policy."""
 
         with self._lock:
             self._ensure_open()
-            self._release_locked()
+            if not isinstance(force_gc, bool):
+                raise ValueError("force_gc must be a boolean")
+            self._release_locked(force_gc=force_gc)
 
     def close(self) -> None:
         """Wait for any active call, release allocator state, and close if owned."""
@@ -783,7 +959,7 @@ class Qwen38WeightPager:
         with self._lock:
             if self._closed:
                 return
-            self._release_locked()
+            self._release_locked(force_gc=True)
             if self.close_source:
                 close = getattr(self.source, "close", None)
                 if callable(close):
@@ -814,6 +990,8 @@ class Qwen38WeightPager:
                 "device": self.resolved_device,
                 "compute_dtype": self.resolved_dtype,
                 "max_resident_bytes": self.max_resident_bytes,
+                "gc_interval_boundaries": self.gc_interval_boundaries,
+                "gc_rss_limit_bytes": self.gc_rss_limit_bytes,
                 "weight_cache_policy": self.WEIGHT_CACHE_POLICY,
                 "source_identity": self.source_identity,
                 "closed": self._closed,

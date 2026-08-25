@@ -1675,7 +1675,10 @@ class StreamedQwen38:
         self._graft_history = None
         self._pending_block_stage = None
         if release:
-            self.pager.release()
+            # ``release=True`` is the public request teardown boundary.  Layer
+            # boundaries use the pager's bounded interval/RSS policy; request
+            # teardown always completes a full cyclic-GC pass.
+            self.pager.release(force_gc=True)
 
     def hidden_stateful_range(
         self,

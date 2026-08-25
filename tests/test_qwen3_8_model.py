@@ -1173,6 +1173,71 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(stopped_evidence.forward_passes, 2)
         self.assertEqual(self.model.next_position, 3)
 
+    def test_gc_policy_preserves_generated_tokens_hidden_and_state(self) -> None:
+        source = Streamer.from_local(self.root, budget_mb=20, use_cache=False)
+        pagers = [
+            Qwen38WeightPager(
+                source,
+                device="cpu",
+                compute_dtype="float32",
+                max_resident_bytes=2 * 1024**2,
+                gc_interval_boundaries=interval,
+                gc_rss_limit_bytes=2**63 - 1,
+            )
+            for interval in (1, 10_000)
+        ]
+        models = [
+            StreamedQwen38(
+                self.config,
+                pager,
+                max_batch_size=1,
+                max_seq_len=16,
+            )
+            for pager in pagers
+        ]
+        try:
+            outputs = []
+            with mock.patch(
+                "immer.runtimes.qwen3_8.pager._process_rss_bytes",
+                return_value=1,
+            ):
+                for model in models:
+                    tokens, _evidence = model.generate_greedy(
+                        [[1, 4]],
+                        max_new_tokens=2,
+                        head_block_rows=7,
+                    )
+                    outputs.append(
+                        (
+                            tokens,
+                            model._layer_states,
+                            model._graft_history,
+                            model.next_position,
+                        )
+                    )
+
+            self.assertEqual(outputs[0][0], outputs[1][0])
+            _assert_layer_states_equal(self, outputs[0][1], outputs[1][1])
+            self.assertIsNone(outputs[0][2])
+            self.assertIsNone(outputs[1][2])
+            self.assertEqual(outputs[0][3], outputs[1][3])
+            self.assertGreater(pagers[0].metrics()["gc_collections_interval"], 0)
+            self.assertEqual(pagers[1].metrics()["gc_collections_interval"], 0)
+            self.assertGreater(pagers[1].metrics()["gc_collections_skipped"], 0)
+            forced_before = [
+                pager.metrics()["gc_collections_forced"] for pager in pagers
+            ]
+            for model in models:
+                model.reset_state(release=True)
+            self.assertEqual(
+                [pager.metrics()["gc_collections_forced"] for pager in pagers],
+                [value + 1 for value in forced_before],
+            )
+        finally:
+            for pager in pagers:
+                pager.close()
+            source.close()
+
     def test_right_padding_preserves_each_valid_prefix(self) -> None:
         batch_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 0, 0]])
         mask = torch.tensor([[True, True, True, True], [True, True, False, False]])

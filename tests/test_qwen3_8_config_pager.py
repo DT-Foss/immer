@@ -346,7 +346,7 @@ class Qwen38PagerTests(unittest.TestCase):
         self.assertEqual(metrics["materialized_tensor_bytes"], 8)
         self.assertEqual(metrics["materialized_weight_releases"], 1)
         self.assertEqual(
-            metrics["weight_cache_policy"], "one-shot-qwen35-exact-range/v2"
+            metrics["weight_cache_policy"], "one-shot-qwen35-exact-range/v3"
         )
 
     def test_real_qwen35_f32_control_tensor_is_range_decoded_exactly(self) -> None:
@@ -584,14 +584,167 @@ class Qwen38PagerTests(unittest.TestCase):
 
         source = self._source()
         pager = Qwen38WeightPager(source, device="cpu", close_source=True)
-        pager.close()
-        pager.close()
+        with mock.patch("immer.runtimes.qwen3_8.pager.gc.collect", return_value=7) as collect:
+            pager.close()
+            pager.close()
 
         self.assertTrue(source.closed)
         self.assertTrue(pager.metrics()["closed"])
         self.assertEqual(pager.metrics()["release_boundaries"], 1)
+        self.assertEqual(pager.metrics()["gc_collections"], 1)
+        self.assertEqual(pager.metrics()["gc_collections_forced"], 1)
+        self.assertEqual(pager.metrics()["gc_objects_collected"], 7)
+        collect.assert_called_once_with()
         with self.assertRaisesRegex(Qwen38PagerError, "closed"):
             pager.tensor_torch("norm.weight")
+
+    def test_cpu_release_skips_gc_below_pressure_and_interval(self) -> None:
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        pager = Qwen38WeightPager(
+            self._source(),
+            device="cpu",
+            gc_interval_boundaries=8,
+            gc_rss_limit_bytes=10_000,
+        )
+        with (
+            mock.patch(
+                "immer.runtimes.qwen3_8.pager._process_rss_bytes",
+                return_value=1_000,
+            ),
+            mock.patch("immer.runtimes.qwen3_8.pager.gc.collect") as collect,
+        ):
+            pager.release()
+            pager.release()
+
+        metrics = pager.metrics()
+        self.assertEqual(metrics["release_boundaries"], 2)
+        self.assertEqual(metrics["gc_collections_skipped"], 2)
+        self.assertEqual(metrics["gc_collections"], 0)
+        self.assertEqual(metrics["gc_last_observed_rss_bytes"], 1_000)
+        collect.assert_not_called()
+
+    def test_darwin_default_limit_uses_current_not_historical_peak_rss(self) -> None:
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        current_rss = 123_456
+        historical_peak = 9 * 1024**3
+        with (
+            mock.patch(
+                "immer.runtimes.qwen3_8.pager.sys.platform",
+                "darwin",
+            ),
+            mock.patch(
+                "immer.runtimes.qwen3_8.pager._darwin_current_rss_bytes",
+                return_value=current_rss,
+            ) as current,
+        ):
+            pager = Qwen38WeightPager(self._source(), device="cpu")
+
+        self.assertEqual(
+            pager.gc_rss_limit_bytes,
+            current_rss + pager.DEFAULT_GC_RSS_HEADROOM_BYTES,
+        )
+        self.assertLess(pager.gc_rss_limit_bytes, historical_peak)
+        current.assert_called_once_with()
+        pager.close()
+
+    def test_rss_pressure_and_deterministic_interval_force_gc(self) -> None:
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        pressure = Qwen38WeightPager(
+            self._source(),
+            device="cpu",
+            gc_interval_boundaries=8,
+            gc_rss_limit_bytes=10_000,
+        )
+        interval = Qwen38WeightPager(
+            self._source(),
+            device="cpu",
+            gc_interval_boundaries=2,
+            gc_rss_limit_bytes=10_000,
+        )
+        with (
+            mock.patch(
+                "immer.runtimes.qwen3_8.pager._process_rss_bytes",
+                side_effect=(10_001, 1_000, 1_000),
+            ),
+            mock.patch(
+                "immer.runtimes.qwen3_8.pager.gc.collect",
+                return_value=0,
+            ) as collect,
+        ):
+            pressure.release()
+            interval.release()
+            interval.release()
+
+        self.assertEqual(collect.call_count, 2)
+        self.assertEqual(pressure.metrics()["gc_collections_pressure"], 1)
+        self.assertEqual(interval.metrics()["gc_collections_skipped"], 1)
+        self.assertEqual(interval.metrics()["gc_collections_interval"], 1)
+
+    def test_forced_teardown_does_not_shift_interval_cadence(self) -> None:
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        pager = Qwen38WeightPager(
+            self._source(),
+            device="cpu",
+            gc_interval_boundaries=3,
+            gc_rss_limit_bytes=10_000,
+        )
+        with (
+            mock.patch(
+                "immer.runtimes.qwen3_8.pager._process_rss_bytes",
+                return_value=1_000,
+            ),
+            mock.patch(
+                "immer.runtimes.qwen3_8.pager.gc.collect",
+                return_value=0,
+            ) as collect,
+        ):
+            pager.release()
+            pager.release(force_gc=True)
+            pager.release()
+            self.assertEqual(pager.metrics()["gc_collections_interval"], 0)
+            pager.release()
+
+        metrics = pager.metrics()
+        self.assertEqual(metrics["release_boundaries"], 4)
+        self.assertEqual(metrics["gc_policy_boundaries"], 3)
+        self.assertEqual(metrics["gc_collections_skipped"], 2)
+        self.assertEqual(metrics["gc_collections_forced"], 1)
+        self.assertEqual(metrics["gc_collections_interval"], 1)
+        self.assertEqual(collect.call_count, 2)
+
+    def test_missing_rss_fails_closed_and_mps_cache_is_still_explicit(self) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        pager = Qwen38WeightPager(
+            self._source(),
+            device="cpu",
+            gc_interval_boundaries=8,
+            gc_rss_limit_bytes=10_000,
+        )
+        pager.device = torch.device("mps")
+        with (
+            mock.patch(
+                "immer.runtimes.qwen3_8.pager._process_rss_bytes",
+                return_value=None,
+            ),
+            mock.patch("immer.runtimes.qwen3_8.pager.gc.collect", return_value=0),
+            mock.patch.object(pager.torch.mps, "empty_cache") as empty_cache,
+        ):
+            pager.release()
+            pager.close()
+
+        metrics = pager.metrics()
+        self.assertEqual(metrics["gc_rss_measurement_failures"], 1)
+        self.assertEqual(metrics["gc_collections_fail_closed"], 1)
+        self.assertEqual(metrics["gc_collections_forced"], 1)
+        self.assertEqual(metrics["mps_cache_purges"], 2)
+        self.assertEqual(empty_cache.call_count, 2)
 
     def test_real_local_streamer_contract_reads_only_requested_bf16_range(self) -> None:
         import torch
