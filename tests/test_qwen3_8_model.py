@@ -8,6 +8,7 @@ from unittest import mock
 import torch
 from safetensors.torch import save_file
 
+import immer.runtimes.qwen3_8.model as qwen_model_module
 from immer.knowledge.streamer import Streamer
 from immer.runtimes.qwen3_8.config import Qwen38Config
 from immer.runtimes.qwen3_8.draft_verification import (
@@ -89,6 +90,20 @@ def _native_tiny_config(*, full_attention_interval: int = 4) -> Qwen38Config:
             else "linear_attention"
         )
         for layer in range(28)
+    ]
+    mapping["num_attention_heads"] = 24
+    mapping["num_key_value_heads"] = 4
+    return Qwen38Config.from_mapping(mapping, require_official=False)
+
+
+def _official_topology_tiny_config() -> Qwen38Config:
+    """Keep official depth/head topology with tiny activation widths."""
+
+    mapping = _tiny_config_mapping()
+    mapping["num_hidden_layers"] = 64
+    mapping["layer_types"] = [
+        "full_attention" if (layer + 1) % 4 == 0 else "linear_attention"
+        for layer in range(64)
     ]
     mapping["num_attention_heads"] = 24
     mapping["num_key_value_heads"] = 4
@@ -402,7 +417,7 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual((stage.evidence.start_pos, stage.evidence.end_pos), (2, 4))
         self.assertEqual(stage.evidence.input_token_ids, ((9, 7),))
         self.assertEqual(stage.evidence.layers_executed, self.config.n_layers)
-        self.assertEqual(stage.evidence.linear_calls, 31)
+        self.assertEqual(stage.evidence.linear_calls, 62)
         self.assertGreater(stage.evidence.staged_state_bytes, self.model.state_bytes)
         self.assertTrue(
             all(
@@ -469,7 +484,7 @@ class Qwen38ModelTests(unittest.TestCase):
             tokenwise = torch.cat((first, second), dim=1)
 
             self.assertTrue(torch.equal(stage.hidden, tokenwise))
-            self.assertEqual(stage.evidence.linear_calls, 31)
+            self.assertEqual(stage.evidence.linear_calls, 62)
             self.assertEqual(
                 first_evidence.linear_calls + second_evidence.linear_calls,
                 62,
@@ -497,14 +512,21 @@ class Qwen38ModelTests(unittest.TestCase):
             self.model.commit_continuation_block(first)
         self.model.discard_continuation_block(second)
 
-        original_mlp = self.model._mlp
+        original_delta_core = qwen_model_module.gated_delta_net_core
+        delta_calls = 0
 
-        def fail_on_layer_two(hidden, *, layer):
-            if layer == 2:
+        def fail_on_second_token(*args, **kwargs):
+            nonlocal delta_calls
+            delta_calls += 1
+            if delta_calls == 2:
                 raise RuntimeError("block transaction failure")
-            return original_mlp(hidden, layer=layer)
+            return original_delta_core(*args, **kwargs)
 
-        with mock.patch.object(self.model, "_mlp", side_effect=fail_on_layer_two):
+        with mock.patch.object(
+            qwen_model_module,
+            "gated_delta_net_core",
+            side_effect=fail_on_second_token,
+        ):
             with self.assertRaisesRegex(RuntimeError, "block transaction failure"):
                 self.model.stage_continuation_block([[9, 7]])
 
@@ -519,6 +541,33 @@ class Qwen38ModelTests(unittest.TestCase):
             )
         )
         _assert_layer_states_equal(self, self.model._layer_states, base_values)
+
+        original_norm_pair = self.model._norm_k2_pair
+
+        def fail_final_norm(hidden, name):
+            if name == self.model.FINAL_NORM_NAME:
+                raise RuntimeError("block final norm failure")
+            return original_norm_pair(hidden, name)
+
+        with mock.patch.object(
+            self.model,
+            "_norm_k2_pair",
+            side_effect=fail_final_norm,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "block final norm failure"):
+                self.model.stage_continuation_block([[9, 7]])
+        self.assertIsNone(self.model._pending_block_stage)
+        self.assertEqual(self.model.next_position, 2)
+        self.assertTrue(
+            all(
+                current is original
+                for current, original in zip(
+                    self.model._layer_states, base_objects, strict=True
+                )
+            )
+        )
+        _assert_layer_states_equal(self, self.model._layer_states, base_values)
+
         recovered, evidence = self.model.decode([[9]])
         self.assertEqual(tuple(recovered.shape), (1, 1, self.config.dim))
         self.assertEqual(evidence.end_pos, 3)
@@ -592,6 +641,128 @@ class Qwen38ModelTests(unittest.TestCase):
         bounded.prefill([[1, 4]])
         with self.assertRaisesRegex(ValueError, "exceeds max_seq_len"):
             bounded.stage_continuation_block([[9, 7]])
+
+    def test_default_prefill_and_decode_never_enter_k2_pair_path(self) -> None:
+        with mock.patch.object(
+            self.model,
+            "_stage_continuation_k2_pair",
+            side_effect=AssertionError("K=2 path entered"),
+        ):
+            self.model.prefill([[1, 4]])
+            hidden, evidence = self.model.decode([[9]])
+        self.assertEqual(tuple(hidden.shape), (1, 1, self.config.dim))
+        self.assertEqual(evidence.linear_calls, 31)
+
+    def test_official_topology_k2_is_bf16_exact_for_off_stable_and_native(
+        self,
+    ) -> None:
+        from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
+        config = _official_topology_tiny_config()
+        official_root = self.root / "official-topology"
+        official_root.mkdir()
+        save_file(_tiny_weights(config), official_root / "model.safetensors")
+        source = Streamer.from_local(
+            official_root,
+            budget_mb=64,
+            use_cache=False,
+        )
+        try:
+            for mode in ("off", "stable", "native"):
+                with self.subTest(mode=mode):
+                    pagers = [
+                        Qwen38WeightPager(
+                            source,
+                            device="cpu",
+                            compute_dtype="bfloat16",
+                            max_resident_bytes=2 * 1024**2,
+                        )
+                        for _ in range(2)
+                    ]
+                    observed = [[], []]
+
+                    def model(index, pager):
+                        kwargs = {}
+                        if mode == "stable":
+                            kwargs = {
+                                "graft": Qwen38StableCrsaGraft(
+                                    mode="crsa",
+                                    alpha=0.1,
+                                ),
+                                "graft_layer": 27,
+                            }
+                        elif mode == "native":
+                            kwargs = {
+                                "native_head_crsa": Qwen38NativeHeadCrsa(alpha=0.1),
+                                "native_head_crsa_observer": observed[index].append,
+                            }
+                        return StreamedQwen38(
+                            config,
+                            pager,
+                            max_batch_size=1,
+                            max_seq_len=16,
+                            **kwargs,
+                        )
+
+                    block_model, token_model = [
+                        model(index, pager) for index, pager in enumerate(pagers)
+                    ]
+                    try:
+                        block_model.prefill([[1, 4]])
+                        token_model.prefill([[1, 4]])
+                        observed[0].clear()
+                        observed[1].clear()
+                        block_reads_before = block_model.pager.metrics()["tensor_reads"]
+                        stage = block_model.stage_continuation_block([[9, 7]])
+                        block_reads = (
+                            block_model.pager.metrics()["tensor_reads"]
+                            - block_reads_before
+                        )
+                        self.assertEqual(observed[0], [])
+
+                        token_reads_before = token_model.pager.metrics()["tensor_reads"]
+                        first, first_evidence = token_model.decode([[9]])
+                        second, second_evidence = token_model.decode([[7]])
+                        token_reads = (
+                            token_model.pager.metrics()["tensor_reads"]
+                            - token_reads_before
+                        )
+                        expected = torch.cat((first, second), dim=1)
+
+                        self.assertTrue(torch.equal(stage.hidden, expected))
+                        self.assertEqual(
+                            stage.evidence.linear_calls,
+                            first_evidence.linear_calls + second_evidence.linear_calls,
+                        )
+                        self.assertEqual(2 * block_reads, token_reads)
+                        self.assertLess(
+                            stage.evidence.source_body_bytes,
+                            first_evidence.source_body_bytes
+                            + second_evidence.source_body_bytes,
+                        )
+                        actual, evidence = block_model.commit_continuation_block(stage)
+                        self.assertTrue(torch.equal(actual, expected))
+                        _assert_layer_states_equal(
+                            self,
+                            block_model._layer_states,
+                            token_model._layer_states,
+                        )
+                        self.assertEqual(evidence.state_bytes, token_model.state_bytes)
+                        if mode == "stable":
+                            self.assertTrue(
+                                torch.equal(
+                                    block_model._graft_history,
+                                    token_model._graft_history,
+                                )
+                            )
+                        elif mode == "native":
+                            self.assertEqual(observed[0], observed[1])
+                            self.assertEqual(len(observed[0]), 2)
+                    finally:
+                        for pager in pagers:
+                            pager.close()
+        finally:
+            source.close()
 
     def test_stateful_bfloat16_prefill_and_decode_are_bit_exact(self) -> None:
         pager = Qwen38WeightPager(
@@ -1269,7 +1440,7 @@ class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
                 (row.query_start, row.query_length, row.history_length_after)
                 for row in self.observed
             ],
-            [(2, 2, 4)],
+            [(2, 1, 3), (3, 1, 4)],
         )
 
     def test_bfloat16_native_block_matches_tokenwise_usage_bit_exactly(self) -> None:
@@ -1319,7 +1490,7 @@ class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
                     (row.query_start, row.query_length, row.history_length_after)
                     for row in observed[0]
                 ],
-                [(2, 2, 4)],
+                [(2, 1, 3), (3, 1, 4)],
             )
             self.assertEqual(
                 [

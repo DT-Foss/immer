@@ -205,7 +205,11 @@ class Qwen38ContinuationBlockParityTests(unittest.TestCase):
         self.assertEqual(block["prefill_mode"], "batched")
         self.assertEqual(
             tokenwise["continuation"]["linear_calls"],
-            2 * block["continuation"]["linear_calls"],
+            block["continuation"]["linear_calls"],
+        )
+        self.assertGreater(
+            tokenwise["continuation"]["source_body_bytes"],
+            block["continuation"]["source_body_bytes"],
         )
         self.assertEqual(
             tokenwise["continuation"]["state"]["tensor_count"],

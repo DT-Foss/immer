@@ -10,8 +10,12 @@ All notable changes to IMMER are recorded here.
   blocks without exposing commit-state tensors to the verifier.
 - Delayed state, graft history, and observers until atomic commit; stale,
   foreign, mutated, reset, failed, and runtime-drifted stages fail closed.
-- Proved tiny CPU BF16 block execution bit-exact to tokenwise execution for the
-  base runtime and stable graft, halving the K=2 linear calls from 62 to 31.
+- The first official matrix-block replay halved bytes and runtime but
+  falsified state parity at layer 0. Replaced it with a layer-major K=2 path
+  that reads every weight once while executing the same two one-token kernels;
+  F.linear calls remain 62 and tensor reads halve.
+- Proved the exact K=2 path bit-identical on a 64-layer/24Q/4KV CPU-BF16
+  fixture for off, stable graft, and native Prefix-Sinkhorn states.
 - Added tokenwise-exact Prefix-Sinkhorn usage updates inside staged blocks;
   tiny CPU BF16 native K=2 now matches tokenwise hidden and every state bit.
 - Hard-bounded the public transaction to the proven `batch=1, K=2` tranche;

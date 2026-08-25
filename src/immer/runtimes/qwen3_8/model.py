@@ -1105,6 +1105,209 @@ class StreamedQwen38:
             del gate, up
         return self.pager.linear(activated, f"{base}.down_proj")
 
+    def _norm_k2_pair(
+        self,
+        hidden: tuple[torch.Tensor, torch.Tensor],
+        name: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize two one-token rows separately from one weight read."""
+
+        weight = self._control(name)
+        try:
+            return (
+                rms_norm(hidden[0], weight, eps=self.config.rms_norm_eps),
+                rms_norm(hidden[1], weight, eps=self.config.rms_norm_eps),
+            )
+        finally:
+            del weight
+
+    def _full_attention_k2_pair(
+        self,
+        hidden: tuple[torch.Tensor, torch.Tensor],
+        *,
+        layer: int,
+        state: AttentionState | None,
+        start_pos: int,
+        native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None],
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], AttentionState]:
+        """Run two exact one-token attention updates with weight-once projections."""
+
+        base = f"model.language_model.layers.{layer}.self_attn"
+        projected_query_gate = self.pager.linear_many(hidden, f"{base}.q_proj")
+        projected_key = self.pager.linear_many(hidden, f"{base}.k_proj")
+        projected_value = self.pager.linear_many(hidden, f"{base}.v_proj")
+        q_norm_weight = self._control(f"{base}.q_norm.weight")
+        k_norm_weight = self._control(f"{base}.k_norm.weight")
+        intervention = (
+            self.native_head_crsa
+            if self.native_head_crsa is not None
+            and layer == self.native_head_crsa.layer
+            else None
+        )
+        mixed_rows: list[torch.Tensor] = []
+        next_state = state
+        try:
+            for offset in range(2):
+                position = (
+                    torch.arange(
+                        start_pos + offset,
+                        start_pos + offset + 1,
+                        device=hidden[offset].device,
+                        dtype=torch.long,
+                    )
+                    .unsqueeze(0)
+                    .expand(hidden[offset].shape[0], -1)
+                )
+                mixed, next_state = full_attention_core(
+                    projected_query_gate[offset],
+                    projected_key[offset],
+                    projected_value[offset],
+                    q_norm_weight=q_norm_weight,
+                    k_norm_weight=k_norm_weight,
+                    num_attention_heads=self.config.n_heads,
+                    num_key_value_heads=self.config.n_kv_heads,
+                    head_dim=self.config.head_dim,
+                    position_ids=position,
+                    state=next_state,
+                    attention_mask=None,
+                    native_head_crsa=intervention,
+                    native_head_crsa_observer=(
+                        native_head_crsa_observer if intervention is not None else None
+                    ),
+                    rope_theta=self.config.rope_theta,
+                    rotary_dim=self.config.rotary_dim,
+                    mrope_section=self.config.mrope_section,
+                    mrope_interleaved=self.config.mrope_interleaved,
+                    rms_norm_eps=self.config.rms_norm_eps,
+                )
+                mixed_rows.append(mixed)
+        finally:
+            del projected_query_gate, projected_key, projected_value
+            del q_norm_weight, k_norm_weight
+        if not isinstance(next_state, AttentionState):  # pragma: no cover - kernel.
+            raise Qwen38RuntimeError("K=2 full attention returned no state")
+        projected = self.pager.linear_many(tuple(mixed_rows), f"{base}.o_proj")
+        return (projected[0], projected[1]), next_state
+
+    def _linear_attention_k2_pair(
+        self,
+        hidden: tuple[torch.Tensor, torch.Tensor],
+        *,
+        layer: int,
+        state: DeltaNetState | None,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], DeltaNetState]:
+        """Run two exact one-token DeltaNet recurrences from one weight pass."""
+
+        base = f"model.language_model.layers.{layer}.linear_attn"
+        mask = torch.ones(
+            (1, 1, 1),
+            dtype=hidden[0].dtype,
+            device=hidden[0].device,
+        )
+        active = (hidden[0] * mask, hidden[1] * mask)
+        projected_qkv = self.pager.linear_many(active, f"{base}.in_proj_qkv")
+        projected_z = self.pager.linear_many(active, f"{base}.in_proj_z")
+        projected_b = self.pager.linear_many(active, f"{base}.in_proj_b")
+        projected_a = self.pager.linear_many(active, f"{base}.in_proj_a")
+        conv_weight = self._control(f"{base}.conv1d.weight", dtype=hidden[0].dtype)
+        a_log = self._control(f"{base}.A_log")
+        dt_bias = self._control(f"{base}.dt_bias")
+        norm_weight = self._control(f"{base}.norm.weight", dtype=hidden[0].dtype)
+        mixed_rows: list[torch.Tensor] = []
+        next_state = state
+        try:
+            for offset in range(2):
+                mixed, next_state = gated_delta_net_core(
+                    projected_qkv[offset],
+                    projected_z[offset],
+                    projected_b[offset],
+                    projected_a[offset],
+                    conv1d_weight=conv_weight,
+                    A_log=a_log,
+                    dt_bias=dt_bias,
+                    norm_weight=norm_weight,
+                    num_key_heads=self.config.linear_num_key_heads,
+                    num_value_heads=self.config.linear_num_value_heads,
+                    key_head_dim=self.config.linear_key_head_dim,
+                    value_head_dim=self.config.linear_value_head_dim,
+                    state=next_state,
+                    rms_norm_eps=self.config.rms_norm_eps,
+                    probe=None,
+                )
+                mixed_rows.append(mixed)
+        finally:
+            del projected_qkv, projected_z, projected_b, projected_a
+            del conv_weight, a_log, dt_bias, norm_weight
+        if not isinstance(next_state, DeltaNetState):  # pragma: no cover - kernel.
+            raise Qwen38RuntimeError("K=2 DeltaNet returned no state")
+        projected = self.pager.linear_many(tuple(mixed_rows), f"{base}.out_proj")
+        return (projected[0], projected[1]), next_state
+
+    def _mlp_k2_pair(
+        self,
+        hidden: tuple[torch.Tensor, torch.Tensor],
+        *,
+        layer: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        base = f"model.language_model.layers.{layer}.mlp"
+        gate = self.pager.linear_many(hidden, f"{base}.gate_proj")
+        up = self.pager.linear_many(hidden, f"{base}.up_proj")
+        try:
+            activated = (swiglu(gate[0], up[0]), swiglu(gate[1], up[1]))
+        finally:
+            del gate, up
+        down = self.pager.linear_many(activated, f"{base}.down_proj")
+        return down[0], down[1]
+
+    def _forward_layer_k2_pair(
+        self,
+        hidden: tuple[torch.Tensor, torch.Tensor],
+        *,
+        layer: int,
+        state: LayerState | None,
+        start_pos: int,
+        native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None],
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], LayerState]:
+        """Apply one layer tokenwise while reading every checkpoint tensor once."""
+
+        prefix = f"model.language_model.layers.{layer}"
+        residual = hidden
+        mixed_input = self._norm_k2_pair(
+            hidden,
+            f"{prefix}.input_layernorm.weight",
+        )
+        if self.config.is_full_attention(layer):
+            if state is not None and not isinstance(state, AttentionState):
+                raise Qwen38RuntimeError("full-attention layer received DeltaNet state")
+            mixed, next_state = self._full_attention_k2_pair(
+                mixed_input,
+                layer=layer,
+                state=state,
+                start_pos=start_pos,
+                native_head_crsa_observer=native_head_crsa_observer,
+            )
+        else:
+            if state is not None and not isinstance(state, DeltaNetState):
+                raise Qwen38RuntimeError("linear-attention layer received KV state")
+            mixed, next_state = self._linear_attention_k2_pair(
+                mixed_input,
+                layer=layer,
+                state=state,
+            )
+        after_attention = (
+            residual[0] + mixed[0],
+            residual[1] + mixed[1],
+        )
+        mlp_input = self._norm_k2_pair(
+            after_attention,
+            f"{prefix}.post_attention_layernorm.weight",
+        )
+        mlp = self._mlp_k2_pair(mlp_input, layer=layer)
+        return (
+            after_attention[0] + mlp[0],
+            after_attention[1] + mlp[1],
+        ), next_state
+
     def _forward_layer(
         self,
         hidden: torch.Tensor,
@@ -1615,6 +1818,101 @@ class StreamedQwen38:
             evidence=evidence,
         )
 
+    def _stage_continuation_k2_pair(
+        self,
+        hidden: torch.Tensor,
+        prior_states: tuple[LayerState | None, ...],
+        *,
+        start_pos: int,
+        graft_history: torch.Tensor | None,
+        progress: Callable[[dict[str, Any]], None] | None,
+    ) -> StatefulLayerRangeResult:
+        """Stage batch-1/K=2 as layer-major pairs of one-token updates."""
+
+        if tuple(hidden.shape) != (1, 2, self.config.dim):
+            raise Qwen38RuntimeError("K=2 embedded hidden shape is invalid")
+        x = hidden.to(device=self.pager.device, dtype=self.pager.compute_dtype)
+        pair = (x[:, :1], x[:, 1:])
+        states = tuple(prior_states)
+        staged = list(states)
+        staged_history = graft_history
+        staged_native_evidence: list[NativeHeadCrsaEvidence] = []
+        source = self.pager.source
+        start_bytes = self._metric(source, "network_or_source_body_bytes")
+        start_linears = self._metric(self.pager, "linear_calls")
+        started = time.perf_counter()
+        try:
+            for layer in range(self.config.n_layers):
+                if progress is not None:
+                    layer_started = time.perf_counter()
+                    layer_bytes = self._metric(source, "network_or_source_body_bytes")
+                pair, next_state = self._forward_layer_k2_pair(
+                    pair,
+                    layer=layer,
+                    state=states[layer],
+                    start_pos=start_pos,
+                    native_head_crsa_observer=staged_native_evidence.append,
+                )
+                staged[layer] = next_state
+                if self.graft is not None and layer == self.graft_layer:
+                    first, after_first = self._apply_graft_stateful(
+                        pair[0],
+                        staged_history,
+                        start_pos=start_pos,
+                    )
+                    second, staged_history = self._apply_graft_stateful(
+                        pair[1],
+                        after_first,
+                        start_pos=start_pos + 1,
+                    )
+                    pair = (first, second)
+                self.pager.release()
+                if progress is not None:
+                    progress(
+                        {
+                            "event": "qwen_stateful_layer_complete",
+                            "layer": layer,
+                            "layers": self.config.n_layers,
+                            "start_pos": start_pos,
+                            "tokens": 2,
+                            "source_body_bytes": self._metric(
+                                source, "network_or_source_body_bytes"
+                            )
+                            - layer_bytes,
+                            "seconds": time.perf_counter() - layer_started,
+                            "state_kind": (
+                                "kv"
+                                if isinstance(next_state, AttentionState)
+                                else "deltanet"
+                            ),
+                        }
+                    )
+        finally:
+            self.pager.release()
+
+        staged_states = tuple(staged)
+        combined = torch.cat(pair, dim=1)
+        evidence = StatefulLayerRangeEvidence(
+            start_pos=start_pos,
+            end_pos=start_pos + 2,
+            start_layer=0,
+            stop_layer=self.config.n_layers,
+            layers_executed=self.config.n_layers,
+            source_body_bytes=(
+                self._metric(source, "network_or_source_body_bytes") - start_bytes
+            ),
+            linear_calls=self._metric(self.pager, "linear_calls") - start_linears,
+            seconds=time.perf_counter() - started,
+            staged_state_bytes=self._continuation_bytes(staged_states, staged_history),
+        )
+        return StatefulLayerRangeResult(
+            hidden=combined,
+            layer_states=staged_states,
+            graft_history=staged_history,
+            native_head_crsa_evidence=tuple(staged_native_evidence),
+            evidence=evidence,
+        )
+
     def stage_continuation_block(
         self,
         token_ids: Any,
@@ -1668,17 +1966,18 @@ class StreamedQwen38:
         started = time.perf_counter()
         try:
             embedded = self.embed_batch(ids)
-            staged = self.hidden_stateful_range(
+            staged = self._stage_continuation_k2_pair(
                 embedded,
                 committed_states,
                 start_pos=start_pos,
-                start_layer=0,
-                stop_layer=self.config.n_layers,
                 graft_history=self._graft_history,
                 progress=progress,
-                native_head_crsa_tokenwise_usage=True,
             )
-            hidden = self.finalize_hidden(staged.hidden)
+            final_pair = self._norm_k2_pair(
+                (staged.hidden[:, :1], staged.hidden[:, 1:]),
+                self.FINAL_NORM_NAME,
+            )
+            hidden = torch.cat(final_pair, dim=1)
         except Exception:
             self._pending_block_stage = None
             self.pager.release()
