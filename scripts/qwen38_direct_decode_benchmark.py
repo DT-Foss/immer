@@ -3910,6 +3910,12 @@ def compare_native_fork_references(args: argparse.Namespace) -> dict[str, Any]:
             pair["traffic"]["complete_layers_executed"],
             measurement="sealed-forward-count-times-checkpoint-depth/v1",
         ),
+        "layer_weight_passes": _saving_record(
+            reference_complete_layers,
+            pair["traffic"]["complete_layers_executed"]
+            - pair["traffic"]["joined_fork_layer_weight_passes"],
+            measurement="complete-layers-minus-shared-fork-pass/v1",
+        ),
         "fork_layer_weight_passes": _saving_record(
             reference_forward_passes,
             pair["traffic"]["actual_fork_layer_weight_passes"],
@@ -4069,6 +4075,17 @@ def _validate_native_fork_reference_comparison_document(
                 pair_traffic.get("complete_layers_executed"), "pair complete layers"
             ),
             measurement="sealed-forward-count-times-checkpoint-depth/v1",
+        ),
+        "layer_weight_passes": _saving_record(
+            total * depth,
+            _nonnegative_count(
+                pair_traffic.get("complete_layers_executed"), "pair complete layers"
+            )
+            - _nonnegative_count(
+                pair_traffic.get("joined_fork_layer_weight_passes"),
+                "pair joined fork-layer passes",
+            ),
+            measurement="complete-layers-minus-shared-fork-pass/v1",
         ),
         "fork_layer_weight_passes": _saving_record(
             total,

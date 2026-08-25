@@ -2167,6 +2167,7 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 "source_body_bytes",
                 "linear_calls",
                 "complete_layers",
+                "layer_weight_passes",
                 "fork_layer_weight_passes",
             ):
                 receipt = comparison["savings"][metric]
@@ -2182,9 +2183,19 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 pair["traffic"]["complete_layers_saved"],
             )
             self.assertEqual(
+                comparison["savings"]["layer_weight_passes"]["saved"],
+                pair["traffic"]["complete_layers_saved"]
+                + pair["traffic"]["joined_fork_layer_weight_passes"],
+            )
+            self.assertEqual(
                 comparison["savings"]["fork_layer_weight_passes"]["saved"], 2
             )
-            for metric in ("complete_layers", "linear_calls", "source_body_bytes"):
+            for metric in (
+                "complete_layers",
+                "layer_weight_passes",
+                "linear_calls",
+                "source_body_bytes",
+            ):
                 nonsense = copy.deepcopy(comparison)
                 nonsense["savings"][metric].update(
                     {"fork": 0, "reference": 1, "saved": 1}
