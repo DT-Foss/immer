@@ -39,7 +39,7 @@ SIGNED_EXPRESSION_PATH = (
 )
 
 SCHEMA = "immer.fertig-abstention-audit/v2"
-REPORT_REVISION = 3
+REPORT_REVISION = 4
 ALLOWED_STATUSES = ("correct", "abstained", "incorrect", "error")
 LEGACY_CATEGORIES = (
     "target_parse_failed",
@@ -64,20 +64,79 @@ CURRENT_LEGACY_COUNTS = {
     "equation_guard": 1,
 }
 CURRENT_STRUCTURAL_COUNTS = {
-    "exact_recovery": 42,
-    "numeric_pronoun_ambiguous": 80,
+    "exact_recovery": 47,
+    "numeric_pronoun_ambiguous": 76,
     "question_pronoun_ambiguous": 5,
     "numeric_clause_unsupported": 93,
-    "target_unsupported": 8,
+    "target_unsupported": 7,
     "relation_ambiguous": 1,
     "relation_unsupported": 1,
     "relation_invalid": 0,
 }
 CURRENT_SCOPE_COUNTS = {
-    "exact_recovery_scope": 42,
-    "potential_coreference_scope": 85,
-    "grammar_scope": 103,
+    "exact_recovery_scope": 47,
+    "potential_coreference_scope": 81,
+    "grammar_scope": 102,
 }
+CURRENT_EXACT_RECOVERY_INDICES = (
+    550,
+    574,
+    587,
+    610,
+    613,
+    619,
+    631,
+    643,
+    651,
+    672,
+    682,
+    692,
+    694,
+    701,
+    722,
+    724,
+    731,
+    745,
+    746,
+    747,
+    754,
+    763,
+    770,
+    778,
+    780,
+    797,
+    819,
+    823,
+    825,
+    836,
+    837,
+    840,
+    844,
+    861,
+    865,
+    868,
+    883,
+    892,
+    901,
+    913,
+    916,
+    924,
+    930,
+    934,
+    944,
+    1219,
+    1261,
+)
+CURRENT_WAVE_EXACT_RECOVERY_INDICES = (672, 780, 944, 1219, 1261)
+CURRENT_PRE_WAVE_EXACT_RECOVERIES = 42
+CURRENT_WAVE_EXACT_MECHANISMS = {
+    672: "signed_event:temporal_categorical_block_remainder",
+    780: "signed_event:absolute_weighted_score_difference",
+    944: "signed_event:exhaustive_unit_rate_ledger",
+    1219: "signed_event:exhaustive_unit_rate_ledger",
+    1261: "signed_event:recurring_pronoun_rate_ledger",
+}
+RECOVERY_WAVE_ID = "ground-operators-conservative-coreference/v1"
 _INCOMPLETE_BINDING = re.compile(
     r"^Bindung unvollständig: (?P<qty>\d+) qty, "
     r"(?P<ratio>\d+) ratio, op=(?P<op>[a-z_]+)$"
@@ -331,6 +390,95 @@ def _ordered_counts(counter: Counter[str], categories: Sequence[str]) -> dict[st
     return {category: counter[category] for category in categories}
 
 
+def _exact_recovery_mechanism(structural: Mapping[str, Any]) -> str:
+    """Name the exact mechanism without assigning old recoveries to a new wave."""
+
+    if structural.get("category") != "exact_recovery":
+        raise AuditError("mechanism attribution requires an exact recovery")
+    reason = structural.get("reason")
+    if not isinstance(reason, str):
+        raise AuditError("exact recovery reason must be text")
+    prefix = "evidence-closed signed event grammar"
+    if reason == prefix:
+        return "preexisting_generic_signed_event_exact"
+    if reason.startswith(f"{prefix}: "):
+        family = reason.removeprefix(f"{prefix}: ")
+        if re.fullmatch(r"[a-z][a-z0-9_]*", family) is None:
+            raise AuditError(f"invalid signed-event mechanism family {family!r}")
+        return f"signed_event:{family}"
+    if reason == "evidence-closed clause compiler":
+        return "clause_compiler"
+    if reason == "":
+        return "preexisting_generic_structural_exact"
+    raise AuditError(f"unrecognized exact recovery mechanism reason {reason!r}")
+
+
+def _indices_identity(indices: Sequence[int]) -> dict[str, Any]:
+    ordered = list(indices)
+    return {
+        "count": len(ordered),
+        "indices": ordered,
+        "indices_sha256": _sha256_bytes(_canonical_json_bytes(ordered)),
+    }
+
+
+def _mechanism_groups(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[int]] = {}
+    for row in rows:
+        mechanism = row.get("exact_recovery_mechanism")
+        index = row.get("index")
+        if not isinstance(mechanism, str) or not mechanism:
+            raise AuditError("exact recovery item lacks mechanism attribution")
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise AuditError("exact recovery item has an invalid index")
+        grouped.setdefault(mechanism, []).append(index)
+    return {
+        mechanism: _indices_identity(sorted(indices))
+        for mechanism, indices in sorted(grouped.items())
+    }
+
+
+def _recovery_attribution(
+    exact_rows: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    ordered_rows = sorted(exact_rows, key=lambda row: int(row["index"]))
+    current_indices = tuple(int(row["index"]) for row in ordered_rows)
+    wave_set = set(CURRENT_WAVE_EXACT_RECOVERY_INDICES)
+    wave_rows = [row for row in ordered_rows if int(row["index"]) in wave_set]
+    prior_rows = [row for row in ordered_rows if int(row["index"]) not in wave_set]
+    wave_indices = tuple(int(row["index"]) for row in wave_rows)
+    prior_indices = tuple(int(row["index"]) for row in prior_rows)
+    current_total = len(current_indices)
+    wave_total = len(wave_indices)
+    prior_total = len(prior_indices)
+    cumulative = {
+        "current_total": current_total,
+        "identity": _indices_identity(current_indices),
+        "mechanisms": _mechanism_groups(ordered_rows),
+        "attribution": (
+            "The current total is cumulative across every listed exact mechanism; "
+            "it is not attributed to one planner wave."
+        ),
+    }
+    wave = {
+        "wave_id": RECOVERY_WAVE_ID,
+        "previously_sealed_exact_recoveries": prior_total,
+        "added_exact_recoveries": wave_total,
+        "current_exact_recoveries": current_total,
+        "previously_sealed_identity": _indices_identity(prior_indices),
+        "added_identity": _indices_identity(wave_indices),
+        "mechanisms": _mechanism_groups(wave_rows),
+        "attribution": (
+            f"{current_total} current exact recoveries = {prior_total} previously "
+            f"sealed recoveries + {wave_total} added by {RECOVERY_WAVE_ID}; this "
+            f"wave claims {wave_total}, not {current_total}."
+        ),
+    }
+    return cumulative, wave
+
+
 def _validate_current_evidence(report: Mapping[str, Any]) -> None:
     observed = report["classification_counts"]
     expected = {
@@ -342,6 +490,49 @@ def _validate_current_evidence(report: Mapping[str, Any]) -> None:
         raise AuditError(
             "current FERTIG evidence drifted; expected "
             f"{expected!r}, observed {observed!r}"
+        )
+    raw_items = report.get("items")
+    if not isinstance(raw_items, list):
+        raise AuditError("current audit evidence has no item array")
+    exact_rows = [
+        row
+        for row in raw_items
+        if isinstance(row, Mapping)
+        and isinstance(row.get("structural"), Mapping)
+        and row["structural"].get("category") == "exact_recovery"
+    ]
+    exact_rows.sort(key=lambda row: int(row["index"]))
+    observed_indices = tuple(int(row["index"]) for row in exact_rows)
+    if observed_indices != CURRENT_EXACT_RECOVERY_INDICES:
+        raise AuditError(
+            "current exact-recovery identity drifted; expected "
+            f"{CURRENT_EXACT_RECOVERY_INDICES!r}, observed {observed_indices!r}"
+        )
+    for row in exact_rows:
+        derived = _exact_recovery_mechanism(row["structural"])
+        if row.get("exact_recovery_mechanism") != derived:
+            raise AuditError(
+                f"exact recovery {row['index']} has inconsistent mechanism attribution"
+            )
+    cumulative, wave = _recovery_attribution(exact_rows)
+    if report.get("exact_recovery_attribution") != cumulative:
+        raise AuditError("current exact-recovery attribution drifted")
+    if report.get("recovery_wave_delta") != wave:
+        raise AuditError("current recovery-wave delta drifted")
+    if wave["previously_sealed_exact_recoveries"] != CURRENT_PRE_WAVE_EXACT_RECOVERIES:
+        raise AuditError("pre-wave exact-recovery total drifted")
+    if tuple(wave["added_identity"]["indices"]) != CURRENT_WAVE_EXACT_RECOVERY_INDICES:
+        raise AuditError("new recovery-wave identity drifted")
+    observed_wave_mechanisms = {
+        int(row["index"]): str(row["exact_recovery_mechanism"])
+        for row in exact_rows
+        if int(row["index"]) in set(CURRENT_WAVE_EXACT_RECOVERY_INDICES)
+    }
+    if observed_wave_mechanisms != CURRENT_WAVE_EXACT_MECHANISMS:
+        raise AuditError(
+            "new recovery-wave mechanism attribution drifted; expected "
+            f"{CURRENT_WAVE_EXACT_MECHANISMS!r}, observed "
+            f"{observed_wave_mechanisms!r}"
         )
 
 
@@ -383,20 +574,23 @@ def build_audit_report(
         structural_counts[structural["category"]] += 1
         scope = _scope_for_structural(structural["category"])
         scope_counts[scope] += 1
-        audited_items.append(
-            {
-                "item_id": item_id,
-                "index": item["index"],
-                "question_sha256": _sha256_bytes(question.encode("utf-8")),
-                "legacy": legacy,
-                "structural": structural,
-                "current_scope": scope,
-                "hungarian_exclusive_assignment_eligible": False,
-                "hungarian_ineligibility_reason": (
-                    "no_extracted_exclusive_candidate_sets_or_cost_matrix"
-                ),
-            }
-        )
+        audited_item = {
+            "item_id": item_id,
+            "index": item["index"],
+            "question_sha256": _sha256_bytes(question.encode("utf-8")),
+            "legacy": legacy,
+            "structural": structural,
+            "current_scope": scope,
+            "hungarian_exclusive_assignment_eligible": False,
+            "hungarian_ineligibility_reason": (
+                "no_extracted_exclusive_candidate_sets_or_cost_matrix"
+            ),
+        }
+        if structural["category"] == "exact_recovery":
+            audited_item["exact_recovery_mechanism"] = _exact_recovery_mechanism(
+                structural
+            )
+        audited_items.append(audited_item)
 
     audited = len(audited_items)
     if audited != baseline_counts["abstained"]:
@@ -419,6 +613,12 @@ def build_audit_report(
 
     recoveries = counts["structural"]["exact_recovery"]
     remaining = audited - recoveries
+    exact_rows = [
+        item
+        for item in audited_items
+        if item["structural"]["category"] == "exact_recovery"
+    ]
+    exact_attribution, wave_delta = _recovery_attribution(exact_rows)
 
     eligible = sum(
         bool(item["hungarian_exclusive_assignment_eligible"]) for item in audited_items
@@ -438,6 +638,8 @@ def build_audit_report(
         "audited_abstentions": audited,
         "current_exact_recoveries": recoveries,
         "current_remaining_abstentions": remaining,
+        "exact_recovery_attribution": exact_attribution,
+        "recovery_wave_delta": wave_delta,
         "classification_counts": counts,
         "hungarian_verdict": {
             "contract": (

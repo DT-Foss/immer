@@ -143,8 +143,46 @@ class MeanExpr:
         _span(self.span)
 
 
+@dataclass(frozen=True, slots=True)
+class AbsoluteExpr:
+    """Exact absolute value of a fully ground expression.
+
+    The compiler deliberately refuses references below this node.  Selecting an
+    absolute-value branch for an unknown would turn the linear proof system into
+    an unsound piecewise solver.
+    """
+
+    value: Expression
+    span: Span
+
+    def __post_init__(self) -> None:
+        _span(self.span)
+
+
+@dataclass(frozen=True, slots=True)
+class CeilingExpr:
+    """Exact ceiling of a fully ground expression.
+
+    As with :class:`AbsoluteExpr`, rounding is admitted only after every child is
+    grounded by numeric evidence.  References and latent unknowns fail closed.
+    """
+
+    value: Expression
+    span: Span
+
+    def __post_init__(self) -> None:
+        _span(self.span)
+
+
 Expression: TypeAlias = (
-    LiteralExpr | RefExpr | ProductExpr | SumExpr | QuotientExpr | MeanExpr
+    LiteralExpr
+    | RefExpr
+    | ProductExpr
+    | SumExpr
+    | QuotientExpr
+    | MeanExpr
+    | AbsoluteExpr
+    | CeilingExpr
 )
 
 
@@ -219,6 +257,8 @@ _EXPRESSION_TYPES = (
     SumExpr,
     QuotientExpr,
     MeanExpr,
+    AbsoluteExpr,
+    CeilingExpr,
 )
 
 
@@ -254,6 +294,8 @@ def _children(expr: Expression) -> tuple[tuple[str, Expression], ...]:
         return tuple(
             (f"value[{index}]", value) for index, value in enumerate(expr.values)
         )
+    if isinstance(expr, (AbsoluteExpr, CeilingExpr)):
+        return (("value", expr.value),)
     raise AssertionError("closed expression union exhausted")
 
 
@@ -501,6 +543,56 @@ class _Compiler:
             if any(not reference.compatible(unit) for unit in units[1:]):
                 raise ExpressionCompileError("mean contains incompatible units")
             return reference
+        if isinstance(expr, (AbsoluteExpr, CeilingExpr)):
+            return self._unit(expr.value)
+        raise AssertionError("closed expression union exhausted")
+
+    def _ground_value(self, expr: Expression) -> tuple[Fraction, Unit]:
+        """Evaluate an evidence-closed expression without crossing a reference."""
+
+        if isinstance(expr, LiteralExpr):
+            return expr.value, expr.unit
+        if isinstance(expr, RefExpr):
+            raise ExpressionCompileError(
+                "absolute value and ceiling require a fully ground expression"
+            )
+        if isinstance(expr, ProductExpr):
+            factors = [self._ground_value(factor) for factor in expr.factors]
+            value, unit = factors[0]
+            for factor_value, factor_unit in factors[1:]:
+                value *= factor_value
+                unit = unit * factor_unit
+            return value, unit
+        if isinstance(expr, SumExpr):
+            values = [self._ground_value(term.expr) for term in expr.terms]
+            reference = values[0][1]
+            if any(not reference.compatible(unit) for _, unit in values[1:]):
+                raise ExpressionCompileError("sum contains incompatible units")
+            total = sum(
+                Fraction(term.sign) * value * unit.scale / reference.scale
+                for term, (value, unit) in zip(expr.terms, values, strict=True)
+            )
+            return total, reference
+        if isinstance(expr, QuotientExpr):
+            numerator, numerator_unit = self._ground_value(expr.numerator)
+            denominator, denominator_unit = self._ground_value(expr.denominator)
+            if denominator == 0:
+                raise ExpressionCompileError("quotient denominator must be nonzero")
+            return numerator / denominator, numerator_unit / denominator_unit
+        if isinstance(expr, MeanExpr):
+            values = [self._ground_value(value) for value in expr.values]
+            reference = values[0][1]
+            if any(not reference.compatible(unit) for _, unit in values[1:]):
+                raise ExpressionCompileError("mean contains incompatible units")
+            total = sum(value * unit.scale / reference.scale for value, unit in values)
+            return total / len(values), reference
+        if isinstance(expr, AbsoluteExpr):
+            value, unit = self._ground_value(expr.value)
+            return abs(value), unit
+        if isinstance(expr, CeilingExpr):
+            value, unit = self._ground_value(expr.value)
+            rounded = Fraction(-(-value.numerator // value.denominator))
+            return rounded, unit
         raise AssertionError("closed expression union exhausted")
 
     def _build_variables(self) -> None:
@@ -525,23 +617,35 @@ class _Compiler:
         self.symbol_variables[target.symbol] = variable
         self.variables.append(variable)
 
-    def _auxiliary(self, unit: Unit, span: Span) -> Variable:
+    def _auxiliary(
+        self, unit: Unit, span: Span, *, integral_counts: bool = True
+    ) -> Variable:
         while True:
             name = f"__signed_expr_{self.auxiliary_index:04d}"
             self.auxiliary_index += 1
             if all(variable.name != name for variable in self.variables):
                 break
-        variable = Variable(name, unit, count=_is_count(unit), span=span)
+        variable = Variable(
+            name,
+            unit,
+            count=integral_counts and _is_count(unit),
+            span=span,
+        )
         self.variables.append(variable)
         return variable
 
-    def _lower(self, expr: Expression) -> Variable | Quantity:
+    def _lower(
+        self, expr: Expression, *, integral_counts: bool = True
+    ) -> Variable | Quantity:
         if isinstance(expr, LiteralExpr):
             return Quantity(expr.value, expr.unit, expr.span)
         if isinstance(expr, RefExpr):
             return self.symbol_variables[expr.symbol]
         if isinstance(expr, ProductExpr):
-            atoms = [self._lower(factor) for factor in expr.factors]
+            atoms = [
+                self._lower(factor, integral_counts=integral_counts)
+                for factor in expr.factors
+            ]
             variables = [atom for atom in atoms if isinstance(atom, Variable)]
             quantities = [atom for atom in atoms if isinstance(atom, Quantity)]
             if len(variables) > 1:
@@ -553,13 +657,22 @@ class _Compiler:
                 accumulator = quantities[0]
                 remaining = quantities[1:]
             for factor in remaining:
-                product = self._auxiliary(accumulator.unit * factor.unit, expr.span)
+                product = self._auxiliary(
+                    accumulator.unit * factor.unit,
+                    expr.span,
+                    integral_counts=integral_counts,
+                )
                 self.constraints.append(Rate(product, accumulator, factor, expr.span))
                 accumulator = product
             return accumulator
         if isinstance(expr, SumExpr):
-            atoms = [self._lower(term.expr) for term in expr.terms]
-            result = self._auxiliary(self._unit(expr), expr.span)
+            atoms = [
+                self._lower(term.expr, integral_counts=integral_counts)
+                for term in expr.terms
+            ]
+            result = self._auxiliary(
+                self._unit(expr), expr.span, integral_counts=integral_counts
+            )
             terms = tuple(
                 Term(atom, Fraction(term.sign))
                 for atom, term in zip(atoms, expr.terms, strict=True)
@@ -567,16 +680,41 @@ class _Compiler:
             self.constraints.append(Sum(result, terms, expr.span))
             return result
         if isinstance(expr, QuotientExpr):
-            numerator = self._lower(expr.numerator)
-            denominator = self._lower(expr.denominator)
+            numerator = self._lower(expr.numerator, integral_counts=integral_counts)
+            denominator = self._lower(expr.denominator, integral_counts=integral_counts)
             assert isinstance(denominator, Quantity)
-            result = self._auxiliary(self._unit(expr), expr.span)
+            result = self._auxiliary(
+                self._unit(expr), expr.span, integral_counts=integral_counts
+            )
             self.constraints.append(Rate(numerator, result, denominator, expr.span))
             return result
         if isinstance(expr, MeanExpr):
-            values = tuple(self._lower(value) for value in expr.values)
-            result = self._auxiliary(self._unit(expr), expr.span)
+            values = tuple(
+                self._lower(value, integral_counts=integral_counts)
+                for value in expr.values
+            )
+            result = self._auxiliary(
+                self._unit(expr), expr.span, integral_counts=integral_counts
+            )
             self.constraints.append(Mean(result, values, expr.span))
+            return result
+        if isinstance(expr, AbsoluteExpr):
+            value, unit = self._ground_value(expr.value)
+            atom = self._lower(expr.value, integral_counts=False)
+            if value >= 0:
+                return atom
+            result = self._auxiliary(unit, expr.span)
+            self.constraints.append(Sum(result, (Term(atom, Fraction(-1)),), expr.span))
+            return result
+        if isinstance(expr, CeilingExpr):
+            value, unit = self._ground_value(expr.value)
+            atom = self._lower(expr.value, integral_counts=False)
+            rounded = Fraction(-(-value.numerator // value.denominator))
+            if value == rounded:
+                return atom
+            result = self._auxiliary(unit, expr.span)
+            correction = Quantity(rounded - value, unit, expr.span)
+            self.constraints.append(Sum(result, (atom, correction), expr.span))
             return result
         raise AssertionError("closed expression union exhausted")
 

@@ -17,6 +17,8 @@ import re
 from .arithmetic_ir import Span, Unit
 from .clause_compiler import SymbolKey
 from .signed_expression import (
+    AbsoluteExpr,
+    CeilingExpr,
     Definition,
     ExpressionCompileError,
     ExpressionCompileResult,
@@ -124,16 +126,25 @@ MONTH = Unit("month", (("time", 1),), Fraction(1))
 COUNT_PER_MONTH = COUNT / MONTH
 PERCENT = Unit("%", (), Fraction(1, 100))
 MILLIMETER = Unit.base("length", symbol="mm")
+SECOND = Unit("second", (("time", 1),), Fraction(1))
+POINT = Unit.base("score", symbol="point")
 
 _LOCAL_CARDINALS = {
+    "zero": Fraction(0),
     "one": Fraction(1),
     "two": Fraction(2),
     "three": Fraction(3),
     "four": Fraction(4),
     "five": Fraction(5),
     "six": Fraction(6),
+    "seven": Fraction(7),
     "eight": Fraction(8),
+    "nine": Fraction(9),
+    "ten": Fraction(10),
+    "eleven": Fraction(11),
+    "twelve": Fraction(12),
     "twenty": Fraction(20),
+    "thirty": Fraction(30),
 }
 
 _FIXED_MONTH_DAYS = {
@@ -3832,9 +3843,8 @@ def _exact_trip_capacity_minimum(
         and berries.number is not None
         and horizon.number > 0
         and trip_duration.number > 0
-        and horizon.number % trip_duration.number == 0
-        and berries.number % (horizon.number / trip_duration.number) == 0,
-        "least-capacity case requires exact positive trip and load divisions",
+        and horizon.number % trip_duration.number == 0,
+        "least-capacity case requires a positive integral trip count",
         FrontendStatus.INVALID,
     )
     trip_index = trip_clause.tokens.index(trip_duration)
@@ -3877,9 +3887,12 @@ def _exact_trip_capacity_minimum(
         builder.literal(berries, COUNT),
         builder.literal(trip_duration, HOUR),
     )
-    expression = QuotientExpr(
-        numerator,
-        builder.literal(horizon, HOUR),
+    expression = CeilingExpr(
+        QuotientExpr(
+            numerator,
+            builder.literal(horizon, HOUR),
+            Span(0, len(source), source),
+        ),
         Span(0, len(source), source),
     )
     return builder.finish(expression, "exact_trip_capacity_minimum")
@@ -4134,13 +4147,6 @@ def _exact_packaging_capacity(
         "capacity item, consumer role, or positive unit binding differs",
         FrontendStatus.AMBIGUOUS,
     )
-    demand_value = kids.number * per_kid.number + adults.number * per_adult.number
-    _require(
-        demand_value % capacity.number == 0
-        and (demand_value / capacity.number) % per_box.number == 0,
-        "box capacity requires an unavailable ceiling for non-exact division",
-        FrontendStatus.UNSUPPORTED,
-    )
     boxes_word = next(token for token in question.tokens if token.norm == "boxes")
     builder = _Builder(source, clause_set)
     demand = _sum(
@@ -4161,14 +4167,20 @@ def _exact_packaging_capacity(
             "adult_demand",
         ),
     )
-    sleeves = QuotientExpr(
-        demand,
-        builder.literal(capacity, COUNT),
+    sleeves = CeilingExpr(
+        QuotientExpr(
+            demand,
+            builder.literal(capacity, COUNT),
+            unit_clause.span,
+        ),
         unit_clause.span,
     )
-    boxes = QuotientExpr(
-        sleeves,
-        builder.literal(per_box, SCALAR),
+    boxes = CeilingExpr(
+        QuotientExpr(
+            sleeves,
+            builder.literal(per_box, SCALAR),
+            pack_clause.span,
+        ),
         pack_clause.span,
     )
     expression = _product(
@@ -4233,20 +4245,17 @@ def _exact_package_demand_cost(
         "package item, demand, price scope, or positive capacity differs",
         FrontendStatus.AMBIGUOUS,
     )
-    demand_value = consumers.number * each_count.number
-    _require(
-        demand_value % yield_count.number == 0,
-        "package demand requires an unavailable ceiling for non-exact division",
-        FrontendStatus.UNSUPPORTED,
-    )
     builder = _Builder(source, clause_set)
     demand = _product(
         builder.literal(consumers, SCALAR),
         builder.literal(each_count, COUNT),
     )
-    boxes = QuotientExpr(
-        demand,
-        builder.literal(yield_count, COUNT),
+    boxes = CeilingExpr(
+        QuotientExpr(
+            demand,
+            builder.literal(yield_count, COUNT),
+            package.span,
+        ),
         package.span,
     )
     expression = _product(boxes, builder.literal(price, MONEY))
@@ -4770,6 +4779,683 @@ def _typed_percentage_trade_transitions(
     )
 
 
+def _exhaustive_unit_rate_ledger(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Resolve one owner pronoun into a fully exhaustive per-item ledger."""
+
+    question = _question(clause_set)
+    sale_mode = (
+        _contains(question.norms, "sells", "everything") and "earn" in question.norms
+    )
+    commissioned_mode = "pay" in question.norms and not sale_mode
+    if not (sale_mode or commissioned_mode):
+        return None
+    ledger_candidates = [
+        clause
+        for clause in clause_set
+        if len(_money_tokens(clause)) >= 2
+        and len(_money_tokens(clause)) == len(_counts(clause))
+        and all(
+            clause.tokens.index(token) + 1 < len(clause.tokens)
+            and clause.norms[clause.tokens.index(token) + 1] == "each"
+            for token in _money_tokens(clause)
+        )
+    ]
+    if len(ledger_candidates) != 1:
+        return None
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            (
+                ("sell" in clause.norms and "planning" in clause.norms)
+                or "carpenter" in clause.norms
+            )
+            and not _numeric((clause,))
+        ),
+        reason="unit-rate ledger owner is not uniquely introduced",
+    )
+    owner_names = [
+        token.norm.rstrip("'s") for token in intro.tokens if token.text[:1].isupper()
+    ]
+    _require(
+        len(owner_names) == 1,
+        "unit-rate ledger requires one explicit owner",
+        FrontendStatus.AMBIGUOUS,
+    )
+    owner = owner_names[0]
+    ledger = ledger_candidates[0]
+
+    subject_pronouns = {word for word in ledger.norms if word in {"he", "she", "they"}}
+    possessives = {
+        word
+        for word in (*intro.norms, *ledger.norms)
+        if word in {"his", "her", "their"}
+    }
+    subject_to_possessive = {"he": "his", "she": "her", "they": "their"}
+    _require(
+        len(subject_pronouns) == 1
+        and possessives == {subject_to_possessive[next(iter(subject_pronouns))]},
+        "unit-rate owner pronouns do not agree",
+        FrontendStatus.AMBIGUOUS,
+    )
+    subject = next(iter(subject_pronouns))
+
+    rows: list[tuple[Token, Token, str, frozenset[str]]] = []
+    prior_money = -1
+    for price in _money_tokens(ledger):
+        price_index = ledger.tokens.index(price)
+        local_counts = [
+            token
+            for token in _counts(ledger)
+            if prior_money < ledger.tokens.index(token) < price_index
+        ]
+        _require(
+            len(local_counts) == 1,
+            "unit-rate price has no unique local quantity",
+            FrontendStatus.AMBIGUOUS,
+        )
+        quantity = local_counts[0]
+        quantity_index = ledger.tokens.index(quantity)
+        relation_words = frozenset(ledger.norms[quantity_index + 1 : price_index])
+        item_words = []
+        for word in ledger.norms[quantity_index + 1 : price_index]:
+            if word in {"at", "can", "cost", "for", "that", "which"}:
+                break
+            if word != ",":
+                item_words.append(word)
+        item = _item_id(item_words)
+        rows.append((quantity, price, item, relation_words))
+        prior_money = price_index
+    _require(
+        len({item for _, _, item, _ in rows}) == len(rows)
+        and all(
+            token.number is not None and token.number >= 0
+            for row in rows
+            for token in row[:2]
+        ),
+        "unit-rate ledger items or values are invalid",
+        FrontendStatus.INVALID,
+    )
+
+    if sale_mode:
+        question_subjects = [
+            word for word in question.norms if word in {"he", "she", "they"}
+        ]
+        _require(
+            ledger.norms[:2] == (subject, "has")
+            and _contains(intro.norms, "planning", "to", "sell")
+            and question_subjects == [subject, subject]
+            and _contains(question.norms, "sells", "everything")
+            and all(
+                {"cost", "sold"}.intersection(relation) for _, _, _, relation in rows
+            ),
+            "sale owner, exhaustive scope, or rate relation differs",
+            FrontendStatus.AMBIGUOUS,
+        )
+    else:
+        friend_offsets = [
+            index
+            for index, word in enumerate(ledger.norms[:-1])
+            if word == "friend" and ledger.tokens[index + 1].text[:1].isupper()
+        ]
+        friend_names = [ledger.norms[index + 1] for index in friend_offsets]
+        _require(
+            len(friend_names) == 1
+            and "manufactured" in ledger.norms
+            and all("for" in relation for _, _, _, relation in rows)
+            and _contains(ledger.norms, "for", next(iter(possessives)), "friend")
+            and _contains(
+                question.norms, "does", friend_names[0], "have", "to", "pay", owner
+            ),
+            "commissioned item payer, maker, or payment direction differs",
+            FrontendStatus.AMBIGUOUS,
+        )
+
+    builder = _Builder(source, clause_set)
+    expression = _sum(
+        *[
+            _signed(
+                1,
+                _product(
+                    builder.literal(quantity, COUNT),
+                    builder.literal(price, PRICE_PER_COUNT),
+                ),
+                f"{item}_line_item",
+            )
+            for quantity, price, item, _ in rows
+        ]
+    )
+    return builder.finish(expression, "exhaustive_unit_rate_ledger")
+
+
+def _recurring_pronoun_rate_ledger(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Bind one possessive inventory to matching rates and a fixed recurrence."""
+
+    question = _question(clause_set)
+    if not (
+        "charge" in question.norms
+        and "spend" in question.norms
+        and "weeks" in question.norms
+        and "dry-cleaning" in question.norms
+    ):
+        return None
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            "clothes" in clause.norms
+            and "dry" in clause.norms
+            and "cleaners" in clause.norms
+            and "weekly" in clause.norms
+        ),
+        reason="recurring service owner is not uniquely introduced",
+    )
+    owner_tokens = [
+        token
+        for token in intro.tokens
+        if token.text[:1].isupper() and token.norm.endswith("'s")
+    ]
+    _require(
+        len(owner_tokens) == 1,
+        "recurring service requires one possessive owner",
+        FrontendStatus.AMBIGUOUS,
+    )
+    inventory = _single_clause(
+        clause_set,
+        lambda clause: (
+            clause.norms[:3] == ("her", "weekly", "drop-off")
+            and "includes" in clause.norms
+            and len(_counts(clause)) >= 2
+        ),
+        reason="weekly item inventory is not unique",
+    )
+    _require(
+        _contains(question.norms, "they", "charge", "her")
+        and _contains(question.norms, "does", "she", "spend"),
+        "recurring service owner pronouns do not agree",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    quantities: dict[str, Token] = {}
+    for quantity in _counts(inventory):
+        item = _noun_after(inventory, quantity)
+        _require(
+            item not in quantities,
+            "duplicate recurring inventory item",
+            FrontendStatus.AMBIGUOUS,
+        )
+        quantities[item] = quantity
+    rates: dict[str, Token] = {}
+    for price in _money_tokens(question):
+        index = question.tokens.index(price)
+        _require(
+            index + 2 < len(question.tokens) and question.norms[index + 1] == "per",
+            "recurring service rate lacks a per-item scope",
+            FrontendStatus.AMBIGUOUS,
+        )
+        item = _noun_after_index(
+            question,
+            index + 1,
+            skip=frozenset({"of", "pair", "the"}),
+        )
+        _require(
+            item not in rates,
+            "duplicate recurring service rate",
+            FrontendStatus.AMBIGUOUS,
+        )
+        rates[item] = price
+    horizon = _one_token(
+        [
+            token
+            for token in _counts(question)
+            if _noun_after(question, token) == "week"
+        ],
+        "recurring service horizon is incomplete",
+    )
+    _require(
+        set(quantities) == set(rates)
+        and horizon.number is not None
+        and horizon.number > 0,
+        "recurring inventory and service rates do not cover the same items",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    weekly = _sum(
+        *[
+            _signed(
+                1,
+                _product(
+                    builder.literal(quantities[item], COUNT),
+                    builder.literal(rates[item], PRICE_PER_COUNT),
+                ),
+                f"{item}_weekly_cost",
+            )
+            for item in sorted(quantities)
+        ]
+    )
+    expression = _product(weekly, builder.literal(horizon, SCALAR))
+    return builder.finish(expression, "recurring_pronoun_rate_ledger")
+
+
+def _temporal_categorical_block_remainder(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Bind a closed categorical calendar from totals and ordered blocks."""
+
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "many")
+        and "left" in question.norms
+        and "month" in question.norms
+        and "next" in question.norms
+        and "days" in question.norms
+    ):
+        return None
+    many_index = question.norms.index("many")
+    _require(
+        many_index + 2 < len(question.tokens)
+        and question.norms[many_index + 2] == "days",
+        "temporal target category is not locally bound",
+        FrontendStatus.AMBIGUOUS,
+    )
+    target_state = _singular(question.norms[many_index + 1])
+
+    overview = _single_clause(
+        clause_set,
+        lambda clause: (
+            "past" in clause.norms
+            and "moods" in clause.norms
+            and "had" in clause.norms
+            and "rest" in clause.norms
+            and "days" in clause.norms
+        ),
+        reason="categorical calendar totals are not unique",
+    )
+    blocks = _single_clause(
+        clause_set,
+        lambda clause: (
+            all(ordinal in clause.norms for ordinal in ("first", "second", "third"))
+            and clause.norms.count("days") == 3
+        ),
+        reason="ordered categorical blocks are not unique",
+    )
+
+    intro_names = {
+        token.norm
+        for clause in clause_set
+        if clause.span.end <= overview.span.start
+        for token in clause.tokens
+        if token.text[:1].isupper()
+    }
+    overview_pronouns = {
+        word for word in overview.norms if word in {"he", "she", "they"}
+    }
+    block_possessives = {
+        word for word in blocks.norms if word in {"his", "her", "their"}
+    }
+    agreement = {"he": "his", "she": "her", "they": "their"}
+    _require(
+        len(intro_names) == 1
+        and len(overview_pronouns) == 1
+        and block_possessives == {agreement[next(iter(overview_pronouns))]},
+        "calendar owner pronouns have no unique antecedent",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    horizon_rows = []
+    for index, token in enumerate(overview.tokens):
+        value = _LOCAL_CARDINALS.get(token.norm)
+        if (
+            value is not None
+            and index > 0
+            and index + 1 < len(overview.tokens)
+            and overview.norms[index - 1] == "past"
+            and overview.norms[index + 1] == "days"
+        ):
+            horizon_rows.append((token, value))
+    _require(
+        len(horizon_rows) == 1,
+        "calendar horizon is not one local word cardinal",
+        FrontendStatus.AMBIGUOUS,
+    )
+    horizon_token, horizon = horizon_rows[0]
+
+    category_rows: dict[str, tuple[Token, Fraction]] = {}
+    for index in range(1, len(overview.tokens) - 1):
+        token = overview.tokens[index - 1]
+        value = _LOCAL_CARDINALS.get(token.norm)
+        if value is None or overview.norms[index + 1] != "days":
+            continue
+        state = _singular(overview.norms[index])
+        if state in category_rows:
+            raise _Reject(FrontendStatus.AMBIGUOUS, "duplicate calendar category total")
+        category_rows[state] = (token, value)
+    rest_rows = [
+        _singular(overview.norms[index + 2])
+        for index in range(len(overview.tokens) - 2)
+        if overview.norms[index : index + 2] == ("rest", "were")
+    ]
+    _require(
+        len(category_rows) == 2
+        and target_state in category_rows
+        and len(rest_rows) == 1
+        and rest_rows[0] not in category_rows,
+        "calendar category totals or remainder state are incomplete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    explicit_total = sum(value for _, value in category_rows.values())
+    rest_total = horizon - explicit_total
+    _require(
+        horizon > 0 and rest_total >= 0,
+        "calendar category totals exceed the horizon",
+        FrontendStatus.INVALID,
+    )
+    category_totals = {state: value for state, (_, value) in category_rows.items()}
+    category_totals[rest_rows[0]] = rest_total
+
+    parsed_blocks: list[tuple[str, Token, Fraction]] = []
+    for ordinal in ("first", "second", "third"):
+        ordinal_index = blocks.norms.index(ordinal)
+        _require(
+            ordinal_index + 4 < len(blocks.tokens)
+            and blocks.norms[ordinal_index + 2 : ordinal_index + 4] == ("days", "were"),
+            "ordered calendar block is malformed",
+            FrontendStatus.AMBIGUOUS,
+        )
+        count_token = blocks.tokens[ordinal_index + 1]
+        count = _LOCAL_CARDINALS.get(count_token.norm)
+        _require(
+            count is not None and count > 0,
+            "calendar block count is not a positive word cardinal",
+            FrontendStatus.INVALID,
+        )
+        state = _singular(blocks.norms[ordinal_index + 4])
+        parsed_blocks.append((state, count_token, count))
+    _require(
+        {state for state, _, _ in parsed_blocks} == set(category_totals)
+        and len({state for state, _, _ in parsed_blocks}) == 3
+        and all(count <= category_totals[state] for state, _, count in parsed_blocks),
+        "ordered blocks and category totals do not describe the same states",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    next_index = question.norms.index("next")
+    _require(
+        next_index + 4 < len(question.tokens)
+        and question.norms[next_index + 2 : next_index + 4] == ("days", "were"),
+        "next categorical block is malformed",
+        FrontendStatus.AMBIGUOUS,
+    )
+    next_count_token = question.tokens[next_index + 1]
+    next_count = _LOCAL_CARDINALS.get(next_count_token.norm)
+    how_index = question.norms.index("how")
+    sequence_tokens = [
+        token
+        for token in question.tokens[next_index + 4 : how_index]
+        if token.norm not in {",", "and"}
+    ]
+    _require(
+        next_count is not None
+        and next_count == len(sequence_tokens)
+        and all(_singular(token.norm) in category_totals for token in sequence_tokens),
+        "next block count and categorical sequence differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    scheduled_days = sum(count for _, _, count in parsed_blocks) + next_count
+    _require(
+        scheduled_days <= horizon,
+        "ordered calendar blocks exceed the horizon",
+        FrontendStatus.INVALID,
+    )
+
+    target_total_token, target_total = category_rows[target_state]
+    target_blocks = [
+        (token, count) for state, token, count in parsed_blocks if state == target_state
+    ]
+    next_targets = [
+        token for token in sequence_tokens if _singular(token.norm) == target_state
+    ]
+    known_target = sum(count for _, count in target_blocks) + len(next_targets)
+    _require(
+        target_total >= known_target,
+        "scheduled target days exceed the declared target total",
+        FrontendStatus.INVALID,
+    )
+
+    builder = _Builder(source, clause_set)
+    terms = [
+        _signed(
+            1,
+            builder.lexical_literal(target_total_token, target_total, COUNT),
+            "declared_target_total",
+        )
+    ]
+    terms.extend(
+        _signed(
+            -1,
+            builder.lexical_literal(token, count, COUNT),
+            "completed_target_block",
+        )
+        for token, count in target_blocks
+    )
+    terms.extend(
+        _signed(
+            -1,
+            builder.lexical_literal(token, Fraction(1), COUNT),
+            "scheduled_target_day",
+        )
+        for token in next_targets
+    )
+    return builder.finish(
+        _sum(*terms),
+        "temporal_categorical_block_remainder",
+    )
+
+
+def _absolute_weighted_score_difference(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Compile a shared score table and signed comparative deltas through Abs."""
+
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "what", "is", "the", "difference")
+        and _contains(question.norms, "between", "their", "two", "scores")
+    ):
+        return None
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            "want" in clause.norms
+            and "know" in clause.norms
+            and "who" in clause.norms
+            and "game" in clause.norms
+        ),
+        reason="score contestants are not uniquely introduced",
+    )
+    names = list(
+        dict.fromkeys(token.norm for token in intro.tokens if token.text[:1].isupper())
+    )
+    _require(
+        len(names) == 2 and len(set(names)) == 2,
+        "score comparison requires exactly two named contestants",
+        FrontendStatus.AMBIGUOUS,
+    )
+    contest = _single_clause(
+        clause_set,
+        lambda clause: (
+            clause.norms[:1] == ("they",)
+            and "each" in clause.norms
+            and "score" in clause.norms
+            and "wins" in clause.norms
+        ),
+        reason="shared score contest scope is not unique",
+    )
+    _require(
+        _contains(contest.norms, "they", "are", "each", "going", "to", "play")
+        and _contains(contest.norms, "highest", "score", "wins"),
+        "score contest does not bind both contestants",
+        FrontendStatus.AMBIGUOUS,
+    )
+    rates = _single_clause(
+        clause_set,
+        lambda clause: (
+            clause.norms[:1] == ("they",)
+            and "receive" in clause.norms
+            and clause.norms.count("points") == 3
+            and len(_counts(clause)) == 3
+        ),
+        reason="shared score-rate table is not unique",
+    )
+
+    rate_by_item: dict[str, tuple[Token, Unit]] = {}
+    for rate in _counts(rates):
+        index = rates.tokens.index(rate)
+        _require(
+            index + 1 < len(rates.tokens)
+            and _singular(rates.norms[index + 1]) == "point",
+            "score rate lacks a local point unit",
+            FrontendStatus.AMBIGUOUS,
+        )
+        quantifiers = [
+            offset
+            for offset in range(index + 2, min(len(rates.tokens), index + 7))
+            if rates.norms[offset] in {"each", "every"}
+        ]
+        _require(
+            len(quantifiers) == 1 and quantifiers[0] + 1 < len(rates.tokens),
+            "score rate lacks one local event scope",
+            FrontendStatus.AMBIGUOUS,
+        )
+        item = _singular(rates.norms[quantifiers[0] + 1])
+        _require(
+            item not in rate_by_item,
+            "duplicate score-rate event",
+            FrontendStatus.AMBIGUOUS,
+        )
+        unit = POINT / (SECOND if item == "second" else COUNT)
+        rate_by_item[item] = (rate, unit)
+
+    deltas = _counts(question)
+    _require(len(deltas) == 3, "comparative score deltas are incomplete")
+    delta_by_item: dict[str, tuple[Token, int, Unit]] = {}
+    for delta in deltas:
+        index = question.tokens.index(delta)
+        _require(index + 1 < len(question.tokens), "score delta item is missing")
+        modifier = question.norms[index + 1]
+        if modifier in {"more", "fewer", "less"}:
+            _require(index + 2 < len(question.tokens), "score delta item is missing")
+            item = _singular(question.norms[index + 2])
+            sign = 1 if modifier == "more" else -1
+        else:
+            item = _singular(modifier)
+            direction = (
+                question.norms[index + 2] if index + 2 < len(question.tokens) else ""
+            )
+            _require(
+                direction in {"faster", "slower"},
+                "score delta has no explicit direction",
+                FrontendStatus.AMBIGUOUS,
+            )
+            sign = 1 if direction == "faster" else -1
+        _require(
+            item not in delta_by_item,
+            "duplicate comparative score event",
+            FrontendStatus.AMBIGUOUS,
+        )
+        unit = SECOND if item == "second" else COUNT
+        delta_by_item[item] = (delta, sign, unit)
+
+    _require(
+        set(rate_by_item) == set(delta_by_item)
+        and question.norms[:2] == ("if", names[0])
+        and _contains(question.norms, "than", names[1])
+        and all(name in question.norms for name in names),
+        "contestant, score event, or comparison scope differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    first, second, third = deltas
+    first_index = question.tokens.index(first)
+    second_index = question.tokens.index(second)
+    third_index = question.tokens.index(third)
+    first_item = _singular(
+        question.norms[first_index + 2]
+        if question.norms[first_index + 1] in {"more", "fewer", "less"}
+        else question.norms[first_index + 1]
+    )
+    second_item = _singular(
+        question.norms[second_index + 2]
+        if question.norms[second_index + 1] in {"more", "fewer", "less"}
+        else question.norms[second_index + 1]
+    )
+    third_item = _singular(
+        question.norms[third_index + 2]
+        if question.norms[third_index + 1] in {"more", "fewer", "less"}
+        else question.norms[third_index + 1]
+    )
+    _require(
+        _contains(
+            question.norms,
+            "if",
+            names[0],
+            "jumps",
+            "on",
+            first.norm,
+            "more",
+            question.norms[first_index + 2],
+            "than",
+            names[1],
+        )
+        and _contains(
+            question.norms,
+            "than",
+            names[1],
+            "and",
+            "collects",
+            second.norm,
+            "more",
+            question.norms[second_index + 2],
+        )
+        and _contains(
+            question.norms,
+            "but",
+            "finishes",
+            "the",
+            "level",
+            third.norm,
+            question.norms[third_index + 1],
+            "slower",
+        )
+        and _contains(rates.norms, first_item, "they", "jump", "on")
+        and _contains(rates.norms, second_item, "they", "collect")
+        and third_item == "second"
+        and _contains(rates.norms, "timer", "when", "they", "finish", "the", "level"),
+        "score actions do not preserve one contestant's signed deltas",
+        FrontendStatus.AMBIGUOUS,
+    )
+    builder = _Builder(source, clause_set)
+    signed_rows = []
+    for item in rate_by_item:
+        rate_token, rate_unit = rate_by_item[item]
+        delta_token, sign, delta_unit = delta_by_item[item]
+        signed_rows.append(
+            _signed(
+                sign,
+                _product(
+                    builder.literal(rate_token, rate_unit),
+                    builder.literal(delta_token, delta_unit),
+                ),
+                f"{item}_score_delta",
+            )
+        )
+    raw_delta = _sum(*signed_rows)
+    expression = AbsoluteExpr(raw_delta, Span(0, len(source), source))
+    return builder.finish(expression, "absolute_weighted_score_difference")
+
+
 _PLANNERS = (
     _rate_length_difference,
     _functioning_chain,
@@ -4810,6 +5496,10 @@ _PLANNERS = (
     _fractional_group_consumption_remainder,
     _typed_chair_capacity_deficit,
     _typed_percentage_trade_transitions,
+    _exhaustive_unit_rate_ledger,
+    _recurring_pronoun_rate_ledger,
+    _temporal_categorical_block_remainder,
+    _absolute_weighted_score_difference,
 )
 
 

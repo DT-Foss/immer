@@ -370,6 +370,43 @@ CALENDAR_CASE = (
     "in March?"
 )
 
+TEMPORAL_BLOCK_CASE = (
+    "Christina records her mood every day on a calendar. Over the past thirty "
+    "days of moods, she had twelve good days and eight bad days and the rest "
+    "were neutral. Her first eight days were good, her second eight days were "
+    "bad, and her third eight days were neutral. If the next three days were "
+    "good, neutral, and good, how many good days were left in the month?"
+)
+
+ABSOLUTE_SCORE_CASE = (
+    "Ava and Emma want to know who is better at the new video game Ava got for "
+    "her birthday. They are each going to play one level and whoever has the "
+    "highest score wins. They receive 10 points for every enemy they jump on, "
+    "5 points for each berry they collect, and 30 points for every second left "
+    "on the timer when they finish the level. If Ava jumps on 8 more enemies "
+    "than Emma and collects 3 more berries, but finishes the level 4 seconds "
+    "slower, what is the difference between their two scores?"
+)
+
+EXHAUSTIVE_SALE_CASE = (
+    "Jen is planning to sell her root crops. She has 6 yams which can be sold "
+    "at $1.5 each, 10 sweet potatoes that cost $2 each, and 4 carrots which "
+    "cost $1.25 each. If she sells everything, how much will she earn?"
+)
+
+COMMISSIONED_LEDGER_CASE = (
+    "John is a carpenter. For his friend Ali, he manufactured 4 wooden tables "
+    "for $20 each and 2 roof frames for $10 each. How much does Ali have to "
+    "pay John?"
+)
+
+RECURRING_RATE_CASE = (
+    "Alicia's clothes have to be sent to the dry cleaners weekly. Her weekly "
+    "drop-off includes 5 blouses, 2 pants and 1 skirt. If they charge her "
+    "$5.00 per blouse, $6.00 per skirt and $8.00 per pair of pants, how much "
+    "does she spend on dry-cleaning in 5 weeks?"
+)
+
 
 class SignedEventFrontendTests(unittest.TestCase):
     def test_six_shared_event_families_compile_and_solve_exactly(self) -> None:
@@ -1093,20 +1130,25 @@ class SignedEventPartCapacityWaveTests(unittest.TestCase):
             with self.subTest(question=question):
                 self.assertFalse(compile_signed_events(question).ok)
 
-    def test_nonexact_capacity_divisions_fail_without_a_ceil_operator(self) -> None:
-        mutations = (
-            PART_CAPACITY_CASES[24][0].replace("9 kids", "10 kids"),
-            PART_CAPACITY_CASES[50][0].replace("30 kids", "31 kids"),
-            PART_CAPACITY_CASES[60][0].replace("24 berries", "25 berries"),
+    def test_nonexact_capacity_divisions_use_explicit_ceiling(self) -> None:
+        cases = (
+            (PART_CAPACITY_CASES[24][0].replace("9 kids", "10 kids"), Fraction(2)),
+            (
+                PART_CAPACITY_CASES[50][0].replace("30 kids", "31 kids"),
+                Fraction(65, 4),
+            ),
+            (
+                PART_CAPACITY_CASES[60][0].replace("24 berries", "25 berries"),
+                Fraction(13),
+            ),
         )
-        for question in mutations:
+        for question, expected in cases:
             with self.subTest(question=question):
                 result = compile_signed_events(question)
-                self.assertFalse(result.ok)
-                self.assertIn(
-                    result.status,
-                    {FrontendStatus.UNSUPPORTED, FrontendStatus.INVALID},
-                )
+                self.assertTrue(result.ok, result.reason)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, expected)
+                self.assertTrue(result.compiled.certificate.verified)
 
     def test_cross_scope_and_extra_evidence_fail_closed(self) -> None:
         cross_scope = (
@@ -1340,6 +1382,162 @@ class SignedEventPartCapacityWaveTests(unittest.TestCase):
             "cost?",
         )
         for question in deferred:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+
+
+class SignedEventGroundOperatorWaveTests(unittest.TestCase):
+    def test_temporal_block_and_absolute_score_delta_are_exact(self) -> None:
+        cases = (
+            (
+                TEMPORAL_BLOCK_CASE,
+                Fraction(2),
+                "temporal_categorical_block_remainder",
+            ),
+            (
+                ABSOLUTE_SCORE_CASE,
+                Fraction(25),
+                "absolute_weighted_score_difference",
+            ),
+        )
+        for question, expected, family in cases:
+            with self.subTest(family=family):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                self.assertEqual(result.family, family)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, expected)
+                self.assertTrue(result.compiled.certificate.verified)
+                parsed = parse_structural_problem(question)
+                self.assertTrue(parsed.ok, parsed.reason)
+                assert parsed.problem is not None
+                self.assertEqual(solve(parsed.problem).target_value, expected)
+
+    def test_temporal_categories_and_score_events_can_be_renamed(self) -> None:
+        temporal = (
+            TEMPORAL_BLOCK_CASE.replace("Christina", "Mara")
+            .replace("good", "calm")
+            .replace("bad", "tense")
+            .replace("neutral", "steady")
+        )
+        score = (
+            ABSOLUTE_SCORE_CASE.replace("Ava", "Mira")
+            .replace("Emma", "Talia")
+            .replace("enemies", "targets")
+            .replace("enemy", "target")
+            .replace("berries", "coins")
+            .replace("berry", "coin")
+        )
+        for question, expected in ((temporal, 2), (score, 25)):
+            with self.subTest(question=question):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, expected)
+
+    def test_temporal_state_count_and_owner_mutations_fail_closed(self) -> None:
+        mutations = (
+            TEMPORAL_BLOCK_CASE.replace("next three days", "next four days"),
+            TEMPORAL_BLOCK_CASE.replace(
+                "third eight days were neutral", "third eight days were bad"
+            ),
+            TEMPORAL_BLOCK_CASE.replace("twelve good days", "seven good days"),
+            TEMPORAL_BLOCK_CASE.replace("Her first eight", "Their first eight"),
+            TEMPORAL_BLOCK_CASE + " Reference 99.",
+        )
+        for question in mutations:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+
+
+class SignedEventConservativeCoreferenceWaveTests(unittest.TestCase):
+    def test_three_closed_pronoun_rate_ledgers_are_exact(self) -> None:
+        cases = (
+            (EXHAUSTIVE_SALE_CASE, Fraction(34), "exhaustive_unit_rate_ledger"),
+            (
+                COMMISSIONED_LEDGER_CASE,
+                Fraction(100),
+                "exhaustive_unit_rate_ledger",
+            ),
+            (
+                RECURRING_RATE_CASE,
+                Fraction(235),
+                "recurring_pronoun_rate_ledger",
+            ),
+        )
+        for question, expected, family in cases:
+            with self.subTest(family=family, question=question):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                self.assertEqual(result.family, family)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, expected)
+                self.assertTrue(result.compiled.certificate.verified)
+                self.assertEqual(
+                    len(result.compiled.evidence_projection),
+                    len(
+                        {
+                            row.evidence.evidence_id
+                            for row in result.compiled.evidence_projection
+                        }
+                    ),
+                )
+
+    def test_owner_and_item_renames_preserve_pronoun_binding(self) -> None:
+        sale = (
+            EXHAUSTIVE_SALE_CASE.replace("Jen", "Mara")
+            .replace("yams", "melons")
+            .replace("sweet potatoes", "red peppers")
+            .replace("carrots", "onions")
+        )
+        commissioned = COMMISSIONED_LEDGER_CASE.replace("John", "Miro").replace(
+            "Ali", "Talia"
+        )
+        recurring = (
+            RECURRING_RATE_CASE.replace("Alicia", "Mara")
+            .replace("blouses", "shirts")
+            .replace("blouse", "shirt")
+            .replace("pants", "trousers")
+            .replace("skirt", "coat")
+        )
+        for question, expected in ((sale, 34), (commissioned, 100), (recurring, 235)):
+            with self.subTest(question=question):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, expected)
+
+    def test_pronoun_scope_relation_and_item_mutations_fail_closed(self) -> None:
+        mutations = (
+            EXHAUSTIVE_SALE_CASE.replace("She has 6 yams", "Mira has 6 yams"),
+            EXHAUSTIVE_SALE_CASE.replace("sells everything", "sells some items"),
+            EXHAUSTIVE_SALE_CASE.replace(
+                "4 carrots which cost", "4 carrots which weigh"
+            ),
+            COMMISSIONED_LEDGER_CASE.replace("his friend Ali", "her friend Ali"),
+            COMMISSIONED_LEDGER_CASE.replace("pay John", "pay Mira"),
+            RECURRING_RATE_CASE.replace("charge her", "charge Mira"),
+            RECURRING_RATE_CASE.replace("per pair of pants", "per pair of socks"),
+            RECURRING_RATE_CASE.replace("in 5 weeks", "in 5 days"),
+            RECURRING_RATE_CASE + " Reference 99.",
+        )
+        for question in mutations:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+
+    def test_absolute_scope_direction_and_actor_mutations_fail_closed(self) -> None:
+        mutations = (
+            ABSOLUTE_SCORE_CASE.replace("They receive", "Ava receives"),
+            ABSOLUTE_SCORE_CASE.replace("4 seconds slower", "4 seconds later"),
+            ABSOLUTE_SCORE_CASE.replace(
+                "than Emma and collects", "than Talia and collects"
+            ),
+            ABSOLUTE_SCORE_CASE.replace(
+                "difference between their two scores", "higher score Ava earned"
+            ),
+            ABSOLUTE_SCORE_CASE + " Reference 99.",
+        )
+        for question in mutations:
             with self.subTest(question=question):
                 self.assertFalse(compile_signed_events(question).ok)
 

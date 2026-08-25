@@ -15,6 +15,8 @@ from immer.cognition.fertig.arithmetic_ir import (
 )
 from immer.cognition.fertig.clause_compiler import SymbolKey
 from immer.cognition.fertig.signed_expression import (
+    AbsoluteExpr,
+    CeilingExpr,
     Definition,
     ExpressionCompileError,
     ExpressionProgram,
@@ -87,6 +89,54 @@ def _compile(builder: _Builder, expr, **kwargs):
 
 
 class CanonicalExpressionTests(unittest.TestCase):
+    def test_ground_absolute_and_ceiling_are_exact_and_certified(self) -> None:
+        absolute_builder = _Builder()
+        delta = _sum(
+            _signed(1, absolute_builder.literal(3, SCALAR)),
+            _signed(-1, absolute_builder.literal(8, SCALAR)),
+        )
+        absolute = _compile(
+            absolute_builder,
+            AbsoluteExpr(delta, Span(0, 0)),
+        )
+        self.assertEqual(absolute.solution.target_value, 5)
+        self.assertTrue(absolute.certificate.verified)
+
+        ceiling_builder = _Builder()
+        ratio = QuotientExpr(
+            ceiling_builder.literal(5, COUNT),
+            ceiling_builder.literal(2, SCALAR),
+            Span(0, 0),
+        )
+        ceiling = _compile(
+            ceiling_builder,
+            CeilingExpr(ratio, Span(0, 0)),
+        )
+        self.assertEqual(ceiling.solution.target_value, 3)
+        self.assertTrue(ceiling.certificate.verified)
+        fractional_intermediates = [
+            variable
+            for variable in ceiling.problem.variables
+            if variable.name.startswith("__signed_expr_") and not variable.count
+        ]
+        self.assertTrue(fractional_intermediates)
+
+    def test_absolute_and_ceiling_reject_references_even_when_defined(self) -> None:
+        for operator in (AbsoluteExpr, CeilingExpr):
+            builder = _Builder()
+            span = Span(0, 0)
+            value = _key("value")
+            definitions = (Definition(value, builder.literal(3, SCALAR), span),)
+            with self.subTest(operator=operator):
+                with self.assertRaisesRegex(
+                    ExpressionCompileError, "fully ground expression"
+                ):
+                    _compile(
+                        builder,
+                        operator(RefExpr(value, span), span),
+                        definitions=definitions,
+                    )
+
     def test_actual_twelve_mapped_expressions_plus_mean63_are_exact(self) -> None:
         cases = []
 
