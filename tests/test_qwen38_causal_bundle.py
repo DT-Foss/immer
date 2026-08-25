@@ -143,6 +143,167 @@ def _fixture(root: Path) -> tuple[Path, Path, str]:
 
 
 class QwenCausalBundleTests(unittest.TestCase):
+    def test_pin_local_inventory_is_stable_and_adopts_without_copying(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-local-pin-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            checkpoint, _old_inventory, _old_fingerprint = _fixture(root)
+            shard = checkpoint / "model.safetensors"
+            before = shard.stat()
+            before_digest = _sha256(shard)
+            repo_id = "Qwen/Qwen3.5-0.8B"
+            revision = "2fc06364715b967f1860aea9cf38778875588b17"
+            first_path = root / "qwen35-local-inventory.json"
+            second_path = root / "qwen35-local-inventory-replay.json"
+            manifest = {
+                name: (path.stat().st_size, _sha256(path))
+                for name in ("config.json", "model.safetensors")
+                if (path := checkpoint / name).is_file()
+            }
+
+            with mock.patch.dict(
+                bundle_script.LOCAL_PINNED_CHECKPOINTS,
+                {(repo_id, revision): manifest},
+            ):
+                first = bundle_script.pin_local_inventory(
+                    checkpoint,
+                    first_path,
+                    repo_id=repo_id,
+                    revision=revision,
+                    budget_mb=20,
+                )
+                second = bundle_script.pin_local_inventory(
+                    checkpoint,
+                    second_path,
+                    repo_id=repo_id,
+                    revision=revision,
+                    budget_mb=20,
+                )
+
+            self.assertEqual(first["source_fingerprint"], second["source_fingerprint"])
+            self.assertEqual(first["shards"], 1)
+            self.assertEqual(first["tensors"], 56)
+            document = json.loads(first_path.read_text())
+            pinned = document["inventory"]["shards"][0]
+            self.assertEqual(pinned["payload_sha256"], before_digest)
+            self.assertEqual(pinned["linked_etag"], before_digest)
+            self.assertEqual(pinned["repo_commit"], revision)
+            self.assertEqual(pinned["etag"], f"sha256:{before_digest}")
+
+            result = bundle_script.adopt_bundle(
+                checkpoint,
+                first_path,
+                repo_id=repo_id,
+                revision=revision,
+                expected_fingerprint=first["source_fingerprint"],
+                require_official=False,
+                weights_layout="flat",
+            )
+            after = shard.stat()
+            self.assertTrue(result["adopted"])
+            self.assertEqual(result["weights_layout"], "flat/v1")
+            self.assertEqual(
+                (after.st_dev, after.st_ino), (before.st_dev, before.st_ino)
+            )
+            self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+            self.assertEqual(_sha256(shard), before_digest)
+
+    def test_pin_local_inventory_rejects_identity_relabeling(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-local-pin-spoof-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            checkpoint, _inventory, _fingerprint = _fixture(root)
+            with self.assertRaisesRegex(
+                bundle_script.QwenCausalBundleError,
+                "content manifest mismatch",
+            ):
+                bundle_script.pin_local_inventory(
+                    checkpoint,
+                    root / "spoofed.json",
+                    repo_id="Qwen/Qwen3.5-0.8B",
+                    revision="2fc06364715b967f1860aea9cf38778875588b17",
+                    budget_mb=20,
+                )
+
+    def test_compatible_cli_selects_the_pinned_qwen35_drafter(self) -> None:
+        with (
+            mock.patch.object(
+                bundle_script,
+                "adopt_bundle",
+                return_value={"adopted": True},
+            ) as adopt,
+            redirect_stderr(io.StringIO()),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            result = bundle_script.main(
+                [
+                    "adopt-flat",
+                    "--checkpoint",
+                    "/checkpoint",
+                    "--inventory",
+                    "/inventory.json",
+                    "--compatible-qwen3",
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            adopt.call_args.kwargs["repo_id"],
+            "Qwen/Qwen3.5-0.8B",
+        )
+        self.assertEqual(
+            adopt.call_args.kwargs["revision"],
+            "2fc06364715b967f1860aea9cf38778875588b17",
+        )
+        self.assertFalse(adopt.call_args.kwargs["require_official"])
+
+    def test_compatible_verify_cli_selects_the_pinned_qwen35_drafter(self) -> None:
+        with (
+            mock.patch.object(
+                bundle_script,
+                "verify_bundle",
+                return_value={"tensor_bindings": 488},
+            ) as verify,
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            result = bundle_script.main(
+                [
+                    "verify",
+                    "--bundle",
+                    "/checkpoint",
+                    "--compatible-qwen3",
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            verify.call_args.kwargs["expected_repo_id"],
+            "Qwen/Qwen3.5-0.8B",
+        )
+        self.assertEqual(
+            verify.call_args.kwargs["expected_revision"],
+            "2fc06364715b967f1860aea9cf38778875588b17",
+        )
+        self.assertFalse(verify.call_args.kwargs["require_official"])
+
+    def test_pin_local_inventory_rejects_unpinned_revision(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-local-pin-revision-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            checkpoint, _inventory, _fingerprint = _fixture(root)
+            with self.assertRaisesRegex(
+                bundle_script.QwenCausalBundleError,
+                "40-hex commit",
+            ):
+                bundle_script.pin_local_inventory(
+                    checkpoint,
+                    root / "inventory.json",
+                    repo_id="Qwen/Qwen3.5-0.8B",
+                    revision="main",
+                    budget_mb=20,
+                )
+
     def test_refresh_inventory_separates_payload_and_xet_identity(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix=".qwen-inventory-refresh-test-", dir=Path.cwd()

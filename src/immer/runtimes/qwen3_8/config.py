@@ -1,4 +1,4 @@
-"""Strict text-decoder configuration for the pinned Qwen3.8-27B checkpoint."""
+"""Strict text-decoder configuration for supported Qwen3.5 checkpoints."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from typing import Any, Mapping
 
 OFFICIAL_REPO_ID = "Qwen/Qwen3.8-27B"
 OFFICIAL_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+QWEN35_DRAFTER_REPO_ID = "Qwen/Qwen3.5-0.8B"
+QWEN35_DRAFTER_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
 
 
 class Qwen38ConfigError(ValueError):
@@ -104,7 +106,7 @@ class Qwen38Config:
     mtp_num_hidden_layers: int
     mtp_use_dedicated_embeddings: bool
     tie_word_embeddings: bool
-    bos_token_id: int
+    bos_token_id: int | None
     eos_token_id: int
     pad_token_id: int | None
 
@@ -155,6 +157,7 @@ class Qwen38Config:
             raise Qwen38ConfigError("Qwen3.8 config root must be an object")
 
         text_raw: Mapping[str, Any]
+        outer_tie: bool | None = None
         if "text_config" in raw:
             if raw.get("model_type") != "qwen3_5":
                 raise Qwen38ConfigError("outer model_type must be 'qwen3_5'")
@@ -170,8 +173,8 @@ class Qwen38Config:
                 raise Qwen38ConfigError("text_config must be an object")
             text_raw = candidate
             outer_tie = raw.get("tie_word_embeddings")
-            if outer_tie is not None and outer_tie is not False:
-                raise Qwen38ConfigError("outer tied embeddings are unsupported")
+            if outer_tie is not None and not isinstance(outer_tie, bool):
+                raise Qwen38ConfigError("outer tie_word_embeddings must be a boolean")
         else:
             text_raw = raw
 
@@ -204,11 +207,24 @@ class Qwen38Config:
                 "mrope_section must contain positive integer sections"
             )
 
-        partial_rotary_factor = _finite_float(text_raw, "partial_rotary_factor")
         rope_partial = _finite_float(rope, "partial_rotary_factor")
+        if "partial_rotary_factor" in text_raw:
+            partial_rotary_factor = _finite_float(text_raw, "partial_rotary_factor")
+        else:
+            # Qwen3.5's published config class assigns 0.25 as a backwards-
+            # compatibility default and the 0.8B checkpoint records the
+            # executable value only inside rope_parameters.  The RoPE object is
+            # authoritative when the legacy duplicate is absent.
+            partial_rotary_factor = rope_partial
         if partial_rotary_factor != rope_partial:
             raise Qwen38ConfigError(
                 "partial_rotary_factor disagrees with rope_parameters"
+            )
+
+        output_gate_type = text_raw.get("output_gate_type", "swish")
+        if not isinstance(output_gate_type, str) or not output_gate_type:
+            raise Qwen38ConfigError(
+                "output_gate_type must be a non-empty string when present"
             )
 
         config = cls(
@@ -235,7 +251,7 @@ class Qwen38Config:
             attention_bias=_boolean(text_raw, "attention_bias"),
             attention_dropout=_finite_float(text_raw, "attention_dropout"),
             attn_output_gate=_boolean(text_raw, "attn_output_gate"),
-            output_gate_type=_string(text_raw, "output_gate_type"),
+            output_gate_type=output_gate_type,
             hidden_act=_string(text_raw, "hidden_act"),
             checkpoint_dtype=_string(text_raw, "dtype"),
             mamba_ssm_dtype=_string(text_raw, "mamba_ssm_dtype"),
@@ -244,10 +260,14 @@ class Qwen38Config:
                 text_raw, "mtp_use_dedicated_embeddings"
             ),
             tie_word_embeddings=_boolean(text_raw, "tie_word_embeddings"),
-            bos_token_id=_nonnegative(text_raw, "bos_token_id"),
+            bos_token_id=_optional_int(text_raw, "bos_token_id"),
             eos_token_id=_nonnegative(text_raw, "eos_token_id"),
             pad_token_id=_optional_int(text_raw, "pad_token_id"),
         )
+        if outer_tie is not None and outer_tie != config.tie_word_embeddings:
+            raise Qwen38ConfigError(
+                "outer and text tie_word_embeddings values disagree"
+            )
         config.validate()
         if require_official:
             config.validate_official()
@@ -309,10 +329,8 @@ class Qwen38Config:
             raise Qwen38ConfigError("runtime requires BF16 checkpoint tensors")
         if self.mamba_ssm_dtype != "float32":
             raise Qwen38ConfigError("DeltaNet recurrence must use float32 state")
-        if self.tie_word_embeddings or self.mtp_use_dedicated_embeddings:
-            raise Qwen38ConfigError(
-                "runtime requires the published untied embedding layout"
-            )
+        if self.mtp_use_dedicated_embeddings:
+            raise Qwen38ConfigError("runtime requires shared decoder/MTP embeddings")
 
     def validate_official(self) -> None:
         expected: dict[str, Any] = {
@@ -364,13 +382,29 @@ def validate_source_identity(
         raise Qwen38ConfigError("tensor source repo/revision identity is incomplete")
     if repo_id.startswith("local:"):
         return "local"
-    if repo_id != OFFICIAL_REPO_ID:
+    supported = {
+        (OFFICIAL_REPO_ID, OFFICIAL_REVISION): "official-pinned",
+        (
+            QWEN35_DRAFTER_REPO_ID,
+            QWEN35_DRAFTER_REVISION,
+        ): "qwen3.5-drafter-pinned",
+    }
+    identity = supported.get((repo_id, revision))
+    if identity is not None:
+        return identity
+    supported_revisions = {
+        OFFICIAL_REPO_ID: OFFICIAL_REVISION,
+        QWEN35_DRAFTER_REPO_ID: QWEN35_DRAFTER_REVISION,
+    }
+    if repo_id not in supported_revisions:
         raise Qwen38ConfigError(
-            f"remote Qwen3.8 source must be {OFFICIAL_REPO_ID!r}, got {repo_id!r}"
+            "remote Qwen source must be one of "
+            f"{tuple(supported_revisions)!r}, got {repo_id!r}"
         )
-    if revision != OFFICIAL_REVISION:
+    wanted = supported_revisions[repo_id]
+    if revision != wanted:
         raise Qwen38ConfigError(
-            "remote Qwen3.8 source must use pinned revision "
-            f"{OFFICIAL_REVISION}, got {revision!r}"
+            f"remote Qwen source {repo_id!r} must use pinned revision "
+            f"{wanted}, got {revision!r}"
         )
-    return "official-pinned"
+    raise AssertionError("unreachable supported Qwen identity")

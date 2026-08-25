@@ -11,6 +11,7 @@ import numpy as np
 
 
 PINNED_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+QWEN35_DRAFTER_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
 
 
 def _official_config() -> dict:
@@ -66,6 +67,57 @@ def _official_config() -> dict:
     }
 
 
+def _qwen35_08b_config() -> dict:
+    """Executable fields observed in Qwen/Qwen3.5-0.8B config.json."""
+
+    return {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "tie_word_embeddings": True,
+        "text_config": {
+            "attention_bias": False,
+            "attention_dropout": 0.0,
+            "attn_output_gate": True,
+            "dtype": "bfloat16",
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 1024,
+            "intermediate_size": 3584,
+            "layer_types": [
+                "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
+                for index in range(24)
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 16,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "mlp_only_layers": [],
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 1,
+            "mtp_use_dedicated_embeddings": False,
+            "num_attention_heads": 8,
+            "num_hidden_layers": 24,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {
+                "mrope_interleaved": True,
+                "mrope_section": [11, 11, 10],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10_000_000,
+                "rope_type": "default",
+            },
+            "tie_word_embeddings": True,
+            "use_cache": True,
+            "vocab_size": 248320,
+        },
+    }
+
+
 def _bf16_bytes(values: np.ndarray) -> bytes:
     contiguous = np.ascontiguousarray(values, dtype=np.float32)
     words = (contiguous.view(np.uint32) >> np.uint32(16)).astype("<u2")
@@ -79,6 +131,7 @@ class _RawBF16Source:
         *,
         repo_id: str | None = None,
         revision: str | None = None,
+        source_dtypes: dict[str, str] | None = None,
     ) -> None:
         if repo_id is not None:
             self.repo_id = repo_id
@@ -89,12 +142,18 @@ class _RawBF16Source:
         self.meta: dict[str, dict] = {}
         payload = bytearray()
         for name, values in tensors.items():
-            encoded = _bf16_bytes(values)
+            source_dtype = (source_dtypes or {}).get(name, "BF16")
+            if source_dtype == "BF16":
+                encoded = _bf16_bytes(values)
+            elif source_dtype == "F32":
+                encoded = np.ascontiguousarray(values, dtype="<f4").tobytes()
+            else:
+                raise ValueError(f"unsupported fixture dtype: {source_dtype}")
             begin = len(payload)
             payload.extend(encoded)
             self.meta[name] = {
                 "name": name,
-                "dtype": "BF16",
+                "dtype": source_dtype,
                 "shape": list(values.shape),
                 "shard": self.shard,
                 "data_start": self.data_start,
@@ -153,6 +212,49 @@ class Qwen38ConfigTests(unittest.TestCase):
             Qwen38Config.from_mapping(raw["text_config"]).vocab_size, 248320
         )
 
+    def test_qwen35_08b_real_nested_config_maps_tied_runtime_contract(self) -> None:
+        from immer.runtimes.qwen3_8.config import Qwen38Config
+
+        config = Qwen38Config.from_mapping(_qwen35_08b_config(), require_official=False)
+
+        self.assertEqual(config.dim, 1024)
+        self.assertEqual(config.intermediate_size, 3584)
+        self.assertEqual(config.n_layers, 24)
+        self.assertEqual((config.n_heads, config.n_kv_heads), (8, 2))
+        self.assertEqual(
+            (config.linear_num_key_heads, config.linear_num_value_heads),
+            (16, 16),
+        )
+        self.assertTrue(config.tie_word_embeddings)
+        self.assertIsNone(config.bos_token_id)
+        self.assertIsNone(config.pad_token_id)
+        self.assertEqual(config.partial_rotary_factor, 0.25)
+        self.assertEqual(config.output_gate_type, "swish")
+        # Exact shapes observed in the published shard header.
+        self.assertEqual(
+            (2 * config.n_heads * config.head_dim, config.dim),
+            (4096, 1024),
+        )
+        key_width = config.linear_num_key_heads * config.linear_key_head_dim
+        value_width = config.linear_num_value_heads * config.linear_value_head_dim
+        self.assertEqual((2 * key_width + value_width, config.dim), (6144, 1024))
+
+    def test_qwen35_08b_rejects_tie_drift_and_explicit_gate_drift(self) -> None:
+        from immer.runtimes.qwen3_8.config import (
+            Qwen38Config,
+            Qwen38ConfigError,
+        )
+
+        wrong_tie = _qwen35_08b_config()
+        wrong_tie["tie_word_embeddings"] = False
+        with self.assertRaisesRegex(Qwen38ConfigError, "values disagree"):
+            Qwen38Config.from_mapping(wrong_tie, require_official=False)
+
+        wrong_gate = _qwen35_08b_config()
+        wrong_gate["text_config"]["output_gate_type"] = "relu"
+        with self.assertRaisesRegex(Qwen38ConfigError, "swish attention output gate"):
+            Qwen38Config.from_mapping(wrong_gate, require_official=False)
+
     def test_rejects_architecture_drift_and_wrong_hybrid_layout(self) -> None:
         from immer.runtimes.qwen3_8.config import (
             Qwen38Config,
@@ -184,9 +286,13 @@ class Qwen38ConfigTests(unittest.TestCase):
             validate_source_identity("Qwen/Qwen3.8-27B", PINNED_REVISION),
             "official-pinned",
         )
+        self.assertEqual(
+            validate_source_identity("Qwen/Qwen3.5-0.8B", QWEN35_DRAFTER_REVISION),
+            "qwen3.5-drafter-pinned",
+        )
         with self.assertRaisesRegex(Qwen38ConfigError, "pinned revision"):
             validate_source_identity("Qwen/Qwen3.8-27B", "main")
-        with self.assertRaisesRegex(Qwen38ConfigError, "must be 'Qwen/Qwen3.8-27B'"):
+        with self.assertRaisesRegex(Qwen38ConfigError, "must be one of"):
             validate_source_identity("some/mirror", PINNED_REVISION)
         with self.assertRaisesRegex(Qwen38ConfigError, "no repo/revision"):
             validate_source_identity(None, None, require_identity=True)
@@ -239,7 +345,35 @@ class Qwen38PagerTests(unittest.TestCase):
         self.assertEqual(metrics["logical_weight_bytes"], 8)
         self.assertEqual(metrics["materialized_tensor_bytes"], 8)
         self.assertEqual(metrics["materialized_weight_releases"], 1)
-        self.assertEqual(metrics["weight_cache_policy"], "one-shot-bf16-exact-range/v1")
+        self.assertEqual(
+            metrics["weight_cache_policy"], "one-shot-qwen35-exact-range/v2"
+        )
+
+    def test_real_qwen35_f32_control_tensor_is_range_decoded_exactly(self) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        values = np.asarray([-0.75, 0.125, 3.5], dtype=np.float32)
+        source = _RawBF16Source(
+            {"model.language_model.layers.0.linear_attn.A_log": values},
+            source_dtypes={"model.language_model.layers.0.linear_attn.A_log": "F32"},
+        )
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=32,
+        )
+
+        actual = pager.tensor_torch(
+            "model.language_model.layers.0.linear_attn.A_log",
+            dtype=torch.float32,
+        )
+
+        self.assertTrue(torch.equal(actual, torch.from_numpy(values.copy())))
+        self.assertEqual(source.raw_calls, [(source.shard, source.data_start, 12)])
+        self.assertEqual(pager.metrics()["logical_weight_bytes"], 12)
 
     def test_linear_many_is_bit_exact_and_reads_one_matrix_once(self) -> None:
         import torch

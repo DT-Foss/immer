@@ -1,0 +1,445 @@
+"""Transactional Qwen3.5 K=2 drafter for the streamed Qwen target runtime.
+
+The small model owns an independent continuation state.  It stages every
+proposal until the target reports the committed history through
+``reconcile``; rejected suffixes never leak into the next draft round.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Sequence
+from dataclasses import asdict, dataclass
+import hashlib
+import numbers
+from typing import Any
+
+import torch
+
+from .model import StatefulBlockStage, StreamedQwen38
+from .pager import Qwen38WeightPager
+
+
+QWEN35_K2_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-k2-draft-provider/v1"
+
+
+class Qwen35K2DraftProviderError(RuntimeError):
+    """The local drafter can no longer prove exact state/history alignment."""
+
+
+def _metric(owner: object, name: str) -> int:
+    metrics = getattr(owner, "metrics", None)
+    values = dict(metrics()) if callable(metrics) else {}
+    value = values.get(name, 0)
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _tensor_stamp(value: torch.Tensor | None) -> object:
+    if value is None:
+        return None
+    raw = value.detach().contiguous().to(device="cpu").view(torch.uint8).numpy()
+    return (
+        id(value),
+        int(value._version),
+        tuple(value.shape),
+        str(value.dtype),
+        str(value.device),
+        hashlib.sha256(raw).hexdigest(),
+    )
+
+
+def _layer_state_stamp(states: Iterable[object | None]) -> tuple[object, ...]:
+    rows: list[object] = []
+    for state in states:
+        if state is None:
+            rows.append(None)
+            continue
+        rows.append(
+            (
+                type(state).__qualname__,
+                *(
+                    _tensor_stamp(getattr(state, name, None))
+                    for name in (
+                        "key",
+                        "value",
+                        "crsa_log_usage",
+                        "conv",
+                        "recurrent",
+                    )
+                ),
+            )
+        )
+    return tuple(rows)
+
+
+@dataclass(frozen=True, slots=True)
+class Qwen35K2DraftProviderMetrics:
+    """Cumulative local-draft work and reconciliation outcomes."""
+
+    schema: str
+    prefill_calls: int
+    draft_calls: int
+    reconcile_calls: int
+    accepted_prefix_0: int
+    accepted_prefix_1: int
+    accepted_prefix_2: int
+    restaged_pairs: int
+    committed_tokens: int
+    source_body_bytes: int
+    linear_calls: int
+    state_bytes: int
+    pending: bool
+    poisoned: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class Qwen35K2DraftProvider:
+    """Use an independent local Qwen3.5 model as an exact recurrent K=2 drafter.
+
+    ``__call__`` receives the target's immutable committed history and returns
+    exactly two greedy draft tokens.  The pair remains transactional until the
+    target decoder calls :meth:`reconcile` with the history it actually
+    committed.  Accepted pairs commit directly, one-token acceptance restages
+    the verified token plus the target correction, and zero-token acceptance
+    decodes only the target correction.
+    """
+
+    def __init__(
+        self,
+        model: StreamedQwen38,
+        *,
+        eos_token_ids: Iterable[int] = (),
+        head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
+    ) -> None:
+        if not isinstance(model, StreamedQwen38):
+            raise TypeError("model must be a StreamedQwen38")
+        if (
+            isinstance(head_block_rows, bool)
+            or not isinstance(head_block_rows, int)
+            or head_block_rows <= 0
+        ):
+            raise ValueError("head_block_rows must be a positive integer")
+        if isinstance(eos_token_ids, (str, bytes)):
+            raise TypeError("eos_token_ids must be an iterable of integers")
+        eos: set[int] = set()
+        try:
+            for raw in eos_token_ids:
+                if isinstance(raw, bool) or not isinstance(raw, numbers.Integral):
+                    raise TypeError("eos_token_ids must contain integers")
+                eos.add(int(raw))
+        except TypeError as exc:
+            if str(exc) == "eos_token_ids must contain integers":
+                raise
+            raise TypeError("eos_token_ids must be iterable") from exc
+        if any(token < 0 or token >= model.config.vocab_size for token in eos):
+            raise ValueError("EOS token outside draft checkpoint vocabulary")
+        if (
+            model.next_position != 0
+            or model.state_batch_size is not None
+            or model.state_bytes != 0
+            or model.state_poisoned
+            or model._pending_block_stage is not None
+        ):
+            raise ValueError("draft model must start with empty clean state")
+
+        self.model = model
+        self.eos_token_ids = frozenset(eos)
+        self.head_block_rows = head_block_rows
+        self._committed_history: tuple[int, ...] | None = None
+        self._last_hidden: torch.Tensor | None = None
+        self._pending_base: tuple[int, ...] | None = None
+        self._pending_proposal: tuple[int, int] | None = None
+        self._pending_stage: StatefulBlockStage | None = None
+        self._poisoned = False
+        self._closed = False
+        self._prefill_calls = 0
+        self._draft_calls = 0
+        self._reconcile_calls = 0
+        self._accepted = [0, 0, 0]
+        self._restaged_pairs = 0
+        self._committed_tokens = 0
+        self._source_start = _metric(model.pager.source, "network_or_source_body_bytes")
+        self._linears_start = _metric(model.pager, "linear_calls")
+        self._seal = self._runtime_stamp()
+
+    @property
+    def committed_history(self) -> tuple[int, ...] | None:
+        return self._committed_history
+
+    @property
+    def pending_proposal(self) -> tuple[int, int] | None:
+        return self._pending_proposal
+
+    @property
+    def poisoned(self) -> bool:
+        return self._poisoned
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def metrics(self) -> Qwen35K2DraftProviderMetrics:
+        return Qwen35K2DraftProviderMetrics(
+            schema=QWEN35_K2_DRAFT_PROVIDER_SCHEMA,
+            prefill_calls=self._prefill_calls,
+            draft_calls=self._draft_calls,
+            reconcile_calls=self._reconcile_calls,
+            accepted_prefix_0=self._accepted[0],
+            accepted_prefix_1=self._accepted[1],
+            accepted_prefix_2=self._accepted[2],
+            restaged_pairs=self._restaged_pairs,
+            committed_tokens=self._committed_tokens,
+            source_body_bytes=(
+                _metric(self.model.pager.source, "network_or_source_body_bytes")
+                - self._source_start
+            ),
+            linear_calls=_metric(self.model.pager, "linear_calls")
+            - self._linears_start,
+            state_bytes=self.model.state_bytes,
+            pending=self._pending_stage is not None,
+            poisoned=self._poisoned,
+        )
+
+    def _pending_stamp(self) -> object:
+        pending = self.model._pending_block_stage
+        if pending is None:
+            return None
+        return (
+            id(pending),
+            id(pending.handle),
+            id(pending.handle._nonce),
+            asdict(pending.evidence),
+            pending.runtime_identity,
+            _tensor_stamp(pending.handle.hidden),
+            _tensor_stamp(pending.hidden),
+            _layer_state_stamp(pending.layer_states),
+            _tensor_stamp(pending.graft_history),
+        )
+
+    def _runtime_stamp(self) -> tuple[object, ...]:
+        return (
+            self.model.next_position,
+            self.model.state_batch_size,
+            self.model.state_poisoned,
+            self.model._continuation_block_runtime_identity(),
+            _layer_state_stamp(self.model._layer_states),
+            _tensor_stamp(self.model._graft_history),
+            self._pending_stamp(),
+            self._committed_history,
+            _tensor_stamp(self._last_hidden),
+            self._pending_base,
+            self._pending_proposal,
+            id(self._pending_stage),
+        )
+
+    def _abort(self, message: str, cause: Exception | None = None) -> None:
+        try:
+            self.model.reset_state(release=True)
+        finally:
+            self._committed_history = None
+            self._last_hidden = None
+            self._pending_base = None
+            self._pending_proposal = None
+            self._pending_stage = None
+            self._poisoned = True
+            self._seal = self._runtime_stamp()
+        error = Qwen35K2DraftProviderError(message)
+        if cause is None:
+            raise error
+        raise error from cause
+
+    def _assert_ready(self) -> None:
+        if self._closed:
+            raise Qwen35K2DraftProviderError("draft provider is closed")
+        if self._poisoned:
+            raise Qwen35K2DraftProviderError("draft provider is poisoned; call reset()")
+        try:
+            changed = self._runtime_stamp() != self._seal
+        except Exception as exc:
+            self._abort("draft model state cannot be verified", exc)
+        if changed:
+            self._abort("draft model cursor or continuation state drifted")
+
+    def _history(self, value: object, *, name: str) -> tuple[int, ...]:
+        if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+            raise TypeError(f"{name} must be an integer sequence")
+        result: list[int] = []
+        for raw in value:
+            if isinstance(raw, bool) or not isinstance(raw, numbers.Integral):
+                raise TypeError(f"{name} must contain integers")
+            token = int(raw)
+            if token < 0 or token >= self.model.config.vocab_size:
+                raise ValueError(f"{name} token outside draft checkpoint vocabulary")
+            result.append(token)
+        if not result:
+            raise ValueError(f"{name} must not be empty")
+        return tuple(result)
+
+    def _scan(self, hidden: torch.Tensor) -> int:
+        values, selected = self.model.pager.topk_logits(
+            hidden,
+            k=1,
+            name=self.model.output_head_name,
+            block_rows=self.head_block_rows,
+        )
+        if tuple(selected.shape) != (1, 1):
+            raise Qwen35K2DraftProviderError(
+                "draft LM head returned an invalid token shape"
+            )
+        token = int(selected[0, 0].item())
+        del values, selected
+        if not 0 <= token < self.model.config.vocab_size:
+            raise Qwen35K2DraftProviderError(
+                "draft LM head selected a token outside its vocabulary"
+            )
+        return token
+
+    def __call__(self, history: tuple[int, ...], /) -> tuple[int, int]:
+        self._assert_ready()
+        try:
+            committed = self._history(history, name="draft history")
+            if self._pending_stage is not None:
+                self._abort("previous draft proposal was not reconciled before reuse")
+            if self._committed_history is None:
+                if len(committed) + 2 > self.model.max_seq_len:
+                    raise ValueError("draft pair would exceed max_seq_len")
+                hidden, _evidence = self.model.prefill([committed], reset=True)
+                self._last_hidden = hidden[:, -1:].detach().clone()
+                self._committed_history = committed
+                self._prefill_calls += 1
+            elif committed != self._committed_history:
+                self._abort("draft history differs from committed local history")
+            if self.model.next_position != len(committed):
+                self._abort("draft model cursor disagrees with committed history")
+            if len(committed) + 2 > self.model.max_seq_len:
+                raise ValueError("draft pair would exceed max_seq_len")
+            if committed[-1] in self.eos_token_ids:
+                raise ValueError("cannot draft after a committed EOS token")
+            if self._last_hidden is None:
+                self._abort("draft model has no hidden state for its committed cursor")
+
+            token0 = self._scan(self._last_hidden[:, -1])
+            if token0 in self.eos_token_ids:
+                token1 = token0
+            else:
+                probe = self.model.stage_continuation_block([[token0, token0]])
+                try:
+                    token1 = self._scan(probe.hidden[:, 0])
+                finally:
+                    self.model.discard_continuation_block(probe)
+
+            proposal = (token0, token1)
+            stage = self.model.stage_continuation_block([proposal])
+            self._pending_base = committed
+            self._pending_proposal = proposal
+            self._pending_stage = stage
+            self._draft_calls += 1
+            self._seal = self._runtime_stamp()
+            return proposal
+        except Qwen35K2DraftProviderError as exc:
+            if not self._poisoned:
+                self._abort(str(exc), exc)
+            raise
+        except Exception as exc:
+            self._abort(f"local draft failed: {type(exc).__name__}: {exc}", exc)
+
+    def reconcile(self, history: tuple[int, ...], /) -> None:
+        """Publish only the target-confirmed prefix and correction tokens."""
+
+        self._assert_ready()
+        try:
+            committed = self._history(history, name="reconciled history")
+            base = self._pending_base
+            proposal = self._pending_proposal
+            stage = self._pending_stage
+            if base is None or proposal is None or stage is None:
+                self._abort("reconcile requires one pending draft proposal")
+            if committed[: len(base)] != base:
+                self._abort("reconciled history changed the committed draft prefix")
+            delta = committed[len(base) :]
+            if len(delta) not in (1, 2):
+                self._abort("reconciled history must commit one or two target tokens")
+            if len(delta) == 2 and delta[0] in self.eos_token_ids:
+                self._abort("reconciled history contains a token after EOS")
+            if self.model.next_position != len(base):
+                self._abort("draft model cursor changed under a pending proposal")
+
+            if len(delta) == 2 and delta == proposal:
+                hidden, _evidence = self.model.commit_continuation_block(stage)
+                accepted = 2
+            elif len(delta) == 2:
+                if delta[0] != proposal[0]:
+                    self._abort(
+                        "two-token reconciliation cannot reject the first proposal"
+                    )
+                self.model.discard_continuation_block(stage)
+                replay = self.model.stage_continuation_block([delta])
+                hidden, _evidence = self.model.commit_continuation_block(replay)
+                accepted = 1
+                self._restaged_pairs += 1
+            else:
+                self.model.discard_continuation_block(stage)
+                hidden, _evidence = self.model.decode([[delta[0]]])
+                accepted = int(delta[0] == proposal[0])
+
+            self._pending_base = None
+            self._pending_proposal = None
+            self._pending_stage = None
+            self._committed_history = committed
+            self._last_hidden = hidden[:, -1:].detach().clone()
+            if (
+                self.model.next_position != len(committed)
+                or self.model._pending_block_stage is not None
+            ):
+                self._abort("reconciled draft state has the wrong committed cursor")
+            self._reconcile_calls += 1
+            self._accepted[accepted] += 1
+            self._committed_tokens += len(delta)
+            self._seal = self._runtime_stamp()
+        except Qwen35K2DraftProviderError as exc:
+            if not self._poisoned:
+                self._abort(str(exc), exc)
+            raise
+        except Exception as exc:
+            self._abort(
+                f"local draft reconciliation failed: {type(exc).__name__}: {exc}",
+                exc,
+            )
+
+    def reset(self) -> None:
+        """Recover explicitly after a failed request or start a new request."""
+
+        if self._closed:
+            raise Qwen35K2DraftProviderError("draft provider is closed")
+        self.model.reset_state(release=True)
+        self._committed_history = None
+        self._last_hidden = None
+        self._pending_base = None
+        self._pending_proposal = None
+        self._pending_stage = None
+        self._poisoned = False
+        self._seal = self._runtime_stamp()
+
+    def close(self) -> None:
+        """Discard unconfirmed draft state and release resident draft weights."""
+
+        if self._closed:
+            return
+        self.model.reset_state(release=True)
+        self._committed_history = None
+        self._last_hidden = None
+        self._pending_base = None
+        self._pending_proposal = None
+        self._pending_stage = None
+        self._poisoned = False
+        self._closed = True
+        self._seal = self._runtime_stamp()
+
+
+__all__ = [
+    "QWEN35_K2_DRAFT_PROVIDER_SCHEMA",
+    "Qwen35K2DraftProvider",
+    "Qwen35K2DraftProviderError",
+    "Qwen35K2DraftProviderMetrics",
+]

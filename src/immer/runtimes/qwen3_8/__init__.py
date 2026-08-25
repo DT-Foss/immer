@@ -12,6 +12,8 @@ from ..deepseek_v4.causal_weights import (
 from .config import (
     OFFICIAL_REPO_ID,
     OFFICIAL_REVISION,
+    QWEN35_DRAFTER_REPO_ID,
+    QWEN35_DRAFTER_REVISION,
     Qwen38Config,
     Qwen38ConfigError,
 )
@@ -26,6 +28,12 @@ from .encoding import (
 )
 from .graft import Qwen38StableCrsaGraft
 from .kernels import AttentionState, DeltaNetProbe, DeltaNetState
+from .local_draft import (
+    QWEN35_K2_DRAFT_PROVIDER_SCHEMA,
+    Qwen35K2DraftProvider,
+    Qwen35K2DraftProviderError,
+    Qwen35K2DraftProviderMetrics,
+)
 from .model import (
     GenerationEvidence,
     PrefillEvidence,
@@ -77,6 +85,7 @@ from .speculative import (
     QWEN38_K2_SPECULATIVE_SCHEMA,
     Qwen38K2SpeculativeDecoder,
     Qwen38SpeculativeError,
+    ReconciledDraftProvider,
 )
 
 
@@ -109,6 +118,12 @@ __all__ = [
     "OFFICIAL_REPO_ID",
     "OFFICIAL_REVISION",
     "PrefillEvidence",
+    "QWEN35_DRAFTER_REPO_ID",
+    "QWEN35_DRAFTER_REVISION",
+    "QWEN35_K2_DRAFT_PROVIDER_SCHEMA",
+    "Qwen35K2DraftProvider",
+    "Qwen35K2DraftProviderError",
+    "Qwen35K2DraftProviderMetrics",
     "Qwen38Config",
     "Qwen38ConfigError",
     "Qwen38CausalChat",
@@ -143,6 +158,7 @@ __all__ = [
     "StatefulLayerRangeEvidence",
     "StatefulLayerRangeResult",
     "StreamedQwen38",
+    "ReconciledDraftProvider",
     "TensorRangePlan",
     "bind_causal_tensor_plans",
     "build_probe_document",

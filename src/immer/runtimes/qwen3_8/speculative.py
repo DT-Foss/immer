@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
+import inspect
 import math
 import numbers
 import time
@@ -45,6 +46,12 @@ class DraftProvider(Protocol):
     """
 
     def __call__(self, history: tuple[int, ...], /) -> Sequence[int]: ...
+
+
+class ReconciledDraftProvider(DraftProvider, Protocol):
+    """Stateful provider notified after the target commits each proposed round."""
+
+    def reconcile(self, history: tuple[int, ...], /) -> None: ...
 
 
 def _plain_nonnegative(value: object, name: str) -> int:
@@ -368,6 +375,48 @@ class Qwen38K2SpeculativeDecoder:
         assert proposal is not None
         return (proposal[0], proposal[1]), integrity_bytes, integrity_seconds
 
+    def _reconcile_provider(self, history: tuple[int, ...]) -> tuple[int, float]:
+        """Notify a stateful drafter without extending its target-model authority."""
+
+        missing = object()
+        static_callback = inspect.getattr_static(
+            self.draft_provider, "reconcile", missing
+        )
+        if static_callback is missing:
+            return 0, 0.0
+
+        stamp_started = time.perf_counter()
+        before = _model_state_stamp(self.model)
+        integrity_seconds = time.perf_counter() - stamp_started
+        integrity_bytes = self.model.state_bytes
+        failure: Exception | None = None
+        try:
+            callback = getattr(self.draft_provider, "reconcile")
+            if not callable(callback):
+                raise TypeError("draft provider reconcile attribute is not callable")
+            callback(history)
+        except Exception as exc:
+            failure = exc
+        stamp_started = time.perf_counter()
+        try:
+            changed = _model_state_stamp(self.model) != before
+        except Exception:
+            changed = True
+        integrity_seconds += time.perf_counter() - stamp_started
+        integrity_bytes += self.model.state_bytes
+        if changed:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError(
+                "draft provider changed target model state while reconciling"
+            )
+        if failure is not None:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError(
+                "draft provider reconciliation failed: "
+                f"{type(failure).__name__}: {failure}"
+            ) from failure
+        return integrity_bytes, integrity_seconds
+
     def _scan(
         self,
         hidden: torch.Tensor,
@@ -377,6 +426,7 @@ class Qwen38K2SpeculativeDecoder:
         _values, selected = self.model.pager.topk_logits(
             hidden,
             k=1,
+            name=self.model.output_head_name,
             block_rows=block_rows,
         )
         expected = (*hidden.shape[:-1], 1)
@@ -404,6 +454,7 @@ class Qwen38K2SpeculativeDecoder:
         values, selected = self.model.pager.topk_logits(
             hidden[:, -1],
             k=1,
+            name=self.model.output_head_name,
             block_rows=block_rows,
         )
         if tuple(selected.shape) != (1, 1):
@@ -576,6 +627,11 @@ class Qwen38K2SpeculativeDecoder:
                 passes = 2
 
             stopped = emitted[-1] in eos
+            reconcile_bytes, reconcile_seconds = self._reconcile_provider(
+                (*prompt, *generated, *emitted)
+            )
+            integrity_bytes += reconcile_bytes
+            integrity_seconds += reconcile_seconds
             row = K2SpeculativeRoundEvidence(
                 round_index=round_index,
                 start_pos=stage.evidence.start_pos,
@@ -637,4 +693,5 @@ __all__ = [
     "QWEN38_K2_SPECULATIVE_SCHEMA",
     "Qwen38K2SpeculativeDecoder",
     "Qwen38SpeculativeError",
+    "ReconciledDraftProvider",
 ]

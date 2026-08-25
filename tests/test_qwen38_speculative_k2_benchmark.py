@@ -181,9 +181,11 @@ class Qwen38SpeculativeK2BenchmarkTests(unittest.TestCase):
             runtime, model = benchmark.direct._runtime(args, recorder, **kwargs)
             greedy_index = 0
 
-            def fixed_topk(hidden, *, k, block_rows, progress=None):
+            def fixed_topk(
+                hidden, *, k, name="lm_head.weight", block_rows, progress=None
+            ):
                 nonlocal greedy_index
-                del k, block_rows, progress
+                del k, name, block_rows, progress
                 if hidden.ndim == 3:
                     chosen = torch.tensor(
                         [[list(targets)]], device=model.pager.device, dtype=torch.long

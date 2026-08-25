@@ -79,6 +79,12 @@ def _tiny_config() -> Qwen38Config:
     )
 
 
+def _tiny_tied_config() -> Qwen38Config:
+    mapping = _tiny_config_mapping()
+    mapping["tie_word_embeddings"] = True
+    return Qwen38Config.from_mapping(mapping, require_official=False)
+
+
 def _native_tiny_config(*, full_attention_interval: int = 4) -> Qwen38Config:
     mapping = _tiny_config_mapping()
     mapping["num_hidden_layers"] = 28
@@ -123,8 +129,9 @@ def _tiny_weights(config: Qwen38Config) -> dict[str, torch.Tensor]:
         "model.language_model.norm.weight": torch.zeros(
             config.dim, dtype=torch.bfloat16
         ),
-        "lm_head.weight": _matrix(config.vocab_size, config.dim, generator),
     }
+    if not config.tie_word_embeddings:
+        tensors["lm_head.weight"] = _matrix(config.vocab_size, config.dim, generator)
     for layer in range(config.n_layers):
         base = f"model.language_model.layers.{layer}"
         tensors[f"{base}.input_layernorm.weight"] = torch.zeros(
@@ -281,6 +288,45 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(report["full_attention_layers"], 1)
         self.assertTrue(report["vision_excluded"])
         self.assertTrue(report["mtp_excluded"])
+
+    def test_tied_qwen35_head_and_f32_controls_execute_without_lm_head(self) -> None:
+        config = _tiny_tied_config()
+        tensors = _tiny_weights(config)
+        self.assertNotIn("lm_head.weight", tensors)
+        for layer in range(config.n_layers):
+            if config.is_full_attention(layer):
+                continue
+            base = f"model.language_model.layers.{layer}.linear_attn"
+            tensors[f"{base}.A_log"] = tensors[f"{base}.A_log"].float()
+            tensors[f"{base}.norm.weight"] = tensors[f"{base}.norm.weight"].float()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            save_file(tensors, root / "model.safetensors")
+            source = Streamer.from_local(root, budget_mb=20, use_cache=False)
+            pager = Qwen38WeightPager(
+                source,
+                device="cpu",
+                compute_dtype="float32",
+                max_resident_bytes=2 * 1024**2,
+            )
+            model = StreamedQwen38(config, pager, max_batch_size=1, max_seq_len=8)
+            try:
+                report = model.checkpoint_preflight()
+                self.assertEqual(report["required_tensors"], 55)
+                self.assertTrue(report["tie_word_embeddings"])
+                self.assertEqual(
+                    report["output_head_tensor"],
+                    "model.language_model.embed_tokens.weight",
+                )
+                generated, evidence = model.generate_greedy(
+                    [[1]], max_new_tokens=1, head_block_rows=8
+                )
+                self.assertEqual(len(generated), 1)
+                self.assertEqual(evidence.generated_token_ids, generated)
+            finally:
+                pager.close()
+                source.close()
 
     def test_complete_prefill_is_finite_and_accounts_every_linear(self) -> None:
         final, evidence = self.model.forward_prefill(torch.tensor([[1, 4, 9]]))

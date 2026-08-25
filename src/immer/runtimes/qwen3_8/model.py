@@ -170,11 +170,17 @@ class _PendingStatefulBlock:
 
 
 class StreamedQwen38:
-    """Qwen3.8-27B text decoder with bounded, sequential weight residency."""
+    """Qwen3.5 text decoder with bounded, sequential weight residency."""
 
     EMBED_NAME = "model.language_model.embed_tokens.weight"
     FINAL_NORM_NAME = "model.language_model.norm.weight"
     HEAD_NAME = "lm_head.weight"
+
+    @property
+    def output_head_name(self) -> str:
+        """Return the physical tensor that implements decoder logits."""
+
+        return self.EMBED_NAME if self.config.tie_word_embeddings else self.HEAD_NAME
 
     def __init__(
         self,
@@ -2342,6 +2348,7 @@ class StreamedQwen38:
             values, token_ids = self.pager.topk_logits(
                 hidden[:, -1],
                 k=1,
+                name=self.output_head_name,
                 block_rows=head_block_rows,
                 progress=head_progress,
             )
@@ -2453,8 +2460,13 @@ class StreamedQwen38:
         required: dict[str, tuple[int, ...]] = {
             self.EMBED_NAME: (self.config.vocab_size, self.config.dim),
             self.FINAL_NORM_NAME: (self.config.dim,),
-            self.HEAD_NAME: (self.config.vocab_size, self.config.dim),
         }
+        if not self.config.tie_word_embeddings:
+            required[self.HEAD_NAME] = (
+                self.config.vocab_size,
+                self.config.dim,
+            )
+        allowed_dtypes: dict[str, frozenset[str]] = {}
         for layer in range(self.config.n_layers):
             base = f"model.language_model.layers.{layer}"
             required[f"{base}.input_layernorm.weight"] = (self.config.dim,)
@@ -2514,6 +2526,11 @@ class StreamedQwen38:
                 required[f"{attn}.dt_bias"] = (self.config.linear_num_value_heads,)
                 required[f"{attn}.norm.weight"] = (self.config.linear_value_head_dim,)
                 required[f"{attn}.out_proj.weight"] = (self.config.dim, value_dim)
+                # Published Qwen3.8-27B stores these controls in BF16 while
+                # Qwen3.5-0.8B stores them in F32.  Both are consumed in the
+                # runtime's explicit float32 recurrence path.
+                allowed_dtypes[f"{attn}.A_log"] = frozenset({"BF16", "F32"})
+                allowed_dtypes[f"{attn}.norm.weight"] = frozenset({"BF16", "F32"})
 
         for name, shape in required.items():
             entry = entries.get(name)
@@ -2523,8 +2540,13 @@ class StreamedQwen38:
             actual_shape = tuple(int(value) for value in entry.get("shape", ()))
             if actual_shape != shape:
                 errors.append(f"{name}: shape {actual_shape}, expected {shape}")
-            if str(entry.get("dtype", "")).upper() != "BF16":
-                errors.append(f"{name}: expected BF16")
+            actual_dtype = str(entry.get("dtype", "")).upper()
+            wanted_dtypes = allowed_dtypes.get(name, frozenset({"BF16"}))
+            if actual_dtype not in wanted_dtypes:
+                errors.append(
+                    f"{name}: dtype {actual_dtype or 'missing'}, expected "
+                    f"{'/'.join(sorted(wanted_dtypes))}"
+                )
         if errors:
             raise Qwen38RuntimeError(
                 f"checkpoint violates {len(errors)} text tensor contracts: "
@@ -2547,6 +2569,8 @@ class StreamedQwen38:
                 self.config.is_full_attention(layer)
                 for layer in range(self.config.n_layers)
             ),
+            "tie_word_embeddings": self.config.tie_word_embeddings,
+            "output_head_tensor": self.output_head_name,
             "vision_excluded": True,
             "mtp_excluded": True,
         }

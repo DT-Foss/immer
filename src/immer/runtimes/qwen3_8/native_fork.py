@@ -1042,6 +1042,7 @@ class Qwen38NativeFork:
         values, ids = self.pager.topk_logits(
             hidden[:, -1],
             k=1,
+            name=self._off_model.output_head_name,
             block_rows=head_block_rows,
             progress=head_progress,
         )

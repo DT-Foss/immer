@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Build and verify a complete local Qwen3.8 ``weights/ + causal/`` bundle.
+"""Build, adopt, and verify complete local Qwen ``weights + causal`` bundles.
 
-Every official shard is size- and SHA-256-verified before any tensor binding is
-published. The builder copies into a resumable staging directory, mounts the
-copied layout under the pinned inventory fingerprint, appends all tensor plans
-to LiveCausal, verifies the finished artifact, and promotes it atomically.
+Every shard is size- and SHA-256-authenticated before any tensor binding is
+published. Remote builds use resumable atomic staging. ``adopt-flat`` implants
+the LiveCausal graph beside an existing pinned checkpoint without copying or
+modifying its weights. The supported local Qwen3.5 drafter is content-pinned in
+code before its inventory can enter that path.
 """
 
 from __future__ import annotations
@@ -40,6 +41,10 @@ from immer.runtimes.qwen3_8 import (
     Qwen38Config,
     tensor_range_plan_from_source,
 )
+from immer.runtimes.qwen3_8.config import (
+    QWEN35_DRAFTER_REPO_ID,
+    QWEN35_DRAFTER_REVISION,
+)
 from immer.knowledge import Streamer
 
 
@@ -61,6 +66,22 @@ NESTED_WEIGHTS_LAYOUT = "nested/v1"
 FLAT_WEIGHTS_LAYOUT = "flat/v1"
 BUNDLE_HEADROOM_BYTES = 64 * 1024**2
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+LOCAL_PINNED_CHECKPOINTS: dict[tuple[str, str], dict[str, tuple[int, str]]] = {
+    (QWEN35_DRAFTER_REPO_ID, QWEN35_DRAFTER_REVISION): {
+        "config.json": (
+            2_907,
+            "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+        ),
+        "model.safetensors.index.json": (
+            50_900,
+            "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e",
+        ),
+        "model.safetensors-00001-of-00001.safetensors": (
+            1_746_942_600,
+            "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
+        ),
+    },
+}
 
 
 class QwenCausalBundleError(RuntimeError):
@@ -86,9 +107,31 @@ def _sha256_bytes(value: bytes) -> str:
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(4 * 1024**2):
+    flags = os.O_RDONLY | int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise QwenCausalBundleError(f"cannot hash checkpoint file: {path}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        linked = _regular_file(path, "checkpoint file")
+        if (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino):
+            raise QwenCausalBundleError("checkpoint file changed while opening")
+        while chunk := os.read(descriptor, 4 * 1024**2):
             digest.update(chunk)
+        current = os.fstat(descriptor)
+        linked = _regular_file(path, "checkpoint file")
+        stable = (
+            current.st_size == opened.st_size
+            and current.st_mtime_ns == opened.st_mtime_ns
+            and current.st_ctime_ns == opened.st_ctime_ns
+            and (linked.st_dev, linked.st_ino) == (opened.st_dev, opened.st_ino)
+        )
+        if not stable:
+            raise QwenCausalBundleError("checkpoint file changed while hashing")
+    finally:
+        os.close(descriptor)
     return digest.hexdigest()
 
 
@@ -567,6 +610,118 @@ def refresh_inventory(
         "shards": len(shards),
         "source_fingerprint": fingerprint,
         "tensors": len(inventory.get("tensors", ())),
+    }
+
+
+def pin_local_inventory(
+    source: Path,
+    output: Path,
+    *,
+    repo_id: str,
+    revision: str,
+    budget_mb: int = 64,
+) -> dict[str, Any]:
+    """Pin one existing local checkpoint by content without copying payloads."""
+
+    if not isinstance(repo_id, str) or not repo_id.strip():
+        raise QwenCausalBundleError("local inventory repository must be non-empty")
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise QwenCausalBundleError("local inventory revision must be a 40-hex commit")
+    if isinstance(budget_mb, bool) or not isinstance(budget_mb, int) or budget_mb <= 0:
+        raise QwenCausalBundleError("local inventory budget must be positive")
+
+    root = source.expanduser().absolute()
+    _plain_directory(root, "local checkpoint source")
+    content_manifest = LOCAL_PINNED_CHECKPOINTS.get((repo_id, revision))
+    if content_manifest is None:
+        raise QwenCausalBundleError(
+            "local checkpoint identity has no code-pinned content manifest"
+        )
+    authenticated_digests: dict[str, str] = {}
+    for name, (expected_size, expected_digest) in content_manifest.items():
+        if Path(name).name != name or not _SHA256.fullmatch(expected_digest):
+            raise QwenCausalBundleError("local content manifest is invalid")
+        path = root / name
+        metadata = _regular_file(path, "pinned local checkpoint file")
+        digest = _sha256_file(path)
+        if metadata.st_size != expected_size or digest != expected_digest:
+            raise QwenCausalBundleError(
+                f"local checkpoint content manifest mismatch: {name}"
+            )
+        authenticated_digests[name] = digest
+
+    streamer = Streamer.from_local(
+        root,
+        repo_id=repo_id,
+        revision=revision,
+        budget_mb=budget_mb,
+        use_cache=False,
+    )
+    try:
+        inventory = json.loads(json.dumps(streamer.inventory()))
+    finally:
+        streamer.close()
+    if inventory.get("repo") != repo_id or inventory.get("revision") != revision:
+        raise QwenCausalBundleError("local inventory logical identity changed")
+    shards = inventory.get("shards")
+    tensors = inventory.get("tensors")
+    if not isinstance(shards, list) or not shards:
+        raise QwenCausalBundleError("local checkpoint has no safetensor shards")
+    if not isinstance(tensors, list) or not tensors:
+        raise QwenCausalBundleError("local checkpoint has no tensor bindings")
+    manifest_shards = {
+        name for name in content_manifest if name.endswith(".safetensors")
+    }
+    inventory_shards = {
+        str(row.get("file")) for row in shards if isinstance(row, Mapping)
+    }
+    if inventory_shards != manifest_shards:
+        raise QwenCausalBundleError(
+            "local inventory shard set differs from the pinned content manifest"
+        )
+
+    for shard in shards:
+        if not isinstance(shard, dict):
+            raise QwenCausalBundleError("local shard entry is invalid")
+        name = shard.get("file")
+        if not isinstance(name, str) or Path(name).name != name:
+            raise QwenCausalBundleError("local shard filename is unsafe")
+        path = root / name
+        metadata = _regular_file(path, "local checkpoint shard")
+        if metadata.st_size != shard.get("size"):
+            raise QwenCausalBundleError(f"local shard size changed: {name}")
+        digest = authenticated_digests.get(name)
+        if digest is None:
+            raise QwenCausalBundleError(
+                f"local shard is absent from the pinned content manifest: {name}"
+            )
+        # These are content receipts, not claims about a remote CAS layout.
+        shard["etag"] = f"sha256:{digest}"
+        shard["cas_url_hash"] = None
+        shard["linked_etag"] = digest
+        shard["payload_sha256"] = digest
+        shard["repo_commit"] = revision
+        shard["xet_hash"] = None
+        shard["cdn_host"] = None
+
+    fingerprint = Streamer._source_fingerprint(inventory)
+    document = {
+        "inventory": inventory,
+        "inventory_sha256": _sha256_bytes(_canonical(inventory)),
+        "repo_id": repo_id,
+        "revision": revision,
+        "schema": "immer.tensor-inventory-cache/v1",
+        "source_fingerprint": fingerprint,
+    }
+    target = output.expanduser().absolute()
+    _atomic_bytes(target, _canonical(document) + b"\n")
+    return {
+        "checkpoint_bytes": sum(int(row["size"]) for row in shards),
+        "inventory": str(target),
+        "inventory_sha256": document["inventory_sha256"],
+        "shards": len(shards),
+        "source_fingerprint": fingerprint,
+        "tensors": len(tensors),
     }
 
 
@@ -1306,6 +1461,12 @@ def _parser() -> argparse.ArgumentParser:
     refresh = subparsers.add_parser("refresh-inventory")
     refresh.add_argument("--output", default=str(DEFAULT_INVENTORY))
     refresh.add_argument("--budget-mb", type=int, default=64)
+    pin_local = subparsers.add_parser("pin-local-inventory")
+    pin_local.add_argument("--source", required=True)
+    pin_local.add_argument("--output", required=True)
+    pin_local.add_argument("--repo-id", required=True)
+    pin_local.add_argument("--revision", required=True)
+    pin_local.add_argument("--budget-mb", type=int, default=64)
     build = subparsers.add_parser("build")
     build.add_argument("--source", required=True)
     build.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
@@ -1317,12 +1478,18 @@ def _parser() -> argparse.ArgumentParser:
     flat = subparsers.add_parser("adopt-flat")
     flat.add_argument("--checkpoint", required=True)
     flat.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
+    flat.add_argument("--repo-id")
+    flat.add_argument("--revision")
+    flat.add_argument("--compatible-qwen3", action="store_true")
     fetch = subparsers.add_parser("fetch-adopt")
     fetch.add_argument("--bundle", required=True)
     fetch.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
     fetch.add_argument("--no-resume", action="store_true")
     verify = subparsers.add_parser("verify")
     verify.add_argument("--bundle", required=True)
+    verify.add_argument("--repo-id")
+    verify.add_argument("--revision")
+    verify.add_argument("--compatible-qwen3", action="store_true")
     return parser
 
 
@@ -1333,6 +1500,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.budget_mb <= 0:
                 raise QwenCausalBundleError("inventory budget must be positive")
             result = refresh_inventory(Path(args.output), budget_mb=args.budget_mb)
+        elif args.command == "pin-local-inventory":
+            result = pin_local_inventory(
+                Path(args.source),
+                Path(args.output),
+                repo_id=args.repo_id,
+                revision=args.revision,
+                budget_mb=args.budget_mb,
+            )
         elif args.command == "build":
             result = build_bundle(
                 Path(args.source),
@@ -1343,9 +1518,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "adopt":
             result = adopt_bundle(Path(args.bundle), Path(args.inventory))
         elif args.command == "adopt-flat":
+            if args.compatible_qwen3:
+                repo_id = args.repo_id or QWEN35_DRAFTER_REPO_ID
+                revision = args.revision or QWEN35_DRAFTER_REVISION
+                if (repo_id, revision) != (
+                    QWEN35_DRAFTER_REPO_ID,
+                    QWEN35_DRAFTER_REVISION,
+                ):
+                    raise QwenCausalBundleError(
+                        "compatible Qwen3 CLI identity must be the pinned 0.8B drafter"
+                    )
+            else:
+                repo_id = args.repo_id or OFFICIAL_REPO_ID
+                revision = args.revision or OFFICIAL_REVISION
             result = adopt_bundle(
                 Path(args.checkpoint),
                 Path(args.inventory),
+                repo_id=repo_id,
+                revision=revision,
+                expected_fingerprint=(
+                    None if args.compatible_qwen3 else OFFICIAL_INVENTORY_FINGERPRINT
+                ),
+                require_official=not args.compatible_qwen3,
                 weights_layout="flat",
             )
         elif args.command == "fetch-adopt":
@@ -1355,7 +1549,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                 resume=not args.no_resume,
             )
         else:
-            result = verify_bundle(Path(args.bundle))
+            if args.compatible_qwen3:
+                repo_id = args.repo_id or QWEN35_DRAFTER_REPO_ID
+                revision = args.revision or QWEN35_DRAFTER_REVISION
+                if (repo_id, revision) != (
+                    QWEN35_DRAFTER_REPO_ID,
+                    QWEN35_DRAFTER_REVISION,
+                ):
+                    raise QwenCausalBundleError(
+                        "compatible Qwen3 CLI identity must be the pinned 0.8B drafter"
+                    )
+            else:
+                repo_id = args.repo_id or OFFICIAL_REPO_ID
+                revision = args.revision or OFFICIAL_REVISION
+            result = verify_bundle(
+                Path(args.bundle),
+                expected_repo_id=repo_id,
+                expected_revision=revision,
+                expected_fingerprint=(
+                    None if args.compatible_qwen3 else OFFICIAL_INVENTORY_FINGERPRINT
+                ),
+                require_official=not args.compatible_qwen3,
+            )
     except QwenCausalBundleError as exc:
         raise SystemExit(f"Qwen causal bundle failed: {exc}") from exc
     print(json.dumps(result, sort_keys=True))

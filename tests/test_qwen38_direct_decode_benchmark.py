@@ -1625,8 +1625,10 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                     observed_prompts.append(tuple(prompt_token_ids[0]))
                     return original_generate(prompt_token_ids, **generate_kwargs)
 
-                def fixed_topk(_hidden, *, k, block_rows, progress=None):
-                    del k, block_rows
+                def fixed_topk(
+                    _hidden, *, k, name="lm_head.weight", block_rows, progress=None
+                ):
+                    del k, name, block_rows
                     if progress is not None:
                         progress(
                             {
@@ -2003,13 +2005,9 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                     ],
                     "kind": "complete-causal-bundle/v1",
                     "layout_fingerprint": fingerprint,
-                    "manifest_sha256": benchmark._sha256(
-                        {"manifest": fingerprint}
-                    ),
+                    "manifest_sha256": benchmark._sha256({"manifest": fingerprint}),
                     "shards": len(inventory_document["shards"]),
-                    "shards_sha256": benchmark._sha256(
-                        {"shards": fingerprint}
-                    ),
+                    "shards_sha256": benchmark._sha256({"shards": fingerprint}),
                     "tensor_bindings": len(inventory_document["tensors"]),
                     "weights_layout": "nested/v1",
                 }
@@ -2017,8 +2015,10 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
             def install_scripted_topk(model, tokens: list[int]) -> None:
                 pending = list(tokens)
 
-                def fixed_topk(_hidden, *, k, block_rows, progress=None):
-                    del k, block_rows
+                def fixed_topk(
+                    _hidden, *, k, name="lm_head.weight", block_rows, progress=None
+                ):
+                    del k, name, block_rows
                     if not pending:
                         raise AssertionError("unexpected LM-head scan")
                     if progress is not None:

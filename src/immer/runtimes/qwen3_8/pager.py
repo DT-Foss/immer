@@ -1,4 +1,4 @@
-"""One-weight-at-a-time BF16 paging for the streamed Qwen3.8 text decoder."""
+"""One-weight-at-a-time paging for the streamed Qwen3.5 text decoder."""
 
 from __future__ import annotations
 
@@ -37,6 +37,8 @@ class PagerMetrics:
 class _TensorLayout:
     name: str
     shape: tuple[int, ...]
+    dtype: str
+    item_bytes: int
     shard: str
     absolute: int
     payload_bytes: int
@@ -50,7 +52,7 @@ class _TensorLayout:
 
 
 class Qwen38WeightPager:
-    """Execute exact BF16 safetensors ranges without retaining model weights.
+    """Execute exact safetensors ranges without retaining model weights.
 
     The source owns its verified disk cache and transport budget.  The pager
     owns no weight cache: a matrix is range-read, moved to the resolved compute
@@ -60,7 +62,7 @@ class Qwen38WeightPager:
 
     DEFAULT_MAX_RESIDENT_BYTES = 384 * 1024**2
     DEFAULT_HEAD_BLOCK_ROWS = 2048
-    WEIGHT_CACHE_POLICY = "one-shot-bf16-exact-range/v1"
+    WEIGHT_CACHE_POLICY = "one-shot-qwen35-exact-range/v2"
 
     def __init__(
         self,
@@ -78,7 +80,7 @@ class Qwen38WeightPager:
         except ImportError as exc:  # pragma: no cover - neural extra
             raise Qwen38PagerError("Qwen3.8 execution requires torch") from exc
         if sys.byteorder != "little":  # safetensors scalar encoding is little-endian
-            raise Qwen38PagerError("Qwen3.8 BF16 paging requires a little-endian host")
+            raise Qwen38PagerError("Qwen3.5 paging requires a little-endian host")
         if device == "auto":
             device = "mps" if torch.backends.mps.is_available() else "cpu"
         if device not in {"cpu", "mps"}:
@@ -174,7 +176,7 @@ class Qwen38WeightPager:
         planned = payload_bytes + numel * self._dtype_bytes(target_dtype)
         if planned > self.max_resident_bytes:
             raise Qwen38PagerError(
-                f"{label} needs {planned} resident bytes (BF16 payload plus "
+                f"{label} needs {planned} resident bytes (source payload plus "
                 f"{str(target_dtype).removeprefix('torch.')} tensor), limit is "
                 f"{self.max_resident_bytes}"
             )
@@ -201,9 +203,10 @@ class Qwen38WeightPager:
             except Exception as exc:
                 raise Qwen38PagerError(f"cannot resolve tensor {name!r}") from exc
         dtype = str(meta.get("dtype", "")).upper()
-        if dtype != "BF16":
+        item_bytes = {"BF16": 2, "F32": 4}.get(dtype)
+        if item_bytes is None:
             raise Qwen38PagerError(
-                f"Qwen3.8 tensor {name!r} must be BF16, got {dtype or 'missing'}"
+                f"Qwen3.5 tensor {name!r} must be BF16 or F32, got {dtype or 'missing'}"
             )
         raw_shape = meta.get("shape")
         if not isinstance(raw_shape, (list, tuple)) or not raw_shape:
@@ -244,24 +247,28 @@ class Qwen38WeightPager:
         for dimension in shape:
             numel *= dimension
         payload_bytes = end - begin
-        if payload_bytes != numel * 2:
+        if payload_bytes != numel * item_bytes:
             raise Qwen38PagerError(
-                f"tensor {name!r} shape requires {numel * 2} BF16 bytes, "
+                f"tensor {name!r} shape requires {numel * item_bytes} "
+                f"{dtype} bytes, "
                 f"offsets contain {payload_bytes}"
             )
         return _TensorLayout(
             name=name,
             shape=tuple(shape),
+            dtype=dtype,
+            item_bytes=item_bytes,
             shard=shard,
             absolute=data_start + begin,
             payload_bytes=payload_bytes,
         )
 
-    def _decode_bf16(
+    def _decode_tensor(
         self,
         raw: bytes,
         *,
         shape: tuple[int, ...],
+        source_dtype: str,
         dtype: Any,
         device: Any,
         name: str,
@@ -269,9 +276,16 @@ class Qwen38WeightPager:
         numel = 1
         for dimension in shape:
             numel *= dimension
-        if len(raw) != numel * 2:
+        item_bytes = {"BF16": 2, "F32": 4}.get(source_dtype)
+        if item_bytes is None:  # pragma: no cover - guarded by _layout.
             raise Qwen38PagerError(
-                f"short BF16 payload for {name!r}: {len(raw)}/{numel * 2} bytes"
+                f"unsupported source dtype for {name!r}: {source_dtype}"
+            )
+        expected_bytes = numel * item_bytes
+        if len(raw) != expected_bytes:
+            raise Qwen38PagerError(
+                f"short {source_dtype} payload for {name!r}: "
+                f"{len(raw)}/{expected_bytes} bytes"
             )
         # The read-only warning is harmless here: the view is never returned or
         # mutated.  It is immediately copied to owned CPU memory or moved to the
@@ -282,10 +296,17 @@ class Qwen38WeightPager:
                 message="The given buffer is not writable",
                 category=UserWarning,
             )
-            storage = self.torch.frombuffer(raw, dtype=self.torch.bfloat16)
+            storage = self.torch.frombuffer(
+                raw,
+                dtype=(
+                    self.torch.bfloat16
+                    if source_dtype == "BF16"
+                    else self.torch.float32
+                ),
+            )
         storage = storage.reshape(shape)
         target_device = self.torch.device(device)
-        if target_device.type == "cpu" and dtype == self.torch.bfloat16:
+        if target_device.type == "cpu" and dtype == storage.dtype:
             result = storage.clone()
         else:
             result = storage.to(device=target_device, dtype=dtype)
@@ -322,9 +343,10 @@ class Qwen38WeightPager:
             ):
                 raise Qwen38PagerError("causal tensor receipt disagrees with layout")
             raw = receipt.part
-        result = self._decode_bf16(
+        result = self._decode_tensor(
             raw,
             shape=layout.shape,
+            source_dtype=layout.dtype,
             dtype=dtype,
             device=device,
             name=name,
@@ -359,7 +381,7 @@ class Qwen38WeightPager:
             raise IndexError(
                 f"rows [{start_row}, {start_row + n_rows}) outside [0, {total_rows})"
             )
-        row_bytes = columns * 2
+        row_bytes = columns * layout.item_bytes
         payload_bytes = n_rows * row_bytes
         numel = n_rows * columns
         self._preflight_resident(
@@ -391,9 +413,10 @@ class Qwen38WeightPager:
                     "causal tensor row receipt disagrees with layout"
                 )
             raw = receipt.part
-        result = self._decode_bf16(
+        result = self._decode_tensor(
             raw,
             shape=(n_rows, columns),
+            source_dtype=layout.dtype,
             dtype=dtype,
             device=device,
             name=name,
@@ -410,7 +433,7 @@ class Qwen38WeightPager:
         dtype: Any | None = None,
         device: str | Any | None = None,
     ) -> Any:
-        """Read one BF16 tensor with exact range and resident preflight."""
+        """Read one BF16/F32 tensor with exact range and resident preflight."""
 
         with self._lock:
             self._ensure_open()
@@ -563,7 +586,9 @@ class Qwen38WeightPager:
         unique_target_bytes = (
             len(set(token_ids)) * columns * self._dtype_bytes(self.compute_dtype)
         )
-        largest_payload = max(stop - start for start, stop in runs) * columns * 2
+        largest_payload = (
+            max(stop - start for start, stop in runs) * columns * layout.item_bytes
+        )
         output_bytes = len(token_ids) * columns * self._dtype_bytes(self.compute_dtype)
         planned = unique_target_bytes + max(largest_payload, output_bytes)
         if planned > self.max_resident_bytes:

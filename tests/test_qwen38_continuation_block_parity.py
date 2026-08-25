@@ -97,8 +97,10 @@ class Qwen38ContinuationBlockParityTests(unittest.TestCase):
         def reference_runtime_factory(*factory_args, **factory_kwargs):
             runtime, model = benchmark._runtime(*factory_args, **factory_kwargs)
 
-            def fixed_topk(_hidden, *, k, block_rows, progress=None):
-                del k, block_rows
+            def fixed_topk(
+                _hidden, *, k, name="lm_head.weight", block_rows, progress=None
+            ):
+                del k, name, block_rows
                 token = next(generated)
                 if progress is not None:
                     progress(
