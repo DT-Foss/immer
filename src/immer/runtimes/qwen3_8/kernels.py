@@ -719,6 +719,8 @@ def _route_native_attention(
     work: _FullAttentionWork,
     intervention: Qwen38NativeHeadCrsa,
     prior_log_usage: torch.Tensor | None,
+    *,
+    tokenwise_usage: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, NativeHeadCrsaEvidence]:
     probabilities = work.base_probabilities
     if intervention.active:
@@ -729,6 +731,7 @@ def _route_native_attention(
         query_start=work.past_length,
         allowed=work.allowed,
         prior_log_usage=prior_log_usage,
+        tokenwise_usage=tokenwise_usage,
     )
 
 
@@ -771,6 +774,7 @@ def full_attention_core(
     attention_mask: torch.Tensor | None = None,
     native_head_crsa: Qwen38NativeHeadCrsa | None = None,
     native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None] | None = None,
+    native_head_crsa_tokenwise_usage: bool = False,
     rope_theta: float = 10_000_000.0,
     rotary_dim: int | None = None,
     partial_rotary_factor: float = 0.25,
@@ -785,6 +789,8 @@ def full_attention_core(
     contains RoPE-applied keys and raw values for exact continuation.
     """
 
+    if not isinstance(native_head_crsa_tokenwise_usage, bool):
+        raise TypeError("native_head_crsa_tokenwise_usage must be a boolean")
     intervention = _validate_native_attention_hook(
         native_head_crsa,
         native_head_crsa_observer,
@@ -818,6 +824,7 @@ def full_attention_core(
             work,
             intervention,
             None if state is None else state.crsa_log_usage,
+            tokenwise_usage=native_head_crsa_tokenwise_usage,
         )
         if native_head_crsa_observer is not None:
             native_head_crsa_observer(evidence)

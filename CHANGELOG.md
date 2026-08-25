@@ -12,8 +12,11 @@ All notable changes to IMMER are recorded here.
   foreign, mutated, reset, failed, and runtime-drifted stages fail closed.
 - Proved tiny CPU BF16 block execution bit-exact to tokenwise execution for the
   base runtime and stable graft, halving the K=2 linear calls from 62 to 31.
-- Kept active native Prefix-Sinkhorn blocks fail-closed until their usage
-  recurrence is tokenwise bit-exact; ordinary native decoding is unchanged.
+- Added tokenwise-exact Prefix-Sinkhorn usage updates inside staged blocks;
+  tiny CPU BF16 native K=2 now matches tokenwise hidden and every state bit.
+- Hard-bounded the public transaction to the proven `batch=1, K=2` tranche;
+  larger blocks and batches fail closed until their DeltaNet arithmetic uses a
+  weight-once/tokenwise-linear path. Ordinary decoding is unchanged.
 
 ### Exact event and binding compiler
 

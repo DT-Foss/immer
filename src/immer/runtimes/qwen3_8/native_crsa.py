@@ -229,8 +229,12 @@ class Qwen38NativeHeadCrsa:
         query_start: int,
         allowed: Tensor,
         prior_log_usage: Tensor | None,
+        tokenwise_usage: bool = False,
     ) -> tuple[Tensor, Tensor | None, NativeHeadCrsaEvidence]:
         """Return native probabilities, staged usage state, and strict evidence."""
+
+        if not isinstance(tokenwise_usage, bool):
+            raise TypeError("tokenwise_usage must be a boolean")
 
         if not isinstance(logits, Tensor) or not logits.is_floating_point():
             raise TypeError("logits must be a floating-point torch tensor")
@@ -309,6 +313,69 @@ class Qwen38NativeHeadCrsa:
             )
             # This return deliberately precedes every clone and dtype cast.
             return base_probabilities, None, evidence
+
+        if tokenwise_usage and query_length > 1:
+            rows: list[Tensor] = []
+            evidence_rows: list[NativeHeadCrsaEvidence] = []
+            usage = prior_log_usage
+            for offset in range(query_length):
+                row_key_length = query_start + offset + 1
+                row_probabilities, usage, row_evidence = self.route(
+                    logits[:, :, offset : offset + 1, :row_key_length],
+                    base_probabilities[:, :, offset : offset + 1, :row_key_length],
+                    query_start=query_start + offset,
+                    allowed=support[:, :, offset : offset + 1, :row_key_length],
+                    prior_log_usage=usage,
+                    tokenwise_usage=False,
+                )
+                if row_key_length < key_length:
+                    row_probabilities = torch.nn.functional.pad(
+                        row_probabilities,
+                        (0, key_length - row_key_length),
+                    )
+                rows.append(row_probabilities)
+                evidence_rows.append(row_evidence)
+            if usage is None:  # pragma: no cover - active route contract.
+                raise RuntimeError("active tokenwise native route lost usage state")
+            probabilities = torch.cat(rows, dim=2)
+            count = len(self.head_indices)
+            evidence = NativeHeadCrsaEvidence(
+                schema=self.evidence_schema,
+                layer=self.layer,
+                query_start=query_start,
+                query_length=query_length,
+                key_length=key_length,
+                selected_query_heads=self.head_indices,
+                selected_kv_heads=self.selected_kv_heads,
+                alpha_per_head=(self.alpha,) * count,
+                argmax_changed_queries_per_head=tuple(
+                    sum(
+                        row.argmax_changed_queries_per_head[head]
+                        for row in evidence_rows
+                    )
+                    for head in range(count)
+                ),
+                mean_l1_probability_delta_per_head=tuple(
+                    sum(
+                        row.mean_l1_probability_delta_per_head[head]
+                        for row in evidence_rows
+                    )
+                    / query_length
+                    for head in range(count)
+                ),
+                free_heads=NATIVE_HEAD_CRSA_FREE_HEADS,
+                free_head_max_abs_error=max(
+                    row.free_head_max_abs_error for row in evidence_rows
+                ),
+                future_weight_max_abs=max(
+                    row.future_weight_max_abs for row in evidence_rows
+                ),
+                row_sum_max_error=max(row.row_sum_max_error for row in evidence_rows),
+                history_length_before=query_start,
+                history_length_after=int(usage.shape[-1]),
+                identity=False,
+            )
+            return probabilities, usage, evidence
 
         selected = torch.tensor(
             self.head_indices, dtype=torch.long, device=logits.device

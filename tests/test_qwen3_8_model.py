@@ -557,18 +557,31 @@ class Qwen38ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
             self.model.commit_continuation_block(stage)
 
-    def test_continuation_block_batch_and_context_boundaries(self) -> None:
-        self.model.prefill([[1, 4], [2, 5]])
-        stage = self.model.stage_continuation_block([[9, 7], [8, 6]])
-        hidden, evidence = self.model.commit_continuation_block(stage)
-        self.assertEqual(tuple(hidden.shape), (2, 2, self.config.dim))
-        self.assertEqual(evidence.input_token_ids, ((9, 7), (8, 6)))
-        self.assertEqual(self.model.next_position, 4)
+    def test_continuation_block_shape_and_context_boundaries(self) -> None:
+        self.model.prefill([[1, 4]])
+        for invalid in ([[9]], [[9, 7, 6]]):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(Qwen38RuntimeError, "batch 1 and K=2"):
+                    self.model.stage_continuation_block(invalid)
 
-        stale = self.model.stage_continuation_block([[3], [4]])
-        self.model.max_batch_size = 1
+        self.model.reset_state()
+        self.model.prefill([[1, 4], [2, 5]])
+        with self.assertRaisesRegex(Qwen38RuntimeError, "batch 1 and K=2"):
+            self.model.stage_continuation_block([[9, 7], [8, 6]])
+
+        self.model.reset_state()
+        self.model.prefill([[1, 4]])
+        stale = self.model.stage_continuation_block([[9, 7]])
+        self.model.max_batch_size = 0
         with self.assertRaisesRegex(Qwen38RuntimeError, "current runtime bounds"):
             self.model.commit_continuation_block(stale)
+        self.model.max_batch_size = 3
+
+        stale = self.model.stage_continuation_block([[9, 7]])
+        self.model.max_seq_len = 3
+        with self.assertRaisesRegex(Qwen38RuntimeError, "current runtime bounds"):
+            self.model.commit_continuation_block(stale)
+        self.model.max_seq_len = 32
 
         bounded = StreamedQwen38(
             self.config,
@@ -1238,18 +1251,86 @@ class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
         self.assertEqual(self.model._metric(self.pager, "linear_calls"), linears_before)
         self.assertEqual(self.observed, [])
 
-    def test_native_continuation_block_requires_tokenwise_exact_usage(self) -> None:
+    def test_native_continuation_block_delays_evidence_until_commit(self) -> None:
         self.model.prefill([[1, 4]])
         self.observed.clear()
         committed = self.model._layer_states[27]
         self.assertIsInstance(committed, AttentionState)
 
-        with self.assertRaisesRegex(Qwen38RuntimeError, "tokenwise-exact native CRSA"):
-            self.model.stage_continuation_block([[9, 7]])
+        stage = self.model.stage_continuation_block([[9, 7]])
 
         self.assertEqual(self.model.next_position, 2)
         self.assertIs(self.model._layer_states[27], committed)
         self.assertEqual(self.observed, [])
+        self.model.commit_continuation_block(stage)
+        self.assertEqual(self.model.next_position, 4)
+        self.assertEqual(
+            [
+                (row.query_start, row.query_length, row.history_length_after)
+                for row in self.observed
+            ],
+            [(2, 2, 4)],
+        )
+
+    def test_bfloat16_native_block_matches_tokenwise_usage_bit_exactly(self) -> None:
+        from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
+        pagers = [
+            Qwen38WeightPager(
+                self.source,
+                device="cpu",
+                compute_dtype="bfloat16",
+                max_resident_bytes=2 * 1024**2,
+            )
+            for _ in range(2)
+        ]
+        observed = [[], []]
+        models = [
+            StreamedQwen38(
+                self.config,
+                pager,
+                native_head_crsa=Qwen38NativeHeadCrsa(alpha=0.1),
+                native_head_crsa_observer=rows.append,
+                max_batch_size=1,
+                max_seq_len=16,
+            )
+            for pager, rows in zip(pagers, observed, strict=True)
+        ]
+        block_model, token_model = models
+        try:
+            block_model.prefill([[1, 4]])
+            observed[0].clear()
+            stage = block_model.stage_continuation_block([[9, 7]])
+
+            token_model.prefill([[1, 4]])
+            observed[1].clear()
+            first, _ = token_model.decode([[9]])
+            second, _ = token_model.decode([[7]])
+            expected = torch.cat((first, second), dim=1)
+
+            self.assertTrue(torch.equal(stage.hidden, expected))
+            actual, _ = block_model.commit_continuation_block(stage)
+            self.assertTrue(torch.equal(actual, expected))
+            _assert_layer_states_equal(
+                self, block_model._layer_states, token_model._layer_states
+            )
+            self.assertEqual(
+                [
+                    (row.query_start, row.query_length, row.history_length_after)
+                    for row in observed[0]
+                ],
+                [(2, 2, 4)],
+            )
+            self.assertEqual(
+                [
+                    (row.query_start, row.query_length, row.history_length_after)
+                    for row in observed[1]
+                ],
+                [(2, 1, 3), (3, 1, 4)],
+            )
+        finally:
+            for pager in pagers:
+                pager.close()
 
     def test_native_layer27_streaming_history_reset_and_poison_are_transactional(
         self,

@@ -995,6 +995,7 @@ class StreamedQwen38:
         start_pos: int = 0,
         native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None]
         | None = None,
+        native_head_crsa_tokenwise_usage: bool = False,
     ) -> tuple[torch.Tensor, AttentionState]:
         base = f"model.language_model.layers.{layer}.self_attn"
         projected_query_gate = self.pager.linear(hidden, f"{base}.q_proj")
@@ -1035,6 +1036,7 @@ class StreamedQwen38:
                 native_head_crsa_observer=(
                     native_head_crsa_observer if native_head_crsa is not None else None
                 ),
+                native_head_crsa_tokenwise_usage=native_head_crsa_tokenwise_usage,
                 rope_theta=self.config.rope_theta,
                 rotary_dim=self.config.rotary_dim,
                 mrope_section=self.config.mrope_section,
@@ -1114,6 +1116,7 @@ class StreamedQwen38:
         stateful: bool,
         native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None]
         | None = None,
+        native_head_crsa_tokenwise_usage: bool = False,
     ) -> tuple[torch.Tensor, LayerState | None]:
         """Apply one block and return its staged continuation state."""
 
@@ -1130,6 +1133,7 @@ class StreamedQwen38:
                 state=state,
                 start_pos=start_pos,
                 native_head_crsa_observer=native_head_crsa_observer,
+                native_head_crsa_tokenwise_usage=native_head_crsa_tokenwise_usage,
             )
         else:
             if state is not None and not isinstance(state, DeltaNetState):
@@ -1474,6 +1478,7 @@ class StreamedQwen38:
         stop_layer: int,
         graft_history: torch.Tensor | None = None,
         progress: Callable[[dict[str, Any]], None] | None = None,
+        native_head_crsa_tokenwise_usage: bool = False,
     ) -> StatefulLayerRangeResult:
         """Stage exactly ``[start_layer, stop_layer)`` without committing state.
 
@@ -1516,6 +1521,8 @@ class StreamedQwen38:
             )
         if progress is not None and not callable(progress):
             raise TypeError("progress must be callable or None")
+        if not isinstance(native_head_crsa_tokenwise_usage, bool):
+            raise TypeError("native_head_crsa_tokenwise_usage must be a boolean")
 
         x = hidden.to(device=self.pager.device, dtype=self.pager.compute_dtype)
         states = self._validate_stateful_range_states(
@@ -1551,6 +1558,7 @@ class StreamedQwen38:
                     start_pos=start_pos,
                     stateful=True,
                     native_head_crsa_observer=staged_native_evidence.append,
+                    native_head_crsa_tokenwise_usage=(native_head_crsa_tokenwise_usage),
                 )
                 if next_state is None:  # pragma: no cover - stateful contract.
                     raise Qwen38RuntimeError("stateful layer returned no continuation")
@@ -1629,9 +1637,9 @@ class StreamedQwen38:
             raise Qwen38RuntimeError(
                 "continuation block staging rejects an active DeltaNet probe"
             )
-        if self.native_head_crsa is not None and self.native_head_crsa.active:
+        if ids.shape[0] != 1 or ids.shape[1] != 2:
             raise Qwen38RuntimeError(
-                "continuation block staging requires tokenwise-exact native CRSA"
+                "continuation block staging is validated only for batch 1 and K=2"
             )
         if ids.shape[0] != self._state_batch_size:
             raise ValueError("continuation block batch differs from committed prefix")
@@ -1668,6 +1676,7 @@ class StreamedQwen38:
                 stop_layer=self.config.n_layers,
                 graft_history=self._graft_history,
                 progress=progress,
+                native_head_crsa_tokenwise_usage=True,
             )
             hidden = self.finalize_hidden(staged.hidden)
         except Exception:
