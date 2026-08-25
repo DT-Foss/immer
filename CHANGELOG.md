@@ -24,6 +24,11 @@ All notable changes to IMMER are recorded here.
   before its hook and produces a measured nonzero post-layer change.
 - Closed the native coordinate contract by binding the intervention to the
   runtime's atomic attention-head group; single-head coordinates are rejected.
+- Completed the first live multi-prompt frontier: two prompts by two coordinates,
+  four successful jobs in one Qwen process. O1 learning progress selected the
+  remaining sibling coordinate of the same prompt next, and the FERTIG-backed
+  semantic label reopened with both its passive observation and causal native
+  measurement intact.
 - Verified the original live cut with `1118/1118` tests and the complete O1
   foundation repair with `1128/1128` tests.
 
