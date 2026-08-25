@@ -179,6 +179,78 @@ WAVE3_CASES = {
     ),
 }
 
+AFFINE_CASES = {
+    6: (
+        "At the Burger Palace restaurant, there is an enormous jar containing "
+        "red, blue and green jelly beans. On the outside of the jar is a note "
+        'that reads, "This jar contains 1% fewer red jelly beans than blue '
+        'jelly beans and 1% more green jelly beans than blue jelly beans." '
+        "If the jar contains a total of 4500 jelly beans, how many more green "
+        "jelly beans does it contain than red jelly beans?",
+        Fraction(30),
+        "balanced_percent_category_difference",
+    ),
+    12: (
+        "In a jewelers store, the price of a gold Jewell is 4/5 times as much "
+        "as the price of a diamond Jewell. The cost of a silver Jewell is $400 "
+        "less than the price of gold. If a diamond Jewell is $2000, find the "
+        "total price for all three jewels.",
+        Fraction(4800),
+        "affine_price_chain_total",
+    ),
+    29: (
+        "Rob, Royce, and Pedro are contractors getting ready to put a new roof "
+        "on three homes. If the three homes will need 250 cases of shingles, "
+        "with the first house needing 1/2 of the second, and the third needing "
+        "double the first. How many cases of shingles will the third house need?",
+        Fraction(100),
+        "ordinal_ratio_partition",
+    ),
+    38: (
+        "Sasha and Julie are best friends playing on opposing basketball teams. "
+        "The teams have two practice games scheduled. In the first game, Sasha "
+        "had the home court advantage and scored 14 points. Julie scored 4 "
+        "fewer points than Sasha in the same game. Sasha always struggles "
+        "during away games and their second match was at Julie's home court. "
+        "Sasha scored 6 fewer points in the second game than Julie's score in "
+        "the first game. How many total points did Sasha score during both games?",
+        Fraction(18),
+        "temporal_affine_score_chain",
+    ),
+    43: (
+        "Jada, Rory, and Kora make clay dishes to present as art for their "
+        "school project. Jada makes twice as many clay dishes as Rory, while "
+        "Rory makes 20 more clay dishes than Kora. If Kora made 20 dishes, how "
+        "many clay dishes they all make together?",
+        Fraction(140),
+        "entity_affine_chain_total",
+    ),
+    46: (
+        "Peter has twice as many socks as Jack and half times as many dishes as "
+        "jack. Jack collected twice as many dishes as socks in the store. If "
+        "jack collected 60 dishes, calculate the total number of socks and "
+        "dishes they have together?",
+        Fraction(180),
+        "cross_entity_property_dag",
+    ),
+    48: (
+        "Claire earns 1 girl scout badge every month. It takes Amber twice as "
+        "long to earn a badge than Claire. Wendy earns three times the amount "
+        "of badges as Claire in the same time frame. How many more badges does "
+        "Wendy earn compared to Amber in a 1 year time frame?",
+        Fraction(30),
+        "inverse_rate_time_difference",
+    ),
+    49: (
+        "A bumper car rink has 12 red cars. They have 2 fewer green cars than "
+        "they have red cars. They have 3 times the number of blue cars as they "
+        "have green cars. The rink also has yellow cars. If the rink has 75 "
+        "cars in total how many yellow cars do they have?",
+        Fraction(23),
+        "chained_inventory_residual",
+    ),
+}
+
 CALENDAR_CASE = (
     "A Reddit group has 1000 members. If each member posts an average of 3 "
     "posts per day, what's the total number of posts that the group will have "
@@ -649,6 +721,191 @@ class SignedEventAggregationWaveTests(unittest.TestCase):
             ),
         )
         for question in mutations:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+
+
+class SignedEventScopedAffineWaveTests(unittest.TestCase):
+    def test_eight_scoped_affine_dags_are_exact_and_certified(self) -> None:
+        for offset, (question, expected, family) in AFFINE_CASES.items():
+            with self.subTest(offset=offset):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                self.assertEqual(result.family, family)
+                assert result.compiled is not None
+                self.assertIs(result.compiled.solution.status, SolveStatus.UNIQUE)
+                self.assertEqual(result.compiled.solution.target_value, expected)
+                self.assertTrue(result.compiled.certificate.verified)
+                self.assertEqual(
+                    len(result.compiled.evidence_projection),
+                    len(
+                        {
+                            row.evidence.evidence_id
+                            for row in result.compiled.evidence_projection
+                        }
+                    ),
+                )
+                parsed = parse_structural_problem(question)
+                self.assertTrue(parsed.ok, parsed.reason)
+                assert parsed.problem is not None
+                self.assertEqual(solve(parsed.problem).target_value, expected)
+
+    def test_fraction_percent_and_year_scaling_keep_exact_units(self) -> None:
+        percent = compile_signed_events(AFFINE_CASES[6][0])
+        self.assertTrue(percent.ok, percent.reason)
+        assert percent.compiled is not None
+        percent_rows = [
+            row.evidence
+            for row in percent.compiled.evidence_projection
+            if row.evidence.unit.symbol == "%"
+        ]
+        self.assertEqual([row.value for row in percent_rows], [1, 1])
+        self.assertTrue(all(row.unit.scale == Fraction(1, 100) for row in percent_rows))
+        self.assertEqual(
+            percent.compiled.problem.target.unit.dimensions, (("count", 1),)
+        )
+
+        ratio = compile_signed_events(AFFINE_CASES[12][0])
+        self.assertTrue(ratio.ok, ratio.reason)
+        assert ratio.compiled is not None
+        fraction_rows = [
+            row.evidence
+            for row in ratio.compiled.evidence_projection
+            if row.evidence.value == Fraction(4, 5)
+        ]
+        self.assertEqual(len(fraction_rows), 1)
+        span = fraction_rows[0].span
+        self.assertEqual(AFFINE_CASES[12][0][span.start : span.end], "4/5")
+
+        annual = compile_signed_events(AFFINE_CASES[48][0])
+        self.assertTrue(annual.ok, annual.reason)
+        assert annual.compiled is not None
+        self.assertEqual(
+            annual.compiled.problem.target.unit.dimensions, (("count", 1),)
+        )
+        self.assertEqual(annual.compiled.problem.target.unit.scale, 1)
+
+    def test_owner_category_and_item_renames_preserve_affine_grammar(self) -> None:
+        variants = (
+            AFFINE_CASES[6][0]
+            .replace("red", "amber")
+            .replace("blue", "cyan")
+            .replace("green", "violet"),
+            AFFINE_CASES[12][0]
+            .replace("gold", "ruby")
+            .replace("diamond", "opal")
+            .replace("silver", "pearl")
+            .replace("Jewell", "Gem")
+            .replace("jewels", "gems"),
+            AFFINE_CASES[38][0].replace("Sasha", "Mira").replace("Julie", "Talia"),
+            AFFINE_CASES[43][0]
+            .replace("Jada", "Mira")
+            .replace("Rory", "Talia")
+            .replace("Kora", "Nia"),
+            AFFINE_CASES[49][0]
+            .replace("red", "amber")
+            .replace("green", "cyan")
+            .replace("blue", "violet")
+            .replace("yellow", "white"),
+        )
+        expected = (30, 4800, 18, 140, 23)
+        for question, answer in zip(variants, expected, strict=True):
+            with self.subTest(question=question):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, answer)
+
+    def test_direction_state_item_and_time_mutations_abstain(self) -> None:
+        mutations = (
+            AFFINE_CASES[6][0].replace(
+                "more green jelly beans than blue", "more green jelly beans than red"
+            ),
+            AFFINE_CASES[6][0].replace("1% more green", "2% more green"),
+            AFFINE_CASES[6][0].replace(
+                "red, blue and green", "red, blue, yellow and green"
+            ),
+            AFFINE_CASES[12][0].replace(
+                "less than the price of gold", "less than the price of diamond"
+            ),
+            AFFINE_CASES[12][0].replace("4/5 times as much", "4/5 more than"),
+            AFFINE_CASES[29][0].replace("double the first", "double the second"),
+            AFFINE_CASES[29][0].replace("250 cases of shingles", "250 cases of tiles"),
+            AFFINE_CASES[38][0].replace("in the same game", "in the second game"),
+            AFFINE_CASES[38][0].replace(
+                "Julie's score in the first game", "Julie's score in the second game"
+            ),
+            AFFINE_CASES[43][0].replace("than Kora", "than Jada"),
+            AFFINE_CASES[43][0].replace(
+                "how many clay dishes", "how many clay sculptures"
+            ),
+            AFFINE_CASES[46][0].replace("half times as many", "half more than"),
+            AFFINE_CASES[46][0].replace(
+                "twice as many dishes as socks in the store",
+                "twice as many socks as dishes in the store",
+            ),
+            AFFINE_CASES[48][0].replace("twice as long", "twice as many"),
+            AFFINE_CASES[48][0].replace("compared to Amber", "compared to Claire"),
+            AFFINE_CASES[49][0].replace(
+                "blue cars as they have green", "blue cars as they have red"
+            ),
+            AFFINE_CASES[49][0].replace("2 fewer green", "2 more green"),
+        )
+        for question in mutations:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+
+    def test_cross_scope_and_extra_evidence_never_enter_affine_dags(self) -> None:
+        cross_scope = (
+            AFFINE_CASES[6][0].replace(
+                "If the jar contains a total", "If another jar contains a total"
+            ),
+            AFFINE_CASES[6][0].replace(
+                "If the jar contains a total",
+                "If the jar and another display together contain a total",
+            ),
+            AFFINE_CASES[12][0].replace(
+                "If a diamond Jewell is $2000", "If an opal Jewell is $2000"
+            ),
+            AFFINE_CASES[12][0].replace(
+                "If a diamond Jewell is $2000",
+                "If a diamond display case costs $2000",
+            ),
+            AFFINE_CASES[29][0].replace(
+                "How many cases of shingles", "How many cases of tiles"
+            ),
+            AFFINE_CASES[38][0].replace("Sasha scored 6 fewer", "Mira scored 6 fewer"),
+            AFFINE_CASES[43][0].replace("while Rory makes 20", "while Mira makes 20"),
+            AFFINE_CASES[43][0].replace(
+                "clay dishes they all make together",
+                "clay dishes do the teachers all make together",
+            ),
+            AFFINE_CASES[46][0].replace("Jack collected twice", "Mira collected twice"),
+            AFFINE_CASES[48][0].replace(
+                "in the same time frame", "in another time frame"
+            ),
+            AFFINE_CASES[49][0].replace("If the rink has 75", "If another rink has 75"),
+        )
+        for question in cross_scope:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+        for offset, (question, _, _) in AFFINE_CASES.items():
+            with self.subTest(offset=offset):
+                self.assertFalse(compile_signed_events(question + " Reference 99.").ok)
+
+    def test_remaining_affine_candidates_stay_deferred(self) -> None:
+        deferred = (
+            "Ava gets 10 points per enemy, 5 per berry, and 30 per timer "
+            "second. She gets 8 more enemies and 3 more berries than Emma but "
+            "finishes 4 seconds slower. What is the difference in their scores?",
+            "Tasha made $80 from lemonade and mowing. She mowed one lawn three "
+            "times and another five times as often as Joe, who paid $6. How "
+            "much came from lemonade?",
+            "Yesterday Denise read 10 pages and Daniel 13. Today Denise read 5 "
+            "more than Daniel read yesterday and Daniel read none. How many "
+            "more pages did Denise read than Daniel?",
+        )
+        for question in deferred:
             with self.subTest(question=question):
                 self.assertFalse(compile_signed_events(question).ok)
 

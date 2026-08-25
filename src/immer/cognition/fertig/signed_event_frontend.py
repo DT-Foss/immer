@@ -76,10 +76,10 @@ class FrontendResult:
 
 _TOKEN = re.compile(
     r"\$\s*(?:\d[\d,]*(?:\.\d+)?|\.\d+)|"
-    r"(?:\d[\d,]*(?:\.\d+)?|\.\d+)|"
+    r"(?:\d+\s*/\s*\d+|\d[\d,]*(?:\.\d+)?|\.\d+)|"
     r"[A-Za-z]+(?:['’\-][A-Za-z]+)*|[.!?;,:]"
 )
-_DIGIT = re.compile(r"^\$?\s*(?:\d[\d,]*(?:\.\d+)?|\.\d+)$")
+_DIGIT = re.compile(r"^\$?\s*(?:\d+\s*/\s*\d+|\d[\d,]*(?:\.\d+)?|\.\d+)$")
 _OPERATOR_NUMBERS = {"once": Fraction(1), "twice": Fraction(2), "half": Fraction(1, 2)}
 
 COUNT = Unit.count()
@@ -95,6 +95,8 @@ MINUTE = Unit("minute", (("time", 1),), Fraction(60))
 HOUR = Unit("hour", (("time", 1),), Fraction(3600))
 FOOT = Unit.base("length", symbol="ft")
 FOOT_PER_COUNT = FOOT / COUNT
+MONTH = Unit("month", (("time", 1),), Fraction(1))
+COUNT_PER_MONTH = COUNT / MONTH
 PERCENT = Unit("%", (), Fraction(1, 100))
 
 _LOCAL_CARDINALS = {
@@ -132,6 +134,9 @@ class _Reject(ValueError):
 
 def _fraction(text: str) -> Fraction:
     raw = text.replace("$", "").replace(",", "").strip()
+    if "/" in raw:
+        numerator, denominator = raw.split("/", 1)
+        return Fraction(int(numerator.strip()), int(denominator.strip()))
     try:
         return Fraction(Decimal(raw))
     except InvalidOperation as exc:
@@ -232,6 +237,8 @@ def _singular(word: str) -> str:
         return "person"
     if word == "feet":
         return "foot"
+    if word == "jewell":
+        return "jewel"
     if word.endswith(("ches", "shes", "xes", "zes")) and len(word) > 4:
         return word[:-2]
     if word.endswith("ies") and len(word) > 3:
@@ -2496,6 +2503,998 @@ def _mean_participant_totals(
     return builder.finish(expression, "mean_participant_totals")
 
 
+def _balanced_percent_category_difference(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "many", "more") and "total" in question.norms
+    ):
+        return None
+    relation = _single_clause(
+        clause_set,
+        lambda clause: (
+            "fewer" in clause.norms
+            and "more" in clause.norms
+            and len(_counts(clause)) == 2
+        ),
+        reason="balanced percentage relations are not unique",
+    )
+    intro = _single_clause(
+        clause_set,
+        lambda clause: "containing" in clause.norms and "and" in clause.norms,
+        reason="category enumeration is not unique",
+    )
+    percents = _counts(relation)
+    _require(
+        all(source[token.span.end : token.span.end + 1] == "%" for token in percents)
+        and percents[0].number == percents[1].number,
+        "percentage magnitudes are not an equal balanced pair",
+    )
+    bindings: dict[str, tuple[str, Token]] = {}
+    for token in percents:
+        index = relation.tokens.index(token)
+        direction = (
+            relation.norms[index + 1] if index + 1 < len(relation.tokens) else ""
+        )
+        than = next(
+            (
+                i
+                for i in range(index + 1, len(relation.tokens))
+                if relation.norms[i] == "than"
+            ),
+            -1,
+        )
+        _require(
+            direction in {"fewer", "more"}
+            and than > index + 2
+            and than + 1 < len(relation.tokens),
+            "percentage direction or baseline is missing",
+        )
+        bindings[direction] = (_singular(relation.norms[index + 2]), token)
+        baseline = _singular(relation.norms[than + 1])
+        bindings[f"{direction}_baseline"] = (baseline, token)
+    _require(
+        {"fewer", "more", "fewer_baseline", "more_baseline"}.issubset(bindings)
+        and bindings["fewer_baseline"][0] == bindings["more_baseline"][0],
+        "percentage relations do not share one baseline",
+        FrontendStatus.AMBIGUOUS,
+    )
+    query_more = question.norms[question.norms.index("more") + 1]
+    query_than = question.norms.index("than") if "than" in question.norms else -1
+    _require(
+        query_more == bindings["more"][0]
+        and query_than >= 0
+        and question.norms[query_than + 1] == bindings["fewer"][0],
+        "question direction differs from the percentage relations",
+        FrontendStatus.AMBIGUOUS,
+    )
+    categories = (
+        bindings["fewer"][0],
+        bindings["more_baseline"][0],
+        bindings["more"][0],
+    )
+    intro_positions = [intro.norms.index(category) for category in categories]
+    containing_index = intro.norms.index("containing")
+    jelly_index = intro.norms.index("jelly") if "jelly" in intro.norms else -1
+    enumerated = [
+        word
+        for word in intro.norms[containing_index + 1 : jelly_index]
+        if word not in {",", "and"}
+    ]
+    _require(
+        len(set(categories)) == 3
+        and intro_positions == sorted(intro_positions)
+        and tuple(enumerated) == categories
+        and "jar" in relation.norms
+        and question.norms[:3] == ("if", "the", "jar"),
+        "category enumeration and relation scopes differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    category_span = Span(
+        intro.tokens[intro_positions[0]].span.start,
+        intro.tokens[intro_positions[-1]].span.end,
+        source,
+    )
+    category_token = Token(
+        source[category_span.start : category_span.end],
+        "enumerated_categories",
+        category_span,
+    )
+    total = _one_token(_counts(question), "category total is incomplete")
+    total_index = question.tokens.index(total)
+    _require(
+        question.norms[:total_index]
+        == ("if", "the", "jar", "contains", "a", "total", "of")
+        and total_index + 2 < len(question.tokens)
+        and question.norms[total_index + 1 : total_index + 3] == ("jelly", "beans"),
+        "category total is not scoped to the single declared jar",
+        FrontendStatus.AMBIGUOUS,
+    )
+    builder = _Builder(source, clause_set)
+    percent_mark_span = Span(percents[0].span.end, percents[0].span.end + 1, source)
+    percent_origin = Token("%", "percent_origin", percent_mark_span)
+    percent_sum = _sum(
+        _signed(
+            1,
+            builder.lexical_literal(percent_origin, Fraction(0), SCALAR),
+            "scalar_origin",
+        ),
+        *[
+            _signed(
+                1,
+                builder.literal(token, PERCENT),
+                "percent_delta",
+            )
+            for token in percents
+        ],
+    )
+    numerator = _product(builder.literal(total, COUNT), percent_sum)
+    expression = QuotientExpr(
+        numerator,
+        builder.lexical_literal(category_token, Fraction(3), SCALAR),
+        Span(0, len(source), source),
+    )
+    return builder.finish(expression, "balanced_percent_category_difference")
+
+
+def _affine_price_chain_total(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not _contains(question.norms, "total", "price", "for", "all", "three"):
+        return None
+    three_index = question.norms.index("three")
+    _require(three_index + 1 < len(question.tokens), "catalog item type is missing")
+    item_type = _singular(question.norms[three_index + 1])
+    ratio_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            _contains(clause.norms, "times", "as", "much", "as")
+            and len(_counts(clause)) == 1
+        ),
+        reason="relative price ratio is not unique",
+    )
+    offset_clause = _single_clause(
+        clause_set,
+        lambda clause: "less" in clause.norms and bool(_money_tokens(clause)),
+        reason="relative price offset is not unique",
+    )
+    base_clause = _single_clause(
+        clause_set,
+        lambda clause: "if" in clause.norms and bool(_money_tokens(clause)),
+        reason="base price assignment is not unique",
+    )
+    ratio = _one_token(_counts(ratio_clause), "price ratio is incomplete")
+    articles = [
+        index + 2
+        for index in range(len(ratio_clause.norms) - 2)
+        if ratio_clause.norms[index : index + 3] == ("price", "of", "a")
+    ]
+    _require(
+        len(articles) == 2
+        and articles[0] + 2 < len(ratio_clause.tokens)
+        and articles[1] + 2 < len(ratio_clause.tokens)
+        and _singular(ratio_clause.norms[articles[0] + 2]) == item_type
+        and _singular(ratio_clause.norms[articles[1] + 2]) == item_type,
+        "ratio price items are not explicitly typed",
+        FrontendStatus.AMBIGUOUS,
+    )
+    target_item = _singular(ratio_clause.norms[articles[0] + 1])
+    base_item = _singular(ratio_clause.norms[articles[1] + 1])
+    silver_offsets = [
+        index for index, word in enumerate(offset_clause.norms) if word in {"a", "an"}
+    ]
+    _require(
+        bool(silver_offsets)
+        and silver_offsets[0] + 2 < len(offset_clause.tokens)
+        and _singular(offset_clause.norms[silver_offsets[0] + 2]) == item_type,
+        "offset target item is missing or untyped",
+    )
+    offset_item = _singular(offset_clause.norms[silver_offsets[0] + 1])
+    less_index = offset_clause.norms.index("less")
+    than_index = (
+        offset_clause.norms.index("than") if "than" in offset_clause.norms else -1
+    )
+    _require(
+        than_index == less_index + 1
+        and than_index + 4 <= len(offset_clause.tokens)
+        and _singular(offset_clause.norms[-1]) == target_item,
+        "price offset source differs from the ratio target",
+        FrontendStatus.AMBIGUOUS,
+    )
+    base_price = _one_token(_money_tokens(base_clause), "base price is incomplete")
+    base_price_index = base_clause.tokens.index(base_price)
+    base_prefix = (
+        (
+            base_clause.norms[0],
+            base_clause.norms[1],
+            _singular(base_clause.norms[2]),
+            _singular(base_clause.norms[3]),
+            base_clause.norms[4],
+        )
+        if base_price_index == 5
+        else ()
+    )
+    _require(
+        base_prefix == ("if", "a", base_item, item_type, "is")
+        and len({base_item, target_item, offset_item}) == 3,
+        "price chain categories are not unique",
+        FrontendStatus.AMBIGUOUS,
+    )
+    offset = _one_token(_money_tokens(offset_clause), "price offset is incomplete")
+
+    builder = _Builder(source, clause_set)
+    symbols = {
+        item: SymbolKey("catalog", "price", item, item_type, "current")
+        for item in (base_item, target_item, offset_item)
+    }
+    definitions = (
+        Definition(
+            symbols[base_item],
+            builder.literal(base_price, MONEY),
+            base_clause.span,
+        ),
+        Definition(
+            symbols[target_item],
+            _product(
+                builder.literal(ratio, SCALAR),
+                RefExpr(symbols[base_item], ratio_clause.span),
+            ),
+            ratio_clause.span,
+        ),
+        Definition(
+            symbols[offset_item],
+            _sum(
+                _signed(1, RefExpr(symbols[target_item], offset_clause.span), "base"),
+                _signed(-1, builder.literal(offset, MONEY), "less"),
+            ),
+            offset_clause.span,
+        ),
+    )
+    expression = _sum(
+        *[
+            _signed(1, RefExpr(symbols[item], question.span), "catalog_item")
+            for item in (base_item, target_item, offset_item)
+        ]
+    )
+    return builder.finish(
+        expression,
+        "affine_price_chain_total",
+        definitions=definitions,
+    )
+
+
+def _ordinal_ratio_partition(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (_contains(question.norms, "how", "many") and "third" in question.norms):
+        return None
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            "three" in clause.norms and "homes" in clause.norms and not _counts(clause)
+        ),
+        reason="three-part partition scope is not unique",
+    )
+    relation = _single_clause(
+        clause_set,
+        lambda clause: (
+            {"first", "second", "third", "double"}.issubset(clause.norms)
+            and bool(_counts(clause))
+        ),
+        reason="ordinal partition relations are not unique",
+    )
+    numbers = _counts(relation)
+    ratios = [
+        token for token in numbers if token.number is not None and token.number < 1
+    ]
+    totals = [token for token in numbers if token not in ratios]
+    ratio = _one_token(ratios, "partition ratio is incomplete")
+    total = _one_token(totals, "partition total is incomplete")
+    double = _unique_word_token(clause_set, "double", clause=relation)
+    ratio_index = relation.tokens.index(ratio)
+    total_index = relation.tokens.index(total)
+    double_index = relation.norms.index("double")
+    total_item_end = next(
+        (
+            index
+            for index in range(total_index + 1, len(relation.tokens))
+            if relation.norms[index] in {",", "with"}
+        ),
+        len(relation.tokens),
+    )
+    how_index = question.norms.index("many")
+    query_item_end = next(
+        (
+            index
+            for index in range(how_index + 1, len(question.tokens))
+            if question.norms[index] in {"will", "does", "do", "did"}
+        ),
+        len(question.tokens),
+    )
+    _require(
+        _contains(relation.norms[:ratio_index], "first", "house", "needing")
+        and _contains(relation.norms[ratio_index + 1 :], "of", "the", "second")
+        and _contains(relation.norms[:double_index], "third", "needing")
+        and _contains(relation.norms[double_index + 1 :], "the", "first")
+        and _item_id(relation.norms[total_index + 1 : total_item_end])
+        == _item_id(question.norms[how_index + 1 : query_item_end])
+        and _contains(question.norms, "third", "house", "need"),
+        "ordinal ratio directions or target differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        _contains(intro.norms, "three", "homes")
+        and _contains(relation.norms, "three", "homes")
+        and ratio.number is not None
+        and ratio.number > 0,
+        "partition is not a closed positive three-part total",
+    )
+    denominator_value = Fraction(1) + ratio.number + 2 * ratio.number
+    relation_span = Span(
+        relation.tokens[relation.norms.index("first")].span.start,
+        relation.tokens[double_index + 2].span.end,
+        source,
+    )
+    denominator_token = Token(
+        source[relation_span.start : relation_span.end],
+        "derived_partition_coefficient",
+        relation_span,
+    )
+
+    builder = _Builder(source, clause_set)
+    numerator = _product(
+        builder.literal(total, COUNT),
+        builder.literal(ratio, SCALAR),
+        builder.lexical_literal(double, Fraction(2), SCALAR),
+    )
+    expression = QuotientExpr(
+        numerator,
+        builder.lexical_literal(denominator_token, denominator_value, SCALAR),
+        Span(0, len(source), source),
+    )
+    return builder.finish(expression, "ordinal_ratio_partition")
+
+
+def _temporal_affine_score_chain(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "many", "total", "points")
+        and _contains(question.norms, "both", "games")
+    ):
+        return None
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            "friends" in clause.norms
+            and "basketball" in clause.norms
+            and "teams" in clause.norms
+            and not _counts(clause)
+        ),
+        reason="score participant scope is not unique",
+    )
+    assignment = _single_clause(
+        clause_set,
+        lambda clause: (
+            "first" in clause.norms
+            and "game" in clause.norms
+            and "scored" in clause.norms
+            and "fewer" not in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="first-game score assignment is not unique",
+    )
+    first_relation = _single_clause(
+        clause_set,
+        lambda clause: (
+            "fewer" in clause.norms
+            and "same" in clause.norms
+            and "game" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="same-game score relation is not unique",
+    )
+    second_relation = _single_clause(
+        clause_set,
+        lambda clause: (
+            "fewer" in clause.norms
+            and "second" in clause.norms
+            and "first" in clause.norms
+            and "score" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="cross-game score relation is not unique",
+    )
+    target_owner = question.norms[question.norms.index("did") + 1]
+    scored_index = assignment.norms.index("scored")
+    assignment_owners = [
+        token.norm
+        for token in assignment.tokens[:scored_index]
+        if token.text[:1].isupper() and token.norm not in {"in"}
+    ]
+    _require(len(assignment_owners) == 1, "first-game scorer is not unique")
+    first_owner = assignment_owners[0]
+    related_owner = first_relation.norms[0]
+    intro_owners = {token.norm for token in intro.tokens if token.text[:1].isupper()}
+    _require(
+        intro_owners == {first_owner, related_owner}
+        and target_owner == first_owner
+        and related_owner != first_owner
+        and _contains(
+            first_relation.norms, "than", first_owner, "in", "the", "same", "game"
+        )
+        and second_relation.norms[0] == first_owner
+        and _contains(second_relation.norms, "second", "game")
+        and _contains(
+            second_relation.norms,
+            "than",
+            f"{related_owner}'s",
+            "score",
+            "in",
+            "the",
+            "first",
+            "game",
+        ),
+        "score owners or temporal states differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    initial = _one_token(_counts(assignment), "first score is incomplete")
+    first_offset = _one_token(_counts(first_relation), "same-game offset is incomplete")
+    second_offset = _one_token(
+        _counts(second_relation), "cross-game offset is incomplete"
+    )
+    builder = _Builder(source, clause_set)
+    s1 = SymbolKey(first_owner, "score", "point", "game", "first")
+    other1 = SymbolKey(related_owner, "score", "point", "game", "first")
+    s2 = SymbolKey(first_owner, "score", "point", "game", "second")
+    definitions = (
+        Definition(s1, builder.literal(initial, COUNT), assignment.span),
+        Definition(
+            other1,
+            _sum(
+                _signed(1, RefExpr(s1, first_relation.span), "source_score"),
+                _signed(-1, builder.literal(first_offset, COUNT), "fewer"),
+            ),
+            first_relation.span,
+        ),
+        Definition(
+            s2,
+            _sum(
+                _signed(1, RefExpr(other1, second_relation.span), "prior_score"),
+                _signed(-1, builder.literal(second_offset, COUNT), "fewer"),
+            ),
+            second_relation.span,
+        ),
+    )
+    expression = _sum(
+        _signed(1, RefExpr(s1, question.span), "first_game"),
+        _signed(1, RefExpr(s2, question.span), "second_game"),
+    )
+    return builder.finish(
+        expression,
+        "temporal_affine_score_chain",
+        definitions=definitions,
+    )
+
+
+def _entity_affine_chain_total(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "many")
+        and "together" in question.norms
+        and "all" in question.norms
+    ):
+        return None
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            "make" in clause.norms
+            and "clay" in clause.norms
+            and "dishes" in clause.norms
+            and not _counts(clause)
+        ),
+        reason="maker enumeration is not unique",
+    )
+    relation = _single_clause(
+        clause_set,
+        lambda clause: (
+            "twice" in clause.norms
+            and "more" in clause.norms
+            and "than" in clause.norms
+        ),
+        reason="maker affine relations are not unique",
+    )
+    names = [token.norm for token in intro.tokens if token.text[:1].isupper()]
+    _require(
+        len(names) == 3 and len(set(names)) == 3, "maker enumeration needs three names"
+    )
+    while_index = relation.norms.index("while") if "while" in relation.norms else -1
+    than_index = relation.norms.index("than") if "than" in relation.norms else -1
+    as_offsets = [index for index, word in enumerate(relation.norms) if word == "as"]
+    _require(
+        while_index > 0
+        and than_index > while_index
+        and as_offsets
+        and as_offsets[-1] + 1 < while_index,
+        "maker relation roles are incomplete",
+    )
+    scaled_owner = relation.norms[0]
+    middle_owner = relation.norms[as_offsets[-1] + 1]
+    offset_owner = relation.norms[while_index + 1]
+    base_owner = relation.norms[than_index + 1]
+    _require(
+        middle_owner == offset_owner
+        and {scaled_owner, middle_owner, base_owner} == set(names)
+        and _contains(relation.norms, "clay", "dishes")
+        and _contains(
+            question.norms, "clay", "dishes", "they", "all", "make", "together"
+        ),
+        "maker entities or item scopes differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    scale = _one_token(
+        [token for token in relation.tokens if token.norm == "twice"],
+        "maker scale is incomplete",
+    )
+    offset = _one_token(
+        [token for token in _counts(relation) if token is not scale],
+        "maker offset is incomplete",
+    )
+    base_values = _counts(question)
+    base_value = _one_token(base_values, "maker base value is incomplete")
+    if_index = question.norms.index("if") if "if" in question.norms else -1
+    _require(
+        if_index >= 0
+        and if_index + 1 < len(question.tokens)
+        and question.norms[if_index + 1] == base_owner
+        and "made" in question.norms[: question.tokens.index(base_value)],
+        "maker base assignment belongs to another entity",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    symbols = {
+        name: SymbolKey(name, "quantity", "clay_dish", "project", "final")
+        for name in names
+    }
+    definitions = (
+        Definition(
+            symbols[base_owner],
+            builder.literal(base_value, COUNT),
+            question.span,
+        ),
+        Definition(
+            symbols[middle_owner],
+            _sum(
+                _signed(1, RefExpr(symbols[base_owner], relation.span), "base"),
+                _signed(1, builder.literal(offset, COUNT), "more"),
+            ),
+            relation.span,
+        ),
+        Definition(
+            symbols[scaled_owner],
+            _product(
+                builder.literal(scale, SCALAR),
+                RefExpr(symbols[middle_owner], relation.span),
+            ),
+            relation.span,
+        ),
+    )
+    expression = _sum(
+        *[
+            _signed(1, RefExpr(symbols[name], question.span), "maker_total")
+            for name in names
+        ]
+    )
+    return builder.finish(
+        expression,
+        "entity_affine_chain_total",
+        definitions=definitions,
+    )
+
+
+def _cross_entity_property_dag(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        "together" in question.norms
+        and "total" in question.norms
+        and {"socks", "dishes"}.issubset(question.norms)
+    ):
+        return None
+    cross = _single_clause(
+        clause_set,
+        lambda clause: (
+            "socks" in clause.norms
+            and "dishes" in clause.norms
+            and "half" in clause.norms
+            and "twice" in clause.norms
+        ),
+        reason="cross-entity property relations are not unique",
+    )
+    within = _single_clause(
+        clause_set,
+        lambda clause: (
+            "collected" in clause.norms
+            and "twice" in clause.norms
+            and "socks" in clause.norms
+            and "dishes" in clause.norms
+            and not clause.question
+        ),
+        reason="within-entity property relation is not unique",
+    )
+    first_owner = cross.norms[0]
+    as_offsets = [index for index, word in enumerate(cross.norms) if word == "as"]
+    _require(len(as_offsets) == 4, "cross-entity comparison roles are incomplete")
+    second_owner = cross.norms[as_offsets[1] + 1]
+    _require(
+        second_owner == cross.norms[as_offsets[3] + 1] == within.norms[0]
+        and first_owner != second_owner
+        and _contains(
+            cross.norms,
+            "twice",
+            "as",
+            "many",
+            "socks",
+            "as",
+            second_owner,
+        )
+        and _contains(
+            cross.norms,
+            "half",
+            "times",
+            "as",
+            "many",
+            "dishes",
+            "as",
+            second_owner,
+        )
+        and _contains(
+            within.norms,
+            "twice",
+            "as",
+            "many",
+            "dishes",
+            "as",
+            "socks",
+        ),
+        "cross-entity owner, item, or awkward-half scope differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    cross_twice = _one_token(
+        [token for token in cross.tokens if token.norm == "twice"],
+        "cross-owner sock scale is incomplete",
+    )
+    half = _one_token(
+        [token for token in cross.tokens if token.norm == "half"],
+        "cross-owner dish scale is incomplete",
+    )
+    within_twice = _one_token(
+        [token for token in within.tokens if token.norm == "twice"],
+        "within-owner scale is incomplete",
+    )
+    base_value = _one_token(_counts(question), "base dish count is incomplete")
+    base_index = question.tokens.index(base_value)
+    _require(
+        second_owner in question.norms[:base_index]
+        and base_index + 1 < len(question.tokens)
+        and _singular(question.norms[base_index + 1]) == "dish"
+        and "they" in question.norms,
+        "base assignment or two-owner total scope differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+
+    def key(owner: str, item: str) -> SymbolKey:
+        return SymbolKey(owner, "quantity", item, "collection", "final")
+
+    jack_dishes = key(second_owner, "dish")
+    jack_socks = key(second_owner, "sock")
+    peter_socks = key(first_owner, "sock")
+    peter_dishes = key(first_owner, "dish")
+    definitions = (
+        Definition(
+            jack_dishes,
+            builder.literal(base_value, COUNT),
+            question.span,
+        ),
+        Definition(
+            jack_socks,
+            QuotientExpr(
+                RefExpr(jack_dishes, within.span),
+                builder.literal(within_twice, SCALAR),
+                within.span,
+            ),
+            within.span,
+        ),
+        Definition(
+            peter_socks,
+            _product(
+                builder.literal(cross_twice, SCALAR),
+                RefExpr(jack_socks, cross.span),
+            ),
+            cross.span,
+        ),
+        Definition(
+            peter_dishes,
+            _product(
+                builder.literal(half, SCALAR),
+                RefExpr(jack_dishes, cross.span),
+            ),
+            cross.span,
+        ),
+    )
+    expression = _sum(
+        *[
+            _signed(1, RefExpr(symbol, question.span), "owner_item_total")
+            for symbol in (jack_dishes, jack_socks, peter_dishes, peter_socks)
+        ]
+    )
+    return builder.finish(
+        expression,
+        "cross_entity_property_dag",
+        definitions=definitions,
+    )
+
+
+def _inverse_rate_time_difference(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "many", "more", "badges")
+        and "compared" in question.norms
+        and "year" in question.norms
+    ):
+        return None
+    base_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "earns" in clause.norms
+            and "badge" in clause.norms
+            and "every" in clause.norms
+            and "month" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="base monthly badge rate is not unique",
+    )
+    inverse_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "twice" in clause.norms
+            and "long" in clause.norms
+            and "badge" in clause.norms
+            and "than" in clause.norms
+        ),
+        reason="inverse duration relation is not unique",
+    )
+    scale_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "three" in clause.norms
+            and "times" in clause.norms
+            and "badges" in clause.norms
+            and _contains(clause.norms, "same", "time", "frame")
+        ),
+        reason="same-frame rate scale is not unique",
+    )
+    base_owner = base_clause.norms[0]
+    takes_index = inverse_clause.norms.index("takes")
+    _require(
+        takes_index + 1 < len(inverse_clause.tokens), "inverse-rate owner is missing"
+    )
+    inverse_owner = inverse_clause.norms[takes_index + 1]
+    scaled_owner = scale_clause.norms[0]
+    _require(
+        len({base_owner, inverse_owner, scaled_owner}) == 3
+        and inverse_clause.norms[-1] == base_owner
+        and base_owner in scale_clause.norms
+        and _contains(question.norms, "more", "badges", "does", scaled_owner)
+        and _contains(question.norms, "compared", "to", inverse_owner),
+        "rate owners or comparison direction differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    base_rate = _one_token(_counts(base_clause), "base badge rate is incomplete")
+    inverse_scale = _one_token(
+        [token for token in inverse_clause.tokens if token.norm == "twice"],
+        "inverse duration scale is incomplete",
+    )
+    forward_scale = _unique_word_token(clause_set, "three", clause=scale_clause)
+    duration = _one_token(_counts(question), "year duration is incomplete")
+    year = _unique_word_token(clause_set, "year", clause=question)
+    base_index = base_clause.tokens.index(base_rate)
+    every_index = base_clause.norms.index("every")
+    _require(
+        duration.number is not None
+        and duration.number > 0
+        and base_index < every_index
+        and _singular(base_clause.norms[every_index - 1]) == "badge"
+        and _noun_after(question, duration) == "year",
+        "badge item or year duration unit differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    symbols = {
+        owner: SymbolKey(owner, "rate", "badge", "earning", "monthly")
+        for owner in (base_owner, inverse_owner, scaled_owner)
+    }
+    definitions = (
+        Definition(
+            symbols[base_owner],
+            builder.literal(base_rate, COUNT_PER_MONTH),
+            base_clause.span,
+        ),
+        Definition(
+            symbols[inverse_owner],
+            QuotientExpr(
+                RefExpr(symbols[base_owner], inverse_clause.span),
+                builder.literal(inverse_scale, SCALAR),
+                inverse_clause.span,
+            ),
+            inverse_clause.span,
+        ),
+        Definition(
+            symbols[scaled_owner],
+            _product(
+                _cardinal_literal(builder, forward_scale),
+                RefExpr(symbols[base_owner], scale_clause.span),
+            ),
+            scale_clause.span,
+        ),
+    )
+    rate_delta = _sum(
+        _signed(1, RefExpr(symbols[scaled_owner], question.span), "faster_rate"),
+        _signed(-1, RefExpr(symbols[inverse_owner], question.span), "slower_rate"),
+    )
+    expression = _product(
+        rate_delta,
+        builder.literal(duration, SCALAR),
+        builder.lexical_literal(year, Fraction(12), MONTH),
+    )
+    return builder.finish(
+        expression,
+        "inverse_rate_time_difference",
+        definitions=definitions,
+    )
+
+
+def _chained_inventory_residual(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "many")
+        and "total" in question.norms
+        and "cars" in question.norms
+    ):
+        return None
+    assignment = _single_clause(
+        clause_set,
+        lambda clause: (
+            "rink" in clause.norms
+            and "has" in clause.norms
+            and len(_counts(clause)) == 1
+            and not clause.question
+        ),
+        reason="inventory base category is not unique",
+    )
+    offset_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "fewer" in clause.norms
+            and "than" in clause.norms
+            and "cars" in clause.norms
+        ),
+        reason="inventory offset category is not unique",
+    )
+    scale_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "times" in clause.norms
+            and "number" in clause.norms
+            and "cars" in clause.norms
+        ),
+        reason="inventory scaled category is not unique",
+    )
+    target_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "also" in clause.norms
+            and "has" in clause.norms
+            and "cars" in clause.norms
+            and not _counts(clause)
+        ),
+        reason="inventory residual category is not unique",
+    )
+    base_count = _one_token(_counts(assignment), "base car count is incomplete")
+    base_index = assignment.tokens.index(base_count)
+    _require(base_index + 2 < len(assignment.tokens), "base car category is incomplete")
+    base_category = _singular(assignment.norms[base_index + 1])
+    fewer_index = offset_clause.norms.index("fewer")
+    than_index = offset_clause.norms.index("than")
+    offset_category = _singular(offset_clause.norms[fewer_index + 1])
+    offset_source = _singular(offset_clause.norms[-2])
+    of_offsets = [
+        index for index, word in enumerate(scale_clause.norms) if word == "of"
+    ]
+    as_index = scale_clause.norms.index("as") if "as" in scale_clause.norms else -1
+    _require(
+        of_offsets and as_index > of_offsets[-1], "scaled car roles are incomplete"
+    )
+    scaled_category = _singular(scale_clause.norms[of_offsets[-1] + 1])
+    scaled_source = _singular(scale_clause.norms[-2])
+    target_category = _singular(target_clause.norms[-2])
+    query_category = question.norms[question.norms.index("many") + 1]
+    _require(
+        offset_source == base_category
+        and scaled_source == offset_category
+        and query_category == target_category
+        and len({base_category, offset_category, scaled_category, target_category}) == 4
+        and all(clause.norms[0] == "they" for clause in (offset_clause, scale_clause))
+        and target_clause.norms[:2] == ("the", "rink")
+        and question.norms[:3] == ("if", "the", "rink"),
+        "inventory actor, category chain, or target differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    offset = _one_token(_counts(offset_clause), "inventory offset is incomplete")
+    scale = _one_token(_counts(scale_clause), "inventory scale is incomplete")
+    total = _one_token(_counts(question), "inventory total is incomplete")
+    _require(
+        than_index > fewer_index and total.number is not None and total.number > 0,
+        "inventory direction or total is invalid",
+    )
+
+    builder = _Builder(source, clause_set)
+    symbols = {
+        category: SymbolKey("rink", "quantity", category, "car", "current")
+        for category in (base_category, offset_category, scaled_category)
+    }
+    definitions = (
+        Definition(
+            symbols[base_category],
+            builder.literal(base_count, COUNT),
+            assignment.span,
+        ),
+        Definition(
+            symbols[offset_category],
+            _sum(
+                _signed(1, RefExpr(symbols[base_category], offset_clause.span), "base"),
+                _signed(-1, builder.literal(offset, COUNT), "fewer"),
+            ),
+            offset_clause.span,
+        ),
+        Definition(
+            symbols[scaled_category],
+            _product(
+                builder.literal(scale, SCALAR),
+                RefExpr(symbols[offset_category], scale_clause.span),
+            ),
+            scale_clause.span,
+        ),
+    )
+    expression = _sum(
+        _signed(1, builder.literal(total, COUNT), "inventory_total"),
+        *[
+            _signed(-1, RefExpr(symbols[category], question.span), "known_category")
+            for category in (base_category, offset_category, scaled_category)
+        ],
+    )
+    return builder.finish(
+        expression,
+        "chained_inventory_residual",
+        definitions=definitions,
+    )
+
+
 _PLANNERS = (
     _rate_length_difference,
     _functioning_chain,
@@ -2516,6 +3515,14 @@ _PLANNERS = (
     _group_seat_purchase,
     _funding_balance_residual,
     _mean_participant_totals,
+    _balanced_percent_category_difference,
+    _affine_price_chain_total,
+    _ordinal_ratio_partition,
+    _temporal_affine_score_chain,
+    _entity_affine_chain_total,
+    _cross_entity_property_dag,
+    _inverse_rate_time_difference,
+    _chained_inventory_residual,
 )
 
 
