@@ -250,15 +250,13 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(
             first["recovery_wave_delta"]["previously_sealed_exact_recoveries"], 1
         )
-        self.assertEqual(
-            first["recovery_wave_history"]["baseline_exact_recoveries"], 1
-        )
+        self.assertEqual(first["recovery_wave_history"]["baseline_exact_recoveries"], 1)
         self.assertEqual(
             [
                 wave["added_exact_recoveries"]
                 for wave in first["recovery_wave_history"]["waves"]
             ],
-            [0, 0, 0],
+            [0, 0, 0, 0],
         )
         self.assertEqual(
             first["hungarian_verdict"]["directly_eligible_exclusive_instances"],
@@ -318,11 +316,11 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(
             audit.CURRENT_STRUCTURAL_COUNTS,
             {
-                "exact_recovery": 66,
-                "numeric_pronoun_ambiguous": 72,
+                "exact_recovery": 70,
+                "numeric_pronoun_ambiguous": 71,
                 "question_pronoun_ambiguous": 3,
-                "numeric_clause_unsupported": 82,
-                "target_unsupported": 6,
+                "numeric_clause_unsupported": 80,
+                "target_unsupported": 5,
                 "relation_ambiguous": 1,
                 "relation_unsupported": 0,
                 "relation_invalid": 0,
@@ -331,14 +329,15 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(
             audit.CURRENT_SCOPE_COUNTS,
             {
-                "exact_recovery_scope": 66,
-                "potential_coreference_scope": 75,
-                "grammar_scope": 89,
+                "exact_recovery_scope": 70,
+                "potential_coreference_scope": 74,
+                "grammar_scope": 86,
             },
         )
         self.assertEqual(
             audit.CURRENT_EXACT_RECOVERY_INDICES,
             (
+                547,
                 550,
                 574,
                 578,
@@ -370,6 +369,7 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                 782,
                 797,
                 802,
+                810,
                 819,
                 823,
                 825,
@@ -393,7 +393,9 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                 944,
                 959,
                 992,
+                1016,
                 1064,
+                1172,
                 1192,
                 1194,
                 1217,
@@ -460,6 +462,19 @@ class FertigAbstentionAuditTests(unittest.TestCase):
             },
         )
         self.assertEqual(
+            audit.RECURRENCE_WAVE_EXACT_RECOVERY_INDICES,
+            (547, 810, 1016, 1172),
+        )
+        self.assertEqual(
+            audit.RECURRENCE_WAVE_EXACT_MECHANISMS,
+            {
+                547: "signed_event:closed_phone_tree_recurrence",
+                810: "signed_event:closed_monthly_state_recurrence",
+                1016: "signed_event:fixed_base_percentage_recurrence",
+                1172: "signed_event:closed_daily_geometric_total",
+            },
+        )
+        self.assertEqual(
             set(audit.CURRENT_EXACT_RECOVERY_MECHANISMS),
             set(audit.CURRENT_EXACT_RECOVERY_INDICES),
         )
@@ -472,11 +487,11 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                         "legacy": audit.CURRENT_LEGACY_COUNTS,
                         "structural": audit.CURRENT_STRUCTURAL_COUNTS,
                         "scope": {
-                            "exact_recovery_scope": 66,
-                            "potential_coreference_scope": 74,
-                            "grammar_scope": 90,
+                            "exact_recovery_scope": 70,
+                            "potential_coreference_scope": 73,
+                            "grammar_scope": 87,
                         },
-                    }
+                    },
                 }
             )
 
@@ -484,7 +499,7 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         report = json.loads(audit.DEFAULT_OUTPUT_PATH.read_text(encoding="utf-8"))
         audit._validate_current_evidence(report)
         identity = report["exact_recovery_attribution"]["identity"]
-        self.assertEqual(identity["count"], 66)
+        self.assertEqual(identity["count"], 70)
         self.assertEqual(
             identity["indices"], list(audit.CURRENT_EXACT_RECOVERY_INDICES)
         )
@@ -494,44 +509,40 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                 audit._canonical_json_bytes(list(audit.CURRENT_EXACT_RECOVERY_INDICES))
             ),
         )
-        mechanism_identity = report["exact_recovery_attribution"][
-            "mechanism_identity"
-        ]
-        self.assertEqual(mechanism_identity["count"], 66)
+        mechanism_identity = report["exact_recovery_attribution"]["mechanism_identity"]
+        self.assertEqual(mechanism_identity["count"], 70)
         self.assertEqual(
-            {
-                row["index"]: row["mechanism"]
-                for row in mechanism_identity["rows"]
-            },
+            {row["index"]: row["mechanism"] for row in mechanism_identity["rows"]},
             audit.CURRENT_EXACT_RECOVERY_MECHANISMS,
         )
         delta = report["recovery_wave_delta"]
-        self.assertEqual(delta["previously_sealed_exact_recoveries"], 57)
-        self.assertEqual(delta["added_exact_recoveries"], 9)
-        self.assertEqual(delta["current_exact_recoveries"], 66)
+        self.assertEqual(delta["previously_sealed_exact_recoveries"], 66)
+        self.assertEqual(delta["added_exact_recoveries"], 4)
+        self.assertEqual(delta["current_exact_recoveries"], 70)
         self.assertEqual(
             delta["added_identity"]["indices"],
-            list(audit.CLOSED_SCHEDULE_WAVE_EXACT_RECOVERY_INDICES),
+            list(audit.RECURRENCE_WAVE_EXACT_RECOVERY_INDICES),
         )
-        self.assertIn("this wave claims 9, not 66", delta["attribution"])
+        self.assertIn("this wave claims 4, not 70", delta["attribution"])
 
         history = report["recovery_wave_history"]
         self.assertEqual(history["baseline_exact_recoveries"], 42)
         self.assertEqual(
             [wave["added_exact_recoveries"] for wave in history["waves"]],
-            [5, 10, 9],
+            [5, 10, 9, 4],
         )
         self.assertEqual(
             [wave["current_exact_recoveries"] for wave in history["waves"]],
-            [47, 57, 66],
+            [47, 57, 66, 70],
         )
         self.assertIn(
-            "66 current exact recoveries = 42 sealed baseline",
+            "70 current exact recoveries = 42 sealed baseline",
             history["attribution"],
         )
         self.assertIn("+ 5 by", history["attribution"])
         self.assertIn("+ 10 by", history["attribution"])
         self.assertIn("+ 9 by", history["attribution"])
+        self.assertIn("+ 4 by", history["attribution"])
 
         swapped = json.loads(json.dumps(report))
         next(item for item in swapped["items"] if item["index"] == 550)["index"] = 549
@@ -546,19 +557,20 @@ class FertigAbstentionAuditTests(unittest.TestCase):
             audit._validate_current_evidence(misattributed)
 
         count_preserving_delta_swap = json.loads(json.dumps(report))
-        count_preserving_delta_swap["recovery_wave_delta"]["added_identity"][
-            "indices"
-        ][0] = audit.GROUND_WAVE_EXACT_RECOVERY_INDICES[0]
+        count_preserving_delta_swap["recovery_wave_delta"]["added_identity"]["indices"][
+            0
+        ] = audit.GROUND_WAVE_EXACT_RECOVERY_INDICES[0]
         with self.assertRaisesRegex(audit.AuditError, "delta drifted"):
             audit._validate_current_evidence(count_preserving_delta_swap)
 
         count_preserving_history_swap = json.loads(json.dumps(report))
-        first_wave, _, final_wave = count_preserving_history_swap[
+        first_wave, *_, final_wave = count_preserving_history_swap[
             "recovery_wave_history"
         ]["waves"]
-        first_wave["added_identity"]["indices"][0], final_wave["added_identity"][
-            "indices"
-        ][0] = (
+        (
+            first_wave["added_identity"]["indices"][0],
+            final_wave["added_identity"]["indices"][0],
+        ) = (
             final_wave["added_identity"]["indices"][0],
             first_wave["added_identity"]["indices"][0],
         )

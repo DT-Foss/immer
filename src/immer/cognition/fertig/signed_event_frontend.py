@@ -31,6 +31,7 @@ from .signed_expression import (
     ExpressionProgram,
     ExpressionTarget,
     GroundProductExpr,
+    IterateExpr,
     LiteralExpr,
     MeanExpr,
     NumericEvidence,
@@ -107,14 +108,17 @@ _UNICODE_FRACTIONS = {
 
 _TOKEN = re.compile(
     r"\$\s*(?:\d[\d,]*(?:\.\d+)?|\.\d+)|"
+    r"(?:\d+(?:st|nd|rd|th))|"
     r"(?:\d+\s*/\s*\d+|\d[\d,]*(?:\.\d+)?|\.\d+|"
     r"[\u00bc-\u00be\u2150-\u215e])|"
     r"[A-Za-z]+(?:['’\-][A-Za-z]+)*|[.!?;,:]"
 )
 _DIGIT = re.compile(
-    r"^\$?\s*(?:\d+\s*/\s*\d+|\d[\d,]*(?:\.\d+)?|\.\d+|"
+    r"^\$?\s*(?:\d+(?:st|nd|rd|th)|\d+\s*/\s*\d+|"
+    r"\d[\d,]*(?:\.\d+)?|\.\d+|"
     r"[\u00bc-\u00be\u2150-\u215e])$"
 )
+_DIGIT_ORDINAL = re.compile(r"^(\d+)(st|nd|rd|th)$")
 _OPERATOR_NUMBERS = {"once": Fraction(1), "twice": Fraction(2), "half": Fraction(1, 2)}
 
 COUNT = Unit.count()
@@ -160,6 +164,29 @@ _LOCAL_CARDINALS = {
     "thrice": Fraction(3),
 }
 
+_LOCAL_ORDINALS = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+    "eleventh": 11,
+    "twelfth": 12,
+    "thirteenth": 13,
+    "fourteenth": 14,
+    "fifteenth": 15,
+    "sixteenth": 16,
+    "seventeenth": 17,
+    "eighteenth": 18,
+    "nineteenth": 19,
+    "twentieth": 20,
+}
+
 _WEEKDAY_NAMES = frozenset(
     {
         "monday",
@@ -186,6 +213,40 @@ _FIXED_MONTH_DAYS = {
     "december": 31,
 }
 _MONTHS = frozenset((*_FIXED_MONTH_DAYS, "february"))
+_MONTH_INDEX = {
+    month: index
+    for index, month in enumerate(
+        (
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ),
+        start=1,
+    )
+}
+_WEEKDAY_INDEX = {
+    day: index
+    for index, day in enumerate(
+        (
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
+        )
+    )
+}
 
 
 class _Reject(ValueError):
@@ -193,6 +254,17 @@ class _Reject(ValueError):
         self.status = status
         self.reason = reason
         super().__init__(reason)
+
+
+def _digit_ordinal_value(surface: str) -> int | None:
+    match = _DIGIT_ORDINAL.fullmatch(surface)
+    if match is None:
+        return None
+    value = int(match.group(1))
+    suffix = "th"
+    if not 10 <= value % 100 <= 20:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
+    return value if match.group(2) == suffix else None
 
 
 def _ssa_family(planner):
@@ -203,9 +275,7 @@ def _ssa_family(planner):
             return planner(source, clause_set)
         except DiscourseSSAError as exc:
             status = (
-                FrontendStatus.AMBIGUOUS
-                if exc.ambiguous
-                else FrontendStatus.INVALID
+                FrontendStatus.AMBIGUOUS if exc.ambiguous else FrontendStatus.INVALID
             )
             raise _Reject(status, exc.reason) from exc
 
@@ -235,7 +305,11 @@ def lex(source: str) -> tuple[Token, ...]:
         norm = text.casefold().replace("’", "'")
         number = None
         money = text.lstrip().startswith("$")
-        if _DIGIT.fullmatch(text):
+        ordinal = _DIGIT_ORDINAL.fullmatch(norm)
+        if ordinal is not None:
+            ordinal_value = _digit_ordinal_value(norm)
+            number = Fraction(ordinal_value) if ordinal_value is not None else None
+        elif _DIGIT.fullmatch(text):
             number = _fraction(text)
         elif norm in _OPERATOR_NUMBERS:
             number = _OPERATOR_NUMBERS[norm]
@@ -5520,9 +5594,18 @@ def _absolute_weighted_score_difference(
 
 
 def _surface_cardinal(token: Token) -> Fraction | None:
+    if _DIGIT_ORDINAL.fullmatch(token.norm):
+        return None
     if token.number is not None:
         return token.number
     return _LOCAL_CARDINALS.get(token.norm)
+
+
+def _surface_ordinal(token: Token) -> int | None:
+    local = _LOCAL_ORDINALS.get(token.norm)
+    if local is not None:
+        return local
+    return _digit_ordinal_value(token.norm)
 
 
 def _bound_cardinal(builder: _Builder, token: Token, unit: Unit) -> LiteralExpr:
@@ -6762,13 +6845,15 @@ def _closed_piecewise_period_cost(
     _require(
         transition.norms[transition.tokens.index(first_years) + 1] == "years"
         and transition.norms[
-            transition.tokens.index(percentage)
-            - 2 : transition.tokens.index(percentage)
+            transition.tokens.index(percentage) - 2 : transition.tokens.index(
+                percentage
+            )
         ]
         == ("increased", "by")
         and transition.norms[
-            transition.tokens.index(later_years)
-            + 1 : transition.tokens.index(later_years)
+            transition.tokens.index(later_years) + 1 : transition.tokens.index(
+                later_years
+            )
             + 3
         ]
         == ("more", "years")
@@ -7243,9 +7328,7 @@ def _shared_duration_affine_rates(
     duration_value = _surface_cardinal(first_duration)
     duration_unit = _singular(first.norms[in_index + 2])
     _require(
-        duration_value is not None
-        and duration_value > 0
-        and duration_unit == "hour",
+        duration_value is not None and duration_value > 0 and duration_unit == "hour",
         "production duration is not a positive hour count",
     )
 
@@ -7487,9 +7570,7 @@ def _closed_collection_share_completion(
     ssa = TypedDiscourseSSA(source)
     collector = ssa.entity(owner, "collector", intro.tokens[0].span)
     inventory_pronoun = inventory.norms[0]
-    ssa.resolve(
-        inventory_pronoun, role="collector", number=DiscourseNumber.SINGULAR
-    )
+    ssa.resolve(inventory_pronoun, role="collector", number=DiscourseNumber.SINGULAR)
 
     count_tokens = [
         token
@@ -7672,8 +7753,7 @@ def _typed_scale_chain_conversion(
         )
         factor = clause.tokens[times_index - 1]
         _require(
-            _surface_cardinal(factor) is not None
-            and _surface_cardinal(factor) > 0,
+            _surface_cardinal(factor) is not None and _surface_cardinal(factor) > 0,
             "scale-chain factor is not positive and exact",
             FrontendStatus.INVALID,
         )
@@ -7683,9 +7763,7 @@ def _typed_scale_chain_conversion(
             if word not in {"a", "an", "the"}
         )
         _require(predicate, "scale-chain predicate is missing")
-        parsed.append(
-            (target, clause.norms[than_index + 1], factor, predicate, clause)
-        )
+        parsed.append((target, clause.norms[than_index + 1], factor, predicate, clause))
     predicates = {row[3] for row in parsed}
     _require(
         len(predicates) == 1,
@@ -7705,9 +7783,7 @@ def _typed_scale_chain_conversion(
     base = _one_token(base_numbers, "scale-chain base magnitude is missing")
     base_index = question.tokens.index(base)
     base_predicate = tuple(
-        word
-        for word in question.norms[3:base_index]
-        if word not in {"a", "an", "the"}
+        word for word in question.norms[3:base_index] if word not in {"a", "an", "the"}
     )
     _require(
         base_predicate == predicate and base_index + 1 < len(question.tokens),
@@ -7851,9 +7927,7 @@ def _temporal_reader_affine_difference(
         ),
         reason="reader group is not uniquely introduced",
     )
-    intro_names = [
-        token.norm for token in intro.tokens if token.text[:1].isupper()
-    ]
+    intro_names = [token.norm for token in intro.tokens if token.text[:1].isupper()]
     _require(
         len(intro_names) == 2 and len(set(intro_names)) == 2,
         "reader group needs exactly two names",
@@ -8405,9 +8479,7 @@ def _ordered_affine_category_ledger(
     builder = _Builder(source, clause_set)
     ssa = TypedDiscourseSSA(source)
     days = ("monday", "tuesday", "wednesday", "thursday", "friday")
-    referents = {
-        day: ssa.entity(day, "weekday", intro.span) for day in days
-    }
+    referents = {day: ssa.entity(day, "weekday", intro.span) for day in days}
     symbols = {
         day: ssa.symbol(
             referents[day],
@@ -8503,9 +8575,7 @@ def _typed_species_scale_total(
         FrontendStatus.AMBIGUOUS,
     )
     factor_rows = [
-        token
-        for token in scale_clause.tokens
-        if _surface_cardinal(token) is not None
+        token for token in scale_clause.tokens if _surface_cardinal(token) is not None
     ]
     factor = _one_token(factor_rows, "species scale is missing")
     members = [
@@ -8555,7 +8625,7 @@ def _typed_species_scale_total(
 
     builder = _Builder(source, clause_set)
     ssa = TypedDiscourseSSA(source)
-    scientist = ssa.entity(owner_names[0], "scientist", base.span)
+    ssa.entity(owner_names[0], "scientist", base.span)
     ssa.resolve("she", role="scientist", number=DiscourseNumber.SINGULAR)
     whale = ssa.entity("whale", "species", base.span)
     shark = ssa.entity("shark", "species", scale_clause.span)
@@ -8791,14 +8861,8 @@ def _typed_scaled_measure_difference(
         and base_words != scaled_words
         and len(as_offsets) == 2
         and tuple(scaled.norms[as_offsets[-1] + 1 :]) == tuple(base_words)
-        and all(
-            token.text[:1].isupper()
-            for token in base.tokens[:base_enrolls]
-        )
-        and all(
-            token.text[:1].isupper()
-            for token in scaled.tokens[:first_comma]
-        ),
+        and all(token.text[:1].isupper() for token in base.tokens[:base_enrolls])
+        and all(token.text[:1].isupper() for token in scaled.tokens[:first_comma]),
         "enrollment names or scale source drifted",
         FrontendStatus.AMBIGUOUS,
     )
@@ -8894,7 +8958,536 @@ def _typed_scaled_measure_difference(
     )
 
 
+def _closed_phone_tree_recurrence(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Return one terminal generation from an explicitly disjoint phone tree."""
+
+    if not any(_contains(clause.norms, "phone", "tree") for clause in clause_set):
+        return None
+    question = _question(clause_set)
+    if not _contains(question.norms, "round", "of", "calls"):
+        return None
+    _require_single_target_marker(question)
+    _require(
+        len(clause_set) == 4,
+        "phone-tree recurrence has clauses outside the closed scope",
+        FrontendStatus.AMBIGUOUS,
+    )
+    tree, seed, recurrence = clause_set[:3]
+    _require(
+        tree.norms[:11]
+        == (
+            "a",
+            "phone",
+            "tree",
+            "is",
+            "used",
+            "to",
+            "contact",
+            "families",
+            "and",
+            "relatives",
+            "of",
+        )
+        and len(tree.norms) == 14
+        and tree.norms[12:] == ("deceased", "coworker"),
+        "phone-tree scope is not explicit",
+        FrontendStatus.AMBIGUOUS,
+    )
+    actor = _possessive_owner(tree.tokens[11])
+    _require(
+        len(seed.tokens) == 6
+        and seed.tokens[0].text[:1].isupper()
+        and seed.norms[:4] == (actor, "decided", "to", "call"),
+        "phone-tree seed owner drifted",
+        FrontendStatus.AMBIGUOUS,
+    )
+    seed_count = seed.tokens[4]
+    seed_item = _singular(seed.norms[5])
+    _require(
+        seed_count.number is not None
+        and seed_count.number > 0
+        and seed_count.number.denominator == 1
+        and seed_item == "family",
+        "phone-tree seed is not one positive family count",
+    )
+    _require(
+        len(recurrence.tokens) == 11
+        and recurrence.norms[:4] == ("then", "each", seed_item, "calls")
+        and recurrence.norms[5:] == ("other", "families", ",", "and", "so", "on"),
+        "phone-tree update rule is not one disjoint repeated generation",
+        FrontendStatus.AMBIGUOUS,
+    )
+    factor = recurrence.tokens[4]
+    _require(
+        factor.number is not None
+        and factor.number > 0
+        and factor.number.denominator == 1,
+        "phone-tree branch factor must be a positive integer",
+        FrontendStatus.INVALID,
+    )
+    ordinal_rows = [token for token in question.tokens if _surface_ordinal(token)]
+    ordinal = _one_token(ordinal_rows, "phone-tree round ordinal is missing")
+    ordinal_value = _surface_ordinal(ordinal)
+    assert ordinal_value is not None
+    _require(
+        question.norms
+        == (
+            "how",
+            "many",
+            "families",
+            "will",
+            "be",
+            "notified",
+            "during",
+            "the",
+            ordinal.norm,
+            "round",
+            "of",
+            "calls",
+        ),
+        "phone-tree query is not one terminal-generation target",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    expression = IterateExpr(
+        builder.literal(seed_count, COUNT),
+        builder.literal(factor, SCALAR),
+        builder.lexical_literal(ordinal, Fraction(ordinal_value), SCALAR),
+        "multiply",
+        "state_count",
+        "final",
+        Span(seed.span.start, question.span.end, source),
+    )
+    return builder.finish(expression, "closed_phone_tree_recurrence")
+
+
+def _closed_monthly_state_recurrence(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Apply one end-of-month update per named month and return baseline delta."""
+
+    question = _question(clause_set)
+    recurrence_rows = [
+        clause
+        for clause in clause_set
+        if not clause.question
+        and "doubles" in clause.norms
+        and _contains(clause.norms, "end", "of", "every", "month")
+    ]
+    if not recurrence_rows or "additional" not in question.norms:
+        return None
+    _require_single_target_marker(question)
+    _require(
+        len(clause_set) == 2 and len(recurrence_rows) == 1,
+        "monthly recurrence has clauses outside the closed scope",
+        FrontendStatus.AMBIGUOUS,
+    )
+    recurrence = recurrence_rows[0]
+    doubles = recurrence.norms.index("doubles")
+    _require(
+        doubles >= 10
+        and recurrence.norms[:7] == ("in", "one", "year", ",", "the", "number", "of")
+        and recurrence.norms[8] == "on"
+        and recurrence.norms[doubles + 1 :]
+        == ("at", "the", "end", "of", "every", "month"),
+        "monthly recurrence state, boundary, or timing is incomplete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    item = recurrence.norms[7]
+    scope = recurrence.norms[9:doubles]
+    _require(scope, "monthly recurrence scope is missing", FrontendStatus.AMBIGUOUS)
+    initial_rows = _counts(question)
+    initial = _one_token(initial_rows, "monthly recurrence initial state is missing")
+    months = [token for token in question.tokens if token.norm in _MONTH_INDEX]
+    month = _one_token(months, "monthly recurrence end month is not unique")
+    _require(
+        initial.number is not None
+        and initial.number >= 0
+        and initial.number.denominator == 1,
+        "monthly recurrence initial state must be a non-negative integer",
+        FrontendStatus.INVALID,
+    )
+    _require(
+        question.norms
+        == (
+            "if",
+            "there",
+            "are",
+            initial.norm,
+            item,
+            "on",
+            *scope,
+            "at",
+            "the",
+            "beginning",
+            "of",
+            "the",
+            "year",
+            ",",
+            "how",
+            "many",
+            "additional",
+            item,
+            "would",
+            "have",
+            "joined",
+            "by",
+            "the",
+            "end",
+            "of",
+            month.norm,
+            ",",
+            "above",
+            "and",
+            "beyond",
+            "the",
+            "number",
+            "of",
+            item,
+            "already",
+            "on",
+            *scope,
+            "at",
+            "the",
+            "beginning",
+            "of",
+            "the",
+            "year",
+        ),
+        "monthly recurrence target, baseline, or calendar scope differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    expression = IterateExpr(
+        builder.literal(initial, COUNT),
+        builder.lexical_literal(recurrence.tokens[doubles], Fraction(2), SCALAR),
+        builder.lexical_literal(month, Fraction(_MONTH_INDEX[month.norm]), SCALAR),
+        "multiply",
+        "updates",
+        "increase",
+        Span(0, len(source), source),
+    )
+    return builder.finish(expression, "closed_monthly_state_recurrence")
+
+
+def _closed_daily_geometric_total(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Sum an explicitly bounded daily geometric sequence including day one."""
+
+    question = _question(clause_set)
+    if not _contains(question.norms, "across", "all"):
+        return None
+    recurrence_rows = [
+        clause
+        for clause in clause_set
+        if not clause.question
+        and _contains(clause.norms, "each", "day", "after", "that", "through")
+        and "double" in clause.norms
+    ]
+    if not recurrence_rows:
+        return None
+    _require_single_target_marker(question)
+    _require(
+        len(clause_set) == 4 and len(recurrence_rows) == 1,
+        "daily recurrence has clauses outside the closed scope",
+        FrontendStatus.AMBIGUOUS,
+    )
+    intro, seed, recurrence = clause_set[:3]
+    actor = intro.tokens[0]
+    _require(
+        actor.text[:1].isupper()
+        and len(seed.tokens) == 9
+        and seed.norms[:1] == ("on",)
+        and seed.norms[2:5] == ("she", "counts", "just")
+        and seed.norms[6:8] == ("puffs", "of"),
+        "daily recurrence owner or initial state is incomplete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    start_day = seed.norms[1]
+    initial = seed.tokens[5]
+    _require(
+        start_day in _WEEKDAY_INDEX
+        and initial.number is not None
+        and initial.number >= 0
+        and initial.number.denominator == 1,
+        "daily recurrence initial day or count is invalid",
+        FrontendStatus.INVALID,
+    )
+    _require(
+        intro.norms
+        == (
+            actor.norm,
+            "likes",
+            "to",
+            "count",
+            "the",
+            "puffs",
+            "of",
+            seed.norms[8],
+            "in",
+            "the",
+            "sky",
+            "while",
+            "she",
+            "eats",
+            "her",
+            "lunch",
+            "outside",
+            "at",
+            "school",
+        ),
+        "daily recurrence antecedent or item drifted",
+        FrontendStatus.AMBIGUOUS,
+    )
+    through = recurrence.norms.index("through")
+    end_day = (
+        recurrence.norms[through + 1] if through + 1 < len(recurrence.tokens) else ""
+    )
+    _require(
+        end_day in _WEEKDAY_INDEX
+        and recurrence.norms
+        == (
+            "each",
+            "day",
+            "after",
+            "that",
+            "through",
+            end_day,
+            ",",
+            "though",
+            ",",
+            "she",
+            "sees",
+            "double",
+            "the",
+            "number",
+            "of",
+            seed.norms[8],
+            "in",
+            "the",
+            "sky",
+            "as",
+            "the",
+            "day",
+            "before",
+        ),
+        "daily recurrence update or prior-state reference differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    cardinal_rows = [
+        token for token in question.tokens if _surface_cardinal(token) is not None
+    ]
+    state_count = _one_token(cardinal_rows, "daily recurrence state count is missing")
+    count_value = _surface_cardinal(state_count)
+    assert count_value is not None
+    _require(
+        count_value.denominator == 1
+        and count_value > 0
+        and _WEEKDAY_INDEX[end_day] - _WEEKDAY_INDEX[start_day] + 1 == count_value,
+        "daily recurrence horizon disagrees with its weekday boundaries",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        question.norms
+        == (
+            "at",
+            "the",
+            "end",
+            "of",
+            "the",
+            "week",
+            ",",
+            "how",
+            "many",
+            seed.norms[8],
+            "will",
+            "she",
+            "have",
+            "counted",
+            "in",
+            "the",
+            "sky",
+            "at",
+            "lunch",
+            "across",
+            "all",
+            state_count.norm,
+            "days",
+        ),
+        "daily recurrence query is not one cumulative target",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    expression = IterateExpr(
+        builder.literal(initial, COUNT),
+        builder.lexical_literal(
+            recurrence.tokens[recurrence.norms.index("double")], Fraction(2), SCALAR
+        ),
+        builder.lexical_literal(state_count, count_value, SCALAR),
+        "multiply",
+        "state_count",
+        "cumulative",
+        Span(seed.span.start, question.span.end, source),
+    )
+    return builder.finish(expression, "closed_daily_geometric_total")
+
+
+def _fixed_base_percentage_recurrence(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Apply a percentage of the original base once per explicit period."""
+
+    rule_rows = [
+        clause
+        for clause in clause_set
+        if not clause.question
+        and _contains(clause.norms, "of", "the", "original", "price", "every", "year")
+        and "increases" in clause.norms
+    ]
+    if not rule_rows:
+        return None
+    question = _question(clause_set)
+    _require_single_target_marker(question)
+    _require(
+        len(clause_set) == 5 and len(rule_rows) == 1,
+        "fixed-base recurrence has clauses outside the closed scope",
+        FrontendStatus.AMBIGUOUS,
+    )
+    title, intro, rule, rounding = (
+        clause_set[0],
+        clause_set[1],
+        rule_rows[0],
+        clause_set[4],
+    )
+    _require(
+        title.norms == ("mrs",)
+        and intro.tokens[0].text[:1].isupper()
+        and intro.norms[1:]
+        == (
+            "owns",
+            "a",
+            "grocery",
+            "store",
+            "that",
+            "sells",
+            "different",
+            "fruits",
+            "and",
+            "vegetables",
+            ",",
+            "which",
+            "includes",
+            rule.norms[3],
+        )
+        and rounding.norms == ("round", "to", "the", "nearest", "integer"),
+        "fixed-base recurrence owner, item, or output directive differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    item = rule.norms[3]
+    percentages = _counts(rule)
+    percentage = _one_token(percentages, "fixed-base percentage is missing")
+    _require(
+        rule.norms
+        == (
+            "the",
+            "price",
+            "of",
+            item,
+            "in",
+            "the",
+            "grocery",
+            "store",
+            "increases",
+            "by",
+            percentage.norm,
+            "of",
+            "the",
+            "original",
+            "price",
+            "every",
+            "year",
+        )
+        and percentage.number is not None
+        and percentage.number >= 0
+        and _has_explicit_percent_marker(source, percentage),
+        "fixed-base percentage must be non-negative and explicitly marked",
+        FrontendStatus.INVALID,
+    )
+    price_rows = _money_tokens(question)
+    initial = _one_token(price_rows, "fixed-base initial price is missing")
+    count_rows = [
+        token
+        for index, token in enumerate(question.tokens)
+        if index > 0
+        and index + 1 < len(question.tokens)
+        and question.norms[index - 1] == "after"
+        and _singular(question.norms[index + 1]) == "year"
+        and _surface_cardinal(token) is not None
+        and not token.money
+    ]
+    count = _one_token(count_rows, "fixed-base period count is missing")
+    count_value = _surface_cardinal(count)
+    assert count_value is not None
+    _require(
+        count_value >= 0 and count_value.denominator == 1,
+        "fixed-base period count must be a non-negative integer",
+        FrontendStatus.INVALID,
+    )
+    _require(
+        question.norms
+        == (
+            "what",
+            "would",
+            "be",
+            "the",
+            "price",
+            "of",
+            item,
+            "after",
+            count.norm,
+            "years",
+            "if",
+            "it",
+            "was",
+            initial.norm,
+            "initially",
+        ),
+        "fixed-base recurrence item, horizon, or initial state differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    assert initial.number is not None and percentage.number is not None
+    rounded_value = initial.number * (
+        1 + count_value * percentage.number * PERCENT.scale
+    )
+    _require(
+        rounded_value.denominator == 1,
+        "nearest-integer rounding would change the exact recurrence value",
+    )
+
+    builder = _Builder(source, clause_set)
+    expression = IterateExpr(
+        builder.literal(initial, MONEY),
+        builder.literal(percentage, PERCENT),
+        _bound_cardinal(builder, count, SCALAR),
+        "add_initial_fraction",
+        "updates",
+        "final",
+        Span(rule.span.start, question.span.end, source),
+    )
+    return builder.finish(expression, "fixed_base_percentage_recurrence")
+
+
 _PLANNERS = (
+    _closed_phone_tree_recurrence,
+    _closed_monthly_state_recurrence,
+    _closed_daily_geometric_total,
+    _fixed_base_percentage_recurrence,
     _closed_value_transition_profit,
     _closed_repeated_unit_price_ledger,
     _closed_affine_two_part_partition,

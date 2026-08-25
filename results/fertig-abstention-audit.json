@@ -21,19 +21,19 @@
       "target_parse_failed": 57
     },
     "scope": {
-      "exact_recovery_scope": 66,
-      "grammar_scope": 89,
-      "potential_coreference_scope": 75
+      "exact_recovery_scope": 70,
+      "grammar_scope": 86,
+      "potential_coreference_scope": 74
     },
     "structural": {
-      "exact_recovery": 66,
-      "numeric_clause_unsupported": 82,
-      "numeric_pronoun_ambiguous": 72,
+      "exact_recovery": 70,
+      "numeric_clause_unsupported": 80,
+      "numeric_pronoun_ambiguous": 71,
       "question_pronoun_ambiguous": 3,
       "relation_ambiguous": 1,
       "relation_invalid": 0,
       "relation_unsupported": 0,
-      "target_unsupported": 6
+      "target_unsupported": 5
     }
   },
   "classification_inputs": [
@@ -42,14 +42,15 @@
     "vendored legacy binding diagnostics",
     "structural parse diagnostics"
   ],
-  "current_exact_recoveries": 66,
-  "current_remaining_abstentions": 164,
+  "current_exact_recoveries": 70,
+  "current_remaining_abstentions": 160,
   "exact_recovery_attribution": {
     "attribution": "The current total is cumulative across every listed exact mechanism; it is not attributed to one planner wave.",
-    "current_total": 66,
+    "current_total": 70,
     "identity": {
-      "count": 66,
+      "count": 70,
       "indices": [
+        547,
         550,
         574,
         578,
@@ -81,6 +82,7 @@
         782,
         797,
         802,
+        810,
         819,
         823,
         825,
@@ -104,7 +106,9 @@
         944,
         959,
         992,
+        1016,
         1064,
+        1172,
         1192,
         1194,
         1217,
@@ -117,11 +121,15 @@
         1300,
         1304
       ],
-      "indices_sha256": "ab17e011da92291b843fabecf3aa633c8df612d93c6ebf4635801f7ca01247d4"
+      "indices_sha256": "69e178b89fdf0ef8ea54f4f793c17dcfd906f97c1eb051177a6a53c48b5abfd8"
     },
     "mechanism_identity": {
-      "count": 66,
+      "count": 70,
       "rows": [
+        {
+          "index": 547,
+          "mechanism": "signed_event:closed_phone_tree_recurrence"
+        },
         {
           "index": 550,
           "mechanism": "signed_event:discounted_purchase_ledger"
@@ -247,6 +255,10 @@
           "mechanism": "signed_event:closed_collection_share_completion"
         },
         {
+          "index": 810,
+          "mechanism": "signed_event:closed_monthly_state_recurrence"
+        },
+        {
           "index": 819,
           "mechanism": "signed_event:equal_share_residual"
         },
@@ -339,8 +351,16 @@
           "mechanism": "signed_event:calendar_frequency_ledger"
         },
         {
+          "index": 1016,
+          "mechanism": "signed_event:fixed_base_percentage_recurrence"
+        },
+        {
           "index": 1064,
           "mechanism": "signed_event:ordered_affine_category_ledger"
+        },
+        {
+          "index": 1172,
+          "mechanism": "signed_event:closed_daily_geometric_total"
         },
         {
           "index": 1192,
@@ -387,7 +407,7 @@
           "mechanism": "signed_event:typed_scaled_measure_difference"
         }
       ],
-      "rows_sha256": "f5bff03afe10d7abdb7bb6018243b67860a910ac3ab2172de30c5f509e7e2c89"
+      "rows_sha256": "3439d71b0cb134c86330c3fbe9c965d42f4d90430acb2f45e19d652de4f28feb"
     },
     "mechanisms": {
       "clause_compiler": {
@@ -503,6 +523,13 @@
         ],
         "indices_sha256": "df50058936439d3cd548a994e53d417d241fac1293b7a148b757e5b33dc800b7"
       },
+      "signed_event:closed_daily_geometric_total": {
+        "count": 1,
+        "indices": [
+          1172
+        ],
+        "indices_sha256": "26bb5b89567a53e6f9cbd5c6d03afb4386da686eda408eef90c773a8656edf64"
+      },
       "signed_event:closed_disjoint_week_schedule": {
         "count": 1,
         "indices": [
@@ -510,12 +537,26 @@
         ],
         "indices_sha256": "52f97f163880dc38bb48165ad68fcf286f9ecd5fba7f2be409648b37c95d7f15"
       },
+      "signed_event:closed_monthly_state_recurrence": {
+        "count": 1,
+        "indices": [
+          810
+        ],
+        "indices_sha256": "91b13cc40d45f95ee98caf0e216908851fc11c5f9e2075956c43e8f9e2a5a26b"
+      },
       "signed_event:closed_named_scale_group_total": {
         "count": 1,
         "indices": [
           959
         ],
         "indices_sha256": "5f64fe9bb649901f00414cdcd73049580316f520e4e323636c9ffe7b51621d9e"
+      },
+      "signed_event:closed_phone_tree_recurrence": {
+        "count": 1,
+        "indices": [
+          547
+        ],
+        "indices_sha256": "1051c287a283ee53dbe624184fbff18506335ddb4d4eb60da86e37c8e289f812"
       },
       "signed_event:closed_piecewise_period_cost": {
         "count": 1,
@@ -622,6 +663,13 @@
           1192
         ],
         "indices_sha256": "18c72de7f24ee18c0192ef0ea06505aa5b458a66e596a579b331a2d040d13ca7"
+      },
+      "signed_event:fixed_base_percentage_recurrence": {
+        "count": 1,
+        "indices": [
+          1016
+        ],
+        "indices_sha256": "c67b55198d5d6378eb6718de259097965ef2eecdc6200bc3e2e26cfe48738a80"
       },
       "signed_event:fractional_group_consumption_remainder": {
         "count": 1,
@@ -850,7 +898,8 @@
   },
   "items": [
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:closed_phone_tree_recurrence",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 547,
@@ -866,9 +915,9 @@
       },
       "question_sha256": "eee04241756a601db97caada1e26d6717b974e1f884c0d793558bc645c3cfee4",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 83:113",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: closed_phone_tree_recurrence",
+        "status": "parsed"
       }
     },
     {
@@ -1593,7 +1642,8 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:closed_monthly_state_recurrence",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 810,
@@ -1609,9 +1659,9 @@
       },
       "question_sha256": "26b92d9e2e3a41b4b49eb3b173345e2336b9a2d1f9a0eaea2d23c4789f711c96",
       "structural": {
-        "category": "target_unsupported",
-        "reason": "unsupported target at 81:298",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: closed_monthly_state_recurrence",
+        "status": "parsed"
       }
     },
     {
@@ -2590,7 +2640,8 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:fixed_base_percentage_recurrence",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1016,
@@ -2601,9 +2652,9 @@
       },
       "question_sha256": "a7d78e5a73eb736fe5dc2312e0fae0d1d67767b9ae25390ee45bdc8bd8b6495d",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 102:192",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: fixed_base_percentage_recurrence",
+        "status": "parsed"
       }
     },
     {
@@ -3438,7 +3489,8 @@
       }
     },
     {
-      "current_scope": "potential_coreference_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:closed_daily_geometric_total",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1172,
@@ -3454,9 +3506,9 @@
       },
       "question_sha256": "8946bef80dca27a607e682ab7218572f60dea9b170a1c154381f5a9e4f7d3336",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: closed_daily_geometric_total",
+        "status": "parsed"
       }
     },
     {
@@ -5686,7 +5738,7 @@
       }
     }
   ],
-  "items_sha256": "00de1d9f045fd8a9778e114cacbdb0c401e281516f26ce989cb82b6d70794494",
+  "items_sha256": "60c362fc428d7f9868dbba3aef1648800610a69f4508f9f7c07f16ee10f48636",
   "provenance": {
     "classification_contract": {
       "gold_used_for_classification": false,
@@ -5712,7 +5764,7 @@
     "files": {
       "audit_runner": {
         "path": "scripts/fertig_abstention_audit.py",
-        "sha256": "95b32579cecc7dfec3e93080f96f7bf06965bde5166486b0f0454e81074c7c52"
+        "sha256": "5bd9ce54eb10386281c60a4cb8c0dd06df3baf0a1890687e7e1a6af8ab5185c7"
       },
       "benchmark_report": {
         "path": "results/bench_gsm8k.json",
@@ -5724,11 +5776,11 @@
       },
       "signed_event_frontend": {
         "path": "src/immer/cognition/fertig/signed_event_frontend.py",
-        "sha256": "846647a980d7816247ac8e59b70e83c8faa97effc34a4cb26443c15bde229037"
+        "sha256": "e1d259ad0b8d7ffb830223916401e24b01aa02db9a961d271e810142bc3f372f"
       },
       "signed_expression_compiler": {
         "path": "src/immer/cognition/fertig/signed_expression.py",
-        "sha256": "a6dc556ada18d86f835245a4622d11f8f707a97aeccca0f9617cf67c9022cca2"
+        "sha256": "7ec50e2428437d4f4df00ff988f7c4924d57f54ce645f80726a5e3469032384c"
       },
       "structural_parser": {
         "path": "src/immer/cognition/fertig/structural.py",
@@ -5736,255 +5788,78 @@
       },
       "typed_discourse_ssa": {
         "path": "src/immer/cognition/fertig/discourse_ssa.py",
-        "sha256": "999d9cf507a3d37cf6891c02bce58d087a2ba53546fcdbe941053db177353af7"
+        "sha256": "9257473f49ae874f0ed784087af66431b9fe4eb02c08720f46be082b4735b592"
       }
     }
   },
   "recovery_wave_delta": {
-    "added_exact_recoveries": 9,
+    "added_exact_recoveries": 4,
     "added_identity": {
-      "count": 9,
+      "count": 4,
       "indices": [
-        627,
-        782,
-        992,
-        1192,
-        1217,
-        1246,
-        1253,
-        1293,
-        1300
+        547,
+        810,
+        1016,
+        1172
       ],
-      "indices_sha256": "6146f3db855b3f96f9059459d787bf1e1a05732ce859094fa42d1d3782a1b36b"
+      "indices_sha256": "ede36b28266846ab6aeb776ab6cd7440d1cbfa4fd39cf9589cdc828e504bf125"
     },
-    "attribution": "66 exact recoveries after closed-calendar-schedule-algebra/v1 = 57 previously sealed + 9 added; this wave claims 9, not 66.",
-    "current_exact_recoveries": 66,
+    "attribution": "70 exact recoveries after closed-recurrence-algebra/v1 = 66 previously sealed + 4 added; this wave claims 4, not 70.",
+    "current_exact_recoveries": 70,
     "mechanism_identity": {
-      "count": 9,
+      "count": 4,
       "rows": [
         {
-          "index": 627,
-          "mechanism": "signed_event:closed_week_complement_schedule"
+          "index": 547,
+          "mechanism": "signed_event:closed_phone_tree_recurrence"
         },
         {
-          "index": 782,
-          "mechanism": "signed_event:closed_disjoint_week_schedule"
+          "index": 810,
+          "mechanism": "signed_event:closed_monthly_state_recurrence"
         },
         {
-          "index": 992,
-          "mechanism": "signed_event:calendar_frequency_ledger"
+          "index": 1016,
+          "mechanism": "signed_event:fixed_base_percentage_recurrence"
         },
         {
-          "index": 1192,
-          "mechanism": "signed_event:explicit_weekly_pay_schedule"
-        },
-        {
-          "index": 1217,
-          "mechanism": "signed_event:closed_piecewise_period_cost"
-        },
-        {
-          "index": 1246,
-          "mechanism": "signed_event:explicit_period_score_total"
-        },
-        {
-          "index": 1253,
-          "mechanism": "signed_event:canonical_duration_rate_conversion"
-        },
-        {
-          "index": 1293,
-          "mechanism": "signed_event:canonical_weekly_sales_total"
-        },
-        {
-          "index": 1300,
-          "mechanism": "signed_event:explicit_weekday_exception_schedule"
+          "index": 1172,
+          "mechanism": "signed_event:closed_daily_geometric_total"
         }
       ],
-      "rows_sha256": "eb1eb7de1d17ea290492d4991dbe7557bb7a0b33ee5e43fd7a0f2f31feda90cb"
+      "rows_sha256": "ba3b2442320639213d729609e46aaeafa5b484377789aec782004cd40d0e01de"
     },
     "mechanisms": {
-      "signed_event:calendar_frequency_ledger": {
+      "signed_event:closed_daily_geometric_total": {
         "count": 1,
         "indices": [
-          992
+          1172
         ],
-        "indices_sha256": "941b03e3e934ef127438c3392525c82a3232750484e9438c97026434d0b5a0ea"
+        "indices_sha256": "26bb5b89567a53e6f9cbd5c6d03afb4386da686eda408eef90c773a8656edf64"
       },
-      "signed_event:canonical_duration_rate_conversion": {
+      "signed_event:closed_monthly_state_recurrence": {
         "count": 1,
         "indices": [
-          1253
+          810
         ],
-        "indices_sha256": "d32a2b9bbf7c2e71e0cf4059d6f5be715af5419fd7f2567036796365a4c47b42"
+        "indices_sha256": "91b13cc40d45f95ee98caf0e216908851fc11c5f9e2075956c43e8f9e2a5a26b"
       },
-      "signed_event:canonical_weekly_sales_total": {
+      "signed_event:closed_phone_tree_recurrence": {
         "count": 1,
         "indices": [
-          1293
+          547
         ],
-        "indices_sha256": "ecdee17ab95f39fc776e75d51a7ba93ddbe1a2aa53f8dc6159b9a87a1b15b513"
+        "indices_sha256": "1051c287a283ee53dbe624184fbff18506335ddb4d4eb60da86e37c8e289f812"
       },
-      "signed_event:closed_disjoint_week_schedule": {
+      "signed_event:fixed_base_percentage_recurrence": {
         "count": 1,
         "indices": [
-          782
+          1016
         ],
-        "indices_sha256": "52f97f163880dc38bb48165ad68fcf286f9ecd5fba7f2be409648b37c95d7f15"
-      },
-      "signed_event:closed_piecewise_period_cost": {
-        "count": 1,
-        "indices": [
-          1217
-        ],
-        "indices_sha256": "b36abcbc9280940c774bfd7a77568727f76fd3c85424e60d6857a85bfd0589eb"
-      },
-      "signed_event:closed_week_complement_schedule": {
-        "count": 1,
-        "indices": [
-          627
-        ],
-        "indices_sha256": "f7b8891be1e6cb6efa8009ff02c63b4801b851ada08d32115f117001e8d48cd5"
-      },
-      "signed_event:explicit_period_score_total": {
-        "count": 1,
-        "indices": [
-          1246
-        ],
-        "indices_sha256": "ee6933d828bdd446952f6218edfbd927c1ee74bdc381ec99141e772e5e5dd875"
-      },
-      "signed_event:explicit_weekday_exception_schedule": {
-        "count": 1,
-        "indices": [
-          1300
-        ],
-        "indices_sha256": "25de4efa7e8adc5d7c45cfb055e8b9def78351a822a6839b854704aad0dc5fbf"
-      },
-      "signed_event:explicit_weekly_pay_schedule": {
-        "count": 1,
-        "indices": [
-          1192
-        ],
-        "indices_sha256": "18c72de7f24ee18c0192ef0ea06505aa5b458a66e596a579b331a2d040d13ca7"
+        "indices_sha256": "c67b55198d5d6378eb6718de259097965ef2eecdc6200bc3e2e26cfe48738a80"
       }
     },
-    "previously_sealed_exact_recoveries": 57,
+    "previously_sealed_exact_recoveries": 66,
     "previously_sealed_identity": {
-      "count": 57,
-      "indices": [
-        550,
-        574,
-        578,
-        587,
-        603,
-        610,
-        613,
-        619,
-        631,
-        643,
-        651,
-        672,
-        682,
-        692,
-        694,
-        701,
-        722,
-        724,
-        731,
-        745,
-        746,
-        747,
-        754,
-        763,
-        770,
-        778,
-        780,
-        797,
-        802,
-        819,
-        823,
-        825,
-        833,
-        836,
-        837,
-        840,
-        844,
-        861,
-        865,
-        868,
-        883,
-        892,
-        900,
-        901,
-        913,
-        916,
-        924,
-        930,
-        934,
-        944,
-        959,
-        1064,
-        1194,
-        1219,
-        1252,
-        1261,
-        1304
-      ],
-      "indices_sha256": "4dbdb9238a05632ea3276234f4f7dedcf30e44b556eeb2c4fda96dbf9bb8b062"
-    },
-    "wave_id": "closed-calendar-schedule-algebra/v1"
-  },
-  "recovery_wave_history": {
-    "attribution": "66 current exact recoveries = 42 sealed baseline + 5 by ground-operators-conservative-coreference/v1 + 10 by typed-discourse-ssa-affine/v1 + 9 by closed-calendar-schedule-algebra/v1; wave deltas are disjoint and cumulative.",
-    "baseline_exact_recoveries": 42,
-    "baseline_identity": {
-      "count": 42,
-      "indices": [
-        550,
-        574,
-        587,
-        610,
-        613,
-        619,
-        631,
-        643,
-        651,
-        682,
-        692,
-        694,
-        701,
-        722,
-        724,
-        731,
-        745,
-        746,
-        747,
-        754,
-        763,
-        770,
-        778,
-        797,
-        819,
-        823,
-        825,
-        836,
-        837,
-        840,
-        844,
-        861,
-        865,
-        868,
-        883,
-        892,
-        901,
-        913,
-        916,
-        924,
-        930,
-        934
-      ],
-      "indices_sha256": "8f92f3bf70d392efbf07d8513fb0a9d67720abba550c0131dc807cf55b964310"
-    },
-    "current_exact_recoveries": 66,
-    "current_identity": {
       "count": 66,
       "indices": [
         550,
@@ -6055,6 +5930,136 @@
         1304
       ],
       "indices_sha256": "ab17e011da92291b843fabecf3aa633c8df612d93c6ebf4635801f7ca01247d4"
+    },
+    "wave_id": "closed-recurrence-algebra/v1"
+  },
+  "recovery_wave_history": {
+    "attribution": "70 current exact recoveries = 42 sealed baseline + 5 by ground-operators-conservative-coreference/v1 + 10 by typed-discourse-ssa-affine/v1 + 9 by closed-calendar-schedule-algebra/v1 + 4 by closed-recurrence-algebra/v1; wave deltas are disjoint and cumulative.",
+    "baseline_exact_recoveries": 42,
+    "baseline_identity": {
+      "count": 42,
+      "indices": [
+        550,
+        574,
+        587,
+        610,
+        613,
+        619,
+        631,
+        643,
+        651,
+        682,
+        692,
+        694,
+        701,
+        722,
+        724,
+        731,
+        745,
+        746,
+        747,
+        754,
+        763,
+        770,
+        778,
+        797,
+        819,
+        823,
+        825,
+        836,
+        837,
+        840,
+        844,
+        861,
+        865,
+        868,
+        883,
+        892,
+        901,
+        913,
+        916,
+        924,
+        930,
+        934
+      ],
+      "indices_sha256": "8f92f3bf70d392efbf07d8513fb0a9d67720abba550c0131dc807cf55b964310"
+    },
+    "current_exact_recoveries": 70,
+    "current_identity": {
+      "count": 70,
+      "indices": [
+        547,
+        550,
+        574,
+        578,
+        587,
+        603,
+        610,
+        613,
+        619,
+        627,
+        631,
+        643,
+        651,
+        672,
+        682,
+        692,
+        694,
+        701,
+        722,
+        724,
+        731,
+        745,
+        746,
+        747,
+        754,
+        763,
+        770,
+        778,
+        780,
+        782,
+        797,
+        802,
+        810,
+        819,
+        823,
+        825,
+        833,
+        836,
+        837,
+        840,
+        844,
+        861,
+        865,
+        868,
+        883,
+        892,
+        900,
+        901,
+        913,
+        916,
+        924,
+        930,
+        934,
+        944,
+        959,
+        992,
+        1016,
+        1064,
+        1172,
+        1192,
+        1194,
+        1217,
+        1219,
+        1246,
+        1252,
+        1253,
+        1261,
+        1293,
+        1300,
+        1304
+      ],
+      "indices_sha256": "69e178b89fdf0ef8ea54f4f793c17dcfd906f97c1eb051177a6a53c48b5abfd8"
     },
     "waves": [
       {
@@ -6565,10 +6570,151 @@
           "indices_sha256": "4dbdb9238a05632ea3276234f4f7dedcf30e44b556eeb2c4fda96dbf9bb8b062"
         },
         "wave_id": "closed-calendar-schedule-algebra/v1"
+      },
+      {
+        "added_exact_recoveries": 4,
+        "added_identity": {
+          "count": 4,
+          "indices": [
+            547,
+            810,
+            1016,
+            1172
+          ],
+          "indices_sha256": "ede36b28266846ab6aeb776ab6cd7440d1cbfa4fd39cf9589cdc828e504bf125"
+        },
+        "attribution": "70 exact recoveries after closed-recurrence-algebra/v1 = 66 previously sealed + 4 added; this wave claims 4, not 70.",
+        "current_exact_recoveries": 70,
+        "mechanism_identity": {
+          "count": 4,
+          "rows": [
+            {
+              "index": 547,
+              "mechanism": "signed_event:closed_phone_tree_recurrence"
+            },
+            {
+              "index": 810,
+              "mechanism": "signed_event:closed_monthly_state_recurrence"
+            },
+            {
+              "index": 1016,
+              "mechanism": "signed_event:fixed_base_percentage_recurrence"
+            },
+            {
+              "index": 1172,
+              "mechanism": "signed_event:closed_daily_geometric_total"
+            }
+          ],
+          "rows_sha256": "ba3b2442320639213d729609e46aaeafa5b484377789aec782004cd40d0e01de"
+        },
+        "mechanisms": {
+          "signed_event:closed_daily_geometric_total": {
+            "count": 1,
+            "indices": [
+              1172
+            ],
+            "indices_sha256": "26bb5b89567a53e6f9cbd5c6d03afb4386da686eda408eef90c773a8656edf64"
+          },
+          "signed_event:closed_monthly_state_recurrence": {
+            "count": 1,
+            "indices": [
+              810
+            ],
+            "indices_sha256": "91b13cc40d45f95ee98caf0e216908851fc11c5f9e2075956c43e8f9e2a5a26b"
+          },
+          "signed_event:closed_phone_tree_recurrence": {
+            "count": 1,
+            "indices": [
+              547
+            ],
+            "indices_sha256": "1051c287a283ee53dbe624184fbff18506335ddb4d4eb60da86e37c8e289f812"
+          },
+          "signed_event:fixed_base_percentage_recurrence": {
+            "count": 1,
+            "indices": [
+              1016
+            ],
+            "indices_sha256": "c67b55198d5d6378eb6718de259097965ef2eecdc6200bc3e2e26cfe48738a80"
+          }
+        },
+        "previously_sealed_exact_recoveries": 66,
+        "previously_sealed_identity": {
+          "count": 66,
+          "indices": [
+            550,
+            574,
+            578,
+            587,
+            603,
+            610,
+            613,
+            619,
+            627,
+            631,
+            643,
+            651,
+            672,
+            682,
+            692,
+            694,
+            701,
+            722,
+            724,
+            731,
+            745,
+            746,
+            747,
+            754,
+            763,
+            770,
+            778,
+            780,
+            782,
+            797,
+            802,
+            819,
+            823,
+            825,
+            833,
+            836,
+            837,
+            840,
+            844,
+            861,
+            865,
+            868,
+            883,
+            892,
+            900,
+            901,
+            913,
+            916,
+            924,
+            930,
+            934,
+            944,
+            959,
+            992,
+            1064,
+            1192,
+            1194,
+            1217,
+            1219,
+            1246,
+            1252,
+            1253,
+            1261,
+            1293,
+            1300,
+            1304
+          ],
+          "indices_sha256": "ab17e011da92291b843fabecf3aa633c8df612d93c6ebf4635801f7ca01247d4"
+        },
+        "wave_id": "closed-recurrence-algebra/v1"
       }
     ]
   },
-  "report_revision": 6,
-  "report_sha256": "0cd977b426cc75814a11accde831d9e2ae774f750151ec4b0f17280e36503400",
+  "report_revision": 7,
+  "report_sha256": "37069477ec7b29bc3f298cf1a999d8e990421decdc2b96c23de26b350cf895fa",
   "schema": "immer.fertig-abstention-audit/v2"
 }

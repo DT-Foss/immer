@@ -220,6 +220,49 @@ class UnitConversionExpr:
         _span(self.span)
 
 
+_ITERATE_RULES = frozenset({"multiply", "add_initial_fraction", "add_current_fraction"})
+_ITERATE_COUNT_MODES = frozenset({"updates", "state_count"})
+_ITERATE_OUTPUTS = frozenset({"final", "increase", "cumulative"})
+
+
+@dataclass(frozen=True, slots=True)
+class IterateExpr:
+    """Exact finite iteration of one fully grounded scalar update rule.
+
+    ``multiply`` means ``x[k+1] = factor * x[k]``.
+    ``add_initial_fraction`` means ``x[k+1] = x[k] + factor * x[0]``.
+    ``add_current_fraction`` means ``x[k+1] = x[k] + factor * x[k]``.
+
+    ``state_count`` includes the initial state, while ``updates`` counts only
+    transitions after it.  Keeping this distinction in the AST prevents the
+    common round-one/month-one off-by-one error.  Cumulative output is admitted
+    only with an explicit state count.
+    """
+
+    initial: Expression
+    factor: Expression
+    count: Expression
+    rule: str
+    count_mode: str
+    output: str
+    span: Span
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.factor, LiteralExpr):
+            raise TypeError("iteration factor must be a ground LiteralExpr")
+        if not isinstance(self.count, LiteralExpr):
+            raise TypeError("iteration count must be a ground LiteralExpr")
+        if self.rule not in _ITERATE_RULES:
+            raise ValueError("unsupported iteration rule")
+        if self.count_mode not in _ITERATE_COUNT_MODES:
+            raise ValueError("unsupported iteration count mode")
+        if self.output not in _ITERATE_OUTPUTS:
+            raise ValueError("unsupported iteration output")
+        if self.output == "cumulative" and self.count_mode != "state_count":
+            raise ValueError("cumulative iteration requires an explicit state count")
+        _span(self.span)
+
+
 Expression: TypeAlias = (
     LiteralExpr
     | RefExpr
@@ -232,6 +275,7 @@ Expression: TypeAlias = (
     | GroundProductExpr
     | ClosedShareExpr
     | UnitConversionExpr
+    | IterateExpr
 )
 
 
@@ -311,6 +355,7 @@ _EXPRESSION_TYPES = (
     GroundProductExpr,
     ClosedShareExpr,
     UnitConversionExpr,
+    IterateExpr,
 )
 
 
@@ -350,6 +395,12 @@ def _children(expr: Expression) -> tuple[tuple[str, Expression], ...]:
         return (("value", expr.value),)
     if isinstance(expr, ClosedShareExpr):
         return (("existing", expr.existing), ("share", expr.share))
+    if isinstance(expr, IterateExpr):
+        return (
+            ("initial", expr.initial),
+            ("factor", expr.factor),
+            ("count", expr.count),
+        )
     raise AssertionError("closed expression union exhausted")
 
 
@@ -608,7 +659,68 @@ class _Compiler:
             if not source.compatible(expr.unit):
                 raise ExpressionCompileError("conversion units are incompatible")
             return expr.unit
+        if isinstance(expr, IterateExpr):
+            initial = self._unit(expr.initial)
+            factor = self._unit(expr.factor)
+            count = self._unit(expr.count)
+            if factor.dimensions:
+                raise ExpressionCompileError("iteration factor must be dimensionless")
+            if count.dimensions:
+                raise ExpressionCompileError("iteration count must be dimensionless")
+            return initial
         raise AssertionError("closed expression union exhausted")
+
+    @staticmethod
+    def _iteration_count(value: Fraction, unit: Unit, mode: str) -> int:
+        normalized = value * unit.scale
+        if normalized.denominator != 1 or normalized < 0:
+            raise ExpressionCompileError(
+                "iteration count must be a non-negative integer"
+            )
+        count = normalized.numerator
+        if count > 4096:
+            raise ExpressionCompileError("iteration count exceeds the exact bound")
+        if mode == "state_count":
+            if count == 0:
+                raise ExpressionCompileError(
+                    "iteration state count must include the initial state"
+                )
+            return count - 1
+        return count
+
+    def _iterate_ground(self, expr: IterateExpr) -> tuple[Fraction, Unit]:
+        initial, initial_unit = self._ground_value(expr.initial, allow_references=True)
+        factor, factor_unit = self._ground_value(expr.factor, allow_references=True)
+        count, count_unit = self._ground_value(expr.count, allow_references=True)
+        if factor_unit.dimensions:
+            raise ExpressionCompileError("iteration factor must be dimensionless")
+        if count_unit.dimensions:
+            raise ExpressionCompileError("iteration count must be dimensionless")
+        scalar = factor * factor_unit.scale
+        updates = self._iteration_count(count, count_unit, expr.count_mode)
+
+        current = initial
+        cumulative = initial
+        for _ in range(updates):
+            if expr.rule == "multiply":
+                current *= scalar
+            elif expr.rule == "add_initial_fraction":
+                current += initial * scalar
+            elif expr.rule == "add_current_fraction":
+                current += current * scalar
+            else:  # guarded by IterateExpr.__post_init__
+                raise AssertionError("closed iteration rule union exhausted")
+            cumulative += current
+
+        if expr.output == "final":
+            value = current
+        elif expr.output == "increase":
+            value = current - initial
+        elif expr.output == "cumulative":
+            value = cumulative
+        else:  # guarded by IterateExpr.__post_init__
+            raise AssertionError("closed iteration output union exhausted")
+        return value, initial_unit
 
     def _ground_value(
         self, expr: Expression, *, allow_references: bool = False
@@ -701,6 +813,8 @@ class _Compiler:
             if not source.compatible(expr.unit):
                 raise ExpressionCompileError("conversion units are incompatible")
             return value * source.scale / expr.unit.scale, expr.unit
+        if isinstance(expr, IterateExpr):
+            return self._iterate_ground(expr)
         raise AssertionError("closed expression union exhausted")
 
     def _build_variables(self) -> None:
@@ -783,8 +897,7 @@ class _Compiler:
                     "ground multi-reference product must be dimensionless"
                 )
             atoms = [
-                self._lower(factor, integral_counts=False)
-                for factor in expr.factors
+                self._lower(factor, integral_counts=False) for factor in expr.factors
             ]
             variable_offsets = [
                 index for index, atom in enumerate(atoms) if isinstance(atom, Variable)
@@ -888,9 +1001,7 @@ class _Compiler:
                     "closed share must be strictly between zero and one"
                 )
             unit = self._unit(expr)
-            result = self._auxiliary(
-                unit, expr.span, integral_counts=integral_counts
-            )
+            result = self._auxiliary(unit, expr.span, integral_counts=integral_counts)
             self.constraints.append(
                 Balance(
                     (Term(result, 1 - share),),
@@ -905,6 +1016,85 @@ class _Compiler:
                 expr.unit, expr.span, integral_counts=integral_counts
             )
             self.constraints.append(Assign(result, atom, expr.span))
+            return result
+        if isinstance(expr, IterateExpr):
+            initial = self._lower(expr.initial, integral_counts=integral_counts)
+            factor = self._lower(expr.factor, integral_counts=False)
+            count = self._lower(expr.count, integral_counts=False)
+            count_value, count_unit = self._ground_value(
+                expr.count, allow_references=True
+            )
+            updates = self._iteration_count(count_value, count_unit, expr.count_mode)
+            if not isinstance(factor, Quantity) or not isinstance(count, Quantity):
+                raise AssertionError("ground iteration operands lowered as variables")
+            factor_quantity = factor
+            count_witness = self._auxiliary(
+                count.unit, expr.count.span, integral_counts=False
+            )
+            self.constraints.append(Assign(count_witness, count, expr.count.span))
+
+            unit = self._unit(expr)
+            states: list[Variable | Quantity] = [initial]
+            initial_delta: Variable | None = None
+            if expr.rule == "add_initial_fraction":
+                initial_delta = self._auxiliary(unit, expr.span, integral_counts=False)
+                self.constraints.append(
+                    Rate(initial_delta, initial, factor_quantity, expr.span)
+                )
+            for _ in range(updates):
+                previous = states[-1]
+                if expr.rule == "multiply":
+                    current = self._auxiliary(
+                        unit, expr.span, integral_counts=integral_counts
+                    )
+                    self.constraints.append(
+                        Rate(current, previous, factor_quantity, expr.span)
+                    )
+                else:
+                    delta = initial_delta
+                    if expr.rule == "add_current_fraction":
+                        delta = self._auxiliary(unit, expr.span, integral_counts=False)
+                        self.constraints.append(
+                            Rate(delta, previous, factor_quantity, expr.span)
+                        )
+                    assert delta is not None
+                    current = self._auxiliary(
+                        unit, expr.span, integral_counts=integral_counts
+                    )
+                    self.constraints.append(Sum(current, (previous, delta), expr.span))
+                states.append(current)
+
+            if expr.output == "final":
+                selected: Variable | Quantity = states[-1]
+            elif expr.output == "increase":
+                selected = self._auxiliary(
+                    unit, expr.span, integral_counts=integral_counts
+                )
+                self.constraints.append(
+                    Sum(selected, (states[-1], Term(initial, Fraction(-1))), expr.span)
+                )
+            elif expr.output == "cumulative":
+                selected = self._auxiliary(
+                    unit, expr.span, integral_counts=integral_counts
+                )
+                self.constraints.append(Sum(selected, tuple(states), expr.span))
+            else:  # guarded by IterateExpr.__post_init__
+                raise AssertionError("closed iteration output union exhausted")
+
+            result = self._auxiliary(unit, expr.span, integral_counts=integral_counts)
+            bridges: list[Variable] = []
+            for witness in (count_witness,):
+                bridge = self._auxiliary(unit, expr.span, integral_counts=False)
+                self.constraints.append(
+                    Rate(
+                        bridge,
+                        witness,
+                        Quantity(Fraction(0), unit / witness.unit, expr.span),
+                        expr.span,
+                    )
+                )
+                bridges.append(bridge)
+            self.constraints.append(Sum(result, (selected, *bridges), expr.span))
             return result
         raise AssertionError("closed expression union exhausted")
 

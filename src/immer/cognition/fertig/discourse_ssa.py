@@ -21,6 +21,7 @@ from .signed_expression import (
     Definition,
     Expression,
     GroundProductExpr,
+    IterateExpr,
     LiteralExpr,
     MeanExpr,
     ProductExpr,
@@ -46,9 +47,7 @@ class DiscourseSSAError(ValueError):
 
 
 _IDENTIFIER = re.compile(r"[^a-z0-9]+")
-_SINGULAR_PRONOUNS = frozenset(
-    {"he", "her", "hers", "him", "his", "it", "its", "she"}
-)
+_SINGULAR_PRONOUNS = frozenset({"he", "her", "hers", "him", "his", "it", "its", "she"})
 _PLURAL_PRONOUNS = frozenset({"their", "theirs", "them", "they"})
 
 
@@ -130,6 +129,12 @@ def _references(expr: Expression) -> set[SymbolKey]:
         return _references(expr.value)
     if isinstance(expr, ClosedShareExpr):
         return _references(expr.existing) | _references(expr.share)
+    if isinstance(expr, IterateExpr):
+        return (
+            _references(expr.initial)
+            | _references(expr.factor)
+            | _references(expr.count)
+        )
     raise TypeError(f"unsupported discourse expression {type(expr).__name__}")
 
 
@@ -308,8 +313,10 @@ class TypedDiscourseSSA:
             key: _references(bound.definition.expr)
             for key, bound in self._definitions.items()
         }
-        undefined = set().union(*dependencies.values(), _references(target)).difference(
-            self._definitions
+        undefined = (
+            set()
+            .union(*dependencies.values(), _references(target))
+            .difference(self._definitions)
         )
         if undefined:
             names = ", ".join(sorted(key.variable_name for key in undefined))

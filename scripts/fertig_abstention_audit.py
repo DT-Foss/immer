@@ -42,7 +42,7 @@ DISCOURSE_SSA_PATH = (
 )
 
 SCHEMA = "immer.fertig-abstention-audit/v2"
-REPORT_REVISION = 6
+REPORT_REVISION = 7
 ALLOWED_STATUSES = ("correct", "abstained", "incorrect", "error")
 LEGACY_CATEGORIES = (
     "target_parse_failed",
@@ -67,21 +67,22 @@ CURRENT_LEGACY_COUNTS = {
     "equation_guard": 1,
 }
 CURRENT_STRUCTURAL_COUNTS = {
-    "exact_recovery": 66,
-    "numeric_pronoun_ambiguous": 72,
+    "exact_recovery": 70,
+    "numeric_pronoun_ambiguous": 71,
     "question_pronoun_ambiguous": 3,
-    "numeric_clause_unsupported": 82,
-    "target_unsupported": 6,
+    "numeric_clause_unsupported": 80,
+    "target_unsupported": 5,
     "relation_ambiguous": 1,
     "relation_unsupported": 0,
     "relation_invalid": 0,
 }
 CURRENT_SCOPE_COUNTS = {
-    "exact_recovery_scope": 66,
-    "potential_coreference_scope": 75,
-    "grammar_scope": 89,
+    "exact_recovery_scope": 70,
+    "potential_coreference_scope": 74,
+    "grammar_scope": 86,
 }
 CURRENT_EXACT_RECOVERY_INDICES = (
+    547,
     550,
     574,
     578,
@@ -113,6 +114,7 @@ CURRENT_EXACT_RECOVERY_INDICES = (
     782,
     797,
     802,
+    810,
     819,
     823,
     825,
@@ -136,7 +138,9 @@ CURRENT_EXACT_RECOVERY_INDICES = (
     944,
     959,
     992,
+    1016,
     1064,
+    1172,
     1192,
     1194,
     1217,
@@ -207,6 +211,14 @@ CLOSED_SCHEDULE_WAVE_EXACT_MECHANISMS = {
     1300: "signed_event:explicit_weekday_exception_schedule",
 }
 CLOSED_SCHEDULE_WAVE_ID = "closed-calendar-schedule-algebra/v1"
+RECURRENCE_WAVE_EXACT_RECOVERY_INDICES = (547, 810, 1016, 1172)
+RECURRENCE_WAVE_EXACT_MECHANISMS = {
+    547: "signed_event:closed_phone_tree_recurrence",
+    810: "signed_event:closed_monthly_state_recurrence",
+    1016: "signed_event:fixed_base_percentage_recurrence",
+    1172: "signed_event:closed_daily_geometric_total",
+}
+RECURRENCE_WAVE_ID = "closed-recurrence-algebra/v1"
 RECOVERY_WAVES = (
     (
         GROUND_WAVE_ID,
@@ -223,8 +235,14 @@ RECOVERY_WAVES = (
         CLOSED_SCHEDULE_WAVE_EXACT_RECOVERY_INDICES,
         CLOSED_SCHEDULE_WAVE_EXACT_MECHANISMS,
     ),
+    (
+        RECURRENCE_WAVE_ID,
+        RECURRENCE_WAVE_EXACT_RECOVERY_INDICES,
+        RECURRENCE_WAVE_EXACT_MECHANISMS,
+    ),
 )
 CURRENT_EXACT_RECOVERY_MECHANISMS = {
+    547: "signed_event:closed_phone_tree_recurrence",
     550: "signed_event:discounted_purchase_ledger",
     574: "signed_event:batch_sale_profit",
     578: "signed_event:grounded_value_pipeline",
@@ -256,6 +274,7 @@ CURRENT_EXACT_RECOVERY_MECHANISMS = {
     782: "signed_event:closed_disjoint_week_schedule",
     797: "signed_event:repeated_duration_total",
     802: "signed_event:closed_collection_share_completion",
+    810: "signed_event:closed_monthly_state_recurrence",
     819: "signed_event:equal_share_residual",
     823: "signed_event:temporal_affine_score_chain",
     825: "clause_compiler",
@@ -279,7 +298,9 @@ CURRENT_EXACT_RECOVERY_MECHANISMS = {
     944: "signed_event:exhaustive_unit_rate_ledger",
     959: "signed_event:closed_named_scale_group_total",
     992: "signed_event:calendar_frequency_ledger",
+    1016: "signed_event:fixed_base_percentage_recurrence",
     1064: "signed_event:ordered_affine_category_ledger",
+    1172: "signed_event:closed_daily_geometric_total",
     1192: "signed_event:explicit_weekly_pay_schedule",
     1194: "signed_event:typed_species_scale_total",
     1217: "signed_event:closed_piecewise_period_cost",
@@ -645,9 +666,7 @@ def _recovery_attribution(
     wave_deltas: list[dict[str, Any]] = []
     for wave_id, indices, _ in RECOVERY_WAVES:
         index_set = set(indices)
-        wave_rows = [
-            row for row in ordered_rows if int(row["index"]) in index_set
-        ]
+        wave_rows = [row for row in ordered_rows if int(row["index"]) in index_set]
         prior_rows = sorted(accumulated_rows, key=lambda row: int(row["index"]))
         accumulated_rows.extend(wave_rows)
         accumulated_rows.sort(key=lambda row: int(row["index"]))
@@ -737,8 +756,7 @@ def _validate_current_evidence(report: Mapping[str, Any]) -> None:
                 f"exact recovery {row['index']} has inconsistent mechanism attribution"
             )
     observed_mechanisms = {
-        int(row["index"]): str(row["exact_recovery_mechanism"])
-        for row in exact_rows
+        int(row["index"]): str(row["exact_recovery_mechanism"]) for row in exact_rows
     }
     if observed_mechanisms != CURRENT_EXACT_RECOVERY_MECHANISMS:
         raise AuditError(
