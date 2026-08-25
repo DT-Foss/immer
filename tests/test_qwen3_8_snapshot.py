@@ -304,6 +304,7 @@ class Qwen38SnapshotTests(unittest.TestCase):
             row["path"] for row in runtime_source_manifest(include_transport=False)
         }
         self.assertIn("immer/runtimes/qwen3_8/native_crsa.py", runtime_paths)
+        self.assertIn("immer/runtimes/qwen3_8/native_fork.py", runtime_paths)
 
         native_root = self.root / "native-alpha-zero"
         native_root.mkdir()

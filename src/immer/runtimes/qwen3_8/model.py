@@ -82,6 +82,21 @@ class StatefulEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class StatefulLayerRangeEvidence:
+    """Accounting receipt for one non-committing decoder-layer range."""
+
+    start_pos: int
+    end_pos: int
+    start_layer: int
+    stop_layer: int
+    layers_executed: int
+    source_body_bytes: int
+    linear_calls: int
+    seconds: float
+    staged_state_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class GenerationEvidence:
     """Receipt for exact greedy generation through the streamed LM head."""
 
@@ -100,6 +115,17 @@ class GenerationEvidence:
 
 
 LayerState = AttentionState | DeltaNetState
+
+
+@dataclass(frozen=True, slots=True)
+class StatefulLayerRangeResult:
+    """Hidden state, continuation state, and receipts staged by a layer range."""
+
+    hidden: torch.Tensor
+    layer_states: tuple[LayerState | None, ...]
+    graft_history: torch.Tensor | None
+    native_head_crsa_evidence: tuple[NativeHeadCrsaEvidence, ...]
+    evidence: StatefulLayerRangeEvidence
 
 
 class StreamedQwen38:
@@ -212,10 +238,13 @@ class StreamedQwen38:
     def state_poisoned(self) -> bool:
         return self._state_poisoned
 
-    @property
-    def state_bytes(self) -> int:
+    @staticmethod
+    def _continuation_bytes(
+        states: Iterable[LayerState | None],
+        graft_history: torch.Tensor | None,
+    ) -> int:
         total = 0
-        for state in self._layer_states:
+        for state in states:
             if isinstance(state, AttentionState):
                 tensors = (state.key, state.value)
                 if state.crsa_log_usage is not None:
@@ -225,9 +254,13 @@ class StreamedQwen38:
             else:
                 continue
             total += sum(tensor.numel() * tensor.element_size() for tensor in tensors)
-        if self._graft_history is not None:
-            total += self._graft_history.numel() * self._graft_history.element_size()
+        if graft_history is not None:
+            total += graft_history.numel() * graft_history.element_size()
         return total
+
+    @property
+    def state_bytes(self) -> int:
+        return self._continuation_bytes(self._layer_states, self._graft_history)
 
     def _on_pager_device(self, tensor: torch.Tensor) -> bool:
         """Match PyTorch's resolved device against a possibly indexless target."""
@@ -1134,6 +1167,13 @@ class StreamedQwen38:
             "off" if self.graft is None else str(getattr(self.graft, "mode", "active"))
         )
 
+    def _graft_active(self) -> bool:
+        return (
+            self.graft is not None
+            and self._graft_mode() != "off"
+            and float(getattr(self.graft, "alpha", 1.0)) != 0.0
+        )
+
     def _emit_native_head_crsa_evidence(
         self, rows: Iterable[NativeHeadCrsaEvidence]
     ) -> None:
@@ -1161,14 +1201,14 @@ class StreamedQwen38:
         self,
         hidden: torch.Tensor,
         history: torch.Tensor | None,
+        *,
+        start_pos: int,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.graft is None:
             return hidden, None
-        mode = self._graft_mode()
-        alpha = float(getattr(self.graft, "alpha", 1.0))
-        active = mode != "off" and alpha != 0.0
+        active = self._graft_active()
         if active:
-            if self._next_position and history is None:
+            if start_pos and history is None:
                 raise Qwen38RuntimeError("graft history is missing for decode")
             if history is not None and history.shape[0] != hidden.shape[0]:
                 raise Qwen38RuntimeError("graft batch changed within a request")
@@ -1185,6 +1225,152 @@ class StreamedQwen38:
             raise Qwen38RuntimeError("graft changed the hidden-state contract")
         next_history = complete.detach().clone() if active else None
         return output[:, -hidden.shape[1] :], next_history
+
+    def _validate_stateful_range_states(
+        self,
+        prior_states: Iterable[LayerState | None],
+        *,
+        batch_size: int,
+        sequence_length: int,
+        start_pos: int,
+        start_layer: int,
+        graft_history: torch.Tensor | None,
+    ) -> tuple[LayerState | None, ...]:
+        """Validate the explicit continuation boundary for a layer range."""
+
+        try:
+            states = tuple(prior_states)
+        except TypeError as exc:
+            raise TypeError("prior_states must be an iterable of layer states") from exc
+        if len(states) != self.config.n_layers:
+            raise ValueError(
+                f"prior_states must contain {self.config.n_layers} layer entries"
+            )
+
+        end_pos = start_pos + sequence_length
+        key_features = (
+            self.config.linear_num_key_heads * self.config.linear_key_head_dim
+        )
+        value_features = (
+            self.config.linear_num_value_heads * self.config.linear_value_head_dim
+        )
+        for layer, state in enumerate(states):
+            already_executed = layer < start_layer
+            required = start_pos > 0 or already_executed
+            if not required:
+                if state is not None:
+                    raise Qwen38RuntimeError("position-zero state is not empty")
+                continue
+            if self.config.is_full_attention(layer):
+                expected_length = end_pos if already_executed else start_pos
+                if not isinstance(state, AttentionState):
+                    raise Qwen38RuntimeError(
+                        f"full-attention layer {layer} has the wrong state type"
+                    )
+                expected_shape = (
+                    batch_size,
+                    self.config.n_kv_heads,
+                    expected_length,
+                    self.config.head_dim,
+                )
+                if tuple(state.key.shape) != expected_shape:
+                    raise Qwen38RuntimeError(
+                        f"full-attention layer {layer} cursor disagrees with range state"
+                    )
+                if (
+                    tuple(state.value.shape) != expected_shape
+                    or not self._on_pager_device(state.value)
+                    or state.value.dtype != self.pager.compute_dtype
+                ):
+                    raise Qwen38RuntimeError(
+                        f"full-attention layer {layer} value state is invalid"
+                    )
+                if (
+                    not self._on_pager_device(state.key)
+                    or state.key.dtype != self.pager.compute_dtype
+                ):
+                    raise Qwen38RuntimeError(
+                        f"full-attention layer {layer} state device/dtype is invalid"
+                    )
+                expects_usage = (
+                    self.native_head_crsa is not None
+                    and self.native_head_crsa.active
+                    and layer == self.native_head_crsa.layer
+                )
+                if expects_usage != (state.crsa_log_usage is not None):
+                    raise Qwen38RuntimeError(
+                        f"full-attention layer {layer} CRSA history disagrees "
+                        "with model configuration"
+                    )
+                if state.crsa_log_usage is not None:
+                    expected_usage_dtype = (
+                        torch.float32
+                        if self.pager.compute_dtype in {torch.bfloat16, torch.float16}
+                        else self.pager.compute_dtype
+                    )
+                    if (
+                        tuple(state.crsa_log_usage.shape)
+                        != (batch_size, 4, expected_length)
+                        or not self._on_pager_device(state.crsa_log_usage)
+                        or state.crsa_log_usage.dtype != expected_usage_dtype
+                    ):
+                        raise Qwen38RuntimeError(
+                            f"full-attention layer {layer} CRSA history "
+                            "shape/device/dtype is invalid"
+                        )
+            else:
+                if not isinstance(state, DeltaNetState):
+                    raise Qwen38RuntimeError(
+                        f"linear-attention layer {layer} has the wrong state type"
+                    )
+                if tuple(state.conv.shape) != (
+                    batch_size,
+                    2 * key_features + value_features,
+                    self.config.linear_conv_kernel_dim,
+                ) or tuple(state.recurrent.shape) != (
+                    batch_size,
+                    self.config.linear_num_value_heads,
+                    self.config.linear_key_head_dim,
+                    self.config.linear_value_head_dim,
+                ):
+                    raise Qwen38RuntimeError(
+                        f"linear-attention layer {layer} state shape is invalid"
+                    )
+                if (
+                    not self._on_pager_device(state.conv)
+                    or state.conv.dtype != self.pager.compute_dtype
+                    or not self._on_pager_device(state.recurrent)
+                    or state.recurrent.dtype != torch.float32
+                ):
+                    raise Qwen38RuntimeError(
+                        f"linear-attention layer {layer} state device/dtype is invalid"
+                    )
+
+        if not self._graft_active():
+            if graft_history is not None:
+                raise Qwen38RuntimeError(
+                    "inactive graft may not retain continuation history"
+                )
+            return states
+        if self.graft_layer is None:  # pragma: no cover - constructor contract.
+            raise Qwen38RuntimeError("active graft has no decoder layer")
+        expected_history = end_pos if self.graft_layer < start_layer else start_pos
+        if expected_history == 0:
+            if graft_history is not None:
+                raise Qwen38RuntimeError("position-zero graft history is not empty")
+            return states
+        if (
+            not isinstance(graft_history, torch.Tensor)
+            or not graft_history.is_floating_point()
+            or tuple(graft_history.shape)
+            != (batch_size, expected_history, self.config.dim)
+            or not self._on_pager_device(graft_history)
+            or graft_history.dtype != self.pager.compute_dtype
+        ):
+            raise Qwen38RuntimeError(
+                "graft history shape/cursor disagrees with range state"
+            )
+        return states
 
     def _poison_state(self) -> None:
         self._layer_states = [None for _ in range(self.config.n_layers)]
@@ -1203,6 +1389,153 @@ class StreamedQwen38:
         self._graft_history = None
         if release:
             self.pager.release()
+
+    def hidden_stateful_range(
+        self,
+        hidden: Any,
+        prior_states: Iterable[LayerState | None],
+        *,
+        start_pos: int,
+        start_layer: int,
+        stop_layer: int,
+        graft_history: torch.Tensor | None = None,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> StatefulLayerRangeResult:
+        """Stage exactly ``[start_layer, stop_layer)`` without committing state.
+
+        The caller owns the explicit hidden-state and continuation boundary.
+        Successful and failed calls leave the model cursor, poison latch, layer
+        states, graft history, and external native-CRSA observer untouched.
+        """
+
+        if not isinstance(hidden, torch.Tensor) or hidden.ndim != 3:
+            raise ValueError("hidden must have [batch, sequence, dim] shape")
+        if not hidden.is_floating_point():
+            raise TypeError("hidden must be floating point")
+        batch_size, sequence_length, width = hidden.shape
+        if width != self.config.dim:
+            raise ValueError("hidden width does not match the checkpoint")
+        if batch_size < 1 or sequence_length < 1:
+            raise ValueError("hidden batch and sequence must be non-empty")
+        if batch_size > self.max_batch_size:
+            raise ValueError("hidden batch exceeds max_batch_size")
+        if sequence_length > self.max_seq_len:
+            raise ValueError("hidden sequence exceeds max_seq_len")
+        if (
+            isinstance(start_pos, bool)
+            or not isinstance(start_pos, int)
+            or start_pos < 0
+        ):
+            raise ValueError("start_pos must be a non-negative integer")
+        if start_pos and sequence_length != 1:
+            raise ValueError("stateful decode accepts exactly one token")
+        end_pos = start_pos + sequence_length
+        if end_pos > self.max_seq_len:
+            raise ValueError(
+                f"context end {end_pos} exceeds max_seq_len={self.max_seq_len}"
+            )
+        if isinstance(start_layer, bool) or not isinstance(start_layer, int):
+            raise TypeError("start_layer must be an integer")
+        if isinstance(stop_layer, bool) or not isinstance(stop_layer, int):
+            raise TypeError("stop_layer must be an integer")
+        if not 0 <= start_layer <= stop_layer <= self.config.n_layers:
+            raise ValueError(
+                "layer range must satisfy 0 <= start_layer <= stop_layer <= depth"
+            )
+        if progress is not None and not callable(progress):
+            raise TypeError("progress must be callable or None")
+
+        x = hidden.to(device=self.pager.device, dtype=self.pager.compute_dtype)
+        states = self._validate_stateful_range_states(
+            prior_states,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            start_pos=start_pos,
+            start_layer=start_layer,
+            graft_history=graft_history,
+        )
+        mask = torch.ones(
+            (batch_size, sequence_length),
+            dtype=torch.bool,
+            device=self.pager.device,
+        )
+        source = self.pager.source
+        start_bytes = self._metric(source, "network_or_source_body_bytes")
+        start_linears = self._metric(self.pager, "linear_calls")
+        started = time.perf_counter()
+        staged = list(states)
+        staged_history = graft_history
+        staged_native_evidence: list[NativeHeadCrsaEvidence] = []
+        try:
+            for layer in range(start_layer, stop_layer):
+                if progress is not None:
+                    layer_started = time.perf_counter()
+                    layer_bytes = self._metric(
+                        source, "network_or_source_body_bytes"
+                    )
+                x, next_state = self._forward_layer(
+                    x,
+                    layer=layer,
+                    token_mask=mask,
+                    state=states[layer],
+                    start_pos=start_pos,
+                    stateful=True,
+                    native_head_crsa_observer=staged_native_evidence.append,
+                )
+                if next_state is None:  # pragma: no cover - stateful contract.
+                    raise Qwen38RuntimeError("stateful layer returned no continuation")
+                staged[layer] = next_state
+                if self.graft is not None and layer == self.graft_layer:
+                    x, staged_history = self._apply_graft_stateful(
+                        x,
+                        staged_history,
+                        start_pos=start_pos,
+                    )
+                self.pager.release()
+                if progress is not None:
+                    progress(
+                        {
+                            "event": "qwen_stateful_layer_complete",
+                            "layer": layer,
+                            "layers": self.config.n_layers,
+                            "start_pos": start_pos,
+                            "tokens": sequence_length,
+                            "source_body_bytes": self._metric(
+                                source, "network_or_source_body_bytes"
+                            )
+                            - layer_bytes,
+                            "seconds": time.perf_counter() - layer_started,
+                            "state_kind": (
+                                "kv"
+                                if isinstance(next_state, AttentionState)
+                                else "deltanet"
+                            ),
+                        }
+                    )
+        finally:
+            self.pager.release()
+
+        staged_states = tuple(staged)
+        evidence = StatefulLayerRangeEvidence(
+            start_pos=start_pos,
+            end_pos=end_pos,
+            start_layer=start_layer,
+            stop_layer=stop_layer,
+            layers_executed=stop_layer - start_layer,
+            source_body_bytes=(
+                self._metric(source, "network_or_source_body_bytes") - start_bytes
+            ),
+            linear_calls=self._metric(self.pager, "linear_calls") - start_linears,
+            seconds=time.perf_counter() - started,
+            staged_state_bytes=self._continuation_bytes(staged_states, staged_history),
+        )
+        return StatefulLayerRangeResult(
+            hidden=x,
+            layer_states=staged_states,
+            graft_history=staged_history,
+            native_head_crsa_evidence=tuple(staged_native_evidence),
+            evidence=evidence,
+        )
 
     def hidden_stateful(
         self,
@@ -1250,83 +1583,31 @@ class StreamedQwen38:
         else:
             if self._state_batch_size != ids.shape[0]:
                 raise ValueError("decode batch size differs from the committed prefix")
-            if any(state is None for state in self._layer_states):
-                raise Qwen38RuntimeError("one or more layer states are missing")
-            for layer, state in enumerate(self._layer_states):
-                if self.config.is_full_attention(layer):
-                    if (
-                        not isinstance(state, AttentionState)
-                        or state.length != start_pos
-                    ):
-                        raise Qwen38RuntimeError(
-                            f"full-attention layer {layer} cursor disagrees with model state"
-                        )
-                    expects_usage = (
-                        self.native_head_crsa is not None
-                        and self.native_head_crsa.active
-                        and layer == self.native_head_crsa.layer
-                    )
-                    if expects_usage != (state.crsa_log_usage is not None):
-                        raise Qwen38RuntimeError(
-                            f"full-attention layer {layer} CRSA history disagrees "
-                            "with model configuration"
-                        )
-                elif not isinstance(state, DeltaNetState):
-                    raise Qwen38RuntimeError(
-                        f"linear-attention layer {layer} has the wrong state type"
-                    )
+        committed_states = self._validate_stateful_range_states(
+            self._layer_states,
+            batch_size=ids.shape[0],
+            sequence_length=ids.shape[1],
+            start_pos=start_pos,
+            start_layer=0,
+            graft_history=self._graft_history,
+        )
 
         source = self.pager.source
         start_bytes = self._metric(source, "network_or_source_body_bytes")
         start_linears = self._metric(self.pager, "linear_calls")
         started = time.perf_counter()
         hidden = self.embed_batch(ids)
-        mask = torch.ones_like(ids, dtype=torch.bool, device=self.pager.device)
-        staged: list[LayerState] = []
-        staged_history = self._graft_history
-        staged_native_evidence: list[NativeHeadCrsaEvidence] = []
         try:
-            for layer in range(self.config.n_layers):
-                layer_started = time.perf_counter()
-                layer_bytes = self._metric(source, "network_or_source_body_bytes")
-                hidden, next_state = self._forward_layer(
-                    hidden,
-                    layer=layer,
-                    token_mask=mask,
-                    state=self._layer_states[layer],
-                    start_pos=start_pos,
-                    stateful=True,
-                    native_head_crsa_observer=staged_native_evidence.append,
-                )
-                if next_state is None:  # pragma: no cover - stateful contract above.
-                    raise Qwen38RuntimeError("stateful layer returned no continuation")
-                staged.append(next_state)
-                if self.graft is not None and layer == self.graft_layer:
-                    hidden, staged_history = self._apply_graft_stateful(
-                        hidden, staged_history
-                    )
-                self.pager.release()
-                if progress is not None:
-                    progress(
-                        {
-                            "event": "qwen_stateful_layer_complete",
-                            "layer": layer,
-                            "layers": self.config.n_layers,
-                            "start_pos": start_pos,
-                            "tokens": ids.shape[1],
-                            "source_body_bytes": self._metric(
-                                source, "network_or_source_body_bytes"
-                            )
-                            - layer_bytes,
-                            "seconds": time.perf_counter() - layer_started,
-                            "state_kind": (
-                                "kv"
-                                if isinstance(next_state, AttentionState)
-                                else "deltanet"
-                            ),
-                        }
-                    )
-            hidden = self.finalize_hidden(hidden)
+            staged = self.hidden_stateful_range(
+                hidden,
+                committed_states,
+                start_pos=start_pos,
+                start_layer=0,
+                stop_layer=self.config.n_layers,
+                graft_history=self._graft_history,
+                progress=progress,
+            )
+            hidden = self.finalize_hidden(staged.hidden)
         except Exception:
             self._poison_state()
             self.pager.release()
@@ -1334,10 +1615,10 @@ class StreamedQwen38:
         finally:
             self.pager.release()
 
-        self._layer_states = staged
+        self._layer_states = list(staged.layer_states)
         self._next_position = end_pos
         self._state_batch_size = ids.shape[0]
-        self._graft_history = staged_history
+        self._graft_history = staged.graft_history
         evidence = StatefulEvidence(
             start_pos=start_pos,
             end_pos=end_pos,
@@ -1361,7 +1642,7 @@ class StreamedQwen38:
                 0 if self._graft_history is None else int(self._graft_history.shape[1])
             ),
         )
-        self._emit_native_head_crsa_evidence(staged_native_evidence)
+        self._emit_native_head_crsa_evidence(staged.native_head_crsa_evidence)
         return hidden, evidence
 
     def prefill(
@@ -1688,5 +1969,7 @@ __all__ = [
     "PrefillEvidence",
     "Qwen38RuntimeError",
     "StatefulEvidence",
+    "StatefulLayerRangeEvidence",
+    "StatefulLayerRangeResult",
     "StreamedQwen38",
 ]

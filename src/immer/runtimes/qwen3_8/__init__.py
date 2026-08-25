@@ -31,6 +31,8 @@ from .model import (
     PrefillEvidence,
     Qwen38RuntimeError,
     StatefulEvidence,
+    StatefulLayerRangeEvidence,
+    StatefulLayerRangeResult,
     StreamedQwen38,
 )
 from .native_crsa import (
@@ -42,6 +44,16 @@ from .native_crsa import (
     NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE,
     NativeHeadCrsaEvidence,
     Qwen38NativeHeadCrsa,
+)
+from .native_fork import (
+    Qwen38ForkArmState,
+    Qwen38ForkForwardResult,
+    Qwen38ForkGenerationEvidence,
+    Qwen38ForkGenerationResult,
+    Qwen38ForkLayerAccounting,
+    Qwen38ForkState,
+    Qwen38ForkTraffic,
+    Qwen38NativeFork,
 )
 from .pager import Qwen38PagerError, Qwen38WeightPager
 from .probe import (
@@ -92,6 +104,14 @@ __all__ = [
     "Qwen38DeltaNetProbeError",
     "Qwen38EncodingError",
     "Qwen38NativeHeadCrsa",
+    "Qwen38NativeFork",
+    "Qwen38ForkArmState",
+    "Qwen38ForkForwardResult",
+    "Qwen38ForkGenerationEvidence",
+    "Qwen38ForkGenerationResult",
+    "Qwen38ForkLayerAccounting",
+    "Qwen38ForkState",
+    "Qwen38ForkTraffic",
     "Qwen38PagerError",
     "Qwen38RuntimeError",
     "Qwen38SnapshotError",
@@ -100,6 +120,8 @@ __all__ = [
     "Qwen38WeightPager",
     "QWEN38_SNAPSHOT_SCHEMA",
     "StatefulEvidence",
+    "StatefulLayerRangeEvidence",
+    "StatefulLayerRangeResult",
     "StreamedQwen38",
     "TensorRangePlan",
     "bind_causal_tensor_plans",

@@ -462,6 +462,82 @@ class Qwen38WeightPager:
                 del weight
                 self._stats.materialized_weight_releases += 1
 
+    def linear_many(
+        self,
+        inputs: Iterable[Any],
+        name: str,
+        *,
+        output_dtype: Any | None = None,
+    ) -> tuple[Any, ...]:
+        """Apply one matrix sequentially to multiple independent inputs.
+
+        Every input is converted and shape-checked before the checkpoint range
+        is read.  The matrix is then materialized exactly once and passed to a
+        separate ``F.linear`` invocation for each input, preserving the kernel
+        shape and numerical result of independent :meth:`linear` calls.
+        """
+
+        with self._lock:
+            self._ensure_open()
+            try:
+                values = tuple(inputs)
+            except TypeError as exc:
+                raise TypeError("inputs must be an iterable") from exc
+            if len(values) < 2:
+                raise ValueError("linear_many requires at least two inputs")
+
+            weight_name = self._weight_name(name)
+            layout = self._layout(weight_name)
+            if len(layout.shape) != 2:
+                raise Qwen38PagerError(f"linear weight {weight_name!r} must be 2D")
+            input_width = layout.shape[1]
+            compute_inputs: list[Any] = []
+            for index, value in enumerate(values):
+                if not isinstance(value, self.torch.Tensor):
+                    try:
+                        value = self.torch.as_tensor(value)
+                    except (TypeError, ValueError) as exc:
+                        raise TypeError(
+                            f"linear input {index} cannot be converted to a tensor"
+                        ) from exc
+                if value.ndim < 1:
+                    raise Qwen38PagerError(
+                        f"linear input {index} must have at least one dimension"
+                    )
+                compute_x = value.to(
+                    device=self.device,
+                    dtype=self.compute_dtype,
+                )
+                if compute_x.shape[-1] != input_width:
+                    raise Qwen38PagerError(
+                        f"linear input {index} width {compute_x.shape[-1]} "
+                        f"disagrees with {weight_name}{layout.shape}"
+                    )
+                compute_inputs.append(compute_x)
+
+            if output_dtype is not None:
+                # Validate the conversion before a source byte is read.  This
+                # accepts exactly the dtype forms understood by Tensor.to.
+                self.torch.empty((), device=self.device).to(dtype=output_dtype)
+
+            weight = self._read_tensor(
+                weight_name,
+                dtype=self.compute_dtype,
+                device=self.device,
+            )
+            try:
+                results: list[Any] = []
+                for compute_x in compute_inputs:
+                    result = self.torch.nn.functional.linear(compute_x, weight)
+                    if output_dtype is not None:
+                        result = result.to(dtype=output_dtype)
+                    results.append(result)
+                    self._stats.linear_calls += 1
+                return tuple(results)
+            finally:
+                del weight
+                self._stats.materialized_weight_releases += 1
+
     def _validate_ids(self, name: str, token_ids: Iterable[int]) -> tuple[int, ...]:
         layout = self._layout(name)
         if len(layout.shape) != 2:

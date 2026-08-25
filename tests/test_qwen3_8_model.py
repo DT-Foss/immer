@@ -186,6 +186,57 @@ def _tiny_weights(config: Qwen38Config) -> dict[str, torch.Tensor]:
     return tensors
 
 
+def _assert_layer_states_equal(
+    case: unittest.TestCase,
+    actual: tuple[AttentionState | DeltaNetState | None, ...]
+    | list[AttentionState | DeltaNetState | None],
+    expected: tuple[AttentionState | DeltaNetState | None, ...]
+    | list[AttentionState | DeltaNetState | None],
+) -> None:
+    case.assertEqual(len(actual), len(expected))
+    for left, right in zip(actual, expected, strict=True):
+        case.assertIs(type(left), type(right))
+        if isinstance(left, AttentionState) and isinstance(right, AttentionState):
+            case.assertTrue(torch.equal(left.key, right.key))
+            case.assertTrue(torch.equal(left.value, right.value))
+            if left.crsa_log_usage is None or right.crsa_log_usage is None:
+                case.assertIsNone(left.crsa_log_usage)
+                case.assertIsNone(right.crsa_log_usage)
+            else:
+                case.assertTrue(torch.equal(left.crsa_log_usage, right.crsa_log_usage))
+        elif isinstance(left, DeltaNetState) and isinstance(right, DeltaNetState):
+            case.assertTrue(torch.equal(left.conv, right.conv))
+            case.assertTrue(torch.equal(left.recurrent, right.recurrent))
+
+
+def _clone_layer_states(
+    states: list[AttentionState | DeltaNetState | None],
+) -> tuple[AttentionState | DeltaNetState | None, ...]:
+    cloned: list[AttentionState | DeltaNetState | None] = []
+    for state in states:
+        if isinstance(state, AttentionState):
+            cloned.append(
+                AttentionState(
+                    key=state.key.clone(),
+                    value=state.value.clone(),
+                    crsa_log_usage=(
+                        None
+                        if state.crsa_log_usage is None
+                        else state.crsa_log_usage.clone()
+                    ),
+                )
+            )
+        elif isinstance(state, DeltaNetState):
+            cloned.append(
+                DeltaNetState(
+                    conv=state.conv.clone(), recurrent=state.recurrent.clone()
+                )
+            )
+        else:
+            cloned.append(None)
+    return tuple(cloned)
+
+
 class Qwen38ModelTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -359,6 +410,273 @@ class Qwen38ModelTests(unittest.TestCase):
         finally:
             pager.close()
 
+    def test_stateful_layer_range_full_and_split_match_committed_prefill(
+        self,
+    ) -> None:
+        token_ids = torch.tensor([[1, 4, 9, 7]])
+        embedded = self.model.embed_batch(token_ids)
+        empty_states = tuple(self.model._layer_states)
+        full_progress = []
+        full = self.model.hidden_stateful_range(
+            embedded,
+            empty_states,
+            start_pos=0,
+            start_layer=0,
+            stop_layer=self.config.n_layers,
+            progress=full_progress.append,
+        )
+
+        self.assertEqual(self.model.next_position, 0)
+        self.assertIsNone(self.model.state_batch_size)
+        self.assertFalse(self.model.state_poisoned)
+        self.assertTrue(all(state is None for state in self.model._layer_states))
+        self.assertEqual(full.evidence.layers_executed, self.config.n_layers)
+        self.assertEqual(full.evidence.linear_calls, 31)
+        self.assertGreater(full.evidence.staged_state_bytes, 0)
+        self.assertEqual(
+            [row["layer"] for row in full_progress],
+            list(range(self.config.n_layers)),
+        )
+
+        split_progress = []
+        lower = self.model.hidden_stateful_range(
+            embedded,
+            empty_states,
+            start_pos=0,
+            start_layer=0,
+            stop_layer=2,
+            progress=split_progress.append,
+        )
+        upper = self.model.hidden_stateful_range(
+            lower.hidden,
+            lower.layer_states,
+            start_pos=0,
+            start_layer=2,
+            stop_layer=self.config.n_layers,
+            graft_history=lower.graft_history,
+            progress=split_progress.append,
+        )
+        self.assertTrue(torch.equal(upper.hidden, full.hidden))
+        _assert_layer_states_equal(self, upper.layer_states, full.layer_states)
+        self.assertEqual(
+            lower.evidence.linear_calls + upper.evidence.linear_calls,
+            full.evidence.linear_calls,
+        )
+        self.assertEqual(
+            [row["layer"] for row in split_progress],
+            list(range(self.config.n_layers)),
+        )
+        explicit_final = self.model.finalize_hidden(full.hidden)
+
+        range_method = self.model.hidden_stateful_range
+        with mock.patch.object(
+            self.model, "hidden_stateful_range", wraps=range_method
+        ) as range_call:
+            committed, evidence = self.model.prefill(token_ids)
+        self.assertTrue(torch.equal(committed, explicit_final))
+        _assert_layer_states_equal(self, self.model._layer_states, full.layer_states)
+        self.assertEqual(evidence[0].linear_calls, 31)
+        range_call.assert_called_once()
+        self.assertEqual(range_call.call_args.kwargs["start_layer"], 0)
+        self.assertEqual(
+            range_call.call_args.kwargs["stop_layer"], self.config.n_layers
+        )
+
+    def test_stateful_layer_range_split_decode_is_bit_exact_and_non_committing(
+        self,
+    ) -> None:
+        self.model.prefill([[1, 4, 9]])
+        committed_objects = tuple(self.model._layer_states)
+        committed_values = _clone_layer_states(self.model._layer_states)
+        embedded = self.model.embed_batch([[7]])
+
+        full = self.model.hidden_stateful_range(
+            embedded,
+            committed_objects,
+            start_pos=3,
+            start_layer=0,
+            stop_layer=self.config.n_layers,
+            graft_history=self.model._graft_history,
+        )
+        lower = self.model.hidden_stateful_range(
+            embedded,
+            committed_objects,
+            start_pos=3,
+            start_layer=0,
+            stop_layer=2,
+            graft_history=self.model._graft_history,
+        )
+        upper = self.model.hidden_stateful_range(
+            lower.hidden,
+            lower.layer_states,
+            start_pos=3,
+            start_layer=2,
+            stop_layer=self.config.n_layers,
+            graft_history=lower.graft_history,
+        )
+
+        self.assertTrue(torch.equal(upper.hidden, full.hidden))
+        _assert_layer_states_equal(self, upper.layer_states, full.layer_states)
+        self.assertEqual(self.model.next_position, 3)
+        self.assertFalse(self.model.state_poisoned)
+        self.assertTrue(
+            all(
+                current is original
+                for current, original in zip(
+                    self.model._layer_states, committed_objects, strict=True
+                )
+            )
+        )
+        _assert_layer_states_equal(self, self.model._layer_states, committed_values)
+
+        decoded, _ = self.model.decode([[7]])
+        self.assertTrue(torch.equal(decoded, self.model.finalize_hidden(full.hidden)))
+        _assert_layer_states_equal(self, self.model._layer_states, full.layer_states)
+
+    def test_stateful_layer_range_failure_rolls_back_without_poisoning(self) -> None:
+        self.model.prefill([[1, 4, 9]])
+        committed_objects = tuple(self.model._layer_states)
+        committed_values = _clone_layer_states(self.model._layer_states)
+        embedded = self.model.embed_batch([[7]])
+        original_mlp = self.model._mlp
+
+        def fail_on_layer_two(hidden, *, layer):
+            if layer == 2:
+                raise RuntimeError("range transaction failure")
+            return original_mlp(hidden, layer=layer)
+
+        with mock.patch.object(self.model, "_mlp", side_effect=fail_on_layer_two):
+            with self.assertRaisesRegex(RuntimeError, "range transaction failure"):
+                self.model.hidden_stateful_range(
+                    embedded,
+                    committed_objects,
+                    start_pos=3,
+                    start_layer=0,
+                    stop_layer=self.config.n_layers,
+                    graft_history=self.model._graft_history,
+                )
+
+        self.assertEqual(self.model.next_position, 3)
+        self.assertEqual(self.model.state_batch_size, 1)
+        self.assertFalse(self.model.state_poisoned)
+        self.assertTrue(
+            all(
+                current is original
+                for current, original in zip(
+                    self.model._layer_states, committed_objects, strict=True
+                )
+            )
+        )
+        _assert_layer_states_equal(self, self.model._layer_states, committed_values)
+        recovered, evidence = self.model.decode([[7]])
+        self.assertEqual(tuple(recovered.shape), (1, 1, self.config.dim))
+        self.assertEqual(evidence.end_pos, 4)
+
+    def test_stateful_layer_range_avoids_per_layer_metrics_without_progress(
+        self,
+    ) -> None:
+        hidden = self.model.embed_batch([[1, 4]])
+        empty = (None,) * self.config.n_layers
+        with mock.patch.object(
+            self.source, "metrics", wraps=self.source.metrics
+        ) as metrics:
+            self.model.hidden_stateful_range(
+                hidden,
+                empty,
+                start_pos=0,
+                start_layer=0,
+                stop_layer=self.config.n_layers,
+            )
+        self.assertEqual(metrics.call_count, 4)
+
+        events: list[dict[str, object]] = []
+        with mock.patch.object(
+            self.source, "metrics", wraps=self.source.metrics
+        ) as metrics:
+            self.model.hidden_stateful_range(
+                hidden,
+                empty,
+                start_pos=0,
+                start_layer=0,
+                stop_layer=self.config.n_layers,
+                progress=events.append,
+            )
+        self.assertEqual(len(events), self.config.n_layers)
+        self.assertEqual(metrics.call_count, 4 + 2 * self.config.n_layers)
+
+    def test_stateful_layer_range_rejects_invalid_boundaries(self) -> None:
+        hidden = self.model.embed_batch([[1, 4]])
+        empty_states = tuple(self.model._layer_states)
+        invalid_ranges = ((-1, 1), (3, 2), (0, self.config.n_layers + 1))
+        for start_layer, stop_layer in invalid_ranges:
+            with self.subTest(start_layer=start_layer, stop_layer=stop_layer):
+                with self.assertRaisesRegex(ValueError, "layer range"):
+                    self.model.hidden_stateful_range(
+                        hidden,
+                        empty_states,
+                        start_pos=0,
+                        start_layer=start_layer,
+                        stop_layer=stop_layer,
+                    )
+        with self.assertRaisesRegex(TypeError, "start_layer"):
+            self.model.hidden_stateful_range(
+                hidden,
+                empty_states,
+                start_pos=0,
+                start_layer=True,
+                stop_layer=1,
+            )
+        with self.assertRaisesRegex(ValueError, "prior_states"):
+            self.model.hidden_stateful_range(
+                hidden,
+                empty_states[:-1],
+                start_pos=0,
+                start_layer=0,
+                stop_layer=1,
+            )
+        with self.assertRaisesRegex(Qwen38RuntimeError, "wrong state type"):
+            self.model.hidden_stateful_range(
+                hidden,
+                empty_states,
+                start_pos=0,
+                start_layer=1,
+                stop_layer=2,
+            )
+
+        empty = self.model.hidden_stateful_range(
+            hidden,
+            empty_states,
+            start_pos=0,
+            start_layer=0,
+            stop_layer=0,
+        )
+        self.assertIs(empty.hidden, hidden)
+        self.assertEqual(empty.layer_states, empty_states)
+        self.assertEqual(empty.evidence.layers_executed, 0)
+        self.assertEqual(empty.evidence.linear_calls, 0)
+
+        self.model.prefill([[1, 4]])
+        prior = list(self.model._layer_states)
+        attention = prior[3]
+        self.assertIsInstance(attention, AttentionState)
+        malformed = AttentionState(
+            key=attention.key.clone(),
+            value=attention.value.clone(),
+            crsa_log_usage=None,
+        )
+        malformed.value.resize_(1, 1, 1, 1)
+        prior[3] = malformed
+        linears_before = self.model._metric(self.pager, "linear_calls")
+        with self.assertRaisesRegex(Qwen38RuntimeError, "value state"):
+            self.model.hidden_stateful_range(
+                self.model.embed_batch([[7]]),
+                prior,
+                start_pos=2,
+                start_layer=0,
+                stop_layer=self.config.n_layers,
+            )
+        self.assertEqual(self.model._metric(self.pager, "linear_calls"), linears_before)
+
     def test_stateful_boundaries_preserve_committed_prefix(self) -> None:
         with self.assertRaisesRegex(ValueError, "completed prefill"):
             self.model.decode([[1]])
@@ -526,6 +844,39 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(token_evidence[-1].graft_history_tokens, 4)
         self.assertGreater(model.state_bytes, self.model.state_bytes)
 
+        model.reset_state()
+        embedded = model.embed_batch(token_ids)
+        empty_states = tuple(model._layer_states)
+        full = model.hidden_stateful_range(
+            embedded,
+            empty_states,
+            start_pos=0,
+            start_layer=0,
+            stop_layer=self.config.n_layers,
+        )
+        below_graft = model.hidden_stateful_range(
+            embedded,
+            empty_states,
+            start_pos=0,
+            start_layer=0,
+            stop_layer=1,
+        )
+        above_graft = model.hidden_stateful_range(
+            below_graft.hidden,
+            below_graft.layer_states,
+            start_pos=0,
+            start_layer=1,
+            stop_layer=self.config.n_layers,
+            graft_history=below_graft.graft_history,
+        )
+        self.assertTrue(torch.equal(above_graft.hidden, full.hidden))
+        _assert_layer_states_equal(self, above_graft.layer_states, full.layer_states)
+        self.assertIsNone(below_graft.graft_history)
+        self.assertTrue(torch.equal(above_graft.graft_history, full.graft_history))
+        self.assertEqual(tuple(full.graft_history.shape), (1, 4, self.config.dim))
+        self.assertEqual(model.next_position, 0)
+        self.assertTrue(all(state is None for state in model._layer_states))
+
 
 class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -557,6 +908,71 @@ class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
         self.pager.close()
         self.source.close()
         self.temporary.cleanup()
+
+    def test_native_layer_range_split_stages_evidence_without_committing(
+        self,
+    ) -> None:
+        token_ids = torch.tensor([[1, 4, 9, 7]])
+        embedded = self.model.embed_batch(token_ids)
+        empty_states = tuple(self.model._layer_states)
+
+        full = self.model.hidden_stateful_range(
+            embedded,
+            empty_states,
+            start_pos=0,
+            start_layer=0,
+            stop_layer=self.config.n_layers,
+        )
+        below_native = self.model.hidden_stateful_range(
+            embedded,
+            empty_states,
+            start_pos=0,
+            start_layer=0,
+            stop_layer=27,
+        )
+        through_native = self.model.hidden_stateful_range(
+            below_native.hidden,
+            below_native.layer_states,
+            start_pos=0,
+            start_layer=27,
+            stop_layer=self.config.n_layers,
+            graft_history=below_native.graft_history,
+        )
+
+        self.assertTrue(torch.equal(through_native.hidden, full.hidden))
+        _assert_layer_states_equal(self, through_native.layer_states, full.layer_states)
+        self.assertEqual(len(full.native_head_crsa_evidence), 1)
+        self.assertEqual(below_native.native_head_crsa_evidence, ())
+        self.assertEqual(
+            through_native.native_head_crsa_evidence,
+            full.native_head_crsa_evidence,
+        )
+        self.assertEqual(self.observed, [])
+        self.assertEqual(self.model.next_position, 0)
+        self.assertFalse(self.model.state_poisoned)
+        self.assertTrue(all(state is None for state in self.model._layer_states))
+
+        malformed_states = list(full.layer_states)
+        native_state = malformed_states[27]
+        self.assertIsInstance(native_state, AttentionState)
+        malformed_native = AttentionState(
+            key=native_state.key.clone(),
+            value=native_state.value.clone(),
+            crsa_log_usage=native_state.crsa_log_usage.clone(),
+        )
+        malformed_native.crsa_log_usage.resize_(1, 4, 3)
+        malformed_states[27] = malformed_native
+        linears_before = self.model._metric(self.pager, "linear_calls")
+        with self.assertRaisesRegex(Qwen38RuntimeError, "CRSA history.*invalid"):
+            self.model.hidden_stateful_range(
+                full.hidden,
+                malformed_states,
+                start_pos=0,
+                start_layer=self.config.n_layers,
+                stop_layer=self.config.n_layers,
+            )
+        self.assertEqual(self.model._metric(self.pager, "linear_calls"), linears_before)
+        self.assertEqual(self.observed, [])
 
     def test_native_layer27_streaming_history_reset_and_poison_are_transactional(
         self,

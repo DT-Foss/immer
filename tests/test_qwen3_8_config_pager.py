@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -239,6 +240,138 @@ class Qwen38PagerTests(unittest.TestCase):
         self.assertEqual(metrics["materialized_tensor_bytes"], 8)
         self.assertEqual(metrics["materialized_weight_releases"], 1)
         self.assertEqual(metrics["weight_cache_policy"], "one-shot-bf16-exact-range/v1")
+
+    def test_linear_many_is_bit_exact_and_reads_one_matrix_once(self) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        first = torch.tensor([[1.0, 1.0]], dtype=torch.float32)
+        second = torch.tensor(
+            [[2.0, -1.0], [0.5, 3.0]],
+            dtype=torch.float32,
+        )
+        reference = Qwen38WeightPager(
+            self._source(),
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=16,
+        )
+        expected = (
+            reference.linear(first, "dense"),
+            reference.linear(second, "dense"),
+        )
+
+        source = self._source()
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=16,
+        )
+        original_linear = torch.nn.functional.linear
+        kernel_shapes: list[tuple[int, ...]] = []
+
+        def observed_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            kernel_shapes.append(tuple(x.shape))
+            return original_linear(x, weight)
+
+        with mock.patch.object(
+            torch.nn.functional,
+            "linear",
+            side_effect=observed_linear,
+        ):
+            actual = pager.linear_many((first, second), "dense")
+
+        self.assertIsInstance(actual, tuple)
+        self.assertEqual(kernel_shapes, [(1, 2), (2, 2)])
+        for value, wanted in zip(actual, expected, strict=True):
+            self.assertTrue(torch.equal(value, wanted))
+        self.assertEqual(len(source.raw_calls), 1)
+        self.assertEqual(source.raw_calls[0][2], 8)
+        metrics = pager.metrics()
+        self.assertEqual(metrics["tensor_reads"], 1)
+        self.assertEqual(metrics["linear_calls"], 2)
+        self.assertEqual(metrics["logical_weight_bytes"], 8)
+        self.assertEqual(metrics["materialized_tensor_bytes"], 8)
+        self.assertEqual(metrics["materialized_weight_releases"], 1)
+        self.assertEqual(metrics["network_or_source_body_bytes"], 8)
+
+    def test_linear_many_rejects_all_inputs_before_reading_weight(self) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import (
+            Qwen38PagerError,
+            Qwen38WeightPager,
+        )
+
+        source = self._source()
+        pager = Qwen38WeightPager(source, device="cpu")
+
+        with self.assertRaisesRegex(ValueError, "at least two"):
+            pager.linear_many((torch.ones((1, 2)),), "dense")
+        with self.assertRaisesRegex(Qwen38PagerError, "input 1 width 3"):
+            pager.linear_many(
+                (torch.ones((1, 2)), torch.ones((1, 3))),
+                "dense",
+            )
+        with self.assertRaises((TypeError, RuntimeError)):
+            pager.linear_many(
+                (torch.ones((1, 2)), torch.ones((1, 2))),
+                "dense",
+                output_dtype="not-a-dtype",
+            )
+
+        self.assertEqual(source.raw_calls, [])
+        metrics = pager.metrics()
+        self.assertEqual(metrics["tensor_reads"], 0)
+        self.assertEqual(metrics["linear_calls"], 0)
+        self.assertEqual(metrics["logical_weight_bytes"], 0)
+        self.assertEqual(metrics["materialized_tensor_bytes"], 0)
+        self.assertEqual(metrics["materialized_weight_releases"], 0)
+
+    def test_linear_many_releases_materialized_weight_after_kernel_failure(
+        self,
+    ) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        source = self._source()
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=16,
+        )
+        original_linear = torch.nn.functional.linear
+        calls = 0
+
+        def fail_second(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected kernel failure")
+            return original_linear(x, weight)
+
+        with mock.patch.object(
+            torch.nn.functional,
+            "linear",
+            side_effect=fail_second,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected kernel failure"):
+                pager.linear_many(
+                    (torch.ones((1, 2)), torch.ones((2, 2))),
+                    "dense",
+                )
+
+        metrics = pager.metrics()
+        self.assertEqual(len(source.raw_calls), 1)
+        self.assertEqual(metrics["tensor_reads"], 1)
+        self.assertEqual(metrics["linear_calls"], 1)
+        self.assertEqual(metrics["logical_weight_bytes"], 8)
+        self.assertEqual(metrics["materialized_tensor_bytes"], 8)
+        self.assertEqual(metrics["materialized_weight_releases"], 1)
 
     def test_fp32_peak_is_payload_plus_decoded_target(self) -> None:
         from immer.runtimes.qwen3_8.pager import (

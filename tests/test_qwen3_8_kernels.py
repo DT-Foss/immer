@@ -439,6 +439,313 @@ class Qwen38KernelTests(unittest.TestCase):
         self.assertTrue(torch.isneginf(padded_state.crsa_log_usage[1, :, -1]).all())
         self.assertEqual(padded_rows[0].future_weight_max_abs, 0.0)
 
+    def test_full_attention_fork_prefill_is_bit_exact_and_shares_only_kv(
+        self,
+    ) -> None:
+        from immer.runtimes.qwen3_8.kernels import (
+            full_attention_core,
+            full_attention_fork_core,
+        )
+        from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
+        torch.manual_seed(211)
+        batch, sequence, heads, kv_heads, width = 2, 5, 24, 4, 4
+        query_gate = torch.randn(
+            batch, sequence, 2 * heads * width, dtype=torch.bfloat16
+        )
+        key = torch.randn(batch, sequence, kv_heads * width, dtype=torch.bfloat16)
+        value = torch.randn(batch, sequence, kv_heads * width, dtype=torch.bfloat16)
+        q_norm = torch.randn(width, dtype=torch.bfloat16) * 0.05
+        k_norm = torch.randn(width, dtype=torch.bfloat16) * 0.05
+        validity = torch.ones(batch, sequence, dtype=torch.bool)
+        validity[1, -1] = False
+        intervention = Qwen38NativeHeadCrsa(alpha=0.01)
+        common = dict(
+            q_norm_weight=q_norm,
+            k_norm_weight=k_norm,
+            num_attention_heads=heads,
+            num_key_value_heads=kv_heads,
+            head_dim=width,
+            attention_mask=validity,
+            rotary_dim=2,
+            rope_theta=1_000.0,
+        )
+        original_tensors = tuple(
+            tensor.clone() for tensor in (query_gate, key, value, q_norm, k_norm)
+        )
+        expected_off, expected_off_state = full_attention_core(
+            query_gate,
+            key,
+            value,
+            **common,
+        )
+        independent_evidence = []
+        expected_native, expected_native_state = full_attention_core(
+            query_gate,
+            key,
+            value,
+            native_head_crsa=intervention,
+            native_head_crsa_observer=independent_evidence.append,
+            **common,
+        )
+        observed = []
+        (
+            actual_off,
+            actual_off_state,
+            actual_native,
+            actual_native_state,
+            evidence,
+        ) = full_attention_fork_core(
+            query_gate,
+            key,
+            value,
+            native_head_crsa=intervention,
+            native_head_crsa_observer=observed.append,
+            **common,
+        )
+
+        self.assertTrue(torch.equal(actual_off, expected_off))
+        self.assertTrue(torch.equal(actual_native, expected_native))
+        self.assertTrue(torch.equal(actual_off_state.key, expected_off_state.key))
+        self.assertTrue(torch.equal(actual_off_state.value, expected_off_state.value))
+        self.assertTrue(torch.equal(actual_native_state.key, expected_native_state.key))
+        self.assertTrue(
+            torch.equal(actual_native_state.value, expected_native_state.value)
+        )
+        self.assertTrue(
+            torch.equal(
+                actual_native_state.crsa_log_usage,
+                expected_native_state.crsa_log_usage,
+            )
+        )
+        self.assertIs(actual_off_state.key, actual_native_state.key)
+        self.assertIs(actual_off_state.value, actual_native_state.value)
+        self.assertIsNone(actual_off_state.crsa_log_usage)
+        self.assertIsNotNone(actual_native_state.crsa_log_usage)
+        self.assertEqual(observed, [evidence])
+        self.assertEqual(evidence, independent_evidence[0])
+        self.assertEqual(evidence.future_weight_max_abs, 0.0)
+        self.assertEqual(evidence.free_head_max_abs_error, 0.0)
+        for actual, original in zip(
+            (query_gate, key, value, q_norm, k_norm),
+            original_tensors,
+            strict=True,
+        ):
+            self.assertTrue(torch.equal(actual, original))
+
+    def test_full_attention_fork_decode_matches_two_independent_arms_exactly(
+        self,
+    ) -> None:
+        from immer.runtimes.qwen3_8.kernels import (
+            full_attention_core,
+            full_attention_fork_core,
+        )
+        from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
+        torch.manual_seed(223)
+        batch, sequence, heads, kv_heads, width = 1, 5, 24, 4, 4
+        query_gate = torch.randn(batch, sequence, 2 * heads * width)
+        key = torch.randn(batch, sequence, kv_heads * width)
+        value = torch.randn(batch, sequence, kv_heads * width)
+        q_norm = torch.randn(width) * 0.05
+        k_norm = torch.randn(width) * 0.05
+        intervention = Qwen38NativeHeadCrsa(alpha=0.07)
+        common = dict(
+            q_norm_weight=q_norm,
+            k_norm_weight=k_norm,
+            num_attention_heads=heads,
+            num_key_value_heads=kv_heads,
+            head_dim=width,
+            rotary_dim=2,
+            rope_theta=1_000.0,
+        )
+        expected_off_prefix, expected_off_state = full_attention_core(
+            query_gate[:, :4],
+            key[:, :4],
+            value[:, :4],
+            **common,
+        )
+        expected_native_prefix, expected_native_state = full_attention_core(
+            query_gate[:, :4],
+            key[:, :4],
+            value[:, :4],
+            native_head_crsa=intervention,
+            **common,
+        )
+        (
+            actual_off_prefix,
+            actual_off_state,
+            actual_native_prefix,
+            actual_native_state,
+            _,
+        ) = full_attention_fork_core(
+            query_gate[:, :4],
+            key[:, :4],
+            value[:, :4],
+            native_head_crsa=intervention,
+            **common,
+        )
+        self.assertTrue(torch.equal(actual_off_prefix, expected_off_prefix))
+        self.assertTrue(torch.equal(actual_native_prefix, expected_native_prefix))
+
+        saved_state = (
+            actual_off_state.key.clone(),
+            actual_off_state.value.clone(),
+            actual_native_state.crsa_log_usage.clone(),
+        )
+        expected_off_decode, expected_off_next = full_attention_core(
+            query_gate[:, 4:],
+            key[:, 4:],
+            value[:, 4:],
+            state=expected_off_state,
+            **common,
+        )
+        expected_native_decode, expected_native_next = full_attention_core(
+            query_gate[:, 4:],
+            key[:, 4:],
+            value[:, 4:],
+            state=expected_native_state,
+            native_head_crsa=intervention,
+            **common,
+        )
+        observed = []
+        (
+            actual_off_decode,
+            actual_off_next,
+            actual_native_decode,
+            actual_native_next,
+            evidence,
+        ) = full_attention_fork_core(
+            query_gate[:, 4:],
+            key[:, 4:],
+            value[:, 4:],
+            off_state=actual_off_state,
+            native_state=actual_native_state,
+            native_head_crsa=intervention,
+            native_head_crsa_observer=observed.append,
+            **common,
+        )
+
+        self.assertTrue(torch.equal(actual_off_decode, expected_off_decode))
+        self.assertTrue(torch.equal(actual_native_decode, expected_native_decode))
+        self.assertTrue(torch.equal(actual_off_next.key, expected_off_next.key))
+        self.assertTrue(torch.equal(actual_off_next.value, expected_off_next.value))
+        self.assertTrue(torch.equal(actual_native_next.key, expected_native_next.key))
+        self.assertTrue(
+            torch.equal(actual_native_next.value, expected_native_next.value)
+        )
+        self.assertTrue(
+            torch.equal(
+                actual_native_next.crsa_log_usage,
+                expected_native_next.crsa_log_usage,
+            )
+        )
+        self.assertIs(actual_off_next.key, actual_native_next.key)
+        self.assertIs(actual_off_next.value, actual_native_next.value)
+        self.assertIsNone(actual_off_next.crsa_log_usage)
+        self.assertEqual(observed, [evidence])
+        self.assertEqual((evidence.query_start, evidence.key_length), (4, 5))
+        self.assertTrue(torch.equal(actual_off_state.key, saved_state[0]))
+        self.assertTrue(torch.equal(actual_off_state.value, saved_state[1]))
+        self.assertTrue(torch.equal(actual_native_state.crsa_log_usage, saved_state[2]))
+
+    def test_full_attention_fork_rejects_ambiguous_or_diverged_states(self) -> None:
+        from immer.runtimes.qwen3_8.kernels import (
+            AttentionState,
+            full_attention_fork_core,
+        )
+        from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
+        torch.manual_seed(227)
+        query_gate = torch.randn(1, 2, 2 * 24 * 4)
+        key = torch.randn(1, 2, 4 * 4)
+        value = torch.randn(1, 2, 4 * 4)
+        common = dict(
+            q_norm_weight=torch.zeros(4),
+            k_norm_weight=torch.zeros(4),
+            num_attention_heads=24,
+            num_key_value_heads=4,
+            head_dim=4,
+            rotary_dim=2,
+        )
+        intervention = Qwen38NativeHeadCrsa(alpha=0.1)
+        _, off_state, _, native_state, _ = full_attention_fork_core(
+            query_gate,
+            key,
+            value,
+            native_head_crsa=intervention,
+            **common,
+        )
+
+        with self.assertRaisesRegex(TypeError, "must be a Qwen38NativeHeadCrsa"):
+            full_attention_fork_core(
+                query_gate,
+                key,
+                value,
+                native_head_crsa=None,  # type: ignore[arg-type]
+                **common,
+            )
+        with self.assertRaisesRegex(TypeError, "observer must be callable"):
+            full_attention_fork_core(
+                query_gate,
+                key,
+                value,
+                native_head_crsa=intervention,
+                native_head_crsa_observer=3,  # type: ignore[arg-type]
+                **common,
+            )
+        with self.assertRaisesRegex(ValueError, "both be present"):
+            full_attention_fork_core(
+                query_gate[:, :1],
+                key[:, :1],
+                value[:, :1],
+                off_state=off_state,
+                native_head_crsa=intervention,
+                **common,
+            )
+        off_with_usage = AttentionState(
+            key=off_state.key,
+            value=off_state.value,
+            crsa_log_usage=native_state.crsa_log_usage,
+        )
+        with self.assertRaisesRegex(ValueError, "off_state may not retain"):
+            full_attention_fork_core(
+                query_gate[:, :1],
+                key[:, :1],
+                value[:, :1],
+                off_state=off_with_usage,
+                native_state=native_state,
+                native_head_crsa=intervention,
+                **common,
+            )
+        with self.assertRaisesRegex(ValueError, "usage does not match"):
+            full_attention_fork_core(
+                query_gate[:, :1],
+                key[:, :1],
+                value[:, :1],
+                off_state=off_state,
+                native_state=off_state,
+                native_head_crsa=intervention,
+                **common,
+            )
+        diverged_key = native_state.key.clone()
+        diverged_key[0, 0, 0, 0] += 1.0
+        diverged_native = AttentionState(
+            key=diverged_key,
+            value=native_state.value,
+            crsa_log_usage=native_state.crsa_log_usage,
+        )
+        with self.assertRaisesRegex(ValueError, "identical K/V history"):
+            full_attention_fork_core(
+                query_gate[:, :1],
+                key[:, :1],
+                value[:, :1],
+                off_state=off_state,
+                native_state=diverged_native,
+                native_head_crsa=intervention,
+                **common,
+            )
+
     def test_causal_depthwise_conv_matches_scalar_and_continuation(self) -> None:
         from immer.runtimes.qwen3_8.kernels import causal_depthwise_conv
 

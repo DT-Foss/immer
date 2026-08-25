@@ -34,6 +34,7 @@ __all__ = [
     "apply_rotary_pos_emb",
     "causal_depthwise_conv",
     "full_attention_core",
+    "full_attention_fork_core",
     "gated_delta_net_core",
     "l2_normalize",
     "recurrent_gated_delta_rule",
@@ -122,6 +123,24 @@ class AttentionState:
     @property
     def length(self) -> int:
         return int(self.key.shape[2])
+
+
+@dataclass(frozen=True, slots=True)
+class _FullAttentionWork:
+    """Shared immutable tensors for one full-attention layer pass."""
+
+    gate: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    repeated_value: torch.Tensor
+    scores: torch.Tensor
+    allowed: torch.Tensor
+    base_probabilities: torch.Tensor
+    batch_size: int
+    sequence_length: int
+    heads: int
+    width: int
+    past_length: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,7 +514,7 @@ def _validate_attention_mask(
     raise ValueError("attention_mask must have 2, 3, or 4 dimensions")
 
 
-def full_attention_core(
+def _full_attention_work(
     projected_query_gate: torch.Tensor,
     projected_key: torch.Tensor,
     projected_value: torch.Tensor,
@@ -508,21 +527,16 @@ def full_attention_core(
     position_ids: torch.Tensor | None = None,
     state: AttentionState | None = None,
     attention_mask: torch.Tensor | None = None,
-    native_head_crsa: Qwen38NativeHeadCrsa | None = None,
-    native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None] | None = None,
+    require_crsa_usage: bool,
+    native_support: bool,
     rope_theta: float = 10_000_000.0,
     rotary_dim: int | None = None,
     partial_rotary_factor: float = 0.25,
     mrope_section: Sequence[int] | None = None,
     mrope_interleaved: bool = True,
     rms_norm_eps: float = 1e-6,
-) -> tuple[torch.Tensor, AttentionState]:
-    """Run gated causal GQA from sequentially streamed projection outputs.
-
-    The returned activation is pre-``o_proj`` with shape
-    ``[batch, sequence, num_attention_heads * head_dim]``.  The returned state
-    contains RoPE-applied keys and raw values for exact continuation.
-    """
+) -> _FullAttentionWork:
+    """Compute tensors shared by ordinary and native full-attention arms."""
 
     query_gate = _floating_tensor(projected_query_gate, "projected_query_gate", ndim=3)
     key_projection = _floating_tensor(projected_key, "projected_key", ndim=3)
@@ -530,17 +544,6 @@ def full_attention_core(
     heads = _positive_int(num_attention_heads, "num_attention_heads")
     kv_heads = _positive_int(num_key_value_heads, "num_key_value_heads")
     width = _positive_int(head_dim, "head_dim")
-    if native_head_crsa is not None and not isinstance(
-        native_head_crsa, Qwen38NativeHeadCrsa
-    ):
-        raise TypeError("native_head_crsa must be a Qwen38NativeHeadCrsa or None")
-    if native_head_crsa_observer is not None:
-        if native_head_crsa is None:
-            raise ValueError(
-                "native_head_crsa_observer requires an active native_head_crsa hook"
-            )
-        if not callable(native_head_crsa_observer):
-            raise TypeError("native_head_crsa_observer must be callable or None")
     if heads % kv_heads:
         raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
     if (
@@ -585,8 +588,7 @@ def full_attention_core(
         _same_device_dtype(key, state.key, "state.key")
         _same_device_dtype(value, state.value, "state.value")
         past_length = state.length
-        needs_usage = native_head_crsa is not None and native_head_crsa.active
-        if needs_usage != (state.crsa_log_usage is not None):
+        if require_crsa_usage != (state.crsa_log_usage is not None):
             raise ValueError(
                 "attention state CRSA usage does not match the native intervention"
             )
@@ -670,11 +672,11 @@ def full_attention_core(
         if is_validity_mask or not mask.is_floating_point():
             validity = mask.bool()
             scores = scores.masked_fill(~validity, torch.finfo(scores.dtype).min)
-            if native_head_crsa is not None:
+            if native_support:
                 allowed = allowed & validity
         else:
             scores = scores + mask.to(dtype=scores.dtype)
-            if native_head_crsa is not None:
+            if native_support:
                 if bool((torch.isnan(mask) | torch.isposinf(mask)).any().item()):
                     raise ValueError(
                         "floating attention_mask may not contain NaN or +inf"
@@ -682,29 +684,263 @@ def full_attention_core(
                 allowed = allowed & ~torch.isneginf(mask)
                 scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
 
-    probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    base_probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    return _FullAttentionWork(
+        gate=gate,
+        key=key,
+        value=value,
+        repeated_value=repeated_value,
+        scores=scores,
+        allowed=allowed,
+        base_probabilities=base_probabilities,
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+        heads=heads,
+        width=width,
+        past_length=past_length,
+    )
+
+
+def _full_attention_output(
+    work: _FullAttentionWork,
+    probabilities: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.matmul(probabilities, work.repeated_value)
+    output = output.transpose(1, 2).contiguous()
+    output = output * torch.sigmoid(work.gate)
+    return output.reshape(
+        work.batch_size,
+        work.sequence_length,
+        work.heads * work.width,
+    )
+
+
+def _route_native_attention(
+    work: _FullAttentionWork,
+    intervention: Qwen38NativeHeadCrsa,
+    prior_log_usage: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, NativeHeadCrsaEvidence]:
+    probabilities = work.base_probabilities
+    if intervention.active:
+        probabilities = probabilities.masked_fill(~work.allowed, 0.0)
+    return intervention.route(
+        work.scores,
+        probabilities,
+        query_start=work.past_length,
+        allowed=work.allowed,
+        prior_log_usage=prior_log_usage,
+    )
+
+
+def _validate_native_attention_hook(
+    native_head_crsa: Qwen38NativeHeadCrsa | None,
+    native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None] | None,
+    *,
+    required: bool,
+) -> Qwen38NativeHeadCrsa | None:
+    if native_head_crsa is None:
+        if required:
+            raise TypeError("native_head_crsa must be a Qwen38NativeHeadCrsa")
+        if native_head_crsa_observer is not None:
+            raise ValueError(
+                "native_head_crsa_observer requires an active native_head_crsa hook"
+            )
+        return None
+    if not isinstance(native_head_crsa, Qwen38NativeHeadCrsa):
+        suffix = "" if required else " or None"
+        raise TypeError(f"native_head_crsa must be a Qwen38NativeHeadCrsa{suffix}")
+    if native_head_crsa_observer is not None and not callable(
+        native_head_crsa_observer
+    ):
+        raise TypeError("native_head_crsa_observer must be callable or None")
+    return native_head_crsa
+
+
+def full_attention_core(
+    projected_query_gate: torch.Tensor,
+    projected_key: torch.Tensor,
+    projected_value: torch.Tensor,
+    *,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    num_attention_heads: int,
+    num_key_value_heads: int,
+    head_dim: int,
+    position_ids: torch.Tensor | None = None,
+    state: AttentionState | None = None,
+    attention_mask: torch.Tensor | None = None,
+    native_head_crsa: Qwen38NativeHeadCrsa | None = None,
+    native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None] | None = None,
+    rope_theta: float = 10_000_000.0,
+    rotary_dim: int | None = None,
+    partial_rotary_factor: float = 0.25,
+    mrope_section: Sequence[int] | None = None,
+    mrope_interleaved: bool = True,
+    rms_norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, AttentionState]:
+    """Run gated causal GQA from sequentially streamed projection outputs.
+
+    The returned activation is pre-``o_proj`` with shape
+    ``[batch, sequence, num_attention_heads * head_dim]``.  The returned state
+    contains RoPE-applied keys and raw values for exact continuation.
+    """
+
+    intervention = _validate_native_attention_hook(
+        native_head_crsa,
+        native_head_crsa_observer,
+        required=False,
+    )
+    work = _full_attention_work(
+        projected_query_gate,
+        projected_key,
+        projected_value,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
+        head_dim=head_dim,
+        position_ids=position_ids,
+        state=state,
+        attention_mask=attention_mask,
+        require_crsa_usage=intervention is not None and intervention.active,
+        native_support=intervention is not None,
+        rope_theta=rope_theta,
+        rotary_dim=rotary_dim,
+        partial_rotary_factor=partial_rotary_factor,
+        mrope_section=mrope_section,
+        mrope_interleaved=mrope_interleaved,
+        rms_norm_eps=rms_norm_eps,
+    )
+    probabilities = work.base_probabilities
     next_log_usage = None
-    if native_head_crsa is not None:
-        if native_head_crsa.active:
-            probabilities = probabilities.masked_fill(~allowed, 0.0)
-        probabilities, next_log_usage, evidence = native_head_crsa.route(
-            scores,
-            probabilities,
-            query_start=past_length,
-            allowed=allowed,
-            prior_log_usage=(None if state is None else state.crsa_log_usage),
+    if intervention is not None:
+        probabilities, next_log_usage, evidence = _route_native_attention(
+            work,
+            intervention,
+            None if state is None else state.crsa_log_usage,
         )
         if native_head_crsa_observer is not None:
             native_head_crsa_observer(evidence)
+    output = _full_attention_output(work, probabilities)
     next_state = AttentionState(
-        key=key,
-        value=value,
+        key=work.key,
+        value=work.value,
         crsa_log_usage=next_log_usage,
     )
-    output = torch.matmul(probabilities, repeated_value)
-    output = output.transpose(1, 2).contiguous()
-    output = output * torch.sigmoid(gate)
-    return output.reshape(batch_size, sequence_length, heads * width), next_state
+    return output, next_state
+
+
+def full_attention_fork_core(
+    projected_query_gate: torch.Tensor,
+    projected_key: torch.Tensor,
+    projected_value: torch.Tensor,
+    *,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    num_attention_heads: int,
+    num_key_value_heads: int,
+    head_dim: int,
+    native_head_crsa: Qwen38NativeHeadCrsa,
+    position_ids: torch.Tensor | None = None,
+    off_state: AttentionState | None = None,
+    native_state: AttentionState | None = None,
+    attention_mask: torch.Tensor | None = None,
+    native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None] | None = None,
+    rope_theta: float = 10_000_000.0,
+    rotary_dim: int | None = None,
+    partial_rotary_factor: float = 0.25,
+    mrope_section: Sequence[int] | None = None,
+    mrope_interleaved: bool = True,
+    rms_norm_eps: float = 1e-6,
+) -> tuple[
+    torch.Tensor,
+    AttentionState,
+    torch.Tensor,
+    AttentionState,
+    NativeHeadCrsaEvidence,
+]:
+    """Fork one shared attention pass into exact off and native Head-CRSA arms.
+
+    Query/key/value normalization, RoPE, causal score construction, masking and
+    base softmax are evaluated exactly once.  Each arm then performs its own
+    ``P @ V`` and output gate without concatenating the two arithmetic paths.
+    Returned K/V tensors are the same immutable-by-contract tensor objects;
+    only the native state owns CRSA usage history.
+    """
+
+    intervention = _validate_native_attention_hook(
+        native_head_crsa,
+        native_head_crsa_observer,
+        required=True,
+    )
+    assert intervention is not None
+    if (off_state is None) != (native_state is None):
+        raise ValueError("off_state and native_state must both be present or both None")
+    if off_state is not None:
+        if not isinstance(off_state, AttentionState):
+            raise TypeError("off_state must be an AttentionState")
+        if not isinstance(native_state, AttentionState):
+            raise TypeError("native_state must be an AttentionState")
+        if off_state.crsa_log_usage is not None:
+            raise ValueError("off_state may not retain CRSA usage")
+        needs_usage = intervention.active
+        if needs_usage != (native_state.crsa_log_usage is not None):
+            raise ValueError(
+                "native_state CRSA usage does not match the native intervention"
+            )
+        if off_state.key.shape != native_state.key.shape:
+            raise ValueError("fork state K/V shapes must match")
+        _same_device_dtype(off_state.key, native_state.key, "native_state.key")
+        _same_device_dtype(off_state.value, native_state.value, "native_state.value")
+        if not torch.equal(off_state.key, native_state.key) or not torch.equal(
+            off_state.value,
+            native_state.value,
+        ):
+            raise ValueError("fork states must contain identical K/V history")
+
+    work = _full_attention_work(
+        projected_query_gate,
+        projected_key,
+        projected_value,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
+        head_dim=head_dim,
+        position_ids=position_ids,
+        state=off_state,
+        attention_mask=attention_mask,
+        require_crsa_usage=False,
+        native_support=True,
+        rope_theta=rope_theta,
+        rotary_dim=rotary_dim,
+        partial_rotary_factor=partial_rotary_factor,
+        mrope_section=mrope_section,
+        mrope_interleaved=mrope_interleaved,
+        rms_norm_eps=rms_norm_eps,
+    )
+    native_probabilities, next_log_usage, evidence = _route_native_attention(
+        work,
+        intervention,
+        None if native_state is None else native_state.crsa_log_usage,
+    )
+    off_output = _full_attention_output(work, work.base_probabilities)
+    native_output = _full_attention_output(work, native_probabilities)
+    off_next_state = AttentionState(key=work.key, value=work.value)
+    native_next_state = AttentionState(
+        key=work.key,
+        value=work.value,
+        crsa_log_usage=next_log_usage,
+    )
+    if native_head_crsa_observer is not None:
+        native_head_crsa_observer(evidence)
+    return (
+        off_output,
+        off_next_state,
+        native_output,
+        native_next_state,
+        evidence,
+    )
 
 
 def causal_depthwise_conv(
