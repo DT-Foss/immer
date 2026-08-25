@@ -40,6 +40,21 @@ class CandidateVerificationStatus(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class CertifiedAnswer:
+    """Canonical answer and the complete evidence of an exact FERTIG proof."""
+
+    answer: str
+    evidence: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "answer": self.answer,
+            "evidence": self.evidence,
+            "kind": "fertig-certified-answer/v1",
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateVerification:
     """Exact candidate judgment plus machine-readable proof evidence."""
 
@@ -227,6 +242,13 @@ def _candidate_fraction(candidate: object) -> Fraction | None:
         return None
 
 
+def canonical_numeric_candidate(candidate: object) -> str | None:
+    """Canonicalize one complete numeric candidate without extracting prose."""
+
+    parsed = _candidate_fraction(candidate)
+    return _canonical_fraction(parsed) if parsed is not None else None
+
+
 def verify_candidate(question: str, candidate: object) -> CandidateVerification:
     """Verify a proposed numeric answer using only exact, gold-free certificates."""
 
@@ -236,9 +258,7 @@ def verify_candidate(question: str, candidate: object) -> CandidateVerification:
         else None
     )
     parsed_candidate = _candidate_fraction(candidate)
-    canonical_candidate = (
-        _canonical_fraction(parsed_candidate) if parsed_candidate is not None else None
-    )
+    canonical_candidate = canonical_numeric_candidate(candidate)
     if not isinstance(question, str) or not question.strip():
         return CandidateVerification(
             CandidateVerificationStatus.ABSTAINED,
@@ -357,6 +377,26 @@ class FertigSolver:
 
         return verify_candidate(question, candidate)
 
+    def certify(self, question: str) -> CertifiedAnswer | None:
+        """Return only a canonical, independently certified exact answer.
+
+        This surface never invokes the checkout, vendored, or installed legacy
+        solver.  ``None`` therefore means that the closed exact frontend did
+        not produce a proof, not that a heuristic failed to guess an answer.
+        """
+
+        if not isinstance(question, str):
+            raise TypeError("question must be text")
+        if not question.strip():
+            return None
+        certified = _solve_certified_evidence(question)
+        if certified is None:
+            return None
+        return CertifiedAnswer(
+            answer=_canonical_fraction(certified.answer),
+            evidence=certified.evidence,
+        )
+
     def handle(self, request: Request) -> Result:
         if request.capability not in self.capabilities:
             return Result(
@@ -388,7 +428,9 @@ class FertigSolver:
 __all__ = [
     "CandidateVerification",
     "CandidateVerificationStatus",
+    "CertifiedAnswer",
     "FertigSolver",
     "FertigStructuralError",
+    "canonical_numeric_candidate",
     "verify_candidate",
 ]

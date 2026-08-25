@@ -48,6 +48,7 @@ class CompositionRoot:
         qwen38_causal_bundle: str | Path | None = None,
         qwen38_tokenizer: str | Path | None = None,
         qwen38_options: Mapping[str, Any] | None = None,
+        qwen38_raw_chat: bool = False,
     ) -> CompositionRoot:
         """Build without loading neural artifacts.
 
@@ -84,6 +85,12 @@ class CompositionRoot:
             raise ValueError(
                 "qwen38_options requires the local Qwen3.8 bundle/tokenizer"
             )
+        if not isinstance(qwen38_raw_chat, bool):
+            raise TypeError("qwen38_raw_chat must be bool")
+        if qwen38_raw_chat and not qwen38_requested:
+            raise ValueError(
+                "qwen38_raw_chat requires the local Qwen3.8 bundle/tokenizer"
+            )
 
         if s3_arithmetic is None:
             from .capabilities.s3_runtime import S3Arithmetic
@@ -99,7 +106,9 @@ class CompositionRoot:
         # importantly, the stream is not passed to S3 at all: S3 owns its
         # private frozen A1 host, while LifeDaemon may own this mutable stream.
         if life_stream is s3_arithmetic or life_stream is fertig:
-            raise ValueError("learning life stream must be distinct from frozen exact backends")
+            raise ValueError(
+                "learning life stream must be distinct from frozen exact backends"
+            )
 
         exact_math = ExactCascade(s3_arithmetic=s3_arithmetic, fertig=fertig)
         if grounded_chat is None and fertig_state_dir is not None:
@@ -124,11 +133,17 @@ class CompositionRoot:
                 )
             assert qwen38_causal_bundle is not None
             assert qwen38_tokenizer is not None
-            general_chat = Qwen38CausalChat(
+            raw_qwen = Qwen38CausalChat(
                 qwen38_causal_bundle,
                 qwen38_tokenizer,
                 **options,
             )
+            if qwen38_raw_chat:
+                general_chat = raw_qwen
+            else:
+                from .cognition.qwen_fertig_chat import QwenFertigChat
+
+                general_chat = QwenFertigChat(raw_qwen, fertig)  # type: ignore[arg-type]
         components = tuple(
             component
             for component in (exact_math, grounded_chat, general_chat)
@@ -171,6 +186,7 @@ def compose_runtime(
     qwen38_causal_bundle: str | Path | None = None,
     qwen38_tokenizer: str | Path | None = None,
     qwen38_options: Mapping[str, Any] | None = None,
+    qwen38_raw_chat: bool = False,
 ) -> CompositionRoot:
     """Functional alias for callers that do not need the classmethod syntax."""
 
@@ -188,6 +204,7 @@ def compose_runtime(
         qwen38_causal_bundle=qwen38_causal_bundle,
         qwen38_tokenizer=qwen38_tokenizer,
         qwen38_options=qwen38_options,
+        qwen38_raw_chat=qwen38_raw_chat,
     )
 
 

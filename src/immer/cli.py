@@ -97,7 +97,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
     except (OSError, TypeError, ValueError) as exc:
         print(json.dumps({
             "status": "error",
-            "component": "qwen3.8.causal-chat",
+            "component": "qwen3.8.fertig-chat",
             "reason": f"{type(exc).__name__}: {exc}",
         }, ensure_ascii=False, sort_keys=True))
         return 2

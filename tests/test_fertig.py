@@ -134,6 +134,26 @@ class FertigAdapterTests(unittest.TestCase):
         self.assertEqual(result.status, ExecutionStatus.OK)
         self.assertEqual(result.output, "500")
 
+    def test_public_certify_returns_only_canonical_full_exact_evidence(self) -> None:
+        solver = FertigSolver()
+
+        certified = solver.certify(self.OVEN_QUESTION)
+        unsupported = solver.certify("What is the capital of France?")
+
+        self.assertIsNotNone(certified)
+        assert certified is not None
+        self.assertEqual(certified.answer, "500")
+        self.assertEqual(certified.evidence["answer"], "500")
+        self.assertTrue(certified.evidence["verified"])
+        self.assertTrue(certified.evidence["certificates"][0]["verified"])
+        self.assertIsNone(unsupported)
+
+        with mock.patch.object(
+            solver, "_solve", side_effect=AssertionError("legacy path called")
+        ) as legacy:
+            self.assertIsNone(solver.certify("still unsupported"))
+        legacy.assert_not_called()
+
     def test_clause_compiler_reaches_the_normal_exact_solver_path(self) -> None:
         question = (
             "Becca, Smendrick, and PJ have collections of Magic Cards. "

@@ -1,4 +1,4 @@
-from .adapter import FertigSolver
+from .adapter import CertifiedAnswer, FertigSolver
 from .grounded import FertigGrounded
 
-__all__ = ["FertigGrounded", "FertigSolver"]
+__all__ = ["CertifiedAnswer", "FertigGrounded", "FertigSolver"]

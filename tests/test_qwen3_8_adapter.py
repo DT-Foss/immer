@@ -10,6 +10,8 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from immer.cli import main
+from immer.cognition.fertig import FertigSolver
+from immer.cognition.qwen_fertig_chat import QwenFertigChat
 from immer.composition import CompositionRoot, compose_runtime
 from immer.contracts import ExecutionStatus, Request, Result
 from immer.runtimes.qwen3_8.adapter import Qwen38CausalChat, Qwen38ChatError
@@ -306,14 +308,14 @@ class Qwen38CausalChatTests(unittest.TestCase):
         runtime = _Runtime()
         component = _chat(runtime)
         exact_a = _ExactBackend()
-        exact_b = _ExactBackend()
+        fertig = FertigSolver()
         with patch(
             "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
             return_value=component,
         ) as constructor:
             root = compose_runtime(
                 s3_arithmetic=exact_a,
-                fertig=exact_b,
+                fertig=fertig,
                 qwen38_causal_bundle="local.causal",
                 qwen38_tokenizer="tokenizer.json",
                 qwen38_options={
@@ -323,11 +325,33 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 },
             )
 
-        self.assertIsInstance(root.general_chat, Qwen38CausalChat)
+        self.assertIsInstance(root.general_chat, QwenFertigChat)
+        self.assertIs(root.general_chat.qwen, component)
+        self.assertIs(root.general_chat.fertig, root.exact_math.fertig)
         self.assertFalse(root.general_chat.loaded)
         constructor.assert_called_once()
         self.assertEqual(root.runtime.registry.capabilities(), ("chat", "exact_math"))
         self.assertTrue(root.dispatch("chat", "hello").ok)
+        root.general_chat.close()
+
+    def test_composition_can_explicitly_construct_raw_qwen_for_low_level_use(
+        self,
+    ) -> None:
+        component = _chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=component,
+        ):
+            root = compose_runtime(
+                s3_arithmetic=_ExactBackend(),
+                fertig=_ExactBackend(),
+                qwen38_causal_bundle="local.causal",
+                qwen38_tokenizer="tokenizer.json",
+                qwen38_raw_chat=True,
+            )
+
+        self.assertIs(root.general_chat, component)
+        self.assertIs(root.runtime.registry.get("chat"), component)
         root.general_chat.close()
 
     def test_composition_rejects_ambiguous_qwen_configuration(self) -> None:
@@ -355,19 +379,15 @@ class Qwen38CausalChatTests(unittest.TestCase):
             )
 
     def test_cli_wires_explicit_local_paths_and_closes_component(self) -> None:
-        component = _chat(_Runtime())
+        qwen = _chat(_Runtime())
+        component = QwenFertigChat(qwen, FertigSolver())
 
         class _Root:
             general_chat = component
 
             def dispatch(self, capability, payload):
                 self.call = (capability, payload)
-                return Result(
-                    ExecutionStatus.OK,
-                    "qwen3.8.causal-chat",
-                    output="answer",
-                    evidence={"bundle": _BUNDLE_RECEIPT},
-                )
+                return self.general_chat.handle(Request(capability, payload))
 
         root = _Root()
         output = io.StringIO()
@@ -389,12 +409,19 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(root.call, ("chat", "hello"))
         self.assertTrue(component.closed)
+        self.assertTrue(qwen.closed)
         options = build.call_args.kwargs
         self.assertEqual(options["qwen38_causal_bundle"], "/models/qwen.causal")
         self.assertEqual(options["qwen38_tokenizer"], "/models/tokenizer.json")
         self.assertEqual(options["qwen38_options"]["max_new_tokens"], 4)
         self.assertEqual(options["qwen38_options"]["source_budget_mb"], 65536)
-        self.assertEqual(json.loads(output.getvalue())["output"], "answer")
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["component"], "qwen3.8.fertig-chat")
+        self.assertEqual(payload["output"], "local answer")
+        self.assertEqual(
+            payload["evidence"]["receipt"]["route"],
+            "qwen_verification_abstained",
+        )
 
 
 if __name__ == "__main__":
