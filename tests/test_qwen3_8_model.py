@@ -388,6 +388,198 @@ class Qwen38ModelTests(unittest.TestCase):
             if self.config.is_full_attention(layer):
                 self.assertEqual(state.length, 4)
 
+    def test_continuation_block_is_non_committing_and_single_use(self) -> None:
+        self.model.prefill([[1, 4]])
+        committed_objects = tuple(self.model._layer_states)
+        committed_values = _clone_layer_states(self.model._layer_states)
+
+        stage = self.model.stage_continuation_block([[9, 7]])
+
+        self.assertEqual(self.model.next_position, 2)
+        self.assertEqual(self.model.state_batch_size, 1)
+        self.assertFalse(self.model.state_poisoned)
+        self.assertEqual(tuple(stage.hidden.shape), (1, 2, self.config.dim))
+        self.assertEqual((stage.evidence.start_pos, stage.evidence.end_pos), (2, 4))
+        self.assertEqual(stage.evidence.input_token_ids, ((9, 7),))
+        self.assertEqual(stage.evidence.layers_executed, self.config.n_layers)
+        self.assertEqual(stage.evidence.linear_calls, 31)
+        self.assertGreater(stage.evidence.staged_state_bytes, self.model.state_bytes)
+        self.assertTrue(
+            all(
+                current is original
+                for current, original in zip(
+                    self.model._layer_states, committed_objects, strict=True
+                )
+            )
+        )
+        _assert_layer_states_equal(self, self.model._layer_states, committed_values)
+
+        object.__setattr__(stage.evidence, "input_token_ids", ((5, 5),))
+        object.__setattr__(stage.evidence, "source_body_bytes", 1)
+        stage.hidden.fill_(float("nan"))
+        hidden, evidence = self.model.commit_continuation_block(stage)
+
+        self.assertIsNot(hidden, stage.hidden)
+        self.assertTrue(torch.isfinite(hidden).all())
+        self.assertEqual((evidence.start_pos, evidence.end_pos), (2, 4))
+        self.assertEqual(evidence.context_mode, "decode")
+        self.assertEqual(evidence.input_token_ids, ((9, 7),))
+        self.assertNotEqual(evidence.source_body_bytes, 1)
+        self.assertEqual(self.model.next_position, 4)
+        for layer, state in enumerate(self.model._layer_states):
+            if self.config.is_full_attention(layer):
+                self.assertEqual(state.length, 4)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+            self.model.commit_continuation_block(stage)
+
+        next_stage = self.model.stage_continuation_block([[5, 6]])
+        self.model.discard_continuation_block(next_stage)
+        self.assertEqual(self.model.next_position, 4)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+            self.model.discard_continuation_block(next_stage)
+
+    def test_bfloat16_continuation_block_matches_tokenwise_state_bit_exactly(
+        self,
+    ) -> None:
+        pagers = [
+            Qwen38WeightPager(
+                self.source,
+                device="cpu",
+                compute_dtype="bfloat16",
+                max_resident_bytes=2 * 1024**2,
+            )
+            for _ in range(2)
+        ]
+        block_model, token_model = (
+            StreamedQwen38(
+                self.config,
+                pager,
+                max_batch_size=1,
+                max_seq_len=16,
+            )
+            for pager in pagers
+        )
+        try:
+            block_model.prefill([[1, 4]])
+            stage = block_model.stage_continuation_block([[9, 7]])
+
+            token_model.prefill([[1, 4]])
+            first, first_evidence = token_model.decode([[9]])
+            second, second_evidence = token_model.decode([[7]])
+            tokenwise = torch.cat((first, second), dim=1)
+
+            self.assertTrue(torch.equal(stage.hidden, tokenwise))
+            self.assertEqual(stage.evidence.linear_calls, 31)
+            self.assertEqual(
+                first_evidence.linear_calls + second_evidence.linear_calls,
+                62,
+            )
+
+            committed, evidence = block_model.commit_continuation_block(stage)
+            self.assertTrue(torch.equal(committed, tokenwise))
+            _assert_layer_states_equal(
+                self, block_model._layer_states, token_model._layer_states
+            )
+            self.assertEqual(evidence.state_bytes, token_model.state_bytes)
+        finally:
+            for pager in pagers:
+                pager.close()
+
+    def test_continuation_block_stale_and_failure_paths_preserve_base_state(
+        self,
+    ) -> None:
+        self.model.prefill([[1, 4]])
+        base_objects = tuple(self.model._layer_states)
+        base_values = _clone_layer_states(self.model._layer_states)
+        first = self.model.stage_continuation_block([[9, 7]])
+        second = self.model.stage_continuation_block([[8, 6]])
+        with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+            self.model.commit_continuation_block(first)
+        self.model.discard_continuation_block(second)
+
+        original_mlp = self.model._mlp
+
+        def fail_on_layer_two(hidden, *, layer):
+            if layer == 2:
+                raise RuntimeError("block transaction failure")
+            return original_mlp(hidden, layer=layer)
+
+        with mock.patch.object(self.model, "_mlp", side_effect=fail_on_layer_two):
+            with self.assertRaisesRegex(RuntimeError, "block transaction failure"):
+                self.model.stage_continuation_block([[9, 7]])
+
+        self.assertEqual(self.model.next_position, 2)
+        self.assertFalse(self.model.state_poisoned)
+        self.assertTrue(
+            all(
+                current is original
+                for current, original in zip(
+                    self.model._layer_states, base_objects, strict=True
+                )
+            )
+        )
+        _assert_layer_states_equal(self, self.model._layer_states, base_values)
+        recovered, evidence = self.model.decode([[9]])
+        self.assertEqual(tuple(recovered.shape), (1, 1, self.config.dim))
+        self.assertEqual(evidence.end_pos, 3)
+
+    def test_continuation_block_rejects_probe_and_state_invalidation(self) -> None:
+        records = []
+        probed = StreamedQwen38(
+            self.config,
+            self.pager,
+            delta_probe=lambda layer, row: records.append((layer, row)),
+            max_batch_size=1,
+            max_seq_len=16,
+        )
+        probed.prefill([[1, 4]])
+        records.clear()
+        with self.assertRaisesRegex(Qwen38RuntimeError, "active DeltaNet probe"):
+            probed.stage_continuation_block([[9, 7]])
+        self.assertEqual(records, [])
+        self.assertEqual(probed.next_position, 2)
+
+        self.model.prefill([[1, 4]])
+        stage = self.model.stage_continuation_block([[9, 7]])
+        self.model.reset_state()
+        with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+            self.model.commit_continuation_block(stage)
+
+        self.model.prefill([[1, 4]])
+        stage = self.model.stage_continuation_block([[9, 7]])
+        self.model.delta_probe = lambda _layer, _row: None
+        with self.assertRaisesRegex(Qwen38RuntimeError, "configuration changed"):
+            self.model.commit_continuation_block(stage)
+        self.model.delta_probe = None
+
+        stage = self.model.stage_continuation_block([[9, 7]])
+        self.model.decode([[8]])
+        with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+            self.model.commit_continuation_block(stage)
+
+    def test_continuation_block_batch_and_context_boundaries(self) -> None:
+        self.model.prefill([[1, 4], [2, 5]])
+        stage = self.model.stage_continuation_block([[9, 7], [8, 6]])
+        hidden, evidence = self.model.commit_continuation_block(stage)
+        self.assertEqual(tuple(hidden.shape), (2, 2, self.config.dim))
+        self.assertEqual(evidence.input_token_ids, ((9, 7), (8, 6)))
+        self.assertEqual(self.model.next_position, 4)
+
+        stale = self.model.stage_continuation_block([[3], [4]])
+        self.model.max_batch_size = 1
+        with self.assertRaisesRegex(Qwen38RuntimeError, "current runtime bounds"):
+            self.model.commit_continuation_block(stale)
+
+        bounded = StreamedQwen38(
+            self.config,
+            self.pager,
+            max_batch_size=1,
+            max_seq_len=3,
+        )
+        bounded.prefill([[1, 4]])
+        with self.assertRaisesRegex(ValueError, "exceeds max_seq_len"):
+            bounded.stage_continuation_block([[9, 7]])
+
     def test_stateful_bfloat16_prefill_and_decode_are_bit_exact(self) -> None:
         pager = Qwen38WeightPager(
             self.source,
@@ -877,6 +1069,78 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(model.next_position, 0)
         self.assertTrue(all(state is None for state in model._layer_states))
 
+    def test_graft_continuation_block_delays_history_commit(self) -> None:
+        graft = Qwen38StableCrsaGraft(mode="crsa", alpha=0.1)
+        model = StreamedQwen38(
+            self.config,
+            self.pager,
+            graft=graft,
+            graft_layer=1,
+            max_batch_size=1,
+            max_seq_len=16,
+        )
+        model.prefill([[1, 4]])
+        committed_history = model._graft_history
+
+        stage = model.stage_continuation_block([[9, 7]])
+
+        self.assertIs(model._graft_history, committed_history)
+        self.assertEqual(tuple(committed_history.shape), (1, 2, self.config.dim))
+        self.assertEqual(stage.evidence.graft_history_tokens, 4)
+        model.commit_continuation_block(stage)
+        self.assertEqual(tuple(model._graft_history.shape), (1, 4, self.config.dim))
+        self.assertEqual(model.next_position, 4)
+
+        stale = model.stage_continuation_block([[8, 6]])
+        graft.alpha = 0.9
+        with self.assertRaisesRegex(Qwen38RuntimeError, "configuration changed"):
+            model.commit_continuation_block(stale)
+        self.assertEqual(model.next_position, 4)
+
+    def test_bfloat16_graft_block_matches_tokenwise_state_bit_exactly(self) -> None:
+        pagers = [
+            Qwen38WeightPager(
+                self.source,
+                device="cpu",
+                compute_dtype="bfloat16",
+                max_resident_bytes=2 * 1024**2,
+            )
+            for _ in range(2)
+        ]
+        models = [
+            StreamedQwen38(
+                self.config,
+                pager,
+                graft=Qwen38StableCrsaGraft(mode="crsa", alpha=0.1),
+                graft_layer=1,
+                max_batch_size=1,
+                max_seq_len=16,
+            )
+            for pager in pagers
+        ]
+        block_model, token_model = models
+        try:
+            block_model.prefill([[1, 4]])
+            stage = block_model.stage_continuation_block([[9, 7]])
+
+            token_model.prefill([[1, 4]])
+            first, _ = token_model.decode([[9]])
+            second, _ = token_model.decode([[7]])
+            expected = torch.cat((first, second), dim=1)
+
+            self.assertTrue(torch.equal(stage.hidden, expected))
+            actual, _ = block_model.commit_continuation_block(stage)
+            self.assertTrue(torch.equal(actual, expected))
+            _assert_layer_states_equal(
+                self, block_model._layer_states, token_model._layer_states
+            )
+            self.assertTrue(
+                torch.equal(block_model._graft_history, token_model._graft_history)
+            )
+        finally:
+            for pager in pagers:
+                pager.close()
+
 
 class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -972,6 +1236,19 @@ class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
                 stop_layer=self.config.n_layers,
             )
         self.assertEqual(self.model._metric(self.pager, "linear_calls"), linears_before)
+        self.assertEqual(self.observed, [])
+
+    def test_native_continuation_block_requires_tokenwise_exact_usage(self) -> None:
+        self.model.prefill([[1, 4]])
+        self.observed.clear()
+        committed = self.model._layer_states[27]
+        self.assertIsInstance(committed, AttentionState)
+
+        with self.assertRaisesRegex(Qwen38RuntimeError, "tokenwise-exact native CRSA"):
+            self.model.stage_continuation_block([[9, 7]])
+
+        self.assertEqual(self.model.next_position, 2)
+        self.assertIs(self.model._layer_states[27], committed)
         self.assertEqual(self.observed, [])
 
     def test_native_layer27_streaming_history_reset_and_poison_are_transactional(

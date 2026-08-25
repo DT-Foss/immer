@@ -4,6 +4,17 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-24
 
+### Transactional Qwen continuation blocks
+
+- Added opaque stage/commit/discard transactions for multi-token continuation
+  blocks without exposing commit-state tensors to the verifier.
+- Delayed state, graft history, and observers until atomic commit; stale,
+  foreign, mutated, reset, failed, and runtime-drifted stages fail closed.
+- Proved tiny CPU BF16 block execution bit-exact to tokenwise execution for the
+  base runtime and stable graft, halving the K=2 linear calls from 62 to 31.
+- Kept active native Prefix-Sinkhorn blocks fail-closed until their usage
+  recurrence is tokenwise bit-exact; ordinary native decoding is unchanged.
+
 ### Exact event and binding compiler
 
 - Added a span-aware quantitative event frontend that lowers thirteen typed

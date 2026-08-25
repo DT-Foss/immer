@@ -10,7 +10,7 @@ path.  MTP can later draft tokens, but it must never alter base-model parity.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 import hashlib
 import json
 import math
@@ -128,6 +128,47 @@ class StatefulLayerRangeResult:
     evidence: StatefulLayerRangeEvidence
 
 
+@dataclass(frozen=True, slots=True)
+class StatefulBlockEvidence:
+    """Receipt for one complete, non-committing continuation block."""
+
+    start_pos: int
+    end_pos: int
+    input_token_ids: tuple[tuple[int, ...], ...]
+    layers_executed: int
+    checkpoint_layers: int
+    complete_layer_stack: bool
+    stateful_cache: bool
+    source_body_bytes: int
+    linear_calls: int
+    seconds: float
+    staged_state_bytes: int
+    graft_mode: str
+    graft_history_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class StatefulBlockStage:
+    """Opaque handle plus cloned verification hidden for one pending block."""
+
+    hidden: torch.Tensor
+    evidence: StatefulBlockEvidence
+    _nonce: object
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingStatefulBlock:
+    """Private commit material; never returned to an untrusted verifier."""
+
+    handle: StatefulBlockStage
+    evidence: StatefulBlockEvidence
+    hidden: torch.Tensor
+    layer_states: tuple[LayerState | None, ...]
+    graft_history: torch.Tensor | None
+    native_head_crsa_evidence: tuple[NativeHeadCrsaEvidence, ...]
+    runtime_identity: str
+
+
 class StreamedQwen38:
     """Qwen3.8-27B text decoder with bounded, sequential weight residency."""
 
@@ -225,6 +266,7 @@ class StreamedQwen38:
         self._state_batch_size: int | None = None
         self._state_poisoned = False
         self._graft_history: torch.Tensor | None = None
+        self._pending_block_stage: _PendingStatefulBlock | None = None
 
     @property
     def next_position(self) -> int:
@@ -862,6 +904,7 @@ class StreamedQwen38:
         self._state_batch_size = batch
         self._state_poisoned = poisoned
         self._graft_history = history_device
+        self._pending_block_stage = None
         return {
             **loaded.summary,
             "next_position": next_position,
@@ -1174,6 +1217,35 @@ class StreamedQwen38:
             and float(getattr(self.graft, "alpha", 1.0)) != 0.0
         )
 
+    def _continuation_block_runtime_identity(self) -> str:
+        """Bind a staged block to every mutable math/runtime attachment."""
+
+        native = (
+            None if self.native_head_crsa is None else asdict(self.native_head_crsa)
+        )
+        source_metrics = self.pager.source.metrics()
+        return self._snapshot_digest(
+            {
+                "config": asdict(self.config),
+                "max_batch_size": self.max_batch_size,
+                "max_seq_len": self.max_seq_len,
+                "pager_id": id(self.pager),
+                "source_id": id(self.pager.source),
+                "source_fingerprint": source_metrics.get(
+                    "inventory_source_fingerprint"
+                ),
+                "source_repo_id": source_metrics.get("repo_id"),
+                "source_revision": source_metrics.get("revision"),
+                "device": str(self.pager.device),
+                "compute_dtype": str(self.pager.compute_dtype),
+                "delta_probe": None
+                if self.delta_probe is None
+                else id(self.delta_probe),
+                "graft": self._graft_snapshot_identity(),
+                "native_head_crsa": native,
+            }
+        )
+
     def _emit_native_head_crsa_evidence(
         self, rows: Iterable[NativeHeadCrsaEvidence]
     ) -> None:
@@ -1378,6 +1450,7 @@ class StreamedQwen38:
         self._state_batch_size = None
         self._graft_history = None
         self._state_poisoned = True
+        self._pending_block_stage = None
 
     def reset_state(self, *, release: bool = False) -> None:
         """Drop every committed KV/DeltaNet cache and clear the poison latch."""
@@ -1387,6 +1460,7 @@ class StreamedQwen38:
         self._state_batch_size = None
         self._state_poisoned = False
         self._graft_history = None
+        self._pending_block_stage = None
         if release:
             self.pager.release()
 
@@ -1427,8 +1501,6 @@ class StreamedQwen38:
             or start_pos < 0
         ):
             raise ValueError("start_pos must be a non-negative integer")
-        if start_pos and sequence_length != 1:
-            raise ValueError("stateful decode accepts exactly one token")
         end_pos = start_pos + sequence_length
         if end_pos > self.max_seq_len:
             raise ValueError(
@@ -1470,9 +1542,7 @@ class StreamedQwen38:
             for layer in range(start_layer, stop_layer):
                 if progress is not None:
                     layer_started = time.perf_counter()
-                    layer_bytes = self._metric(
-                        source, "network_or_source_body_bytes"
-                    )
+                    layer_bytes = self._metric(source, "network_or_source_body_bytes")
                 x, next_state = self._forward_layer(
                     x,
                     layer=layer,
@@ -1536,6 +1606,215 @@ class StreamedQwen38:
             native_head_crsa_evidence=tuple(staged_native_evidence),
             evidence=evidence,
         )
+
+    def stage_continuation_block(
+        self,
+        token_ids: Any,
+        *,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> StatefulBlockStage:
+        """Execute a continuation block without changing committed state.
+
+        At most one stage is live per model.  Creating a later stage
+        invalidates the earlier one.  Native Head-CRSA evidence stays private
+        until :meth:`commit_continuation_block` succeeds.
+        """
+
+        ids = self._token_tensor(token_ids)
+        if self._state_poisoned:
+            raise Qwen38RuntimeError("decoder state is poisoned; call reset_state()")
+        if self._next_position == 0:
+            raise ValueError("continuation block requires a completed prefill")
+        if self.delta_probe is not None:
+            raise Qwen38RuntimeError(
+                "continuation block staging rejects an active DeltaNet probe"
+            )
+        if self.native_head_crsa is not None and self.native_head_crsa.active:
+            raise Qwen38RuntimeError(
+                "continuation block staging requires tokenwise-exact native CRSA"
+            )
+        if ids.shape[0] != self._state_batch_size:
+            raise ValueError("continuation block batch differs from committed prefix")
+        if progress is not None and not callable(progress):
+            raise TypeError("progress must be callable or None")
+        start_pos = self._next_position
+        end_pos = start_pos + ids.shape[1]
+        if end_pos > self.max_seq_len:
+            raise ValueError(
+                f"context end {end_pos} exceeds max_seq_len={self.max_seq_len}"
+            )
+        committed_states = self._validate_stateful_range_states(
+            self._layer_states,
+            batch_size=ids.shape[0],
+            sequence_length=ids.shape[1],
+            start_pos=start_pos,
+            start_layer=0,
+            graft_history=self._graft_history,
+        )
+        runtime_identity = self._continuation_block_runtime_identity()
+
+        self._pending_block_stage = None
+        source = self.pager.source
+        start_bytes = self._metric(source, "network_or_source_body_bytes")
+        start_linears = self._metric(self.pager, "linear_calls")
+        started = time.perf_counter()
+        try:
+            embedded = self.embed_batch(ids)
+            staged = self.hidden_stateful_range(
+                embedded,
+                committed_states,
+                start_pos=start_pos,
+                start_layer=0,
+                stop_layer=self.config.n_layers,
+                graft_history=self._graft_history,
+                progress=progress,
+            )
+            hidden = self.finalize_hidden(staged.hidden)
+        except Exception:
+            self._pending_block_stage = None
+            self.pager.release()
+            raise
+        finally:
+            self.pager.release()
+
+        input_ids = tuple(
+            tuple(int(value) for value in row)
+            for row in ids.detach().to("cpu").tolist()
+        )
+        evidence = StatefulBlockEvidence(
+            start_pos=start_pos,
+            end_pos=end_pos,
+            input_token_ids=input_ids,
+            layers_executed=self.config.n_layers,
+            checkpoint_layers=self.config.n_layers,
+            complete_layer_stack=True,
+            stateful_cache=True,
+            source_body_bytes=(
+                self._metric(source, "network_or_source_body_bytes") - start_bytes
+            ),
+            linear_calls=self._metric(self.pager, "linear_calls") - start_linears,
+            seconds=time.perf_counter() - started,
+            staged_state_bytes=self._continuation_bytes(
+                staged.layer_states, staged.graft_history
+            ),
+            graft_mode=self._graft_mode(),
+            graft_history_tokens=(
+                0
+                if staged.graft_history is None
+                else int(staged.graft_history.shape[1])
+            ),
+        )
+        stage = StatefulBlockStage(
+            hidden=hidden.detach().clone(),
+            evidence=replace(evidence),
+            _nonce=object(),
+        )
+        self._pending_block_stage = _PendingStatefulBlock(
+            handle=stage,
+            evidence=evidence,
+            hidden=hidden,
+            layer_states=staged.layer_states,
+            graft_history=staged.graft_history,
+            native_head_crsa_evidence=staged.native_head_crsa_evidence,
+            runtime_identity=runtime_identity,
+        )
+        return stage
+
+    def discard_continuation_block(self, stage: StatefulBlockStage) -> None:
+        """Invalidate exactly the currently pending block without a commit."""
+
+        if not isinstance(stage, StatefulBlockStage):
+            raise TypeError("stage must be a StatefulBlockStage")
+        pending = self._pending_block_stage
+        if pending is None or stage is not pending.handle:
+            raise Qwen38RuntimeError("continuation block stage is stale or foreign")
+        self._pending_block_stage = None
+        self.pager.release()
+
+    def commit_continuation_block(
+        self, stage: StatefulBlockStage
+    ) -> tuple[torch.Tensor, StatefulEvidence]:
+        """Atomically publish one staged block and its delayed evidence."""
+
+        if not isinstance(stage, StatefulBlockStage):
+            raise TypeError("stage must be a StatefulBlockStage")
+        pending = self._pending_block_stage
+        if pending is None or stage is not pending.handle:
+            raise Qwen38RuntimeError("continuation block stage is stale or foreign")
+        row = pending.evidence
+        if self._state_poisoned:
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError("decoder state is poisoned; call reset_state()")
+        if self._next_position != row.start_pos:
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError("continuation block base state changed")
+        if self._state_batch_size != len(row.input_token_ids):
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError("continuation block batch state changed")
+        if (
+            len(row.input_token_ids) > self.max_batch_size
+            or row.end_pos > self.max_seq_len
+        ):
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError(
+                "continuation block exceeds current runtime bounds"
+            )
+        if self._continuation_block_runtime_identity() != pending.runtime_identity:
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError("continuation block runtime configuration changed")
+        if tuple(pending.hidden.shape) != (
+            len(row.input_token_ids),
+            row.end_pos - row.start_pos,
+            self.config.dim,
+        ):
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError("continuation block hidden shape is invalid")
+        if (
+            not pending.hidden.is_floating_point()
+            or not self._on_pager_device(pending.hidden)
+            or pending.hidden.dtype != self.pager.compute_dtype
+        ):
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError(
+                "continuation block hidden device/dtype is invalid"
+            )
+        try:
+            self._validate_stateful_range_states(
+                pending.layer_states,
+                batch_size=len(row.input_token_ids),
+                sequence_length=0,
+                start_pos=row.end_pos,
+                start_layer=0,
+                graft_history=pending.graft_history,
+            )
+        except Exception:
+            self._pending_block_stage = None
+            raise
+
+        committed_states = list(pending.layer_states)
+        self._pending_block_stage = None
+        self._layer_states = committed_states
+        self._next_position = row.end_pos
+        self._state_batch_size = len(row.input_token_ids)
+        self._graft_history = pending.graft_history
+        evidence = StatefulEvidence(
+            start_pos=row.start_pos,
+            end_pos=row.end_pos,
+            input_token_ids=row.input_token_ids,
+            layers_executed=row.layers_executed,
+            checkpoint_layers=row.checkpoint_layers,
+            complete_layer_stack=row.complete_layer_stack,
+            context_mode="decode",
+            stateful_cache=row.stateful_cache,
+            source_body_bytes=row.source_body_bytes,
+            linear_calls=row.linear_calls,
+            seconds=row.seconds,
+            state_bytes=self.state_bytes,
+            graft_mode=row.graft_mode,
+            graft_history_tokens=row.graft_history_tokens,
+        )
+        self._emit_native_head_crsa_evidence(pending.native_head_crsa_evidence)
+        return pending.hidden, evidence
 
     def hidden_stateful(
         self,
@@ -1615,6 +1894,7 @@ class StreamedQwen38:
         finally:
             self.pager.release()
 
+        self._pending_block_stage = None
         self._layer_states = list(staged.layer_states)
         self._next_position = end_pos
         self._state_batch_size = ids.shape[0]
