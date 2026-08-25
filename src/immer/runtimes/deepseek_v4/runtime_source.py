@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Any
 
 from immer.knowledge import Streamer
@@ -32,6 +33,19 @@ _ABSOLUTE_PATH_IN_TEXT = re.compile(
     r"(?<![:/])/(?:[^/\s'\"]+/)*[^/\s'\":,\)\]]+"
 )
 _PINNED_INVENTORY_SCHEMA = "immer.tensor-inventory-cache/v1"
+_PINNED_INVENTORY_KEYS = frozenset(
+    {
+        "inventory",
+        "inventory_sha256",
+        "repo_id",
+        "revision",
+        "schema",
+        "source_fingerprint",
+    }
+)
+_MAX_PINNED_INVENTORY_BYTES = 64 * 1024 * 1024
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_STREAMER_SOURCE_FINGERPRINT = Streamer._source_fingerprint
 GENERAL_DENSE_COVERAGE_CAPABILITY = "deepseek-v4-general-dense-coverage/v1"
 _TRACE_SPARSE_BUNDLE_SCHEMA = "immer.deepseek-v4-sparse-causal-bundle/v1"
 
@@ -68,6 +82,8 @@ class DeepSeekRuntimeSource:
     label: str
     mount: CausalWeightMount | None = None
     logical_model: LogicalModelIdentity | None = None
+    remote_pinned_inventory_fingerprint: str | None = None
+    remote_pinned_inventory_sha256: str | None = None
     _closed: bool = field(default=False, init=False, repr=False)
 
     @property
@@ -89,6 +105,10 @@ class DeepSeekRuntimeSource:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def remote_pinned_inventory_adopted(self) -> bool:
+        return self.remote_pinned_inventory_fingerprint is not None
 
     def close(self) -> None:
         if self._closed:
@@ -155,6 +175,99 @@ def _strict_json(path: Path, *, label: str) -> Any:
         ) from exc
 
 
+def _stable_regular_bytes(path: Path, *, label: str) -> bytes:
+    """Read one bounded file while proving its path and inode stayed stable."""
+
+    target = path.expanduser().absolute()
+    try:
+        before_path = target.lstat()
+    except OSError as exc:
+        raise DeepSeekRuntimeSourceError(f"cannot inspect {label}: {target}") from exc
+    if stat.S_ISLNK(before_path.st_mode) or not stat.S_ISREG(before_path.st_mode):
+        raise DeepSeekRuntimeSourceError(
+            f"{label} must be an unchanged regular non-symlink file"
+        )
+    if before_path.st_size > _MAX_PINNED_INVENTORY_BYTES:
+        raise DeepSeekRuntimeSourceError(
+            f"{label} exceeds {_MAX_PINNED_INVENTORY_BYTES} bytes"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(target, flags)
+        before_read = os.fstat(descriptor)
+        if not stat.S_ISREG(before_read.st_mode) or not os.path.samestat(
+            before_path, before_read
+        ):
+            raise DeepSeekRuntimeSourceError(
+                f"{label} changed before it could be read"
+            )
+        chunks: list[bytes] = []
+        remaining = before_read.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise DeepSeekRuntimeSourceError(f"short read from {label}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        after_read = os.fstat(descriptor)
+        after_path = target.lstat()
+    except DeepSeekRuntimeSourceError:
+        raise
+    except OSError as exc:
+        raise DeepSeekRuntimeSourceError(f"cannot read {label}: {target}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if (
+        not os.path.samestat(before_read, after_read)
+        or not os.path.samestat(after_read, after_path)
+        or any(
+            getattr(before_read, field) != getattr(after_read, field)
+            for field in stable_fields
+        )
+        or any(
+            getattr(after_read, field) != getattr(after_path, field)
+            for field in stable_fields
+        )
+        or len(encoded) != before_read.st_size
+    ):
+        raise DeepSeekRuntimeSourceError(f"{label} changed while it was read")
+    return encoded
+
+
+def _strict_json_bytes(encoded: bytes, *, label: str) -> Any:
+    def pairs(entries: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in entries:
+            if key in result:
+                raise DeepSeekRuntimeSourceError(
+                    f"duplicate JSON key in {label}: {key!r}"
+                )
+            result[key] = value
+        return result
+
+    def invalid_constant(value: str) -> None:
+        raise DeepSeekRuntimeSourceError(
+            f"non-finite JSON value in {label}: {value}"
+        )
+
+    try:
+        return json.loads(
+            encoded,
+            object_pairs_hook=pairs,
+            parse_constant=invalid_constant,
+        )
+    except DeepSeekRuntimeSourceError:
+        raise
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise DeepSeekRuntimeSourceError(f"invalid JSON in {label}") from exc
+
+
 def _pinned_inventory(
     root: Path,
 ) -> tuple[Mapping[str, Any] | None, str | None]:
@@ -198,6 +311,66 @@ def _canonical_sha256(value: Any) -> str:
             "causal bundle capability body is not canonical JSON"
         ) from exc
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _remote_pinned_inventory(
+    path: str | os.PathLike[str],
+    *,
+    repo_id: str,
+    revision: str,
+) -> tuple[dict[str, Any], str, str]:
+    try:
+        target = Path(path)
+    except TypeError as exc:
+        raise DeepSeekRuntimeSourceError(
+            "remote_pinned_inventory must be a filesystem path"
+        ) from exc
+    document = _strict_json_bytes(
+        _stable_regular_bytes(target, label="remote pinned inventory"),
+        label="remote pinned inventory",
+    )
+    if (
+        not isinstance(document, dict)
+        or set(document) != _PINNED_INVENTORY_KEYS
+        or document.get("schema") != _PINNED_INVENTORY_SCHEMA
+    ):
+        raise DeepSeekRuntimeSourceError(
+            "remote pinned inventory envelope schema is invalid"
+        )
+    inventory = document.get("inventory")
+    if not isinstance(inventory, dict):
+        raise DeepSeekRuntimeSourceError(
+            "remote pinned inventory payload is invalid"
+        )
+    inventory_sha256 = document.get("inventory_sha256")
+    if (
+        not isinstance(inventory_sha256, str)
+        or _SHA256.fullmatch(inventory_sha256) is None
+        or inventory_sha256 != _canonical_sha256(inventory)
+    ):
+        raise DeepSeekRuntimeSourceError(
+            "remote pinned inventory SHA-256 does not match"
+        )
+    fingerprint = document.get("source_fingerprint")
+    calculated_fingerprint = _STREAMER_SOURCE_FINGERPRINT(inventory)
+    if (
+        not isinstance(fingerprint, str)
+        or _SHA256.fullmatch(fingerprint) is None
+        or fingerprint != calculated_fingerprint
+    ):
+        raise DeepSeekRuntimeSourceError(
+            "remote pinned inventory source fingerprint does not match"
+        )
+    if (
+        document.get("repo_id") != repo_id
+        or document.get("revision") != revision
+        or inventory.get("repo") != repo_id
+        or inventory.get("revision") != revision
+    ):
+        raise DeepSeekRuntimeSourceError(
+            "remote pinned inventory does not match requested repo/revision"
+        )
+    return inventory, fingerprint, inventory_sha256
 
 
 def _require_general_causal_bundle(root: Path) -> None:
@@ -270,6 +443,7 @@ def open_deepseek_runtime_source(
     verbose: bool = False,
     access_observer: Any | None = None,
     require_remote_pinned_revision: bool = False,
+    remote_pinned_inventory: str | os.PathLike[str] | None = None,
 ) -> DeepSeekRuntimeSource:
     """Open one bounded source without copying checkpoint weights.
 
@@ -279,7 +453,9 @@ def open_deepseek_runtime_source(
     sealed direct-decode consumer because ordinary tensor reads could otherwise
     cross sparse file holes. Both readers are strict by construction; callers
     pass them to ``DeepSeekWeightPager`` without enabling missing-route
-    fallback. Ordinary local and remote sources retain Streamer behavior.
+    fallback. A remote pinned inventory is adopted and verified before an
+    access observer is attached, so every emitted range carries the stable
+    inventory fingerprint instead of transport-derived scan metadata.
     """
 
     if not isinstance(source, str) or not source.strip():
@@ -307,6 +483,10 @@ def open_deepseek_runtime_source(
         raise DeepSeekRuntimeSourceError("max_cache_bytes must be non-negative")
 
     if causal_bundle is not None:
+        if remote_pinned_inventory is not None:
+            raise DeepSeekRuntimeSourceError(
+                "remote_pinned_inventory cannot be used with a causal bundle"
+            )
         _require_pinned_revision(revision, target="causal bundle")
         bundle_root = Path(causal_bundle).expanduser().absolute()
         _require_general_causal_bundle(bundle_root)
@@ -351,6 +531,10 @@ def open_deepseek_runtime_source(
     }
     local = _local_source_path(source)
     if local is not None:
+        if remote_pinned_inventory is not None:
+            raise DeepSeekRuntimeSourceError(
+                "remote_pinned_inventory cannot be used with a local source"
+            )
         if not local.is_dir():
             raise FileNotFoundError(
                 f"local source directory does not exist: {local}"
@@ -366,7 +550,64 @@ def open_deepseek_runtime_source(
 
     if require_remote_pinned_revision:
         _require_pinned_revision(revision, target="remote source")
-    return DeepSeekRuntimeSource(Streamer(source, **common), source)
+    if remote_pinned_inventory is None:
+        return DeepSeekRuntimeSource(Streamer(source, **common), source)
+
+    _require_pinned_revision(revision, target="remote pinned inventory")
+    inventory, fingerprint, inventory_sha256 = _remote_pinned_inventory(
+        remote_pinned_inventory,
+        repo_id=source,
+        revision=revision,
+    )
+    remote_common = dict(common)
+    remote_common["access_observer"] = None
+    streamer = Streamer(source, **remote_common)
+    try:
+        adopted = streamer.adopt_pinned_inventory(
+            inventory,
+            expected_fingerprint=fingerprint,
+        )
+        identity = streamer.metrics()
+        if (
+            adopted != fingerprint
+            or identity.get("repo_id") != source
+            or identity.get("revision") != revision
+            or identity.get("inventory_source_fingerprint") != fingerprint
+        ):
+            raise DeepSeekRuntimeSourceError(
+                "remote Streamer did not adopt the requested pinned identity"
+            )
+    except BaseException as exc:
+        try:
+            streamer.close()
+        except Exception:
+            pass
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        if isinstance(exc, DeepSeekRuntimeSourceError):
+            raise
+        raise DeepSeekRuntimeSourceError(
+            "remote Streamer rejected the pinned inventory"
+        ) from exc
+
+    try:
+        if access_observer is not None:
+            streamer.set_access_observer(
+                access_observer,
+                prepare_identity=False,
+            )
+    except BaseException:
+        try:
+            streamer.close()
+        except Exception:
+            pass
+        raise
+    return DeepSeekRuntimeSource(
+        streamer,
+        source,
+        remote_pinned_inventory_fingerprint=fingerprint,
+        remote_pinned_inventory_sha256=inventory_sha256,
+    )
 
 
 __all__ = [

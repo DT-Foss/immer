@@ -28,7 +28,7 @@ import tempfile
 from typing import Any
 import uuid
 
-from immer.knowledge import AccessTrace, Streamer
+from immer.knowledge import AccessTrace, AccessTraceError, Streamer
 from immer.runtimes.deepseek_v4 import (
     CausalWeightMount,
     DeepSeekWeightPager,
@@ -50,6 +50,8 @@ BUNDLE_SCHEMA = "immer.deepseek-v4-sparse-causal-bundle/v1"
 APPEND_PENDING_SCHEMA = "immer.deepseek-v4-expert-append-pending/v1"
 APPEND_RECEIPT_SCHEMA = "immer.deepseek-v4-expert-append-receipt/v1"
 APPEND_VERIFY_SCHEMA = "immer.deepseek-v4-expert-append-verification/v1"
+TRACE_EXPERT_PLAN_SCHEMA = "immer.deepseek-v4-trace-expert-plan/v1"
+TRACE_EXPERT_INGEST_SCHEMA = "immer.deepseek-v4-trace-expert-ingest/v1"
 GENERAL_BUNDLE_SCHEMA = "immer.deepseek-v4-general-causal-bundle/v1"
 GENERAL_DENSE_COVERAGE_CAPABILITY = "deepseek-v4-general-dense-coverage/v1"
 DENSE_PLAN_SCHEMA = "immer.deepseek-v4-dense-promotion-plan/v1"
@@ -71,6 +73,7 @@ _EXPERT_TENSOR = re.compile(
 _EXPERT_PARTS = frozenset(
     (f"w{index}.{kind}" for index in (1, 2, 3) for kind in ("scale", "weight"))
 )
+_REMOTE_RANGE_RESERVATION_OVERHEAD_BYTES = 16 * 1024
 _DENSE_DTYPE_BYTES = {
     "BOOL": 1,
     "BF16": 2,
@@ -726,6 +729,197 @@ def _covered_experts(
     return {
         layer: tuple(sorted(experts)) for layer, experts in sorted(by_layer.items())
     }
+
+
+def _coordinate_records(
+    coordinates: Iterable[tuple[int, int]],
+) -> list[dict[str, int]]:
+    return [
+        {"expert_id": expert_id, "layer": layer}
+        for layer, expert_id in sorted(set(coordinates))
+    ]
+
+
+def _inventory_expert_resources(
+    inventory: Mapping[str, Any],
+) -> dict[tuple[int, int], dict[str, int]]:
+    tensors = inventory.get("tensors")
+    if not isinstance(tensors, list) or not tensors:
+        raise SparseBundleError("bundle pinned inventory tensor table is invalid")
+    parts: dict[tuple[int, int], dict[str, int]] = defaultdict(dict)
+    for tensor in tensors:
+        if not isinstance(tensor, Mapping):
+            raise SparseBundleError("bundle pinned inventory tensor row is invalid")
+        match = _EXPERT_TENSOR.fullmatch(str(tensor.get("name", "")))
+        if match is None:
+            continue
+        offsets = tensor.get("offset_in_shard")
+        if (
+            not isinstance(offsets, list)
+            or len(offsets) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in offsets
+            )
+            or offsets[0] < 0
+            or offsets[1] <= offsets[0]
+        ):
+            raise SparseBundleError("bundle pinned expert tensor range is invalid")
+        coordinate = (int(match.group(1)), int(match.group(2)))
+        part = f"{match.group(3)}.{match.group(4)}"
+        if part in parts[coordinate]:
+            raise SparseBundleError("bundle pinned inventory duplicates expert parts")
+        parts[coordinate][part] = offsets[1] - offsets[0]
+    resources: dict[tuple[int, int], dict[str, int]] = {}
+    for coordinate, observed in parts.items():
+        if set(observed) != _EXPERT_PARTS:
+            raise SparseBundleError("bundle pinned inventory has incomplete experts")
+        resources[coordinate] = {
+            "maximum_part_bytes": max(observed.values()),
+            "parts": len(observed),
+            "payload_bytes": sum(observed.values()),
+        }
+    if not resources:
+        raise SparseBundleError("bundle pinned inventory has no complete experts")
+    return resources
+
+
+def _manifest_expert_coordinates(
+    manifest: Mapping[str, Any],
+    inventory_coordinates: set[tuple[int, int]],
+) -> set[tuple[int, int]]:
+    covered = manifest.get("covered_experts")
+    binding_count = manifest.get("causal_bindings")
+    if (
+        not isinstance(covered, Mapping)
+        or not covered
+        or isinstance(binding_count, bool)
+        or not isinstance(binding_count, int)
+        or binding_count < 1
+    ):
+        raise SparseBundleError("bundle covered-expert table is invalid")
+    coordinates: set[tuple[int, int]] = set()
+    for raw_layer, raw_experts in covered.items():
+        if (
+            not isinstance(raw_layer, str)
+            or re.fullmatch(r"0|[1-9][0-9]*", raw_layer) is None
+            or not isinstance(raw_experts, list)
+            or not raw_experts
+            or any(
+                isinstance(expert_id, bool)
+                or not isinstance(expert_id, int)
+                or expert_id < 0
+                for expert_id in raw_experts
+            )
+            or raw_experts != sorted(set(raw_experts))
+        ):
+            raise SparseBundleError("bundle covered-expert table is noncanonical")
+        layer = int(raw_layer)
+        coordinates.update((layer, expert_id) for expert_id in raw_experts)
+    if len(coordinates) != binding_count or not coordinates.issubset(
+        inventory_coordinates
+    ):
+        raise SparseBundleError("bundle covered experts disagree with inventory")
+    return coordinates
+
+
+def _sealed_trace_coverage(
+    paths: Iterable[Path],
+    *,
+    repo_id: str,
+    revision: str,
+    fingerprint: str,
+    inventory: Mapping[str, Any],
+) -> tuple[
+    tuple[dict[str, Any], ...],
+    dict[str, tuple[tuple[int, int], ...]],
+    tuple[tuple[str, int, int], ...],
+]:
+    raw_shards = inventory.get("shards")
+    if not isinstance(raw_shards, list) or not raw_shards:
+        raise SparseBundleError("bundle pinned inventory shard table is invalid")
+    shard_sizes: dict[str, int] = {}
+    for shard in raw_shards:
+        if not isinstance(shard, Mapping):
+            raise SparseBundleError("bundle pinned inventory shard row is invalid")
+        name = shard.get("file")
+        size = shard.get("size")
+        if (
+            not isinstance(name, str)
+            or Path(name).name != name
+            or name in (".", "..")
+            or name in shard_sizes
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size <= 0
+        ):
+            raise SparseBundleError("bundle pinned inventory shard identity is invalid")
+        shard_sizes[name] = size
+
+    evidence_by_sha256: dict[str, dict[str, Any]] = {}
+    leaves: set[tuple[str, int, int]] = set()
+    supplied = tuple(paths)
+    if not supplied:
+        raise SparseBundleError("at least one sealed access trace is required")
+    for path in supplied:
+        encoded = _stable_file_bytes(path)
+        try:
+            trace = AccessTrace.from_bytes(encoded)
+            trace.verify()
+        except AccessTraceError as exc:
+            raise SparseBundleError(f"invalid sealed access trace: {path}") from exc
+        if (
+            trace.repo_id != repo_id
+            or trace.revision != revision
+            or trace.inventory_fingerprint != fingerprint
+        ):
+            raise SparseBundleError(f"access trace identity mismatch: {path}")
+        if not trace.operations:
+            raise SparseBundleError(f"access trace is empty: {path}")
+        trace_leaves: set[tuple[str, int, int]] = set()
+        for operation in trace.operations:
+            for leaf in operation.leaves:
+                shard_size = shard_sizes.get(leaf.shard)
+                if (
+                    Path(leaf.shard).name != leaf.shard
+                    or leaf.shard in (".", "..")
+                    or shard_size is None
+                    or leaf.offset + leaf.length > shard_size
+                ):
+                    raise SparseBundleError(
+                        f"access trace leaf is outside pinned inventory: {path}"
+                    )
+                trace_leaves.add((leaf.shard, leaf.offset, leaf.length))
+        if not trace_leaves:
+            raise SparseBundleError(f"access trace is empty: {path}")
+        prior = evidence_by_sha256.get(trace.sha256)
+        evidence = {
+            "operation_count": len(trace.operations),
+            "sha256": trace.sha256,
+            "unique_leaf_count": len(trace_leaves),
+            "unique_leaves_sha256": _sha256(
+                [
+                    {"length": length, "offset": offset, "shard": shard}
+                    for shard, offset, length in sorted(trace_leaves)
+                ]
+            ),
+        }
+        if prior is not None and prior != evidence:
+            raise SparseBundleError("duplicate access trace SHA conflicts")
+        evidence_by_sha256[trace.sha256] = evidence
+        leaves.update(trace_leaves)
+
+    intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for shard, offset, length in leaves:
+        intervals[shard].append((offset, offset + length))
+    merged = {
+        shard: _merge_intervals(ranges) for shard, ranges in sorted(intervals.items())
+    }
+    return (
+        tuple(evidence_by_sha256[digest] for digest in sorted(evidence_by_sha256)),
+        merged,
+        tuple(sorted(leaves)),
+    )
 
 
 def _revision_record(value: tuple[int, str]) -> dict[str, Any]:
@@ -2828,6 +3022,235 @@ def _stable_file_bytes(path: Path, *, maximum: int = 256 * 1024 * 1024) -> bytes
         return b"".join(chunks)
     finally:
         os.close(descriptor)
+
+
+def _trace_expert_ingest_plan(args: argparse.Namespace) -> dict[str, Any]:
+    root = Path(args.bundle).expanduser().absolute()
+    model = LogicalModelIdentity(repo_id=args.repo_id, revision=args.revision)
+    root_descriptor = _open_plain_root(root)
+    try:
+        manifest, manifest_identity = _load_bundle_manifest_at(
+            root_descriptor,
+            repo_id=args.repo_id,
+            revision=args.revision,
+            expected_layout=getattr(args, "layout_fingerprint", None),
+        )
+        _assert_no_dense_pending_at(root_descriptor)
+        weights_descriptor = _open_directory_at(root_descriptor, "weights")
+        try:
+            inventory = _load_pinned_inventory_at(weights_descriptor, manifest)
+        finally:
+            os.close(weights_descriptor)
+    finally:
+        os.close(root_descriptor)
+
+    expert_resources = _inventory_expert_resources(inventory)
+    inventory_coordinates = set(expert_resources)
+    base_coordinates = _manifest_expert_coordinates(
+        manifest,
+        inventory_coordinates,
+    )
+    append_state = _verify_append_store(
+        root,
+        model,
+        repo_id=args.repo_id,
+        revision=args.revision,
+        expected_layout=getattr(args, "layout_fingerprint", None),
+        budget_mb=float(args.budget_mb),
+    )
+    if append_state["pending"] is not None:
+        raise SparseBundleError(
+            "pending expert append must be reconciled before trace ingest"
+        )
+    appended_coordinates = {
+        (int(layer), int(expert_id)) for layer, expert_id in append_state["coordinates"]
+    }
+    if not appended_coordinates.issubset(inventory_coordinates):
+        raise SparseBundleError("append receipts cite experts outside inventory")
+    existing_coordinates = base_coordinates | appended_coordinates
+
+    with CausalWeightMount(root, model, budget_mb=float(args.budget_mb)) as mount:
+        if mount.layout.layout_fingerprint != manifest["layout_fingerprint"]:
+            raise SparseBundleError("current causal graph layout identity changed")
+        by_layer: dict[int, list[int]] = defaultdict(list)
+        for layer, expert_id in sorted(existing_coordinates):
+            by_layer[layer].append(expert_id)
+        try:
+            resolved_count = sum(
+                len(mount.resolve_expert_plans(layer, expert_ids))
+                for layer, expert_ids in sorted(by_layer.items())
+            )
+        except KeyError as exc:
+            raise SparseBundleError(
+                "current causal graph lost an expert binding"
+            ) from exc
+        if resolved_count != len(existing_coordinates):
+            raise SparseBundleError("current causal graph lost an expert binding")
+        graph_revision = _revision_record(mount.graph.store.revision())
+
+    trace_evidence, intervals, unique_leaves = _sealed_trace_coverage(
+        (
+            Path(path).expanduser().absolute()
+            for path in (getattr(args, "access_trace", None) or ())
+        ),
+        repo_id=args.repo_id,
+        revision=args.revision,
+        fingerprint=str(manifest["layout_fingerprint"]),
+        inventory=inventory,
+    )
+    covered = _covered_experts(inventory, intervals)
+    derived_coordinates = {
+        (layer, expert_id)
+        for layer, expert_ids in covered.items()
+        for expert_id in expert_ids
+    }
+    if not derived_coordinates:
+        raise SparseBundleError("access traces are incomplete for every routed expert")
+    if not derived_coordinates.issubset(inventory_coordinates):
+        raise SparseBundleError("trace-derived experts disagree with inventory")
+    missing_coordinates = derived_coordinates - existing_coordinates
+    derived_payload_bytes = sum(
+        expert_resources[coordinate]["payload_bytes"]
+        for coordinate in derived_coordinates
+    )
+    existing_payload_bytes = sum(
+        expert_resources[coordinate]["payload_bytes"]
+        for coordinate in existing_coordinates
+    )
+    missing_payload_bytes = sum(
+        expert_resources[coordinate]["payload_bytes"]
+        for coordinate in missing_coordinates
+    )
+    missing_leaf_count = sum(
+        expert_resources[coordinate]["parts"] for coordinate in missing_coordinates
+    )
+    minimum_leaf_transfer_budget_bytes = (
+        missing_payload_bytes
+        + missing_leaf_count * _REMOTE_RANGE_RESERVATION_OVERHEAD_BYTES
+    )
+    missing_maximum_part_bytes = max(
+        (
+            expert_resources[coordinate]["maximum_part_bytes"]
+            for coordinate in missing_coordinates
+        ),
+        default=0,
+    )
+    leaf_records = [
+        {"length": length, "offset": offset, "shard": shard}
+        for shard, offset, length in unique_leaves
+    ]
+    body = {
+        "append_receipts_sha256": _sha256(append_state["receipts"]),
+        "bundle_manifest": manifest_identity,
+        "coordinates": {
+            "derived": _coordinate_records(derived_coordinates),
+            "existing": _coordinate_records(existing_coordinates),
+            "missing": _coordinate_records(missing_coordinates),
+        },
+        "counts": {
+            "derived": len(derived_coordinates),
+            "derived_payload_bytes": derived_payload_bytes,
+            "existing": len(existing_coordinates),
+            "existing_payload_bytes": existing_payload_bytes,
+            "missing": len(missing_coordinates),
+            "missing_leaves": missing_leaf_count,
+            "missing_payload_bytes": missing_payload_bytes,
+            "traces": len(trace_evidence),
+            "unique_leaves": len(unique_leaves),
+        },
+        "graph_revision": graph_revision,
+        "inventory_layout_sha256": _sha256(
+            Streamer._inventory_layout_projection(inventory)
+        ),
+        "layout_fingerprint": manifest["layout_fingerprint"],
+        "logical_model": dict(manifest["logical_model"]),
+        "resource_requirements": {
+            "minimum_available_staging_disk_bytes": (
+                missing_payload_bytes + 8 * 1024 * 1024 if missing_coordinates else 0
+            ),
+            "minimum_leaf_transfer_budget_bytes": minimum_leaf_transfer_budget_bytes,
+            "minimum_resident_limit_bytes": missing_maximum_part_bytes,
+            "minimum_staging_limit_bytes": missing_payload_bytes,
+            "source_budget_requires_inventory_scan_headroom": bool(
+                missing_coordinates
+            ),
+            "source_range_reservation_overhead_bytes_per_leaf": (
+                _REMOTE_RANGE_RESERVATION_OVERHEAD_BYTES
+            ),
+        },
+        "trace_evidence": list(trace_evidence),
+        "trace_evidence_sha256": _sha256(list(trace_evidence)),
+        "unique_leaves_sha256": _sha256(leaf_records),
+    }
+    return {
+        "body": body,
+        "schema": TRACE_EXPERT_PLAN_SCHEMA,
+        "sha256": _sha256(body),
+    }
+
+
+def _trace_expert_ingest_document(
+    plan: Mapping[str, Any],
+    *,
+    status: str,
+    append: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    identity = {
+        "append": None if append is None else dict(append),
+        "plan": dict(plan),
+        "schema": TRACE_EXPERT_INGEST_SCHEMA,
+        "status": status,
+    }
+    return {**identity, "sha256": _sha256(identity)}
+
+
+def append_trace_experts(args: argparse.Namespace) -> dict[str, Any]:
+    plan = _trace_expert_ingest_plan(args)
+    body = plan["body"]
+    missing = tuple(
+        (int(record["layer"]), int(record["expert_id"]))
+        for record in body["coordinates"]["missing"]
+    )
+    if getattr(args, "plan_only", False):
+        return _trace_expert_ingest_document(
+            plan,
+            status="planned",
+            append=None,
+        )
+    if not missing:
+        return _trace_expert_ingest_document(
+            plan,
+            status="already-complete",
+            append=None,
+        )
+    append_args = argparse.Namespace(**vars(args))
+    append_args.expert = list(missing)
+    result = append_experts(append_args)
+    final_plan = _trace_expert_ingest_plan(args)
+    final_body = final_plan["body"]
+    for key in (
+        "bundle_manifest",
+        "layout_fingerprint",
+        "logical_model",
+        "trace_evidence_sha256",
+        "unique_leaves_sha256",
+    ):
+        if final_body.get(key) != body.get(key):
+            raise SparseBundleError(
+                "trace ingest identity changed while experts were appended"
+            )
+    final_missing = final_body["coordinates"]["missing"]
+    final_existing = {
+        (int(record["layer"]), int(record["expert_id"]))
+        for record in final_body["coordinates"]["existing"]
+    }
+    if final_missing or not set(missing).issubset(final_existing):
+        raise SparseBundleError("trace ingest append postcondition is incomplete")
+    return _trace_expert_ingest_document(
+        final_plan,
+        status=str(result["status"]),
+        append={**result, "requested_plan_sha256": plan["sha256"]},
+    )
 
 
 def _dense_plan_record(plan: TensorRangePlan) -> dict[str, Any]:
@@ -5298,6 +5721,50 @@ def _parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     append.set_defaults(handler=append_experts)
+
+    trace_append = subparsers.add_parser(
+        "append-trace-experts",
+        help=(
+            "derive complete routed experts from sealed access traces and "
+            "durably append only missing bindings"
+        ),
+    )
+    trace_append.add_argument("--bundle", required=True)
+    trace_append.add_argument(
+        "--access-trace",
+        action="append",
+        required=True,
+        help="sealed access trace; repeat to union coverage",
+    )
+    trace_append.add_argument("--repo-id", default=OFFICIAL_SOURCE)
+    trace_append.add_argument("--revision", default=OFFICIAL_REVISION)
+    trace_append.add_argument(
+        "--layout-fingerprint",
+        default=OFFICIAL_LAYOUT_FINGERPRINT,
+    )
+    trace_append.add_argument("--budget-mb", type=_positive_float, default=512.0)
+    trace_append.add_argument(
+        "--resident-limit-mb",
+        type=_positive_float,
+        default=64.0,
+    )
+    trace_append.add_argument(
+        "--staging-limit-mb",
+        type=_positive_float,
+        default=256.0,
+    )
+    trace_append.add_argument("--remote-cache-dir")
+    trace_append.add_argument(
+        "--remote-cache-limit-mb",
+        type=_positive_float,
+        default=256.0,
+    )
+    trace_append.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="emit the sealed canonical append plan without mutating the bundle",
+    )
+    trace_append.set_defaults(handler=append_trace_experts)
 
     promote = subparsers.add_parser(
         "promote-dense",

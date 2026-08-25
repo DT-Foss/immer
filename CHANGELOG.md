@@ -19,6 +19,17 @@ All notable changes to IMMER are recorded here.
   general runners; only bundles carrying authenticated full-dense coverage are
   admitted. Benchmark access traces commit before their reports and contain no
   shareable absolute paths.
+- Added remote pinned-inventory adoption before trace observation. A live
+  immutable checkpoint is header-verified against the causal bundle's pinned
+  72,317-tensor layout, then every recorded range is born under that stable
+  source identity instead of mutable transport metadata. Inventory SHA and
+  fingerprint are bound into benchmark provenance and signatures.
+- Added sealed trace-to-graph ingestion. Multiple traces are identity-checked,
+  unioned, reduced to complete six-part expert coordinates, compared against
+  current base and append bindings, and handed to the existing crash-safe
+  append transaction only for the missing set. Plan mode is offline,
+  path-free, canonically hashed, and reports exact payload, staging, resident,
+  disk, and cold leaf-transfer requirements before mutation.
 - Routed every dense, control, embedding, I64 router, candidate-head, scalar
   head, and batched full-head read through the revision-bound causal tensor
   reader. Expert and dense rails remain separate, missing bindings have no
@@ -38,8 +49,8 @@ All notable changes to IMMER are recorded here.
   transported state remains a proposal. Target adjudication selected the same
   top token on both paths: token `12747`, decoded as the FERTIG-certified exact
   answer `450`; their Top-10 sets are identical with eight equal rank slots.
-- Verified the complete repository with `1238/1238` tests, the DeepSeek scope
-  with `419` tests plus `111` subtests, and the Qwen causal regression scope
+- Verified the complete repository with `1252/1252` tests, the expanded
+  DeepSeek scope with `433/433` tests, and the Qwen causal regression scope
   with `54/54` tests.
 
 ### Qwen compute batteries

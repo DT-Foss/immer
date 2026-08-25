@@ -319,6 +319,7 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             "--cache-budget-mb",
             "--causal-bundle",
             "--logical-repo-id",
+            "--remote-pinned-inventory",
             "--access-trace",
             "--max-dataset-mb",
             "--max-prompt-tokens",
@@ -432,6 +433,14 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             )
             self.assertEqual(document["source_transport_policy"], "local-range/v1")
             self.assertEqual(document["source_transport_connection_limit"], 0)
+            self.assertEqual(
+                document["remote_pinned_inventory"],
+                {
+                    "adopted": False,
+                    "inventory_sha256": None,
+                    "source_fingerprint": None,
+                },
+            )
             self.assertRegex(document["runtime_source_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(document["runtime_dependency_sha256"], r"^[0-9a-f]{64}$")
             self.assertEqual(
@@ -509,6 +518,10 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             provenance_protocol = document["modes"]["off"]["run"]["provenance"][
                 "protocol"
             ]
+            self.assertEqual(
+                provenance_protocol["remote_pinned_inventory"],
+                document["remote_pinned_inventory"],
+            )
             self.assertIn(
                 "external_pretokenized_prompt/v1",
                 provenance_protocol["prompt_protocols"],
@@ -774,6 +787,8 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
                 label="causal:fixture",
                 causal_weight_reader=expert_reader,
                 causal_tensor_reader=tensor_reader,
+                remote_pinned_inventory_fingerprint="a" * 64,
+                remote_pinned_inventory_sha256="b" * 64,
             )
             rows = [{"id": "row-0"}]
             with (
@@ -790,7 +805,147 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             self.assertIs(
                 execute.call_args.kwargs["causal_tensor_reader"], tensor_reader
             )
+            self.assertEqual(
+                execute.call_args.kwargs["remote_pinned_inventory_fingerprint"],
+                "a" * 64,
+            )
+            self.assertEqual(
+                execute.call_args.kwargs["remote_pinned_inventory_sha256"],
+                "b" * 64,
+            )
             owner.close.assert_called_once_with()
+
+    def test_parser_and_source_factory_forward_remote_pinned_inventory(self) -> None:
+        module = _script_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pinned = root / "inventory.pinned.json"
+            args = module._parser().parse_args(
+                [
+                    "--dataset",
+                    str(root / "dataset.json"),
+                    "--task",
+                    "mmlu",
+                    "--journal",
+                    str(root / "run.jsonl"),
+                    "--output",
+                    str(root / "report.json"),
+                    "--remote-pinned-inventory",
+                    str(pinned),
+                ]
+            )
+            recorder = object()
+            owner = object()
+            with mock.patch.object(
+                module,
+                "open_deepseek_runtime_source",
+                return_value=owner,
+            ) as opened:
+                self.assertIs(module._build_source(args, recorder), owner)
+
+            self.assertEqual(args.remote_pinned_inventory, str(pinned))
+            self.assertEqual(
+                opened.call_args.kwargs["remote_pinned_inventory"], str(pinned)
+            )
+            self.assertIs(opened.call_args.kwargs["access_observer"], recorder)
+            self.assertTrue(opened.call_args.kwargs["require_remote_pinned_revision"])
+
+    def test_remote_pinned_adoption_changes_signature_and_provenance(self) -> None:
+        module = _script_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "checkpoint"
+            _fixture_writer()(checkpoint)
+            dataset = root / "mmlu.json"
+            dataset.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "identity",
+                            "prompt_token_ids": [7],
+                            "candidate_token_ids": [[0], [1]],
+                            "choices": ["zero", "one"],
+                            "answer": 0,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            reports: list[dict[str, object]] = []
+            for name, fingerprint, inventory_sha256 in (
+                ("ordinary", None, None),
+                ("adopted", "a" * 64, "b" * 64),
+            ):
+                report = root / f"{name}.report.json"
+                args = module._parser().parse_args(
+                    [
+                        "--dataset",
+                        str(dataset),
+                        "--task",
+                        "mmlu",
+                        "--source",
+                        str(checkpoint),
+                        "--revision",
+                        "fixture-v1",
+                        "--modes",
+                        "off",
+                        "--journal",
+                        str(root / f"{name}.journal.jsonl"),
+                        "--output",
+                        str(report),
+                        "--cache-dir",
+                        str(root / "shared-cache"),
+                        "--source-budget-mb",
+                        "64",
+                        "--cache-budget-mb",
+                        "8",
+                        "--device",
+                        "cpu",
+                        "--dtype",
+                        "float32",
+                        "--no-activation-quantization",
+                        "--preflight",
+                        "none",
+                    ]
+                )
+                source = module.Streamer.from_local(
+                    checkpoint,
+                    revision="fixture-v1",
+                    budget_mb=64,
+                    cache_dir=root / "shared-cache",
+                    max_cache_bytes=8 * 1024**2,
+                )
+                owner = module.DeepSeekRuntimeSource(
+                    source=source,
+                    label="local:<external>",
+                    remote_pinned_inventory_fingerprint=fingerprint,
+                    remote_pinned_inventory_sha256=inventory_sha256,
+                )
+                with mock.patch.object(module, "_build_source", return_value=owner):
+                    receipt = module.run(args)
+                self.assertEqual(receipt["status"], "complete")
+                reports.append(json.loads(report.read_text(encoding="utf-8")))
+
+            ordinary, adopted = reports
+            self.assertNotEqual(ordinary["signature"], adopted["signature"])
+            self.assertFalse(ordinary["remote_pinned_inventory"]["adopted"])
+            self.assertEqual(
+                adopted["remote_pinned_inventory"],
+                {
+                    "adopted": True,
+                    "inventory_sha256": "b" * 64,
+                    "source_fingerprint": "a" * 64,
+                },
+            )
+            adopted_protocol = adopted["modes"]["off"]["run"]["provenance"][
+                "protocol"
+            ]
+            self.assertEqual(
+                adopted_protocol["remote_pinned_inventory"],
+                adopted["remote_pinned_inventory"],
+            )
+            self.assertNotIn(str(root), json.dumps(adopted, sort_keys=True))
 
     def test_runtime_budget_exhaustion_is_an_item_error_in_denominator(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

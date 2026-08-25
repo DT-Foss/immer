@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import hashlib
 import importlib.util
 import json
@@ -123,6 +124,68 @@ class SparseCausalBundleTests(unittest.TestCase):
             repo_id=_LOGICAL_MODEL.repo_id,
             revision=_LOGICAL_MODEL.revision,
         )
+
+    @staticmethod
+    def _trace_args(
+        append_args: argparse.Namespace,
+        trace_path: Path,
+        *,
+        plan_only: bool,
+    ) -> argparse.Namespace:
+        values = vars(append_args).copy()
+        values.update(
+            access_trace=[str(trace_path)],
+            plan_only=plan_only,
+        )
+        return argparse.Namespace(**values)
+
+    @staticmethod
+    def _expert_trace(
+        source_root: Path,
+        output: Path,
+        fingerprint: str,
+        expert_ids: tuple[int, ...],
+        *,
+        omit_last_part: bool = False,
+    ):
+        pinned = json.loads(
+            output.joinpath("weights", "inventory.pinned.json").read_text(
+                encoding="utf-8"
+            )
+        )["inventory"]
+        recorder = AccessTraceRecorder()
+        source = Streamer.from_local(
+            source_root,
+            repo_id=_LOGICAL_MODEL.repo_id,
+            revision=_LOGICAL_MODEL.revision,
+            pinned_inventory=pinned,
+            pinned_fingerprint=fingerprint,
+            use_cache=False,
+            budget_mb=16,
+            access_observer=recorder,
+        )
+        try:
+            inventory = source.inventory()
+            selected = [
+                tensor
+                for tensor in inventory["tensors"]
+                if any(
+                    f".experts.{expert_id}." in tensor["name"]
+                    for expert_id in expert_ids
+                )
+            ]
+            if omit_last_part:
+                selected = selected[:-1]
+            for tensor in selected:
+                begin, end = tensor["offset_in_shard"]
+                source.raw_bytes(
+                    tensor["shard"],
+                    int(tensor["data_start"]) + int(begin),
+                    int(end) - int(begin),
+                )
+            return recorder.snapshot()
+        finally:
+            source.close()
 
     def test_header_reconstruction_preserves_original_data_start(self) -> None:
         shard = {"data_start": 128, "file": "model.safetensors", "st_metadata": None}
@@ -639,6 +702,410 @@ class SparseCausalBundleTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.expert, [(12, 131), (31, 4)])
+        self.assertEqual(args.resident_limit_mb, 64.0)
+        self.assertEqual(args.staging_limit_mb, 256.0)
+
+    def test_trace_expert_plan_derives_filters_and_seals_missing_coordinates(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            source_root, output, fingerprint, append_args = self._sparse_append_fixture(
+                base
+            )
+            trace = self._expert_trace(
+                source_root,
+                output,
+                fingerprint,
+                (0, 1),
+            )
+            trace_path = base / "sealed-trace.json"
+            trace_path.write_bytes(trace.to_bytes())
+            args = self._trace_args(append_args, trace_path, plan_only=True)
+
+            with mock.patch.object(
+                bundle_script,
+                "_open_remote_source",
+                side_effect=AssertionError("plan-only opened the remote source"),
+            ):
+                result = bundle_script.append_trace_experts(args)
+            self.assertEqual(result["status"], "planned")
+            self.assertIsNone(result["append"])
+            plan = result["plan"]
+            self.assertEqual(plan["schema"], bundle_script.TRACE_EXPERT_PLAN_SCHEMA)
+            self.assertEqual(plan["sha256"], bundle_script._sha256(plan["body"]))
+            self.assertEqual(
+                plan["body"]["counts"],
+                {
+                    "derived": 2,
+                    "derived_payload_bytes": 42,
+                    "existing": 1,
+                    "existing_payload_bytes": 21,
+                    "missing": 1,
+                    "missing_leaves": 6,
+                    "missing_payload_bytes": 21,
+                    "traces": 1,
+                    "unique_leaves": 12,
+                },
+            )
+            self.assertEqual(
+                plan["body"]["resource_requirements"],
+                {
+                    "minimum_available_staging_disk_bytes": 8 * 1024 * 1024 + 21,
+                    "minimum_leaf_transfer_budget_bytes": 21 + 6 * 16 * 1024,
+                    "minimum_resident_limit_bytes": 5,
+                    "minimum_staging_limit_bytes": 21,
+                    "source_budget_requires_inventory_scan_headroom": True,
+                    "source_range_reservation_overhead_bytes_per_leaf": 16 * 1024,
+                },
+            )
+            self.assertEqual(
+                plan["body"]["coordinates"],
+                {
+                    "derived": [
+                        {"expert_id": 0, "layer": 3},
+                        {"expert_id": 1, "layer": 3},
+                    ],
+                    "existing": [{"expert_id": 0, "layer": 3}],
+                    "missing": [{"expert_id": 1, "layer": 3}],
+                },
+            )
+            self.assertEqual(
+                result["sha256"],
+                bundle_script._sha256(
+                    {key: value for key, value in result.items() if key != "sha256"}
+                ),
+            )
+
+    def test_trace_expert_ingest_appends_once_then_is_offline_noop(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            source_root, output, fingerprint, append_args = self._sparse_append_fixture(
+                base
+            )
+            trace = self._expert_trace(
+                source_root,
+                output,
+                fingerprint,
+                (0, 1),
+            )
+            trace_path = base / "sealed-trace.json"
+            trace_path.write_bytes(trace.to_bytes())
+            planned = bundle_script.append_trace_experts(
+                self._trace_args(append_args, trace_path, plan_only=True)
+            )
+            args = self._trace_args(append_args, trace_path, plan_only=False)
+
+            with mock.patch.object(
+                bundle_script,
+                "_open_remote_source",
+                side_effect=lambda _args: self._remote(source_root),
+            ) as opener:
+                first = bundle_script.append_trace_experts(args)
+            self.assertEqual(first["status"], "appended")
+            self.assertEqual(first["append"]["appended_bindings"], 1)
+            self.assertEqual(
+                first["append"]["requested_plan_sha256"],
+                planned["plan"]["sha256"],
+            )
+            self.assertEqual(first["plan"]["body"]["counts"]["missing"], 0)
+            self.assertEqual(opener.call_count, 1)
+            receipt = json.loads(
+                output.joinpath(
+                    "expert-appends",
+                    "receipts",
+                    f"{first['append']['transaction_id']}.json",
+                ).read_text(encoding="utf-8")
+            )
+            appended_payload_bytes = sum(
+                leaf["length"] for leaf in receipt["body"]["transaction"]["leaves"]
+            )
+            self.assertEqual(
+                planned["plan"]["body"]["counts"]["missing_payload_bytes"],
+                appended_payload_bytes,
+            )
+
+            shard = output / "weights" / "model.safetensors"
+            physical_before = shard.stat().st_blocks
+            with mock.patch.object(
+                bundle_script,
+                "_open_remote_source",
+                side_effect=AssertionError("idempotent no-op used the network"),
+            ):
+                replay = bundle_script.append_trace_experts(args)
+            self.assertEqual(replay["status"], "already-complete")
+            self.assertIsNone(replay["append"])
+            self.assertEqual(replay["plan"]["body"]["counts"]["missing"], 0)
+            self.assertEqual(
+                replay["plan"]["body"]["counts"]["missing_payload_bytes"], 0
+            )
+            self.assertEqual(
+                replay["plan"]["body"]["resource_requirements"],
+                {
+                    "minimum_available_staging_disk_bytes": 0,
+                    "minimum_leaf_transfer_budget_bytes": 0,
+                    "minimum_resident_limit_bytes": 0,
+                    "minimum_staging_limit_bytes": 0,
+                    "source_budget_requires_inventory_scan_headroom": False,
+                    "source_range_reservation_overhead_bytes_per_leaf": 16 * 1024,
+                },
+            )
+            self.assertEqual(shard.stat().st_blocks, physical_before)
+            verified = bundle_script.verify_bundle(
+                self._verify_args(output, fingerprint)
+            )
+            self.assertEqual(verified["causal_bindings"], 2)
+            self.assertEqual(verified["appended_bindings"], 1)
+
+    def test_trace_expert_ingest_replans_after_concurrent_same_append(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            source_root, output, fingerprint, append_args = self._sparse_append_fixture(
+                base
+            )
+            trace = self._expert_trace(
+                source_root,
+                output,
+                fingerprint,
+                (0, 1),
+            )
+            trace_path = base / "sealed-trace.json"
+            trace_path.write_bytes(trace.to_bytes())
+            args = self._trace_args(append_args, trace_path, plan_only=False)
+            original_append = bundle_script.append_experts
+
+            def concurrent_append(inner_args):
+                original_append(inner_args)
+                return original_append(inner_args)
+
+            with (
+                mock.patch.object(
+                    bundle_script,
+                    "_open_remote_source",
+                    side_effect=lambda _args: self._remote(source_root),
+                ) as opener,
+                mock.patch.object(
+                    bundle_script,
+                    "append_experts",
+                    side_effect=concurrent_append,
+                ),
+            ):
+                result = bundle_script.append_trace_experts(args)
+
+            self.assertEqual(result["status"], "already-appended")
+            self.assertEqual(result["plan"]["body"]["counts"]["missing"], 0)
+            self.assertEqual(
+                result["plan"]["body"]["counts"]["missing_payload_bytes"], 0
+            )
+            self.assertEqual(opener.call_count, 1)
+            self.assertRegex(
+                result["append"]["requested_plan_sha256"], r"^[0-9a-f]{64}$"
+            )
+
+    def test_trace_expert_plan_unions_traces_and_deduplicates_trace_sha(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            source_root, output, fingerprint, append_args = self._sparse_append_fixture(
+                base
+            )
+            trace_zero = self._expert_trace(
+                source_root,
+                output,
+                fingerprint,
+                (0,),
+            )
+            trace_one = self._expert_trace(
+                source_root,
+                output,
+                fingerprint,
+                (1,),
+            )
+            zero_path = base / "trace-zero.json"
+            duplicate_zero_path = base / "trace-zero-copy.json"
+            one_path = base / "trace-one.json"
+            zero_path.write_bytes(trace_zero.to_bytes())
+            duplicate_zero_path.write_bytes(trace_zero.to_bytes())
+            one_path.write_bytes(trace_one.to_bytes())
+
+            values = vars(append_args).copy()
+            values.update(
+                access_trace=[str(zero_path), str(one_path)],
+                plan_only=True,
+            )
+            unique = bundle_script.append_trace_experts(argparse.Namespace(**values))
+            values["access_trace"] = [
+                str(one_path),
+                str(duplicate_zero_path),
+                str(zero_path),
+            ]
+            duplicated = bundle_script.append_trace_experts(
+                argparse.Namespace(**values)
+            )
+
+            self.assertEqual(unique, duplicated)
+            body = unique["plan"]["body"]
+            self.assertEqual(body["counts"]["traces"], 2)
+            self.assertEqual(body["counts"]["unique_leaves"], 12)
+            self.assertEqual(body["counts"]["derived"], 2)
+            self.assertEqual(body["counts"]["derived_payload_bytes"], 42)
+            self.assertEqual(body["counts"]["missing_leaves"], 6)
+            self.assertEqual(body["counts"]["missing_payload_bytes"], 21)
+            self.assertEqual(len(body["trace_evidence"]), 2)
+            self.assertEqual(
+                body["coordinates"]["derived"],
+                [
+                    {"expert_id": 0, "layer": 3},
+                    {"expert_id": 1, "layer": 3},
+                ],
+            )
+
+    def test_trace_expert_ingest_rejects_identity_tamper_symlink_and_incomplete(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            source_root, output, fingerprint, append_args = self._sparse_append_fixture(
+                base
+            )
+            trace = self._expert_trace(
+                source_root,
+                output,
+                fingerprint,
+                (1,),
+            )
+            valid_path = base / "valid.json"
+            valid_path.write_bytes(trace.to_bytes())
+
+            empty = bundle_script.AccessTrace(
+                repo_id=trace.repo_id,
+                revision=trace.revision,
+                inventory_fingerprint=trace.inventory_fingerprint,
+                operations=(),
+            )
+            empty_path = base / "empty.json"
+            empty_path.write_bytes(empty.to_bytes())
+            with self.assertRaisesRegex(
+                bundle_script.SparseBundleError,
+                "access trace is empty",
+            ):
+                bundle_script.append_trace_experts(
+                    self._trace_args(append_args, empty_path, plan_only=True)
+                )
+
+            wrong_revision = "b" * 40
+            wrong = bundle_script.AccessTrace(
+                repo_id=trace.repo_id,
+                revision=wrong_revision,
+                inventory_fingerprint=trace.inventory_fingerprint,
+                operations=tuple(
+                    replace(operation, revision=wrong_revision)
+                    for operation in trace.operations
+                ),
+            )
+            wrong_path = base / "wrong.json"
+            wrong_path.write_bytes(wrong.to_bytes())
+            with self.assertRaisesRegex(
+                bundle_script.SparseBundleError,
+                "identity mismatch",
+            ):
+                bundle_script.append_trace_experts(
+                    self._trace_args(append_args, wrong_path, plan_only=True)
+                )
+
+            tampered = json.loads(trace.to_json())
+            tampered["sha256"] = "0" * 64
+            tampered_path = base / "tampered.json"
+            tampered_path.write_text(
+                json.dumps(tampered, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                bundle_script.SparseBundleError,
+                "invalid sealed access trace",
+            ):
+                bundle_script.append_trace_experts(
+                    self._trace_args(append_args, tampered_path, plan_only=True)
+                )
+
+            link_path = base / "trace-link.json"
+            link_path.symlink_to(valid_path.name)
+            with self.assertRaisesRegex(
+                bundle_script.SparseBundleError,
+                "non-symlink regular file",
+            ):
+                bundle_script.append_trace_experts(
+                    self._trace_args(append_args, link_path, plan_only=True)
+                )
+
+            incomplete = self._expert_trace(
+                source_root,
+                output,
+                fingerprint,
+                (1,),
+                omit_last_part=True,
+            )
+            incomplete_path = base / "incomplete.json"
+            incomplete_path.write_bytes(incomplete.to_bytes())
+            with self.assertRaisesRegex(
+                bundle_script.SparseBundleError,
+                "incomplete for every routed expert",
+            ):
+                bundle_script.append_trace_experts(
+                    self._trace_args(append_args, incomplete_path, plan_only=True)
+                )
+
+    def test_trace_expert_ingest_rejects_pending_append(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            source_root, output, fingerprint, append_args = self._sparse_append_fixture(
+                base
+            )
+            trace = self._expert_trace(
+                source_root,
+                output,
+                fingerprint,
+                (1,),
+            )
+            trace_path = base / "sealed-trace.json"
+            trace_path.write_bytes(trace.to_bytes())
+            append_args.inject_crash = "payload-before-binding"
+            with (
+                mock.patch.object(
+                    bundle_script,
+                    "_open_remote_source",
+                    side_effect=lambda _args: self._remote(source_root),
+                ),
+                self.assertRaises(bundle_script.InjectedAppendCrash),
+            ):
+                bundle_script.append_experts(append_args)
+
+            args = self._trace_args(append_args, trace_path, plan_only=True)
+            args.inject_crash = None
+            with self.assertRaisesRegex(
+                bundle_script.SparseBundleError,
+                "pending expert append",
+            ):
+                bundle_script.append_trace_experts(args)
+
+    def test_trace_expert_cli_wires_sealed_traces_and_plan_mode(self) -> None:
+        args = bundle_script._parser().parse_args(
+            [
+                "append-trace-experts",
+                "--bundle",
+                "/tmp/model.causal",
+                "--access-trace",
+                "/tmp/trace-a.json",
+                "--access-trace",
+                "/tmp/trace-b.json",
+                "--plan-only",
+            ]
+        )
+        self.assertIs(args.handler, bundle_script.append_trace_experts)
+        self.assertEqual(
+            args.access_trace,
+            ["/tmp/trace-a.json", "/tmp/trace-b.json"],
+        )
+        self.assertTrue(args.plan_only)
         self.assertEqual(args.resident_limit_mb, 64.0)
         self.assertEqual(args.staging_limit_mb, 256.0)
 

@@ -12,6 +12,55 @@ from immer.runtimes.deepseek_v4 import runtime_source as runtime
 
 
 PINNED_REVISION = "7" * 40
+REMOTE_REPO = "fixture/deepseek-v4"
+
+
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _remote_inventory_document(
+    *,
+    repo_id: str = REMOTE_REPO,
+    revision: str = PINNED_REVISION,
+) -> dict[str, object]:
+    inventory = {
+        "repo": repo_id,
+        "revision": revision,
+        "shards": [
+            {
+                "cas_url_hash": "a" * 64,
+                "data_start": 128,
+                "etag": '"' + "b" * 64 + '"',
+                "file": "model-00001-of-00001.safetensors",
+                "header_len": 120,
+                "size": 130,
+            }
+        ],
+        "tensors": [],
+    }
+    return {
+        "inventory": inventory,
+        "inventory_sha256": _canonical_sha256(inventory),
+        "repo_id": repo_id,
+        "revision": revision,
+        "schema": "immer.tensor-inventory-cache/v1",
+        "source_fingerprint": runtime.Streamer._source_fingerprint(inventory),
+    }
+
+
+def _write_remote_inventory(path: Path, document: dict[str, object]) -> None:
+    path.write_text(
+        json.dumps(document, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def _write_general_manifest(root: Path, *, capability: bool = True) -> None:
@@ -43,6 +92,241 @@ def _write_general_manifest(root: Path, *, capability: bool = True) -> None:
 
 
 class DeepSeekRuntimeSourceTests(unittest.TestCase):
+    def test_remote_pinned_inventory_is_adopted_before_observer_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pinned = root / "inventory.pinned.json"
+            document = _remote_inventory_document()
+            _write_remote_inventory(pinned, document)
+            fingerprint = str(document["source_fingerprint"])
+            inventory_sha256 = str(document["inventory_sha256"])
+            observer = object()
+            streamer_source = mock.Mock()
+            streamer_source.adopt_pinned_inventory.return_value = fingerprint
+            streamer_source.metrics.return_value = {
+                "repo_id": REMOTE_REPO,
+                "revision": PINNED_REVISION,
+                "inventory_source_fingerprint": fingerprint,
+            }
+
+            with mock.patch.object(
+                runtime, "Streamer", return_value=streamer_source
+            ) as streamer:
+                opened = runtime.open_deepseek_runtime_source(
+                    source=REMOTE_REPO,
+                    revision=PINNED_REVISION,
+                    logical_repo_id=REMOTE_REPO,
+                    causal_bundle=None,
+                    budget_mb=64,
+                    cache_dir=root / "cache",
+                    use_cache=True,
+                    max_cache_bytes=123,
+                    access_observer=observer,
+                    require_remote_pinned_revision=True,
+                    remote_pinned_inventory=pinned,
+                )
+
+            self.assertIs(opened.source, streamer_source)
+            self.assertTrue(opened.remote_pinned_inventory_adopted)
+            self.assertEqual(
+                opened.remote_pinned_inventory_fingerprint, fingerprint
+            )
+            self.assertEqual(
+                opened.remote_pinned_inventory_sha256, inventory_sha256
+            )
+            self.assertIsNone(streamer.call_args.kwargs["access_observer"])
+            self.assertEqual(
+                streamer_source.method_calls,
+                [
+                    mock.call.adopt_pinned_inventory(
+                        document["inventory"],
+                        expected_fingerprint=fingerprint,
+                    ),
+                    mock.call.metrics(),
+                    mock.call.set_access_observer(
+                        observer,
+                        prepare_identity=False,
+                    ),
+                ],
+            )
+            opened.close()
+
+    def test_remote_pinned_inventory_rejects_wrong_identity_and_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases: dict[str, tuple[dict[str, object], str]] = {}
+
+            wrong_repo = _remote_inventory_document(repo_id="foreign/model")
+            cases["repo"] = (wrong_repo, "repo/revision")
+
+            wrong_revision = _remote_inventory_document(revision="8" * 40)
+            cases["revision"] = (wrong_revision, "repo/revision")
+
+            wrong_digest = _remote_inventory_document()
+            wrong_digest["inventory_sha256"] = "0" * 64
+            cases["digest"] = (wrong_digest, "SHA-256")
+
+            wrong_fingerprint = _remote_inventory_document()
+            wrong_fingerprint["source_fingerprint"] = "0" * 64
+            cases["fingerprint"] = (wrong_fingerprint, "fingerprint")
+
+            inner_identity = _remote_inventory_document()
+            inner_inventory = dict(inner_identity["inventory"])
+            inner_inventory["repo"] = "foreign/model"
+            inner_identity["inventory"] = inner_inventory
+            inner_identity["inventory_sha256"] = _canonical_sha256(inner_inventory)
+            inner_identity["source_fingerprint"] = (
+                runtime.Streamer._source_fingerprint(inner_inventory)
+            )
+            cases["inner_repo"] = (inner_identity, "repo/revision")
+
+            for name, (document, message) in cases.items():
+                with self.subTest(name=name):
+                    pinned = root / f"{name}.json"
+                    _write_remote_inventory(pinned, document)
+                    with (
+                        mock.patch.object(runtime, "Streamer") as streamer,
+                        self.assertRaisesRegex(
+                            runtime.DeepSeekRuntimeSourceError, message
+                        ),
+                    ):
+                        runtime.open_deepseek_runtime_source(
+                            source=REMOTE_REPO,
+                            revision=PINNED_REVISION,
+                            logical_repo_id=REMOTE_REPO,
+                            causal_bundle=None,
+                            budget_mb=64,
+                            cache_dir=root / "cache",
+                            use_cache=True,
+                            max_cache_bytes=123,
+                            remote_pinned_inventory=pinned,
+                        )
+                    streamer.assert_not_called()
+
+    def test_remote_pinned_inventory_rejects_symlink_local_and_causal_sources(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pinned = root / "inventory.pinned.json"
+            _write_remote_inventory(pinned, _remote_inventory_document())
+            linked = root / "linked.json"
+            linked.symlink_to(pinned)
+            with self.assertRaisesRegex(
+                runtime.DeepSeekRuntimeSourceError, "regular non-symlink"
+            ):
+                runtime.open_deepseek_runtime_source(
+                    source=REMOTE_REPO,
+                    revision=PINNED_REVISION,
+                    logical_repo_id=REMOTE_REPO,
+                    causal_bundle=None,
+                    budget_mb=64,
+                    cache_dir=root / "cache",
+                    use_cache=True,
+                    max_cache_bytes=123,
+                    remote_pinned_inventory=linked,
+                )
+
+            local = root / "local-checkpoint"
+            local.mkdir()
+            with self.assertRaisesRegex(
+                runtime.DeepSeekRuntimeSourceError, "local source"
+            ):
+                runtime.open_deepseek_runtime_source(
+                    source=str(local),
+                    revision="local",
+                    logical_repo_id=REMOTE_REPO,
+                    causal_bundle=None,
+                    budget_mb=64,
+                    cache_dir=root / "cache",
+                    use_cache=True,
+                    max_cache_bytes=123,
+                    remote_pinned_inventory=pinned,
+                )
+
+            with self.assertRaisesRegex(
+                runtime.DeepSeekRuntimeSourceError, "causal bundle"
+            ):
+                runtime.open_deepseek_runtime_source(
+                    source=REMOTE_REPO,
+                    revision=PINNED_REVISION,
+                    logical_repo_id=REMOTE_REPO,
+                    causal_bundle=root / "bundle",
+                    budget_mb=64,
+                    cache_dir=root / "cache",
+                    use_cache=True,
+                    max_cache_bytes=123,
+                    remote_pinned_inventory=pinned,
+                )
+
+    def test_remote_pinned_inventory_adoption_failure_closes_streamer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pinned = root / "inventory.pinned.json"
+            _write_remote_inventory(pinned, _remote_inventory_document())
+            streamer_source = mock.Mock()
+            streamer_source.adopt_pinned_inventory.side_effect = RuntimeError("no")
+            with (
+                mock.patch.object(
+                    runtime, "Streamer", return_value=streamer_source
+                ),
+                self.assertRaisesRegex(
+                    runtime.DeepSeekRuntimeSourceError,
+                    "rejected the pinned inventory",
+                ),
+            ):
+                runtime.open_deepseek_runtime_source(
+                    source=REMOTE_REPO,
+                    revision=PINNED_REVISION,
+                    logical_repo_id=REMOTE_REPO,
+                    causal_bundle=None,
+                    budget_mb=64,
+                    cache_dir=root / "cache",
+                    use_cache=True,
+                    max_cache_bytes=123,
+                    access_observer=object(),
+                    remote_pinned_inventory=pinned,
+                )
+            streamer_source.close.assert_called_once_with()
+            streamer_source.set_access_observer.assert_not_called()
+
+    def test_remote_pinned_inventory_observer_failure_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pinned = root / "inventory.pinned.json"
+            document = _remote_inventory_document()
+            _write_remote_inventory(pinned, document)
+            fingerprint = str(document["source_fingerprint"])
+            streamer_source = mock.Mock()
+            streamer_source.adopt_pinned_inventory.return_value = fingerprint
+            streamer_source.metrics.return_value = {
+                "repo_id": REMOTE_REPO,
+                "revision": PINNED_REVISION,
+                "inventory_source_fingerprint": fingerprint,
+            }
+            streamer_source.set_access_observer.side_effect = TypeError(
+                "invalid observer"
+            )
+            with (
+                mock.patch.object(
+                    runtime, "Streamer", return_value=streamer_source
+                ),
+                self.assertRaisesRegex(TypeError, "invalid observer"),
+            ):
+                runtime.open_deepseek_runtime_source(
+                    source=REMOTE_REPO,
+                    revision=PINNED_REVISION,
+                    logical_repo_id=REMOTE_REPO,
+                    causal_bundle=None,
+                    budget_mb=64,
+                    cache_dir=root / "cache",
+                    use_cache=True,
+                    max_cache_bytes=123,
+                    access_observer=object(),
+                    remote_pinned_inventory=pinned,
+                )
+            streamer_source.close.assert_called_once_with()
+
     def test_causal_bundle_mount_owns_source_reader_and_close(self) -> None:
         mounted_source = mock.Mock()
         reader = object()

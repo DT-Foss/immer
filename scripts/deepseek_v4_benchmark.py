@@ -662,6 +662,7 @@ def _build_source(
             max_cache_bytes=int(args.cache_budget_mb * 1024**2),
             access_observer=recorder,
             require_remote_pinned_revision=True,
+            remote_pinned_inventory=args.remote_pinned_inventory,
         )
     except (DeepSeekRuntimeSourceError, FileNotFoundError) as exc:
         raise RunnerError(str(exc)) from exc
@@ -1567,6 +1568,7 @@ def _build_report(
             "causal_tensor_reader_attached"
         ],
         "causal_missing_fallback": header["causal_missing_fallback"],
+        "remote_pinned_inventory": header["remote_pinned_inventory"],
         "quantized_accumulation_policy": header["quantized_accumulation_policy"],
         "attention_qat_policy": header["attention_qat_policy"],
         "expert_prefetch_policy": header["expert_prefetch_policy"],
@@ -1623,6 +1625,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--task", required=True, choices=("mmlu", "gsm8k"))
     parser.add_argument("--source", default=OFFICIAL_SOURCE)
+    parser.add_argument(
+        "--remote-pinned-inventory",
+        help=(
+            "authenticated tensor-inventory envelope adopted by the immutable "
+            "remote source before tracing"
+        ),
+    )
     parser.add_argument(
         "--causal-bundle",
         help="local bundle with authenticated complete dense-weight coverage",
@@ -1715,6 +1724,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             source_label=runtime_source.label,
             causal_weight_reader=runtime_source.causal_weight_reader,
             causal_tensor_reader=runtime_source.causal_tensor_reader,
+            remote_pinned_inventory_fingerprint=(
+                runtime_source.remote_pinned_inventory_fingerprint
+            ),
+            remote_pinned_inventory_sha256=(
+                runtime_source.remote_pinned_inventory_sha256
+            ),
             access_trace_recorder=recorder,
             trace_targets=trace_targets,
         )
@@ -1734,9 +1749,28 @@ def _run_with_source(
     source_label: str,
     causal_weight_reader: Any | None = None,
     causal_tensor_reader: Any | None = None,
+    remote_pinned_inventory_fingerprint: str | None = None,
+    remote_pinned_inventory_sha256: str | None = None,
     access_trace_recorder: AccessTraceRecorder | None = None,
     trace_targets: tuple[Path, Path] | None = None,
 ) -> dict[str, Any]:
+    remote_pinned_inventory = {
+        "adopted": remote_pinned_inventory_fingerprint is not None,
+        "inventory_sha256": remote_pinned_inventory_sha256,
+        "source_fingerprint": remote_pinned_inventory_fingerprint,
+    }
+    if (
+        (remote_pinned_inventory_fingerprint is None)
+        != (remote_pinned_inventory_sha256 is None)
+        or (
+            remote_pinned_inventory_fingerprint is not None
+            and (
+                _DIGEST.fullmatch(remote_pinned_inventory_fingerprint) is None
+                or _DIGEST.fullmatch(str(remote_pinned_inventory_sha256)) is None
+            )
+        )
+    ):
+        raise RunnerError("remote pinned inventory identity is incomplete")
     config, config_meta = _load_config(args, source)
     tokenizer = _load_tokenizer(args, source, selected_rows, task)
     if args.graft_layer is not None and not 0 <= args.graft_layer < config.n_layers:
@@ -1805,6 +1839,7 @@ def _run_with_source(
             "causal_weight_reader_attached": causal_weight_reader is not None,
             "causal_tensor_reader_attached": causal_tensor_reader is not None,
             "causal_missing_fallback": False,
+            "remote_pinned_inventory": remote_pinned_inventory,
             "activation_quantization": not args.no_activation_quantization,
             "quantized_accumulation_policy": (
                 DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
@@ -1878,6 +1913,7 @@ def _run_with_source(
         "causal_weight_reader_attached": causal_weight_reader is not None,
         "causal_tensor_reader_attached": causal_tensor_reader is not None,
         "causal_missing_fallback": False,
+        "remote_pinned_inventory": remote_pinned_inventory,
         "modes": modes,
         "seeds": seeds,
         "seed_protocol": {mode: list(_mode_seeds(mode, seeds)) for mode in modes},
@@ -1961,6 +1997,7 @@ def _run_with_source(
         "causal_weight_reader_attached": causal_weight_reader is not None,
         "causal_tensor_reader_attached": causal_tensor_reader is not None,
         "causal_missing_fallback": False,
+        "remote_pinned_inventory": remote_pinned_inventory,
         "quantized_accumulation_policy": (
             DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
         ),
