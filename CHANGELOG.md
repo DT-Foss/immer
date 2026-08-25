@@ -25,6 +25,10 @@ All notable changes to IMMER are recorded here.
   `[token, EOS]` chain through two fresh causal-bundle runtimes, hashes every
   hidden/KV/DeltaNet/graft state, authenticates both access traces, and seals
   either a positive or mismatch result.
+- The official 64-layer CPU-BF16 replay is positive: every hidden and
+  continuation-state hash matches, continuation source bytes fall by
+  `49.99999%` (`97.41 GB → 48.71 GB`), and model time falls by `46.48%`
+  (`158.14 s → 84.63 s`) while preserving all 992 one-token linear calls.
 
 ### Exact event and binding compiler
 
