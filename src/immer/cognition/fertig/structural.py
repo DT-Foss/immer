@@ -31,6 +31,7 @@ from .arithmetic_ir import (
     variables_in_constraint,
 )
 from .clause_compiler import SymbolKey, compile_clauses
+from .signed_event_frontend import FrontendStatus, compile_signed_events
 
 
 _UNICODE_FRACTIONS = {
@@ -2706,7 +2707,26 @@ def parse_structural_problem(source: str) -> ParseResult:
     """Parse *source* without ever returning a partial numeric graph."""
 
     primary = StructuralParser(source).parse()
-    if primary.ok or primary.status is not ParseStatus.UNSUPPORTED:
+    if primary.ok:
+        return primary
+    signed = compile_signed_events(source)
+    if signed.ok and signed.compiled is not None:
+        return ParseResult(
+            ParseStatus.PARSED,
+            signed.compiled.problem,
+            reason=f"evidence-closed signed event grammar: {signed.family}",
+        )
+    if signed.family_matched and signed.status in {
+        FrontendStatus.AMBIGUOUS,
+        FrontendStatus.INVALID,
+    }:
+        status = (
+            ParseStatus.AMBIGUOUS
+            if signed.status is FrontendStatus.AMBIGUOUS
+            else ParseStatus.INVALID
+        )
+        return ParseResult(status, reason=signed.reason)
+    if primary.status is not ParseStatus.UNSUPPORTED:
         return primary
     compiled = compile_clauses(source)
     if not compiled.ok or compiled.problem is None:
