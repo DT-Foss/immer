@@ -511,7 +511,12 @@ def _validate_phase(value: object, *, allow_stage: bool) -> Mapping[str, Any]:
     return value
 
 
-def _validate_execution(document: object, *, mode: str) -> Mapping[str, Any]:
+def _validate_execution(
+    document: object,
+    *,
+    mode: str,
+    access_trace_path: str | os.PathLike[str] | None = None,
+) -> Mapping[str, Any]:
     required = {
         "bundle",
         "checkpoint",
@@ -583,7 +588,9 @@ def _validate_execution(document: object, *, mode: str) -> Mapping[str, Any]:
     elif stage_base_state is not None or stage_base_state_equal is not None:
         raise ContinuationParityError("tokenwise execution contains block-stage state")
     try:
-        direct._verify_access_trace_receipt(document.get("trace"))
+        direct._verify_access_trace_receipt(
+            document.get("trace"), artifact_path=access_trace_path
+        )
     except Exception as exc:
         raise ContinuationParityError(str(exc)) from exc
     return document
@@ -638,7 +645,11 @@ def _contains_gold_key(value: object) -> bool:
     return False
 
 
-def _validate_result_document(document: dict[str, Any]) -> dict[str, Any]:
+def _validate_result_document(
+    document: dict[str, Any],
+    *,
+    trace_paths: Mapping[str, str | os.PathLike[str]] | None = None,
+) -> dict[str, Any]:
     required = {
         "comparison",
         "contract",
@@ -713,8 +724,19 @@ def _validate_result_document(document: dict[str, Any]) -> dict[str, Any]:
         "tokenwise",
     }:
         raise ContinuationParityError("continuation parity executions are invalid")
-    tokenwise = _validate_execution(executions["tokenwise"], mode="tokenwise")
-    block = _validate_execution(executions["block"], mode="block")
+    resolved_traces = {} if trace_paths is None else dict(trace_paths)
+    if set(resolved_traces).difference({"tokenwise", "block"}):
+        raise ContinuationParityError("continuation trace relocation keys are invalid")
+    tokenwise = _validate_execution(
+        executions["tokenwise"],
+        mode="tokenwise",
+        access_trace_path=resolved_traces.get("tokenwise"),
+    )
+    block = _validate_execution(
+        executions["block"],
+        mode="block",
+        access_trace_path=resolved_traces.get("block"),
+    )
     if (
         tokenwise["checkpoint"] != reference["checkpoint"]
         or block["checkpoint"] != reference["checkpoint"]
@@ -731,6 +753,29 @@ def _validate_result_document(document: dict[str, Any]) -> dict[str, Any]:
     if document["status"] != expected_status:
         raise ContinuationParityError("continuation parity status is inconsistent")
     return document
+
+
+def _load_result(path: str | os.PathLike[str]) -> dict[str, Any]:
+    """Validate a result with transported traces relocated beside the JSON."""
+
+    source = Path(path).expanduser().resolve()
+    document = direct._strict_json(source)
+    executions = document.get("executions")
+    trace_paths: dict[str, Path] = {}
+    if isinstance(executions, Mapping):
+        for mode in ("tokenwise", "block"):
+            execution = executions.get(mode)
+            receipt = execution.get("trace") if isinstance(execution, Mapping) else None
+            recorded = (
+                Path(str(receipt.get("path"))) if isinstance(receipt, Mapping) else None
+            )
+            if recorded is not None and recorded.is_file():
+                trace_paths[mode] = recorded
+            elif recorded is not None:
+                adjacent = source.parent / recorded.name
+                if adjacent.is_file():
+                    trace_paths[mode] = adjacent
+    return _validate_result_document(document, trace_paths=trace_paths)
 
 
 def _load_inputs_reference(

@@ -226,6 +226,8 @@ class Qwen38ContinuationBlockParityTests(unittest.TestCase):
         )
         self.assertNotEqual(tokenwise["trace"]["sha256"], block["trace"]["sha256"])
         self.assertEqual(parity._validate_result_document(document), document)
+        benchmark._write_json(args.output, document)
+        self.assertEqual(parity._load_result(args.output), document)
 
     def test_real_state_difference_returns_a_sealed_mismatch(self) -> None:
         args = self._args("mismatch")
