@@ -12,7 +12,9 @@ except ImportError:
 from immer.runtimes.o1_state.adapter import is_available
 
 
-@unittest.skipIf(torch is None or not is_available(), "torch or vendored o1-state missing")
+@unittest.skipIf(
+    torch is None or not is_available(), "torch or vendored o1-state missing"
+)
 class PlasticityTests(unittest.TestCase):
     def test_invalid_surprise_configuration_is_rejected(self) -> None:
         from immer.runtimes.o1_state.plasticity import LearningStream
@@ -53,7 +55,7 @@ class PlasticityTests(unittest.TestCase):
 
         stream = LearningStream(seed=5, min_observations=2, quantile=0.0)
         losses = []
-        for _ in range(6):
+        for _ in range(20):
             stream.observe("wiederholung macht den meister")
             losses.append(stream.loss_ema)
         # nach Updates auf demselben Text muss das EMA unter dem ersten Wert liegen
@@ -77,13 +79,21 @@ class PlasticityTests(unittest.TestCase):
         stream = LearningStream(seed=11)
         stream.observe("metriken")
         report = stream.metrics()
-        for key in ("tokens", "loss_ema", "surprises", "updates", "sleeps", "span_buffer"):
+        for key in (
+            "tokens",
+            "loss_ema",
+            "surprises",
+            "updates",
+            "sleeps",
+            "span_buffer",
+        ):
             self.assertIn(key, report)
 
     def test_non_surprising_chunks_never_carry_an_autograd_graph(self) -> None:
         from immer.runtimes.o1_state.plasticity import LearningStream
 
         stream = LearningStream(seed=13, min_observations=100)
+        stream._is_surprising = lambda _loss: False
         stream.observe("a quiet ordinary chunk")
         for state in stream.states:
             self.assertFalse(state.requires_grad)
@@ -100,10 +110,12 @@ class PlasticityTests(unittest.TestCase):
         }
         stream.observe("this chunk must update")
         self.assertEqual(stream.updates, 1)
-        self.assertTrue(any(
-            not stream.torch.equal(before[name], value)
-            for name, value in stream.model.state_dict().items()
-        ))
+        self.assertTrue(
+            any(
+                not stream.torch.equal(before[name], value)
+                for name, value in stream.model.state_dict().items()
+            )
+        )
         for state in stream.states:
             self.assertFalse(state.requires_grad)
             self.assertIsNone(state.grad_fn)

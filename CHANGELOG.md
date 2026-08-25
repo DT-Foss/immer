@@ -4,6 +4,29 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-25
 
+### O1 semantic cartography over causal Qwen
+
+- Reconnected the system's O1-State foundation to causal Qwen execution:
+  persistent scheduling, prompt-level learning progress, replay, and resume now
+  drive exact layer/module probes into an append-only SemanticWeightAtlas.
+- Restored the canonical POS objective (`x_t -> x_(t+1)`) with continuous byte
+  carry, surprise-gated plasticity, and content-addressed persistence of model,
+  optimizer, recurrent Z-state, and stream tail.
+- Added a multi-prompt `prepare`/`run`/`status`/`query` loop with immutable model
+  pins, separate weight-rail and atlas revisions, exact tensor-range receipts,
+  atomic appends, crash recovery, and complete prompt-by-coordinate frontiers.
+- Added external semantic-label bindings for exact FERTIG proofs. Label source,
+  semantic label, and proof digest are part of probe identity; model output has
+  no label authority, and placebo controls never inherit the primary label.
+- Added exact passive, off, native Prefix-Sinkhorn, and paired placebo probe
+  modes. The first full-checkpoint execution completed both passive coordinates
+  and the first paired native layer-27 coordinate; the intervention is identical
+  before its hook and produces a measured nonzero post-layer change.
+- Closed the native coordinate contract by binding the intervention to the
+  runtime's atomic attention-head group; single-head coordinates are rejected.
+- Verified the original live cut with `1118/1118` tests and the complete O1
+  foundation repair with `1128/1128` tests.
+
 ### Exact K=1–4 continuation and live K=4
 
 - Generalized the layer-major weight-once continuation transaction from K=2

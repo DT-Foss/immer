@@ -43,7 +43,9 @@ class LearningStream(O1StateStream):
             raise ValueError("max_grad_norm must be positive")
         super().__init__(**kwargs)
         self.optimizer = self.torch.optim.SGD(self.model.parameters(), lr=lr)
-        self.sleep_optimizer = self.torch.optim.SGD(self.model.parameters(), lr=sleep_lr)
+        self.sleep_optimizer = self.torch.optim.SGD(
+            self.model.parameters(), lr=sleep_lr
+        )
         self.window = deque(maxlen=window)
         self.quantile = quantile
         self.min_observations = min_observations
@@ -57,7 +59,7 @@ class LearningStream(O1StateStream):
 
     def _is_surprising(self, loss: float) -> bool:
         if not self.window or len(self.window) < self.min_observations:
-            return False
+            return True
         values = sorted(self.window)
         rank = int(self.quantile * (len(values) - 1))
         return loss > values[rank]
@@ -68,29 +70,33 @@ class LearningStream(O1StateStream):
 
     def _observe_locked(self, text: str) -> None:
         torch = self.torch
-        data = text.encode("utf-8") or b"\x00"
-        for i in range(0, len(data), self.seq_len):
-            chunk = data[i : i + self.seq_len]
-            x = torch.tensor(list(chunk), dtype=torch.long).unsqueeze(0)
+        chunks, next_tail = self._prediction_chunks(text)
+        for source, target, span in chunks:
+            x = torch.tensor(list(source), dtype=torch.long).unsqueeze(0)
+            y = torch.tensor(list(target), dtype=torch.long).unsqueeze(0)
             incoming = self._detached_states(self.states)
 
             # POS canon: measure without a graph; only a surprising chunk is
             # recomputed from the exact same incoming state with autograd.
             with torch.no_grad():
                 logits, observed_states = self.model(x, incoming)
-                observed_loss = torch.nn.functional.cross_entropy(logits[0], x[0])
+                observed_loss = torch.nn.functional.cross_entropy(logits[0], y[0])
             value = float(observed_loss)
-            self.loss_ema = value if self.loss_ema is None else 0.99 * self.loss_ema + 0.01 * value
-            self.tokens += len(chunk)
+            self.loss_ema = (
+                value if self.loss_ema is None else 0.99 * self.loss_ema + 0.01 * value
+            )
+            self.tokens += len(source)
             surprising = self._is_surprising(value)
             if surprising:
                 self.surprises += 1
-                self.spans.append(chunk)
+                self.spans.append(span)
                 logits, learned_states = self.model(x, incoming)
-                loss = torch.nn.functional.cross_entropy(logits[0], x[0])
+                loss = torch.nn.functional.cross_entropy(logits[0], y[0])
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.max_grad_norm
+                )
                 self.optimizer.step()
                 self.updates += 1
                 self.states = self._detached_states(learned_states)
@@ -98,10 +104,13 @@ class LearningStream(O1StateStream):
                 self.states = self._detached_states(observed_states)
             # The threshold is defined by previous chunks only.
             self.window.append(value)
+        self.tail = next_tail
 
     @staticmethod
     def _detached_states(states: list[Any]) -> list[Any]:
-        return [state.detach() if hasattr(state, "detach") else state for state in states]
+        return [
+            state.detach() if hasattr(state, "detach") else state for state in states
+        ]
 
     # -- consolidation -----------------------------------------------------
 
@@ -118,13 +127,18 @@ class LearningStream(O1StateStream):
         if self.spans:
             frozen = list(self.spans)
             for _ in range(epochs):
-                for chunk in frozen:
-                    x = torch.tensor(list(chunk), dtype=torch.long).unsqueeze(0)
+                for span in frozen:
+                    if len(span) < 2:
+                        continue
+                    x = torch.tensor(list(span[:-1]), dtype=torch.long).unsqueeze(0)
+                    y = torch.tensor(list(span[1:]), dtype=torch.long).unsqueeze(0)
                     logits, _ = self.model(x, None)
-                    loss = torch.nn.functional.cross_entropy(logits[0], x[0])
+                    loss = torch.nn.functional.cross_entropy(logits[0], y[0])
                     self.sleep_optimizer.zero_grad(set_to_none=True)
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.max_grad_norm
+                    )
                     self.sleep_optimizer.step()
                     replayed += 1
             self.spans.clear()

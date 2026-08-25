@@ -1190,6 +1190,7 @@ class O1Cartographer:
         )
         return (
             ("probe_family", job.probe_family),
+            ("prompt", job.prompt_sha256 or "none"),
             ("intervention", job.intervention),
             ("module", job.target.module),
             ("target", target),
@@ -1617,6 +1618,7 @@ class O1Cartographer:
             if self._file_sha256 is None:
                 if existing == encoded:
                     self._file_sha256 = _sha256_bytes(existing)
+                    self._commit_stream_snapshot()
                     return document["state_sha256"]
                 raise CartographyIntegrityError(
                     "cartography sidecar appeared during initialization"
@@ -1632,7 +1634,15 @@ class O1Cartographer:
                 "cartography sidecar commit does not match staged state"
             )
         self._file_sha256 = _sha256_bytes(committed)
+        self._commit_stream_snapshot()
         return document["state_sha256"]
+
+    def _commit_stream_snapshot(self) -> None:
+        if self._stream_state is None:
+            return
+        commit = getattr(self.stream, "commit_snapshot", None)
+        if callable(commit):
+            commit(self._stream_state)
 
     @staticmethod
     def _atomic_write(path: Path, data: bytes) -> None:

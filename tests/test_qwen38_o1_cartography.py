@@ -92,6 +92,7 @@ class _FakeMeasurement:
     coordinate: _FakeCoordinate
     intervention: _FakeIntervention
     spec_sha256: str
+    observed_semantic_label: str | None = None
 
     @property
     def sha256(self) -> str:
@@ -102,6 +103,7 @@ class _FakeMeasurement:
                 "model_pin_sha256": self.model_pin.sha256,
                 "probe_sha256": self.probe.sha256,
                 "spec_sha256": self.spec_sha256,
+                "semantic_label": self.observed_semantic_label,
             }
         )
 
@@ -112,6 +114,7 @@ class _FakeMeasurement:
             "model_pin_sha256": self.model_pin.sha256,
             "probe_sha256": self.probe.sha256,
             "sha256": self.sha256,
+            "semantic_label": self.observed_semantic_label,
         }
 
 
@@ -196,6 +199,13 @@ class _FakeAtlas:
             if value.coordinate.sha256 == coordinate_sha256
         )
 
+    def query_by_semantic_label(self, semantic_label):
+        return self._result(
+            value
+            for value in self.store.values()
+            if value.observed_semantic_label == semantic_label
+        )
+
     def coverage_matrix(self):
         return {
             "measurement_count": len(self.store),
@@ -237,6 +247,7 @@ class _FakeProbe:
                     _digest({"alpha": 0.0, "kind": "original-qwen-identity"}),
                 ),
                 spec_sha256=spec.sha256,
+                observed_semantic_label=spec.semantic_label,
             )
         )
 
@@ -427,6 +438,107 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         )
         self.assertEqual([outcome.read_bytes for outcome in scheduler.outcomes], [7, 7])
 
+    def test_multi_prompt_registry_runs_cross_product_and_queries_separately(
+        self,
+    ) -> None:
+        run_root = self.base / "multi-prompt"
+        other_tokens = (2, 5, 8, 13, 21)
+        other_sha = prompt_token_sha256(other_tokens)
+        manifest = cartography.prepare_manifest(
+            run_root,
+            bundle_root=self.bundle,
+            model_pin=_pin(),
+            prompts=(
+                {"sha256": self.prompt_sha, "token_ids": list(self.tokens)},
+                {"sha256": other_sha, "token_ids": list(other_tokens)},
+            ),
+            jobs=_jobs(),
+            code_revision=CODE_REVISION,
+            seed=17,
+        )
+        self.assertEqual(len(manifest["body"]["prompts"]), 2)
+        self.assertEqual(len(manifest["body"]["jobs"]), 4)
+
+        report = self._run(run_root)
+        self.assertEqual(report["attempts_executed"], 4)
+        self.assertEqual(report["coverage"]["promoted_jobs"], 4)
+        first = cartography.query_cartography(
+            run_root,
+            prompt_sha256=self.prompt_sha,
+            runtime_factory=_runtime_factory,
+            atlas_factory=_FakeAtlas,
+        )
+        second = cartography.query_cartography(
+            run_root,
+            prompt_sha256=other_sha,
+            runtime_factory=_runtime_factory,
+            atlas_factory=_FakeAtlas,
+        )
+        self.assertEqual(len(first["measurements"]), 2)
+        self.assertEqual(len(second["measurements"]), 2)
+        self.assertTrue(
+            {row["sha256"] for row in first["measurements"]}.isdisjoint(
+                row["sha256"] for row in second["measurements"]
+            )
+        )
+
+        document = json.loads((run_root / cartography.MANIFEST_NAME).read_text())
+        document["body"]["prompts"][0]["token_ids"][0] += 1
+        document["sha256"] = _digest(document["body"])
+        (run_root / cartography.MANIFEST_NAME).write_bytes(
+            json.dumps(
+                document,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        with self.assertRaisesRegex(
+            cartography.O1CartographyCliError, "prompt token IDs"
+        ):
+            cartography.status_cartography(run_root)
+
+    def test_external_prompt_label_reaches_atlas_label_query(self) -> None:
+        run_root = self.base / "external-label"
+        label = "arithmetic/subtraction"
+        label_source = _digest({"source": "fertig-exact"})
+        label_evidence = _digest({"proof": "fraction-rref"})
+        manifest = cartography.prepare_manifest(
+            run_root,
+            bundle_root=self.bundle,
+            model_pin=_pin(),
+            prompts=(
+                {
+                    "sha256": self.prompt_sha,
+                    "token_ids": list(self.tokens),
+                    "spec_defaults": {
+                        "label_evidence_sha256": label_evidence,
+                        "label_source_sha256": label_source,
+                        "semantic_label": label,
+                    },
+                },
+            ),
+            jobs=(_jobs()[0],),
+            code_revision=CODE_REVISION,
+            seed=17,
+        )
+        spec = manifest["body"]["jobs"][0]["spec"]
+        self.assertEqual(spec["semantic_label"], label)
+        self.assertEqual(spec["label_evidence_sha256"], label_evidence)
+
+        report = self._run(run_root)
+        self.assertEqual(report["coverage"]["promoted_jobs"], 1)
+        queried = cartography.query_cartography(
+            run_root,
+            semantic_label=label,
+            runtime_factory=_runtime_factory,
+            atlas_factory=_FakeAtlas,
+        )
+        self.assertEqual(len(queried["measurements"]), 1)
+        self.assertEqual(queried["measurements"][0]["semantic_label"], label)
+
     def test_crash_after_outcome_checkpoint_reuses_atlas_proof(self) -> None:
         run_root = self.base / "crash"
         self._prepare(run_root)
@@ -465,6 +577,46 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         resumed = self._run(run_root, max_jobs=1)
         self.assertEqual(resumed["coverage"]["succeeded_jobs"], 1)
         self.assertEqual(resumed["coverage"]["attempts"], 2)
+
+    def test_default_o1_organism_sidecar_survives_fresh_status_restore(self) -> None:
+        run_root = self.base / "organism"
+        self._prepare(run_root)
+        report = self._run(run_root, max_jobs=1, stream_factory=None)
+        self.assertEqual(report["coverage"]["succeeded_jobs"], 1)
+
+        state = json.loads((run_root / cartography.SCHEDULER_NAME).read_text())
+        stream_state = state["stream_state"]
+        self.assertGreaterEqual(state["outcomes"][0]["learning_progress"], 1.0)
+        receipt = stream_state["sidecar"]
+        self.assertEqual(receipt["schema"], "immer.o1-state-sidecar-receipt/v1")
+        self.assertGreater(stream_state["tokens"], 0)
+        self.assertIsNotNone(stream_state["tail"])
+        sidecars = tuple(run_root.glob("o1-state.*.pt"))
+        self.assertEqual([path.name for path in sidecars], [receipt["name"]])
+
+        status = cartography.status_cartography(
+            run_root,
+            runtime_factory=_runtime_factory,
+            atlas_factory=_FakeAtlas,
+            stream_factory=None,
+        )
+        self.assertEqual(status["coverage"]["succeeded_jobs"], 1)
+        self.assertEqual(tuple(run_root.glob("o1-state.*.pt")), sidecars)
+
+    def test_stream_factory_type_error_is_not_retried_or_weakened(self) -> None:
+        calls = []
+
+        def broken_factory(*, seed, sidecar):
+            calls.append((seed, sidecar))
+            raise TypeError("constructor body failed")
+
+        with self.assertRaisesRegex(TypeError, "constructor body failed"):
+            cartography._stream(
+                broken_factory,
+                seed=7,
+                sidecar=self.base / cartography.O1_STATE_NAME,
+            )
+        self.assertEqual(len(calls), 1)
 
     def test_resealed_output_escape_and_state_symlink_are_rejected(self) -> None:
         run_root = self.base / "containment"

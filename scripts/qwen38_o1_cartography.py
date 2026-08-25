@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a bounded, resumable O1 cartography loop over a local Qwen3.8 bundle."""
+"""Run resumable O1 cartography over a local causal Qwen3.8 bundle."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields, replace
 import fcntl
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -22,6 +23,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from immer.runtimes.o1_state import O1Cartographer, ProbeJob, ProbeTarget
+from immer.runtimes.o1_state.plasticity import LearningStream
 from immer.runtimes.qwen3_8 import (
     HiddenSketchProjection,
     LogicalModelIdentity,
@@ -41,15 +43,26 @@ from immer.runtimes.qwen3_8 import (
 from immer.runtimes.qwen3_8.bundle import QWEN38_BUNDLE_SCHEMA
 
 
-MANIFEST_SCHEMA = "immer.qwen3.8-o1-cartography-run/v1"
+MANIFEST_SCHEMA_V1 = "immer.qwen3.8-o1-cartography-run/v1"
+MANIFEST_SCHEMA = "immer.qwen3.8-o1-cartography-run/v2"
 MANIFEST_NAME = "manifest.json"
 SCHEDULER_NAME = "scheduler.json"
 ATLAS_NAME = "atlas"
+O1_STATE_NAME = "o1-state.pt"
 _MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _CODE_REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _FORBIDDEN_JOB_KEYS = frozenset(
     {"answer", "completion", "gold", "label", "output", "prompt", "question"}
+)
+_PROMPT_DEFAULT_FIELDS = frozenset(
+    {
+        "family_sha256",
+        "label_evidence_sha256",
+        "label_source_sha256",
+        "question_sha256",
+        "semantic_label",
+    }
 )
 
 
@@ -139,7 +152,7 @@ def _plain_root(value: str | os.PathLike[str], *, create: bool) -> Path:
 
 
 def _contained(root: Path, name: str) -> Path:
-    if name not in {MANIFEST_NAME, SCHEDULER_NAME, ATLAS_NAME}:
+    if name not in {MANIFEST_NAME, SCHEDULER_NAME, ATLAS_NAME, O1_STATE_NAME}:
         raise O1CartographyCliError("cartography output name is not allowlisted")
     candidate = root / name
     if candidate.parent != root:
@@ -302,11 +315,13 @@ def _spec_from_record(value: object) -> ProbeSpec:
         "family_sha256",
         "hidden_sketch",
         "intervention_mode",
+        "label_evidence_sha256",
         "label_source_sha256",
         "native_head_crsa",
         "prompt_sha256",
         "prompt_token_ids",
         "question_sha256",
+        "semantic_label",
         "start_layer",
         "stop_layer",
     }
@@ -339,6 +354,8 @@ def _spec_from_record(value: object) -> ProbeSpec:
         question_sha256=value["question_sha256"],
         family_sha256=value["family_sha256"],
         label_source_sha256=value["label_source_sha256"],
+        semantic_label=value["semantic_label"],
+        label_evidence_sha256=value["label_evidence_sha256"],
         native_head_crsa=_native_from_record(value["native_head_crsa"]),
     )
 
@@ -352,6 +369,68 @@ def _target_for_spec(spec: ProbeSpec) -> ProbeTarget:
     return ProbeTarget(coordinate.module, "module", None)
 
 
+def _prompt_record(value: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or not {"sha256", "token_ids"} <= set(value):
+        raise O1CartographyCliError("prompt registry entry is malformed")
+    if set(value) - {"sha256", "token_ids", "spec_defaults"}:
+        raise O1CartographyCliError("prompt registry entry has unknown fields")
+    try:
+        tokens = tuple(value["token_ids"])
+    except TypeError as exc:
+        raise O1CartographyCliError("prompt token IDs must be a sequence") from exc
+    claimed = _sha(value["sha256"], "prompt SHA-256")
+    if prompt_token_sha256(tokens) != claimed:
+        raise O1CartographyCliError("prompt token IDs do not match prompt SHA-256")
+    defaults = value.get("spec_defaults", {})
+    if not isinstance(defaults, Mapping) or set(defaults) - _PROMPT_DEFAULT_FIELDS:
+        raise O1CartographyCliError("prompt spec defaults are malformed")
+    normalized = dict(defaults)
+    for name in ("question_sha256", "family_sha256", "label_source_sha256"):
+        if name in normalized:
+            normalized[name] = _sha(normalized[name], name)
+    label = normalized.get("semantic_label")
+    evidence = normalized.get("label_evidence_sha256")
+    if (label is None) != (evidence is None):
+        raise O1CartographyCliError(
+            "prompt semantic label and evidence SHA-256 must be supplied together"
+        )
+    if label is not None:
+        if (
+            not isinstance(label, str)
+            or not label
+            or label != label.strip()
+            or "\x00" in label
+            or len(label) > 512
+        ):
+            raise O1CartographyCliError("prompt semantic label is invalid")
+        normalized["label_evidence_sha256"] = _sha(evidence, "label_evidence_sha256")
+        if "label_source_sha256" not in normalized:
+            raise O1CartographyCliError(
+                "prompt semantic label requires an external label source"
+            )
+    return {
+        "sha256": claimed,
+        "spec_defaults": normalized,
+        "token_ids": list(tokens),
+    }
+
+
+def _manifest_prompts(body: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    if "prompts" in body:
+        raw = body["prompts"]
+        if not isinstance(raw, list) or not raw:
+            raise O1CartographyCliError("run prompt registry is malformed")
+        prompts = tuple(_prompt_record(value) for value in raw)
+    else:
+        legacy = body.get("prompt")
+        if not isinstance(legacy, Mapping) or set(legacy) != {"sha256", "token_ids"}:
+            raise O1CartographyCliError("legacy run prompt pin is malformed")
+        prompts = (_prompt_record({**legacy, "spec_defaults": {}}),)
+    if len({row["sha256"] for row in prompts}) != len(prompts):
+        raise O1CartographyCliError("run prompt registry contains duplicates")
+    return tuple(sorted(prompts, key=lambda row: row["sha256"]))
+
+
 def _prepared_job(
     value: ProbeSpec | Mapping[str, Any],
     *,
@@ -360,13 +439,17 @@ def _prepared_job(
     code_revision: str,
     model_pin_sha256: str,
     base_seed: int,
+    prompt_defaults: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     probe_family = "unlabeled"
+    defaults = dict(prompt_defaults or {})
     target: ProbeTarget | None = None
     read_budget_bytes = None
     model_budget_seconds = None
     if isinstance(value, ProbeSpec):
         spec = value
+        if any(getattr(spec, name) != member for name, member in defaults.items()):
+            raise O1CartographyCliError("probe spec conflicts with its prompt defaults")
     elif isinstance(value, Mapping):
         if _contains_forbidden_job_key(value):
             raise O1CartographyCliError(
@@ -382,11 +465,13 @@ def _prepared_job(
             "family_sha256",
             "hidden_sketch",
             "intervention_mode",
+            "label_evidence_sha256",
             "label_source_sha256",
             "native_head_crsa",
             "prompt_sha256",
             "prompt_token_ids",
             "question_sha256",
+            "semantic_label",
             "start_layer",
             "stop_layer",
         }:
@@ -406,8 +491,19 @@ def _prepared_job(
                 "intervention_mode": raw_spec.get("intervention_mode", "passive"),
                 "code_revision": code_revision,
             }
-            for name in ("question_sha256", "family_sha256", "label_source_sha256"):
+            kwargs.update(defaults)
+            for name in (
+                "question_sha256",
+                "family_sha256",
+                "label_source_sha256",
+                "semantic_label",
+                "label_evidence_sha256",
+            ):
                 if name in raw_spec:
+                    if name in defaults and raw_spec[name] != defaults[name]:
+                        raise O1CartographyCliError(
+                            "job spec conflicts with its prompt defaults"
+                        )
                     kwargs[name] = raw_spec[name]
             if "budget" in raw_spec:
                 kwargs["budget"] = ProbeResourceBudget(**dict(raw_spec["budget"]))
@@ -427,6 +523,8 @@ def _prepared_job(
             target = ProbeTarget.from_document(value["target"])
     else:
         raise O1CartographyCliError("jobs must be ProbeSpec instances or objects")
+    if probe_family == "unlabeled" and spec.semantic_label is not None:
+        probe_family = spec.semantic_label
     if (
         spec.prompt_token_ids != prompt_token_ids
         or spec.prompt_sha256 != prompt_sha256
@@ -459,8 +557,9 @@ def prepare_manifest(
     *,
     bundle_root: str | os.PathLike[str],
     model_pin: ModelPin,
-    prompt_token_ids: Sequence[int],
-    prompt_sha256: str,
+    prompt_token_ids: Sequence[int] | None = None,
+    prompt_sha256: str | None = None,
+    prompts: Sequence[Mapping[str, Any]] | None = None,
     jobs: Sequence[ProbeSpec | Mapping[str, Any]],
     code_revision: str,
     seed: int = 0,
@@ -476,23 +575,60 @@ def prepare_manifest(
         raise TypeError("model_pin must be a ModelPin")
     if model_pin.code_revision != code:
         raise O1CartographyCliError("model pin and run code revision differ")
-    tokens = tuple(prompt_token_ids)
-    claimed_prompt = _sha(prompt_sha256, "prompt SHA-256")
-    if prompt_token_sha256(tokens) != claimed_prompt:
-        raise O1CartographyCliError("prompt token IDs do not match prompt SHA-256")
-    if not jobs or len(jobs) > 1_000_000:
+    if prompts is None:
+        if prompt_token_ids is None or prompt_sha256 is None:
+            raise O1CartographyCliError("single-prompt prepare requires tokens and SHA")
+        registry = (
+            _prompt_record(
+                {
+                    "sha256": prompt_sha256,
+                    "spec_defaults": {},
+                    "token_ids": list(prompt_token_ids),
+                }
+            ),
+        )
+    else:
+        if prompt_token_ids is not None or prompt_sha256 is not None:
+            raise O1CartographyCliError(
+                "single-prompt arguments and prompt registry are mutually exclusive"
+            )
+        try:
+            registry = tuple(_prompt_record(value) for value in prompts)
+        except TypeError as exc:
+            raise O1CartographyCliError("prompt registry must be a sequence") from exc
+        if not registry or len({row["sha256"] for row in registry}) != len(registry):
+            raise O1CartographyCliError(
+                "prompt registry must be non-empty and duplicate-free"
+            )
+        registry = tuple(sorted(registry, key=lambda row: row["sha256"]))
+    if not jobs or len(jobs) * len(registry) > 1_000_000:
         raise O1CartographyCliError("finite job frontier must be non-empty and bounded")
-    prepared = [
-        _prepared_job(
-            value,
-            prompt_token_ids=tokens,
-            prompt_sha256=claimed_prompt,
-            code_revision=code,
-            model_pin_sha256=model_pin.sha256,
-            base_seed=seed,
+    if len(registry) > 1 and any(
+        isinstance(value, ProbeSpec)
+        or (
+            isinstance(value, Mapping)
+            and isinstance(value.get("spec", value), Mapping)
+            and "prompt_token_ids" in value.get("spec", value)
         )
         for value in jobs
-    ]
+    ):
+        raise O1CartographyCliError(
+            "multi-prompt frontiers require prompt-independent job templates"
+        )
+    prepared = []
+    for prompt in registry:
+        for value in jobs:
+            prepared.append(
+                _prepared_job(
+                    value,
+                    prompt_token_ids=tuple(prompt["token_ids"]),
+                    prompt_sha256=prompt["sha256"],
+                    code_revision=code,
+                    model_pin_sha256=model_pin.sha256,
+                    base_seed=seed,
+                    prompt_defaults=prompt["spec_defaults"],
+                )
+            )
     ids = [row["job"]["job_id"] for row in prepared]
     if len(ids) != len(set(ids)):
         raise O1CartographyCliError("finite job frontier contains duplicate jobs")
@@ -521,7 +657,7 @@ def prepare_manifest(
         "model_pin": model_pin.to_document(),
         "model_pin_sha256": model_pin.sha256,
         "outputs": {"atlas": ATLAS_NAME, "scheduler": SCHEDULER_NAME},
-        "prompt": {"sha256": claimed_prompt, "token_ids": list(tokens)},
+        "prompts": list(registry),
         "runtime": runtime_body,
         "scheduler": {"seed": seed},
     }
@@ -539,7 +675,7 @@ def _load_manifest(root: Path) -> tuple[dict[str, Any], Mapping[str, Any]]:
     if (
         not isinstance(document, dict)
         or set(document) != {"body", "schema", "sha256"}
-        or document.get("schema") != MANIFEST_SCHEMA
+        or document.get("schema") not in {MANIFEST_SCHEMA_V1, MANIFEST_SCHEMA}
         or not isinstance(document.get("body"), Mapping)
         or document.get("sha256") != _digest(document["body"])
     ):
@@ -553,10 +689,11 @@ def _load_manifest(root: Path) -> tuple[dict[str, Any], Mapping[str, Any]]:
         "model_pin",
         "model_pin_sha256",
         "outputs",
-        "prompt",
         "runtime",
         "scheduler",
     }
+    prompt_field = "prompts" if document.get("schema") == MANIFEST_SCHEMA else "prompt"
+    required.add(prompt_field)
     if set(body) != required or body.get("holdout_accessed") is not False:
         raise O1CartographyCliError("run manifest body is malformed")
     if body.get("outputs") != {"atlas": ATLAS_NAME, "scheduler": SCHEDULER_NAME}:
@@ -567,18 +704,13 @@ def _load_manifest(root: Path) -> tuple[dict[str, Any], Mapping[str, Any]]:
     if pin.code_revision != _code_revision(body.get("code_revision")):
         raise O1CartographyCliError("run code/model pins differ")
     bundle = body.get("bundle")
-    prompt = body.get("prompt")
     if (
         not isinstance(bundle, Mapping)
         or set(bundle) != {"manifest_sha256", "root"}
         or bundle.get("manifest_sha256") != pin.bundle_manifest_sha256
-        or not isinstance(prompt, Mapping)
-        or set(prompt) != {"sha256", "token_ids"}
     ):
-        raise O1CartographyCliError("run bundle/prompt pin is malformed")
-    token_ids = tuple(prompt["token_ids"])
-    if prompt_token_sha256(token_ids) != _sha(prompt["sha256"], "prompt SHA-256"):
-        raise O1CartographyCliError("run prompt pin is invalid")
+        raise O1CartographyCliError("run bundle pin is malformed")
+    _manifest_prompts(body)
     _manifest_jobs(body)
     return document, body
 
@@ -589,7 +721,7 @@ def _manifest_jobs(body: Mapping[str, Any]) -> tuple[tuple[ProbeJob, ProbeSpec],
         raise O1CartographyCliError("run job frontier is malformed")
     code = body["code_revision"]
     model_pin_sha = body["model_pin_sha256"]
-    prompt = body["prompt"]
+    prompts = {row["sha256"]: row for row in _manifest_prompts(body)}
     rows: list[tuple[ProbeJob, ProbeSpec]] = []
     for raw in raw_jobs:
         if not isinstance(raw, Mapping) or set(raw) != {"job", "spec"}:
@@ -599,15 +731,21 @@ def _manifest_jobs(body: Mapping[str, Any]) -> tuple[tuple[ProbeJob, ProbeSpec],
         if (
             job.code_pin != code
             or job.model_pin != model_pin_sha
-            or job.prompt_sha256 != prompt["sha256"]
+            or job.prompt_sha256 != spec.prompt_sha256
             or job.layer != spec.coordinate.layer
             or job.target.module != spec.coordinate.module
             or job.intervention != spec.intervention_mode
-            or spec.prompt_sha256 != prompt["sha256"]
-            or list(spec.prompt_token_ids) != prompt["token_ids"]
             or spec.code_revision != code
         ):
             raise O1CartographyCliError("run job/spec identity is inconsistent")
+        prompt = prompts.get(spec.prompt_sha256)
+        if prompt is None or list(spec.prompt_token_ids) != prompt["token_ids"]:
+            raise O1CartographyCliError("run job references an unsealed prompt")
+        if any(
+            getattr(spec, name) != value
+            for name, value in prompt["spec_defaults"].items()
+        ):
+            raise O1CartographyCliError("run job differs from its prompt defaults")
         rows.append((job, spec))
     if len({job.job_id for job, _spec in rows}) != len(rows):
         raise O1CartographyCliError("run job frontier contains duplicates")
@@ -695,7 +833,7 @@ def _default_runtime_factory(body: Mapping[str, Any]) -> CartographyRuntime:
             require_source_identity=True,
             causal_tensor_reader=mount.tensor_reader,
         )
-        prompt_length = len(body["prompt"]["token_ids"])
+        prompt_length = max(len(row["token_ids"]) for row in _manifest_prompts(body))
         model = StreamedQwen38(
             config,
             pager,
@@ -734,13 +872,30 @@ def _open_runtime(
     return runtime
 
 
-def _stream(stream_factory: Callable[..., Any] | None, seed: int) -> Any:
+def _stream(
+    stream_factory: Callable[..., Any] | None,
+    *,
+    seed: int,
+    sidecar: Path,
+) -> Any:
     if stream_factory is None:
-        return None
+        return LearningStream(seed=seed, sidecar=sidecar)
     try:
-        return stream_factory(seed=seed)
-    except TypeError:
-        return stream_factory()
+        signature = inspect.signature(stream_factory)
+    except (TypeError, ValueError) as exc:
+        raise O1CartographyCliError(
+            "stream factory must expose an inspectable call signature"
+        ) from exc
+    parameters = signature.parameters
+    accepts_kwargs = any(
+        value.kind is inspect.Parameter.VAR_KEYWORD for value in parameters.values()
+    )
+    kwargs = {}
+    if accepts_kwargs or "seed" in parameters:
+        kwargs["seed"] = seed
+    if accepts_kwargs or "sidecar" in parameters:
+        kwargs["sidecar"] = sidecar
+    return stream_factory(**kwargs)
 
 
 def _scheduler(
@@ -752,7 +907,11 @@ def _scheduler(
 ) -> O1Cartographer | None:
     state_path = _contained(root, SCHEDULER_NAME)
     seed = _uint(body["scheduler"]["seed"], "scheduler seed")
-    stream = _stream(stream_factory, seed)
+    stream = _stream(
+        stream_factory,
+        seed=seed,
+        sidecar=_contained(root, O1_STATE_NAME),
+    )
     if state_path.exists() or state_path.is_symlink():
         return O1Cartographer.restore(
             state_path,
@@ -1186,13 +1345,22 @@ def query_cartography(
     *,
     coordinate_sha256: str | None = None,
     prompt_sha256: str | None = None,
+    semantic_label: str | None = None,
     runtime_factory: RuntimeFactory | None = None,
     atlas_factory: AtlasFactory = SemanticWeightAtlas,
 ) -> dict[str, Any]:
     """Authenticate the atlas and query exactly one coordinate or prompt index."""
 
-    if (coordinate_sha256 is None) == (prompt_sha256 is None):
-        raise O1CartographyCliError("query requires exactly one coordinate or prompt")
+    if (
+        sum(
+            value is not None
+            for value in (coordinate_sha256, prompt_sha256, semantic_label)
+        )
+        != 1
+    ):
+        raise O1CartographyCliError(
+            "query requires exactly one coordinate, prompt, or semantic label"
+        )
     root_path = _plain_root(root, create=False)
     with _root_lock(root_path):
         manifest, body = _load_manifest(root_path)
@@ -1217,16 +1385,15 @@ def query_cartography(
                 result = atlas.query_by_coordinate(
                     _sha(coordinate_sha256, "coordinate SHA-256")
                 )
+            elif semantic_label is not None:
+                result = atlas.query_by_semantic_label(semantic_label)
             else:
                 prompt = _sha(prompt_sha256, "prompt SHA-256")
-                signatures = (
-                    {
-                        spec.probe_identity.prompt_signature
-                        for _job, spec in _manifest_jobs(body)
-                    }
-                    if prompt == body["prompt"]["sha256"]
-                    else set()
-                )
+                signatures = {
+                    spec.probe_identity.prompt_signature
+                    for _job, spec in _manifest_jobs(body)
+                    if spec.prompt_sha256 == prompt
+                }
                 results = [
                     atlas.query_by_prompt_signature(value) for value in signatures
                 ]
@@ -1315,6 +1482,36 @@ def _jobs_input(args: argparse.Namespace) -> list[Mapping[str, Any]]:
     return values
 
 
+def _prompts_input(args: argparse.Namespace) -> list[Mapping[str, Any]] | None:
+    if args.prompts_json is None:
+        if args.prompt_sha256 is None:
+            raise O1CartographyCliError(
+                "--prompt-sha256 is required with --prompt-token-ids"
+            )
+        return None
+    if args.prompt_sha256 is not None:
+        raise O1CartographyCliError(
+            "--prompt-sha256 cannot be combined with --prompts-json"
+        )
+    source = Path(args.prompts_json).expanduser().absolute()
+    if any(
+        marker in part.casefold()
+        for part in source.parts
+        for marker in ("holdout", "heldout", "hold-out")
+    ):
+        raise O1CartographyCliError("holdout paths are excluded from cartography")
+    document = _strict_json_bytes(
+        _stable_regular_bytes(source, "prompt registry"), "prompt registry"
+    )
+    if isinstance(document, Mapping) and set(document) == {"prompts"}:
+        document = document["prompts"]
+    if not isinstance(document, list) or any(
+        not isinstance(value, Mapping) for value in document
+    ):
+        raise O1CartographyCliError("prompt registry JSON root must be a list")
+    return list(document)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1327,8 +1524,10 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--bundle-fingerprint", required=True)
     prepare.add_argument("--bundle-manifest-sha256", required=True)
     prepare.add_argument("--code-revision", required=True)
-    prepare.add_argument("--prompt-token-ids", required=True, type=_token_ids)
-    prepare.add_argument("--prompt-sha256", required=True)
+    prompt_inputs = prepare.add_mutually_exclusive_group(required=True)
+    prompt_inputs.add_argument("--prompt-token-ids", type=_token_ids)
+    prompt_inputs.add_argument("--prompts-json")
+    prepare.add_argument("--prompt-sha256")
     inputs = prepare.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--jobs-json")
     inputs.add_argument("--job", action="append")
@@ -1366,11 +1565,13 @@ def _parser() -> argparse.ArgumentParser:
     selector = query.add_mutually_exclusive_group(required=True)
     selector.add_argument("--coordinate-sha256")
     selector.add_argument("--prompt-sha256")
+    selector.add_argument("--semantic-label")
     return parser
 
 
 def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "prepare":
+        prompts = _prompts_input(args)
         pin = ModelPin(
             repo_id=args.repo_id,
             revision=args.revision,
@@ -1384,8 +1585,9 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
             args.root,
             bundle_root=args.bundle_root,
             model_pin=pin,
-            prompt_token_ids=args.prompt_token_ids,
-            prompt_sha256=args.prompt_sha256,
+            prompt_token_ids=(None if prompts is not None else args.prompt_token_ids),
+            prompt_sha256=(None if prompts is not None else args.prompt_sha256),
+            prompts=prompts,
             jobs=_jobs_input(args),
             code_revision=args.code_revision,
             seed=args.seed,
@@ -1410,6 +1612,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
             args.root,
             coordinate_sha256=args.coordinate_sha256,
             prompt_sha256=args.prompt_sha256,
+            semantic_label=args.semantic_label,
         )
     raise AssertionError(f"unknown command: {args.command}")
 

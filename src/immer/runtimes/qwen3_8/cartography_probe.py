@@ -183,6 +183,24 @@ def _sha(value: object, label: str) -> str:
     return value
 
 
+def _label_binding_sha256(
+    label_source_sha256: str,
+    semantic_label: str | None,
+    label_evidence_sha256: str | None,
+) -> str:
+    if semantic_label is None:
+        return label_source_sha256
+    assert label_evidence_sha256 is not None
+    return _digest(
+        {
+            "label_evidence_sha256": label_evidence_sha256,
+            "label_source_sha256": label_source_sha256,
+            "schema": "immer.external-semantic-label-binding/v1",
+            "semantic_label": semantic_label,
+        }
+    )
+
+
 def _positive(value: object, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise Qwen38CartographyProbeError(f"{label} must be a positive integer")
@@ -345,6 +363,8 @@ class ProbeSpec:
     question_sha256: str | None = None
     family_sha256: str = _UNLABELED_FAMILY_SHA256
     label_source_sha256: str = _NO_LABEL_SOURCE_SHA256
+    semantic_label: str | None = None
+    label_evidence_sha256: str | None = None
     native_head_crsa: Qwen38NativeHeadCrsa | None = None
 
     def __post_init__(self) -> None:
@@ -392,6 +412,29 @@ class ProbeSpec:
         )
         family = _sha(self.family_sha256, "family_sha256")
         label_source = _sha(self.label_source_sha256, "label_source_sha256")
+        semantic_label = self.semantic_label
+        label_evidence = self.label_evidence_sha256
+        if (semantic_label is None) != (label_evidence is None):
+            raise Qwen38CartographyProbeError(
+                "semantic_label and label_evidence_sha256 must be supplied together"
+            )
+        if semantic_label is not None:
+            if (
+                not isinstance(semantic_label, str)
+                or not semantic_label
+                or semantic_label != semantic_label.strip()
+                or "\x00" in semantic_label
+                or len(semantic_label) > 512
+            ):
+                raise Qwen38CartographyProbeError(
+                    "semantic_label must be bounded canonical external text"
+                )
+            assert label_evidence is not None
+            label_evidence = _sha(label_evidence, "label_evidence_sha256")
+            if label_source == _NO_LABEL_SOURCE_SHA256:
+                raise Qwen38CartographyProbeError(
+                    "semantic_label requires a non-default external label source"
+                )
         native = self.native_head_crsa
         if mode == "native":
             if not isinstance(native, Qwen38NativeHeadCrsa) or not native.active:
@@ -416,6 +459,8 @@ class ProbeSpec:
         object.__setattr__(self, "question_sha256", question)
         object.__setattr__(self, "family_sha256", family)
         object.__setattr__(self, "label_source_sha256", label_source)
+        object.__setattr__(self, "semantic_label", semantic_label)
+        object.__setattr__(self, "label_evidence_sha256", label_evidence)
 
     @property
     def probe_identity(self) -> ProbeIdentity:
@@ -424,7 +469,11 @@ class ProbeSpec:
             question_sha256=self.question_sha256,
             token_sha256=self.prompt_sha256,
             family_sha256=self.family_sha256,
-            label_source_sha256=self.label_source_sha256,
+            label_source_sha256=_label_binding_sha256(
+                self.label_source_sha256,
+                self.semantic_label,
+                self.label_evidence_sha256,
+            ),
         )
 
     def as_record(self) -> dict[str, Any]:
@@ -437,6 +486,7 @@ class ProbeSpec:
                 None if self.hidden_sketch is None else self.hidden_sketch.as_record()
             ),
             "intervention_mode": self.intervention_mode,
+            "label_evidence_sha256": self.label_evidence_sha256,
             "label_source_sha256": self.label_source_sha256,
             "native_head_crsa": (
                 None if self.native_head_crsa is None else asdict(self.native_head_crsa)
@@ -444,6 +494,7 @@ class ProbeSpec:
             "prompt_sha256": self.prompt_sha256,
             "prompt_token_ids": list(self.prompt_token_ids),
             "question_sha256": self.question_sha256,
+            "semantic_label": self.semantic_label,
             "start_layer": self.start_layer,
             "stop_layer": self.stop_layer,
         }
@@ -500,7 +551,10 @@ class CartographyProbeResult:
 
         measured = MeasurementReceipt.from_document(self.measurement.to_document())
         self.access_trace.verify()
-        _verify_evidence_document(self.evidence_document)
+        primary_body = _verify_evidence_document(self.evidence_document)
+        _verify_external_label_binding(
+            measured, self.evidence_document, primary_measurement=True
+        )
         if measured.access_trace_sha256 != self.access_trace.sha256:
             raise Qwen38CartographyIntegrityError(
                 "measurement access trace does not match its raw proof"
@@ -532,7 +586,16 @@ class CartographyProbeResult:
             self.control_measurement.to_document()
         )
         self.control_access_trace.verify()
-        _verify_evidence_document(self.control_evidence_document)
+        control_body = _verify_evidence_document(self.control_evidence_document)
+        _verify_external_label_binding(
+            control,
+            self.control_evidence_document,
+            primary_measurement=False,
+        )
+        if control_body.get("probe_spec") != primary_body.get("probe_spec"):
+            raise Qwen38CartographyIntegrityError(
+                "paired evidence does not share one external probe specification"
+            )
         if control.access_trace_sha256 != self.control_access_trace.sha256:
             raise Qwen38CartographyIntegrityError(
                 "control access trace does not match its raw proof"
@@ -583,6 +646,115 @@ def _verify_evidence_document(document: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(body, Mapping) or document.get("sha256") != _digest(body):
         raise Qwen38CartographyIntegrityError("evidence document SHA-256 mismatch")
     return json.loads(_canonical(dict(body)))
+
+
+def _external_label_assertion(
+    spec: ProbeSpec, *, applies_to_this_arm: bool
+) -> dict[str, Any]:
+    external = spec.semantic_label is not None
+    applies = external and applies_to_this_arm
+    return {
+        "applies_to_this_arm": applies,
+        "assertion_origin": "external" if external else "none",
+        "label_evidence_sha256": spec.label_evidence_sha256,
+        "label_source_sha256": spec.label_source_sha256,
+        "model_output_used": False,
+        "probe_label_binding_sha256": spec.probe_identity.label_source_sha256,
+        "semantic_label": spec.semantic_label if applies else None,
+    }
+
+
+def _verify_external_label_binding(
+    measurement: MeasurementReceipt,
+    evidence_document: Mapping[str, Any],
+    *,
+    primary_measurement: bool,
+) -> None:
+    body = _verify_evidence_document(evidence_document)
+    assertion = body.get("external_label_assertion")
+    fields = {
+        "applies_to_this_arm",
+        "assertion_origin",
+        "label_evidence_sha256",
+        "label_source_sha256",
+        "model_output_used",
+        "probe_label_binding_sha256",
+        "semantic_label",
+    }
+    if not isinstance(assertion, Mapping) or set(assertion) != fields:
+        raise Qwen38CartographyIntegrityError(
+            "external label assertion evidence is malformed"
+        )
+    probe_spec = body.get("probe_spec")
+    if not isinstance(probe_spec, Mapping):
+        raise Qwen38CartographyIntegrityError(
+            "external label assertion has no bound probe spec"
+        )
+    source = assertion.get("label_source_sha256")
+    label = probe_spec.get("semantic_label")
+    label_evidence = probe_spec.get("label_evidence_sha256")
+    if (
+        assertion.get("model_output_used") is not False
+        or source != probe_spec.get("label_source_sha256")
+        or assertion.get("label_evidence_sha256") != label_evidence
+        or assertion.get("probe_label_binding_sha256")
+        != measurement.probe.label_source_sha256
+        or measurement.probe.label_source_sha256
+        != _label_binding_sha256(source, label, label_evidence)
+    ):
+        raise Qwen38CartographyIntegrityError(
+            "external label assertion is not bound to its probe identity"
+        )
+    origin = assertion.get("assertion_origin")
+    applies = assertion.get("applies_to_this_arm")
+    if origin == "none":
+        if (
+            applies is not False
+            or label is not None
+            or label_evidence is not None
+            or assertion.get("semantic_label") is not None
+            or measurement.observation_status != "recorded"
+            or measurement.observed_semantic_label is not None
+        ):
+            raise Qwen38CartographyIntegrityError(
+                "unlabeled measurement carries semantic-label state"
+            )
+        return
+    if origin != "external" or not isinstance(label, str):
+        raise Qwen38CartographyIntegrityError(
+            "semantic label is not an external assertion"
+        )
+    if not isinstance(label_evidence, str) or _SHA256.fullmatch(label_evidence) is None:
+        raise Qwen38CartographyIntegrityError(
+            "external label evidence SHA-256 is invalid"
+        )
+    if source == _NO_LABEL_SOURCE_SHA256:
+        raise Qwen38CartographyIntegrityError(
+            "external label assertion uses the no-label source"
+        )
+    if applies is not primary_measurement:
+        raise Qwen38CartographyIntegrityError(
+            "external label assertion is attached to the wrong probe arm"
+        )
+    if primary_measurement:
+        expected_status = "eligible" if measurement.placebo_effects else "recorded"
+        if (
+            assertion.get("semantic_label") != label
+            or measurement.observation_status != expected_status
+            or measurement.observed_semantic_label != label
+        ):
+            raise Qwen38CartographyIntegrityError(
+                "primary measurement does not carry its external label assertion"
+            )
+    else:
+        if (
+            assertion.get("semantic_label") is not None
+            or measurement.observation_status != "recorded"
+            or measurement.observed_semantic_label is not None
+        ):
+            raise Qwen38CartographyIntegrityError(
+                "control measurement inherited the primary external label"
+            )
 
 
 def _tensor_record(value: torch.Tensor) -> dict[str, Any]:
@@ -1409,6 +1581,7 @@ def _evidence_body(
     control_measurement_sha256: str | None,
     weight_rail_revision: GraphRevision,
     atlas_head_revision: GraphRevision,
+    external_label_applies: bool,
 ) -> dict[str, Any]:
     return {
         "access_trace": capture.access_trace.to_document(),
@@ -1418,6 +1591,9 @@ def _evidence_body(
         "coordinate": coordinate.to_document(),
         "crsa_evidence": capture.crsa_evidence,
         "deltanet_probes": capture.delta_probes,
+        "external_label_assertion": _external_label_assertion(
+            spec, applies_to_this_arm=external_label_applies
+        ),
         "final_hidden_sha256": capture.final_hidden_sha256,
         "final_state_sha256": capture.final_state_sha256,
         "graph_revision": {
@@ -1431,7 +1607,11 @@ def _evidence_body(
         "paired_comparisons": [] if paired is None else paired,
         "preflight": dict(preflight),
         "probe_spec": spec.as_record(),
-        "semantic_label_source": "none-model-output-is-untrusted",
+        "semantic_label_source": (
+            "external-assertion-model-output-unused"
+            if spec.semantic_label is not None
+            else "none-model-output-is-untrusted"
+        ),
         "source_body_bytes": capture.source_body_bytes,
         "tensor_range_receipts": [row.as_record() for row in capture.tensor_receipts],
         "weight_rail_revision": weight_rail_revision.to_document(),
@@ -1449,6 +1629,7 @@ def _measurement(
     weight_rail_revision: GraphRevision,
     atlas_head_revision: GraphRevision,
     placebo_effects: tuple[PlaceboEffect, ...] = (),
+    semantic_label: str | None = None,
 ) -> MeasurementReceipt:
     return MeasurementReceipt(
         model_pin=model_pin,
@@ -1458,8 +1639,10 @@ def _measurement(
             mode=capture.intervention_mode,
             configuration_sha256=_digest(capture.intervention_configuration),
         ),
-        observation_status="recorded",
-        observed_semantic_label=None,
+        observation_status=(
+            "eligible" if semantic_label is not None and placebo_effects else "recorded"
+        ),
+        observed_semantic_label=semantic_label,
         hidden_sha256=capture.final_hidden_sha256,
         activation_sha256=capture.activation_sha256,
         logits_sha256=_digest(
@@ -1546,6 +1729,7 @@ class Qwen38CartographyProbe:
                         control_measurement_sha256=None,
                         weight_rail_revision=weight_rail_revision,
                         atlas_head_revision=atlas_head_revision,
+                        external_label_applies=False,
                     )
                     control_body["resource_preflight"] = {
                         "planned_operations": planned_operations,
@@ -1614,6 +1798,7 @@ class Qwen38CartographyProbe:
                     ),
                     weight_rail_revision=weight_rail_revision,
                     atlas_head_revision=atlas_head_revision,
+                    external_label_applies=True,
                 )
                 primary_body["resource_preflight"] = {
                     "planned_operations": planned_operations,
@@ -1635,6 +1820,7 @@ class Qwen38CartographyProbe:
                     weight_rail_revision=weight_rail_revision,
                     atlas_head_revision=atlas_head_revision,
                     placebo_effects=effects,
+                    semantic_label=spec.semantic_label,
                 )
         finally:
             model.pager.release()

@@ -15,6 +15,7 @@ from immer.runtimes.o1_state.cartographer import (
     CartographyIdentityError,
     CartographyIntegrityError,
     O1Cartographer,
+    ProbeJob,
     ProbeOutcome,
     ProbeTarget,
     RetryPolicy,
@@ -175,6 +176,33 @@ class O1CartographerTests(unittest.TestCase):
             second = scheduler.next_job()
             self.assertNotEqual(first.job_id, second.job_id)
             self.assertEqual(second.probe_family, first.probe_family)
+
+    def test_surprise_reprioritizes_uncovered_sibling_prompt(self) -> None:
+        prompt_a = hashlib.sha256(b"prompt-a").hexdigest()
+        prompt_b = hashlib.sha256(b"prompt-b").hexdigest()
+        jobs = tuple(
+            ProbeJob.create(
+                layer=index,
+                target=ProbeTarget(f"module-{prompt_index}-{index}", "module", None),
+                probe_family="shared-family",
+                intervention="baseline",
+                code_pin=CODE_PIN,
+                model_pin=MODEL_PIN,
+                seed=prompt_index * 10 + index,
+                prompt_sha256=prompt,
+            )
+            for prompt_index, prompt in enumerate((prompt_a, prompt_b))
+            for index in (0, 1)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = self.make_scheduler(
+                Path(tmp), jobs=jobs, stream=FakeO1Stream([10.0])
+            )
+            first = scheduler.next_job()
+            scheduler.step(lambda _job, _attempt: {"activation_norm": 123.0})
+            second = scheduler.next_job()
+            self.assertNotEqual(first.job_id, second.job_id)
+            self.assertEqual(second.prompt_sha256, first.prompt_sha256)
 
     def test_crash_resume_preserves_aborted_attempt_then_retries(self) -> None:
         jobs = frontier(layers=(0,), families=("a",))

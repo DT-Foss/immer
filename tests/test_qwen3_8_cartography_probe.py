@@ -45,6 +45,11 @@ from test_qwen3_8_model import _native_tiny_config, _tiny_config, _tiny_weights
 
 _IDENTITY = LogicalModelIdentity(repo_id="local:cartography-test", revision="fixture")
 _CODE_REVISION = "a" * 40
+_LABEL_SOURCE_SHA256 = hashlib.sha256(b"external-door-label-source/v1").hexdigest()
+_LABEL_EVIDENCE_SHA256 = hashlib.sha256(
+    b"externally-verified-door-label-evidence/v1"
+).hexdigest()
+_SEMANTIC_LABEL = "arithmetic.addition"
 
 
 def _write_bundle_manifest(
@@ -225,6 +230,76 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
         first.verify()
         second.verify()
 
+    def test_passive_external_label_is_recorded_and_evidence_bound(self) -> None:
+        unlabeled = self._spec(hidden_sketch=None)
+        spec = replace(
+            unlabeled,
+            label_source_sha256=_LABEL_SOURCE_SHA256,
+            semantic_label=_SEMANTIC_LABEL,
+            label_evidence_sha256=_LABEL_EVIDENCE_SHA256,
+        )
+        self.assertNotEqual(spec.sha256, unlabeled.sha256)
+        self.assertEqual(spec.as_record()["semantic_label"], _SEMANTIC_LABEL)
+        self.assertEqual(
+            spec.as_record()["label_evidence_sha256"], _LABEL_EVIDENCE_SHA256
+        )
+        other_label = replace(spec, semantic_label="arithmetic.subtraction")
+        other_evidence = replace(spec, label_evidence_sha256="c" * 64)
+        self.assertNotEqual(spec.probe_identity, other_label.probe_identity)
+        self.assertNotEqual(spec.probe_identity, other_evidence.probe_identity)
+
+        result = self._execute(spec)
+        measurement = result.measurement
+        self.assertEqual(measurement.observation_status, "recorded")
+        self.assertEqual(measurement.observed_semantic_label, _SEMANTIC_LABEL)
+        self.assertEqual(
+            measurement.probe.label_source_sha256,
+            spec.probe_identity.label_source_sha256,
+        )
+        self.assertNotEqual(measurement.probe.label_source_sha256, _LABEL_SOURCE_SHA256)
+        assertion = result.evidence_document["body"]["external_label_assertion"]
+        self.assertEqual(
+            assertion,
+            {
+                "applies_to_this_arm": True,
+                "assertion_origin": "external",
+                "label_evidence_sha256": _LABEL_EVIDENCE_SHA256,
+                "label_source_sha256": _LABEL_SOURCE_SHA256,
+                "model_output_used": False,
+                "probe_label_binding_sha256": spec.probe_identity.label_source_sha256,
+                "semantic_label": _SEMANTIC_LABEL,
+            },
+        )
+        self.assertEqual(
+            result.evidence_document["body"]["semantic_label_source"],
+            "external-assertion-model-output-unused",
+        )
+        result.verify()
+
+    def test_external_label_pair_and_default_source_are_strict(self) -> None:
+        base = self._spec(hidden_sketch=None)
+        with self.assertRaisesRegex(Qwen38CartographyProbeError, "supplied together"):
+            replace(base, semantic_label=_SEMANTIC_LABEL)
+        with self.assertRaisesRegex(Qwen38CartographyProbeError, "supplied together"):
+            replace(base, label_evidence_sha256=_LABEL_EVIDENCE_SHA256)
+        with self.assertRaisesRegex(
+            Qwen38CartographyProbeError, "non-default external label source"
+        ):
+            replace(
+                base,
+                semantic_label=_SEMANTIC_LABEL,
+                label_evidence_sha256=_LABEL_EVIDENCE_SHA256,
+            )
+        with self.assertRaisesRegex(
+            Qwen38CartographyProbeError, "bounded canonical external text"
+        ):
+            replace(
+                base,
+                label_source_sha256=_LABEL_SOURCE_SHA256,
+                semantic_label="  arithmetic.addition  ",
+                label_evidence_sha256=_LABEL_EVIDENCE_SHA256,
+            )
+
     def test_paired_placebo_has_exactly_zero_effect(self) -> None:
         result = self._execute(
             self._spec(intervention_mode="placebo", hidden_sketch=None)
@@ -398,6 +473,9 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
                 ),
                 intervention_mode="native",
                 code_revision=_CODE_REVISION,
+                label_source_sha256=_LABEL_SOURCE_SHA256,
+                semantic_label=_SEMANTIC_LABEL,
+                label_evidence_sha256=_LABEL_EVIDENCE_SHA256,
                 native_head_crsa=Qwen38NativeHeadCrsa(alpha=0.01),
             )
             try:
@@ -409,7 +487,29 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
                 assert control is not None
                 self.assertEqual(control.intervention.mode, "placebo")
                 self.assertEqual(result.measurement.intervention.mode, "native")
+                self.assertEqual(control.observation_status, "recorded")
+                self.assertIsNone(control.observed_semantic_label)
+                self.assertEqual(result.measurement.observation_status, "eligible")
+                self.assertEqual(
+                    result.measurement.observed_semantic_label, _SEMANTIC_LABEL
+                )
                 self.assertTrue(result.measurement.placebo_effects)
+                control_assertion = result.control_evidence_document["body"][
+                    "external_label_assertion"
+                ]
+                self.assertEqual(control_assertion["assertion_origin"], "external")
+                self.assertFalse(control_assertion["applies_to_this_arm"])
+                self.assertIsNone(control_assertion["semantic_label"])
+                self.assertEqual(
+                    control_assertion["label_evidence_sha256"],
+                    _LABEL_EVIDENCE_SHA256,
+                )
+                primary_assertion = result.evidence_document["body"][
+                    "external_label_assertion"
+                ]
+                self.assertTrue(primary_assertion["applies_to_this_arm"])
+                self.assertEqual(primary_assertion["semantic_label"], _SEMANTIC_LABEL)
+                self.assertFalse(primary_assertion["model_output_used"])
                 self.assertTrue(
                     result.control_evidence_document["body"]["crsa_evidence"][0][
                         "identity"
@@ -430,6 +530,8 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
                     for receipt in result.measurements_in_append_order
                 )
                 self.assertEqual(appended, (True, True))
+                labeled = atlas.query_by_semantic_label(_SEMANTIC_LABEL)
+                self.assertEqual(labeled.measurements, (result.measurement,))
             finally:
                 pager.close()
 
