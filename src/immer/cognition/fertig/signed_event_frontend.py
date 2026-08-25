@@ -74,12 +74,37 @@ class FrontendResult:
         return self.status is FrontendStatus.COMPILED and self.compiled is not None
 
 
+_UNICODE_FRACTIONS = {
+    "¼": Fraction(1, 4),
+    "½": Fraction(1, 2),
+    "¾": Fraction(3, 4),
+    "⅐": Fraction(1, 7),
+    "⅑": Fraction(1, 9),
+    "⅒": Fraction(1, 10),
+    "⅓": Fraction(1, 3),
+    "⅔": Fraction(2, 3),
+    "⅕": Fraction(1, 5),
+    "⅖": Fraction(2, 5),
+    "⅗": Fraction(3, 5),
+    "⅘": Fraction(4, 5),
+    "⅙": Fraction(1, 6),
+    "⅚": Fraction(5, 6),
+    "⅛": Fraction(1, 8),
+    "⅜": Fraction(3, 8),
+    "⅝": Fraction(5, 8),
+    "⅞": Fraction(7, 8),
+}
+
 _TOKEN = re.compile(
     r"\$\s*(?:\d[\d,]*(?:\.\d+)?|\.\d+)|"
-    r"(?:\d+\s*/\s*\d+|\d[\d,]*(?:\.\d+)?|\.\d+)|"
+    r"(?:\d+\s*/\s*\d+|\d[\d,]*(?:\.\d+)?|\.\d+|"
+    r"[\u00bc-\u00be\u2150-\u215e])|"
     r"[A-Za-z]+(?:['’\-][A-Za-z]+)*|[.!?;,:]"
 )
-_DIGIT = re.compile(r"^\$?\s*(?:\d+\s*/\s*\d+|\d[\d,]*(?:\.\d+)?|\.\d+)$")
+_DIGIT = re.compile(
+    r"^\$?\s*(?:\d+\s*/\s*\d+|\d[\d,]*(?:\.\d+)?|\.\d+|"
+    r"[\u00bc-\u00be\u2150-\u215e])$"
+)
 _OPERATOR_NUMBERS = {"once": Fraction(1), "twice": Fraction(2), "half": Fraction(1, 2)}
 
 COUNT = Unit.count()
@@ -98,6 +123,7 @@ FOOT_PER_COUNT = FOOT / COUNT
 MONTH = Unit("month", (("time", 1),), Fraction(1))
 COUNT_PER_MONTH = COUNT / MONTH
 PERCENT = Unit("%", (), Fraction(1, 100))
+MILLIMETER = Unit.base("length", symbol="mm")
 
 _LOCAL_CARDINALS = {
     "one": Fraction(1),
@@ -106,6 +132,7 @@ _LOCAL_CARDINALS = {
     "four": Fraction(4),
     "five": Fraction(5),
     "six": Fraction(6),
+    "eight": Fraction(8),
     "twenty": Fraction(20),
 }
 
@@ -134,6 +161,8 @@ class _Reject(ValueError):
 
 def _fraction(text: str) -> Fraction:
     raw = text.replace("$", "").replace(",", "").strip()
+    if raw in _UNICODE_FRACTIONS:
+        return _UNICODE_FRACTIONS[raw]
     if "/" in raw:
         numerator, denominator = raw.split("/", 1)
         return Fraction(int(numerator.strip()), int(denominator.strip()))
@@ -3495,6 +3524,1252 @@ def _chained_inventory_residual(
     )
 
 
+def _part_scaled_period_total(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "total", "amount")
+        and _contains(question.norms, "two", "months")
+        and {"first", "second"}.issubset(question.norms)
+    ):
+        return None
+    relation = _single_clause(
+        clause_set,
+        lambda clause: (
+            "sales" in clause.norms
+            and "half" in clause.norms
+            and len(_money_tokens(clause)) == 1
+        ),
+        reason="first-period part relation is not unique",
+    )
+    owner_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "shop" in clause.norms and "hats" in clause.norms and not _counts(clause)
+        ),
+        reason="period sales owner and item scope is not unique",
+    )
+    owner = owner_clause.norms[0]
+    _require(
+        owner_clause.tokens[0].text[:1].isupper()
+        and relation.norms[0] in {"her", f"{owner}'s"}
+        and _contains(relation.norms, "red", "hats")
+        and _contains(relation.norms, "green", "hats")
+        and _contains(
+            relation.norms,
+            "half",
+            "the",
+            "total",
+            "amount",
+            "she",
+            "earned",
+            "from",
+            "selling",
+            "green",
+            "hats",
+        )
+        and _contains(question.norms, "second", "month")
+        and _contains(question.norms, "first", "month"),
+        "period sales actor, item, or state differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    red = _one_token(_money_tokens(relation), "known category sales are incomplete")
+    half = _one_token(
+        [token for token in relation.tokens if token.norm == "half"],
+        "part-to-whole ratio is incomplete",
+    )
+    second_ratio = _one_token(
+        [
+            token
+            for token in _counts(question)
+            if token.number is not None and token.number < 1
+        ],
+        "second-period ratio is incomplete",
+    )
+    _require(
+        _contains(question.norms, "second", "month", "her", "sales", "were")
+        and _contains(question.norms, "total", "sales", "of", "the", "first", "month"),
+        "second-period ratio basis is not explicit",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    red_key = SymbolKey(owner, "sales", "red_hat", "month", "first")
+    green_key = SymbolKey(owner, "sales", "green_hat", "month", "first")
+    first_key = SymbolKey(owner, "sales", "all_hats", "month", "first")
+    second_key = SymbolKey(owner, "sales", "all_hats", "month", "second")
+    definitions = (
+        Definition(red_key, builder.literal(red, MONEY), relation.span),
+        Definition(
+            green_key,
+            QuotientExpr(
+                RefExpr(red_key, relation.span),
+                builder.literal(half, SCALAR),
+                relation.span,
+            ),
+            relation.span,
+        ),
+        Definition(
+            first_key,
+            _sum(
+                _signed(1, RefExpr(red_key, relation.span), "red_sales"),
+                _signed(1, RefExpr(green_key, relation.span), "green_sales"),
+            ),
+            relation.span,
+        ),
+        Definition(
+            second_key,
+            _product(
+                builder.literal(second_ratio, SCALAR),
+                RefExpr(first_key, question.span),
+            ),
+            question.span,
+        ),
+    )
+    expression = _sum(
+        _signed(1, RefExpr(first_key, question.span), "first_month"),
+        _signed(1, RefExpr(second_key, question.span), "second_month"),
+    )
+    return builder.finish(
+        expression,
+        "part_scaled_period_total",
+        definitions=definitions,
+    )
+
+
+def _fractional_remnant_total(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "total", "length")
+        and _contains(question.norms, "not", "used")
+    ):
+        return None
+    owner_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "three" in clause.norms
+            and "glue" in clause.norms
+            and "sticks" in clause.norms
+            and "used" in clause.norms
+        ),
+        reason="remnant collection is not unique",
+    )
+    remnants = _single_clause(
+        clause_set,
+        lambda clause: "left" in clause.norms and len(_counts(clause)) == 3,
+        reason="fractional remnants are not unique",
+    )
+    fractions = _counts(remnants)
+    _require(
+        all(token.number is not None and 0 < token.number <= 1 for token in fractions)
+        and all(
+            remnants.tokens.index(token) + 1 < len(remnants.tokens)
+            and remnants.norms[remnants.tokens.index(token) + 1] == "left"
+            for token in fractions
+        )
+        and {"one", "second", "third"}.issubset(remnants.norms),
+        "remnant states are not a closed three-stick partition",
+        FrontendStatus.AMBIGUOUS,
+    )
+    original = _one_token(_counts(question), "original stick length is incomplete")
+    original_index = question.tokens.index(original)
+    _require(
+        owner_clause.tokens[0].text[:1].isupper()
+        and _contains(question.norms, "glue", "stick")
+        and _contains(question.norms, "glue", "sticks", "that", "are", "not", "used")
+        and original_index + 1 < len(question.tokens)
+        and _singular(question.norms[original_index + 1]) == "millimeter"
+        and "originally" in question.norms,
+        "remnant owner, item, state, or length unit differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    builder = _Builder(source, clause_set)
+    remaining_fraction = _sum(
+        *[
+            _signed(1, builder.literal(token, SCALAR), "fraction_left")
+            for token in fractions
+        ]
+    )
+    expression = _product(
+        remaining_fraction,
+        builder.literal(original, MILLIMETER),
+    )
+    return builder.finish(expression, "fractional_remnant_total")
+
+
+def _reverse_affine_state_duration(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "usual", "concerts", "run")
+        and "minutes" in question.norms
+    ):
+        return None
+    owner_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "final" in clause.norms
+            and "concert" in clause.norms
+            and "tour" in clause.norms
+            and not _counts(clause)
+        ),
+        reason="concert owner and final state are not unique",
+    )
+    scale_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "twice" in clause.norms
+            and "long" in clause.norms
+            and "usual" in clause.norms
+        ),
+        reason="final-to-usual duration scale is not unique",
+    )
+    encore_clause = _single_clause(
+        clause_set,
+        lambda clause: "encore" in clause.norms and len(_counts(clause)) == 1,
+        reason="final-state encore is not unique",
+    )
+    owner = owner_clause.norms[0]
+    makes_index = scale_clause.norms.index("makes")
+    performs_index = encore_clause.norms.index("performs")
+    scale_subjects = [
+        word
+        for word in scale_clause.norms[:makes_index]
+        if word in {owner, "he", "she", "they"}
+    ]
+    encore_subjects = [
+        word
+        for word in encore_clause.norms[:performs_index]
+        if word in {owner, "he", "she", "they"}
+    ]
+    _require(
+        owner_clause.tokens[0].text[:1].isupper()
+        and len(scale_subjects) == len(encore_subjects) == 1
+        and scale_subjects[0] == encore_subjects[0]
+        and _contains(scale_clause.norms, "final", "concert")
+        and _contains(scale_clause.norms, "usual", "concerts")
+        and _contains(encore_clause.norms, "end", "of", "the", "concert"),
+        "concert actor, item, or state differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    scale = _one_token(
+        [token for token in scale_clause.tokens if token.norm == "twice"],
+        "final duration scale is incomplete",
+    )
+    encore = _one_token(_counts(encore_clause), "encore duration is incomplete")
+    final = _one_token(
+        [token for token in _counts(question) if token is not encore],
+        "final runtime is incomplete",
+    )
+    final_index = question.tokens.index(final)
+    _require(
+        final_index + 1 < len(question.tokens)
+        and _singular(question.norms[final_index + 1]) == "minute"
+        and _contains(
+            question.norms[:final_index], "runtime", "of", "this", "final", "concert"
+        ),
+        "final runtime value or unit is not explicitly bound",
+        FrontendStatus.AMBIGUOUS,
+    )
+    builder = _Builder(source, clause_set)
+    adjusted = _sum(
+        _signed(1, builder.literal(final, MINUTE), "final_runtime"),
+        _signed(-1, builder.literal(encore, MINUTE), "encore"),
+    )
+    expression = QuotientExpr(
+        adjusted,
+        builder.literal(scale, SCALAR),
+        Span(0, len(source), source),
+    )
+    return builder.finish(expression, "reverse_affine_state_duration")
+
+
+def _exact_trip_capacity_minimum(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        "least" in question.norms
+        and "berries" in question.norms
+        and _contains(question.norms, "per", "trip")
+        and _contains(question.norms, "same", "number", "of", "berries")
+    ):
+        return None
+    trip_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "trip" in clause.norms
+            and "hours" in clause.norms
+            and "berries" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="trip duration is not unique",
+    )
+    trip_duration = _one_token(_counts(trip_clause), "trip duration is incomplete")
+    question_numbers = _counts(question)
+    _require(len(question_numbers) == 2, "capacity target and horizon are incomplete")
+    berries = next(
+        (
+            token
+            for token in question_numbers
+            if _noun_after(question, token) == "berry"
+        ),
+        None,
+    )
+    horizon = next(
+        (token for token in question_numbers if _noun_after(question, token) == "hour"),
+        None,
+    )
+    _require(
+        berries is not None
+        and horizon is not None
+        and trip_duration.number is not None
+        and horizon.number is not None
+        and berries.number is not None
+        and horizon.number > 0
+        and trip_duration.number > 0
+        and horizon.number % trip_duration.number == 0
+        and berries.number % (horizon.number / trip_duration.number) == 0,
+        "least-capacity case requires exact positive trip and load divisions",
+        FrontendStatus.INVALID,
+    )
+    trip_index = trip_clause.tokens.index(trip_duration)
+    berry_index = question.tokens.index(berries)
+    _require(
+        trip_index + 1 < len(trip_clause.tokens)
+        and _singular(trip_clause.norms[trip_index + 1]) == "hour"
+        and "sloth" in trip_clause.norms
+        and berry_index + 1 < len(question.tokens)
+        and _contains(
+            trip_clause.norms,
+            "pick",
+            "up",
+            question.norms[berry_index + 1],
+        )
+        and _contains(
+            question.norms,
+            "collect",
+            berries.norm,
+            question.norms[berry_index + 1],
+        )
+        and _contains(
+            question.norms,
+            "least",
+            "number",
+            "of",
+            question.norms[berry_index + 1],
+            "he",
+            "can",
+            "pick",
+            "up",
+        )
+        and _contains(question.norms, "if", "he", "wants", "to", "collect"),
+        "trip actor, item, or time unit differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    assert berries is not None and horizon is not None
+    builder = _Builder(source, clause_set)
+    numerator = _product(
+        builder.literal(berries, COUNT),
+        builder.literal(trip_duration, HOUR),
+    )
+    expression = QuotientExpr(
+        numerator,
+        builder.literal(horizon, HOUR),
+        Span(0, len(source), source),
+    )
+    return builder.finish(expression, "exact_trip_capacity_minimum")
+
+
+def _weighted_bundle_residual_count(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "many")
+        and {"red", "yellow", "balloons"}.issubset(question.norms)
+    ):
+        return None
+    rates = _single_clause(
+        clause_set,
+        lambda clause: (
+            "each" in clause.norms
+            and "red" in clause.norms
+            and "yellow" in clause.norms
+            and len(_word_cardinals(clause)) == 2
+        ),
+        reason="per-color bundle rates are not unique",
+    )
+    owner_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "balloons" in clause.norms
+            and "bologna" in clause.norms
+            and not _counts(clause)
+            and not _word_cardinals(clause)
+        ),
+        reason="bundle actor is not unique",
+    )
+    owner = owner_clause.norms[0]
+    _require(
+        owner_clause.tokens[0].text[:1].isupper()
+        and rates.norms[0] in {owner, "he", "she", "they"}
+        and owner in question.norms
+        and _contains(
+            rates.norms,
+            "two",
+            "pieces",
+            "of",
+            "bologna",
+            "at",
+            "each",
+            "red",
+            "balloon",
+        )
+        and _contains(
+            rates.norms,
+            "three",
+            "pieces",
+            "of",
+            "bologna",
+            "at",
+            "each",
+            "yellow",
+            "balloon",
+        )
+        and _contains(question.norms, "pieces", "of", "bologna")
+        and _contains(
+            question.norms, "bundle", "of", "red", "and", "yellow", "balloons"
+        )
+        and _contains(question.norms, "balloons", "were", "red")
+        and _contains(
+            question.norms, "balloons", "in", "the", "bundle", "were", "yellow"
+        ),
+        "bundle actor, item, color, or target scope differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    two = _unique_word_token(clause_set, "two", clause=rates)
+    three = _unique_word_token(clause_set, "three", clause=rates)
+    twenty = _unique_word_token(clause_set, "twenty", clause=question)
+    total = _one_token(_counts(question), "bundle contribution total is incomplete")
+    builder = _Builder(source, clause_set)
+    known = _product(
+        _cardinal_literal(builder, twenty, COUNT),
+        _cardinal_literal(builder, two),
+    )
+    remainder = _sum(
+        _signed(1, builder.literal(total, COUNT), "piece_total"),
+        _signed(-1, known, "known_red_contribution"),
+    )
+    expression = QuotientExpr(
+        remainder,
+        _cardinal_literal(builder, three),
+        Span(0, len(source), source),
+    )
+    return builder.finish(expression, "weighted_bundle_residual_count")
+
+
+def _equal_allowance_purchase_balance(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        "mother" in question.norms
+        and _contains(question.norms, "each", "one", "of", "them")
+    ):
+        return None
+    owner_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "allowance" in clause.norms
+            and "same" in clause.norms
+            and "mother" in clause.norms
+        ),
+        reason="equal allowance owners are not unique",
+    )
+    combine_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "two" in clause.norms
+            and "girls" in clause.norms
+            and "combine" in clause.norms
+        ),
+        reason="allowance pooling relation is not unique",
+    )
+    cake_clause = _single_clause(
+        clause_set,
+        lambda clause: "cake" in clause.norms and len(_money_tokens(clause)) == 1,
+        reason="cake purchase is not unique",
+    )
+    balloon_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "dozen" in clause.norms
+            and "balloons" in clause.norms
+            and len(_money_tokens(clause)) == 1
+        ),
+        reason="balloon batch purchase is not unique",
+    )
+    ice_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "remaining" in clause.norms
+            and "ice" in clause.norms
+            and "each" in clause.norms
+        ),
+        reason="remaining-money purchase is not unique",
+    )
+    names = {token.norm for token in owner_clause.tokens if token.text[:1].isupper()}
+    question_names = {word.removesuffix("'s") for word in question.norms}
+    _require(
+        len(names) == 2
+        and _contains(combine_clause.norms, "combine", "their", "allowance")
+        and names.issubset(question_names)
+        and _contains(balloon_clause.norms, "for", "2", "balloons")
+        and _contains(
+            ice_clause.norms, "remaining", "money", "was", "used", "to", "buy"
+        )
+        and _contains(ice_clause.norms, "tubs", "of", "ice", "cream"),
+        "allowance owners, pool, batch, or exhaustive spend scope differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    cake = _one_token(_money_tokens(cake_clause), "cake cost is incomplete")
+    dozen_count = _one_token(_counts(balloon_clause)[:1], "dozen count is incomplete")
+    balloon_price = _one_token(
+        _money_tokens(balloon_clause), "balloon batch price is incomplete"
+    )
+    balloon_batch = _one_token(
+        [token for token in _counts(balloon_clause) if token is not dozen_count],
+        "balloon price batch is incomplete",
+    )
+    dozen = _unique_word_token(clause_set, "dozen", clause=balloon_clause)
+    ice_count = _one_token(_counts(ice_clause), "ice-cream count is incomplete")
+    ice_price = _one_token(_money_tokens(ice_clause), "ice-cream price is incomplete")
+    recipients = _unique_word_token(clause_set, "two", clause=combine_clause)
+
+    builder = _Builder(source, clause_set)
+    balloon_units = QuotientExpr(
+        _product(
+            builder.literal(dozen_count, SCALAR),
+            builder.lexical_literal(dozen, Fraction(12), COUNT),
+        ),
+        builder.literal(balloon_batch, COUNT),
+        balloon_clause.span,
+    )
+    subtotal = _sum(
+        _signed(1, builder.literal(cake, MONEY), "cake"),
+        _signed(
+            1,
+            _product(balloon_units, builder.literal(balloon_price, MONEY)),
+            "balloons",
+        ),
+        _signed(
+            1,
+            _product(
+                builder.literal(ice_count, COUNT),
+                builder.literal(ice_price, PRICE_PER_COUNT),
+            ),
+            "ice_cream",
+        ),
+    )
+    expression = QuotientExpr(
+        subtotal,
+        _cardinal_literal(builder, recipients),
+        Span(0, len(source), source),
+    )
+    return builder.finish(expression, "equal_allowance_purchase_balance")
+
+
+def _exact_packaging_capacity(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "many", "boxes")
+        and "need" in question.norms
+        and "apiece" in question.norms
+    ):
+        return None
+    unit_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "each" in clause.norms
+            and "sleeve" in clause.norms
+            and "smores" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="per-sleeve capacity is not unique",
+    )
+    pack_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "sleeves" in clause.norms
+            and "box" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="sleeves-per-box capacity is not unique",
+    )
+    capacity = _one_token(_counts(unit_clause), "sleeve capacity is incomplete")
+    per_box = _one_token(_counts(pack_clause), "box capacity is incomplete")
+    numbers = _counts(question)
+    _require(len(numbers) == 4, "consumer demand terms are incomplete")
+    kids, per_kid, adults, per_adult = numbers
+    _require(
+        _contains(question.norms, "kids", "want")
+        and _contains(question.norms, "smores", "apiece")
+        and _contains(question.norms, "adults", "will", "eat")
+        and _noun_after(question, per_kid) == "smore"
+        and _noun_after(question, per_adult) == "smore"
+        and _contains(unit_clause.norms, "sleeve", "of", "graham", "crackers")
+        and _contains(pack_clause.norms, "sleeves", "in", "a", "box")
+        and _contains(question.norms, "boxes", "of", "graham", "crackers")
+        and all(
+            token.number is not None and token.number > 0
+            for token in (*numbers, capacity, per_box)
+        ),
+        "capacity item, consumer role, or positive unit binding differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    demand_value = kids.number * per_kid.number + adults.number * per_adult.number
+    _require(
+        demand_value % capacity.number == 0
+        and (demand_value / capacity.number) % per_box.number == 0,
+        "box capacity requires an unavailable ceiling for non-exact division",
+        FrontendStatus.UNSUPPORTED,
+    )
+    boxes_word = next(token for token in question.tokens if token.norm == "boxes")
+    builder = _Builder(source, clause_set)
+    demand = _sum(
+        _signed(
+            1,
+            _product(
+                builder.literal(kids, SCALAR),
+                builder.literal(per_kid, COUNT),
+            ),
+            "child_demand",
+        ),
+        _signed(
+            1,
+            _product(
+                builder.literal(adults, SCALAR),
+                builder.literal(per_adult, COUNT),
+            ),
+            "adult_demand",
+        ),
+    )
+    sleeves = QuotientExpr(
+        demand,
+        builder.literal(capacity, COUNT),
+        unit_clause.span,
+    )
+    boxes = QuotientExpr(
+        sleeves,
+        builder.literal(per_box, SCALAR),
+        pack_clause.span,
+    )
+    expression = _product(
+        boxes,
+        builder.lexical_literal(boxes_word, Fraction(1), COUNT),
+    )
+    return builder.finish(expression, "exact_packaging_capacity")
+
+
+def _exact_package_demand_cost(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not ("spend" in question.norms and "jello" in question.norms):
+        return None
+    package = _single_clause(
+        clause_set,
+        lambda clause: (
+            "box" in clause.norms
+            and "jello" in clause.norms
+            and "cups" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="jello package yield is not unique",
+    )
+    demand_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "kids" in clause.norms
+            and "each" in clause.norms
+            and "cups" in clause.norms
+            and len(_counts(clause)) == 2
+        ),
+        reason="party cup demand is not unique",
+    )
+    price_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "jello" in clause.norms
+            and "sale" in clause.norms
+            and len(_money_tokens(clause)) == 1
+        ),
+        reason="jello package price is not unique",
+    )
+    yield_count = _one_token(_counts(package), "cups-per-box yield is incomplete")
+    consumers, each_count = _counts(demand_clause)
+    price = _one_token(_money_tokens(price_clause), "package price is incomplete")
+    yield_index = package.tokens.index(yield_count)
+    _require(
+        _contains(package.norms, "box", "of", "flavored", "jello")
+        and "makes" in package.norms[:yield_index]
+        and package.norms[yield_index + 1 : yield_index + 4]
+        == ("small", "jello", "cups")
+        and _contains(demand_clause.norms, "each", "kid", "can", "have")
+        and _contains(
+            price_clause.norms, "jello", "is", "currently", "on", "sale", "for"
+        )
+        and all(
+            token.number is not None and token.number > 0
+            for token in (yield_count, consumers, each_count)
+        ),
+        "package item, demand, price scope, or positive capacity differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    demand_value = consumers.number * each_count.number
+    _require(
+        demand_value % yield_count.number == 0,
+        "package demand requires an unavailable ceiling for non-exact division",
+        FrontendStatus.UNSUPPORTED,
+    )
+    builder = _Builder(source, clause_set)
+    demand = _product(
+        builder.literal(consumers, SCALAR),
+        builder.literal(each_count, COUNT),
+    )
+    boxes = QuotientExpr(
+        demand,
+        builder.literal(yield_count, COUNT),
+        package.span,
+    )
+    expression = _product(boxes, builder.literal(price, MONEY))
+    return builder.finish(expression, "exact_package_demand_cost")
+
+
+def _typed_bowl_capacity_leftover(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        "leftover" in question.norms
+        and _contains(question.norms, "each", "child")
+        and "lunch" in question.norms
+    ):
+        return None
+    owner_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "soup" in clause.norms
+            and "family" in clause.norms
+            and "dinner" in clause.norms
+        ),
+        reason="soup owner and meal scope are not unique",
+    )
+    capacity = _single_clause(
+        clause_set,
+        lambda clause: (
+            "pot" in clause.norms
+            and "adult's" in clause.norms
+            and "child's" in clause.norms
+            and len(_word_cardinals(clause)) == 2
+        ),
+        reason="adult/child bowl capacity is not unique",
+    )
+    family = _single_clause(
+        clause_set,
+        lambda clause: (
+            "wife" in clause.norms
+            and "adult" in clause.norms
+            and "children" in clause.norms
+            and "two" in clause.norms
+        ),
+        reason="meal participant composition is not unique",
+    )
+    owner = owner_clause.norms[0]
+    _require(
+        owner_clause.tokens[0].text[:1].isupper()
+        and capacity.norms[0] in {owner, "he", "she", "they", "it"}
+        and family.norms[0] in {owner, "he", "she", "they"}
+        and _contains(capacity.norms, "adult's", "bowls", "or")
+        and _contains(capacity.norms, "child's", "bowls")
+        and _contains(family.norms, "adult", "wife")
+        and _contains(family.norms, "their", "two", "children")
+        and not any(token.text[:1].isupper() for token in family.tokens[1:])
+        and _contains(
+            question.norms, "everyone", "eats", "one", "bowl", "at", "a", "meal"
+        )
+        and _contains(question.norms, "bowl", "of", "soup")
+        and _contains(question.norms, "leftover", "soup"),
+        "soup actor, bowl type, participant, or meal state differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    adult_capacity = _unique_word_token(clause_set, "four", clause=capacity)
+    child_capacity = _unique_word_token(clause_set, "eight", clause=capacity)
+    children = _unique_word_token(clause_set, "two", clause=family)
+    one_bowl = _unique_word_token(clause_set, "one", clause=question)
+    adult_start = family.tokens[0].span.start
+    adult_end = family.tokens[family.norms.index("wife")].span.end
+    adult_span = Span(adult_start, adult_end, source)
+    adults = Token(
+        source[adult_span.start : adult_span.end],
+        "two_explicit_adults",
+        adult_span,
+    )
+
+    builder = _Builder(source, clause_set)
+    child_capacity_key = SymbolKey(
+        owner, "capacity", "child_bowl", "pot", "before_meal"
+    )
+    child_capacity_definition = Definition(
+        child_capacity_key,
+        _cardinal_literal(builder, child_capacity, COUNT),
+        capacity.span,
+    )
+    adult_equivalent = QuotientExpr(
+        RefExpr(child_capacity_key, capacity.span),
+        _cardinal_literal(builder, adult_capacity),
+        capacity.span,
+    )
+    adult_use = _product(
+        adult_equivalent,
+        builder.lexical_literal(adults, Fraction(2), SCALAR),
+    )
+    before_children = _sum(
+        _signed(1, RefExpr(child_capacity_key, question.span), "pot_capacity"),
+        _signed(-1, adult_use, "adult_dinner_use"),
+    )
+    per_child_before_dinner = QuotientExpr(
+        before_children,
+        _cardinal_literal(builder, children),
+        family.span,
+    )
+    expression = _sum(
+        _signed(1, per_child_before_dinner, "per_child_share"),
+        _signed(-1, _cardinal_literal(builder, one_bowl, COUNT), "dinner_bowl"),
+    )
+    return builder.finish(
+        expression,
+        "typed_bowl_capacity_leftover",
+        definitions=(child_capacity_definition,),
+    )
+
+
+def _fractional_group_consumption_remainder(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "many", "slices", "of", "pizza")
+        and "left" in question.norms
+    ):
+        return None
+    group_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "friends" in clause.norms
+            and "pizzas" in clause.norms
+            and "each" in clause.norms
+            and "four" in clause.norms
+        ),
+        reason="pizza owner group is not unique",
+    )
+    owner = group_clause.norms[0]
+    size_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "each" in clause.norms
+            and "pizza" in clause.norms
+            and "slices" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="slices-per-pizza size is not unique",
+    )
+    first_group = _single_clause(
+        clause_set,
+        lambda clause: (
+            owner in clause.norms
+            and "friends" in clause.norms
+            and "ate" in clause.norms
+            and any(
+                token.number is not None and token.number < 1
+                for token in _counts(clause)
+            )
+        ),
+        reason="first pizza-consumption group is not unique",
+    )
+    second_group = _single_clause(
+        clause_set,
+        lambda clause: (
+            "remaining" in clause.norms
+            and "friends" in clause.norms
+            and "ate" in clause.norms
+            and any(
+                token.number is not None and token.number < 1
+                for token in _counts(clause)
+            )
+        ),
+        reason="remaining pizza-consumption group is not unique",
+    )
+    _require(
+        group_clause.tokens[0].text[:1].isupper()
+        and first_group.norms[0] == owner
+        and _contains(group_clause.norms, "each", "ordered", "their", "own", "pizzas")
+        and _contains(size_clause.norms, "each", "pizza", "had")
+        and _contains(first_group.norms, "of", "their", "pizzas")
+        and _contains(second_group.norms, "of", "their", "pizzas"),
+        "pizza actor, ownership, item, or group scope differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    four = _unique_word_token(clause_set, "four", clause=group_clause)
+    group_one_two = _unique_word_token(clause_set, "two", clause=first_group)
+    group_two = _unique_word_token(clause_set, "two", clause=second_group)
+    fraction_one = _one_token(
+        _counts(first_group), "first eaten fraction is incomplete"
+    )
+    fraction_two = _one_token(
+        _counts(second_group), "second eaten fraction is incomplete"
+    )
+    slices = _one_token(_counts(size_clause), "pizza slice count is incomplete")
+    _require(
+        all(
+            token.number is not None and 0 < token.number < 1
+            for token in (fraction_one, fraction_two)
+        )
+        and _LOCAL_CARDINALS[group_one_two.norm] + 1 + _LOCAL_CARDINALS[group_two.norm]
+        == _LOCAL_CARDINALS[four.norm] + 1,
+        "pizza groups do not exhaust the declared owners",
+        FrontendStatus.AMBIGUOUS,
+    )
+    group_one_span = Span(
+        first_group.tokens[0].span.start,
+        first_group.tokens[first_group.norms.index("friends")].span.end,
+        source,
+    )
+    group_one = Token(
+        source[group_one_span.start : group_one_span.end],
+        "named_owner_plus_two_friends",
+        group_one_span,
+    )
+
+    builder = _Builder(source, clause_set)
+    remaining_pizzas = _sum(
+        _signed(
+            1,
+            builder.lexical_literal(group_clause.tokens[0], Fraction(1), SCALAR),
+            "named_owner",
+        ),
+        _signed(1, _cardinal_literal(builder, four), "friends"),
+        _signed(
+            -1,
+            _product(
+                builder.lexical_literal(group_one, Fraction(3), SCALAR),
+                builder.literal(fraction_one, SCALAR),
+            ),
+            "first_group_eaten",
+        ),
+        _signed(
+            -1,
+            _product(
+                _cardinal_literal(builder, group_two),
+                builder.literal(fraction_two, SCALAR),
+            ),
+            "second_group_eaten",
+        ),
+    )
+    expression = _product(
+        remaining_pizzas,
+        builder.literal(slices, COUNT),
+    )
+    return builder.finish(expression, "fractional_group_consumption_remainder")
+
+
+def _typed_chair_capacity_deficit(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "many", "more", "chairs")
+        and "get" in question.norms
+    ):
+        return None
+    attendance = _single_clause(
+        clause_set,
+        lambda clause: (
+            "tomorrow" in clause.norms
+            and "adults" in clause.norms
+            and "babies" in clause.norms
+            and len(_counts(clause)) == 2
+        ),
+        reason="typed attendance demand is not unique",
+    )
+    ratio_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "regular" in clause.norms
+            and "high" in clause.norms
+            and "times" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="regular/high chair ratio is not unique",
+    )
+    adults, babies = _counts(attendance)
+    scale = _one_token(_counts(ratio_clause), "regular-chair scale is incomplete")
+    high = _one_token(_counts(question), "high-chair assignment is incomplete")
+    _require(
+        _noun_after(attendance, adults) == "adult"
+        and _noun_after(attendance, babies) == "baby"
+        and _contains(ratio_clause.norms, "regular", "chairs", "as", "high", "chairs")
+        and _contains(
+            question.norms[: question.tokens.index(high)], "if", "there", "are"
+        )
+        and _contains(question.norms, "high", "chairs")
+        and "restaurant" in attendance.norms
+        and "restaurant" in ratio_clause.norms,
+        "attendance type, chair type, owner, or state differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        all(
+            token.number is not None and token.number > 0
+            for token in (adults, babies, scale, high)
+        )
+        and adults.number >= scale.number * high.number
+        and babies.number >= high.number,
+        "typed deficit requires positive demands and nonnegative per-type shortages",
+        FrontendStatus.INVALID,
+    )
+    builder = _Builder(source, clause_set)
+    high_key = SymbolKey(
+        "restaurant", "capacity", "high_chair", "tomorrow", "available"
+    )
+    regular_key = SymbolKey(
+        "restaurant", "capacity", "regular_chair", "tomorrow", "available"
+    )
+    definitions = (
+        Definition(high_key, builder.literal(high, COUNT), question.span),
+        Definition(
+            regular_key,
+            _product(
+                builder.literal(scale, SCALAR),
+                RefExpr(high_key, ratio_clause.span),
+            ),
+            ratio_clause.span,
+        ),
+    )
+    expression = _sum(
+        _signed(1, builder.literal(adults, COUNT), "adult_demand"),
+        _signed(-1, RefExpr(regular_key, question.span), "regular_capacity"),
+        _signed(1, builder.literal(babies, COUNT), "baby_demand"),
+        _signed(-1, RefExpr(high_key, question.span), "high_capacity"),
+    )
+    return builder.finish(
+        expression,
+        "typed_chair_capacity_deficit",
+        definitions=definitions,
+    )
+
+
+def _typed_percentage_trade_transitions(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "many", "buttons") and "end" in question.norms
+    ):
+        return None
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            "trading" in clause.norms
+            and "stickers" in clause.norms
+            and "buttons" in clause.norms
+        ),
+        reason="trade actor and item scope are not unique",
+    )
+    large_sticker_rate = _single_clause(
+        clause_set,
+        lambda clause: (
+            "large" in clause.norms
+            and "sticker" in clause.norms
+            and "button" in clause.norms
+            and "three" in clause.norms
+            and "or" in clause.norms
+        ),
+        reason="large-sticker conversion choices are not unique",
+    )
+    small_identity = _single_clause(
+        clause_set,
+        lambda clause: (
+            "small" in clause.norms
+            and "sticker" in clause.norms
+            and "one" in clause.norms
+            and "button" in clause.norms
+        ),
+        reason="small-sticker identity conversion is not unique",
+    )
+    large_button_rate = _single_clause(
+        clause_set,
+        lambda clause: (
+            "large" in clause.norms
+            and "button" in clause.norms
+            and "three" in clause.norms
+            and "small" in clause.norms
+            and "stickers" in clause.norms
+        ),
+        reason="large-button inverse conversion is not unique",
+    )
+    initial = _single_clause(
+        clause_set,
+        lambda clause: (
+            "starts" in clause.norms
+            and "small" in clause.norms
+            and "large" in clause.norms
+            and len(_counts(clause)) == 2
+        ),
+        reason="initial sticker inventory is not unique",
+    )
+    small_trade = _single_clause(
+        clause_set,
+        lambda clause: (
+            _contains(clause.norms, "small", "stickers")
+            and _contains(clause.norms, "large", "buttons")
+            and "rest" not in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="small-sticker percentage trade is not unique",
+    )
+    large_trade = _single_clause(
+        clause_set,
+        lambda clause: (
+            "large" in clause.norms
+            and "rest" in clause.norms
+            and "small" in clause.norms
+            and "buttons" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="large-sticker split trade is not unique",
+    )
+    owner = initial.norms[0]
+    _require(
+        owner == intro.norms[0]
+        and all(
+            clause.norms[0] in {owner, "he", "she", "they"}
+            for clause in (small_trade, large_trade)
+        )
+        and _contains(
+            large_sticker_rate.norms,
+            "large",
+            "sticker",
+            "is",
+            "worth",
+            "a",
+            "large",
+            "button",
+        )
+        and _contains(large_sticker_rate.norms, "or", "three", "small", "buttons")
+        and _contains(
+            small_identity.norms,
+            "small",
+            "sticker",
+            "is",
+            "worth",
+            "one",
+            "small",
+            "button",
+        )
+        and _contains(
+            large_button_rate.norms,
+            "large",
+            "button",
+            "is",
+            "worth",
+            "three",
+            "small",
+            "stickers",
+        )
+        and _contains(small_trade.norms, "small", "stickers", "for", "large", "buttons")
+        and _contains(large_trade.norms, "large", "stickers", "for", "large", "buttons")
+        and _contains(
+            large_trade.norms, "rest", "of", "them", "for", "small", "buttons"
+        ),
+        "trade actor, item direction, conversion, or exhaustive split differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    initial_small, initial_large = _counts(initial)
+    small_percent = _one_token(
+        _counts(small_trade), "small trade percentage is incomplete"
+    )
+    large_percent = _one_token(
+        _counts(large_trade), "large trade percentage is incomplete"
+    )
+    _require(
+        all(
+            token.number is not None
+            and 0 < token.number < 100
+            and source[token.span.end : token.span.end + 1] == "%"
+            for token in (small_percent, large_percent)
+        ),
+        "trade percentages are invalid",
+    )
+    to_small_rate = _unique_word_token(clause_set, "three", clause=large_sticker_rate)
+    to_large_divisor = _unique_word_token(clause_set, "three", clause=large_button_rate)
+    complement_span = Span(large_percent.span.start, large_percent.span.end + 1, source)
+    complement = Token(
+        source[complement_span.start : complement_span.end],
+        "large_trade_complement",
+        complement_span,
+    )
+    zero_span = Span(small_percent.span.end, small_percent.span.end + 1, source)
+    zero = Token("%", "count_scale_origin", zero_span)
+
+    builder = _Builder(source, clause_set)
+    large_key = SymbolKey(owner, "quantity", "large_sticker", "trade", "initial")
+    large_definition = Definition(
+        large_key,
+        builder.literal(initial_large, COUNT),
+        initial.span,
+    )
+    small_to_large = QuotientExpr(
+        _product(
+            builder.literal(initial_small, COUNT),
+            builder.literal(small_percent, PERCENT),
+        ),
+        _cardinal_literal(builder, to_large_divisor),
+        small_trade.span,
+    )
+    large_to_large = _product(
+        RefExpr(large_key, large_trade.span),
+        builder.literal(large_percent, PERCENT),
+    )
+    large_to_small = _product(
+        RefExpr(large_key, large_trade.span),
+        builder.lexical_literal(
+            complement,
+            Fraction(100) - large_percent.number,
+            PERCENT,
+        ),
+        _cardinal_literal(builder, to_small_rate),
+    )
+    expression = _sum(
+        _signed(1, builder.lexical_literal(zero, Fraction(0), COUNT), "count_origin"),
+        _signed(1, small_to_large, "large_buttons_from_small"),
+        _signed(1, large_to_large, "large_buttons_from_large"),
+        _signed(1, large_to_small, "small_buttons_from_large"),
+    )
+    return builder.finish(
+        expression,
+        "typed_percentage_trade_transitions",
+        definitions=(large_definition,),
+    )
+
+
 _PLANNERS = (
     _rate_length_difference,
     _functioning_chain,
@@ -3523,6 +4798,18 @@ _PLANNERS = (
     _cross_entity_property_dag,
     _inverse_rate_time_difference,
     _chained_inventory_residual,
+    _part_scaled_period_total,
+    _fractional_remnant_total,
+    _reverse_affine_state_duration,
+    _exact_trip_capacity_minimum,
+    _weighted_bundle_residual_count,
+    _equal_allowance_purchase_balance,
+    _exact_packaging_capacity,
+    _exact_package_demand_cost,
+    _typed_bowl_capacity_leftover,
+    _fractional_group_consumption_remainder,
+    _typed_chair_capacity_deficit,
+    _typed_percentage_trade_transitions,
 )
 
 

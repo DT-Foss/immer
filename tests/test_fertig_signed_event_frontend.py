@@ -251,6 +251,119 @@ AFFINE_CASES = {
     ),
 }
 
+PART_CAPACITY_CASES = {
+    15: (
+        "Ariadne has a shop selling hats of two different colors, red and green. "
+        "Her sales from red hats were $400 in a particular month, half the total "
+        "amount she earned from selling green hats. Calculate the total amount "
+        "she made in two months if in the second month her sales were 3/4 of "
+        "the total sales of the first month.",
+        Fraction(2100),
+        "part_scaled_period_total",
+    ),
+    20: (
+        "Tomorrow, 42 adults and 15 babies will be attending a function at "
+        "Mia’s restaurant. The restaurant has 5 times as many regular chairs "
+        "as high chairs. If there are 8 high chairs, how many more chairs does "
+        "she have to get?",
+        Fraction(9),
+        "typed_chair_capacity_deficit",
+    ),
+    23: (
+        "Bryce and four of his friends each ordered their own pizzas after "
+        "football practice. Each pizza had 12 slices. Bryce and two friends "
+        "ate 2/3 of their pizzas. The two remaining friends ate ¾ of their "
+        "pizzas. How many slices of pizza were left?",
+        Fraction(18),
+        "fractional_group_consumption_remainder",
+    ),
+    24: (
+        "Each sleeve of graham crackers makes the base for 8 large smores. "
+        "There are 3 sleeves in a box. If 9 kids want 2 smores apiece and 6 "
+        "adults will eat 1 smore apiece, how many boxes of graham crackers "
+        "will they need?",
+        Fraction(1),
+        "exact_packaging_capacity",
+    ),
+    28: (
+        "Lorraine and Colleen are trading stickers for buttons. Each large "
+        "sticker is worth a large button or three small buttons. A small "
+        "sticker is worth one small button. A large button is worth three "
+        "small stickers. Lorraine starts with 30 small stickers and 40 large "
+        "stickers. She trades 90% of her small stickers for large buttons. She "
+        "trades 50% of her large stickers for large buttons and trades the "
+        "rest of them for small buttons. How many buttons does she have by "
+        "the end?",
+        Fraction(89),
+        "typed_percentage_trade_transitions",
+    ),
+    45: (
+        "Patrick has three glue sticks that are partially used. One has 1/6 "
+        "left, the second has 2/3 left and the third one has 1/2 left. If a "
+        "glue stick is 12 millimeters long originally, what is the total "
+        "length of the glue sticks that are not used?",
+        Fraction(16),
+        "fractional_remnant_total",
+    ),
+    50: (
+        "A three-ounce box of flavored jello makes 10 small jello cups. Greg "
+        "wants to make small jello cups for his son's outdoor birthday party. "
+        "There will be 30 kids and he wants to have enough so that each kid "
+        "can have 4 jello cups. Jello is currently on sale for $1.25. How much "
+        "will he spend on jello?",
+        Fraction(15),
+        "exact_package_demand_cost",
+    ),
+    52: (
+        "Elaina is holding the final concert in her tour. To celebrate her "
+        "final concert, she makes the concert twice as long as her usual "
+        "concerts. At the end of the concert, she also performs a 15-minute "
+        "encore. If the runtime of this final concert is 65 minutes then how "
+        "long, in minutes, do her usual concerts run for?",
+        Fraction(25),
+        "reverse_affine_state_duration",
+    ),
+    57: (
+        "Calvin is making soup for his family for dinner. He has a pot with "
+        "enough soup to fill four adult's bowls or eight child's bowls. He is "
+        "an adult and will be eating with his adult wife and their two "
+        "children. If everyone eats one bowl at a meal, how many times will "
+        "each child be able to have a bowl of soup for lunch from the leftover "
+        "soup?",
+        Fraction(1),
+        "typed_bowl_capacity_leftover",
+    ),
+    58: (
+        "Benny threw bologna at his balloons. He threw two pieces of bologna "
+        "at each red balloon and three pieces of bologna at each yellow "
+        "balloon. If Benny threw 58 pieces of bologna at a bundle of red and "
+        "yellow balloons, and twenty of the balloons were red, then how many "
+        "of the balloons in the bundle were yellow?",
+        Fraction(6),
+        "weighted_bundle_residual_count",
+    ),
+    59: (
+        "Julia and Nadine were given the same amount of allowance by their "
+        "mother. The two girls decided to combine their allowance to surprise "
+        "their father on his birthday. They bought a cake which costs $11. "
+        "They also bought 1 dozen balloons which were sold for $0.5 for 2 "
+        "balloons. The remaining money was used to buy 2 tubs of ice cream for "
+        "$7 each. How much did Julia and Nadine's mother give each one of them?",
+        Fraction(14),
+        "equal_allowance_purchase_balance",
+    ),
+    60: (
+        "A three-toed sloth moves very slowly, and only eats when he is up in "
+        "his tree. For a meal of berries, it takes the sloth 4 hours to make "
+        "the trip down the tree, pick up berries, and climb back up into his "
+        "tree. Assuming he picks the same number of berries on each trip, what "
+        "is the least number of berries he can pick up per trip down to the "
+        "ground if he wants to collect 24 berries in 8 hours?",
+        Fraction(12),
+        "exact_trip_capacity_minimum",
+    ),
+}
+
 CALENDAR_CASE = (
     "A Reddit group has 1000 members. If each member posts an average of 3 "
     "posts per day, what's the total number of posts that the group will have "
@@ -852,6 +965,219 @@ class SignedEventScopedAffineWaveTests(unittest.TestCase):
             AFFINE_CASES[49][0].replace("2 fewer green", "2 more green"),
         )
         for question in mutations:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+
+
+class SignedEventPartCapacityWaveTests(unittest.TestCase):
+    def test_twelve_part_capacity_cases_are_exact_and_certified(self) -> None:
+        for offset, (question, expected, family) in PART_CAPACITY_CASES.items():
+            with self.subTest(offset=offset):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                self.assertEqual(result.family, family)
+                assert result.compiled is not None
+                self.assertIs(result.compiled.solution.status, SolveStatus.UNIQUE)
+                self.assertEqual(result.compiled.solution.target_value, expected)
+                self.assertTrue(result.compiled.certificate.verified)
+                self.assertEqual(
+                    len(result.compiled.evidence_projection),
+                    len(
+                        {
+                            row.evidence.evidence_id
+                            for row in result.compiled.evidence_projection
+                        }
+                    ),
+                )
+                parsed = parse_structural_problem(question)
+                self.assertTrue(parsed.ok, parsed.reason)
+                assert parsed.problem is not None
+                self.assertEqual(solve(parsed.problem).target_value, expected)
+
+    def test_unicode_fraction_percent_dozen_and_capacity_units_are_exact(self) -> None:
+        pizza = compile_signed_events(PART_CAPACITY_CASES[23][0])
+        self.assertTrue(pizza.ok, pizza.reason)
+        assert pizza.compiled is not None
+        unicode_rows = [
+            row.evidence
+            for row in pizza.compiled.evidence_projection
+            if row.evidence.value == Fraction(3, 4)
+        ]
+        self.assertEqual(len(unicode_rows), 1)
+        span = unicode_rows[0].span
+        self.assertEqual(PART_CAPACITY_CASES[23][0][span.start : span.end], "¾")
+
+        trades = compile_signed_events(PART_CAPACITY_CASES[28][0])
+        self.assertTrue(trades.ok, trades.reason)
+        assert trades.compiled is not None
+        percent_rows = [
+            row.evidence
+            for row in trades.compiled.evidence_projection
+            if row.evidence.unit.symbol == "%"
+        ]
+        self.assertEqual(sorted(row.value for row in percent_rows), [50, 50, 90])
+        self.assertTrue(all(row.unit.scale == Fraction(1, 100) for row in percent_rows))
+
+        allowance = compile_signed_events(PART_CAPACITY_CASES[59][0])
+        self.assertTrue(allowance.ok, allowance.reason)
+        assert allowance.compiled is not None
+        dozen_rows = [
+            row.evidence
+            for row in allowance.compiled.evidence_projection
+            if row.evidence.value == 12
+            and row.evidence.span.source[
+                row.evidence.span.start : row.evidence.span.end
+            ]
+            == "dozen"
+        ]
+        self.assertEqual(len(dozen_rows), 1)
+
+        for offset in (20, 23, 24, 57, 58, 60):
+            result = compile_signed_events(PART_CAPACITY_CASES[offset][0])
+            self.assertTrue(result.ok, result.reason)
+            assert result.compiled is not None
+            self.assertEqual(
+                result.compiled.problem.target.unit.dimensions, (("count", 1),)
+            )
+
+    def test_owner_renames_preserve_part_capacity_relations(self) -> None:
+        variants = (
+            PART_CAPACITY_CASES[15][0].replace("Ariadne", "Mara"),
+            PART_CAPACITY_CASES[23][0].replace("Bryce", "Mira"),
+            PART_CAPACITY_CASES[52][0].replace("Elaina", "Talia"),
+            PART_CAPACITY_CASES[58][0].replace("Benny", "Miro"),
+            PART_CAPACITY_CASES[59][0]
+            .replace("Julia", "Mira")
+            .replace("Nadine", "Talia"),
+        )
+        expected = (2100, 18, 25, 6, 14)
+        for question, answer in zip(variants, expected, strict=True):
+            with self.subTest(question=question):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, answer)
+
+    def test_part_state_item_and_distribution_mutations_abstain(self) -> None:
+        mutations = (
+            PART_CAPACITY_CASES[15][0].replace(
+                "half the total amount", "half the number of hats"
+            ),
+            PART_CAPACITY_CASES[20][0].replace("15 babies", "15 toddlers"),
+            PART_CAPACITY_CASES[23][0].replace(
+                "two remaining friends", "three remaining friends"
+            ),
+            PART_CAPACITY_CASES[28][0].replace(
+                "rest of them for small buttons", "rest of them for large buttons"
+            ),
+            PART_CAPACITY_CASES[45][0].replace("1/2 left", "1/2 used"),
+            PART_CAPACITY_CASES[45][0].replace(
+                "glue sticks that are not used", "candles that are not used"
+            ),
+            PART_CAPACITY_CASES[52][0].replace(
+                "end of the concert", "start of another concert"
+            ),
+            PART_CAPACITY_CASES[57][0].replace("adult wife", "child wife"),
+            PART_CAPACITY_CASES[58][0].replace(
+                "three pieces of bologna at each yellow",
+                "three pieces of cheese at each yellow",
+            ),
+            PART_CAPACITY_CASES[59][0].replace(
+                "remaining money was used", "some other money was used"
+            ),
+            PART_CAPACITY_CASES[60][0].replace(
+                "same number of berries", "different number of berries"
+            ),
+        )
+        for question in mutations:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+
+    def test_nonexact_capacity_divisions_fail_without_a_ceil_operator(self) -> None:
+        mutations = (
+            PART_CAPACITY_CASES[24][0].replace("9 kids", "10 kids"),
+            PART_CAPACITY_CASES[50][0].replace("30 kids", "31 kids"),
+            PART_CAPACITY_CASES[60][0].replace("24 berries", "25 berries"),
+        )
+        for question in mutations:
+            with self.subTest(question=question):
+                result = compile_signed_events(question)
+                self.assertFalse(result.ok)
+                self.assertIn(
+                    result.status,
+                    {FrontendStatus.UNSUPPORTED, FrontendStatus.INVALID},
+                )
+
+    def test_cross_scope_and_extra_evidence_fail_closed(self) -> None:
+        cross_scope = (
+            PART_CAPACITY_CASES[15][0].replace(
+                "second month her sales", "second shop its sales"
+            ),
+            PART_CAPACITY_CASES[20][0].replace(
+                "If there are 8 high chairs", "If another restaurant has 8 high chairs"
+            ),
+            PART_CAPACITY_CASES[23][0].replace(
+                "Bryce and two friends ate", "Mira and two friends ate"
+            ),
+            PART_CAPACITY_CASES[23][0].replace(
+                "slices of pizza were left", "slices of cake were left"
+            ),
+            PART_CAPACITY_CASES[24][0].replace(
+                "3 sleeves in a box", "3 sleeves in another package"
+            ),
+            PART_CAPACITY_CASES[24][0].replace(
+                "6 adults will eat 1 smore", "6 adults will eat 1 marshmallow"
+            ),
+            PART_CAPACITY_CASES[24][0].replace(
+                "boxes of graham crackers", "boxes of marshmallows"
+            ),
+            PART_CAPACITY_CASES[28][0].replace("Lorraine starts", "Mira starts"),
+            PART_CAPACITY_CASES[50][0].replace(
+                "Jello is currently on sale", "Pudding is currently on sale"
+            ),
+            PART_CAPACITY_CASES[52][0].replace(
+                "she also performs", "Mira also performs"
+            ),
+            PART_CAPACITY_CASES[57][0].replace(
+                "their two children", "Mira's two children"
+            ),
+            PART_CAPACITY_CASES[57][0].replace("leftover soup", "leftover stew"),
+            PART_CAPACITY_CASES[58][0].replace("If Benny threw 58", "If Mira threw 58"),
+            PART_CAPACITY_CASES[58][0].replace(
+                "bundle of red and yellow balloons",
+                "bundle of red and blue balloons",
+            ),
+            PART_CAPACITY_CASES[59][0].replace(
+                "Julia and Nadine's mother", "Julia and Mira's mother"
+            ),
+            PART_CAPACITY_CASES[60][0].replace(
+                "if he wants to collect", "if another sloth wants to collect"
+            ),
+            PART_CAPACITY_CASES[60][0].replace("pick up berries", "pick up apples"),
+            PART_CAPACITY_CASES[60][0].replace(
+                "least number of berries he can pick up",
+                "least number of apples he can pick up",
+            ),
+        )
+        for question in cross_scope:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+        for offset, (question, _, _) in PART_CAPACITY_CASES.items():
+            with self.subTest(offset=offset):
+                self.assertFalse(compile_signed_events(question + " Reference 99.").ok)
+
+    def test_temporal_share_and_installation_ambiguities_remain_deferred(self) -> None:
+        deferred = (
+            "Over thirty days there were twelve good days. The first eight "
+            "were good and the next three were good, neutral, good. How many "
+            "good days were left?",
+            "There are three puppies, five koalas, two zebras, and four frogs. "
+            "How many goats make goats 30% of the final collection?",
+            "Installation includes 4 mirrors, 2 shelves, 1 chandelier, and 10 "
+            "pictures. Extra items cost $15. Angela has 6 mirrors, 2 "
+            "chandeliers, and 20 pictures. What does installation cost?",
+        )
+        for question in deferred:
             with self.subTest(question=question):
                 self.assertFalse(compile_signed_events(question).ok)
 

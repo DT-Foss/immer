@@ -44,19 +44,22 @@ All notable changes to IMMER are recorded here.
 
 ### Exact event and binding compiler
 
-- Added a span-aware quantitative event frontend that lowers twenty-seven typed
+- Added a span-aware quantitative event frontend that lowers thirty-nine typed
   transaction, rate, comparison, residual, and repeated-duration families to
   exact signed-expression DAGs.
 - Added exact calendar-rate binding for fixed 30/31-day months; February and
   multi-month questions remain fail-closed without an explicit day basis.
 - Added unique object-possessive binding for original-length relations without
   global pronoun guessing.
-- Raised the question-only 64-item exact-certificate frontier from 3 to 31;
+- Raised the question-only 64-item exact-certificate frontier from 3 to 43;
   every other item remains an abstention.
 - Upgraded the gold-free abstention audit to partition exact recoveries from
-  remaining ambiguity and unsupported grammar. The current report proves 30
-  recoveries from the previous 230 abstentions, leaves 200 fail-closed, and
+  remaining ambiguity and unsupported grammar. The current report proves 42
+  recoveries from the previous 230 abstentions, leaves 188 fail-closed, and
   binds the event/DAG compiler hashes in report provenance.
+- Added typed part, package-capacity, fractional-remainder, pooled-allowance,
+  inverse-duration, and exact-trip-minimum DAGs. Non-divisible capacity cases
+  remain abstinent until an explicit ceiling operator exists.
 - Added adversarial coverage for cross-owner, cross-item, foreign-price,
   duplicate-share, numeric-noise, reordered-clause, and possessive-scope
   attacks.

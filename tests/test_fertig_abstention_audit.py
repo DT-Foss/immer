@@ -289,11 +289,11 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(
             audit.CURRENT_STRUCTURAL_COUNTS,
             {
-                "exact_recovery": 30,
-                "numeric_pronoun_ambiguous": 84,
+                "exact_recovery": 42,
+                "numeric_pronoun_ambiguous": 80,
                 "question_pronoun_ambiguous": 5,
-                "numeric_clause_unsupported": 99,
-                "target_unsupported": 10,
+                "numeric_clause_unsupported": 93,
+                "target_unsupported": 8,
                 "relation_ambiguous": 1,
                 "relation_unsupported": 1,
                 "relation_invalid": 0,
@@ -302,9 +302,9 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(
             audit.CURRENT_SCOPE_COUNTS,
             {
-                "exact_recovery_scope": 30,
-                "potential_coreference_scope": 89,
-                "grammar_scope": 111,
+                "exact_recovery_scope": 42,
+                "potential_coreference_scope": 85,
+                "grammar_scope": 103,
             },
         )
         with self.assertRaisesRegex(audit.AuditError, "evidence drifted"):
@@ -314,9 +314,9 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                         "legacy": audit.CURRENT_LEGACY_COUNTS,
                         "structural": audit.CURRENT_STRUCTURAL_COUNTS,
                         "scope": {
-                            "exact_recovery_scope": 30,
-                            "potential_coreference_scope": 88,
-                            "grammar_scope": 112,
+                            "exact_recovery_scope": 42,
+                            "potential_coreference_scope": 84,
+                            "grammar_scope": 104,
                         },
                     }
                 }

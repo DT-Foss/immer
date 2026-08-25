@@ -21,19 +21,19 @@
       "target_parse_failed": 57
     },
     "scope": {
-      "exact_recovery_scope": 30,
-      "grammar_scope": 111,
-      "potential_coreference_scope": 89
+      "exact_recovery_scope": 42,
+      "grammar_scope": 103,
+      "potential_coreference_scope": 85
     },
     "structural": {
-      "exact_recovery": 30,
-      "numeric_clause_unsupported": 99,
-      "numeric_pronoun_ambiguous": 84,
+      "exact_recovery": 42,
+      "numeric_clause_unsupported": 93,
+      "numeric_pronoun_ambiguous": 80,
       "question_pronoun_ambiguous": 5,
       "relation_ambiguous": 1,
       "relation_invalid": 0,
       "relation_unsupported": 1,
-      "target_unsupported": 10
+      "target_unsupported": 8
     }
   },
   "classification_inputs": [
@@ -42,8 +42,8 @@
     "vendored legacy binding diagnostics",
     "structural parse diagnostics"
   ],
-  "current_exact_recoveries": 30,
-  "current_remaining_abstentions": 200,
+  "current_exact_recoveries": 42,
+  "current_remaining_abstentions": 188,
   "gold_label_free": true,
   "hungarian_verdict": {
     "contract": "an instance is directly eligible only when extraction supplies two exclusive candidate sets and a complete pairwise cost matrix",
@@ -327,7 +327,7 @@
       }
     },
     {
-      "current_scope": "potential_coreference_scope",
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 651,
@@ -338,9 +338,9 @@
       },
       "question_sha256": "8a4fdde087b05414ffbcdfca828e87a5edda76a9ed887492a035a6c5789d4936",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: part_scaled_period_total",
+        "status": "parsed"
       }
     },
     {
@@ -422,7 +422,7 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 694,
@@ -438,9 +438,9 @@
       },
       "question_sha256": "26951bd58640bd492d0ba638fc90b8fc5d62c4860aca1524bed4a3119f5887a8",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:82",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: typed_chair_capacity_deficit",
+        "status": "parsed"
       }
     },
     {
@@ -483,7 +483,7 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 724,
@@ -499,13 +499,13 @@
       },
       "question_sha256": "b13dce67ede5758f2b4ae90e1d3e65afd8053fbefbba6edf284af0245eb8c883",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 85:109",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: fractional_group_consumption_remainder",
+        "status": "parsed"
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 731,
@@ -521,9 +521,9 @@
       },
       "question_sha256": "bc3378ff760c0d0a89ab3bec3ed62507ac8a16f6ed70f0386ad6f497376d9984",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:64",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: exact_packaging_capacity",
+        "status": "parsed"
       }
     },
     {
@@ -593,7 +593,7 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 754,
@@ -609,9 +609,9 @@
       },
       "question_sha256": "1dd8f2b1009069f3f3a4fc04f91742a3fd89aa1cad6fb5a6625dbc4ece1b41a5",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 211:271",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: typed_percentage_trade_transitions",
+        "status": "parsed"
       }
     },
     {
@@ -952,7 +952,7 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 840,
@@ -968,9 +968,9 @@
       },
       "question_sha256": "25552acc93629dbe9e69f123765b4129f222726a37cf06722e66090c52ff9385",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 55:127",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: fractional_remnant_total",
+        "status": "parsed"
       }
     },
     {
@@ -1057,7 +1057,7 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 868,
@@ -1073,9 +1073,9 @@
       },
       "question_sha256": "51522c33248bb7e91745b44b814f263fb96044731539bf93124820d127637d54",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:61",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: exact_package_demand_cost",
+        "status": "parsed"
       }
     },
     {
@@ -1101,7 +1101,7 @@
       }
     },
     {
-      "current_scope": "potential_coreference_scope",
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 883,
@@ -1117,9 +1117,9 @@
       },
       "question_sha256": "f2d4d7e5edbe95c346938dc6db1e368f40a364a4767b41bc66b17d52da9d899e",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: reverse_affine_state_duration",
+        "status": "parsed"
       }
     },
     {
@@ -1206,7 +1206,7 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 901,
@@ -1222,13 +1222,13 @@
       },
       "question_sha256": "136aeda7ea6fcf2e6c173e2eb3a3222afd46ffb099d218c36d4643a19168183a",
       "structural": {
-        "category": "target_unsupported",
-        "reason": "unsupported target at 208:339",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: typed_bowl_capacity_leftover",
+        "status": "parsed"
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 913,
@@ -1244,13 +1244,13 @@
       },
       "question_sha256": "d38f11f637baa6f8d1f30e6abe4998aeb68b927db5967759814d1f7941619b83",
       "structural": {
-        "category": "target_unsupported",
-        "reason": "unsupported target at 142:310",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: weighted_bundle_residual_count",
+        "status": "parsed"
       }
     },
     {
-      "current_scope": "potential_coreference_scope",
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 916,
@@ -1266,13 +1266,13 @@
       },
       "question_sha256": "b44a7bc68a7d7e9e88305edabcfdcef48d06ab160a09531943e717df47c78b3d",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: equal_allowance_purchase_balance",
+        "status": "parsed"
       }
     },
     {
-      "current_scope": "potential_coreference_scope",
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 924,
@@ -1283,9 +1283,9 @@
       },
       "question_sha256": "dd6cf24849d2716eb4ea7348e13e02909f84bba9dfe3a025c811a0858b6c2630",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: exact_trip_capacity_minimum",
+        "status": "parsed"
       }
     },
     {
@@ -4822,7 +4822,7 @@
       }
     }
   ],
-  "items_sha256": "6da418ee61a8479113f98aae1d53ad816a162e0a007f7ef8199ebbee3b401b8e",
+  "items_sha256": "0a555b27f4201f0910b429991cbecd6562563e742e7af4546e981927b1bee2a7",
   "provenance": {
     "classification_contract": {
       "gold_used_for_classification": false,
@@ -4848,7 +4848,7 @@
     "files": {
       "audit_runner": {
         "path": "scripts/fertig_abstention_audit.py",
-        "sha256": "80f7ea693ae1d1ec0de706b73f6c9d86e74d0f62888d6d0d26dba11cd3a3f5a8"
+        "sha256": "a603a838b9541e41a9126e4c586cba99934bf1457aa36ef229903719a18d02ae"
       },
       "benchmark_report": {
         "path": "results/bench_gsm8k.json",
@@ -4860,7 +4860,7 @@
       },
       "signed_event_frontend": {
         "path": "src/immer/cognition/fertig/signed_event_frontend.py",
-        "sha256": "d6d3937eea9ebba353cb3ddf31f2fbace196a313eaebc1960622d52836e4c39c"
+        "sha256": "025b9824a27faba67872d5735af191ef7f47aae2946720f48908dcd2d7899d78"
       },
       "signed_expression_compiler": {
         "path": "src/immer/cognition/fertig/signed_expression.py",
@@ -4873,6 +4873,6 @@
     }
   },
   "report_revision": 3,
-  "report_sha256": "e2ddfc7edc24bdfe1f851471f40a86f7bbeea1914f6e1c6fe118da13334e647e",
+  "report_sha256": "06d5e2f60b120708a2687f6818cefd16633a15f633ab15d752975331d3a84f5e",
   "schema": "immer.fertig-abstention-audit/v2"
 }
