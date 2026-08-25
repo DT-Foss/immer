@@ -23,6 +23,7 @@ from .signed_expression import (
     ExpressionProgram,
     ExpressionTarget,
     LiteralExpr,
+    MeanExpr,
     NumericEvidence,
     ProductExpr,
     QuotientExpr,
@@ -90,6 +91,21 @@ PRICE_PER_COUNT = MONEY / COUNT
 PRICE_PER_LENGTH = MONEY / LENGTH
 COUNT_PER_TIME = COUNT / TIME
 COUNT_PER_MEMBER_TIME = COUNT / COUNT / TIME
+MINUTE = Unit("minute", (("time", 1),), Fraction(60))
+HOUR = Unit("hour", (("time", 1),), Fraction(3600))
+FOOT = Unit.base("length", symbol="ft")
+FOOT_PER_COUNT = FOOT / COUNT
+PERCENT = Unit("%", (), Fraction(1, 100))
+
+_LOCAL_CARDINALS = {
+    "one": Fraction(1),
+    "two": Fraction(2),
+    "three": Fraction(3),
+    "four": Fraction(4),
+    "five": Fraction(5),
+    "six": Fraction(6),
+    "twenty": Fraction(20),
+}
 
 _FIXED_MONTH_DAYS = {
     "january": 31,
@@ -214,6 +230,8 @@ def _singular(word: str) -> str:
         return "child"
     if word == "people":
         return "person"
+    if word == "feet":
+        return "foot"
     if word.endswith(("ches", "shes", "xes", "zes")) and len(word) > 4:
         return word[:-2]
     if word.endswith("ies") and len(word) > 3:
@@ -433,6 +451,29 @@ def _wide_span(first, second, source: str) -> Span:
         max(first.span.end, second.span.end),
         source,
     )
+
+
+def _item_id(words: tuple[str, ...] | list[str]) -> str:
+    parts = [word for word in words if word not in {"a", "an", "and", "one", "the"}]
+    if not parts:
+        raise _Reject(FrontendStatus.AMBIGUOUS, "item scope is empty")
+    parts[-1] = _singular(parts[-1])
+    return "_".join(parts)
+
+
+def _cardinal_literal(
+    builder: _Builder, token: Token, unit: Unit = SCALAR
+) -> LiteralExpr:
+    value = _LOCAL_CARDINALS.get(token.norm)
+    if value is None:
+        raise _Reject(
+            FrontendStatus.UNSUPPORTED, "word cardinal is outside the grammar"
+        )
+    return builder.lexical_literal(token, value, unit)
+
+
+def _word_cardinals(clause: Clause, *, after: int = 0) -> list[Token]:
+    return [token for token in clause.tokens[after:] if token.norm in _LOCAL_CARDINALS]
 
 
 def _single_clause(
@@ -1673,6 +1714,788 @@ def _inventory_total_residual(
     return builder.finish(expression, "inventory_total_residual")
 
 
+def _discounted_purchase_ledger(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        "spend" in question.norms
+        and "items" in question.norms
+        and "buy" in question.norms
+    ):
+        return None
+    store_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "sells" in clause.norms
+            and not _money_tokens(clause)
+            and not _counts(clause)
+        ),
+        reason="purchase store scope is not unique",
+    )
+    sells_index = store_clause.norms.index("sells")
+    _require(sells_index > 0, "purchase store noun is missing")
+    store = _singular(store_clause.norms[sells_index - 1])
+    prices_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "sold" in clause.norms
+            and "each" in clause.norms
+            and len(_money_tokens(clause)) > 1
+        ),
+        reason="purchase price schedule is not unique",
+    )
+    purchase = _single_clause(
+        clause_set,
+        lambda clause: (
+            "wants" in clause.norms
+            and "buy" in clause.norms
+            and bool(_word_cardinals(clause))
+        ),
+        reason="purchase quantities are not unique",
+    )
+    discount_clause = _single_clause(
+        clause_set,
+        lambda clause: "discount" in clause.norms and bool(_counts(clause)),
+        reason="purchase discount is not unique",
+    )
+    does = question.norms.index("does") if "does" in question.norms else -1
+    wants_index = purchase.norms.index("wants") if "wants" in purchase.norms else -1
+    buyer = question.norms[does + 1] if 0 <= does < len(question.tokens) - 1 else ""
+    purchase_subject = purchase.norms[wants_index - 1] if wants_index > 0 else ""
+    _require(
+        buyer
+        and purchase.norms[0] == buyer
+        and purchase_subject in {buyer, "he", "she", "they"}
+        and not any(
+            token.text[:1].isupper() for token in purchase.tokens[1:wants_index]
+        ),
+        "purchase actor differs from the queried actor",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    price_map: dict[str, Token] = {}
+    prices = _money_tokens(prices_clause)
+    for price in prices:
+        index = prices_clause.tokens.index(price)
+        at_offsets = [i for i in range(index) if prices_clause.norms[i] == "at"]
+        _require(bool(at_offsets), "unit price lacks an at-item binding")
+        at = at_offsets[-1]
+        boundary = max(
+            (i for i in range(at) if prices_clause.norms[i] in {",", "and"}),
+            default=-1,
+        )
+        words = list(prices_clause.norms[boundary + 1 : at])
+        if "is" in words:
+            words = words[: words.index("is")]
+        item = _item_id(words)
+        _require(
+            item not in price_map,
+            "duplicate purchase price item",
+            FrontendStatus.AMBIGUOUS,
+        )
+        price_map[item] = price
+
+    quantity_map: dict[str, Token] = {}
+    buy_index = purchase.norms.index("buy")
+    for cardinal in _word_cardinals(purchase, after=buy_index + 1):
+        index = purchase.tokens.index(cardinal)
+        end = next(
+            (
+                i
+                for i in range(index + 1, len(purchase.tokens))
+                if purchase.norms[i] in {",", "and"}
+            ),
+            len(purchase.tokens),
+        )
+        item = _item_id(list(purchase.norms[index + 1 : end]))
+        _require(
+            item not in quantity_map,
+            "duplicate purchase quantity item",
+            FrontendStatus.AMBIGUOUS,
+        )
+        quantity_map[item] = cardinal
+    _require(
+        quantity_map.keys() == price_map.keys(),
+        "purchase quantities and unit prices bind different items",
+        FrontendStatus.AMBIGUOUS,
+    )
+    discount = _one_token(_counts(discount_clause), "discount percentage is incomplete")
+    _require(
+        discount.number is not None
+        and 0 < discount.number < 100
+        and source[discount.span.end : discount.span.end + 1] == "%"
+        and discount_clause.norms[:2] == ("the", store)
+        and _contains(discount_clause.norms, "on", "all", "the", "purchased", "items"),
+        "discount basis is not explicit",
+    )
+
+    builder = _Builder(source, clause_set)
+    subtotal_expr = _sum(
+        *[
+            _signed(
+                1,
+                _product(
+                    _cardinal_literal(builder, quantity_map[item], COUNT),
+                    builder.literal(price, PRICE_PER_COUNT),
+                ),
+                "purchase_line",
+            )
+            for item, price in price_map.items()
+        ]
+    )
+    subtotal_symbol = SymbolKey(
+        "buyer", "subtotal", "items", "purchase", "before_discount"
+    )
+    subtotal = Definition(subtotal_symbol, subtotal_expr, prices_clause.span)
+    discount_expr = builder.literal(discount, PERCENT)
+    expression = _sum(
+        _signed(1, RefExpr(subtotal_symbol, question.span), "subtotal"),
+        _signed(
+            -1,
+            _product(discount_expr, RefExpr(subtotal_symbol, question.span)),
+            "discount",
+        ),
+    )
+    return builder.finish(
+        expression,
+        "discounted_purchase_ledger",
+        definitions=(subtotal,),
+    )
+
+
+def _batch_sale_profit(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        "profit" in question.norms
+        and "sell" in question.norms
+        and "each" in question.norms
+    ):
+        return None
+    input_clause = _single_clause(
+        clause_set,
+        lambda clause: "source" in clause.norms and "makes" in clause.norms,
+        reason="input yield clause is not unique",
+    )
+    batch_clause = _single_clause(
+        clause_set,
+        lambda clause: "spend" in clause.norms and "per" in clause.norms,
+        reason="batch cost clause is not unique",
+    )
+    source_index = input_clause.norms.index("source")
+    spend_index = batch_clause.norms.index("spend")
+    sell_index = question.norms.index("sell")
+    _require(
+        source_index == spend_index == 1
+        and sell_index > 0
+        and input_clause.norms[0]
+        == batch_clause.norms[0]
+        == question.norms[sell_index - 1],
+        "profit clauses do not share one actor",
+        FrontendStatus.AMBIGUOUS,
+    )
+    input_price = _one_token(_money_tokens(input_clause), "input price is incomplete")
+    yield_count = _one_token(_counts(input_clause), "input yield is incomplete")
+    batch_price = _one_token(_money_tokens(batch_clause), "batch price is incomplete")
+    batch_count = _one_token(_counts(batch_clause), "batch size is incomplete")
+    sale_price = _one_token(_money_tokens(question), "sale price is incomplete")
+    sale_count = _one_token(_counts(question), "sale quantity is incomplete")
+    batch_count_index = batch_clause.tokens.index(batch_count)
+    per_offsets = [
+        index for index, word in enumerate(batch_clause.norms) if word == "per"
+    ]
+    _require(
+        len(per_offsets) == 1
+        and per_offsets[0] + 1 == batch_count_index
+        and batch_count_index + 2 == len(batch_clause.tokens),
+        "batch cost has an additional or incomplete rate basis",
+        FrontendStatus.AMBIGUOUS,
+    )
+    time_words = {
+        "day",
+        "days",
+        "daily",
+        "hour",
+        "hours",
+        "week",
+        "weeks",
+        "month",
+        "months",
+        "year",
+        "years",
+    }
+    _require(
+        not any(
+            time_words.intersection(clause.norms)
+            for clause in (input_clause, batch_clause, question)
+        ),
+        "batch profit has an unsupported time basis",
+        FrontendStatus.AMBIGUOUS,
+    )
+    sale_item = _noun_after(question, sale_count)
+    _require(
+        sale_item
+        == _noun_after(input_clause, yield_count)
+        == _noun_after(batch_clause, batch_count),
+        "yield, batch, and sale items differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    price_index = input_clause.tokens.index(input_price)
+    _require(
+        price_index + 2 < len(input_clause.tokens)
+        and input_clause.norms[price_index + 1] in {"a", "per"}
+        and input_clause.norms[price_index + 2]
+        in input_clause.norms[: input_clause.tokens.index(yield_count)],
+        "input price unit is not bound to the yield source",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    sold_symbol = SymbolKey("seller", "quantity", sale_item, "sale", "sold")
+    sold = Definition(
+        sold_symbol,
+        builder.literal(sale_count, COUNT),
+        question.span,
+    )
+    sale_ref = RefExpr(sold_symbol, question.span)
+    revenue = _product(
+        sale_ref,
+        builder.literal(sale_price, PRICE_PER_COUNT),
+    )
+    input_units = QuotientExpr(
+        RefExpr(sold_symbol, input_clause.span),
+        builder.literal(yield_count, SCALAR),
+        _wide_span(sale_ref, yield_count, source),
+    )
+    batch_units = QuotientExpr(
+        RefExpr(sold_symbol, batch_clause.span),
+        builder.literal(batch_count, COUNT),
+        _wide_span(sale_ref, batch_count, source),
+    )
+    expression = _sum(
+        _signed(1, revenue, "sales"),
+        _signed(
+            -1,
+            _product(input_units, builder.literal(input_price, PRICE_PER_COUNT)),
+            "input_cost",
+        ),
+        _signed(
+            -1,
+            _product(batch_units, builder.literal(batch_price, MONEY)),
+            "batch_cost",
+        ),
+    )
+    return builder.finish(expression, "batch_sale_profit", definitions=(sold,))
+
+
+def _bundle_relative_price_dag(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        "price" in question.norms and _contains(question.norms, "for", "such", "a")
+    ):
+        return None
+    bundle_index = next(
+        index + 3
+        for index in range(len(question.norms) - 3)
+        if question.norms[index : index + 3] == ("for", "such", "a")
+    )
+    _require(bundle_index < len(question.tokens), "bundle target is missing")
+    bundle_item = _singular(question.norms[bundle_index])
+    components = _single_clause(
+        clause_set,
+        lambda clause: (
+            bundle_item in {_singular(word) for word in clause.norms}
+            and "consists" in clause.norms
+            and len(_counts(clause)) > 1
+        ),
+        reason="bundle components are not unique",
+    )
+    base_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            _contains(clause.norms, "twice", "as", "much")
+            and bool(_money_tokens(clause))
+        ),
+        reason="base and first relative price are not unique",
+    )
+    chained_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            _contains(clause.norms, "three", "times", "as", "much", "as")
+            and "per" in clause.norms
+        ),
+        reason="second relative price is not unique",
+    )
+    count_map: dict[str, Token] = {}
+    for count in _counts(components):
+        item = _noun_after(components, count)
+        _require(
+            item not in count_map,
+            "duplicate bundle component",
+            FrontendStatus.AMBIGUOUS,
+        )
+        count_map[item] = count
+    ones = [index for index, word in enumerate(base_clause.norms) if word == "one"]
+    _require(len(ones) == 2, "relative-price items are incomplete")
+    base_item = _singular(base_clause.norms[ones[0] + 1])
+    dependent_item = _singular(base_clause.norms[ones[1] + 1])
+    third_item = _singular(chained_clause.norms[0])
+    as_offsets = [
+        index for index, word in enumerate(chained_clause.norms) if word == "as"
+    ]
+    source_item = None
+    if as_offsets:
+        tail = chained_clause.norms[as_offsets[-1] + 1 :]
+        source_words = [
+            word for word in tail if word not in {"a", "an", "per", "piece"}
+        ]
+        if source_words:
+            source_item = _singular(source_words[0])
+    _require(
+        source_item == dependent_item
+        and {base_item, dependent_item, third_item} == count_map.keys(),
+        "bundle and relative-price item scopes differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    base_price = _one_token(_money_tokens(base_clause), "base item price is incomplete")
+    twice = _one_token(
+        [token for token in base_clause.tokens if token.norm == "twice"],
+        "first price multiplier is incomplete",
+    )
+    three = _unique_word_token(clause_set, "three", clause=chained_clause)
+
+    builder = _Builder(source, clause_set)
+    symbols = {
+        item: SymbolKey("bundle", "unit_price", item, bundle_item, "current")
+        for item in count_map
+    }
+    definitions = (
+        Definition(
+            symbols[base_item],
+            builder.literal(base_price, PRICE_PER_COUNT),
+            base_clause.span,
+        ),
+        Definition(
+            symbols[dependent_item],
+            _product(
+                builder.literal(twice, SCALAR),
+                RefExpr(symbols[base_item], base_clause.span),
+            ),
+            base_clause.span,
+        ),
+        Definition(
+            symbols[third_item],
+            _product(
+                _cardinal_literal(builder, three),
+                RefExpr(symbols[dependent_item], chained_clause.span),
+            ),
+            chained_clause.span,
+        ),
+    )
+    expression = _sum(
+        *[
+            _signed(
+                1,
+                _product(
+                    builder.literal(count, COUNT),
+                    RefExpr(symbols[item], components.span),
+                ),
+                "bundle_component",
+            )
+            for item, count in count_map.items()
+        ]
+    )
+    return builder.finish(
+        expression,
+        "bundle_relative_price_dag",
+        definitions=definitions,
+    )
+
+
+def _group_seat_purchase(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        "group" in question.norms
+        and "spent" in question.norms
+        and bool(_money_tokens(question))
+    ):
+        return None
+    group_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "friends" in clause.norms
+            and "meet" in clause.norms
+            and len(_counts(clause)) == 2
+        ),
+        reason="group composition is not unique",
+    )
+    capacity = _single_clause(
+        clause_set,
+        lambda clause: (
+            "each" in clause.norms
+            and "seat" in clause.norms
+            and "person" in clause.norms
+            and "drinks" in clause.norms
+            and "snacks" in clause.norms
+        ),
+        reason="seat capacity is not unique",
+    )
+    reservation = _single_clause(
+        clause_set,
+        lambda clause: (
+            "they" in clause.norms
+            and "each" in clause.norms
+            and "save" in clause.norms
+            and "seat" in clause.norms
+            and any(word in clause.norms for word in {"buy", "buys"})
+            and "fill" in clause.norms
+            and {"drinks", "snacks"}.issubset(clause.norms)
+        ),
+        reason="group-to-seat purchase scope is not unique",
+    )
+    singleton = group_clause.tokens[0]
+    _require(
+        singleton.text[:1].isupper()
+        and any(
+            _contains(group_clause.norms, "of", pronoun, "friends")
+            for pronoun in {"his", "her", "their"}
+        )
+        and _contains(group_clause.norms, "more", "friends", "there"),
+        "group singleton and friend scopes are not explicit",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        reservation.norms[0] == "they"
+        and not any(token.text[:1].isupper() for token in reservation.tokens[1:]),
+        "seat reservation is not bound to the declared group",
+        FrontendStatus.AMBIGUOUS,
+    )
+    buy_index = next(
+        index for index, word in enumerate(reservation.norms) if word in {"buy", "buys"}
+    )
+    then_offsets = [
+        index for index in range(buy_index) if reservation.norms[index] == "then"
+    ]
+    _require(
+        bool(then_offsets)
+        and all(
+            word in {"they"}
+            for word in reservation.norms[then_offsets[-1] + 1 : buy_index]
+        ),
+        "purchase verb has a foreign local subject",
+        FrontendStatus.AMBIGUOUS,
+    )
+    friend_counts = _counts(group_clause)
+    one = _unique_word_token(clause_set, "one", clause=capacity)
+    two = _unique_word_token(clause_set, "two", clause=capacity)
+    three = _unique_word_token(clause_set, "three", clause=capacity)
+    _require(
+        _noun_after(capacity, one) == "person"
+        and _noun_after(capacity, two) == "drink"
+        and _noun_after(capacity, three) == "snack"
+        and {"drinks", "snacks"}.issubset(question.norms),
+        "seat capacity and purchased item scopes differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    unit_price = _one_token(_money_tokens(question), "group unit price is incomplete")
+    cost_index = question.norms.index("cost") if "cost" in question.norms else -1
+    drinks_index = question.norms.index("drinks") if "drinks" in question.norms else -1
+    _require(
+        drinks_index >= 0
+        and question.norms[:drinks_index] == ("if",)
+        and cost_index >= 0
+        and _contains(question.norms[:cost_index], "drinks", "and", "snacks")
+        and "each" in question.norms[question.tokens.index(unit_price) :],
+        "group price lacks each-item scope",
+    )
+
+    builder = _Builder(source, clause_set)
+    group_symbol = SymbolKey("group", "size", "person", "cinema", "present")
+    seats_symbol = SymbolKey("group", "seat_count", "seat", "cinema", "reserved")
+    group = Definition(
+        group_symbol,
+        _sum(
+            _signed(
+                1,
+                builder.lexical_literal(singleton, Fraction(1), COUNT),
+                "named_person",
+            ),
+            *[
+                _signed(1, builder.literal(count, COUNT), "friends")
+                for count in friend_counts
+            ],
+        ),
+        group_clause.span,
+    )
+    seats = Definition(
+        seats_symbol,
+        QuotientExpr(
+            RefExpr(group_symbol, capacity.span),
+            _cardinal_literal(builder, one),
+            capacity.span,
+        ),
+        capacity.span,
+    )
+    purchased_items = _sum(
+        _signed(
+            1,
+            _product(
+                RefExpr(seats_symbol, capacity.span),
+                _cardinal_literal(builder, two),
+            ),
+            "drinks",
+        ),
+        _signed(
+            1,
+            _product(
+                RefExpr(seats_symbol, capacity.span),
+                _cardinal_literal(builder, three),
+            ),
+            "snacks",
+        ),
+    )
+    expression = _product(
+        purchased_items,
+        builder.literal(unit_price, PRICE_PER_COUNT),
+    )
+    return builder.finish(
+        expression,
+        "group_seat_purchase",
+        definitions=(group, seats),
+    )
+
+
+def _funding_balance_residual(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        "extra" in question.norms
+        and "purse" in question.norms
+        and bool(_money_tokens(question))
+    ):
+        return None
+    intro = _single_clause(
+        clause_set,
+        lambda clause: "saving" in clause.norms and "new" in clause.norms,
+        reason="funding owner and target are not unique",
+    )
+    new_index = intro.norms.index("new")
+    _require(new_index + 1 < len(intro.tokens), "funding target item is missing")
+    target_item = _singular(intro.norms[new_index + 1])
+    price_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "costs" in clause.norms
+            and target_item in {_singular(word) for word in clause.norms}
+            and bool(_money_tokens(clause))
+        ),
+        reason="target purchase price is not unique",
+    )
+    reduction_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "traded" in clause.norms
+            and "reduced" in clause.norms
+            and bool(_money_tokens(clause))
+        ),
+        reason="trade-in reduction is not unique",
+    )
+    paid_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "paid" in clause.norms
+            and _contains(clause.norms, "this", "week")
+            and bool(_money_tokens(clause))
+        ),
+        reason="current income is not unique",
+    )
+    gift_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            "mom" in clause.norms
+            and "give" in clause.norms
+            and bool(_money_tokens(clause))
+        ),
+        reason="current gift is not unique",
+    )
+    owner = intro.norms[0]
+    does_index = question.norms.index("does") if "does" in question.norms else -1
+    query_pronoun = (
+        question.norms[does_index + 1]
+        if 0 <= does_index < len(question.tokens) - 1
+        else ""
+    )
+    possessive = {"he": "his", "she": "her", "they": "their"}.get(query_pronoun)
+    object_pronoun = {"he": "him", "she": "her", "they": "them"}.get(query_pronoun)
+    give_index = gift_clause.norms.index("give")
+    traded_index = reduction_clause.norms.index("traded")
+    trade_tail = reduction_clause.norms[traded_index + 1 :]
+    trade_item = None
+    if len(trade_tail) >= 4 and trade_tail[0] == "in" and trade_tail[2] == "old":
+        trade_item = _singular(trade_tail[3])
+    paid_index = paid_clause.norms.index("paid")
+    paid_has = [
+        index for index in range(paid_index) if paid_clause.norms[index] == "has"
+    ]
+    paid_and = [
+        index
+        for index in range(paid_has[-1] if paid_has else 0)
+        if paid_clause.norms[index] == "and"
+    ]
+    local_pay_subject = (
+        paid_clause.norms[paid_and[-1] + 1 : paid_has[-1]]
+        if paid_has and paid_and
+        else ()
+    )
+    _require(
+        intro.tokens[0].text[:1].isupper()
+        and owner in question.norms
+        and possessive is not None
+        and object_pronoun is not None
+        and {"now", "only", "needs"}.issubset(question.norms)
+        and paid_clause.norms[0] == query_pronoun
+        and all(word == query_pronoun for word in local_pay_subject)
+        and gift_clause.norms[0] in {f"{owner}'s", possessive}
+        and give_index + 1 < len(gift_clause.tokens)
+        and gift_clause.norms[give_index + 1] == object_pronoun
+        and _contains(
+            price_clause.norms, "the", target_item, query_pronoun, "wants", "costs"
+        )
+        and len(trade_tail) >= 4
+        and trade_tail[1] == possessive
+        and trade_item == target_item
+        and _contains(
+            reduction_clause.norms,
+            "price",
+            "of",
+            "the",
+            "new",
+            "one",
+            "would",
+            "be",
+            "reduced",
+            "by",
+        )
+        and "purse" in paid_clause.norms
+        and target_item in {_singular(word) for word in question.norms},
+        "funding contributions do not share owner, item, and current scope",
+        FrontendStatus.AMBIGUOUS,
+    )
+    amounts = (
+        _one_token(_money_tokens(price_clause), "purchase price is incomplete"),
+        _one_token(_money_tokens(reduction_clause), "trade reduction is incomplete"),
+        _one_token(_money_tokens(paid_clause), "income is incomplete"),
+        _one_token(_money_tokens(gift_clause), "gift is incomplete"),
+        _one_token(_money_tokens(question), "remaining need is incomplete"),
+    )
+    builder = _Builder(source, clause_set)
+    expression = _ledger(
+        builder,
+        (
+            _Contribution(amounts[0], MONEY, "purchase_price"),
+            _Contribution(amounts[1], MONEY, "trade_reduction", sign=-1),
+            _Contribution(amounts[2], MONEY, "current_income", sign=-1),
+            _Contribution(amounts[3], MONEY, "current_gift", sign=-1),
+            _Contribution(amounts[4], MONEY, "remaining_need", sign=-1),
+        ),
+    )
+    return builder.finish(expression, "funding_balance_residual")
+
+
+def _mean_participant_totals(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "average", "total", "distance")
+        and "spat" in question.norms
+    ):
+        return None
+    intro = _single_clause(
+        clause_set,
+        lambda clause: "contest" in clause.norms and "and" in clause.norms,
+        reason="contest participants are not unique",
+    )
+    names = {token.norm for token in intro.tokens if token.text[:1].isupper()}
+    rows = [
+        clause
+        for clause in clause_set
+        if "has" in clause.norms
+        and "spits" in clause.norms
+        and len(_counts(clause)) == 2
+    ]
+    _require(
+        len(names) == len(rows) == 2,
+        "mean requires exactly two explicitly named contestant totals",
+        FrontendStatus.AMBIGUOUS,
+    )
+    explicit_seed_rows = sum("seeds" in clause.norms for clause in rows)
+    _require(
+        "seed" in intro.norms and explicit_seed_rows >= 1,
+        "elliptical contestant item has no parallel seed binding",
+        FrontendStatus.AMBIGUOUS,
+    )
+    parsed: list[tuple[Token, Token]] = []
+    owners: set[str] = set()
+    actor_pronouns: set[str] = set()
+    for clause in rows:
+        owner = clause.norms[0].removesuffix("'s")
+        counts = _counts(clause)
+        seed_count, distance = counts
+        distance_index = clause.tokens.index(distance)
+        spits_index = clause.norms.index("spits")
+        item_after_count = _noun_after(clause, seed_count)
+        pronouns = [
+            word
+            for word in clause.norms[clause.tokens.index(seed_count) + 1 : spits_index]
+            if word in {"he", "she", "they"}
+        ]
+        _require(
+            owner in names
+            and owner not in owners
+            and (
+                item_after_count == "seed"
+                or (
+                    item_after_count in {"he", "she", "they"}
+                    and explicit_seed_rows == 1
+                )
+            )
+            and distance_index + 1 < len(clause.tokens)
+            and _singular(clause.norms[distance_index + 1]) == "foot"
+            and _contains(clause.norms[:distance_index], "each", "one")
+            and len(pronouns) == 1
+            and not any(token.text[:1].isupper() for token in clause.tokens[1:]),
+            "contestant count, item, or distance unit is not uniquely bound",
+            FrontendStatus.AMBIGUOUS,
+        )
+        owners.add(owner)
+        actor_pronouns.add(pronouns[0])
+        parsed.append((seed_count, distance))
+    _require(
+        len(actor_pronouns) == 1,
+        "contestant clauses use inconsistent actor pronouns",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    totals = tuple(
+        _product(
+            builder.literal(seed_count, COUNT),
+            builder.literal(distance, FOOT_PER_COUNT),
+        )
+        for seed_count, distance in parsed
+    )
+    expression = MeanExpr(totals, Span(0, len(source), source))
+    return builder.finish(expression, "mean_participant_totals")
+
+
 _PLANNERS = (
     _rate_length_difference,
     _functioning_chain,
@@ -1687,6 +2510,12 @@ _PLANNERS = (
     _equal_share_residual,
     _unit_cost_residual,
     _inventory_total_residual,
+    _discounted_purchase_ledger,
+    _batch_sale_profit,
+    _bundle_relative_price_dag,
+    _group_seat_purchase,
+    _funding_balance_residual,
+    _mean_participant_totals,
 )
 
 

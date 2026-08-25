@@ -64,19 +64,19 @@ CURRENT_LEGACY_COUNTS = {
     "equation_guard": 1,
 }
 CURRENT_STRUCTURAL_COUNTS = {
-    "exact_recovery": 16,
-    "numeric_pronoun_ambiguous": 89,
+    "exact_recovery": 22,
+    "numeric_pronoun_ambiguous": 85,
     "question_pronoun_ambiguous": 6,
-    "numeric_clause_unsupported": 107,
+    "numeric_clause_unsupported": 105,
     "target_unsupported": 10,
     "relation_ambiguous": 1,
     "relation_unsupported": 1,
     "relation_invalid": 0,
 }
 CURRENT_SCOPE_COUNTS = {
-    "exact_recovery_scope": 16,
-    "potential_coreference_scope": 95,
-    "grammar_scope": 119,
+    "exact_recovery_scope": 22,
+    "potential_coreference_scope": 91,
+    "grammar_scope": 117,
 }
 _INCOMPLETE_BINDING = re.compile(
     r"^Bindung unvollständig: (?P<qty>\d+) qty, "

@@ -117,6 +117,68 @@ SECOND_CASES = {
     ),
 }
 
+WAVE3_CASES = {
+    1: (
+        "A shop sells school supplies. One notebook is sold at $1.50 each, a "
+        "pen at $0.25 each, a calculator at $12 each, and a geometry set at "
+        "$10. Daniel is an engineering student, and he wants to buy five "
+        "notebooks, two pens, one calculator, and one geometry set. The shop "
+        "gives a 10% discount on all the purchased items. How much does Daniel "
+        "have to spend on all the items he wants to buy?",
+        Fraction(27),
+        "discounted_purchase_ledger",
+    ),
+    3: (
+        "A food truck only sells grilled cheeses. They source their bread for "
+        "$3.00 a loaf and each loaf makes 10 sandwiches. They spend $30.00 on "
+        "different cheeses and condiments per 10 sandwiches. If they sell 10 "
+        "sandwiches for $7.00 each, what is their net profit?",
+        Fraction(37),
+        "batch_sale_profit",
+    ),
+    19: (
+        "A certain company is in the business of selling fresh fruit. One "
+        "crate of such fruit consists of 5 bananas, 12 apples, and 7 oranges. "
+        "The price for such a crate depends on the price of its individual "
+        "fruits. One apple costs $0.5 and one banana costs twice as much. "
+        "Oranges are the most expensive and cost three times as much as a "
+        "banana per piece. What would be the price for such a crate of fruit?",
+        Fraction(32),
+        "bundle_relative_price_dag",
+    ),
+    21: (
+        "Aiden and 12 of his friends are going to see a film at the cinema, "
+        "and meet up with 7 more friends there. They each save a seat and then "
+        "buy enough drinks and snacks to fill the seats. Each seat has enough "
+        "room to hold one person, two drinks, and three snacks. If drinks and "
+        "snacks cost $2 each, how much money, in dollars, has the group spent "
+        "overall on snacks and drinks?",
+        Fraction(200),
+        "group_seat_purchase",
+    ),
+    44: (
+        "Erika is saving for a new laptop. The laptop she wants costs $600. "
+        "The sales assistant told her that if she traded in her old laptop, "
+        "the price of the new one would be reduced by $200. She thinks this is "
+        "a good deal and agrees to do it. She already has some savings in her "
+        "purse, and has also been paid $150 this week for her part-time job. "
+        "Her mom agrees to give her $80 to help her. If Erika now only needs "
+        "an extra $50 to buy the laptop, how much money does she have in her "
+        "purse?",
+        Fraction(120),
+        "funding_balance_residual",
+    ),
+    63: (
+        "Zoey and Sydney are having a watermelon seed spitting contest. "
+        "Whoever spits their seeds the most total distance wins. They each get "
+        "one watermelon. Zoey's has 40 seeds and she spits each one 10 feet. "
+        "Sydney's has 35 she spits each one 12 feet. What is the average total "
+        "distance spat?",
+        Fraction(410),
+        "mean_participant_totals",
+    ),
+}
+
 CALENDAR_CASE = (
     "A Reddit group has 1000 members. If each member posts an average of 3 "
     "posts per day, what's the total number of posts that the group will have "
@@ -504,6 +566,199 @@ class SignedEventContributionFrontendTests(unittest.TestCase):
             ]
             self.assertEqual(len(matches), 1)
             self.assertEqual(matches[0].value, value)
+
+
+class SignedEventAggregationWaveTests(unittest.TestCase):
+    def test_safe_wave_compiles_independently_derived_exact_values(self) -> None:
+        # 1: basket 30 less 10%; 3: sales 70 less batch costs 33;
+        # 19: 5*1 + 12*(1/2) + 7*3; 21: 20 seats * 5 items * $2;
+        # 44: 600-200-150-80-50; 63: mean(40*10, 35*12).
+        for offset, (question, expected, family) in WAVE3_CASES.items():
+            with self.subTest(offset=offset):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                self.assertEqual(result.family, family)
+                assert result.compiled is not None
+                self.assertIs(result.compiled.solution.status, SolveStatus.UNIQUE)
+                self.assertEqual(result.compiled.solution.target_value, expected)
+                self.assertTrue(result.compiled.certificate.verified)
+                self.assertEqual(
+                    len(result.compiled.evidence_projection),
+                    len(
+                        {
+                            row.evidence.evidence_id
+                            for row in result.compiled.evidence_projection
+                        }
+                    ),
+                )
+                parsed = parse_structural_problem(question)
+                self.assertTrue(parsed.ok, parsed.reason)
+                assert parsed.problem is not None
+                self.assertEqual(solve(parsed.problem).target_value, expected)
+
+    def test_domain_and_actor_renames_preserve_relations(self) -> None:
+        variants = (
+            WAVE3_CASES[1][0]
+            .replace("Daniel", "Mira")
+            .replace("notebook", "journal")
+            .replace("a pen at", "a marker at")
+            .replace("two pens", "two markers")
+            .replace("calculator", "compass")
+            .replace("geometry set", "drafting kit"),
+            WAVE3_CASES[19][0]
+            .replace("crate", "basket")
+            .replace("bananas", "plums")
+            .replace("banana", "plum")
+            .replace("apples", "pears")
+            .replace("apple", "pear")
+            .replace("oranges", "melons")
+            .replace("Oranges", "Melons"),
+            WAVE3_CASES[44][0].replace("Erika", "Lina").replace("laptop", "bicycle"),
+            WAVE3_CASES[63][0].replace("Zoey", "Mira").replace("Sydney", "Talia"),
+        )
+        expected = (Fraction(27), Fraction(32), Fraction(120), Fraction(410))
+        for question, answer in zip(variants, expected, strict=True):
+            with self.subTest(question=question):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, answer)
+
+    def test_relation_unit_actor_and_time_mutations_abstain(self) -> None:
+        mutations = (
+            WAVE3_CASES[1][0].replace(
+                "on all the purchased items", "on notebooks only"
+            ),
+            WAVE3_CASES[1][0].replace("one calculator", "one ruler"),
+            WAVE3_CASES[3][0].replace("per 10 sandwiches", "per 10 salads"),
+            WAVE3_CASES[3][0].replace("They spend $30.00", "Mara spends $30.00"),
+            WAVE3_CASES[3][0].replace(
+                "per 10 sandwiches.", "per 10 sandwiches per day."
+            ),
+            WAVE3_CASES[19][0].replace("twice as much", "twice as many"),
+            WAVE3_CASES[19][0].replace(
+                "as a banana per piece", "as an apple per piece"
+            ),
+            WAVE3_CASES[21][0].replace("save a seat", "save a table"),
+            WAVE3_CASES[21][0].replace("If drinks and snacks cost", "If drinks cost"),
+            WAVE3_CASES[44][0].replace("paid $150 this week", "paid $150 last week"),
+            WAVE3_CASES[44][0].replace("She already has", "Ben already has"),
+            WAVE3_CASES[63][0].replace("12 feet", "12 yards"),
+            WAVE3_CASES[63][0].replace(
+                "average total distance", "average seed distance"
+            ),
+        )
+        for question in mutations:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+
+    def test_cross_scope_or_extra_numeric_evidence_abstains(self) -> None:
+        cross_scope = (
+            WAVE3_CASES[1][0].replace(
+                "The shop gives a 10% discount",
+                "Another shop gives a 10% discount",
+            ),
+            WAVE3_CASES[1][0].replace("and he wants to buy", "and Ben wants to buy"),
+            WAVE3_CASES[3][0].replace(
+                "They spend $30.00", "Another truck spends $30.00"
+            ),
+            WAVE3_CASES[19][0].replace("7 oranges", "7 oranges and 2 pears"),
+            WAVE3_CASES[21][0].replace(
+                "They each save a seat", "Another group each save a seat"
+            ),
+            WAVE3_CASES[21][0].replace(
+                "and then buy enough", "and then Ben buys enough"
+            ),
+            WAVE3_CASES[21][0].replace(
+                "If drinks and snacks cost", "If Ben says drinks and snacks cost"
+            ),
+            WAVE3_CASES[44][0].replace("Her mom agrees", "Mara's mom agrees"),
+            WAVE3_CASES[44][0].replace(
+                "She already has some savings in her purse, and has also been paid",
+                "Ben has also been paid",
+            ),
+            WAVE3_CASES[44][0].replace(
+                "and has also been paid", "and Ben has also been paid"
+            ),
+            WAVE3_CASES[44][0].replace("give her $80", "give Ben $80"),
+            WAVE3_CASES[44][0].replace(
+                "she traded in her old laptop", "she traded in Mara's old laptop"
+            ),
+            WAVE3_CASES[44][0].replace(
+                "her old laptop, the price of the new one",
+                "her old bike, although she mentioned a laptop, the price of the new one",
+            ),
+            WAVE3_CASES[63][0].replace(
+                "What is the average",
+                "Kai's has 2 seeds and he spits each one 3 feet. What is the average",
+            ),
+        )
+        for question in cross_scope:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+        for offset, (question, _, _) in WAVE3_CASES.items():
+            with self.subTest(offset=offset):
+                self.assertFalse(
+                    compile_signed_events(
+                        question.replace("?", " with unrelated reference 99?")
+                    ).ok
+                )
+
+    def test_safe_clause_reordering_preserves_the_dag(self) -> None:
+        purchase = WAVE3_CASES[1][0]
+        reordered = purchase.replace(
+            "One notebook is sold at $1.50 each, a pen at $0.25 each, a "
+            "calculator at $12 each, and a geometry set at $10. Daniel is an "
+            "engineering student, and he wants to buy five notebooks, two "
+            "pens, one calculator, and one geometry set. The shop gives a 10% "
+            "discount on all the purchased items.",
+            "The shop gives a 10% discount on all the purchased items. Daniel "
+            "is an engineering student, and he wants to buy five notebooks, "
+            "two pens, one calculator, and one geometry set. One notebook is "
+            "sold at $1.50 each, a pen at $0.25 each, a calculator at $12 each, "
+            "and a geometry set at $10.",
+        )
+        result = compile_signed_events(reordered)
+        self.assertTrue(result.ok, result.reason)
+        assert result.compiled is not None
+        self.assertEqual(result.compiled.solution.target_value, 27)
+
+    def test_percentage_evidence_preserves_surface_value_and_unit_scale(self) -> None:
+        question = WAVE3_CASES[1][0]
+        result = compile_signed_events(question)
+        self.assertTrue(result.ok, result.reason)
+        assert result.compiled is not None
+        percentages = [
+            row.evidence
+            for row in result.compiled.evidence_projection
+            if row.evidence.unit.symbol == "%"
+        ]
+        self.assertEqual(len(percentages), 1)
+        self.assertEqual(percentages[0].value, 10)
+        self.assertEqual(percentages[0].unit.scale, Fraction(1, 100))
+        span = percentages[0].span
+        self.assertEqual(question[span.start : span.end], "10")
+
+    def test_ambiguous_or_unitless_candidates_remain_deferred(self) -> None:
+        deferred = (
+            "On Tuesday, Clara bought 20 pomegranates at $20 each. At the till "
+            "she got $2 off because she had a voucher. The next day, the price "
+            "shot to $30 per fruit, but the store also offered a 10% discount "
+            "on the total cost. Sheila took advantage of the discount and "
+            "bought 20 pomegranates. What is the difference between the final "
+            "prices paid for the pomegranates on the two days?",
+            "Britany records 18 4-minute TikTok videos each week. She spends 2 "
+            "hours a week writing songs, and 15 minutes six days a week doing "
+            "makeup. How much time does Britany spend on TikTok in a month with "
+            "four weeks?",
+            "An installation package costs $129 and includes 4 mirrors, 2 "
+            "shelves, 1 chandelier, and 10 pictures. Extra items cost $15 each. "
+            "Angela has 6 mirrors, 2 chandeliers, and 20 pictures. What is the "
+            "cost?",
+        )
+        for question in deferred:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
 
 
 if __name__ == "__main__":
