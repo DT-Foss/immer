@@ -30,6 +30,16 @@ All notable changes to IMMER are recorded here.
   append transaction only for the missing set. Plan mode is offline,
   path-free, canonically hashed, and reports exact payload, staging, resident,
   disk, and cold leaf-transfer requirements before mutation.
+- Hardened large expert transactions with block-accurate storage preflight.
+  Staged files and sparse target intervals are accounted independently,
+  shared and split filesystems receive the correct floors, and both are
+  rechecked immediately before the first remote leaf read. Planned recovery
+  and completed idempotent replay remain offline and unrestricted.
+- Completed the first pinned batched MMLU frontier item. One 44-token CPU-BF16
+  forward selected the correct choice B in `2,494.815 s` from
+  `50,246,717,453` source bytes with zero rejected charges. Its ingestible
+  trace seals `4,754` operations and `8,009` leaves under the causal bundle's
+  exact source fingerprint.
 - Routed every dense, control, embedding, I64 router, candidate-head, scalar
   head, and batched full-head read through the revision-bound causal tensor
   reader. Expert and dense rails remain separate, missing bindings have no
@@ -49,8 +59,8 @@ All notable changes to IMMER are recorded here.
   transported state remains a proposal. Target adjudication selected the same
   top token on both paths: token `12747`, decoded as the FERTIG-certified exact
   answer `450`; their Top-10 sets are identical with eight equal rank slots.
-- Verified the complete repository with `1252/1252` tests, the expanded
-  DeepSeek scope with `433/433` tests, and the Qwen causal regression scope
+- Verified the complete repository with `1259/1259` tests, the expanded
+  DeepSeek scope with `440/440` tests, and the Qwen causal regression scope
   with `54/54` tests.
 
 ### Qwen compute batteries

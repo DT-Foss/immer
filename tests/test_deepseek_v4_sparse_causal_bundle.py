@@ -538,6 +538,344 @@ class SparseCausalBundleTests(unittest.TestCase):
                     with self.assertRaises(KeyError):
                         mount.resolve_expert_plans(3, (1,))
 
+    def test_total_filesystem_preflight_precedes_remote_open_and_mutation(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            _source_root, output, _fingerprint, args = self._sparse_append_fixture(
+                Path(temporary)
+            )
+            shard = output / "weights" / "model.safetensors"
+            before = shard.read_bytes()
+            payload_bytes = 21
+            available = 8 * 1024 * 1024 + payload_bytes + payload_bytes // 2
+            filesystem = mock.Mock(f_bavail=available, f_frsize=1)
+            with (
+                mock.patch.object(
+                    bundle_script.os,
+                    "fstatvfs",
+                    return_value=filesystem,
+                ),
+                mock.patch.object(
+                    bundle_script,
+                    "_open_remote_source",
+                    side_effect=AssertionError("disk preflight opened the remote"),
+                ) as opener,
+                mock.patch.object(bundle_script, "_atomic_json_at") as mutation,
+                self.assertRaisesRegex(
+                    bundle_script.SparseBundleError,
+                    "insufficient free disk for the complete expert append",
+                ),
+            ):
+                bundle_script.append_experts(args)
+            opener.assert_not_called()
+            mutation.assert_not_called()
+            self.assertEqual(shard.read_bytes(), before)
+            self.assertFalse(
+                output.joinpath("expert-appends", "pending.json").exists()
+            )
+
+    def test_total_filesystem_preflight_accounts_for_block_rounding(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            _source_root, output, _fingerprint, args = self._sparse_append_fixture(
+                Path(temporary)
+            )
+            block_size = 4096
+            logical_floor = 8 * 1024 * 1024 + 2 * 21
+            available = ((logical_floor + block_size - 1) // block_size) * block_size
+            filesystem = mock.Mock(
+                f_bavail=available // block_size,
+                f_frsize=block_size,
+            )
+            with (
+                mock.patch.object(
+                    bundle_script.os,
+                    "fstatvfs",
+                    return_value=filesystem,
+                ),
+                mock.patch.object(
+                    bundle_script,
+                    "_open_remote_source",
+                    side_effect=AssertionError("disk preflight opened the remote"),
+                ) as opener,
+                mock.patch.object(bundle_script, "_atomic_json_at") as mutation,
+                self.assertRaisesRegex(
+                    bundle_script.SparseBundleError,
+                    "insufficient free disk for the complete expert append",
+                ),
+            ):
+                bundle_script.append_experts(args)
+            opener.assert_not_called()
+            mutation.assert_not_called()
+
+    def test_stage_rechecks_full_floor_before_first_remote_read(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            source_root, output, _fingerprint, args = self._sparse_append_fixture(
+                Path(temporary)
+            )
+            shard = output / "weights" / "model.safetensors"
+            before = shard.read_bytes()
+            block_size = 4096
+            full_floor = 8 * 1024 * 1024 + 7 * block_size
+            stage_available = 8 * 1024 * 1024 + block_size
+            self.assertGreater(stage_available, 8 * 1024 * 1024 + 21)
+            filesystems = (
+                mock.Mock(
+                    f_bavail=full_floor // block_size,
+                    f_frsize=block_size,
+                ),
+                mock.Mock(
+                    f_bavail=full_floor // block_size,
+                    f_frsize=block_size,
+                ),
+                mock.Mock(
+                    f_bavail=stage_available // block_size,
+                    f_frsize=block_size,
+                ),
+                mock.Mock(
+                    f_bavail=stage_available // block_size,
+                    f_frsize=block_size,
+                ),
+            )
+            remote = self._remote(source_root)
+            original = remote.raw_bytes
+            raw_reads = 0
+
+            def counted_raw_bytes(shard: str, offset: int, length: int) -> bytes:
+                nonlocal raw_reads
+                raw_reads += 1
+                return original(shard, offset, length)
+
+            remote.raw_bytes = counted_raw_bytes  # type: ignore[method-assign]
+            with (
+                mock.patch.object(
+                    bundle_script.os,
+                    "fstatvfs",
+                    side_effect=filesystems,
+                ) as statvfs,
+                mock.patch.object(
+                    bundle_script,
+                    "_open_remote_source",
+                    return_value=remote,
+                ) as opener,
+                self.assertRaisesRegex(
+                    bundle_script.SparseBundleError,
+                    "insufficient free disk for the complete expert append",
+                ),
+            ):
+                bundle_script.append_experts(args)
+            self.assertEqual(statvfs.call_count, 4)
+            self.assertEqual(opener.call_count, 1)
+            self.assertEqual(raw_reads, 0)
+            self.assertEqual(shard.read_bytes(), before)
+            with CausalWeightMount(output, _LOGICAL_MODEL, budget_mb=16) as mount:
+                with self.assertRaises(KeyError):
+                    mount.resolve_expert_plans(3, (1,))
+
+    def test_cross_device_append_uses_independent_filesystem_floors(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            source_root, output, _fingerprint, args = self._sparse_append_fixture(
+                Path(temporary)
+            )
+            staging_block_size = 4096
+            target_block_size = 8192
+            staging_floor = 8 * 1024 * 1024 + 6 * staging_block_size
+            target_floor = 8 * 1024 * 1024 + target_block_size
+            filesystems = (
+                mock.Mock(
+                    f_bavail=staging_floor // staging_block_size,
+                    f_frsize=staging_block_size,
+                ),
+                mock.Mock(
+                    f_bavail=target_floor // target_block_size,
+                    f_frsize=target_block_size,
+                ),
+                mock.Mock(
+                    f_bavail=staging_floor // staging_block_size,
+                    f_frsize=staging_block_size,
+                ),
+                mock.Mock(
+                    f_bavail=target_floor // target_block_size,
+                    f_frsize=target_block_size,
+                ),
+            )
+            with (
+                mock.patch.object(
+                    bundle_script,
+                    "_directory_device",
+                    side_effect=(1, 2, 1, 2),
+                ),
+                mock.patch.object(
+                    bundle_script.os,
+                    "fstatvfs",
+                    side_effect=filesystems,
+                ) as statvfs,
+                mock.patch.object(
+                    bundle_script,
+                    "_open_remote_source",
+                    side_effect=lambda _args: self._remote(source_root),
+                ) as opener,
+            ):
+                result = bundle_script.append_experts(args)
+            self.assertEqual(result["status"], "appended")
+            self.assertEqual(opener.call_count, 1)
+            self.assertEqual(statvfs.call_count, 4)
+            with CausalWeightMount(output, _LOGICAL_MODEL, budget_mb=16) as mount:
+                self.assertEqual(mount.resolve_expert_plans(3, (1,))[0].expert_id, 1)
+            with (
+                mock.patch.object(
+                    bundle_script,
+                    "_directory_device",
+                    side_effect=AssertionError(
+                        "idempotent replay imposed a filesystem restriction"
+                    ),
+                ),
+                mock.patch.object(
+                    bundle_script,
+                    "_open_remote_source",
+                    side_effect=AssertionError("idempotent replay opened the remote"),
+                ),
+            ):
+                replay = bundle_script.append_experts(args)
+            self.assertEqual(replay["status"], "already-appended")
+
+    def test_cross_device_preflight_checks_each_filesystem_independently(
+        self,
+    ) -> None:
+        staging_block_size = 4096
+        target_block_size = 8192
+        staging_floor = 8 * 1024 * 1024 + 6 * staging_block_size
+        target_floor = 8 * 1024 * 1024 + target_block_size
+        for constrained, message in (
+            ("staging", "staging filesystem"),
+            ("target", "target filesystem"),
+        ):
+            with self.subTest(constrained=constrained), tempfile.TemporaryDirectory(
+                dir=Path.cwd()
+            ) as temporary:
+                _source_root, output, _fingerprint, args = self._sparse_append_fixture(
+                    Path(temporary)
+                )
+                shard = output / "weights" / "model.safetensors"
+                before = shard.read_bytes()
+                stage_available = staging_floor - (
+                    staging_block_size if constrained == "staging" else 0
+                )
+                target_available = target_floor - (
+                    target_block_size if constrained == "target" else 0
+                )
+                with (
+                    mock.patch.object(
+                        bundle_script,
+                        "_directory_device",
+                        side_effect=(1, 2),
+                    ),
+                    mock.patch.object(
+                        bundle_script.os,
+                        "fstatvfs",
+                        side_effect=(
+                            mock.Mock(
+                                f_bavail=stage_available // staging_block_size,
+                                f_frsize=staging_block_size,
+                            ),
+                            mock.Mock(
+                                f_bavail=target_available // target_block_size,
+                                f_frsize=target_block_size,
+                            ),
+                        ),
+                    ),
+                    mock.patch.object(
+                        bundle_script,
+                        "_open_remote_source",
+                        side_effect=AssertionError(
+                            "split-filesystem preflight opened the remote"
+                        ),
+                    ) as opener,
+                    mock.patch.object(bundle_script, "_atomic_json_at") as mutation,
+                    self.assertRaisesRegex(
+                        bundle_script.SparseBundleError,
+                        message,
+                    ),
+                ):
+                    bundle_script.append_experts(args)
+                opener.assert_not_called()
+                mutation.assert_not_called()
+                self.assertEqual(shard.read_bytes(), before)
+
+    def test_planned_pending_uses_stage_floor_before_first_remote_read(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            source_root, output, fingerprint, args = self._sparse_append_fixture(
+                Path(temporary)
+            )
+            shard = output / "weights" / "model.safetensors"
+            before = shard.read_bytes()
+            block_size = 4096
+            full_floor = 8 * 1024 * 1024 + 7 * block_size
+            args.resident_limit_mb = 1e-7
+            with (
+                mock.patch.object(
+                    bundle_script.os,
+                    "fstatvfs",
+                    return_value=mock.Mock(
+                        f_bavail=full_floor // block_size,
+                        f_frsize=block_size,
+                    ),
+                ),
+                mock.patch.object(
+                    bundle_script,
+                    "_open_remote_source",
+                    side_effect=lambda _args: self._remote(source_root),
+                ),
+                self.assertRaisesRegex(
+                    bundle_script.SparseBundleError,
+                    "resident memory bound",
+                ),
+            ):
+                bundle_script.append_experts(args)
+            self.assertEqual(
+                bundle_script.verify_bundle(
+                    self._verify_args(output, fingerprint)
+                )["pending_append"]["state"],
+                "planned",
+            )
+
+            args.resident_limit_mb = 1.0
+            stage_available = 8 * 1024 * 1024 + block_size
+            remote = self._remote(source_root)
+            original = remote.raw_bytes
+            raw_reads = 0
+
+            def counted_raw_bytes(shard: str, offset: int, length: int) -> bytes:
+                nonlocal raw_reads
+                raw_reads += 1
+                return original(shard, offset, length)
+
+            remote.raw_bytes = counted_raw_bytes  # type: ignore[method-assign]
+            with (
+                mock.patch.object(
+                    bundle_script.os,
+                    "fstatvfs",
+                    return_value=mock.Mock(
+                        f_bavail=stage_available // block_size,
+                        f_frsize=block_size,
+                    ),
+                ) as statvfs,
+                mock.patch.object(
+                    bundle_script,
+                    "_open_remote_source",
+                    return_value=remote,
+                ),
+                self.assertRaisesRegex(
+                    bundle_script.SparseBundleError,
+                    "insufficient free disk for the complete expert append",
+                ),
+            ):
+                bundle_script.append_experts(args)
+            self.assertEqual(statvfs.call_count, 2)
+            self.assertEqual(raw_reads, 0)
+            self.assertEqual(shard.read_bytes(), before)
+            with CausalWeightMount(output, _LOGICAL_MODEL, budget_mb=16) as mount:
+                with self.assertRaises(KeyError):
+                    mount.resolve_expert_plans(3, (1,))
+
     def test_occupied_nonmatching_bytes_fail_before_any_binding(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             source_root, output, _fingerprint, args = self._sparse_append_fixture(
@@ -723,10 +1061,17 @@ class SparseCausalBundleTests(unittest.TestCase):
             trace_path.write_bytes(trace.to_bytes())
             args = self._trace_args(append_args, trace_path, plan_only=True)
 
-            with mock.patch.object(
-                bundle_script,
-                "_open_remote_source",
-                side_effect=AssertionError("plan-only opened the remote source"),
+            with (
+                mock.patch.object(
+                    bundle_script.os,
+                    "fstatvfs",
+                    return_value=mock.Mock(f_frsize=4096),
+                ),
+                mock.patch.object(
+                    bundle_script,
+                    "_open_remote_source",
+                    side_effect=AssertionError("plan-only opened the remote source"),
+                ),
             ):
                 result = bundle_script.append_trace_experts(args)
             self.assertEqual(result["status"], "planned")
@@ -751,12 +1096,25 @@ class SparseCausalBundleTests(unittest.TestCase):
             self.assertEqual(
                 plan["body"]["resource_requirements"],
                 {
+                    "filesystems_shared": True,
+                    "minimum_available_bundle_filesystem_bytes": 8 * 1024 * 1024
+                    + 7 * 4096,
                     "minimum_available_staging_disk_bytes": 8 * 1024 * 1024 + 21,
+                    "minimum_available_staging_filesystem_bytes": 8
+                    * 1024
+                    * 1024
+                    + 6 * 4096,
+                    "minimum_available_target_filesystem_bytes": 8
+                    * 1024
+                    * 1024
+                    + 4096,
                     "minimum_leaf_transfer_budget_bytes": 21 + 6 * 16 * 1024,
                     "minimum_resident_limit_bytes": 5,
                     "minimum_staging_limit_bytes": 21,
+                    "staging_filesystem_block_size_bytes": 4096,
                     "source_budget_requires_inventory_scan_headroom": True,
                     "source_range_reservation_overhead_bytes_per_leaf": 16 * 1024,
+                    "target_filesystem_block_size_bytes": 4096,
                 },
             )
             self.assertEqual(
@@ -775,6 +1133,69 @@ class SparseCausalBundleTests(unittest.TestCase):
                 bundle_script._sha256(
                     {key: value for key, value in result.items() if key != "sha256"}
                 ),
+            )
+
+    def test_trace_expert_plan_reports_split_filesystem_floors(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            base = Path(temporary)
+            source_root, output, fingerprint, append_args = self._sparse_append_fixture(
+                base
+            )
+            output.joinpath("expert-appends").mkdir()
+            trace = self._expert_trace(
+                source_root,
+                output,
+                fingerprint,
+                (0, 1),
+            )
+            trace_path = base / "sealed-trace.json"
+            trace_path.write_bytes(trace.to_bytes())
+            args = self._trace_args(append_args, trace_path, plan_only=True)
+            with (
+                mock.patch.object(
+                    bundle_script,
+                    "_directory_device",
+                    side_effect=(1, 2),
+                ),
+                mock.patch.object(
+                    bundle_script.os,
+                    "fstatvfs",
+                    side_effect=(
+                        mock.Mock(f_frsize=4096),
+                        mock.Mock(f_frsize=8192),
+                    ),
+                ),
+                mock.patch.object(
+                    bundle_script,
+                    "_open_remote_source",
+                    side_effect=AssertionError("cross-device plan opened the remote"),
+                ) as opener,
+            ):
+                result = bundle_script.append_trace_experts(args)
+            opener.assert_not_called()
+            self.assertEqual(result["status"], "planned")
+            self.assertEqual(
+                result["plan"]["body"]["resource_requirements"],
+                {
+                    "filesystems_shared": False,
+                    "minimum_available_bundle_filesystem_bytes": None,
+                    "minimum_available_staging_disk_bytes": 8 * 1024 * 1024 + 21,
+                    "minimum_available_staging_filesystem_bytes": 8
+                    * 1024
+                    * 1024
+                    + 6 * 4096,
+                    "minimum_available_target_filesystem_bytes": 8
+                    * 1024
+                    * 1024
+                    + 8192,
+                    "minimum_leaf_transfer_budget_bytes": 21 + 6 * 16 * 1024,
+                    "minimum_resident_limit_bytes": 5,
+                    "minimum_staging_limit_bytes": 21,
+                    "staging_filesystem_block_size_bytes": 4096,
+                    "source_budget_requires_inventory_scan_headroom": True,
+                    "source_range_reservation_overhead_bytes_per_leaf": 16 * 1024,
+                    "target_filesystem_block_size_bytes": 8192,
+                },
             )
 
     def test_trace_expert_ingest_appends_once_then_is_offline_noop(self) -> None:
@@ -842,12 +1263,22 @@ class SparseCausalBundleTests(unittest.TestCase):
             self.assertEqual(
                 replay["plan"]["body"]["resource_requirements"],
                 {
+                    "filesystems_shared": True,
+                    "minimum_available_bundle_filesystem_bytes": 0,
                     "minimum_available_staging_disk_bytes": 0,
+                    "minimum_available_staging_filesystem_bytes": 0,
+                    "minimum_available_target_filesystem_bytes": 0,
                     "minimum_leaf_transfer_budget_bytes": 0,
                     "minimum_resident_limit_bytes": 0,
                     "minimum_staging_limit_bytes": 0,
+                    "staging_filesystem_block_size_bytes": os.statvfs(
+                        output / "expert-appends"
+                    ).f_frsize,
                     "source_budget_requires_inventory_scan_headroom": False,
                     "source_range_reservation_overhead_bytes_per_leaf": 16 * 1024,
+                    "target_filesystem_block_size_bytes": os.statvfs(
+                        output / "weights"
+                    ).f_frsize,
                 },
             )
             self.assertEqual(shard.stat().st_blocks, physical_before)

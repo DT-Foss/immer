@@ -73,6 +73,7 @@ _EXPERT_TENSOR = re.compile(
 _EXPERT_PARTS = frozenset(
     (f"w{index}.{kind}" for index in (1, 2, 3) for kind in ("scale", "weight"))
 )
+_EXPERT_APPEND_DISK_RESERVE_BYTES = 8 * 1024 * 1024
 _REMOTE_RANGE_RESERVATION_OVERHEAD_BYTES = 16 * 1024
 _DENSE_DTYPE_BYTES = {
     "BOOL": 1,
@@ -295,6 +296,28 @@ def _open_directory_at(directory: int, name: str, *, create: bool = False) -> in
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _optional_directory_at(directory: int, name: str) -> int | None:
+    try:
+        return _open_directory_at(directory, name)
+    except SparseBundleError as exc:
+        try:
+            os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        raise exc
+
+
+def _directory_device(descriptor: int) -> int:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SparseBundleError("bundle filesystem descriptor is not a directory")
+    return metadata.st_dev
+
+
+def _filesystems_shared(left_descriptor: int, right_descriptor: int) -> bool:
+    return _directory_device(left_descriptor) == _directory_device(right_descriptor)
 
 
 def _open_plain_root(path: Path) -> int:
@@ -740,13 +763,13 @@ def _coordinate_records(
     ]
 
 
-def _inventory_expert_resources(
+def _inventory_expert_leaves(
     inventory: Mapping[str, Any],
-) -> dict[tuple[int, int], dict[str, int]]:
+) -> dict[tuple[int, int], tuple[dict[str, Any], ...]]:
     tensors = inventory.get("tensors")
     if not isinstance(tensors, list) or not tensors:
         raise SparseBundleError("bundle pinned inventory tensor table is invalid")
-    parts: dict[tuple[int, int], dict[str, int]] = defaultdict(dict)
+    parts: dict[tuple[int, int], dict[str, dict[str, Any]]] = defaultdict(dict)
     for tensor in tensors:
         if not isinstance(tensor, Mapping):
             raise SparseBundleError("bundle pinned inventory tensor row is invalid")
@@ -765,23 +788,150 @@ def _inventory_expert_resources(
             or offsets[1] <= offsets[0]
         ):
             raise SparseBundleError("bundle pinned expert tensor range is invalid")
+        data_start = tensor.get("data_start")
+        shard = tensor.get("shard")
+        if (
+            isinstance(data_start, bool)
+            or not isinstance(data_start, int)
+            or data_start < 0
+            or not isinstance(shard, str)
+            or Path(shard).name != shard
+            or shard in (".", "..")
+        ):
+            raise SparseBundleError("bundle pinned expert tensor address is invalid")
         coordinate = (int(match.group(1)), int(match.group(2)))
         part = f"{match.group(3)}.{match.group(4)}"
         if part in parts[coordinate]:
             raise SparseBundleError("bundle pinned inventory duplicates expert parts")
-        parts[coordinate][part] = offsets[1] - offsets[0]
-    resources: dict[tuple[int, int], dict[str, int]] = {}
+        parts[coordinate][part] = {
+            "absolute_offset": data_start + offsets[0],
+            "length": offsets[1] - offsets[0],
+            "shard": shard,
+        }
+    leaves: dict[tuple[int, int], tuple[dict[str, Any], ...]] = {}
     for coordinate, observed in parts.items():
         if set(observed) != _EXPERT_PARTS:
             raise SparseBundleError("bundle pinned inventory has incomplete experts")
-        resources[coordinate] = {
-            "maximum_part_bytes": max(observed.values()),
-            "parts": len(observed),
-            "payload_bytes": sum(observed.values()),
-        }
-    if not resources:
+        leaves[coordinate] = tuple(dict(observed[part]) for part in sorted(observed))
+    if not leaves:
         raise SparseBundleError("bundle pinned inventory has no complete experts")
-    return resources
+    return leaves
+
+
+def _inventory_expert_resources(
+    inventory: Mapping[str, Any],
+) -> dict[tuple[int, int], dict[str, int]]:
+    leaves = _inventory_expert_leaves(inventory)
+    return {
+        coordinate: {
+            "maximum_part_bytes": max(int(leaf["length"]) for leaf in selected),
+            "parts": len(selected),
+            "payload_bytes": sum(int(leaf["length"]) for leaf in selected),
+        }
+        for coordinate, selected in leaves.items()
+    }
+
+
+def _expert_leaf_allocation_bytes(
+    leaves: Iterable[Mapping[str, Any]],
+    staging_block_size: int,
+    target_block_size: int,
+) -> tuple[int, int]:
+    for block_size in (staging_block_size, target_block_size):
+        if (
+            isinstance(block_size, bool)
+            or not isinstance(block_size, int)
+            or block_size < 1
+        ):
+            raise SparseBundleError("bundle filesystem block size is invalid")
+    stage_bytes = 0
+    target_intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for leaf in leaves:
+        length = leaf.get("length")
+        start = leaf.get("absolute_offset")
+        shard = leaf.get("shard")
+        if (
+            isinstance(length, bool)
+            or not isinstance(length, int)
+            or length < 1
+            or isinstance(start, bool)
+            or not isinstance(start, int)
+            or start < 0
+            or not isinstance(shard, str)
+            or Path(shard).name != shard
+            or shard in (".", "..")
+        ):
+            raise SparseBundleError("expert leaf allocation address is invalid")
+        stop = start + length
+        stage_bytes += (
+            (length + staging_block_size - 1) // staging_block_size
+        ) * staging_block_size
+        target_intervals[shard].append(
+            (
+                (start // target_block_size) * target_block_size,
+                (
+                    (stop + target_block_size - 1) // target_block_size
+                )
+                * target_block_size,
+            )
+        )
+    target_bytes = sum(
+        stop - start
+        for intervals in target_intervals.values()
+        for start, stop in _merge_intervals(intervals)
+    )
+    return stage_bytes, target_bytes
+
+
+def _expert_append_allocation_bytes(
+    inventory: Mapping[str, Any],
+    coordinates: Iterable[tuple[int, int]],
+    staging_block_size: int,
+    target_block_size: int,
+) -> tuple[int, int]:
+    leaves = _inventory_expert_leaves(inventory)
+    requested = tuple(sorted(set(coordinates)))
+    missing = set(requested) - set(leaves)
+    if missing:
+        raise SparseBundleError(
+            "requested expert is absent from the bundle pinned inventory"
+        )
+    return _expert_leaf_allocation_bytes(
+        (
+            leaf
+            for coordinate in requested
+            for leaf in leaves[coordinate]
+        ),
+        staging_block_size,
+        target_block_size,
+    )
+
+
+def _require_expert_append_free_space(
+    *,
+    stage_bytes: int,
+    target_bytes: int,
+    stage_available: int,
+    target_available: int,
+    filesystems_shared: bool,
+) -> None:
+    if filesystems_shared:
+        required = (
+            stage_bytes + target_bytes + _EXPERT_APPEND_DISK_RESERVE_BYTES
+        )
+        if required > min(stage_available, target_available):
+            raise SparseBundleError(
+                "insufficient free disk for the complete expert append"
+            )
+        return
+    if stage_bytes + _EXPERT_APPEND_DISK_RESERVE_BYTES > stage_available:
+        raise SparseBundleError(
+            "insufficient free disk on the expert staging filesystem"
+        )
+    if target_bytes + _EXPERT_APPEND_DISK_RESERVE_BYTES > target_available:
+        raise SparseBundleError(
+            "insufficient free disk on the expert target filesystem"
+        )
 
 
 def _manifest_expert_coordinates(
@@ -1501,6 +1651,7 @@ def _hash_file_at(directory: int, name: str, expected_length: int) -> str:
 def _stage_remote_payloads(
     source: Streamer,
     stage_descriptor: int,
+    weights_descriptor: int,
     leaves: Sequence[Mapping[str, Any]],
     *,
     resident_limit_bytes: int,
@@ -1513,11 +1664,23 @@ def _stage_remote_payloads(
         raise SparseBundleError("one expert leaf exceeds the resident memory bound")
     if total > staging_limit_bytes:
         raise SparseBundleError("expert payload exceeds the staging disk bound")
-    available = (
-        os.fstatvfs(stage_descriptor).f_bavail * os.fstatvfs(stage_descriptor).f_frsize
+    stage_filesystem = os.fstatvfs(stage_descriptor)
+    target_filesystem = os.fstatvfs(weights_descriptor)
+    stage_bytes, target_bytes = _expert_leaf_allocation_bytes(
+        leaves,
+        stage_filesystem.f_frsize,
+        target_filesystem.f_frsize,
     )
-    if total + 8 * 1024 * 1024 > available:
-        raise SparseBundleError("insufficient free disk for the complete expert stage")
+    _require_expert_append_free_space(
+        stage_bytes=stage_bytes,
+        target_bytes=target_bytes,
+        stage_available=stage_filesystem.f_bavail * stage_filesystem.f_frsize,
+        target_available=target_filesystem.f_bavail * target_filesystem.f_frsize,
+        filesystems_shared=_filesystems_shared(
+            stage_descriptor,
+            weights_descriptor,
+        ),
+    )
 
     staged: list[dict[str, Any]] = []
     for leaf in leaves:
@@ -2518,6 +2681,46 @@ def append_experts(args: argparse.Namespace) -> dict[str, Any]:
             expected_layout=getattr(args, "layout_fingerprint", None),
         )
         _assert_no_dense_pending_at(root_descriptor)
+        pending_before_remote = _optional_json_at(
+            append_descriptor,
+            _APPEND_PENDING,
+        )
+        if pending_before_remote is None:
+            inventory = _load_pinned_inventory_at(weights_descriptor, manifest)
+            stage_filesystem = os.fstatvfs(append_descriptor)
+            target_filesystem = os.fstatvfs(weights_descriptor)
+            stage_bytes, target_bytes = _expert_append_allocation_bytes(
+                inventory,
+                coordinates,
+                stage_filesystem.f_frsize,
+                target_filesystem.f_frsize,
+            )
+            _require_expert_append_free_space(
+                stage_bytes=stage_bytes,
+                target_bytes=target_bytes,
+                stage_available=(
+                    stage_filesystem.f_bavail * stage_filesystem.f_frsize
+                ),
+                target_available=(
+                    target_filesystem.f_bavail * target_filesystem.f_frsize
+                ),
+                filesystems_shared=_filesystems_shared(
+                    append_descriptor,
+                    weights_descriptor,
+                ),
+            )
+        else:
+            pending_transaction, _pending_history = _verify_pending(
+                pending_before_remote[0]
+            )
+            _require_local_transaction_identity(
+                pending_transaction,
+                coordinates=coordinates,
+                manifest_identity=manifest_identity,
+                repo_id=args.repo_id,
+                revision=args.revision,
+                layout_fingerprint=str(manifest["layout_fingerprint"]),
+            )
         source = _open_remote_source(args)
         try:
             _adopt_bundle_inventory(source, weights_descriptor, manifest)
@@ -2674,6 +2877,7 @@ def append_experts(args: argparse.Namespace) -> dict[str, Any]:
                         staged = _stage_remote_payloads(
                             source,
                             stage_descriptor,
+                            weights_descriptor,
                             leaves,
                             resident_limit_bytes=resident_limit_bytes,
                             staging_limit_bytes=staging_limit_bytes,
@@ -3037,9 +3241,29 @@ def _trace_expert_ingest_plan(args: argparse.Namespace) -> dict[str, Any]:
         )
         _assert_no_dense_pending_at(root_descriptor)
         weights_descriptor = _open_directory_at(root_descriptor, "weights")
+        append_descriptor: int | None = None
         try:
+            append_descriptor = _optional_directory_at(
+                root_descriptor,
+                _APPEND_DIRECTORY,
+            )
+            staging_descriptor = (
+                root_descriptor if append_descriptor is None else append_descriptor
+            )
+            filesystems_shared = _filesystems_shared(
+                staging_descriptor,
+                weights_descriptor,
+            )
             inventory = _load_pinned_inventory_at(weights_descriptor, manifest)
+            staging_filesystem_block_size_bytes = os.fstatvfs(
+                staging_descriptor
+            ).f_frsize
+            target_filesystem_block_size_bytes = os.fstatvfs(
+                weights_descriptor
+            ).f_frsize
         finally:
+            if append_descriptor is not None:
+                os.close(append_descriptor)
             os.close(weights_descriptor)
     finally:
         os.close(root_descriptor)
@@ -3135,6 +3359,33 @@ def _trace_expert_ingest_plan(args: argparse.Namespace) -> dict[str, Any]:
         ),
         default=0,
     )
+    stage_allocation_bytes, target_allocation_bytes = (
+        _expert_append_allocation_bytes(
+            inventory,
+            missing_coordinates,
+            staging_filesystem_block_size_bytes,
+            target_filesystem_block_size_bytes,
+        )
+        if missing_coordinates
+        else (0, 0)
+    )
+    minimum_available_staging_filesystem_bytes = (
+        stage_allocation_bytes + _EXPERT_APPEND_DISK_RESERVE_BYTES
+        if missing_coordinates
+        else 0
+    )
+    minimum_available_target_filesystem_bytes = (
+        target_allocation_bytes + _EXPERT_APPEND_DISK_RESERVE_BYTES
+        if missing_coordinates
+        else 0
+    )
+    minimum_available_bundle_filesystem_bytes = (
+        stage_allocation_bytes
+        + target_allocation_bytes
+        + _EXPERT_APPEND_DISK_RESERVE_BYTES
+        if missing_coordinates and filesystems_shared
+        else (0 if filesystems_shared else None)
+    )
     leaf_records = [
         {"length": length, "offset": offset, "shard": shard}
         for shard, offset, length in unique_leaves
@@ -3165,18 +3416,34 @@ def _trace_expert_ingest_plan(args: argparse.Namespace) -> dict[str, Any]:
         "layout_fingerprint": manifest["layout_fingerprint"],
         "logical_model": dict(manifest["logical_model"]),
         "resource_requirements": {
+            "filesystems_shared": filesystems_shared,
+            "minimum_available_bundle_filesystem_bytes": (
+                minimum_available_bundle_filesystem_bytes
+            ),
+            "minimum_available_staging_filesystem_bytes": (
+                minimum_available_staging_filesystem_bytes
+            ),
             "minimum_available_staging_disk_bytes": (
-                missing_payload_bytes + 8 * 1024 * 1024 if missing_coordinates else 0
+                missing_payload_bytes + _EXPERT_APPEND_DISK_RESERVE_BYTES
+                if missing_coordinates
+                else 0
+            ),
+            "minimum_available_target_filesystem_bytes": (
+                minimum_available_target_filesystem_bytes
             ),
             "minimum_leaf_transfer_budget_bytes": minimum_leaf_transfer_budget_bytes,
             "minimum_resident_limit_bytes": missing_maximum_part_bytes,
             "minimum_staging_limit_bytes": missing_payload_bytes,
+            "staging_filesystem_block_size_bytes": (
+                staging_filesystem_block_size_bytes
+            ),
             "source_budget_requires_inventory_scan_headroom": bool(
                 missing_coordinates
             ),
             "source_range_reservation_overhead_bytes_per_leaf": (
                 _REMOTE_RANGE_RESERVATION_OVERHEAD_BYTES
             ),
+            "target_filesystem_block_size_bytes": target_filesystem_block_size_bytes,
         },
         "trace_evidence": list(trace_evidence),
         "trace_evidence_sha256": _sha256(list(trace_evidence)),
