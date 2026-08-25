@@ -1,5 +1,6 @@
 """Pinned, text-only, range-streamed Qwen3.8 runtime."""
 
+from .adapter import Qwen38CausalChat, Qwen38Chat, Qwen38ChatError
 from ..deepseek_v4.causal_weights import (
     CausalTensorReader,
     CausalWeightMount,
@@ -83,6 +84,9 @@ __all__ = [
     "PrefillEvidence",
     "Qwen38Config",
     "Qwen38ConfigError",
+    "Qwen38CausalChat",
+    "Qwen38Chat",
+    "Qwen38ChatError",
     "Qwen38BundleError",
     "Qwen38DraftVerifier",
     "Qwen38DeltaNetProbeError",

@@ -70,6 +70,51 @@ def _solve(
     return 0 if result.ok else 2
 
 
+def _chat_qwen38(args: argparse.Namespace) -> int:
+    """Run one turn through the verified local causal Qwen3.8 facade."""
+
+    from .composition import CompositionRoot
+
+    component = None
+    try:
+        composition = CompositionRoot.build(
+            qwen38_causal_bundle=args.qwen38_causal_bundle,
+            qwen38_tokenizer=args.qwen38_tokenizer,
+            qwen38_options={
+                "system_prompt": args.system_prompt,
+                "device": args.device,
+                "compute_dtype": args.compute_dtype,
+                "source_budget_mb": args.source_budget_mb,
+                "max_resident_bytes": int(args.max_resident_mb * 1024**2),
+                "max_prompt_tokens": args.max_prompt_tokens,
+                "max_new_tokens": args.max_new_tokens,
+                "max_context_tokens": args.max_context_tokens,
+                "head_block_rows": args.head_block_rows,
+            },
+        )
+        component = composition.general_chat
+        result = composition.dispatch("chat", args.message)
+    except (OSError, TypeError, ValueError) as exc:
+        print(json.dumps({
+            "status": "error",
+            "component": "qwen3.8.causal-chat",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }, ensure_ascii=False, sort_keys=True))
+        return 2
+    finally:
+        close = getattr(component, "close", None)
+        if callable(close):
+            close()
+    print(json.dumps({
+        "status": result.status.value,
+        "component": result.component,
+        "output": result.output,
+        "reason": result.reason,
+        "evidence": dict(result.evidence),
+    }, ensure_ascii=False, sort_keys=True))
+    return 0 if result.ok else 2
+
+
 def _doctor(*, deep: bool = False, artifact_root: str | Path | None = None) -> int:
     from .runtimes.o1_state.adapter import is_available as o1state_available
 
@@ -635,6 +680,26 @@ def build_parser() -> argparse.ArgumentParser:
     solve.add_argument("question")
     solve.add_argument("--manifest", help="SHIP-v6 manifest (default: bundled manifest)")
     solve.add_argument("--artifact-root", help="external SHIP artifact directory")
+    chat = sub.add_parser(
+        "chat",
+        help="run one greedy turn through a verified local Qwen3.8 causal bundle",
+    )
+    chat.add_argument("message")
+    chat.add_argument("--qwen38-causal-bundle", required=True)
+    chat.add_argument("--qwen38-tokenizer", required=True)
+    chat.add_argument("--system-prompt", default="")
+    chat.add_argument("--device", choices=("auto", "cpu", "mps"), default="auto")
+    chat.add_argument(
+        "--compute-dtype",
+        choices=("auto", "float16", "bfloat16", "float32"),
+        default="auto",
+    )
+    chat.add_argument("--source-budget-mb", type=float, default=65536)
+    chat.add_argument("--max-resident-mb", type=int, default=384)
+    chat.add_argument("--max-prompt-tokens", type=int, default=1024)
+    chat.add_argument("--max-new-tokens", type=int, default=64)
+    chat.add_argument("--max-context-tokens", type=int, default=2048)
+    chat.add_argument("--head-block-rows", type=int, default=2048)
     organs = sub.add_parser("organs", help="inspect the cold organ bank")
     organs.add_argument("--manifest", help="SHIP-v6/OrganBank manifest")
     organs.add_argument("--artifact-root", help="external SHIP artifact directory")
@@ -710,6 +775,8 @@ def main(argv: list[str] | None = None) -> int:
         return _doctor(deep=args.deep, artifact_root=args.artifact_root)
     if args.command == "solve":
         return _solve(args.question, args.manifest, args.artifact_root)
+    if args.command == "chat":
+        return _chat_qwen38(args)
     if args.command == "organs":
         return _organs(args)
     if args.command == "artifacts":

@@ -45,6 +45,9 @@ class CompositionRoot:
         general_chat: Component | None = None,
         fertig_state_dir: str | Path | None = None,
         fertig_graph: str | Path | None = None,
+        qwen38_causal_bundle: str | Path | None = None,
+        qwen38_tokenizer: str | Path | None = None,
+        qwen38_options: Mapping[str, Any] | None = None,
     ) -> CompositionRoot:
         """Build without loading neural artifacts.
 
@@ -64,6 +67,23 @@ class CompositionRoot:
             raise ValueError("pass either fertig or fertig_root, not both")
         if grounded_chat is not None and fertig_state_dir is not None:
             raise ValueError("pass either grounded_chat or fertig_state_dir, not both")
+        qwen38_requested = (
+            qwen38_causal_bundle is not None or qwen38_tokenizer is not None
+        )
+        if (qwen38_causal_bundle is None) != (qwen38_tokenizer is None):
+            raise ValueError(
+                "qwen38_causal_bundle and qwen38_tokenizer must be configured together"
+            )
+        if general_chat is not None and qwen38_requested:
+            raise ValueError(
+                "pass either general_chat or the local Qwen3.8 bundle/tokenizer, not both"
+            )
+        if qwen38_options is not None and not isinstance(qwen38_options, Mapping):
+            raise TypeError("qwen38_options must be a mapping or None")
+        if qwen38_options is not None and not qwen38_requested:
+            raise ValueError(
+                "qwen38_options requires the local Qwen3.8 bundle/tokenizer"
+            )
 
         if s3_arithmetic is None:
             from .capabilities.s3_runtime import S3Arithmetic
@@ -88,6 +108,26 @@ class CompositionRoot:
             grounded_chat = FertigGrounded(
                 fertig_state_dir,
                 graph_path=fertig_graph,
+            )
+        if general_chat is None and qwen38_requested:
+            from .runtimes.qwen3_8.adapter import Qwen38CausalChat
+
+            options = {} if qwen38_options is None else dict(qwen38_options)
+            forbidden = {
+                "bundle_path",
+                "runtime_factory",
+                "tokenizer_path",
+            }.intersection(options)
+            if forbidden:
+                raise ValueError(
+                    "qwen38_options cannot override protected Qwen3.8 constructor fields"
+                )
+            assert qwen38_causal_bundle is not None
+            assert qwen38_tokenizer is not None
+            general_chat = Qwen38CausalChat(
+                qwen38_causal_bundle,
+                qwen38_tokenizer,
+                **options,
             )
         components = tuple(
             component
@@ -128,6 +168,9 @@ def compose_runtime(
     general_chat: Component | None = None,
     fertig_state_dir: str | Path | None = None,
     fertig_graph: str | Path | None = None,
+    qwen38_causal_bundle: str | Path | None = None,
+    qwen38_tokenizer: str | Path | None = None,
+    qwen38_options: Mapping[str, Any] | None = None,
 ) -> CompositionRoot:
     """Functional alias for callers that do not need the classmethod syntax."""
 
@@ -142,6 +185,9 @@ def compose_runtime(
         general_chat=general_chat,
         fertig_state_dir=fertig_state_dir,
         fertig_graph=fertig_graph,
+        qwen38_causal_bundle=qwen38_causal_bundle,
+        qwen38_tokenizer=qwen38_tokenizer,
+        qwen38_options=qwen38_options,
     )
 
 
