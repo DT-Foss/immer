@@ -17,6 +17,10 @@ All notable changes to IMMER are recorded here.
 - Hard-bounded the public transaction to the proven `batch=1, K=2` tranche;
   larger blocks and batches fail closed until their DeltaNet arithmetic uses a
   weight-once/tokenwise-linear path. Ordinary decoding is unchanged.
+- Added a gold-free official parity harness that replays a sealed off-arm
+  `[token, EOS]` chain through two fresh causal-bundle runtimes, hashes every
+  hidden/KV/DeltaNet/graft state, authenticates both access traces, and seals
+  either a positive or mismatch result.
 
 ### Exact event and binding compiler
 
