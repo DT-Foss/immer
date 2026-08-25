@@ -50,6 +50,12 @@ All notable changes to IMMER are recorded here.
   from the immutable pinned remote Streamer. The mode has no missing-route
   fallback, never touches local sparse expert holes, owns both sources
   transactionally, and records both physical planes and caches separately.
+- Sealed the first split-rail replay against the pinned full-remote reference.
+  All four MMLU logits and the correct choice B are bit-identical. Item latency
+  falls from `2,496.599 s` to `1,772.060 s` (`1.408868x`, `29.021044%`), while
+  remote bytes fall by `5,627,335,452` (`11.203862%`). The split reads exactly
+  those saved bytes through the local causal dense rail, so total logical
+  bytes are conserved exactly with zero fallback and zero rejected charges.
 - Routed every dense, control, embedding, I64 router, candidate-head, scalar
   head, and batched full-head read through the revision-bound causal tensor
   reader. Expert and dense rails remain separate, missing bindings have no
