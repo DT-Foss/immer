@@ -2,7 +2,27 @@
 
 All notable changes to IMMER are recorded here.
 
-## [Unreleased] — 2026-08-24
+## [Unreleased] — 2026-08-25
+
+### Causal Qwen3.5 live drafting
+
+- Extended the exact streamed runtime and flat causal-bundle adoption to the
+  pinned Qwen3.5-0.8B profile, including nested text configuration, tied
+  embeddings, mixed full-attention/DeltaNet layers, and vision/MTP exclusion.
+- Added a local transactional K=2 draft provider. Draft state advances only
+  across target-accepted tokens; mismatch-0, mismatch-1, reset, mutation,
+  terminal, and target-only suffix paths remain state-consistent and fail
+  closed.
+- Proved the causalized drafter's two-token greedy output identical to an
+  independent local Transformers BF16 reference on the same pinned checkpoint.
+- Added an end-to-end native Prefix-Sinkhorn smoke path in which the local
+  Qwen3.5 drafter proposes and Qwen3.8 alone verifies and commits. The sealed
+  fixed trial accepts `2/2` proposals and emits the same two target tokens as a
+  same-runtime greedy control.
+- On that fixed two-token trial, combined target-plus-drafter source bytes fall
+  `31.24%` (`151.20 GB → 103.96 GB`) and wall time falls `23.03%`
+  (`243.38 s → 187.33 s`), a `1.299x` speedup. This receipt covers one
+  fixed prompt and one K=2 verification round.
 
 ### Transactional Qwen continuation blocks
 
@@ -50,22 +70,25 @@ All notable changes to IMMER are recorded here.
 
 ### Exact event and binding compiler
 
-- Added a span-aware quantitative event frontend that lowers thirty-nine typed
+- Added a span-aware quantitative event frontend that lowers forty-three typed
   transaction, rate, comparison, residual, and repeated-duration families to
   exact signed-expression DAGs.
+- Added fully grounded exact `Abs` and `Ceil` expression nodes. Both operators
+  reject unresolved expressions before lowering, and ceiling-backed capacity
+  plans preserve exact rational evidence through the final integer result.
 - Added exact calendar-rate binding for fixed 30/31-day months; February and
   multi-month questions remain fail-closed without an explicit day basis.
 - Added unique object-possessive binding for original-length relations without
   global pronoun guessing.
-- Raised the question-only 64-item exact-certificate frontier from 3 to 43;
+- Raised the question-only 64-item exact-certificate frontier from 3 to 45;
   every other item remains an abstention.
 - Upgraded the gold-free abstention audit to partition exact recoveries from
-  remaining ambiguity and unsupported grammar. The current report proves 42
-  recoveries from the previous 230 abstentions, leaves 188 fail-closed, and
+  remaining ambiguity and unsupported grammar. The current report proves 47
+  recoveries from the previous 230 abstentions, leaves 183 fail-closed, and
   binds the event/DAG compiler hashes in report provenance.
 - Added typed part, package-capacity, fractional-remainder, pooled-allowance,
-  inverse-duration, and exact-trip-minimum DAGs. Non-divisible capacity cases
-  remain abstinent until an explicit ceiling operator exists.
+  inverse-duration, exact-trip-minimum, temporal block remainder, exhaustive
+  unit-rate, recurring-pronoun rate, and absolute weighted-difference DAGs.
 - Added adversarial coverage for cross-owner, cross-item, foreign-price,
   duplicate-share, numeric-noise, reordered-clause, and possessive-scope
   attacks.

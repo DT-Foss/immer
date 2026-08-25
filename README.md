@@ -16,8 +16,10 @@ release surface.
 
 - **Causalized local weights.** Immutable tensor payloads are paired with an
   appendable causal address graph inside one local model bundle.
-- **Frontier execution.** A complete DeepSeek-V4-Flash decoder runs from exact
-  weight ranges with authenticated layer-level resume.
+- **Local target execution.** Qwen3.8-27B runs directly from causalized local
+  weights with stateful full-attention and DeltaNet continuation.
+- **Native local drafting.** A causalized Qwen3.5-0.8B proposes transactional
+  K=2 continuations that Qwen3.8 alone verifies and commits.
 - **Grounded composition.** [FERTIG](https://github.com/DT-Foss/FERTIG)
   supplies deterministic parsing, verification, and explicit abstention.
 - **Transport intelligence.** Label-free route observations support held-out
@@ -31,9 +33,9 @@ release surface.
 
 | Trial | Result | Scope |
 |---|---:|---|
-| DeepSeek-V4 exact decoder | 43/43 layers complete | fixed exact layer-major integration run |
-| DeepSeek-V4 + FERTIG | 6/8 correct, 0 wrong | fixed eight-item GSM8K integration slice |
-| SHIP-v6 exact core | 152/152 answers and routes | frozen host plus four exact organs |
+| Qwen3.8 exact continuation | bit-identical K=2 state | 64-layer CPU-BF16 parity trial; 50.00% fewer source bytes and 1.869x model-time speedup |
+| Qwen3.5 → Qwen3.8 live drafting | 2/2 draft tokens accepted | fixed two-token native Prefix-Sinkhorn trial; 31.24% fewer combined source bytes and 1.299x wall-time speedup |
+| FERTIG exact frontier | 45/64 certified, 19 abstained | fixed gold-free development slice; holdout untouched |
 
 The public benchmark ledger states the exact corpus and measurement boundary
 for every released number: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
