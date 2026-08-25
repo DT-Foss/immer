@@ -29,6 +29,7 @@ DEFAULT_MAX_METADATA_BYTES = 64 * 1024 * 1024
 DEFAULT_HTTP_CONNECTIONS = 2
 MAX_ERROR_BODY_BYTES = 4 * 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_MAX_SIGNED_64 = (1 << 63) - 1
 
 
 def _requests_api() -> Any:
@@ -810,20 +811,44 @@ def scan_inventory(reader: Any, budget: _BudgetLike) -> dict[str, Any]:
     payload_total = 0
     for shard_file in shard_files:
         header, data_start, info = reader.fetch_st_header(shard_file)
+        if (
+            isinstance(data_start, bool)
+            or not isinstance(data_start, int)
+            or not 0 <= data_start <= _MAX_SIGNED_64
+        ):
+            raise SourceError(f"Safetensors-Headerstart fuer {shard_file!r} ist ungueltig")
         tensor_count = 0
+        shard_intervals: list[tuple[int, int, str]] = []
         for name, entry in header.items():
             if not isinstance(entry, dict):
                 raise SourceError(f"Tensor-Metadaten fuer {name!r} sind ungueltig")
             try:
-                offset_begin, offset_end = (
-                    int(value) for value in entry["data_offsets"]
-                )
+                raw_offsets = entry["data_offsets"]
+                if (
+                    not isinstance(raw_offsets, (list, tuple))
+                    or len(raw_offsets) != 2
+                    or any(
+                        isinstance(value, bool) or not isinstance(value, int)
+                        for value in raw_offsets
+                    )
+                ):
+                    raise TypeError("data_offsets must contain two integers")
+                offset_begin, offset_end = raw_offsets
                 shape = [int(value) for value in entry["shape"]]
                 dtype = str(entry["dtype"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise SourceError(
                     f"Tensor-Metadaten fuer {name!r} sind unvollstaendig"
                 ) from exc
+            if (
+                offset_begin < 0
+                or offset_end < offset_begin
+                or offset_end > _MAX_SIGNED_64 - data_start
+            ):
+                raise SourceError(
+                    f"Tensor-Offsets fuer {name!r} sind ungueltig"
+                )
+            shard_intervals.append((offset_begin, offset_end, name))
             numel = math.prod(shape) if shape else 1
             byte_count = offset_end - offset_begin
             inventory["tensors"].append(
@@ -842,13 +867,32 @@ def scan_inventory(reader: Any, budget: _BudgetLike) -> dict[str, Any]:
             )
             tensor_count += 1
             payload_total += byte_count
+        shard_payload_end = 0
+        for offset_begin, offset_end, name in sorted(shard_intervals):
+            if offset_begin != shard_payload_end:
+                raise SourceError(
+                    f"Tensor-Offsets fuer {name!r} sind nicht lueckenlos"
+                )
+            shard_payload_end = offset_end
+        derived_size = data_start + shard_payload_end
+        reported_size = info.get("size")
+        if reported_size is not None:
+            if isinstance(reported_size, bool) or not isinstance(reported_size, int):
+                raise SourceError(
+                    f"Gemeldete Dateigroesse fuer {shard_file!r} ist ungueltig"
+                )
+            if reported_size != derived_size:
+                raise SourceError(
+                    f"Safetensors-Groesse fuer {shard_file!r} stimmt nicht: "
+                    f"{reported_size} != {derived_size}"
+                )
         inventory["shards"].append(
             {
                 "file": shard_file,
                 "n_tensors": tensor_count,
                 "header_len": info.get("header_len"),
                 "data_start": data_start,
-                "size": info.get("size"),
+                "size": derived_size,
                 "etag": info.get("etag"),
                 "cas_url_hash": info.get("cas_url_hash"),
                 "linked_etag": info.get("linked_etag"),

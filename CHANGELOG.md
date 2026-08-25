@@ -24,6 +24,10 @@ All notable changes to IMMER are recorded here.
   72,317-tensor layout, then every recorded range is born under that stable
   source identity instead of mutable transport metadata. Inventory SHA and
   fingerprint are bound into benchmark provenance and signatures.
+- Made pinned inventory adoption stable across cold and cached header scans.
+  When a cache hit has no HTTP file-size field, the scanner derives the exact
+  safetensors size from its contiguous validated data offsets; any reported
+  mismatch, gap, overlap, coercion, or signed-range violation fails closed.
 - Added sealed trace-to-graph ingestion. Multiple traces are identity-checked,
   unioned, reduced to complete six-part expert coordinates, compared against
   current base and append bindings, and handed to the existing crash-safe
@@ -65,7 +69,7 @@ All notable changes to IMMER are recorded here.
   transported state remains a proposal. Target adjudication selected the same
   top token on both paths: token `12747`, decoded as the FERTIG-certified exact
   answer `450`; their Top-10 sets are identical with eight equal rank slots.
-- Verified the complete repository with `1273/1273` tests, the expanded
+- Verified the complete repository with `1279/1279` tests, the expanded
   DeepSeek scope with `454/454` tests, and the Qwen causal regression scope
   with `54/54` tests.
 
