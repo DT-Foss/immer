@@ -1,4 +1,4 @@
-"""Exact causal bindings from routed experts to immutable shard byte ranges.
+"""Exact causal bindings from model coordinates to immutable shard byte ranges.
 
 The model identity and its physical safetensors layout are deliberately
 separate.  A semantic ``(layer, expert_id)`` key belongs to the logical model;
@@ -6,7 +6,8 @@ direct LiveCausal edges point from that key to one layout-specific immutable
 range plan.  Repacking shards therefore regenerates bindings without changing
 the model identity or any weight byte.
 
-This module is only an address plane.  It never changes router decisions,
+Dense tensor keys and routed-expert keys remain separate address planes over
+the same authenticated layout. This module never changes router decisions,
 decodes tensors, mutates weights, or permits model computation to be skipped.
 """
 
@@ -431,6 +432,19 @@ class CausalTensorReadReceipt:
     relative_offset: int
     length: int
     part: memoryview
+
+
+@dataclass(frozen=True, slots=True)
+class CausalTensorRangesReadReceipt:
+    """Authenticated bounded multi-range read inside one tensor plan."""
+
+    plan: TensorRangePlan
+    ranges: tuple[tuple[int, int], ...]
+    parts: tuple[memoryview, ...]
+    requested_bytes: int
+    resident_bytes: int
+    source_requests: int
+    source_bytes: int
 
 
 def semantic_expert_key(
@@ -1552,7 +1566,11 @@ class CausalTensorReader:
         self._plan_cache_invalidations = 0
         self._metrics_lock = threading.Lock()
         self._read_calls = 0
+        self._multi_range_read_calls = 0
         self._requested_bytes = 0
+        self._resident_bytes = 0
+        self._source_requests = 0
+        self._source_bytes = 0
         if source is not None:
             self._validate_source_identity()
 
@@ -1605,38 +1623,203 @@ class CausalTensorReader:
             )
         return matches[0]
 
-    def resolve_tensor_plan(self, name: str) -> TensorRangePlan:
-        """Resolve one tensor with one warm graph-revision check."""
+    def resolve_tensor_plans(self, names: Iterable[str]) -> tuple[TensorRangePlan, ...]:
+        """Resolve an arbitrary tensor set against one stable graph revision."""
 
-        tensor_name = _text(name, "tensor name", maximum=4096)
+        if isinstance(names, (str, bytes)):
+            raise CausalWeightError("tensor names must be an iterable of strings")
+        try:
+            tensor_names = tuple(
+                _text(name, "tensor name", maximum=4096) for name in names
+            )
+        except TypeError as exc:
+            raise CausalWeightError("tensor names must be iterable") from exc
+        if not tensor_names:
+            return ()
+        unique_names = tuple(dict.fromkeys(tensor_names))
         with self._plan_cache_lock:
             for _attempt in range(_PLAN_CACHE_RESOLVE_RETRIES):
                 revision = self.graph.store.revision()
                 self._adopt_plan_cache_revision(revision)
-                cached = self._plan_cache.get(tensor_name)
-                if cached is not None:
-                    self._plan_cache_hits += 1
-                    return cached
+                cached_names = {
+                    name for name in unique_names if name in self._plan_cache
+                }
+                missing = tuple(
+                    name for name in unique_names if name not in self._plan_cache
+                )
+                if not missing:
+                    self._plan_cache_hits += len(unique_names)
+                    return tuple(self._plan_cache[name] for name in tensor_names)
                 try:
-                    resolved = self._resolve_tensor_plan_uncached(tensor_name)
+                    resolved = {
+                        name: self._resolve_tensor_plan_uncached(name)
+                        for name in missing
+                    }
                 except Exception:
                     after = self.graph.store.revision()
                     if after != revision:
                         self._adopt_plan_cache_revision(after)
                         continue
-                    self._plan_cache_misses += 1
+                    self._plan_cache_hits += len(cached_names)
+                    self._plan_cache_misses += len(missing)
                     raise
                 after = self.graph.store.revision()
                 if after != revision:
                     self._adopt_plan_cache_revision(after)
                     continue
-                self._plan_cache[tensor_name] = resolved
-                self._plan_cache_misses += 1
-                return resolved
-            self._plan_cache_misses += 1
+                self._plan_cache.update(resolved)
+                self._plan_cache_hits += len(cached_names)
+                self._plan_cache_misses += len(missing)
+                return tuple(self._plan_cache[name] for name in tensor_names)
+            self._plan_cache_misses += len(unique_names)
             raise CausalWeightIntegrityError(
                 "causal graph revision changed during every tensor-plan retry"
             )
+
+    def resolve_tensor_plan(self, name: str) -> TensorRangePlan:
+        """Resolve one tensor with one warm graph-revision check."""
+
+        return self.resolve_tensor_plans((name,))[0]
+
+    def read_tensor_ranges(
+        self,
+        name: str,
+        ranges: Iterable[tuple[int, int]],
+        *,
+        resident_limit_bytes: int | None = None,
+        max_gap_bytes: int = 0,
+    ) -> CausalTensorRangesReadReceipt:
+        """Read exact subranges through one bounded ``raw_bytes_many`` receipt.
+
+        The dense causal rail never admits envelope gap bytes. Callers can
+        batch disjoint rows, but every returned byte must belong to a requested
+        tensor subrange and the resident receipt must equal the logical payload.
+        """
+
+        self._validate_source_identity()
+        assert self.source is not None
+        if isinstance(ranges, (str, bytes)):
+            raise CausalWeightError("tensor ranges must be an iterable of pairs")
+        try:
+            raw_ranges = tuple(ranges)
+        except TypeError as exc:
+            raise CausalWeightError("tensor ranges must be iterable") from exc
+        if not raw_ranges:
+            raise CausalWeightError("tensor ranges must not be empty")
+        if (
+            isinstance(max_gap_bytes, bool)
+            or not isinstance(max_gap_bytes, int)
+            or max_gap_bytes != 0
+        ):
+            raise CausalWeightError("causal tensor multi-range reads require zero gaps")
+
+        plan = self.resolve_tensor_plan(name)
+        normalized: list[tuple[int, int]] = []
+        for index, raw_range in enumerate(raw_ranges):
+            if not isinstance(raw_range, (tuple, list)) or len(raw_range) != 2:
+                raise CausalWeightError(
+                    f"tensor range {index} must be an (offset, length) pair"
+                )
+            offset = _uint64(raw_range[0], f"tensor range {index} offset")
+            length = _uint64(
+                raw_range[1], f"tensor range {index} length", positive=True
+            )
+            if offset > plan.length or length > plan.length - offset:
+                raise CausalWeightError(
+                    f"tensor range {index} exceeds its bound plan"
+                )
+            normalized.append((offset, length))
+        requested_bytes = sum(length for _offset, length in normalized)
+        if resident_limit_bytes is None:
+            resident_limit = requested_bytes
+        else:
+            resident_limit = _uint64(
+                resident_limit_bytes,
+                "resident_limit_bytes",
+                positive=True,
+            )
+            if resident_limit < requested_bytes:
+                raise CausalWeightError(
+                    "resident_limit_bytes is smaller than the exact tensor payload"
+                )
+
+        raw_bytes_many = getattr(self.source, "raw_bytes_many", None)
+        if not callable(raw_bytes_many):
+            raise CausalWeightError(
+                "attached tensor source must implement raw_bytes_many"
+            )
+        result = raw_bytes_many(
+            plan.shard,
+            tuple(
+                (plan.absolute_offset + offset, length)
+                for offset, length in normalized
+            ),
+            resident_limit_bytes=resident_limit,
+            max_gap_bytes=0,
+        )
+        try:
+            raw_parts = tuple(result.parts)
+            counters = (
+                result.resident_bytes,
+                result.source_requests,
+                result.source_bytes,
+            )
+        except (AttributeError, TypeError) as exc:
+            raise CausalWeightIntegrityError(
+                "raw_bytes_many returned an invalid tensor receipt"
+            ) from exc
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in counters):
+            raise CausalWeightIntegrityError(
+                "raw_bytes_many returned an invalid tensor receipt"
+            )
+        resident_bytes, source_requests, source_bytes = counters
+        if len(raw_parts) != len(normalized):
+            raise CausalWeightIntegrityError(
+                "raw_bytes_many returned the wrong tensor part count"
+            )
+        parts: list[memoryview] = []
+        for index, (raw_part, (_offset, length)) in enumerate(
+            zip(raw_parts, normalized, strict=True)
+        ):
+            try:
+                part = (
+                    raw_part if isinstance(raw_part, memoryview) else memoryview(raw_part)
+                )
+            except TypeError as exc:
+                raise CausalWeightIntegrityError(
+                    f"raw_bytes_many tensor part {index} is not a buffer"
+                ) from exc
+            if not part.readonly or len(part) != length:
+                raise CausalWeightIntegrityError(
+                    f"raw_bytes_many tensor part {index} is mutable or short"
+                )
+            parts.append(part)
+        if (
+            resident_bytes != requested_bytes
+            or resident_bytes > resident_limit
+            or not 0 <= source_requests <= len(normalized)
+            or not 0 <= source_bytes <= requested_bytes
+        ):
+            raise CausalWeightIntegrityError(
+                "raw_bytes_many returned impossible tensor accounting"
+            )
+        receipt = CausalTensorRangesReadReceipt(
+            plan=plan,
+            ranges=tuple(normalized),
+            parts=tuple(parts),
+            requested_bytes=requested_bytes,
+            resident_bytes=resident_bytes,
+            source_requests=source_requests,
+            source_bytes=source_bytes,
+        )
+        with self._metrics_lock:
+            self._read_calls += 1
+            self._multi_range_read_calls += 1
+            self._requested_bytes += requested_bytes
+            self._resident_bytes += resident_bytes
+            self._source_requests += source_requests
+            self._source_bytes += source_bytes
+        return receipt
 
     def read_tensor_range(
         self,
@@ -1647,8 +1830,6 @@ class CausalTensorReader:
     ) -> CausalTensorReadReceipt:
         """Read one exact tensor subrange after graph resolution."""
 
-        self._validate_source_identity()
-        assert self.source is not None
         plan = self.resolve_tensor_plan(name)
         offset = _uint64(relative_offset, "relative_offset")
         resolved_length = plan.length - offset if length is None else length
@@ -1659,34 +1840,22 @@ class CausalTensorReader:
         )
         if offset > plan.length or resolved_length > plan.length - offset:
             raise CausalWeightError("tensor subrange exceeds its bound plan")
-        raw_bytes = getattr(self.source, "raw_bytes", None)
-        if not callable(raw_bytes):
-            raise CausalWeightError("attached tensor source must implement raw_bytes")
-        raw = raw_bytes(
-            plan.shard,
-            plan.absolute_offset + offset,
-            resolved_length,
+        batch = self.read_tensor_ranges(
+            name,
+            ((offset, resolved_length),),
+            resident_limit_bytes=resolved_length,
+            max_gap_bytes=0,
         )
-        try:
-            part = raw if isinstance(raw, memoryview) else memoryview(raw)
-        except TypeError as exc:
+        if batch.plan != plan or batch.ranges != ((offset, resolved_length),):
             raise CausalWeightIntegrityError(
-                "tensor source returned a non-buffer payload"
-            ) from exc
-        if not part.readonly or len(part) != resolved_length:
-            raise CausalWeightIntegrityError(
-                "tensor source returned a mutable or short payload"
+                "tensor singleton receipt disagrees with its resolved plan"
             )
-        receipt = CausalTensorReadReceipt(
-            plan=plan,
+        return CausalTensorReadReceipt(
+            plan=batch.plan,
             relative_offset=offset,
             length=resolved_length,
-            part=part,
+            part=batch.parts[0],
         )
-        with self._metrics_lock:
-            self._read_calls += 1
-            self._requested_bytes += resolved_length
-        return receipt
 
     def metrics(self) -> dict[str, int | str]:
         with self._plan_cache_lock:
@@ -1703,7 +1872,11 @@ class CausalTensorReader:
             return {
                 "layout_fingerprint": self.layout.layout_fingerprint,
                 "read_calls": self._read_calls,
+                "multi_range_read_calls": self._multi_range_read_calls,
                 "requested_bytes": self._requested_bytes,
+                "resident_bytes": self._resident_bytes,
+                "source_requests": self._source_requests,
+                "source_bytes": self._source_bytes,
                 **cache,
             }
 
@@ -1916,6 +2089,22 @@ class CausalWeightMount:
             length=length,
         )
 
+    def read_tensor_ranges(
+        self,
+        name: str,
+        ranges: Iterable[tuple[int, int]],
+        *,
+        resident_limit_bytes: int | None = None,
+        max_gap_bytes: int = 0,
+    ) -> CausalTensorRangesReadReceipt:
+        self._require_open()
+        return self.tensor_reader.read_tensor_ranges(
+            name,
+            ranges,
+            resident_limit_bytes=resident_limit_bytes,
+            max_gap_bytes=max_gap_bytes,
+        )
+
     def close(self) -> None:
         if self._closed:
             return
@@ -1937,6 +2126,7 @@ __all__ = [
     "CAUSAL_WEIGHT_BINDING_SCHEMA",
     "CausalTensorBindingReceipt",
     "CausalTensorReadReceipt",
+    "CausalTensorRangesReadReceipt",
     "CausalTensorReader",
     "CausalWeightBindingReceipt",
     "CausalWeightConflictError",

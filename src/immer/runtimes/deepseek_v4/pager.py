@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable, Mapping
 import re
 import threading
 import time
+from pathlib import PurePosixPath
 from typing import Any, Protocol
 
 import numpy as np
@@ -87,6 +88,10 @@ class PagerMetrics:
     causal_expert_plan_misses: int = 0
     causal_expert_plan_fallbacks: int = 0
     causal_expert_plan_invalid: int = 0
+    causal_tensor_plan_resolves: int = 0
+    causal_tensor_reads: int = 0
+    causal_tensor_multi_reads: int = 0
+    causal_tensor_requested_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +156,59 @@ class CausalExpertPlanResolver(Protocol):
         layer: int,
         expert_ids: Iterable[int],
     ) -> tuple[OfficialExpertRangePlan, ...]: ...
+
+
+class CausalTensorPlanResolver(Protocol):
+    """Structural contract for the dense causal tensor address plane.
+
+    It lives in the pager module so ``causal_weights`` can implement it without
+    a runtime import cycle. Concrete plans and receipts are validated by value;
+    no graph implementation class is imported here.
+    """
+
+    source: Any
+    layout: Any
+
+    def resolve_tensor_plan(self, name: str) -> Any: ...
+
+    def resolve_tensor_plans(self, names: Iterable[str]) -> tuple[Any, ...]: ...
+
+    def read_tensor_range(
+        self,
+        name: str,
+        *,
+        relative_offset: int = 0,
+        length: int | None = None,
+    ) -> Any: ...
+
+    def read_tensor_ranges(
+        self,
+        name: str,
+        ranges: Iterable[tuple[int, int]],
+        *,
+        resident_limit_bytes: int | None = None,
+        max_gap_bytes: int = 0,
+    ) -> Any: ...
+
+    def metrics(self) -> Mapping[str, Any]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _DenseTensorLayout:
+    name: str
+    dtype: str
+    shape: tuple[int, ...]
+    shard: str
+    absolute_offset: int
+    length: int
+    item_bytes: int
+
+    @property
+    def numel(self) -> int:
+        elements = 1
+        for dimension in self.shape:
+            elements *= dimension
+        return elements
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,6 +381,17 @@ class DeepSeekWeightPager:
     _OFFICIAL_EXPERT_BASE = re.compile(
         r"^layers\.(0|[1-9][0-9]*)\.ffn\.experts\.(0|[1-9][0-9]*)$"
     )
+    _DENSE_TENSOR_ITEM_BYTES = {
+        "BF16": 2,
+        "F16": 2,
+        "F32": 4,
+        "F8_E4M3": 1,
+        "F8_E4M3FN": 1,
+        "F8_E8M0": 1,
+        "I8": 1,
+        "I32": 4,
+        "I64": 8,
+    }
 
     def __init__(
         self,
@@ -336,6 +405,7 @@ class DeepSeekWeightPager:
         expert_reservoir_budget_bytes: int | None = None,
         expert_reservoir_workers: int | None = None,
         causal_weight_reader: CausalExpertPlanResolver | None = None,
+        causal_tensor_reader: CausalTensorPlanResolver | None = None,
         causal_missing_fallback: bool = False,
     ) -> None:
         try:
@@ -413,11 +483,76 @@ class DeepSeekWeightPager:
         self._expert_reservoir_executor: ThreadPoolExecutor | None = None
         self._expert_reservoir_owner = object()
         self._causal_weight_reader: CausalExpertPlanResolver | None = None
+        self._causal_tensor_reader: CausalTensorPlanResolver | None = None
         self._causal_missing_fallback = False
         self.attach_causal_weight_reader(
             causal_weight_reader,
             fallback_on_missing=causal_missing_fallback,
         )
+        self.attach_causal_tensor_reader(causal_tensor_reader)
+
+    @property
+    def causal_tensor_reader_attached(self) -> bool:
+        return self._causal_tensor_reader is not None
+
+    def attach_causal_tensor_reader(
+        self,
+        reader: CausalTensorPlanResolver | None,
+    ) -> None:
+        """Attach the strict dense tensor rail without importing its graph type."""
+
+        if reader is not None:
+            required = (
+                "resolve_tensor_plan",
+                "resolve_tensor_plans",
+                "read_tensor_range",
+                "read_tensor_ranges",
+                "metrics",
+            )
+            missing = tuple(
+                name for name in required if not callable(getattr(reader, name, None))
+            )
+            if missing:
+                raise TypeError(
+                    "causal tensor reader lacks required methods: "
+                    + ", ".join(missing)
+                )
+            layout = getattr(reader, "layout", None)
+            expected_fingerprint = getattr(layout, "layout_fingerprint", None)
+            reader_source = getattr(reader, "source", None)
+            if reader_source is not self.source:
+                source_metrics = getattr(self.source, "metrics", None)
+                snapshot = source_metrics() if callable(source_metrics) else None
+                observed_fingerprint = (
+                    snapshot.get("inventory_source_fingerprint")
+                    if isinstance(snapshot, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(expected_fingerprint, str)
+                    or not expected_fingerprint
+                    or observed_fingerprint != expected_fingerprint
+                ):
+                    raise DeepSeekPagerError(
+                        "causal tensor reader layout does not match the pager source"
+                    )
+        with self._prefetch_lock:
+            if (
+                self._active_prefetch_window is not None
+                or self._active_prefetch_payload is not None
+                or self._draining_prefetch
+                or self._draining_executor is not None
+                or self._active_expert_reservoir is not None
+                or self._retired_expert_reservoirs
+            ):
+                raise DeepSeekPagerError(
+                    "cannot replace the causal tensor reader during expert prefetch"
+                )
+            if reader is not None and self._causal_missing_fallback:
+                raise DeepSeekPagerError(
+                    "dense causal addressing forbids missing expert fallback"
+                )
+            self._causal_tensor_reader = reader
 
     def attach_causal_weight_reader(
         self,
@@ -437,6 +572,10 @@ class DeepSeekWeightPager:
 
         if not isinstance(fallback_on_missing, bool):
             raise ValueError("fallback_on_missing must be a boolean")
+        if fallback_on_missing and self._causal_tensor_reader is not None:
+            raise DeepSeekPagerError(
+                "dense causal addressing forbids missing expert fallback"
+            )
         if reader is None:
             if fallback_on_missing:
                 raise ValueError("missing fallback requires an attached reader")
@@ -517,6 +656,413 @@ class DeepSeekWeightPager:
         runs.append((run_start, previous + 1))
         return runs
 
+    @classmethod
+    def _validate_dense_layout(
+        cls,
+        plan: Any,
+        *,
+        expected_name: str,
+    ) -> _DenseTensorLayout:
+        """Lower one untrusted structural plan before any payload read."""
+
+        try:
+            name = plan.name
+            dtype = str(plan.dtype).upper()
+            raw_shape = plan.shape
+            shard = plan.shard
+            absolute_offset = plan.absolute_offset
+            length = plan.length
+        except AttributeError as exc:
+            raise DeepSeekPagerError(
+                f"causal tensor plan for {expected_name!r} is malformed"
+            ) from exc
+        if name != expected_name:
+            raise DeepSeekPagerError(
+                f"causal tensor plan name mismatch for {expected_name!r}"
+            )
+        item_bytes = cls._DENSE_TENSOR_ITEM_BYTES.get(dtype)
+        if item_bytes is None:
+            raise DeepSeekPagerError(
+                f"unsupported dense tensor dtype {dtype or 'missing'} at {name}"
+            )
+        if not isinstance(raw_shape, (tuple, list)) or len(raw_shape) > 16:
+            raise DeepSeekPagerError(f"invalid dense tensor shape at {name}")
+        shape: list[int] = []
+        elements = 1
+        for dimension in raw_shape:
+            if (
+                isinstance(dimension, bool)
+                or not isinstance(dimension, int)
+                or dimension <= 0
+            ):
+                raise DeepSeekPagerError(f"invalid dense tensor shape at {name}")
+            shape.append(dimension)
+            elements *= dimension
+        shard_path = PurePosixPath(shard) if isinstance(shard, str) else None
+        if (
+            not isinstance(shard, str)
+            or not shard
+            or "\\" in shard
+            or shard_path is None
+            or shard_path.is_absolute()
+            or any(part in {"", ".", ".."} for part in shard_path.parts)
+        ):
+            raise DeepSeekPagerError(f"invalid dense tensor shard at {name}")
+        if (
+            isinstance(absolute_offset, bool)
+            or not isinstance(absolute_offset, int)
+            or absolute_offset < 0
+            or isinstance(length, bool)
+            or not isinstance(length, int)
+            or length <= 0
+            or length != elements * item_bytes
+            or absolute_offset > (1 << 64) - 1
+            or length > (1 << 64) - 1 - absolute_offset
+        ):
+            raise DeepSeekPagerError(f"invalid dense tensor byte plan at {name}")
+        return _DenseTensorLayout(
+            name=name,
+            dtype=dtype,
+            shape=tuple(shape),
+            shard=shard,
+            absolute_offset=absolute_offset,
+            length=length,
+            item_bytes=item_bytes,
+        )
+
+    @classmethod
+    def _source_dense_layout(
+        cls,
+        name: str,
+        meta: Mapping[str, Any],
+    ) -> _DenseTensorLayout:
+        """Lower ordinary Streamer metadata into the same internal contract."""
+
+        try:
+            offsets = meta["offset_in_shard"]
+            begin, end = offsets
+            dtype = str(meta["dtype"]).upper()
+            raw_shape = meta["shape"]
+            begin, end = int(begin), int(end)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DeepSeekPagerError(f"invalid tensor metadata at {name}") from exc
+        item_bytes = cls._DENSE_TENSOR_ITEM_BYTES.get(dtype)
+        if item_bytes is None or not isinstance(raw_shape, (tuple, list)):
+            raise DeepSeekPagerError(f"invalid tensor metadata at {name}")
+        shape = tuple(int(dimension) for dimension in raw_shape)
+        if any(dimension <= 0 for dimension in shape):
+            raise DeepSeekPagerError(f"invalid tensor metadata at {name}")
+        length = end - begin
+        if begin < 0 or length <= 0:
+            raise DeepSeekPagerError(f"invalid tensor metadata at {name}")
+
+        # Synthetic/legacy TensorSource fixtures need no physical address for
+        # scalar tensor()/rows() reads. Missing physical coordinates merely
+        # disable the ordinary raw_bytes_many head optimization; a causal plan
+        # never permits these placeholders.
+        shard = meta.get("shard")
+        data_start = meta.get("data_start")
+        if (
+            isinstance(shard, str)
+            and shard
+            and isinstance(data_start, int)
+            and not isinstance(data_start, bool)
+            and data_start >= 0
+        ):
+            absolute_offset = data_start + begin
+        else:
+            shard = ""
+            absolute_offset = -1
+        return _DenseTensorLayout(
+            name=name,
+            dtype=dtype,
+            shape=shape,
+            shard=shard,
+            absolute_offset=absolute_offset,
+            length=length,
+            item_bytes=item_bytes,
+        )
+
+    def _dense_layout(self, name: str) -> _DenseTensorLayout:
+        if not isinstance(name, str) or not name:
+            raise ValueError("tensor name must be a non-empty string")
+        reader = self._causal_tensor_reader
+        if reader is None:
+            try:
+                meta = self.source.find(name)
+            except KeyError:
+                raise
+            except Exception as exc:
+                raise DeepSeekPagerError(f"cannot resolve tensor {name!r}") from exc
+            if not isinstance(meta, Mapping):
+                raise DeepSeekPagerError(f"invalid tensor metadata at {name}")
+            return self._source_dense_layout(name, meta)
+        self._stats.causal_tensor_plan_resolves += 1
+        try:
+            plan = reader.resolve_tensor_plan(name)
+        except KeyError as exc:
+            raise DeepSeekPagerError(
+                f"causal tensor binding is missing for {name}"
+            ) from exc
+        except Exception as exc:
+            raise DeepSeekPagerError(
+                f"causal tensor resolution failed for {name}"
+            ) from exc
+        return self._validate_dense_layout(plan, expected_name=name)
+
+    def preflight_tensor_plans(
+        self,
+        names: Iterable[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve all required dense bindings atomically and without payload I/O."""
+
+        if isinstance(names, (str, bytes)):
+            raise ValueError("tensor names must be an iterable of strings")
+        raw_names = tuple(names)
+        if any(not isinstance(name, str) or not name for name in raw_names):
+            raise ValueError("tensor names must be non-empty strings")
+        tensor_names = tuple(dict.fromkeys(raw_names))
+        reader = self._causal_tensor_reader
+        if reader is None:
+            layouts = tuple(self._dense_layout(name) for name in tensor_names)
+        else:
+            self._stats.causal_tensor_plan_resolves += len(tensor_names)
+            try:
+                plans = reader.resolve_tensor_plans(tensor_names)
+            except KeyError as exc:
+                missing = exc.args[0] if exc.args else "unknown"
+                raise DeepSeekPagerError(
+                    f"causal tensor binding is missing during preflight: {missing}"
+                ) from exc
+            except Exception as exc:
+                raise DeepSeekPagerError(
+                    "causal tensor binding preflight failed"
+                ) from exc
+            if not isinstance(plans, tuple) or len(plans) != len(tensor_names):
+                raise DeepSeekPagerError(
+                    "causal tensor preflight returned the wrong plan count"
+                )
+            layouts = tuple(
+                self._validate_dense_layout(plan, expected_name=name)
+                for name, plan in zip(tensor_names, plans, strict=True)
+            )
+        return {
+            layout.name: {
+                "dtype": layout.dtype,
+                "shape": layout.shape,
+                "length": layout.length,
+                "shard": layout.shard,
+                "absolute_offset": layout.absolute_offset,
+            }
+            for layout in layouts
+        }
+
+    @staticmethod
+    def _receipt_plan_matches(layout: _DenseTensorLayout, plan: Any) -> bool:
+        try:
+            return (
+                plan.name == layout.name
+                and str(plan.dtype).upper() == layout.dtype
+                and tuple(plan.shape) == layout.shape
+                and plan.shard == layout.shard
+                and plan.absolute_offset == layout.absolute_offset
+                and plan.length == layout.length
+            )
+        except AttributeError:
+            return False
+
+    def _causal_dense_ranges(
+        self,
+        layout: _DenseTensorLayout,
+        ranges: tuple[tuple[int, int], ...],
+        *,
+        resident_limit_bytes: int,
+    ) -> tuple[memoryview, ...]:
+        reader = self._causal_tensor_reader
+        if reader is None:  # pragma: no cover - callers guard the branch.
+            raise DeepSeekPagerError("causal tensor reader is not attached")
+        try:
+            receipt = reader.read_tensor_ranges(
+                layout.name,
+                ranges,
+                resident_limit_bytes=resident_limit_bytes,
+                max_gap_bytes=0,
+            )
+        except Exception as exc:
+            raise DeepSeekPagerError(
+                f"causal tensor payload read failed for {layout.name}"
+            ) from exc
+        try:
+            receipt_ranges = tuple(tuple(item) for item in receipt.ranges)
+            raw_parts = tuple(receipt.parts)
+            counters = (
+                receipt.requested_bytes,
+                receipt.resident_bytes,
+                receipt.source_requests,
+                receipt.source_bytes,
+            )
+        except (AttributeError, TypeError) as exc:
+            raise DeepSeekPagerError(
+                f"invalid causal tensor receipt for {layout.name}"
+            ) from exc
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in counters):
+            raise DeepSeekPagerError(
+                f"invalid causal tensor receipt for {layout.name}"
+            )
+        requested_bytes, resident_bytes, source_requests, source_bytes = counters
+        expected_bytes = sum(length for _offset, length in ranges)
+        if (
+            not self._receipt_plan_matches(layout, getattr(receipt, "plan", None))
+            or receipt_ranges != ranges
+            or len(raw_parts) != len(ranges)
+            or requested_bytes != expected_bytes
+            or resident_bytes != expected_bytes
+            or resident_bytes > resident_limit_bytes
+            or not 0 <= source_requests <= len(ranges)
+            or not 0 <= source_bytes <= expected_bytes
+        ):
+            raise DeepSeekPagerError(
+                f"invalid causal tensor receipt for {layout.name}"
+            )
+        parts: list[memoryview] = []
+        for index, (raw_part, (_offset, length)) in enumerate(
+            zip(raw_parts, ranges, strict=True)
+        ):
+            try:
+                part = (
+                    raw_part if isinstance(raw_part, memoryview) else memoryview(raw_part)
+                )
+            except TypeError as exc:
+                raise DeepSeekPagerError(
+                    f"causal tensor receipt part {index} is not a buffer"
+                ) from exc
+            if not part.readonly or len(part) != length:
+                raise DeepSeekPagerError(
+                    f"invalid causal tensor receipt part {index} for {layout.name}"
+                )
+            parts.append(part)
+        self._stats.causal_tensor_reads += 1
+        self._stats.causal_tensor_multi_reads += int(len(ranges) > 1)
+        self._stats.causal_tensor_requested_bytes += expected_bytes
+        return tuple(parts)
+
+    def _decode_dense_part(
+        self,
+        layout: _DenseTensorLayout,
+        part: memoryview,
+        *,
+        shape: tuple[int, ...],
+        label: str,
+    ) -> np.ndarray:
+        decoded = self._decode_coalesced_tensor(
+            _CoalescedTensor(
+                name=label,
+                dtype=layout.dtype,
+                shape=shape,
+                logical_bytes=len(part),
+                payload=part,
+            )
+        )
+        return np.ascontiguousarray(decoded).copy()
+
+    def _dense_tensor_array(self, layout: _DenseTensorLayout) -> np.ndarray:
+        if self._causal_tensor_reader is None:
+            return self.source.tensor(layout.name)
+        (part,) = self._causal_dense_ranges(
+            layout,
+            ((0, layout.length),),
+            resident_limit_bytes=layout.length,
+        )
+        return self._decode_dense_part(
+            layout,
+            part,
+            shape=layout.shape,
+            label=layout.name,
+        )
+
+    def _dense_rows_array(
+        self,
+        layout: _DenseTensorLayout,
+        start_row: int,
+        n_rows: int,
+    ) -> np.ndarray:
+        if len(layout.shape) != 2:
+            raise DeepSeekPagerError(f"row paging requires a 2D tensor: {layout.name}")
+        total_rows, columns = layout.shape
+        if (
+            isinstance(start_row, bool)
+            or not isinstance(start_row, int)
+            or isinstance(n_rows, bool)
+            or not isinstance(n_rows, int)
+            or start_row < 0
+            or n_rows < 0
+            or start_row > total_rows - n_rows
+        ):
+            raise IndexError(
+                f"rows [{start_row}, {start_row + n_rows}) outside [0, {total_rows})"
+            )
+        if n_rows == 0:
+            return np.empty((0, columns), dtype=np.float32)
+        if self._causal_tensor_reader is None:
+            return self.source.rows(
+                layout.name,
+                start_row=start_row,
+                n_rows=n_rows,
+            )
+        row_bytes = columns * layout.item_bytes
+        relative_offset = start_row * row_bytes
+        length = n_rows * row_bytes
+        (part,) = self._causal_dense_ranges(
+            layout,
+            ((relative_offset, length),),
+            resident_limit_bytes=length,
+        )
+        return self._decode_dense_part(
+            layout,
+            part,
+            shape=(n_rows, columns),
+            label=f"{layout.name}[{start_row}:{start_row + n_rows}]",
+        )
+
+    def _dense_row_runs(
+        self,
+        layout: _DenseTensorLayout,
+        runs: list[tuple[int, int]],
+    ) -> tuple[np.ndarray, ...]:
+        if self._causal_tensor_reader is None:
+            return tuple(
+                self.source.rows(
+                    layout.name,
+                    start_row=start,
+                    n_rows=stop - start,
+                )
+                for start, stop in runs
+            )
+        if len(layout.shape) != 2:
+            raise DeepSeekPagerError(f"row paging requires a 2D tensor: {layout.name}")
+        total_rows, columns = layout.shape
+        row_bytes = columns * layout.item_bytes
+        ranges: list[tuple[int, int]] = []
+        for start, stop in runs:
+            if start < 0 or stop <= start or stop > total_rows:
+                raise IndexError(f"row run [{start}, {stop}) is outside {layout.name}")
+            ranges.append((start * row_bytes, (stop - start) * row_bytes))
+        requested_bytes = sum(length for _offset, length in ranges)
+        parts = self._causal_dense_ranges(
+            layout,
+            tuple(ranges),
+            resident_limit_bytes=requested_bytes,
+        )
+        return tuple(
+            self._decode_dense_part(
+                layout,
+                part,
+                shape=(stop - start, columns),
+                label=f"{layout.name}[{start}:{stop}]",
+            )
+            for (start, stop), part in zip(runs, parts, strict=True)
+        )
+
     @staticmethod
     def _decode_coalesced_tensor(tensor: _CoalescedTensor) -> np.ndarray:
         """Decode one safetensors payload already covered by a larger range."""
@@ -530,6 +1076,10 @@ class DeepSeekWeightPager:
             )
         if dtype == "I8":
             values = np.frombuffer(tensor.payload, dtype=np.int8)
+        elif dtype == "I32":
+            values = np.frombuffer(tensor.payload, dtype="<i4")
+        elif dtype == "I64":
+            values = np.frombuffer(tensor.payload, dtype="<i8")
         elif dtype in {"F8_E4M3", "F8_E4M3FN"}:
             bits = np.frombuffer(tensor.payload, dtype=np.uint8)
             invalid = np.flatnonzero((bits & np.uint8(0x7F)) == np.uint8(0x7F))
@@ -587,7 +1137,7 @@ class DeepSeekWeightPager:
 
     @staticmethod
     def _head_row_layout(
-        meta: dict[str, Any],
+        layout: _DenseTensorLayout,
         *,
         block_rows: int,
     ) -> tuple[str, str, int, tuple[_HeadRowLeaf, ...]] | None:
@@ -599,50 +1149,34 @@ class DeepSeekWeightPager:
         decoding and remain on the scalar source path.
         """
 
-        itemsize_by_dtype = {"BF16": 2, "F16": 2, "F32": 4}
-        try:
-            shape = tuple(int(value) for value in meta["shape"])
-            if len(shape) != 2 or shape[0] <= 0 or shape[1] <= 0:
-                return None
-            dtype = str(meta["dtype"]).upper()
-            itemsize = itemsize_by_dtype.get(dtype)
-            if itemsize is None:
-                return None
-            shard = str(meta["shard"])
-            data_start = int(meta["data_start"])
-            offsets = meta["offset_in_shard"]
-            if (
-                not shard
-                or data_start < 8
-                or not isinstance(offsets, (list, tuple))
-                or len(offsets) != 2
-            ):
-                return None
-            begin, end = (int(value) for value in offsets)
-            if begin < 0 or end <= begin:
-                return None
-            vocab, columns = shape
-            row_bytes = columns * itemsize
-            if end - begin != vocab * row_bytes:
-                return None
-        except (KeyError, TypeError, ValueError, OverflowError):
+        if (
+            len(layout.shape) != 2
+            or layout.dtype not in {"BF16", "F16", "F32"}
+            or not layout.shard
+            or layout.absolute_offset < 0
+        ):
+            return None
+        vocab, columns = layout.shape
+        row_bytes = columns * layout.item_bytes
+        if layout.length != vocab * row_bytes:
             return None
 
         leaves = tuple(
             _HeadRowLeaf(
                 start_row=start,
                 count=min(block_rows, vocab - start),
-                absolute=data_start + begin + start * row_bytes,
+                absolute=layout.absolute_offset + start * row_bytes,
                 length=min(block_rows, vocab - start) * row_bytes,
             )
             for start in range(0, vocab, block_rows)
         )
-        return shard, dtype, columns, leaves
+        return layout.shard, layout.dtype, columns, leaves
 
     def _read_head_leaf_batch(
         self,
         *,
         name: str,
+        layout: _DenseTensorLayout,
         shard: str,
         dtype: str,
         columns: int,
@@ -650,30 +1184,47 @@ class DeepSeekWeightPager:
     ) -> tuple[_CoalescedTensor, ...]:
         """Fetch exact row leaves with a bounded, fail-closed receipt."""
 
-        raw_bytes_many = getattr(self.source, "raw_bytes_many", None)
-        if not callable(raw_bytes_many):  # guarded by topk_logits planning
-            raise DeepSeekPagerError("head multi-range capability disappeared")
         requested = tuple((leaf.absolute, leaf.length) for leaf in leaves)
         requested_bytes = sum(leaf.length for leaf in leaves)
         if requested_bytes > self.HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES:
             raise DeepSeekPagerError(
                 "head multi-range plan exceeds the raw resident limit"
             )
-        result = raw_bytes_many(
-            shard,
-            requested,
-            resident_limit_bytes=self.HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES,
-            max_gap_bytes=self.HEAD_TRANSPORT_MAX_GAP_BYTES,
-        )
-        try:
-            parts = tuple(result.parts)
-            resident_bytes = int(result.resident_bytes)
-            source_requests = int(result.source_requests)
-            source_bytes = int(result.source_bytes)
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise DeepSeekPagerError(
-                f"invalid head multi-range receipt for {shard}"
-            ) from exc
+        if self._causal_tensor_reader is not None:
+            relative = tuple(
+                (absolute - layout.absolute_offset, length)
+                for absolute, length in requested
+            )
+            parts = self._causal_dense_ranges(
+                layout,
+                relative,
+                resident_limit_bytes=self.HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES,
+            )
+            resident_bytes = requested_bytes
+            # Reader-level metrics own physical source accounting. Pager head
+            # metrics count the authenticated logical batch without inventing
+            # transport requests or bytes.
+            source_requests = 0
+            source_bytes = 0
+        else:
+            raw_bytes_many = getattr(self.source, "raw_bytes_many", None)
+            if not callable(raw_bytes_many):  # guarded by topk_logits planning
+                raise DeepSeekPagerError("head multi-range capability disappeared")
+            result = raw_bytes_many(
+                shard,
+                requested,
+                resident_limit_bytes=self.HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES,
+                max_gap_bytes=self.HEAD_TRANSPORT_MAX_GAP_BYTES,
+            )
+            try:
+                parts = tuple(result.parts)
+                resident_bytes = int(result.resident_bytes)
+                source_requests = int(result.source_requests)
+                source_bytes = int(result.source_bytes)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise DeepSeekPagerError(
+                    f"invalid head multi-range receipt for {shard}"
+                ) from exc
         if len(parts) != len(leaves):
             raise DeepSeekPagerError(
                 f"head multi-range part count mismatch for {shard}: "
@@ -767,11 +1318,20 @@ class DeepSeekWeightPager:
         retaining exactly the same layout validation.
         """
 
+        match = self._OFFICIAL_EXPERT_BASE.fullmatch(base)
+        reader = self._causal_weight_reader
+        if (
+            match is not None
+            and reader is None
+            and self._causal_tensor_reader is not None
+        ):
+            raise DeepSeekPagerError(
+                "dense causal addressing requires the separate expert reader for "
+                f"{base}"
+            )
         raw_bytes = getattr(self.source, "raw_bytes", None)
         if require_payload_reader and not callable(raw_bytes):
             return None
-        match = self._OFFICIAL_EXPERT_BASE.fullmatch(base)
-        reader = self._causal_weight_reader
         if reader is not None and match is not None:
             layer, expert_id = int(match.group(1)), int(match.group(2))
             self._stats.causal_expert_plan_resolves += 1
@@ -1166,6 +1726,87 @@ class DeepSeekWeightPager:
                 )
             )
         return tuple(public)
+
+    def preflight_expert_plans(
+        self,
+        layer: int,
+        expert_ids: Iterable[int],
+    ) -> tuple[OfficialExpertRangePlan, ...]:
+        """Validate one layer's entire causal expert rail without payload I/O."""
+
+        normalized_layer = self._validate_expert_coordinate(layer, name="layer")
+        if isinstance(expert_ids, (str, bytes)):
+            raise ValueError("expert_ids must be an iterable of integers")
+        normalized_ids: list[int] = []
+        seen: set[int] = set()
+        for raw_expert_id in expert_ids:
+            expert_id = self._validate_expert_coordinate(
+                raw_expert_id,
+                name="expert_id",
+            )
+            if expert_id not in seen:
+                seen.add(expert_id)
+                normalized_ids.append(expert_id)
+        if not normalized_ids:
+            return ()
+        reader = self._causal_weight_reader
+        if reader is None:
+            if self._causal_tensor_reader is not None:
+                raise DeepSeekPagerError(
+                    "dense causal addressing requires the separate expert reader"
+                )
+            return self.plan_expert_ranges(normalized_layer, normalized_ids)
+        if self._causal_missing_fallback:
+            raise DeepSeekPagerError(
+                "causal expert preflight forbids missing-route fallback"
+            )
+
+        self._stats.causal_expert_plan_resolves += len(normalized_ids)
+        try:
+            resolved = reader.resolve_expert_plans(normalized_layer, normalized_ids)
+        except KeyError as exc:
+            self._stats.causal_expert_plan_misses += len(normalized_ids)
+            raise DeepSeekPagerError(
+                f"causal weight binding is missing for layer {normalized_layer}"
+            ) from exc
+        except Exception as exc:
+            self._stats.causal_expert_plan_invalid += len(normalized_ids)
+            raise DeepSeekPagerError(
+                f"causal weight resolution failed for layer {normalized_layer}"
+            ) from exc
+        if not isinstance(resolved, tuple) or len(resolved) != len(normalized_ids):
+            self._stats.causal_expert_plan_invalid += len(normalized_ids)
+            raise DeepSeekPagerError(
+                f"causal weight resolver returned the wrong plan count for layer "
+                f"{normalized_layer}"
+            )
+
+        validated: list[OfficialExpertRangePlan] = []
+        for expert_id, public in zip(normalized_ids, resolved, strict=True):
+            base = f"layers.{normalized_layer}.ffn.experts.{expert_id}"
+            try:
+                private = self._private_expert_plan(
+                    public,
+                    base=base,
+                    layer=normalized_layer,
+                    expert_id=expert_id,
+                )
+                canonical = self._public_expert_plan(
+                    private,
+                    layer=normalized_layer,
+                    expert_id=expert_id,
+                )
+            except DeepSeekPagerError:
+                self._stats.causal_expert_plan_invalid += 1
+                raise
+            if canonical != public:
+                self._stats.causal_expert_plan_invalid += 1
+                raise DeepSeekPagerError(
+                    f"causal expert plan is not canonical for {base}"
+                )
+            validated.append(canonical)
+        self._stats.causal_expert_plan_hits += len(validated)
+        return tuple(validated)
 
     def _read_expert_plan(self, plan: _ExpertReadPlan) -> _CoalescedExpert:
         """Read one pre-resolved plan without any metadata/source discovery."""
@@ -2130,15 +2771,25 @@ class DeepSeekWeightPager:
 
     def _materialize_weight(self, prefix: str) -> _MaterializedWeight:
         weight_name = self._weight_name(prefix)
-        meta = self.source.find(weight_name)
-        storage_dtype = str(meta["dtype"]).upper()
-        logical_bytes = self._payload_bytes(meta)
+        weight_layout = self._dense_layout(weight_name)
+        storage_dtype = weight_layout.dtype
+        logical_bytes = weight_layout.length
+        scale_name: str | None = None
+        scale_layout: _DenseTensorLayout | None = None
+        if storage_dtype in {"F8_E4M3", "F8_E4M3FN", "I8"}:
+            scale_name = weight_name.removesuffix("weight") + "scale"
+            # Resolve and validate both leaves before the first payload byte.
+            scale_layout = self._dense_layout(scale_name)
+            if scale_layout.dtype != "F8_E8M0":
+                raise DeepSeekPagerError(
+                    f"MX scale {scale_name} must be F8_E8M0, got {scale_layout.dtype}"
+                )
         with self._priority_scope(weight_name):
-            raw = self.source.tensor(weight_name)
+            raw = self._dense_tensor_array(weight_layout)
             if storage_dtype in {"F8_E4M3", "F8_E4M3FN"}:
-                scale_name = weight_name.removesuffix("weight") + "scale"
-                scale = self.source.tensor(scale_name)
-                logical_bytes += self._payload_bytes(self.source.find(scale_name))
+                assert scale_name is not None and scale_layout is not None
+                scale = self._dense_tensor_array(scale_layout)
+                logical_bytes += scale_layout.length
                 weight = self._encoded_weight_parts(
                     raw,
                     scale,
@@ -2147,9 +2798,9 @@ class DeepSeekWeightPager:
                     logical_bytes=logical_bytes,
                 )
             elif storage_dtype == "I8":
-                scale_name = weight_name.removesuffix("weight") + "scale"
-                scale = self.source.tensor(scale_name)
-                logical_bytes += self._payload_bytes(self.source.find(scale_name))
+                assert scale_name is not None and scale_layout is not None
+                scale = self._dense_tensor_array(scale_layout)
+                logical_bytes += scale_layout.length
                 weight = self._encoded_weight_parts(
                     raw,
                     scale,
@@ -2680,6 +3331,42 @@ class DeepSeekWeightPager:
             del weight
             self._release_materialized_weight()
 
+    def tensor_rows(
+        self,
+        name: str,
+        row_ids: Iterable[int],
+        *,
+        dtype: Any | None = None,
+        device: str | Any | None = None,
+    ) -> Any:
+        """Read arbitrary 2D rows through the active authenticated address plane."""
+
+        torch = self.torch
+        ids = [int(row_id) for row_id in row_ids]
+        layout = self._dense_layout(name)
+        if len(layout.shape) != 2:
+            raise DeepSeekPagerError(f"row tensor {name} must be 2D")
+        total_rows, columns = layout.shape
+        if any(row_id < 0 or row_id >= total_rows for row_id in ids):
+            raise IndexError(f"tensor row outside [0, {total_rows})")
+        target_device = self.device if device is None else torch.device(device)
+        if not ids:
+            result = torch.empty((0, columns), device=target_device)
+            return result if dtype is None else result.to(dtype=dtype)
+        runs = self._consecutive_runs(ids)
+        by_id: dict[int, np.ndarray] = {}
+        with self._priority_scope(name, 1):
+            arrays = self._dense_row_runs(layout, runs)
+        for (start, _stop), rows in zip(runs, arrays, strict=True):
+            for offset, row in enumerate(rows):
+                by_id[start + offset] = row
+        array = np.stack([by_id[row_id] for row_id in ids])
+        result = torch.from_numpy(np.ascontiguousarray(array))
+        if dtype is not None or target_device.type != "cpu":
+            result = result.to(device=target_device, dtype=dtype or result.dtype)
+        result.requires_grad_(False)
+        return result
+
     def tensor_torch(
         self,
         name: str,
@@ -2690,14 +3377,14 @@ class DeepSeekWeightPager:
         """Load one small control tensor (norm/router/HC), never a quantized matrix."""
 
         torch = self.torch
-        meta = self.source.find(name)
-        storage_dtype = str(meta["dtype"]).upper()
+        layout = self._dense_layout(name)
+        storage_dtype = layout.dtype
         if storage_dtype in {"F8_E4M3", "F8_E4M3FN", "F8_E8M0"}:
             raise DeepSeekPagerError(
                 f"tensor_torch() refuses unscaled float8 tensor {name}"
             )
         with self._priority_scope(name, 1):
-            array = self.source.tensor(name)
+            array = self._dense_tensor_array(layout)
         result = torch.from_numpy(np.ascontiguousarray(array))
         target_device = self.device if device is None else torch.device(device)
         if dtype is not None or target_device.type != "cpu":
@@ -2708,29 +3395,15 @@ class DeepSeekWeightPager:
     def embedding(self, token_ids: Iterable[int], *, name: str = "embed.weight") -> Any:
         """Read only requested embedding rows, coalescing consecutive token IDs."""
 
-        torch = self.torch
         ids = [int(token_id) for token_id in token_ids]
-        meta = self.source.find(name)
-        if len(meta["shape"]) != 2:
-            raise DeepSeekPagerError(f"embedding tensor {name} must be 2D")
-        vocab = int(meta["shape"][0])
-        if any(token_id < 0 or token_id >= vocab for token_id in ids):
-            raise IndexError(f"embedding token outside [0, {vocab})")
-        if not ids:
-            return torch.empty((0, int(meta["shape"][1])), device=self.device)
-
-        runs = self._consecutive_runs(ids)
-        by_id: dict[int, np.ndarray] = {}
-        with self._priority_scope(name, 1):
-            for start, stop in runs:
-                rows = self.source.rows(name, start_row=start, n_rows=stop - start)
-                for offset, row in enumerate(rows):
-                    by_id[start + offset] = row
-        array = np.stack([by_id[token_id] for token_id in ids])
-        self._stats.embedding_rows += len(ids)
-        return torch.from_numpy(np.ascontiguousarray(array)).to(
-            self.device, dtype=self.compute_dtype
+        result = self.tensor_rows(
+            name,
+            ids,
+            dtype=self.compute_dtype,
+            device=self.device,
         )
+        self._stats.embedding_rows += len(ids)
+        return result
 
     def candidate_logits(
         self,
@@ -2745,23 +3418,13 @@ class DeepSeekWeightPager:
         ids = [int(token_id) for token_id in token_ids]
         if not ids:
             raise ValueError("candidate token IDs must not be empty")
-        meta = self.source.find(name)
-        if len(meta["shape"]) != 2:
-            raise DeepSeekPagerError(f"head tensor {name} must be 2D")
-        vocab = int(meta["shape"][0])
-        if any(token_id < 0 or token_id >= vocab for token_id in ids):
-            raise IndexError(f"candidate token outside [0, {vocab})")
-        by_id: dict[int, np.ndarray] = {}
-        with self._priority_scope(name, 1):
-            for start, stop in self._consecutive_runs(ids):
-                rows = self.source.rows(name, start_row=start, n_rows=stop - start)
-                for offset, row in enumerate(rows):
-                    by_id[start + offset] = row
-        rows = [by_id[token_id] for token_id in ids]
         # ParallelHead stores checkpoint BF16 rows as FP32 parameters and
         # explicitly evaluates ``F.linear(x.float(), weight)``.
-        weight = torch.from_numpy(np.ascontiguousarray(rows)).to(
-            self.device, dtype=torch.float32
+        weight = self.tensor_rows(
+            name,
+            ids,
+            dtype=torch.float32,
+            device=self.device,
         )
         x = hidden.to(self.device, dtype=torch.float32)
         self._stats.head_rows += len(ids)
@@ -2829,8 +3492,8 @@ class DeepSeekWeightPager:
             instrument_block_observer
         ):
             raise ValueError("instrument_block_observer must be callable or None")
-        meta = self.source.find(name)
-        shape = tuple(int(value) for value in meta["shape"])
+        layout = self._dense_layout(name)
+        shape = layout.shape
         if len(shape) != 2:
             raise DeepSeekPagerError(f"head tensor {name} must be 2D")
         vocab = shape[0]
@@ -2882,22 +3545,29 @@ class DeepSeekWeightPager:
             for start in range(0, vocab, block_rows)
         )
         self._stats.head_logical_leaves += len(logical_leaves)
-        raw_bytes_many = getattr(self.source, "raw_bytes_many", None)
+        raw_bytes_many = (
+            None
+            if self._causal_tensor_reader is not None
+            else getattr(self.source, "raw_bytes_many", None)
+        )
+        multi_range_capable = self._causal_tensor_reader is not None or callable(
+            raw_bytes_many
+        )
         head_layout = None
-        if transport_range_batch_blocks > 1 and callable(raw_bytes_many):
-            head_layout = self._head_row_layout(meta, block_rows=block_rows)
+        if transport_range_batch_blocks > 1 and multi_range_capable:
+            head_layout = self._head_row_layout(layout, block_rows=block_rows)
 
         if transport_range_batch_blocks == 1:
             for start, count in logical_leaves:
                 with self._priority_scope(name, 1):
-                    rows = self.source.rows(name, start_row=start, n_rows=count)
+                    rows = self._dense_rows_array(layout, start, count)
                 consume_block(start, count, rows)
         elif head_layout is None:
             self._stats.head_transport_fallbacks += 1
             self._stats.head_transport_fallback_leaves += len(logical_leaves)
             for start, count in logical_leaves:
                 with self._priority_scope(name, 1):
-                    rows = self.source.rows(name, start_row=start, n_rows=count)
+                    rows = self._dense_rows_array(layout, start, count)
                 consume_block(start, count, rows)
         else:
             shard, dtype, columns, leaves = head_layout
@@ -2908,10 +3578,10 @@ class DeepSeekWeightPager:
                     self._stats.head_transport_fallbacks += 1
                     self._stats.head_transport_fallback_leaves += 1
                     with self._priority_scope(name, 1):
-                        rows = self.source.rows(
-                            name,
-                            start_row=leaf.start_row,
-                            n_rows=leaf.count,
+                        rows = self._dense_rows_array(
+                            layout,
+                            leaf.start_row,
+                            leaf.count,
                         )
                     consume_block(leaf.start_row, leaf.count, rows)
                     index += 1
@@ -2931,6 +3601,7 @@ class DeepSeekWeightPager:
                 with self._priority_scope(name, 1):
                     tensors = self._read_head_leaf_batch(
                         name=name,
+                        layout=layout,
                         shard=shard,
                         dtype=dtype,
                         columns=columns,
@@ -3020,6 +3691,11 @@ class DeepSeekWeightPager:
 
     def metrics(self) -> dict[str, Any]:
         source_metrics = self.source.metrics()
+        causal_tensor_metrics = (
+            None
+            if self._causal_tensor_reader is None
+            else dict(self._causal_tensor_reader.metrics())
+        )
         with self._prefetch_lock:
             draining = bool(self._draining_prefetch)
             reservoir_active = self._active_expert_reservoir is not None
@@ -3069,6 +3745,8 @@ class DeepSeekWeightPager:
             "expert_reservoir_active": reservoir_active,
             "expert_reservoir_retired": reservoir_retired,
             "causal_weight_reader_attached": self._causal_weight_reader is not None,
+            "causal_tensor_reader_attached": self._causal_tensor_reader is not None,
+            "causal_tensor_reader": causal_tensor_metrics,
             "causal_missing_fallback": self._causal_missing_fallback,
             "source": source_metrics,
         }
@@ -3076,6 +3754,7 @@ class DeepSeekWeightPager:
 
 __all__ = [
     "CausalExpertPlanResolver",
+    "CausalTensorPlanResolver",
     "DeepSeekPagerError",
     "DeepSeekWeightPager",
     "ExpertSourceRange",

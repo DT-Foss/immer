@@ -739,6 +739,79 @@ class StreamedDeepSeekV4Tests(unittest.TestCase):
         self.assertEqual(tokenwise.next_position, len(token_ids[0]))
         self.assertGreater(tokenwise.attention_state_bytes, 0)
 
+    def test_nonzero_batched_suffix_rejects_without_mutating_prefix(self) -> None:
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager, StreamedDeepSeekV4
+
+        model = StreamedDeepSeekV4(
+            _config(4),
+            DeepSeekWeightPager(
+                _CompressedTinyCheckpoint(random_weights=True),
+                device="cpu",
+                compute_dtype="float32",
+            ),
+            max_seq_len=16,
+        )
+        model.prefill([[3, 7, 11]], tokenwise=False)
+        before_position = model.next_position
+        before_bytes = model.attention_state_bytes
+        with self.assertRaisesRegex(ValueError, "exactly one token"):
+            model.prefill([[13, 17]], tokenwise=False, reset=False)
+        self.assertEqual(model.next_position, before_position)
+        self.assertEqual(model.attention_state_bytes, before_bytes)
+        hidden, _evidence = model.decode([[13]])
+        self.assertEqual(tuple(hidden.shape), (1, 1, 128))
+
+    def test_multitoken_suffix_failure_discards_the_complete_request(self) -> None:
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager, StreamedDeepSeekV4
+
+        model = StreamedDeepSeekV4(
+            _config(4),
+            DeepSeekWeightPager(
+                _CompressedTinyCheckpoint(random_weights=True),
+                device="cpu",
+                compute_dtype="float32",
+            ),
+            max_seq_len=16,
+        )
+        model.prefill([[3, 7, 11]], tokenwise=False)
+        original_block = model._block
+
+        def fail_on_second_suffix_token(hidden, layer, ids, start_pos):
+            if int(ids[0, 0].item()) == 17:
+                raise RuntimeError("injected suffix failure")
+            return original_block(hidden, layer, ids, start_pos)
+
+        with mock.patch.object(model, "_block", side_effect=fail_on_second_suffix_token):
+            with self.assertRaisesRegex(RuntimeError, "injected suffix failure"):
+                model.prefill([[13, 17, 19]], tokenwise=True, reset=False)
+        self.assertTrue(model.state_poisoned)
+        self.assertEqual(model.next_position, 0)
+        with self.assertRaisesRegex(RuntimeError, "poisoned"):
+            model.prefill([[23]], tokenwise=True, reset=False)
+        model.reset_state(release=True)
+        self.assertFalse(model.state_poisoned)
+        self.assertEqual(model.attention_state_bytes, 0)
+
+    def test_suffix_context_overflow_is_rejected_before_partial_commit(self) -> None:
+        from immer.runtimes.deepseek_v4 import DeepSeekWeightPager, StreamedDeepSeekV4
+
+        model = StreamedDeepSeekV4(
+            _config(4),
+            DeepSeekWeightPager(
+                _CompressedTinyCheckpoint(random_weights=True),
+                device="cpu",
+                compute_dtype="float32",
+            ),
+            max_seq_len=4,
+        )
+        model.prefill([[3, 7, 11]], tokenwise=False)
+        before_bytes = model.attention_state_bytes
+        with self.assertRaisesRegex(ValueError, "context end 5"):
+            model.prefill([[13, 17]], tokenwise=True, reset=False)
+        self.assertEqual(model.next_position, 3)
+        self.assertEqual(model.attention_state_bytes, before_bytes)
+        self.assertFalse(model.state_poisoned)
+
     def test_crsa_graft_history_is_equal_for_full_and_tokenwise_prefill(self) -> None:
         import torch
 

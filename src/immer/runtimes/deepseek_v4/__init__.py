@@ -11,6 +11,7 @@ from .causal_weights import (
     CAUSAL_WEIGHT_BINDING_SCHEMA,
     CausalTensorBindingReceipt,
     CausalTensorReadReceipt,
+    CausalTensorRangesReadReceipt,
     CausalTensorReader,
     CausalWeightBindingReceipt,
     CausalWeightConflictError,
@@ -34,6 +35,7 @@ from .causal_weights import (
     tensor_range_plan_from_source,
 )
 from .pager import (
+    CausalTensorPlanResolver,
     DeepSeekWeightPager,
     ExpertSourceRange,
     ExpertTensorLayout,
@@ -54,6 +56,18 @@ from .quantization import (
     unpack_fp4_e2m1,
 )
 from .snapshot import DeepSeekV4SnapshotError, SnapshotLimits
+from .semantic_state_cache import (
+    AnchorReceipt,
+    BOUNDARY_KINDS,
+    OrphanGcReceipt,
+    RestoredAnchor,
+    SemanticStateAnchorCache,
+    SemanticStateCacheBudgetError,
+    SemanticStateCacheConflict,
+    SemanticStateCacheError,
+    semantic_label_sha256,
+    token_prefix_sha256,
+)
 from .route_markov import (
     LayerMarkovExpertPredictor,
     LayerMicroWindowPlan,
@@ -69,6 +83,13 @@ from .route_model import (
     write_route_model_artifact,
 )
 from .provenance import runtime_dependency_versions, runtime_source_manifest
+from .runtime_source import (
+    DeepSeekRuntimeSource,
+    DeepSeekRuntimeSourceError,
+    GENERAL_DENSE_COVERAGE_CAPABILITY,
+    open_deepseek_runtime_source,
+    shareable_runtime_evidence,
+)
 from .layerwise import (
     LAYERWISE_SCHEMA,
     OFFICIAL_SOURCE_SAFE_BYTES,
@@ -80,10 +101,14 @@ from .layerwise import (
 )
 
 __all__ = [
+    "AnchorReceipt",
+    "BOUNDARY_KINDS",
     "CAUSAL_TENSOR_BINDING_SCHEMA",
     "CAUSAL_WEIGHT_BINDING_SCHEMA",
     "CausalTensorBindingReceipt",
+    "CausalTensorPlanResolver",
     "CausalTensorReadReceipt",
+    "CausalTensorRangesReadReceipt",
     "CausalTensorReader",
     "CausalWeightBindingReceipt",
     "CausalWeightConflictError",
@@ -98,11 +123,14 @@ __all__ = [
     "CausalWeightReader",
     "DeepSeekV4Config",
     "DeepSeekV4SnapshotError",
+    "DeepSeekRuntimeSource",
+    "DeepSeekRuntimeSourceError",
     "DeepSeekWeightPager",
     "ExpertBindingReceipt",
     "ExpertSourceRange",
     "ExpertTensorLayout",
     "GenerationEvidence",
+    "GENERAL_DENSE_COVERAGE_CAPABILITY",
     "LAYERWISE_SCHEMA",
     "LayerwiseError",
     "LayerwiseItem",
@@ -114,11 +142,17 @@ __all__ = [
     "OFFICIAL_SOURCE_SAFE_BYTES",
     "OneTokenEvidence",
     "OfficialExpertRangePlan",
+    "OrphanGcReceipt",
     "MicroWindowPrediction",
     "ROUTE_MODEL_SCHEMA",
+    "RestoredAnchor",
     "RouteModelArtifact",
     "RouteModelArtifactError",
     "StatefulEvidence",
+    "SemanticStateAnchorCache",
+    "SemanticStateCacheBudgetError",
+    "SemanticStateCacheConflict",
+    "SemanticStateCacheError",
     "StreamedDeepSeekV4",
     "SnapshotLimits",
     "TensorBindingReceipt",
@@ -133,12 +167,16 @@ __all__ = [
     "quantize_dequantize_fp8",
     "quantize_fp8_e4m3_parts",
     "plan_micro_window_prefetch",
+    "open_deepseek_runtime_source",
     "load_route_model_artifact",
     "runtime_dependency_versions",
     "runtime_source_manifest",
+    "shareable_runtime_evidence",
     "semantic_expert_key",
+    "semantic_label_sha256",
     "semantic_tensor_key",
     "tensor_range_plan_from_source",
+    "token_prefix_sha256",
     "unpack_fp4_e2m1",
     "write_route_model_artifact",
 ]

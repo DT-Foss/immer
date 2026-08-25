@@ -11,6 +11,7 @@ scores without scanning the one-gibibyte vocabulary head.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import math
@@ -25,13 +26,17 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from immer.knowledge import Streamer
+from immer.knowledge import AccessTraceRecorder, Streamer
 from immer.runtimes.deepseek_v4 import (
+    DeepSeekRuntimeSource,
+    DeepSeekRuntimeSourceError,
     DeepSeekV4Config,
     DeepSeekWeightPager,
     StreamedDeepSeekV4,
+    open_deepseek_runtime_source,
     runtime_dependency_versions,
     runtime_source_manifest,
+    shareable_runtime_evidence,
 )
 from immer.runtimes.deepseek_v4.benchmark import (
     JOURNAL_GENESIS_SHA256,
@@ -142,6 +147,137 @@ def _atomic_write_json(path: Path, document: Mapping[str, Any]) -> None:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _pretty_json_bytes(document: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            document,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _atomic_create_bytes(path: Path, encoded: bytes, *, label: str) -> None:
+    target = path.expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        raise RunnerError(f"{label} already exists: {target}")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, target, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise RunnerError(f"{label} already exists: {target}") from exc
+        directory = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _preflight_new_artifact(path: Path, *, label: str) -> Path:
+    target = path.expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        raise RunnerError(f"{label} already exists: {target}")
+    descriptor: int | None = None
+    temporary: str | None = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{target.name}.preflight-", dir=target.parent
+        )
+        os.close(descriptor)
+        descriptor = None
+    except OSError as exc:
+        raise RunnerError(f"cannot prepare {label} destination: {target}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+    return target
+
+
+def _preflight_trace_outputs(args: argparse.Namespace) -> tuple[Path, Path] | None:
+    if args.access_trace is None:
+        return None
+    if args.resume:
+        raise RunnerError(
+            "--access-trace requires a fresh non-resumed run so every source "
+            "operation is present"
+        )
+    trace = Path(args.access_trace).expanduser().resolve()
+    report = Path(args.output).expanduser().resolve()
+    journal = Path(args.journal).expanduser().resolve()
+    if trace in {report, journal} or report == journal:
+        raise RunnerError("trace, journal, and report paths must be distinct")
+    # Both externally visible commit targets are proven new and writable before
+    # dataset parsing, source construction, or model execution starts.
+    _preflight_new_artifact(trace, label="access trace")
+    _preflight_new_artifact(report, label="benchmark report")
+    return trace, report
+
+
+def _seal_access_trace(
+    recorder: AccessTraceRecorder | None,
+    destination: str | None,
+) -> tuple[dict[str, Any], tuple[Path, bytes] | None]:
+    if recorder is None:
+        if destination is not None:
+            raise RunnerError("access trace destination has no recorder")
+        return {"enabled": False}, None
+    if destination is None:
+        raise RunnerError("access trace recorder has no destination")
+    metrics = recorder.metrics()
+    if metrics["dropped_capacity"] or metrics["dropped_identity"]:
+        raise RunnerError("access trace dropped source operations")
+    trace = recorder.snapshot()
+    trace.verify()
+    target = Path(destination).expanduser().resolve()
+    receipt = {
+        "artifact": target.name,
+        "enabled": True,
+        "leaves": metrics["leaves"],
+        "operations": metrics["operations"],
+        "sha256": trace.sha256,
+    }
+    return receipt, (target, trace.to_bytes())
+
+
+def _publish_trace_then_report(
+    *,
+    trace_payload: tuple[Path, bytes],
+    report_path: Path,
+    report: Mapping[str, Any],
+) -> None:
+    trace_path, trace_bytes = trace_payload
+    _atomic_create_bytes(trace_path, trace_bytes, label="access trace")
+    try:
+        _atomic_create_bytes(
+            report_path,
+            _pretty_json_bytes(report),
+            label="benchmark report",
+        )
+    except BaseException as exc:
+        raise RunnerError(
+            "benchmark report publication failed after the authenticated trace "
+            f"was committed; orphan trace artifact={trace_path.name!r}; this run "
+            "did not publish a report"
+        ) from exc
 
 
 class JsonlJournal:
@@ -510,38 +646,25 @@ def _load_tokenizer(
     return LocalTokenizer.from_bytes(raw, location="source:tokenizer.json")
 
 
-def _local_source(value: str) -> Path | None:
-    raw = value.removeprefix("local:") if value.startswith("local:") else value
-    candidate = Path(raw).expanduser()
-    explicit_path = (
-        value.startswith("local:")
-        or candidate.is_absolute()
-        or raw.startswith(("./", "../"))
-    )
-    if explicit_path:
-        return candidate.resolve()
-    return candidate.resolve() if candidate.is_dir() else None
-
-
-def _build_source(args: argparse.Namespace) -> tuple[Streamer, str]:
-    cache_dir = Path(args.cache_dir).expanduser().resolve()
-    common = {
-        "revision": args.revision,
-        "budget_mb": args.source_budget_mb,
-        "cache_dir": cache_dir,
-        "use_cache": not args.no_cache,
-        "max_cache_bytes": int(args.cache_budget_mb * 1024**2),
-        "verbose": False,
-    }
-    local = _local_source(args.source)
-    if local is not None:
-        if not local.is_dir():
-            raise RunnerError(f"local checkpoint does not exist: {local}")
-        return Streamer.from_local(local, **common), f"local:{local}"
-    source = Streamer(args.source, **common)
-    if re.fullmatch(r"[0-9a-fA-F]{40,64}", args.revision) is None:
-        raise RunnerError("remote checkpoints require an immutable revision digest")
-    return source, args.source
+def _build_source(
+    args: argparse.Namespace,
+    recorder: AccessTraceRecorder | None = None,
+) -> DeepSeekRuntimeSource:
+    try:
+        return open_deepseek_runtime_source(
+            source=args.source,
+            revision=args.revision,
+            logical_repo_id=args.logical_repo_id,
+            causal_bundle=args.causal_bundle,
+            budget_mb=args.source_budget_mb,
+            cache_dir=args.cache_dir,
+            use_cache=not args.no_cache,
+            max_cache_bytes=int(args.cache_budget_mb * 1024**2),
+            access_observer=recorder,
+            require_remote_pinned_revision=True,
+        )
+    except (DeepSeekRuntimeSourceError, FileNotFoundError) as exc:
+        raise RunnerError(str(exc)) from exc
 
 
 def _load_config(
@@ -1402,7 +1525,7 @@ def _build_report(
         "contract_schema": SCHEMA_VERSION,
         "signature": header["signature"],
         "status": "complete" if journal.complete else "incomplete",
-        "journal": str(journal.path),
+        "journal": journal.path.name,
         "expected_item_runs": expected,
         "completed_item_runs": len(records),
         "journal_integrity": {
@@ -1437,6 +1560,13 @@ def _build_report(
         "prompt_protocols": header["prompt_protocols"],
         "assistant_generation_prefixes": header["assistant_generation_prefixes"],
         "candidate_tokenizations": header["candidate_tokenizations"],
+        "causal_weight_reader_attached": header[
+            "causal_weight_reader_attached"
+        ],
+        "causal_tensor_reader_attached": header[
+            "causal_tensor_reader_attached"
+        ],
+        "causal_missing_fallback": header["causal_missing_fallback"],
         "quantized_accumulation_policy": header["quantized_accumulation_policy"],
         "attention_qat_policy": header["attention_qat_policy"],
         "expert_prefetch_policy": header["expert_prefetch_policy"],
@@ -1470,11 +1600,15 @@ def _build_report(
         "budgets": {
             "source_limit_bytes_per_process": int(source.budget.limit),
             "source_used_bytes_this_process": int(source.bytes_moved()),
-            "cache_limit_bytes": int(args.cache_budget_mb * 1024**2),
-            "cache_enabled": not args.no_cache,
+            "cache_limit_bytes": (
+                0
+                if args.causal_bundle is not None
+                else int(args.cache_budget_mb * 1024**2)
+            ),
+            "cache_enabled": not args.no_cache and args.causal_bundle is None,
         },
-        "source_metrics_this_process": source.metrics(),
-        "pager_metrics_this_process": pager.metrics(),
+        "source_metrics_this_process": shareable_runtime_evidence(source.metrics()),
+        "pager_metrics_this_process": shareable_runtime_evidence(pager.metrics()),
     }
 
 
@@ -1489,6 +1623,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--task", required=True, choices=("mmlu", "gsm8k"))
     parser.add_argument("--source", default=OFFICIAL_SOURCE)
+    parser.add_argument(
+        "--causal-bundle",
+        help="local bundle with authenticated complete dense-weight coverage",
+    )
+    parser.add_argument("--logical-repo-id", default=OFFICIAL_SOURCE)
+    parser.add_argument(
+        "--access-trace",
+        help="create a complete authenticated source-range trace after success",
+    )
     parser.add_argument("--revision", default=OFFICIAL_REVISION)
     parser.add_argument("--config", default=None)
     parser.add_argument("--tokenizer-json", default=None)
@@ -1548,6 +1691,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    trace_targets = _preflight_trace_outputs(args)
     task = BenchmarkTask(args.task)
     modes = _parse_modes(args.modes)
     seeds = _parse_seeds(args.seeds)
@@ -1555,7 +1699,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         Path(args.dataset), maximum_bytes=int(args.max_dataset_mb * 1024**2)
     )
     selected_rows = rows[: args.limit] if args.limit is not None else rows
-    source, source_label = _build_source(args)
+    recorder = AccessTraceRecorder() if args.access_trace is not None else None
+    if (trace_targets is None) != (recorder is None):
+        raise RunnerError("access trace preflight/recorder state is inconsistent")
+    runtime_source = _build_source(args, recorder)
     try:
         return _run_with_source(
             args,
@@ -1564,13 +1711,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             seeds=seeds,
             rows=rows,
             selected_rows=selected_rows,
-            source=source,
-            source_label=source_label,
+            source=runtime_source.source,
+            source_label=runtime_source.label,
+            causal_weight_reader=runtime_source.causal_weight_reader,
+            causal_tensor_reader=runtime_source.causal_tensor_reader,
+            access_trace_recorder=recorder,
+            trace_targets=trace_targets,
         )
     finally:
-        close = getattr(source, "close", None)
-        if callable(close):
-            close()
+        runtime_source.close()
 
 
 def _run_with_source(
@@ -1583,6 +1732,10 @@ def _run_with_source(
     selected_rows: list[dict[str, Any]],
     source: Streamer,
     source_label: str,
+    causal_weight_reader: Any | None = None,
+    causal_tensor_reader: Any | None = None,
+    access_trace_recorder: AccessTraceRecorder | None = None,
+    trace_targets: tuple[Path, Path] | None = None,
 ) -> dict[str, Any]:
     config, config_meta = _load_config(args, source)
     tokenizer = _load_tokenizer(args, source, selected_rows, task)
@@ -1610,6 +1763,9 @@ def _run_with_source(
         compute_dtype=args.dtype,
         simulate_activation_quantization=not args.no_activation_quantization,
         expert_prefetch=not args.no_expert_prefetch,
+        causal_weight_reader=causal_weight_reader,
+        causal_tensor_reader=causal_tensor_reader,
+        causal_missing_fallback=False,
     )
     inventory_sha = _digest_or_canonical(
         source_identity_metrics.get("inventory_source_fingerprint"), inventory
@@ -1638,7 +1794,7 @@ def _run_with_source(
         tokenizer_sha256=tokenizer_sha,
         dataset=dataset_provenance,
         harness_revision=f"script-sha256:{script_sha}",
-        command=tuple(sys.argv),
+        command=tuple(shareable_runtime_evidence(tuple(sys.argv))),
         protocol={
             "benchmark_protocols": benchmark_protocols,
             "prompt_protocols": prompt_protocols,
@@ -1646,6 +1802,9 @@ def _run_with_source(
             "assistant_generation_prefixes": assistant_generation_prefixes,
             "candidate_tokenizations": candidate_tokenizations,
             "candidate_suffixes_are_scored_after_recorded_prompt": True,
+            "causal_weight_reader_attached": causal_weight_reader is not None,
+            "causal_tensor_reader_attached": causal_tensor_reader is not None,
+            "causal_missing_fallback": False,
             "activation_quantization": not args.no_activation_quantization,
             "quantized_accumulation_policy": (
                 DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
@@ -1688,19 +1847,26 @@ def _run_with_source(
             "runtime_dependency_sha256": runtime_dependency_sha256,
             "runtime_dependencies": runtime_dependencies,
             "tokenizer_location": (
-                "pretokenized-token-ids/v1" if tokenizer is None else tokenizer.location
+                "pretokenized-token-ids/v1"
+                if tokenizer is None
+                else shareable_runtime_evidence(tokenizer.location)
             ),
         },
     )
     signature_payload = {
         "harness_sha256": script_sha,
         "source": source_label,
+        "causal_bundle": args.causal_bundle is not None,
+        "logical_repo_id": args.logical_repo_id,
+        "access_trace_enabled": access_trace_recorder is not None,
         "revision": args.revision,
         "config_sha256": config_meta["sha256"],
         "inventory_sha256": inventory_sha,
         "tokenizer_sha256": tokenizer_sha,
         "tokenizer_location": (
-            "pretokenized-token-ids/v1" if tokenizer is None else tokenizer.location
+            "pretokenized-token-ids/v1"
+            if tokenizer is None
+            else shareable_runtime_evidence(tokenizer.location)
         ),
         "dataset": asdict(dataset_provenance),
         "task": task.value,
@@ -1709,6 +1875,9 @@ def _run_with_source(
         "prompt_protocols": prompt_protocols,
         "assistant_generation_prefixes": assistant_generation_prefixes,
         "candidate_tokenizations": candidate_tokenizations,
+        "causal_weight_reader_attached": causal_weight_reader is not None,
+        "causal_tensor_reader_attached": causal_tensor_reader is not None,
+        "causal_missing_fallback": False,
         "modes": modes,
         "seeds": seeds,
         "seed_protocol": {mode: list(_mode_seeds(mode, seeds)) for mode in modes},
@@ -1761,8 +1930,10 @@ def _run_with_source(
         "eos_token_ids": tuple(args.eos_token_ids),
         "source_budget_mb": args.source_budget_mb,
         "cache_budget_mb": args.cache_budget_mb,
-        "cache_dir": str(Path(args.cache_dir).expanduser().resolve()),
-        "cache_enabled": not args.no_cache,
+        "cache_dir": shareable_runtime_evidence(
+            str(Path(args.cache_dir).expanduser().resolve())
+        ),
+        "cache_enabled": not args.no_cache and args.causal_bundle is None,
         "preflight": args.preflight,
         "thinking_mode": args.thinking_mode,
         "reasoning_effort": args.reasoning_effort,
@@ -1787,6 +1958,9 @@ def _run_with_source(
         "prompt_protocols": prompt_protocols,
         "assistant_generation_prefixes": assistant_generation_prefixes,
         "candidate_tokenizations": candidate_tokenizations,
+        "causal_weight_reader_attached": causal_weight_reader is not None,
+        "causal_tensor_reader_attached": causal_tensor_reader is not None,
+        "causal_missing_fallback": False,
         "quantized_accumulation_policy": (
             DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
         ),
@@ -1829,7 +2003,11 @@ def _run_with_source(
         "selected_item_ids": [str(row["id"]) for row in selected_rows],
         "budgets": {
             "source_bytes": int(args.source_budget_mb * 1024**2),
-            "cache_bytes": int(args.cache_budget_mb * 1024**2),
+            "cache_bytes": (
+                0
+                if args.causal_bundle is not None
+                else int(args.cache_budget_mb * 1024**2)
+            ),
         },
     }
     expected_keys = tuple(
@@ -1859,19 +2037,31 @@ def _run_with_source(
             model = _model_for_mode(config, pager, args, mode, seed)
             try:
                 for row in pending:
-                    record = _item_record(
-                        mode=mode,
-                        seed=seed,
-                        row=row,
-                        plan=plans[str(row["id"])],
-                        task=task,
-                        model=model,
-                        pager=pager,
-                        source=source,
-                        tokenizer=tokenizer,
-                        args=args,
-                        signature=signature,
+                    scope = (
+                        access_trace_recorder.scope(
+                            phase="benchmark_item",
+                            task=task.value,
+                            mode=mode,
+                            seed=seed,
+                            item_id=str(row["id"]),
+                        )
+                        if access_trace_recorder is not None
+                        else nullcontext()
                     )
+                    with scope:
+                        record = _item_record(
+                            mode=mode,
+                            seed=seed,
+                            row=row,
+                            plan=plans[str(row["id"])],
+                            task=task,
+                            model=model,
+                            pager=pager,
+                            source=source,
+                            tokenizer=tokenizer,
+                            args=args,
+                            signature=signature,
+                        )
                     journal.append_item(record)
                     new_records += 1
             finally:
@@ -1879,9 +2069,9 @@ def _run_with_source(
                 del model
                 pager.release()
     pager.release()
-    close = getattr(source, "close", None)
-    if callable(close):
-        close()
+    access_trace, trace_payload = _seal_access_trace(
+        access_trace_recorder, args.access_trace
+    )
     report = _build_report(
         journal,
         source=source,
@@ -1891,16 +2081,37 @@ def _run_with_source(
         seeds=seeds,
         selected_rows=selected_rows,
     )
-    _atomic_write_json(Path(args.output), report)
+    report["access_trace"] = access_trace
+    if trace_payload is not None:
+        if trace_targets is None:
+            raise RunnerError("trace payload exists without preflight targets")
+        expected_trace, expected_report = trace_targets
+        if trace_payload[0] != expected_trace:
+            raise RunnerError("sealed trace destination differs from preflight")
+        _publish_trace_then_report(
+            trace_payload=trace_payload,
+            report_path=expected_report,
+            report=report,
+        )
+    else:
+        _atomic_write_json(Path(args.output), report)
+    operator_paths = {
+        "journal": str(Path(args.journal).expanduser().resolve()),
+        "report": str(Path(args.output).expanduser().resolve()),
+    }
+    if args.access_trace is not None:
+        operator_paths["access_trace"] = str(
+            Path(args.access_trace).expanduser().resolve()
+        )
     return {
+        "access_trace": access_trace,
         "status": report["status"],
         "signature": signature,
         "new_item_runs": new_records,
         "completed_item_runs": report["completed_item_runs"],
         "expected_item_runs": report["expected_item_runs"],
         "journal_tip_sha256": report["journal_integrity"]["tip_sha256"],
-        "journal": str(Path(args.journal).expanduser().resolve()),
-        "report": str(Path(args.output).expanduser().resolve()),
+        "operator_paths": operator_paths,
     }
 
 

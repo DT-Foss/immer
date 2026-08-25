@@ -51,6 +51,11 @@ def _canonical(value) -> bytes:
     ).encode("utf-8")
 
 
+def _tensor_sha256(value: torch.Tensor) -> str:
+    tensor = value.detach().to(device="cpu").contiguous()
+    return hashlib.sha256(tensor.view(torch.uint8).numpy().tobytes()).hexdigest()
+
+
 class _DifferentSource(_CompressedTinyCheckpoint):
     def metrics(self) -> dict:
         result = super().metrics()
@@ -119,6 +124,67 @@ class DeepSeekV4SnapshotTests(unittest.TestCase):
 
             actual, _ = restored.decode(next_token)
             torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    def test_restored_prefix_accepts_arbitrary_tokenwise_suffix_bit_exactly(
+        self,
+    ) -> None:
+        prefix = [[3, 10, 17, 24, 31, 38, 45]]
+        suffix = [[52, 59, 66, 73]]
+        uninterrupted = self._compressed_model(4, graft=True)
+        uninterrupted.prefill(prefix, tokenwise=False)
+        expected, expected_evidence = uninterrupted.prefill(
+            suffix,
+            tokenwise=True,
+            reset=False,
+        )
+
+        with self._temporary_directory() as directory:
+            root = Path(directory)
+            prefix_path = root / "prefix.json"
+            source = self._compressed_model(4, graft=True)
+            prefix_hidden, _ = source.prefill(prefix, tokenwise=False)
+            prefix_receipt = source.save_state(prefix_path)
+            self.assertEqual(
+                prefix_receipt["final_hidden_sha256"],
+                _tensor_sha256(prefix_hidden[:, -1:]),
+            )
+
+            restored = self._compressed_model(4, graft=True)
+            loaded = restored.load_state(prefix_path)
+            self.assertEqual(
+                loaded["final_hidden_sha256"],
+                prefix_receipt["final_hidden_sha256"],
+            )
+            self.assertEqual(
+                restored.last_hidden_sha256,
+                prefix_receipt["final_hidden_sha256"],
+            )
+            actual, actual_evidence = restored.prefill(
+                suffix,
+                tokenwise=True,
+                reset=False,
+            )
+            expected_state = uninterrupted.save_state(root / "expected" / "state.json")
+            actual_state = restored.save_state(root / "actual" / "state.json")
+
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+        self.assertEqual(restored.last_hidden_sha256, _tensor_sha256(actual[:, -1:]))
+        self.assertEqual(
+            [(row.start_pos, row.end_pos) for row in actual_evidence],
+            [(7, 8), (8, 9), (9, 10), (10, 11)],
+        )
+        self.assertEqual(
+            tuple(replace(row, seconds=0.0) for row in actual_evidence),
+            tuple(replace(row, seconds=0.0) for row in expected_evidence),
+        )
+        self.assertEqual(restored.next_position, 11)
+        self.assertEqual(
+            actual_state["payload_sha256"], expected_state["payload_sha256"]
+        )
+        self.assertEqual(
+            actual_state["manifest_body_sha256"],
+            expected_state["manifest_body_sha256"],
+        )
 
     def test_transport_neutral_prefix_restores_across_exact_prefetch_arms(self) -> None:
         config = replace(

@@ -13,7 +13,6 @@ import hashlib
 import json
 import math
 from pathlib import Path
-import re
 import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -22,11 +21,15 @@ import pyarrow.parquet as parquet
 
 from immer.knowledge import Streamer
 from immer.runtimes.deepseek_v4 import (
+    DeepSeekRuntimeSource,
+    DeepSeekRuntimeSourceError,
     DeepSeekV4Config,
     DeepSeekWeightPager,
     LayerwiseItem,
     LayerwiseScorer,
     StreamedDeepSeekV4,
+    open_deepseek_runtime_source,
+    shareable_runtime_evidence,
 )
 from immer.runtimes.deepseek_v4.encoding import encode_user_prompt
 
@@ -41,7 +44,6 @@ DEFAULT_TOKENIZER = (
 DEFAULT_RUN_DIR = ROOT / "artifacts" / "private" / "deepseek-v4-layerwise"
 DEFAULT_CACHE = ROOT / "artifacts" / "private" / "deepseek-v4-cache"
 ASSISTANT_PREFIX = "Answer:"
-_PINNED_REVISION = re.compile(r"[0-9a-fA-F]{40,64}")
 
 
 class CliError(RuntimeError):
@@ -88,6 +90,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", default=str(DEFAULT_DATASET))
     parser.add_argument("--tokenizer-json", default=str(DEFAULT_TOKENIZER))
     parser.add_argument("--source", default=OFFICIAL_SOURCE)
+    parser.add_argument(
+        "--causal-bundle",
+        help="local bundle with authenticated complete dense-weight coverage",
+    )
+    parser.add_argument("--logical-repo-id", default=OFFICIAL_SOURCE)
     parser.add_argument("--revision", default=OFFICIAL_REVISION)
     parser.add_argument("--config")
     parser.add_argument("--run-dir", default=str(DEFAULT_RUN_DIR))
@@ -155,27 +162,21 @@ def _read_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _source(args: argparse.Namespace) -> tuple[Streamer, str]:
-    cache = Path(args.cache_dir).expanduser().resolve()
-    common = {
-        "revision": args.revision,
-        "budget_mb": args.source_budget_mb,
-        "cache_dir": cache,
-        "use_cache": not args.no_cache,
-        "max_cache_bytes": int(args.cache_budget_gb * 1024**3),
-        "verbose": False,
-    }
-    raw = args.source.removeprefix("local:")
-    candidate = Path(raw).expanduser()
-    is_path = args.source.startswith("local:") or candidate.is_absolute() or raw.startswith(("./", "../"))
-    if is_path:
-        local = candidate.resolve()
-        if not local.is_dir():
-            raise CliError(f"local checkpoint directory does not exist: {local}")
-        return Streamer.from_local(local, **common), f"local:{local}"
-    if _PINNED_REVISION.fullmatch(args.revision) is None:
-        raise CliError("remote source requires an immutable revision digest")
-    return Streamer(args.source, **common), args.source
+def _source(args: argparse.Namespace) -> DeepSeekRuntimeSource:
+    try:
+        return open_deepseek_runtime_source(
+            source=args.source,
+            revision=args.revision,
+            logical_repo_id=args.logical_repo_id,
+            causal_bundle=args.causal_bundle,
+            budget_mb=args.source_budget_mb,
+            cache_dir=args.cache_dir,
+            use_cache=not args.no_cache,
+            max_cache_bytes=int(args.cache_budget_gb * 1024**3),
+            require_remote_pinned_revision=True,
+        )
+    except (DeepSeekRuntimeSourceError, FileNotFoundError) as exc:
+        raise CliError(str(exc)) from exc
 
 
 def _config(args: argparse.Namespace, source: Streamer) -> tuple[DeepSeekV4Config, str]:
@@ -308,20 +309,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.limit is not None:
         rows = rows[: args.limit]
     tokenizer = LocalTokenizer(Path(args.tokenizer_json))
-    source, source_label = _source(args)
+    runtime_source = _source(args)
     try:
         return _run_with_source(
             args,
             dataset=dataset,
             rows=rows,
             tokenizer=tokenizer,
-            source=source,
-            source_label=source_label,
+            source=runtime_source.source,
+            source_label=runtime_source.label,
+            causal_weight_reader=runtime_source.causal_weight_reader,
+            causal_tensor_reader=runtime_source.causal_tensor_reader,
         )
     finally:
-        close = getattr(source, "close", None)
-        if callable(close):
-            close()
+        runtime_source.close()
 
 
 def _run_with_source(
@@ -332,6 +333,8 @@ def _run_with_source(
     tokenizer: LocalTokenizer,
     source: Streamer,
     source_label: str,
+    causal_weight_reader: Any | None = None,
+    causal_tensor_reader: Any | None = None,
 ) -> dict[str, Any]:
     config, config_sha256 = _config(args, source)
     items = _items(rows, tokenizer, config, args)
@@ -341,57 +344,80 @@ def _run_with_source(
         compute_dtype=args.dtype,
         simulate_activation_quantization=not args.no_activation_quantization,
         expert_prefetch=not args.no_expert_prefetch,
+        causal_weight_reader=causal_weight_reader,
+        causal_tensor_reader=causal_tensor_reader,
+        causal_missing_fallback=False,
     )
-    model = StreamedDeepSeekV4(
-        config,
-        pager,
-        max_batch_size=args.microbatch_size,
-        max_seq_len=args.max_prompt_tokens,
-    )
-    if args.preflight != "none":
-        model.checkpoint_preflight(exhaustive_experts=args.preflight == "exhaustive")
-    scorer = LayerwiseScorer(
-        model,
-        items,
-        run_dir=args.run_dir,
-        modes=_modes(args.modes),
-        microbatch_size=args.microbatch_size,
-        padding=args.padding,
-        graft_layer=args.graft_layer,
-        graft_alpha=args.graft_alpha,
-        graft_seed=args.graft_seed,
-        tokenizer_sha256=tokenizer.sha256,
-        dataset_sha256=hashlib.sha256(dataset.read_bytes()).hexdigest(),
-        config_sha256=config_sha256,
-        require_full_source_disk=args.require_full_source_disk,
-        source_cache_reserve_bytes=int(args.cache_budget_gb * 1024**3),
-        disk_margin_bytes=int(args.disk_margin_gb * 1024**3),
-    )
+    try:
+        model = StreamedDeepSeekV4(
+            config,
+            pager,
+            max_batch_size=args.microbatch_size,
+            max_seq_len=args.max_prompt_tokens,
+        )
+        if args.preflight != "none":
+            model.checkpoint_preflight(
+                exhaustive_experts=args.preflight == "exhaustive"
+            )
+        scorer = LayerwiseScorer(
+            model,
+            items,
+            run_dir=args.run_dir,
+            modes=_modes(args.modes),
+            microbatch_size=args.microbatch_size,
+            padding=args.padding,
+            graft_layer=args.graft_layer,
+            graft_alpha=args.graft_alpha,
+            graft_seed=args.graft_seed,
+            tokenizer_sha256=tokenizer.sha256,
+            dataset_sha256=hashlib.sha256(dataset.read_bytes()).hexdigest(),
+            config_sha256=config_sha256,
+            require_full_source_disk=args.require_full_source_disk,
+            source_cache_reserve_bytes=(
+                0
+                if args.causal_bundle is not None
+                else int(args.cache_budget_gb * 1024**3)
+            ),
+            disk_margin_bytes=int(args.disk_margin_gb * 1024**3),
+        )
+    except BaseException:
+        pager.release()
+        raise
     source_transfer_budget = int(args.source_budget_mb * 1024**2)
     if source_transfer_budget < scorer.plan.official_source_safe_bytes:
+        pager.release()
         raise CliError(
             "source transfer budget is below the checkpoint safe cap: "
             f"{source_transfer_budget} < {scorer.plan.official_source_safe_bytes} bytes"
         )
     if args.dry_run:
-        return {
+        receipt = {
             "status": "planned",
             "source": source_label,
             "source_transfer_budget_bytes": source_transfer_budget,
-            "run_dir": str(Path(args.run_dir).expanduser().absolute()),
+            "run_dir": shareable_runtime_evidence(
+                str(Path(args.run_dir).expanduser().absolute())
+            ),
             **scorer.plan_dict(),
         }
+        pager.release()
+        return receipt
 
     def progress(row: Mapping[str, Any]) -> None:
         if row.get("event") == "layer_complete":
             sys.stderr.write(json.dumps(dict(row), sort_keys=True) + "\n")
             sys.stderr.flush()
 
-    result = scorer.run(resume=args.resume, progress=progress)
+    try:
+        result = scorer.run(resume=args.resume, progress=progress)
+    finally:
+        pager.release()
     return {
         "status": "complete",
         "source": source_label,
-        "run_dir": str(Path(args.run_dir).expanduser().absolute()),
+        "run_dir": shareable_runtime_evidence(
+            str(Path(args.run_dir).expanduser().absolute())
+        ),
         "result_body_sha256": _canonical_digest(result),
         "summaries": _accuracy(result),
         "result": result,

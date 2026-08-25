@@ -4,6 +4,44 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-25
 
+### DeepSeek-V4 frontier streaming and live causal crystallization
+
+- Added arbitrary exact suffix continuation after live or restored DeepSeek-V4
+  prefixes. Multi-token suffixes execute through the checkpoint's native
+  one-token transition, reject overflow before mutation, and clear the whole
+  request on an in-flight failure.
+- Added native semantic compute-battery anchors for DeepSeek-V4 with deepest
+  prefix restore, model-bound final-hidden seeds, snapshot-first publication,
+  deterministic byte-bounded LRU, fail-closed empty-target restore, and
+  manifest-owned orphan recovery.
+- Added one owned local/remote/causal runtime factory and wired it into the PoC,
+  layerwise scorer, and benchmark runner. Trace-sparse bundles are rejected by
+  general runners; only bundles carrying authenticated full-dense coverage are
+  admitted. Benchmark access traces commit before their reports and contain no
+  shareable absolute paths.
+- Routed every dense, control, embedding, I64 router, candidate-head, scalar
+  head, and batched full-head read through the revision-bound causal tensor
+  reader. Expert and dense rails remain separate, missing bindings have no
+  fallback, and bounded zero-gap multi-range receipts account for every byte.
+- Added crash-safe live expert append. Exact remote leaves are staged and
+  hashed before sparse-shard mutation, shard bytes become durable before graph
+  visibility, and offline retry reconciles every durable crash boundary.
+- Added dense bundle promotion for the exact `1,564`-tensor main-decoder
+  contract. The official bundle authenticates `8,845,959,388` dense bytes,
+  materializes only the missing `2,136,760,320` bytes, publishes `1,564`
+  tensor bindings, and exposes the general dense capability only after complete
+  payload and graph verification.
+- Transferred the official logical `166.9 GB` checkpoint as a roughly `12 GB`
+  physical sparse causal bundle to Beast. A transported 83-token state required
+  six new expert rails and then completed all 43 layers locally in `167.764 s`.
+  MPS and CPU state are structurally identical but numerically distinct, so the
+  transported state remains a proposal. Target adjudication selected the same
+  top token on both paths: token `12747`, decoded as the FERTIG-certified exact
+  answer `450`; their Top-10 sets are identical with eight equal rank slots.
+- Verified the complete repository with `1238/1238` tests, the DeepSeek scope
+  with `419` tests plus `111` subtests, and the Qwen causal regression scope
+  with `54/54` tests.
+
 ### Qwen compute batteries
 
 - Added exact native continuation batteries over authenticated Qwen snapshots.

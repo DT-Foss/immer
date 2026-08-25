@@ -38,11 +38,14 @@ from typing import Any, Sequence, TextIO
 
 from immer.knowledge import Streamer
 from immer.runtimes.deepseek_v4 import (
+    DeepSeekRuntimeSource,
     DeepSeekV4Config,
     DeepSeekWeightPager,
     StreamedDeepSeekV4,
+    open_deepseek_runtime_source,
     runtime_dependency_versions,
     runtime_source_manifest,
+    shareable_runtime_evidence,
 )
 from immer.runtimes.deepseek_v4.graft import DeepSeekV4CrsaGraft
 
@@ -196,34 +199,18 @@ def _hardware_metadata() -> dict[str, Any]:
     }
 
 
-def _local_source_path(value: str) -> Path | None:
-    raw = value.removeprefix("local:") if value.startswith("local:") else value
-    candidate = Path(raw).expanduser()
-    explicit_path = (
-        value.startswith("local:")
-        or candidate.is_absolute()
-        or raw.startswith(("./", "../"))
+def _build_source(args: argparse.Namespace) -> DeepSeekRuntimeSource:
+    return open_deepseek_runtime_source(
+        source=args.source,
+        revision=args.revision,
+        logical_repo_id=args.logical_repo_id,
+        causal_bundle=args.causal_bundle,
+        budget_mb=args.budget_mb,
+        cache_dir=args.cache_dir,
+        use_cache=not args.no_cache,
+        max_cache_bytes=int(args.max_cache_gb * 1024**3),
+        require_remote_pinned_revision=True,
     )
-    if explicit_path:
-        return candidate.resolve()
-    return candidate.resolve() if candidate.is_dir() else None
-
-
-def _build_source(args: argparse.Namespace) -> tuple[Streamer, str]:
-    local = _local_source_path(args.source)
-    common = {
-        "revision": args.revision,
-        "budget_mb": args.budget_mb,
-        "cache_dir": args.cache_dir,
-        "use_cache": not args.no_cache,
-        "max_cache_bytes": int(args.max_cache_gb * 1024**3),
-        "verbose": False,
-    }
-    if local is not None:
-        if not local.is_dir():
-            raise FileNotFoundError(f"local source directory does not exist: {local}")
-        return Streamer.from_local(local, **common), f"local:{local}"
-    return Streamer(args.source, **common), args.source
 
 
 def _load_config(
@@ -254,10 +241,7 @@ def _load_config(
 def _arguments_metadata(args: argparse.Namespace) -> dict[str, Any]:
     result = vars(args).copy()
     result.pop("handler", None)
-    for key in ("cache_dir", "config", "output_json"):
-        if result.get(key) is not None:
-            result[key] = str(Path(result[key]).expanduser().resolve())
-    return result
+    return shareable_runtime_evidence(result)
 
 
 def _base_report(
@@ -292,8 +276,12 @@ def _provenance(
         "revision": args.revision,
         "revision_is_pinned": bool(metrics.get("revision_is_pinned")),
         "revision_is_mutable": bool(metrics.get("revision_is_mutable")),
-        "config": config_meta,
-        "cache_dir": None if args.no_cache else str(Path(args.cache_dir).resolve()),
+        "config": shareable_runtime_evidence(config_meta),
+        "cache_dir": (
+            None
+            if args.no_cache or args.causal_bundle is not None
+            else shareable_runtime_evidence(str(Path(args.cache_dir).resolve()))
+        ),
         "cache_limit_bytes": (
             0 if args.no_cache else int(metrics.get("cache_limit_bytes") or 0)
         ),
@@ -363,6 +351,7 @@ def _runtime(
     args: argparse.Namespace,
     progress: ProgressLog,
 ) -> tuple[
+    DeepSeekRuntimeSource,
     Streamer,
     DeepSeekV4Config,
     DeepSeekWeightPager,
@@ -370,20 +359,20 @@ def _runtime(
     dict[str, Any],
     str,
 ]:
-    source, source_label = _build_source(args)
+    runtime_source = _build_source(args)
     try:
-        return _runtime_with_source(args, progress, source, source_label)
+        return _runtime_with_source(args, progress, runtime_source)
     except BaseException:
-        source.close()
+        runtime_source.close()
         raise
 
 
 def _runtime_with_source(
     args: argparse.Namespace,
     progress: ProgressLog,
-    source: Streamer,
-    source_label: str,
+    runtime_source: DeepSeekRuntimeSource,
 ) -> tuple[
+    DeepSeekRuntimeSource,
     Streamer,
     DeepSeekV4Config,
     DeepSeekWeightPager,
@@ -391,6 +380,8 @@ def _runtime_with_source(
     dict[str, Any],
     str,
 ]:
+    source = runtime_source.source
+    source_label = runtime_source.label
     progress.emit(
         "source_ready",
         source=source_label,
@@ -418,42 +409,51 @@ def _runtime_with_source(
         compute_dtype=args.dtype,
         simulate_activation_quantization=not args.no_activation_quantization,
         expert_prefetch=not args.no_expert_prefetch,
+        causal_weight_reader=runtime_source.causal_weight_reader,
+        causal_tensor_reader=runtime_source.causal_tensor_reader,
+        causal_missing_fallback=False,
     )
-    graft_mode = str(getattr(args, "graft_mode", "off"))
-    graft = None
-    graft_layer = None
-    if graft_mode != "off":
-        graft = DeepSeekV4CrsaGraft(
-            mode=graft_mode,
-            alpha=float(args.graft_alpha),
-            max_history=int(args.context_limit),
-            shuffle_seed=int(args.graft_seed),
+    try:
+        graft_mode = str(getattr(args, "graft_mode", "off"))
+        graft = None
+        graft_layer = None
+        if graft_mode != "off":
+            graft = DeepSeekV4CrsaGraft(
+                mode=graft_mode,
+                alpha=float(args.graft_alpha),
+                max_history=int(args.context_limit),
+                shuffle_seed=int(args.graft_seed),
+            )
+            graft_layer = (
+                int(args.graft_layer)
+                if args.graft_layer is not None
+                else config.n_layers // 2
+            )
+        model = StreamedDeepSeekV4(
+            config,
+            pager,
+            graft=graft,
+            graft_layer=graft_layer,
+            max_batch_size=1,
+            max_seq_len=int(getattr(args, "context_limit", 512)),
         )
-        graft_layer = (
-            int(args.graft_layer)
-            if args.graft_layer is not None
-            else config.n_layers // 2
-        )
-    model = StreamedDeepSeekV4(
-        config,
-        pager,
-        graft=graft,
-        graft_layer=graft_layer,
-        max_batch_size=1,
-        max_seq_len=int(getattr(args, "context_limit", 512)),
-    )
-    return source, config, pager, model, config_meta, source_label
+    except BaseException:
+        pager.release()
+        raise
+    return runtime_source, source, config, pager, model, config_meta, source_label
 
 
 def _release_runtime(runtime: tuple[Any, ...]) -> None:
-    source, _config, pager, model, _config_meta, _source_label = runtime
+    runtime_source, _source, _config, pager, model, _config_meta, _source_label = (
+        runtime
+    )
     try:
         model.reset_state(release=True)
     finally:
         try:
             pager.release()
         finally:
-            source.close()
+            runtime_source.close()
 
 
 def _preflight(
@@ -474,10 +474,9 @@ def _preflight_with_runtime(
     base: dict[str, Any],
     runtime: tuple[Any, ...],
 ) -> dict[str, Any]:
-    source, config, pager, model, config_meta, source_label = runtime
+    _owner, source, config, pager, model, config_meta, source_label = runtime
     checks = model.checkpoint_preflight(exhaustive_experts=not args.sampled_experts)
     progress.emit("preflight_complete", **checks)
-    source.close()
     return {
         **base,
         "status": "ok",
@@ -486,8 +485,8 @@ def _preflight_with_runtime(
         "provenance": _provenance(
             args, source_label, source, config_meta, config, pager
         ),
-        "pager": pager.metrics(),
-        "source_metrics": source.metrics(),
+        "pager": shareable_runtime_evidence(pager.metrics()),
+        "source_metrics": shareable_runtime_evidence(source.metrics()),
     }
 
 
@@ -519,7 +518,7 @@ def _one_token_with_runtime(
     base: dict[str, Any],
     runtime: tuple[Any, ...],
 ) -> dict[str, Any]:
-    source, config, pager, model, config_meta, source_label = runtime
+    _owner, source, config, pager, model, config_meta, source_label = runtime
     checks = model.checkpoint_preflight(exhaustive_experts=not args.sampled_experts)
     progress.emit("preflight_complete", **checks)
 
@@ -576,7 +575,6 @@ def _one_token_with_runtime(
         source_body_bytes=evidence.source_body_bytes,
         seconds=evidence.seconds,
     )
-    source.close()
     return {
         **base,
         "status": "ok",
@@ -598,8 +596,8 @@ def _one_token_with_runtime(
         "provenance": _provenance(
             args, source_label, source, config_meta, config, pager
         ),
-        "pager": pager.metrics(),
-        "source_metrics": source.metrics(),
+        "pager": shareable_runtime_evidence(pager.metrics()),
+        "source_metrics": shareable_runtime_evidence(source.metrics()),
     }
 
 
@@ -700,7 +698,7 @@ def _generate_with_runtime(
     base: dict[str, Any],
     runtime: tuple[Any, ...],
 ) -> dict[str, Any]:
-    source, config, pager, model, config_meta, source_label = runtime
+    _owner, source, config, pager, model, config_meta, source_label = runtime
     checks = model.checkpoint_preflight(exhaustive_experts=not args.sampled_experts)
     progress.emit("preflight_complete", **checks)
     prompt_ids, encoding = _tokenize_prompt(source, args)
@@ -752,7 +750,6 @@ def _generate_with_runtime(
         source_body_bytes=evidence.source_body_bytes,
         seconds=evidence.seconds,
     )
-    source.close()
     return {
         **base,
         "status": "ok",
@@ -789,8 +786,8 @@ def _generate_with_runtime(
         "provenance": _provenance(
             args, source_label, source, config_meta, config, pager
         ),
-        "pager": pager.metrics(),
-        "source_metrics": source.metrics(),
+        "pager": shareable_runtime_evidence(pager.metrics()),
+        "source_metrics": shareable_runtime_evidence(source.metrics()),
     }
 
 
@@ -828,6 +825,19 @@ def _common_parser() -> argparse.ArgumentParser:
         "--source",
         default=OFFICIAL_SOURCE,
         help="HF repository ID, local directory, or local:/absolute/path",
+    )
+    common.add_argument(
+        "--causal-bundle",
+        help=(
+            "local in-place or nested causal bundle; weights are mounted without "
+            "copying, sparse routes fail closed, and authenticated complete dense "
+            "coverage is required"
+        ),
+    )
+    common.add_argument(
+        "--logical-repo-id",
+        default=OFFICIAL_SOURCE,
+        help="logical repository identity bound into a causal bundle",
     )
     common.add_argument(
         "--revision",
@@ -1003,10 +1013,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         exit_code = 1
         error: dict[str, Any] = {
             "type": type(exc).__name__,
-            "message": str(exc),
+            "message": shareable_runtime_evidence(str(exc)),
         }
         if args.debug:
-            error["traceback"] = traceback.format_exc()
+            error["traceback"] = shareable_runtime_evidence(
+                traceback.format_exc()
+            )
         report = {
             **base,
             "status": "error",
@@ -1028,7 +1040,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = {
                 **report,
                 "status": "error",
-                "output_error": {"type": type(exc).__name__, "message": str(exc)},
+                "output_error": {
+                    "type": type(exc).__name__,
+                    "message": shareable_runtime_evidence(str(exc)),
+                },
             }
     sys.stdout.buffer.write(_json_bytes(report, pretty=True))
     sys.stdout.flush()

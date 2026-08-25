@@ -11,7 +11,6 @@ state per layer and supports start-zero prefill plus contiguous decode.
 from __future__ import annotations
 
 import time
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
 import json
@@ -215,33 +214,28 @@ class StreamedDeepSeekV4:
         self._next_position = 0
         self._state_poisoned = False
         self._graft_history: Any | None = None
+        self._last_hidden_sha256: str | None = None
 
     def checkpoint_preflight(
         self, *, exhaustive_experts: bool = True
     ) -> dict[str, Any]:
         """Validate tensor presence and critical storage formats without payload reads."""
 
-        source = self.pager.source
-        inventory = source.inventory()
-        entries = {entry["name"]: entry for entry in inventory.get("tensors", [])}
         required: set[str] = set()
+        contracts: dict[str, tuple[set[str], tuple[int, ...]]] = {}
+        expert_contracts: dict[int, tuple[int, ...]] = {}
         errors: list[str] = []
         fp8 = {"F8_E4M3", "F8_E4M3FN"}
 
         def expect(name: str, dtypes: set[str], shape: tuple[int, ...]) -> None:
             required.add(name)
-            entry = entries.get(name)
-            if entry is None:
-                errors.append(f"missing {name}")
-                return
-            actual_dtype = str(entry.get("dtype", "")).upper()
-            actual_shape = tuple(int(value) for value in entry.get("shape", ()))
-            if actual_dtype not in dtypes:
-                errors.append(
-                    f"{name}: dtype {actual_dtype}, expected {'/'.join(sorted(dtypes))}"
+            previous = contracts.get(name)
+            contract = (set(dtypes), shape)
+            if previous is not None and previous != contract:
+                raise DeepSeekV4RuntimeError(
+                    f"internal checkpoint contract conflict at {name}"
                 )
-            if actual_shape != shape:
-                errors.append(f"{name}: shape {actual_shape}, expected {shape}")
+            contracts[name] = contract
 
         def fp8_matrix(name: str, out_dim: int, in_dim: int) -> None:
             expect(f"{name}.weight", fp8, (out_dim, in_dim))
@@ -363,6 +357,7 @@ class StreamedDeepSeekV4:
             ):
                 fp8_matrix(f"{prefix}.ffn.shared_experts.{projection}", out_dim, in_dim)
             expert_ids = range(config.n_routed_experts) if exhaustive_experts else (0,)
+            expert_contracts[layer] = tuple(expert_ids)
             for expert_id in expert_ids:
                 for projection, out_dim, in_dim in (
                     ("w1", config.moe_inter_dim, config.dim),
@@ -374,24 +369,74 @@ class StreamedDeepSeekV4:
                         out_dim,
                         in_dim,
                     )
+        source = self.pager.source
+        if self.pager.causal_tensor_reader_attached:
+            try:
+                entries = self.pager.preflight_tensor_plans(sorted(required))
+            except Exception as exc:
+                raise DeepSeekV4RuntimeError(
+                    "checkpoint causal dense-binding preflight failed before "
+                    "payload reads"
+                ) from exc
+            address_plane = "causal-tensor-rail/v1"
+            inventory_tensors = len(entries)
+            try:
+                expert_plan_count = 0
+                for layer, expert_ids in expert_contracts.items():
+                    expert_plan_count += len(
+                        self.pager.preflight_expert_plans(layer, expert_ids)
+                    )
+            except Exception as exc:
+                raise DeepSeekV4RuntimeError(
+                    "checkpoint causal expert-binding preflight failed before "
+                    f"payload reads: {exc}"
+                ) from exc
+        else:
+            inventory = source.inventory()
+            entries = {
+                entry["name"]: entry for entry in inventory.get("tensors", [])
+            }
+            address_plane = "streamer-inventory/v1"
+            inventory_tensors = len(entries)
+            expert_plan_count = 0
+
+        for name, (dtypes, shape) in contracts.items():
+            entry = entries.get(name)
+            if entry is None:
+                errors.append(f"missing {name}")
+                continue
+            actual_dtype = str(entry.get("dtype", "")).upper()
+            actual_shape = tuple(int(value) for value in entry.get("shape", ()))
+            if actual_dtype not in dtypes:
+                errors.append(
+                    f"{name}: dtype {actual_dtype}, expected {'/'.join(sorted(dtypes))}"
+                )
+            if actual_shape != shape:
+                errors.append(f"{name}: shape {actual_shape}, expected {shape}")
+
         if errors:
             preview = "; ".join(errors[:8])
             raise DeepSeekV4RuntimeError(
                 f"checkpoint violates {len(errors)} required tensor contracts: {preview}"
             )
-        required_bytes = sum(
-            int(entries[name]["offset_in_shard"][1])
-            - int(entries[name]["offset_in_shard"][0])
-            for name in required
-        )
+        if self.pager.causal_tensor_reader_attached:
+            required_bytes = sum(int(entries[name]["length"]) for name in required)
+        else:
+            required_bytes = sum(
+                int(entries[name]["offset_in_shard"][1])
+                - int(entries[name]["offset_in_shard"][0])
+                for name in required
+            )
         return {
             "required_tensors": len(required),
             "required_payload_bytes": required_bytes,
             "exhaustive_experts": bool(exhaustive_experts),
-            "inventory_tensors": len(entries),
+            "inventory_tensors": inventory_tensors,
             "inventory_fingerprint": self.pager.source.metrics().get(
                 "inventory_source_fingerprint"
             ),
+            "tensor_address_plane": address_plane,
+            "required_expert_plans": expert_plan_count,
         }
 
     def _control(self, name: str, *, dtype: Any | None = None) -> Any:
@@ -537,6 +582,14 @@ class StreamedDeepSeekV4:
         return self._next_position
 
     @property
+    def state_poisoned(self) -> bool:
+        return self._state_poisoned
+
+    @property
+    def last_hidden_sha256(self) -> str | None:
+        return self._last_hidden_sha256
+
+    @property
     def attention_state_bytes(self) -> int:
         return sum(
             state.state_nbytes for state in self._attention_states if state is not None
@@ -559,6 +612,7 @@ class StreamedDeepSeekV4:
         self._next_position = 0
         self._state_poisoned = False
         self._graft_history = None
+        self._last_hidden_sha256 = None
 
     @staticmethod
     def _snapshot_digest(value: Any) -> str:
@@ -575,6 +629,11 @@ class StreamedDeepSeekV4:
                 "runtime identity cannot be represented as canonical JSON"
             ) from exc
         return hashlib.sha256(encoded).hexdigest()
+
+    def _hidden_digest(self, value: Any) -> str:
+        tensor = value.detach().to(device="cpu").contiguous()
+        raw = tensor.view(self.torch.uint8).numpy().reshape(-1).tobytes()
+        return hashlib.sha256(raw).hexdigest()
 
     def _graft_snapshot_identity(self) -> dict[str, Any]:
         if self.graft is None:
@@ -634,7 +693,10 @@ class StreamedDeepSeekV4:
         source = self.pager.source
         # Inventory acquisition is metadata-only and establishes the immutable
         # source fingerprint before any continuation can be published/loaded.
-        source.inventory()
+        # A mounted dense causal reader already authenticated that fingerprint;
+        # do not re-enter Streamer discovery behind the graph address plane.
+        if not self.pager.causal_tensor_reader_attached:
+            source.inventory()
         metrics = source.metrics()
         fingerprint = metrics.get("inventory_source_fingerprint")
         if not isinstance(fingerprint, str) or not fingerprint:
@@ -731,6 +793,22 @@ class StreamedDeepSeekV4:
             raise DeepSeekV4SnapshotError("model cursor exceeds its context bound")
         if self._state_poisoned and self._next_position != 0:
             raise DeepSeekV4SnapshotError("poisoned model has a non-zero cursor")
+        if self._next_position == 0:
+            if self._last_hidden_sha256 is not None:
+                raise DeepSeekV4SnapshotError(
+                    "zero-cursor model retains a final-hidden digest"
+                )
+        elif (
+            not isinstance(self._last_hidden_sha256, str)
+            or len(self._last_hidden_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self._last_hidden_sha256
+            )
+        ):
+            raise DeepSeekV4SnapshotError(
+                "active model lacks a valid final-hidden digest"
+            )
         if self._route_prefetch_plan is not None or self._route_prefetch_reservoir:
             raise DeepSeekV4SnapshotError(
                 "cannot snapshot while a causal route prefetch is active"
@@ -798,6 +876,7 @@ class StreamedDeepSeekV4:
             {
                 "next_position": self._next_position,
                 "state_poisoned": self._state_poisoned,
+                "final_hidden_sha256": self._last_hidden_sha256,
                 "max_batch_size": self.max_batch_size,
                 "max_seq_len": self.max_seq_len,
                 "max_position_embeddings": self.config.max_position_embeddings,
@@ -841,6 +920,7 @@ class StreamedDeepSeekV4:
             **result,
             "next_position": self._next_position,
             "state_poisoned": self._state_poisoned,
+            "final_hidden_sha256": self._last_hidden_sha256,
             "transport_neutral": transport_neutral,
         }
 
@@ -904,6 +984,23 @@ class StreamedDeepSeekV4:
             raise DeepSeekV4SnapshotError("snapshot poison latch must be boolean")
         if poisoned and next_position:
             raise DeepSeekV4SnapshotError("poisoned snapshot has a non-zero cursor")
+        final_hidden_sha256 = state.get("final_hidden_sha256")
+        if next_position:
+            if (
+                not isinstance(final_hidden_sha256, str)
+                or len(final_hidden_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in final_hidden_sha256
+                )
+            ):
+                raise DeepSeekV4SnapshotError(
+                    "active snapshot final-hidden digest is invalid"
+                )
+        elif final_hidden_sha256 is not None:
+            raise DeepSeekV4SnapshotError(
+                "zero-cursor snapshot retains a final-hidden digest"
+            )
         expected_scalars = {
             "max_batch_size": self.max_batch_size,
             "max_seq_len": self.max_seq_len,
@@ -1112,10 +1209,12 @@ class StreamedDeepSeekV4:
         self._next_position = next_position
         self._state_poisoned = poisoned
         self._graft_history = history_device
+        self._last_hidden_sha256 = final_hidden_sha256
         return {
             **loaded.summary,
             "next_position": next_position,
             "state_poisoned": poisoned,
+            "final_hidden_sha256": final_hidden_sha256,
             "transport_neutral": transport_neutral,
         }
 
@@ -1218,30 +1317,12 @@ class StreamedDeepSeekV4:
         ids = [
             int(value) for value in token_ids.detach().to("cpu").reshape(-1).tolist()
         ]
-        unique = sorted(set(ids))
-        runs: list[tuple[int, int]] = []
-        if unique:
-            start = previous = unique[0]
-            for token_id in unique[1:]:
-                if token_id != previous + 1:
-                    runs.append((start, previous + 1))
-                    start = token_id
-                previous = token_id
-            runs.append((start, previous + 1))
-        by_id: dict[int, np.ndarray] = {}
-        priority = getattr(self.pager.source, "cache_priority", None)
-        scope = priority(1) if callable(priority) else nullcontext()
-        with scope:
-            for start, stop in runs:
-                rows = self.pager.source.rows(
-                    name, start_row=start, n_rows=stop - start
-                )
-                for offset, row in enumerate(rows):
-                    by_id[start + offset] = row
-        array = np.stack([by_id[token_id] for token_id in ids]).astype(
-            np.int64, copy=False
+        return self.pager.tensor_rows(
+            name,
+            ids,
+            dtype=self.torch.long,
+            device=device,
         )
-        return self.torch.from_numpy(np.ascontiguousarray(array)).to(device)
 
     def _route_experts_many(
         self, x: Any, layer: int, token_ids: Any
@@ -1949,6 +2030,7 @@ class StreamedDeepSeekV4:
                 norm_eps=self.config.norm_eps,
             )
             h = self._norm(h, "norm.weight")
+            final_hidden_sha256 = self._hidden_digest(h[:, -1:])
         except Exception:
             # Clear every partially mutated cache but keep a poison latch so
             # reuse is explicit.  The caller must acknowledge the failed
@@ -1959,11 +2041,13 @@ class StreamedDeepSeekV4:
             self._next_position = 0
             self._graft_history = None
             self._state_poisoned = True
+            self._last_hidden_sha256 = None
             if self._route_prefetch_plan is not None:
                 self._cancel_route_prefetch()
             raise
 
         self._next_position = end_pos
+        self._last_hidden_sha256 = final_hidden_sha256
         end_bytes = int(
             self.pager.source.metrics().get("network_or_source_body_bytes", 0)
         )
@@ -2004,22 +2088,36 @@ class StreamedDeepSeekV4:
         reset: bool = True,
         progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[Any, tuple[StatefulEvidence, ...]]:
-        """Prefill a request, defaulting to bounded exact tokenwise execution."""
+        """Start a request or extend its exact native continuation state.
+
+        ``reset=True`` starts at position zero.  ``reset=False`` keeps the
+        committed prefix and evaluates an arbitrary contiguous suffix through
+        the checkpoint's published one-token decode transition.  A non-zero
+        multi-token block therefore requires ``tokenwise=True``; this preserves
+        native arithmetic, bounds the active expert union, and leaves the
+        existing poison-on-failure transaction contract intact.
+        """
 
         ids = self._token_tensor(token_ids)
         if reset:
             self.reset_state()
-        elif self._next_position != 0:
-            raise ValueError("prefill requires position zero or reset=True")
+        start_pos = self._next_position
+        end_pos = start_pos + ids.shape[1]
+        if end_pos > self.max_seq_len:
+            raise ValueError(
+                f"context end {end_pos} exceeds max_seq_len={self.max_seq_len}"
+            )
         if not tokenwise:
-            hidden, evidence = self.hidden_stateful(ids, start_pos=0, progress=progress)
+            hidden, evidence = self.hidden_stateful(
+                ids, start_pos=start_pos, progress=progress
+            )
             return hidden, (evidence,)
         outputs = []
         evidence_rows = []
-        for position in range(ids.shape[1]):
+        for offset in range(ids.shape[1]):
             hidden, evidence = self.hidden_stateful(
-                ids[:, position : position + 1],
-                start_pos=position,
+                ids[:, offset : offset + 1],
+                start_pos=start_pos + offset,
                 progress=progress,
             )
             outputs.append(hidden)

@@ -128,7 +128,11 @@ class LayerwiseScriptTests(unittest.TestCase):
             with (
                 mock.patch.object(MODULE, "_read_rows", return_value=rows),
                 mock.patch.object(MODULE, "LocalTokenizer", _ContextTokenizer),
-                mock.patch.object(MODULE, "_source", return_value=(_source(), "fixture")),
+                mock.patch.object(
+                    MODULE,
+                    "_source",
+                    return_value=MODULE.DeepSeekRuntimeSource(_source(), "fixture"),
+                ),
                 mock.patch.object(
                     MODULE, "_config", return_value=(_config(), "2" * 64)
                 ),
@@ -178,7 +182,11 @@ class LayerwiseScriptTests(unittest.TestCase):
                     mock.patch.object(MODULE, "_read_rows", return_value=rows),
                     mock.patch.object(MODULE, "LocalTokenizer", _ContextTokenizer),
                     mock.patch.object(
-                        MODULE, "_source", return_value=(_source(), "fixture")
+                        MODULE,
+                        "_source",
+                        return_value=MODULE.DeepSeekRuntimeSource(
+                            _source(), "fixture"
+                        ),
                     ),
                     mock.patch.object(
                         MODULE, "_config", return_value=(_config(), "2" * 64)
@@ -200,9 +208,47 @@ class LayerwiseScriptTests(unittest.TestCase):
             self.assertEqual(resumed["summaries"], first["summaries"])
 
     def test_help_is_available_without_model_access(self) -> None:
-        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as raised:
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
             MODULE._parser().parse_args(["--help"])
         self.assertEqual(raised.exception.code, 0)
+        self.assertIn("--causal-bundle", output.getvalue())
+        self.assertIn("--logical-repo-id", output.getvalue())
+
+    def test_run_forwards_both_causal_readers_to_runtime_builder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset.parquet"
+            dataset.write_bytes(b"fixture")
+            args = MODULE._parser().parse_args(
+                ["--dataset", str(dataset), "--limit", "1"]
+            )
+            source = object()
+            expert_reader = object()
+            tensor_reader = object()
+            owner = mock.Mock(
+                source=source,
+                label="causal:fixture",
+                causal_weight_reader=expert_reader,
+                causal_tensor_reader=tensor_reader,
+            )
+            rows = [{"id": "row-0"}]
+            with (
+                mock.patch.object(MODULE, "_read_rows", return_value=rows),
+                mock.patch.object(MODULE, "LocalTokenizer", _ContextTokenizer),
+                mock.patch.object(MODULE, "_source", return_value=owner),
+                mock.patch.object(
+                    MODULE, "_run_with_source", return_value={"status": "ok"}
+                ) as execute,
+            ):
+                self.assertEqual(MODULE.run(args), {"status": "ok"})
+            self.assertIs(
+                execute.call_args.kwargs["causal_weight_reader"], expert_reader
+            )
+            self.assertIs(
+                execute.call_args.kwargs["causal_tensor_reader"], tensor_reader
+            )
+            owner.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

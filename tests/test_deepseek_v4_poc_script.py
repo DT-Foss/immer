@@ -8,20 +8,38 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
 
+from immer.runtimes.deepseek_v4 import (
+    CausalWeightMount,
+    DeepSeekWeightPager,
+    GENERAL_DENSE_COVERAGE_CAPABILITY,
+    LogicalModelIdentity,
+    tensor_range_plan_from_source,
+)
+
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "deepseek_v4_poc.py"
+PINNED_REVISION = "7" * 40
 
 
-def _write_safetensors(path: Path, tensors: dict[str, tuple[str, np.ndarray]]) -> None:
+def _write_safetensors(
+    path: Path,
+    tensors: dict[str, tuple[str, np.ndarray]],
+    *,
+    tensor_order: Sequence[str] | None = None,
+) -> None:
     header: dict[str, object] = {}
     payloads: list[bytes] = []
     offset = 0
-    for name in sorted(tensors):
+    names = tuple(sorted(tensors)) if tensor_order is None else tuple(tensor_order)
+    if len(names) != len(tensors) or set(names) != set(tensors):
+        raise ValueError("tensor_order must contain every tensor exactly once")
+    for name in names:
         dtype, value = tensors[name]
         array = np.ascontiguousarray(value)
         payload = array.tobytes(order="C")
@@ -109,7 +127,7 @@ def _bf16(value: np.ndarray) -> tuple[str, np.ndarray]:
     return "BF16", (words >> 16).astype(np.uint16)
 
 
-def _tiny_checkpoint(root: Path) -> None:
+def _tiny_checkpoint(root: Path, *, official_expert_layout: bool = False) -> None:
     root.mkdir(parents=True)
     (root / "config.json").write_text(
         json.dumps(_tiny_config(), separators=(",", ":")), encoding="utf-8"
@@ -174,7 +192,65 @@ def _tiny_checkpoint(root: Path) -> None:
             weight, scale = _fp4_matrix(*shape)
             tensors[f"{prefix}.weight"] = weight
             tensors[f"{prefix}.scale"] = scale
-    _write_safetensors(root / "model.safetensors", tensors)
+    tensor_order = None
+    if official_expert_layout:
+        expert_names = {
+            name for name in tensors if ".ffn.experts." in name
+        }
+        tensor_order = [name for name in sorted(tensors) if name not in expert_names]
+        for expert in range(2):
+            base = f"layers.0.ffn.experts.{expert}"
+            tensor_order.extend(
+                f"{base}.{projection}.{part}"
+                for part in ("scale", "weight")
+                for projection in ("w1", "w2", "w3")
+            )
+    _write_safetensors(
+        root / "model.safetensors", tensors, tensor_order=tensor_order
+    )
+
+
+def _flat_causal_bundle(root: Path, *, bind_expert_zero: bool) -> None:
+    (root / "causal").mkdir()
+    body = {
+        "capabilities": {
+            "general_dense_weight_coverage": GENERAL_DENSE_COVERAGE_CAPABILITY
+        },
+        "weights_layout": "flat/v1",
+    }
+    encoded = json.dumps(
+        body,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    manifest = {
+        "body": body,
+        "schema": "immer.deepseek-v4-flat-causal-fixture/v1",
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+    (root / "bundle.json").write_text(
+        json.dumps(manifest, separators=(",", ":")), encoding="utf-8"
+    )
+    model = LogicalModelIdentity("fixture/deepseek-v4", PINNED_REVISION)
+    with CausalWeightMount(root, model, budget_mb=4) as mount:
+        mount.bind_tensor_plans(
+            tensor_range_plan_from_source(mount.source, entry["name"])
+            for entry in mount.source.inventory().get("tensors", ())
+        )
+        pager = DeepSeekWeightPager(
+            mount.source,
+            device="cpu",
+            compute_dtype="float32",
+            simulate_activation_quantization=False,
+            expert_prefetch=False,
+        )
+        try:
+            if bind_expert_zero:
+                mount.bind_plans(pager.plan_expert_ranges(0, (0, 1)))
+        finally:
+            pager.release()
 
 
 class DeepSeekV4PocScriptTests(unittest.TestCase):
@@ -202,6 +278,8 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
         self.assertEqual(one.returncode, 0, one.stderr)
         for option in (
             "--source",
+            "--causal-bundle",
+            "--logical-repo-id",
             "--revision",
             "--config",
             "--cache-dir",
@@ -233,11 +311,44 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
     def test_missing_absolute_source_path_fails_locally_without_remote_fallback(
         self,
     ) -> None:
-        missing = Path(tempfile.gettempdir()) / "immer-v4-source-does-not-exist"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing = root / "immer-v4-source-does-not-exist"
+            output = root / "error.json"
+            result = self._run(
+                "preflight",
+                "--source",
+                str(missing),
+                "--budget-mb",
+                "1",
+                "--no-cache",
+                "--debug",
+                "--output-json",
+                str(output),
+            )
+            persisted = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(result.returncode, 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(persisted, report)
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["error"]["type"], "FileNotFoundError")
+        self.assertIn(
+            "local source directory does not exist", report["error"]["message"]
+        )
+        encoded = json.dumps(report, sort_keys=True)
+        self.assertNotIn(str(root.resolve()), encoded)
+        self.assertNotIn(str(ROOT.resolve()), encoded)
+        self.assertIn("<external-path>", report["error"]["message"])
+
+    def test_remote_source_requires_immutable_revision_before_network_access(
+        self,
+    ) -> None:
         result = self._run(
             "preflight",
             "--source",
-            str(missing),
+            "fixture/remote",
+            "--revision",
+            "main",
             "--budget-mb",
             "1",
             "--no-cache",
@@ -245,10 +356,39 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         report = json.loads(result.stdout)
         self.assertEqual(report["status"], "error")
-        self.assertEqual(report["error"]["type"], "FileNotFoundError")
-        self.assertIn(
-            "local source directory does not exist", report["error"]["message"]
-        )
+        self.assertEqual(report["error"]["type"], "DeepSeekRuntimeSourceError")
+        self.assertIn("immutable", report["error"]["message"])
+
+    def test_generic_poc_rejects_trace_sparse_bundle_before_weight_access(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary) / "sparse"
+            bundle.mkdir()
+            (bundle / "bundle.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "immer.deepseek-v4-sparse-causal-bundle/v1",
+                        "sha256": "0" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = self._run(
+                "preflight",
+                "--causal-bundle",
+                str(bundle),
+                "--logical-repo-id",
+                "fixture/deepseek-v4",
+                "--revision",
+                PINNED_REVISION,
+                "--budget-mb",
+                "1",
+            )
+        self.assertEqual(result.returncode, 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "error")
+        self.assertIn("decode-trace-specific", report["error"]["message"])
 
     def test_tiny_local_checkpoint_preflight_and_one_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -284,6 +424,7 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
             self.assertEqual(preflight.returncode, 0, preflight.stderr)
             report = json.loads(preflight.stdout)
             self.assertEqual(report["status"], "ok")
+            self.assertNotIn(str(work.resolve()), json.dumps(report, sort_keys=True))
             self.assertEqual(report["mode"], "preflight")
             self.assertTrue(report["preflight"]["exhaustive_experts"])
             self.assertGreater(report["preflight"]["required_tensors"], 40)
@@ -469,6 +610,107 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
             self.assertEqual(report["status"], "error")
             self.assertEqual(report["error"]["type"], "ValueError")
             self.assertIn("vocabulary", report["error"]["message"])
+
+    def test_flat_causal_bundle_uses_strict_reader_without_copying_weights(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "checkpoint"
+            _tiny_checkpoint(checkpoint, official_expert_layout=True)
+            weight_before = (checkpoint / "model.safetensors").stat()
+            _flat_causal_bundle(checkpoint, bind_expert_zero=True)
+            result = self._run(
+                "one-token",
+                "--causal-bundle",
+                str(checkpoint),
+                "--logical-repo-id",
+                "fixture/deepseek-v4",
+                "--revision",
+                PINNED_REVISION,
+                "--budget-mb",
+                "4",
+                "--device",
+                "cpu",
+                "--dtype",
+                "float32",
+                "--no-activation-quantization",
+                "--no-expert-prefetch",
+                "--token-id",
+                "7",
+                "--top-k",
+                "1",
+                "--head-block-rows",
+                "32",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertTrue(report["pager"]["causal_weight_reader_attached"])
+            self.assertTrue(report["pager"]["causal_tensor_reader_attached"])
+            self.assertFalse(report["pager"]["causal_missing_fallback"])
+            self.assertGreater(report["pager"]["causal_expert_plan_hits"], 0)
+            self.assertEqual(report["pager"]["causal_expert_plan_fallbacks"], 0)
+            weight_after = (checkpoint / "model.safetensors").stat()
+            self.assertEqual(
+                (weight_after.st_ino, weight_after.st_size),
+                (weight_before.st_ino, weight_before.st_size),
+            )
+            self.assertFalse((checkpoint / "weights").exists())
+
+    def test_flat_causal_bundle_missing_sparse_route_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint"
+            _tiny_checkpoint(checkpoint, official_expert_layout=True)
+            _flat_causal_bundle(checkpoint, bind_expert_zero=False)
+            preflight = self._run(
+                "preflight",
+                "--causal-bundle",
+                str(checkpoint),
+                "--logical-repo-id",
+                "fixture/deepseek-v4",
+                "--revision",
+                PINNED_REVISION,
+                "--budget-mb",
+                "4",
+                "--device",
+                "cpu",
+                "--dtype",
+                "float32",
+                "--no-activation-quantization",
+                "--no-expert-prefetch",
+            )
+            self.assertEqual(preflight.returncode, 1)
+            preflight_report = json.loads(preflight.stdout)
+            self.assertEqual(preflight_report["status"], "error")
+            self.assertIn(
+                "causal weight binding is missing",
+                preflight_report["error"]["message"],
+            )
+            result = self._run(
+                "one-token",
+                "--causal-bundle",
+                str(checkpoint),
+                "--logical-repo-id",
+                "fixture/deepseek-v4",
+                "--revision",
+                PINNED_REVISION,
+                "--budget-mb",
+                "4",
+                "--device",
+                "cpu",
+                "--dtype",
+                "float32",
+                "--no-activation-quantization",
+                "--no-expert-prefetch",
+                "--token-id",
+                "7",
+            )
+            self.assertEqual(result.returncode, 1)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn(
+                "causal weight binding is missing", report["error"]["message"]
+            )
 
 
 if __name__ == "__main__":

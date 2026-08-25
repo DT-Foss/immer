@@ -10,6 +10,9 @@ import types
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
+
+from immer.knowledge import AccessTrace
 
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -314,6 +317,9 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             "--output",
             "--source-budget-mb",
             "--cache-budget-mb",
+            "--causal-bundle",
+            "--logical-repo-id",
+            "--access-trace",
             "--max-dataset-mb",
             "--max-prompt-tokens",
             "--thinking-mode",
@@ -596,6 +602,196 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             self.assertIn("budget", error["error"].lower())
             self.assertFalse(report.exists())
 
+    def test_success_writes_authenticated_access_trace_and_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            checkpoint = work / "checkpoint"
+            _fixture_writer()(checkpoint)
+            dataset = work / "mmlu.json"
+            dataset.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "trace",
+                            "prompt_token_ids": [7],
+                            "candidate_token_ids": [0, 1],
+                            "answer": 0,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            trace_path = work / "source.access-trace.json"
+            report_path = work / "report.json"
+            result = self._run(
+                "--dataset",
+                str(dataset),
+                "--task",
+                "mmlu",
+                "--source",
+                str(checkpoint),
+                "--revision",
+                "fixture",
+                "--modes",
+                "off",
+                "--journal",
+                str(work / "run.jsonl"),
+                "--output",
+                str(report_path),
+                "--access-trace",
+                str(trace_path),
+                "--cache-dir",
+                str(work / "cache"),
+                "--source-budget-mb",
+                "64",
+                "--cache-budget-mb",
+                "0",
+                "--no-cache",
+                "--device",
+                "cpu",
+                "--dtype",
+                "float32",
+                "--no-activation-quantization",
+                "--no-expert-prefetch",
+                "--max-prompt-tokens",
+                "8",
+                "--preflight",
+                "none",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            receipt = json.loads(result.stdout)["access_trace"]
+            self.assertTrue(receipt["enabled"])
+            self.assertEqual(receipt["artifact"], trace_path.name)
+            self.assertNotIn("path", receipt)
+            self.assertGreater(receipt["operations"], 0)
+            self.assertGreater(receipt["leaves"], 0)
+            trace = AccessTrace.from_bytes(trace_path.read_bytes())
+            trace.verify()
+            self.assertEqual(receipt["sha256"], trace.sha256)
+            self.assertEqual(receipt["operations"], len(trace.operations))
+            self.assertTrue(
+                any(
+                    dict(operation.tags).get("phase") == "benchmark_item"
+                    for operation in trace.operations
+                )
+            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["access_trace"], receipt)
+            encoded_report = json.dumps(report, sort_keys=True)
+            self.assertNotIn(str(work.resolve()), encoded_report)
+            operator_paths = json.loads(result.stdout)["operator_paths"]
+            self.assertEqual(
+                operator_paths["access_trace"], str(trace_path.resolve())
+            )
+
+    def test_trace_publish_is_snapshot_first_and_report_last_on_crash(self) -> None:
+        module = _script_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trace = root / "trace.json"
+            report = root / "report.json"
+            calls: list[str] = []
+            original = module._atomic_create_bytes
+
+            def crash_report(path, encoded, *, label):
+                calls.append(label)
+                if label == "benchmark report":
+                    raise OSError("simulated report commit crash")
+                return original(path, encoded, label=label)
+
+            with (
+                mock.patch.object(
+                    module, "_atomic_create_bytes", side_effect=crash_report
+                ),
+                self.assertRaisesRegex(
+                    module.RunnerError, "orphan trace.*did not publish a report"
+                ),
+            ):
+                module._publish_trace_then_report(
+                    trace_payload=(trace, b"authenticated-trace"),
+                    report_path=report,
+                    report={"status": "complete"},
+                )
+            self.assertEqual(calls, ["access trace", "benchmark report"])
+            self.assertEqual(trace.read_bytes(), b"authenticated-trace")
+            self.assertFalse(report.exists())
+
+    def test_trace_preflight_rejects_eexist_before_dataset_or_source(self) -> None:
+        module = _script_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for occupied in ("trace", "report"):
+                with self.subTest(occupied=occupied):
+                    trace = root / f"{occupied}.trace.json"
+                    report = root / f"{occupied}.report.json"
+                    target = trace if occupied == "trace" else report
+                    target.write_bytes(b"existing")
+                    args = module._parser().parse_args(
+                        [
+                            "--dataset",
+                            str(root / "must-not-be-read.json"),
+                            "--task",
+                            "mmlu",
+                            "--journal",
+                            str(root / f"{occupied}.journal.jsonl"),
+                            "--output",
+                            str(report),
+                            "--access-trace",
+                            str(trace),
+                        ]
+                    )
+                    with (
+                        mock.patch.object(module, "_read_dataset") as dataset,
+                        mock.patch.object(module, "_build_source") as source,
+                        self.assertRaisesRegex(module.RunnerError, "already exists"),
+                    ):
+                        module.run(args)
+                    dataset.assert_not_called()
+                    source.assert_not_called()
+                    self.assertEqual(target.read_bytes(), b"existing")
+
+    def test_run_forwards_both_causal_readers_to_benchmark_runtime(self) -> None:
+        module = _script_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = module._parser().parse_args(
+                [
+                    "--dataset",
+                    str(root / "dataset.json"),
+                    "--task",
+                    "mmlu",
+                    "--journal",
+                    str(root / "run.jsonl"),
+                    "--output",
+                    str(root / "report.json"),
+                ]
+            )
+            source = object()
+            expert_reader = object()
+            tensor_reader = object()
+            owner = mock.Mock(
+                source=source,
+                label="causal:fixture",
+                causal_weight_reader=expert_reader,
+                causal_tensor_reader=tensor_reader,
+            )
+            rows = [{"id": "row-0"}]
+            with (
+                mock.patch.object(module, "_read_dataset", return_value=rows),
+                mock.patch.object(module, "_build_source", return_value=owner),
+                mock.patch.object(
+                    module, "_run_with_source", return_value={"status": "ok"}
+                ) as execute,
+            ):
+                self.assertEqual(module.run(args), {"status": "ok"})
+            self.assertIs(
+                execute.call_args.kwargs["causal_weight_reader"], expert_reader
+            )
+            self.assertIs(
+                execute.call_args.kwargs["causal_tensor_reader"], tensor_reader
+            )
+            owner.close.assert_called_once_with()
+
     def test_runtime_budget_exhaustion_is_an_item_error_in_denominator(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
@@ -672,6 +868,7 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
                 encoding="utf-8",
             )
             journal = work / "run.jsonl"
+            trace = work / "failed.access-trace.json"
             base = (
                 "--dataset",
                 str(dataset),
@@ -687,6 +884,8 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
                 str(journal),
                 "--output",
                 str(work / "report.json"),
+                "--access-trace",
+                str(trace),
                 "--cache-dir",
                 str(work / "cache"),
                 "--source-budget-mb",
@@ -700,6 +899,7 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("prompt token outside", result.stderr)
             self.assertFalse(journal.exists())
+            self.assertFalse(trace.exists())
 
     def test_text_plan_uses_official_thinking_envelope(self) -> None:
         module = _script_module()
