@@ -18,11 +18,20 @@ All notable changes to IMMER are recorded here.
   verify/invalidation profitability inequality, value-density selection, SoC,
   self-discharge and cache-turnover accounting.
 - Added a sealed AB/BA/ABBA/BAAB harness that separates idle charging from peak
-  demand and requires bit-identical final hidden and serialized native state.
+  demand. Its iso-boundary control requires bit-identical hidden, LM-head, and
+  complete serialized native state; a separate best-live one-shot control
+  requires the same next token and dtype-bounded drift across the final hidden
+  vector and every Attention/DeltaNet/CRSA continuation tensor.
+- The first official local CPU-BF16 cell charges a 65-token invariant before
+  its 33-token suffix exists. Authenticated discharge cuts the fastest fresh
+  path from `130.457495 s` to `91.304167 s`, removing `30.012326%` of peak
+  latency for a `1.428823x` speedup. The iso-boundary result is bit-identical;
+  all 129 one-shot comparison-state tensors remain inside the pinned BF16
+  numerical bound.
 - Added a FERTIG verifier that binds one honest replica vote to the complete
   cartography evidence and three bound proof surfaces without presenting
   those surfaces as a fake three-node quorum.
-- Verified the complete integration with `1175/1175` tests.
+- Verified the complete integration with `1178/1178` tests.
 
 ### O1 semantic cartography over causal Qwen
 

@@ -4,9 +4,11 @@
 The sealed input contains token IDs only.  ``charge`` performs the expensive
 prefix prefill outside the demand path and commits a native continuation
 snapshot.  ``compare`` keeps one authenticated model open while executing a
-sealed AB/BA (or balanced ABBA/BAAB) schedule.  Every arm starts from released
-state, and output is committed only when final hidden tensors and serialized
-native state payloads are bit-identical.
+sealed AB/BA (or balanced ABBA/BAAB) schedule.  The cold baseline recomputes
+the prefix and crosses the same continuation boundary as the battery arm;
+this makes save/restore the only mathematical difference between the two.
+Output is committed only when final hidden tensors and serialized native state
+payloads are bit-identical.
 """
 
 from __future__ import annotations
@@ -38,7 +40,10 @@ from immer.runtimes.qwen3_8.semantic_state_cache import (
     AnchorReceipt,
     SemanticStateAnchorCache,
 )
-from immer.runtimes.qwen3_8.snapshot import QWEN38_SNAPSHOT_SCHEMA
+from immer.runtimes.qwen3_8.snapshot import (
+    QWEN38_SNAPSHOT_SCHEMA,
+    read_qwen38_snapshot,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +61,9 @@ _SCHEDULES = {
     "ABBA": ("baseline", "battery", "battery", "baseline"),
     "BAAB": ("battery", "baseline", "baseline", "battery"),
 }
+ONE_SHOT_RELATIVE_L2_EPS_MULTIPLIER = 4.0
+ONE_SHOT_RELATIVE_L2_FLOOR = 2e-5
+STATE_COMPARISON_MAX_PEAK_BYTES = 2 * 1024**3
 
 
 class AnchorBatteryBenchmarkError(RuntimeError):
@@ -374,6 +382,230 @@ def _tensor_receipt(value: torch.Tensor) -> dict[str, Any]:
     }
 
 
+def _tensor_drift(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, Any]:
+    """Measure numerical drift without pretending reduction order is an ABI."""
+
+    if tuple(reference.shape) != tuple(candidate.shape):
+        raise AnchorBatteryBenchmarkError("one-shot hidden shape differs")
+    if reference.dtype != candidate.dtype:
+        raise AnchorBatteryBenchmarkError("one-shot hidden dtype differs")
+    left = reference.detach().to(device="cpu", dtype=torch.float64)
+    right = candidate.detach().to(device="cpu", dtype=torch.float64)
+    if not bool(torch.isfinite(left).all()) or not bool(torch.isfinite(right).all()):
+        raise AnchorBatteryBenchmarkError("one-shot hidden comparison is non-finite")
+    delta = right - left
+    reference_norm = float(torch.linalg.vector_norm(left).item())
+    delta_norm = float(torch.linalg.vector_norm(delta).item())
+    return {
+        "candidate_sha256": _tensor_receipt(candidate)["sha256"],
+        "dtype": str(reference.dtype).removeprefix("torch."),
+        "exact": bool(torch.equal(reference, candidate)),
+        "max_abs": float(delta.abs().max().item()),
+        "mean_abs": float(delta.abs().mean().item()),
+        "reference_sha256": _tensor_receipt(reference)["sha256"],
+        "relative_l2": (
+            0.0 if reference_norm == 0.0 and delta_norm == 0.0 else None
+            if reference_norm == 0.0
+            else delta_norm / reference_norm
+        ),
+        "shape": list(reference.shape),
+    }
+
+
+def _one_shot_relative_l2_limit(dtype: torch.dtype) -> float:
+    try:
+        epsilon = float(torch.finfo(dtype).eps)
+    except TypeError as exc:
+        raise AnchorBatteryBenchmarkError(
+            "one-shot hidden dtype is not floating point"
+        ) from exc
+    return max(
+        ONE_SHOT_RELATIVE_L2_FLOOR,
+        ONE_SHOT_RELATIVE_L2_EPS_MULTIPLIER * epsilon,
+    )
+
+
+def _snapshot_state_drift(
+    reference_path: Path,
+    candidate_path: Path,
+) -> dict[str, Any]:
+    """Authenticate and compare every logical continuation tensor numerically."""
+
+    reference_manifest = _stable_json(
+        reference_path, "reference state manifest", max_bytes=MAX_INPUT_BYTES
+    )
+    candidate_manifest = _stable_json(
+        candidate_path, "candidate state manifest", max_bytes=MAX_INPUT_BYTES
+    )
+    reference_body = reference_manifest.get("body")
+    candidate_body = candidate_manifest.get("body")
+    if not isinstance(reference_body, Mapping) or not isinstance(
+        candidate_body, Mapping
+    ):
+        raise AnchorBatteryBenchmarkError("state comparison manifest body is missing")
+    reference_identity = reference_body.get("identity")
+    candidate_identity = candidate_body.get("identity")
+    if not isinstance(reference_identity, Mapping) or not isinstance(
+        candidate_identity, Mapping
+    ):
+        raise AnchorBatteryBenchmarkError("state comparison identity is missing")
+    if _canonical(reference_identity) != _canonical(candidate_identity):
+        raise AnchorBatteryBenchmarkError("one-shot state identity differs")
+    execution = reference_identity.get("execution")
+    compute_dtype_name = (
+        execution.get("compute_dtype") if isinstance(execution, Mapping) else None
+    )
+    execution_dtypes = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    execution_dtype = execution_dtypes.get(compute_dtype_name)
+    if execution_dtype is None:
+        # Test fixtures and third-party compatible snapshot producers may use a
+        # minimal identity. In that case the strictest logical tensor dtype is
+        # retained below; production Qwen snapshots always take this branch.
+        execution_limit = None
+    else:
+        execution_limit = _one_shot_relative_l2_limit(execution_dtype)
+    reference = read_qwen38_snapshot(
+        reference_path,
+        expected_identity=reference_identity,
+        resident_bytes=0,
+        max_restore_peak_bytes=STATE_COMPARISON_MAX_PEAK_BYTES,
+    )
+    reference_tensor_bytes = reference.summary.get("tensor_bytes")
+    if (
+        isinstance(reference_tensor_bytes, bool)
+        or not isinstance(reference_tensor_bytes, int)
+        or reference_tensor_bytes <= 0
+    ):
+        raise AnchorBatteryBenchmarkError(
+            "reference state comparison byte count is invalid"
+        )
+    candidate = read_qwen38_snapshot(
+        candidate_path,
+        expected_identity=candidate_identity,
+        resident_bytes=reference_tensor_bytes,
+        max_restore_peak_bytes=STATE_COMPARISON_MAX_PEAK_BYTES,
+    )
+    if _canonical(reference.state) != _canonical(candidate.state):
+        raise AnchorBatteryBenchmarkError("one-shot structural state differs")
+    if set(reference.tensors) != set(candidate.tensors) or not reference.tensors:
+        raise AnchorBatteryBenchmarkError(
+            "one-shot logical continuation tensor set differs or is empty"
+        )
+
+    tensor_count = len(reference.tensors)
+    bit_exact_count = 0
+    aggregate_reference_sq = 0.0
+    aggregate_delta_sq = 0.0
+    maximum_abs = 0.0
+    worst_name = ""
+    worst_relative_l2 = 0.0
+    worst_limit = 0.0
+    worst_ratio = 0.0
+    failures: list[str] = []
+    for name in sorted(reference.tensors):
+        left_tensor = reference.tensors[name]
+        right_tensor = candidate.tensors[name]
+        if left_tensor.dtype != right_tensor.dtype or tuple(left_tensor.shape) != tuple(
+            right_tensor.shape
+        ):
+            raise AnchorBatteryBenchmarkError(
+                f"one-shot continuation tensor contract differs: {name}"
+            )
+        if torch.equal(left_tensor, right_tensor):
+            bit_exact_count += 1
+        left = left_tensor.to(device="cpu", dtype=torch.float64)
+        right = right_tensor.to(device="cpu", dtype=torch.float64)
+        left_neg_inf = torch.isneginf(left)
+        right_neg_inf = torch.isneginf(right)
+        if not torch.equal(left_neg_inf, right_neg_inf):
+            raise AnchorBatteryBenchmarkError(
+                f"one-shot continuation -inf mask differs: {name}"
+            )
+        if bool((torch.isnan(left) | torch.isposinf(left)).any()) or bool(
+            (torch.isnan(right) | torch.isposinf(right)).any()
+        ):
+            raise AnchorBatteryBenchmarkError(
+                f"one-shot continuation tensor is non-finite: {name}"
+            )
+        finite = ~left_neg_inf
+        finite_left = left[finite]
+        finite_right = right[finite]
+        delta = finite_right - finite_left
+        reference_sq = float(torch.sum(finite_left * finite_left).item())
+        delta_sq = float(torch.sum(delta * delta).item())
+        aggregate_reference_sq += reference_sq
+        aggregate_delta_sq += delta_sq
+        tensor_max_abs = 0.0 if delta.numel() == 0 else float(delta.abs().max().item())
+        maximum_abs = max(maximum_abs, tensor_max_abs)
+        relative_l2 = (
+            0.0
+            if reference_sq == 0.0 and delta_sq == 0.0
+            else math.inf
+            if reference_sq == 0.0
+            else math.sqrt(delta_sq / reference_sq)
+        )
+        # Float32 recurrent state still consumes BF16 activations. The valid
+        # segmentation drift is therefore bounded by the pinned execution
+        # dtype, not by the storage dtype of an individual continuation tensor.
+        limit = (
+            _one_shot_relative_l2_limit(left_tensor.dtype)
+            if execution_limit is None
+            else execution_limit
+        )
+        ratio = relative_l2 / limit
+        if ratio > worst_ratio:
+            worst_name = name
+            worst_relative_l2 = relative_l2
+            worst_limit = limit
+            worst_ratio = ratio
+        if not math.isfinite(relative_l2) or relative_l2 > limit:
+            failures.append(name)
+        del left, right, finite_left, finite_right, delta
+
+    if failures:
+        raise AnchorBatteryBenchmarkError(
+            "best-live one-shot continuation state exceeds dtype-bound "
+            f"relative-L2 limits in {len(failures)} tensor(s); first={failures[0]}"
+        )
+    aggregate_relative_l2 = (
+        0.0
+        if aggregate_reference_sq == 0.0 and aggregate_delta_sq == 0.0
+        else math.inf
+        if aggregate_reference_sq == 0.0
+        else math.sqrt(aggregate_delta_sq / aggregate_reference_sq)
+    )
+    reference_payload = reference_body.get("payload")
+    candidate_payload = candidate_body.get("payload")
+    if not isinstance(reference_payload, Mapping) or not isinstance(
+        candidate_payload, Mapping
+    ):
+        raise AnchorBatteryBenchmarkError("state comparison payload is missing")
+    return {
+        "aggregate_relative_l2": aggregate_relative_l2,
+        "all_tensors_within_dtype_bound": True,
+        "bit_exact_tensor_count": bit_exact_count,
+        "candidate_payload_sha256": candidate_payload.get("sha256"),
+        "drift_bound_compute_dtype": compute_dtype_name,
+        "maximum_abs": maximum_abs,
+        "non_bit_exact_tensor_count": tensor_count - bit_exact_count,
+        "reference_payload_sha256": reference_payload.get("sha256"),
+        "structural_state_exact": True,
+        "tensor_count": tensor_count,
+        "verification_estimated_peak_bytes": candidate.summary.get(
+            "estimated_restore_peak_bytes"
+        ),
+        "verification_max_restore_peak_bytes": STATE_COMPARISON_MAX_PEAK_BYTES,
+        "worst_normalized_relative_l2": worst_ratio,
+        "worst_tensor": worst_name,
+        "worst_tensor_relative_l2": worst_relative_l2,
+        "worst_tensor_relative_l2_limit": worst_limit,
+    }
+
+
 def _source_bytes(owner: object) -> int:
     pager = getattr(owner, "pager", None)
     source = getattr(pager, "source", None)
@@ -573,6 +805,8 @@ def _run_arm(
     source_before = _source_bytes(owner)
     evidence_before = len(native_evidence)
     restore_seconds = 0.0
+    baseline_prefix_seconds = 0.0
+    one_shot_prefill_seconds = 0.0
     suffix_seconds = 0.0
     head: dict[str, Any] | None = None
     anchor: AnchorReceipt | None = None
@@ -580,12 +814,18 @@ def _run_arm(
 
     if route == "baseline":
         started = time.perf_counter()
-        hidden, _forwards = model.prefill([list(full)], reset=True)
-        compute_seconds = time.perf_counter() - started
-        final_hidden = hidden[:, -1:]
-        if not suffix:
-            head = _head_scan(model, final_hidden)
-            compute_seconds += float(head["seconds"])
+        prefix_hidden, _forwards = model.prefill([list(prefix)], reset=True)
+        baseline_prefix_seconds = time.perf_counter() - started
+        if suffix:
+            started = time.perf_counter()
+            hidden, _forwards = model.prefill([list(suffix)], reset=False)
+            suffix_seconds = time.perf_counter() - started
+            final_hidden = hidden[:, -1:]
+        else:
+            final_hidden = prefix_hidden[:, -1:]
+        head = _head_scan(model, final_hidden)
+        suffix_seconds += float(head["seconds"])
+        compute_seconds = baseline_prefix_seconds + suffix_seconds
     elif route == "battery":
         started = time.perf_counter()
         restored = cache.restore_deepest(model, full)
@@ -606,14 +846,23 @@ def _run_arm(
                     "exact-prefix anchor has no seed hidden"
                 )
             final_hidden = restored.seed_hidden
-            head = _head_scan(model, final_hidden)
-            suffix_seconds = float(head["seconds"])
+        head = _head_scan(model, final_hidden)
+        suffix_seconds += float(head["seconds"])
         compute_seconds = restore_seconds + suffix_seconds
+    elif route == "one-shot":
+        started = time.perf_counter()
+        hidden, _forwards = model.prefill([list(full)], reset=True)
+        one_shot_prefill_seconds = time.perf_counter() - started
+        final_hidden = hidden[:, -1:]
+        head = _head_scan(model, final_hidden)
+        suffix_seconds = float(head["seconds"])
+        compute_seconds = one_shot_prefill_seconds + suffix_seconds
     else:  # pragma: no cover - guarded by sealed schedule validation.
         raise AnchorBatteryBenchmarkError("unknown benchmark route")
 
     source_after = _source_bytes(owner)
-    state = _snapshot_audit(model, audit_root, f"arm-{arm_index:02d}-{route}")
+    audit_name = f"arm-{arm_index:02d}-{route}"
+    state = _snapshot_audit(model, audit_root, audit_name)
     model_source_bytes = source_after - source_before
     if model_source_bytes < 0:
         raise AnchorBatteryBenchmarkError("model source byte counter moved backwards")
@@ -635,6 +884,7 @@ def _run_arm(
             "prefix_sha256": anchor.prefix_sha256,
             "receipt_sha256": anchor.receipt_sha256,
         },
+        "baseline_prefix_recompute_seconds": baseline_prefix_seconds,
         "demand_seconds": compute_seconds,
         "final_hidden": _tensor_receipt(final_hidden),
         "final_state": state,
@@ -643,9 +893,19 @@ def _run_arm(
         "native_crsa": _evidence_rows(native_evidence[evidence_before:]),
         "restore_and_verify_seconds": restore_seconds,
         "route": route,
+        "route_protocol": (
+            "cold-prefix+continuation-suffix"
+            if route == "baseline"
+            else "authenticated-anchor-restore+continuation-suffix"
+            if route == "battery"
+            else "best-live-one-shot"
+        ),
+        "one_shot_prefill_seconds": one_shot_prefill_seconds,
         "snapshot_restore_bytes": snapshot_restore_bytes,
         "suffix_or_head_seconds": suffix_seconds,
         "total_read_bytes": model_source_bytes + snapshot_restore_bytes,
+        "_final_hidden_tensor": final_hidden.detach().to(device="cpu").clone(),
+        "_audit_manifest_path": str(audit_root / audit_name / "state.json"),
     }
     model.reset_state(release=True)
     return arm
@@ -678,6 +938,15 @@ def compare_arms(
     batteries = [row for row in arms if row["route"] == "battery"]
     if not baselines or not batteries:
         raise AnchorBatteryBenchmarkError("schedule lacks an A/B arm")
+    one_shot = _run_arm(
+        "one-shot",
+        owner,
+        cache,
+        document,
+        native_evidence=native_evidence,
+        audit_root=audit_root,
+        arm_index=len(arms),
+    )
     reference_hidden = baselines[0]["final_hidden"]["sha256"]
     reference_payload = baselines[0]["final_state"]["payload_sha256"]
     reference_body = baselines[0]["final_state"]["manifest_body_sha256"]
@@ -708,6 +977,43 @@ def compare_arms(
             ):
                 raise AnchorBatteryBenchmarkError("restored LM-head scan is not exact")
 
+    if (
+        one_shot["head_scan"] is None
+        or reference_head is None
+        or one_shot["head_scan"]["token_ids"]["sha256"]
+        != reference_head["token_ids"]["sha256"]
+    ):
+        raise AnchorBatteryBenchmarkError(
+            "best-live one-shot and continuation paths choose different next tokens"
+        )
+    reference_tensor = baselines[0]["_final_hidden_tensor"]
+    one_shot_drift = _tensor_drift(
+        reference_tensor, one_shot["_final_hidden_tensor"]
+    )
+    drift_limit = _one_shot_relative_l2_limit(reference_tensor.dtype)
+    relative_l2 = one_shot_drift["relative_l2"]
+    within_drift_bound = (
+        isinstance(relative_l2, float)
+        and math.isfinite(relative_l2)
+        and relative_l2 <= drift_limit
+    )
+    one_shot_drift["relative_l2_limit"] = drift_limit
+    one_shot_drift["within_bound"] = within_drift_bound
+    if not within_drift_bound:
+        raise AnchorBatteryBenchmarkError(
+            "best-live one-shot and continuation hidden states exceed the "
+            "dtype-bound relative-L2 limit"
+        )
+    one_shot_state_drift = _snapshot_state_drift(
+        Path(baselines[0]["_audit_manifest_path"]),
+        Path(one_shot["_audit_manifest_path"]),
+    )
+    for arm in arms:
+        arm.pop("_final_hidden_tensor")
+        arm.pop("_audit_manifest_path")
+    one_shot.pop("_final_hidden_tensor")
+    one_shot.pop("_audit_manifest_path")
+
     baseline_seconds = statistics.median(row["demand_seconds"] for row in baselines)
     battery_seconds = statistics.median(row["demand_seconds"] for row in batteries)
     baseline_model_bytes = statistics.median(
@@ -722,32 +1028,62 @@ def compare_arms(
     battery_total_bytes = statistics.median(
         row["total_read_bytes"] for row in batteries
     )
-    saved = baseline_seconds - battery_seconds
+    one_shot_seconds = float(one_shot["demand_seconds"])
+    best_fresh_seconds = min(baseline_seconds, one_shot_seconds)
+    best_fresh_total_bytes = min(
+        baseline_total_bytes, float(one_shot["total_read_bytes"])
+    )
+    boundary_saved = baseline_seconds - battery_seconds
+    conservative_saved = best_fresh_seconds - battery_seconds
     return {
         "arms": arms,
         "exactness": {
+            "comparison_domain": "identical-prefix-boundary-continuation-abi",
             "final_hidden_bit_exact": True,
             "final_state_manifest_body_bit_exact": True,
             "final_state_payload_bit_exact": True,
             "head_scan_bit_exact": reference_head is not None,
+            "one_shot_next_token_exact": True,
+            "one_shot_vs_continuation_hidden_drift": one_shot_drift,
+            "one_shot_vs_continuation_state_drift": one_shot_state_drift,
             "reference_hidden_sha256": reference_hidden,
             "reference_state_payload_sha256": reference_payload,
             "reference_state_manifest_body_sha256": reference_body,
         },
         "peak_demand": {
             "anchor_charge_excluded": True,
+            "baseline_protocol": "cold-prefix+continuation-suffix",
             "baseline_median_model_source_bytes": baseline_model_bytes,
             "baseline_median_seconds": baseline_seconds,
             "baseline_median_total_read_bytes": baseline_total_bytes,
             "battery_median_model_source_bytes": battery_model_bytes,
             "battery_median_seconds": battery_seconds,
             "battery_median_total_read_bytes": battery_total_bytes,
-            "saved_seconds": saved,
-            "speedup": None
+            "battery_protocol": "authenticated-anchor-restore+continuation-suffix",
+            "best_fresh_median_seconds": best_fresh_seconds,
+            "best_fresh_total_read_bytes": best_fresh_total_bytes,
+            "one_shot_model_source_bytes": one_shot["model_source_bytes"],
+            "one_shot_seconds": one_shot_seconds,
+            "one_shot_total_read_bytes": one_shot["total_read_bytes"],
+            "boundary_recompute_saved_seconds": boundary_saved,
+            "boundary_total_read_bytes_saved": (
+                baseline_total_bytes - battery_total_bytes
+            ),
+            "conservative_best_fresh_saved_seconds": conservative_saved,
+            "conservative_best_fresh_total_read_bytes_saved": (
+                best_fresh_total_bytes - battery_total_bytes
+            ),
+            "conservative_speedup_vs_best_fresh": None
+            if battery_seconds == 0.0
+            else best_fresh_seconds / battery_seconds,
+            "speedup_vs_boundary_recompute": None
             if battery_seconds == 0.0
             else baseline_seconds / battery_seconds,
-            "total_read_bytes_saved": baseline_total_bytes - battery_total_bytes,
+            "speedup_vs_one_shot": None
+            if battery_seconds == 0.0
+            else one_shot_seconds / battery_seconds,
         },
+        "one_shot_reference": one_shot,
     }
 
 

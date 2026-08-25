@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -21,6 +20,7 @@ from immer.runtimes.qwen3_8.semantic_state_cache import (
     SemanticStateAnchorCache,
     token_prefix_sha256,
 )
+from immer.runtimes.qwen3_8.snapshot import SnapshotTensor, write_qwen38_snapshot
 
 from test_qwen3_8_model import _native_tiny_config, _tiny_config, _tiny_weights
 
@@ -84,15 +84,26 @@ class _FakePager:
 class _FakeModel:
     output_head_name = "lm_head.weight"
 
-    def __init__(self, source: _FakeSource, *, corrupt_suffix: bool = False) -> None:
+    def __init__(
+        self,
+        source: _FakeSource,
+        *,
+        corrupt_suffix: bool = False,
+        one_shot_drift: float = 0.0,
+        one_shot_state_drift: float = 0.0,
+    ) -> None:
         self.pager = _FakePager(source)
         self.state = 0
         self.next_position = 0
         self.corrupt_suffix = corrupt_suffix
+        self.one_shot_drift = one_shot_drift
+        self.one_shot_state_drift = one_shot_state_drift
+        self.audit_state_bias = 0.0
 
     def reset_state(self, *, release=False):
         self.state = 0
         self.next_position = 0
+        self.audit_state_bias = 0.0
 
     def prefill(self, token_ids, *, reset=True):
         if reset:
@@ -102,40 +113,24 @@ class _FakeModel:
         self.state += sum(tokens)
         self.next_position += len(tokens)
         value = self.state + (1 if self.corrupt_suffix and not reset else 0)
+        if reset and len(tokens) > 3:
+            value += self.one_shot_drift
+            self.audit_state_bias = self.one_shot_state_drift
         hidden = torch.tensor([[[float(value)]]], dtype=torch.float32)
         return hidden, ()
 
     def save_state(self, path, **_kwargs):
-        target = Path(path)
-        payload_raw = str(self.state).encode("ascii")
-        payload_sha = hashlib.sha256(payload_raw).hexdigest()
-        payload_name = f"{payload_sha}.npz"
-        (target.parent / payload_name).write_bytes(payload_raw)
-        body = {
-            "payload": {
-                "bytes": len(payload_raw),
-                "file": payload_name,
-                "sha256": payload_sha,
+        value = float(self.state) + self.audit_state_bias
+        return write_qwen38_snapshot(
+            path,
+            identity={"fake_runtime": "v1"},
+            state={"fake_state": self.state, "next_position": self.next_position},
+            tensors={
+                "state.fake": SnapshotTensor(
+                    torch.tensor([value], dtype=torch.float32)
+                )
             },
-            "tensor_bytes": 0,
-            "tensor_count": 0,
-            "tensors": [],
-        }
-        body_sha = hashlib.sha256(benchmark._canonical_ascii(body)).hexdigest()
-        manifest = {
-            "body": body,
-            "body_sha256": body_sha,
-            "schema": benchmark.QWEN38_SNAPSHOT_SCHEMA,
-            "version": 1,
-        }
-        target.write_bytes(benchmark._canonical_ascii(manifest) + b"\n")
-        return {
-            "manifest_body_sha256": body_sha,
-            "payload_sha256": payload_sha,
-            "payload_bytes": len(payload_raw),
-            "tensor_count": 0,
-            "tensor_bytes": 0,
-        }
+        )
 
 
 class _FakeReceipt:
@@ -198,9 +193,19 @@ class _FakeCache:
         )
 
 
-def _fake_owner(*, corrupt_suffix=False):
+def _fake_owner(
+    *,
+    corrupt_suffix=False,
+    one_shot_drift=0.0,
+    one_shot_state_drift=0.0,
+):
     source = _FakeSource()
-    model = _FakeModel(source, corrupt_suffix=corrupt_suffix)
+    model = _FakeModel(
+        source,
+        corrupt_suffix=corrupt_suffix,
+        one_shot_drift=one_shot_drift,
+        one_shot_state_drift=one_shot_state_drift,
+    )
     return SimpleNamespace(model=model, pager=model.pager)
 
 
@@ -282,15 +287,37 @@ class AnchorBatteryFakeExecutionTests(unittest.TestCase):
         self.assertTrue(result["exactness"]["final_hidden_bit_exact"])
         self.assertTrue(result["exactness"]["final_state_payload_bit_exact"])
         self.assertEqual(
-            result["peak_demand"]["baseline_median_model_source_bytes"], 500
+            result["exactness"]["comparison_domain"],
+            "identical-prefix-boundary-continuation-abi",
         )
         self.assertEqual(
-            result["peak_demand"]["battery_median_model_source_bytes"], 200
+            result["peak_demand"]["baseline_median_model_source_bytes"], 507
         )
-        self.assertEqual(result["peak_demand"]["baseline_median_total_read_bytes"], 500)
-        self.assertEqual(result["peak_demand"]["battery_median_total_read_bytes"], 3368)
-        self.assertEqual(result["peak_demand"]["total_read_bytes_saved"], -2868)
+        self.assertEqual(
+            result["peak_demand"]["battery_median_model_source_bytes"], 207
+        )
+        self.assertEqual(result["peak_demand"]["baseline_median_total_read_bytes"], 507)
+        self.assertEqual(result["peak_demand"]["battery_median_total_read_bytes"], 3375)
+        self.assertEqual(
+            result["peak_demand"]["boundary_total_read_bytes_saved"], -2868
+        )
+        self.assertEqual(
+            result["peak_demand"]["conservative_best_fresh_total_read_bytes_saved"],
+            -2868,
+        )
+        self.assertNotIn("speedup", result["peak_demand"])
         self.assertTrue(result["peak_demand"]["anchor_charge_excluded"])
+        self.assertGreaterEqual(
+            result["arms"][0]["baseline_prefix_recompute_seconds"], 0.0
+        )
+        self.assertEqual(
+            result["arms"][0]["route_protocol"],
+            "cold-prefix+continuation-suffix",
+        )
+        self.assertEqual(
+            result["arms"][1]["route_protocol"],
+            "authenticated-anchor-restore+continuation-suffix",
+        )
         self.assertEqual(result["arms"][1]["anchor"]["hit_count"], 1)
         self.assertEqual(
             result["arms"][0]["final_state"]["native_crsa_usage_tensor_count"],
@@ -301,6 +328,24 @@ class AnchorBatteryFakeExecutionTests(unittest.TestCase):
         )
         self.assertEqual(result["arms"][1]["snapshot_restore_bytes"], 3168)
         self.assertEqual(result["arms"][2]["anchor"]["hit_count"], 2)
+        self.assertTrue(result["exactness"]["one_shot_next_token_exact"])
+        self.assertTrue(
+            result["exactness"]["one_shot_vs_continuation_hidden_drift"]["exact"]
+        )
+        self.assertTrue(
+            result["exactness"]["one_shot_vs_continuation_state_drift"][
+                "all_tensors_within_dtype_bound"
+            ]
+        )
+        self.assertTrue(
+            result["exactness"]["one_shot_vs_continuation_hidden_drift"][
+                "within_bound"
+            ]
+        )
+        self.assertEqual(result["one_shot_reference"]["route"], "one-shot")
+        self.assertEqual(
+            result["one_shot_reference"]["route_protocol"], "best-live-one-shot"
+        )
 
     def test_empty_suffix_uses_seed_hidden_and_exact_direct_head_scan(self) -> None:
         document = _input(suffix=())
@@ -334,6 +379,44 @@ class AnchorBatteryFakeExecutionTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 benchmark.AnchorBatteryBenchmarkError,
                 "hidden|state payload",
+            ):
+                benchmark.compare_arms(
+                    owner,
+                    cache,
+                    document,
+                    native_evidence=[],
+                    audit_root=Path(temporary),
+                )
+
+    def test_one_shot_shared_continuation_drift_exceeding_dtype_bound_fails(
+        self,
+    ) -> None:
+        document = _input()
+        owner = _fake_owner(one_shot_drift=0.75)
+        cache = _FakeCache()
+        benchmark.charge_anchor(owner, cache, document, native_evidence=[])
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                benchmark.AnchorBatteryBenchmarkError,
+                "relative-L2",
+            ):
+                benchmark.compare_arms(
+                    owner,
+                    cache,
+                    document,
+                    native_evidence=[],
+                    audit_root=Path(temporary),
+                )
+
+    def test_one_shot_state_drift_exceeding_dtype_bound_fails(self) -> None:
+        document = _input()
+        owner = _fake_owner(one_shot_state_drift=0.75)
+        cache = _FakeCache()
+        benchmark.charge_anchor(owner, cache, document, native_evidence=[])
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                benchmark.AnchorBatteryBenchmarkError,
+                "continuation state exceeds dtype-bound",
             ):
                 benchmark.compare_arms(
                     owner,
@@ -394,7 +477,8 @@ class AnchorBatteryTinyRuntimeTests(unittest.TestCase):
             self.assertGreater(charge["cache_bytes"], 0)
             self.assertTrue(result["exactness"]["final_hidden_bit_exact"])
             self.assertTrue(result["exactness"]["final_state_payload_bit_exact"])
-            self.assertFalse(result["exactness"]["head_scan_bit_exact"])
+            self.assertTrue(result["exactness"]["one_shot_next_token_exact"])
+            self.assertTrue(result["exactness"]["head_scan_bit_exact"])
             self.assertEqual(
                 result["arms"][0]["final_state"]["payload_sha256"],
                 result["arms"][1]["final_state"]["payload_sha256"],
@@ -458,6 +542,75 @@ class AnchorBatteryTinyRuntimeTests(unittest.TestCase):
                 1,
             )
             self.assertGreater(result["arms"][1]["snapshot_restore_bytes"], 0)
+
+    def test_native_crsa_multitoken_suffix_restore_is_bit_exact_at_same_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-anchor-benchmark-native-suffix-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            model_root = root / "model"
+            model_root.mkdir()
+            config = _native_tiny_config()
+            save_file(_tiny_weights(config), model_root / "model.safetensors")
+            source = Streamer.from_local(model_root, budget_mb=40, use_cache=False)
+            pager = Qwen38WeightPager(
+                source,
+                device="cpu",
+                compute_dtype="bfloat16",
+                max_resident_bytes=4 * 1024**2,
+            )
+            native_evidence = []
+            model = StreamedQwen38(
+                config,
+                pager,
+                native_head_crsa=Qwen38NativeHeadCrsa(alpha=0.1),
+                native_head_crsa_observer=native_evidence.append,
+                max_batch_size=1,
+                max_seq_len=32,
+            )
+            owner = SimpleNamespace(model=model, pager=pager)
+            cache = SemanticStateAnchorCache(root / "cache")
+            document = _input(
+                prefix=(1, 4, 9),
+                suffix=(7, 6, 5),
+                attention_mode="native-crsa",
+            )
+            try:
+                benchmark.charge_anchor(
+                    owner, cache, document, native_evidence=native_evidence
+                )
+                result = benchmark.compare_arms(
+                    owner,
+                    cache,
+                    document,
+                    native_evidence=native_evidence,
+                    audit_root=root / "audits",
+                )
+            finally:
+                model.reset_state(release=True)
+                pager.close()
+                source.close()
+            self.assertTrue(result["exactness"]["final_hidden_bit_exact"])
+            self.assertTrue(result["exactness"]["final_state_payload_bit_exact"])
+            self.assertTrue(result["exactness"]["one_shot_next_token_exact"])
+            self.assertEqual(
+                result["arms"][0]["final_state"][
+                    "native_crsa_usage_tensor_count"
+                ],
+                1,
+            )
+            self.assertEqual(
+                result["arms"][1]["final_state"][
+                    "native_crsa_usage_tensor_count"
+                ],
+                1,
+            )
+            self.assertEqual(
+                result["arms"][0]["final_state"]["payload_sha256"],
+                result["arms"][1]["final_state"]["payload_sha256"],
+            )
 
 
 if __name__ == "__main__":
