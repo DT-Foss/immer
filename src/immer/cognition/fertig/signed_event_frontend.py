@@ -86,6 +86,22 @@ TIME = Unit.base("time", symbol="day")
 PRICE_PER_COUNT = MONEY / COUNT
 PRICE_PER_LENGTH = MONEY / LENGTH
 COUNT_PER_TIME = COUNT / TIME
+COUNT_PER_MEMBER_TIME = COUNT / COUNT / TIME
+
+_FIXED_MONTH_DAYS = {
+    "january": 31,
+    "march": 31,
+    "april": 30,
+    "may": 31,
+    "june": 30,
+    "july": 31,
+    "august": 31,
+    "september": 30,
+    "october": 31,
+    "november": 30,
+    "december": 31,
+}
+_MONTHS = frozenset((*_FIXED_MONTH_DAYS, "february"))
 
 
 class _Reject(ValueError):
@@ -466,6 +482,66 @@ def _daily_combined(
     return builder.finish(expr, "combined_daily_total")
 
 
+def _calendar_daily_total(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    question = _question(clause_set)
+    if not _contains(question.norms, "total", "number", "of", "posts"):
+        return None
+    mentioned_months = [token for token in question.tokens if token.norm in _MONTHS]
+    if not mentioned_months:
+        return None
+    if len(mentioned_months) != 1:
+        raise _Reject(FrontendStatus.AMBIGUOUS, "calendar month is not unique")
+    month = mentioned_months[0]
+    month_index = question.tokens.index(month)
+    if month_index == 0 or question.norms[month_index - 1] != "in":
+        raise _Reject(
+            FrontendStatus.UNSUPPORTED,
+            "calendar month has no local in-scope binding",
+        )
+    if month.norm not in _FIXED_MONTH_DAYS:
+        raise _Reject(
+            FrontendStatus.UNSUPPORTED,
+            "February requires an explicit day count",
+        )
+
+    member_counts: list[Token] = []
+    daily_rates: list[Token] = []
+    for token in _numeric(clause_set):
+        clause = _clause_for(clause_set, token)
+        index = clause.tokens.index(token)
+        following = clause.norms[index + 1 : index + 5]
+        if (
+            index > 0
+            and clause.norms[index - 1] == "has"
+            and following
+            and _singular(following[0]) == "member"
+        ):
+            member_counts.append(token)
+        if _contains(following, "posts", "per", "day") and _contains(
+            clause.norms[:index], "each", "member"
+        ):
+            daily_rates.append(token)
+    if len(member_counts) != 1 or len(daily_rates) != 1:
+        raise _Reject(
+            FrontendStatus.UNSUPPORTED,
+            "calendar daily-rate relation is incomplete",
+        )
+
+    builder = _Builder(source, clause_set)
+    expression = _product(
+        builder.literal(member_counts[0], COUNT),
+        builder.literal(daily_rates[0], COUNT_PER_MEMBER_TIME),
+        builder.lexical_literal(
+            month,
+            Fraction(_FIXED_MONTH_DAYS[month.norm]),
+            TIME,
+        ),
+    )
+    return builder.finish(expression, "calendar_daily_total")
+
+
 def _old_new_savings(
     source: str, clause_set: tuple[Clause, ...]
 ) -> FrontendResult | None:
@@ -710,6 +786,7 @@ _PLANNERS = (
     _rate_length_difference,
     _functioning_chain,
     _daily_combined,
+    _calendar_daily_total,
     _old_new_savings,
     _category_sales,
     _repeated_duration,

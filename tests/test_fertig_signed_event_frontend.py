@@ -60,6 +60,12 @@ CASES = {
     ),
 }
 
+CALENDAR_CASE = (
+    "A Reddit group has 1000 members. If each member posts an average of 3 "
+    "posts per day, what's the total number of posts that the group will have "
+    "in March?"
+)
+
 
 class SignedEventFrontendTests(unittest.TestCase):
     def test_six_shared_event_families_compile_and_solve_exactly(self) -> None:
@@ -162,6 +168,39 @@ class SignedEventFrontendTests(unittest.TestCase):
         self.assertTrue(result.ok, result.reason)
         assert result.compiled is not None
         self.assertEqual(result.compiled.solution.target_value, Fraction(540))
+
+    def test_calendar_daily_rate_compiles_with_exact_month_basis(self) -> None:
+        for month, days in (("March", 31), ("April", 30), ("December", 31)):
+            with self.subTest(month=month):
+                question = CALENDAR_CASE.replace("March", month)
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                self.assertEqual(result.family, "calendar_daily_total")
+                assert result.compiled is not None
+                self.assertEqual(
+                    result.compiled.solution.target_value,
+                    Fraction(1000 * 3 * days),
+                )
+                self.assertTrue(result.compiled.certificate.verified)
+
+                parsed = parse_structural_problem(question)
+                self.assertTrue(parsed.ok, parsed.reason)
+                assert parsed.problem is not None
+                self.assertEqual(solve(parsed.problem).target_value, 1000 * 3 * days)
+
+    def test_calendar_daily_rate_rejects_unproven_or_noisy_bindings(self) -> None:
+        mutations = (
+            CALENDAR_CASE.replace("March", "February"),
+            CALENDAR_CASE.replace("March", "March or April"),
+            CALENDAR_CASE.replace("each member", "each moderator"),
+            CALENDAR_CASE.replace(
+                "has 1000 members", "has 1000 members and 5 moderators"
+            ),
+            CALENDAR_CASE.replace("in March", "in an unspecified month"),
+        )
+        for question in mutations:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
 
     def test_ambiguous_comparison_orientation_is_rejected(self) -> None:
         question = CASES[8][0].replace("Lewis' street", "the other street")
