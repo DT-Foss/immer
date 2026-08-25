@@ -29,6 +29,14 @@ All notable changes to IMMER are recorded here.
   continuation-state hash matches, continuation source bytes fall by
   `49.99999%` (`97.41 GB → 48.71 GB`), and model time falls by `46.48%`
   (`158.14 s → 84.63 s`) while preserving all 992 one-token linear calls.
+- Added exact K=2 speculative generation over an arbitrary draft provider:
+  full acceptance commits once, mismatch-0 decodes the target token,
+  mismatch-1 restages the verified prefix, and EOS never commits post-stop
+  state. Every path is bit-identical to greedy generation in regression tests.
+- Hardened same-process draft hooks with before/after committed-state hashing;
+  mutation resets and fails closed. Integrity cost is explicit in
+  `provider_guard_bytes` and `provider_guard_seconds`, and speculative
+  generation exposes no live progress callbacks around pending state.
 
 ### Exact event and binding compiler
 

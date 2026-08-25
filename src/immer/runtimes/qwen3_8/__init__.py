@@ -69,6 +69,15 @@ from .probe import (
     verify_probe_document,
 )
 from .snapshot import QWEN38_SNAPSHOT_SCHEMA, Qwen38SnapshotError
+from .speculative import (
+    DraftProvider,
+    K2SpeculativeGenerationEvidence,
+    K2SpeculativeGenerationResult,
+    K2SpeculativeRoundEvidence,
+    QWEN38_K2_SPECULATIVE_SCHEMA,
+    Qwen38K2SpeculativeDecoder,
+    Qwen38SpeculativeError,
+)
 
 
 __all__ = [
@@ -82,10 +91,14 @@ __all__ = [
     "DELTANET_COMPONENTS",
     "DELTANET_PROBE_SCHEMA",
     "END_OF_TEXT_TOKEN_ID",
+    "DraftProvider",
     "GenerationEvidence",
     "IM_END_TOKEN_ID",
     "IM_START_TOKEN_ID",
     "LogicalModelIdentity",
+    "K2SpeculativeGenerationEvidence",
+    "K2SpeculativeGenerationResult",
+    "K2SpeculativeRoundEvidence",
     "NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA",
     "NATIVE_HEAD_CRSA_FREE_HEADS",
     "NATIVE_HEAD_CRSA_KV_HEADS",
@@ -116,11 +129,14 @@ __all__ = [
     "Qwen38ForkTraffic",
     "Qwen38PagerError",
     "Qwen38RuntimeError",
+    "Qwen38K2SpeculativeDecoder",
     "Qwen38SnapshotError",
+    "Qwen38SpeculativeError",
     "Qwen38StableCrsaGraft",
     "Qwen38Tokenizer",
     "Qwen38WeightPager",
     "QWEN38_SNAPSHOT_SCHEMA",
+    "QWEN38_K2_SPECULATIVE_SCHEMA",
     "StatefulEvidence",
     "StatefulBlockEvidence",
     "StatefulBlockStage",
