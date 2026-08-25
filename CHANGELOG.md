@@ -41,6 +41,12 @@ All notable changes to IMMER are recorded here.
   causal-bundle runtimes, greedy-versus-speculative token/state parity,
   independently audited staged hidden, authenticated traces, adjusted cost
   receipts, transported validation, and forged bundle/state/cost rejection.
+- The official fixed-Q3 draft `[794, 220]` is fully accepted and positive:
+  greedy and speculative tokens, committed hidden, cursor, KV, and DeltaNet
+  states match exactly. Adjusted source bytes fall `33.89%`
+  (`151.21 GB → 99.96 GB`), model time falls `22.44%`
+  (`289.19 s → 224.31 s`), forward passes fall `3 → 2`, and head scans
+  `2 → 1`; strict provider-state hashing costs `0.228 s`.
 
 ### Exact event and binding compiler
 
