@@ -16,14 +16,21 @@ import re
 
 from .arithmetic_ir import Span, Unit
 from .clause_compiler import SymbolKey
+from .discourse_ssa import (
+    DiscourseNumber,
+    DiscourseSSAError,
+    TypedDiscourseSSA,
+)
 from .signed_expression import (
     AbsoluteExpr,
     CeilingExpr,
+    ClosedShareExpr,
     Definition,
     ExpressionCompileError,
     ExpressionCompileResult,
     ExpressionProgram,
     ExpressionTarget,
+    GroundProductExpr,
     LiteralExpr,
     MeanExpr,
     NumericEvidence,
@@ -32,6 +39,7 @@ from .signed_expression import (
     RefExpr,
     SignedTerm,
     SumExpr,
+    UnitConversionExpr,
     compile_expression,
 )
 
@@ -128,6 +136,9 @@ PERCENT = Unit("%", (), Fraction(1, 100))
 MILLIMETER = Unit.base("length", symbol="mm")
 SECOND = Unit("second", (("time", 1),), Fraction(1))
 POINT = Unit.base("score", symbol="point")
+MASS = Unit.base("mass", symbol="lb")
+VOLUME = Unit.base("volume", symbol="gal")
+INCH = Unit("inch", (("length", 1),), Fraction(1, 12))
 
 _LOCAL_CARDINALS = {
     "zero": Fraction(0),
@@ -168,6 +179,24 @@ class _Reject(ValueError):
         self.status = status
         self.reason = reason
         super().__init__(reason)
+
+
+def _ssa_family(planner):
+    """Translate typed discourse failures into the frontend's closed statuses."""
+
+    def guarded(source: str, clause_set: tuple[Clause, ...]):
+        try:
+            return planner(source, clause_set)
+        except DiscourseSSAError as exc:
+            status = (
+                FrontendStatus.AMBIGUOUS
+                if exc.ambiguous
+                else FrontendStatus.INVALID
+            )
+            raise _Reject(status, exc.reason) from exc
+
+    guarded.__name__ = planner.__name__
+    return guarded
 
 
 def _fraction(text: str) -> Fraction:
@@ -563,6 +592,19 @@ def _question(clause_set: tuple[Clause, ...]) -> Clause:
     if len(rows) != 1:
         raise _Reject(FrontendStatus.AMBIGUOUS, "one explicit question is required")
     return rows[0]
+
+
+def _require_single_target_marker(question: Clause) -> None:
+    markers = [
+        token
+        for token in question.tokens
+        if token.norm in {"calculate", "find", "how", "what"}
+    ]
+    _require(
+        len(markers) == 1,
+        "question contains multiple or missing target markers",
+        FrontendStatus.AMBIGUOUS,
+    )
 
 
 def _rate_length_difference(
@@ -5456,7 +5498,1954 @@ def _absolute_weighted_score_difference(
     return builder.finish(expression, "absolute_weighted_score_difference")
 
 
+def _surface_cardinal(token: Token) -> Fraction | None:
+    if token.number is not None:
+        return token.number
+    return _LOCAL_CARDINALS.get(token.norm)
+
+
+def _bound_cardinal(builder: _Builder, token: Token, unit: Unit) -> LiteralExpr:
+    value = _surface_cardinal(token)
+    if value is None:
+        raise _Reject(FrontendStatus.UNSUPPORTED, "numeric relation is not exact")
+    return builder.lexical_literal(token, value, unit)
+
+
+def _leading_subject(clause: Clause) -> tuple[str, int]:
+    index = 1 if clause.norms[:1] in {("and",), ("but",)} else 0
+    _require(
+        index < len(clause.tokens) and clause.tokens[index].text[:1].isupper(),
+        "relation subject is not one explicit name",
+        FrontendStatus.AMBIGUOUS,
+    )
+    return clause.norms[index], index
+
+
+@_ssa_family
+def _grounded_value_pipeline(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Compile an explicitly grounded sequence of named intermediate values."""
+
+    question = _question(clause_set)
+    if not _contains(question.norms, "what", "was", "the", "final", "value"):
+        return None
+    _require_single_target_marker(question)
+    relation_rows = [
+        clause
+        for clause in clause_set
+        if _contains(clause.norms, "this", "starting", "value", "plus", "half")
+        and _contains(clause.norms, "the", "resulting", "value", "was", "multiplied")
+    ]
+    if not relation_rows:
+        return None
+    _require(
+        len(relation_rows) == 1,
+        "grounded value pipeline is not unique",
+        FrontendStatus.AMBIGUOUS,
+    )
+    relation = relation_rows[0]
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and _contains(clause.norms, "starting", "value", "of")
+            and "gave" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="starting-value declaration is not unique",
+    )
+    owner, owner_index = _leading_subject(intro)
+    gave_index = intro.norms.index("gave")
+    start_index = intro.norms.index("starting")
+    _require(
+        owner_index == 0
+        and gave_index == 1
+        and start_index >= 6
+        and intro.norms[start_index - 1] in {"a", "the"}
+        and intro.norms[start_index : start_index + 3] == ("starting", "value", "of"),
+        "starting value has no closed owner/object scope",
+        FrontendStatus.AMBIGUOUS,
+    )
+    articles = [
+        index
+        for index in range(gave_index + 1, start_index)
+        if intro.norms[index] in {"a", "an", "the"}
+    ]
+    _require(len(articles) >= 2, "value-stream object is not locally introduced")
+    object_words = intro.norms[articles[0] + 1 : articles[-1]]
+    object_id = _item_id(object_words)
+    final_index = question.norms.index("final")
+    _require(
+        final_index + 4 < len(question.tokens)
+        and question.norms[final_index + 2 : final_index + 4] == ("of", "the")
+        and _item_id(question.norms[final_index + 4 :]) == object_id,
+        "final value targets another value stream",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        relation.norms[:10]
+        == (
+            "this",
+            "starting",
+            "value",
+            "plus",
+            "half",
+            "the",
+            "number",
+            "was",
+            "divided",
+            "by",
+        )
+        and _contains(
+            relation.norms,
+            "and",
+            "the",
+            "resulting",
+            "value",
+            "was",
+            "multiplied",
+            "by",
+            "the",
+            "starting",
+            "value",
+            "minus",
+        ),
+        "value pipeline operators or antecedents are incomplete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    half = relation.tokens[4]
+    by_offsets = [index for index, word in enumerate(relation.norms) if word == "by"]
+    minus_index = relation.norms.index("minus")
+    _require(
+        len(by_offsets) == 2
+        and by_offsets[0] + 1 < len(relation.tokens)
+        and minus_index + 1 < len(relation.tokens),
+        "value pipeline operands are incomplete",
+    )
+    divisor = relation.tokens[by_offsets[0] + 1]
+    offset = relation.tokens[minus_index + 1]
+    _require(
+        _surface_cardinal(half) == Fraction(1, 2)
+        and divisor.number is not None
+        and divisor.number != 0
+        and offset.number is not None,
+        "value pipeline operands are invalid",
+        FrontendStatus.INVALID,
+    )
+    initial = _one_token(_counts(intro), "starting value is missing")
+
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    stream = ssa.entity(object_id, "value_stream", intro.span)
+
+    def symbol(state: str, span: Span):
+        return ssa.symbol(
+            stream,
+            property="value",
+            item="scalar",
+            scope="pipeline",
+            state=state,
+            role="state_value",
+            unit=SCALAR,
+            span=span,
+        )
+
+    starting = symbol("starting", intro.span)
+    augmented = symbol("augmented", relation.span)
+    divided = symbol("divided", relation.span)
+    remainder = symbol("starting_remainder", relation.span)
+    final = symbol("final", question.span)
+    ssa.define(
+        starting,
+        builder.literal(initial, SCALAR),
+        intro.span,
+        relation_id="starting_value",
+    )
+    ssa.define(
+        augmented,
+        _sum(
+            _signed(
+                1,
+                ssa.ref(starting, relation.span, role="state_value", unit=SCALAR),
+                "starting_value",
+            ),
+            _signed(
+                1,
+                _product(
+                    builder.literal(half, SCALAR),
+                    ssa.ref(starting, relation.span, role="state_value", unit=SCALAR),
+                ),
+                "half_starting_value",
+            ),
+        ),
+        relation.span,
+        relation_id="starting_plus_half",
+    )
+    ssa.define(
+        divided,
+        QuotientExpr(
+            ssa.ref(augmented, relation.span, role="state_value", unit=SCALAR),
+            builder.literal(divisor, SCALAR),
+            relation.span,
+        ),
+        relation.span,
+        relation_id="divide_result",
+    )
+    ssa.define(
+        remainder,
+        _sum(
+            _signed(
+                1,
+                ssa.ref(starting, relation.span, role="state_value", unit=SCALAR),
+                "starting_value",
+            ),
+            _signed(-1, builder.literal(offset, SCALAR), "minus_offset"),
+        ),
+        relation.span,
+        relation_id="starting_minus_offset",
+    )
+    ssa.define(
+        final,
+        GroundProductExpr(
+            (
+                ssa.ref(divided, relation.span, role="state_value", unit=SCALAR),
+                ssa.ref(remainder, relation.span, role="state_value", unit=SCALAR),
+            ),
+            relation.span,
+        ),
+        relation.span,
+        relation_id="grounded_final_product",
+    )
+    expression = ssa.ref(final, question.span, role="state_value", unit=SCALAR)
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "grounded_value_pipeline", definitions=definitions
+    )
+
+
+@_ssa_family
+def _shared_duration_affine_rates(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Bind two explicit production rates to one shared duration."""
+
+    question = _question(clause_set)
+    if not (
+        "worked" in question.norms
+        and "together" in question.norms
+        and _contains(question.norms, "total", "amount")
+    ):
+        return None
+    _require_single_target_marker(question)
+    first_rows = [
+        clause
+        for clause in clause_set
+        if not clause.question
+        and _contains(clause.norms, "can", "make")
+        and "in" in clause.norms
+        and "times" not in clause.norms
+        and len(_counts(clause)) == 1
+    ]
+    second_rows = [
+        clause
+        for clause in clause_set
+        if not clause.question
+        and _contains(clause.norms, "times", "as", "many")
+        and "hour" in clause.norms
+    ]
+    if not first_rows or not second_rows:
+        return None
+    _require(
+        len(first_rows) == len(second_rows) == 1,
+        "production-rate clauses are not unique",
+        FrontendStatus.AMBIGUOUS,
+    )
+    first, second = first_rows[0], second_rows[0]
+    first_owner, first_owner_index = _leading_subject(first)
+    second_owner, second_owner_index = _leading_subject(second)
+    _require(
+        first_owner_index == second_owner_index == 0 and first_owner != second_owner,
+        "production owners are not two distinct names",
+        FrontendStatus.AMBIGUOUS,
+    )
+    amount = _one_token(_counts(first), "production amount is missing")
+    amount_index = first.tokens.index(amount)
+    in_index = first.norms.index("in", amount_index)
+    _require(
+        amount_index + 3 <= in_index
+        and _singular(first.norms[amount_index + 1]) == "pound"
+        and first.norms[amount_index + 2] == "of",
+        "production amount lacks pound/item scope",
+    )
+    item = _item_id(first.norms[amount_index + 3 : in_index])
+    _require(in_index + 2 < len(first.tokens), "production duration is missing")
+    first_duration = first.tokens[in_index + 1]
+    duration_value = _surface_cardinal(first_duration)
+    duration_unit = _singular(first.norms[in_index + 2])
+    _require(
+        duration_value is not None
+        and duration_value > 0
+        and duration_unit == "hour",
+        "production duration is not a positive hour count",
+    )
+
+    times_index = second.norms.index("times")
+    _require(times_index > 0, "relative production scale is missing")
+    ratio = second.tokens[times_index - 1]
+    ratio_value = _surface_cardinal(ratio)
+    as_offsets = [index for index, word in enumerate(second.norms) if word == "as"]
+    _require(
+        ratio_value is not None
+        and ratio_value > 0
+        and len(as_offsets) == 2
+        and as_offsets[-1] + 1 < len(second.tokens)
+        and second.norms[as_offsets[-1] + 1] == first_owner,
+        "relative production source or scale is incomplete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    second_singular = tuple(_singular(word) for word in second.norms)
+    _require(
+        _contains(second_singular, "pound", "of", item)
+        and _contains(second.norms, "in", "an", "hour")
+        and _contains(
+            second.norms,
+            "as",
+            first_owner,
+            "makes",
+            "in",
+            "the",
+            first_duration.norm,
+            "hours",
+        ),
+        "relative production item or reference duration differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    horizon = _one_token(_counts(question), "shared work duration is missing")
+    horizon_index = question.tokens.index(horizon)
+    _require(
+        _contains(question.norms, "if", "they", "worked", "for")
+        and horizon_index + 1 < len(question.tokens)
+        and _singular(question.norms[horizon_index + 1]) == "hour"
+        and _contains(question.norms, "they", "made", "together")
+        and {"pound", item}.issubset({_singular(word) for word in question.norms}),
+        "shared duration target does not cover both producers and the same item",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        question.norms
+        == (
+            "if",
+            "they",
+            "worked",
+            "for",
+            horizon.norm,
+            question.norms[horizon_index + 1],
+            "in",
+            "a",
+            "day",
+            ",",
+            "calculate",
+            "the",
+            "total",
+            "amount",
+            "of",
+            item,
+            "pounds",
+            "they",
+            "made",
+            "together",
+        ),
+        "production question contains another requested target",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    producer_a = ssa.entity(first_owner, "producer", first.tokens[0].span)
+    producer_b = ssa.entity(second_owner, "producer", second.tokens[0].span)
+    group = ssa.group(
+        "producer_group", (producer_a, producer_b), "producer", question.span
+    )
+    ssa.resolve(
+        "they",
+        role="producer",
+        number=DiscourseNumber.PLURAL,
+        members=(first_owner, second_owner),
+    )
+
+    amount_symbol = ssa.symbol(
+        producer_a,
+        property="amount",
+        item=item,
+        scope="reference_period",
+        state="declared",
+        role="production_amount",
+        unit=MASS,
+        span=first.span,
+    )
+    rate_a = ssa.symbol(
+        producer_a,
+        property="rate",
+        item=item,
+        scope="hour",
+        state="current",
+        role="production_rate",
+        unit=MASS / HOUR,
+        span=first.span,
+    )
+    rate_b = ssa.symbol(
+        producer_b,
+        property="rate",
+        item=item,
+        scope="hour",
+        state="current",
+        role="production_rate",
+        unit=MASS / HOUR,
+        span=second.span,
+    )
+    group_rate = ssa.symbol(
+        group,
+        property="rate",
+        item=item,
+        scope="hour",
+        state="combined",
+        role="production_rate",
+        unit=MASS / HOUR,
+        span=question.span,
+    )
+    ssa.define(
+        amount_symbol,
+        builder.literal(amount, MASS),
+        first.span,
+        relation_id="reference_amount",
+    )
+    ssa.define(
+        rate_a,
+        QuotientExpr(
+            ssa.ref(
+                amount_symbol,
+                first.span,
+                role="production_amount",
+                unit=MASS,
+            ),
+            _bound_cardinal(builder, first_duration, HOUR),
+            first.span,
+        ),
+        first.span,
+        relation_id="reference_rate",
+    )
+    one_hour = next(
+        token
+        for index, token in enumerate(second.tokens)
+        if token.norm == "hour" and index > 0 and second.norms[index - 1] == "an"
+    )
+    ssa.define(
+        rate_b,
+        QuotientExpr(
+            _product(
+                _bound_cardinal(builder, ratio, SCALAR),
+                ssa.ref(
+                    amount_symbol,
+                    second.span,
+                    role="production_amount",
+                    unit=MASS,
+                ),
+            ),
+            builder.lexical_literal(one_hour, Fraction(1), HOUR),
+            second.span,
+        ),
+        second.span,
+        relation_id="relative_rate",
+    )
+    ssa.define(
+        group_rate,
+        _sum(
+            _signed(
+                1,
+                ssa.ref(rate_a, question.span, role="production_rate"),
+                "first_rate",
+            ),
+            _signed(
+                1,
+                ssa.ref(rate_b, question.span, role="production_rate"),
+                "second_rate",
+            ),
+        ),
+        question.span,
+        relation_id="combined_rate",
+    )
+    expression = _product(
+        ssa.ref(group_rate, question.span, role="production_rate"),
+        builder.literal(horizon, HOUR),
+    )
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "shared_duration_affine_rates", definitions=definitions
+    )
+
+
+@_ssa_family
+def _closed_collection_share_completion(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Complete one inventory until the new category has an exact final share."""
+
+    question = _question(clause_set)
+    if not (
+        "percentage" in question.norms
+        and _contains(question.norms, "how", "many")
+        and "all" in question.norms
+    ):
+        return None
+    _require_single_target_marker(question)
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "collects" in clause.norms
+            and "animals" in clause.norms
+            and not _counts(clause)
+        ),
+        reason="collection owner is not uniquely introduced",
+    )
+    inventory = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "has" in clause.norms
+            and clause.norms.count("stuffed") >= 4
+            and len(_word_cardinals(clause)) >= 2
+        ),
+        reason="collection inventory is not unique",
+    )
+    owner, _ = _leading_subject(intro)
+    _require(
+        intro.norms[:4] == (owner, "collects", "stuffed", "animals"),
+        "collection type is not explicitly scoped",
+        FrontendStatus.AMBIGUOUS,
+    )
+    ssa = TypedDiscourseSSA(source)
+    collector = ssa.entity(owner, "collector", intro.tokens[0].span)
+    inventory_pronoun = inventory.norms[0]
+    ssa.resolve(
+        inventory_pronoun, role="collector", number=DiscourseNumber.SINGULAR
+    )
+
+    count_tokens = [
+        token
+        for token in inventory.tokens
+        if _surface_cardinal(token) is not None
+        and token.norm not in {"half", "once", "twice"}
+    ]
+    _require(
+        len(count_tokens) >= 2,
+        "collection categories have no exhaustive exact counts",
+    )
+    categories: list[str] = []
+    for count in count_tokens:
+        index = inventory.tokens.index(count)
+        _require(
+            index + 2 < len(inventory.tokens)
+            and inventory.norms[index + 1] == "stuffed",
+            "collection count lacks one local category",
+            FrontendStatus.AMBIGUOUS,
+        )
+        categories.append(_singular(inventory.norms[index + 2]))
+    _require(
+        len(set(categories)) == len(categories),
+        "collection category is declared more than once",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    how_index = question.norms.index("many")
+    _require(
+        how_index + 2 < len(question.tokens)
+        and question.norms[how_index + 1] == "stuffed",
+        "share-completion target category is missing",
+    )
+    target = _singular(question.norms[how_index + 2])
+    percentage_index = question.norms.index("percentage")
+    _require(
+        percentage_index + 4 < len(question.tokens)
+        and question.norms[percentage_index + 1 : percentage_index + 3]
+        == ("of", "stuffed")
+        and _singular(question.norms[percentage_index + 3]) == target
+        and question.norms[percentage_index + 4] == "is"
+        and _contains(question.norms, "of", "all", "of", "her", "stuffed", "animals")
+        and target not in categories,
+        "share target, owner, or final collection scope differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        question.norms[how_index:]
+        == (
+            "many",
+            "stuffed",
+            question.norms[how_index + 2],
+            "should",
+            question.norms[-2],
+            "buy",
+        )
+        and question.norms[-2] in {"he", "she", "they"},
+        "share question contains another requested target",
+        FrontendStatus.AMBIGUOUS,
+    )
+    ssa.resolve("her", role="collector", number=DiscourseNumber.SINGULAR)
+    shares = [
+        token
+        for token in _digit_tokens(question)
+        if token.span.end < len(source)
+        and source[token.span.end : token.span.end + 1] == "%"
+    ]
+    share = _one_token(shares, "final category share is missing")
+    _require(
+        share.number is not None and 0 < share.number < 100,
+        "final category share must lie strictly inside 0..100",
+        FrontendStatus.INVALID,
+    )
+
+    builder = _Builder(source, clause_set)
+    existing_symbol = ssa.symbol(
+        collector,
+        property="quantity",
+        item="stuffed_animal",
+        scope="collection",
+        state="existing",
+        role="collection_total",
+        unit=COUNT,
+        span=inventory.span,
+    )
+    target_symbol = ssa.symbol(
+        collector,
+        property="quantity",
+        item=target,
+        scope="collection",
+        state="purchase",
+        role="category_completion",
+        unit=COUNT,
+        span=question.span,
+    )
+    existing_expr = _sum(
+        *[
+            _signed(
+                1,
+                _bound_cardinal(builder, token, COUNT),
+                f"existing_{category}",
+            )
+            for token, category in zip(count_tokens, categories, strict=True)
+        ]
+    )
+    ssa.define(
+        existing_symbol,
+        existing_expr,
+        inventory.span,
+        relation_id="exhaustive_existing_inventory",
+    )
+    ssa.define(
+        target_symbol,
+        ClosedShareExpr(
+            ssa.ref(
+                existing_symbol,
+                question.span,
+                role="collection_total",
+                unit=COUNT,
+            ),
+            builder.literal(share, PERCENT),
+            question.span,
+        ),
+        question.span,
+        relation_id="closed_final_share",
+    )
+    expression = ssa.ref(
+        target_symbol,
+        question.span,
+        role="category_completion",
+        unit=COUNT,
+    )
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "closed_collection_share_completion", definitions=definitions
+    )
+
+
+@_ssa_family
+def _typed_scale_chain_conversion(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Compile an order-independent named scale chain with explicit units."""
+
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "high", "can")
+        and "times" in tuple(word for clause in clause_set for word in clause.norms)
+    ):
+        return None
+    _require_single_target_marker(question)
+    relation_clauses = [
+        clause
+        for clause in clause_set
+        if not clause.question
+        and "times" in clause.norms
+        and "higher" in clause.norms
+        and "than" in clause.norms
+    ]
+    if not relation_clauses:
+        return None
+    parsed: list[tuple[str, str, Token, tuple[str, ...], Clause]] = []
+    for clause in relation_clauses:
+        target, start = _leading_subject(clause)
+        _require(
+            start + 1 < len(clause.tokens) and clause.norms[start + 1] == "can",
+            "scale-chain target has no local predicate",
+        )
+        times_index = clause.norms.index("times")
+        than_index = clause.norms.index("than")
+        _require(
+            times_index > start + 2
+            and clause.norms[times_index + 1 : times_index + 2] == ("higher",)
+            and than_index == times_index + 2
+            and than_index + 2 < len(clause.tokens)
+            and clause.tokens[than_index + 1].text[:1].isupper()
+            and clause.norms[than_index + 2] == "can",
+            "scale-chain roles or direction are incomplete",
+            FrontendStatus.AMBIGUOUS,
+        )
+        factor = clause.tokens[times_index - 1]
+        _require(
+            _surface_cardinal(factor) is not None
+            and _surface_cardinal(factor) > 0,
+            "scale-chain factor is not positive and exact",
+            FrontendStatus.INVALID,
+        )
+        predicate = tuple(
+            word
+            for word in clause.norms[start + 2 : times_index - 1]
+            if word not in {"a", "an", "the"}
+        )
+        _require(predicate, "scale-chain predicate is missing")
+        parsed.append(
+            (target, clause.norms[than_index + 1], factor, predicate, clause)
+        )
+    predicates = {row[3] for row in parsed}
+    _require(
+        len(predicates) == 1,
+        "scale-chain clauses describe different properties",
+        FrontendStatus.AMBIGUOUS,
+    )
+    predicate = next(iter(predicates))
+
+    _require(question.norms[:1] == ("if",), "scale-chain base is not explicit")
+    _require(
+        len(question.tokens) > 8 and question.tokens[1].text[:1].isupper(),
+        "scale-chain base owner is missing",
+    )
+    base_owner = question.norms[1]
+    _require(question.norms[2] == "can", "scale-chain base predicate is missing")
+    base_numbers = _counts(question)
+    base = _one_token(base_numbers, "scale-chain base magnitude is missing")
+    base_index = question.tokens.index(base)
+    base_predicate = tuple(
+        word
+        for word in question.norms[3:base_index]
+        if word not in {"a", "an", "the"}
+    )
+    _require(
+        base_predicate == predicate and base_index + 1 < len(question.tokens),
+        "scale-chain base property differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    base_unit_word = _singular(question.norms[base_index + 1])
+    _require(base_unit_word == "inch", "scale-chain base unit is unsupported")
+    how_index = question.norms.index("how")
+    _require(
+        question.norms[how_index : how_index + 3] == ("how", "high", "can")
+        and how_index + 3 < len(question.tokens)
+        and question.tokens[how_index + 3].text[:1].isupper(),
+        "scale-chain target owner is missing",
+    )
+    target_owner = question.norms[how_index + 3]
+    in_offsets = [
+        index
+        for index in range(how_index + 4, len(question.tokens))
+        if question.norms[index] == "in"
+    ]
+    _require(len(in_offsets) == 1, "scale-chain output unit is not unique")
+    output_index = in_offsets[0]
+    query_predicate = tuple(
+        word
+        for word in question.norms[how_index + 4 : output_index]
+        if word not in {"a", "an", "the", ","}
+    )
+    _require(
+        query_predicate == predicate and output_index + 1 < len(question.tokens),
+        "scale-chain query property differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    output_word = _singular(question.norms[output_index + 1])
+    output_unit = (
+        FOOT if output_word == "foot" else INCH if output_word == "inch" else None
+    )
+    _require(output_unit is not None, "scale-chain output unit is unsupported")
+    _require(
+        output_index + 2 == len(question.tokens),
+        "scale-chain question contains another requested target",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    names = sorted(
+        {base_owner, target_owner}.union(
+            {
+                name
+                for target, source_name, _, _, _ in parsed
+                for name in (target, source_name)
+            }
+        )
+    )
+    referents = {
+        name: ssa.entity(
+            name,
+            "scaled_actor",
+            next(
+                token.span
+                for clause in clause_set
+                for token in clause.tokens
+                if token.norm == name and token.text[:1].isupper()
+            ),
+        )
+        for name in names
+    }
+    symbols = {
+        name: ssa.symbol(
+            referents[name],
+            property="height",
+            item="_".join(predicate),
+            scope="capacity",
+            state="current",
+            role="scaled_measure",
+            unit=INCH,
+            span=referents[name].span,
+        )
+        for name in names
+    }
+    ssa.resolve(base_owner, role="scaled_actor", number=DiscourseNumber.SINGULAR)
+    ssa.resolve(target_owner, role="scaled_actor", number=DiscourseNumber.SINGULAR)
+    ssa.define(
+        symbols[base_owner],
+        builder.literal(base, INCH),
+        question.span,
+        relation_id="scale_chain_base",
+    )
+    for target, source_name, factor, _, clause in parsed:
+        ssa.define(
+            symbols[target],
+            _product(
+                _bound_cardinal(builder, factor, SCALAR),
+                ssa.ref(
+                    symbols[source_name],
+                    clause.span,
+                    role="scaled_measure",
+                    unit=INCH,
+                ),
+            ),
+            clause.span,
+            relation_id=f"scale_{target}_from_{source_name}",
+        )
+    expression = UnitConversionExpr(
+        ssa.ref(
+            symbols[target_owner],
+            question.span,
+            role="scaled_measure",
+            unit=INCH,
+        ),
+        output_unit,
+        question.span,
+    )
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "typed_scale_chain_conversion", definitions=definitions
+    )
+
+
+@_ssa_family
+def _temporal_reader_affine_difference(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Bind explicit day states and one cross-entity affine antecedent."""
+
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "many", "more", "pages")
+        and question.norms.count("read") >= 1
+    ):
+        return None
+    _require_single_target_marker(question)
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "reading" in clause.norms
+            and _contains(clause.norms, "the", "same", "book")
+            and not _counts(clause)
+        ),
+        reason="reader group is not uniquely introduced",
+    )
+    intro_names = [
+        token.norm for token in intro.tokens if token.text[:1].isupper()
+    ]
+    _require(
+        len(intro_names) == 2 and len(set(intro_names)) == 2,
+        "reader group needs exactly two names",
+        FrontendStatus.AMBIGUOUS,
+    )
+    yesterday = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and clause.norms[:1] == ("yesterday",)
+            and "while" in clause.norms
+            and clause.norms.count("read") == 2
+            and len(_counts(clause)) == 2
+        ),
+        reason="yesterday reader assignments are not unique",
+    )
+    today = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and clause.norms[:1] == ("today",)
+            and "while" in clause.norms
+            and "yesterday" in clause.norms
+            and "not" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="today reader relations are not unique",
+    )
+
+    yesterday_owner_index = 2 if yesterday.norms[1:2] == (",",) else 1
+    today_owner_index = 2 if today.norms[1:2] == (",",) else 1
+    while_index = yesterday.norms.index("while")
+    first_read = yesterday.norms.index("read")
+    second_read = yesterday.norms.index("read", while_index)
+    _require(
+        first_read > yesterday_owner_index
+        and second_read > while_index
+        and yesterday.tokens[yesterday_owner_index].text[:1].isupper()
+        and yesterday.tokens[while_index + 1].text[:1].isupper(),
+        "yesterday assignments lack explicit owners",
+    )
+    yesterday_rows = {
+        yesterday.norms[yesterday_owner_index]: next(
+            token
+            for token in _counts(yesterday)
+            if first_read < yesterday.tokens.index(token) < while_index
+        ),
+        yesterday.norms[while_index + 1]: next(
+            token
+            for token in _counts(yesterday)
+            if yesterday.tokens.index(token) > second_read
+        ),
+    }
+    _require(
+        set(yesterday_rows) == set(intro_names)
+        and all(
+            _singular(yesterday.norms[yesterday.tokens.index(token) + 1]) == "page"
+            for token in yesterday_rows.values()
+        ),
+        "yesterday owners or page units differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    today_while = today.norms.index("while")
+    _require(
+        len(today.tokens) > today_owner_index + 1
+        and today.tokens[today_owner_index].text[:1].isupper()
+        and today.norms[today_owner_index + 1] == "read"
+        and _contains(today.norms, "more", "than", "as", "many", "pages", "as", "what")
+        and today_while + 1 < len(today.tokens)
+        and today.tokens[today_while + 1].text[:1].isupper(),
+        "today affine relation is malformed",
+        FrontendStatus.AMBIGUOUS,
+    )
+    target_owner = today.norms[today_owner_index]
+    offset = _one_token(_counts(today), "today affine offset is missing")
+    what_index = today.norms.index("what")
+    _require(
+        what_index + 3 < len(today.tokens)
+        and today.tokens[what_index + 1].text[:1].isupper()
+        and today.norms[what_index + 2 : what_index + 4] == ("read", "yesterday"),
+        "today source antecedent is not explicit",
+    )
+    source_owner = today.norms[what_index + 1]
+    zero_owner = today.norms[today_while + 1]
+    _require(
+        {target_owner, source_owner} == set(intro_names)
+        and source_owner == zero_owner
+        and _contains(
+            today.norms[today_while:],
+            "was",
+            "not",
+            "able",
+            "to",
+            "read",
+            "any",
+            "pages",
+            "today",
+        ),
+        "today owner roles or zero-state evidence differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    did_index = question.norms.index("did")
+    than_offsets = [
+        index for index, word in enumerate(question.norms) if word == "than"
+    ]
+    _require(
+        did_index + 1 < len(question.tokens)
+        and question.norms[did_index + 1] == target_owner
+        and len(than_offsets) == 1
+        and than_offsets[0] + 1 < len(question.tokens)
+        and question.norms[than_offsets[0] + 1] == source_owner,
+        "reader difference target or direction differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        question.norms
+        == (
+            "how",
+            "many",
+            "more",
+            "pages",
+            "did",
+            target_owner,
+            "read",
+            "more",
+            "than",
+            source_owner,
+        ),
+        "reader question changes the cumulative time scope",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    readers = {
+        name: ssa.entity(
+            name,
+            "reader",
+            next(token.span for token in intro.tokens if token.norm == name),
+        )
+        for name in intro_names
+    }
+    ssa.group(
+        "reader_group",
+        tuple(readers[name] for name in intro_names),
+        "reader",
+        intro.span,
+    )
+
+    def symbol(owner: str, day: str, span: Span):
+        return ssa.symbol(
+            readers[owner],
+            property="quantity",
+            item="page",
+            scope="reading",
+            state=day,
+            role="daily_pages",
+            unit=COUNT,
+            span=span,
+        )
+
+    yesterday_symbols = {
+        name: symbol(name, "yesterday", yesterday.span) for name in intro_names
+    }
+    today_symbols = {name: symbol(name, "today", today.span) for name in intro_names}
+    for name in intro_names:
+        ssa.define(
+            yesterday_symbols[name],
+            builder.literal(yesterday_rows[name], COUNT),
+            yesterday.span,
+            relation_id=f"yesterday_{name}",
+        )
+    ssa.define(
+        today_symbols[target_owner],
+        _sum(
+            _signed(
+                1,
+                ssa.ref(
+                    yesterday_symbols[source_owner],
+                    today.span,
+                    role="daily_pages",
+                    unit=COUNT,
+                ),
+                "source_yesterday",
+            ),
+            _signed(1, builder.literal(offset, COUNT), "more_pages"),
+        ),
+        today.span,
+        relation_id="today_affine_reading",
+    )
+    not_token = next(token for token in today.tokens if token.norm == "not")
+    ssa.define(
+        today_symbols[source_owner],
+        builder.lexical_literal(not_token, Fraction(0), COUNT),
+        today.span,
+        relation_id="today_explicit_zero",
+    )
+    expression = _sum(
+        _signed(
+            1,
+            ssa.ref(
+                yesterday_symbols[target_owner],
+                question.span,
+                role="daily_pages",
+            ),
+            "target_yesterday",
+        ),
+        _signed(
+            1,
+            ssa.ref(today_symbols[target_owner], question.span, role="daily_pages"),
+            "target_today",
+        ),
+        _signed(
+            -1,
+            ssa.ref(
+                yesterday_symbols[source_owner],
+                question.span,
+                role="daily_pages",
+            ),
+            "source_yesterday",
+        ),
+        _signed(
+            -1,
+            ssa.ref(today_symbols[source_owner], question.span, role="daily_pages"),
+            "source_today",
+        ),
+    )
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "temporal_reader_affine_difference", definitions=definitions
+    )
+
+
+@_ssa_family
+def _closed_named_scale_group_total(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Recover an exhaustive named group from reversible scale relations."""
+
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "total", "number", "of", "balls")
+        and "coach" in question.norms
+        and "practice" in question.norms
+    ):
+        return None
+    _require_single_target_marker(question)
+    relation = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and clause.norms.count("twice") == 2
+            and clause.norms.count("carried") == 2
+            and clause.norms.count("balls") == 2
+        ),
+        reason="carrier scale relations are not unique",
+    )
+    twice_offsets = [
+        index for index, word in enumerate(relation.norms) if word == "twice"
+    ]
+    and_index = relation.norms.index("and")
+    _require(
+        twice_offsets[0] == 2
+        and relation.norms[1] == "carried"
+        and relation.norms[twice_offsets[0] : twice_offsets[0] + 6]
+        == ("twice", "as", "many", "balls", "as", relation.norms[7])
+        and and_index + 2 < len(relation.tokens)
+        and relation.norms[and_index + 2] == "carried"
+        and relation.norms[twice_offsets[1] : twice_offsets[1] + 6]
+        == ("twice", "as", "many", "balls", "as", relation.norms[-1]),
+        "carrier scale directions are incomplete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    first_target = relation.norms[0]
+    middle = relation.norms[7]
+    second_target = relation.norms[and_index + 1]
+    last = relation.norms[-1]
+    _require(
+        middle == second_target
+        and len({first_target, middle, last}) == 3
+        and all(
+            token.text[:1].isupper()
+            for token in (
+                relation.tokens[0],
+                relation.tokens[7],
+                relation.tokens[and_index + 1],
+                relation.tokens[-1],
+            )
+        ),
+        "carrier relation has name drift or multiple antecedents",
+        FrontendStatus.AMBIGUOUS,
+    )
+    group_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "boys" in clause.norms
+            and _contains(clause.norms, "carried", "all", "of", "the", "balls")
+        ),
+        reason="carrier group is not declared exhaustive",
+    )
+    three = next(
+        (token for token in group_clause.tokens if token.norm == "three"), None
+    )
+    _require(
+        three is not None
+        and _surface_cardinal(three) == len({first_target, middle, last}),
+        "carrier group size differs from named members",
+        FrontendStatus.AMBIGUOUS,
+    )
+    assignment = _one_token(_counts(question), "carrier base count is missing")
+    assignment_index = question.tokens.index(assignment)
+    _require(
+        question.norms[:2] == ("if", middle)
+        and assignment_index + 1 < len(question.tokens)
+        and _singular(question.norms[assignment_index + 1]) == "ball",
+        "carrier base count belongs to another member or item",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        question.norms[question.norms.index("what") :]
+        == (
+            "what",
+            "is",
+            "the",
+            "total",
+            "number",
+            "of",
+            "balls",
+            "that",
+            "the",
+            "coach",
+            "brought",
+            "to",
+            "practice",
+        ),
+        "carrier question contains another requested target",
+        FrontendStatus.AMBIGUOUS,
+    )
+    introduction = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "asked" in clause.norms
+            and all(name in clause.norms for name in (first_target, middle, last))
+            and _contains(clause.norms, "pick", "up", "the", "balls")
+        ),
+        reason="carrier names are not uniquely introduced",
+    )
+
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    owners = {
+        name: ssa.entity(
+            name,
+            "carrier",
+            next(token.span for token in introduction.tokens if token.norm == name),
+        )
+        for name in (first_target, middle, last)
+    }
+    ssa.group(
+        "carrier_group",
+        tuple(owners[name] for name in (first_target, middle, last)),
+        "carrier",
+        group_clause.span,
+    )
+    symbols = {
+        name: ssa.symbol(
+            owners[name],
+            property="quantity",
+            item="ball",
+            scope="practice",
+            state="carried",
+            role="carried_count",
+            unit=COUNT,
+            span=relation.span,
+        )
+        for name in owners
+    }
+    ssa.define(
+        symbols[middle],
+        builder.literal(assignment, COUNT),
+        question.span,
+        relation_id="middle_carrier_count",
+    )
+    first_scale = relation.tokens[twice_offsets[0]]
+    second_scale = relation.tokens[twice_offsets[1]]
+    ssa.define(
+        symbols[first_target],
+        _product(
+            builder.literal(first_scale, SCALAR),
+            ssa.ref(symbols[middle], relation.span, role="carried_count"),
+        ),
+        relation.span,
+        relation_id="first_from_middle",
+    )
+    ssa.define(
+        symbols[last],
+        QuotientExpr(
+            ssa.ref(symbols[middle], relation.span, role="carried_count"),
+            builder.literal(second_scale, SCALAR),
+            relation.span,
+        ),
+        relation.span,
+        relation_id="last_from_middle",
+    )
+    expression = _sum(
+        *[
+            _signed(
+                1,
+                ssa.ref(symbols[name], question.span, role="carried_count"),
+                "exhaustive_carrier",
+            )
+            for name in (first_target, middle, last)
+        ]
+    )
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "closed_named_scale_group_total", definitions=definitions
+    )
+
+
+@_ssa_family
+def _ordered_affine_category_ledger(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Compile a closed five-category ledger with one shared scale antecedent."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:2] == ("in", "all")
+        and _contains(question.norms, "how", "many")
+        and "visited" in question.norms
+    ):
+        return None
+    _require_single_target_marker(question)
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and _contains(clause.norms, "monday", "through", "friday")
+            and "hosted" in clause.norms
+        ),
+        reason="category horizon is not uniquely declared",
+    )
+    monday = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and clause.norms[:2] == ("on", "monday")
+            and len(_counts(clause)) == 1
+            and "visited" in clause.norms
+        ),
+        reason="Monday category assignment is not unique",
+    )
+    scaled = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "tuesday" in clause.norms
+            and "wednesday" in clause.norms
+            and "twice" in clause.norms
+            and "times" in clause.norms
+        ),
+        reason="scaled weekday categories are not unique",
+    )
+    trailing = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "thursday" in clause.norms
+            and "friday" in clause.norms
+            and len(_counts(clause)) == 2
+        ),
+        reason="trailing weekday categories are not unique",
+    )
+    _require(
+        clause_set.index(scaled) == clause_set.index(monday) + 1
+        and scaled.norms
+        == (
+            "twice",
+            "as",
+            "many",
+            "visited",
+            "on",
+            "tuesday",
+            "and",
+            "three",
+            "times",
+            "as",
+            "many",
+            "visited",
+            "on",
+            "wednesday",
+        ),
+        "omitted scale antecedent is not the unique prior category",
+        FrontendStatus.AMBIGUOUS,
+    )
+    monday_value = _one_token(_counts(monday), "Monday count is missing")
+    monday_index = monday.tokens.index(monday_value)
+    _require(monday_index + 1 < len(monday.tokens), "weekday item is missing")
+    item = _singular(monday.norms[monday_index + 1])
+    item_surface = monday.norms[monday_index + 1]
+    many_index = question.norms.index("many")
+    trailing_values = _counts(trailing)
+    _require(
+        many_index + 1 < len(question.tokens)
+        and _singular(question.norms[many_index + 1]) == item
+        and trailing.norms[:2] == ("another", trailing_values[0].norm)
+        and _singular(trailing.norms[2]) == item
+        and _contains(trailing.norms, "visited", "on", "thursday")
+        and _contains(
+            trailing.norms,
+            "and",
+            trailing_values[1].norm,
+            "visited",
+            "on",
+            "friday",
+        )
+        and all(day in intro.norms for day in ("monday", "friday")),
+        "weekday ledger roles are incomplete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    hosted_index = intro.norms.index("hosted")
+    venue_words = intro.norms[1:hosted_index] if intro.norms[:1] == ("the",) else ()
+    _require(
+        venue_words
+        and question.norms
+        == (
+            "in",
+            "all",
+            ",",
+            "how",
+            "many",
+            item_surface,
+            "visited",
+            "the",
+            *venue_words,
+            "last",
+            "week",
+        ),
+        "weekday question contains another requested target",
+        FrontendStatus.AMBIGUOUS,
+    )
+    twice = scaled.tokens[0]
+    three = scaled.tokens[7]
+
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    days = ("monday", "tuesday", "wednesday", "thursday", "friday")
+    referents = {
+        day: ssa.entity(day, "weekday", intro.span) for day in days
+    }
+    symbols = {
+        day: ssa.symbol(
+            referents[day],
+            property="quantity",
+            item=item,
+            scope="field_trip",
+            state="visited",
+            role="category_count",
+            unit=COUNT,
+            span=intro.span,
+        )
+        for day in days
+    }
+    ssa.define(
+        symbols["monday"],
+        builder.literal(monday_value, COUNT),
+        monday.span,
+        relation_id="monday_count",
+    )
+    for day, scale_token in (("tuesday", twice), ("wednesday", three)):
+        ssa.define(
+            symbols[day],
+            _product(
+                _bound_cardinal(builder, scale_token, SCALAR),
+                ssa.ref(symbols["monday"], scaled.span, role="category_count"),
+            ),
+            scaled.span,
+            relation_id=f"{day}_from_monday",
+        )
+    for day, token in zip(("thursday", "friday"), trailing_values, strict=True):
+        ssa.define(
+            symbols[day],
+            builder.literal(token, COUNT),
+            trailing.span,
+            relation_id=f"{day}_count",
+        )
+    expression = _sum(
+        *[
+            _signed(
+                1,
+                ssa.ref(symbols[day], question.span, role="category_count"),
+                f"{day}_ledger",
+            )
+            for day in days
+        ]
+    )
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "ordered_affine_category_ledger", definitions=definitions
+    )
+
+
+@_ssa_family
+def _typed_species_scale_total(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Scale one per-member measure and apply an explicit target multiplicity."""
+
+    question = _question(clause_set)
+    if not (
+        "gallons" in question.norms
+        and "blood" in question.norms
+        and "sharks" in question.norms
+    ):
+        return None
+    _require_single_target_marker(question)
+    base = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "each" in clause.norms
+            and "whale" in clause.norms
+            and "gallons" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="species base measure is not unique",
+    )
+    scale_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and _contains(clause.norms, "shark", "has")
+            and _contains(clause.norms, "times", "as", "much", "blood", "as")
+        ),
+        reason="species scale relation is not unique",
+    )
+    learned_index = base.norms.index("learned")
+    owner_token = base.tokens[learned_index - 1]
+    owner_names = [owner_token.norm] if owner_token.text[:1].isupper() else []
+    _require(
+        len(owner_names) == 1 and scale_clause.norms[:1] == ("she",),
+        "science owner or pronoun antecedent is not unique",
+        FrontendStatus.AMBIGUOUS,
+    )
+    factor_rows = [
+        token
+        for token in scale_clause.tokens
+        if _surface_cardinal(token) is not None
+    ]
+    factor = _one_token(factor_rows, "species scale is missing")
+    members = [
+        token for token in question.tokens if _surface_cardinal(token) is not None
+    ]
+    member_count = _one_token(members, "target species multiplicity is missing")
+    member_index = question.tokens.index(member_count)
+    _require(
+        _surface_cardinal(factor) is not None
+        and _surface_cardinal(factor) > 0
+        and member_index + 1 < len(question.tokens)
+        and _singular(question.norms[member_index + 1]) == "shark"
+        and _contains(scale_clause.norms, "as", "a", "whale"),
+        "species relation target, source, or multiplicity differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        question.norms
+        == (
+            "calculate",
+            "the",
+            "number",
+            "of",
+            "gallons",
+            "of",
+            "blood",
+            "that",
+            member_count.norm,
+            question.norms[member_index + 1],
+            "swimming",
+            "in",
+            "the",
+            "sea",
+            "have",
+        ),
+        "species question contains another requested target",
+        FrontendStatus.AMBIGUOUS,
+    )
+    amount = _one_token(_counts(base), "species base amount is missing")
+    amount_index = base.tokens.index(amount)
+    _require(
+        amount_index + 3 < len(base.tokens)
+        and _singular(base.norms[amount_index + 1]) == "gallon"
+        and base.norms[amount_index + 2 : amount_index + 4] == ("of", "blood"),
+        "species base unit or property differs",
+    )
+
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    scientist = ssa.entity(owner_names[0], "scientist", base.span)
+    ssa.resolve("she", role="scientist", number=DiscourseNumber.SINGULAR)
+    whale = ssa.entity("whale", "species", base.span)
+    shark = ssa.entity("shark", "species", scale_clause.span)
+    whale_amount = ssa.symbol(
+        whale,
+        property="volume",
+        item="blood",
+        scope="per_member",
+        state="current",
+        role="member_measure",
+        unit=VOLUME,
+        span=base.span,
+    )
+    shark_amount = ssa.symbol(
+        shark,
+        property="volume",
+        item="blood",
+        scope="per_member",
+        state="current",
+        role="member_measure",
+        unit=VOLUME,
+        span=scale_clause.span,
+    )
+    ssa.define(
+        whale_amount,
+        builder.literal(amount, VOLUME),
+        base.span,
+        relation_id="whale_blood",
+    )
+    ssa.define(
+        shark_amount,
+        _product(
+            _bound_cardinal(builder, factor, SCALAR),
+            ssa.ref(whale_amount, scale_clause.span, role="member_measure"),
+        ),
+        scale_clause.span,
+        relation_id="shark_from_whale",
+    )
+    expression = _product(
+        _bound_cardinal(builder, member_count, SCALAR),
+        ssa.ref(shark_amount, question.span, role="member_measure"),
+    )
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "typed_species_scale_total", definitions=definitions
+    )
+
+
+@_ssa_family
+def _typed_ratio_property_chain_total(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Bind a reversible three-property ratio chain to one explicit base."""
+
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "total", "number", "of", "items")
+        and "saw" in question.norms
+    ):
+        return None
+    _require_single_target_marker(question)
+    relation = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and clause.norms.count("half") == 2
+            and clause.norms.count("as") == 4
+            and "saw" in clause.norms
+        ),
+        reason="property ratio chain is not unique",
+    )
+    owner, _ = _leading_subject(relation)
+    half_offsets = [
+        index for index, word in enumerate(relation.norms) if word == "half"
+    ]
+    parsed: list[tuple[str, str, Token]] = []
+    for index in half_offsets:
+        _require(
+            relation.norms[index : index + 3] == ("half", "as", "many")
+            and index + 5 < len(relation.tokens)
+            and relation.norms[index + 4] == "as",
+            "property ratio roles are incomplete",
+            FrontendStatus.AMBIGUOUS,
+        )
+        parsed.append(
+            (
+                _singular(relation.norms[index + 3]),
+                _singular(relation.norms[index + 5]),
+                relation.tokens[index],
+            )
+        )
+    first_target, middle, first_half = parsed[0]
+    second_target, last, second_half = parsed[1]
+    _require(
+        middle == second_target and len({first_target, middle, last}) == 3,
+        "property ratio chain has no unique middle antecedent",
+        FrontendStatus.AMBIGUOUS,
+    )
+    base = _one_token(_counts(question), "property-chain base is missing")
+    base_index = question.tokens.index(base)
+    _require(
+        base_index + 1 < len(question.tokens)
+        and _singular(question.norms[base_index + 1]) == middle
+        and owner in question.norms
+        and _contains(
+            question.norms,
+            "calculate",
+            "the",
+            "total",
+            "number",
+            "of",
+            "items",
+        ),
+        "property-chain base, owner, or target differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        question.norms[question.norms.index("calculate") :]
+        == (
+            "calculate",
+            "the",
+            "total",
+            "number",
+            "of",
+            "items",
+            owner,
+            "saw",
+        ),
+        "property-chain question contains another requested target",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    observer = ssa.entity(owner, "observer", relation.tokens[0].span)
+    symbols = {
+        item: ssa.symbol(
+            observer,
+            property="quantity",
+            item=item,
+            scope="changing_room",
+            state="observed",
+            role="observed_count",
+            unit=COUNT,
+            span=relation.span,
+        )
+        for item in (first_target, middle, last)
+    }
+    ssa.define(
+        symbols[middle],
+        builder.literal(base, COUNT),
+        question.span,
+        relation_id="middle_property_base",
+    )
+    ssa.define(
+        symbols[first_target],
+        _product(
+            builder.literal(first_half, SCALAR),
+            ssa.ref(symbols[middle], relation.span, role="observed_count"),
+        ),
+        relation.span,
+        relation_id="first_half_middle",
+    )
+    ssa.define(
+        symbols[last],
+        QuotientExpr(
+            ssa.ref(symbols[middle], relation.span, role="observed_count"),
+            builder.literal(second_half, SCALAR),
+            relation.span,
+        ),
+        relation.span,
+        relation_id="middle_half_last",
+    )
+    expression = _sum(
+        *[
+            _signed(
+                1,
+                ssa.ref(symbols[item], question.span, role="observed_count"),
+                "observed_item",
+            )
+            for item in (first_target, middle, last)
+        ]
+    )
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "typed_ratio_property_chain_total", definitions=definitions
+    )
+
+
+@_ssa_family
+def _typed_scaled_measure_difference(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Compile one named base, one scaled peer, and an explicit difference."""
+
+    question = _question(clause_set)
+    if not (
+        _contains(question.norms, "how", "much", "greater")
+        and question.norms.count("enrollment") == 2
+    ):
+        return None
+    _require_single_target_marker(question)
+    base = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "enrolls" in clause.norms
+            and "times" not in clause.norms
+            and "as" not in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="base enrollment is not unique",
+    )
+    scaled = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "enrolls" in clause.norms
+            and _contains(clause.norms, "as", "many", "students", "as")
+            and len(_counts(clause)) == 1
+        ),
+        reason="scaled enrollment is not unique",
+    )
+    base_enrolls = base.norms.index("enrolls")
+    scaled_enrolls = scaled.norms.index("enrolls")
+    base_words = base.norms[:base_enrolls]
+    first_comma = scaled.norms.index(",") if "," in scaled.norms else scaled_enrolls
+    scaled_words = scaled.norms[:first_comma]
+    as_offsets = [index for index, word in enumerate(scaled.norms) if word == "as"]
+    _require(
+        base_words
+        and scaled_words
+        and base_words != scaled_words
+        and len(as_offsets) == 2
+        and tuple(scaled.norms[as_offsets[-1] + 1 :]) == tuple(base_words)
+        and all(
+            token.text[:1].isupper()
+            for token in base.tokens[:base_enrolls]
+        )
+        and all(
+            token.text[:1].isupper()
+            for token in scaled.tokens[:first_comma]
+        ),
+        "enrollment names or scale source drifted",
+        FrontendStatus.AMBIGUOUS,
+    )
+    base_value = _one_token(_counts(base), "base enrollment amount is missing")
+    ratio = _one_token(_counts(scaled), "scaled enrollment ratio is missing")
+    _require(
+        ratio.number is not None and 0 < ratio.number < 1,
+        "scaled enrollment ratio must lie inside 0..1",
+        FrontendStatus.INVALID,
+    )
+    _require(
+        _contains(question.norms, "at", *base_words)
+        and _contains(question.norms, "than", "the", "enrollment", "at", *scaled_words),
+        "enrollment difference direction or owners differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        question.norms
+        == (
+            "how",
+            "much",
+            "greater",
+            "is",
+            "the",
+            "average",
+            "enrollment",
+            "at",
+            *base_words,
+            "than",
+            "the",
+            "enrollment",
+            "at",
+            *scaled_words,
+        ),
+        "enrollment question contains another requested target",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    base_owner = ssa.entity(" ".join(base_words), "school", base.span)
+    scaled_owner = ssa.entity(" ".join(scaled_words), "school", scaled.span)
+    base_symbol = ssa.symbol(
+        base_owner,
+        property="quantity",
+        item="student",
+        scope="annual_enrollment",
+        state="average",
+        role="enrollment_count",
+        unit=COUNT,
+        span=base.span,
+    )
+    scaled_symbol = ssa.symbol(
+        scaled_owner,
+        property="quantity",
+        item="student",
+        scope="annual_enrollment",
+        state="average",
+        role="enrollment_count",
+        unit=COUNT,
+        span=scaled.span,
+    )
+    ssa.define(
+        base_symbol,
+        builder.literal(base_value, COUNT),
+        base.span,
+        relation_id="base_enrollment",
+    )
+    ssa.define(
+        scaled_symbol,
+        _product(
+            builder.literal(ratio, SCALAR),
+            ssa.ref(base_symbol, scaled.span, role="enrollment_count"),
+        ),
+        scaled.span,
+        relation_id="scaled_enrollment",
+    )
+    expression = _sum(
+        _signed(
+            1,
+            ssa.ref(base_symbol, question.span, role="enrollment_count"),
+            "greater_base",
+        ),
+        _signed(
+            -1,
+            ssa.ref(scaled_symbol, question.span, role="enrollment_count"),
+            "smaller_peer",
+        ),
+    )
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "typed_scaled_measure_difference", definitions=definitions
+    )
+
+
 _PLANNERS = (
+    _grounded_value_pipeline,
+    _shared_duration_affine_rates,
+    _closed_collection_share_completion,
+    _typed_scale_chain_conversion,
+    _temporal_reader_affine_difference,
+    _closed_named_scale_group_total,
+    _ordered_affine_category_ledger,
+    _typed_species_scale_total,
+    _typed_ratio_property_chain_total,
+    _typed_scaled_measure_difference,
     _rate_length_difference,
     _functioning_chain,
     _daily_combined,

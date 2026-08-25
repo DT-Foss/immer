@@ -22,7 +22,6 @@ QUARANTINED_MATH_ROWS = (
     1213,
     1215,
     1244,
-    1252,
     1272,
     1306,
 )
@@ -44,9 +43,20 @@ CERTIFIED_MATH_ROWS = {
     485: "220",
     489: "-10",
     541: "50",
+    # Typed discourse-SSA wave, independently derived from question text.
+    578: "48",
     580: "500",
+    603: "1800",
     682: "80",
+    802: "6",
+    833: "40",
+    900: "15",
+    959: "7",
+    1064: "247",
+    1194: "1200",
+    1252: "70",
     1261: "235",
+    1304: "1000",
 }
 SELECTIVE_EXTERNAL_RESOLVER_CASES = (
     (

@@ -37,9 +37,12 @@ SIGNED_EVENT_PATH = (
 SIGNED_EXPRESSION_PATH = (
     ROOT / "src" / "immer" / "cognition" / "fertig" / "signed_expression.py"
 )
+DISCOURSE_SSA_PATH = (
+    ROOT / "src" / "immer" / "cognition" / "fertig" / "discourse_ssa.py"
+)
 
 SCHEMA = "immer.fertig-abstention-audit/v2"
-REPORT_REVISION = 4
+REPORT_REVISION = 5
 ALLOWED_STATUSES = ("correct", "abstained", "incorrect", "error")
 LEGACY_CATEGORIES = (
     "target_parse_failed",
@@ -64,24 +67,26 @@ CURRENT_LEGACY_COUNTS = {
     "equation_guard": 1,
 }
 CURRENT_STRUCTURAL_COUNTS = {
-    "exact_recovery": 47,
-    "numeric_pronoun_ambiguous": 76,
-    "question_pronoun_ambiguous": 5,
-    "numeric_clause_unsupported": 93,
+    "exact_recovery": 57,
+    "numeric_pronoun_ambiguous": 75,
+    "question_pronoun_ambiguous": 3,
+    "numeric_clause_unsupported": 86,
     "target_unsupported": 7,
     "relation_ambiguous": 1,
     "relation_unsupported": 1,
     "relation_invalid": 0,
 }
 CURRENT_SCOPE_COUNTS = {
-    "exact_recovery_scope": 47,
-    "potential_coreference_scope": 81,
-    "grammar_scope": 102,
+    "exact_recovery_scope": 57,
+    "potential_coreference_scope": 78,
+    "grammar_scope": 95,
 }
 CURRENT_EXACT_RECOVERY_INDICES = (
     550,
     574,
+    578,
     587,
+    603,
     610,
     613,
     619,
@@ -105,9 +110,11 @@ CURRENT_EXACT_RECOVERY_INDICES = (
     778,
     780,
     797,
+    802,
     819,
     823,
     825,
+    833,
     836,
     837,
     840,
@@ -117,6 +124,7 @@ CURRENT_EXACT_RECOVERY_INDICES = (
     868,
     883,
     892,
+    900,
     901,
     913,
     916,
@@ -124,19 +132,120 @@ CURRENT_EXACT_RECOVERY_INDICES = (
     930,
     934,
     944,
+    959,
+    1064,
+    1194,
     1219,
+    1252,
     1261,
+    1304,
 )
-CURRENT_WAVE_EXACT_RECOVERY_INDICES = (672, 780, 944, 1219, 1261)
-CURRENT_PRE_WAVE_EXACT_RECOVERIES = 42
-CURRENT_WAVE_EXACT_MECHANISMS = {
+BASELINE_EXACT_RECOVERIES = 42
+GROUND_WAVE_EXACT_RECOVERY_INDICES = (672, 780, 944, 1219, 1261)
+GROUND_WAVE_EXACT_MECHANISMS = {
     672: "signed_event:temporal_categorical_block_remainder",
     780: "signed_event:absolute_weighted_score_difference",
     944: "signed_event:exhaustive_unit_rate_ledger",
     1219: "signed_event:exhaustive_unit_rate_ledger",
     1261: "signed_event:recurring_pronoun_rate_ledger",
 }
-RECOVERY_WAVE_ID = "ground-operators-conservative-coreference/v1"
+GROUND_WAVE_ID = "ground-operators-conservative-coreference/v1"
+DISCOURSE_SSA_WAVE_EXACT_RECOVERY_INDICES = (
+    578,
+    603,
+    802,
+    833,
+    900,
+    959,
+    1064,
+    1194,
+    1252,
+    1304,
+)
+DISCOURSE_SSA_WAVE_EXACT_MECHANISMS = {
+    578: "signed_event:grounded_value_pipeline",
+    603: "signed_event:shared_duration_affine_rates",
+    802: "signed_event:closed_collection_share_completion",
+    833: "signed_event:typed_scale_chain_conversion",
+    900: "signed_event:temporal_reader_affine_difference",
+    959: "signed_event:closed_named_scale_group_total",
+    1064: "signed_event:ordered_affine_category_ledger",
+    1194: "signed_event:typed_species_scale_total",
+    1252: "signed_event:typed_ratio_property_chain_total",
+    1304: "signed_event:typed_scaled_measure_difference",
+}
+DISCOURSE_SSA_WAVE_ID = "typed-discourse-ssa-affine/v1"
+RECOVERY_WAVES = (
+    (
+        GROUND_WAVE_ID,
+        GROUND_WAVE_EXACT_RECOVERY_INDICES,
+        GROUND_WAVE_EXACT_MECHANISMS,
+    ),
+    (
+        DISCOURSE_SSA_WAVE_ID,
+        DISCOURSE_SSA_WAVE_EXACT_RECOVERY_INDICES,
+        DISCOURSE_SSA_WAVE_EXACT_MECHANISMS,
+    ),
+)
+CURRENT_EXACT_RECOVERY_MECHANISMS = {
+    550: "signed_event:discounted_purchase_ledger",
+    574: "signed_event:batch_sale_profit",
+    578: "signed_event:grounded_value_pipeline",
+    587: "signed_event:balanced_percent_category_difference",
+    603: "signed_event:shared_duration_affine_rates",
+    610: "signed_event:rate_length_difference",
+    613: "signed_event:calendar_daily_total",
+    619: "signed_event:functioning_count",
+    631: "signed_event:affine_price_chain_total",
+    643: "signed_event:combined_daily_total",
+    651: "signed_event:part_scaled_period_total",
+    672: "signed_event:temporal_categorical_block_remainder",
+    682: "preexisting_generic_structural_exact",
+    692: "signed_event:bundle_relative_price_dag",
+    694: "signed_event:typed_chair_capacity_deficit",
+    701: "signed_event:group_seat_purchase",
+    722: "signed_event:avoided_cost_transaction",
+    724: "signed_event:fractional_group_consumption_remainder",
+    731: "signed_event:exact_packaging_capacity",
+    745: "signed_event:profit_contribution_ledger",
+    746: "signed_event:alternative_cost_savings",
+    747: "signed_event:old_new_rate_savings",
+    754: "signed_event:typed_percentage_trade_transitions",
+    763: "signed_event:ordinal_ratio_partition",
+    770: "signed_event:category_sales_difference",
+    778: "clause_compiler",
+    780: "signed_event:absolute_weighted_score_difference",
+    797: "signed_event:repeated_duration_total",
+    802: "signed_event:closed_collection_share_completion",
+    819: "signed_event:equal_share_residual",
+    823: "signed_event:temporal_affine_score_chain",
+    825: "clause_compiler",
+    833: "signed_event:typed_scale_chain_conversion",
+    836: "signed_event:entity_affine_chain_total",
+    837: "signed_event:funding_balance_residual",
+    840: "signed_event:fractional_remnant_total",
+    844: "signed_event:cross_entity_property_dag",
+    861: "signed_event:inverse_rate_time_difference",
+    865: "signed_event:chained_inventory_residual",
+    868: "signed_event:exact_package_demand_cost",
+    883: "signed_event:reverse_affine_state_duration",
+    892: "signed_event:unit_cost_residual",
+    900: "signed_event:temporal_reader_affine_difference",
+    901: "signed_event:typed_bowl_capacity_leftover",
+    913: "signed_event:weighted_bundle_residual_count",
+    916: "signed_event:equal_allowance_purchase_balance",
+    924: "signed_event:exact_trip_capacity_minimum",
+    930: "signed_event:inventory_total_residual",
+    934: "signed_event:mean_participant_totals",
+    944: "signed_event:exhaustive_unit_rate_ledger",
+    959: "signed_event:closed_named_scale_group_total",
+    1064: "signed_event:ordered_affine_category_ledger",
+    1194: "signed_event:typed_species_scale_total",
+    1219: "signed_event:exhaustive_unit_rate_ledger",
+    1252: "signed_event:typed_ratio_property_chain_total",
+    1261: "signed_event:recurring_pronoun_rate_ledger",
+    1304: "signed_event:typed_scaled_measure_difference",
+}
 _INCOMPLETE_BINDING = re.compile(
     r"^Bindung unvollständig: (?P<qty>\d+) qty, "
     r"(?P<ratio>\d+) ratio, op=(?P<op>[a-z_]+)$"
@@ -440,46 +549,113 @@ def _mechanism_groups(
     }
 
 
+def _mechanism_identity(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    ordered = [
+        {
+            "index": int(row["index"]),
+            "mechanism": str(row["exact_recovery_mechanism"]),
+        }
+        for row in sorted(rows, key=lambda row: int(row["index"]))
+    ]
+    return {
+        "count": len(ordered),
+        "rows": ordered,
+        "rows_sha256": _sha256_bytes(_canonical_json_bytes(ordered)),
+    }
+
+
 def _recovery_attribution(
     exact_rows: Sequence[Mapping[str, Any]],
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     ordered_rows = sorted(exact_rows, key=lambda row: int(row["index"]))
     current_indices = tuple(int(row["index"]) for row in ordered_rows)
-    wave_set = set(CURRENT_WAVE_EXACT_RECOVERY_INDICES)
-    wave_rows = [row for row in ordered_rows if int(row["index"]) in wave_set]
-    prior_rows = [row for row in ordered_rows if int(row["index"]) not in wave_set]
-    wave_indices = tuple(int(row["index"]) for row in wave_rows)
-    prior_indices = tuple(int(row["index"]) for row in prior_rows)
     current_total = len(current_indices)
-    wave_total = len(wave_indices)
-    prior_total = len(prior_indices)
     cumulative = {
         "current_total": current_total,
         "identity": _indices_identity(current_indices),
         "mechanisms": _mechanism_groups(ordered_rows),
+        "mechanism_identity": _mechanism_identity(ordered_rows),
         "attribution": (
             "The current total is cumulative across every listed exact mechanism; "
             "it is not attributed to one planner wave."
         ),
     }
-    wave = {
-        "wave_id": RECOVERY_WAVE_ID,
-        "previously_sealed_exact_recoveries": prior_total,
-        "added_exact_recoveries": wave_total,
+
+    wave_indices_seen: set[int] = set()
+    for wave_id, indices, mechanisms in RECOVERY_WAVES:
+        index_set = set(indices)
+        if len(index_set) != len(indices) or wave_indices_seen.intersection(index_set):
+            raise AuditError(f"recovery-wave indices overlap at {wave_id}")
+        if set(mechanisms) != index_set:
+            raise AuditError(f"recovery-wave mechanisms are incomplete at {wave_id}")
+        wave_indices_seen.update(index_set)
+
+    baseline_rows = [
+        row for row in ordered_rows if int(row["index"]) not in wave_indices_seen
+    ]
+    accumulated_rows = list(baseline_rows)
+    wave_deltas: list[dict[str, Any]] = []
+    for wave_id, indices, _ in RECOVERY_WAVES:
+        index_set = set(indices)
+        wave_rows = [
+            row for row in ordered_rows if int(row["index"]) in index_set
+        ]
+        prior_rows = sorted(accumulated_rows, key=lambda row: int(row["index"]))
+        accumulated_rows.extend(wave_rows)
+        accumulated_rows.sort(key=lambda row: int(row["index"]))
+        wave_indices = tuple(int(row["index"]) for row in wave_rows)
+        prior_indices = tuple(int(row["index"]) for row in prior_rows)
+        wave_total = len(wave_indices)
+        prior_total = len(prior_indices)
+        after_total = len(accumulated_rows)
+        wave_deltas.append(
+            {
+                "wave_id": wave_id,
+                "previously_sealed_exact_recoveries": prior_total,
+                "added_exact_recoveries": wave_total,
+                "current_exact_recoveries": after_total,
+                "previously_sealed_identity": _indices_identity(prior_indices),
+                "added_identity": _indices_identity(wave_indices),
+                "mechanisms": _mechanism_groups(wave_rows),
+                "mechanism_identity": _mechanism_identity(wave_rows),
+                "attribution": (
+                    f"{after_total} exact recoveries after {wave_id} = "
+                    f"{prior_total} previously sealed + {wave_total} added; this "
+                    f"wave claims {wave_total}, not {after_total}."
+                ),
+            }
+        )
+
+    if tuple(int(row["index"]) for row in accumulated_rows) != current_indices:
+        raise AuditError("recovery-wave history does not cover the current identity")
+    baseline_indices = tuple(int(row["index"]) for row in baseline_rows)
+    history = {
+        "baseline_exact_recoveries": len(baseline_indices),
+        "baseline_identity": _indices_identity(baseline_indices),
+        "waves": wave_deltas,
         "current_exact_recoveries": current_total,
-        "previously_sealed_identity": _indices_identity(prior_indices),
-        "added_identity": _indices_identity(wave_indices),
-        "mechanisms": _mechanism_groups(wave_rows),
+        "current_identity": _indices_identity(current_indices),
         "attribution": (
-            f"{current_total} current exact recoveries = {prior_total} previously "
-            f"sealed recoveries + {wave_total} added by {RECOVERY_WAVE_ID}; this "
-            f"wave claims {wave_total}, not {current_total}."
+            f"{current_total} current exact recoveries = {len(baseline_indices)} "
+            + "sealed baseline"
+            + "".join(
+                f" + {wave['added_exact_recoveries']} by {wave['wave_id']}"
+                for wave in wave_deltas
+            )
+            + "; wave deltas are disjoint and cumulative."
         ),
     }
-    return cumulative, wave
+    return cumulative, wave_deltas[-1], history
 
 
 def _validate_current_evidence(report: Mapping[str, Any]) -> None:
+    if (
+        report.get("schema") != SCHEMA
+        or report.get("report_revision") != REPORT_REVISION
+    ):
+        raise AuditError("current audit schema or report revision drifted")
     observed = report["classification_counts"]
     expected = {
         "legacy": CURRENT_LEGACY_COUNTS,
@@ -514,26 +690,48 @@ def _validate_current_evidence(report: Mapping[str, Any]) -> None:
             raise AuditError(
                 f"exact recovery {row['index']} has inconsistent mechanism attribution"
             )
-    cumulative, wave = _recovery_attribution(exact_rows)
+    observed_mechanisms = {
+        int(row["index"]): str(row["exact_recovery_mechanism"])
+        for row in exact_rows
+    }
+    if observed_mechanisms != CURRENT_EXACT_RECOVERY_MECHANISMS:
+        raise AuditError(
+            "current exact-recovery mechanisms drifted; expected "
+            f"{CURRENT_EXACT_RECOVERY_MECHANISMS!r}, observed "
+            f"{observed_mechanisms!r}"
+        )
+    cumulative, wave, history = _recovery_attribution(exact_rows)
     if report.get("exact_recovery_attribution") != cumulative:
         raise AuditError("current exact-recovery attribution drifted")
     if report.get("recovery_wave_delta") != wave:
         raise AuditError("current recovery-wave delta drifted")
-    if wave["previously_sealed_exact_recoveries"] != CURRENT_PRE_WAVE_EXACT_RECOVERIES:
-        raise AuditError("pre-wave exact-recovery total drifted")
-    if tuple(wave["added_identity"]["indices"]) != CURRENT_WAVE_EXACT_RECOVERY_INDICES:
-        raise AuditError("new recovery-wave identity drifted")
-    observed_wave_mechanisms = {
-        int(row["index"]): str(row["exact_recovery_mechanism"])
-        for row in exact_rows
-        if int(row["index"]) in set(CURRENT_WAVE_EXACT_RECOVERY_INDICES)
-    }
-    if observed_wave_mechanisms != CURRENT_WAVE_EXACT_MECHANISMS:
-        raise AuditError(
-            "new recovery-wave mechanism attribution drifted; expected "
-            f"{CURRENT_WAVE_EXACT_MECHANISMS!r}, observed "
-            f"{observed_wave_mechanisms!r}"
-        )
+    if report.get("recovery_wave_history") != history:
+        raise AuditError("current recovery-wave history drifted")
+    if history["baseline_exact_recoveries"] != BASELINE_EXACT_RECOVERIES:
+        raise AuditError("baseline exact-recovery total drifted")
+    expected_prior = BASELINE_EXACT_RECOVERIES
+    for delta, (wave_id, indices, mechanisms) in zip(
+        history["waves"], RECOVERY_WAVES, strict=True
+    ):
+        if delta["wave_id"] != wave_id:
+            raise AuditError("recovery-wave order drifted")
+        if delta["previously_sealed_exact_recoveries"] != expected_prior:
+            raise AuditError(f"pre-wave exact-recovery total drifted at {wave_id}")
+        if tuple(delta["added_identity"]["indices"]) != indices:
+            raise AuditError(f"recovery-wave identity drifted at {wave_id}")
+        observed_wave_mechanisms = {
+            row["index"]: row["mechanism"]
+            for row in delta["mechanism_identity"]["rows"]
+        }
+        if observed_wave_mechanisms != mechanisms:
+            raise AuditError(
+                f"recovery-wave mechanism attribution drifted at {wave_id}"
+            )
+        expected_prior += len(indices)
+        if delta["current_exact_recoveries"] != expected_prior:
+            raise AuditError(f"post-wave exact-recovery total drifted at {wave_id}")
+    if expected_prior != len(CURRENT_EXACT_RECOVERY_INDICES):
+        raise AuditError("recovery-wave chain does not reach the current total")
 
 
 def build_audit_report(
@@ -618,7 +816,7 @@ def build_audit_report(
         for item in audited_items
         if item["structural"]["category"] == "exact_recovery"
     ]
-    exact_attribution, wave_delta = _recovery_attribution(exact_rows)
+    exact_attribution, wave_delta, wave_history = _recovery_attribution(exact_rows)
 
     eligible = sum(
         bool(item["hungarian_exclusive_assignment_eligible"]) for item in audited_items
@@ -640,6 +838,7 @@ def build_audit_report(
         "current_remaining_abstentions": remaining,
         "exact_recovery_attribution": exact_attribution,
         "recovery_wave_delta": wave_delta,
+        "recovery_wave_history": wave_history,
         "classification_counts": counts,
         "hungarian_verdict": {
             "contract": (
@@ -689,6 +888,7 @@ def current_provenance(benchmark_path: Path) -> dict[str, Any]:
         "structural_parser": STRUCTURAL_PATH,
         "signed_event_frontend": SIGNED_EVENT_PATH,
         "signed_expression_compiler": SIGNED_EXPRESSION_PATH,
+        "typed_discourse_ssa": DISCOURSE_SSA_PATH,
     }
     file_evidence = {
         name: {"path": _path_label(path), "sha256": _sha256_file(path)}

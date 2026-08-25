@@ -1542,5 +1542,382 @@ class SignedEventConservativeCoreferenceWaveTests(unittest.TestCase):
                 self.assertFalse(compile_signed_events(question).ok)
 
 
+DISCOURSE_SSA_CASES = {
+    4: (
+        "Diane gave a number train a starting value of 20. This starting value "
+        "plus half the number was divided by 5 and the resulting value was "
+        "multiplied by the starting value minus 12. What was the final value "
+        "of the number train?",
+        Fraction(48),
+        "grounded_value_pipeline",
+    ),
+    7: (
+        "Ruiz can make 120 pounds of chocolates in two hours. Marissa makes "
+        "3/4 times as many pounds of chocolates in an hour as Ruiz makes in "
+        "the two hours. If they worked for 12 hours in a day, calculate the "
+        "total amount of chocolate pounds they made together.",
+        Fraction(1800),
+        "shared_duration_affine_rates",
+    ),
+    35: (
+        "Bubbles collects stuffed animals. She has three stuffed puppies, five "
+        "stuffed koalas, two stuffed zebras and four stuffed frogs. If she "
+        "wants to buy enough stuffed goats, such that the percentage of stuffed "
+        "goats is 30% of all of her stuffed animals, how many stuffed goats "
+        "should she buy?",
+        Fraction(6),
+        "closed_collection_share_completion",
+    ),
+    42: (
+        "Naruto can lift a mountain ten times higher than Kagiyami can. But "
+        "Kagiyami can lift a mountain 4 times higher than Saskay can. And "
+        "Saskay can lift a mountain 12 times higher than Pompei can. If Pompei "
+        "can lift a mountain 1 inch, how high can Naruto lift a mountain, in "
+        "feet?",
+        Fraction(40),
+        "typed_scale_chain_conversion",
+    ),
+    56: (
+        "Denise and Daniel are reading the same book. Yesterday, Denise read "
+        "10 pages while Daniel read 13 pages. Today, Denise read 5 more than as "
+        "many pages as what Daniel read yesterday, while Daniel was not able "
+        "to read any pages today. How many more pages did Denise read more "
+        "than Daniel?",
+        Fraction(15),
+        "temporal_reader_affine_difference",
+    ),
+}
+
+AUDIT_AFFINE_ANALOGUES = {
+    959: (
+        "Coach brought one bag filled with basketballs to practice and dumped "
+        "them all out onto the gym floor before practice began. After the "
+        "practice time was over, he asked Jordan, Jason, and Jeffrey to pick up "
+        "the balls and carry them over to the bag. The three boys picked up and "
+        "carried all of the balls in one trip. Jordan carried twice as many balls "
+        "as Jason, and Jason carried twice as many balls as Jeffrey. If Jason "
+        "had picked up and carried 2 balls, what is the total number of balls "
+        "that the coach brought to practice?",
+        Fraction(7),
+        "closed_named_scale_group_total",
+    ),
+    1064: (
+        "The Science Center hosted field trips Monday through Friday last week. "
+        "On Monday, 32 classes visited. Twice as many visited on Tuesday and "
+        "three times as many visited on Wednesday. Another 30 classes visited "
+        "on Thursday and 25 visited on Friday. In all, how many classes visited "
+        "the Science Center last week?",
+        Fraction(247),
+        "ordered_affine_category_ledger",
+    ),
+    1194: (
+        "From her science class study, Brady learned that each whale in the sea "
+        "has 40 gallons of blood. She also learned that a shark has three times "
+        "as much blood as a whale. Calculate the number of gallons of blood that "
+        "ten sharks swimming in the sea have.",
+        Fraction(1200),
+        "typed_species_scale_total",
+    ),
+    1252: (
+        "Dominick went to his team's changing room and saw half as many robots "
+        "as helmets and half as many helmets as footballs kept there. If there "
+        "were 20 helmets, calculate the total number of items Dominick saw.",
+        Fraction(70),
+        "typed_ratio_property_chain_total",
+    ),
+    1304: (
+        "Norman High School enrolls an average of 4000 students every year. "
+        "Butler High School, the neighboring school, enrolls an average of 3/4 "
+        "as many students as Norman High School. How much greater is the average "
+        "enrollment at Norman High School than the enrollment at Butler High "
+        "School?",
+        Fraction(1000),
+        "typed_scaled_measure_difference",
+    ),
+}
+
+
+class SignedEventDiscourseSSAWaveTests(unittest.TestCase):
+    def test_five_gold_free_question_derivations_are_exact(self) -> None:
+        # Expected values are independently derived from these question texts:
+        # no benchmark answer, prediction, label, or holdout field enters here.
+        for offset, (question, expected, family) in DISCOURSE_SSA_CASES.items():
+            with self.subTest(offset=offset):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                self.assertEqual(result.family, family)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, expected)
+                self.assertTrue(result.compiled.certificate.verified)
+                parsed = parse_structural_problem(question)
+                self.assertTrue(parsed.ok, parsed.reason)
+                assert parsed.problem is not None
+                self.assertEqual(solve(parsed.problem).target_value, expected)
+
+    def test_names_domains_and_items_are_not_memorized(self) -> None:
+        variants = (
+            (
+                DISCOURSE_SSA_CASES[4][0]
+                .replace("Diane", "Mara")
+                .replace("number train", "value machine"),
+                48,
+            ),
+            (
+                DISCOURSE_SSA_CASES[7][0]
+                .replace("Ruiz", "Omar")
+                .replace("Marissa", "Lina")
+                .replace("chocolates", "candies")
+                .replace("chocolate pounds", "candy pounds"),
+                1800,
+            ),
+            (
+                DISCOURSE_SSA_CASES[35][0]
+                .replace("Bubbles", "Mara")
+                .replace("puppies", "kittens")
+                .replace("koalas", "pandas")
+                .replace("zebras", "llamas")
+                .replace("frogs", "otters")
+                .replace("goats", "badgers"),
+                6,
+            ),
+            (
+                DISCOURSE_SSA_CASES[42][0]
+                .replace("Naruto", "Aria")
+                .replace("Kagiyami", "Bram")
+                .replace("Saskay", "Cora")
+                .replace("Pompei", "Dara")
+                .replace("mountain", "tower"),
+                40,
+            ),
+            (
+                DISCOURSE_SSA_CASES[56][0]
+                .replace("Denise", "Mira")
+                .replace("Daniel", "Tomas"),
+                15,
+            ),
+        )
+        for question, expected in variants:
+            with self.subTest(question=question):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, expected)
+
+    def test_explicit_state_clauses_can_be_reordered(self) -> None:
+        rate = DISCOURSE_SSA_CASES[7][0]
+        first, second, question = rate.split(". ", 2)
+        scale = DISCOURSE_SSA_CASES[42][0]
+        one, two, three, scale_question = scale.split(". ", 3)
+        reader = DISCOURSE_SSA_CASES[56][0]
+        intro, yesterday, today, reader_question = reader.split(". ", 3)
+        variants = (
+            (f"{second}. {first}. {question}", 1800),
+            (f"{three}. {one}. {two}. {scale_question}", 40),
+            (f"{intro}. {today}. {yesterday}. {reader_question}", 15),
+        )
+        for question_text, expected in variants:
+            with self.subTest(question=question_text):
+                result = compile_signed_events(question_text)
+                self.assertTrue(result.ok, result.reason)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, expected)
+
+    def test_role_reversal_name_drift_and_multiple_antecedents_abstain(self) -> None:
+        mutations = (
+            DISCOURSE_SSA_CASES[4][0].replace(
+                "multiplied by the starting value minus 12",
+                "multiplied by the resulting value minus 12",
+            ),
+            DISCOURSE_SSA_CASES[7][0].replace(
+                "as Ruiz makes in the two hours",
+                "as Marissa makes in the two hours",
+            ),
+            DISCOURSE_SSA_CASES[35][0].replace(
+                "Bubbles collects stuffed animals.",
+                "Bubbles collects stuffed animals. Mira collects stuffed animals.",
+            ),
+            DISCOURSE_SSA_CASES[35][0].replace("all of her", "all of their"),
+            DISCOURSE_SSA_CASES[42][0].replace(
+                "than Kagiyami can", "than Kagiyam can"
+            ),
+            DISCOURSE_SSA_CASES[42][0].replace(
+                "Saskay can lift a mountain 12 times higher than Pompei can",
+                "Pompei can lift a mountain 12 times higher than Saskay can",
+            ),
+            DISCOURSE_SSA_CASES[56][0].replace(
+                "did Denise read more than Daniel", "did Daniel read more than Denise"
+            ),
+            DISCOURSE_SSA_CASES[56][0].replace(
+                "what Daniel read yesterday", "what Mira read yesterday"
+            ),
+        )
+        for question in mutations:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+
+    def test_numeric_noise_and_ungrounded_products_never_enter_the_ssa(self) -> None:
+        for offset, (question, _, _) in DISCOURSE_SSA_CASES.items():
+            with self.subTest(offset=offset):
+                self.assertFalse(
+                    compile_signed_events(question + " Unrelated reference 99.").ok
+                )
+        ungrounded = DISCOURSE_SSA_CASES[4][0].replace(
+            "multiplied by the starting value minus 12",
+            "multiplied by an unknown adjustment",
+        )
+        self.assertFalse(compile_signed_events(ungrounded).ok)
+
+    def test_five_gold_free_audit_analogues_are_exact(self) -> None:
+        # These values are likewise derived only from the visible question text.
+        for index, (question, expected, family) in AUDIT_AFFINE_ANALOGUES.items():
+            with self.subTest(index=index):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                self.assertEqual(result.family, family)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, expected)
+                self.assertTrue(result.compiled.certificate.verified)
+
+    def test_audit_analogues_support_structural_renames_and_reordering(self) -> None:
+        enrollment = AUDIT_AFFINE_ANALOGUES[1304][0]
+        base, scaled, query = enrollment.split(". ", 2)
+        variants = (
+            (
+                AUDIT_AFFINE_ANALOGUES[959][0]
+                .replace("Jordan", "Aria")
+                .replace("Jason", "Bram")
+                .replace("Jeffrey", "Cora"),
+                7,
+            ),
+            (AUDIT_AFFINE_ANALOGUES[1064][0].replace("classes", "groups"), 247),
+            (AUDIT_AFFINE_ANALOGUES[1194][0].replace("Brady", "Mara"), 1200),
+            (
+                AUDIT_AFFINE_ANALOGUES[1252][0]
+                .replace("Dominick", "Miro")
+                .replace("robots", "drones")
+                .replace("helmets", "visors")
+                .replace("footballs", "cones"),
+                70,
+            ),
+            (
+                AUDIT_AFFINE_ANALOGUES[1304][0]
+                .replace("Norman High School", "Arden Academy")
+                .replace("Butler High School", "Briar Academy"),
+                1000,
+            ),
+            (f"{scaled}. {base}. {query}", 1000),
+        )
+        for question, expected in variants:
+            with self.subTest(question=question):
+                result = compile_signed_events(question)
+                self.assertTrue(result.ok, result.reason)
+                assert result.compiled is not None
+                self.assertEqual(result.compiled.solution.target_value, expected)
+
+    def test_audit_analogue_role_and_evidence_mutations_abstain(self) -> None:
+        mutations = (
+            AUDIT_AFFINE_ANALOGUES[959][0].replace(
+                "and Jason carried twice", "and Mira carried twice"
+            ),
+            AUDIT_AFFINE_ANALOGUES[1064][0].replace(
+                "Twice as many visited",
+                "On Sunday, 9 classes visited. Twice as many visited",
+            ),
+            AUDIT_AFFINE_ANALOGUES[1194][0].replace(
+                "She also learned", "They also learned"
+            ),
+            AUDIT_AFFINE_ANALOGUES[1252][0].replace(
+                "half as many helmets as footballs",
+                "half as many visors as footballs",
+            ),
+            AUDIT_AFFINE_ANALOGUES[1304][0].replace(
+                "as Norman High School. How much",
+                "as Norton High School. How much",
+            ),
+        )
+        for question in mutations:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+        for index, (question, _, _) in AUDIT_AFFINE_ANALOGUES.items():
+            with self.subTest(index=index):
+                self.assertFalse(compile_signed_events(question + " Reference 99.").ok)
+
+    def test_time_narrowing_and_composite_targets_abstain(self) -> None:
+        reader = DISCOURSE_SSA_CASES[56][0]
+        mutations = (
+            reader.replace(
+                "How many more pages did Denise read more than Daniel?",
+                "How many more pages did Denise read today than Daniel?",
+            ),
+            reader.replace(
+                "How many more pages did Denise read more than Daniel?",
+                "How many more pages did Denise read yesterday than Daniel?",
+            ),
+            DISCOURSE_SSA_CASES[4][0].replace(
+                "of the number train?",
+                "of the number train and what was its prior value?",
+            ),
+            DISCOURSE_SSA_CASES[7][0].replace(
+                "they made together.",
+                "they made together and how many boxes they used?",
+            ),
+            DISCOURSE_SSA_CASES[35][0].replace(
+                "should she buy?",
+                "should she buy and how much money would that cost?",
+            ),
+            DISCOURSE_SSA_CASES[42][0].replace(
+                "in feet?", "in feet, and how much wider is it?"
+            ),
+            AUDIT_AFFINE_ANALOGUES[959][0].replace(
+                "brought to practice?",
+                "brought to practice and how many bags were used?",
+            ),
+            AUDIT_AFFINE_ANALOGUES[1064][0].replace(
+                "last week?", "last week and how many chaperones came?"
+            ),
+            AUDIT_AFFINE_ANALOGUES[1194][0].replace(
+                "sea have.", "sea have and how many fins they have?"
+            ),
+            AUDIT_AFFINE_ANALOGUES[1252][0].replace(
+                "Dominick saw.", "Dominick saw and how many robots were there?"
+            ),
+            AUDIT_AFFINE_ANALOGUES[1304][0].replace(
+                "Butler High School?",
+                "Butler High School and how many teachers enroll?",
+            ),
+            DISCOURSE_SSA_CASES[7][0].replace(
+                "chocolate pounds they made together.",
+                "chocolate pounds and boxes they made together.",
+            ),
+            DISCOURSE_SSA_CASES[35][0].replace(
+                "stuffed goats should she buy?",
+                "stuffed goats and dollars should she buy?",
+            ),
+            AUDIT_AFFINE_ANALOGUES[959][0].replace(
+                "number of balls that",
+                "number of balls and bags that",
+            ),
+            AUDIT_AFFINE_ANALOGUES[1064][0].replace(
+                "how many classes visited",
+                "how many classes and chaperones visited",
+            ),
+            AUDIT_AFFINE_ANALOGUES[1194][0].replace(
+                "gallons of blood that",
+                "gallons of blood and the fin count that",
+            ),
+            AUDIT_AFFINE_ANALOGUES[1252][0].replace(
+                "number of items Dominick",
+                "number of items and the robot count Dominick",
+            ),
+            AUDIT_AFFINE_ANALOGUES[1304][0].replace(
+                "average enrollment at Norman",
+                "average enrollment and graduation at Norman",
+            ),
+        )
+        for question in mutations:
+            with self.subTest(question=question):
+                self.assertFalse(compile_signed_events(question).ok)
+
+
 if __name__ == "__main__":
     unittest.main()

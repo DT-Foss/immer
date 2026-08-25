@@ -6,6 +6,7 @@ import unittest
 
 from immer.cognition.fertig.arithmetic_ir import (
     Assign,
+    Balance,
     Mean as IRMean,
     Rate,
     SolveStatus,
@@ -17,10 +18,12 @@ from immer.cognition.fertig.clause_compiler import SymbolKey
 from immer.cognition.fertig.signed_expression import (
     AbsoluteExpr,
     CeilingExpr,
+    ClosedShareExpr,
     Definition,
     ExpressionCompileError,
     ExpressionProgram,
     ExpressionTarget,
+    GroundProductExpr,
     LiteralExpr,
     MeanExpr,
     NumericEvidence,
@@ -29,6 +32,7 @@ from immer.cognition.fertig.signed_expression import (
     RefExpr,
     SignedTerm,
     SumExpr,
+    UnitConversionExpr,
     compile_expression,
 )
 
@@ -39,6 +43,9 @@ MONEY = Unit.base("money", symbol="USD")
 PRICE = MONEY / COUNT
 SECOND = Unit.base("time", symbol="s")
 MINUTE = Unit("min", (("time", 1),), Fraction(60))
+PERCENT = Unit("%", (), Fraction(1, 100))
+FOOT = Unit.base("length", symbol="ft")
+INCH = Unit("in", (("length", 1),), Fraction(1, 12))
 
 
 def _key(name: str, property_name: str = "quantity") -> SymbolKey:
@@ -89,6 +96,60 @@ def _compile(builder: _Builder, expr, **kwargs):
 
 
 class CanonicalExpressionTests(unittest.TestCase):
+    def test_typed_ground_product_share_and_conversion_keep_connected_proofs(
+        self,
+    ) -> None:
+        product_builder = _Builder()
+        span = Span(0, 0)
+        left, right = _key("left"), _key("right")
+        definitions = (
+            Definition(left, product_builder.literal(6, SCALAR), span),
+            Definition(right, product_builder.literal(8, SCALAR), span),
+        )
+        product = _compile(
+            product_builder,
+            GroundProductExpr(
+                (RefExpr(left, span), RefExpr(right, span)), span
+            ),
+            definitions=definitions,
+        )
+        self.assertEqual(product.solution.target_value, 48)
+        self.assertTrue(product.certificate.verified)
+        self.assertTrue(
+            {left.variable_name, right.variable_name}.issubset(
+                product.certificate.component_variables
+            )
+        )
+
+        share_builder = _Builder()
+        existing = _key("existing")
+        share = _compile(
+            share_builder,
+            ClosedShareExpr(
+                RefExpr(existing, span),
+                share_builder.literal(30, PERCENT),
+                span,
+            ),
+            definitions=(
+                Definition(existing, share_builder.literal(14), span),
+            ),
+        )
+        self.assertEqual(share.solution.target_value, 6)
+        self.assertIn(Balance, {type(row) for row in share.problem.constraints})
+        self.assertIn(existing.variable_name, share.certificate.component_variables)
+
+        conversion_builder = _Builder()
+        inches = _key("inches")
+        conversion = _compile(
+            conversion_builder,
+            UnitConversionExpr(RefExpr(inches, span), FOOT, span),
+            definitions=(
+                Definition(inches, conversion_builder.literal(480, INCH), span),
+            ),
+        )
+        self.assertEqual(conversion.solution.target_value, 40)
+        self.assertTrue(conversion.certificate.verified)
+
     def test_ground_absolute_and_ceiling_are_exact_and_certified(self) -> None:
         absolute_builder = _Builder()
         delta = _sum(

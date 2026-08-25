@@ -251,6 +251,16 @@ class FertigAbstentionAuditTests(unittest.TestCase):
             first["recovery_wave_delta"]["previously_sealed_exact_recoveries"], 1
         )
         self.assertEqual(
+            first["recovery_wave_history"]["baseline_exact_recoveries"], 1
+        )
+        self.assertEqual(
+            [
+                wave["added_exact_recoveries"]
+                for wave in first["recovery_wave_history"]["waves"]
+            ],
+            [0, 0],
+        )
+        self.assertEqual(
             first["hungarian_verdict"]["directly_eligible_exclusive_instances"],
             0,
         )
@@ -308,10 +318,10 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(
             audit.CURRENT_STRUCTURAL_COUNTS,
             {
-                "exact_recovery": 47,
-                "numeric_pronoun_ambiguous": 76,
-                "question_pronoun_ambiguous": 5,
-                "numeric_clause_unsupported": 93,
+                "exact_recovery": 57,
+                "numeric_pronoun_ambiguous": 75,
+                "question_pronoun_ambiguous": 3,
+                "numeric_clause_unsupported": 86,
                 "target_unsupported": 7,
                 "relation_ambiguous": 1,
                 "relation_unsupported": 1,
@@ -321,9 +331,9 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(
             audit.CURRENT_SCOPE_COUNTS,
             {
-                "exact_recovery_scope": 47,
-                "potential_coreference_scope": 81,
-                "grammar_scope": 102,
+                "exact_recovery_scope": 57,
+                "potential_coreference_scope": 78,
+                "grammar_scope": 95,
             },
         )
         self.assertEqual(
@@ -331,7 +341,9 @@ class FertigAbstentionAuditTests(unittest.TestCase):
             (
                 550,
                 574,
+                578,
                 587,
+                603,
                 610,
                 613,
                 619,
@@ -355,9 +367,11 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                 778,
                 780,
                 797,
+                802,
                 819,
                 823,
                 825,
+                833,
                 836,
                 837,
                 840,
@@ -367,6 +381,7 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                 868,
                 883,
                 892,
+                900,
                 901,
                 913,
                 916,
@@ -374,17 +389,22 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                 930,
                 934,
                 944,
+                959,
+                1064,
+                1194,
                 1219,
+                1252,
                 1261,
+                1304,
             ),
         )
         self.assertEqual(
-            audit.CURRENT_WAVE_EXACT_RECOVERY_INDICES,
+            audit.GROUND_WAVE_EXACT_RECOVERY_INDICES,
             (672, 780, 944, 1219, 1261),
         )
-        self.assertEqual(audit.CURRENT_PRE_WAVE_EXACT_RECOVERIES, 42)
+        self.assertEqual(audit.BASELINE_EXACT_RECOVERIES, 42)
         self.assertEqual(
-            audit.CURRENT_WAVE_EXACT_MECHANISMS,
+            audit.GROUND_WAVE_EXACT_MECHANISMS,
             {
                 672: "signed_event:temporal_categorical_block_remainder",
                 780: "signed_event:absolute_weighted_score_difference",
@@ -393,16 +413,41 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                 1261: "signed_event:recurring_pronoun_rate_ledger",
             },
         )
+        self.assertEqual(
+            audit.DISCOURSE_SSA_WAVE_EXACT_RECOVERY_INDICES,
+            (578, 603, 802, 833, 900, 959, 1064, 1194, 1252, 1304),
+        )
+        self.assertEqual(
+            audit.DISCOURSE_SSA_WAVE_EXACT_MECHANISMS,
+            {
+                578: "signed_event:grounded_value_pipeline",
+                603: "signed_event:shared_duration_affine_rates",
+                802: "signed_event:closed_collection_share_completion",
+                833: "signed_event:typed_scale_chain_conversion",
+                900: "signed_event:temporal_reader_affine_difference",
+                959: "signed_event:closed_named_scale_group_total",
+                1064: "signed_event:ordered_affine_category_ledger",
+                1194: "signed_event:typed_species_scale_total",
+                1252: "signed_event:typed_ratio_property_chain_total",
+                1304: "signed_event:typed_scaled_measure_difference",
+            },
+        )
+        self.assertEqual(
+            set(audit.CURRENT_EXACT_RECOVERY_MECHANISMS),
+            set(audit.CURRENT_EXACT_RECOVERY_INDICES),
+        )
         with self.assertRaisesRegex(audit.AuditError, "evidence drifted"):
             audit._validate_current_evidence(
                 {
+                    "schema": audit.SCHEMA,
+                    "report_revision": audit.REPORT_REVISION,
                     "classification_counts": {
                         "legacy": audit.CURRENT_LEGACY_COUNTS,
                         "structural": audit.CURRENT_STRUCTURAL_COUNTS,
                         "scope": {
-                            "exact_recovery_scope": 47,
-                            "potential_coreference_scope": 80,
-                            "grammar_scope": 103,
+                            "exact_recovery_scope": 57,
+                            "potential_coreference_scope": 77,
+                            "grammar_scope": 96,
                         },
                     }
                 }
@@ -412,7 +457,7 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         report = json.loads(audit.DEFAULT_OUTPUT_PATH.read_text(encoding="utf-8"))
         audit._validate_current_evidence(report)
         identity = report["exact_recovery_attribution"]["identity"]
-        self.assertEqual(identity["count"], 47)
+        self.assertEqual(identity["count"], 57)
         self.assertEqual(
             identity["indices"], list(audit.CURRENT_EXACT_RECOVERY_INDICES)
         )
@@ -422,15 +467,43 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                 audit._canonical_json_bytes(list(audit.CURRENT_EXACT_RECOVERY_INDICES))
             ),
         )
+        mechanism_identity = report["exact_recovery_attribution"][
+            "mechanism_identity"
+        ]
+        self.assertEqual(mechanism_identity["count"], 57)
+        self.assertEqual(
+            {
+                row["index"]: row["mechanism"]
+                for row in mechanism_identity["rows"]
+            },
+            audit.CURRENT_EXACT_RECOVERY_MECHANISMS,
+        )
         delta = report["recovery_wave_delta"]
-        self.assertEqual(delta["previously_sealed_exact_recoveries"], 42)
-        self.assertEqual(delta["added_exact_recoveries"], 5)
-        self.assertEqual(delta["current_exact_recoveries"], 47)
+        self.assertEqual(delta["previously_sealed_exact_recoveries"], 47)
+        self.assertEqual(delta["added_exact_recoveries"], 10)
+        self.assertEqual(delta["current_exact_recoveries"], 57)
         self.assertEqual(
             delta["added_identity"]["indices"],
-            list(audit.CURRENT_WAVE_EXACT_RECOVERY_INDICES),
+            list(audit.DISCOURSE_SSA_WAVE_EXACT_RECOVERY_INDICES),
         )
-        self.assertIn("this wave claims 5, not 47", delta["attribution"])
+        self.assertIn("this wave claims 10, not 57", delta["attribution"])
+
+        history = report["recovery_wave_history"]
+        self.assertEqual(history["baseline_exact_recoveries"], 42)
+        self.assertEqual(
+            [wave["added_exact_recoveries"] for wave in history["waves"]],
+            [5, 10],
+        )
+        self.assertEqual(
+            [wave["current_exact_recoveries"] for wave in history["waves"]],
+            [47, 57],
+        )
+        self.assertIn(
+            "57 current exact recoveries = 42 sealed baseline",
+            history["attribution"],
+        )
+        self.assertIn("+ 5 by", history["attribution"])
+        self.assertIn("+ 10 by", history["attribution"])
 
         swapped = json.loads(json.dumps(report))
         next(item for item in swapped["items"] if item["index"] == 550)["index"] = 549
@@ -443,6 +516,45 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         ] = "signed_event:unrelated"
         with self.assertRaisesRegex(audit.AuditError, "inconsistent mechanism"):
             audit._validate_current_evidence(misattributed)
+
+        count_preserving_delta_swap = json.loads(json.dumps(report))
+        count_preserving_delta_swap["recovery_wave_delta"]["added_identity"][
+            "indices"
+        ][0] = audit.GROUND_WAVE_EXACT_RECOVERY_INDICES[0]
+        with self.assertRaisesRegex(audit.AuditError, "delta drifted"):
+            audit._validate_current_evidence(count_preserving_delta_swap)
+
+        count_preserving_history_swap = json.loads(json.dumps(report))
+        first_wave, second_wave = count_preserving_history_swap[
+            "recovery_wave_history"
+        ]["waves"]
+        first_wave["added_identity"]["indices"][0], second_wave["added_identity"][
+            "indices"
+        ][0] = (
+            second_wave["added_identity"]["indices"][0],
+            first_wave["added_identity"]["indices"][0],
+        )
+        with self.assertRaisesRegex(audit.AuditError, "history drifted"):
+            audit._validate_current_evidence(count_preserving_history_swap)
+
+        full_mechanism_misattribution = json.loads(json.dumps(report))
+        full_mechanism_misattribution["exact_recovery_attribution"][
+            "mechanism_identity"
+        ]["rows"][0]["mechanism"] = "signed_event:unrelated"
+        with self.assertRaisesRegex(audit.AuditError, "attribution drifted"):
+            audit._validate_current_evidence(full_mechanism_misattribution)
+
+        unsealed = dict(report)
+        observed_report_sha256 = unsealed.pop("report_sha256")
+        self.assertEqual(
+            observed_report_sha256,
+            audit._sha256_bytes(audit._canonical_json_bytes(unsealed)),
+        )
+        for evidence in report["provenance"]["files"].values():
+            path = Path(evidence["path"])
+            resolved = path if path.is_absolute() else audit.ROOT / path
+            self.assertEqual(evidence["sha256"], audit._sha256_file(resolved))
+        self.assertIn("typed_discourse_ssa", report["provenance"]["files"])
 
     def test_atomic_output_and_provenance_hashes_are_sealed(self) -> None:
         provenance = audit.current_provenance(audit.DEFAULT_BENCHMARK_PATH)

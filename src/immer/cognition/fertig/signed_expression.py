@@ -9,6 +9,7 @@ from typing import Mapping, TypeAlias
 
 from .arithmetic_ir import (
     Assign,
+    Balance,
     Certificate,
     Constraint,
     Mean,
@@ -174,6 +175,51 @@ class CeilingExpr:
         _span(self.span)
 
 
+@dataclass(frozen=True, slots=True)
+class GroundProductExpr:
+    """Product admitted only after its complete dependency DAG is ground.
+
+    Ordinary :class:`ProductExpr` remains affine and still rejects
+    ``unknown * unknown``.  This separate node is for sequential calculations
+    whose referenced values are all uniquely defined by numeric evidence.
+    """
+
+    factors: tuple[Expression, ...]
+    span: Span
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "factors", tuple(self.factors))
+        _span(self.span)
+
+
+@dataclass(frozen=True, slots=True)
+class ClosedShareExpr:
+    """Solve ``x / (existing + x) = share`` for a grounded closed share."""
+
+    existing: Expression
+    share: LiteralExpr
+    span: Span
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.share, LiteralExpr):
+            raise TypeError("closed share must use a ground LiteralExpr")
+        _span(self.span)
+
+
+@dataclass(frozen=True, slots=True)
+class UnitConversionExpr:
+    """One explicit conversion to a compatible output unit."""
+
+    value: Expression
+    unit: Unit
+    span: Span
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.unit, Unit):
+            raise TypeError("conversion target must be a Unit")
+        _span(self.span)
+
+
 Expression: TypeAlias = (
     LiteralExpr
     | RefExpr
@@ -183,6 +229,9 @@ Expression: TypeAlias = (
     | MeanExpr
     | AbsoluteExpr
     | CeilingExpr
+    | GroundProductExpr
+    | ClosedShareExpr
+    | UnitConversionExpr
 )
 
 
@@ -259,6 +308,9 @@ _EXPRESSION_TYPES = (
     MeanExpr,
     AbsoluteExpr,
     CeilingExpr,
+    GroundProductExpr,
+    ClosedShareExpr,
+    UnitConversionExpr,
 )
 
 
@@ -271,7 +323,7 @@ def _require_expression(expr: object, path: str) -> Expression:
 def _children(expr: Expression) -> tuple[tuple[str, Expression], ...]:
     if isinstance(expr, (LiteralExpr, RefExpr)):
         return ()
-    if isinstance(expr, ProductExpr):
+    if isinstance(expr, (ProductExpr, GroundProductExpr)):
         if len(expr.factors) < 2:
             raise ExpressionCompileError("product requires at least two factors")
         return tuple(
@@ -294,8 +346,10 @@ def _children(expr: Expression) -> tuple[tuple[str, Expression], ...]:
         return tuple(
             (f"value[{index}]", value) for index, value in enumerate(expr.values)
         )
-    if isinstance(expr, (AbsoluteExpr, CeilingExpr)):
+    if isinstance(expr, (AbsoluteExpr, CeilingExpr, UnitConversionExpr)):
         return (("value", expr.value),)
+    if isinstance(expr, ClosedShareExpr):
+        return (("existing", expr.existing), ("share", expr.share))
     raise AssertionError("closed expression union exhausted")
 
 
@@ -521,7 +575,7 @@ class _Compiler:
             unit = self._unit(definition.expr)
             self.definition_units[expr.symbol] = unit
             return unit
-        if isinstance(expr, ProductExpr):
+        if isinstance(expr, (ProductExpr, GroundProductExpr)):
             units = [self._unit(factor) for factor in expr.factors]
             result = units[0]
             for unit in units[1:]:
@@ -545,26 +599,52 @@ class _Compiler:
             return reference
         if isinstance(expr, (AbsoluteExpr, CeilingExpr)):
             return self._unit(expr.value)
+        if isinstance(expr, ClosedShareExpr):
+            if expr.share.unit.dimensions:
+                raise ExpressionCompileError("closed share must be dimensionless")
+            return self._unit(expr.existing)
+        if isinstance(expr, UnitConversionExpr):
+            source = self._unit(expr.value)
+            if not source.compatible(expr.unit):
+                raise ExpressionCompileError("conversion units are incompatible")
+            return expr.unit
         raise AssertionError("closed expression union exhausted")
 
-    def _ground_value(self, expr: Expression) -> tuple[Fraction, Unit]:
-        """Evaluate an evidence-closed expression without crossing a reference."""
+    def _ground_value(
+        self, expr: Expression, *, allow_references: bool = False
+    ) -> tuple[Fraction, Unit]:
+        """Evaluate an expression whose complete definition DAG is ground."""
 
         if isinstance(expr, LiteralExpr):
             return expr.value, expr.unit
         if isinstance(expr, RefExpr):
-            raise ExpressionCompileError(
-                "absolute value and ceiling require a fully ground expression"
+            if not allow_references:
+                raise ExpressionCompileError(
+                    "absolute value and ceiling require a fully ground expression"
+                )
+            definition = self.definitions.get(expr.symbol)
+            if definition is None:
+                raise ExpressionCompileError(
+                    "ground operator contains an undefined reference"
+                )
+            return self._ground_value(
+                definition.expr, allow_references=allow_references
             )
-        if isinstance(expr, ProductExpr):
-            factors = [self._ground_value(factor) for factor in expr.factors]
+        if isinstance(expr, (ProductExpr, GroundProductExpr)):
+            factors = [
+                self._ground_value(factor, allow_references=allow_references)
+                for factor in expr.factors
+            ]
             value, unit = factors[0]
             for factor_value, factor_unit in factors[1:]:
                 value *= factor_value
                 unit = unit * factor_unit
             return value, unit
         if isinstance(expr, SumExpr):
-            values = [self._ground_value(term.expr) for term in expr.terms]
+            values = [
+                self._ground_value(term.expr, allow_references=allow_references)
+                for term in expr.terms
+            ]
             reference = values[0][1]
             if any(not reference.compatible(unit) for _, unit in values[1:]):
                 raise ExpressionCompileError("sum contains incompatible units")
@@ -574,25 +654,53 @@ class _Compiler:
             )
             return total, reference
         if isinstance(expr, QuotientExpr):
-            numerator, numerator_unit = self._ground_value(expr.numerator)
-            denominator, denominator_unit = self._ground_value(expr.denominator)
+            numerator, numerator_unit = self._ground_value(
+                expr.numerator, allow_references=allow_references
+            )
+            denominator, denominator_unit = self._ground_value(
+                expr.denominator, allow_references=allow_references
+            )
             if denominator == 0:
                 raise ExpressionCompileError("quotient denominator must be nonzero")
             return numerator / denominator, numerator_unit / denominator_unit
         if isinstance(expr, MeanExpr):
-            values = [self._ground_value(value) for value in expr.values]
+            values = [
+                self._ground_value(value, allow_references=allow_references)
+                for value in expr.values
+            ]
             reference = values[0][1]
             if any(not reference.compatible(unit) for _, unit in values[1:]):
                 raise ExpressionCompileError("mean contains incompatible units")
             total = sum(value * unit.scale / reference.scale for value, unit in values)
             return total / len(values), reference
         if isinstance(expr, AbsoluteExpr):
-            value, unit = self._ground_value(expr.value)
+            value, unit = self._ground_value(
+                expr.value, allow_references=allow_references
+            )
             return abs(value), unit
         if isinstance(expr, CeilingExpr):
-            value, unit = self._ground_value(expr.value)
+            value, unit = self._ground_value(
+                expr.value, allow_references=allow_references
+            )
             rounded = Fraction(-(-value.numerator // value.denominator))
             return rounded, unit
+        if isinstance(expr, ClosedShareExpr):
+            existing, unit = self._ground_value(
+                expr.existing, allow_references=allow_references
+            )
+            share = expr.share.value * expr.share.unit.scale
+            if not 0 < share < 1:
+                raise ExpressionCompileError(
+                    "closed share must be strictly between zero and one"
+                )
+            return existing * share / (1 - share), unit
+        if isinstance(expr, UnitConversionExpr):
+            value, source = self._ground_value(
+                expr.value, allow_references=allow_references
+            )
+            if not source.compatible(expr.unit):
+                raise ExpressionCompileError("conversion units are incompatible")
+            return value * source.scale / expr.unit.scale, expr.unit
         raise AssertionError("closed expression union exhausted")
 
     def _build_variables(self) -> None:
@@ -665,6 +773,62 @@ class _Compiler:
                 self.constraints.append(Rate(product, accumulator, factor, expr.span))
                 accumulator = product
             return accumulator
+        if isinstance(expr, GroundProductExpr):
+            grounded = [
+                self._ground_value(factor, allow_references=True)
+                for factor in expr.factors
+            ]
+            if any(unit.dimensions for _, unit in grounded):
+                raise ExpressionCompileError(
+                    "ground multi-reference product must be dimensionless"
+                )
+            atoms = [
+                self._lower(factor, integral_counts=False)
+                for factor in expr.factors
+            ]
+            variable_offsets = [
+                index for index, atom in enumerate(atoms) if isinstance(atom, Variable)
+            ]
+            if len(variable_offsets) < 2:
+                raise ExpressionCompileError(
+                    "ground product requires at least two referenced values"
+                )
+            anchor_index = variable_offsets[0]
+            anchor = atoms[anchor_index]
+            assert isinstance(anchor, Variable)
+            coefficient_value = Fraction(1)
+            coefficient_unit = Unit.scalar()
+            for index, (value, factor_unit) in enumerate(grounded):
+                if index == anchor_index:
+                    continue
+                coefficient_value *= value
+                coefficient_unit = coefficient_unit * factor_unit
+            unit = self._unit(expr)
+            result = self._auxiliary(unit, expr.span)
+            self.constraints.append(
+                Rate(
+                    result,
+                    anchor,
+                    Quantity(coefficient_value, coefficient_unit, expr.span),
+                    expr.span,
+                )
+            )
+            witnesses = [
+                atom
+                for index, atom in enumerate(atoms)
+                if index != anchor_index and isinstance(atom, Variable)
+            ]
+            # Zero-weight witnesses connect every proven factor definition to
+            # the target certificate.  The multiplication coefficient above
+            # is the exact evaluation of those same ground definitions.
+            self.constraints.append(
+                Sum(
+                    result,
+                    (result, *(Term(witness, Fraction(0)) for witness in witnesses)),
+                    expr.span,
+                )
+            )
+            return result
         if isinstance(expr, SumExpr):
             atoms = [
                 self._lower(term.expr, integral_counts=integral_counts)
@@ -715,6 +879,32 @@ class _Compiler:
             result = self._auxiliary(unit, expr.span)
             correction = Quantity(rounded - value, unit, expr.span)
             self.constraints.append(Sum(result, (atom, correction), expr.span))
+            return result
+        if isinstance(expr, ClosedShareExpr):
+            existing = self._lower(expr.existing, integral_counts=integral_counts)
+            share = expr.share.value * expr.share.unit.scale
+            if not 0 < share < 1:
+                raise ExpressionCompileError(
+                    "closed share must be strictly between zero and one"
+                )
+            unit = self._unit(expr)
+            result = self._auxiliary(
+                unit, expr.span, integral_counts=integral_counts
+            )
+            self.constraints.append(
+                Balance(
+                    (Term(result, 1 - share),),
+                    (Term(existing, share),),
+                    expr.span,
+                )
+            )
+            return result
+        if isinstance(expr, UnitConversionExpr):
+            atom = self._lower(expr.value, integral_counts=integral_counts)
+            result = self._auxiliary(
+                expr.unit, expr.span, integral_counts=integral_counts
+            )
+            self.constraints.append(Assign(result, atom, expr.span))
             return result
         raise AssertionError("closed expression union exhausted")
 
