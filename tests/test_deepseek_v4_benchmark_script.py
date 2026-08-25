@@ -789,6 +789,7 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
                 causal_tensor_reader=tensor_reader,
                 remote_pinned_inventory_fingerprint="a" * 64,
                 remote_pinned_inventory_sha256="b" * 64,
+                remote_expert_split_rail=False,
             )
             rows = [{"id": "row-0"}]
             with (
@@ -812,6 +813,9 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             self.assertEqual(
                 execute.call_args.kwargs["remote_pinned_inventory_sha256"],
                 "b" * 64,
+            )
+            self.assertFalse(
+                execute.call_args.kwargs["remote_expert_split_rail"]
             )
             owner.close.assert_called_once_with()
 
@@ -849,6 +853,373 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
             )
             self.assertIs(opened.call_args.kwargs["access_observer"], recorder)
             self.assertTrue(opened.call_args.kwargs["require_remote_pinned_revision"])
+            self.assertFalse(opened.call_args.kwargs["remote_expert_split_rail"])
+
+    def test_parser_and_run_forward_remote_expert_split_rail(self) -> None:
+        module = _script_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            pinned = root / "inventory.pinned.json"
+            args = module._parser().parse_args(
+                [
+                    "--dataset",
+                    str(root / "dataset.json"),
+                    "--task",
+                    "mmlu",
+                    "--journal",
+                    str(root / "run.jsonl"),
+                    "--output",
+                    str(root / "report.json"),
+                    "--causal-bundle",
+                    str(bundle),
+                    "--remote-pinned-inventory",
+                    str(pinned),
+                    "--remote-expert-split-rail",
+                ]
+            )
+            self.assertTrue(args.remote_expert_split_rail)
+
+            recorder = None
+            owner = mock.Mock()
+            with mock.patch.object(
+                module,
+                "open_deepseek_runtime_source",
+                return_value=owner,
+            ) as opened:
+                self.assertIs(module._build_source(args, recorder), owner)
+            self.assertTrue(opened.call_args.kwargs["remote_expert_split_rail"])
+            self.assertEqual(opened.call_args.kwargs["causal_bundle"], str(bundle))
+            self.assertEqual(
+                opened.call_args.kwargs["remote_pinned_inventory"], str(pinned)
+            )
+
+            source = object()
+            tensor_reader = object()
+            owner = mock.Mock(
+                source=source,
+                label="split:fixture",
+                causal_weight_reader=None,
+                causal_tensor_reader=tensor_reader,
+                remote_pinned_inventory_fingerprint="a" * 64,
+                remote_pinned_inventory_sha256="b" * 64,
+                remote_expert_split_rail=True,
+                local_causal_layout_fingerprint="a" * 64,
+            )
+            rows = [{"id": "row-0"}]
+            with (
+                mock.patch.object(module, "_read_dataset", return_value=rows),
+                mock.patch.object(module, "_build_source", return_value=owner),
+                mock.patch.object(
+                    module, "_run_with_source", return_value={"status": "ok"}
+                ) as execute,
+            ):
+                self.assertEqual(module.run(args), {"status": "ok"})
+            self.assertTrue(execute.call_args.kwargs["remote_expert_split_rail"])
+            self.assertEqual(
+                execute.call_args.kwargs["local_causal_layout_fingerprint"],
+                "a" * 64,
+            )
+            self.assertIsNone(execute.call_args.kwargs["causal_weight_reader"])
+            self.assertIs(
+                execute.call_args.kwargs["causal_tensor_reader"], tensor_reader
+            )
+            owner.close.assert_called_once_with()
+
+    def test_split_rail_rejects_access_trace_before_any_artifact_or_input(self) -> None:
+        module = _script_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = module._parser().parse_args(
+                [
+                    "--dataset",
+                    str(root / "missing-dataset.json"),
+                    "--task",
+                    "mmlu",
+                    "--journal",
+                    str(root / "run.jsonl"),
+                    "--output",
+                    str(root / "report.json"),
+                    "--access-trace",
+                    str(root / "trace.json"),
+                    "--causal-bundle",
+                    str(root / "bundle"),
+                    "--remote-pinned-inventory",
+                    str(root / "inventory.json"),
+                    "--remote-expert-split-rail",
+                ]
+            )
+            with (
+                mock.patch.object(module, "_read_dataset") as dataset,
+                mock.patch.object(module, "_build_source") as source,
+                self.assertRaisesRegex(module.RunnerError, "not supported"),
+            ):
+                module.run(args)
+            dataset.assert_not_called()
+            source.assert_not_called()
+            self.assertFalse((root / "report.json").exists())
+            self.assertFalse((root / "trace.json").exists())
+
+    def test_split_rail_plane_identity_and_remote_cache_policy(self) -> None:
+        module = _script_module()
+        fingerprint = "a" * 64
+        layout = types.SimpleNamespace(layout_fingerprint=fingerprint)
+        tensor_reader = types.SimpleNamespace(layout=layout)
+        planes = module._weight_planes(
+            remote_expert_split_rail=True,
+            causal_weight_reader=None,
+            causal_tensor_reader=tensor_reader,
+            local_causal_layout_fingerprint=fingerprint,
+            remote_pinned_inventory_fingerprint=fingerprint,
+            remote_pinned_inventory_sha256="b" * 64,
+        )
+        self.assertEqual(planes["mode"], "remote-expert-split-rail/v1")
+        self.assertEqual(
+            planes["dense"]["address_plane"],
+            "local-causal-tensor-reader/v1",
+        )
+        self.assertEqual(
+            planes["routed_experts"]["address_plane"],
+            "remote-pinned-streamer/v1",
+        )
+        with self.assertRaisesRegex(module.RunnerError, "mismatched"):
+            module._weight_planes(
+                remote_expert_split_rail=True,
+                causal_weight_reader=None,
+                causal_tensor_reader=tensor_reader,
+                local_causal_layout_fingerprint=fingerprint,
+                remote_pinned_inventory_fingerprint="c" * 64,
+                remote_pinned_inventory_sha256="b" * 64,
+            )
+
+        args = types.SimpleNamespace(
+            no_cache=False,
+            causal_bundle="/local/bundle",
+        )
+        self.assertTrue(
+            module._remote_cache_enabled(
+                args, remote_expert_split_rail=True
+            )
+        )
+        self.assertFalse(
+            module._remote_cache_enabled(
+                args, remote_expert_split_rail=False
+            )
+        )
+
+    def test_split_rail_binds_provenance_cache_and_disjoint_metrics(self) -> None:
+        module = _script_module()
+        fingerprint = "a" * 64
+        inventory_sha256 = "b" * 64
+        remote_metrics = {
+            "repo_id": module.OFFICIAL_SOURCE,
+            "revision": module.OFFICIAL_REVISION,
+            "inventory_source_fingerprint": fingerprint,
+            "revision_is_pinned": True,
+            "revision_is_mutable": False,
+            "transport_policy": "http-range-bounded/v1",
+            "transport_connection_limit": 4,
+            "cache_bytes_reused": 11,
+        }
+        local_dense_metrics = {
+            "read_calls": 7,
+            "source_bytes": 1234,
+        }
+
+        class Source:
+            budget = types.SimpleNamespace(limit=64 * 1024**2)
+
+            def inventory(self):
+                return {"repo": module.OFFICIAL_SOURCE, "tensors": []}
+
+            def metrics(self):
+                return dict(remote_metrics)
+
+            def bytes_moved(self):
+                return 4321
+
+        source = Source()
+        tensor_reader = types.SimpleNamespace(
+            layout=types.SimpleNamespace(layout_fingerprint=fingerprint)
+        )
+        pager_instances: list[object] = []
+
+        def pager_init(instance, pager_source, **kwargs):
+            instance.source = pager_source
+            instance.expert_prefetch_enabled = False
+            instance.expert_range_coalesce_max_experts = 1
+            pager_instances.append((instance, kwargs))
+
+        def pager_metrics(_instance):
+            return {
+                "remote_expert_split_rail": True,
+                "expert_address_plane": "remote-pinned-streamer/v1",
+                "causal_missing_fallback": False,
+                "causal_tensor_reader": dict(local_dense_metrics),
+                "source": dict(remote_metrics),
+                "materialized_bytes": 9,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "fixture.json"
+            row = {"id": "split-row", "answer": 0}
+            dataset.write_text(json.dumps([row]), encoding="utf-8")
+            args = module._parser().parse_args(
+                [
+                    "--dataset",
+                    str(dataset),
+                    "--task",
+                    "mmlu",
+                    "--journal",
+                    str(root / "run.jsonl"),
+                    "--output",
+                    str(root / "report.json"),
+                    "--causal-bundle",
+                    str(root / "bundle"),
+                    "--remote-pinned-inventory",
+                    str(root / "inventory.json"),
+                    "--remote-expert-split-rail",
+                    "--modes",
+                    "off",
+                    "--cache-budget-mb",
+                    "8",
+                    "--preflight",
+                    "none",
+                ]
+            )
+            with (
+                mock.patch.object(
+                    module,
+                    "_load_config",
+                    return_value=(
+                        types.SimpleNamespace(n_layers=1),
+                        {"sha256": "c" * 64},
+                    ),
+                ),
+                mock.patch.object(module, "_load_tokenizer", return_value=None),
+                mock.patch.object(
+                    module,
+                    "_prepare_rows",
+                    return_value={
+                        "split-row": types.SimpleNamespace(
+                            benchmark_protocol="fixture/v1",
+                            prompt_encoding="fixture/v1",
+                            prompt_protocol="fixture/v1",
+                            candidate_tokenization="fixture/v1",
+                            assistant_generation_prefix=None,
+                        )
+                    },
+                ),
+                mock.patch.object(
+                    module,
+                    "_model_for_mode",
+                    return_value=mock.Mock(),
+                ),
+                mock.patch.object(
+                    module,
+                    "_item_record",
+                    side_effect=lambda **kwargs: {
+                        "schema": module.JOURNAL_SCHEMA,
+                        "type": "item",
+                        "signature": kwargs["signature"],
+                        "mode": kwargs["mode"],
+                        "seed": kwargs["seed"],
+                        "item_id": str(kwargs["row"]["id"]),
+                        "item": {
+                            "item_id": str(kwargs["row"]["id"]),
+                            "task": "mmlu",
+                            "seed": kwargs["seed"],
+                            "status": "correct",
+                            "expected": 0,
+                            "predicted": 0,
+                            "error": None,
+                            "metadata": {
+                                "benchmark_protocol": "fixture/v1",
+                                "mode": kwargs["mode"],
+                            },
+                        },
+                        "performance": {
+                            "item_id": str(kwargs["row"]["id"]),
+                            "seed": kwargs["seed"],
+                            "cache_state": "uncontrolled",
+                            "latency_ms": 1.0,
+                            "source_bytes": 2,
+                            "cache_bytes": 0,
+                            "requests": 1,
+                            "output_tokens": 1,
+                            "error": None,
+                        },
+                        "measurements": {},
+                    },
+                ),
+                mock.patch.object(module.DeepSeekWeightPager, "__init__", pager_init),
+                mock.patch.object(
+                    module.DeepSeekWeightPager, "metrics", pager_metrics
+                ),
+                mock.patch.object(
+                    module.DeepSeekWeightPager, "release", lambda _instance: None
+                ),
+            ):
+                receipt = module._run_with_source(
+                    args,
+                    task=module.BenchmarkTask.MMLU,
+                    modes=("off",),
+                    seeds=(0,),
+                    rows=[row],
+                    selected_rows=[row],
+                    source=source,
+                    source_label="split-fixture",
+                    causal_weight_reader=None,
+                    causal_tensor_reader=tensor_reader,
+                    remote_pinned_inventory_fingerprint=fingerprint,
+                    remote_pinned_inventory_sha256=inventory_sha256,
+                    remote_expert_split_rail=True,
+                    local_causal_layout_fingerprint=fingerprint,
+                )
+
+            self.assertEqual(receipt["status"], "complete")
+            report = json.loads((root / "report.json").read_text(encoding="utf-8"))
+            header = json.loads((root / "run.jsonl").read_text().splitlines()[0])
+            self.assertTrue(report["remote_expert_split_rail"])
+            self.assertEqual(
+                report["weight_planes"]["dense"][
+                    "inventory_source_fingerprint"
+                ],
+                fingerprint,
+            )
+            self.assertEqual(
+                report["weight_planes"]["routed_experts"]["inventory_sha256"],
+                inventory_sha256,
+            )
+            self.assertEqual(
+                report["remote_expert_cache"],
+                {"enabled": True, "limit_bytes": 8 * 1024**2},
+            )
+            self.assertEqual(report["budgets"]["cache_limit_bytes"], 8 * 1024**2)
+            self.assertTrue(report["budgets"]["cache_enabled"])
+            protocol = report["modes"]["off"]["run"]["provenance"][
+                "protocol"
+            ]
+            self.assertTrue(protocol["remote_expert_split_rail"])
+            self.assertEqual(protocol["weight_planes"], report["weight_planes"])
+            self.assertEqual(header["weight_planes"], report["weight_planes"])
+            self.assertEqual(
+                report["remote_expert_source_metrics_this_process"],
+                module.shareable_runtime_evidence(remote_metrics),
+            )
+            self.assertEqual(
+                report["local_dense_causal_metrics_this_process"],
+                local_dense_metrics,
+            )
+            self.assertNotIn("source_metrics_this_process", report)
+            self.assertNotIn("source", report["pager_metrics_this_process"])
+            self.assertNotIn(
+                "causal_tensor_reader", report["pager_metrics_this_process"]
+            )
+            _instance, pager_kwargs = pager_instances[0]
+            self.assertTrue(pager_kwargs["remote_expert_split_rail"])
+            self.assertFalse(pager_kwargs["causal_missing_fallback"])
 
     def test_remote_pinned_adoption_changes_signature_and_provenance(self) -> None:
         module = _script_module()

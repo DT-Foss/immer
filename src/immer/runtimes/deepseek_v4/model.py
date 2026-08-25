@@ -222,6 +222,7 @@ class StreamedDeepSeekV4:
         """Validate tensor presence and critical storage formats without payload reads."""
 
         required: set[str] = set()
+        routed_expert_required: set[str] = set()
         contracts: dict[str, tuple[set[str], tuple[int, ...]]] = {}
         expert_contracts: dict[int, tuple[int, ...]] = {}
         errors: list[str] = []
@@ -246,8 +247,11 @@ class StreamedDeepSeekV4:
             )
 
         def fp4_matrix(name: str, out_dim: int, in_dim: int) -> None:
-            expect(f"{name}.weight", {"I8"}, (out_dim, in_dim // 2))
-            expect(f"{name}.scale", {"F8_E8M0"}, (out_dim, in_dim // 32))
+            weight_name = f"{name}.weight"
+            scale_name = f"{name}.scale"
+            expect(weight_name, {"I8"}, (out_dim, in_dim // 2))
+            expect(scale_name, {"F8_E8M0"}, (out_dim, in_dim // 32))
+            routed_expert_required.update((weight_name, scale_name))
 
         config = self.config
         expect("embed.weight", {"BF16"}, (config.vocab_size, config.dim))
@@ -371,8 +375,13 @@ class StreamedDeepSeekV4:
                     )
         source = self.pager.source
         if self.pager.causal_tensor_reader_attached:
+            dense_required = (
+                required - routed_expert_required
+                if self.pager.remote_expert_split_rail
+                else required
+            )
             try:
-                entries = self.pager.preflight_tensor_plans(sorted(required))
+                entries = self.pager.preflight_tensor_plans(sorted(dense_required))
             except Exception as exc:
                 raise DeepSeekV4RuntimeError(
                     "checkpoint causal dense-binding preflight failed before "
@@ -383,14 +392,62 @@ class StreamedDeepSeekV4:
             try:
                 expert_plan_count = 0
                 for layer, expert_ids in expert_contracts.items():
-                    expert_plan_count += len(
-                        self.pager.preflight_expert_plans(layer, expert_ids)
-                    )
+                    plans = self.pager.preflight_expert_plans(layer, expert_ids)
+                    expert_plan_count += len(plans)
+                    if not self.pager.remote_expert_split_rail:
+                        continue
+                    for expert_id, plan in zip(expert_ids, plans, strict=True):
+                        base = f"layers.{layer}.ffn.experts.{expert_id}"
+                        expected_names = {
+                            f"{base}.{projection}.{leaf}"
+                            for projection in ("w1", "w2", "w3")
+                            for leaf in ("weight", "scale")
+                        }
+                        if (
+                            plan.base != base
+                            or plan.layer != layer
+                            or plan.expert_id != expert_id
+                            or not isinstance(plan.ranges, tuple)
+                        ):
+                            raise DeepSeekV4RuntimeError(
+                                f"remote expert plan coordinates are invalid for {base}"
+                            )
+                        tensors = tuple(
+                            tensor
+                            for source_range in plan.ranges
+                            for tensor in source_range.tensors
+                        )
+                        observed_names = [tensor.name for tensor in tensors]
+                        if (
+                            len(tensors) != 6
+                            or len(set(observed_names)) != 6
+                            or set(observed_names) != expected_names
+                        ):
+                            raise DeepSeekV4RuntimeError(
+                                f"remote expert tensor membership is invalid for {base}"
+                            )
+                        for tensor in tensors:
+                            entries[tensor.name] = {
+                                "absolute_offset": tensor.absolute_offset,
+                                "dtype": tensor.dtype,
+                                "length": tensor.length,
+                                "shape": tensor.shape,
+                                "shard": next(
+                                    source_range.shard
+                                    for source_range in plan.ranges
+                                    if tensor in source_range.tensors
+                                ),
+                            }
             except Exception as exc:
+                label = (
+                    "checkpoint expert-binding preflight failed before "
+                    if self.pager.remote_expert_split_rail
+                    else "checkpoint causal expert-binding preflight failed before "
+                )
                 raise DeepSeekV4RuntimeError(
-                    "checkpoint causal expert-binding preflight failed before "
-                    f"payload reads: {exc}"
+                    f"{label}payload reads: {exc}"
                 ) from exc
+            inventory_tensors = len(entries)
         else:
             inventory = source.inventory()
             entries = {
@@ -436,6 +493,7 @@ class StreamedDeepSeekV4:
                 "inventory_source_fingerprint"
             ),
             "tensor_address_plane": address_plane,
+            "expert_address_plane": self.pager.expert_address_plane,
             "required_expert_plans": expert_plan_count,
         }
 

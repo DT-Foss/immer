@@ -663,6 +663,7 @@ def _build_source(
             access_observer=recorder,
             require_remote_pinned_revision=True,
             remote_pinned_inventory=args.remote_pinned_inventory,
+            remote_expert_split_rail=args.remote_expert_split_rail,
         )
     except (DeepSeekRuntimeSourceError, FileNotFoundError) as exc:
         raise RunnerError(str(exc)) from exc
@@ -694,6 +695,98 @@ def _load_config(
 def _digest_or_canonical(value: Any, fallback: Any) -> str:
     text = str(value or "").lower()
     return text if _DIGEST.fullmatch(text) else canonical_digest(fallback)
+
+
+def _remote_cache_enabled(
+    args: argparse.Namespace, *, remote_expert_split_rail: bool
+) -> bool:
+    """Return whether the active remote plane owns a bounded disk cache."""
+
+    return bool(
+        not args.no_cache
+        and (
+            args.causal_bundle is None
+            or remote_expert_split_rail
+        )
+    )
+
+
+def _weight_planes(
+    *,
+    remote_expert_split_rail: bool,
+    causal_weight_reader: Any | None,
+    causal_tensor_reader: Any | None,
+    local_causal_layout_fingerprint: str | None,
+    remote_pinned_inventory_fingerprint: str | None,
+    remote_pinned_inventory_sha256: str | None,
+) -> dict[str, Any]:
+    """Describe and bind the physical dense/expert address planes."""
+
+    reader_layout = getattr(causal_tensor_reader, "layout", None)
+    observed_local_fingerprint = getattr(
+        reader_layout, "layout_fingerprint", None
+    )
+    if local_causal_layout_fingerprint is None:
+        local_causal_layout_fingerprint = observed_local_fingerprint
+    elif (
+        observed_local_fingerprint is not None
+        and observed_local_fingerprint != local_causal_layout_fingerprint
+    ):
+        raise RunnerError("local causal tensor reader identity is inconsistent")
+
+    if remote_expert_split_rail:
+        if causal_weight_reader is not None or causal_tensor_reader is None:
+            raise RunnerError(
+                "remote expert split rail requires only the local causal tensor reader"
+            )
+        if (
+            local_causal_layout_fingerprint is None
+            or remote_pinned_inventory_fingerprint is None
+            or remote_pinned_inventory_sha256 is None
+            or local_causal_layout_fingerprint
+            != remote_pinned_inventory_fingerprint
+        ):
+            raise RunnerError(
+                "remote expert split rail inventory identity is incomplete or mismatched"
+            )
+        mode = "remote-expert-split-rail/v1"
+        dense_plane = "local-causal-tensor-reader/v1"
+        expert_plane = "remote-pinned-streamer/v1"
+    else:
+        mode = "unified-source/v1"
+        dense_plane = (
+            "local-causal-tensor-reader/v1"
+            if causal_tensor_reader is not None
+            else "streamer-tensor-name/v1"
+        )
+        expert_plane = (
+            "local-causal-expert-reader/v1"
+            if causal_weight_reader is not None
+            else "streamer-tensor-name/v1"
+        )
+
+    dense_fingerprint = (
+        local_causal_layout_fingerprint
+        if causal_tensor_reader is not None
+        else remote_pinned_inventory_fingerprint
+    )
+    expert_fingerprint = (
+        local_causal_layout_fingerprint
+        if causal_weight_reader is not None
+        else remote_pinned_inventory_fingerprint
+    )
+    return {
+        "mode": mode,
+        "dense": {
+            "address_plane": dense_plane,
+            "inventory_source_fingerprint": dense_fingerprint,
+        },
+        "routed_experts": {
+            "address_plane": expert_plane,
+            "inventory_sha256": remote_pinned_inventory_sha256,
+            "inventory_source_fingerprint": expert_fingerprint,
+        },
+    }
 
 
 def _parse_modes(values: Sequence[str]) -> tuple[str, ...]:
@@ -1521,7 +1614,10 @@ def _build_report(
     if expected_keys != journal.expected_keys:
         raise RunnerError("report key plan differs from the authenticated journal")
     expected = len(expected_keys)
-    return {
+    split_rail = bool(header["remote_expert_split_rail"])
+    cache_enabled = bool(header["remote_expert_cache"]["enabled"])
+    pager_metrics = dict(pager.metrics())
+    report = {
         "schema": REPORT_SCHEMA,
         "contract_schema": SCHEMA_VERSION,
         "signature": header["signature"],
@@ -1568,6 +1664,9 @@ def _build_report(
             "causal_tensor_reader_attached"
         ],
         "causal_missing_fallback": header["causal_missing_fallback"],
+        "remote_expert_split_rail": split_rail,
+        "weight_planes": header["weight_planes"],
+        "remote_expert_cache": header["remote_expert_cache"],
         "remote_pinned_inventory": header["remote_pinned_inventory"],
         "quantized_accumulation_policy": header["quantized_accumulation_policy"],
         "attention_qat_policy": header["attention_qat_policy"],
@@ -1603,15 +1702,39 @@ def _build_report(
             "source_limit_bytes_per_process": int(source.budget.limit),
             "source_used_bytes_this_process": int(source.bytes_moved()),
             "cache_limit_bytes": (
-                0
-                if args.causal_bundle is not None
-                else int(args.cache_budget_mb * 1024**2)
+                int(args.cache_budget_mb * 1024**2) if cache_enabled else 0
             ),
-            "cache_enabled": not args.no_cache and args.causal_bundle is None,
+            "cache_enabled": cache_enabled,
         },
-        "source_metrics_this_process": shareable_runtime_evidence(source.metrics()),
-        "pager_metrics_this_process": shareable_runtime_evidence(pager.metrics()),
     }
+    if split_rail:
+        remote_metrics = pager_metrics.pop("source", source.metrics())
+        local_dense_metrics = pager_metrics.pop("causal_tensor_reader", None)
+        report.update(
+            {
+                "remote_expert_source_metrics_this_process": (
+                    shareable_runtime_evidence(remote_metrics)
+                ),
+                "local_dense_causal_metrics_this_process": (
+                    shareable_runtime_evidence(local_dense_metrics)
+                ),
+                "pager_metrics_this_process": shareable_runtime_evidence(
+                    pager_metrics
+                ),
+            }
+        )
+    else:
+        report.update(
+            {
+                "source_metrics_this_process": shareable_runtime_evidence(
+                    source.metrics()
+                ),
+                "pager_metrics_this_process": shareable_runtime_evidence(
+                    pager_metrics
+                ),
+            }
+        )
+    return report
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1635,6 +1758,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--causal-bundle",
         help="local bundle with authenticated complete dense-weight coverage",
+    )
+    parser.add_argument(
+        "--remote-expert-split-rail",
+        action="store_true",
+        help=(
+            "read dense tensors through the local causal bundle and routed "
+            "experts through the immutable pinned remote source"
+        ),
     )
     parser.add_argument("--logical-repo-id", default=OFFICIAL_SOURCE)
     parser.add_argument(
@@ -1700,6 +1831,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.remote_expert_split_rail and args.access_trace is not None:
+        raise RunnerError(
+            "--access-trace is not supported with --remote-expert-split-rail"
+        )
     trace_targets = _preflight_trace_outputs(args)
     task = BenchmarkTask(args.task)
     modes = _parse_modes(args.modes)
@@ -1713,6 +1848,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RunnerError("access trace preflight/recorder state is inconsistent")
     runtime_source = _build_source(args, recorder)
     try:
+        split_rail = getattr(runtime_source, "remote_expert_split_rail", False) is True
         return _run_with_source(
             args,
             task=task,
@@ -1729,6 +1865,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             remote_pinned_inventory_sha256=(
                 runtime_source.remote_pinned_inventory_sha256
+            ),
+            remote_expert_split_rail=split_rail,
+            local_causal_layout_fingerprint=(
+                runtime_source.local_causal_layout_fingerprint
+                if split_rail
+                else None
             ),
             access_trace_recorder=recorder,
             trace_targets=trace_targets,
@@ -1751,9 +1893,22 @@ def _run_with_source(
     causal_tensor_reader: Any | None = None,
     remote_pinned_inventory_fingerprint: str | None = None,
     remote_pinned_inventory_sha256: str | None = None,
+    remote_expert_split_rail: bool = False,
+    local_causal_layout_fingerprint: str | None = None,
     access_trace_recorder: AccessTraceRecorder | None = None,
     trace_targets: tuple[Path, Path] | None = None,
 ) -> dict[str, Any]:
+    if not isinstance(remote_expert_split_rail, bool):
+        raise RunnerError("remote_expert_split_rail must be a boolean")
+    if remote_expert_split_rail:
+        if args.causal_bundle is None:
+            raise RunnerError(
+                "remote expert split rail requires --causal-bundle"
+            )
+        if access_trace_recorder is not None or args.access_trace is not None:
+            raise RunnerError(
+                "access tracing is not supported with remote expert split rail"
+            )
     remote_pinned_inventory = {
         "adopted": remote_pinned_inventory_fingerprint is not None,
         "inventory_sha256": remote_pinned_inventory_sha256,
@@ -1771,6 +1926,25 @@ def _run_with_source(
         )
     ):
         raise RunnerError("remote pinned inventory identity is incomplete")
+    weight_planes = _weight_planes(
+        remote_expert_split_rail=remote_expert_split_rail,
+        causal_weight_reader=causal_weight_reader,
+        causal_tensor_reader=causal_tensor_reader,
+        local_causal_layout_fingerprint=local_causal_layout_fingerprint,
+        remote_pinned_inventory_fingerprint=(
+            remote_pinned_inventory_fingerprint
+        ),
+        remote_pinned_inventory_sha256=remote_pinned_inventory_sha256,
+    )
+    remote_cache_enabled = _remote_cache_enabled(
+        args, remote_expert_split_rail=remote_expert_split_rail
+    )
+    remote_expert_cache = {
+        "enabled": remote_cache_enabled,
+        "limit_bytes": (
+            int(args.cache_budget_mb * 1024**2) if remote_cache_enabled else 0
+        ),
+    }
     config, config_meta = _load_config(args, source)
     tokenizer = _load_tokenizer(args, source, selected_rows, task)
     if args.graft_layer is not None and not 0 <= args.graft_layer < config.n_layers:
@@ -1800,6 +1974,7 @@ def _run_with_source(
         causal_weight_reader=causal_weight_reader,
         causal_tensor_reader=causal_tensor_reader,
         causal_missing_fallback=False,
+        remote_expert_split_rail=remote_expert_split_rail,
     )
     inventory_sha = _digest_or_canonical(
         source_identity_metrics.get("inventory_source_fingerprint"), inventory
@@ -1839,6 +2014,9 @@ def _run_with_source(
             "causal_weight_reader_attached": causal_weight_reader is not None,
             "causal_tensor_reader_attached": causal_tensor_reader is not None,
             "causal_missing_fallback": False,
+            "remote_expert_split_rail": remote_expert_split_rail,
+            "weight_planes": weight_planes,
+            "remote_expert_cache": remote_expert_cache,
             "remote_pinned_inventory": remote_pinned_inventory,
             "activation_quantization": not args.no_activation_quantization,
             "quantized_accumulation_policy": (
@@ -1913,6 +2091,9 @@ def _run_with_source(
         "causal_weight_reader_attached": causal_weight_reader is not None,
         "causal_tensor_reader_attached": causal_tensor_reader is not None,
         "causal_missing_fallback": False,
+        "remote_expert_split_rail": remote_expert_split_rail,
+        "weight_planes": weight_planes,
+        "remote_expert_cache": remote_expert_cache,
         "remote_pinned_inventory": remote_pinned_inventory,
         "modes": modes,
         "seeds": seeds,
@@ -1969,7 +2150,7 @@ def _run_with_source(
         "cache_dir": shareable_runtime_evidence(
             str(Path(args.cache_dir).expanduser().resolve())
         ),
-        "cache_enabled": not args.no_cache and args.causal_bundle is None,
+        "cache_enabled": remote_cache_enabled,
         "preflight": args.preflight,
         "thinking_mode": args.thinking_mode,
         "reasoning_effort": args.reasoning_effort,
@@ -1997,6 +2178,9 @@ def _run_with_source(
         "causal_weight_reader_attached": causal_weight_reader is not None,
         "causal_tensor_reader_attached": causal_tensor_reader is not None,
         "causal_missing_fallback": False,
+        "remote_expert_split_rail": remote_expert_split_rail,
+        "weight_planes": weight_planes,
+        "remote_expert_cache": remote_expert_cache,
         "remote_pinned_inventory": remote_pinned_inventory,
         "quantized_accumulation_policy": (
             DeepSeekWeightPager.QUANTIZED_ACCUMULATION_POLICY
@@ -2041,9 +2225,9 @@ def _run_with_source(
         "budgets": {
             "source_bytes": int(args.source_budget_mb * 1024**2),
             "cache_bytes": (
-                0
-                if args.causal_bundle is not None
-                else int(args.cache_budget_mb * 1024**2)
+                int(args.cache_budget_mb * 1024**2)
+                if remote_cache_enabled
+                else 0
             ),
         },
     }

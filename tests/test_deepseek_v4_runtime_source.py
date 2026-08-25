@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from immer.runtimes.deepseek_v4 import LogicalModelIdentity
+from immer.runtimes.deepseek_v4 import CausalWeightLayoutIdentity, LogicalModelIdentity
 from immer.runtimes.deepseek_v4 import runtime_source as runtime
 
 
@@ -376,6 +376,194 @@ class DeepSeekRuntimeSourceTests(unittest.TestCase):
         opened.close()
         mount.close.assert_called_once_with()
         mounted_source.close.assert_not_called()
+
+    def test_remote_expert_split_rail_owns_remote_and_local_planes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            _write_general_manifest(bundle)
+            pinned = root / "remote-inventory.json"
+            document = _remote_inventory_document()
+            _write_remote_inventory(pinned, document)
+            fingerprint = str(document["source_fingerprint"])
+            model = LogicalModelIdentity(REMOTE_REPO, PINNED_REVISION)
+            mount_source = mock.Mock()
+            tensor_reader = object()
+            mount = mock.Mock(
+                source=mount_source,
+                reader=object(),
+                tensor_reader=tensor_reader,
+                layout=CausalWeightLayoutIdentity(model, fingerprint),
+            )
+            remote_source = mock.Mock()
+            remote_source.adopt_pinned_inventory.return_value = fingerprint
+            remote_source.metrics.return_value = {
+                "repo_id": REMOTE_REPO,
+                "revision": PINNED_REVISION,
+                "revision_is_pinned": True,
+                "revision_is_mutable": False,
+                "inventory_source_fingerprint": fingerprint,
+            }
+
+            with (
+                mock.patch.object(
+                    runtime, "CausalWeightMount", return_value=mount
+                ) as mount_type,
+                mock.patch.object(
+                    runtime, "Streamer", return_value=remote_source
+                ) as streamer_type,
+            ):
+                opened = runtime.open_deepseek_runtime_source(
+                    source=REMOTE_REPO,
+                    revision=PINNED_REVISION,
+                    logical_repo_id=REMOTE_REPO,
+                    causal_bundle=bundle,
+                    budget_mb=64,
+                    cache_dir=root / "remote-cache",
+                    use_cache=True,
+                    max_cache_bytes=123,
+                    remote_pinned_inventory=pinned,
+                    remote_expert_split_rail=True,
+                )
+
+            self.assertTrue(opened.remote_expert_split_rail)
+            self.assertTrue(opened.is_causal_bundle)
+            self.assertIs(opened.source, remote_source)
+            self.assertIsNone(opened.causal_weight_reader)
+            self.assertIs(opened.causal_tensor_reader, tensor_reader)
+            self.assertEqual(opened.local_causal_layout_fingerprint, fingerprint)
+            self.assertEqual(
+                opened.label,
+                f"remote-expert-split-rail:{REMOTE_REPO}@{PINNED_REVISION[:12]}",
+            )
+            mount_type.assert_called_once_with(
+                bundle,
+                model,
+                budget_mb=64.0,
+                verbose=False,
+            )
+            self.assertEqual(streamer_type.call_args.args, (REMOTE_REPO,))
+            self.assertTrue(streamer_type.call_args.kwargs["use_cache"])
+            self.assertEqual(streamer_type.call_args.kwargs["max_cache_bytes"], 123)
+            remote_source.adopt_pinned_inventory.assert_called_once_with(
+                document["inventory"], expected_fingerprint=fingerprint
+            )
+
+            opened.close()
+            opened.close()
+            remote_source.close.assert_called_once_with()
+            mount.close.assert_called_once_with()
+            mount_source.close.assert_not_called()
+
+    def test_remote_expert_split_rail_rejects_invalid_contract_before_open(self) -> None:
+        cases = (
+            ({"causal_bundle": None}, "general causal bundle"),
+            ({"remote_pinned_inventory": None}, "remote_pinned_inventory"),
+            ({"access_observer": object()}, "access observers"),
+            ({"source": "/tmp/local-checkpoint"}, "remote source"),
+            ({"logical_repo_id": "foreign/model"}, "match exactly"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            _write_general_manifest(bundle)
+            pinned = root / "remote-inventory.json"
+            _write_remote_inventory(pinned, _remote_inventory_document())
+            base: dict[str, object] = {
+                "source": REMOTE_REPO,
+                "revision": PINNED_REVISION,
+                "logical_repo_id": REMOTE_REPO,
+                "causal_bundle": bundle,
+                "budget_mb": 64,
+                "cache_dir": root / "cache",
+                "use_cache": True,
+                "max_cache_bytes": 123,
+                "remote_pinned_inventory": pinned,
+                "remote_expert_split_rail": True,
+            }
+            for overrides, message in cases:
+                with self.subTest(message=message):
+                    arguments = {**base, **overrides}
+                    with (
+                        mock.patch.object(runtime, "CausalWeightMount") as mount,
+                        mock.patch.object(runtime, "Streamer") as streamer,
+                        self.assertRaisesRegex(
+                            runtime.DeepSeekRuntimeSourceError, message
+                        ),
+                    ):
+                        runtime.open_deepseek_runtime_source(**arguments)
+                    mount.assert_not_called()
+                    streamer.assert_not_called()
+
+    def test_remote_expert_split_rail_mismatch_closes_both_partial_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            _write_general_manifest(bundle)
+            pinned = root / "remote-inventory.json"
+            document = _remote_inventory_document()
+            _write_remote_inventory(pinned, document)
+            fingerprint = str(document["source_fingerprint"])
+            model = LogicalModelIdentity(REMOTE_REPO, PINNED_REVISION)
+            mount = mock.Mock(
+                layout=CausalWeightLayoutIdentity(model, fingerprint)
+            )
+            remote_source = mock.Mock()
+            remote_source.adopt_pinned_inventory.return_value = fingerprint
+            remote_source.metrics.return_value = {
+                "repo_id": REMOTE_REPO,
+                "revision": PINNED_REVISION,
+                "revision_is_pinned": True,
+                "revision_is_mutable": False,
+                "inventory_source_fingerprint": "0" * 64,
+            }
+            with (
+                mock.patch.object(
+                    runtime, "CausalWeightMount", return_value=mount
+                ),
+                mock.patch.object(
+                    runtime, "Streamer", return_value=remote_source
+                ),
+                self.assertRaisesRegex(
+                    runtime.DeepSeekRuntimeSourceError, "exactly match"
+                ),
+            ):
+                runtime.open_deepseek_runtime_source(
+                    source=REMOTE_REPO,
+                    revision=PINNED_REVISION,
+                    logical_repo_id=REMOTE_REPO,
+                    causal_bundle=bundle,
+                    budget_mb=64,
+                    cache_dir=root / "cache",
+                    use_cache=True,
+                    max_cache_bytes=123,
+                    remote_pinned_inventory=pinned,
+                    remote_expert_split_rail=True,
+                )
+            remote_source.close.assert_called_once_with()
+            mount.close.assert_called_once_with()
+
+    def test_remote_expert_split_close_attempts_both_owners_after_failure(self) -> None:
+        remote_source = mock.Mock()
+        mount = mock.Mock()
+        remote_source.close.side_effect = RuntimeError("remote close failed")
+        mount.close.side_effect = RuntimeError("mount close failed")
+        opened = runtime.DeepSeekRuntimeSource(
+            source=remote_source,
+            label="split",
+            mount=mount,
+            remote_expert_split_rail=True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "remote close failed"):
+            opened.close()
+        opened.close()
+        self.assertTrue(opened.closed)
+        remote_source.close.assert_called_once_with()
+        mount.close.assert_called_once_with()
 
     def test_causal_bundle_rejects_mutable_revision_before_mount(self) -> None:
         with (

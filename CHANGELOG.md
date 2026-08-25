@@ -40,6 +40,12 @@ All notable changes to IMMER are recorded here.
   `50,246,717,453` source bytes with zero rejected charges. Its ingestible
   trace seals `4,754` operations and `8,009` leaves under the causal bundle's
   exact source fingerprint.
+- Added an explicit remote-expert split rail for storage-bounded execution.
+  The pager reads every dense/control/shared/head/router tensor through the
+  local causal tensor reader while every routed expert plan and payload comes
+  from the immutable pinned remote Streamer. The mode has no missing-route
+  fallback, never touches local sparse expert holes, owns both sources
+  transactionally, and records both physical planes and caches separately.
 - Routed every dense, control, embedding, I64 router, candidate-head, scalar
   head, and batched full-head read through the revision-bound causal tensor
   reader. Expert and dense rails remain separate, missing bindings have no
@@ -59,8 +65,8 @@ All notable changes to IMMER are recorded here.
   transported state remains a proposal. Target adjudication selected the same
   top token on both paths: token `12747`, decoded as the FERTIG-certified exact
   answer `450`; their Top-10 sets are identical with eight equal rank slots.
-- Verified the complete repository with `1259/1259` tests, the expanded
-  DeepSeek scope with `440/440` tests, and the Qwen causal regression scope
+- Verified the complete repository with `1273/1273` tests, the expanded
+  DeepSeek scope with `454/454` tests, and the Qwen causal regression scope
   with `54/54` tests.
 
 ### Qwen compute batteries

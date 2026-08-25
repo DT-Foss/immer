@@ -84,13 +84,16 @@ class DeepSeekRuntimeSource:
     logical_model: LogicalModelIdentity | None = None
     remote_pinned_inventory_fingerprint: str | None = None
     remote_pinned_inventory_sha256: str | None = None
+    remote_expert_split_rail: bool = False
     _closed: bool = field(default=False, init=False, repr=False)
 
     @property
     def causal_weight_reader(self) -> CausalWeightReader | None:
         """Return the strict sparse-route reader when a bundle is mounted."""
 
-        return None if self.mount is None else self.mount.reader
+        if self.mount is None or self.remote_expert_split_rail:
+            return None
+        return self.mount.reader
 
     @property
     def causal_tensor_reader(self) -> CausalTensorReader | None:
@@ -110,18 +113,43 @@ class DeepSeekRuntimeSource:
     def remote_pinned_inventory_adopted(self) -> bool:
         return self.remote_pinned_inventory_fingerprint is not None
 
+    @property
+    def local_causal_layout_fingerprint(self) -> str | None:
+        """Return the mounted local layout identity without exposing its path."""
+
+        if self.mount is None:
+            return None
+        return self.mount.layout.layout_fingerprint
+
     def close(self) -> None:
         if self._closed:
             return
-        try:
-            if self.mount is not None:
-                self.mount.close()
-            else:
-                close = getattr(self.source, "close", None)
-                if callable(close):
+        # Mark closed before invoking either owner.  This makes every close
+        # idempotent even when one owner raises while still guaranteeing that
+        # the other independent split-rail owner is attempted exactly once.
+        self._closed = True
+        failure: BaseException | None = None
+        if self.remote_expert_split_rail:
+            close = getattr(self.source, "close", None)
+            if callable(close):
+                try:
                     close()
-        finally:
-            self._closed = True
+                except BaseException as exc:  # both owners must be attempted
+                    failure = exc
+            if self.mount is not None:
+                try:
+                    self.mount.close()
+                except BaseException as exc:  # preserve the first failure
+                    if failure is None:
+                        failure = exc
+        elif self.mount is not None:
+            self.mount.close()
+        else:
+            close = getattr(self.source, "close", None)
+            if callable(close):
+                close()
+        if failure is not None:
+            raise failure
 
     def __enter__(self) -> DeepSeekRuntimeSource:
         if self._closed:
@@ -444,6 +472,7 @@ def open_deepseek_runtime_source(
     access_observer: Any | None = None,
     require_remote_pinned_revision: bool = False,
     remote_pinned_inventory: str | os.PathLike[str] | None = None,
+    remote_expert_split_rail: bool = False,
 ) -> DeepSeekRuntimeSource:
     """Open one bounded source without copying checkpoint weights.
 
@@ -455,7 +484,9 @@ def open_deepseek_runtime_source(
     pass them to ``DeepSeekWeightPager`` without enabling missing-route
     fallback. A remote pinned inventory is adopted and verified before an
     access observer is attached, so every emitted range carries the stable
-    inventory fingerprint instead of transport-derived scan metadata.
+    inventory fingerprint instead of transport-derived scan metadata.  Split
+    rail mode keeps dense tensors on that local causal mount while a separately
+    owned, pinned remote Streamer supplies routed experts.
     """
 
     if not isinstance(source, str) or not source.strip():
@@ -481,6 +512,122 @@ def open_deepseek_runtime_source(
         raise DeepSeekRuntimeSourceError("max_cache_bytes must be an integer")
     if max_cache_bytes < 0:
         raise DeepSeekRuntimeSourceError("max_cache_bytes must be non-negative")
+    if not isinstance(remote_expert_split_rail, bool):
+        raise DeepSeekRuntimeSourceError(
+            "remote_expert_split_rail must be a boolean"
+        )
+
+    if remote_expert_split_rail:
+        if causal_bundle is None:
+            raise DeepSeekRuntimeSourceError(
+                "remote expert split rail requires a general causal bundle"
+            )
+        if remote_pinned_inventory is None:
+            raise DeepSeekRuntimeSourceError(
+                "remote expert split rail requires remote_pinned_inventory"
+            )
+        if access_observer is not None:
+            raise DeepSeekRuntimeSourceError(
+                "remote expert split rail does not support access observers"
+            )
+        _require_pinned_revision(revision, target="remote expert split rail")
+        if _local_source_path(source) is not None:
+            raise DeepSeekRuntimeSourceError(
+                "remote expert split rail requires a remote source"
+            )
+        if source != logical_repo_id:
+            raise DeepSeekRuntimeSourceError(
+                "remote expert split rail requires source and logical_repo_id "
+                "to match exactly"
+            )
+
+        bundle_root = Path(causal_bundle).expanduser().absolute()
+        _require_general_causal_bundle(bundle_root)
+        model = LogicalModelIdentity(repo_id=logical_repo_id, revision=revision)
+        try:
+            mount = CausalWeightMount(
+                bundle_root,
+                model,
+                budget_mb=float(budget_mb),
+                verbose=verbose,
+            )
+        except Exception as exc:
+            raise DeepSeekRuntimeSourceError(
+                "cannot mount local DeepSeek-V4 causal bundle"
+            ) from exc
+
+        remote_source: Streamer | None = None
+        try:
+            inventory, fingerprint, inventory_sha256 = _remote_pinned_inventory(
+                remote_pinned_inventory,
+                repo_id=source,
+                revision=revision,
+            )
+            if (
+                mount.layout.model != model
+                or mount.layout.layout_fingerprint != fingerprint
+            ):
+                raise DeepSeekRuntimeSourceError(
+                    "remote expert inventory does not exactly match the local "
+                    "causal layout"
+                )
+            remote_source = Streamer(
+                source,
+                revision=revision,
+                budget_mb=float(budget_mb),
+                cache_dir=Path(cache_dir).expanduser().resolve(),
+                use_cache=use_cache,
+                max_cache_bytes=max_cache_bytes,
+                verbose=verbose,
+                access_observer=None,
+            )
+            adopted = remote_source.adopt_pinned_inventory(
+                inventory,
+                expected_fingerprint=fingerprint,
+            )
+            identity = remote_source.metrics()
+            if (
+                adopted != fingerprint
+                or identity.get("repo_id") != mount.layout.model.repo_id
+                or identity.get("revision") != mount.layout.model.revision
+                or identity.get("revision_is_pinned") is not True
+                or identity.get("revision_is_mutable") is not False
+                or identity.get("inventory_source_fingerprint")
+                != mount.layout.layout_fingerprint
+            ):
+                raise DeepSeekRuntimeSourceError(
+                    "remote expert Streamer identity does not exactly match the "
+                    "local causal layout"
+                )
+            return DeepSeekRuntimeSource(
+                source=remote_source,
+                label=(
+                    f"remote-expert-split-rail:{model.repo_id}@"
+                    f"{model.revision[:12]}"
+                ),
+                mount=mount,
+                logical_model=model,
+                remote_pinned_inventory_fingerprint=fingerprint,
+                remote_pinned_inventory_sha256=inventory_sha256,
+                remote_expert_split_rail=True,
+            )
+        except BaseException as exc:
+            if remote_source is not None:
+                try:
+                    remote_source.close()
+                except BaseException:
+                    pass
+            try:
+                mount.close()
+            except BaseException:
+                pass
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            if isinstance(exc, DeepSeekRuntimeSourceError):
+                raise
+            raise DeepSeekRuntimeSourceError(
+                "remote expert Streamer rejected the pinned inventory"
+            ) from exc
 
     if causal_bundle is not None:
         if remote_pinned_inventory is not None:

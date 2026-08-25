@@ -17,7 +17,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from ...knowledge.streamer import TensorEncodingError, TensorSource
+from ...knowledge.streamer import LocalRangeReader, TensorEncodingError, TensorSource
 from .quantization import (
     dequantize_fp8_e4m3,
     quantize_fp8_e4m3_parts,
@@ -378,6 +378,9 @@ class DeepSeekWeightPager:
     HEAD_TRANSPORT_MAX_RANGE_BATCH_BLOCKS = 8
     HEAD_TRANSPORT_RESIDENT_LIMIT_BYTES = 64 * 1024**2
     HEAD_TRANSPORT_MAX_GAP_BYTES = 0
+    REMOTE_EXPERT_ADDRESS_PLANE = "remote-pinned-streamer/v1"
+    CAUSAL_EXPERT_ADDRESS_PLANE = "causal-expert-rail/v1"
+    STREAMER_EXPERT_ADDRESS_PLANE = "streamer-inventory/v1"
     _OFFICIAL_EXPERT_BASE = re.compile(
         r"^layers\.(0|[1-9][0-9]*)\.ffn\.experts\.(0|[1-9][0-9]*)$"
     )
@@ -407,6 +410,7 @@ class DeepSeekWeightPager:
         causal_weight_reader: CausalExpertPlanResolver | None = None,
         causal_tensor_reader: CausalTensorPlanResolver | None = None,
         causal_missing_fallback: bool = False,
+        remote_expert_split_rail: bool = False,
     ) -> None:
         try:
             import torch
@@ -485,6 +489,22 @@ class DeepSeekWeightPager:
         self._causal_weight_reader: CausalExpertPlanResolver | None = None
         self._causal_tensor_reader: CausalTensorPlanResolver | None = None
         self._causal_missing_fallback = False
+        if not isinstance(remote_expert_split_rail, bool):
+            raise ValueError("remote_expert_split_rail must be a boolean")
+        self._remote_expert_split_rail = remote_expert_split_rail
+        if self.remote_expert_split_rail:
+            if causal_weight_reader is not None:
+                raise DeepSeekPagerError(
+                    "remote expert split rail forbids a causal weight reader"
+                )
+            if causal_missing_fallback:
+                raise DeepSeekPagerError(
+                    "remote expert split rail forbids missing-route fallback"
+                )
+            if causal_tensor_reader is None:
+                raise DeepSeekPagerError(
+                    "remote expert split rail requires a local causal tensor reader"
+                )
         self.attach_causal_weight_reader(
             causal_weight_reader,
             fallback_on_missing=causal_missing_fallback,
@@ -495,11 +515,102 @@ class DeepSeekWeightPager:
     def causal_tensor_reader_attached(self) -> bool:
         return self._causal_tensor_reader is not None
 
+    @property
+    def remote_expert_split_rail(self) -> bool:
+        return self._remote_expert_split_rail
+
+    @property
+    def expert_address_plane(self) -> str:
+        if self.remote_expert_split_rail:
+            return self.REMOTE_EXPERT_ADDRESS_PLANE
+        if self._causal_weight_reader is not None:
+            return self.CAUSAL_EXPERT_ADDRESS_PLANE
+        return self.STREAMER_EXPERT_ADDRESS_PLANE
+
+    def _validate_remote_expert_split_reader(
+        self,
+        reader: CausalTensorPlanResolver,
+    ) -> None:
+        """Authenticate the two distinct sources before enabling split routing."""
+
+        source_metrics_method = getattr(self.source, "metrics", None)
+        if not callable(source_metrics_method):
+            raise DeepSeekPagerError(
+                "remote expert split rail requires source provenance metrics"
+            )
+        source_metrics = source_metrics_method()
+        if not isinstance(source_metrics, Mapping):
+            raise DeepSeekPagerError(
+                "remote expert split rail source provenance is invalid"
+            )
+        revision = source_metrics.get("revision")
+        repo_id = source_metrics.get("repo_id")
+        source_fingerprint = source_metrics.get("inventory_source_fingerprint")
+        if (
+            source_metrics.get("revision_is_pinned") is not True
+            or source_metrics.get("revision_is_mutable") is not False
+            or not isinstance(repo_id, str)
+            or not repo_id
+            or repo_id.startswith("local:")
+            or not isinstance(revision, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40,64}", revision) is None
+            or not isinstance(source_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", source_fingerprint) is None
+        ):
+            raise DeepSeekPagerError(
+                "remote expert split rail requires an authenticated remote pinned source"
+            )
+
+        layout = getattr(reader, "layout", None)
+        layout_fingerprint = getattr(layout, "layout_fingerprint", None)
+        reader_source = getattr(reader, "source", None)
+        if reader_source is None or reader_source is self.source:
+            raise DeepSeekPagerError(
+                "remote expert split rail requires a distinct local tensor source"
+            )
+        local_metrics_method = getattr(reader_source, "metrics", None)
+        local_metrics = (
+            local_metrics_method() if callable(local_metrics_method) else None
+        )
+        local_upstream = getattr(getattr(reader_source, "reader", None), "upstream", None)
+        local_repo_id = (
+            local_metrics.get("repo_id")
+            if isinstance(local_metrics, Mapping)
+            else None
+        )
+        if (
+            not isinstance(local_metrics, Mapping)
+            or (
+                not isinstance(local_upstream, LocalRangeReader)
+                and (
+                    not isinstance(local_repo_id, str)
+                    or not local_repo_id.startswith("local:")
+                )
+            )
+            or local_metrics.get("inventory_source_fingerprint")
+            != layout_fingerprint
+        ):
+            raise DeepSeekPagerError(
+                "remote expert split rail requires a local causal tensor reader"
+            )
+        if source_fingerprint != layout_fingerprint:
+            raise DeepSeekPagerError(
+                "remote expert split rail source fingerprint does not match the "
+                "tensor-reader layout"
+            )
+
     def attach_causal_tensor_reader(
         self,
         reader: CausalTensorPlanResolver | None,
     ) -> None:
         """Attach the strict dense tensor rail without importing its graph type."""
+
+        if self.remote_expert_split_rail:
+            if reader is None:
+                raise DeepSeekPagerError(
+                    "remote expert split rail requires a local causal tensor reader"
+                )
+            self._validate_remote_expert_split_reader(reader)
 
         if reader is not None:
             required = (
@@ -572,6 +683,12 @@ class DeepSeekWeightPager:
 
         if not isinstance(fallback_on_missing, bool):
             raise ValueError("fallback_on_missing must be a boolean")
+        if self.remote_expert_split_rail and (
+            reader is not None or fallback_on_missing
+        ):
+            raise DeepSeekPagerError(
+                "remote expert split rail forbids causal expert addressing and fallback"
+            )
         if fallback_on_missing and self._causal_tensor_reader is not None:
             raise DeepSeekPagerError(
                 "dense causal addressing forbids missing expert fallback"
@@ -1324,6 +1441,7 @@ class DeepSeekWeightPager:
             match is not None
             and reader is None
             and self._causal_tensor_reader is not None
+            and not self.remote_expert_split_rail
         ):
             raise DeepSeekPagerError(
                 "dense causal addressing requires the separate expert reader for "
@@ -1378,7 +1496,37 @@ class DeepSeekWeightPager:
                 raise
             self._stats.causal_expert_plan_hits += 1
             return plan
-        return self._source_expert_plan(base)
+        plan = self._source_expert_plan(base)
+        if self.remote_expert_split_rail and match is not None and plan is None:
+            raise DeepSeekPagerError(
+                f"remote expert split rail cannot form an exact plan for {base}"
+            )
+        if self.remote_expert_split_rail and match is not None and plan is not None:
+            layer, expert_id = int(match.group(1)), int(match.group(2))
+            public = self._public_expert_plan(
+                plan,
+                layer=layer,
+                expert_id=expert_id,
+            )
+            private = self._private_expert_plan(
+                public,
+                base=base,
+                layer=layer,
+                expert_id=expert_id,
+            )
+            if (
+                self._public_expert_plan(
+                    private,
+                    layer=layer,
+                    expert_id=expert_id,
+                )
+                != public
+            ):
+                raise DeepSeekPagerError(
+                    f"remote expert plan is not canonical for {base}"
+                )
+            return private
+        return plan
 
     def _source_expert_plan(self, base: str) -> _ExpertReadPlan | None:
         """Discover one expert through safetensors metadata when no rail applies."""
@@ -1751,11 +1899,36 @@ class DeepSeekWeightPager:
             return ()
         reader = self._causal_weight_reader
         if reader is None:
-            if self._causal_tensor_reader is not None:
+            if (
+                self._causal_tensor_reader is not None
+                and not self.remote_expert_split_rail
+            ):
                 raise DeepSeekPagerError(
                     "dense causal addressing requires the separate expert reader"
                 )
-            return self.plan_expert_ranges(normalized_layer, normalized_ids)
+            plans = self.plan_expert_ranges(normalized_layer, normalized_ids)
+            if not self.remote_expert_split_rail:
+                return plans
+            canonical: list[OfficialExpertRangePlan] = []
+            for expert_id, public in zip(normalized_ids, plans, strict=True):
+                base = f"layers.{normalized_layer}.ffn.experts.{expert_id}"
+                private = self._private_expert_plan(
+                    public,
+                    base=base,
+                    layer=normalized_layer,
+                    expert_id=expert_id,
+                )
+                rebuilt = self._public_expert_plan(
+                    private,
+                    layer=normalized_layer,
+                    expert_id=expert_id,
+                )
+                if rebuilt != public:
+                    raise DeepSeekPagerError(
+                        f"remote expert plan is not canonical for {base}"
+                    )
+                canonical.append(rebuilt)
+            return tuple(canonical)
         if self._causal_missing_fallback:
             raise DeepSeekPagerError(
                 "causal expert preflight forbids missing-route fallback"
@@ -3748,6 +3921,8 @@ class DeepSeekWeightPager:
             "causal_tensor_reader_attached": self._causal_tensor_reader is not None,
             "causal_tensor_reader": causal_tensor_metrics,
             "causal_missing_fallback": self._causal_missing_fallback,
+            "remote_expert_split_rail": self.remote_expert_split_rail,
+            "expert_address_plane": self.expert_address_plane,
             "source": source_metrics,
         }
 
