@@ -43,8 +43,8 @@ def _binding(reason: str, *, target_ok: bool = True):
     )
 
 
-def _parse(status: str, reason: str):
-    return SimpleNamespace(ok=False, status=status, reason=reason)
+def _parse(status: str, reason: str, *, ok: bool = False):
+    return SimpleNamespace(ok=ok, status=status, reason=reason)
 
 
 def _benchmark(*, wrong: bool = False):
@@ -127,6 +127,11 @@ class FertigAbstentionAuditTests(unittest.TestCase):
     def test_structural_categories_and_scopes_are_closed(self) -> None:
         fixtures = (
             (
+                _parse("parsed", "evidence-closed signed event grammar", ok=True),
+                "exact_recovery",
+                "exact_recovery_scope",
+            ),
+            (
                 _parse("ambiguous", "numeric pronoun binding is not proven"),
                 "numeric_pronoun_ambiguous",
                 "potential_coreference_scope",
@@ -146,6 +151,21 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                 "target_unsupported",
                 "grammar_scope",
             ),
+            (
+                _parse("ambiguous", "new typed ambiguity"),
+                "relation_ambiguous",
+                "grammar_scope",
+            ),
+            (
+                _parse("unsupported", "new typed unsupported relation"),
+                "relation_unsupported",
+                "grammar_scope",
+            ),
+            (
+                _parse("invalid", "new typed invalid relation"),
+                "relation_invalid",
+                "grammar_scope",
+            ),
         )
         for result, expected, scope in fixtures:
             with self.subTest(expected=expected):
@@ -157,8 +177,8 @@ class FertigAbstentionAuditTests(unittest.TestCase):
             audit.classify_structural_parse(
                 _parse("unsupported", "numeric pronoun binding is not proven")
             )
-        with self.assertRaisesRegex(audit.AuditError, "unrecognized"):
-            audit.classify_structural_parse(_parse("unsupported", "unknown"))
+        with self.assertRaisesRegex(audit.AuditError, "unrecognized structural status"):
+            audit.classify_structural_parse(_parse("novel", "unknown"))
 
     def test_report_is_deterministic_complete_gold_free_and_zero_hungarian(
         self,
@@ -174,7 +194,9 @@ class FertigAbstentionAuditTests(unittest.TestCase):
             "question 1": _parse("ambiguous", "numeric pronoun binding is not proven"),
             "question 2": _parse("ambiguous", "question pronoun binding is not proven"),
             "question 3": _parse("unsupported", "unparsed numeric clause at 0:10"),
-            "question 4": _parse("unsupported", "unsupported target at 4:14"),
+            "question 4": _parse(
+                "parsed", "evidence-closed signed event grammar", ok=True
+            ),
         }
         legacy_calls: list[str] = []
         structural_calls: list[str] = []
@@ -203,9 +225,12 @@ class FertigAbstentionAuditTests(unittest.TestCase):
             first["classification_counts"]["scope"],
             {
                 "potential_coreference_scope": 2,
-                "grammar_scope": 2,
+                "grammar_scope": 1,
+                "exact_recovery_scope": 1,
             },
         )
+        self.assertEqual(first["current_exact_recoveries"], 1)
+        self.assertEqual(first["current_remaining_abstentions"], 3)
         self.assertEqual(
             first["hungarian_verdict"]["directly_eligible_exclusive_instances"],
             0,
@@ -264,15 +289,23 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(
             audit.CURRENT_STRUCTURAL_COUNTS,
             {
-                "numeric_pronoun_ambiguous": 127,
-                "question_pronoun_ambiguous": 4,
-                "numeric_clause_unsupported": 95,
-                "target_unsupported": 4,
+                "exact_recovery": 16,
+                "numeric_pronoun_ambiguous": 89,
+                "question_pronoun_ambiguous": 6,
+                "numeric_clause_unsupported": 107,
+                "target_unsupported": 10,
+                "relation_ambiguous": 1,
+                "relation_unsupported": 1,
+                "relation_invalid": 0,
             },
         )
         self.assertEqual(
             audit.CURRENT_SCOPE_COUNTS,
-            {"potential_coreference_scope": 131, "grammar_scope": 99},
+            {
+                "exact_recovery_scope": 16,
+                "potential_coreference_scope": 95,
+                "grammar_scope": 119,
+            },
         )
         with self.assertRaisesRegex(audit.AuditError, "evidence drifted"):
             audit._validate_current_evidence(
@@ -281,8 +314,9 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                         "legacy": audit.CURRENT_LEGACY_COUNTS,
                         "structural": audit.CURRENT_STRUCTURAL_COUNTS,
                         "scope": {
-                            "potential_coreference_scope": 130,
-                            "grammar_scope": 100,
+                            "exact_recovery_scope": 16,
+                            "potential_coreference_scope": 94,
+                            "grammar_scope": 120,
                         },
                     }
                 }

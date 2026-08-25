@@ -11,7 +11,6 @@ from immer.contracts import ExecutionStatus, Request
 ROOT = Path(__file__).resolve().parent.parent
 GSM8K = ROOT / "evals" / "gsm8k_test.parquet"
 QUARANTINED_MATH_ROWS = (
-    682,
     963,
     1012,
     1016,
@@ -28,7 +27,7 @@ QUARANTINED_MATH_ROWS = (
     1306,
 )
 FORMERLY_MASKED_BINDING_ERRORS = (570, 1261, 1295)
-GUARDED_FORMULA_ROWS = {
+CERTIFIED_MATH_ROWS = {
     53: "40",
     128: "880",
     210: "10",
@@ -46,6 +45,7 @@ GUARDED_FORMULA_ROWS = {
     489: "-10",
     541: "50",
     580: "500",
+    682: "80",
 }
 SELECTIVE_EXTERNAL_RESOLVER_CASES = (
     (
@@ -361,12 +361,12 @@ class FertigAdapterTests(unittest.TestCase):
         self.assertIn("BindingParserError", result.reason)
 
     @unittest.skipUnless(GSM8K.is_file(), "vendored GSM8K split unavailable")
-    def test_guarded_formula_rows_are_now_exactly_certified(self) -> None:
+    def test_observed_exact_rows_are_now_certified(self) -> None:
         import pandas as pd
 
         rows = pd.read_parquet(GSM8K)
         solver = FertigSolver()
-        for index, expected in GUARDED_FORMULA_ROWS.items():
+        for index, expected in CERTIFIED_MATH_ROWS.items():
             with self.subTest(index=index):
                 result = solver.handle(
                     Request("exact_math", str(rows.iloc[index]["question"]))

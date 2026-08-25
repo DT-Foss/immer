@@ -31,9 +31,15 @@ DEFAULT_OUTPUT_PATH = ROOT / "results" / "fertig-abstention-audit.json"
 VENDOR_ROOT = ROOT / "src" / "immer" / "cognition" / "fertig" / "_vendor"
 LEGACY_BINDINGS_PATH = VENDOR_ROOT / "fertig" / "bindings.py"
 STRUCTURAL_PATH = ROOT / "src" / "immer" / "cognition" / "fertig" / "structural.py"
+SIGNED_EVENT_PATH = (
+    ROOT / "src" / "immer" / "cognition" / "fertig" / "signed_event_frontend.py"
+)
+SIGNED_EXPRESSION_PATH = (
+    ROOT / "src" / "immer" / "cognition" / "fertig" / "signed_expression.py"
+)
 
-SCHEMA = "immer.fertig-abstention-audit/v1"
-REPORT_REVISION = 2
+SCHEMA = "immer.fertig-abstention-audit/v2"
+REPORT_REVISION = 3
 ALLOWED_STATUSES = ("correct", "abstained", "incorrect", "error")
 LEGACY_CATEGORIES = (
     "target_parse_failed",
@@ -42,10 +48,14 @@ LEGACY_CATEGORIES = (
     "equation_guard",
 )
 STRUCTURAL_CATEGORIES = (
+    "exact_recovery",
     "numeric_pronoun_ambiguous",
     "question_pronoun_ambiguous",
     "numeric_clause_unsupported",
     "target_unsupported",
+    "relation_ambiguous",
+    "relation_unsupported",
+    "relation_invalid",
 )
 CURRENT_LEGACY_COUNTS = {
     "target_parse_failed": 57,
@@ -54,14 +64,19 @@ CURRENT_LEGACY_COUNTS = {
     "equation_guard": 1,
 }
 CURRENT_STRUCTURAL_COUNTS = {
-    "numeric_pronoun_ambiguous": 127,
-    "question_pronoun_ambiguous": 4,
-    "numeric_clause_unsupported": 95,
-    "target_unsupported": 4,
+    "exact_recovery": 16,
+    "numeric_pronoun_ambiguous": 89,
+    "question_pronoun_ambiguous": 6,
+    "numeric_clause_unsupported": 107,
+    "target_unsupported": 10,
+    "relation_ambiguous": 1,
+    "relation_unsupported": 1,
+    "relation_invalid": 0,
 }
 CURRENT_SCOPE_COUNTS = {
-    "potential_coreference_scope": 131,
-    "grammar_scope": 99,
+    "exact_recovery_scope": 16,
+    "potential_coreference_scope": 95,
+    "grammar_scope": 119,
 }
 _INCOMPLETE_BINDING = re.compile(
     r"^Bindung unvollständig: (?P<qty>\d+) qty, "
@@ -238,10 +253,23 @@ def _status_value(result: Any) -> str:
 
 
 def classify_structural_parse(result: Any) -> dict[str, str]:
-    """Classify a closed-parser abstention without solving or reading gold."""
+    """Classify one current closed-parser outcome without reading gold."""
 
     if bool(getattr(result, "ok", False)):
-        raise AuditError("baseline abstention now has a parsed structural problem")
+        status = _status_value(result)
+        if status != "parsed":
+            raise AuditError(
+                f"successful structural parse has status {status!r}, expected 'parsed'"
+            )
+        reason = getattr(result, "reason", "")
+        if not isinstance(reason, str):
+            raise AuditError("successful structural parse returned no reason")
+        return {
+            "category": "exact_recovery",
+            "status": status,
+            "reason": reason,
+        }
+
     status = _status_value(result)
     reason = getattr(result, "reason", None)
     if not isinstance(reason, str):
@@ -259,8 +287,19 @@ def classify_structural_parse(result: Any) -> dict[str, str]:
     elif reason.startswith("unsupported target at "):
         category = "target_unsupported"
         expected_status = "unsupported"
+    elif status == "ambiguous":
+        category = "relation_ambiguous"
+        expected_status = "ambiguous"
+    elif status == "unsupported":
+        category = "relation_unsupported"
+        expected_status = "unsupported"
+    elif status == "invalid":
+        category = "relation_invalid"
+        expected_status = "invalid"
     else:
-        raise AuditError(f"unrecognized structural abstention reason: {reason!r}")
+        raise AuditError(
+            f"unrecognized structural status {status!r} for reason {reason!r}"
+        )
     if status != expected_status:
         raise AuditError(
             f"structural reason {reason!r} has status {status!r}, "
@@ -270,9 +309,17 @@ def classify_structural_parse(result: Any) -> dict[str, str]:
 
 
 def _scope_for_structural(category: str) -> str:
+    if category == "exact_recovery":
+        return "exact_recovery_scope"
     if category in {"numeric_pronoun_ambiguous", "question_pronoun_ambiguous"}:
         return "potential_coreference_scope"
-    if category in {"numeric_clause_unsupported", "target_unsupported"}:
+    if category in {
+        "numeric_clause_unsupported",
+        "target_unsupported",
+        "relation_ambiguous",
+        "relation_unsupported",
+        "relation_invalid",
+    }:
         return "grammar_scope"
     raise AuditError(f"unrecognized structural category {category!r}")
 
@@ -343,7 +390,7 @@ def build_audit_report(
                 "question_sha256": _sha256_bytes(question.encode("utf-8")),
                 "legacy": legacy,
                 "structural": structural,
-                "potential_scope": scope,
+                "current_scope": scope,
                 "hungarian_exclusive_assignment_eligible": False,
                 "hungarian_ineligibility_reason": (
                     "no_extracted_exclusive_candidate_sets_or_cost_matrix"
@@ -359,12 +406,19 @@ def build_audit_report(
         "structural": _ordered_counts(structural_counts, STRUCTURAL_CATEGORIES),
         "scope": _ordered_counts(
             scope_counts,
-            ("potential_coreference_scope", "grammar_scope"),
+            (
+                "exact_recovery_scope",
+                "potential_coreference_scope",
+                "grammar_scope",
+            ),
         ),
     }
     for name, partition in counts.items():
         if sum(partition.values()) != audited:
             raise AuditError(f"{name} classifications are not a complete partition")
+
+    recoveries = counts["structural"]["exact_recovery"]
+    remaining = audited - recoveries
 
     eligible = sum(
         bool(item["hungarian_exclusive_assignment_eligible"]) for item in audited_items
@@ -382,6 +436,8 @@ def build_audit_report(
         ],
         "baseline_partition": {"n": len(benchmark_items), **baseline_counts},
         "audited_abstentions": audited,
+        "current_exact_recoveries": recoveries,
+        "current_remaining_abstentions": remaining,
         "classification_counts": counts,
         "hungarian_verdict": {
             "contract": (
@@ -391,8 +447,9 @@ def build_audit_report(
             "directly_eligible_exclusive_instances": eligible,
             "verdict": (
                 "0 directly eligible exclusive Hungarian instances under the "
-                "current extracted contract; the measured scopes are coreference "
-                "or grammar/relation construction, not global one-to-one assignment"
+                "current extracted contract; exact recoveries need no assignment, "
+                "and the remaining scopes are coreference or grammar/relation "
+                "construction, not global one-to-one assignment"
             ),
         },
         "baseline_bindings": {
@@ -428,6 +485,8 @@ def current_provenance(benchmark_path: Path) -> dict[str, Any]:
         "audit_runner": Path(__file__).resolve(),
         "legacy_bindings": LEGACY_BINDINGS_PATH,
         "structural_parser": STRUCTURAL_PATH,
+        "signed_event_frontend": SIGNED_EVENT_PATH,
+        "signed_expression_compiler": SIGNED_EXPRESSION_PATH,
     }
     file_evidence = {
         name: {"path": _path_label(path), "sha256": _sha256_file(path)}

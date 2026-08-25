@@ -439,6 +439,35 @@ class PartStructuralParserTests(unittest.TestCase):
         self.assertEqual(result.status, ParseStatus.AMBIGUOUS)
         self.assertIsNone(result.problem)
 
+    def test_original_length_binds_unique_object_possessive(self) -> None:
+        source = (
+            "Shania is designing her own dress, and decides to make it a longer "
+            "dress by extending the dress by 50% of its original length. She also "
+            "adds 20cm to the bottom of the dress with a lace trim. If the final "
+            "design is 140cm long then how long, in centimeters, was the dress in "
+            "its original design?"
+        )
+
+        parsed, solution = _solve(source)
+
+        self.assertEqual(solution.target_value, 80)
+        self.assertIn("length.shania.dress.original", solution.values)
+        self.assertIn("length.shania.dress.extension", solution.values)
+
+        mutations = (
+            source.replace("own dress,", "own dress and cape,"),
+            source.replace("was the dress in", "was the coat in"),
+            source.replace("She also adds", "He also adds"),
+            source.replace("a lace trim", "a 3 dollar lace trim"),
+            source.replace("a lace trim", "an if final design trim"),
+            source.replace("a lace trim", "a how long design trim"),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                result = parse_structural_problem(mutation)
+                self.assertFalse(result.ok)
+                self.assertIsNone(result.problem)
+
     def test_part_rejects_fractional_people(self) -> None:
         result = parse_structural_problem(
             "Mira has 10 students. 25% of those students are absent. "
@@ -1098,11 +1127,6 @@ class FailClosedStructuralParserTests(unittest.TestCase):
             "Janeth borrowed $2000 and promised to return it with an additional 10% "
             "of the amount. If she is going to pay $165 a month for 12 months, how "
             "much will be Janeth's remaining balance by then?",
-            "Shania is designing her own dress, and decides to make it a longer dress "
-            "by extending the dress by 50% of its original length. She also adds 20cm "
-            "to the bottom of the dress with a lace trim. If the final design is "
-            "140cm long then how long, in centimeters, was the dress in its original "
-            "design?",
             "Sasha and Julie are best friends playing on opposing basketball teams. "
             "The teams have two practice games scheduled. In the first game, Sasha "
             "had the home court advantage and scored 14 points. Julie scored 4 fewer "

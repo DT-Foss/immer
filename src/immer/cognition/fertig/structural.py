@@ -212,6 +212,10 @@ _TIME_UNITS = {
 _TIME_WORD = r"seconds?|minutes?|hours?|days?|weeks?|months?|years?"
 _LENGTH_WORD = r"cm|centimeters?|inches?|meters?"
 _SIMPLE_NOUN = r"[A-Za-z][A-Za-z'\-]*"
+_DECORATION_WORD = (
+    r"(?!(?:if|then|how|what|when|where|why|final|original|length|design)\b)"
+    + _SIMPLE_NOUN
+)
 _EXPLICIT_NUMERIC_FRACTION = r"(?:\d[\d,]*/\d[\d,]*|[\u00bc-\u00be\u2150-\u215e])"
 _FRACTION_TEXT = (
     rf"(?:{_NUMBER}\s*%|{_EXPLICIT_NUMERIC_FRACTION}|half|"
@@ -254,6 +258,24 @@ _ORIGINAL_LENGTH_PART = re.compile(
     rf"(?P<final_unit>{_LENGTH_WORD})\.\s+What\s+was\s+the\s+original\s+"
     rf"length\s+of\s+the\s+(?P<query_object>{_SIMPLE_NOUN})\s+in\s+"
     rf"(?P<query_unit>{_LENGTH_WORD})\s*\?\s*$",
+    re.IGNORECASE,
+)
+
+_ORIGINAL_LENGTH_POSSESSIVE = re.compile(
+    rf"^\s*(?P<owner>{_NAME})\s+is\s+designing\s+"
+    rf"(?P<possessive>his|her|their)\s+own\s+"
+    rf"(?P<intro_object>{_SIMPLE_NOUN})\s*,\s+and\s+decides\s+to\s+make\s+it\s+"
+    rf"a\s+longer\s+(?P<longer_object>{_SIMPLE_NOUN})\s+by\s+extending\s+the\s+"
+    rf"(?P<object>{_SIMPLE_NOUN})\s+by\s+(?P<percent>{_NUMBER})\s*%\s+of\s+"
+    rf"its\s+original\s+length\.\s+(?P<subject_pronoun>He|She|They)\s+also\s+"
+    rf"adds\s+(?P<addition>{_NUMBER})\s*(?P<addition_unit>{_LENGTH_WORD})\s+"
+    rf"to\s+the\s+bottom\s+of\s+the\s+(?P<addition_object>{_SIMPLE_NOUN})\s+"
+    rf"with\s+(?:a|an|the)\s+"
+    rf"(?P<decoration>{_DECORATION_WORD}(?:\s+{_DECORATION_WORD}){{0,3}})\.\s+"
+    rf"If\s+the\s+final\s+design\s+is\s+"
+    rf"(?P<final>{_NUMBER})\s*(?P<final_unit>{_LENGTH_WORD})\s+long\s+then\s+"
+    rf"how\s+long\s*,\s+in\s+(?P<query_unit>{_LENGTH_WORD})\s*,\s+was\s+the\s+"
+    rf"(?P<query_object>{_SIMPLE_NOUN})\s+in\s+its\s+original\s+design\s*\?\s*$",
     re.IGNORECASE,
 )
 
@@ -1026,12 +1048,38 @@ class StructuralParser:
     def _parse_original_length_part(self) -> bool:
         match = _ORIGINAL_LENGTH_PART.fullmatch(self.source)
         if match is None:
+            match = _ORIGINAL_LENGTH_POSSESSIVE.fullmatch(self.source)
+        if match is None:
             return False
 
-        object_groups = ["object", "query_object"]
+        expanded = "intro_object" in match.groupdict()
+        object_groups = (
+            (
+                "intro_object",
+                "longer_object",
+                "object",
+                "addition_object",
+                "query_object",
+            )
+            if expanded
+            else ("object", "query_object")
+        )
         objects = tuple(_singular(match.group(group)) for group in object_groups)
         if len(set(objects)) != 1:
             raise _Abort(ParseStatus.AMBIGUOUS, "percent basis object is not explicit")
+        if expanded:
+            possessive_subject = {
+                "his": "he",
+                "her": "she",
+                "their": "they",
+            }
+            possessive = _entity(match.group("possessive"))
+            subject = _entity(match.group("subject_pronoun"))
+            if possessive_subject[possessive] != subject:
+                raise _Abort(
+                    ParseStatus.AMBIGUOUS,
+                    "possessive owner and subject pronoun do not agree",
+                )
 
         addition_unit = _length_unit(match.group("addition_unit"))
         final_unit = _length_unit(match.group("final_unit"))

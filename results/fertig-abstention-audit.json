@@ -21,14 +21,19 @@
       "target_parse_failed": 57
     },
     "scope": {
-      "grammar_scope": 99,
-      "potential_coreference_scope": 131
+      "exact_recovery_scope": 16,
+      "grammar_scope": 119,
+      "potential_coreference_scope": 95
     },
     "structural": {
-      "numeric_clause_unsupported": 95,
-      "numeric_pronoun_ambiguous": 127,
-      "question_pronoun_ambiguous": 4,
-      "target_unsupported": 4
+      "exact_recovery": 16,
+      "numeric_clause_unsupported": 107,
+      "numeric_pronoun_ambiguous": 89,
+      "question_pronoun_ambiguous": 6,
+      "relation_ambiguous": 1,
+      "relation_invalid": 0,
+      "relation_unsupported": 1,
+      "target_unsupported": 10
     }
   },
   "classification_inputs": [
@@ -37,14 +42,17 @@
     "vendored legacy binding diagnostics",
     "structural parse diagnostics"
   ],
+  "current_exact_recoveries": 16,
+  "current_remaining_abstentions": 214,
   "gold_label_free": true,
   "hungarian_verdict": {
     "contract": "an instance is directly eligible only when extraction supplies two exclusive candidate sets and a complete pairwise cost matrix",
     "directly_eligible_exclusive_instances": 0,
-    "verdict": "0 directly eligible exclusive Hungarian instances under the current extracted contract; the measured scopes are coreference or grammar/relation construction, not global one-to-one assignment"
+    "verdict": "0 directly eligible exclusive Hungarian instances under the current extracted contract; exact recoveries need no assignment, and the remaining scopes are coreference or grammar/relation construction, not global one-to-one assignment"
   },
   "items": [
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 547,
@@ -58,7 +66,6 @@
         },
         "reason": "Bindung unvollständig: 2 qty, 0 ratio, op=left"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "eee04241756a601db97caada1e26d6717b974e1f884c0d793558bc645c3cfee4",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -67,6 +74,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 550,
@@ -80,7 +88,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=product"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "f5cc8b9f8550f2d6c785df4ff7895597e558fe62e40a5d451c2dc1ef176cb405",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -89,6 +96,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 570,
@@ -97,7 +105,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "c0cd2a6956c0c6c4160338cdaf126ac825a94f5d85f26879f8c6d57e1cfb3d90",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -106,6 +113,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 574,
@@ -114,7 +122,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "f60080fb9229d890b495edeac98428e4ab49d7494c73b3890792e30b2f72894b",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -123,6 +130,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 578,
@@ -131,7 +139,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "d09c58e99911f2b94d31ca7253b5e3bae34d4e3f264c562ce5e7daaa53f3b8aa",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -140,6 +147,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 580,
@@ -148,7 +156,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "4567a4117b2d6148d24543ffa866f94cd1c9e50d786a7843a3a0dc83e0cd11b3",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -157,6 +164,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 587,
@@ -170,7 +178,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "4c9439fa1014db5aa1e67ed4978cab4b45353c18bb39d6f9449e2fdb8335304e",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -179,6 +186,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 603,
@@ -187,7 +195,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "353010b224ab5f3dad40f4f2004ee62a822e11e29cde09acb79f59782b7ec9f5",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -196,6 +203,7 @@
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 610,
@@ -209,15 +217,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "55528533cc93f490f454c714ecabfa4cbcfc236223461b4aa5d79d73bae9e313",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: rate_length_difference",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 613,
@@ -226,15 +234,15 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "c78fa26851c9f4059442b539fc9bf3bae7415fcb981f719b671f37d6b38e22c1",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:31",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: calendar_daily_total",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 619,
@@ -243,15 +251,15 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "297086917a42d14569ec6555f82db1631f8a7c56190f50ec131e1f614f59db38",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:52",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: functioning_count",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 627,
@@ -260,15 +268,15 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "3f7d3c8f58f11ef18ae87e8b13fd3392aa3095b33a1f5a10ea7daccb917e93e5",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "relation_unsupported",
+        "reason": "exactly one explicit target is required",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 631,
@@ -277,7 +285,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "15c874942d6f3fd88b477918ca92565471c619e380307872c8b189d12867b3a0",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -286,6 +293,7 @@
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 643,
@@ -294,15 +302,15 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "d01547b90f3b34ef24fde0356833a59fd43cf62ffb1a27bd2aad04bc6314aa2e",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:87",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: combined_daily_total",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 650,
@@ -311,7 +319,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "2ef174b9372aad840542160b031da72c297a615c6489ace4700647d042037860",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -320,6 +327,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 651,
@@ -328,7 +336,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "8a4fdde087b05414ffbcdfca828e87a5edda76a9ed887492a035a6c5789d4936",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -337,6 +344,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 666,
@@ -350,7 +358,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=product"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "477ccaf5ccaf202145cbe574456faf5de3dd15eaa57124ec964d4c1e6b74233b",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -359,6 +366,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 672,
@@ -372,15 +380,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=left"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "db22fa8e24434d81ecb2059824dc4e9303a7a50882cb2c3bc4de7588be493e7b",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "target_unsupported",
+        "reason": "unsupported target at 262:356",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 682,
@@ -389,15 +397,15 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "4c528ff4beacf686e63369a4e9d75bfded6b89820ffc0b106dc7b047e6c645df",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 692,
@@ -406,7 +414,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "34f6c6b00d301ae5472546c4150b3dabdf2a1771300a2bab649ae2fe45417ab3",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -415,6 +422,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 694,
@@ -428,7 +436,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "26951bd58640bd492d0ba638fc90b8fc5d62c4860aca1524bed4a3119f5887a8",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -437,6 +444,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 701,
@@ -445,7 +453,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "0270a167830c18419ddee1b968f27067a5eb9ef1dacff873ddb1e16c3d017478",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -454,6 +461,7 @@
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 722,
@@ -467,15 +475,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "d79a0a1e51f40426474865eda5c2782cff976d3c2b80d5cc2ae40f15f85d62a9",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: avoided_cost_transaction",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 724,
@@ -489,15 +497,15 @@
         },
         "reason": "Bindung unvollständig: 1 qty, 0 ratio, op=left"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "b13dce67ede5758f2b4ae90e1d3e65afd8053fbefbba6edf284af0245eb8c883",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 85:109",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 731,
@@ -511,7 +519,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "bc3378ff760c0d0a89ab3bec3ed62507ac8a16f6ed70f0386ad6f497376d9984",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -520,6 +527,7 @@
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 745,
@@ -533,15 +541,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "dc3605a75eb8adbf61e968e2bfac32a655f66c080958f39c132a5df60de256be",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: profit_contribution_ledger",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 746,
@@ -555,15 +563,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=left"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "689d7d3ceac9fef27856fea705c949807fc3eab2ebbf53ebbd4ba53388b96668",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 78:245",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: alternative_cost_savings",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 747,
@@ -577,15 +585,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "8e86f442e4b8ab1214f3a3a8b09a3db66fd7cad0d0cdef5fffda5c2eb35b39a3",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: old_new_rate_savings",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 754,
@@ -599,7 +607,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "1dd8f2b1009069f3f3a4fc04f91742a3fd89aa1cad6fb5a6625dbc4ece1b41a5",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -608,6 +615,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 763,
@@ -621,7 +629,6 @@
         },
         "reason": "Bindung unvollständig: 1 qty, 0 ratio, op=left"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "5af878f1fa177c1d835a2a652f8f16436472f20fafcbd51d42018bca200facc2",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -630,6 +637,7 @@
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 770,
@@ -643,15 +651,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "6b14d2eb20ae834c16bb2f9121a37bea3888e3694704164071952487b8ef9eba",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: category_sales_difference",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 778,
@@ -665,15 +673,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=product"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "c7d44bb98eabc5a36d02d2d1f52feba30fcf11b389edceea9b21400801a78458",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:155",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed clause compiler",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 780,
@@ -682,7 +690,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "47b9c582d0caca78cb51690693250b920dbbfcb2a27222402d00bd435193a5e9",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -691,6 +698,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 782,
@@ -704,7 +712,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "ff7424c7745311917c032ea2912425a5c50bb520ee3d4b35b67b87bb11f50bc4",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -713,6 +720,7 @@
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 797,
@@ -726,15 +734,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "656e874e3f82ca4984c9340f9873fae61f97a5e1d405ca1c8a34bf0e8cec0ad1",
       "structural": {
-        "category": "question_pronoun_ambiguous",
-        "reason": "question pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: repeated_duration_total",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 802,
@@ -748,15 +756,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "8b47e7bec0853166a910a158c4518b276f335815a9a426bb308126331ce5e1e0",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
+        "category": "question_pronoun_ambiguous",
+        "reason": "question pronoun binding is not proven",
         "status": "ambiguous"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 810,
@@ -770,7 +778,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "26b92d9e2e3a41b4b49eb3b173345e2336b9a2d1f9a0eaea2d23c4789f711c96",
       "structural": {
         "category": "target_unsupported",
@@ -779,6 +786,7 @@
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 819,
@@ -792,15 +800,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "d9eb85dbea16ec3f3df18c7cf393ed27bd082874bb8f7b04f4f89edb46375faf",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 95:133",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: equal_share_residual",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 823,
@@ -809,7 +817,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "99d384b14857cc004d17ce6b2b437cfb14f23e87c7ed28b65c261b44a9b60d98",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -818,6 +825,7 @@
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 825,
@@ -831,15 +839,15 @@
         },
         "reason": "Bindung unvollständig: 1 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "f17c2f137ad0cc13d6454b5c278de021bb00e1d2ff2b0c03c1646c8a9b6c825f",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 59:88",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed clause compiler",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 830,
@@ -853,7 +861,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "0d3dc91f7dd0f0f28de95126e4bfb4f9f609d7ef3849078ef65658e73597f8af",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -862,6 +869,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 831,
@@ -875,7 +883,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "f23967bf69dffbbf5ed078b32b046a105d4e8e0e3cb873c18c2b58e96af11969",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -884,6 +891,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 833,
@@ -892,7 +900,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "332180f6dff1c2d7c8040a27e89e6cc13f56c691d5bcdc01cc664f9c15a5ed63",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -901,6 +908,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 836,
@@ -914,15 +922,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "cf158eca25037c528f8dc3b57cc175098e54804962fc69896323d16d9975922b",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 82:174",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 837,
@@ -936,7 +944,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "da8be9e9373e2f8b27c094ab244bb3232ab75274d38813f862202688fa6e28ae",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -945,6 +952,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 840,
@@ -958,15 +966,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "25552acc93629dbe9e69f123765b4129f222726a37cf06722e66090c52ff9385",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 55:127",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 844,
@@ -975,7 +983,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "44f3552fcc34a3969d8d75e860e456093bf8cac8c8ec13c4335fe66c7f6f39e7",
       "structural": {
         "category": "question_pronoun_ambiguous",
@@ -984,6 +991,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 852,
@@ -997,7 +1005,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "7432b9f2c05773a0fda89112696ca8b911d680a2fcef879fc99e00719e043a08",
       "structural": {
         "category": "target_unsupported",
@@ -1006,6 +1013,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 861,
@@ -1019,7 +1027,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "39d6bd05131a48026d9465881432cccd8028ee9e19352de22eb57b7cf218223f",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1028,6 +1035,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 865,
@@ -1041,7 +1049,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "9fa70f2dd7a054f455917badddd9f69389ec5d530e05f6df3fd45626018d5bd5",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1050,6 +1057,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 868,
@@ -1063,7 +1071,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "51522c33248bb7e91745b44b814f263fb96044731539bf93124820d127637d54",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1072,6 +1079,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 880,
@@ -1085,7 +1093,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=left"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "3a43441138b0b2a36dc79d49e66b229878b18d5536b059de6acc5120f4aa2ff6",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1094,6 +1101,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 883,
@@ -1107,7 +1115,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "f2d4d7e5edbe95c346938dc6db1e368f40a364a4767b41bc66b17d52da9d899e",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1116,6 +1123,7 @@
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 892,
@@ -1129,15 +1137,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "ce521f854df34e284742bb42eb7170242a0a77dc01445727ba8aec1782bdc062",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: unit_cost_residual",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 894,
@@ -1151,7 +1159,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "2cc798489b7bf2752f090cdd504c84aad930b882fbd1dd0502f55cf81496e1b9",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1160,6 +1167,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 898,
@@ -1168,15 +1176,15 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "420b6c70f9754d97664d605b6c542daed5b505abccb027f96ae2a5d450716678",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 86:172",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 900,
@@ -1190,7 +1198,6 @@
         },
         "reason": "Bindung unvollständig: 1 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "c4ae8d1951190d223ab674849490c44d95ea11faa45207868af21d61ab14ac8f",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1199,6 +1206,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 901,
@@ -1212,15 +1220,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=left"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "136aeda7ea6fcf2e6c173e2eb3a3222afd46ffb099d218c36d4643a19168183a",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "target_unsupported",
+        "reason": "unsupported target at 208:339",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 913,
@@ -1234,15 +1242,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "d38f11f637baa6f8d1f30e6abe4998aeb68b927db5967759814d1f7941619b83",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "target_unsupported",
+        "reason": "unsupported target at 142:310",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 916,
@@ -1256,7 +1264,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "b44a7bc68a7d7e9e88305edabcfdcef48d06ab160a09531943e717df47c78b3d",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1265,6 +1272,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 924,
@@ -1273,7 +1281,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "dd6cf24849d2716eb4ea7348e13e02909f84bba9dfe3a025c811a0858b6c2630",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1282,6 +1289,7 @@
       }
     },
     {
+      "current_scope": "exact_recovery_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 930,
@@ -1295,15 +1303,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "35ca9ab30c488b97b740f779e422691b52bd4a91309a5bc360d59f7f99333372",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: inventory_total_residual",
+        "status": "parsed"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 931,
@@ -1312,7 +1320,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "1aea626b4cf5a0a1201649a84124a0e27d85396550541ccf926478dc913b13cb",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1321,6 +1328,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 934,
@@ -1329,7 +1337,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "75db5f55a47213aa2278dcb557134306c1dabd3fea5e227cb5d7e56b8e78d8fe",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1338,6 +1345,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 935,
@@ -1351,7 +1359,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "298733e22a4f1a0dc82500ad0b041017a0e457aa2a53ac060de891828402e70b",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1360,6 +1367,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 936,
@@ -1373,7 +1381,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "79a51caa84107c5dcf3f151db2465e374936204c015989cbcb2dfb0bcf2eb30d",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1382,6 +1389,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 939,
@@ -1390,15 +1398,15 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "209a34dca12a7b5a9b987ddd965839b7ccbf006607fb5b8320177706ea0e5f2a",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 136:205",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 944,
@@ -1412,7 +1420,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "166c80c7c0564d74494e4b196dcd481ea905a73b98ebf210377c95b7275ab955",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1421,6 +1428,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 953,
@@ -1434,15 +1442,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "1695cf1a111991fcf5df6cd58f7374a0dd207bc9bbd3b2dae7782fd9ddeed981",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 82:115",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 955,
@@ -1451,7 +1459,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "68c81058a97785eccbe69961fd2497f3317a38aa062d43f73e431a86a7347577",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1460,6 +1467,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 959,
@@ -1473,15 +1481,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "d569f63306f91b99c2f0e94a07b4beecad282c6be9c524bab162fac9897c2585",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
+        "category": "question_pronoun_ambiguous",
+        "reason": "question pronoun binding is not proven",
         "status": "ambiguous"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 960,
@@ -1495,15 +1503,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "3ef523956b50b11bce8a4beeb4a85218d36b9eda454bd2916f926883b855349f",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "target_unsupported",
+        "reason": "unsupported target at 456:536",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 963,
@@ -1517,7 +1525,6 @@
         },
         "reason": "Bindung unvollständig: 1 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "81558eb793680dd456e566a7cc88614703828d2b0c2969e14ce36bcd6313ddfe",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1526,6 +1533,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 974,
@@ -1534,7 +1542,6 @@
         "category": "equation_guard",
         "reason": "Zeit-/Geldbilanz nicht strukturell bewiesen"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "19ba003f901e443a54113110765b37952441fc55b31d9eb7a3f08940d096fe0c",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1543,6 +1550,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 984,
@@ -1556,7 +1564,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "2cf00f5bf0e5006ce2858c75914b9e8b08ce7ea183119c769c5acab32b7545a6",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1565,6 +1572,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 990,
@@ -1578,7 +1586,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "569fe2a067082d1d21647bd6dea12fbd43afe6b7bff23d4ca71e779ae19d3b2a",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1587,6 +1594,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 992,
@@ -1600,15 +1608,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "d0305a3476e12c964760b0077607cfaa3c03e1234c8ada89ae2ea207838d1f0a",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "target_unsupported",
+        "reason": "unsupported target at 267:309",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 993,
@@ -1622,7 +1630,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "0407558da1e3fd8f9ee6e7fbbc1be7d9f54d279c13c20422bec34670af25e615",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1631,6 +1638,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 996,
@@ -1639,7 +1647,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "c73d918c6c99ce50b236855f6461718ad0300f17ddec31e8d3fac1220ef7d288",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1648,6 +1655,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 997,
@@ -1661,7 +1669,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "66878f1c646c979a20c9094588cd6e596454c9d2ed1f520e23c01564efe319b1",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1670,6 +1677,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1009,
@@ -1683,7 +1691,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "ff4f0f1fb145febeed6e532192344e9d9a18dfbd5f3e82d05bd210b574c8f517",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1692,6 +1699,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1012,
@@ -1700,7 +1708,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "55a162e4b38af59af46a60fc870a09bc900561992a794f5eee859485694bf185",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1709,6 +1716,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1014,
@@ -1722,7 +1730,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "60dcca05c2f0750cfadd66c6ba8b40293a542053aee18cf45bd213dcc3bff54d",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1731,6 +1738,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1016,
@@ -1739,15 +1747,15 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "a7d78e5a73eb736fe5dc2312e0fae0d1d67767b9ae25390ee45bdc8bd8b6495d",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 102:192",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1022,
@@ -1761,7 +1769,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "db634e32d2d438d72ebfef31654f065cfaf20ea40cfa592d83707175749d4653",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1770,6 +1777,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1027,
@@ -1783,7 +1791,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "19e905ba9674592c7e35f39865f4b174c9f22f9674814139ac736397117b5d18",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1792,6 +1799,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1030,
@@ -1800,7 +1808,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "5eef63aee8639040452671b119306ca5bf70524481c3a34e4c54b1c3e327fca1",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1809,6 +1816,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1038,
@@ -1822,7 +1830,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "bdfb019bdbe56ffafd540dfd02b608dfe876467a53056b72e8c891634af033ee",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1831,6 +1838,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1042,
@@ -1844,7 +1852,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "b7f59158b17ad0c29c87d8a94177e34cffceba9fe3ea77e028e09b79d6e4c2b9",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1853,6 +1860,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1044,
@@ -1861,15 +1869,15 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "ba865f7c812c132a254921ae640d86c5d091ab15454ed2e744c67132674f89d8",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 109:149",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1045,
@@ -1878,7 +1886,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "e4f79fb42b5132aade5edb11386b07c6535f90f56be73f0683704798c402540a",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1887,6 +1894,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1047,
@@ -1900,7 +1908,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "151afe2d0e1d93eb8330255848da77241c6da845e22b44d32b7756071fbbaa3c",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1909,6 +1916,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1048,
@@ -1917,7 +1925,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "6feb7653ae34934a94bd843384672437d0ca7134689faf64ba96096c96137280",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1926,6 +1933,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1053,
@@ -1939,7 +1947,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "3d3024d62dd3b030efdb8efd2a4aaebde133c9e20e36f72847e5f44be458784a",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1948,6 +1955,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1056,
@@ -1961,7 +1969,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "5c77e890f2588e1c9e518c4fd29ab54173e2e9de895d6de3d9385e148079c7be",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -1970,6 +1977,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1062,
@@ -1983,7 +1991,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "f4ee65938fd8ac2b369ab926e7cb15d140020c804e823b29ce7441b799c881aa",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -1992,6 +1999,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1064,
@@ -2005,7 +2013,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=left"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "f21a9e6cdbfa4b4f8e686e3678309d92a4a1189e427c89c96d713d211263d85d",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2014,6 +2021,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1071,
@@ -2027,15 +2035,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "8cb9405680b09bfb8fa429740f1ff8bda7056b297e4863811f3a2c4c199c3a74",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 55:143",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1077,
@@ -2049,7 +2057,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "259a353192fcb98cb3cd298a540304596d48603db3aff3767a48920ae6dd2b93",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2058,6 +2065,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1078,
@@ -2071,7 +2079,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "47484d317509112369ed291782c060232e596e6ec2e58c86468e66345446b925",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2080,6 +2087,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1086,
@@ -2093,15 +2101,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "0fd5beca3ad36df10907617d0ae85d7e9857e29010070a97c95beefdb8484243",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 97:187",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1090,
@@ -2115,7 +2123,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "3101f57b15af1b33d94eed7fc263c1d722c7481a6f078b18b82005859b9444f5",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2124,6 +2131,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1094,
@@ -2132,7 +2140,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "d36ca220f1854e823517588685356a322515f2e2912bc5427e955bd877827d32",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2141,6 +2148,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1103,
@@ -2154,15 +2162,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "d454e529748bf7928c6c00e33ecce1de8d9e299185d3f30a6e544cb17472d6b4",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 218:270",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1105,
@@ -2176,7 +2184,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "61d9ff55e1365bd568ddb09ecda33663b162b0568e7ac953c512b6fb8b02c14c",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2185,6 +2192,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1110,
@@ -2198,7 +2206,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "cfd73b5b79ab85ce48ffa2ec07eeb885bc77bd7ad1a794c777272caa3eb050a7",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2207,6 +2214,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1111,
@@ -2220,7 +2228,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "a9f00036243d0862b639dd86f1eb89ef9c0f8bccdb156ddf58afff70dcdb7d74",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2229,6 +2236,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1113,
@@ -2237,7 +2245,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "04b3b6a76c29971fb683933e91ccbdcfcb65cbabc70f4a3dac7ba03767be28c8",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2246,6 +2253,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1119,
@@ -2254,7 +2262,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "cc2a173fae47bb72d54f9222630bfeeb352e00bb718103a5749dc9ae35184c19",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2263,6 +2270,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1122,
@@ -2276,7 +2284,6 @@
         },
         "reason": "Bindung unvollständig: 2 qty, 0 ratio, op=left"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "9a1d207ae486776ab2a316f66781cfa81f91a7a5685758e43d6a1d565aeabc5d",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2285,6 +2292,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1127,
@@ -2293,7 +2301,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "48705328fbdd61a3820c40b3b488089f341ace66f78cd69797d464fccb66a37e",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2302,6 +2309,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1129,
@@ -2315,7 +2323,6 @@
         },
         "reason": "Bindung unvollständig: 1 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "1121bf3acb3c86f04f778f73bdf02156fb2c59592097fec3bdd25ffccd31d0bb",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2324,6 +2331,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1137,
@@ -2337,7 +2345,6 @@
         },
         "reason": "Bindung unvollständig: 2 qty, 0 ratio, op=left"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "6515b49f952e34bb6a36a888a0b12468965a50523dbbde2ae9629b3f849f7214",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2346,6 +2353,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1139,
@@ -2359,15 +2367,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "cd13703a96a61fdff8e2711aeed23d659572cf2fc9ae50d25316ad239b2bbede",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 44:105",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1142,
@@ -2381,7 +2389,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "2f076d4d3c64a56351175af78ac6386e1215dc36501944501b0f2c619dc4fc71",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2390,6 +2397,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1147,
@@ -2403,7 +2411,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "fc025886eb1408a1b9c8f43ba10e2eca740bb615666340e83a1356485f788108",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2412,6 +2419,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1156,
@@ -2425,7 +2433,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=left"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "941e44e0da01da5e27f219352e40a4eaf1fd369f9293afeb7f6ac79230ec478d",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2434,6 +2441,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1158,
@@ -2447,7 +2455,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "3703cfe38de79be827061967bee038ecef8178b406b65301bf7438b97a2794a2",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2456,6 +2463,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1159,
@@ -2464,7 +2472,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "75bd98ff26a608769a1553b795ded53dba0272110a651e6040a6c3b3f9c52565",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2473,6 +2480,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1161,
@@ -2486,7 +2494,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "c53c536c2b1f33fcabaa23d513d748d38bc452cc5f2b69384597e9d59fcac34c",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2495,6 +2502,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1165,
@@ -2508,7 +2516,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "26c65d311a4dbe809a882d45dae57f6a5e5a9b3ce9f6241228db4a41ad7e3f88",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2517,6 +2524,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1166,
@@ -2525,7 +2533,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "8c0bb115ed1bd33d48bbba0d92cc6b7e9174b84f2ef0f5cf8be37177b165742f",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2534,6 +2541,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1169,
@@ -2547,7 +2555,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=left"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "4459d95c1ca8a6eb82ab683c929ad13f3e2695381923726001c1f6dfb7eb90a1",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2556,6 +2563,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1171,
@@ -2569,7 +2577,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "e03f54e7d94c8c839d23e29574fb37822b7f8fde42fb1b9bb4358cf8e6867a82",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2578,6 +2585,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1172,
@@ -2591,7 +2599,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "8946bef80dca27a607e682ab7218572f60dea9b170a1c154381f5a9e4f7d3336",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2600,6 +2607,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1173,
@@ -2613,7 +2621,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "6206bc51a78315ffc176309157e0bdb07d5eb50510d21e8555c6370c7fce9df9",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2622,6 +2629,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1176,
@@ -2635,7 +2643,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "311f98609d976ebfd1c5c5c7a78b7101fb0ffa6bbf245cabbe02a2615b532ef7",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2644,6 +2651,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1177,
@@ -2657,7 +2665,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "4568b20a15c96f226b13dfef1edde89e5df8a593901478b1c43bb8a8fd5a6927",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2666,6 +2673,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1179,
@@ -2674,7 +2682,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "213b8d6329ee91c7f3bd3ee7bce5818db01b08b0d107b26c757745cf26e26f21",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2683,6 +2690,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1180,
@@ -2696,7 +2704,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "5c273a4296dab569a9227675d3415098976f9b9726e03ddf75856b179512a2b6",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2705,6 +2712,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1181,
@@ -2713,7 +2721,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "e2efd4ff76ac641f2575c3e4510aa67159aefb66516dadc6eaaea131cd20d54b",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2722,6 +2729,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1184,
@@ -2735,7 +2743,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=product"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "1a93ae062315cbef8cdf8609209ee78e97d81bd56078fbd3c48c44c078eb182e",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2744,6 +2751,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1185,
@@ -2757,7 +2765,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "7eb4490ab13eba4445fb5620d9204f4fa7933d49cb7bf03c68caa8e45a7ba924",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2766,6 +2773,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1187,
@@ -2779,7 +2787,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "d3eceda393448f03457d9f02e2488f22eef1461c68bc9e9dad06f8115dda83bf",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2788,6 +2795,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1188,
@@ -2796,15 +2804,15 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "edc65df3736cf7afb0305fdc45f2260801b640939866a888e0e20fb3cb1d160d",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "target_unsupported",
+        "reason": "unsupported target at 83:115",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1189,
@@ -2818,7 +2826,6 @@
         },
         "reason": "Bindung unvollständig: 1 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "ee808165885152e0e14b99442edfa69d3c055047068ae9e838bce82944f72ea3",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2827,6 +2834,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1191,
@@ -2840,7 +2848,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "1fbc3423c0dba9cb68e78fc7910579c19a88617f1b778f9363f34a2d777e7ab5",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2849,6 +2856,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1192,
@@ -2862,7 +2870,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "1f9257cb5d0b8bf64a279522328921f8fc0d41f37fe7222659fff9c83bf8d4d5",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2871,6 +2878,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1193,
@@ -2884,7 +2892,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "48e1f4b965acee41e103bda238c02dc29292f3d604e5831e685f26d4b87ab43e",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2893,6 +2900,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1194,
@@ -2901,7 +2909,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "403c14d7e3268a34e7db02d081f0111ca60985533e231e07ab8787d3b58d03c3",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2910,6 +2917,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1195,
@@ -2918,7 +2926,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "1b204b20ed9ceb1eab09c6bafe39bebadd4c8be944d511c4960dc8fb0502aac6",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2927,6 +2934,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1197,
@@ -2940,7 +2948,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "ff0da3f89a7fc9f75b37943216028bb5d19e2e3f318fb96ff8d35e9e6bbb784b",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -2949,6 +2956,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1198,
@@ -2957,7 +2965,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "edcaf9b86f1f41327d3d08fe472332403959947c1da41e1a23da2baf9ec326a5",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2966,6 +2973,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1199,
@@ -2979,7 +2987,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=left"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "afec5cd2fe1d2e1ec02edd7450c8de7cc40921105415c0064f133702a7938459",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -2988,6 +2995,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1200,
@@ -3001,7 +3009,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "035f5831e174711adc99caee27750f2356b4e6909f13d63f7fba156f98d4ee2f",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3010,6 +3017,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1202,
@@ -3023,15 +3031,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=left"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "a560fa2733b9bef0401c069cca4435f95cf5ed2fc57807e04aeb47cdba49c582",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
+        "category": "question_pronoun_ambiguous",
+        "reason": "question pronoun binding is not proven",
         "status": "ambiguous"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1203,
@@ -3040,7 +3048,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "d16951dd9a6ed6779ea1ee3d512ac41971acf436c9a22ffa70b34a805fda88b5",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3049,6 +3056,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1204,
@@ -3062,7 +3070,6 @@
         },
         "reason": "Bindung unvollständig: 2 qty, 0 ratio, op=left"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "8340c7f0c10ef4f77a4284ed8087b43ba75df281f51977db562bc247a61001bd",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3071,6 +3078,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1205,
@@ -3084,15 +3092,15 @@
         },
         "reason": "Bindung unvollständig: 4 qty, 0 ratio, op=left"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "a0b9c4b917b45afdc30ff1d4ada14379c79e62cbd84b9e70426c0b673671ba69",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 72:102",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1206,
@@ -3106,7 +3114,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=left"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "ad6628c18313d944a7fa7626937245bf4d6a515f1c7c070f973a7d4a6c5d6bcd",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3115,6 +3122,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1208,
@@ -3123,7 +3131,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "6b97458b600b5a1b0992dc4ec55ba41eb6cabce7bb53dcd3ab43817a6088c1cf",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3132,6 +3139,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1212,
@@ -3140,15 +3148,15 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "477173f48977592b7627a654454f237f2a473c156166e14bddb1f6b284987848",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 138:223",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1213,
@@ -3162,7 +3170,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "06591e3000388735364d0f5a24cb2d03e55a8c5ff25a847e956a23829d27ed01",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3171,6 +3178,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1215,
@@ -3184,7 +3192,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "133bd9511497c576ed3c22b04b66faec134eed2f6d12491bc21b6cf295afc368",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3193,6 +3200,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1216,
@@ -3201,7 +3209,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "5b792a71f89b52160ec355ba1e09a047f88e7dc50f3869dfda3990f5e051327a",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3210,6 +3217,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1217,
@@ -3223,15 +3231,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "8449de11d68a10fbf378f8b97378cd55f298ec0fa29d0a251ccff0a31e0dd5dd",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 61:88",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1219,
@@ -3245,7 +3253,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=product"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "fb3b58905ee0abc1548dd85c10c648d2890a1e92e1f418ee4ab36569b1e2cbc7",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3254,6 +3261,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1220,
@@ -3267,7 +3275,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "23adfa57ee7e97fd304d85b137ee80a40610c665645c8816bea291e6fe358b12",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3276,6 +3283,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1222,
@@ -3289,7 +3297,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "5093c4828b637d67011d0a7fa3afafeacd2587842353a5f89e015f587dc53f50",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3298,6 +3305,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1223,
@@ -3311,7 +3319,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=product"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "f2cd1186949207c89eeab2662cd4342e75944cfbb1c637039ef88895c61d679d",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3320,6 +3327,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1225,
@@ -3333,7 +3341,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "4181c7adb123f467ca3256f124c48171bf0e064fa53f2ed90d7d9ed091af492b",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3342,6 +3349,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1226,
@@ -3355,7 +3363,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "dde46487272fd041e5941aececdb7c932a4d3663f4e28ada3057e9169dbc4e6f",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3364,6 +3371,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1227,
@@ -3377,7 +3385,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "619fa2238b72108df351d667ddb22d1fa0c0ad2c8eeb48642bcaa0674429795f",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3386,6 +3393,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1229,
@@ -3394,7 +3402,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "38bdd73bd14b5fa9dffd32a1d75ff7494cdfb37d9d61f7437db0f5e6b5f8052c",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3403,6 +3410,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1230,
@@ -3416,7 +3424,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "cd7058cf798fc4337d547bc812b2e173b134408b437832f836122189285c32f4",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3425,6 +3432,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1234,
@@ -3438,7 +3446,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "b59a44d33edf98f25df3625bb254f36c6cd8de6dddc8187f5812387a43cfeaaa",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3447,6 +3454,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1235,
@@ -3455,7 +3463,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "78dd8c8b20f38c37bf2b306b4fa3ab15feae8b3eb6da642bbc6813a58d392456",
       "structural": {
         "category": "question_pronoun_ambiguous",
@@ -3464,6 +3471,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1238,
@@ -3477,7 +3485,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "a2a8fd633d7662d12aca7c9f6e635c3c827ba1a6385194cf57bcf470fb03c974",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3486,6 +3493,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1240,
@@ -3499,15 +3507,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "ffc98910f1fab3af61a727b3cf6eccc3c3c750b0a7ecdf537175315bc9947717",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 74:120",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1241,
@@ -3521,7 +3529,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "b36d2503f6a089a027c7d96f4e732f0206c5a6def243f2dcd7d0879c500036ef",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3530,6 +3537,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1243,
@@ -3543,7 +3551,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "06a2b53d8ececf53f1092fc711a0bb794b12888d333bc187d54ea61ccde17db7",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3552,6 +3559,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1244,
@@ -3565,7 +3573,6 @@
         },
         "reason": "Bindung unvollständig: 2 qty, 0 ratio, op=left"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "473c35477619a0b18541295f26756440ef9576bb112bbce2557bab81c836db4c",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3574,6 +3581,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1245,
@@ -3587,7 +3595,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "851383cec9e7f23b30996e8611f7442133a1ec4499e770685df671546980559d",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3596,6 +3603,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1246,
@@ -3604,7 +3612,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "88c5c9b085326acb934a18e19db08bad1e8120503bf7f6b3e6d0a3cb9c0ac3cd",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3613,6 +3620,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1247,
@@ -3626,7 +3634,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "5b64f57167758237b3a6a643faab2e68ce062af04ec7efa8f8826c74a01a093e",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3635,6 +3642,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1248,
@@ -3648,7 +3656,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "9d6030c88a165ceb3975a6bbb6eb4d60c751b2f18db9d93823d9d87abec3d539",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3657,6 +3664,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1251,
@@ -3670,7 +3678,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "a45936495f064c16cf6621fe21bf0d84f54f5850bf6bfe19ced45b30c591aa36",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3679,6 +3686,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1252,
@@ -3687,15 +3695,15 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "8b33d0a0eefe84b0781cef7bdbc30c84e8fc45caef2099cdc17c21b70b2dbb60",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 131:205",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1253,
@@ -3709,7 +3717,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "3c9fa086daad5ada81f3a87cca5eec8d6328e02f9d5c7122714c1ee378eaabe6",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3718,6 +3725,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1254,
@@ -3731,7 +3739,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "913049ca11c366f5d9e99b5905a46beda4064ed179577cd01b0e834af8ce1ab5",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3740,6 +3747,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1256,
@@ -3753,7 +3761,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "ab8dc3a9e0b031f0ef781442f8c1a7708bd20d71968084f22632441f0c38366e",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3762,6 +3769,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1257,
@@ -3775,7 +3783,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "3a86a0576f3212898885f2fe36ad9516afd3535226eb338fffa055479adc2691",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3784,6 +3791,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1258,
@@ -3797,7 +3805,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=product"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "0f52b2f27041f23ee64e1240af75ba162d687dd4cb3035c6b0af7abd1c6497c4",
       "structural": {
         "category": "target_unsupported",
@@ -3806,6 +3813,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1259,
@@ -3819,7 +3827,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "2e4540b8e9e3979c0567cb565c74c6810a1e09d38284af035ef73b1aae7ee92e",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3828,6 +3835,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1260,
@@ -3841,7 +3849,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "dfd7ef9bd1177f6d8c337cec70214e8b6f9b0a7b78269d5e6bb4e6b5fdc1870f",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3850,6 +3857,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1261,
@@ -3863,7 +3871,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=product"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "d4914b2ec5695b947ffe70fac8981071ee761114a9fa8ba2de2a7ec301373479",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3872,6 +3879,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1262,
@@ -3885,7 +3893,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "48de513784221b58d0ecb3aaa4e1afa7521b8d49c478555982bab76e13114e96",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3894,6 +3901,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1263,
@@ -3902,7 +3910,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "fbca4a501fef777426771b32ba6b6dcd62843e785dcd43ce34fe2a1c9bd1797f",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3911,6 +3918,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1264,
@@ -3924,7 +3932,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "7d9f9a119119c9d5c8a9f08d3c97cdce47988e7ba3476304f309c46699dbf30f",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3933,6 +3940,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1265,
@@ -3946,7 +3954,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "4d6fc740fa65f34314d6eaf56b746ae322e82939700135b078bec4745629fc50",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -3955,6 +3962,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1267,
@@ -3968,7 +3976,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "6195030e1395d10573fa513d2bcce916c64a925351f82dc4f38bc66d36db197c",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3977,6 +3984,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1268,
@@ -3990,7 +3998,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "8ad95507859d447d55387d64e678a0fbbd09683995df8c0512ce52e2ab06da3d",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -3999,6 +4006,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1269,
@@ -4012,7 +4020,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "c9da308003667fe153894159e3b670fd976986604cd7d31f22524cb83434aafc",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4021,6 +4028,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1270,
@@ -4034,7 +4042,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "0200e6459433efc593e8e0cf77a51d6b94eb1e4a1f6bc1999fb64e896ca3ad6b",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4043,6 +4050,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1272,
@@ -4056,7 +4064,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "db8209d8cf78aacb65c409d3046bd5a78e0c641c5e4d52f8006efcd1fd8ee64a",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4065,6 +4072,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1273,
@@ -4078,7 +4086,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "6a0784b8afb825c7de0a0f7eb7f256372b0a5fe55e66a5d1b761f5a10029b18e",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4087,6 +4094,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1274,
@@ -4100,7 +4108,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "1e1f15a4f98ff3cf54bcbbb5263f703deff6f0e7268b165b4efea0d986a207d0",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4109,6 +4116,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1277,
@@ -4117,7 +4125,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "b8b9bfd39eb0e30cda8cb711f5ad3dd1700903a371255d313c9e0d5c49c7c7c3",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4126,6 +4133,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1278,
@@ -4139,7 +4147,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "8b75a12254132bcaa50bd6e8bc7e9754db606e66f4aca3ecfb2b833c38f5bf66",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4148,6 +4155,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1279,
@@ -4161,7 +4169,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "d5109d41c04521d8c10f39e5bf08f70d1f4d58e8fa0102937efb300119d41ff8",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4170,6 +4177,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1281,
@@ -4183,7 +4191,6 @@
         },
         "reason": "Bindung unvollständig: 2 qty, 0 ratio, op=left"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "22d608d67e55ce6bb4930a78e2bb19e5c9232e28ad03170276e413b964975e58",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4192,6 +4199,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1282,
@@ -4205,7 +4213,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=product"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "58b5e29a86f73c7cb3e059a4b909da427b82db3d6d3f8be833003f4f6b54db56",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4214,6 +4221,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1283,
@@ -4227,7 +4235,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=left"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "6870edb83ee196cd18b87e4460ec2f54a81bf113d2f425b28b50da189cbe61f7",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4236,6 +4243,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1285,
@@ -4249,7 +4257,6 @@
         },
         "reason": "Bindung unvollständig: 4 qty, 0 ratio, op=left"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "191ddec16cd4791adb2a2a2e00dd02d379169c4695fe3cfc8ade075958d7aeb4",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4258,6 +4265,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1287,
@@ -4271,7 +4279,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "d3419c8269cdb946881d4e8e2e2b8b96e5aa081d75bc4c1cdd2ac5722af95119",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4280,6 +4287,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1288,
@@ -4293,7 +4301,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "370f1dabd58264cd58a96e001deb2a3d34f70f365f6ac1013d81c839102b8873",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4302,6 +4309,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1289,
@@ -4315,15 +4323,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "d2df3eca291bb9fa61ec0ca1abdaf539f79a388a9c859aac86308631508bab68",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 140:182",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1292,
@@ -4332,7 +4340,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "dbffd01c046059b8278d9e0517a86a71dfa8fa465253d3cd55889970584a28b3",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4341,6 +4348,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1293,
@@ -4354,7 +4362,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "46bce9107e1ae7735bc4f2cd6cee35d5161d475217674fa69129b234a16e4c52",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4363,6 +4370,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1294,
@@ -4376,7 +4384,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "e53a57cf7d37b643695f013b12b20e46fa58721030a672c9106015e35bcbc887",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4385,6 +4392,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1295,
@@ -4398,7 +4406,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "0c0f15cc9083b3f8608ea984d66aa47df39de10a153296bbf8049d091c65d55a",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4407,6 +4414,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1296,
@@ -4420,15 +4428,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "a7934457a2753fe212e6607f06e5b41937bc281939e8c43ce4f575aab2a8bb4f",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "numeric_clause_unsupported",
+        "reason": "unparsed numeric clause at 76:141",
+        "status": "unsupported"
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1297,
@@ -4442,15 +4450,15 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "ac83a1ad12f01a199d419f96cdb23170130f3a663ac74baa7dd7f8396e6a6eea",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
+        "category": "relation_ambiguous",
+        "reason": "profit actor declaration is not unique",
         "status": "ambiguous"
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1299,
@@ -4464,7 +4472,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=left"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "d4350e7f863b05ee6fc0dc0e92fe04815e183172553fc1674fbef33febb33971",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4473,6 +4480,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1300,
@@ -4486,7 +4494,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=product"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "0e15d21591acf91047c42bb7c8157aba2ff3743e5f08e228f4f850ee51848dbc",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4495,6 +4502,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1302,
@@ -4508,7 +4516,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "0d5bf73514e9adcf4e6cc6ccbc29b3fb52d5962d510d029781a3efa0cc68ca05",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4517,6 +4524,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1303,
@@ -4530,7 +4538,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "82304ae7cf12488ad28928e4fe39e26bcbc79eb57192f685e2bd1f1083593560",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4539,6 +4546,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1304,
@@ -4552,7 +4560,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "83dce85ac5275c165b3cb23cc6d703bbc793d0839b931b1a962288b140412be8",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4561,6 +4568,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1305,
@@ -4574,7 +4582,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "fb7a39c564a466208fe4200cca3885303a99acc75c81b36cc30ae3265fda480a",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4583,6 +4590,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1306,
@@ -4596,7 +4604,6 @@
         },
         "reason": "Bindung unvollständig: 1 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "19f8f54a31c562e3640fdcc97dc3f21924dad555306a7e47377df31aa8cc6714",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4605,6 +4612,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1307,
@@ -4618,7 +4626,6 @@
         },
         "reason": "Bindung unvollständig: 2 qty, 0 ratio, op=left"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "e47612db4c66b2028f10a078db58f9bb91ab3f4d58df21502a7b9efe209aed08",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4627,6 +4634,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1308,
@@ -4640,7 +4648,6 @@
         },
         "reason": "Bindung unvollständig: 1 qty, 1 ratio, op=left"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "d235b82a3a28a094f70f471f336055f7f656ce55ad0037fe440c3e39de1a4be1",
       "structural": {
         "category": "target_unsupported",
@@ -4649,6 +4656,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1309,
@@ -4657,7 +4665,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "5dc76d774bd01a74954bc2acab35f65f9f600d1b6f58bff0a7ba4af83adec48c",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4666,6 +4673,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1310,
@@ -4679,7 +4687,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "055e011172b610fae76c080090cb1551109c2c66429e0a7537b05eee7781ebcb",
       "structural": {
         "category": "question_pronoun_ambiguous",
@@ -4688,6 +4695,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1312,
@@ -4701,7 +4709,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=product"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "b614c3bc0bfe681ccb27a1b6a2513b23fc2384624759c0ac22b2423d6807ba4c",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4710,6 +4717,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1313,
@@ -4723,7 +4731,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "e4d81d5ad61492bdf4c1d82ade25441b1bed31cd6de30ecaac8eccb1d77c461f",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4732,6 +4739,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1314,
@@ -4740,7 +4748,6 @@
         "category": "target_parse_failed",
         "reason": "kein Frageziel"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "74a28283bb4646fcb3ae1b620d6ea17c2d6e47fc84860f5712ccdf4bd2738fe1",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4749,6 +4756,7 @@
       }
     },
     {
+      "current_scope": "grammar_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1315,
@@ -4762,7 +4770,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=diff"
       },
-      "potential_scope": "grammar_scope",
       "question_sha256": "aea1f30b23e918eb4c7bc0faea45a7ee59efbc98d2514a0f079a8a5e448f681f",
       "structural": {
         "category": "numeric_clause_unsupported",
@@ -4771,6 +4778,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1316,
@@ -4784,7 +4792,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "c0676c5d9ca2b510f43acd1e73715754d4e303616d84c859e9725d365ce47da3",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4793,6 +4800,7 @@
       }
     },
     {
+      "current_scope": "potential_coreference_scope",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1317,
@@ -4806,7 +4814,6 @@
         },
         "reason": "Bindung unvollständig: 0 qty, 0 ratio, op=sum"
       },
-      "potential_scope": "potential_coreference_scope",
       "question_sha256": "8140dfb089414657348452b17bf530d02849fe0437e55f06073644c2eb90ab5e",
       "structural": {
         "category": "numeric_pronoun_ambiguous",
@@ -4815,7 +4822,7 @@
       }
     }
   ],
-  "items_sha256": "f79a2fcb9c2b561944f374ef1d87d2c20a36dd8b3d410f4cfbddc4010b0eec89",
+  "items_sha256": "dcc3c243d370764cf42faeec0495476fc3d7ee4baad127c760782702e3014cc4",
   "provenance": {
     "classification_contract": {
       "gold_used_for_classification": false,
@@ -4827,17 +4834,21 @@
         "equation_guard"
       ],
       "structural_categories": [
+        "exact_recovery",
         "numeric_pronoun_ambiguous",
         "question_pronoun_ambiguous",
         "numeric_clause_unsupported",
-        "target_unsupported"
+        "target_unsupported",
+        "relation_ambiguous",
+        "relation_unsupported",
+        "relation_invalid"
       ]
     },
-    "classification_contract_sha256": "6f709d0bee4d541714d47c4e9dcddda1544f5a48466644b90b25a9f1cf383f85",
+    "classification_contract_sha256": "3e38e0fbb7258b520d9472b5eddaa7fdaccdec0a8ae747e23a3c616167c91221",
     "files": {
       "audit_runner": {
         "path": "scripts/fertig_abstention_audit.py",
-        "sha256": "99525e73d66d44e84f97ddfac6dfa29e24277c496362ab03b6820548a3bc72da"
+        "sha256": "05124c03614cef51ebad07b0353fb057a8957808dc8fc6091c07607fb0fdff49"
       },
       "benchmark_report": {
         "path": "results/bench_gsm8k.json",
@@ -4847,13 +4858,21 @@
         "path": "src/immer/cognition/fertig/_vendor/fertig/bindings.py",
         "sha256": "a26e3353199250ccf03d7bc21861979322f4e0ae9897ec385bb6fc9f94b6417b"
       },
+      "signed_event_frontend": {
+        "path": "src/immer/cognition/fertig/signed_event_frontend.py",
+        "sha256": "c5e150f9e36fe07151ced5671502cd1d375f7d1a520dd94eb4bb5c8264feb398"
+      },
+      "signed_expression_compiler": {
+        "path": "src/immer/cognition/fertig/signed_expression.py",
+        "sha256": "0ae1617072452c8749ff11dd70e58a612e3eb22b66ee095ec612f67f3fb63194"
+      },
       "structural_parser": {
         "path": "src/immer/cognition/fertig/structural.py",
-        "sha256": "50cf2cb9434bd2129a7d01053ba783c84560a68add5e1bcb3663babfffdf7992"
+        "sha256": "5d110597da3a82bc708fecd7f6a74e90f393567d0413b17d40c2b799c4ba7cb8"
       }
     }
   },
-  "report_revision": 2,
-  "report_sha256": "7d3001f3b65cf978bbba4f408eab9090fb5dfb41c7d560aa5bd1ff3515a0f6af",
-  "schema": "immer.fertig-abstention-audit/v1"
+  "report_revision": 3,
+  "report_sha256": "871dade4c58cc80e5386ae0f5712116d3e628a991777d4ee76428dfb81013e2d",
+  "schema": "immer.fertig-abstention-audit/v2"
 }
