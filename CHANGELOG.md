@@ -4,13 +4,46 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-25
 
+### Exact K=1–4 continuation and live K=4
+
+- Generalized the layer-major weight-once continuation transaction from K=2
+  to exact K=1–4 execution while preserving tokenwise hidden, KV, DeltaNet,
+  and native Prefix-Sinkhorn state.
+- Added an exact K=4 speculative decoder and causal Qwen3.5 provider with
+  mismatch positions 0–3, EOS positions 0–3, verified-prefix restaging,
+  terminal tails, mutation rejection, and target-only commit ownership.
+- Added a sealed live K=4 harness with an independently executed four-token
+  tokenwise control and a same-prompt 2×K=2 control.
+- The fixed native Prefix-Sinkhorn trial accepts `4/4` proposals. K=4, 2×K=2,
+  and tokenwise control match on output, final target and drafter state, CRSA
+  history, and all four position-hidden hashes.
+- Against 2×K=2, K=4 target source bytes fall `33.893858%`
+  (`151.20 GB → 99.96 GB`), combined target-plus-drafter bytes fall
+  `32.391019%` (`158.22 GB → 106.97 GB`), and wall time falls `25.885088%`
+  (`261.20 s → 193.58 s`), a `1.349256x` speedup.
+- Added a frozen four-prompt long-lived K4 cohort protocol with deterministic
+  question-only selection, counterbalanced K4/2×K2 order, exactly-once bundle
+  authentication and preflight, complete hidden/state/CRSA parity, atomic
+  receipts, and abort-without-retry. The cohort execution remains pending; no
+  cohort result is reported.
+
+### Pressure-triggered cyclic GC
+
+- Replaced per-layer forced cyclic collection with a deterministic interval,
+  RSS-pressure, and teardown policy. Explicit test collection and teardown
+  remain available; metric failures fail closed to collection.
+- The fixed causal Qwen3.8 CPU-BF16 A/B is bit-identical across prefix hidden,
+  continuation hidden, both state manifests, tokens, cursor, and native
+  Prefix-Sinkhorn evidence. Collections fall `134 → 2`, process wall time
+  falls `6.875829%`, and speed rises to `1.073835x`.
+
 ### Causal Qwen3.5 live drafting
 
 - Extended the exact streamed runtime and flat causal-bundle adoption to the
   pinned Qwen3.5-0.8B profile, including nested text configuration, tied
   embeddings, mixed full-attention/DeltaNet layers, and vision/MTP exclusion.
-- Added a local transactional K=2 draft provider. Draft state advances only
-  across target-accepted tokens; mismatch-0, mismatch-1, reset, mutation,
+- Added local transactional K=2 and K=4 draft providers. Draft state advances
+  only across target-accepted tokens; mismatch-0, mismatch-1, reset, mutation,
   terminal, and target-only suffix paths remain state-consistent and fail
   closed.
 - Proved the causalized drafter's two-token greedy output identical to an
@@ -38,9 +71,8 @@ All notable changes to IMMER are recorded here.
   fixture for off, stable graft, and native Prefix-Sinkhorn states.
 - Added tokenwise-exact Prefix-Sinkhorn usage updates inside staged blocks;
   tiny CPU BF16 native K=2 now matches tokenwise hidden and every state bit.
-- Hard-bounded the public transaction to the proven `batch=1, K=2` tranche;
-  larger blocks and batches fail closed until their DeltaNet arithmetic uses a
-  weight-once/tokenwise-linear path. Ordinary decoding is unchanged.
+- Generalized the public transaction to the proven `batch=1, K=1–4` tranche;
+  larger blocks and batches fail closed. Ordinary decoding is unchanged.
 - Added a gold-free official parity harness that replays a sealed off-arm
   `[token, EOS]` chain through two fresh causal-bundle runtimes, hashes every
   hidden/KV/DeltaNet/graft state, authenticates both access traces, and seals
@@ -70,7 +102,7 @@ All notable changes to IMMER are recorded here.
 
 ### Exact event and binding compiler
 
-- Added a span-aware quantitative event frontend that lowers forty-three typed
+- Added a span-aware quantitative event frontend with seventy-four typed
   transaction, rate, comparison, residual, and repeated-duration families to
   exact signed-expression DAGs.
 - Added fully grounded exact `Abs` and `Ceil` expression nodes. Both operators
@@ -80,12 +112,24 @@ All notable changes to IMMER are recorded here.
   multi-month questions remain fail-closed without an explicit day basis.
 - Added unique object-possessive binding for original-length relations without
   global pronoun guessing.
-- Raised the question-only 64-item exact-certificate frontier from 3 to 45;
+- Raised the question-only 64-item public exact-certificate frontier from 3 to
+  58; the structural path certifies 57 and the guarded-formula path adds one;
   every other item remains an abstention.
 - Upgraded the gold-free abstention audit to partition exact recoveries from
-  remaining ambiguity and unsupported grammar. The current report proves 47
-  recoveries from the previous 230 abstentions, leaves 183 fail-closed, and
+  remaining ambiguity and unsupported grammar. The current report proves 74
+  recoveries from the previous 230 abstentions, leaves 156 fail-closed, and
   binds the event/DAG compiler hashes in report provenance.
+- Added typed discourse SSA with exact singular/plural referents, role and unit
+  identity, topological definitions, target closure, and cycle rejection.
+- Added closed calendar/schedule algebra for weekly complements, disjoint day
+  sets, explicit periods, frequency conversion, and weekday exceptions.
+- Added exact ground recurrence algebra for terminal and cumulative affine
+  recurrence and fixed-base growth. The cumulative recovery chain is
+  `42 + 5 + 10 + 9 + 4`.
+- Added closed bundle/tariff algebra for equal daily budgets, two-day discount
+  differences, exact monthly duration ledgers, and typed positive-part
+  installation overage charges. The final cumulative chain is
+  `42 + 5 + 10 + 9 + 4 + 4`.
 - Added typed part, package-capacity, fractional-remainder, pooled-allowance,
   inverse-duration, exact-trip-minimum, temporal block remainder, exhaustive
   unit-rate, recurring-pronoun rate, and absolute weighted-difference DAGs.

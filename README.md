@@ -19,7 +19,7 @@ release surface.
 - **Local target execution.** Qwen3.8-27B runs directly from causalized local
   weights with stateful full-attention and DeltaNet continuation.
 - **Native local drafting.** A causalized Qwen3.5-0.8B proposes transactional
-  K=2 continuations that Qwen3.8 alone verifies and commits.
+  K=2 and K=4 continuations that Qwen3.8 alone verifies and commits.
 - **Grounded composition.** [FERTIG](https://github.com/DT-Foss/FERTIG)
   supplies deterministic parsing, verification, and explicit abstention.
 - **Transport intelligence.** Label-free route observations support held-out
@@ -33,9 +33,10 @@ release surface.
 
 | Trial | Result | Scope |
 |---|---:|---|
-| Qwen3.8 exact continuation | bit-identical K=2 state | 64-layer CPU-BF16 parity trial; 50.00% fewer source bytes and 1.869x model-time speedup |
-| Qwen3.5 → Qwen3.8 live drafting | 2/2 draft tokens accepted | fixed two-token native Prefix-Sinkhorn trial; 31.24% fewer combined source bytes and 1.299x wall-time speedup |
-| FERTIG exact frontier | 45/64 certified, 19 abstained | fixed gold-free development slice; holdout untouched |
+| Qwen3.8 exact continuation | bit-identical K=1–4 state | exact transactional core with tokenwise hidden, KV, DeltaNet, and Prefix-Sinkhorn parity |
+| Qwen3.5 → Qwen3.8 live K=4 | 4/4 draft tokens accepted | fixed native Prefix-Sinkhorn trial; 32.39% fewer combined source bytes and 1.349x wall-time speedup versus 2×K=2 |
+| Qwen GC pressure policy | bit-identical; 134 → 2 collections | fixed causal CPU-BF16 A/B; 6.88% less process wall time and 1.074x speedup |
+| FERTIG exact frontier | 58/64 certified, 6 abstained | fixed gold-free development slice; holdout untouched |
 
 The public benchmark ledger states the exact corpus and measurement boundary
 for every released number: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
