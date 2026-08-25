@@ -24,7 +24,7 @@ QUARANTINED_MATH_ROWS = (
     1272,
     1306,
 )
-FORMERLY_MASKED_BINDING_ERRORS = (570, 1295)
+FORMERLY_MASKED_BINDING_ERRORS = (1295,)
 CERTIFIED_MATH_ROWS = {
     53: "40",
     128: "880",
@@ -44,14 +44,18 @@ CERTIFIED_MATH_ROWS = {
     541: "50",
     # Recent exact frontend waves, independently derived from question text.
     547: "81",
+    570: "23",
     578: "48",
     580: "500",
     603: "1800",
     627: "54",
+    650: "142",
     682: "80",
     782: "27",
     802: "6",
     810: "310",
+    830: "18.8",
+    831: "324",
     833: "40",
     900: "15",
     959: "7",

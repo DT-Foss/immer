@@ -25,6 +25,7 @@ from .signed_expression import (
     LiteralExpr,
     MeanExpr,
     ProductExpr,
+    PositivePartExpr,
     QuotientExpr,
     RefExpr,
     SumExpr,
@@ -125,7 +126,9 @@ def _references(expr: Expression) -> set[SymbolKey]:
         for value in expr.values:
             rows.update(_references(value))
         return rows
-    if isinstance(expr, (AbsoluteExpr, CeilingExpr, UnitConversionExpr)):
+    if isinstance(
+        expr, (AbsoluteExpr, PositivePartExpr, CeilingExpr, UnitConversionExpr)
+    ):
         return _references(expr.value)
     if isinstance(expr, ClosedShareExpr):
         return _references(expr.existing) | _references(expr.share)

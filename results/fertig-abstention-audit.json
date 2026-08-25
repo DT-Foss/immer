@@ -21,13 +21,13 @@
       "target_parse_failed": 57
     },
     "scope": {
-      "exact_recovery_scope": 70,
-      "grammar_scope": 86,
+      "exact_recovery_scope": 74,
+      "grammar_scope": 82,
       "potential_coreference_scope": 74
     },
     "structural": {
-      "exact_recovery": 70,
-      "numeric_clause_unsupported": 80,
+      "exact_recovery": 74,
+      "numeric_clause_unsupported": 76,
       "numeric_pronoun_ambiguous": 71,
       "question_pronoun_ambiguous": 3,
       "relation_ambiguous": 1,
@@ -42,16 +42,17 @@
     "vendored legacy binding diagnostics",
     "structural parse diagnostics"
   ],
-  "current_exact_recoveries": 70,
-  "current_remaining_abstentions": 160,
+  "current_exact_recoveries": 74,
+  "current_remaining_abstentions": 156,
   "exact_recovery_attribution": {
     "attribution": "The current total is cumulative across every listed exact mechanism; it is not attributed to one planner wave.",
-    "current_total": 70,
+    "current_total": 74,
     "identity": {
-      "count": 70,
+      "count": 74,
       "indices": [
         547,
         550,
+        570,
         574,
         578,
         587,
@@ -62,6 +63,7 @@
         627,
         631,
         643,
+        650,
         651,
         672,
         682,
@@ -86,6 +88,8 @@
         819,
         823,
         825,
+        830,
+        831,
         833,
         836,
         837,
@@ -121,10 +125,10 @@
         1300,
         1304
       ],
-      "indices_sha256": "69e178b89fdf0ef8ea54f4f793c17dcfd906f97c1eb051177a6a53c48b5abfd8"
+      "indices_sha256": "6a18d5e5bb7a5bce7a1395cc9b3284ff093e2d131bb82d00908f1bea7702d272"
     },
     "mechanism_identity": {
-      "count": 70,
+      "count": 74,
       "rows": [
         {
           "index": 547,
@@ -133,6 +137,10 @@
         {
           "index": 550,
           "mechanism": "signed_event:discounted_purchase_ledger"
+        },
+        {
+          "index": 570,
+          "mechanism": "signed_event:equal_daily_budget_item_schedule"
         },
         {
           "index": 574,
@@ -173,6 +181,10 @@
         {
           "index": 643,
           "mechanism": "signed_event:combined_daily_total"
+        },
+        {
+          "index": 650,
+          "mechanism": "signed_event:two_day_discount_price_difference"
         },
         {
           "index": 651,
@@ -269,6 +281,14 @@
         {
           "index": 825,
           "mechanism": "clause_compiler"
+        },
+        {
+          "index": 830,
+          "mechanism": "signed_event:closed_monthly_duration_ledger"
+        },
+        {
+          "index": 831,
+          "mechanism": "signed_event:typed_installation_overage_cost"
         },
         {
           "index": 833,
@@ -407,7 +427,7 @@
           "mechanism": "signed_event:typed_scaled_measure_difference"
         }
       ],
-      "rows_sha256": "3439d71b0cb134c86330c3fbe9c965d42f4d90430acb2f45e19d652de4f28feb"
+      "rows_sha256": "6e825130f1c8c131fc4b0bafd0459d11e6ae161500c283ab3c1d06fe2f425a69"
     },
     "mechanisms": {
       "clause_compiler": {
@@ -537,6 +557,13 @@
         ],
         "indices_sha256": "52f97f163880dc38bb48165ad68fcf286f9ecd5fba7f2be409648b37c95d7f15"
       },
+      "signed_event:closed_monthly_duration_ledger": {
+        "count": 1,
+        "indices": [
+          830
+        ],
+        "indices_sha256": "18b6adfeb80b373cba1cf5005469f61649491f9013b8c60d63c4fc387239fcd4"
+      },
       "signed_event:closed_monthly_state_recurrence": {
         "count": 1,
         "indices": [
@@ -606,6 +633,13 @@
           916
         ],
         "indices_sha256": "bbc30a443b211f7f4c354ae3b81bb32b362ab30f51f4e999e5eba6e517176d56"
+      },
+      "signed_event:equal_daily_budget_item_schedule": {
+        "count": 1,
+        "indices": [
+          570
+        ],
+        "indices_sha256": "6eccad61c35b2399f78275b765b3faadd8c618b60dfacd91acf102115f8492f4"
       },
       "signed_event:equal_share_residual": {
         "count": 1,
@@ -825,6 +859,13 @@
         ],
         "indices_sha256": "e0edce42b2e517f3fa9b423a1f71c59dcc633a6f392a9530c371ef644ff10a48"
       },
+      "signed_event:two_day_discount_price_difference": {
+        "count": 1,
+        "indices": [
+          650
+        ],
+        "indices_sha256": "cc157199a785b530298e7dc6870b26f49bd3990ae0b8ad13f0310679730ced70"
+      },
       "signed_event:typed_bowl_capacity_leftover": {
         "count": 1,
         "indices": [
@@ -838,6 +879,13 @@
           694
         ],
         "indices_sha256": "be5ea0aae4d2721ad9a69405892c3b46d589516daee5256eb467bed5c386d418"
+      },
+      "signed_event:typed_installation_overage_cost": {
+        "count": 1,
+        "indices": [
+          831
+        ],
+        "indices_sha256": "e5cad3924626346a6734c9fbb1afb2ae957e81c5d78dfddd1b7e668c0f2b02e6"
       },
       "signed_event:typed_percentage_trade_transitions": {
         "count": 1,
@@ -944,7 +992,8 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:equal_daily_budget_item_schedule",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 570,
@@ -955,9 +1004,9 @@
       },
       "question_sha256": "c0cd2a6956c0c6c4160338cdaf126ac825a94f5d85f26879f8c6d57e1cfb3d90",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:71",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: equal_daily_budget_item_schedule",
+        "status": "parsed"
       }
     },
     {
@@ -1168,7 +1217,8 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:two_day_discount_price_difference",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 650,
@@ -1179,9 +1229,9 @@
       },
       "question_sha256": "2ef174b9372aad840542160b031da72c297a615c6489ace4700647d042037860",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:52",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: two_day_discount_price_difference",
+        "status": "parsed"
       }
     },
     {
@@ -1729,7 +1779,8 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:closed_monthly_duration_ledger",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 830,
@@ -1745,13 +1796,14 @@
       },
       "question_sha256": "0d3dc91f7dd0f0f28de95126e4bfb4f9f609d7ef3849078ef65658e73597f8af",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:51",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: closed_monthly_duration_ledger",
+        "status": "parsed"
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:typed_installation_overage_cost",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 831,
@@ -1767,9 +1819,9 @@
       },
       "question_sha256": "f23967bf69dffbbf5ed078b32b046a105d4e8e0e3cb873c18c2b58e96af11969",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:55",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: typed_installation_overage_cost",
+        "status": "parsed"
       }
     },
     {
@@ -5738,7 +5790,7 @@
       }
     }
   ],
-  "items_sha256": "60c362fc428d7f9868dbba3aef1648800610a69f4508f9f7c07f16ee10f48636",
+  "items_sha256": "05609087c85d64061eb9a3bee99705e77f14330052b27b1dba1d1b3733d3f0f5",
   "provenance": {
     "classification_contract": {
       "gold_used_for_classification": false,
@@ -5764,7 +5816,7 @@
     "files": {
       "audit_runner": {
         "path": "scripts/fertig_abstention_audit.py",
-        "sha256": "5bd9ce54eb10386281c60a4cb8c0dd06df3baf0a1890687e7e1a6af8ab5185c7"
+        "sha256": "b2cc6bbbc4fa4e5a1e5056780f13f8fd86f50d1a7b1fe00aa0a07de6a02bf87e"
       },
       "benchmark_report": {
         "path": "results/bench_gsm8k.json",
@@ -5776,11 +5828,11 @@
       },
       "signed_event_frontend": {
         "path": "src/immer/cognition/fertig/signed_event_frontend.py",
-        "sha256": "e1d259ad0b8d7ffb830223916401e24b01aa02db9a961d271e810142bc3f372f"
+        "sha256": "8b91a3a99e8db368b8cf35aec949ac81836f76f878e9762294408defbce66157"
       },
       "signed_expression_compiler": {
         "path": "src/immer/cognition/fertig/signed_expression.py",
-        "sha256": "7ec50e2428437d4f4df00ff988f7c4924d57f54ce645f80726a5e3469032384c"
+        "sha256": "1fcc27202eb75be753188e23d0ff635792fa172122a59cf5e669d94a5341253c"
       },
       "structural_parser": {
         "path": "src/immer/cognition/fertig/structural.py",
@@ -5788,7 +5840,7 @@
       },
       "typed_discourse_ssa": {
         "path": "src/immer/cognition/fertig/discourse_ssa.py",
-        "sha256": "9257473f49ae874f0ed784087af66431b9fe4eb02c08720f46be082b4735b592"
+        "sha256": "207229ad970bdffc1c62d0440d3149cb6feae81df75eac26215fef4469f2c981"
       }
     }
   },
@@ -5797,195 +5849,69 @@
     "added_identity": {
       "count": 4,
       "indices": [
-        547,
-        810,
-        1016,
-        1172
+        570,
+        650,
+        830,
+        831
       ],
-      "indices_sha256": "ede36b28266846ab6aeb776ab6cd7440d1cbfa4fd39cf9589cdc828e504bf125"
+      "indices_sha256": "a089fda4c3843655a60ad35faff29000ea126a5083925f2b542ee040f7b6d02d"
     },
-    "attribution": "70 exact recoveries after closed-recurrence-algebra/v1 = 66 previously sealed + 4 added; this wave claims 4, not 70.",
-    "current_exact_recoveries": 70,
+    "attribution": "74 exact recoveries after closed-bundle-tariff-algebra/v1 = 70 previously sealed + 4 added; this wave claims 4, not 74.",
+    "current_exact_recoveries": 74,
     "mechanism_identity": {
       "count": 4,
       "rows": [
         {
-          "index": 547,
-          "mechanism": "signed_event:closed_phone_tree_recurrence"
+          "index": 570,
+          "mechanism": "signed_event:equal_daily_budget_item_schedule"
         },
         {
-          "index": 810,
-          "mechanism": "signed_event:closed_monthly_state_recurrence"
+          "index": 650,
+          "mechanism": "signed_event:two_day_discount_price_difference"
         },
         {
-          "index": 1016,
-          "mechanism": "signed_event:fixed_base_percentage_recurrence"
+          "index": 830,
+          "mechanism": "signed_event:closed_monthly_duration_ledger"
         },
         {
-          "index": 1172,
-          "mechanism": "signed_event:closed_daily_geometric_total"
+          "index": 831,
+          "mechanism": "signed_event:typed_installation_overage_cost"
         }
       ],
-      "rows_sha256": "ba3b2442320639213d729609e46aaeafa5b484377789aec782004cd40d0e01de"
+      "rows_sha256": "d8aaad165a32c098b981b5bbb7a03dd5736520c94cbe153ea9d38687ff7bc171"
     },
     "mechanisms": {
-      "signed_event:closed_daily_geometric_total": {
+      "signed_event:closed_monthly_duration_ledger": {
         "count": 1,
         "indices": [
-          1172
+          830
         ],
-        "indices_sha256": "26bb5b89567a53e6f9cbd5c6d03afb4386da686eda408eef90c773a8656edf64"
+        "indices_sha256": "18b6adfeb80b373cba1cf5005469f61649491f9013b8c60d63c4fc387239fcd4"
       },
-      "signed_event:closed_monthly_state_recurrence": {
+      "signed_event:equal_daily_budget_item_schedule": {
         "count": 1,
         "indices": [
-          810
+          570
         ],
-        "indices_sha256": "91b13cc40d45f95ee98caf0e216908851fc11c5f9e2075956c43e8f9e2a5a26b"
+        "indices_sha256": "6eccad61c35b2399f78275b765b3faadd8c618b60dfacd91acf102115f8492f4"
       },
-      "signed_event:closed_phone_tree_recurrence": {
+      "signed_event:two_day_discount_price_difference": {
         "count": 1,
         "indices": [
-          547
+          650
         ],
-        "indices_sha256": "1051c287a283ee53dbe624184fbff18506335ddb4d4eb60da86e37c8e289f812"
+        "indices_sha256": "cc157199a785b530298e7dc6870b26f49bd3990ae0b8ad13f0310679730ced70"
       },
-      "signed_event:fixed_base_percentage_recurrence": {
+      "signed_event:typed_installation_overage_cost": {
         "count": 1,
         "indices": [
-          1016
+          831
         ],
-        "indices_sha256": "c67b55198d5d6378eb6718de259097965ef2eecdc6200bc3e2e26cfe48738a80"
+        "indices_sha256": "e5cad3924626346a6734c9fbb1afb2ae957e81c5d78dfddd1b7e668c0f2b02e6"
       }
     },
-    "previously_sealed_exact_recoveries": 66,
+    "previously_sealed_exact_recoveries": 70,
     "previously_sealed_identity": {
-      "count": 66,
-      "indices": [
-        550,
-        574,
-        578,
-        587,
-        603,
-        610,
-        613,
-        619,
-        627,
-        631,
-        643,
-        651,
-        672,
-        682,
-        692,
-        694,
-        701,
-        722,
-        724,
-        731,
-        745,
-        746,
-        747,
-        754,
-        763,
-        770,
-        778,
-        780,
-        782,
-        797,
-        802,
-        819,
-        823,
-        825,
-        833,
-        836,
-        837,
-        840,
-        844,
-        861,
-        865,
-        868,
-        883,
-        892,
-        900,
-        901,
-        913,
-        916,
-        924,
-        930,
-        934,
-        944,
-        959,
-        992,
-        1064,
-        1192,
-        1194,
-        1217,
-        1219,
-        1246,
-        1252,
-        1253,
-        1261,
-        1293,
-        1300,
-        1304
-      ],
-      "indices_sha256": "ab17e011da92291b843fabecf3aa633c8df612d93c6ebf4635801f7ca01247d4"
-    },
-    "wave_id": "closed-recurrence-algebra/v1"
-  },
-  "recovery_wave_history": {
-    "attribution": "70 current exact recoveries = 42 sealed baseline + 5 by ground-operators-conservative-coreference/v1 + 10 by typed-discourse-ssa-affine/v1 + 9 by closed-calendar-schedule-algebra/v1 + 4 by closed-recurrence-algebra/v1; wave deltas are disjoint and cumulative.",
-    "baseline_exact_recoveries": 42,
-    "baseline_identity": {
-      "count": 42,
-      "indices": [
-        550,
-        574,
-        587,
-        610,
-        613,
-        619,
-        631,
-        643,
-        651,
-        682,
-        692,
-        694,
-        701,
-        722,
-        724,
-        731,
-        745,
-        746,
-        747,
-        754,
-        763,
-        770,
-        778,
-        797,
-        819,
-        823,
-        825,
-        836,
-        837,
-        840,
-        844,
-        861,
-        865,
-        868,
-        883,
-        892,
-        901,
-        913,
-        916,
-        924,
-        930,
-        934
-      ],
-      "indices_sha256": "8f92f3bf70d392efbf07d8513fb0a9d67720abba550c0131dc807cf55b964310"
-    },
-    "current_exact_recoveries": 70,
-    "current_identity": {
       "count": 70,
       "indices": [
         547,
@@ -6060,6 +5986,140 @@
         1304
       ],
       "indices_sha256": "69e178b89fdf0ef8ea54f4f793c17dcfd906f97c1eb051177a6a53c48b5abfd8"
+    },
+    "wave_id": "closed-bundle-tariff-algebra/v1"
+  },
+  "recovery_wave_history": {
+    "attribution": "74 current exact recoveries = 42 sealed baseline + 5 by ground-operators-conservative-coreference/v1 + 10 by typed-discourse-ssa-affine/v1 + 9 by closed-calendar-schedule-algebra/v1 + 4 by closed-recurrence-algebra/v1 + 4 by closed-bundle-tariff-algebra/v1; wave deltas are disjoint and cumulative.",
+    "baseline_exact_recoveries": 42,
+    "baseline_identity": {
+      "count": 42,
+      "indices": [
+        550,
+        574,
+        587,
+        610,
+        613,
+        619,
+        631,
+        643,
+        651,
+        682,
+        692,
+        694,
+        701,
+        722,
+        724,
+        731,
+        745,
+        746,
+        747,
+        754,
+        763,
+        770,
+        778,
+        797,
+        819,
+        823,
+        825,
+        836,
+        837,
+        840,
+        844,
+        861,
+        865,
+        868,
+        883,
+        892,
+        901,
+        913,
+        916,
+        924,
+        930,
+        934
+      ],
+      "indices_sha256": "8f92f3bf70d392efbf07d8513fb0a9d67720abba550c0131dc807cf55b964310"
+    },
+    "current_exact_recoveries": 74,
+    "current_identity": {
+      "count": 74,
+      "indices": [
+        547,
+        550,
+        570,
+        574,
+        578,
+        587,
+        603,
+        610,
+        613,
+        619,
+        627,
+        631,
+        643,
+        650,
+        651,
+        672,
+        682,
+        692,
+        694,
+        701,
+        722,
+        724,
+        731,
+        745,
+        746,
+        747,
+        754,
+        763,
+        770,
+        778,
+        780,
+        782,
+        797,
+        802,
+        810,
+        819,
+        823,
+        825,
+        830,
+        831,
+        833,
+        836,
+        837,
+        840,
+        844,
+        861,
+        865,
+        868,
+        883,
+        892,
+        900,
+        901,
+        913,
+        916,
+        924,
+        930,
+        934,
+        944,
+        959,
+        992,
+        1016,
+        1064,
+        1172,
+        1192,
+        1194,
+        1217,
+        1219,
+        1246,
+        1252,
+        1253,
+        1261,
+        1293,
+        1300,
+        1304
+      ],
+      "indices_sha256": "6a18d5e5bb7a5bce7a1395cc9b3284ff093e2d131bb82d00908f1bea7702d272"
     },
     "waves": [
       {
@@ -6711,10 +6771,155 @@
           "indices_sha256": "ab17e011da92291b843fabecf3aa633c8df612d93c6ebf4635801f7ca01247d4"
         },
         "wave_id": "closed-recurrence-algebra/v1"
+      },
+      {
+        "added_exact_recoveries": 4,
+        "added_identity": {
+          "count": 4,
+          "indices": [
+            570,
+            650,
+            830,
+            831
+          ],
+          "indices_sha256": "a089fda4c3843655a60ad35faff29000ea126a5083925f2b542ee040f7b6d02d"
+        },
+        "attribution": "74 exact recoveries after closed-bundle-tariff-algebra/v1 = 70 previously sealed + 4 added; this wave claims 4, not 74.",
+        "current_exact_recoveries": 74,
+        "mechanism_identity": {
+          "count": 4,
+          "rows": [
+            {
+              "index": 570,
+              "mechanism": "signed_event:equal_daily_budget_item_schedule"
+            },
+            {
+              "index": 650,
+              "mechanism": "signed_event:two_day_discount_price_difference"
+            },
+            {
+              "index": 830,
+              "mechanism": "signed_event:closed_monthly_duration_ledger"
+            },
+            {
+              "index": 831,
+              "mechanism": "signed_event:typed_installation_overage_cost"
+            }
+          ],
+          "rows_sha256": "d8aaad165a32c098b981b5bbb7a03dd5736520c94cbe153ea9d38687ff7bc171"
+        },
+        "mechanisms": {
+          "signed_event:closed_monthly_duration_ledger": {
+            "count": 1,
+            "indices": [
+              830
+            ],
+            "indices_sha256": "18b6adfeb80b373cba1cf5005469f61649491f9013b8c60d63c4fc387239fcd4"
+          },
+          "signed_event:equal_daily_budget_item_schedule": {
+            "count": 1,
+            "indices": [
+              570
+            ],
+            "indices_sha256": "6eccad61c35b2399f78275b765b3faadd8c618b60dfacd91acf102115f8492f4"
+          },
+          "signed_event:two_day_discount_price_difference": {
+            "count": 1,
+            "indices": [
+              650
+            ],
+            "indices_sha256": "cc157199a785b530298e7dc6870b26f49bd3990ae0b8ad13f0310679730ced70"
+          },
+          "signed_event:typed_installation_overage_cost": {
+            "count": 1,
+            "indices": [
+              831
+            ],
+            "indices_sha256": "e5cad3924626346a6734c9fbb1afb2ae957e81c5d78dfddd1b7e668c0f2b02e6"
+          }
+        },
+        "previously_sealed_exact_recoveries": 70,
+        "previously_sealed_identity": {
+          "count": 70,
+          "indices": [
+            547,
+            550,
+            574,
+            578,
+            587,
+            603,
+            610,
+            613,
+            619,
+            627,
+            631,
+            643,
+            651,
+            672,
+            682,
+            692,
+            694,
+            701,
+            722,
+            724,
+            731,
+            745,
+            746,
+            747,
+            754,
+            763,
+            770,
+            778,
+            780,
+            782,
+            797,
+            802,
+            810,
+            819,
+            823,
+            825,
+            833,
+            836,
+            837,
+            840,
+            844,
+            861,
+            865,
+            868,
+            883,
+            892,
+            900,
+            901,
+            913,
+            916,
+            924,
+            930,
+            934,
+            944,
+            959,
+            992,
+            1016,
+            1064,
+            1172,
+            1192,
+            1194,
+            1217,
+            1219,
+            1246,
+            1252,
+            1253,
+            1261,
+            1293,
+            1300,
+            1304
+          ],
+          "indices_sha256": "69e178b89fdf0ef8ea54f4f793c17dcfd906f97c1eb051177a6a53c48b5abfd8"
+        },
+        "wave_id": "closed-bundle-tariff-algebra/v1"
       }
     ]
   },
-  "report_revision": 7,
-  "report_sha256": "37069477ec7b29bc3f298cf1a999d8e990421decdc2b96c23de26b350cf895fa",
+  "report_revision": 8,
+  "report_sha256": "c90a73400c31420dab18e5d5b1e8a91146138b006a7435b4f6672de7c52be547",
   "schema": "immer.fertig-abstention-audit/v2"
 }

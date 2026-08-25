@@ -36,6 +36,7 @@ from .signed_expression import (
     MeanExpr,
     NumericEvidence,
     ProductExpr,
+    PositivePartExpr,
     QuotientExpr,
     RefExpr,
     SignedTerm,
@@ -6413,6 +6414,872 @@ def _closed_disjoint_week_schedule(
     )
 
 
+def _equal_daily_budget_item_schedule(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Split one weekly budget over an inclusive weekday range and its rest."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:3] == ("how", "many", "total")
+        and _contains(question.norms, "by", "the", "end", "of", "the", "week")
+    ):
+        return None
+    intro_rows = [
+        clause
+        for clause in clause_set
+        if (
+            not clause.question
+            and "wishes" in clause.norms
+            and _contains(clause.norms, "equal", "amount", "each", "day")
+            and _contains(clause.norms, "for", "one", "week")
+        )
+    ]
+    if not intro_rows:
+        return None
+    _require(
+        len(clause_set) == 4 and len(intro_rows) == 1,
+        "daily-budget schedule has clauses outside the closed week",
+        FrontendStatus.AMBIGUOUS,
+    )
+    intro = intro_rows[0]
+    range_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and clause.norms[:1] == ("from",)
+            and "through" in clause.norms
+            and "spent" in clause.norms
+            and "cost" in clause.norms
+        ),
+        reason="inclusive weekday spending segment is not unique",
+    )
+    rest_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and clause.norms[:6] == ("for", "the", "rest", "of", "the", "week")
+            and "buy" in clause.norms
+            and "cost" in clause.norms
+        ),
+        reason="rest-of-week spending segment is not unique",
+    )
+    _require_single_target_marker(question)
+    owner, owner_index = _leading_subject(intro)
+    budget = _one_token(_money_tokens(intro), "weekly budget is missing")
+    _require(
+        owner_index == 0
+        and intro.norms[1:7]
+        == ("has", budget.norm, "and", "wishes", "to", "spend")
+        and intro.norms[7:]
+        == (
+            "an",
+            "equal",
+            "amount",
+            "each",
+            "day",
+            "for",
+            "one",
+            "week",
+        ),
+        "daily budget owner, equality, or one-week scope differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    weekdays = [
+        token for token in range_clause.tokens if token.norm in _WEEKDAY_NAMES
+    ]
+    _require(
+        len(weekdays) == 2
+        and range_clause.norms[:5]
+        == ("from", weekdays[0].norm, "through", weekdays[1].norm, ","),
+        "weekday range must have exactly two inclusive endpoints",
+        FrontendStatus.AMBIGUOUS,
+    )
+    range_days = (
+        (_WEEKDAY_INDEX[weekdays[1].norm] - _WEEKDAY_INDEX[weekdays[0].norm]) % 7
+    ) + 1
+    rest_days = 7 - range_days
+    _require(
+        0 < range_days < 7 and rest_days > 0,
+        "weekday range and rest must be disjoint nonempty segments of seven days",
+        FrontendStatus.INVALID,
+    )
+
+    pronoun = range_clause.norms[5] if len(range_clause.tokens) > 5 else ""
+    possessive = {"he": "his", "she": "her", "they": "their"}.get(pronoun)
+    _require(
+        possessive is not None
+        and range_clause.norms[5:10]
+        == (pronoun, "spent", possessive, "money", "on")
+        and rest_clause.norms[6:10] == (",", pronoun, "will", "buy")
+        and question.norms[5:8] == ("will", pronoun, "have"),
+        "daily-budget pronouns do not preserve one owner",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    def priced_item(clause: Clause, start_word: str) -> tuple[tuple[str, ...], Token]:
+        start = clause.norms.index(start_word) + 1
+        which_rows = [
+            index
+            for index in range(start, len(clause.tokens))
+            if clause.norms[index] == "which"
+        ]
+        _require(len(which_rows) == 1, "priced item has no unique relative clause")
+        which = which_rows[0]
+        price = _one_token(_money_tokens(clause), "segment unit price is missing")
+        price_index = clause.tokens.index(price)
+        _require(
+            which > start
+            and clause.norms[which:price_index] == ("which", "cost")
+            and clause.norms[price_index + 1 :] == ("each",),
+            "segment price lacks one local each-item basis",
+            FrontendStatus.AMBIGUOUS,
+        )
+        return tuple(clause.norms[start:which]), price
+
+    first_item, first_price = priced_item(range_clause, "on")
+    second_item, second_price = priced_item(rest_clause, "buy")
+    target_item = tuple(question.norms[3:5])
+    common_width = 0
+    for width in range(1, min(len(first_item), len(second_item)) + 1):
+        if first_item[-width:] != second_item[-width:]:
+            break
+        common_width = width
+    _require(
+        common_width > 0
+        and first_item[-common_width:] == target_item
+        and first_item != second_item,
+        "weekly segments and target do not share one typed item family",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        question.norms
+        == (
+            "how",
+            "many",
+            "total",
+            *target_item,
+            "will",
+            pronoun,
+            "have",
+            "by",
+            "the",
+            "end",
+            "of",
+            "the",
+            "week",
+        ),
+        "daily-budget target contains an unbound relation",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        budget.number is not None
+        and budget.number >= 0
+        and first_price.number is not None
+        and first_price.number > 0
+        and second_price.number is not None
+        and second_price.number > 0,
+        "weekly budget and item prices must be non-negative with positive rates",
+        FrontendStatus.INVALID,
+    )
+    daily_budget = budget.number / 7
+    first_count = daily_budget * range_days / first_price.number
+    second_count = daily_budget * rest_days / second_price.number
+    _require(
+        first_count.denominator == second_count.denominator == 1,
+        "daily spending does not imply integral item counts in both segments",
+        FrontendStatus.INVALID,
+    )
+
+    builder = _Builder(source, clause_set)
+    per_day = QuotientExpr(
+        builder.literal(budget, MONEY),
+        builder.lexical_literal(intro.tokens[-1], Fraction(7), TIME),
+        intro.span,
+    )
+    per_day_symbol = SymbolKey(
+        owner, "budget", "money", "day", "equal_daily"
+    )
+    per_day_definition = Definition(per_day_symbol, per_day, intro.span)
+    first_total = QuotientExpr(
+        _product(
+            RefExpr(per_day_symbol, range_clause.span),
+            builder.lexical_literal(weekdays[1], Fraction(range_days), TIME),
+        ),
+        builder.literal(first_price, PRICE_PER_COUNT),
+        range_clause.span,
+    )
+    second_total = QuotientExpr(
+        _product(
+            RefExpr(per_day_symbol, rest_clause.span),
+            builder.lexical_literal(rest_clause.tokens[2], Fraction(rest_days), TIME),
+        ),
+        builder.literal(second_price, PRICE_PER_COUNT),
+        rest_clause.span,
+    )
+    expression = _sum(
+        _signed(1, first_total, "inclusive_weekday_items"),
+        _signed(1, second_total, "rest_of_week_items"),
+    )
+    return builder.finish(
+        expression,
+        "equal_daily_budget_item_schedule",
+        definitions=(per_day_definition,),
+    )
+
+
+def _two_day_discount_price_difference(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Compare same-item totals under a fixed voucher and a percent discount."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:5] == ("what", "is", "the", "difference", "between")
+        and _contains(question.norms, "final", "prices", "paid")
+        and question.norms[-4:] == ("on", "the", "two", "days")
+    ):
+        return None
+    first_rows = [
+        clause
+        for clause in clause_set
+        if (
+            not clause.question
+            and clause.norms[:1] == ("on",)
+            and "bought" in clause.norms
+            and "at" in clause.norms
+            and "each" in clause.norms
+        )
+    ]
+    if not first_rows:
+        return None
+    _require(
+        len(clause_set) == 5 and len(first_rows) == 1,
+        "two-day price comparison has clauses outside the closed ledger",
+        FrontendStatus.AMBIGUOUS,
+    )
+    first = first_rows[0]
+    voucher_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "voucher" in clause.norms
+            and "off" in clause.norms
+            and bool(_money_tokens(clause))
+        ),
+        reason="fixed voucher clause is not unique",
+    )
+    discount_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and _contains(clause.norms, "the", "next", "day")
+            and "discount" in clause.norms
+            and bool(_money_tokens(clause))
+        ),
+        reason="next-day percentage price clause is not unique",
+    )
+    second = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "advantage" in clause.norms
+            and "bought" in clause.norms
+            and bool(_counts(clause))
+        ),
+        reason="discounted purchase clause is not unique",
+    )
+    _require_single_target_marker(question)
+
+    weekdays = [token for token in first.tokens if token.norm in _WEEKDAY_NAMES]
+    first_quantity = _one_token(_counts(first), "first-day item count is missing")
+    first_price = _one_token(_money_tokens(first), "first-day unit price is missing")
+    bought = first.norms.index("bought")
+    at = first.norms.index("at")
+    _require(
+        len(weekdays) == 1
+        and first.norms[:3] == ("on", weekdays[0].norm, ",")
+        and first.tokens[3].text[:1].isupper()
+        and first.tokens.index(first_quantity) == bought + 1
+        and first.tokens.index(first_price) == at + 1
+        and first.norms[first.tokens.index(first_price) + 1 :] == ("each",),
+        "first-day actor, item quantity, or each-price basis differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    first_item = tuple(first.norms[bought + 2 : at])
+    _require(
+        bool(first_item)
+        and first.norms
+        == (
+            "on",
+            weekdays[0].norm,
+            ",",
+            first.norms[3],
+            "bought",
+            first_quantity.norm,
+            *first_item,
+            "at",
+            first_price.norm,
+            "each",
+        ),
+        "first-day purchase contains an unbound item relation",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    voucher = _one_token(_money_tokens(voucher_clause), "voucher amount is missing")
+    first_pronouns = [
+        token.norm
+        for token in voucher_clause.tokens
+        if token.norm in {"he", "she", "they"}
+    ]
+    _require(
+        voucher_clause.norms[:3] == ("at", "the", "till")
+        and len(first_pronouns) == 2
+        and len(set(first_pronouns)) == 1
+        and voucher_clause.norms
+        == (
+            "at",
+            "the",
+            "till",
+            first_pronouns[0],
+            "got",
+            voucher.norm,
+            "off",
+            "because",
+            first_pronouns[0],
+            "had",
+            "a",
+            "voucher",
+        ),
+        "voucher is not bound to one first-day buyer and final total",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    second_price = _one_token(
+        _money_tokens(discount_clause), "next-day unit price is missing"
+    )
+    discount = _one_token(
+        _counts(discount_clause), "next-day discount percentage is missing"
+    )
+    price_index = discount_clause.tokens.index(second_price)
+    discount_index = discount_clause.tokens.index(discount)
+    rate_unit = (
+        discount_clause.norms[price_index + 2]
+        if price_index + 2 < len(discount_clause.tokens)
+        else ""
+    )
+    _require(
+        price_index == 8
+        and rate_unit in {"fruit", "item"}
+        and discount_index == 18
+        and discount_clause.norms
+        == (
+            "the",
+            "next",
+            "day",
+            ",",
+            "the",
+            "price",
+            "shot",
+            "to",
+            second_price.norm,
+            "per",
+            rate_unit,
+            ",",
+            "but",
+            "the",
+            "store",
+            "also",
+            "offered",
+            "a",
+            discount.norm,
+            "discount",
+            "on",
+            "the",
+            "total",
+            "cost",
+        )
+        and discount.number is not None
+        and 0 < discount.number < 100
+        and _has_explicit_percent_marker(source, discount),
+        "next-day discount lacks a same-item total-cost percentage basis",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    second_quantity = _one_token(_counts(second), "second-day item count is missing")
+    second_bought = second.norms.index("bought")
+    second_names = [token for token in second.tokens if token.text[:1].isupper()]
+    _require(
+        len(second_names) == 1
+        and second.tokens[0] is second_names[0]
+        and second.tokens.index(second_quantity) == second_bought + 1
+        and second.norms[1:second_bought]
+        == ("took", "advantage", "of", "the", "discount", "and"),
+        "second-day buyer or accepted discount is not uniquely bound",
+        FrontendStatus.AMBIGUOUS,
+    )
+    second_item = tuple(second.norms[second_bought + 2 :])
+    target_item = tuple(question.norms[10:-4])
+    if target_item[:1] == ("the",):
+        target_item = target_item[1:]
+    _require(
+        first_item == second_item == target_item,
+        "two-day purchases and target name different items",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        question.norms
+        == (
+            "what",
+            "is",
+            "the",
+            "difference",
+            "between",
+            "the",
+            "final",
+            "prices",
+            "paid",
+            "for",
+            "the",
+            *target_item,
+            "on",
+            "the",
+            "two",
+            "days",
+        ),
+        "two-day price target contains an unbound relation",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        all(
+            token.number is not None and token.number >= 0
+            for token in (
+                first_quantity,
+                first_price,
+                voucher,
+                second_price,
+                second_quantity,
+            )
+        )
+        and first_price.number > 0
+        and second_price.number > 0
+        and voucher.number <= first_quantity.number * first_price.number,
+        "purchase quantities, prices, or voucher are outside the closed domain",
+        FrontendStatus.INVALID,
+    )
+
+    total_token = discount_clause.tokens[discount_clause.norms.index("total")]
+    builder = _Builder(source, clause_set)
+    first_final = _sum(
+        _signed(
+            1,
+            _product(
+                builder.literal(first_quantity, COUNT),
+                builder.literal(first_price, PRICE_PER_COUNT),
+            ),
+            "first_day_subtotal",
+        ),
+        _signed(-1, builder.literal(voucher, MONEY), "fixed_voucher"),
+    )
+    retained = _sum(
+        _signed(
+            1,
+            builder.lexical_literal(total_token, Fraction(1), SCALAR),
+            "whole_total",
+        ),
+        _signed(-1, builder.literal(discount, PERCENT), "percentage_discount"),
+    )
+    second_final = _product(
+        builder.literal(second_quantity, COUNT),
+        builder.literal(second_price, PRICE_PER_COUNT),
+        retained,
+    )
+    raw_difference = _sum(
+        _signed(1, first_final, "first_day_final"),
+        _signed(-1, second_final, "second_day_final"),
+    )
+    expression = AbsoluteExpr(raw_difference, Span(0, len(source), source))
+    return builder.finish(expression, "two_day_discount_price_difference")
+
+
+def _closed_monthly_duration_ledger(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Sum three weekly activity durations and convert four weeks to hours."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:3] == ("how", "much", "time")
+        and _contains(question.norms, "in", "a", "month", "with")
+        and question.norms[-1:] == ("weeks",)
+    ):
+        return None
+    record_rows = [
+        clause
+        for clause in clause_set
+        if (
+            not clause.question
+            and "records" in clause.norms
+            and "minute" in clause.norms
+            and "videos" in clause.norms
+            and _contains(clause.norms, "each", "week")
+        )
+    ]
+    if not record_rows:
+        return None
+    _require(
+        len(clause_set) == 3 and len(record_rows) == 1,
+        "monthly duration ledger has clauses outside the closed schedule",
+        FrontendStatus.AMBIGUOUS,
+    )
+    record = record_rows[0]
+    schedule = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "spends" in clause.norms
+            and "hours" in clause.norms
+            and "minutes" in clause.norms
+            and "days" in clause.norms
+        ),
+        reason="weekly writing/makeup schedule is not unique",
+    )
+    _require_single_target_marker(question)
+    owner, owner_index = _leading_subject(record)
+    record_numbers = _counts(record)
+    _require(
+        owner_index == 0
+        and len(record_numbers) == 2
+        and record.norms[1] == "records",
+        "recording owner, count, or duration is incomplete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    video_count, video_minutes = record_numbers
+    _require(
+        record.tokens.index(video_count) == 2
+        and record.tokens.index(video_minutes) == 3
+        and record.norms[4] == "minute"
+        and _singular(record.norms[6]) == "video"
+        and record.norms[7:] == ("each", "week"),
+        "recording multiplicity, per-video duration, or weekly scope differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    platform = record.norms[5]
+    _require(
+        platform.isalpha() and platform not in {"a", "an", "the"},
+        "recording platform is not a stable single-token scope",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    pronoun = schedule.norms[0]
+    possessive, reflexives = {
+        "he": ("his", {"himself"}),
+        "she": ("her", {"herself"}),
+        "they": ("their", {"themself", "themselves"}),
+    }.get(pronoun, ("", set()))
+    _require(
+        schedule.norms[:2] == (pronoun, "spends")
+        and bool(possessive)
+        and "writing" in schedule.norms
+        and "doing" in schedule.norms
+        and possessive in schedule.norms
+        and bool(reflexives.intersection(schedule.norms))
+        and schedule.norms.count(platform) == 2,
+        "weekly activity owner or platform scope drifts",
+        FrontendStatus.AMBIGUOUS,
+    )
+    schedule_numbers = _counts(schedule)
+    _require(len(schedule_numbers) == 2, "weekly activity durations are incomplete")
+    hour_rows = [
+        token for token in schedule_numbers if _noun_after(schedule, token) == "hour"
+    ]
+    minute_rows = [
+        token
+        for token in schedule_numbers
+        if _noun_after(schedule, token) == "minute"
+    ]
+    hours = _one_token(hour_rows, "weekly writing hours are missing")
+    makeup_minutes = _one_token(minute_rows, "daily makeup minutes are missing")
+    hours_index = schedule.tokens.index(hours)
+    makeup_index = schedule.tokens.index(makeup_minutes)
+    six = _one_token(
+        [token for token in schedule.tokens if token.norm == "six"],
+        "makeup day count is missing",
+    )
+    six_index = schedule.tokens.index(six)
+    _require(
+        schedule.norms[hours_index + 2 : hours_index + 4] == ("a", "week")
+        and six_index == makeup_index + 2
+        and schedule.norms[six_index + 1 : six_index + 4]
+        == ("days", "a", "week")
+        and "writing" in schedule.norms[hours_index + 4 :]
+        and "doing" in schedule.norms[makeup_index + 5 :],
+        "weekly activity durations lack their local recurrence scopes",
+        FrontendStatus.AMBIGUOUS,
+    )
+    weeks = _one_token(
+        [token for token in question.tokens if token.norm == "four"],
+        "four-week month horizon is missing",
+    )
+    _require(
+        question.norms
+        == (
+            "how",
+            "much",
+            "time",
+            "does",
+            owner,
+            "spend",
+            "on",
+            platform,
+            "in",
+            "a",
+            "month",
+            "with",
+            weeks.norm,
+            "weeks",
+        ),
+        "monthly duration target changes owner, platform, or horizon",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        all(
+            token.number is not None and token.number >= 0
+            for token in (video_count, video_minutes, hours, makeup_minutes)
+        ),
+        "activity durations and multiplicities must be non-negative",
+        FrontendStatus.INVALID,
+    )
+
+    builder = _Builder(source, clause_set)
+    weekly = _sum(
+        _signed(
+            1,
+            _product(
+                builder.literal(video_count, COUNT),
+                builder.literal(video_minutes, MINUTE / COUNT),
+            ),
+            "recording_duration",
+        ),
+        _signed(1, builder.literal(hours, HOUR), "writing_duration"),
+        _signed(
+            1,
+            _product(
+                builder.literal(makeup_minutes, MINUTE),
+                _bound_cardinal(builder, six, SCALAR),
+            ),
+            "makeup_duration",
+        ),
+    )
+    month = _product(weekly, _bound_cardinal(builder, weeks, SCALAR))
+    expression = UnitConversionExpr(month, HOUR, Span(0, len(source), source))
+    return builder.finish(expression, "closed_monthly_duration_ledger")
+
+
+def _typed_installation_overage_cost(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Price per-SKU positive overages above an exhaustive included package."""
+
+    question = _question(clause_set)
+    if question.norms[:3] != ("how", "much", "will") or "cost" not in question.norms:
+        return None
+    base_rows = [
+        clause
+        for clause in clause_set
+        if (
+            not clause.question
+            and "firm" in clause.norms
+            and "offers" in clause.norms
+            and "installation" in clause.norms
+            and bool(_money_tokens(clause))
+        )
+    ]
+    if not base_rows:
+        return None
+    _require(
+        len(clause_set) == 5 and len(base_rows) == 1,
+        "installation tariff has clauses outside the closed package",
+        FrontendStatus.AMBIGUOUS,
+    )
+    base_clause = base_rows[0]
+    quota_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and clause.norms[:3] == ("it", "includes", "hanging")
+            and len(_counts(clause)) >= 2
+        ),
+        reason="included installation quotas are not unique",
+    )
+    surcharge_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and _contains(clause.norms, "install", "additional", "items")
+            and _contains(clause.norms, "per", "item")
+            and bool(_money_tokens(clause))
+        ),
+        reason="per-extra-item surcharge is not unique",
+    )
+    demand_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "has" in clause.norms
+            and "needs" in clause.norms
+            and "installed" in clause.norms
+            and "hung" in clause.norms
+            and bool(_counts(clause))
+        ),
+        reason="customer installation demand is not unique",
+    )
+    _require_single_target_marker(question)
+    base = _one_token(_money_tokens(base_clause), "installation base price is missing")
+    surcharge = _one_token(
+        _money_tokens(surcharge_clause), "per-extra-item surcharge is missing"
+    )
+    firm_index = base_clause.norms.index("firm")
+    _require(
+        base_clause.norms[:1] in {("a",), ("an",)}
+        and firm_index >= 2
+        and all(word.isalpha() for word in base_clause.norms[1:firm_index])
+        and base_clause.norms[firm_index:]
+        == ("firm", "offers", "installation", "for", base.norm)
+        and surcharge_clause.norms
+        == (
+            "they",
+            "will",
+            "install",
+            "additional",
+            "items",
+            "for",
+            "an",
+            "extra",
+            surcharge.norm,
+            "per",
+            "item",
+        ),
+        "installation base or surcharge basis differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    def item_count_map(
+        clause: Clause, numbers: list[Token], *, prefix_end: int, suffix_start: int
+    ) -> dict[str, Token]:
+        rows: dict[str, Token] = {}
+        positions = [clause.tokens.index(token) for token in numbers]
+        _require(
+            bool(positions) and positions[0] == prefix_end,
+            "typed item list does not start at its closed scope",
+            FrontendStatus.AMBIGUOUS,
+        )
+        for offset, (token, position) in enumerate(zip(numbers, positions, strict=True)):
+            _require(
+                position + 1 < len(clause.tokens),
+                "typed item count has no following SKU",
+            )
+            item = _singular(clause.norms[position + 1])
+            _require(
+                item not in rows,
+                "typed item list repeats one SKU",
+                FrontendStatus.AMBIGUOUS,
+            )
+            end = positions[offset + 1] if offset + 1 < len(positions) else suffix_start
+            _require(
+                end > position + 1
+                and set(clause.norms[position + 2 : end]).issubset({",", "and"}),
+                "typed item list contains an unbound relation",
+                FrontendStatus.AMBIGUOUS,
+            )
+            rows[item] = token
+        return rows
+
+    quota_numbers = _counts(quota_clause)
+    quota_map = item_count_map(
+        quota_clause,
+        quota_numbers,
+        prefix_end=3,
+        suffix_start=len(quota_clause.tokens),
+    )
+    owner, owner_index = _leading_subject(demand_clause)
+    has_index = demand_clause.norms.index("has")
+    needs_index = demand_clause.norms.index("needs")
+    demand_numbers = _counts(demand_clause)
+    demand_map = item_count_map(
+        demand_clause,
+        demand_numbers,
+        prefix_end=has_index + 1,
+        suffix_start=needs_index - 2,
+    )
+    pronoun = demand_clause.norms[needs_index - 1]
+    object_pronoun = {"she": "her", "he": "him", "they": "them"}.get(pronoun)
+    _require(
+        owner_index == 0
+        and has_index == 1
+        and demand_clause.norms[needs_index - 2 :]
+        == ("that", pronoun, "needs", "installed", "hung")
+        and object_pronoun is not None
+        and question.norms
+        == ("how", "much", "will", "this", "cost", object_pronoun),
+        "installation customer, exhaustive demand, or target pronoun differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        demand_map.keys() <= quota_map.keys(),
+        "customer demand contains a SKU outside the package",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        base.number is not None
+        and base.number >= 0
+        and surcharge.number is not None
+        and surcharge.number >= 0
+        and all(
+            token.number is not None
+            and token.number >= 0
+            and token.number.denominator == 1
+            for token in (*quota_numbers, *demand_numbers)
+        ),
+        "installation prices and SKU counts must be non-negative exact values",
+        FrontendStatus.INVALID,
+    )
+
+    builder = _Builder(source, clause_set)
+    overages = []
+    for item, quota in quota_map.items():
+        demand = demand_map.get(item)
+        raw_terms = []
+        if demand is not None:
+            raw_terms.append(
+                _signed(1, builder.literal(demand, COUNT), f"{item}_demand")
+            )
+        raw_terms.append(
+            _signed(-1, builder.literal(quota, COUNT), f"{item}_included")
+        )
+        raw = _sum(*raw_terms)
+        overages.append(
+            _signed(
+                1,
+                PositivePartExpr(raw, raw.span),
+                f"{item}_positive_overage",
+            )
+        )
+    extra_count = _sum(*overages)
+    expression = _sum(
+        _signed(1, builder.literal(base, MONEY), "installation_base"),
+        _signed(
+            1,
+            _product(
+                builder.literal(surcharge, PRICE_PER_COUNT),
+                extra_count,
+            ),
+            "per_sku_overage_cost",
+        ),
+    )
+    return builder.finish(expression, "typed_installation_overage_cost")
+
+
 def _calendar_frequency_ledger(
     source: str, clause_set: tuple[Clause, ...]
 ) -> FrontendResult | None:
@@ -9494,6 +10361,10 @@ _PLANNERS = (
     _typed_two_link_scale_chain,
     _closed_week_complement_schedule,
     _closed_disjoint_week_schedule,
+    _equal_daily_budget_item_schedule,
+    _two_day_discount_price_difference,
+    _closed_monthly_duration_ledger,
+    _typed_installation_overage_cost,
     _calendar_frequency_ledger,
     _explicit_weekly_pay_schedule,
     _canonical_duration_rate_conversion,

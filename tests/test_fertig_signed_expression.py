@@ -28,6 +28,7 @@ from immer.cognition.fertig.signed_expression import (
     MeanExpr,
     NumericEvidence,
     ProductExpr,
+    PositivePartExpr,
     QuotientExpr,
     RefExpr,
     SignedTerm,
@@ -182,8 +183,20 @@ class CanonicalExpressionTests(unittest.TestCase):
         ]
         self.assertTrue(fractional_intermediates)
 
+    def test_ground_positive_part_selects_each_exact_branch_and_keeps_evidence(self) -> None:
+        for value, expected in ((5, 5), (-3, 0), (0, 0)):
+            with self.subTest(value=value):
+                builder = _Builder()
+                expression = PositivePartExpr(
+                    builder.literal(value, SCALAR), Span(0, 0)
+                )
+                compiled = _compile(builder, expression)
+                self.assertEqual(compiled.solution.target_value, expected)
+                self.assertTrue(compiled.certificate.verified)
+                self.assertEqual(len(compiled.evidence_projection), 1)
+
     def test_absolute_and_ceiling_reject_references_even_when_defined(self) -> None:
-        for operator in (AbsoluteExpr, CeilingExpr):
+        for operator in (AbsoluteExpr, PositivePartExpr, CeilingExpr):
             builder = _Builder()
             span = Span(0, 0)
             value = _key("value")

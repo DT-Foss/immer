@@ -256,7 +256,7 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                 wave["added_exact_recoveries"]
                 for wave in first["recovery_wave_history"]["waves"]
             ],
-            [0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
         )
         self.assertEqual(
             first["hungarian_verdict"]["directly_eligible_exclusive_instances"],
@@ -316,10 +316,10 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(
             audit.CURRENT_STRUCTURAL_COUNTS,
             {
-                "exact_recovery": 70,
+                "exact_recovery": 74,
                 "numeric_pronoun_ambiguous": 71,
                 "question_pronoun_ambiguous": 3,
-                "numeric_clause_unsupported": 80,
+                "numeric_clause_unsupported": 76,
                 "target_unsupported": 5,
                 "relation_ambiguous": 1,
                 "relation_unsupported": 0,
@@ -329,9 +329,9 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         self.assertEqual(
             audit.CURRENT_SCOPE_COUNTS,
             {
-                "exact_recovery_scope": 70,
+                "exact_recovery_scope": 74,
                 "potential_coreference_scope": 74,
-                "grammar_scope": 86,
+                "grammar_scope": 82,
             },
         )
         self.assertEqual(
@@ -339,6 +339,7 @@ class FertigAbstentionAuditTests(unittest.TestCase):
             (
                 547,
                 550,
+                570,
                 574,
                 578,
                 587,
@@ -349,6 +350,7 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                 627,
                 631,
                 643,
+                650,
                 651,
                 672,
                 682,
@@ -373,6 +375,8 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                 819,
                 823,
                 825,
+                830,
+                831,
                 833,
                 836,
                 837,
@@ -475,6 +479,19 @@ class FertigAbstentionAuditTests(unittest.TestCase):
             },
         )
         self.assertEqual(
+            audit.BUNDLE_TARIFF_WAVE_EXACT_RECOVERY_INDICES,
+            (570, 650, 830, 831),
+        )
+        self.assertEqual(
+            audit.BUNDLE_TARIFF_WAVE_EXACT_MECHANISMS,
+            {
+                570: "signed_event:equal_daily_budget_item_schedule",
+                650: "signed_event:two_day_discount_price_difference",
+                830: "signed_event:closed_monthly_duration_ledger",
+                831: "signed_event:typed_installation_overage_cost",
+            },
+        )
+        self.assertEqual(
             set(audit.CURRENT_EXACT_RECOVERY_MECHANISMS),
             set(audit.CURRENT_EXACT_RECOVERY_INDICES),
         )
@@ -487,9 +504,9 @@ class FertigAbstentionAuditTests(unittest.TestCase):
                         "legacy": audit.CURRENT_LEGACY_COUNTS,
                         "structural": audit.CURRENT_STRUCTURAL_COUNTS,
                         "scope": {
-                            "exact_recovery_scope": 70,
+                            "exact_recovery_scope": 74,
                             "potential_coreference_scope": 73,
-                            "grammar_scope": 87,
+                            "grammar_scope": 83,
                         },
                     },
                 }
@@ -499,7 +516,7 @@ class FertigAbstentionAuditTests(unittest.TestCase):
         report = json.loads(audit.DEFAULT_OUTPUT_PATH.read_text(encoding="utf-8"))
         audit._validate_current_evidence(report)
         identity = report["exact_recovery_attribution"]["identity"]
-        self.assertEqual(identity["count"], 70)
+        self.assertEqual(identity["count"], 74)
         self.assertEqual(
             identity["indices"], list(audit.CURRENT_EXACT_RECOVERY_INDICES)
         )
@@ -510,33 +527,33 @@ class FertigAbstentionAuditTests(unittest.TestCase):
             ),
         )
         mechanism_identity = report["exact_recovery_attribution"]["mechanism_identity"]
-        self.assertEqual(mechanism_identity["count"], 70)
+        self.assertEqual(mechanism_identity["count"], 74)
         self.assertEqual(
             {row["index"]: row["mechanism"] for row in mechanism_identity["rows"]},
             audit.CURRENT_EXACT_RECOVERY_MECHANISMS,
         )
         delta = report["recovery_wave_delta"]
-        self.assertEqual(delta["previously_sealed_exact_recoveries"], 66)
+        self.assertEqual(delta["previously_sealed_exact_recoveries"], 70)
         self.assertEqual(delta["added_exact_recoveries"], 4)
-        self.assertEqual(delta["current_exact_recoveries"], 70)
+        self.assertEqual(delta["current_exact_recoveries"], 74)
         self.assertEqual(
             delta["added_identity"]["indices"],
-            list(audit.RECURRENCE_WAVE_EXACT_RECOVERY_INDICES),
+            list(audit.BUNDLE_TARIFF_WAVE_EXACT_RECOVERY_INDICES),
         )
-        self.assertIn("this wave claims 4, not 70", delta["attribution"])
+        self.assertIn("this wave claims 4, not 74", delta["attribution"])
 
         history = report["recovery_wave_history"]
         self.assertEqual(history["baseline_exact_recoveries"], 42)
         self.assertEqual(
             [wave["added_exact_recoveries"] for wave in history["waves"]],
-            [5, 10, 9, 4],
+            [5, 10, 9, 4, 4],
         )
         self.assertEqual(
             [wave["current_exact_recoveries"] for wave in history["waves"]],
-            [47, 57, 66, 70],
+            [47, 57, 66, 70, 74],
         )
         self.assertIn(
-            "70 current exact recoveries = 42 sealed baseline",
+            "74 current exact recoveries = 42 sealed baseline",
             history["attribution"],
         )
         self.assertIn("+ 5 by", history["attribution"])

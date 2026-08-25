@@ -161,6 +161,22 @@ class AbsoluteExpr:
 
 
 @dataclass(frozen=True, slots=True)
+class PositivePartExpr:
+    """Exact ``max(value, 0)`` for a fully grounded expression.
+
+    This is the closed overage operator: the selected branch is determined
+    entirely by numeric evidence before lowering.  References and latent
+    unknowns remain forbidden, just as they are for :class:`AbsoluteExpr`.
+    """
+
+    value: Expression
+    span: Span
+
+    def __post_init__(self) -> None:
+        _span(self.span)
+
+
+@dataclass(frozen=True, slots=True)
 class CeilingExpr:
     """Exact ceiling of a fully ground expression.
 
@@ -271,6 +287,7 @@ Expression: TypeAlias = (
     | QuotientExpr
     | MeanExpr
     | AbsoluteExpr
+    | PositivePartExpr
     | CeilingExpr
     | GroundProductExpr
     | ClosedShareExpr
@@ -351,6 +368,7 @@ _EXPRESSION_TYPES = (
     QuotientExpr,
     MeanExpr,
     AbsoluteExpr,
+    PositivePartExpr,
     CeilingExpr,
     GroundProductExpr,
     ClosedShareExpr,
@@ -391,7 +409,9 @@ def _children(expr: Expression) -> tuple[tuple[str, Expression], ...]:
         return tuple(
             (f"value[{index}]", value) for index, value in enumerate(expr.values)
         )
-    if isinstance(expr, (AbsoluteExpr, CeilingExpr, UnitConversionExpr)):
+    if isinstance(
+        expr, (AbsoluteExpr, PositivePartExpr, CeilingExpr, UnitConversionExpr)
+    ):
         return (("value", expr.value),)
     if isinstance(expr, ClosedShareExpr):
         return (("existing", expr.existing), ("share", expr.share))
@@ -648,7 +668,7 @@ class _Compiler:
             if any(not reference.compatible(unit) for unit in units[1:]):
                 raise ExpressionCompileError("mean contains incompatible units")
             return reference
-        if isinstance(expr, (AbsoluteExpr, CeilingExpr)):
+        if isinstance(expr, (AbsoluteExpr, PositivePartExpr, CeilingExpr)):
             return self._unit(expr.value)
         if isinstance(expr, ClosedShareExpr):
             if expr.share.unit.dimensions:
@@ -790,6 +810,11 @@ class _Compiler:
                 expr.value, allow_references=allow_references
             )
             return abs(value), unit
+        if isinstance(expr, PositivePartExpr):
+            value, unit = self._ground_value(
+                expr.value, allow_references=allow_references
+            )
+            return max(value, Fraction(0)), unit
         if isinstance(expr, CeilingExpr):
             value, unit = self._ground_value(
                 expr.value, allow_references=allow_references
@@ -982,6 +1007,21 @@ class _Compiler:
                 return atom
             result = self._auxiliary(unit, expr.span)
             self.constraints.append(Sum(result, (Term(atom, Fraction(-1)),), expr.span))
+            return result
+        if isinstance(expr, PositivePartExpr):
+            value, unit = self._ground_value(expr.value)
+            atom = self._lower(expr.value, integral_counts=False)
+            if value >= 0:
+                return atom
+            result = self._auxiliary(
+                unit, expr.span, integral_counts=integral_counts
+            )
+            # Keep the rejected branch in the proof component as a zero-weight
+            # witness: the output is zero because the evidence-ground value is
+            # negative, not because its evidence disappeared from the DAG.
+            self.constraints.append(
+                Sum(result, (Term(atom, Fraction(0)),), expr.span)
+            )
             return result
         if isinstance(expr, CeilingExpr):
             value, unit = self._ground_value(expr.value)

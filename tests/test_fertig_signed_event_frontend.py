@@ -1369,16 +1369,15 @@ class SignedEventPartCapacityWaveTests(unittest.TestCase):
             "On Tuesday, Clara bought 20 pomegranates at $20 each. At the till "
             "she got $2 off because she had a voucher. The next day, the price "
             "shot to $30 per fruit, but the store also offered a 10% discount "
-            "on the total cost. Sheila took advantage of the discount and "
+            "on one selected fruit. Sheila took advantage of the discount and "
             "bought 20 pomegranates. What is the difference between the final "
             "prices paid for the pomegranates on the two days?",
             "Britany records 18 4-minute TikTok videos each week. She spends 2 "
             "hours a week writing songs, and 15 minutes six days a week doing "
-            "makeup. How much time does Britany spend on TikTok in a month with "
-            "four weeks?",
+            "makeup. How much time does Britany spend on TikTok in a month?",
             "An installation package costs $129 and includes 4 mirrors, 2 "
             "shelves, 1 chandelier, and 10 pictures. Extra items cost $15 each. "
-            "Angela has 6 mirrors, 2 chandeliers, and 20 pictures. What is the "
+            "Angela has 6 windows, 2 chandeliers, and 20 pictures. What is the "
             "cost?",
         )
         for question in deferred:

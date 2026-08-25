@@ -42,7 +42,7 @@ DISCOURSE_SSA_PATH = (
 )
 
 SCHEMA = "immer.fertig-abstention-audit/v2"
-REPORT_REVISION = 7
+REPORT_REVISION = 8
 ALLOWED_STATUSES = ("correct", "abstained", "incorrect", "error")
 LEGACY_CATEGORIES = (
     "target_parse_failed",
@@ -67,23 +67,24 @@ CURRENT_LEGACY_COUNTS = {
     "equation_guard": 1,
 }
 CURRENT_STRUCTURAL_COUNTS = {
-    "exact_recovery": 70,
+    "exact_recovery": 74,
     "numeric_pronoun_ambiguous": 71,
     "question_pronoun_ambiguous": 3,
-    "numeric_clause_unsupported": 80,
+    "numeric_clause_unsupported": 76,
     "target_unsupported": 5,
     "relation_ambiguous": 1,
     "relation_unsupported": 0,
     "relation_invalid": 0,
 }
 CURRENT_SCOPE_COUNTS = {
-    "exact_recovery_scope": 70,
+    "exact_recovery_scope": 74,
     "potential_coreference_scope": 74,
-    "grammar_scope": 86,
+    "grammar_scope": 82,
 }
 CURRENT_EXACT_RECOVERY_INDICES = (
     547,
     550,
+    570,
     574,
     578,
     587,
@@ -94,6 +95,7 @@ CURRENT_EXACT_RECOVERY_INDICES = (
     627,
     631,
     643,
+    650,
     651,
     672,
     682,
@@ -118,6 +120,8 @@ CURRENT_EXACT_RECOVERY_INDICES = (
     819,
     823,
     825,
+    830,
+    831,
     833,
     836,
     837,
@@ -219,6 +223,14 @@ RECURRENCE_WAVE_EXACT_MECHANISMS = {
     1172: "signed_event:closed_daily_geometric_total",
 }
 RECURRENCE_WAVE_ID = "closed-recurrence-algebra/v1"
+BUNDLE_TARIFF_WAVE_EXACT_RECOVERY_INDICES = (570, 650, 830, 831)
+BUNDLE_TARIFF_WAVE_EXACT_MECHANISMS = {
+    570: "signed_event:equal_daily_budget_item_schedule",
+    650: "signed_event:two_day_discount_price_difference",
+    830: "signed_event:closed_monthly_duration_ledger",
+    831: "signed_event:typed_installation_overage_cost",
+}
+BUNDLE_TARIFF_WAVE_ID = "closed-bundle-tariff-algebra/v1"
 RECOVERY_WAVES = (
     (
         GROUND_WAVE_ID,
@@ -240,10 +252,16 @@ RECOVERY_WAVES = (
         RECURRENCE_WAVE_EXACT_RECOVERY_INDICES,
         RECURRENCE_WAVE_EXACT_MECHANISMS,
     ),
+    (
+        BUNDLE_TARIFF_WAVE_ID,
+        BUNDLE_TARIFF_WAVE_EXACT_RECOVERY_INDICES,
+        BUNDLE_TARIFF_WAVE_EXACT_MECHANISMS,
+    ),
 )
 CURRENT_EXACT_RECOVERY_MECHANISMS = {
     547: "signed_event:closed_phone_tree_recurrence",
     550: "signed_event:discounted_purchase_ledger",
+    570: "signed_event:equal_daily_budget_item_schedule",
     574: "signed_event:batch_sale_profit",
     578: "signed_event:grounded_value_pipeline",
     587: "signed_event:balanced_percent_category_difference",
@@ -254,6 +272,7 @@ CURRENT_EXACT_RECOVERY_MECHANISMS = {
     627: "signed_event:closed_week_complement_schedule",
     631: "signed_event:affine_price_chain_total",
     643: "signed_event:combined_daily_total",
+    650: "signed_event:two_day_discount_price_difference",
     651: "signed_event:part_scaled_period_total",
     672: "signed_event:temporal_categorical_block_remainder",
     682: "preexisting_generic_structural_exact",
@@ -278,6 +297,8 @@ CURRENT_EXACT_RECOVERY_MECHANISMS = {
     819: "signed_event:equal_share_residual",
     823: "signed_event:temporal_affine_score_chain",
     825: "clause_compiler",
+    830: "signed_event:closed_monthly_duration_ledger",
+    831: "signed_event:typed_installation_overage_cost",
     833: "signed_event:typed_scale_chain_conversion",
     836: "signed_event:entity_affine_chain_total",
     837: "signed_event:funding_balance_residual",
