@@ -37,6 +37,10 @@ All notable changes to IMMER are recorded here.
   mutation resets and fails closed. Integrity cost is explicit in
   `provider_guard_bytes` and `provider_guard_seconds`, and speculative
   generation exposes no live progress callbacks around pending state.
+- Added a sealed gold-free Q3 K2 benchmark: fixed input projection, two fresh
+  causal-bundle runtimes, greedy-versus-speculative token/state parity,
+  independently audited staged hidden, authenticated traces, adjusted cost
+  receipts, transported validation, and forged bundle/state/cost rejection.
 
 ### Exact event and binding compiler
 
