@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import platform
 import re
@@ -53,6 +54,8 @@ _CODE_REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _MODES = frozenset(("passive", "off", "native", "placebo"))
 _UNLABELED_FAMILY_SHA256 = hashlib.sha256(b"immer:unlabeled-family/v1").hexdigest()
 _NO_LABEL_SOURCE_SHA256 = hashlib.sha256(b"immer:no-label-source/v1").hexdigest()
+_MAX_BUNDLE_MANIFEST_BYTES = 64 * 1024**2
+_MAX_RUNTIME_SOURCE_BYTES = 64 * 1024**2
 
 
 class Qwen38CartographyProbeError(RuntimeError):
@@ -84,6 +87,94 @@ def _canonical(value: object) -> bytes:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _read_regular_bytes(path: Path, *, label: str, max_bytes: int) -> bytes:
+    """Read one bounded regular file through a stable ``O_NOFOLLOW`` fd."""
+
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path")
+    limit = _positive(max_bytes, "max_bytes")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if not isinstance(nofollow, int):
+        raise Qwen38CartographyIntegrityError(
+            "local cartography reads require O_NOFOLLOW"
+        )
+    try:
+        linked_before = path.lstat()
+    except OSError as exc:
+        raise Qwen38CartographyIntegrityError(
+            f"cannot inspect {label}: {path}"
+        ) from exc
+    if (
+        not stat.S_ISREG(linked_before.st_mode)
+        or linked_before.st_size < 0
+        or linked_before.st_size > limit
+    ):
+        raise Qwen38CartographyIntegrityError(
+            f"{label} must be a bounded non-symlink regular file"
+        )
+    flags = os.O_RDONLY | nofollow
+    flags |= int(getattr(os, "O_CLOEXEC", 0))
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size < 0
+            or opened.st_size > limit
+            or (opened.st_dev, opened.st_ino)
+            != (linked_before.st_dev, linked_before.st_ino)
+            or opened.st_size != linked_before.st_size
+        ):
+            raise Qwen38CartographyIntegrityError(
+                f"{label} changed while its descriptor was opened"
+            )
+        remaining = int(opened.st_size)
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise Qwen38CartographyIntegrityError(
+                    f"{label} ended before its authenticated size"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise Qwen38CartographyIntegrityError(
+                f"{label} grew beyond its authenticated size"
+            )
+        opened_after = os.fstat(descriptor)
+        try:
+            linked_after = path.lstat()
+        except OSError as exc:
+            raise Qwen38CartographyIntegrityError(
+                f"{label} path changed after its descriptor read"
+            ) from exc
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        expected = tuple(getattr(opened, field) for field in stable_fields)
+        if (
+            tuple(getattr(opened_after, field) for field in stable_fields) != expected
+            or tuple(getattr(linked_before, field) for field in stable_fields)
+            != expected
+            or tuple(getattr(linked_after, field) for field in stable_fields)
+            != expected
+            or not stat.S_ISREG(linked_after.st_mode)
+        ):
+            raise Qwen38CartographyIntegrityError(
+                f"{label} changed during its descriptor read"
+            )
+        return b"".join(chunks)
+    except Qwen38CartographyIntegrityError:
+        raise
+    except OSError as exc:
+        raise Qwen38CartographyIntegrityError(
+            f"cannot read authenticated {label}: {path}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _sha(value: object, label: str) -> str:
@@ -810,19 +901,21 @@ def _bundle_manifest_sha256(model: StreamedQwen38) -> str:
             "exactly one mounted causal bundle.json must be discoverable"
         )
     path = existing[0]
-    before = path.stat()
     try:
-        raw = path.read_bytes()
+        raw = _read_regular_bytes(
+            path,
+            label="causal bundle manifest",
+            max_bytes=_MAX_BUNDLE_MANIFEST_BYTES,
+        )
         document = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except Qwen38CartographyIntegrityError:
+        raise
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise Qwen38CartographyIntegrityError(
             "causal bundle manifest is unreadable"
         ) from exc
-    after = path.stat()
     if (
-        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-        or not isinstance(document, Mapping)
+        not isinstance(document, Mapping)
         or set(document) != {"body", "schema", "sha256"}
         or document.get("schema") != QWEN38_BUNDLE_SCHEMA
         or not isinstance(document.get("body"), Mapping)
@@ -859,21 +952,12 @@ def _bundle_manifest_sha256(model: StreamedQwen38) -> str:
 
 
 def _file_sha256(path: Path) -> str:
-    try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise Qwen38CartographyIntegrityError(
-            f"cannot inspect cartography runtime source: {path}"
-        ) from exc
-    if not stat.S_ISREG(metadata.st_mode):
-        raise Qwen38CartographyIntegrityError(
-            f"cartography runtime source is not a regular file: {path}"
-        )
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+    raw = _read_regular_bytes(
+        path,
+        label="cartography runtime source",
+        max_bytes=_MAX_RUNTIME_SOURCE_BYTES,
+    )
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _runtime_provenance(

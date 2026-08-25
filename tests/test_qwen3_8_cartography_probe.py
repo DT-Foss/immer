@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from unittest import mock
 import torch
 from safetensors.torch import save_file
 
+import immer.runtimes.qwen3_8.cartography_probe as cartography_module
 from immer.knowledge import LiveGraph
 from immer.runtimes.deepseek_v4.causal_weights import (
     CausalWeightMount,
@@ -118,6 +120,7 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
             prefix=".qwen-cartography-test-", dir=Path.cwd()
         )
         root = Path(self.temporary.name)
+        self.root = root
         (root / "weights").mkdir()
         (root / "causal").mkdir()
         self.config = _tiny_config()
@@ -298,6 +301,60 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
                 self._execute(self._spec(hidden_sketch=None))
         self.assertEqual(_committed_state(self.model), before)
         self.assertFalse(self.mount.source.metrics()["access_observer_enabled"])
+
+    def test_manifest_and_runtime_source_symlinks_fail_closed(self) -> None:
+        manifest = self.root / "bundle.json"
+        manifest_target = self.root / "bundle-target.json"
+        manifest.rename(manifest_target)
+        manifest.symlink_to(manifest_target.name)
+        before = _committed_state(self.model)
+        with self.assertRaisesRegex(
+            Qwen38CartographyIntegrityError, "non-symlink regular file"
+        ):
+            self._execute(self._spec(hidden_sketch=None))
+        self.assertEqual(_committed_state(self.model), before)
+
+        source_target = self.root / "runtime-target.py"
+        source_target.write_text("value = 1\n", encoding="utf-8")
+        source_link = self.root / "runtime-link.py"
+        source_link.symlink_to(source_target.name)
+        with self.assertRaisesRegex(
+            Qwen38CartographyIntegrityError, "non-symlink regular file"
+        ):
+            cartography_module._file_sha256(source_link)
+
+    def test_manifest_path_swap_during_descriptor_read_is_rejected(self) -> None:
+        manifest = self.root / "bundle.json"
+        replacement = self.root / "bundle-replacement.json"
+        displaced = self.root / "bundle-displaced.json"
+        replacement.write_bytes(manifest.read_bytes())
+        manifest_identity = manifest.stat()
+        real_read = os.read
+        swapped = False
+
+        def swapping_read(descriptor: int, length: int) -> bytes:
+            nonlocal swapped
+            chunk = real_read(descriptor, length)
+            opened = os.fstat(descriptor)
+            if not swapped and (opened.st_dev, opened.st_ino) == (
+                manifest_identity.st_dev,
+                manifest_identity.st_ino,
+            ):
+                swapped = True
+                os.replace(manifest, displaced)
+                os.replace(replacement, manifest)
+            return chunk
+
+        before = _committed_state(self.model)
+        with mock.patch.object(
+            cartography_module.os, "read", side_effect=swapping_read
+        ):
+            with self.assertRaisesRegex(
+                Qwen38CartographyIntegrityError, "changed during"
+            ):
+                self._execute(self._spec(hidden_sketch=None))
+        self.assertTrue(swapped)
+        self.assertEqual(_committed_state(self.model), before)
 
     def test_native_layer27_pair_records_crsa_and_appends_control_first(self) -> None:
         root = Path(self.temporary.name) / "native"
