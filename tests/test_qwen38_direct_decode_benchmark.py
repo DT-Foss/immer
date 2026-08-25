@@ -333,6 +333,57 @@ def _branch_generation_args(
     return args
 
 
+def _native_fork_generation_args(
+    *,
+    branch_input: Path,
+    tokenizer: Path,
+    output: Path,
+    trace: Path,
+    source: Path,
+    inventory: Path,
+    cache: Path,
+):
+    args = benchmark._parser().parse_args(
+        [
+            "generate-native-fork",
+            "--input",
+            str(branch_input),
+            "--tokenizer-json",
+            str(tokenizer),
+            "--output",
+            str(output),
+            "--access-trace",
+            str(trace),
+            "--source",
+            str(source),
+            "--pinned-inventory",
+            str(inventory),
+            "--cache-dir",
+            str(cache),
+            "--logical-repo-id",
+            REPO_ID,
+            "--revision",
+            REVISION,
+            "--device",
+            "cpu",
+            "--dtype",
+            "float32",
+            "--max-seq-len",
+            "12",
+            "--max-new-tokens",
+            "3",
+            "--head-block-rows",
+            "64",
+            "--max-resident-mb",
+            "2",
+            "--source-budget-mb",
+            "20",
+        ]
+    )
+    args._require_official = False
+    return args
+
+
 def _reseal(document: dict) -> dict:
     document.pop("sha256", None)
     document["sha256"] = benchmark._sha256(document)
@@ -1876,6 +1927,301 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                     tokenizer_path,
                     root / "vague-never.json",
                 )
+
+    def test_native_fork_pair_matches_independent_references_and_saves_work(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            benchmark.QwenDirectDecodeError, "sealed worst-case bound"
+        ):
+            benchmark._native_fork_source_budget_preflight(
+                argparse.Namespace(source_budget_mb=3, max_new_tokens=3),
+                {"checkpoint_bytes": 300_000},
+                items=2,
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-native-fork-benchmark-test-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            source_weights, inventory = _native_fixture(root)
+            tokenizer_path = root / "tokenizer.json"
+            eos = _answer_branch_tokenizer(tokenizer_path)
+            source = root / "sealed-answer-dev.json"
+            _prepared_branch_source(
+                source,
+                eos=eos,
+                gold=("1",),
+                system_prompt=benchmark.ANSWER_OUTPUT_INSTRUCTION,
+                thinking=False,
+            )
+            branch_input = root / "answer-input.json"
+            selected = _select_answer_branch(source, tokenizer_path, branch_input)
+
+            production_without_causal = _native_fork_generation_args(
+                branch_input=branch_input,
+                tokenizer=tokenizer_path,
+                output=root / "production-never.json",
+                trace=root / "production-never-trace.json",
+                source=source_weights,
+                inventory=inventory,
+                cache=root / "production-never-cache",
+            )
+            production_without_causal._require_official = True
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "local complete causal bundle"
+            ):
+                benchmark.generate_native_fork(production_without_causal)
+
+            legacy = root / "legacy-input.json"
+            _select_branch(source, tokenizer_path, legacy, limit=1)
+            rejected = _native_fork_generation_args(
+                branch_input=legacy,
+                tokenizer=tokenizer_path,
+                output=root / "legacy-never.json",
+                trace=root / "legacy-never-trace.json",
+                source=source_weights,
+                inventory=inventory,
+                cache=root / "legacy-cache",
+            )
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "answer-prefix v3"
+            ):
+                benchmark.generate_native_fork(rejected)
+
+            eos_token = eos[0]
+
+            def install_complete_causal_receipt(runtime) -> None:
+                inventory_document = runtime.source.inventory()
+                fingerprint = runtime.source.metrics()["inventory_source_fingerprint"]
+                checkpoint_bytes = runtime.verification["checkpoint_bytes"]
+                runtime.verification = {
+                    "checkpoint_bytes": checkpoint_bytes,
+                    "graph_revision": [
+                        1,
+                        benchmark._sha256({"graph": fingerprint}),
+                    ],
+                    "kind": "complete-causal-bundle/v1",
+                    "layout_fingerprint": fingerprint,
+                    "manifest_sha256": benchmark._sha256(
+                        {"manifest": fingerprint}
+                    ),
+                    "shards": len(inventory_document["shards"]),
+                    "shards_sha256": benchmark._sha256(
+                        {"shards": fingerprint}
+                    ),
+                    "tensor_bindings": len(inventory_document["tensors"]),
+                    "weights_layout": "nested/v1",
+                }
+
+            def install_scripted_topk(model, tokens: list[int]) -> None:
+                pending = list(tokens)
+
+                def fixed_topk(_hidden, *, k, block_rows, progress=None):
+                    del k, block_rows
+                    if not pending:
+                        raise AssertionError("unexpected LM-head scan")
+                    if progress is not None:
+                        progress(
+                            {
+                                "rows_done": model.config.vocab_size,
+                                "vocab_rows": model.config.vocab_size,
+                            }
+                        )
+                    return (
+                        torch.tensor([[1.0]], device=model.pager.device),
+                        torch.tensor([[pending.pop(0)]], device=model.pager.device),
+                    )
+
+                model.pager.topk_logits = fixed_topk
+
+            pair_runtime_calls = 0
+
+            def pair_factory(*factory_args, **factory_kwargs):
+                nonlocal pair_runtime_calls
+                pair_runtime_calls += 1
+                runtime, fork = benchmark._native_fork_runtime(
+                    *factory_args, **factory_kwargs
+                )
+                install_complete_causal_receipt(runtime)
+                install_scripted_topk(fork, [1, 1, eos_token, 5, eos_token])
+                return runtime, fork
+
+            pair_path = root / "pair.json"
+            pair_args = _native_fork_generation_args(
+                branch_input=branch_input,
+                tokenizer=tokenizer_path,
+                output=pair_path,
+                trace=root / "pair-trace.json",
+                source=source_weights,
+                inventory=inventory,
+                cache=root / "pair-cache",
+            )
+            with redirect_stderr(io.StringIO()):
+                pair = benchmark.generate_native_fork(
+                    pair_args, runtime_factory=pair_factory
+                )
+            benchmark._write_json(pair_path, pair)
+            self.assertEqual(pair_runtime_calls, 1)
+            self.assertEqual(pair["schema"], benchmark.NATIVE_FORK_PAIR_SCHEMA)
+            self.assertEqual(pair["input"], selected)
+            self.assertEqual(pair["execution"]["runtime_instances"], 1)
+            self.assertEqual(pair["execution"]["source_instances"], 1)
+            self.assertEqual(pair["execution"]["weight_pagers"], 1)
+            self.assertEqual(
+                pair["items"][0]["off"]["generated_token_ids"], [1, eos_token]
+            )
+            self.assertEqual(
+                pair["items"][0]["native"]["generated_token_ids"],
+                [1, 5, eos_token],
+            )
+            self.assertEqual(pair["items"][0]["off"]["forward_passes"], 3)
+            self.assertEqual(pair["items"][0]["native"]["forward_passes"], 4)
+            self.assertTrue(pair["items"][0]["fork"]["permanently_split"])
+            self.assertEqual(pair["items"][0]["fork"]["first_divergence_index"], 1)
+            self.assertEqual(pair["items"][0]["fork"]["joined_pair_forward_passes"], 2)
+            self.assertEqual(
+                len(pair["items"][0]["native"]["intervention_evidence"]), 4
+            )
+            self.assertEqual(
+                pair["traffic"]["complete_layers_saved"],
+                2 * benchmark.NATIVE_HEAD_CRSA_LAYER,
+            )
+            self.assertEqual(
+                pair["traffic"]["runtime_source_body_bytes"],
+                pair["traffic"]["source_body_bytes"],
+            )
+            self.assertEqual(benchmark._load_native_fork_pair(pair_path), pair)
+            remote_bundle = copy.deepcopy(pair)
+            remote_bundle["bundle"]["kind"] = "remote-pinned-range-source/v1"
+            _reseal(remote_bundle)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "complete causal bundle"
+            ):
+                benchmark._validate_native_fork_pair_document(remote_bundle)
+
+            def arm_factory(tokens: list[int]):
+                def factory(*factory_args, **factory_kwargs):
+                    runtime, model = benchmark._runtime(*factory_args, **factory_kwargs)
+                    install_complete_causal_receipt(runtime)
+                    install_scripted_topk(model, tokens)
+                    return runtime, model
+
+                return factory
+
+            off_path = root / "off.json"
+            off_args = _branch_generation_args(
+                branch_input=branch_input,
+                tokenizer=tokenizer_path,
+                output=off_path,
+                trace=root / "off-trace.json",
+                source=source_weights,
+                inventory=inventory,
+                cache=root / "off-cache",
+                mode="off",
+            )
+            off_args.head_block_rows = 64
+            with redirect_stderr(io.StringIO()):
+                off = benchmark.generate_arm(
+                    off_args, runtime_factory=arm_factory([1, eos_token])
+                )
+            benchmark._write_json(off_path, off)
+
+            native_path = root / "native.json"
+            native_args = _branch_generation_args(
+                branch_input=branch_input,
+                tokenizer=tokenizer_path,
+                output=native_path,
+                trace=root / "native-trace.json",
+                source=source_weights,
+                inventory=inventory,
+                cache=root / "native-cache",
+                mode="native-crsa",
+            )
+            native_args.head_block_rows = 64
+            with redirect_stderr(io.StringIO()):
+                native = benchmark.generate_arm(
+                    native_args,
+                    runtime_factory=arm_factory([1, 5, eos_token]),
+                )
+            benchmark._write_json(native_path, native)
+
+            comparison_path = root / "comparison.json"
+            comparison_args = benchmark._parser().parse_args(
+                [
+                    "compare-native-fork-references",
+                    "--pair",
+                    str(pair_path),
+                    "--off",
+                    str(off_path),
+                    "--native",
+                    str(native_path),
+                    "--output",
+                    str(comparison_path),
+                ]
+            )
+            comparison = benchmark.compare_native_fork_references(comparison_args)
+            benchmark._write_json(comparison_path, comparison)
+            self.assertTrue(comparison["items"][0]["reference_parity"])
+            for metric in (
+                "source_body_bytes",
+                "linear_calls",
+                "complete_layers",
+                "fork_layer_weight_passes",
+            ):
+                receipt = comparison["savings"][metric]
+                self.assertEqual(
+                    receipt["saved"], receipt["reference"] - receipt["fork"]
+                )
+            self.assertEqual(
+                comparison["savings"]["source_body_bytes"]["measurement"],
+                "runtime-source-body-byte-counters/v1",
+            )
+            self.assertEqual(
+                comparison["savings"]["complete_layers"]["saved"],
+                pair["traffic"]["complete_layers_saved"],
+            )
+            self.assertEqual(
+                comparison["savings"]["fork_layer_weight_passes"]["saved"], 2
+            )
+            for metric in ("complete_layers", "linear_calls", "source_body_bytes"):
+                nonsense = copy.deepcopy(comparison)
+                nonsense["savings"][metric].update(
+                    {"fork": 0, "reference": 1, "saved": 1}
+                )
+                _reseal(nonsense)
+                with self.assertRaisesRegex(
+                    benchmark.QwenDirectDecodeError, "measured savings"
+                ):
+                    benchmark._validate_native_fork_reference_comparison_document(
+                        nonsense
+                    )
+
+            broken_seal = copy.deepcopy(pair)
+            broken_seal["status"] = "tampered"
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "not sealed|seal mismatch|schema"
+            ):
+                benchmark._validate_native_fork_pair_document(broken_seal)
+            broken_accounting = copy.deepcopy(pair)
+            broken_accounting["items"][0]["traffic"]["complete_layers_saved"] += 1
+            _reseal(broken_accounting)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "complete_layers_saved"
+            ):
+                benchmark._validate_native_fork_pair_document(broken_accounting)
+            broken_evidence = copy.deepcopy(pair)
+            broken_evidence["items"][0]["native"]["intervention_evidence"][0][
+                "future_weight_max_abs"
+            ] = 0.1
+            broken_evidence["items"][0]["native"]["intervention_evidence_sha256"] = (
+                benchmark._sha256(
+                    broken_evidence["items"][0]["native"]["intervention_evidence"]
+                )
+            )
+            _reseal(broken_evidence)
+            with self.assertRaisesRegex(benchmark.QwenDirectDecodeError, "evidence"):
+                benchmark._validate_native_fork_pair_document(broken_evidence)
 
 
 if __name__ == "__main__":

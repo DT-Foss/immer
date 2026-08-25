@@ -48,6 +48,7 @@ from immer.runtimes.qwen3_8 import (
     Qwen38BundleError,
     Qwen38Config,
     Qwen38NativeHeadCrsa,
+    Qwen38NativeFork,
     Qwen38StableCrsaGraft,
     Qwen38Tokenizer,
     Qwen38WeightPager,
@@ -73,6 +74,10 @@ BRANCH_EVALUATION_SCHEMA = "immer.qwen3.8-generation-branch-evaluation/v2"
 NATIVE_BRANCH_RESULT_SCHEMA = "immer.qwen3.8-generation-branch-arm/v3"
 TRIAD_COMPARISON_SCHEMA = "immer.qwen3.8-generation-branch-comparison/v3"
 TRIAD_EVALUATION_SCHEMA = "immer.qwen3.8-generation-branch-evaluation/v3"
+NATIVE_FORK_PAIR_SCHEMA = "immer.qwen3.8-generation-native-fork-pair/v1"
+NATIVE_FORK_REFERENCE_COMPARISON_SCHEMA = (
+    "immer.qwen3.8-generation-native-fork-reference-comparison/v1"
+)
 BRANCH_QUESTION_SCHEMA = "immer.qwen3.8-generation-branch-questions/v1"
 BRANCH_ADJUDICATION_SCHEMA = "immer.qwen3.8-generation-branch-adjudication/v1"
 BRANCH_ADJUDICATION_EVALUATION_SCHEMA = (
@@ -2834,6 +2839,1273 @@ def _load_native_branch_result(path: str | os.PathLike[str]) -> dict[str, Any]:
     )
 
 
+def _native_fork_source_budget_preflight(
+    args: argparse.Namespace,
+    verification: Mapping[str, Any] | None,
+    *,
+    items: int,
+) -> None:
+    """Reserve the independent two-arm upper bound for one forked run."""
+
+    _branch_source_budget_preflight(args, verification, items=2 * items)
+
+
+def _native_fork_runtime(
+    args: argparse.Namespace,
+    recorder: AccessTraceRecorder,
+    *,
+    native_head_crsa: Qwen38NativeHeadCrsa,
+) -> tuple[RuntimeSource, Qwen38NativeFork]:
+    """Build one authenticated source, one pager, and one native fork."""
+
+    runtime = _build_source(args, recorder)
+    pager: Qwen38WeightPager | None = None
+    try:
+        raw_config = runtime.source.reader.fetch_file("config.json")
+        config_document = json.loads(raw_config)
+        if not isinstance(config_document, Mapping):
+            raise QwenDirectDecodeError("checkpoint config root is invalid")
+        config = Qwen38Config.from_mapping(
+            config_document,
+            require_official=getattr(args, "_require_official", True),
+        )
+        pager = Qwen38WeightPager(
+            runtime.source,
+            device=args.device,
+            compute_dtype=args.dtype,
+            max_resident_bytes=args.max_resident_mb * 1024**2,
+            require_source_identity=True,
+            causal_tensor_reader=(
+                None if runtime.mount is None else runtime.mount.tensor_reader
+            ),
+        )
+        fork = Qwen38NativeFork(
+            config,
+            pager,
+            native_head_crsa=native_head_crsa,
+            max_seq_len=args.max_seq_len,
+        )
+        fork.checkpoint_preflight()
+        return runtime, fork
+    except Exception:
+        if pager is not None:
+            pager.close()
+        runtime.close()
+        raise
+
+
+def _cleanup_native_fork(runtime: RuntimeSource, fork: Qwen38NativeFork) -> None:
+    active_error = sys.exc_info()[1]
+    cleanup_error: Exception | None = None
+    for action in (fork.pager.close, runtime.close):
+        try:
+            action()
+        except Exception as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+    if active_error is None and cleanup_error is not None:
+        raise cleanup_error
+
+
+def _checkpoint_from_pager(pager: Qwen38WeightPager) -> dict[str, str]:
+    source = pager.source
+    source.inventory()
+    metrics = source.metrics()
+    return {
+        "inventory_fingerprint": str(metrics["inventory_source_fingerprint"]),
+        "repo_id": str(metrics["repo_id"]),
+        "revision": str(metrics["revision"]),
+    }
+
+
+_FORK_TRAFFIC_BASE_FIELDS = (
+    "shared_source_body_bytes",
+    "off_source_body_bytes",
+    "native_source_body_bytes",
+    "shared_linear_calls",
+    "off_linear_calls",
+    "native_linear_calls",
+    "shared_layers",
+    "off_layers",
+    "native_layers",
+    "independent_complete_layers",
+    "complete_layers_saved",
+)
+
+
+def _native_fork_traffic_record(
+    value: object,
+    *,
+    off_forward_passes: int,
+    native_forward_passes: int,
+) -> dict[str, int]:
+    try:
+        record = {name: int(getattr(value, name)) for name in _FORK_TRAFFIC_BASE_FIELDS}
+        joined_weight_passes = int(getattr(value, "fork_layer_weight_passes"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise QwenDirectDecodeError("native fork traffic receipt is invalid") from exc
+    independent_weight_passes = off_forward_passes + native_forward_passes
+    actual_weight_passes = independent_weight_passes - joined_weight_passes
+    record.update(
+        {
+            "actual_fork_layer_weight_passes": actual_weight_passes,
+            "complete_layers_executed": (
+                record["independent_complete_layers"] - record["complete_layers_saved"]
+            ),
+            "fork_layer_weight_passes_saved": joined_weight_passes,
+            "independent_fork_layer_weight_passes": independent_weight_passes,
+            "joined_fork_layer_weight_passes": joined_weight_passes,
+            "layers": (
+                record["shared_layers"] + record["off_layers"] + record["native_layers"]
+            ),
+            "linear_calls": (
+                record["shared_linear_calls"]
+                + record["off_linear_calls"]
+                + record["native_linear_calls"]
+            ),
+            "source_body_bytes": (
+                record["shared_source_body_bytes"]
+                + record["off_source_body_bytes"]
+                + record["native_source_body_bytes"]
+            ),
+        }
+    )
+    return record
+
+
+def _native_fork_arm_record(
+    *,
+    arm: str,
+    prompt: Sequence[int],
+    generated: Sequence[int],
+    text: str,
+    stopped_on_eos: bool,
+    eos: Sequence[int],
+    forward_passes: int,
+    head_block_rows: int,
+    vocab_size: int,
+    intervention_evidence: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    generated_ids = tuple(int(token) for token in generated)
+    finish_reason = "stop" if stopped_on_eos else "length"
+    eos_token_id = generated_ids[-1] if stopped_on_eos else None
+    record: dict[str, Any] = {
+        "context_mode": "stateful_autoregressive",
+        "eos_token_id": eos_token_id,
+        "finish_reason": finish_reason,
+        "forward_passes": forward_passes,
+        "general_generation": True,
+        "generated_text": text,
+        "generated_token_ids": list(generated_ids),
+        "head_scan_blocks": len(generated_ids)
+        * math.ceil(vocab_size / head_block_rows),
+        "head_scans": len(generated_ids),
+        "parsed_numeric_answer": extract_gsm8k_answer(
+            f"{ANSWER_GENERATION_PREFIX_LITERAL}{text}"
+        ),
+        "prefill_mode": "batched",
+        "stateful_autoregressive": True,
+        "stopped_on_eos": stopped_on_eos,
+        "token_chain_sha256": _token_chain_sha256(prompt, generated_ids),
+    }
+    if arm == "native":
+        rows = [dict(row) for row in (intervention_evidence or ())]
+        record["intervention_evidence"] = rows
+        record["intervention_evidence_sha256"] = _sha256(rows)
+    return record
+
+
+def _native_fork_identity(depth: int) -> dict[str, Any]:
+    saved, independent = Qwen38NativeFork.complete_layer_savings(depth)
+    return {
+        "common_complete_layers": NATIVE_HEAD_CRSA_LAYER,
+        "complete_layers_saved_per_joined_forward": saved,
+        "fork_layer": NATIVE_HEAD_CRSA_LAYER,
+        "independent_complete_layers_per_joined_forward": independent,
+        "independent_fork_layer_weight_passes_per_joined_forward": 2,
+        "joined_fork_layer_weight_passes_per_joined_forward": 1,
+        "kind": "native-layer-27-lockstep-fork/v1",
+        "permanent_split_after_token_divergence": True,
+        "rejoin_after_split": False,
+        "shared_checkpoint_source": True,
+        "shared_weight_pager": True,
+    }
+
+
+def _validate_complete_causal_bundle_receipt(
+    value: object,
+    *,
+    checkpoint: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    required = {
+        "checkpoint_bytes",
+        "graph_revision",
+        "kind",
+        "layout_fingerprint",
+        "manifest_sha256",
+        "shards",
+        "shards_sha256",
+        "tensor_bindings",
+        "weights_layout",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != required
+        or value.get("kind") != "complete-causal-bundle/v1"
+        or value.get("weights_layout") not in {"flat/v1", "nested/v1"}
+        or value.get("layout_fingerprint") != checkpoint.get("inventory_fingerprint")
+    ):
+        raise QwenDirectDecodeError("native fork requires a complete causal bundle")
+    for name in ("layout_fingerprint", "manifest_sha256", "shards_sha256"):
+        _digest_string(value.get(name), f"native fork bundle {name}")
+    for name in ("checkpoint_bytes", "shards", "tensor_bindings"):
+        if _nonnegative_count(value.get(name), f"native fork bundle {name}") < 1:
+            raise QwenDirectDecodeError(
+                f"native fork bundle {name} must be positive"
+            )
+    revision = value.get("graph_revision")
+    if (
+        not isinstance(revision, list)
+        or len(revision) != 2
+        or isinstance(revision[0], bool)
+        or not isinstance(revision[0], int)
+        or revision[0] < 0
+    ):
+        raise QwenDirectDecodeError("native fork bundle graph revision is invalid")
+    _digest_string(revision[1], "native fork bundle graph revision")
+    return value
+
+
+def generate_native_fork(
+    args: argparse.Namespace,
+    *,
+    runtime_factory: Callable[..., tuple[RuntimeSource, Qwen38NativeFork]]
+    | None = None,
+    tokenizer_factory: Callable[..., Qwen38Tokenizer] = Qwen38Tokenizer,
+) -> dict[str, Any]:
+    """Generate off/native arms through one real layer-27 runtime fork."""
+
+    inputs = _load_branch_input(args.input)
+    if inputs["schema"] != BRANCH_INPUT_SCHEMA_V3:
+        raise QwenDirectDecodeError(
+            "native fork requires a sealed answer-prefix v3 input"
+        )
+    if (
+        getattr(args, "_require_official", True)
+        and getattr(args, "causal_bundle", None) is None
+    ):
+        raise QwenDirectDecodeError(
+            "official native fork generation requires one local complete causal bundle"
+        )
+    if (
+        args.logical_repo_id != inputs["source"]["checkpoint"]
+        or args.revision != inputs["source"]["revision"]
+    ):
+        raise QwenDirectDecodeError(
+            "requested checkpoint/revision differs from branch input"
+        )
+    tokenizer, tokenizer_identity = _tokenizer_record(
+        args.tokenizer_json,
+        require_official=getattr(args, "_require_official", True),
+        tokenizer_factory=tokenizer_factory,
+    )
+    if tokenizer_identity != inputs["tokenizer"]:
+        raise QwenDirectDecodeError("generation tokenizer differs from branch input")
+    prefix = _answer_generation_prefix(tokenizer, tokenizer_identity)
+    if tuple(inputs["protocol"]["generation_prefix"]["token_ids"]) != prefix:
+        raise QwenDirectDecodeError(
+            "answer generation prefix differs from pinned tokenizer"
+        )
+    prompts = [
+        _token_rows(row["effective_prompt_token_ids"], f"prompt {row['item_id']}")
+        for row in inputs["items"]
+    ]
+    if max(len(prompt) for prompt in prompts) + args.max_new_tokens > args.max_seq_len:
+        raise QwenDirectDecodeError("generation bound exceeds max_seq_len")
+    intervention, intervention_identity = _build_native_intervention(args)
+    recorder = AccessTraceRecorder()
+    factory = _native_fork_runtime if runtime_factory is None else runtime_factory
+    runtime, fork = factory(
+        args,
+        recorder,
+        native_head_crsa=intervention,
+    )
+    if (
+        fork.native_head_crsa is not intervention
+        or fork.max_seq_len != args.max_seq_len
+        or fork.pager.source is not runtime.source
+    ):
+        _cleanup_native_fork(runtime, fork)
+        raise QwenDirectDecodeError(
+            "native fork runtime attachment differs from contract"
+        )
+    try:
+        _native_fork_source_budget_preflight(
+            args, runtime.verification, items=len(prompts)
+        )
+    except Exception:
+        _cleanup_native_fork(runtime, fork)
+        raise
+    started = time.perf_counter()
+    source_start = _source_metric(fork.pager.source, "network_or_source_body_bytes")
+    items: list[dict[str, Any]] = []
+    try:
+        eos = tuple(
+            int(value) for value in inputs["protocol"]["accepted_eos_token_ids"]
+        )
+        if (
+            max((*eos, *(token for prompt in prompts for token in prompt)))
+            >= fork.config.vocab_size
+        ):
+            raise QwenDirectDecodeError(
+                "native fork token exceeds checkpoint vocabulary"
+            )
+        for source_row, prompt in zip(inputs["items"], prompts, strict=True):
+            head_blocks = 0
+            head_scans = 0
+
+            def head_progress(event: Mapping[str, int]) -> None:
+                nonlocal head_blocks, head_scans
+                head_blocks += 1
+                if event.get("rows_done") == event.get("vocab_rows"):
+                    head_scans += 1
+
+            try:
+                generated = fork.generate_greedy(
+                    [prompt],
+                    max_new_tokens=args.max_new_tokens,
+                    eos_token_ids=eos,
+                    head_block_rows=args.head_block_rows,
+                    progress=_progress,
+                    head_progress=head_progress,
+                )
+            except Exception as exc:
+                raise QwenDirectDecodeError(
+                    f"native fork generation failed for {source_row['item_id']}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            evidence = generated.evidence
+            off_ids = tuple(int(token) for token in generated.off_token_ids)
+            native_ids = tuple(int(token) for token in generated.native_token_ids)
+            if (
+                not off_ids
+                or not native_ids
+                or tuple(evidence.prompt_token_ids) != prompt
+                or tuple(evidence.off_generated_token_ids) != off_ids
+                or tuple(evidence.native_generated_token_ids) != native_ids
+            ):
+                raise QwenDirectDecodeError("native fork generation evidence differs")
+            if head_scans != len(off_ids) + len(native_ids):
+                raise QwenDirectDecodeError(
+                    "native fork LM-head scan count is incomplete"
+                )
+            expected_head_blocks = head_scans * math.ceil(
+                fork.config.vocab_size / args.head_block_rows
+            )
+            if head_blocks != expected_head_blocks:
+                raise QwenDirectDecodeError(
+                    "native fork LM-head block accounting differs"
+                )
+            off_text = tokenizer.decode(off_ids)
+            native_text = tokenizer.decode(native_ids)
+            if "####" in off_text or "####" in native_text:
+                raise QwenDirectDecodeError(
+                    "answer fork generated text re-emits the sealed #### prefix"
+                )
+            evidence_rows = [
+                row.to_dict() for row in evidence.traffic.native_head_crsa_evidence
+            ]
+            off = _native_fork_arm_record(
+                arm="off",
+                prompt=prompt,
+                generated=off_ids,
+                text=off_text,
+                stopped_on_eos=bool(evidence.off_stopped_on_eos),
+                eos=eos,
+                forward_passes=int(evidence.off_forward_passes),
+                head_block_rows=args.head_block_rows,
+                vocab_size=fork.config.vocab_size,
+            )
+            native = _native_fork_arm_record(
+                arm="native",
+                prompt=prompt,
+                generated=native_ids,
+                text=native_text,
+                stopped_on_eos=bool(evidence.native_stopped_on_eos),
+                eos=eos,
+                forward_passes=int(evidence.native_forward_passes),
+                head_block_rows=args.head_block_rows,
+                vocab_size=fork.config.vocab_size,
+                intervention_evidence=evidence_rows,
+            )
+            first = _first_divergence(off_ids, native_ids)
+            if first != evidence.first_divergence_step:
+                raise QwenDirectDecodeError("native fork divergence evidence differs")
+            traffic = _native_fork_traffic_record(
+                evidence.traffic,
+                off_forward_passes=off["forward_passes"],
+                native_forward_passes=native["forward_passes"],
+            )
+            item_fork = {
+                "final_joined": bool(evidence.final_joined),
+                "first_divergence_index": first,
+                "first_divergence_position": generated.state.first_divergence_position,
+                "initially_joined": True,
+                "joined_pair_forward_passes": traffic[
+                    "joined_fork_layer_weight_passes"
+                ],
+                "permanently_split": not bool(evidence.final_joined),
+                "rejoined_after_split": False,
+            }
+            items.append(
+                {
+                    "fork": item_fork,
+                    "item_id": str(source_row["item_id"]),
+                    "native": native,
+                    "off": off,
+                    "prompt_token_ids": list(prompt),
+                    "seconds": float(evidence.seconds),
+                    "traffic": traffic,
+                }
+            )
+        checkpoint = _checkpoint_from_pager(fork.pager)
+        if (
+            checkpoint["repo_id"] != inputs["source"]["checkpoint"]
+            or checkpoint["revision"] != inputs["source"]["revision"]
+        ):
+            raise QwenDirectDecodeError("runtime checkpoint differs from branch input")
+        trace = _trace_receipt(recorder, args.access_trace)
+        generation = {
+            "algorithm": "exact-greedy/v1",
+            "eos_token_ids": list(eos),
+            "general_generation": True,
+            "head_block_rows": args.head_block_rows,
+            "max_new_tokens": args.max_new_tokens,
+            "max_seq_len": args.max_seq_len,
+            "prefill_mode": "batched-per-item",
+            "stateful_autoregressive": True,
+            "teacher_forced_tokens_after_prompt": 0,
+            "temperature": 0.0,
+        }
+        execution = {
+            "checkpoint_layers": int(fork.config.n_layers),
+            "cohort_size": len(items),
+            "device": str(fork.pager.device),
+            "dtype": str(fork.pager.compute_dtype).removeprefix("torch."),
+            "execution_mode": "serial_items/native-lockstep-fork",
+            "max_batch_size": 1,
+            "model_views": 2,
+            "runtime_instances": 1,
+            "shared_pair_prefills": len(items),
+            "source_instances": 1,
+            "weight_pagers": 1,
+        }
+        sum_fields = (
+            *_FORK_TRAFFIC_BASE_FIELDS,
+            "actual_fork_layer_weight_passes",
+            "complete_layers_executed",
+            "fork_layer_weight_passes_saved",
+            "independent_fork_layer_weight_passes",
+            "joined_fork_layer_weight_passes",
+            "layers",
+            "linear_calls",
+            "source_body_bytes",
+        )
+        traffic: dict[str, Any] = {
+            name: sum(row["traffic"][name] for row in items) for name in sum_fields
+        }
+        traffic.update(
+            {
+                "access_trace": trace,
+                "access_trace_sha256": trace["sha256"],
+                "forward_passes": sum(
+                    row[arm]["forward_passes"]
+                    for row in items
+                    for arm in ("off", "native")
+                ),
+                "generation_seconds": sum(row["seconds"] for row in items),
+                "head_scan_blocks": sum(
+                    row[arm]["head_scan_blocks"]
+                    for row in items
+                    for arm in ("off", "native")
+                ),
+                "head_scans": sum(
+                    row[arm]["head_scans"] for row in items for arm in ("off", "native")
+                ),
+                "native_forward_passes": sum(
+                    row["native"]["forward_passes"] for row in items
+                ),
+                "off_forward_passes": sum(
+                    row["off"]["forward_passes"] for row in items
+                ),
+                "runtime_source_body_bytes": (
+                    _source_metric(fork.pager.source, "network_or_source_body_bytes")
+                    - source_start
+                ),
+                "wall_seconds": time.perf_counter() - started,
+            }
+        )
+        identity = {
+            "bundle": dict(runtime.verification or {}),
+            "checkpoint": checkpoint,
+            "execution": execution,
+            "fork": _native_fork_identity(fork.config.n_layers),
+            "generation": generation,
+            "input": _branch_input_identity(inputs),
+            "intervention": intervention_identity,
+            "items": items,
+            "schema": NATIVE_FORK_PAIR_SCHEMA,
+            "status": "sealed",
+            "tokenizer": tokenizer_identity,
+            "traffic": traffic,
+        }
+        result = _result(identity)
+        return _validate_native_fork_pair_document(result)
+    finally:
+        _cleanup_native_fork(runtime, fork)
+
+
+_NATIVE_FORK_ITEM_TRAFFIC_FIELDS = frozenset(
+    {
+        *_FORK_TRAFFIC_BASE_FIELDS,
+        "actual_fork_layer_weight_passes",
+        "complete_layers_executed",
+        "fork_layer_weight_passes_saved",
+        "independent_fork_layer_weight_passes",
+        "joined_fork_layer_weight_passes",
+        "layers",
+        "linear_calls",
+        "source_body_bytes",
+    }
+)
+_NATIVE_FORK_ARM_FIELDS = frozenset(
+    {
+        "context_mode",
+        "eos_token_id",
+        "finish_reason",
+        "forward_passes",
+        "general_generation",
+        "generated_text",
+        "generated_token_ids",
+        "head_scan_blocks",
+        "head_scans",
+        "parsed_numeric_answer",
+        "prefill_mode",
+        "stateful_autoregressive",
+        "stopped_on_eos",
+        "token_chain_sha256",
+    }
+)
+
+
+def _validate_native_fork_arm_record(
+    value: object,
+    *,
+    arm: str,
+    item_id: str,
+    prompt: tuple[int, ...],
+    eos: tuple[int, ...],
+    generation: Mapping[str, Any],
+    tokenizer_vocab: int,
+) -> Mapping[str, Any]:
+    required = set(_NATIVE_FORK_ARM_FIELDS)
+    if arm == "native":
+        required.update({"intervention_evidence", "intervention_evidence_sha256"})
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise QwenDirectDecodeError(f"native fork {arm} token record is invalid")
+    generated = _token_rows(value.get("generated_token_ids"), f"fork {arm} tokens")
+    max_new_tokens = int(generation["max_new_tokens"])
+    if (
+        len(generated) > max_new_tokens
+        or max((*prompt, *generated)) >= tokenizer_vocab
+        or len(prompt) + len(generated) > generation["max_seq_len"]
+    ):
+        raise QwenDirectDecodeError(f"native fork {arm} token bound was exceeded")
+    text = value.get("generated_text")
+    if not isinstance(text, str) or "####" in text:
+        raise QwenDirectDecodeError(
+            f"native fork {arm} text violates answer-prefix semantics"
+        )
+    if value.get("parsed_numeric_answer") != extract_gsm8k_answer(
+        f"{ANSWER_GENERATION_PREFIX_LITERAL}{text}"
+    ):
+        raise QwenDirectDecodeError(
+            f"native fork {arm} parsed numeric answer is inconsistent"
+        )
+    if value.get("token_chain_sha256") != _token_chain_sha256(prompt, generated):
+        raise QwenDirectDecodeError(f"native fork {arm} token chain differs")
+    stopped = value.get("stopped_on_eos")
+    if not isinstance(stopped, bool):
+        raise QwenDirectDecodeError(f"native fork {arm} EOS state is invalid")
+    if stopped:
+        if (
+            value.get("finish_reason") != "stop"
+            or value.get("eos_token_id") != generated[-1]
+            or generated[-1] not in eos
+        ):
+            raise QwenDirectDecodeError(f"native fork {arm} EOS evidence differs")
+    elif (
+        value.get("finish_reason") != "length"
+        or value.get("eos_token_id") is not None
+        or len(generated) != max_new_tokens
+    ):
+        raise QwenDirectDecodeError(f"native fork {arm} length evidence differs")
+    if (
+        value.get("context_mode") != "stateful_autoregressive"
+        or value.get("general_generation") is not True
+        or value.get("stateful_autoregressive") is not True
+        or value.get("prefill_mode") != "batched"
+        or value.get("forward_passes") != len(generated) + 1
+        or value.get("head_scans") != len(generated)
+        or value.get("head_scan_blocks")
+        != len(generated) * math.ceil(tokenizer_vocab / generation["head_block_rows"])
+    ):
+        raise QwenDirectDecodeError(
+            f"native fork {arm} autoregressive evidence differs"
+        )
+    for name in ("forward_passes", "head_scan_blocks", "head_scans"):
+        _nonnegative_count(value.get(name), f"native fork {arm} {name}")
+    if arm == "native":
+        _validate_native_evidence_chain(
+            {
+                "forward_passes": value["forward_passes"],
+                "intervention_evidence": value["intervention_evidence"],
+                "intervention_evidence_sha256": value["intervention_evidence_sha256"],
+                "item_id": item_id,
+                "prompt_token_ids": list(prompt),
+            }
+        )
+    return value
+
+
+def _validate_native_fork_item_traffic(
+    value: object,
+    *,
+    depth: int,
+    off_forward_passes: int,
+    native_forward_passes: int,
+    joined_forward_passes: int,
+) -> Mapping[str, int]:
+    if not isinstance(value, Mapping) or set(value) != _NATIVE_FORK_ITEM_TRAFFIC_FIELDS:
+        raise QwenDirectDecodeError("native fork item traffic schema is invalid")
+    for name in value:
+        _nonnegative_count(value.get(name), f"native fork item traffic {name}")
+    expected = {
+        "independent_complete_layers": (off_forward_passes + native_forward_passes)
+        * depth,
+        "complete_layers_saved": joined_forward_passes * NATIVE_HEAD_CRSA_LAYER,
+        "independent_fork_layer_weight_passes": (
+            off_forward_passes + native_forward_passes
+        ),
+        "joined_fork_layer_weight_passes": joined_forward_passes,
+        "fork_layer_weight_passes_saved": joined_forward_passes,
+        "actual_fork_layer_weight_passes": (
+            off_forward_passes + native_forward_passes - joined_forward_passes
+        ),
+        "shared_layers": joined_forward_passes * NATIVE_HEAD_CRSA_LAYER,
+        "off_layers": (
+            joined_forward_passes * (depth - NATIVE_HEAD_CRSA_LAYER)
+            + (off_forward_passes - joined_forward_passes) * depth
+        ),
+        "native_layers": (
+            joined_forward_passes * (depth - NATIVE_HEAD_CRSA_LAYER)
+            + (native_forward_passes - joined_forward_passes) * depth
+        ),
+    }
+    expected["complete_layers_executed"] = (
+        expected["independent_complete_layers"] - expected["complete_layers_saved"]
+    )
+    expected["layers"] = expected["complete_layers_executed"]
+    for name, expected_value in expected.items():
+        if value.get(name) != expected_value:
+            raise QwenDirectDecodeError(
+                f"native fork item traffic {name} is inconsistent"
+            )
+    for total, fields in {
+        "source_body_bytes": (
+            "shared_source_body_bytes",
+            "off_source_body_bytes",
+            "native_source_body_bytes",
+        ),
+        "linear_calls": (
+            "shared_linear_calls",
+            "off_linear_calls",
+            "native_linear_calls",
+        ),
+        "layers": ("shared_layers", "off_layers", "native_layers"),
+    }.items():
+        if value[total] != sum(value[name] for name in fields):
+            raise QwenDirectDecodeError(
+                f"native fork item traffic {total} sum is inconsistent"
+            )
+    return value
+
+
+def _validate_native_fork_pair_document(
+    document: dict[str, Any],
+    *,
+    access_trace_path: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    required = {
+        "bundle",
+        "checkpoint",
+        "execution",
+        "fork",
+        "generation",
+        "input",
+        "intervention",
+        "items",
+        "schema",
+        "sha256",
+        "status",
+        "tokenizer",
+        "traffic",
+    }
+    if (
+        set(document) != required
+        or document.get("schema") != NATIVE_FORK_PAIR_SCHEMA
+        or document.get("status") != "sealed"
+    ):
+        raise QwenDirectDecodeError("native fork pair schema is invalid")
+    _verify_document_seal(document, "native fork pair")
+    _validate_native_intervention_identity(document.get("intervention"))
+    inputs = document.get("input")
+    if not isinstance(inputs, dict):
+        raise QwenDirectDecodeError("native fork pair input is invalid")
+    _validate_branch_input(inputs)
+    if inputs["schema"] != BRANCH_INPUT_SCHEMA_V3:
+        raise QwenDirectDecodeError("native fork pair input is not answer-prefix v3")
+    checkpoint = document.get("checkpoint")
+    if not isinstance(checkpoint, Mapping) or set(checkpoint) != {
+        "inventory_fingerprint",
+        "repo_id",
+        "revision",
+    }:
+        raise QwenDirectDecodeError("native fork checkpoint identity is invalid")
+    if any(not isinstance(value, str) or not value for value in checkpoint.values()):
+        raise QwenDirectDecodeError("native fork checkpoint identity is invalid")
+    if (
+        checkpoint["repo_id"] != inputs["source"]["checkpoint"]
+        or checkpoint["revision"] != inputs["source"]["revision"]
+    ):
+        raise QwenDirectDecodeError("native fork checkpoint differs from input")
+    bundle = document.get("bundle")
+    _validate_complete_causal_bundle_receipt(bundle, checkpoint=checkpoint)
+    tokenizer = document.get("tokenizer")
+    if tokenizer != inputs["tokenizer"]:
+        raise QwenDirectDecodeError("native fork tokenizer differs from input")
+    if not isinstance(tokenizer, Mapping):  # pragma: no cover - implied above.
+        raise QwenDirectDecodeError("native fork tokenizer identity is invalid")
+    tokenizer_vocab = _nonnegative_count(
+        tokenizer.get("vocab_size"), "native fork tokenizer vocabulary"
+    )
+    generation = document.get("generation")
+    generation_required = {
+        "algorithm",
+        "eos_token_ids",
+        "general_generation",
+        "head_block_rows",
+        "max_new_tokens",
+        "max_seq_len",
+        "prefill_mode",
+        "stateful_autoregressive",
+        "teacher_forced_tokens_after_prompt",
+        "temperature",
+    }
+    if not isinstance(generation, Mapping) or set(generation) != generation_required:
+        raise QwenDirectDecodeError("native fork generation identity is invalid")
+    eos = _token_rows(generation.get("eos_token_ids"), "native fork EOS IDs")
+    if (
+        list(eos) != inputs["protocol"]["accepted_eos_token_ids"]
+        or generation.get("algorithm") != "exact-greedy/v1"
+        or generation.get("general_generation") is not True
+        or generation.get("stateful_autoregressive") is not True
+        or generation.get("teacher_forced_tokens_after_prompt") != 0
+        or generation.get("temperature") != 0.0
+        or generation.get("prefill_mode") != "batched-per-item"
+        or _nonnegative_count(generation.get("max_new_tokens"), "max_new_tokens") < 1
+        or _nonnegative_count(generation.get("max_seq_len"), "max_seq_len") < 1
+        or _nonnegative_count(generation.get("head_block_rows"), "head_block_rows") < 1
+    ):
+        raise QwenDirectDecodeError("native fork generation contract differs")
+    execution = document.get("execution")
+    execution_fields = {
+        "checkpoint_layers",
+        "cohort_size",
+        "device",
+        "dtype",
+        "execution_mode",
+        "max_batch_size",
+        "model_views",
+        "runtime_instances",
+        "shared_pair_prefills",
+        "source_instances",
+        "weight_pagers",
+    }
+    rows = document.get("items")
+    if (
+        not isinstance(execution, Mapping)
+        or set(execution) != execution_fields
+        or not isinstance(rows, list)
+        or not rows
+    ):
+        raise QwenDirectDecodeError("native fork execution structure is invalid")
+    depth = _nonnegative_count(execution.get("checkpoint_layers"), "fork depth")
+    if (
+        depth <= NATIVE_HEAD_CRSA_LAYER
+        or execution.get("cohort_size") != len(rows)
+        or execution.get("shared_pair_prefills") != len(rows)
+        or execution.get("execution_mode") != "serial_items/native-lockstep-fork"
+        or execution.get("max_batch_size") != 1
+        or execution.get("model_views") != 2
+        or execution.get("runtime_instances") != 1
+        or execution.get("source_instances") != 1
+        or execution.get("weight_pagers") != 1
+        or not isinstance(execution.get("device"), str)
+        or not execution["device"]
+        or not isinstance(execution.get("dtype"), str)
+        or not execution["dtype"]
+    ):
+        raise QwenDirectDecodeError("native fork execution accounting differs")
+    if document.get("fork") != _native_fork_identity(depth):
+        raise QwenDirectDecodeError("native fork identity is not canonical")
+    item_ids = inputs["selection"]["item_ids"]
+    item_traffic: list[Mapping[str, int]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != {
+            "fork",
+            "item_id",
+            "native",
+            "off",
+            "prompt_token_ids",
+            "seconds",
+            "traffic",
+        }:
+            raise QwenDirectDecodeError("native fork generated item schema is invalid")
+        if row.get("item_id") != item_ids[index]:
+            raise QwenDirectDecodeError("native fork generated item order differs")
+        prompt = _token_rows(row.get("prompt_token_ids"), "native fork prompt")
+        sealed = inputs["items"][index]
+        if (
+            row["item_id"] != sealed["item_id"]
+            or list(prompt) != sealed["effective_prompt_token_ids"]
+        ):
+            raise QwenDirectDecodeError("native fork prompt differs from input")
+        off = _validate_native_fork_arm_record(
+            row.get("off"),
+            arm="off",
+            item_id=row["item_id"],
+            prompt=prompt,
+            eos=eos,
+            generation=generation,
+            tokenizer_vocab=tokenizer_vocab,
+        )
+        native = _validate_native_fork_arm_record(
+            row.get("native"),
+            arm="native",
+            item_id=row["item_id"],
+            prompt=prompt,
+            eos=eos,
+            generation=generation,
+            tokenizer_vocab=tokenizer_vocab,
+        )
+        first = _first_divergence(
+            off["generated_token_ids"], native["generated_token_ids"]
+        )
+        fork_receipt = row.get("fork")
+        joined = first + 1 if first is not None else 1 + len(off["generated_token_ids"])
+        expected_fork = {
+            "final_joined": first is None,
+            "first_divergence_index": first,
+            "first_divergence_position": (
+                None if first is None else len(prompt) + first
+            ),
+            "initially_joined": True,
+            "joined_pair_forward_passes": joined,
+            "permanently_split": first is not None,
+            "rejoined_after_split": False,
+        }
+        if fork_receipt != expected_fork:
+            raise QwenDirectDecodeError("native fork split evidence is inconsistent")
+        traffic = _validate_native_fork_item_traffic(
+            row.get("traffic"),
+            depth=depth,
+            off_forward_passes=off["forward_passes"],
+            native_forward_passes=native["forward_passes"],
+            joined_forward_passes=joined,
+        )
+        item_traffic.append(traffic)
+        _finite_nonnegative(row.get("seconds"), "native fork item seconds")
+    traffic = document.get("traffic")
+    aggregate_fields = {
+        *_NATIVE_FORK_ITEM_TRAFFIC_FIELDS,
+        "access_trace",
+        "access_trace_sha256",
+        "forward_passes",
+        "generation_seconds",
+        "head_scan_blocks",
+        "head_scans",
+        "native_forward_passes",
+        "off_forward_passes",
+        "runtime_source_body_bytes",
+        "wall_seconds",
+    }
+    if not isinstance(traffic, Mapping) or set(traffic) != aggregate_fields:
+        raise QwenDirectDecodeError("native fork aggregate traffic schema is invalid")
+    _verify_access_trace_receipt(
+        traffic.get("access_trace"), artifact_path=access_trace_path
+    )
+    if traffic.get("access_trace_sha256") != traffic["access_trace"]["sha256"]:
+        raise QwenDirectDecodeError("native fork trace digest differs")
+    expected_sums: dict[str, int | float] = {
+        name: sum(row[name] for row in item_traffic)
+        for name in _NATIVE_FORK_ITEM_TRAFFIC_FIELDS
+    }
+    expected_sums.update(
+        {
+            "forward_passes": sum(
+                row[arm]["forward_passes"] for row in rows for arm in ("off", "native")
+            ),
+            "generation_seconds": sum(row["seconds"] for row in rows),
+            "head_scan_blocks": sum(
+                row[arm]["head_scan_blocks"]
+                for row in rows
+                for arm in ("off", "native")
+            ),
+            "head_scans": sum(
+                row[arm]["head_scans"] for row in rows for arm in ("off", "native")
+            ),
+            "native_forward_passes": sum(
+                row["native"]["forward_passes"] for row in rows
+            ),
+            "off_forward_passes": sum(row["off"]["forward_passes"] for row in rows),
+        }
+    )
+    for name, expected in expected_sums.items():
+        if traffic.get(name) != expected:
+            raise QwenDirectDecodeError(
+                f"native fork aggregate traffic {name} is inconsistent"
+            )
+    for name in (
+        "runtime_source_body_bytes",
+        "wall_seconds",
+    ):
+        if name == "wall_seconds":
+            _finite_nonnegative(traffic.get(name), f"native fork {name}")
+        else:
+            _nonnegative_count(traffic.get(name), f"native fork {name}")
+    if traffic["runtime_source_body_bytes"] != traffic["source_body_bytes"]:
+        raise QwenDirectDecodeError("native fork runtime/source bytes differ")
+    if traffic["wall_seconds"] < traffic["generation_seconds"]:
+        raise QwenDirectDecodeError("native fork wall timing is below model timing")
+    return document
+
+
+def _load_native_fork_pair(path: str | os.PathLike[str]) -> dict[str, Any]:
+    document = _strict_json(path)
+    return _validate_native_fork_pair_document(
+        document,
+        access_trace_path=_relocated_access_trace_path(path, document),
+    )
+
+
+_REFERENCE_TOKEN_FIELDS = (
+    "eos_token_id",
+    "finish_reason",
+    "forward_passes",
+    "generated_text",
+    "generated_token_ids",
+    "parsed_numeric_answer",
+    "stopped_on_eos",
+    "token_chain_sha256",
+)
+
+
+def _reference_token_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {name: value[name] for name in _REFERENCE_TOKEN_FIELDS}
+
+
+def _saving_record(
+    reference: int,
+    fork: int,
+    *,
+    measurement: str,
+) -> dict[str, Any]:
+    return {
+        "fork": fork,
+        "measurement": measurement,
+        "reference": reference,
+        "saved": reference - fork,
+    }
+
+
+def compare_native_fork_references(args: argparse.Namespace) -> dict[str, Any]:
+    """Prove fork parity against independently sealed off-v2/native-v3 arms."""
+
+    pair = _load_native_fork_pair(args.pair)
+    off = _load_branch_result(args.off)
+    native = _load_native_branch_result(args.native)
+    if off.get("arm") != "off" or native.get("arm") != "native-crsa":
+        raise QwenDirectDecodeError(
+            "native fork comparison requires off-v2 and native-v3 references"
+        )
+    if off["input"]["schema"] != BRANCH_INPUT_SCHEMA_V3:
+        raise QwenDirectDecodeError("native fork off reference is not answer-prefix v3")
+    for name in ("bundle", "checkpoint", "input", "tokenizer", "generation"):
+        if off[name] != native[name] or pair[name] != off[name]:
+            raise QwenDirectDecodeError(
+                f"native fork/reference {name} identity differs"
+            )
+    if pair["intervention"] != native["intervention"]:
+        raise QwenDirectDecodeError("native fork/reference intervention differs")
+    if (
+        off["execution"]["checkpoint_layers"] != pair["execution"]["checkpoint_layers"]
+        or native["execution"]["checkpoint_layers"]
+        != pair["execution"]["checkpoint_layers"]
+    ):
+        raise QwenDirectDecodeError("native fork/reference checkpoint depth differs")
+    if not (len(pair["items"]) == len(off["items"]) == len(native["items"])):
+        raise QwenDirectDecodeError("native fork/reference item counts differ")
+    items: list[dict[str, Any]] = []
+    for pair_row, off_row, native_row in zip(
+        pair["items"], off["items"], native["items"], strict=True
+    ):
+        if (
+            pair_row["item_id"] != off_row["item_id"]
+            or pair_row["item_id"] != native_row["item_id"]
+            or pair_row["prompt_token_ids"] != off_row["prompt_token_ids"]
+            or pair_row["prompt_token_ids"] != native_row["prompt_token_ids"]
+        ):
+            raise QwenDirectDecodeError("native fork/reference item identity differs")
+        pair_off = _reference_token_projection(pair_row["off"])
+        pair_native = _reference_token_projection(pair_row["native"])
+        reference_off = _reference_token_projection(off_row)
+        reference_native = _reference_token_projection(native_row)
+        if pair_off != reference_off:
+            raise QwenDirectDecodeError(
+                f"native fork off parity differs for {pair_row['item_id']}"
+            )
+        if pair_native != reference_native:
+            raise QwenDirectDecodeError(
+                f"native fork native parity differs for {pair_row['item_id']}"
+            )
+        items.append(
+            {
+                "fork": pair_row["fork"],
+                "item_id": pair_row["item_id"],
+                "native": pair_native,
+                "off": pair_off,
+                "prompt_token_ids": pair_row["prompt_token_ids"],
+                "reference_parity": True,
+            }
+        )
+    reference_forward_passes = (
+        off["traffic"]["forward_passes"] + native["traffic"]["forward_passes"]
+    )
+    depth = pair["execution"]["checkpoint_layers"]
+    reference_complete_layers = reference_forward_passes * depth
+    savings = {
+        "complete_layers": _saving_record(
+            reference_complete_layers,
+            pair["traffic"]["complete_layers_executed"],
+            measurement="sealed-forward-count-times-checkpoint-depth/v1",
+        ),
+        "fork_layer_weight_passes": _saving_record(
+            reference_forward_passes,
+            pair["traffic"]["actual_fork_layer_weight_passes"],
+            measurement="sealed-fork-layer-pass-accounting/v1",
+        ),
+        "linear_calls": _saving_record(
+            off["traffic"]["linear_calls"] + native["traffic"]["linear_calls"],
+            pair["traffic"]["linear_calls"],
+            measurement="runtime-linear-call-counters/v1",
+        ),
+        "source_body_bytes": _saving_record(
+            off["traffic"]["source_body_bytes"]
+            + native["traffic"]["source_body_bytes"],
+            pair["traffic"]["source_body_bytes"],
+            measurement="runtime-source-body-byte-counters/v1",
+        ),
+    }
+    identity = {
+        "identity": {
+            "bundle": pair["bundle"],
+            "checkpoint": pair["checkpoint"],
+            "fork": pair["fork"],
+            "generation": pair["generation"],
+            "input_sha256": pair["input"]["sha256"],
+            "intervention": pair["intervention"],
+            "tokenizer": pair["tokenizer"],
+        },
+        "items": items,
+        "pair": {
+            "result_sha256": pair["sha256"],
+            "traffic": pair["traffic"],
+            "traffic_sha256": _sha256(pair["traffic"]),
+        },
+        "references": {
+            "native": {
+                "result_sha256": native["sha256"],
+                "traffic": native["traffic"],
+                "traffic_sha256": _sha256(native["traffic"]),
+            },
+            "off": {
+                "result_sha256": off["sha256"],
+                "traffic": off["traffic"],
+                "traffic_sha256": _sha256(off["traffic"]),
+            },
+        },
+        "savings": savings,
+        "schema": NATIVE_FORK_REFERENCE_COMPARISON_SCHEMA,
+        "status": "sealed",
+    }
+    result = _result(identity)
+    return _validate_native_fork_reference_comparison_document(result)
+
+
+def _validate_native_fork_reference_comparison_document(
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "identity",
+        "items",
+        "pair",
+        "references",
+        "savings",
+        "schema",
+        "sha256",
+        "status",
+    }
+    if (
+        set(document) != required
+        or document.get("schema") != NATIVE_FORK_REFERENCE_COMPARISON_SCHEMA
+        or document.get("status") != "sealed"
+    ):
+        raise QwenDirectDecodeError(
+            "native fork reference comparison schema is invalid"
+        )
+    _verify_document_seal(document, "native fork reference comparison")
+    identity = document.get("identity")
+    if not isinstance(identity, Mapping) or set(identity) != {
+        "bundle",
+        "checkpoint",
+        "fork",
+        "generation",
+        "input_sha256",
+        "intervention",
+        "tokenizer",
+    }:
+        raise QwenDirectDecodeError("native fork comparison identity is invalid")
+    _digest_string(identity.get("input_sha256"), "native fork comparison input")
+    _validate_native_intervention_identity(identity.get("intervention"))
+    checkpoint = identity.get("checkpoint")
+    if not isinstance(checkpoint, Mapping):
+        raise QwenDirectDecodeError("native fork comparison checkpoint is invalid")
+    _validate_complete_causal_bundle_receipt(
+        identity.get("bundle"), checkpoint=checkpoint
+    )
+    fork_identity = identity.get("fork")
+    independent = (
+        fork_identity.get("independent_complete_layers_per_joined_forward")
+        if isinstance(fork_identity, Mapping)
+        else None
+    )
+    if isinstance(independent, bool) or not isinstance(independent, int):
+        raise QwenDirectDecodeError("native fork comparison depth is invalid")
+    depth = independent // 2
+    if independent != 2 * depth or fork_identity != _native_fork_identity(depth):
+        raise QwenDirectDecodeError("native fork comparison identity is inconsistent")
+    pair = document.get("pair")
+    references = document.get("references")
+    if (
+        not isinstance(pair, Mapping)
+        or set(pair) != {"result_sha256", "traffic", "traffic_sha256"}
+        or not isinstance(references, Mapping)
+        or set(references) != {"off", "native"}
+    ):
+        raise QwenDirectDecodeError("native fork comparison receipts are invalid")
+    receipts: dict[str, Mapping[str, Any]] = {}
+    for name, receipt in (("pair", pair), *references.items()):
+        if (
+            not isinstance(receipt, Mapping)
+            or set(receipt) != {"result_sha256", "traffic", "traffic_sha256"}
+            or not isinstance(receipt.get("traffic"), Mapping)
+        ):
+            raise QwenDirectDecodeError(f"native fork {name} receipt is invalid")
+        _digest_string(receipt.get("result_sha256"), f"native fork {name} result")
+        if receipt.get("traffic_sha256") != _sha256(receipt["traffic"]):
+            raise QwenDirectDecodeError(f"native fork {name} traffic digest differs")
+        receipts[name] = receipt["traffic"]
+    rows = document.get("items")
+    if (
+        not isinstance(rows, list)
+        or not rows
+        or any(
+            not isinstance(row, Mapping) or row.get("reference_parity") is not True
+            for row in rows
+        )
+    ):
+        raise QwenDirectDecodeError("native fork comparison parity is invalid")
+    forwards = {
+        arm: sum(row[arm]["forward_passes"] for row in rows)
+        for arm in ("off", "native")
+    }
+    for arm in ("off", "native"):
+        if receipts[arm].get("forward_passes") != forwards[arm]:
+            raise QwenDirectDecodeError(f"native fork {arm} traffic is inconsistent")
+    total = forwards["off"] + forwards["native"]
+    pair_traffic = receipts["pair"]
+    if (
+        pair_traffic.get("off_forward_passes") != forwards["off"]
+        or pair_traffic.get("native_forward_passes") != forwards["native"]
+        or pair_traffic.get("forward_passes") != total
+        or pair_traffic.get("independent_complete_layers") != total * depth
+    ):
+        raise QwenDirectDecodeError("native fork pair traffic is inconsistent")
+    expected = {
+        "complete_layers": _saving_record(
+            total * depth,
+            _nonnegative_count(
+                pair_traffic.get("complete_layers_executed"), "pair complete layers"
+            ),
+            measurement="sealed-forward-count-times-checkpoint-depth/v1",
+        ),
+        "fork_layer_weight_passes": _saving_record(
+            total,
+            _nonnegative_count(
+                pair_traffic.get("actual_fork_layer_weight_passes"),
+                "pair fork-layer passes",
+            ),
+            measurement="sealed-fork-layer-pass-accounting/v1",
+        ),
+        "linear_calls": _saving_record(
+            sum(
+                _nonnegative_count(receipts[arm].get("linear_calls"), arm)
+                for arm in ("off", "native")
+            ),
+            _nonnegative_count(pair_traffic.get("linear_calls"), "pair linears"),
+            measurement="runtime-linear-call-counters/v1",
+        ),
+        "source_body_bytes": _saving_record(
+            sum(
+                _nonnegative_count(receipts[arm].get("source_body_bytes"), arm)
+                for arm in ("off", "native")
+            ),
+            _nonnegative_count(pair_traffic.get("source_body_bytes"), "pair bytes"),
+            measurement="runtime-source-body-byte-counters/v1",
+        ),
+    }
+    if document.get("savings") != expected:
+        raise QwenDirectDecodeError("native fork measured savings are inconsistent")
+    return document
+
+
+def _load_native_fork_reference_comparison(
+    path: str | os.PathLike[str],
+) -> dict[str, Any]:
+    return _validate_native_fork_reference_comparison_document(_strict_json(path))
+
+
 def _paired_identity(
     off: Mapping[str, Any], candidate: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -3996,7 +5268,9 @@ def _runtime_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _branch_runtime_arguments(parser: argparse.ArgumentParser) -> None:
+def _branch_runtime_arguments(
+    parser: argparse.ArgumentParser, *, include_mode: bool = True
+) -> None:
     parser.add_argument("--input", required=True)
     parser.add_argument("--tokenizer-json", required=True)
     parser.add_argument("--output", required=True)
@@ -4017,13 +5291,14 @@ def _branch_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16"
     )
-    parser.add_argument(
-        "--mode", choices=("off", "stable-crsa", "native-crsa"), required=True
-    )
-    parser.add_argument("--graft-layer", type=_nonnegative_int, default=27)
-    parser.add_argument("--graft-alpha", type=_unit_float, default=0.01)
-    parser.add_argument("--graft-max-history", type=_positive_int, default=256)
-    parser.add_argument("--graft-rms-eps", type=_positive_float, default=1e-6)
+    if include_mode:
+        parser.add_argument(
+            "--mode", choices=("off", "stable-crsa", "native-crsa"), required=True
+        )
+        parser.add_argument("--graft-layer", type=_nonnegative_int, default=27)
+        parser.add_argument("--graft-alpha", type=_unit_float, default=0.01)
+        parser.add_argument("--graft-max-history", type=_positive_int, default=256)
+        parser.add_argument("--graft-rms-eps", type=_positive_float, default=1e-6)
     parser.add_argument("--native-alpha", type=_unit_float, default=NATIVE_CRSA_ALPHA)
     parser.add_argument(
         "--native-balance-alpha",
@@ -4089,6 +5364,15 @@ def _parser() -> argparse.ArgumentParser:
     branch_generate = subparsers.add_parser("generate-arm")
     _branch_runtime_arguments(branch_generate)
     branch_generate.set_defaults(handler=generate_arm)
+    fork_generate = subparsers.add_parser("generate-native-fork")
+    _branch_runtime_arguments(fork_generate, include_mode=False)
+    fork_generate.set_defaults(handler=generate_native_fork)
+    fork_compare = subparsers.add_parser("compare-native-fork-references")
+    fork_compare.add_argument("--pair", required=True)
+    fork_compare.add_argument("--off", required=True)
+    fork_compare.add_argument("--native", required=True)
+    fork_compare.add_argument("--output", required=True)
+    fork_compare.set_defaults(handler=compare_native_fork_references)
     branch_compare = subparsers.add_parser(
         "compare-generated-arms", aliases=("compare-branches",)
     )
