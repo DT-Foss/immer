@@ -21,19 +21,19 @@
       "target_parse_failed": 57
     },
     "scope": {
-      "exact_recovery_scope": 57,
-      "grammar_scope": 95,
-      "potential_coreference_scope": 78
+      "exact_recovery_scope": 66,
+      "grammar_scope": 89,
+      "potential_coreference_scope": 75
     },
     "structural": {
-      "exact_recovery": 57,
-      "numeric_clause_unsupported": 86,
-      "numeric_pronoun_ambiguous": 75,
+      "exact_recovery": 66,
+      "numeric_clause_unsupported": 82,
+      "numeric_pronoun_ambiguous": 72,
       "question_pronoun_ambiguous": 3,
       "relation_ambiguous": 1,
       "relation_invalid": 0,
-      "relation_unsupported": 1,
-      "target_unsupported": 7
+      "relation_unsupported": 0,
+      "target_unsupported": 6
     }
   },
   "classification_inputs": [
@@ -42,13 +42,13 @@
     "vendored legacy binding diagnostics",
     "structural parse diagnostics"
   ],
-  "current_exact_recoveries": 57,
-  "current_remaining_abstentions": 173,
+  "current_exact_recoveries": 66,
+  "current_remaining_abstentions": 164,
   "exact_recovery_attribution": {
     "attribution": "The current total is cumulative across every listed exact mechanism; it is not attributed to one planner wave.",
-    "current_total": 57,
+    "current_total": 66,
     "identity": {
-      "count": 57,
+      "count": 66,
       "indices": [
         550,
         574,
@@ -58,6 +58,7 @@
         610,
         613,
         619,
+        627,
         631,
         643,
         651,
@@ -77,6 +78,7 @@
         770,
         778,
         780,
+        782,
         797,
         802,
         819,
@@ -101,17 +103,24 @@
         934,
         944,
         959,
+        992,
         1064,
+        1192,
         1194,
+        1217,
         1219,
+        1246,
         1252,
+        1253,
         1261,
+        1293,
+        1300,
         1304
       ],
-      "indices_sha256": "4dbdb9238a05632ea3276234f4f7dedcf30e44b556eeb2c4fda96dbf9bb8b062"
+      "indices_sha256": "ab17e011da92291b843fabecf3aa633c8df612d93c6ebf4635801f7ca01247d4"
     },
     "mechanism_identity": {
-      "count": 57,
+      "count": 66,
       "rows": [
         {
           "index": 550,
@@ -144,6 +153,10 @@
         {
           "index": 619,
           "mechanism": "signed_event:functioning_count"
+        },
+        {
+          "index": 627,
+          "mechanism": "signed_event:closed_week_complement_schedule"
         },
         {
           "index": 631,
@@ -220,6 +233,10 @@
         {
           "index": 780,
           "mechanism": "signed_event:absolute_weighted_score_difference"
+        },
+        {
+          "index": 782,
+          "mechanism": "signed_event:closed_disjoint_week_schedule"
         },
         {
           "index": 797,
@@ -318,31 +335,59 @@
           "mechanism": "signed_event:closed_named_scale_group_total"
         },
         {
+          "index": 992,
+          "mechanism": "signed_event:calendar_frequency_ledger"
+        },
+        {
           "index": 1064,
           "mechanism": "signed_event:ordered_affine_category_ledger"
+        },
+        {
+          "index": 1192,
+          "mechanism": "signed_event:explicit_weekly_pay_schedule"
         },
         {
           "index": 1194,
           "mechanism": "signed_event:typed_species_scale_total"
         },
         {
+          "index": 1217,
+          "mechanism": "signed_event:closed_piecewise_period_cost"
+        },
+        {
           "index": 1219,
           "mechanism": "signed_event:exhaustive_unit_rate_ledger"
+        },
+        {
+          "index": 1246,
+          "mechanism": "signed_event:explicit_period_score_total"
         },
         {
           "index": 1252,
           "mechanism": "signed_event:typed_ratio_property_chain_total"
         },
         {
+          "index": 1253,
+          "mechanism": "signed_event:canonical_duration_rate_conversion"
+        },
+        {
           "index": 1261,
           "mechanism": "signed_event:recurring_pronoun_rate_ledger"
+        },
+        {
+          "index": 1293,
+          "mechanism": "signed_event:canonical_weekly_sales_total"
+        },
+        {
+          "index": 1300,
+          "mechanism": "signed_event:explicit_weekday_exception_schedule"
         },
         {
           "index": 1304,
           "mechanism": "signed_event:typed_scaled_measure_difference"
         }
       ],
-      "rows_sha256": "67e014746e74c1fbceace792b3335ea63504dc84f69b12646cb9d3de87f3612b"
+      "rows_sha256": "f5bff03afe10d7abdb7bb6018243b67860a910ac3ab2172de30c5f509e7e2c89"
     },
     "mechanisms": {
       "clause_compiler": {
@@ -416,6 +461,27 @@
         ],
         "indices_sha256": "f77698e3eba3c41c5c26f013b6a95196b2feab8fe4670d67f821f96fa4685d75"
       },
+      "signed_event:calendar_frequency_ledger": {
+        "count": 1,
+        "indices": [
+          992
+        ],
+        "indices_sha256": "941b03e3e934ef127438c3392525c82a3232750484e9438c97026434d0b5a0ea"
+      },
+      "signed_event:canonical_duration_rate_conversion": {
+        "count": 1,
+        "indices": [
+          1253
+        ],
+        "indices_sha256": "d32a2b9bbf7c2e71e0cf4059d6f5be715af5419fd7f2567036796365a4c47b42"
+      },
+      "signed_event:canonical_weekly_sales_total": {
+        "count": 1,
+        "indices": [
+          1293
+        ],
+        "indices_sha256": "ecdee17ab95f39fc776e75d51a7ba93ddbe1a2aa53f8dc6159b9a87a1b15b513"
+      },
       "signed_event:category_sales_difference": {
         "count": 1,
         "indices": [
@@ -437,12 +503,33 @@
         ],
         "indices_sha256": "df50058936439d3cd548a994e53d417d241fac1293b7a148b757e5b33dc800b7"
       },
+      "signed_event:closed_disjoint_week_schedule": {
+        "count": 1,
+        "indices": [
+          782
+        ],
+        "indices_sha256": "52f97f163880dc38bb48165ad68fcf286f9ecd5fba7f2be409648b37c95d7f15"
+      },
       "signed_event:closed_named_scale_group_total": {
         "count": 1,
         "indices": [
           959
         ],
         "indices_sha256": "5f64fe9bb649901f00414cdcd73049580316f520e4e323636c9ffe7b51621d9e"
+      },
+      "signed_event:closed_piecewise_period_cost": {
+        "count": 1,
+        "indices": [
+          1217
+        ],
+        "indices_sha256": "b36abcbc9280940c774bfd7a77568727f76fd3c85424e60d6857a85bfd0589eb"
+      },
+      "signed_event:closed_week_complement_schedule": {
+        "count": 1,
+        "indices": [
+          627
+        ],
+        "indices_sha256": "f7b8891be1e6cb6efa8009ff02c63b4801b851ada08d32115f117001e8d48cd5"
       },
       "signed_event:combined_daily_total": {
         "count": 1,
@@ -514,6 +601,27 @@
           1219
         ],
         "indices_sha256": "7055581187994b5a8f391d9b39ef7ebc6dd7074edabfd8f656c1ac0c080b7980"
+      },
+      "signed_event:explicit_period_score_total": {
+        "count": 1,
+        "indices": [
+          1246
+        ],
+        "indices_sha256": "ee6933d828bdd446952f6218edfbd927c1ee74bdc381ec99141e772e5e5dd875"
+      },
+      "signed_event:explicit_weekday_exception_schedule": {
+        "count": 1,
+        "indices": [
+          1300
+        ],
+        "indices_sha256": "25de4efa7e8adc5d7c45cfb055e8b9def78351a822a6839b854704aad0dc5fbf"
+      },
+      "signed_event:explicit_weekly_pay_schedule": {
+        "count": 1,
+        "indices": [
+          1192
+        ],
+        "indices_sha256": "18c72de7f24ee18c0192ef0ea06505aa5b458a66e596a579b331a2d040d13ca7"
       },
       "signed_event:fractional_group_consumption_remainder": {
         "count": 1,
@@ -957,7 +1065,8 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:closed_week_complement_schedule",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 627,
@@ -968,9 +1077,9 @@
       },
       "question_sha256": "3f7d3c8f58f11ef18ae87e8b13fd3392aa3095b33a1f5a10ea7daccb917e93e5",
       "structural": {
-        "category": "relation_unsupported",
-        "reason": "exactly one explicit target is required",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: closed_week_complement_schedule",
+        "status": "parsed"
       }
     },
     {
@@ -1415,7 +1524,8 @@
       }
     },
     {
-      "current_scope": "potential_coreference_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:closed_disjoint_week_schedule",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 782,
@@ -1431,9 +1541,9 @@
       },
       "question_sha256": "ff7424c7745311917c032ea2912425a5c50bb520ee3d4b35b67b87bb11f50bc4",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: closed_disjoint_week_schedule",
+        "status": "parsed"
       }
     },
     {
@@ -2335,7 +2445,8 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:calendar_frequency_ledger",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 992,
@@ -2351,9 +2462,9 @@
       },
       "question_sha256": "d0305a3476e12c964760b0077607cfaa3c03e1234c8ada89ae2ea207838d1f0a",
       "structural": {
-        "category": "target_unsupported",
-        "reason": "unsupported target at 267:309",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: calendar_frequency_ledger",
+        "status": "parsed"
       }
     },
     {
@@ -3598,7 +3709,8 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:explicit_weekly_pay_schedule",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1192,
@@ -3614,9 +3726,9 @@
       },
       "question_sha256": "1f9257cb5d0b8bf64a279522328921f8fc0d41f37fe7222659fff9c83bf8d4d5",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:43",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: explicit_weekly_pay_schedule",
+        "status": "parsed"
       }
     },
     {
@@ -3960,7 +4072,8 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:closed_piecewise_period_cost",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1217,
@@ -3976,9 +4089,9 @@
       },
       "question_sha256": "8449de11d68a10fbf378f8b97378cd55f298ec0fa29d0a251ccff0a31e0dd5dd",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 61:88",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: closed_piecewise_period_cost",
+        "status": "parsed"
       }
     },
     {
@@ -4347,7 +4460,8 @@
       }
     },
     {
-      "current_scope": "potential_coreference_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:explicit_period_score_total",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1246,
@@ -4358,9 +4472,9 @@
       },
       "question_sha256": "88c5c9b085326acb934a18e19db08bad1e8120503bf7f6b3e6d0a3cb9c0ac3cd",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: explicit_period_score_total",
+        "status": "parsed"
       }
     },
     {
@@ -4448,7 +4562,8 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:canonical_duration_rate_conversion",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1253,
@@ -4464,9 +4579,9 @@
       },
       "question_sha256": "3c9fa086daad5ada81f3a87cca5eec8d6328e02f9d5c7122714c1ee378eaabe6",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:52",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: canonical_duration_rate_conversion",
+        "status": "parsed"
       }
     },
     {
@@ -5094,7 +5209,8 @@
       }
     },
     {
-      "current_scope": "potential_coreference_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:canonical_weekly_sales_total",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1293,
@@ -5110,9 +5226,9 @@
       },
       "question_sha256": "46bce9107e1ae7735bc4f2cd6cee35d5161d475217674fa69129b234a16e4c52",
       "structural": {
-        "category": "numeric_pronoun_ambiguous",
-        "reason": "numeric pronoun binding is not proven",
-        "status": "ambiguous"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: canonical_weekly_sales_total",
+        "status": "parsed"
       }
     },
     {
@@ -5199,7 +5315,7 @@
       "question_sha256": "ac83a1ad12f01a199d419f96cdb23170130f3a663ac74baa7dd7f8396e6a6eea",
       "structural": {
         "category": "relation_ambiguous",
-        "reason": "profit actor declaration is not unique",
+        "reason": "asset transition actor is not uniquely introduced; profit actor declaration is not unique",
         "status": "ambiguous"
       }
     },
@@ -5226,7 +5342,8 @@
       }
     },
     {
-      "current_scope": "grammar_scope",
+      "current_scope": "exact_recovery_scope",
+      "exact_recovery_mechanism": "signed_event:explicit_weekday_exception_schedule",
       "hungarian_exclusive_assignment_eligible": false,
       "hungarian_ineligibility_reason": "no_extracted_exclusive_candidate_sets_or_cost_matrix",
       "index": 1300,
@@ -5242,9 +5359,9 @@
       },
       "question_sha256": "0e15d21591acf91047c42bb7c8157aba2ff3743e5f08e228f4f850ee51848dbc",
       "structural": {
-        "category": "numeric_clause_unsupported",
-        "reason": "unparsed numeric clause at 0:46",
-        "status": "unsupported"
+        "category": "exact_recovery",
+        "reason": "evidence-closed signed event grammar: explicit_weekday_exception_schedule",
+        "status": "parsed"
       }
     },
     {
@@ -5569,7 +5686,7 @@
       }
     }
   ],
-  "items_sha256": "ca061be887c4c36a44e53364013bc7dfd7467841597c421c6ff1cd1f47f8432d",
+  "items_sha256": "00de1d9f045fd8a9778e114cacbdb0c401e281516f26ce989cb82b6d70794494",
   "provenance": {
     "classification_contract": {
       "gold_used_for_classification": false,
@@ -5595,7 +5712,7 @@
     "files": {
       "audit_runner": {
         "path": "scripts/fertig_abstention_audit.py",
-        "sha256": "533b79bd51a365e91132c578ecfc13de02d099afeaf17842b8ecabff25fff6b1"
+        "sha256": "95b32579cecc7dfec3e93080f96f7bf06965bde5166486b0f0454e81074c7c52"
       },
       "benchmark_report": {
         "path": "results/bench_gsm8k.json",
@@ -5607,7 +5724,7 @@
       },
       "signed_event_frontend": {
         "path": "src/immer/cognition/fertig/signed_event_frontend.py",
-        "sha256": "466f9f1c4eedaef2dd85dd5796b205edda36f065b3f4965b4e17d09c3da68d6f"
+        "sha256": "846647a980d7816247ac8e59b70e83c8faa97effc34a4cb26443c15bde229037"
       },
       "signed_expression_compiler": {
         "path": "src/immer/cognition/fertig/signed_expression.py",
@@ -5624,252 +5741,133 @@
     }
   },
   "recovery_wave_delta": {
-    "added_exact_recoveries": 10,
+    "added_exact_recoveries": 9,
     "added_identity": {
-      "count": 10,
+      "count": 9,
       "indices": [
-        578,
-        603,
-        802,
-        833,
-        900,
-        959,
-        1064,
-        1194,
-        1252,
-        1304
+        627,
+        782,
+        992,
+        1192,
+        1217,
+        1246,
+        1253,
+        1293,
+        1300
       ],
-      "indices_sha256": "13dd72de5b96221d7a66f2d4f98072493619832d69196777ef84d10d64e7a550"
+      "indices_sha256": "6146f3db855b3f96f9059459d787bf1e1a05732ce859094fa42d1d3782a1b36b"
     },
-    "attribution": "57 exact recoveries after typed-discourse-ssa-affine/v1 = 47 previously sealed + 10 added; this wave claims 10, not 57.",
-    "current_exact_recoveries": 57,
+    "attribution": "66 exact recoveries after closed-calendar-schedule-algebra/v1 = 57 previously sealed + 9 added; this wave claims 9, not 66.",
+    "current_exact_recoveries": 66,
     "mechanism_identity": {
-      "count": 10,
+      "count": 9,
       "rows": [
         {
-          "index": 578,
-          "mechanism": "signed_event:grounded_value_pipeline"
+          "index": 627,
+          "mechanism": "signed_event:closed_week_complement_schedule"
         },
         {
-          "index": 603,
-          "mechanism": "signed_event:shared_duration_affine_rates"
+          "index": 782,
+          "mechanism": "signed_event:closed_disjoint_week_schedule"
         },
         {
-          "index": 802,
-          "mechanism": "signed_event:closed_collection_share_completion"
+          "index": 992,
+          "mechanism": "signed_event:calendar_frequency_ledger"
         },
         {
-          "index": 833,
-          "mechanism": "signed_event:typed_scale_chain_conversion"
+          "index": 1192,
+          "mechanism": "signed_event:explicit_weekly_pay_schedule"
         },
         {
-          "index": 900,
-          "mechanism": "signed_event:temporal_reader_affine_difference"
+          "index": 1217,
+          "mechanism": "signed_event:closed_piecewise_period_cost"
         },
         {
-          "index": 959,
-          "mechanism": "signed_event:closed_named_scale_group_total"
+          "index": 1246,
+          "mechanism": "signed_event:explicit_period_score_total"
         },
         {
-          "index": 1064,
-          "mechanism": "signed_event:ordered_affine_category_ledger"
+          "index": 1253,
+          "mechanism": "signed_event:canonical_duration_rate_conversion"
         },
         {
-          "index": 1194,
-          "mechanism": "signed_event:typed_species_scale_total"
+          "index": 1293,
+          "mechanism": "signed_event:canonical_weekly_sales_total"
         },
         {
-          "index": 1252,
-          "mechanism": "signed_event:typed_ratio_property_chain_total"
-        },
-        {
-          "index": 1304,
-          "mechanism": "signed_event:typed_scaled_measure_difference"
+          "index": 1300,
+          "mechanism": "signed_event:explicit_weekday_exception_schedule"
         }
       ],
-      "rows_sha256": "9867d968dd3d4481a220168d8ae574af595af98c0fe9b6e55ecc1029d179413d"
+      "rows_sha256": "eb1eb7de1d17ea290492d4991dbe7557bb7a0b33ee5e43fd7a0f2f31feda90cb"
     },
     "mechanisms": {
-      "signed_event:closed_collection_share_completion": {
+      "signed_event:calendar_frequency_ledger": {
         "count": 1,
         "indices": [
-          802
+          992
         ],
-        "indices_sha256": "df50058936439d3cd548a994e53d417d241fac1293b7a148b757e5b33dc800b7"
+        "indices_sha256": "941b03e3e934ef127438c3392525c82a3232750484e9438c97026434d0b5a0ea"
       },
-      "signed_event:closed_named_scale_group_total": {
+      "signed_event:canonical_duration_rate_conversion": {
         "count": 1,
         "indices": [
-          959
+          1253
         ],
-        "indices_sha256": "5f64fe9bb649901f00414cdcd73049580316f520e4e323636c9ffe7b51621d9e"
+        "indices_sha256": "d32a2b9bbf7c2e71e0cf4059d6f5be715af5419fd7f2567036796365a4c47b42"
       },
-      "signed_event:grounded_value_pipeline": {
+      "signed_event:canonical_weekly_sales_total": {
         "count": 1,
         "indices": [
-          578
+          1293
         ],
-        "indices_sha256": "938be59e99cb028088395534cabaf3dc1a40684543287621dbb298209e844b5d"
+        "indices_sha256": "ecdee17ab95f39fc776e75d51a7ba93ddbe1a2aa53f8dc6159b9a87a1b15b513"
       },
-      "signed_event:ordered_affine_category_ledger": {
+      "signed_event:closed_disjoint_week_schedule": {
         "count": 1,
         "indices": [
-          1064
+          782
         ],
-        "indices_sha256": "768ee2b68e24e9808dd7384e77b766028d2827250592e3362da43352aed86a9a"
+        "indices_sha256": "52f97f163880dc38bb48165ad68fcf286f9ecd5fba7f2be409648b37c95d7f15"
       },
-      "signed_event:shared_duration_affine_rates": {
+      "signed_event:closed_piecewise_period_cost": {
         "count": 1,
         "indices": [
-          603
+          1217
         ],
-        "indices_sha256": "dfa8c28f8b0d1875c49859249340db91f6e3721f5aa0f4ee1980b5a2e40557fe"
+        "indices_sha256": "b36abcbc9280940c774bfd7a77568727f76fd3c85424e60d6857a85bfd0589eb"
       },
-      "signed_event:temporal_reader_affine_difference": {
+      "signed_event:closed_week_complement_schedule": {
         "count": 1,
         "indices": [
-          900
+          627
         ],
-        "indices_sha256": "e0edce42b2e517f3fa9b423a1f71c59dcc633a6f392a9530c371ef644ff10a48"
+        "indices_sha256": "f7b8891be1e6cb6efa8009ff02c63b4801b851ada08d32115f117001e8d48cd5"
       },
-      "signed_event:typed_ratio_property_chain_total": {
+      "signed_event:explicit_period_score_total": {
         "count": 1,
         "indices": [
-          1252
+          1246
         ],
-        "indices_sha256": "2e7093901811994069c153459f67228e87d5d2d06a2dbc50508eb7071654f849"
+        "indices_sha256": "ee6933d828bdd446952f6218edfbd927c1ee74bdc381ec99141e772e5e5dd875"
       },
-      "signed_event:typed_scale_chain_conversion": {
+      "signed_event:explicit_weekday_exception_schedule": {
         "count": 1,
         "indices": [
-          833
+          1300
         ],
-        "indices_sha256": "a5435c0ebb11494a44155614fe5ee610bcfa900898daca3c8e384ac8fd6ae5a1"
+        "indices_sha256": "25de4efa7e8adc5d7c45cfb055e8b9def78351a822a6839b854704aad0dc5fbf"
       },
-      "signed_event:typed_scaled_measure_difference": {
+      "signed_event:explicit_weekly_pay_schedule": {
         "count": 1,
         "indices": [
-          1304
+          1192
         ],
-        "indices_sha256": "e7b78b5fb6435946a10d2fbf77edcff83b28dcdb71a51853327b118f2d78a0d1"
-      },
-      "signed_event:typed_species_scale_total": {
-        "count": 1,
-        "indices": [
-          1194
-        ],
-        "indices_sha256": "3efdab7b2907ec7f11423d7a574ca7d42f8f4fdd5041020fbe47388674837a7b"
+        "indices_sha256": "18c72de7f24ee18c0192ef0ea06505aa5b458a66e596a579b331a2d040d13ca7"
       }
     },
-    "previously_sealed_exact_recoveries": 47,
+    "previously_sealed_exact_recoveries": 57,
     "previously_sealed_identity": {
-      "count": 47,
-      "indices": [
-        550,
-        574,
-        587,
-        610,
-        613,
-        619,
-        631,
-        643,
-        651,
-        672,
-        682,
-        692,
-        694,
-        701,
-        722,
-        724,
-        731,
-        745,
-        746,
-        747,
-        754,
-        763,
-        770,
-        778,
-        780,
-        797,
-        819,
-        823,
-        825,
-        836,
-        837,
-        840,
-        844,
-        861,
-        865,
-        868,
-        883,
-        892,
-        901,
-        913,
-        916,
-        924,
-        930,
-        934,
-        944,
-        1219,
-        1261
-      ],
-      "indices_sha256": "6ea48fbedad5336a3d38979a9738442a71ea456e2e555c06847871048a3d3290"
-    },
-    "wave_id": "typed-discourse-ssa-affine/v1"
-  },
-  "recovery_wave_history": {
-    "attribution": "57 current exact recoveries = 42 sealed baseline + 5 by ground-operators-conservative-coreference/v1 + 10 by typed-discourse-ssa-affine/v1; wave deltas are disjoint and cumulative.",
-    "baseline_exact_recoveries": 42,
-    "baseline_identity": {
-      "count": 42,
-      "indices": [
-        550,
-        574,
-        587,
-        610,
-        613,
-        619,
-        631,
-        643,
-        651,
-        682,
-        692,
-        694,
-        701,
-        722,
-        724,
-        731,
-        745,
-        746,
-        747,
-        754,
-        763,
-        770,
-        778,
-        797,
-        819,
-        823,
-        825,
-        836,
-        837,
-        840,
-        844,
-        861,
-        865,
-        868,
-        883,
-        892,
-        901,
-        913,
-        916,
-        924,
-        930,
-        934
-      ],
-      "indices_sha256": "8f92f3bf70d392efbf07d8513fb0a9d67720abba550c0131dc807cf55b964310"
-    },
-    "current_exact_recoveries": 57,
-    "current_identity": {
       "count": 57,
       "indices": [
         550,
@@ -5931,6 +5929,132 @@
         1304
       ],
       "indices_sha256": "4dbdb9238a05632ea3276234f4f7dedcf30e44b556eeb2c4fda96dbf9bb8b062"
+    },
+    "wave_id": "closed-calendar-schedule-algebra/v1"
+  },
+  "recovery_wave_history": {
+    "attribution": "66 current exact recoveries = 42 sealed baseline + 5 by ground-operators-conservative-coreference/v1 + 10 by typed-discourse-ssa-affine/v1 + 9 by closed-calendar-schedule-algebra/v1; wave deltas are disjoint and cumulative.",
+    "baseline_exact_recoveries": 42,
+    "baseline_identity": {
+      "count": 42,
+      "indices": [
+        550,
+        574,
+        587,
+        610,
+        613,
+        619,
+        631,
+        643,
+        651,
+        682,
+        692,
+        694,
+        701,
+        722,
+        724,
+        731,
+        745,
+        746,
+        747,
+        754,
+        763,
+        770,
+        778,
+        797,
+        819,
+        823,
+        825,
+        836,
+        837,
+        840,
+        844,
+        861,
+        865,
+        868,
+        883,
+        892,
+        901,
+        913,
+        916,
+        924,
+        930,
+        934
+      ],
+      "indices_sha256": "8f92f3bf70d392efbf07d8513fb0a9d67720abba550c0131dc807cf55b964310"
+    },
+    "current_exact_recoveries": 66,
+    "current_identity": {
+      "count": 66,
+      "indices": [
+        550,
+        574,
+        578,
+        587,
+        603,
+        610,
+        613,
+        619,
+        627,
+        631,
+        643,
+        651,
+        672,
+        682,
+        692,
+        694,
+        701,
+        722,
+        724,
+        731,
+        745,
+        746,
+        747,
+        754,
+        763,
+        770,
+        778,
+        780,
+        782,
+        797,
+        802,
+        819,
+        823,
+        825,
+        833,
+        836,
+        837,
+        840,
+        844,
+        861,
+        865,
+        868,
+        883,
+        892,
+        900,
+        901,
+        913,
+        916,
+        924,
+        930,
+        934,
+        944,
+        959,
+        992,
+        1064,
+        1192,
+        1194,
+        1217,
+        1219,
+        1246,
+        1252,
+        1253,
+        1261,
+        1293,
+        1300,
+        1304
+      ],
+      "indices_sha256": "ab17e011da92291b843fabecf3aa633c8df612d93c6ebf4635801f7ca01247d4"
     },
     "waves": [
       {
@@ -6249,10 +6373,202 @@
           "indices_sha256": "6ea48fbedad5336a3d38979a9738442a71ea456e2e555c06847871048a3d3290"
         },
         "wave_id": "typed-discourse-ssa-affine/v1"
+      },
+      {
+        "added_exact_recoveries": 9,
+        "added_identity": {
+          "count": 9,
+          "indices": [
+            627,
+            782,
+            992,
+            1192,
+            1217,
+            1246,
+            1253,
+            1293,
+            1300
+          ],
+          "indices_sha256": "6146f3db855b3f96f9059459d787bf1e1a05732ce859094fa42d1d3782a1b36b"
+        },
+        "attribution": "66 exact recoveries after closed-calendar-schedule-algebra/v1 = 57 previously sealed + 9 added; this wave claims 9, not 66.",
+        "current_exact_recoveries": 66,
+        "mechanism_identity": {
+          "count": 9,
+          "rows": [
+            {
+              "index": 627,
+              "mechanism": "signed_event:closed_week_complement_schedule"
+            },
+            {
+              "index": 782,
+              "mechanism": "signed_event:closed_disjoint_week_schedule"
+            },
+            {
+              "index": 992,
+              "mechanism": "signed_event:calendar_frequency_ledger"
+            },
+            {
+              "index": 1192,
+              "mechanism": "signed_event:explicit_weekly_pay_schedule"
+            },
+            {
+              "index": 1217,
+              "mechanism": "signed_event:closed_piecewise_period_cost"
+            },
+            {
+              "index": 1246,
+              "mechanism": "signed_event:explicit_period_score_total"
+            },
+            {
+              "index": 1253,
+              "mechanism": "signed_event:canonical_duration_rate_conversion"
+            },
+            {
+              "index": 1293,
+              "mechanism": "signed_event:canonical_weekly_sales_total"
+            },
+            {
+              "index": 1300,
+              "mechanism": "signed_event:explicit_weekday_exception_schedule"
+            }
+          ],
+          "rows_sha256": "eb1eb7de1d17ea290492d4991dbe7557bb7a0b33ee5e43fd7a0f2f31feda90cb"
+        },
+        "mechanisms": {
+          "signed_event:calendar_frequency_ledger": {
+            "count": 1,
+            "indices": [
+              992
+            ],
+            "indices_sha256": "941b03e3e934ef127438c3392525c82a3232750484e9438c97026434d0b5a0ea"
+          },
+          "signed_event:canonical_duration_rate_conversion": {
+            "count": 1,
+            "indices": [
+              1253
+            ],
+            "indices_sha256": "d32a2b9bbf7c2e71e0cf4059d6f5be715af5419fd7f2567036796365a4c47b42"
+          },
+          "signed_event:canonical_weekly_sales_total": {
+            "count": 1,
+            "indices": [
+              1293
+            ],
+            "indices_sha256": "ecdee17ab95f39fc776e75d51a7ba93ddbe1a2aa53f8dc6159b9a87a1b15b513"
+          },
+          "signed_event:closed_disjoint_week_schedule": {
+            "count": 1,
+            "indices": [
+              782
+            ],
+            "indices_sha256": "52f97f163880dc38bb48165ad68fcf286f9ecd5fba7f2be409648b37c95d7f15"
+          },
+          "signed_event:closed_piecewise_period_cost": {
+            "count": 1,
+            "indices": [
+              1217
+            ],
+            "indices_sha256": "b36abcbc9280940c774bfd7a77568727f76fd3c85424e60d6857a85bfd0589eb"
+          },
+          "signed_event:closed_week_complement_schedule": {
+            "count": 1,
+            "indices": [
+              627
+            ],
+            "indices_sha256": "f7b8891be1e6cb6efa8009ff02c63b4801b851ada08d32115f117001e8d48cd5"
+          },
+          "signed_event:explicit_period_score_total": {
+            "count": 1,
+            "indices": [
+              1246
+            ],
+            "indices_sha256": "ee6933d828bdd446952f6218edfbd927c1ee74bdc381ec99141e772e5e5dd875"
+          },
+          "signed_event:explicit_weekday_exception_schedule": {
+            "count": 1,
+            "indices": [
+              1300
+            ],
+            "indices_sha256": "25de4efa7e8adc5d7c45cfb055e8b9def78351a822a6839b854704aad0dc5fbf"
+          },
+          "signed_event:explicit_weekly_pay_schedule": {
+            "count": 1,
+            "indices": [
+              1192
+            ],
+            "indices_sha256": "18c72de7f24ee18c0192ef0ea06505aa5b458a66e596a579b331a2d040d13ca7"
+          }
+        },
+        "previously_sealed_exact_recoveries": 57,
+        "previously_sealed_identity": {
+          "count": 57,
+          "indices": [
+            550,
+            574,
+            578,
+            587,
+            603,
+            610,
+            613,
+            619,
+            631,
+            643,
+            651,
+            672,
+            682,
+            692,
+            694,
+            701,
+            722,
+            724,
+            731,
+            745,
+            746,
+            747,
+            754,
+            763,
+            770,
+            778,
+            780,
+            797,
+            802,
+            819,
+            823,
+            825,
+            833,
+            836,
+            837,
+            840,
+            844,
+            861,
+            865,
+            868,
+            883,
+            892,
+            900,
+            901,
+            913,
+            916,
+            924,
+            930,
+            934,
+            944,
+            959,
+            1064,
+            1194,
+            1219,
+            1252,
+            1261,
+            1304
+          ],
+          "indices_sha256": "4dbdb9238a05632ea3276234f4f7dedcf30e44b556eeb2c4fda96dbf9bb8b062"
+        },
+        "wave_id": "closed-calendar-schedule-algebra/v1"
       }
     ]
   },
-  "report_revision": 5,
-  "report_sha256": "65bb45cf1e1942445da62ef68a4d0967a4af94637ca03b7bcba9cc4980bd201a",
+  "report_revision": 6,
+  "report_sha256": "0cd977b426cc75814a11accde831d9e2ae774f750151ec4b0f17280e36503400",
   "schema": "immer.fertig-abstention-audit/v2"
 }

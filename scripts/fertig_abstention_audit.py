@@ -42,7 +42,7 @@ DISCOURSE_SSA_PATH = (
 )
 
 SCHEMA = "immer.fertig-abstention-audit/v2"
-REPORT_REVISION = 5
+REPORT_REVISION = 6
 ALLOWED_STATUSES = ("correct", "abstained", "incorrect", "error")
 LEGACY_CATEGORIES = (
     "target_parse_failed",
@@ -67,19 +67,19 @@ CURRENT_LEGACY_COUNTS = {
     "equation_guard": 1,
 }
 CURRENT_STRUCTURAL_COUNTS = {
-    "exact_recovery": 57,
-    "numeric_pronoun_ambiguous": 75,
+    "exact_recovery": 66,
+    "numeric_pronoun_ambiguous": 72,
     "question_pronoun_ambiguous": 3,
-    "numeric_clause_unsupported": 86,
-    "target_unsupported": 7,
+    "numeric_clause_unsupported": 82,
+    "target_unsupported": 6,
     "relation_ambiguous": 1,
-    "relation_unsupported": 1,
+    "relation_unsupported": 0,
     "relation_invalid": 0,
 }
 CURRENT_SCOPE_COUNTS = {
-    "exact_recovery_scope": 57,
-    "potential_coreference_scope": 78,
-    "grammar_scope": 95,
+    "exact_recovery_scope": 66,
+    "potential_coreference_scope": 75,
+    "grammar_scope": 89,
 }
 CURRENT_EXACT_RECOVERY_INDICES = (
     550,
@@ -90,6 +90,7 @@ CURRENT_EXACT_RECOVERY_INDICES = (
     610,
     613,
     619,
+    627,
     631,
     643,
     651,
@@ -109,6 +110,7 @@ CURRENT_EXACT_RECOVERY_INDICES = (
     770,
     778,
     780,
+    782,
     797,
     802,
     819,
@@ -133,11 +135,18 @@ CURRENT_EXACT_RECOVERY_INDICES = (
     934,
     944,
     959,
+    992,
     1064,
+    1192,
     1194,
+    1217,
     1219,
+    1246,
     1252,
+    1253,
     1261,
+    1293,
+    1300,
     1304,
 )
 BASELINE_EXACT_RECOVERIES = 42
@@ -175,6 +184,29 @@ DISCOURSE_SSA_WAVE_EXACT_MECHANISMS = {
     1304: "signed_event:typed_scaled_measure_difference",
 }
 DISCOURSE_SSA_WAVE_ID = "typed-discourse-ssa-affine/v1"
+CLOSED_SCHEDULE_WAVE_EXACT_RECOVERY_INDICES = (
+    627,
+    782,
+    992,
+    1192,
+    1217,
+    1246,
+    1253,
+    1293,
+    1300,
+)
+CLOSED_SCHEDULE_WAVE_EXACT_MECHANISMS = {
+    627: "signed_event:closed_week_complement_schedule",
+    782: "signed_event:closed_disjoint_week_schedule",
+    992: "signed_event:calendar_frequency_ledger",
+    1192: "signed_event:explicit_weekly_pay_schedule",
+    1217: "signed_event:closed_piecewise_period_cost",
+    1246: "signed_event:explicit_period_score_total",
+    1253: "signed_event:canonical_duration_rate_conversion",
+    1293: "signed_event:canonical_weekly_sales_total",
+    1300: "signed_event:explicit_weekday_exception_schedule",
+}
+CLOSED_SCHEDULE_WAVE_ID = "closed-calendar-schedule-algebra/v1"
 RECOVERY_WAVES = (
     (
         GROUND_WAVE_ID,
@@ -186,6 +218,11 @@ RECOVERY_WAVES = (
         DISCOURSE_SSA_WAVE_EXACT_RECOVERY_INDICES,
         DISCOURSE_SSA_WAVE_EXACT_MECHANISMS,
     ),
+    (
+        CLOSED_SCHEDULE_WAVE_ID,
+        CLOSED_SCHEDULE_WAVE_EXACT_RECOVERY_INDICES,
+        CLOSED_SCHEDULE_WAVE_EXACT_MECHANISMS,
+    ),
 )
 CURRENT_EXACT_RECOVERY_MECHANISMS = {
     550: "signed_event:discounted_purchase_ledger",
@@ -196,6 +233,7 @@ CURRENT_EXACT_RECOVERY_MECHANISMS = {
     610: "signed_event:rate_length_difference",
     613: "signed_event:calendar_daily_total",
     619: "signed_event:functioning_count",
+    627: "signed_event:closed_week_complement_schedule",
     631: "signed_event:affine_price_chain_total",
     643: "signed_event:combined_daily_total",
     651: "signed_event:part_scaled_period_total",
@@ -215,6 +253,7 @@ CURRENT_EXACT_RECOVERY_MECHANISMS = {
     770: "signed_event:category_sales_difference",
     778: "clause_compiler",
     780: "signed_event:absolute_weighted_score_difference",
+    782: "signed_event:closed_disjoint_week_schedule",
     797: "signed_event:repeated_duration_total",
     802: "signed_event:closed_collection_share_completion",
     819: "signed_event:equal_share_residual",
@@ -239,11 +278,18 @@ CURRENT_EXACT_RECOVERY_MECHANISMS = {
     934: "signed_event:mean_participant_totals",
     944: "signed_event:exhaustive_unit_rate_ledger",
     959: "signed_event:closed_named_scale_group_total",
+    992: "signed_event:calendar_frequency_ledger",
     1064: "signed_event:ordered_affine_category_ledger",
+    1192: "signed_event:explicit_weekly_pay_schedule",
     1194: "signed_event:typed_species_scale_total",
+    1217: "signed_event:closed_piecewise_period_cost",
     1219: "signed_event:exhaustive_unit_rate_ledger",
+    1246: "signed_event:explicit_period_score_total",
     1252: "signed_event:typed_ratio_property_chain_total",
+    1253: "signed_event:canonical_duration_rate_conversion",
     1261: "signed_event:recurring_pronoun_rate_ledger",
+    1293: "signed_event:canonical_weekly_sales_total",
+    1300: "signed_event:explicit_weekday_exception_schedule",
     1304: "signed_event:typed_scaled_measure_difference",
 }
 _INCOMPLETE_BINDING = re.compile(

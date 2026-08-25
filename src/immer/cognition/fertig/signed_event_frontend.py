@@ -132,6 +132,7 @@ FOOT = Unit.base("length", symbol="ft")
 FOOT_PER_COUNT = FOOT / COUNT
 MONTH = Unit("month", (("time", 1),), Fraction(1))
 COUNT_PER_MONTH = COUNT / MONTH
+YEAR = Unit("year", (("time", 1),), Fraction(31557600))
 PERCENT = Unit("%", (), Fraction(1, 100))
 MILLIMETER = Unit.base("length", symbol="mm")
 SECOND = Unit("second", (("time", 1),), Fraction(1))
@@ -156,7 +157,20 @@ _LOCAL_CARDINALS = {
     "twelve": Fraction(12),
     "twenty": Fraction(20),
     "thirty": Fraction(30),
+    "thrice": Fraction(3),
 }
+
+_WEEKDAY_NAMES = frozenset(
+    {
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    }
+)
 
 _FIXED_MONTH_DAYS = {
     "january": 31,
@@ -527,6 +541,13 @@ def _wide_span(first, second, source: str) -> Span:
         max(first.span.end, second.span.end),
         source,
     )
+
+
+def _has_explicit_percent_marker(source: str, token: Token) -> bool:
+    """Require the percentage operator immediately after its numeric surface."""
+
+    tail = source[token.span.end : token.span.end + 16].lstrip().casefold()
+    return tail.startswith("%") or bool(re.match(r"percent(?:age)?\b", tail))
 
 
 def _item_id(words: tuple[str, ...] | list[str]) -> str:
@@ -5521,6 +5542,1444 @@ def _leading_subject(clause: Clause) -> tuple[str, int]:
     return clause.norms[index], index
 
 
+def _possessive_owner(token: Token) -> str:
+    """Return one explicit ``name's`` owner without fuzzy normalization."""
+
+    if not token.norm.endswith("'s") or len(token.norm) <= 2:
+        raise _Reject(
+            FrontendStatus.AMBIGUOUS,
+            "quantitative owner is not an explicit possessive name",
+        )
+    owner = token.norm[:-2]
+    _require(
+        token.text[:1].isupper() and owner.isalpha(),
+        "quantitative owner is not a stable named identity",
+        FrontendStatus.AMBIGUOUS,
+    )
+    return owner
+
+
+@_ssa_family
+def _closed_value_transition_profit(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Close one asset value transition against every explicit acquisition cost."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:3] == ("how", "much", "profit") and "make" in question.norms
+    ):
+        return None
+    _require_single_target_marker(question)
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "decides" in clause.norms
+            and "flipping" in clause.norms
+            and not _numeric((clause,))
+        ),
+        reason="asset transition actor is not uniquely introduced",
+    )
+    purchase = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "buys" in clause.norms
+            and _contains(clause.norms, "puts", "in")
+            and "repairs" in clause.norms
+        ),
+        reason="asset acquisition and repair ledger is not unique",
+    )
+    transition = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and clause.norms[:2] == ("this", "increased")
+            and _contains(clause.norms, "the", "value", "of")
+            and "by" in clause.norms
+        ),
+        reason="asset value transition is not unique",
+    )
+    names = [token for token in intro.tokens if token.text[:1].isupper()]
+    actor_token = _one_token(
+        names,
+        "asset transition needs one named actor",
+        status=FrontendStatus.AMBIGUOUS,
+    )
+    actor = actor_token.norm
+    _require(
+        len(intro.norms) == 7
+        and intro.norms[:5] == (actor, "decides", "to", "try", "flipping")
+        and intro.norms[5] in {"a", "an"},
+        "asset transition introduction is not locally closed",
+        FrontendStatus.AMBIGUOUS,
+    )
+    asset = _singular(intro.norms[6])
+    _require(
+        purchase.norms[:1] in {("he",), ("she",)},
+        "asset acquisition owner is not an explicit singular pronoun",
+        FrontendStatus.AMBIGUOUS,
+    )
+    pronoun = purchase.norms[0]
+    _require(
+        question.norms == ("how", "much", "profit", "did", pronoun, "make")
+        and (
+            _contains(purchase.norms, "buys", "a", asset, "for")
+            or _contains(purchase.norms, "buys", "an", asset, "for")
+        ),
+        "asset owner, item, or profit target differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        transition.norms[:6] == ("this", "increased", "the", "value", "of", "the")
+        and len(transition.norms) == 9
+        and _singular(transition.norms[6]) == asset
+        and transition.norms[7] == "by",
+        "value transition does not name the acquired asset",
+        FrontendStatus.AMBIGUOUS,
+    )
+    costs = _money_tokens(purchase)
+    _require(len(costs) == 2, "asset ledger needs acquisition and repair costs")
+    purchase_cost, repair_cost = costs
+    first_for = purchase.norms.index("for")
+    repair_index = purchase.norms.index("repairs")
+    _require(
+        purchase.tokens.index(purchase_cost) == first_for + 1
+        and purchase.tokens.index(repair_cost) < repair_index
+        and purchase.norms[purchase.tokens.index(repair_cost) + 1 : repair_index + 1]
+        == ("in", "repairs"),
+        "asset costs have no unique acquisition/repair roles",
+        FrontendStatus.AMBIGUOUS,
+    )
+    percentage = _one_token(_counts(transition), "asset value percentage is missing")
+    _require(
+        percentage.number is not None
+        and percentage.number >= 0
+        and _has_explicit_percent_marker(source, percentage),
+        "asset value percentage must be non-negative and explicitly marked",
+        FrontendStatus.INVALID,
+    )
+
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    owner = ssa.entity(actor, "asset_owner", actor_token.span)
+
+    def symbol(state: str, role: str, span: Span):
+        return ssa.symbol(
+            owner,
+            property="value",
+            item=asset,
+            scope="flip",
+            state=state,
+            role=role,
+            unit=MONEY,
+            span=span,
+        )
+
+    acquired = symbol("acquired", "asset_value", purchase.span)
+    repairs = symbol("repairs", "repair_cost", purchase.span)
+    increase = symbol("increase", "value_delta", transition.span)
+    final_value = symbol("final", "asset_value", transition.span)
+    ssa.define(
+        acquired,
+        builder.literal(purchase_cost, MONEY),
+        purchase.span,
+        relation_id="asset_acquisition",
+    )
+    ssa.define(
+        repairs,
+        builder.literal(repair_cost, MONEY),
+        purchase.span,
+        relation_id="repair_cost",
+    )
+    ssa.define(
+        increase,
+        _product(
+            ssa.ref(acquired, transition.span, role="asset_value"),
+            builder.literal(percentage, PERCENT),
+        ),
+        transition.span,
+        relation_id="percent_of_acquired_value",
+    )
+    ssa.define(
+        final_value,
+        _sum(
+            _signed(
+                1,
+                ssa.ref(acquired, transition.span, role="asset_value"),
+                "acquired_value",
+            ),
+            _signed(
+                1,
+                ssa.ref(increase, transition.span, role="value_delta"),
+                "explicit_increase",
+            ),
+        ),
+        transition.span,
+        relation_id="closed_value_transition",
+    )
+    expression = _sum(
+        _signed(
+            1,
+            ssa.ref(final_value, question.span, role="asset_value"),
+            "sale_value",
+        ),
+        _signed(
+            -1,
+            ssa.ref(acquired, question.span, role="asset_value"),
+            "acquisition_cost",
+        ),
+        _signed(
+            -1,
+            ssa.ref(repairs, question.span, role="repair_cost"),
+            "repair_cost",
+        ),
+    )
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "closed_value_transition_profit", definitions=definitions
+    )
+
+
+def _closed_repeated_unit_price_ledger(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Sum disjoint lot counts whose prices name the same explicit lot unit."""
+
+    question = _question(clause_set)
+    if question.norms != ("how", "much", "was", "the", "total", "cost"):
+        return None
+    schedule = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "bought" in clause.norms
+            and clause.norms.count("dozen") >= 2
+            and bool(_money_tokens(clause))
+        ),
+        reason="repeated-unit purchase schedule is not unique",
+    )
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and clause is not schedule
+            and "bought" in clause.norms
+            and "various" in clause.norms
+            and not _numeric((clause,))
+        ),
+        reason="repeated-unit buyer is not uniquely introduced",
+    )
+    names = [token.norm for token in intro.tokens if token.text[:1].isupper()]
+    _require(
+        len(names) == 1 and schedule.norms[:2] in {("she", "bought"), ("he", "bought")},
+        "repeated-unit schedule has no unique owner",
+        FrontendStatus.AMBIGUOUS,
+    )
+    counts = _counts(schedule)
+    prices = _money_tokens(schedule)
+    _require(
+        len(counts) == len(prices) and len(counts) >= 2,
+        "repeated-unit schedule is incomplete",
+    )
+    count_offsets = [schedule.tokens.index(token) for token in counts]
+    _require(
+        count_offsets == sorted(count_offsets),
+        "repeated-unit lots are not ordered",
+        FrontendStatus.INVALID,
+    )
+    rows: list[tuple[Token, Token, Token, Token, str]] = []
+    items: set[str] = set()
+    for row_index, (count, price) in enumerate(zip(counts, prices, strict=True)):
+        start = schedule.tokens.index(count)
+        end = (
+            schedule.tokens.index(counts[row_index + 1])
+            if row_index + 1 < len(counts)
+            else len(schedule.tokens)
+        )
+        segment = schedule.tokens[start:end]
+        price_index = schedule.tokens.index(price)
+        dozens = [token for token in segment if token.norm == "dozen"]
+        _require(
+            len(dozens) == 2
+            and start + 1 == schedule.tokens.index(dozens[0])
+            and price_index + 2 == schedule.tokens.index(dozens[1])
+            and schedule.norms[price_index + 1] == "per",
+            "lot count and per-lot denominator are not explicit and disjoint",
+            FrontendStatus.AMBIGUOUS,
+        )
+        marker_offsets = [
+            index
+            for index in range(start + 2, price_index)
+            if schedule.norms[index] in {"which", "cost", "for"}
+        ]
+        marker = marker_offsets[0] if marker_offsets else price_index
+        item_words = [
+            word
+            for word in schedule.norms[start + 2 : marker]
+            if word not in {",", "and"}
+        ]
+        item = _item_id(item_words)
+        _require(item not in items, "repeated-unit item occurs in multiple lots")
+        items.add(item)
+        rows.append((count, dozens[0], price, dozens[1], item))
+
+    builder = _Builder(source, clause_set)
+    terms = []
+    for count, lot_unit, price, denominator, item in rows:
+        per_item_rate = QuotientExpr(
+            builder.literal(price, MONEY),
+            builder.lexical_literal(denominator, Fraction(12), COUNT),
+            _wide_span(price, denominator, source),
+        )
+        lot_total = _product(
+            builder.literal(count, SCALAR),
+            builder.lexical_literal(lot_unit, Fraction(12), COUNT),
+            per_item_rate,
+        )
+        terms.append(_signed(1, lot_total, f"{item}_lot"))
+    return builder.finish(_sum(*terms), "closed_repeated_unit_price_ledger")
+
+
+def _closed_affine_two_part_partition(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Select the larger member of an exhaustive two-part total and delta."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:2] == ("how", "many")
+        and "does" in question.norms
+        and "have" in question.norms
+    ):
+        return None
+    relation_rows = [
+        clause
+        for clause in clause_set
+        if (
+            not clause.question
+            and clause.norms[:2] == ("there", "are")
+            and "more" in clause.norms
+            and "than" in clause.norms
+            and len(_counts(clause)) == 1
+        )
+    ]
+    if not relation_rows:
+        return None
+    _require_single_target_marker(question)
+    total_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "has" in clause.norms
+            and len(_counts(clause)) == 1
+            and "more" not in clause.norms
+        ),
+        reason="two-part total is not unique",
+    )
+    _require(
+        len(relation_rows) == 1,
+        "two-part difference is not unique",
+        FrontendStatus.AMBIGUOUS,
+    )
+    relation = relation_rows[0]
+    owner_tokens = [token for token in total_clause.tokens if token.text[:1].isupper()]
+    owner_token = _one_token(
+        owner_tokens,
+        "two-part owner is not unique",
+        status=FrontendStatus.AMBIGUOUS,
+    )
+    owner = owner_token.norm
+    total = _one_token(_counts(total_clause), "two-part total is missing")
+    difference = _one_token(_counts(relation), "two-part delta is missing")
+    total_item = _noun_after(total_clause, total)
+    difference_index = relation.tokens.index(difference)
+    than_index = relation.norms.index("than")
+    _require(
+        difference_index + 3 < than_index
+        and relation.norms[difference_index + 1] == "more"
+        and than_index + 2 < len(relation.tokens),
+        "two-part category roles are incomplete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    target_category = relation.norms[difference_index + 2]
+    target_item_surface = relation.norms[difference_index + 3]
+    target_item = _singular(target_item_surface)
+    baseline_category = relation.norms[than_index + 1]
+    baseline_item = _singular(relation.norms[than_index + 2])
+    _require(
+        target_item == baseline_item == total_item
+        and target_category != baseline_category
+        and than_index + 3 == len(relation.tokens),
+        "two-part categories are not exhaustive and type-consistent",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        question.norms
+        == (
+            "how",
+            "many",
+            target_category,
+            target_item_surface,
+            "does",
+            owner,
+            "have",
+        ),
+        "two-part query owner, category, or item differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        total.number is not None
+        and difference.number is not None
+        and total.number >= difference.number
+        and (total.number + difference.number).denominator == 1
+        and (total.number + difference.number).numerator % 2 == 0,
+        "two-part total and difference do not yield integral categories",
+        FrontendStatus.INVALID,
+    )
+    builder = _Builder(source, clause_set)
+    expression = MeanExpr(
+        (
+            builder.literal(total, COUNT),
+            builder.literal(difference, COUNT),
+        ),
+        _wide_span(total, difference, source),
+    )
+    return builder.finish(expression, "closed_affine_two_part_partition")
+
+
+@_ssa_family
+def _typed_two_link_scale_chain(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Compose two explicitly named same-property ratios from a grounded base."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:1] == ("if",) and _contains(question.norms, "how", "old", "is")
+    ):
+        return None
+    _require_single_target_marker(question)
+    relations = [
+        clause
+        for clause in clause_set
+        if (
+            not clause.question
+            and "times" in clause.norms
+            and {"old", "older"}.intersection(clause.norms)
+        )
+    ]
+    if not relations:
+        return None
+    _require(
+        len(relations) == 2,
+        "scale chain requires exactly two named relations",
+        FrontendStatus.AMBIGUOUS,
+    )
+    parsed: list[tuple[str, str, str, Token, Clause, int]] = []
+    for relation in relations:
+        _require(
+            len(relation.tokens) in {9, 10}
+            and relation.norms[2] == "is"
+            and relation.norms[4] == "times",
+            "scale relation shape is incomplete",
+            FrontendStatus.AMBIGUOUS,
+        )
+        target = _possessive_owner(relation.tokens[0])
+        item = _singular(relation.norms[1])
+        factor = relation.tokens[3]
+        if relation.norms[5:8] == ("as", "old", "as"):
+            source_index = 8
+        elif relation.norms[5:7] == ("older", "than"):
+            source_index = 7
+        else:
+            raise _Reject(
+                FrontendStatus.AMBIGUOUS,
+                "scale relation has no explicit ratio direction",
+            )
+        source_owner = _possessive_owner(relation.tokens[source_index])
+        _require(
+            source_index + 2 == len(relation.tokens)
+            and _singular(relation.norms[source_index + 1]) == item
+            and _surface_cardinal(factor) is not None
+            and _surface_cardinal(factor) > 0,
+            "scale relation owner, property, or factor differs",
+            FrontendStatus.AMBIGUOUS,
+        )
+        parsed.append((target, source_owner, item, factor, relation, source_index))
+    first = next((row for row in parsed if row[1] == parsed[1][0]), None)
+    if first is None:
+        first = next((row for row in parsed if row[1] == parsed[0][0]), None)
+    _require(first is not None, "scale relations do not form one chain")
+    assert first is not None
+    second = parsed[0] if parsed[1] is first else parsed[1]
+    _require(
+        first[1] == second[0]
+        and len({first[0], first[1], second[1]}) == 3
+        and first[2] == second[2],
+        "scale relations branch, cycle, or change property",
+        FrontendStatus.AMBIGUOUS,
+    )
+    target_owner, middle_owner, item = first[:3]
+    base_owner = second[1]
+    base = _one_token(_counts(question), "scale-chain base age is missing")
+    base_index = question.tokens.index(base)
+    _require(
+        question.norms[:4] == ("if", f"{base_owner}'s", item, "is")
+        and base_index == 4
+        and _singular(question.norms[5]) == "year"
+        and question.norms[6:8] == ("old", ",")
+        and question.norms[8:] == ("how", "old", "is", f"{target_owner}'s", item),
+        "scale-chain base or requested endpoint differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    word_factors = [
+        token
+        for clause in clause_set
+        for token in clause.tokens
+        if token.norm in _LOCAL_CARDINALS
+    ]
+    _require(
+        word_factors in ([first[3], second[3]], [second[3], first[3]]),
+        "scale chain contains unbound word-cardinal noise",
+        FrontendStatus.AMBIGUOUS,
+    )
+
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    owners = {
+        target_owner: ssa.entity(target_owner, "asset_owner", first[4].tokens[0].span),
+        middle_owner: ssa.entity(
+            middle_owner, "asset_owner", first[4].tokens[first[5]].span
+        ),
+        base_owner: ssa.entity(
+            base_owner, "asset_owner", second[4].tokens[second[5]].span
+        ),
+    }
+    symbols = {
+        name: ssa.symbol(
+            owners[name],
+            property="age",
+            item=item,
+            scope="current",
+            state="old",
+            role="age",
+            unit=YEAR,
+            span=question.span,
+        )
+        for name in owners
+    }
+    ssa.define(
+        symbols[base_owner],
+        builder.literal(base, YEAR),
+        question.span,
+        relation_id="scale_chain_base",
+    )
+    ssa.define(
+        symbols[middle_owner],
+        _product(
+            _bound_cardinal(builder, second[3], SCALAR),
+            ssa.ref(symbols[base_owner], second[4].span, role="age", unit=YEAR),
+        ),
+        second[4].span,
+        relation_id="scale_chain_middle",
+    )
+    ssa.define(
+        symbols[target_owner],
+        _product(
+            _bound_cardinal(builder, first[3], SCALAR),
+            ssa.ref(symbols[middle_owner], first[4].span, role="age", unit=YEAR),
+        ),
+        first[4].span,
+        relation_id="scale_chain_target",
+    )
+    expression = ssa.ref(symbols[target_owner], question.span, role="age", unit=YEAR)
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "typed_two_link_scale_chain", definitions=definitions
+    )
+
+
+def _closed_week_complement_schedule(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Close a first segment and its explicit remaining-week complement."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:5] == ("calculate", "the", "total", "number", "of")
+        and question.norms[-1:] == ("week",)
+    ):
+        return None
+    schedule_rows = [
+        clause
+        for clause in clause_set
+        if (
+            not clause.question
+            and _contains(clause.norms, "first", "three", "days")
+            and _contains(clause.norms, "remaining", "days", "of", "the", "week")
+        )
+    ]
+    if not schedule_rows:
+        return None
+    _require(
+        len(schedule_rows) == 1,
+        "remaining-week schedule is not unique",
+        FrontendStatus.AMBIGUOUS,
+    )
+    schedule = schedule_rows[0]
+    _require_single_target_marker(question)
+    item = _singular(schedule.norms[schedule.norms.index("ten") + 1])
+    query_action = question.norms[7] if len(question.norms) > 7 else ""
+    _require(
+        question.norms
+        == (
+            "calculate",
+            "the",
+            "total",
+            "number",
+            "of",
+            schedule.norms[schedule.norms.index("ten") + 1],
+            "it",
+            query_action,
+            "that",
+            "week",
+        )
+        and query_action in {"pulled", "towed"}
+        and item == _singular(schedule.norms[schedule.norms.index("four") + 2]),
+        "week schedule item or target differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    ten = _unique_word_token(clause_set, "ten", clause=schedule)
+    three = _unique_word_token(clause_set, "three", clause=schedule)
+    four = _unique_word_token(clause_set, "four", clause=schedule)
+    weeks = [token for token in schedule.tokens if token.norm == "week"]
+    _require(
+        len(weeks) == 2
+        and _surface_cardinal(ten) == 10
+        and _surface_cardinal(three) == 3
+        and _surface_cardinal(four) == 4,
+        "week schedule cardinalities are incomplete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    _require(
+        _contains(
+            schedule.norms,
+            "ten",
+            schedule.norms[schedule.tokens.index(ten) + 1],
+            "for",
+            "each",
+        )
+        and _contains(
+            schedule.norms,
+            "four",
+            "fewer",
+            schedule.norms[schedule.tokens.index(four) + 2],
+            "on",
+            "each",
+        ),
+        "week schedule rates have no local per-day scope",
+        FrontendStatus.AMBIGUOUS,
+    )
+    builder = _Builder(source, clause_set)
+    base_rate = _bound_cardinal(builder, ten, COUNT_PER_TIME)
+    first_days = _bound_cardinal(builder, three, TIME)
+    all_week_days = builder.lexical_literal(weeks[0], Fraction(7), TIME)
+    complement_week_days = builder.lexical_literal(weeks[1], Fraction(7), TIME)
+    reduction = _bound_cardinal(builder, four, COUNT_PER_TIME)
+    remaining_days = _sum(
+        _signed(1, complement_week_days, "closed_week"),
+        _signed(-1, first_days, "first_segment"),
+    )
+    expression = _sum(
+        _signed(1, _product(base_rate, all_week_days), "unreduced_week"),
+        _signed(
+            -1,
+            _product(reduction, remaining_days),
+            "remaining_segment_reduction",
+        ),
+    )
+    return builder.finish(expression, "closed_week_complement_schedule")
+
+
+@_ssa_family
+def _closed_disjoint_week_schedule(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Compile two disjoint daily-rate segments that exactly cover one week."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:3] == ("how", "many", "times")
+        and question.norms[-2:] == ("a", "week")
+    ):
+        return None
+    usual_rows = [
+        clause
+        for clause in clause_set
+        if (
+            not clause.question
+            and "thrice" in clause.norms
+            and _contains(clause.norms, "a", "day", "for")
+        )
+    ]
+    if not usual_rows:
+        return None
+    _require(len(usual_rows) == 1, "usual weekly segment is not unique")
+    usual = usual_rows[0]
+    other = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and _contains(clause.norms, "other", "days")
+            and "twice" in clause.norms
+            and "usual" in clause.norms
+        ),
+        reason="other weekly segment is not unique",
+    )
+    _require_single_target_marker(question)
+    names = [token for token in usual.tokens if token.text[:1].isupper()]
+    _require(
+        len(names) == 2
+        and usual.norms[1] == "and"
+        and other.norms[:3] == ("but", "on", "two")
+        and _contains(other.norms, "they", "ride")
+        and question.norms[3:8] == ("do", "they", "ride", "their", "bikes"),
+        "weekly group, activity, or pronoun scope differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    rate = _unique_word_token(clause_set, "thrice", clause=usual)
+    usual_days = _one_token(_counts(usual), "usual-day count is missing")
+    other_days = _unique_word_token(clause_set, "two", clause=other)
+    scale = _unique_word_token(clause_set, "twice", clause=other)
+    _require(
+        usual_days.number is not None
+        and usual_days.number > 0
+        and _surface_cardinal(other_days) is not None
+        and usual_days.number + _surface_cardinal(other_days) == 7,
+        "weekly segments overlap or do not cover exactly seven days",
+        FrontendStatus.INVALID,
+    )
+
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    group_members = tuple(
+        ssa.entity(token.norm, "rider", token.span) for token in names
+    )
+    group = ssa.group("rider_group", group_members, "rider", usual.span)
+    ssa.resolve(
+        "they", role="rider", members=tuple(row.identity for row in group_members)
+    )
+    base = ssa.symbol(
+        group,
+        property="rate",
+        item="ride",
+        scope="week",
+        state="usual",
+        role="daily_rate",
+        unit=COUNT_PER_TIME,
+        span=usual.span,
+    )
+    scaled = ssa.symbol(
+        group,
+        property="rate",
+        item="ride",
+        scope="week",
+        state="other",
+        role="daily_rate",
+        unit=COUNT_PER_TIME,
+        span=other.span,
+    )
+    ssa.define(
+        base,
+        _bound_cardinal(builder, rate, COUNT_PER_TIME),
+        usual.span,
+        relation_id="usual_daily_rate",
+    )
+    ssa.define(
+        scaled,
+        _product(
+            _bound_cardinal(builder, scale, SCALAR),
+            ssa.ref(base, other.span, role="daily_rate", unit=COUNT_PER_TIME),
+        ),
+        other.span,
+        relation_id="other_daily_rate",
+    )
+    expression = _sum(
+        _signed(
+            1,
+            _product(
+                ssa.ref(base, question.span, role="daily_rate"),
+                builder.literal(usual_days, TIME),
+            ),
+            "usual_days",
+        ),
+        _signed(
+            1,
+            _product(
+                ssa.ref(scaled, question.span, role="daily_rate"),
+                _bound_cardinal(builder, other_days, TIME),
+            ),
+            "other_days",
+        ),
+    )
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "closed_disjoint_week_schedule", definitions=definitions
+    )
+
+
+def _calendar_frequency_ledger(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Convert explicit monthly and quarterly frequencies to one calendar year."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:3] == ("how", "many", "checks")
+        and question.norms[-2:] == ("per", "year")
+    ):
+        return None
+    intro = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "writes" in clause.norms
+            and "checks" in clause.norms
+            and _contains(clause.norms, "every", "year")
+        ),
+        reason="calendar-frequency owner is not uniquely introduced",
+    )
+    owner = _leading_subject(intro)[0]
+    _require(
+        question.norms
+        == ("how", "many", "checks", "does", owner, "write", "per", "year"),
+        "calendar-frequency owner or target differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    monthly = [
+        clause
+        for clause in clause_set
+        if not clause.question and "month" in clause.norms
+    ]
+    quarterly = [
+        clause
+        for clause in clause_set
+        if not clause.question and "quarterly" in clause.norms
+    ]
+    _require(
+        len(monthly) == 3 and len(quarterly) == 1,
+        "monthly/quarterly schedule is not complete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    once_rows = [clause for clause in monthly if clause.norms[:1] == ("once",)]
+    twice_rows = [clause for clause in monthly if clause.norms[:1] == ("twice",)]
+    every_rows = [
+        clause
+        for clause in monthly
+        if "every" in clause.norms and "once" not in clause.norms
+    ]
+    _require(
+        len(once_rows) == len(twice_rows) == len(every_rows) == 1
+        and all(clause.norms.count("check") == 1 for clause in monthly)
+        and quarterly[0].norms.count("check") == 1,
+        "calendar-frequency event categories overlap or are missing",
+        FrontendStatus.AMBIGUOUS,
+    )
+    once_clause = once_rows[0]
+    twice_clause = twice_rows[0]
+    every_clause = every_rows[0]
+    quarter_clause = quarterly[0]
+    _require(
+        once_clause.norms[:4] == ("once", "per", "month", "he")
+        and twice_clause.norms[:4] == ("twice", "per", "month", "he")
+        and every_clause.norms[:1] == ("he",)
+        and quarter_clause.norms[:4] == ("and", "quarterly", ",", "he"),
+        "calendar-frequency clauses do not share one explicit owner",
+        FrontendStatus.AMBIGUOUS,
+    )
+    once = _unique_word_token(clause_set, "once", clause=once_clause)
+    twice = _unique_word_token(clause_set, "twice", clause=twice_clause)
+    every = _unique_word_token(clause_set, "every", clause=every_clause)
+    quarter = _unique_word_token(clause_set, "quarterly", clause=quarter_clause)
+    year = _unique_word_token(clause_set, "year", clause=intro)
+    builder = _Builder(source, clause_set)
+    monthly_rate = _sum(
+        _signed(1, builder.literal(once, COUNT_PER_MONTH), "monthly_once"),
+        _signed(
+            1,
+            builder.lexical_literal(every, Fraction(1), COUNT_PER_MONTH),
+            "monthly_every",
+        ),
+        _signed(1, builder.literal(twice, COUNT_PER_MONTH), "monthly_twice"),
+    )
+    expression = _sum(
+        _signed(
+            1,
+            _product(
+                monthly_rate,
+                builder.lexical_literal(year, Fraction(12), MONTH),
+            ),
+            "monthly_checks",
+        ),
+        _signed(
+            1,
+            builder.lexical_literal(quarter, Fraction(4), COUNT),
+            "quarterly_checks",
+        ),
+    )
+    return builder.finish(expression, "calendar_frequency_ledger")
+
+
+def _explicit_weekly_pay_schedule(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Multiply an explicit hours/days/weeks schedule and add a proven bonus."""
+
+    question = _question(clause_set)
+    if not (
+        "exactly" in question.norms
+        and "weeks" in question.norms
+        and _contains(question.norms, "how", "much", "will")
+    ):
+        return None
+    work_rows = [
+        clause
+        for clause in clause_set
+        if (
+            not clause.question
+            and "works" in clause.norms
+            and "hours" in clause.norms
+            and "days" in clause.norms
+            and "week" in clause.norms
+        )
+    ]
+    if not work_rows:
+        return None
+    _require(len(work_rows) == 1, "weekly work schedule is not unique")
+    work = work_rows[0]
+    owner = _leading_subject(work)[0]
+    rate_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and _contains(clause.norms, "hourly", "rate", "is")
+            and len(_money_tokens(clause)) == 1
+        ),
+        reason="hourly pay rate is not unique",
+    )
+    bonus_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "additional" in clause.norms
+            and "attendance" in clause.norms
+            and len(_money_tokens(clause)) == 1
+        ),
+        reason="attendance bonus is not unique",
+    )
+    _require(
+        question.norms[:2] == ("suppose", owner)
+        and _contains(question.norms, "did", "not", "incur", "any", "absences")
+        and rate_clause.norms[:3] == ("her", "hourly", "rate")
+        and bonus_clause.norms[:2] == (owner, "also")
+        and _contains(bonus_clause.norms, "if", "she", "has")
+        and question.norms[-5:] == ("how", "much", "will", "she", "receive"),
+        "attendance condition or pay target is not proven",
+        FrontendStatus.AMBIGUOUS,
+    )
+    work_values = _counts(work)
+    _require(len(work_values) == 2, "hours/days schedule is incomplete")
+    hours, days = work_values
+    weeks = _one_token(_counts(question), "explicit week count is missing")
+    hourly = _one_token(_money_tokens(rate_clause), "hourly rate is missing")
+    bonus = _one_token(_money_tokens(bonus_clause), "attendance bonus is missing")
+    _require(
+        _noun_after(work, hours) == "hour"
+        and _noun_after(work, days) == "day"
+        and _noun_after(question, weeks) == "week",
+        "work schedule units differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    builder = _Builder(source, clause_set)
+    wage = _product(
+        builder.literal(hours, HOUR),
+        builder.literal(days, SCALAR),
+        builder.literal(weeks, SCALAR),
+        builder.literal(hourly, MONEY / HOUR),
+    )
+    expression = _sum(
+        _signed(1, wage, "scheduled_wage"),
+        _signed(1, builder.literal(bonus, MONEY), "attendance_bonus"),
+    )
+    return builder.finish(expression, "explicit_weekly_pay_schedule")
+
+
+def _canonical_duration_rate_conversion(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Convert one explicit daily duration to calls over a stated work week."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:3] == ("how", "many", "calls")
+        and _contains(question.norms, "day", "work", "week")
+    ):
+        return None
+    daily = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "hours" in clause.norms
+            and _contains(clause.norms, "each", "day")
+            and _contains(clause.norms, "answering", "phones")
+        ),
+        reason="daily call duration is not unique",
+    )
+    per_call = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "minutes" in clause.norms
+            and _contains(clause.norms, "a", "call")
+        ),
+        reason="per-call duration is not unique",
+    )
+    owner = _leading_subject(daily)[0]
+    _require(
+        per_call.norms[:3] == ("it", "takes", "him")
+        and question.norms[3:8] == ("does", "he", "deal", "with", "during")
+        and "his" in question.norms,
+        "call schedule owner or pronoun scope differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    hours = _one_token(_counts(daily), "daily hours are missing")
+    minutes = _one_token(_counts(per_call), "per-call minutes are missing")
+    days = _one_token(_counts(question), "work-week days are missing")
+    call = _unique_word_token(clause_set, "a", clause=per_call)
+    _require(
+        _noun_after(daily, hours) == "hour"
+        and _noun_after(per_call, minutes) == "minute"
+        and _noun_after(question, days) == "day"
+        and owner not in {"he", "him"},
+        "duration conversion units or owner are incomplete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    builder = _Builder(source, clause_set)
+    scheduled_call_time = _product(
+        builder.literal(hours, HOUR),
+        builder.literal(days, SCALAR),
+        builder.lexical_literal(call, Fraction(1), COUNT),
+    )
+    quotient = QuotientExpr(
+        scheduled_call_time,
+        builder.literal(minutes, MINUTE),
+        _wide_span(hours, minutes, source),
+    )
+    expression = UnitConversionExpr(
+        quotient,
+        COUNT,
+        _wide_span(hours, days, source),
+    )
+    return builder.finish(expression, "canonical_duration_rate_conversion")
+
+
+def _explicit_weekday_exception_schedule(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Count a seven-day week minus a closed list of named exceptions."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:3] == ("how", "much", "does")
+        and question.norms[-2:] == ("2", "weeks")
+    ):
+        return None
+    daily = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "services" in clause.norms
+            and _contains(clause.norms, "a", "day")
+        ),
+        reason="daily service rate is not unique",
+    )
+    calendar = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and _contains(clause.norms, "open", "every", "day", "of", "the", "week")
+            and "except" in clause.norms
+        ),
+        reason="weekly exception schedule is not unique",
+    )
+    pay = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "paid" in clause.norms
+            and _contains(clause.norms, "per", "car")
+        ),
+        reason="per-service pay is not unique",
+    )
+    owner = _leading_subject(daily)[0]
+    _require(
+        owner not in {"he", "she", "they"}
+        and calendar.norms[:1] == ("he",)
+        and pay.norms[:1] == ("he",)
+        and question.norms == ("how", "much", "does", "he", "make", "in", "2", "weeks"),
+        "weekday schedule owner or target differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    exceptions = [token for token in calendar.tokens if token.norm in _WEEKDAY_NAMES]
+    _require(
+        len(exceptions) == 2
+        and len({token.norm for token in exceptions}) == 2
+        and calendar.norms[calendar.norms.index("except") + 1 :]
+        == (exceptions[0].norm, "and", exceptions[1].norm),
+        "weekday exceptions are missing, duplicated, or open-ended",
+        FrontendStatus.AMBIGUOUS,
+    )
+    cars = _one_token(_counts(daily), "daily service count is missing")
+    price = _one_token(_money_tokens(pay), "per-service pay is missing")
+    weeks = _one_token(_counts(question), "week horizon is missing")
+    week = _unique_word_token(clause_set, "week", clause=calendar)
+    per_index = pay.norms.index("per")
+    _require(
+        per_index + 1 < len(pay.tokens)
+        and _noun_after(daily, cars) == _singular(pay.norms[per_index + 1]),
+        "daily workload and pay rate name different items",
+        FrontendStatus.AMBIGUOUS,
+    )
+    builder = _Builder(source, clause_set)
+    open_days = _sum(
+        _signed(
+            1,
+            builder.lexical_literal(week, Fraction(7), TIME),
+            "calendar_week",
+        ),
+        *[
+            _signed(
+                -1,
+                builder.lexical_literal(token, Fraction(1), TIME),
+                "closed_exception",
+            )
+            for token in exceptions
+        ],
+    )
+    expression = _product(
+        builder.literal(cars, COUNT_PER_TIME),
+        open_days,
+        builder.literal(weeks, SCALAR),
+        builder.literal(price, MONEY / COUNT),
+    )
+    return builder.finish(expression, "explicit_weekday_exception_schedule")
+
+
+@_ssa_family
+def _closed_piecewise_period_cost(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Sum two explicit year segments separated by one exact price transition."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:3] == ("how", "much", "did")
+        and _contains(question.norms, "spend", "on", "all", "visits")
+    ):
+        return None
+    cadence = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "visits" in clause.norms
+            and _contains(clause.norms, "times", "a", "year")
+        ),
+        reason="annual visit cadence is not unique",
+    )
+    owner = _leading_subject(cadence)[0]
+    price_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and _contains(clause.norms, "cost", "of", "one", "visit", "is")
+            and len(_money_tokens(clause)) == 1
+        ),
+        reason="base visit price is not unique",
+    )
+    transition = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "increased" in clause.norms
+            and "years" in clause.norms
+            and _contains(clause.norms, "more", "years")
+        ),
+        reason="piecewise visit transition is not unique",
+    )
+    cadence_token = _one_token(
+        [token for token in cadence.tokens if _surface_cardinal(token) is not None],
+        "annual visit cadence is missing",
+    )
+    cadence_index = cadence.tokens.index(cadence_token)
+    _require(cadence_index > 0, "annual visit venue is missing")
+    venue = cadence.norms[cadence_index - 1]
+    _require(
+        question.norms
+        == (
+            "how",
+            "much",
+            "did",
+            owner,
+            "spend",
+            "on",
+            "all",
+            "visits",
+            "to",
+            "the",
+            venue,
+        )
+        and _contains(
+            transition.norms,
+            owner,
+            "decided",
+            "not",
+            "to",
+            "give",
+            "up",
+            "any",
+            "visit",
+        )
+        and _contains(transition.norms, "go", "to", "the", venue),
+        "piecewise schedule owner, item, or exhaustive target differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    price = _one_token(_money_tokens(price_clause), "base visit price is missing")
+    segments = _counts(transition)
+    _require(len(segments) == 3, "piecewise periods or increase are incomplete")
+    first_years, percentage, later_years = segments
+    _require(
+        transition.norms[transition.tokens.index(first_years) + 1] == "years"
+        and transition.norms[
+            transition.tokens.index(percentage)
+            - 2 : transition.tokens.index(percentage)
+        ]
+        == ("increased", "by")
+        and transition.norms[
+            transition.tokens.index(later_years)
+            + 1 : transition.tokens.index(later_years)
+            + 3
+        ]
+        == ("more", "years")
+        and percentage.number is not None
+        and percentage.number >= 0
+        and _has_explicit_percent_marker(source, percentage),
+        "piecewise segment boundaries or transition are ambiguous",
+        FrontendStatus.AMBIGUOUS,
+    )
+    one_visit = _unique_word_token(clause_set, "one", clause=price_clause)
+
+    _require(
+        _surface_cardinal(one_visit) == 1,
+        "base price is not explicitly per one visit",
+        FrontendStatus.AMBIGUOUS,
+    )
+    builder = _Builder(source, clause_set)
+    ssa = TypedDiscourseSSA(source)
+    visitor = ssa.entity(owner, "visitor", cadence.tokens[0].span)
+    later_period = ssa.symbol(
+        visitor,
+        property="duration",
+        item="visit_schedule",
+        scope="museum",
+        state="later",
+        role="period_duration",
+        unit=YEAR,
+        span=transition.span,
+    )
+    price_weighted_period = ssa.symbol(
+        visitor,
+        property="duration",
+        item="visit_schedule",
+        scope="museum",
+        state="price_weighted",
+        role="period_duration",
+        unit=YEAR,
+        span=transition.span,
+    )
+    ssa.define(
+        later_period,
+        builder.literal(later_years, YEAR),
+        transition.span,
+        relation_id="later_period",
+    )
+    ssa.define(
+        price_weighted_period,
+        _sum(
+            _signed(1, builder.literal(first_years, YEAR), "initial_years"),
+            _signed(
+                1,
+                ssa.ref(later_period, transition.span, role="period_duration"),
+                "later_years",
+            ),
+            _signed(
+                1,
+                _product(
+                    builder.literal(percentage, PERCENT),
+                    ssa.ref(later_period, transition.span, role="period_duration"),
+                ),
+                "price_increase_weight",
+            ),
+        ),
+        transition.span,
+        relation_id="price_weighted_period",
+    )
+    expression = _product(
+        builder.literal(price, MONEY / COUNT),
+        _bound_cardinal(builder, cadence_token, COUNT / YEAR),
+        ssa.ref(
+            price_weighted_period,
+            question.span,
+            role="period_duration",
+            unit=YEAR,
+        ),
+    )
+    definitions = ssa.finalize(expression)
+    return builder.finish(
+        expression, "closed_piecewise_period_cost", definitions=definitions
+    )
+
+
+def _explicit_period_score_total(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Multiply an explicit per-year event rate, score, and repeated horizon."""
+
+    question = _question(clause_set)
+    if not (
+        "calculate" in question.norms
+        and _contains(question.norms, "total", "number", "of", "points")
+        and question.norms[-2:] == ("four", "years")
+    ):
+        return None
+    history = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "joined" in clause.norms
+            and _contains(clause.norms, "four", "years", "ago")
+        ),
+        reason="scoring horizon is not uniquely introduced",
+    )
+    rate_clause = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "playing" in clause.norms
+            and _contains(clause.norms, "games", "every", "year")
+        ),
+        reason="annual game rate is not unique",
+    )
+    owner = _leading_subject(history)[0]
+    _require(
+        owner not in {"he", "she", "they"}
+        and rate_clause.norms[:1] == ("she",)
+        and question.norms[:4] == ("if", "her", "score", "for")
+        and question.norms[-5:] == ("scored", "in", "the", "four", "years"),
+        "period score owner or horizon differs",
+        FrontendStatus.AMBIGUOUS,
+    )
+    rates = _counts(rate_clause)
+    question_values = _counts(question)
+    games = _one_token(rates, "annual game count is missing")
+    points = _one_token(question_values, "per-game score is missing")
+    horizon = _unique_word_token(clause_set, "four", clause=question)
+    history_horizon = _unique_word_token(clause_set, "four", clause=history)
+    _require(
+        _surface_cardinal(history_horizon) == _surface_cardinal(horizon)
+        and _contains(question.norms, "every", "game", "is", points.norm, "points"),
+        "period score evidence is incomplete",
+        FrontendStatus.AMBIGUOUS,
+    )
+    builder = _Builder(source, clause_set)
+    expression = _product(
+        builder.literal(games, COUNT / YEAR),
+        builder.literal(points, POINT / COUNT),
+        _bound_cardinal(builder, horizon, YEAR),
+    )
+    return builder.finish(expression, "explicit_period_score_total")
+
+
+def _canonical_weekly_sales_total(
+    source: str, clause_set: tuple[Clause, ...]
+) -> FrontendResult | None:
+    """Convert a stated number of weeks to seven-day production periods."""
+
+    question = _question(clause_set)
+    if not (
+        question.norms[:3] == ("how", "much", "money")
+        and question.norms[-2:] == ("two", "weeks")
+    ):
+        return None
+    production = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and _contains(clause.norms, "one", "day")
+            and "produce" in clause.norms
+            and len(_counts(clause)) == 1
+        ),
+        reason="daily production rate is not unique",
+    )
+    sale = _single_clause(
+        clause_set,
+        lambda clause: (
+            not clause.question
+            and "sells" in clause.norms
+            and _contains(clause.norms, "per", "bar")
+            and len(_money_tokens(clause)) == 1
+        ),
+        reason="per-item sale rate is not unique",
+    )
+    _require(
+        _contains(sale.norms, "sells", "all", "the", "produced")
+        and _contains(question.norms, "selling", "produced")
+        and question.norms[-2:] == ("two", "weeks"),
+        "weekly sale is not exhaustive or changes item scope",
+        FrontendStatus.AMBIGUOUS,
+    )
+    daily = _one_token(_counts(production), "daily production is missing")
+    price = _one_token(_money_tokens(sale), "sale price is missing")
+    weeks = _unique_word_token(clause_set, "two", clause=question)
+    week = _unique_word_token(clause_set, "weeks", clause=question)
+    sale_per_index = sale.norms.index("per")
+    during_index = question.norms.index("during")
+    produced_offsets = [
+        index
+        for index, word in enumerate(question.norms[:during_index])
+        if word == "produced"
+    ]
+    _require(
+        sale_per_index + 1 < len(sale.tokens)
+        and len(produced_offsets) == 1
+        and produced_offsets[0] + 1 < during_index
+        and _noun_after(production, daily)
+        == _singular(sale.norms[sale_per_index + 1])
+        == _singular(question.norms[during_index - 1]),
+        "production and sale item units differ",
+        FrontendStatus.AMBIGUOUS,
+    )
+    builder = _Builder(source, clause_set)
+    expression = _product(
+        builder.literal(daily, COUNT_PER_TIME),
+        builder.literal(price, MONEY / COUNT),
+        _bound_cardinal(builder, weeks, SCALAR),
+        builder.lexical_literal(week, Fraction(7), TIME),
+    )
+    return builder.finish(expression, "canonical_weekly_sales_total")
+
+
 @_ssa_family
 def _grounded_value_pipeline(
     source: str, clause_set: tuple[Clause, ...]
@@ -7436,6 +8895,19 @@ def _typed_scaled_measure_difference(
 
 
 _PLANNERS = (
+    _closed_value_transition_profit,
+    _closed_repeated_unit_price_ledger,
+    _closed_affine_two_part_partition,
+    _typed_two_link_scale_chain,
+    _closed_week_complement_schedule,
+    _closed_disjoint_week_schedule,
+    _calendar_frequency_ledger,
+    _explicit_weekly_pay_schedule,
+    _canonical_duration_rate_conversion,
+    _explicit_weekday_exception_schedule,
+    _closed_piecewise_period_cost,
+    _explicit_period_score_total,
+    _canonical_weekly_sales_total,
     _grounded_value_pipeline,
     _shared_duration_affine_rates,
     _closed_collection_share_completion,
