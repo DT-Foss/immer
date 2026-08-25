@@ -115,6 +115,7 @@ def _native_fixture(root: Path) -> tuple[Path, Path]:
     ]
     mapping["num_attention_heads"] = 24
     mapping["num_key_value_heads"] = 4
+    mapping["max_position_embeddings"] = 256
     save_file(_tiny_weights(config), source_root / "model.safetensors")
     source_root.joinpath("config.json").write_text(
         json.dumps(mapping, separators=(",", ":")), encoding="utf-8"
@@ -156,9 +157,12 @@ def _prepared_branch_source(
     *,
     eos: tuple[int, int],
     gold: tuple[str, ...] = ("1", "2"),
+    questions: tuple[str, ...] | None = None,
     system_prompt: str = "fixture",
     thinking: bool = False,
 ) -> dict:
+    if questions is not None and len(questions) != len(gold):
+        raise ValueError("questions and gold must have equal length")
     item_ids = [f"dev-{index}" for index in range(len(gold))]
     document = {
         "items": [
@@ -168,6 +172,7 @@ def _prepared_branch_source(
                 "gold": target,
                 "item_id": item_id,
                 "prompt_token_ids": [1, 4 + index],
+                **({"question": questions[index]} if questions is not None else {}),
             }
             for index, (item_id, target) in enumerate(zip(item_ids, gold, strict=True))
         ],
@@ -241,6 +246,29 @@ def _select_answer_branch(
     )
     args._require_official = False
     selected = benchmark.select_answer_branch_cohort(args)
+    benchmark._write_json(output, selected)
+    return selected
+
+
+def _select_answer_questions(
+    source: Path,
+    branch_input: Path,
+    output: Path,
+):
+    args = benchmark._parser().parse_args(
+        [
+            "select-answer-branch-questions",
+            "--input",
+            str(branch_input),
+            "--inputs",
+            str(source),
+            "--inputs-sha256",
+            benchmark._sha256_file(source),
+            "--output",
+            str(output),
+        ]
+    )
+    selected = benchmark.select_answer_branch_questions(args)
     benchmark._write_json(output, selected)
     return selected
 
@@ -1135,6 +1163,18 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
             self.assertEqual(native["schema"], benchmark.NATIVE_BRANCH_RESULT_SCHEMA)
             self.assertNotIn("graft", native)
             self.assertEqual(native["intervention"]["kind"], "native-head-crsa")
+            transported = copy.deepcopy(native)
+            transported["traffic"]["access_trace"]["path"] = (
+                "/detached-host/access-native.json"
+            )
+            _reseal(transported)
+            transported_path = root / "result-native.json"
+            transported_trace = root / "access-native.json"
+            transported_trace.write_bytes(Path(native_args.access_trace).read_bytes())
+            benchmark._write_json(transported_path, transported)
+            self.assertEqual(
+                benchmark._load_native_branch_result(transported_path), transported
+            )
             self.assertEqual(
                 native["intervention"]["config"],
                 {
@@ -1459,13 +1499,33 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
             tokenizer_path = root / "tokenizer.json"
             eos = _answer_branch_tokenizer(tokenizer_path)
             source = root / "sealed-answer-dev.json"
+            oven_question = (
+                "Maggie's oven is malfunctioning. When she sets it to 450 the "
+                "actual temperature is 468. If it's off by the same percentage "
+                "for any recipe, what temperature should she set it at if her "
+                "recipe calls for 520 degrees?"
+            )
             source_document = _prepared_branch_source(
                 source,
                 eos=eos,
-                gold=("1",),
+                gold=("500",),
+                questions=(oven_question,),
                 system_prompt=benchmark.ANSWER_OUTPUT_INSTRUCTION,
                 thinking=False,
             )
+            answer_tokenizer = benchmark.Qwen38Tokenizer(
+                tokenizer_path, require_official=False
+            )
+            source_prompt_ids = list(
+                answer_tokenizer.encode(
+                    answer_tokenizer.render_no_thinking_prompt(
+                        benchmark.ANSWER_OUTPUT_INSTRUCTION,
+                        oven_question,
+                    )
+                )
+            )
+            source_document["items"][0]["prompt_token_ids"] = source_prompt_ids
+            benchmark._write_json(source, source_document)
             answer_input_path = root / "answer-input.json"
             selected = _select_answer_branch(source, tokenizer_path, answer_input_path)
             self.assertEqual(selected["schema"], benchmark.BRANCH_INPUT_SCHEMA_V3)
@@ -1492,17 +1552,17 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 (794, 220),
             )
             item = selected["items"][0]
-            self.assertEqual(item["source_prompt_token_ids"], [1, 4])
+            self.assertEqual(item["source_prompt_token_ids"], source_prompt_ids)
             self.assertEqual(
                 item["effective_prompt_token_ids"],
-                [1, 4, *prefix["token_ids"]],
+                [*source_prompt_ids, *prefix["token_ids"]],
             )
             self.assertEqual(benchmark._load_branch_input(answer_input_path), selected)
 
             legacy_path = root / "legacy-input.json"
             legacy = _select_branch(source, tokenizer_path, legacy_path, limit=1)
             self.assertEqual(legacy["schema"], benchmark.BRANCH_INPUT_SCHEMA)
-            self.assertEqual(legacy["items"][0]["prompt_token_ids"], [1, 4])
+            self.assertEqual(legacy["items"][0]["prompt_token_ids"], source_prompt_ids)
 
             observed_prompts: list[tuple[int, ...]] = []
 
@@ -1544,6 +1604,7 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
                 mode="native-crsa",
             )
             generation_args.max_new_tokens = 1
+            generation_args.max_seq_len = len(item["effective_prompt_token_ids"]) + 1
             with redirect_stderr(io.StringIO()):
                 result = benchmark.generate_arm(
                     generation_args, runtime_factory=runtime_factory
@@ -1569,7 +1630,184 @@ class QwenDirectDecodeBenchmarkTests(unittest.TestCase):
             ):
                 benchmark._load_native_branch_result(doubled_path)
             _rows, targets = benchmark._gold_rows_for_branch(source_document, result)
-            self.assertEqual(targets, {"dev-0": "1"})
+            self.assertEqual(targets, {"dev-0": "500"})
+
+            questions_path = root / "answer-questions.json"
+            questions = _select_answer_questions(
+                source, answer_input_path, questions_path
+            )
+            self.assertEqual(questions["schema"], benchmark.BRANCH_QUESTION_SCHEMA)
+            self.assertEqual(questions["items"][0]["question"], oven_question)
+            self.assertFalse(questions["protocol"]["projection_contains_label_fields"])
+            self.assertTrue(questions["protocol"]["source_file_may_contain_labels"])
+            self.assertEqual(
+                questions["protocol"]["system_prompt"],
+                benchmark.ANSWER_OUTPUT_INSTRUCTION,
+            )
+
+            native_eval = copy.deepcopy(result)
+            _rewrite_generated_answer(native_eval, 0, tokens=[4], text="504")
+            off = benchmark._native_v2_common_projection(native_eval)
+            _rewrite_generated_answer(off, 0, tokens=[2], text="502")
+            stable = copy.deepcopy(off)
+            stable["arm"] = "stable-crsa"
+            stable["graft"] = benchmark._build_graft(
+                argparse.Namespace(
+                    mode="stable-crsa",
+                    graft_alpha=0.1,
+                    graft_layer=2,
+                    graft_max_history=256,
+                    graft_rms_eps=1e-6,
+                )
+            )[2]
+            _rewrite_generated_answer(stable, 0, tokens=[4], text="504")
+            off_path = root / "adjudication-off.json"
+            stable_path = root / "adjudication-stable.json"
+            native_path = root / "adjudication-native.json"
+            benchmark._write_json(off_path, off)
+            benchmark._write_json(stable_path, stable)
+            benchmark._write_json(native_path, native_eval)
+            triad = benchmark._compare_generated_triad_documents(
+                off, stable, native_eval
+            )
+            triad_path = root / "adjudication-triad.json"
+            benchmark._write_json(triad_path, triad)
+            adjudication_args = benchmark._parser().parse_args(
+                [
+                    "adjudicate-generated-triad",
+                    "--off",
+                    str(off_path),
+                    "--stable",
+                    str(stable_path),
+                    "--native",
+                    str(native_path),
+                    "--triad",
+                    str(triad_path),
+                    "--questions",
+                    str(questions_path),
+                    "--tokenizer-json",
+                    str(tokenizer_path),
+                    "--output",
+                    str(root / "adjudication.json"),
+                ]
+            )
+            adjudication = benchmark.adjudicate_generated_triad(adjudication_args)
+            adjudication_path = Path(adjudication_args.output)
+            benchmark._write_json(adjudication_path, adjudication)
+            self.assertEqual(
+                adjudication["schema"], benchmark.BRANCH_ADJUDICATION_SCHEMA
+            )
+            self.assertFalse(adjudication["protocol"]["gold_accessed_by_adjudicator"])
+            self.assertEqual(adjudication["summary"]["certificate_overrides"], 1)
+            adjudicated = adjudication["items"][0]
+            self.assertEqual(
+                adjudicated["candidates"],
+                {"native_crsa": "504", "off": "502", "stable_crsa": "504"},
+            )
+            self.assertEqual(adjudicated["decision"], "certificate_override")
+            self.assertEqual(adjudicated["selected_answer"], "500")
+            self.assertEqual(
+                {row["status"] for row in adjudicated["verifications"].values()},
+                {"mismatch"},
+            )
+            self.assertEqual(
+                benchmark._load_branch_adjudication_document(adjudication_path),
+                adjudication,
+            )
+
+            evaluation_args = benchmark._parser().parse_args(
+                [
+                    "evaluate-adjudicated-triad",
+                    "--off",
+                    str(off_path),
+                    "--stable",
+                    str(stable_path),
+                    "--native",
+                    str(native_path),
+                    "--triad",
+                    str(triad_path),
+                    "--questions",
+                    str(questions_path),
+                    "--tokenizer-json",
+                    str(tokenizer_path),
+                    "--adjudication",
+                    str(adjudication_path),
+                    "--gold-source",
+                    str(source),
+                    "--gold-source-sha256",
+                    benchmark._sha256_file(source),
+                    "--output",
+                    str(root / "adjudication-evaluation.json"),
+                ]
+            )
+            evaluation = benchmark.evaluate_adjudicated_triad(evaluation_args)
+            self.assertEqual(
+                evaluation["schema"],
+                benchmark.BRANCH_ADJUDICATION_EVALUATION_SCHEMA,
+            )
+            self.assertEqual(evaluation["summary"]["wrong_to_correct"], 1)
+            self.assertEqual(evaluation["summary"]["net_correct_delta"], 1)
+            self.assertEqual(evaluation["summary"]["verdict"], "improved")
+            self.assertTrue(evaluation["summary"]["quality_success"])
+
+            unsupported = benchmark._build_adjudication_item(
+                item_id="unsupported",
+                question="What is the capital of France?",
+                candidates={"native_crsa": "4", "off": "4", "stable_crsa": "4"},
+            )
+            self.assertEqual(unsupported["decision"], "abstained")
+            self.assertIsNone(unsupported["selected_answer"])
+
+            question_tamper = copy.deepcopy(questions)
+            question_tamper["items"][0]["question"] += " changed"
+            question_tamper_path = root / "question-tamper.json"
+            benchmark._write_json(question_tamper_path, question_tamper)
+            tampered_args = copy.copy(adjudication_args)
+            tampered_args.questions = str(question_tamper_path)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "seal mismatch"
+            ):
+                benchmark.adjudicate_generated_triad(tampered_args)
+
+            resealed_question = copy.deepcopy(questions)
+            resealed_question["items"][0]["question"] = oven_question.replace(
+                "520 degrees?", "1 degrees?"
+            )
+            resealed_question["items"][0]["question_sha256"] = hashlib.sha256(
+                resealed_question["items"][0]["question"].encode("utf-8")
+            ).hexdigest()
+            _reseal(resealed_question)
+            resealed_question_path = root / "question-resealed-forgery.json"
+            benchmark._write_json(resealed_question_path, resealed_question)
+            forged_args = copy.copy(adjudication_args)
+            forged_args.questions = str(resealed_question_path)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError,
+                "does not reproduce the sealed source prompt",
+            ):
+                benchmark.adjudicate_generated_triad(forged_args)
+
+            evidence_tamper = copy.deepcopy(adjudication)
+            evidence_tamper["items"][0]["selected_answer"] = "504"
+            _reseal(evidence_tamper)
+            evidence_tamper_path = root / "adjudication-evidence-tamper.json"
+            benchmark._write_json(evidence_tamper_path, evidence_tamper)
+            with self.assertRaisesRegex(
+                benchmark.QwenDirectDecodeError, "evidence mismatch"
+            ):
+                benchmark._load_branch_adjudication_document(evidence_tamper_path)
+            blocked_evaluation = copy.copy(evaluation_args)
+            blocked_evaluation.adjudication = str(evidence_tamper_path)
+            with mock.patch.object(
+                benchmark,
+                "_externally_sealed_json",
+                side_effect=AssertionError("gold opened before adjudication seal"),
+            ) as gold_open:
+                with self.assertRaisesRegex(
+                    benchmark.QwenDirectDecodeError, "evidence mismatch"
+                ):
+                    benchmark.evaluate_adjudicated_triad(blocked_evaluation)
+                gold_open.assert_not_called()
 
             def assert_tamper_rejected(name: str, mutate) -> None:
                 document = copy.deepcopy(selected)

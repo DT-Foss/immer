@@ -349,6 +349,18 @@ _JOB_NET_DIFFERENCE = re.compile(
     re.IGNORECASE,
 )
 
+_OVEN_PERCENTAGE_CALIBRATION = re.compile(
+    rf"(?P<owner>{_NAME})['’]s\s+oven\s+is\s+malfunctioning\.\s+When\s+"
+    rf"(?P<subject_pronoun>he|she)\s+sets\s+it\s+to\s+"
+    rf"(?P<setting>{_UNSIGNED})\s+the\s+actual\s+temperature\s+is\s+"
+    rf"(?P<actual>{_UNSIGNED})\.\s+If\s+it['’]s\s+off\s+by\s+the\s+same\s+"
+    rf"percentage\s+for\s+any\s+recipe,\s+what\s+temperature\s+should\s+"
+    rf"(?P<query_pronoun>he|she)\s+set\s+it\s+at\s+if\s+"
+    rf"(?P<possessive>his|her)\s+recipe\s+calls\s+for\s+"
+    rf"(?P<requested>{_UNSIGNED})\s+degrees\?",
+    re.IGNORECASE,
+)
+
 
 def _resolve_prism(source: str) -> FormulaSolution | None:
     match = _fullmatch(_PRISM_COST, source)
@@ -1022,6 +1034,41 @@ def _resolve_job_net_difference(source: str) -> FormulaSolution | None:
     )
 
 
+def _resolve_oven_percentage_calibration(source: str) -> FormulaSolution | None:
+    match = _fullmatch(_OVEN_PERCENTAGE_CALIBRATION, source)
+    if match is None:
+        return None
+    pronouns = (
+        match.group("subject_pronoun").casefold(),
+        match.group("query_pronoun").casefold(),
+        match.group("possessive").casefold(),
+    )
+    if pronouns not in {("he", "he", "his"), ("she", "she", "her")}:
+        return None
+    values = {
+        name: _fraction(match.group(name))
+        for name in ("setting", "actual", "requested")
+    }
+    if min(values.values()) <= 0:
+        return None
+    answer = values["requested"] * values["setting"] / values["actual"]
+    return _solution(
+        source,
+        match,
+        family="constant_percentage_oven_calibration",
+        equation="answer = requested_actual * observed_setting / observed_actual",
+        numeric_groups=("setting", "actual", "requested"),
+        inputs=values,
+        context={
+            "device": "oven",
+            "owner": match.group("owner"),
+            "relationship": "actual = setting * constant_factor",
+        },
+        answer=answer,
+        verify=lambda row: row["requested"] * row["setting"] / row["actual"],
+    )
+
+
 _RESOLVERS = (
     _resolve_prism,
     _resolve_ratio,
@@ -1039,6 +1086,7 @@ _RESOLVERS = (
     _resolve_annual_driving_cost,
     _resolve_party_remainder,
     _resolve_job_net_difference,
+    _resolve_oven_percentage_calibration,
 )
 
 

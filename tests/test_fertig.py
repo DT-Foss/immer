@@ -45,6 +45,7 @@ GUARDED_FORMULA_ROWS = {
     485: "220",
     489: "-10",
     541: "50",
+    580: "500",
 }
 SELECTIVE_EXTERNAL_RESOLVER_CASES = (
     (
@@ -99,6 +100,40 @@ SELECTIVE_EXTERNAL_RESOLVER_CASES = (
 
 
 class FertigAdapterTests(unittest.TestCase):
+    OVEN_QUESTION = (
+        "Maggie's oven is malfunctioning. When she sets it to 450 the actual "
+        "temperature is 468. If it's off by the same percentage for any recipe, "
+        "what temperature should she set it at if her recipe calls for 520 degrees?"
+    )
+
+    def test_public_candidate_verification_is_exact_and_gold_free(self) -> None:
+        solver = FertigSolver()
+        verified = solver.verify_candidate(self.OVEN_QUESTION, "500.0")
+        mismatch = solver.verify_candidate(self.OVEN_QUESTION, "504")
+        malformed = solver.verify_candidate(self.OVEN_QUESTION, "five hundred")
+        malformed_grouping = solver.verify_candidate(self.OVEN_QUESTION, "5,0,0")
+        unsupported = solver.verify_candidate("What is the capital of France?", "500")
+
+        self.assertEqual(verified.status.value, "verified")
+        self.assertEqual(verified.candidate, "500")
+        self.assertEqual(verified.expected, "500")
+        self.assertTrue(
+            verified.evidence["exact_solution"]["certificates"][0]["verified"]
+        )
+        self.assertEqual(mismatch.status.value, "mismatch")
+        self.assertEqual(mismatch.expected, "500")
+        self.assertEqual(malformed.status.value, "mismatch")
+        self.assertIsNone(malformed.candidate)
+        self.assertFalse(malformed.evidence["candidate_numeric"])
+        self.assertEqual(malformed_grouping.status.value, "mismatch")
+        self.assertIsNone(malformed_grouping.candidate)
+        self.assertEqual(unsupported.status.value, "abstained")
+        self.assertEqual(unsupported.evidence["reason"], "no_exact_certificate")
+
+        result = solver.handle(Request("exact_math", self.OVEN_QUESTION))
+        self.assertEqual(result.status, ExecutionStatus.OK)
+        self.assertEqual(result.output, "500")
+
     def test_clause_compiler_reaches_the_normal_exact_solver_path(self) -> None:
         question = (
             "Becca, Smendrick, and PJ have collections of Magic Cards. "

@@ -26,6 +26,7 @@ from typing import Any
 
 import torch
 
+from immer.cognition.fertig import FertigSolver
 from immer.knowledge import AccessTrace, AccessTraceRecorder, Streamer
 from immer.runtimes.deepseek_v4.benchmark import extract_gsm8k_answer
 from immer.runtimes.qwen3_8 import (
@@ -72,6 +73,11 @@ BRANCH_EVALUATION_SCHEMA = "immer.qwen3.8-generation-branch-evaluation/v2"
 NATIVE_BRANCH_RESULT_SCHEMA = "immer.qwen3.8-generation-branch-arm/v3"
 TRIAD_COMPARISON_SCHEMA = "immer.qwen3.8-generation-branch-comparison/v3"
 TRIAD_EVALUATION_SCHEMA = "immer.qwen3.8-generation-branch-evaluation/v3"
+BRANCH_QUESTION_SCHEMA = "immer.qwen3.8-generation-branch-questions/v1"
+BRANCH_ADJUDICATION_SCHEMA = "immer.qwen3.8-generation-branch-adjudication/v1"
+BRANCH_ADJUDICATION_EVALUATION_SCHEMA = (
+    "immer.qwen3.8-generation-branch-adjudication-evaluation/v1"
+)
 TOKEN_CHAIN_SCHEMA = "immer.qwen3.8-autoregressive-token-chain/v1"
 EXTERNAL_RAW_SEAL_KIND = "external-raw-file-sha256/v1"
 
@@ -635,6 +641,114 @@ def select_answer_branch_cohort(
     return _result(identity)
 
 
+def _selected_question_rows(
+    source: Mapping[str, Any], branch_input: Mapping[str, Any]
+) -> list[Mapping[str, Any]]:
+    """Bind source questions to one sealed answer-prefix selection without labels."""
+
+    if branch_input.get("schema") != BRANCH_INPUT_SCHEMA_V3:
+        raise QwenDirectDecodeError(
+            "question projection requires a sealed answer-prefix branch input"
+        )
+    projection = _source_contract_projection(source)
+    if _sha256(projection) != branch_input["source"]["contract_sha256"]:
+        raise QwenDirectDecodeError("question source generation contract differs")
+    _validate_answer_source_protocol(projection)
+    selection = branch_input["selection"]
+    expected_items = projection["items"][
+        selection["offset"] : selection["offset"] + selection["limit"]
+    ]
+    prefix = tuple(branch_input["protocol"]["generation_prefix"]["token_ids"])
+    sealed_items = branch_input["items"]
+    if selection["source_items"] != len(projection["items"]) or len(
+        sealed_items
+    ) != len(expected_items):
+        raise QwenDirectDecodeError(
+            "sealed answer branch selection differs from question source"
+        )
+    for sealed, expected in zip(sealed_items, expected_items, strict=True):
+        source_prompt = list(expected["prompt_token_ids"])
+        if (
+            sealed["item_id"] != expected["item_id"]
+            or sealed["source_prompt_token_ids"] != source_prompt
+            or sealed["effective_prompt_token_ids"] != [*source_prompt, *prefix]
+        ):
+            raise QwenDirectDecodeError(
+                "sealed answer prompts differ from question source"
+            )
+    by_id = {row["item_id"]: row for row in _source_rows(source)}
+    rows: list[Mapping[str, Any]] = []
+    for item_id in selection["item_ids"]:
+        row = by_id.get(item_id)
+        if row is None:
+            raise QwenDirectDecodeError("question source is missing a selected item")
+        question = row.get("question")
+        if not isinstance(question, str) or not question.strip():
+            raise QwenDirectDecodeError(
+                "question source contains an invalid original question"
+            )
+        rows.append(row)
+    return rows
+
+
+def select_answer_branch_questions(args: argparse.Namespace) -> dict[str, Any]:
+    """Project original questions into a label-free exact-adjudication artifact."""
+
+    branch_input = _load_branch_input(args.input)
+    if branch_input["schema"] != BRANCH_INPUT_SCHEMA_V3:
+        raise QwenDirectDecodeError(
+            "question projection requires a sealed answer-prefix branch input"
+        )
+    expected_source_sha256 = _digest_string(
+        args.inputs_sha256, "question source externally pinned raw file"
+    )
+    if expected_source_sha256 != branch_input["source"]["raw_file_sha256"]:
+        raise QwenDirectDecodeError(
+            "question source external SHA-256 differs from sealed branch input"
+        )
+    source, source_raw_sha256 = _externally_sealed_json(
+        args.inputs,
+        expected_source_sha256,
+        "question source",
+    )
+    rows = _selected_question_rows(source, branch_input)
+    projection = _source_contract_projection(source)
+    items = [
+        {
+            "item_id": row["item_id"],
+            "question": row["question"],
+            "question_sha256": hashlib.sha256(
+                row["question"].encode("utf-8")
+            ).hexdigest(),
+        }
+        for row in rows
+    ]
+    identity = {
+        "branch_input_sha256": branch_input["sha256"],
+        "items": items,
+        "protocol": {
+            "projection_contains_label_fields": False,
+            "rendering": "qwen3.8-no-thinking/v1",
+            "role": "pre-gold-exact-semantic-adjudication/v1",
+            "source_file_may_contain_labels": True,
+            "system_prompt": projection["protocol"]["system_prompt"],
+            "thinking": False,
+        },
+        "schema": BRANCH_QUESTION_SCHEMA,
+        "selection": dict(branch_input["selection"]),
+        "source": {
+            "contract_sha256": branch_input["source"]["contract_sha256"],
+            "raw_file_sha256": source_raw_sha256,
+            "schema": source["schema"],
+            "seal_kind": EXTERNAL_RAW_SEAL_KIND,
+        },
+        "status": "sealed",
+    }
+    if _contains_forbidden_branch_input_key(identity):  # pragma: no cover
+        raise QwenDirectDecodeError("question projection contains forbidden labels")
+    return _validate_branch_question_document(_result(identity))
+
+
 def _validate_branch_input_document(document: dict[str, Any]) -> dict[str, Any]:
     required = {
         "items",
@@ -904,6 +1018,160 @@ def _validate_branch_input(document: dict[str, Any]) -> dict[str, Any]:
 
 def _load_branch_input(path: str | os.PathLike[str]) -> dict[str, Any]:
     return _validate_branch_input(_strict_json(path))
+
+
+def _validate_branch_question_document(
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "branch_input_sha256",
+        "items",
+        "protocol",
+        "schema",
+        "selection",
+        "sha256",
+        "source",
+        "status",
+    }
+    if (
+        set(document) != required
+        or document.get("schema") != BRANCH_QUESTION_SCHEMA
+        or document.get("status") != "sealed"
+    ):
+        raise QwenDirectDecodeError("branch question document schema is invalid")
+    _verify_document_seal(document, "branch question document")
+    _digest_string(document.get("branch_input_sha256"), "branch question input")
+    if _contains_forbidden_branch_input_key(document):
+        raise QwenDirectDecodeError("branch question document contains label fields")
+    protocol = document.get("protocol")
+    source = document.get("source")
+    selection = document.get("selection")
+    items = document.get("items")
+    if (
+        not isinstance(protocol, Mapping)
+        or not isinstance(source, Mapping)
+        or not isinstance(selection, Mapping)
+        or not isinstance(items, list)
+    ):
+        raise QwenDirectDecodeError("branch question document structure is invalid")
+    if set(protocol) != {
+        "projection_contains_label_fields",
+        "rendering",
+        "role",
+        "source_file_may_contain_labels",
+        "system_prompt",
+        "thinking",
+    } or (
+        protocol.get("projection_contains_label_fields") is not False
+        or protocol.get("rendering") != "qwen3.8-no-thinking/v1"
+        or protocol.get("role") != "pre-gold-exact-semantic-adjudication/v1"
+        or protocol.get("source_file_may_contain_labels") is not True
+        or not isinstance(protocol.get("system_prompt"), str)
+        or protocol.get("thinking") is not False
+    ):
+        raise QwenDirectDecodeError("branch question protocol is invalid")
+    if set(source) != {
+        "contract_sha256",
+        "raw_file_sha256",
+        "schema",
+        "seal_kind",
+    } or (
+        source.get("schema") != FERTIG_INPUT_SCHEMA
+        or source.get("seal_kind") != EXTERNAL_RAW_SEAL_KIND
+    ):
+        raise QwenDirectDecodeError("branch question source identity is invalid")
+    _digest_string(source.get("contract_sha256"), "branch question source contract")
+    _digest_string(source.get("raw_file_sha256"), "branch question raw source")
+    if (
+        set(selection)
+        != {
+            "item_ids",
+            "kind",
+            "limit",
+            "offset",
+            "source_items",
+        }
+        or selection.get("kind") != "ordered-slice/v1"
+    ):
+        raise QwenDirectDecodeError("branch question selection is invalid")
+    offset = _nonnegative_count(selection.get("offset"), "question selection offset")
+    limit = _nonnegative_count(selection.get("limit"), "question selection limit")
+    source_items = _nonnegative_count(
+        selection.get("source_items"), "question source item count"
+    )
+    item_ids = selection.get("item_ids")
+    if (
+        limit < 1
+        or offset + limit > source_items
+        or len(items) != limit
+        or not isinstance(item_ids, list)
+        or len(item_ids) != limit
+    ):
+        raise QwenDirectDecodeError("branch question selection bounds are invalid")
+    seen: set[str] = set()
+    for index, row in enumerate(items):
+        if not isinstance(row, Mapping) or set(row) != {
+            "item_id",
+            "question",
+            "question_sha256",
+        }:
+            raise QwenDirectDecodeError("branch question item schema is invalid")
+        item_id = row.get("item_id")
+        question = row.get("question")
+        if (
+            not isinstance(item_id, str)
+            or not item_id
+            or item_id in seen
+            or item_id != item_ids[index]
+            or not isinstance(question, str)
+            or not question.strip()
+        ):
+            raise QwenDirectDecodeError("branch question item identity is invalid")
+        question_sha256 = hashlib.sha256(question.encode("utf-8")).hexdigest()
+        if row.get("question_sha256") != question_sha256:
+            raise QwenDirectDecodeError("branch question digest mismatch")
+        seen.add(item_id)
+    return document
+
+
+def _load_branch_question_document(
+    path: str | os.PathLike[str],
+) -> dict[str, Any]:
+    return _validate_branch_question_document(_strict_json(path))
+
+
+def _verify_question_prompt_bindings(
+    questions: Mapping[str, Any],
+    branch_input: Mapping[str, Any],
+    tokenizer_path: str | os.PathLike[str],
+) -> None:
+    """Prove every projected question reproduces its sealed source prompt."""
+
+    require_official = branch_input["tokenizer"]["require_official"]
+    tokenizer, identity = _tokenizer_record(
+        tokenizer_path,
+        require_official=require_official,
+    )
+    if identity != branch_input["tokenizer"]:
+        raise QwenDirectDecodeError(
+            "question tokenizer differs from the sealed branch tokenizer"
+        )
+    system_prompt = questions["protocol"]["system_prompt"]
+    question_rows = questions["items"]
+    prompt_rows = branch_input["items"]
+    if len(question_rows) != len(prompt_rows):
+        raise QwenDirectDecodeError("question and sealed prompt counts differ")
+    for question_row, prompt_row in zip(question_rows, prompt_rows, strict=True):
+        if question_row["item_id"] != prompt_row["item_id"]:
+            raise QwenDirectDecodeError("question and sealed prompt order differs")
+        rendered = tokenizer.render_no_thinking_prompt(
+            system_prompt,
+            question_row["question"],
+        )
+        if list(tokenizer.encode(rendered)) != prompt_row["source_prompt_token_ids"]:
+            raise QwenDirectDecodeError(
+                "question text does not reproduce the sealed source prompt"
+            )
 
 
 def _load_input(path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -1932,7 +2200,11 @@ def generate_arm(
         _cleanup(runtime, model)
 
 
-def _verify_access_trace_receipt(receipt: object) -> None:
+def _verify_access_trace_receipt(
+    receipt: object,
+    *,
+    artifact_path: str | os.PathLike[str] | None = None,
+) -> None:
     if not isinstance(receipt, Mapping) or set(receipt) != {
         "inventory_fingerprint",
         "leaves",
@@ -1948,8 +2220,11 @@ def _verify_access_trace_receipt(receipt: object) -> None:
     operations = _nonnegative_count(
         receipt.get("operations"), "access-trace operations"
     )
+    trace_path = (
+        Path(str(receipt["path"])) if artifact_path is None else Path(artifact_path)
+    )
     try:
-        trace = AccessTrace.from_bytes(Path(str(receipt["path"])).read_bytes())
+        trace = AccessTrace.from_bytes(trace_path.read_bytes())
         trace.verify()
     except Exception as exc:
         raise QwenDirectDecodeError("branch access-trace artifact is invalid") from exc
@@ -2028,11 +2303,40 @@ def _validate_graft_identity(graft: object, arm: str) -> Mapping[str, Any]:
     return graft
 
 
+def _relocated_access_trace_path(
+    result_path: str | os.PathLike[str], document: Mapping[str, Any]
+) -> Path:
+    """Resolve one transported result's adjacent trace without changing its seal."""
+
+    receipt = document.get("traffic")
+    if not isinstance(receipt, Mapping):
+        return Path("")
+    access_trace = receipt.get("access_trace")
+    if not isinstance(access_trace, Mapping):
+        return Path("")
+    recorded = Path(str(access_trace.get("path", "")))
+    if recorded.is_file():
+        return recorded
+    source = Path(result_path)
+    if "result-" not in source.name:
+        return recorded
+    adjacent = source.with_name(source.name.replace("result-", "access-", 1))
+    return adjacent if adjacent.is_file() else recorded
+
+
 def _load_branch_result(path: str | os.PathLike[str]) -> dict[str, Any]:
-    return _validate_branch_result_document(_strict_json(path))
+    document = _strict_json(path)
+    return _validate_branch_result_document(
+        document,
+        access_trace_path=_relocated_access_trace_path(path, document),
+    )
 
 
-def _validate_branch_result_document(document: dict[str, Any]) -> dict[str, Any]:
+def _validate_branch_result_document(
+    document: dict[str, Any],
+    *,
+    access_trace_path: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
     required = {
         "arm",
         "bundle",
@@ -2310,7 +2614,9 @@ def _validate_branch_result_document(document: dict[str, Any]) -> dict[str, Any]
     }
     if not isinstance(traffic, Mapping) or set(traffic) != traffic_required:
         raise QwenDirectDecodeError("branch traffic evidence is invalid")
-    _verify_access_trace_receipt(traffic.get("access_trace"))
+    _verify_access_trace_receipt(
+        traffic.get("access_trace"), artifact_path=access_trace_path
+    )
     if traffic.get("access_trace_sha256") != traffic["access_trace"]["sha256"]:
         raise QwenDirectDecodeError("branch access-trace digest is inconsistent")
     sums = {
@@ -2479,6 +2785,8 @@ def _native_v2_common_projection(document: Mapping[str, Any]) -> dict[str, Any]:
 
 def _validate_native_branch_result_document(
     document: dict[str, Any],
+    *,
+    access_trace_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     required = {
         "arm",
@@ -2506,7 +2814,10 @@ def _validate_native_branch_result_document(
         raise QwenDirectDecodeError("native branch result schema is invalid")
     _verify_document_seal(document, "native branch result")
     _validate_native_intervention_identity(document.get("intervention"))
-    _validate_branch_result_document(_native_v2_common_projection(document))
+    _validate_branch_result_document(
+        _native_v2_common_projection(document),
+        access_trace_path=access_trace_path,
+    )
     layers = document["execution"]["checkpoint_layers"]
     if layers <= NATIVE_HEAD_CRSA_LAYER:
         raise QwenDirectDecodeError("native CRSA layer exceeds checkpoint depth")
@@ -2516,7 +2827,11 @@ def _validate_native_branch_result_document(
 
 
 def _load_native_branch_result(path: str | os.PathLike[str]) -> dict[str, Any]:
-    return _validate_native_branch_result_document(_strict_json(path))
+    document = _strict_json(path)
+    return _validate_native_branch_result_document(
+        document,
+        access_trace_path=_relocated_access_trace_path(path, document),
+    )
 
 
 def _paired_identity(
@@ -2887,6 +3202,408 @@ def _load_generated_triad_comparison(
         comparisons["off_vs_native"], arm="native-crsa", item_ids=item_ids
     )
     return document
+
+
+def _build_adjudication_item(
+    *,
+    item_id: str,
+    question: str,
+    candidates: Mapping[str, object],
+    solver: FertigSolver | None = None,
+) -> dict[str, Any]:
+    required_arms = ("off", "stable_crsa", "native_crsa")
+    if set(candidates) != set(required_arms):
+        raise QwenDirectDecodeError("adjudication candidate arms are invalid")
+    exact_solver = solver or FertigSolver()
+    try:
+        results = {
+            arm: exact_solver.verify_candidate(question, candidates[arm])
+            for arm in required_arms
+        }
+    except Exception as exc:
+        raise QwenDirectDecodeError(
+            f"FERTIG candidate verification failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    verifications = {arm: result.to_dict() for arm, result in results.items()}
+    statuses = {result.status.value for result in results.values()}
+    if statuses == {"abstained"}:
+        decision = "abstained"
+        exact_solution = None
+        selected_answer = None
+    else:
+        if "abstained" in statuses or not statuses <= {"verified", "mismatch"}:
+            raise QwenDirectDecodeError(
+                "FERTIG verification support differs across identical questions"
+            )
+        expected = {result.expected for result in results.values()}
+        exact_evidence = {
+            _canonical(result.evidence["exact_solution"]) for result in results.values()
+        }
+        if len(expected) != 1 or None in expected or len(exact_evidence) != 1:
+            raise QwenDirectDecodeError(
+                "FERTIG exact evidence differs across candidate arms"
+            )
+        selected_answer = expected.pop()
+        exact_solution = next(iter(results.values())).evidence["exact_solution"]
+        decision = (
+            "certificate_override" if "mismatch" in statuses else "certificate_verified"
+        )
+    return {
+        "candidates": {arm: verifications[arm]["candidate"] for arm in required_arms},
+        "decision": decision,
+        "exact_solution": exact_solution,
+        "item_id": item_id,
+        "question": question,
+        "question_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
+        "selected_answer": selected_answer,
+        "verifications": verifications,
+    }
+
+
+def _adjudication_summary(items: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    overrides = sum(row.get("decision") == "certificate_override" for row in items)
+    verified = sum(row.get("decision") == "certificate_verified" for row in items)
+    abstained = sum(row.get("decision") == "abstained" for row in items)
+    return {
+        "abstained": abstained,
+        "certificate_overrides": overrides,
+        "certificate_verified": verified,
+        "certified": overrides + verified,
+        "total": len(items),
+    }
+
+
+def _validate_branch_adjudication_document(
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "arm_seals",
+        "branch_input_sha256",
+        "items",
+        "protocol",
+        "question_source_sha256",
+        "schema",
+        "sha256",
+        "status",
+        "summary",
+        "triad_sha256",
+    }
+    if (
+        set(document) != required
+        or document.get("schema") != BRANCH_ADJUDICATION_SCHEMA
+        or document.get("status") != "sealed"
+    ):
+        raise QwenDirectDecodeError("branch adjudication schema is invalid")
+    _verify_document_seal(document, "branch adjudication")
+    _digest_string(document.get("branch_input_sha256"), "adjudication branch input")
+    _digest_string(document.get("question_source_sha256"), "adjudication questions")
+    _digest_string(document.get("triad_sha256"), "adjudication triad")
+    seals = document.get("arm_seals")
+    protocol = document.get("protocol")
+    items = document.get("items")
+    summary = document.get("summary")
+    if not isinstance(seals, Mapping) or set(seals) != {
+        "native_crsa",
+        "off",
+        "stable_crsa",
+    }:
+        raise QwenDirectDecodeError("adjudication arm seals are invalid")
+    for arm, seal in seals.items():
+        _digest_string(seal, f"adjudication {arm} arm")
+    if protocol != {
+        "all_arm_seals_admitted_before_questions": True,
+        "decision_rule": "exact-fertig-certificate-overrides-candidates/v1",
+        "generation_was_label_free": True,
+        "gold_accessed_by_adjudicator": False,
+        "question_prompt_binding": "official-tokenizer-reencode/v1",
+        "triad_seal_admitted_before_questions": True,
+        "unsupported_policy": "abstain",
+    }:
+        raise QwenDirectDecodeError("branch adjudication protocol is invalid")
+    if not isinstance(items, list) or not items:
+        raise QwenDirectDecodeError("branch adjudication contains no items")
+    recomputed: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in items:
+        if not isinstance(row, Mapping) or set(row) != {
+            "candidates",
+            "decision",
+            "exact_solution",
+            "item_id",
+            "question",
+            "question_sha256",
+            "selected_answer",
+            "verifications",
+        }:
+            raise QwenDirectDecodeError("branch adjudication item schema is invalid")
+        item_id = row.get("item_id")
+        question = row.get("question")
+        candidates = row.get("candidates")
+        if (
+            not isinstance(item_id, str)
+            or not item_id
+            or item_id in seen
+            or not isinstance(question, str)
+            or not question.strip()
+            or not isinstance(candidates, Mapping)
+        ):
+            raise QwenDirectDecodeError("branch adjudication item identity is invalid")
+        expected = _build_adjudication_item(
+            item_id=item_id,
+            question=question,
+            candidates=candidates,
+        )
+        if _canonical(row) != _canonical(expected):
+            raise QwenDirectDecodeError("branch adjudication evidence mismatch")
+        recomputed.append(expected)
+        seen.add(item_id)
+    expected_summary = _adjudication_summary(recomputed)
+    if not isinstance(summary, Mapping) or dict(summary) != expected_summary:
+        raise QwenDirectDecodeError("branch adjudication summary is inconsistent")
+    return document
+
+
+def _load_branch_adjudication_document(
+    path: str | os.PathLike[str],
+) -> dict[str, Any]:
+    return _validate_branch_adjudication_document(_strict_json(path))
+
+
+def adjudicate_generated_triad(args: argparse.Namespace) -> dict[str, Any]:
+    """Apply exact FERTIG certificates after arms seal and before any gold access."""
+
+    off = _load_branch_result(args.off)
+    stable = _load_branch_result(args.stable)
+    native = _load_native_branch_result(args.native)
+    expected_triad = _compare_generated_triad_documents(off, stable, native)
+    triad = _load_generated_triad_comparison(args.triad)
+    if _canonical(triad) != _canonical(expected_triad):
+        raise QwenDirectDecodeError("triad comparison does not bind admitted arms")
+    if off["input"]["schema"] != BRANCH_INPUT_SCHEMA_V3:
+        raise QwenDirectDecodeError(
+            "exact adjudication requires sealed answer-prefix branch arms"
+        )
+
+    # Questions are admitted only after every arm and the recomputed triad seal.
+    questions = _load_branch_question_document(args.questions)
+    if (
+        questions["branch_input_sha256"] != off["input"]["sha256"]
+        or questions["selection"] != off["input"]["selection"]
+        or questions["source"]["contract_sha256"]
+        != off["input"]["source"]["contract_sha256"]
+        or questions["source"]["raw_file_sha256"]
+        != off["input"]["source"]["raw_file_sha256"]
+    ):
+        raise QwenDirectDecodeError(
+            "branch question document does not bind the admitted answer input"
+        )
+    _verify_question_prompt_bindings(
+        questions,
+        off["input"],
+        args.tokenizer_json,
+    )
+    question_rows = questions["items"]
+    if not (
+        len(question_rows)
+        == len(off["items"])
+        == len(stable["items"])
+        == len(native["items"])
+    ):
+        raise QwenDirectDecodeError("adjudication arm and question counts differ")
+    items: list[dict[str, Any]] = []
+    solver = FertigSolver()
+    for question_row, off_row, stable_row, native_row in zip(
+        question_rows,
+        off["items"],
+        stable["items"],
+        native["items"],
+        strict=True,
+    ):
+        item_id = question_row["item_id"]
+        if item_id not in {
+            off_row["item_id"],
+            stable_row["item_id"],
+            native_row["item_id"],
+        } or not (
+            item_id
+            == off_row["item_id"]
+            == stable_row["item_id"]
+            == native_row["item_id"]
+        ):
+            raise QwenDirectDecodeError("adjudication item order differs across arms")
+        items.append(
+            _build_adjudication_item(
+                item_id=item_id,
+                question=question_row["question"],
+                candidates={
+                    "native_crsa": native_row["parsed_numeric_answer"],
+                    "off": off_row["parsed_numeric_answer"],
+                    "stable_crsa": stable_row["parsed_numeric_answer"],
+                },
+                solver=solver,
+            )
+        )
+    identity = {
+        "arm_seals": dict(triad["arm_seals"]),
+        "branch_input_sha256": off["input"]["sha256"],
+        "items": items,
+        "protocol": {
+            "all_arm_seals_admitted_before_questions": True,
+            "decision_rule": "exact-fertig-certificate-overrides-candidates/v1",
+            "generation_was_label_free": True,
+            "gold_accessed_by_adjudicator": False,
+            "question_prompt_binding": "official-tokenizer-reencode/v1",
+            "triad_seal_admitted_before_questions": True,
+            "unsupported_policy": "abstain",
+        },
+        "question_source_sha256": questions["sha256"],
+        "schema": BRANCH_ADJUDICATION_SCHEMA,
+        "status": "sealed",
+        "summary": _adjudication_summary(items),
+        "triad_sha256": triad["sha256"],
+    }
+    return _validate_branch_adjudication_document(_result(identity))
+
+
+def evaluate_adjudicated_triad(args: argparse.Namespace) -> dict[str, Any]:
+    """Measure the sealed adjudicated system only after every pre-gold seal binds."""
+
+    # Re-admit the complete generation side before opening any label-bearing bytes.
+    off = _load_branch_result(args.off)
+    stable = _load_branch_result(args.stable)
+    native = _load_native_branch_result(args.native)
+    expected_triad = _compare_generated_triad_documents(off, stable, native)
+    triad = _load_generated_triad_comparison(args.triad)
+    if _canonical(triad) != _canonical(expected_triad):
+        raise QwenDirectDecodeError("triad comparison does not bind admitted arms")
+    questions = _load_branch_question_document(args.questions)
+    expected_adjudication = adjudicate_generated_triad(args)
+    if (
+        expected_adjudication["arm_seals"] != triad["arm_seals"]
+        or expected_adjudication["triad_sha256"] != triad["sha256"]
+        or expected_adjudication["question_source_sha256"] != questions["sha256"]
+        or expected_adjudication["branch_input_sha256"] != off["input"]["sha256"]
+    ):
+        raise QwenDirectDecodeError(
+            "adjudication inputs changed while their seals were being admitted"
+        )
+    adjudication = _load_branch_adjudication_document(args.adjudication)
+    if _canonical(adjudication) != _canonical(expected_adjudication):
+        raise QwenDirectDecodeError(
+            "adjudication does not bind admitted arms, triad, and questions"
+        )
+
+    expected_source_sha256 = _digest_string(
+        args.gold_source_sha256, "label source externally pinned raw file"
+    )
+    if expected_source_sha256 != off["input"]["source"]["raw_file_sha256"]:
+        raise QwenDirectDecodeError(
+            "label source external SHA-256 differs from sealed branch input"
+        )
+    source, source_raw_sha256 = _externally_sealed_json(
+        args.gold_source,
+        expected_source_sha256,
+        "label source",
+    )
+    _source_rows(source)
+    _rows, targets = _gold_rows_for_branch(source, off)
+
+    transitions = {
+        "correct_to_abstained": 0,
+        "correct_to_correct": 0,
+        "correct_to_wrong": 0,
+        "wrong_to_abstained": 0,
+        "wrong_to_correct": 0,
+        "wrong_to_wrong": 0,
+    }
+    items: list[dict[str, Any]] = []
+    off_correct_count = 0
+    system_correct_count = 0
+    covered = 0
+    for off_row, adjudicated in zip(off["items"], adjudication["items"], strict=True):
+        item_id = off_row["item_id"]
+        if adjudicated["item_id"] != item_id:
+            raise QwenDirectDecodeError("adjudication evaluation item order differs")
+        target = targets[item_id]
+        selected = adjudicated["selected_answer"]
+        off_correct = off_row["parsed_numeric_answer"] == target
+        system_correct = selected is not None and selected == target
+        off_correct_count += off_correct
+        system_correct_count += system_correct
+        covered += selected is not None
+        if selected is None:
+            transition = "correct_to_abstained" if off_correct else "wrong_to_abstained"
+        else:
+            transition = _transition_against_off(
+                off_correct=off_correct,
+                candidate_correct=system_correct,
+            )
+        transitions[transition] += 1
+        items.append(
+            {
+                "decision": adjudicated["decision"],
+                "gold": target,
+                "item_id": item_id,
+                "off_correct": off_correct,
+                "off_parsed_numeric_answer": off_row["parsed_numeric_answer"],
+                "selected_answer": selected,
+                "system_correct": system_correct,
+                "transition": transition,
+                "unsafe": transition in {"correct_to_abstained", "correct_to_wrong"},
+            }
+        )
+    total = len(items)
+    net = system_correct_count - off_correct_count
+    unsafe = transitions["correct_to_wrong"] + transitions["correct_to_abstained"]
+    if unsafe:
+        verdict = "unsafe"
+    elif net > 0:
+        verdict = "improved"
+    elif net < 0:
+        verdict = "regressed"
+    else:
+        verdict = "neutral"
+    return _result(
+        {
+            "adjudication_sha256": adjudication["sha256"],
+            "arm_seals": dict(triad["arm_seals"]),
+            "items": items,
+            "protocol": {
+                "adjudicator_did_not_access_label_source": True,
+                "adjudication_recomputed_before_label_source": True,
+                "all_seals_admitted_before_evaluator_opened_label_source": True,
+                "generation_was_label_free": True,
+                "transition_rule": "canonical-numeric-exact-match-with-abstention/v1",
+            },
+            "question_source_sha256": questions["sha256"],
+            "schema": BRANCH_ADJUDICATION_EVALUATION_SCHEMA,
+            "source": {
+                "contract_sha256": off["input"]["source"]["contract_sha256"],
+                "raw_file_sha256": source_raw_sha256,
+                "schema": source["schema"],
+                "seal_kind": EXTERNAL_RAW_SEAL_KIND,
+            },
+            "status": "sealed",
+            "summary": {
+                **transitions,
+                "coverage": covered / total,
+                "covered": covered,
+                "net_accuracy_delta": net / total,
+                "net_correct_delta": net,
+                "off_accuracy": off_correct_count / total,
+                "off_correct": off_correct_count,
+                "quality_success": (
+                    transitions["wrong_to_correct"] > 0 and net > 0 and unsafe == 0
+                ),
+                "system_accuracy": system_correct_count / total,
+                "system_correct": system_correct_count,
+                "total": total,
+                "unsafe_correct_losses": unsafe,
+                "verdict": verdict,
+            },
+            "triad_sha256": triad["sha256"],
+        }
+    )
 
 
 def _gold_rows_for_branch(
@@ -3360,6 +4077,15 @@ def _parser() -> argparse.ArgumentParser:
     answer_branch_select.add_argument("--limit", type=_positive_int, default=8)
     answer_branch_select.add_argument("--output", required=True)
     answer_branch_select.set_defaults(handler=select_answer_branch_cohort)
+    question_select = subparsers.add_parser(
+        "select-answer-branch-questions",
+        aliases=("select-branch-questions",),
+    )
+    question_select.add_argument("--input", required=True)
+    question_select.add_argument("--inputs", "--source-input", required=True)
+    question_select.add_argument("--inputs-sha256", required=True)
+    question_select.add_argument("--output", required=True)
+    question_select.set_defaults(handler=select_answer_branch_questions)
     branch_generate = subparsers.add_parser("generate-arm")
     _branch_runtime_arguments(branch_generate)
     branch_generate.set_defaults(handler=generate_arm)
@@ -3394,6 +4120,47 @@ def _parser() -> argparse.ArgumentParser:
     )
     triad_compare.add_argument("--output", required=True)
     triad_compare.set_defaults(handler=compare_generated_triad)
+    triad_adjudicate = subparsers.add_parser("adjudicate-generated-triad")
+    triad_adjudicate.add_argument("--off", required=True)
+    triad_adjudicate.add_argument(
+        "--stable",
+        "--hidden",
+        "--stable-crsa",
+        dest="stable",
+        required=True,
+    )
+    triad_adjudicate.add_argument(
+        "--native", "--native-crsa", dest="native", required=True
+    )
+    triad_adjudicate.add_argument(
+        "--triad", "--comparison", dest="triad", required=True
+    )
+    triad_adjudicate.add_argument("--questions", required=True)
+    triad_adjudicate.add_argument("--tokenizer-json", required=True)
+    triad_adjudicate.add_argument("--output", required=True)
+    triad_adjudicate.set_defaults(handler=adjudicate_generated_triad)
+    adjudication_evaluate = subparsers.add_parser("evaluate-adjudicated-triad")
+    adjudication_evaluate.add_argument("--off", required=True)
+    adjudication_evaluate.add_argument(
+        "--stable",
+        "--hidden",
+        "--stable-crsa",
+        dest="stable",
+        required=True,
+    )
+    adjudication_evaluate.add_argument(
+        "--native", "--native-crsa", dest="native", required=True
+    )
+    adjudication_evaluate.add_argument(
+        "--triad", "--comparison", dest="triad", required=True
+    )
+    adjudication_evaluate.add_argument("--questions", required=True)
+    adjudication_evaluate.add_argument("--tokenizer-json", required=True)
+    adjudication_evaluate.add_argument("--adjudication", required=True)
+    adjudication_evaluate.add_argument("--gold-source", "--source-input", required=True)
+    adjudication_evaluate.add_argument("--gold-source-sha256", required=True)
+    adjudication_evaluate.add_argument("--output", required=True)
+    adjudication_evaluate.set_defaults(handler=evaluate_adjudicated_triad)
     triad_evaluate = subparsers.add_parser("evaluate-generated-triad")
     triad_evaluate.add_argument("--off", required=True)
     triad_evaluate.add_argument(

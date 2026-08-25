@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from enum import Enum
+from fractions import Fraction
 import hashlib
 import importlib
 import importlib.util
 import os
+import re
 import sys
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
-from typing import Iterator
+from typing import Any, Iterator
 
 from ...contracts import ExecutionStatus, Request, Result
 from .arithmetic_ir import SolveStatus, solve as solve_arithmetic_ir
@@ -16,13 +21,50 @@ from .formula_certificates import solve_guarded_formula
 from .structural import ParseStatus, parse_structural_problem
 
 
+_CANDIDATE_NUMBER = r"[-+]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)"
+_CANDIDATE_NUMERIC = re.compile(
+    rf"(?:{_CANDIDATE_NUMBER})(?:\s*/\s*(?:{_CANDIDATE_NUMBER}))?"
+)
+
+
 class FertigStructuralError(RuntimeError):
     """The closed structural frontend encountered invalid internal input."""
 
 
-def _format_fraction(value: object) -> str:
-    from fractions import Fraction
+class CandidateVerificationStatus(str, Enum):
+    """Gold-free outcome of checking one candidate against exact FERTIG proof."""
 
+    VERIFIED = "verified"
+    MISMATCH = "mismatch"
+    ABSTAINED = "abstained"
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateVerification:
+    """Exact candidate judgment plus machine-readable proof evidence."""
+
+    status: CandidateVerificationStatus
+    candidate: str | None
+    expected: str | None
+    evidence: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate": self.candidate,
+            "evidence": self.evidence,
+            "expected": self.expected,
+            "kind": "fertig-candidate-verification/v1",
+            "status": self.status.value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _CertifiedAnswer:
+    answer: Fraction
+    evidence: dict[str, Any]
+
+
+def _format_fraction(value: object) -> str:
     if not isinstance(value, Fraction):
         raise FertigStructuralError("structural solver returned a non-Fraction target")
     if value.denominator == 1:
@@ -30,19 +72,96 @@ def _format_fraction(value: object) -> str:
     return str(float(value))
 
 
-def _solve_certified(question: str) -> str | None:
+def _canonical_fraction(value: Fraction) -> str:
+    if value.denominator == 1:
+        return str(value.numerator)
+    denominator = value.denominator
+    twos = 0
+    while denominator % 2 == 0:
+        denominator //= 2
+        twos += 1
+    fives = 0
+    while denominator % 5 == 0:
+        denominator //= 5
+        fives += 1
+    if denominator != 1:
+        return f"{value.numerator}/{value.denominator}"
+    places = max(twos, fives)
+    scaled = value.numerator * 2 ** (places - twos) * 5 ** (places - fives)
+    sign = "-" if scaled < 0 else ""
+    digits = str(abs(scaled)).rjust(places + 1, "0")
+    return f"{sign}{digits[:-places]}.{digits[-places:]}".rstrip("0").rstrip(".")
+
+
+def _structural_certificate_evidence(solution: object) -> dict[str, Any]:
+    certificate = getattr(solution, "certificate", None)
+    if certificate is None or not certificate.verified:
+        raise FertigStructuralError("unique structural solution lacks a certificate")
+    return {
+        "component_variables": list(certificate.component_variables),
+        "equation_count": certificate.equation_count,
+        "kind": "fraction_rref/v1",
+        "pivot_columns": list(certificate.pivot_columns),
+        "rank": certificate.rank,
+        "residuals": [
+            {
+                "constraint_index": residual.constraint_index,
+                "span": (
+                    None
+                    if residual.span is None
+                    else {
+                        "end": residual.span.end,
+                        "start": residual.span.start,
+                    }
+                ),
+                "value": _canonical_fraction(residual.value),
+            }
+            for residual in certificate.residuals
+        ],
+        "variable_count": certificate.variable_count,
+        "verified": True,
+        "zero_residuals": all(row.value == 0 for row in certificate.residuals),
+    }
+
+
+def _solve_certified_evidence(question: str) -> _CertifiedAnswer | None:
     formula = solve_guarded_formula(question)
     parsed = parse_structural_problem(question)
     if parsed.status is ParseStatus.INVALID:
         raise FertigStructuralError(f"invalid structural parse: {parsed.reason}")
     if not parsed.ok:
-        return _format_fraction(formula.answer) if formula is not None else None
+        if formula is None:
+            return None
+        answer = formula.answer
+        certificates = [formula.certificate.to_dict()]
+        return _CertifiedAnswer(
+            answer,
+            {
+                "answer": _canonical_fraction(answer),
+                "certificates": certificates,
+                "kind": "fertig-exact-solution/v1",
+                "source_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
+                "verified": True,
+            },
+        )
     assert parsed.problem is not None
     solution = solve_arithmetic_ir(parsed.problem)
     if solution.status is SolveStatus.INVALID:
         raise FertigStructuralError(f"invalid arithmetic IR: {solution.reason}")
     if not solution.unique:
-        return _format_fraction(formula.answer) if formula is not None else None
+        if formula is None:
+            return None
+        answer = formula.answer
+        return _CertifiedAnswer(
+            answer,
+            {
+                "answer": _canonical_fraction(answer),
+                "certificates": [formula.certificate.to_dict()],
+                "kind": "fertig-exact-solution/v1",
+                "source_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
+                "verified": True,
+            },
+        )
     if (
         solution.target_value is None
         or solution.certificate is None
@@ -53,7 +172,112 @@ def _solve_certified(question: str) -> str | None:
         raise FertigStructuralError(
             "independent exact certificates disagree on the target value"
         )
-    return _format_fraction(solution.target_value)
+    certificates = [_structural_certificate_evidence(solution)]
+    if formula is not None:
+        certificates.append(formula.certificate.to_dict())
+    answer = solution.target_value
+    return _CertifiedAnswer(
+        answer,
+        {
+            "answer": _canonical_fraction(answer),
+            "certificates": certificates,
+            "kind": "fertig-exact-solution/v1",
+            "source_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
+            "verified": True,
+        },
+    )
+
+
+def _solve_certified(question: str) -> str | None:
+    certified = _solve_certified_evidence(question)
+    return _format_fraction(certified.answer) if certified is not None else None
+
+
+def _candidate_fraction(candidate: object) -> Fraction | None:
+    if isinstance(candidate, bool) or candidate is None:
+        return None
+    if isinstance(candidate, Fraction):
+        return candidate
+    if isinstance(candidate, int):
+        return Fraction(candidate)
+    if isinstance(candidate, Decimal):
+        return Fraction(candidate) if candidate.is_finite() else None
+    if not isinstance(candidate, str):
+        return None
+    raw = candidate.strip()
+    if not raw or _CANDIDATE_NUMERIC.fullmatch(raw) is None:
+        return None
+    parts = raw.split("/")
+    if len(parts) > 2:
+        return None
+    try:
+        if len(parts) == 2:
+            numerator = Decimal(parts[0].strip().replace(",", ""))
+            denominator = Decimal(parts[1].strip().replace(",", ""))
+            if (
+                not numerator.is_finite()
+                or not denominator.is_finite()
+                or denominator == 0
+            ):
+                return None
+            return Fraction(numerator) / Fraction(denominator)
+        decimal = Decimal(raw.replace(",", ""))
+        return Fraction(decimal) if decimal.is_finite() else None
+    except (InvalidOperation, ValueError, ZeroDivisionError):
+        return None
+
+
+def verify_candidate(question: str, candidate: object) -> CandidateVerification:
+    """Verify a proposed numeric answer using only exact, gold-free certificates."""
+
+    question_sha256 = (
+        hashlib.sha256(question.encode("utf-8")).hexdigest()
+        if isinstance(question, str)
+        else None
+    )
+    parsed_candidate = _candidate_fraction(candidate)
+    canonical_candidate = (
+        _canonical_fraction(parsed_candidate) if parsed_candidate is not None else None
+    )
+    if not isinstance(question, str) or not question.strip():
+        return CandidateVerification(
+            CandidateVerificationStatus.ABSTAINED,
+            canonical_candidate,
+            None,
+            {
+                "exact_solution": None,
+                "question_sha256": question_sha256,
+                "reason": "question_must_be_non_empty_text",
+            },
+        )
+    certified = _solve_certified_evidence(question)
+    if certified is None:
+        return CandidateVerification(
+            CandidateVerificationStatus.ABSTAINED,
+            canonical_candidate,
+            None,
+            {
+                "exact_solution": None,
+                "question_sha256": question_sha256,
+                "reason": "no_exact_certificate",
+            },
+        )
+    expected = _canonical_fraction(certified.answer)
+    matches = parsed_candidate is not None and parsed_candidate == certified.answer
+    return CandidateVerification(
+        (
+            CandidateVerificationStatus.VERIFIED
+            if matches
+            else CandidateVerificationStatus.MISMATCH
+        ),
+        canonical_candidate,
+        expected,
+        {
+            "candidate_numeric": parsed_candidate is not None,
+            "exact_solution": certified.evidence,
+            "question_sha256": question_sha256,
+        },
+    )
 
 
 @contextmanager
@@ -126,6 +350,13 @@ class FertigSolver:
             ) from exc
         return solver.solve(question)
 
+    def verify_candidate(
+        self, question: str, candidate: object
+    ) -> CandidateVerification:
+        """Return an exact gold-free judgment without invoking legacy heuristics."""
+
+        return verify_candidate(question, candidate)
+
     def handle(self, request: Request) -> Result:
         if request.capability not in self.capabilities:
             return Result(
@@ -154,4 +385,10 @@ class FertigSolver:
         return Result(ExecutionStatus.OK, self.name, output=answer)
 
 
-__all__ = ["FertigSolver", "FertigStructuralError"]
+__all__ = [
+    "CandidateVerification",
+    "CandidateVerificationStatus",
+    "FertigSolver",
+    "FertigStructuralError",
+    "verify_candidate",
+]

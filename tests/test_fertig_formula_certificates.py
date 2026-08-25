@@ -134,6 +134,13 @@ CASES = (
         Fraction(8400),
         "two_job_after_tax_difference",
     ),
+    (
+        "Maggie's oven is malfunctioning. When she sets it to 450 the actual "
+        "temperature is 468. If it's off by the same percentage for any recipe, "
+        "what temperature should she set it at if her recipe calls for 520 degrees?",
+        Fraction(500),
+        "constant_percentage_oven_calibration",
+    ),
 )
 
 
@@ -182,6 +189,34 @@ class FormulaCertificateTests(unittest.TestCase):
         )
         for span in certificate.numeric_spans:
             self.assertEqual(source[span.start : span.end], span.text)
+
+    def test_oven_calibration_is_exact_and_consumes_all_numeric_spans(self) -> None:
+        source = CASES[-1][0]
+        solution = solve_guarded_formula(source)
+        self.assertIsNotNone(solution)
+        assert solution is not None
+        self.assertEqual(solution.answer, Fraction(520 * 450, 468))
+        self.assertEqual(
+            [span.text for span in solution.certificate.numeric_spans],
+            ["450", "468", "520"],
+        )
+        self.assertEqual(
+            solution.certificate.source_sha256,
+            hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        )
+
+    def test_oven_calibration_rejects_ambiguity_and_reference_drift(self) -> None:
+        source = CASES[-1][0]
+        variants = (
+            source + " Use calibration 2.",
+            source.replace("should she set", "should he set"),
+            source.replace("her recipe", "his recipe"),
+            source.replace("same percentage", "same number of degrees"),
+            source.replace("actual temperature is 468", "actual temperature is 0"),
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertIsNone(solve_guarded_formula(variant))
 
 
 if __name__ == "__main__":
