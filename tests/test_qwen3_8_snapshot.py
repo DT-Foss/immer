@@ -72,6 +72,34 @@ class Qwen38SnapshotTests(unittest.TestCase):
             max_seq_len=max_seq_len,
         )
 
+    def _native_model(
+        self,
+        *,
+        intervention: Qwen38NativeHeadCrsa | None,
+        dtype: str = "bfloat16",
+    ) -> StreamedQwen38:
+        native_root = self.root / "native"
+        native_root.mkdir(exist_ok=True)
+        config = _native_tiny_config()
+        checkpoint = native_root / "model.safetensors"
+        if not checkpoint.exists():
+            save_file(_tiny_weights(config), checkpoint)
+        source = Streamer.from_local(native_root, budget_mb=20, use_cache=False)
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype=dtype,
+            max_resident_bytes=2 * 1024**2,
+        )
+        self.resources.append((pager, source))
+        return StreamedQwen38(
+            config,
+            pager,
+            native_head_crsa=intervention,
+            max_batch_size=3,
+            max_seq_len=16,
+        )
+
     def test_prefill_save_restore_decode_is_bit_exact(self) -> None:
         prompt = [[1, 4, 9]]
         next_token = [[7]]
@@ -96,9 +124,51 @@ class Qwen38SnapshotTests(unittest.TestCase):
         actual, _ = restored.decode(next_token)
         self.assertTrue(torch.equal(actual, expected))
 
+        full = self._model(dtype="bfloat16")
+        full_hidden, _ = full.prefill([[1, 4, 9, 7, 6]])
+        extended = self._model(dtype="bfloat16")
+        extended.load_state(path)
+        suffix_hidden, suffix_evidence = extended.prefill([[7, 6]], reset=False)
+        self.assertTrue(torch.equal(suffix_hidden, full_hidden[:, 3:]))
+        self.assertEqual(suffix_evidence[0].start_pos, 3)
+        self.assertEqual(suffix_evidence[0].end_pos, 5)
+        self.assertEqual(extended.next_position, 5)
+
+        long_suffix = [7, 6, 5, 4, 3, 2, 8, 10, 11]
+        full_long = self._model(dtype="bfloat16")
+        full_long_hidden, _ = full_long.prefill([[1, 4, 9, *long_suffix]])
+        extended_long = self._model(dtype="bfloat16")
+        extended_long.load_state(path)
+        suffix_long_hidden, suffix_long_evidence = extended_long.prefill(
+            [long_suffix], reset=False
+        )
+        self.assertTrue(torch.equal(suffix_long_hidden, full_long_hidden[:, 3:]))
+        self.assertEqual(
+            [(row.start_pos, row.end_pos) for row in suffix_long_evidence],
+            [(3, 12)],
+        )
+        self.assertEqual(extended_long.next_position, 12)
+
         manifest = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(manifest["schema"], QWEN38_SNAPSHOT_SCHEMA)
         self.assertEqual(manifest["body"]["state"]["state_batch_size"], 1)
+
+    def test_multitoken_suffix_failure_never_commits_a_partial_block(self) -> None:
+        model = self._model(dtype="bfloat16")
+        model.prefill([[1, 4, 9]])
+        original_mlp = model._mlp
+
+        def fail_at_layer(hidden, *, layer):
+            if layer == 1:
+                raise RuntimeError("injected suffix failure")
+            return original_mlp(hidden, layer=layer)
+
+        with mock.patch.object(model, "_mlp", side_effect=fail_at_layer):
+            with self.assertRaisesRegex(RuntimeError, "injected suffix failure"):
+                model.prefill([[7, 6, 5, 4, 3, 2]], reset=False)
+        self.assertTrue(model.state_poisoned)
+        self.assertEqual(model.next_position, 0)
+        self.assertEqual(model.state_bytes, 0)
 
     @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
     def test_mps_indexed_state_round_trip_matches_indexless_pager_device(self) -> None:
@@ -274,59 +344,90 @@ class Qwen38SnapshotTests(unittest.TestCase):
         with self.assertRaisesRegex(DeepSeekV4SnapshotError, "unsupported.*schema"):
             read_snapshot(path, expected_identity=identity)
 
-    def test_native_head_crsa_snapshots_refuse_before_io_and_bind_source(self) -> None:
-        source = Streamer.from_local(self.root, budget_mb=20, use_cache=False)
-        pager = Qwen38WeightPager(
-            source,
-            device="cpu",
-            compute_dtype="float32",
-            max_resident_bytes=2 * 1024**2,
-        )
-        self.resources.append((pager, source))
-        model = StreamedQwen38(
-            _native_tiny_config(),
-            pager,
-            native_head_crsa=Qwen38NativeHeadCrsa(),
-            max_seq_len=16,
-        )
-        path = self.root / "native-refused.json"
-        with self.assertRaisesRegex(
-            Qwen38SnapshotError, "native Head-CRSA.*unsupported"
-        ):
-            model.save_state(path)
-        self.assertFalse(path.exists())
-        with self.assertRaisesRegex(
-            Qwen38SnapshotError, "native Head-CRSA.*unsupported"
-        ):
-            model.load_state(path)
-
+    def test_native_head_crsa_snapshot_continues_bit_exact_and_binds_source(
+        self,
+    ) -> None:
         runtime_paths = {
             row["path"] for row in runtime_source_manifest(include_transport=False)
         }
         self.assertIn("immer/runtimes/qwen3_8/native_crsa.py", runtime_paths)
         self.assertIn("immer/runtimes/qwen3_8/native_fork.py", runtime_paths)
 
-        native_root = self.root / "native-alpha-zero"
-        native_root.mkdir()
-        config = _native_tiny_config()
-        save_file(_tiny_weights(config), native_root / "model.safetensors")
-        identity_source = Streamer.from_local(
-            native_root, budget_mb=20, use_cache=False
+        intervention = Qwen38NativeHeadCrsa(alpha=0.1)
+        prompt = [[1, 4, 9]]
+        next_token = [[7]]
+        uninterrupted = self._native_model(intervention=intervention)
+        uninterrupted.prefill(prompt)
+        expected, _ = uninterrupted.decode(next_token)
+
+        saved = self._native_model(intervention=intervention)
+        saved.prefill(prompt)
+        path = self.root / "native-prefix.json"
+        receipt = saved.save_state(path)
+        self.assertEqual(receipt["tensor_count"], 57)
+        self.assertEqual(receipt["tensor_bytes"], saved.state_bytes)
+
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        identity = manifest["body"]["identity"]["native_head_crsa"]
+        self.assertEqual(identity["alpha"], 0.1)
+        self.assertEqual(identity["layer"], 27)
+        layer_row = manifest["body"]["state"]["attention_layers"][27]
+        usage_name = "state.layer_027.crsa_log_usage"
+        self.assertEqual(layer_row["crsa_log_usage"], usage_name)
+        descriptor = next(
+            row for row in manifest["body"]["tensors"] if row["name"] == usage_name
         )
-        identity_pager = Qwen38WeightPager(
-            identity_source,
-            device="cpu",
-            compute_dtype="bfloat16",
-            max_resident_bytes=2 * 1024**2,
+        self.assertEqual(descriptor["shape"], [1, 4, 3])
+        self.assertEqual(descriptor["dtype"], "float32")
+        self.assertEqual(descriptor["finite_policy"], "finite_or_neg_inf")
+
+        restored = self._native_model(intervention=intervention)
+        restored.load_state(path)
+        restored_state = restored._layer_states[27]
+        saved_state = saved._layer_states[27]
+        self.assertIsNotNone(restored_state.crsa_log_usage)
+        self.assertTrue(
+            torch.equal(restored_state.crsa_log_usage, saved_state.crsa_log_usage)
         )
-        self.resources.append((identity_pager, identity_source))
-        alpha_zero = StreamedQwen38(
-            config,
-            identity_pager,
-            native_head_crsa=Qwen38NativeHeadCrsa(alpha=0.0),
-            max_seq_len=16,
+        actual, _ = restored.decode(next_token)
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_native_head_crsa_identity_mismatch_rejects_before_mutation(self) -> None:
+        source = self._native_model(intervention=Qwen38NativeHeadCrsa(alpha=0.1))
+        prompt = [[1, 4, 9]]
+        source.prefill(prompt)
+        path = self.root / "native-identity.json"
+        source.save_state(path)
+
+        mismatch = self._native_model(intervention=Qwen38NativeHeadCrsa(alpha=0.2))
+        mismatch.prefill([[2, 3]])
+        mismatch_position = mismatch.next_position
+        mismatch_bytes = mismatch.state_bytes
+        mismatch_usage = mismatch._layer_states[27].crsa_log_usage.clone()
+        with self.assertRaisesRegex(Qwen38SnapshotError, "identity mismatch"):
+            mismatch.load_state(path)
+        self.assertEqual(mismatch.next_position, mismatch_position)
+        self.assertEqual(mismatch.state_bytes, mismatch_bytes)
+        self.assertTrue(
+            torch.equal(
+                mismatch._layer_states[27].crsa_log_usage,
+                mismatch_usage,
+            )
         )
-        off = StreamedQwen38(config, identity_pager, max_seq_len=16)
+
+        off = self._native_model(intervention=None)
+        off.prefill([[2, 3]])
+        off_position = off.next_position
+        off_bytes = off.state_bytes
+        with self.assertRaisesRegex(Qwen38SnapshotError, "identity mismatch"):
+            off.load_state(path)
+        self.assertEqual(off.next_position, off_position)
+        self.assertEqual(off.state_bytes, off_bytes)
+        self.assertIsNone(off._layer_states[27].crsa_log_usage)
+
+    def test_alpha_zero_native_snapshot_is_off_compatible(self) -> None:
+        alpha_zero = self._native_model(intervention=Qwen38NativeHeadCrsa(alpha=0.0))
+        off = self._native_model(intervention=None)
         prompt = [[1, 4, 9]]
         alpha_zero.prefill(prompt)
         identity_path = self.root / "native-alpha-zero.json"

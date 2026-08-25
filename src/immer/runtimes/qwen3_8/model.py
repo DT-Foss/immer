@@ -336,11 +336,31 @@ class StreamedQwen38:
             ) from exc
         return hashlib.sha256(encoded).hexdigest()
 
-    def _reject_native_head_crsa_snapshot(self) -> None:
-        if self.native_head_crsa is not None and self.native_head_crsa.active:
-            raise Qwen38SnapshotError(
-                "native Head-CRSA continuation snapshots are unsupported in this tranche"
-            )
+    def _native_head_crsa_snapshot_identity(self) -> dict[str, Any]:
+        intervention = self.native_head_crsa
+        if intervention is None or not intervention.active:
+            return {"kind": "none"}
+        return {
+            "kind": (
+                f"{type(intervention).__module__}.{type(intervention).__qualname__}"
+            ),
+            **asdict(intervention),
+        }
+
+    def _native_head_crsa_usage_required(self, layer: int) -> bool:
+        intervention = self.native_head_crsa
+        return (
+            intervention is not None
+            and intervention.active
+            and layer == intervention.layer
+        )
+
+    def _native_head_crsa_usage_dtype(self) -> torch.dtype:
+        return (
+            torch.float32
+            if self.pager.compute_dtype in {torch.float16, torch.bfloat16}
+            else self.pager.compute_dtype
+        )
 
     def _graft_snapshot_identity(self) -> dict[str, Any]:
         if self.graft is None:
@@ -388,7 +408,6 @@ class StreamedQwen38:
         }
 
     def _snapshot_identity(self, *, transport_neutral: bool = False) -> dict[str, Any]:
-        self._reject_native_head_crsa_snapshot()
         source = self.pager.source
         source.inventory()
         metrics = source.metrics()
@@ -450,12 +469,12 @@ class StreamedQwen38:
             },
             "execution": execution,
             "graft": self._graft_snapshot_identity(),
+            "native_head_crsa": self._native_head_crsa_snapshot_identity(),
         }
 
     def _snapshot_model_state(
         self,
     ) -> tuple[dict[str, Any], dict[str, SnapshotTensor]]:
-        self._reject_native_head_crsa_snapshot()
         if not 0 <= self._next_position <= self.max_seq_len:
             raise Qwen38SnapshotError("model cursor exceeds its context bound")
         if self._state_poisoned and self._next_position:
@@ -486,10 +505,6 @@ class StreamedQwen38:
                     raise Qwen38SnapshotError(
                         f"full-attention layer {layer} has the wrong state type"
                     )
-                if state.crsa_log_usage is not None:
-                    raise Qwen38SnapshotError(
-                        "native Head-CRSA usage cannot be written by this snapshot schema"
-                    )
                 expected = (
                     batch,
                     self.config.n_kv_heads,
@@ -511,14 +526,44 @@ class StreamedQwen38:
                 value_name = f"{prefix}.value"
                 tensors[key_name] = SnapshotTensor(state.key)
                 tensors[value_name] = SnapshotTensor(state.value)
-                layers.append(
-                    {
-                        "kind": "full_attention",
-                        "layer": layer,
-                        "key": key_name,
-                        "value": value_name,
-                    }
-                )
+                row = {
+                    "kind": "full_attention",
+                    "layer": layer,
+                    "key": key_name,
+                    "value": value_name,
+                }
+                usage_required = self._native_head_crsa_usage_required(layer)
+                if usage_required != (state.crsa_log_usage is not None):
+                    raise Qwen38SnapshotError(
+                        f"full-attention layer {layer} CRSA usage is inconsistent "
+                        "with the native intervention"
+                    )
+                if state.crsa_log_usage is not None:
+                    usage = state.crsa_log_usage
+                    if tuple(usage.shape) != (batch, 4, self._next_position):
+                        raise Qwen38SnapshotError(
+                            f"full-attention layer {layer} CRSA usage shape is "
+                            "inconsistent"
+                        )
+                    if (
+                        usage.dtype != self._native_head_crsa_usage_dtype()
+                        or not self._on_pager_device(usage)
+                    ):
+                        raise Qwen38SnapshotError(
+                            f"full-attention layer {layer} CRSA usage dtype/device "
+                            "is inconsistent"
+                        )
+                    if bool((torch.isnan(usage) | torch.isposinf(usage)).any().item()):
+                        raise Qwen38SnapshotError(
+                            f"full-attention layer {layer} CRSA usage may contain "
+                            "only finite values or -inf"
+                        )
+                    usage_name = f"{prefix}.crsa_log_usage"
+                    tensors[usage_name] = SnapshotTensor(
+                        usage, finite_policy="finite_or_neg_inf"
+                    )
+                    row["crsa_log_usage"] = usage_name
+                layers.append(row)
             else:
                 if not isinstance(state, DeltaNetState):
                     raise Qwen38SnapshotError(
@@ -628,7 +673,6 @@ class StreamedQwen38:
     ) -> dict[str, Any]:
         """Atomically save every native Qwen continuation tensor."""
 
-        self._reject_native_head_crsa_snapshot()
         if not isinstance(transport_neutral, bool):
             raise TypeError("transport_neutral must be a boolean")
         limits = self._snapshot_limits(max_bytes, max_tensors)
@@ -669,7 +713,6 @@ class StreamedQwen38:
     ) -> dict[str, Any]:
         """Transactionally restore a bounded native Qwen continuation."""
 
-        self._reject_native_head_crsa_snapshot()
         if not isinstance(transport_neutral, bool):
             raise TypeError("transport_neutral must be a boolean")
         limits = self._snapshot_limits(max_bytes, max_tensors)
@@ -751,26 +794,36 @@ class StreamedQwen38:
                 if self.config.is_full_attention(layer)
                 else "linear_attention"
             )
-            expected_keys = (
-                {"kind", "layer", "key", "value"}
-                if expected_kind == "full_attention"
-                else {"kind", "layer", "conv", "recurrent"}
+            usage_required = (
+                expected_kind == "full_attention"
+                and self._native_head_crsa_usage_required(layer)
             )
+            if expected_kind == "full_attention":
+                expected_keys = {"kind", "layer", "key", "value"}
+                if usage_required:
+                    expected_keys.add("crsa_log_usage")
+            else:
+                expected_keys = {"kind", "layer", "conv", "recurrent"}
             if set(row) != expected_keys or row.get("kind") != expected_kind:
                 raise Qwen38SnapshotError("snapshot layer-state role is invalid")
-            names = (
-                (row.get("key"), row.get("value"))
-                if expected_kind == "full_attention"
-                else (row.get("conv"), row.get("recurrent"))
-            )
-            expected_names = (
-                (f"state.layer_{layer:03d}.key", f"state.layer_{layer:03d}.value")
-                if expected_kind == "full_attention"
-                else (
+            if expected_kind == "full_attention":
+                names = (row.get("key"), row.get("value"))
+                expected_names = (
+                    f"state.layer_{layer:03d}.key",
+                    f"state.layer_{layer:03d}.value",
+                )
+                if usage_required:
+                    names = (*names, row.get("crsa_log_usage"))
+                    expected_names = (
+                        *expected_names,
+                        f"state.layer_{layer:03d}.crsa_log_usage",
+                    )
+            else:
+                names = (row.get("conv"), row.get("recurrent"))
+                expected_names = (
                     f"state.layer_{layer:03d}.conv",
                     f"state.layer_{layer:03d}.recurrent",
                 )
-            )
             if names != expected_names:
                 raise Qwen38SnapshotError("snapshot tensor role name is invalid")
             referenced.update(expected_names)
@@ -798,15 +851,21 @@ class StreamedQwen38:
         }
         for name, tensor in loaded.tensors.items():
             descriptor = descriptors.get(name)
+            is_crsa_usage = name.endswith(".crsa_log_usage")
+            expected_policy = "finite_or_neg_inf" if is_crsa_usage else "finite"
             if (
                 not isinstance(descriptor, dict)
-                or descriptor.get("finite_policy") != "finite"
+                or descriptor.get("finite_policy") != expected_policy
             ):
                 raise Qwen38SnapshotError("snapshot tensor finite policy is invalid")
             expected_dtype = (
                 torch.float32
                 if name.endswith(".recurrent")
-                else self.pager.compute_dtype
+                else (
+                    self._native_head_crsa_usage_dtype()
+                    if is_crsa_usage
+                    else self.pager.compute_dtype
+                )
             )
             if tensor.dtype != expected_dtype:
                 raise Qwen38SnapshotError(
@@ -837,6 +896,10 @@ class StreamedQwen38:
                 if self.config.is_full_attention(layer):
                     key = loaded.tensors.pop(row["key"])
                     value = loaded.tensors.pop(row["value"])
+                    usage_name = row.get("crsa_log_usage")
+                    usage = (
+                        None if usage_name is None else loaded.tensors.pop(usage_name)
+                    )
                     expected = (
                         batch,
                         self.config.n_kv_heads,
@@ -851,9 +914,19 @@ class StreamedQwen38:
                     del key
                     value_device = value.to(device=self.pager.device).detach()
                     del value
+                    usage_device = None
+                    if usage is not None:
+                        if tuple(usage.shape) != (batch, 4, next_position):
+                            raise Qwen38SnapshotError(
+                                f"full-attention layer {layer} CRSA usage shape "
+                                "is invalid"
+                            )
+                        usage_device = usage.to(device=self.pager.device).detach()
+                        del usage
                     new_states[layer] = AttentionState(
                         key=key_device,
                         value=value_device,
+                        crsa_log_usage=usage_device,
                     )
                 else:
                     conv = loaded.tensors.pop(row["conv"])
@@ -2453,7 +2526,7 @@ class StreamedQwen38:
         start_pos: int | None = None,
         progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[torch.Tensor, StatefulEvidence]:
-        """Execute one complete prefill or contiguous one-token decode.
+        """Execute one complete prefill or contiguous decode block.
 
         State commits only after all 64 layers and the final norm succeed. A
         failed call clears partial state and latches the runtime until the
@@ -2477,8 +2550,6 @@ class StreamedQwen38:
             raise ValueError(
                 f"non-contiguous model forward: expected {self._next_position}, got {start_pos}"
             )
-        if start_pos and ids.shape[1] != 1:
-            raise ValueError("stateful decode accepts exactly one token")
         end_pos = start_pos + ids.shape[1]
         if end_pos > self.max_seq_len:
             raise ValueError(
@@ -2563,24 +2634,30 @@ class StreamedQwen38:
         reset: bool = True,
         progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[torch.Tensor, tuple[StatefulEvidence, ...]]:
-        """Commit an equal-length prompt as one chunk or exact token steps."""
+        """Commit a fresh prompt or extend an existing prefix by a token block.
+
+        ``reset=True`` starts at position zero. ``reset=False`` preserves the
+        committed KV/DeltaNet/CRSA state and treats ``token_ids`` as the exact
+        suffix beginning at :attr:`next_position`.
+        """
 
         if not isinstance(tokenwise, bool):
             raise TypeError("tokenwise must be a boolean")
         ids = self._token_tensor(token_ids)
         if reset:
             self.reset_state()
-        elif self._next_position != 0:
-            raise ValueError("prefill requires position zero or reset=True")
+        start_pos = self._next_position
         if not tokenwise:
-            hidden, evidence = self.hidden_stateful(ids, start_pos=0, progress=progress)
+            hidden, evidence = self.hidden_stateful(
+                ids, start_pos=start_pos, progress=progress
+            )
             return hidden, (evidence,)
         outputs: list[torch.Tensor] = []
         evidence_rows: list[StatefulEvidence] = []
         for position in range(ids.shape[1]):
             hidden, evidence = self.hidden_stateful(
                 ids[:, position : position + 1],
-                start_pos=position,
+                start_pos=start_pos + position,
                 progress=progress,
             )
             outputs.append(hidden)

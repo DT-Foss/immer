@@ -4,6 +4,26 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-25
 
+### Qwen compute batteries
+
+- Added exact native continuation batteries over authenticated Qwen snapshots.
+  Active Prefix-Sinkhorn usage state, KV state and DeltaNet state now survive
+  save/restore and remain bound to the complete runtime identity.
+- Added a semantic anchor cache with deepest exact-prefix matching, atomic
+  snapshot-first/index-commit recovery, deterministic LRU, byte budgets and
+  explicit orphan collection. Exact-prefix cells carry authenticated final
+  hidden state for direct LM-head scanning without replaying the last token.
+- Added the demand-driven control plane: incremental radix prefix mining,
+  semantic boundaries, O1 learning-progress signals, the complete charge/store/
+  verify/invalidation profitability inequality, value-density selection, SoC,
+  self-discharge and cache-turnover accounting.
+- Added a sealed AB/BA/ABBA/BAAB harness that separates idle charging from peak
+  demand and requires bit-identical final hidden and serialized native state.
+- Added a FERTIG verifier that binds one honest replica vote to the complete
+  cartography evidence and three bound proof surfaces without presenting
+  those surfaces as a fake three-node quorum.
+- Verified the complete integration with `1175/1175` tests.
+
 ### O1 semantic cartography over causal Qwen
 
 - Reconnected the system's O1-State foundation to causal Qwen execution:
