@@ -9,10 +9,14 @@ from safetensors.torch import save_file
 from immer.knowledge import Streamer
 from immer.runtimes.qwen3_8 import (
     QWEN35_K2_DRAFT_PROVIDER_SCHEMA,
+    QWEN35_K4_DRAFT_PROVIDER_SCHEMA,
     Qwen35K2DraftProvider,
     Qwen35K2DraftProviderError,
+    Qwen35K4DraftProvider,
+    Qwen35K4DraftProviderError,
     Qwen38Config,
     Qwen38K2SpeculativeDecoder,
+    Qwen38K4SpeculativeDecoder,
     Qwen38SpeculativeError,
     Qwen38WeightPager,
     StreamedQwen38,
@@ -340,6 +344,207 @@ class Qwen35LocalDraftTests(unittest.TestCase):
             provider((1, 4))
         with self.assertRaisesRegex(Qwen35K2DraftProviderError, "closed"):
             provider.reset()
+
+    def test_k4_identical_local_model_accepts_two_complete_blocks(self) -> None:
+        baseline = self._model()
+        expected, _evidence = baseline.generate_greedy(
+            [[1, 4]], max_new_tokens=8, head_block_rows=7
+        )
+        target = self._model()
+        draft = self._model()
+        provider = Qwen35K4DraftProvider(draft, head_block_rows=7)
+
+        result = Qwen38K4SpeculativeDecoder(target, provider).generate(
+            [[1, 4]], max_new_tokens=8, head_block_rows=7
+        )
+
+        self.assertEqual(result.token_ids, expected)
+        self.assertEqual(provider.committed_history, (1, 4, *expected))
+        self.assertIsNone(provider.pending_proposal)
+        self._assert_model_state_equal(target, baseline)
+        self._assert_model_state_equal(draft, baseline)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.schema, QWEN35_K4_DRAFT_PROVIDER_SCHEMA)
+        self.assertEqual(metrics.prefill_calls, 1)
+        self.assertEqual(metrics.draft_calls, 2)
+        self.assertEqual(metrics.extension_calls, 6)
+        self.assertEqual(metrics.reconcile_calls, 2)
+        self.assertEqual(metrics.accepted_prefix_4, 2)
+        self.assertEqual(metrics.committed_tokens, 8)
+        self.assertFalse(metrics.pending)
+        self.assertFalse(metrics.poisoned)
+
+    def test_k4_proposal_is_opaque_and_does_not_move_committed_cursor(self) -> None:
+        draft = self._model()
+        provider = Qwen35K4DraftProvider(draft, head_block_rows=7)
+
+        proposal = provider((1, 4))
+
+        self.assertEqual(len(proposal), 4)
+        self.assertEqual(draft.next_position, 2)
+        self.assertEqual(provider.committed_history, (1, 4))
+        self.assertEqual(provider.pending_proposal, proposal)
+        self.assertIsNotNone(draft._pending_block_stage)
+        assert draft._pending_block_stage is not None
+        self.assertEqual(
+            draft._pending_block_stage.evidence.input_token_ids,
+            (proposal,),
+        )
+        self.assertEqual(provider.metrics().extension_calls, 3)
+        provider.close()
+        self.assertEqual(draft.next_position, 0)
+        self.assertEqual(draft.state_bytes, 0)
+
+    def test_k4_reconcile_prefix_zero_through_four_is_exact(self) -> None:
+        base = (1, 4)
+        for accepted in range(5):
+            with self.subTest(accepted=accepted):
+                draft = self._model()
+                provider = Qwen35K4DraftProvider(draft, head_block_rows=7)
+                proposal = provider(base)
+                if accepted == 4:
+                    delta = proposal
+                else:
+                    correction = (proposal[accepted] + 1) % self.config.vocab_size
+                    delta = (*proposal[:accepted], correction)
+
+                provider.reconcile((*base, *delta))
+
+                reference = self._model()
+                reference.prefill([base])
+                if len(delta) == 1:
+                    reference.decode([[delta[0]]])
+                else:
+                    replay = reference.stage_continuation_block([delta])
+                    reference.commit_continuation_block(replay)
+                self._assert_model_state_equal(draft, reference)
+                self.assertEqual(provider.committed_history, (*base, *delta))
+                self.assertIsNone(provider.pending_proposal)
+                metrics = provider.metrics()
+                self.assertEqual(
+                    getattr(metrics, f"accepted_prefix_{accepted}"),
+                    1,
+                )
+                self.assertEqual(metrics.committed_tokens, len(delta))
+                self.assertEqual(
+                    metrics.restaged_blocks,
+                    int(1 < len(delta) < 4 or (len(delta) == 4 and accepted < 4)),
+                )
+
+    def test_k4_rejected_suffix_never_reaches_the_next_proposal(self) -> None:
+        base = (1, 4)
+        provider = Qwen35K4DraftProvider(self._model(), head_block_rows=7)
+        first = provider(base)
+        correction = (first[2] + 1) % self.config.vocab_size
+        committed = (*base, first[0], first[1], correction)
+        provider.reconcile(committed)
+
+        reference = self._model()
+        reference.prefill([base])
+        replay = reference.stage_continuation_block([[first[0], first[1], correction]])
+        hidden, _evidence = reference.commit_continuation_block(replay)
+        values, selected = reference.pager.topk_logits(
+            hidden[:, -1],
+            k=1,
+            name=reference.output_head_name,
+            block_rows=7,
+        )
+        expected_next = int(selected[0, 0].item())
+        del values, selected
+
+        second = provider(committed)
+
+        self.assertEqual(second[0], expected_next)
+        self.assertNotEqual(provider.model.next_position, len(base) + 4)
+        self.assertEqual(provider.model.next_position, len(committed))
+        provider.close()
+
+    def test_k4_eos_at_every_position_replays_only_through_eos(self) -> None:
+        probe = self._model()
+        tokens, _evidence = probe.generate_greedy(
+            [[1, 4]], max_new_tokens=4, head_block_rows=7
+        )
+        self.assertEqual(len(set(tokens)), 4)
+        for eos_index in range(4):
+            with self.subTest(eos_index=eos_index):
+                eos = tokens[eos_index]
+                draft = self._model()
+                provider = Qwen35K4DraftProvider(
+                    draft,
+                    eos_token_ids=(eos,),
+                    head_block_rows=7,
+                )
+                proposal = provider((1, 4))
+                self.assertEqual(proposal[: eos_index + 1], tokens[: eos_index + 1])
+                self.assertTrue(all(token == eos for token in proposal[eos_index:]))
+
+                committed = (1, 4, *proposal[: eos_index + 1])
+                provider.reconcile(committed)
+
+                reference = self._model()
+                reference.prefill([[1, 4]])
+                delta = proposal[: eos_index + 1]
+                if len(delta) == 1:
+                    reference.decode([[delta[0]]])
+                else:
+                    stage = reference.stage_continuation_block([delta])
+                    reference.commit_continuation_block(stage)
+                self._assert_model_state_equal(draft, reference)
+                self.assertEqual(draft.next_position, len(committed))
+                self.assertIsNone(provider.pending_proposal)
+
+    def test_k4_drift_invalid_reconcile_and_extension_failure_fail_closed(self) -> None:
+        provider = Qwen35K4DraftProvider(self._model(), head_block_rows=7)
+        proposal = provider((1, 4))
+        pending = provider.model._pending_block_stage
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        pending.layer_states[0].recurrent.data.add_(1.0)
+        with self.assertRaisesRegex(
+            Qwen35K4DraftProviderError, "cursor or continuation state drifted"
+        ):
+            provider.reconcile((1, 4, *proposal))
+        self.assertTrue(provider.poisoned)
+        self.assertEqual(provider.model.next_position, 0)
+
+        provider.reset()
+        proposal = provider((1, 4))
+        bad_second = (proposal[1] + 1) % self.config.vocab_size
+        with self.assertRaisesRegex(
+            Qwen35K4DraftProviderError, "before its final item"
+        ):
+            provider.reconcile((1, 4, proposal[0], bad_second, proposal[2]))
+        self.assertTrue(provider.poisoned)
+
+        provider.reset()
+        proposal = provider((1, 4))
+        with self.assertRaisesRegex(
+            Qwen35K4DraftProviderError, "accepted block without EOS"
+        ):
+            provider.reconcile((1, 4, proposal[0], proposal[1]))
+        self.assertTrue(provider.poisoned)
+
+        broken_model = self._model()
+        broken = Qwen35K4DraftProvider(broken_model, head_block_rows=7)
+        original = broken_model.extend_continuation_block
+        calls = 0
+
+        def fail_second(stage, input_ids):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("extension failed")
+            return original(stage, input_ids)
+
+        broken_model.extend_continuation_block = (  # type: ignore[method-assign]
+            fail_second
+        )
+        with self.assertRaisesRegex(Qwen35K4DraftProviderError, "extension failed"):
+            broken((1, 4))
+        self.assertTrue(broken.poisoned)
+        self.assertEqual(broken_model.next_position, 0)
+        self.assertEqual(broken_model.state_bytes, 0)
+        self.assertIsNone(broken_model._pending_block_stage)
 
 
 if __name__ == "__main__":

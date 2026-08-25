@@ -11,6 +11,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
 import inspect
+import json
 import math
 import numbers
 import time
@@ -23,6 +24,8 @@ from .pager import Qwen38WeightPager
 
 
 QWEN38_K2_SPECULATIVE_SCHEMA = "immer.qwen3.8-k2-speculative-generation/v1"
+QWEN38_K4_SPECULATIVE_SCHEMA = "immer.qwen3.8-k4-speculative-generation/v1"
+QWEN38_K4_SPECULATIVE_ROUND_SCHEMA = "immer.qwen3.8-k4-speculative-round/v1"
 
 ReplayKind = Literal[
     "commit-k2",
@@ -30,6 +33,20 @@ ReplayKind = Literal[
     "mismatch0-decode",
     "mismatch1-restage",
     "remaining-single",
+]
+
+K4ReplayKind = Literal[
+    "commit-k4",
+    "eos0-decode",
+    "eos1-restage",
+    "eos2-restage",
+    "eos3-restage",
+    "eos3-commit-k4",
+    "mismatch0-decode",
+    "mismatch1-restage",
+    "mismatch2-restage",
+    "mismatch3-restage",
+    "terminal-single",
 ]
 
 
@@ -50,6 +67,18 @@ class DraftProvider(Protocol):
 
 class ReconciledDraftProvider(DraftProvider, Protocol):
     """Stateful provider notified after the target commits each proposed round."""
+
+    def reconcile(self, history: tuple[int, ...], /) -> None: ...
+
+
+class K4DraftProvider(Protocol):
+    """Propose exactly four tokens from immutable committed token history."""
+
+    def __call__(self, history: tuple[int, ...], /) -> Sequence[int]: ...
+
+
+class K4ReconciledDraftProvider(K4DraftProvider, Protocol):
+    """Stateful K=4 provider notified only after target-confirmed commits."""
 
     def reconcile(self, history: tuple[int, ...], /) -> None: ...
 
@@ -137,6 +166,27 @@ def _model_state_stamp(model: StreamedQwen38) -> tuple[object, ...]:
         _tensor_stamp(model._graft_history),
         id(model._pending_block_stage),
     )
+
+
+def _canonical_sha256(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_sha256(value: object, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +372,362 @@ class K2SpeculativeGenerationResult:
     def __post_init__(self) -> None:
         if self.token_ids != self.evidence.generated_token_ids:
             raise ValueError("result tokens differ from generation evidence")
+
+
+@dataclass(frozen=True, slots=True)
+class K4SpeculativeRoundEvidence:
+    """Self-sealed accounting for one exact K=4 verification or tail step.
+
+    The digest detects accidental or post-hoc receipt changes.  It is not an
+    authentication mechanism; the authenticated outer execution receipt owns
+    that boundary.
+    """
+
+    schema: str
+    round_index: int
+    start_pos: int
+    end_pos: int
+    eos_token_ids: tuple[int, ...]
+    proposed_token_ids: tuple[int, ...]
+    target_token_ids: tuple[int, ...]
+    emitted_token_ids: tuple[int, ...]
+    accepted_prefix_length: int
+    replay_kind: K4ReplayKind
+    forward_passes: int
+    head_scans: int
+    source_body_bytes: int
+    linear_calls: int
+    provider_guard_bytes: int
+    provider_guard_seconds: float
+    seconds: float
+    state_bytes: int
+    stopped_on_eos: bool
+    evidence_sha256: str
+
+    def _unsigned_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "round_index": self.round_index,
+            "start_pos": self.start_pos,
+            "end_pos": self.end_pos,
+            "eos_token_ids": list(self.eos_token_ids),
+            "proposed_token_ids": list(self.proposed_token_ids),
+            "target_token_ids": list(self.target_token_ids),
+            "emitted_token_ids": list(self.emitted_token_ids),
+            "accepted_prefix_length": self.accepted_prefix_length,
+            "replay_kind": self.replay_kind,
+            "forward_passes": self.forward_passes,
+            "head_scans": self.head_scans,
+            "source_body_bytes": self.source_body_bytes,
+            "linear_calls": self.linear_calls,
+            "provider_guard_bytes": self.provider_guard_bytes,
+            "provider_guard_seconds": self.provider_guard_seconds,
+            "seconds": self.seconds,
+            "state_bytes": self.state_bytes,
+            "stopped_on_eos": self.stopped_on_eos,
+        }
+
+    def __post_init__(self) -> None:
+        if self.schema != QWEN38_K4_SPECULATIVE_ROUND_SCHEMA:
+            raise ValueError("K=4 round evidence schema is invalid")
+        for name in (
+            "round_index",
+            "start_pos",
+            "end_pos",
+            "accepted_prefix_length",
+            "forward_passes",
+            "head_scans",
+            "source_body_bytes",
+            "linear_calls",
+            "provider_guard_bytes",
+            "state_bytes",
+        ):
+            _plain_nonnegative(getattr(self, name), name)
+        _finite_nonnegative(self.provider_guard_seconds, "provider_guard_seconds")
+        _finite_nonnegative(self.seconds, "seconds")
+        if self.provider_guard_seconds > self.seconds:
+            raise ValueError("provider integrity time exceeds round time")
+        if self.end_pos - self.start_pos != len(self.emitted_token_ids):
+            raise ValueError("round cursor delta must equal emitted token count")
+        if self.head_scans != 1:
+            raise ValueError("every K=4 round must perform exactly one head scan")
+        if not isinstance(self.stopped_on_eos, bool):
+            raise TypeError("stopped_on_eos must be boolean")
+        if not isinstance(self.eos_token_ids, tuple) or any(
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+            for token in self.eos_token_ids
+        ):
+            raise TypeError("eos_token_ids must contain non-negative integers")
+        if tuple(sorted(set(self.eos_token_ids))) != self.eos_token_ids:
+            raise ValueError("eos_token_ids must be sorted unique non-negative IDs")
+        for name in (
+            "proposed_token_ids",
+            "target_token_ids",
+            "emitted_token_ids",
+        ):
+            if not isinstance(getattr(self, name), tuple):
+                raise TypeError(f"{name} must be a tuple")
+            if any(
+                isinstance(token, bool) or not isinstance(token, int) or token < 0
+                for token in getattr(self, name)
+            ):
+                raise TypeError(f"{name} must contain non-negative integers")
+
+        if self.replay_kind == "terminal-single":
+            if self.proposed_token_ids:
+                raise ValueError("terminal tail rounds cannot contain a proposal")
+            if len(self.target_token_ids) != 1:
+                raise ValueError("terminal tail rounds require one target token")
+            expected_emitted = self.target_token_ids
+            expected_accepted = 0
+            expected_passes = 1
+            expected_stopped = self.target_token_ids[0] in self.eos_token_ids
+        else:
+            if len(self.proposed_token_ids) != 4:
+                raise ValueError("K=4 verification requires exactly four proposals")
+            if len(self.target_token_ids) != 4:
+                raise ValueError("K=4 verification requires exactly four targets")
+            common = 0
+            while (
+                common < 4
+                and self.proposed_token_ids[common] == self.target_token_ids[common]
+            ):
+                common += 1
+            valid_width = 4 if common == 4 else common + 1
+            eos_index = next(
+                (
+                    index
+                    for index, token in enumerate(self.target_token_ids[:valid_width])
+                    if token in self.eos_token_ids
+                ),
+                None,
+            )
+            if eos_index is not None:
+                expected_emitted = self.target_token_ids[: eos_index + 1]
+                expected_accepted = min(common, eos_index + 1)
+                if eos_index == 0:
+                    expected_kind: K4ReplayKind = "eos0-decode"
+                    expected_passes = 2
+                elif eos_index == 3 and common == 4:
+                    expected_kind = "eos3-commit-k4"
+                    expected_passes = 1
+                else:
+                    eos_replays: dict[int, K4ReplayKind] = {
+                        1: "eos1-restage",
+                        2: "eos2-restage",
+                        3: "eos3-restage",
+                    }
+                    expected_kind = eos_replays[eos_index]
+                    expected_passes = 2
+                expected_stopped = True
+            elif common == 4:
+                expected_emitted = self.proposed_token_ids
+                expected_accepted = 4
+                expected_kind = "commit-k4"
+                expected_passes = 1
+                expected_stopped = False
+            else:
+                expected_emitted = self.target_token_ids[: common + 1]
+                expected_accepted = common
+                mismatch_replays: dict[int, K4ReplayKind] = {
+                    0: "mismatch0-decode",
+                    1: "mismatch1-restage",
+                    2: "mismatch2-restage",
+                    3: "mismatch3-restage",
+                }
+                expected_kind = mismatch_replays[common]
+                expected_passes = 2
+                expected_stopped = False
+            if self.replay_kind != expected_kind:
+                raise ValueError("K=4 replay kind disagrees with target transition")
+
+        if self.emitted_token_ids != expected_emitted:
+            raise ValueError("emitted tokens disagree with the target transition")
+        if self.accepted_prefix_length != expected_accepted:
+            raise ValueError("accepted prefix disagrees with the target transition")
+        if self.forward_passes != expected_passes:
+            raise ValueError("forward-pass count disagrees with the replay kind")
+        if self.stopped_on_eos != expected_stopped:
+            raise ValueError("EOS state disagrees with the target transition")
+        _require_sha256(self.evidence_sha256, "evidence_sha256")
+        if self.evidence_sha256 != _canonical_sha256(self._unsigned_dict()):
+            raise ValueError("K=4 round evidence digest is invalid")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self._unsigned_dict(), "evidence_sha256": self.evidence_sha256}
+
+
+def _sealed_k4_round(**values: Any) -> K4SpeculativeRoundEvidence:
+    unsigned = K4SpeculativeRoundEvidence.__new__(K4SpeculativeRoundEvidence)
+    for field_name, field_value in values.items():
+        object.__setattr__(unsigned, field_name, field_value)
+    payload = unsigned._unsigned_dict()
+    return K4SpeculativeRoundEvidence(
+        **values,
+        evidence_sha256=_canonical_sha256(payload),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class K4SpeculativeGenerationEvidence:
+    """Self-sealed aggregate exact-greedy K=4 execution receipt."""
+
+    schema: str
+    prompt_token_ids: tuple[int, ...]
+    eos_token_ids: tuple[int, ...]
+    generated_token_ids: tuple[int, ...]
+    rounds: tuple[K4SpeculativeRoundEvidence, ...]
+    prefill_forward_passes: int
+    forward_passes: int
+    head_scans: int
+    accepted_draft_tokens: int
+    source_body_bytes: int
+    linear_calls: int
+    provider_guard_bytes: int
+    provider_guard_seconds: float
+    seconds: float
+    state_bytes: int
+    stopped_on_eos: bool
+    evidence_sha256: str
+
+    def _unsigned_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "prompt_token_ids": list(self.prompt_token_ids),
+            "eos_token_ids": list(self.eos_token_ids),
+            "generated_token_ids": list(self.generated_token_ids),
+            "rounds": [row.to_dict() for row in self.rounds],
+            "prefill_forward_passes": self.prefill_forward_passes,
+            "forward_passes": self.forward_passes,
+            "head_scans": self.head_scans,
+            "accepted_draft_tokens": self.accepted_draft_tokens,
+            "source_body_bytes": self.source_body_bytes,
+            "linear_calls": self.linear_calls,
+            "provider_guard_bytes": self.provider_guard_bytes,
+            "provider_guard_seconds": self.provider_guard_seconds,
+            "seconds": self.seconds,
+            "state_bytes": self.state_bytes,
+            "stopped_on_eos": self.stopped_on_eos,
+        }
+
+    def __post_init__(self) -> None:
+        if self.schema != QWEN38_K4_SPECULATIVE_SCHEMA:
+            raise ValueError("K=4 speculative evidence schema is invalid")
+        if not isinstance(self.prompt_token_ids, tuple) or not self.prompt_token_ids:
+            raise ValueError("prompt_token_ids must not be empty")
+        if any(
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+            for token in self.prompt_token_ids
+        ):
+            raise TypeError("prompt_token_ids must contain non-negative integers")
+        if not isinstance(self.generated_token_ids, tuple) or any(
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+            for token in self.generated_token_ids
+        ):
+            raise TypeError("generated_token_ids must contain non-negative integers")
+        if not isinstance(self.eos_token_ids, tuple) or any(
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+            for token in self.eos_token_ids
+        ):
+            raise TypeError("eos_token_ids must contain non-negative integers")
+        if not isinstance(self.rounds, tuple) or not self.rounds:
+            raise ValueError("K=4 speculative evidence must contain a round")
+        if any(not isinstance(row, K4SpeculativeRoundEvidence) for row in self.rounds):
+            raise TypeError("rounds must contain K4SpeculativeRoundEvidence")
+        if tuple(sorted(set(self.eos_token_ids))) != self.eos_token_ids:
+            raise ValueError("eos_token_ids must be sorted and unique")
+        for name in (
+            "prefill_forward_passes",
+            "forward_passes",
+            "head_scans",
+            "accepted_draft_tokens",
+            "source_body_bytes",
+            "linear_calls",
+            "provider_guard_bytes",
+            "state_bytes",
+        ):
+            _plain_nonnegative(getattr(self, name), name)
+        _finite_nonnegative(self.provider_guard_seconds, "provider_guard_seconds")
+        _finite_nonnegative(self.seconds, "seconds")
+        if self.provider_guard_seconds > self.seconds:
+            raise ValueError("provider integrity time exceeds generation time")
+        if not isinstance(self.stopped_on_eos, bool):
+            raise TypeError("stopped_on_eos must be boolean")
+        cursor = len(self.prompt_token_ids)
+        emitted: list[int] = []
+        stopped_rows = 0
+        for index, row in enumerate(self.rounds):
+            if row.round_index != index:
+                raise ValueError("K=4 round indexes must be contiguous")
+            if row.eos_token_ids != self.eos_token_ids:
+                raise ValueError("round EOS policy differs from generation policy")
+            if row.start_pos != cursor:
+                raise ValueError("K=4 round cursor chain is discontinuous")
+            cursor = row.end_pos
+            emitted.extend(row.emitted_token_ids)
+            if row.stopped_on_eos:
+                stopped_rows += 1
+                if index != len(self.rounds) - 1:
+                    raise ValueError("no round may follow a terminal EOS round")
+        if tuple(emitted) != self.generated_token_ids:
+            raise ValueError("round tokens differ from generated_token_ids")
+        if self.forward_passes != self.prefill_forward_passes + sum(
+            row.forward_passes for row in self.rounds
+        ):
+            raise ValueError("aggregate forward-pass accounting is inconsistent")
+        if self.head_scans != sum(row.head_scans for row in self.rounds):
+            raise ValueError("aggregate head-scan accounting is inconsistent")
+        if self.accepted_draft_tokens != sum(
+            row.accepted_prefix_length for row in self.rounds
+        ):
+            raise ValueError("aggregate accepted-token accounting is inconsistent")
+        if self.provider_guard_bytes != sum(
+            row.provider_guard_bytes for row in self.rounds
+        ):
+            raise ValueError("aggregate provider integrity bytes are inconsistent")
+        if self.provider_guard_seconds != sum(
+            row.provider_guard_seconds for row in self.rounds
+        ):
+            raise ValueError("aggregate provider integrity time is inconsistent")
+        if self.source_body_bytes < sum(row.source_body_bytes for row in self.rounds):
+            raise ValueError("aggregate source bytes omit round work")
+        if self.linear_calls < sum(row.linear_calls for row in self.rounds):
+            raise ValueError("aggregate linear calls omit round work")
+        if self.seconds < sum(row.seconds for row in self.rounds):
+            raise ValueError("aggregate time omits round work")
+        if self.state_bytes != self.rounds[-1].state_bytes:
+            raise ValueError("aggregate state bytes differ from the final round")
+        if self.stopped_on_eos != (stopped_rows == 1):
+            raise ValueError("aggregate EOS state differs from the final round")
+        _require_sha256(self.evidence_sha256, "evidence_sha256")
+        if self.evidence_sha256 != _canonical_sha256(self._unsigned_dict()):
+            raise ValueError("K=4 generation evidence digest is invalid")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self._unsigned_dict(), "evidence_sha256": self.evidence_sha256}
+
+
+def _sealed_k4_generation(**values: Any) -> K4SpeculativeGenerationEvidence:
+    unsigned = K4SpeculativeGenerationEvidence.__new__(K4SpeculativeGenerationEvidence)
+    for field_name, field_value in values.items():
+        object.__setattr__(unsigned, field_name, field_value)
+    payload = unsigned._unsigned_dict()
+    return K4SpeculativeGenerationEvidence(
+        **values,
+        evidence_sha256=_canonical_sha256(payload),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class K4SpeculativeGenerationResult:
+    """Generated tokens and their immutable K=4 execution receipt."""
+
+    token_ids: tuple[int, ...]
+    evidence: K4SpeculativeGenerationEvidence
+
+    def __post_init__(self) -> None:
+        if self.token_ids != self.evidence.generated_token_ids:
+            raise ValueError("result tokens differ from K=4 generation evidence")
 
 
 class Qwen38K2SpeculativeDecoder:
@@ -685,13 +1091,380 @@ class Qwen38K2SpeculativeDecoder:
         return K2SpeculativeGenerationResult(tuple(generated), evidence)
 
 
+class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
+    """Generate exact greedy tokens with one K=4 target stage and head scan.
+
+    A proposal is authority-free.  The target either commits the complete
+    verified K=4 stage or discards it and replays only the proven prefix plus
+    the first target correction.  No rejected or post-EOS suffix reaches
+    committed continuation state.
+    """
+
+    def __init__(self, model: StreamedQwen38, draft_provider: K4DraftProvider) -> None:
+        super().__init__(model, draft_provider)
+
+    def _proposal_k4(
+        self, history: tuple[int, ...]
+    ) -> tuple[tuple[int, int, int, int], int, float]:
+        stamp_started = time.perf_counter()
+        before = _model_state_stamp(self.model)
+        integrity_seconds = time.perf_counter() - stamp_started
+        integrity_bytes = self.model.state_bytes
+        failure: Exception | None = None
+        proposal: tuple[int, ...] | None = None
+        try:
+            raw = self.draft_provider(history)
+        except Exception as exc:
+            failure = exc
+        else:
+            try:
+                proposal = _token_tuple(
+                    raw,
+                    "K=4 draft proposal",
+                    lengths=frozenset({4}),
+                )
+                if any(
+                    token < 0 or token >= self.model.config.vocab_size
+                    for token in proposal
+                ):
+                    raise ValueError("draft token outside checkpoint vocabulary")
+            except (TypeError, ValueError) as exc:
+                failure = exc
+        stamp_started = time.perf_counter()
+        try:
+            changed = _model_state_stamp(self.model) != before
+        except Exception:
+            changed = True
+        integrity_seconds += time.perf_counter() - stamp_started
+        integrity_bytes += self.model.state_bytes
+        if changed:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError("draft provider changed target model state")
+        if failure is not None:
+            if isinstance(failure, (TypeError, ValueError)):
+                raise Qwen38SpeculativeError(str(failure)) from failure
+            raise Qwen38SpeculativeError(
+                f"draft provider failed: {type(failure).__name__}: {failure}"
+            ) from failure
+        assert proposal is not None
+        return (
+            (
+                proposal[0],
+                proposal[1],
+                proposal[2],
+                proposal[3],
+            ),
+            integrity_bytes,
+            integrity_seconds,
+        )
+
+    def _single_round_k4(
+        self,
+        hidden: torch.Tensor,
+        *,
+        round_index: int,
+        eos: frozenset[int],
+        eos_ids: tuple[int, ...],
+        block_rows: int,
+    ) -> tuple[torch.Tensor, K4SpeculativeRoundEvidence]:
+        start_pos = self.model.next_position
+        source_start = _owner_metric(
+            self.model.pager.source, "network_or_source_body_bytes"
+        )
+        linears_start = _owner_metric(self.model.pager, "linear_calls")
+        started = time.perf_counter()
+        values, selected = self.model.pager.topk_logits(
+            hidden[:, -1],
+            k=1,
+            name=self.model.output_head_name,
+            block_rows=block_rows,
+        )
+        if tuple(selected.shape) != (1, 1):
+            raise Qwen38SpeculativeError(
+                "LM head returned an invalid single target shape"
+            )
+        target = int(selected[0, 0].item())
+        del values, selected
+        next_hidden, _state_evidence = self.model.decode([[target]])
+        stopped = target in eos
+        seconds = time.perf_counter() - started
+        evidence = _sealed_k4_round(
+            schema=QWEN38_K4_SPECULATIVE_ROUND_SCHEMA,
+            round_index=round_index,
+            start_pos=start_pos,
+            end_pos=self.model.next_position,
+            eos_token_ids=eos_ids,
+            proposed_token_ids=(),
+            target_token_ids=(target,),
+            emitted_token_ids=(target,),
+            accepted_prefix_length=0,
+            replay_kind="terminal-single",
+            forward_passes=1,
+            head_scans=1,
+            source_body_bytes=(
+                _owner_metric(self.model.pager.source, "network_or_source_body_bytes")
+                - source_start
+            ),
+            linear_calls=_owner_metric(self.model.pager, "linear_calls")
+            - linears_start,
+            provider_guard_bytes=0,
+            provider_guard_seconds=0.0,
+            seconds=seconds,
+            state_bytes=self.model.state_bytes,
+            stopped_on_eos=stopped,
+        )
+        return next_hidden, evidence
+
+    def generate(
+        self,
+        prompt_token_ids: object,
+        *,
+        max_new_tokens: int = 1,
+        eos_token_ids: Iterable[int] = (),
+        head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
+    ) -> K4SpeculativeGenerationResult:
+        """Generate exact greedy K=4 continuation and commit every output token."""
+
+        if (
+            isinstance(max_new_tokens, bool)
+            or not isinstance(max_new_tokens, int)
+            or max_new_tokens <= 0
+        ):
+            raise ValueError("max_new_tokens must be a positive integer")
+        if (
+            isinstance(head_block_rows, bool)
+            or not isinstance(head_block_rows, int)
+            or head_block_rows <= 0
+        ):
+            raise ValueError("head_block_rows must be a positive integer")
+        prompt_tensor = self.model._token_tensor(prompt_token_ids)
+        if prompt_tensor.shape[0] != 1:
+            raise ValueError("speculative generation requires batch size one")
+        prompt = tuple(
+            int(value) for value in prompt_tensor[0].detach().to(device="cpu").tolist()
+        )
+        if len(prompt) + max_new_tokens > self.model.max_seq_len:
+            raise ValueError("generation would exceed max_seq_len")
+        if isinstance(eos_token_ids, (str, bytes)):
+            raise TypeError("eos_token_ids must be an iterable of integers")
+        eos_values: set[int] = set()
+        try:
+            for raw in eos_token_ids:
+                if isinstance(raw, bool) or not isinstance(raw, numbers.Integral):
+                    raise TypeError("eos_token_ids must contain integers")
+                eos_values.add(int(raw))
+        except TypeError as exc:
+            if str(exc) == "eos_token_ids must contain integers":
+                raise
+            raise TypeError("eos_token_ids must be iterable") from exc
+        if any(
+            token < 0 or token >= self.model.config.vocab_size for token in eos_values
+        ):
+            raise ValueError("EOS token outside checkpoint vocabulary")
+        eos = frozenset(eos_values)
+        eos_ids = tuple(sorted(eos))
+
+        source_start = _owner_metric(
+            self.model.pager.source, "network_or_source_body_bytes"
+        )
+        linears_start = _owner_metric(self.model.pager, "linear_calls")
+        started = time.perf_counter()
+        hidden, prefill_evidence = self.model.prefill(
+            [prompt], reset=True, tokenwise=False
+        )
+        generated: list[int] = []
+        rounds: list[K4SpeculativeRoundEvidence] = []
+        stopped = False
+
+        while len(generated) < max_new_tokens and not stopped:
+            remaining = max_new_tokens - len(generated)
+            round_index = len(rounds)
+            if remaining < 4:
+                hidden, row = self._single_round_k4(
+                    hidden,
+                    round_index=round_index,
+                    eos=eos,
+                    eos_ids=eos_ids,
+                    block_rows=head_block_rows,
+                )
+                generated.extend(row.emitted_token_ids)
+                rounds.append(row)
+                stopped = row.stopped_on_eos
+                continue
+
+            round_source_start = _owner_metric(
+                self.model.pager.source, "network_or_source_body_bytes"
+            )
+            round_linears_start = _owner_metric(self.model.pager, "linear_calls")
+            round_started = time.perf_counter()
+            proposal, integrity_bytes, integrity_seconds = self._proposal_k4(
+                (*prompt, *generated)
+            )
+            stage = self.model.stage_continuation_block([proposal])
+            try:
+                verification_hidden = torch.cat(
+                    (hidden[:, -1:], stage.hidden[:, :3]), dim=1
+                )
+                targets = self._scan(
+                    verification_hidden,
+                    block_rows=head_block_rows,
+                )
+                if len(targets) != 4:  # pragma: no cover - guarded by _scan.
+                    raise Qwen38SpeculativeError(
+                        "K=4 verification returned wrong width"
+                    )
+            except Exception:
+                try:
+                    self.model.discard_continuation_block(stage)
+                except Exception:
+                    pass
+                raise
+
+            common = 0
+            while common < 4 and proposal[common] == targets[common]:
+                common += 1
+            valid_width = 4 if common == 4 else common + 1
+            eos_index = next(
+                (
+                    index
+                    for index, token in enumerate(targets[:valid_width])
+                    if token in eos
+                ),
+                None,
+            )
+
+            if eos_index is not None:
+                emitted = targets[: eos_index + 1]
+                accepted = min(common, eos_index + 1)
+                if eos_index == 3 and common == 4:
+                    hidden, _state_evidence = self.model.commit_continuation_block(
+                        stage
+                    )
+                    replay_kind: K4ReplayKind = "eos3-commit-k4"
+                    passes = 1
+                else:
+                    self.model.discard_continuation_block(stage)
+                    if eos_index == 0:
+                        hidden, _state_evidence = self.model.decode([[emitted[0]]])
+                        replay_kind = "eos0-decode"
+                    else:
+                        replay = self.model.stage_continuation_block([emitted])
+                        hidden, _state_evidence = self.model.commit_continuation_block(
+                            replay
+                        )
+                        eos_replays: dict[int, K4ReplayKind] = {
+                            1: "eos1-restage",
+                            2: "eos2-restage",
+                            3: "eos3-restage",
+                        }
+                        replay_kind = eos_replays[eos_index]
+                    passes = 2
+            elif common == 4:
+                hidden, _state_evidence = self.model.commit_continuation_block(stage)
+                emitted = proposal
+                accepted = 4
+                replay_kind = "commit-k4"
+                passes = 1
+            else:
+                emitted = targets[: common + 1]
+                accepted = common
+                self.model.discard_continuation_block(stage)
+                if common == 0:
+                    hidden, _state_evidence = self.model.decode([[emitted[0]]])
+                    replay_kind = "mismatch0-decode"
+                else:
+                    replay = self.model.stage_continuation_block([emitted])
+                    hidden, _state_evidence = self.model.commit_continuation_block(
+                        replay
+                    )
+                    mismatch_replays: dict[int, K4ReplayKind] = {
+                        1: "mismatch1-restage",
+                        2: "mismatch2-restage",
+                        3: "mismatch3-restage",
+                    }
+                    replay_kind = mismatch_replays[common]
+                passes = 2
+
+            stopped = eos_index is not None
+            reconcile_bytes, reconcile_seconds = self._reconcile_provider(
+                (*prompt, *generated, *emitted)
+            )
+            integrity_bytes += reconcile_bytes
+            integrity_seconds += reconcile_seconds
+            seconds = time.perf_counter() - round_started
+            row = _sealed_k4_round(
+                schema=QWEN38_K4_SPECULATIVE_ROUND_SCHEMA,
+                round_index=round_index,
+                start_pos=stage.evidence.start_pos,
+                end_pos=self.model.next_position,
+                eos_token_ids=eos_ids,
+                proposed_token_ids=proposal,
+                target_token_ids=targets,
+                emitted_token_ids=emitted,
+                accepted_prefix_length=accepted,
+                replay_kind=replay_kind,
+                forward_passes=passes,
+                head_scans=1,
+                source_body_bytes=(
+                    _owner_metric(
+                        self.model.pager.source, "network_or_source_body_bytes"
+                    )
+                    - round_source_start
+                ),
+                linear_calls=_owner_metric(self.model.pager, "linear_calls")
+                - round_linears_start,
+                provider_guard_bytes=integrity_bytes,
+                provider_guard_seconds=integrity_seconds,
+                seconds=seconds,
+                state_bytes=self.model.state_bytes,
+                stopped_on_eos=stopped,
+            )
+            generated.extend(emitted)
+            rounds.append(row)
+
+        generation_seconds = time.perf_counter() - started
+        evidence = _sealed_k4_generation(
+            schema=QWEN38_K4_SPECULATIVE_SCHEMA,
+            prompt_token_ids=prompt,
+            eos_token_ids=eos_ids,
+            generated_token_ids=tuple(generated),
+            rounds=tuple(rounds),
+            prefill_forward_passes=len(prefill_evidence),
+            forward_passes=len(prefill_evidence)
+            + sum(row.forward_passes for row in rounds),
+            head_scans=sum(row.head_scans for row in rounds),
+            accepted_draft_tokens=sum(row.accepted_prefix_length for row in rounds),
+            source_body_bytes=(
+                _owner_metric(self.model.pager.source, "network_or_source_body_bytes")
+                - source_start
+            ),
+            linear_calls=_owner_metric(self.model.pager, "linear_calls")
+            - linears_start,
+            provider_guard_bytes=sum(row.provider_guard_bytes for row in rounds),
+            provider_guard_seconds=sum(row.provider_guard_seconds for row in rounds),
+            seconds=generation_seconds,
+            state_bytes=self.model.state_bytes,
+            stopped_on_eos=stopped,
+        )
+        return K4SpeculativeGenerationResult(tuple(generated), evidence)
+
+
 __all__ = [
     "DraftProvider",
+    "K4DraftProvider",
+    "K4ReconciledDraftProvider",
     "K2SpeculativeGenerationEvidence",
     "K2SpeculativeGenerationResult",
     "K2SpeculativeRoundEvidence",
+    "K4ReplayKind",
+    "K4SpeculativeGenerationEvidence",
+    "K4SpeculativeGenerationResult",
+    "K4SpeculativeRoundEvidence",
     "QWEN38_K2_SPECULATIVE_SCHEMA",
+    "QWEN38_K4_SPECULATIVE_ROUND_SCHEMA",
+    "QWEN38_K4_SPECULATIVE_SCHEMA",
     "Qwen38K2SpeculativeDecoder",
+    "Qwen38K4SpeculativeDecoder",
     "Qwen38SpeculativeError",
     "ReconciledDraftProvider",
 ]

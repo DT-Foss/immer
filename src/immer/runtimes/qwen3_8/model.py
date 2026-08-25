@@ -172,6 +172,7 @@ class _PendingStatefulBlock:
 class StreamedQwen38:
     """Qwen3.5 text decoder with bounded, sequential weight residency."""
 
+    MAX_CONTINUATION_BLOCK_WIDTH = 4
     EMBED_NAME = "model.language_model.embed_tokens.weight"
     FINAL_NORM_NAME = "model.language_model.norm.weight"
     HEAD_NAME = "lm_head.weight"
@@ -1111,37 +1112,59 @@ class StreamedQwen38:
             del gate, up
         return self.pager.linear(activated, f"{base}.down_proj")
 
+    def _linear_token_rows(
+        self,
+        hidden: tuple[torch.Tensor, ...],
+        name: str,
+    ) -> tuple[torch.Tensor, ...]:
+        """Apply one matrix once to one-to-four independent token rows."""
+
+        if len(hidden) == 1:
+            return (self.pager.linear(hidden[0], name),)
+        return self.pager.linear_many(hidden, name)
+
+    def _norm_token_rows(
+        self,
+        hidden: tuple[torch.Tensor, ...],
+        name: str,
+    ) -> tuple[torch.Tensor, ...]:
+        """Normalize independent token rows separately from one weight read."""
+
+        if not 1 <= len(hidden) <= self.MAX_CONTINUATION_BLOCK_WIDTH:
+            raise Qwen38RuntimeError("continuation token-row width is invalid")
+        weight = self._control(name)
+        try:
+            return tuple(
+                rms_norm(row, weight, eps=self.config.rms_norm_eps) for row in hidden
+            )
+        finally:
+            del weight
+
     def _norm_k2_pair(
         self,
         hidden: tuple[torch.Tensor, torch.Tensor],
         name: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Normalize two one-token rows separately from one weight read."""
+        """Preserve the public K=2 implementation seam and exact arithmetic."""
 
-        weight = self._control(name)
-        try:
-            return (
-                rms_norm(hidden[0], weight, eps=self.config.rms_norm_eps),
-                rms_norm(hidden[1], weight, eps=self.config.rms_norm_eps),
-            )
-        finally:
-            del weight
+        rows = self._norm_token_rows(hidden, name)
+        return rows[0], rows[1]
 
-    def _full_attention_k2_pair(
+    def _full_attention_token_rows(
         self,
-        hidden: tuple[torch.Tensor, torch.Tensor],
+        hidden: tuple[torch.Tensor, ...],
         *,
         layer: int,
         state: AttentionState | None,
         start_pos: int,
         native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None],
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor], AttentionState]:
-        """Run two exact one-token attention updates with weight-once projections."""
+    ) -> tuple[tuple[torch.Tensor, ...], AttentionState]:
+        """Run exact one-token attention recurrence with weight-once projections."""
 
         base = f"model.language_model.layers.{layer}.self_attn"
-        projected_query_gate = self.pager.linear_many(hidden, f"{base}.q_proj")
-        projected_key = self.pager.linear_many(hidden, f"{base}.k_proj")
-        projected_value = self.pager.linear_many(hidden, f"{base}.v_proj")
+        projected_query_gate = self._linear_token_rows(hidden, f"{base}.q_proj")
+        projected_key = self._linear_token_rows(hidden, f"{base}.k_proj")
+        projected_value = self._linear_token_rows(hidden, f"{base}.v_proj")
         q_norm_weight = self._control(f"{base}.q_norm.weight")
         k_norm_weight = self._control(f"{base}.k_norm.weight")
         intervention = (
@@ -1153,16 +1176,16 @@ class StreamedQwen38:
         mixed_rows: list[torch.Tensor] = []
         next_state = state
         try:
-            for offset in range(2):
+            for offset, row in enumerate(hidden):
                 position = (
                     torch.arange(
                         start_pos + offset,
                         start_pos + offset + 1,
-                        device=hidden[offset].device,
+                        device=row.device,
                         dtype=torch.long,
                     )
                     .unsqueeze(0)
-                    .expand(hidden[offset].shape[0], -1)
+                    .expand(row.shape[0], -1)
                 )
                 mixed, next_state = full_attention_core(
                     projected_query_gate[offset],
@@ -1191,18 +1214,38 @@ class StreamedQwen38:
             del projected_query_gate, projected_key, projected_value
             del q_norm_weight, k_norm_weight
         if not isinstance(next_state, AttentionState):  # pragma: no cover - kernel.
-            raise Qwen38RuntimeError("K=2 full attention returned no state")
-        projected = self.pager.linear_many(tuple(mixed_rows), f"{base}.o_proj")
-        return (projected[0], projected[1]), next_state
+            raise Qwen38RuntimeError("continuation full attention returned no state")
+        projected = self._linear_token_rows(tuple(mixed_rows), f"{base}.o_proj")
+        return projected, next_state
 
-    def _linear_attention_k2_pair(
+    def _full_attention_k2_pair(
         self,
         hidden: tuple[torch.Tensor, torch.Tensor],
         *,
         layer: int,
+        state: AttentionState | None,
+        start_pos: int,
+        native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None],
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], AttentionState]:
+        """Preserve the K=2 implementation seam over the generic exact path."""
+
+        rows, next_state = self._full_attention_token_rows(
+            hidden,
+            layer=layer,
+            state=state,
+            start_pos=start_pos,
+            native_head_crsa_observer=native_head_crsa_observer,
+        )
+        return (rows[0], rows[1]), next_state
+
+    def _linear_attention_token_rows(
+        self,
+        hidden: tuple[torch.Tensor, ...],
+        *,
+        layer: int,
         state: DeltaNetState | None,
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor], DeltaNetState]:
-        """Run two exact one-token DeltaNet recurrences from one weight pass."""
+    ) -> tuple[tuple[torch.Tensor, ...], DeltaNetState]:
+        """Run exact one-token DeltaNet recurrence from one weight pass."""
 
         base = f"model.language_model.layers.{layer}.linear_attn"
         mask = torch.ones(
@@ -1210,11 +1253,11 @@ class StreamedQwen38:
             dtype=hidden[0].dtype,
             device=hidden[0].device,
         )
-        active = (hidden[0] * mask, hidden[1] * mask)
-        projected_qkv = self.pager.linear_many(active, f"{base}.in_proj_qkv")
-        projected_z = self.pager.linear_many(active, f"{base}.in_proj_z")
-        projected_b = self.pager.linear_many(active, f"{base}.in_proj_b")
-        projected_a = self.pager.linear_many(active, f"{base}.in_proj_a")
+        active = tuple(row * mask for row in hidden)
+        projected_qkv = self._linear_token_rows(active, f"{base}.in_proj_qkv")
+        projected_z = self._linear_token_rows(active, f"{base}.in_proj_z")
+        projected_b = self._linear_token_rows(active, f"{base}.in_proj_b")
+        projected_a = self._linear_token_rows(active, f"{base}.in_proj_a")
         conv_weight = self._control(f"{base}.conv1d.weight", dtype=hidden[0].dtype)
         a_log = self._control(f"{base}.A_log")
         dt_bias = self._control(f"{base}.dt_bias")
@@ -1222,7 +1265,7 @@ class StreamedQwen38:
         mixed_rows: list[torch.Tensor] = []
         next_state = state
         try:
-            for offset in range(2):
+            for offset in range(len(hidden)):
                 mixed, next_state = gated_delta_net_core(
                     projected_qkv[offset],
                     projected_z[offset],
@@ -1245,9 +1288,42 @@ class StreamedQwen38:
             del projected_qkv, projected_z, projected_b, projected_a
             del conv_weight, a_log, dt_bias, norm_weight
         if not isinstance(next_state, DeltaNetState):  # pragma: no cover - kernel.
-            raise Qwen38RuntimeError("K=2 DeltaNet returned no state")
-        projected = self.pager.linear_many(tuple(mixed_rows), f"{base}.out_proj")
-        return (projected[0], projected[1]), next_state
+            raise Qwen38RuntimeError("continuation DeltaNet returned no state")
+        projected = self._linear_token_rows(tuple(mixed_rows), f"{base}.out_proj")
+        return projected, next_state
+
+    def _linear_attention_k2_pair(
+        self,
+        hidden: tuple[torch.Tensor, torch.Tensor],
+        *,
+        layer: int,
+        state: DeltaNetState | None,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], DeltaNetState]:
+        """Preserve the K=2 implementation seam over the generic exact path."""
+
+        rows, next_state = self._linear_attention_token_rows(
+            hidden,
+            layer=layer,
+            state=state,
+        )
+        return (rows[0], rows[1]), next_state
+
+    def _mlp_token_rows(
+        self,
+        hidden: tuple[torch.Tensor, ...],
+        *,
+        layer: int,
+    ) -> tuple[torch.Tensor, ...]:
+        base = f"model.language_model.layers.{layer}.mlp"
+        gate = self._linear_token_rows(hidden, f"{base}.gate_proj")
+        up = self._linear_token_rows(hidden, f"{base}.up_proj")
+        try:
+            activated = tuple(
+                swiglu(gate[index], up[index]) for index in range(len(hidden))
+            )
+        finally:
+            del gate, up
+        return self._linear_token_rows(activated, f"{base}.down_proj")
 
     def _mlp_k2_pair(
         self,
@@ -1255,15 +1331,55 @@ class StreamedQwen38:
         *,
         layer: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        base = f"model.language_model.layers.{layer}.mlp"
-        gate = self.pager.linear_many(hidden, f"{base}.gate_proj")
-        up = self.pager.linear_many(hidden, f"{base}.up_proj")
-        try:
-            activated = (swiglu(gate[0], up[0]), swiglu(gate[1], up[1]))
-        finally:
-            del gate, up
-        down = self.pager.linear_many(activated, f"{base}.down_proj")
-        return down[0], down[1]
+        rows = self._mlp_token_rows(hidden, layer=layer)
+        return rows[0], rows[1]
+
+    def _forward_layer_token_rows(
+        self,
+        hidden: tuple[torch.Tensor, ...],
+        *,
+        layer: int,
+        state: LayerState | None,
+        start_pos: int,
+        native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None],
+    ) -> tuple[tuple[torch.Tensor, ...], LayerState]:
+        """Apply one layer tokenwise while reading every checkpoint tensor once."""
+
+        prefix = f"model.language_model.layers.{layer}"
+        residual = hidden
+        mixed_input = self._norm_token_rows(
+            hidden,
+            f"{prefix}.input_layernorm.weight",
+        )
+        if self.config.is_full_attention(layer):
+            if state is not None and not isinstance(state, AttentionState):
+                raise Qwen38RuntimeError("full-attention layer received DeltaNet state")
+            mixed, next_state = self._full_attention_token_rows(
+                mixed_input,
+                layer=layer,
+                state=state,
+                start_pos=start_pos,
+                native_head_crsa_observer=native_head_crsa_observer,
+            )
+        else:
+            if state is not None and not isinstance(state, DeltaNetState):
+                raise Qwen38RuntimeError("linear-attention layer received KV state")
+            mixed, next_state = self._linear_attention_token_rows(
+                mixed_input,
+                layer=layer,
+                state=state,
+            )
+        after_attention = tuple(
+            residual[index] + mixed[index] for index in range(len(hidden))
+        )
+        mlp_input = self._norm_token_rows(
+            after_attention,
+            f"{prefix}.post_attention_layernorm.weight",
+        )
+        mlp = self._mlp_token_rows(mlp_input, layer=layer)
+        return tuple(
+            after_attention[index] + mlp[index] for index in range(len(hidden))
+        ), next_state
 
     def _forward_layer_k2_pair(
         self,
@@ -1274,7 +1390,7 @@ class StreamedQwen38:
         start_pos: int,
         native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None],
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], LayerState]:
-        """Apply one layer tokenwise while reading every checkpoint tensor once."""
+        """Preserve the original K=2 seam over generic weight-once helpers."""
 
         prefix = f"model.language_model.layers.{layer}"
         residual = hidden
@@ -1827,7 +1943,7 @@ class StreamedQwen38:
             evidence=evidence,
         )
 
-    def _stage_continuation_k2_pair(
+    def _stage_continuation_token_rows(
         self,
         hidden: torch.Tensor,
         prior_states: tuple[LayerState | None, ...],
@@ -1836,12 +1952,17 @@ class StreamedQwen38:
         graft_history: torch.Tensor | None,
         progress: Callable[[dict[str, Any]], None] | None,
     ) -> StatefulLayerRangeResult:
-        """Stage batch-1/K=2 as layer-major pairs of one-token updates."""
+        """Stage batch-1/K=1..4 as layer-major one-token recurrences."""
 
-        if tuple(hidden.shape) != (1, 2, self.config.dim):
-            raise Qwen38RuntimeError("K=2 embedded hidden shape is invalid")
+        if (
+            hidden.ndim != 3
+            or hidden.shape[0] != 1
+            or hidden.shape[2] != self.config.dim
+            or not 1 <= hidden.shape[1] <= self.MAX_CONTINUATION_BLOCK_WIDTH
+        ):
+            raise Qwen38RuntimeError("continuation embedded hidden shape is invalid")
         x = hidden.to(device=self.pager.device, dtype=self.pager.compute_dtype)
-        pair = (x[:, :1], x[:, 1:])
+        rows = tuple(x[:, offset : offset + 1] for offset in range(x.shape[1]))
         states = tuple(prior_states)
         staged = list(states)
         staged_history = graft_history
@@ -1855,26 +1976,34 @@ class StreamedQwen38:
                 if progress is not None:
                     layer_started = time.perf_counter()
                     layer_bytes = self._metric(source, "network_or_source_body_bytes")
-                pair, next_state = self._forward_layer_k2_pair(
-                    pair,
-                    layer=layer,
-                    state=states[layer],
-                    start_pos=start_pos,
-                    native_head_crsa_observer=staged_native_evidence.append,
-                )
+                if len(rows) == 2:
+                    pair, next_state = self._forward_layer_k2_pair(
+                        (rows[0], rows[1]),
+                        layer=layer,
+                        state=states[layer],
+                        start_pos=start_pos,
+                        native_head_crsa_observer=staged_native_evidence.append,
+                    )
+                    rows = pair
+                else:
+                    rows, next_state = self._forward_layer_token_rows(
+                        rows,
+                        layer=layer,
+                        state=states[layer],
+                        start_pos=start_pos,
+                        native_head_crsa_observer=staged_native_evidence.append,
+                    )
                 staged[layer] = next_state
                 if self.graft is not None and layer == self.graft_layer:
-                    first, after_first = self._apply_graft_stateful(
-                        pair[0],
-                        staged_history,
-                        start_pos=start_pos,
-                    )
-                    second, staged_history = self._apply_graft_stateful(
-                        pair[1],
-                        after_first,
-                        start_pos=start_pos + 1,
-                    )
-                    pair = (first, second)
+                    grafted: list[torch.Tensor] = []
+                    for offset, row in enumerate(rows):
+                        row, staged_history = self._apply_graft_stateful(
+                            row,
+                            staged_history,
+                            start_pos=start_pos + offset,
+                        )
+                        grafted.append(row)
+                    rows = tuple(grafted)
                 self.pager.release()
                 if progress is not None:
                     progress(
@@ -1883,7 +2012,7 @@ class StreamedQwen38:
                             "layer": layer,
                             "layers": self.config.n_layers,
                             "start_pos": start_pos,
-                            "tokens": 2,
+                            "tokens": len(rows),
                             "source_body_bytes": self._metric(
                                 source, "network_or_source_body_bytes"
                             )
@@ -1900,10 +2029,10 @@ class StreamedQwen38:
             self.pager.release()
 
         staged_states = tuple(staged)
-        combined = torch.cat(pair, dim=1)
+        combined = torch.cat(rows, dim=1)
         evidence = StatefulLayerRangeEvidence(
             start_pos=start_pos,
-            end_pos=start_pos + 2,
+            end_pos=start_pos + len(rows),
             start_layer=0,
             stop_layer=self.config.n_layers,
             layers_executed=self.config.n_layers,
@@ -1920,6 +2049,27 @@ class StreamedQwen38:
             graft_history=staged_history,
             native_head_crsa_evidence=tuple(staged_native_evidence),
             evidence=evidence,
+        )
+
+    def _stage_continuation_k2_pair(
+        self,
+        hidden: torch.Tensor,
+        prior_states: tuple[LayerState | None, ...],
+        *,
+        start_pos: int,
+        graft_history: torch.Tensor | None,
+        progress: Callable[[dict[str, Any]], None] | None,
+    ) -> StatefulLayerRangeResult:
+        """Preserve the existing K=2 staging seam and evidence contract."""
+
+        if tuple(hidden.shape) != (1, 2, self.config.dim):
+            raise Qwen38RuntimeError("K=2 embedded hidden shape is invalid")
+        return self._stage_continuation_token_rows(
+            hidden,
+            prior_states,
+            start_pos=start_pos,
+            graft_history=graft_history,
+            progress=progress,
         )
 
     def stage_continuation_block(
@@ -1944,9 +2094,12 @@ class StreamedQwen38:
             raise Qwen38RuntimeError(
                 "continuation block staging rejects an active DeltaNet probe"
             )
-        if ids.shape[0] != 1 or ids.shape[1] != 2:
+        if (
+            ids.shape[0] != 1
+            or not 1 <= ids.shape[1] <= self.MAX_CONTINUATION_BLOCK_WIDTH
+        ):
             raise Qwen38RuntimeError(
-                "continuation block staging is validated only for batch 1 and K=2"
+                "continuation block staging requires batch 1 and K in [1, 4]"
             )
         if ids.shape[0] != self._state_batch_size:
             raise ValueError("continuation block batch differs from committed prefix")
@@ -1975,18 +2128,34 @@ class StreamedQwen38:
         started = time.perf_counter()
         try:
             embedded = self.embed_batch(ids)
-            staged = self._stage_continuation_k2_pair(
-                embedded,
-                committed_states,
-                start_pos=start_pos,
-                graft_history=self._graft_history,
-                progress=progress,
-            )
-            final_pair = self._norm_k2_pair(
-                (staged.hidden[:, :1], staged.hidden[:, 1:]),
-                self.FINAL_NORM_NAME,
-            )
-            hidden = torch.cat(final_pair, dim=1)
+            if ids.shape[1] == 2:
+                staged = self._stage_continuation_k2_pair(
+                    embedded,
+                    committed_states,
+                    start_pos=start_pos,
+                    graft_history=self._graft_history,
+                    progress=progress,
+                )
+                final_rows = self._norm_k2_pair(
+                    (staged.hidden[:, :1], staged.hidden[:, 1:]),
+                    self.FINAL_NORM_NAME,
+                )
+            else:
+                staged = self._stage_continuation_token_rows(
+                    embedded,
+                    committed_states,
+                    start_pos=start_pos,
+                    graft_history=self._graft_history,
+                    progress=progress,
+                )
+                final_rows = self._norm_token_rows(
+                    tuple(
+                        staged.hidden[:, offset : offset + 1]
+                        for offset in range(ids.shape[1])
+                    ),
+                    self.FINAL_NORM_NAME,
+                )
+            hidden = torch.cat(final_rows, dim=1)
         except Exception:
             self._pending_block_stage = None
             self.pager.release()
@@ -2036,6 +2205,150 @@ class StreamedQwen38:
             runtime_identity=runtime_identity,
         )
         return stage
+
+    def extend_continuation_block(
+        self,
+        stage: StatefulBlockStage,
+        one_token: Any,
+        *,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> StatefulBlockStage:
+        """Consume a pending stage and append one exact private token update.
+
+        The returned handle contains the aggregate hidden/evidence view.  The
+        old handle is invalid even when extension fails, while committed model
+        state and the public native-CRSA observer remain untouched.
+        """
+
+        if not isinstance(stage, StatefulBlockStage):
+            raise TypeError("stage must be a StatefulBlockStage")
+        pending = self._pending_block_stage
+        if pending is None or stage is not pending.handle:
+            raise Qwen38RuntimeError("continuation block stage is stale or foreign")
+
+        # A matching handle is consumed exactly once.  No later validation or
+        # compute failure may leave the old private transaction committable.
+        self._pending_block_stage = None
+        try:
+            ids = self._token_tensor(one_token)
+            row = pending.evidence
+            width = row.end_pos - row.start_pos
+            if self._state_poisoned:
+                raise Qwen38RuntimeError(
+                    "decoder state is poisoned; call reset_state()"
+                )
+            if self.delta_probe is not None:
+                raise Qwen38RuntimeError(
+                    "continuation block staging rejects an active DeltaNet probe"
+                )
+            if tuple(ids.shape) != (1, 1):
+                raise Qwen38RuntimeError(
+                    "continuation block extension requires batch 1 and one token"
+                )
+            if not 1 <= width < self.MAX_CONTINUATION_BLOCK_WIDTH:
+                raise Qwen38RuntimeError("continuation block extension exceeds K=4")
+            if self._next_position != row.start_pos:
+                raise Qwen38RuntimeError("continuation block base state changed")
+            if self._state_batch_size != 1 or len(row.input_token_ids) != 1:
+                raise Qwen38RuntimeError("continuation block batch state changed")
+            if row.end_pos + 1 > self.max_seq_len or self.max_batch_size < 1:
+                raise Qwen38RuntimeError(
+                    "continuation block exceeds current runtime bounds"
+                )
+            runtime_identity = self._continuation_block_runtime_identity()
+            if runtime_identity != pending.runtime_identity:
+                raise Qwen38RuntimeError(
+                    "continuation block runtime configuration changed"
+                )
+            if tuple(pending.hidden.shape) != (1, width, self.config.dim):
+                raise Qwen38RuntimeError("continuation block hidden shape is invalid")
+            if (
+                not pending.hidden.is_floating_point()
+                or not self._on_pager_device(pending.hidden)
+                or pending.hidden.dtype != self.pager.compute_dtype
+            ):
+                raise Qwen38RuntimeError(
+                    "continuation block hidden device/dtype is invalid"
+                )
+            staged_base = self._validate_stateful_range_states(
+                pending.layer_states,
+                batch_size=1,
+                sequence_length=0,
+                start_pos=row.end_pos,
+                start_layer=0,
+                graft_history=pending.graft_history,
+            )
+            if progress is not None and not callable(progress):
+                raise TypeError("progress must be callable or None")
+
+            source = self.pager.source
+            start_bytes = self._metric(source, "network_or_source_body_bytes")
+            start_linears = self._metric(self.pager, "linear_calls")
+            started = time.perf_counter()
+            embedded = self.embed_batch(ids)
+            staged = self._stage_continuation_token_rows(
+                embedded,
+                staged_base,
+                start_pos=row.end_pos,
+                graft_history=pending.graft_history,
+                progress=progress,
+            )
+            final_row = self._norm_token_rows(
+                (staged.hidden,),
+                self.FINAL_NORM_NAME,
+            )[0]
+            hidden = torch.cat((pending.hidden, final_row), dim=1)
+            input_ids = (
+                row.input_token_ids[0]
+                + tuple(int(value) for value in ids[0].detach().to("cpu").tolist()),
+            )
+            evidence = StatefulBlockEvidence(
+                start_pos=row.start_pos,
+                end_pos=row.end_pos + 1,
+                input_token_ids=input_ids,
+                layers_executed=self.config.n_layers,
+                checkpoint_layers=self.config.n_layers,
+                complete_layer_stack=True,
+                stateful_cache=True,
+                source_body_bytes=row.source_body_bytes
+                + self._metric(source, "network_or_source_body_bytes")
+                - start_bytes,
+                linear_calls=row.linear_calls
+                + self._metric(self.pager, "linear_calls")
+                - start_linears,
+                seconds=row.seconds + time.perf_counter() - started,
+                staged_state_bytes=self._continuation_bytes(
+                    staged.layer_states, staged.graft_history
+                ),
+                graft_mode=self._graft_mode(),
+                graft_history_tokens=(
+                    0
+                    if staged.graft_history is None
+                    else int(staged.graft_history.shape[1])
+                ),
+            )
+            next_stage = StatefulBlockStage(
+                hidden=hidden.detach().clone(),
+                evidence=replace(evidence),
+                _nonce=object(),
+            )
+            self._pending_block_stage = _PendingStatefulBlock(
+                handle=next_stage,
+                evidence=evidence,
+                hidden=hidden,
+                layer_states=staged.layer_states,
+                graft_history=staged.graft_history,
+                native_head_crsa_evidence=(
+                    pending.native_head_crsa_evidence + staged.native_head_crsa_evidence
+                ),
+                runtime_identity=runtime_identity,
+            )
+            return next_stage
+        except Exception:
+            self._pending_block_stage = None
+            raise
+        finally:
+            self.pager.release()
 
     def discard_continuation_block(self, stage: StatefulBlockStage) -> None:
         """Invalidate exactly the currently pending block without a commit."""

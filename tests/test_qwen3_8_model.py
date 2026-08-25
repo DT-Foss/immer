@@ -654,14 +654,14 @@ class Qwen38ModelTests(unittest.TestCase):
 
     def test_continuation_block_shape_and_context_boundaries(self) -> None:
         self.model.prefill([[1, 4]])
-        for invalid in ([[9]], [[9, 7, 6]]):
-            with self.subTest(invalid=invalid):
-                with self.assertRaisesRegex(Qwen38RuntimeError, "batch 1 and K=2"):
-                    self.model.stage_continuation_block(invalid)
+        with self.assertRaisesRegex(ValueError, "dimensions must be non-empty"):
+            self.model.stage_continuation_block(torch.empty((1, 0), dtype=torch.long))
+        with self.assertRaisesRegex(Qwen38RuntimeError, "K in \\[1, 4\\]"):
+            self.model.stage_continuation_block([[9, 7, 6, 5, 4]])
 
         self.model.reset_state()
         self.model.prefill([[1, 4], [2, 5]])
-        with self.assertRaisesRegex(Qwen38RuntimeError, "batch 1 and K=2"):
+        with self.assertRaisesRegex(Qwen38RuntimeError, "batch 1"):
             self.model.stage_continuation_block([[9, 7], [8, 6]])
 
         self.model.reset_state()
@@ -699,7 +699,171 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(tuple(hidden.shape), (1, 1, self.config.dim))
         self.assertEqual(evidence.linear_calls, 31)
 
-    def test_official_topology_k2_is_bf16_exact_for_off_stable_and_native(
+    def test_continuation_extension_is_opaque_single_use_and_foreign_safe(
+        self,
+    ) -> None:
+        pager = Qwen38WeightPager(
+            self.source,
+            device="cpu",
+            compute_dtype="float32",
+            max_resident_bytes=2 * 1024**2,
+        )
+        reference = StreamedQwen38(
+            self.config,
+            pager,
+            max_batch_size=1,
+            max_seq_len=16,
+        )
+        try:
+            self.model.prefill([[1, 4]])
+            reference.prefill([[1, 4]])
+            committed_objects = tuple(self.model._layer_states)
+            committed_values = _clone_layer_states(self.model._layer_states)
+
+            first = self.model.stage_continuation_block([[9]])
+            object.__setattr__(first.evidence, "input_token_ids", ((5,),))
+            first.hidden.fill_(float("nan"))
+            extended = self.model.extend_continuation_block(first, [[7]])
+
+            first_hidden, _ = reference.decode([[9]])
+            second_hidden, _ = reference.decode([[7]])
+            expected = torch.cat((first_hidden, second_hidden), dim=1)
+            self.assertTrue(torch.equal(extended.hidden, expected))
+            self.assertEqual(extended.evidence.input_token_ids, ((9, 7),))
+            self.assertEqual(
+                (extended.evidence.start_pos, extended.evidence.end_pos),
+                (2, 4),
+            )
+            self.assertEqual(extended.evidence.linear_calls, 62)
+            self.assertEqual(self.model.next_position, 2)
+            self.assertTrue(
+                all(
+                    current is original
+                    for current, original in zip(
+                        self.model._layer_states,
+                        committed_objects,
+                        strict=True,
+                    )
+                )
+            )
+            _assert_layer_states_equal(self, self.model._layer_states, committed_values)
+            with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+                self.model.commit_continuation_block(first)
+
+            actual, evidence = self.model.commit_continuation_block(extended)
+            self.assertTrue(torch.equal(actual, expected))
+            self.assertEqual(evidence.input_token_ids, ((9, 7),))
+            _assert_layer_states_equal(
+                self, self.model._layer_states, reference._layer_states
+            )
+
+            discard = self.model.stage_continuation_block([[6, 5, 4]])
+            self.model.discard_continuation_block(discard)
+            self.assertEqual(self.model.next_position, 4)
+            with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+                self.model.extend_continuation_block(discard, [[3]])
+
+            self.model.reset_state()
+            self.model.prefill([[1, 4]])
+            reset_stage = self.model.stage_continuation_block([[9]])
+            self.model.reset_state()
+            with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+                self.model.extend_continuation_block(reset_stage, [[7]])
+
+            self.model.prefill([[1, 4]])
+            reference.reset_state()
+            reference.prefill([[1, 4]])
+            local = self.model.stage_continuation_block([[9]])
+            foreign = reference.stage_continuation_block([[9]])
+            with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+                self.model.extend_continuation_block(foreign, [[7]])
+            self.model.commit_continuation_block(local)
+            reference.discard_continuation_block(foreign)
+        finally:
+            pager.close()
+
+    def test_continuation_extension_failure_discards_without_committed_mutation(
+        self,
+    ) -> None:
+        self.model.prefill([[1, 4]])
+        committed_objects = tuple(self.model._layer_states)
+        committed_values = _clone_layer_states(self.model._layer_states)
+        first = self.model.stage_continuation_block([[9]])
+
+        with mock.patch.object(
+            qwen_model_module,
+            "gated_delta_net_core",
+            side_effect=RuntimeError("extension transaction failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "extension transaction failure"):
+                self.model.extend_continuation_block(first, [[7]])
+
+        self.assertIsNone(self.model._pending_block_stage)
+        self.assertEqual(self.model.next_position, 2)
+        self.assertFalse(self.model.state_poisoned)
+        self.assertTrue(
+            all(
+                current is original
+                for current, original in zip(
+                    self.model._layer_states,
+                    committed_objects,
+                    strict=True,
+                )
+            )
+        )
+        _assert_layer_states_equal(self, self.model._layer_states, committed_values)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+            self.model.commit_continuation_block(first)
+
+        full = self.model.stage_continuation_block([[9, 7, 6, 5]])
+        with self.assertRaisesRegex(Qwen38RuntimeError, "exceeds K=4"):
+            self.model.extend_continuation_block(full, [[4]])
+        self.assertIsNone(self.model._pending_block_stage)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+            self.model.commit_continuation_block(full)
+
+        probed = self.model.stage_continuation_block([[9]])
+        self.model.delta_probe = lambda _layer, _row: None
+        with self.assertRaisesRegex(Qwen38RuntimeError, "active DeltaNet probe"):
+            self.model.extend_continuation_block(probed, [[7]])
+        self.model.delta_probe = None
+        self.assertIsNone(self.model._pending_block_stage)
+
+        original_norm_rows = self.model._norm_token_rows
+
+        def fail_final_norm(hidden, name):
+            if name == self.model.FINAL_NORM_NAME:
+                raise RuntimeError("generic block final norm failure")
+            return original_norm_rows(hidden, name)
+
+        with mock.patch.object(
+            self.model,
+            "_norm_token_rows",
+            side_effect=fail_final_norm,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "generic block final norm failure"
+            ):
+                self.model.stage_continuation_block([[9, 7, 6]])
+        self.assertIsNone(self.model._pending_block_stage)
+        self.assertEqual(self.model.next_position, 2)
+        _assert_layer_states_equal(self, self.model._layer_states, committed_values)
+
+        extend_final = self.model.stage_continuation_block([[9]])
+        with mock.patch.object(
+            self.model,
+            "_norm_token_rows",
+            side_effect=fail_final_norm,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "generic block final norm failure"
+            ):
+                self.model.extend_continuation_block(extend_final, [[7]])
+        self.assertIsNone(self.model._pending_block_stage)
+        self.assertEqual(self.model.next_position, 2)
+        _assert_layer_states_equal(self, self.model._layer_states, committed_values)
+
+    def test_official_topology_k1_to_k4_are_bf16_exact_for_all_runtime_modes(
         self,
     ) -> None:
         from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
@@ -714,99 +878,177 @@ class Qwen38ModelTests(unittest.TestCase):
             use_cache=False,
         )
         try:
-            for mode in ("off", "stable", "native"):
-                with self.subTest(mode=mode):
-                    pagers = [
-                        Qwen38WeightPager(
-                            source,
-                            device="cpu",
-                            compute_dtype="bfloat16",
-                            max_resident_bytes=2 * 1024**2,
-                        )
-                        for _ in range(2)
-                    ]
-                    observed = [[], []]
+            for mode in ("off", "stable", "native-prefix-sinkhorn"):
+                for width in range(1, 5):
+                    with self.subTest(mode=mode, width=width):
+                        token_ids = [9, 7, 6, 5][:width]
+                        observed = [[], [], []]
+                        pagers = [
+                            Qwen38WeightPager(
+                                source,
+                                device="cpu",
+                                compute_dtype="bfloat16",
+                                max_resident_bytes=2 * 1024**2,
+                            )
+                            for _ in range(3)
+                        ]
 
-                    def model(index, pager):
-                        kwargs = {}
-                        if mode == "stable":
-                            kwargs = {
-                                "graft": Qwen38StableCrsaGraft(
-                                    mode="crsa",
-                                    alpha=0.1,
-                                ),
-                                "graft_layer": 27,
-                            }
-                        elif mode == "native":
-                            kwargs = {
-                                "native_head_crsa": Qwen38NativeHeadCrsa(alpha=0.1),
-                                "native_head_crsa_observer": observed[index].append,
-                            }
-                        return StreamedQwen38(
-                            config,
-                            pager,
-                            max_batch_size=1,
-                            max_seq_len=16,
-                            **kwargs,
-                        )
+                        def model(index, pager):
+                            kwargs = {}
+                            if mode == "stable":
+                                kwargs = {
+                                    "graft": Qwen38StableCrsaGraft(
+                                        mode="crsa",
+                                        alpha=0.1,
+                                    ),
+                                    "graft_layer": 27,
+                                }
+                            elif mode == "native-prefix-sinkhorn":
+                                kwargs = {
+                                    "native_head_crsa": Qwen38NativeHeadCrsa(alpha=0.1),
+                                    "native_head_crsa_observer": observed[index].append,
+                                }
+                            return StreamedQwen38(
+                                config,
+                                pager,
+                                max_batch_size=1,
+                                max_seq_len=16,
+                                **kwargs,
+                            )
 
-                    block_model, token_model = [
-                        model(index, pager) for index, pager in enumerate(pagers)
-                    ]
-                    try:
-                        block_model.prefill([[1, 4]])
-                        token_model.prefill([[1, 4]])
-                        observed[0].clear()
-                        observed[1].clear()
-                        block_reads_before = block_model.pager.metrics()["tensor_reads"]
-                        stage = block_model.stage_continuation_block([[9, 7]])
-                        block_reads = (
-                            block_model.pager.metrics()["tensor_reads"]
-                            - block_reads_before
-                        )
-                        self.assertEqual(observed[0], [])
+                        block_model, extension_model, token_model = [
+                            model(index, pager) for index, pager in enumerate(pagers)
+                        ]
+                        try:
+                            block_model.prefill([[1, 4]])
+                            extension_model.prefill([[1, 4]])
+                            token_model.prefill([[1, 4]])
+                            observed[0].clear()
+                            observed[1].clear()
+                            observed[2].clear()
+                            block_reads_before = block_model.pager.metrics()[
+                                "tensor_reads"
+                            ]
+                            stage = block_model.stage_continuation_block([token_ids])
+                            block_reads = (
+                                block_model.pager.metrics()["tensor_reads"]
+                                - block_reads_before
+                            )
+                            self.assertEqual(observed[0], [])
 
-                        token_reads_before = token_model.pager.metrics()["tensor_reads"]
-                        first, first_evidence = token_model.decode([[9]])
-                        second, second_evidence = token_model.decode([[7]])
-                        token_reads = (
-                            token_model.pager.metrics()["tensor_reads"]
-                            - token_reads_before
-                        )
-                        expected = torch.cat((first, second), dim=1)
+                            extension_reads_before = extension_model.pager.metrics()[
+                                "tensor_reads"
+                            ]
+                            extension_stages = [
+                                extension_model.stage_continuation_block(
+                                    [[token_ids[0]]]
+                                )
+                            ]
+                            for token in token_ids[1:]:
+                                extension_stages.append(
+                                    extension_model.extend_continuation_block(
+                                        extension_stages[-1], [[token]]
+                                    )
+                                )
+                            extension_stage = extension_stages[-1]
+                            extension_reads = (
+                                extension_model.pager.metrics()["tensor_reads"]
+                                - extension_reads_before
+                            )
+                            self.assertEqual(observed[1], [])
 
-                        self.assertTrue(torch.equal(stage.hidden, expected))
-                        self.assertEqual(
-                            stage.evidence.linear_calls,
-                            first_evidence.linear_calls + second_evidence.linear_calls,
-                        )
-                        self.assertEqual(2 * block_reads, token_reads)
-                        self.assertLess(
-                            stage.evidence.source_body_bytes,
-                            first_evidence.source_body_bytes
-                            + second_evidence.source_body_bytes,
-                        )
-                        actual, evidence = block_model.commit_continuation_block(stage)
-                        self.assertTrue(torch.equal(actual, expected))
-                        _assert_layer_states_equal(
-                            self,
-                            block_model._layer_states,
-                            token_model._layer_states,
-                        )
-                        self.assertEqual(evidence.state_bytes, token_model.state_bytes)
-                        if mode == "stable":
+                            token_reads_before = token_model.pager.metrics()[
+                                "tensor_reads"
+                            ]
+                            outputs = []
+                            token_evidence = []
+                            for token in token_ids:
+                                hidden, evidence = token_model.decode([[token]])
+                                outputs.append(hidden)
+                                token_evidence.append(evidence)
+                            token_reads = (
+                                token_model.pager.metrics()["tensor_reads"]
+                                - token_reads_before
+                            )
+                            expected = torch.cat(outputs, dim=1)
+
+                            self.assertTrue(torch.equal(stage.hidden, expected))
                             self.assertTrue(
-                                torch.equal(
-                                    block_model._graft_history,
-                                    token_model._graft_history,
+                                torch.equal(extension_stage.hidden, expected)
+                            )
+                            self.assertEqual(
+                                extension_stage.evidence.input_token_ids,
+                                (tuple(token_ids),),
+                            )
+                            self.assertEqual(
+                                extension_stage.evidence.linear_calls,
+                                stage.evidence.linear_calls,
+                            )
+                            self.assertEqual(
+                                stage.evidence.linear_calls,
+                                sum(row.linear_calls for row in token_evidence),
+                            )
+                            self.assertEqual(width * block_reads, token_reads)
+                            self.assertEqual(width * block_reads, extension_reads)
+                            if width == 1:
+                                self.assertEqual(
+                                    stage.evidence.source_body_bytes,
+                                    token_evidence[0].source_body_bytes,
+                                )
+                            else:
+                                self.assertLess(
+                                    stage.evidence.source_body_bytes,
+                                    sum(
+                                        row.source_body_bytes for row in token_evidence
+                                    ),
+                                )
+                            actual, evidence = block_model.commit_continuation_block(
+                                stage
+                            )
+                            extended, extension_evidence = (
+                                extension_model.commit_continuation_block(
+                                    extension_stage
                                 )
                             )
-                        elif mode == "native":
-                            self.assertEqual(observed[0], observed[1])
-                            self.assertEqual(len(observed[0]), 2)
-                    finally:
-                        for pager in pagers:
-                            pager.close()
+                            self.assertTrue(torch.equal(actual, expected))
+                            self.assertTrue(torch.equal(extended, expected))
+                            _assert_layer_states_equal(
+                                self,
+                                block_model._layer_states,
+                                token_model._layer_states,
+                            )
+                            _assert_layer_states_equal(
+                                self,
+                                extension_model._layer_states,
+                                token_model._layer_states,
+                            )
+                            self.assertEqual(
+                                evidence.state_bytes, token_model.state_bytes
+                            )
+                            self.assertEqual(
+                                extension_evidence.state_bytes,
+                                token_model.state_bytes,
+                            )
+                            if mode == "stable":
+                                self.assertTrue(
+                                    torch.equal(
+                                        block_model._graft_history,
+                                        token_model._graft_history,
+                                    )
+                                )
+                                self.assertTrue(
+                                    torch.equal(
+                                        extension_model._graft_history,
+                                        token_model._graft_history,
+                                    )
+                                )
+                            elif mode == "native-prefix-sinkhorn":
+                                self.assertEqual(observed[0], observed[2])
+                                self.assertEqual(observed[1], observed[2])
+                                self.assertEqual(len(observed[0]), width)
+                        finally:
+                            for pager in pagers:
+                                pager.close()
         finally:
             source.close()
 
