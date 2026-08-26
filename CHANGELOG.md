@@ -15,6 +15,10 @@ All notable changes to IMMER are recorded here.
   Mixed prompt-plus-job appends materialize both `new prompt × old jobs` and
   `all prompts × new jobs`; inherited job-specific family and semantic evidence
   bindings remain exact.
+- Bound attention coordinates to the authenticated Qwen hybrid topology.
+  `attention-q` now resolves `linear_attn.in_proj_qkv` on DeltaNet layers and
+  `self_attn.q_proj` on full-attention layers from the local bundle config;
+  the first live L45 failure exposed and closed the stale all-softmax mapping.
 - Added the durable `idle` runner and weight-free `frontier-status`. Idle cycles
   resume after process failure, consume later frontier events, persist exact
   run/wait/error accounting, and reject a journal rollback once the scheduler
@@ -46,8 +50,8 @@ All notable changes to IMMER are recorded here.
   selects three executable affine/permutation/Markov families correctly on
   `174/180` decisions and `60/60` late decisions; the information-destroying
   shuffled-context placebo reaches `49/180` and `13/60` late.
-- Verified the complete repository with `1,707/1,707` tests under fatal
-  `ResourceWarning` in `591.411 s`. Ruff, formatting, compile, JSON, Markdown
+- Verified the complete repository with `1,708/1,708` tests under fatal
+  `ResourceWarning` in `590.926 s`. Ruff, formatting, compile, JSON, Markdown
   links, private-path, diff, and anti-hedge gates pass.
 
 ### Demand-routed execution and exact operator algebras

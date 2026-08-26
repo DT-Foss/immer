@@ -1196,6 +1196,7 @@ def qwen38_frontier_grid(
     native_alpha: float = 0.01,
     native_balance_alpha: float = 1.0,
     native_diagonal_debit: float = 3.0,
+    layer_types: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Build a deterministic Qwen layer/site/intervention measurement grid."""
 
@@ -1221,6 +1222,16 @@ def qwen38_frontier_grid(
         raise O1CartographyCliError(
             f"unknown Qwen grid intervention: {sorted(unknown_modes)[0]}"
         )
+    topology = (
+        None if layer_types is None else tuple(str(value) for value in layer_types)
+    )
+    if topology is not None:
+        if not topology or any(
+            value not in {"full_attention", "linear_attention"} for value in topology
+        ):
+            raise O1CartographyCliError("Qwen layer topology is malformed")
+        if max(layer_axis) >= len(topology):
+            raise O1CartographyCliError("grid layer lies outside Qwen topology")
     sketch = HiddenSketchProjection(
         seed_sha256=(
             _digest(
@@ -1245,7 +1256,15 @@ def qwen38_frontier_grid(
     for layer in sorted(layer_axis):
         prefix = f"model.language_model.layers.{layer}"
         for site in sorted(site_axis):
-            module_suffix, tensor_suffix = _GRID_SITES[site]
+            if (
+                site == "attention-q"
+                and topology is not None
+                and topology[layer] == "linear_attention"
+            ):
+                module_suffix = "linear_attn"
+                tensor_suffix = "linear_attn.in_proj_qkv.weight"
+            else:
+                module_suffix, tensor_suffix = _GRID_SITES[site]
             module = f"{prefix}.{module_suffix}"
             tensor = f"{prefix}.{tensor_suffix}"
             for mode in sorted(intervention_axis):
@@ -3321,6 +3340,26 @@ def _prompt_registry_file(value: str) -> list[Mapping[str, Any]]:
     return list(document)
 
 
+def _grid_layer_types(root: str | os.PathLike[str]) -> tuple[str, ...]:
+    """Authenticate the run's local Qwen config and return its real topology."""
+
+    root_path = _plain_root(root, create=False)
+    _manifest, body = _load_manifest(root_path)
+    bundle = _plain_root(body["bundle"]["root"], create=False)
+    document = _strict_json_bytes(
+        _stable_regular_bytes(bundle / "config.json", "Qwen grid config"),
+        "Qwen grid config",
+    )
+    if not isinstance(document, Mapping):
+        raise O1CartographyCliError("Qwen grid config root is malformed")
+    options = body["runtime"]
+    config = Qwen38Config.from_mapping(
+        document,
+        require_official=bool(options["require_official_config"]),
+    )
+    return config.layer_types
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -3489,6 +3528,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 native_alpha=args.native_alpha,
                 native_balance_alpha=args.native_balance_alpha,
                 native_diagonal_debit=args.native_diagonal_debit,
+                layer_types=_grid_layer_types(args.root),
             )
         elif args.inherit_jobs:
             jobs = None

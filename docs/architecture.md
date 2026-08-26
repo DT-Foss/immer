@@ -225,6 +225,9 @@ new cells without losing outcomes, histories, replay, stream state, or Atlas
 coverage. `frontier-status` authenticates this state without opening model
 weights; the durable idle runner waits for later events and records every run,
 wait, failure, probe call, and harvested observation across restarts.
+Attention coordinates follow the authenticated hybrid layer topology:
+DeltaNet layers use `linear_attn.in_proj_qkv`, while full-attention layers use
+`self_attn.q_proj`.
 
 Atlas revisions expose exact hash-chain membership. Rollback, fork, forged
 historical events, and a head change during proof construction fail closed.

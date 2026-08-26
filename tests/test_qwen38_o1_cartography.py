@@ -849,6 +849,45 @@ class Qwen38O1CartographyTests(unittest.TestCase):
             {32},
         )
 
+    def test_qwen_grid_resolves_hybrid_attention_from_real_layer_types(self) -> None:
+        grid = cartography.qwen38_frontier_grid(
+            layers=(0, 3),
+            sites=("attention-q",),
+            interventions=("passive",),
+            layer_types=(
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ),
+        )
+        by_layer = {row["spec"]["coordinate"]["layer"]: row for row in grid}
+        self.assertEqual(
+            by_layer[0]["spec"]["coordinate"]["module"],
+            "model.language_model.layers.0.linear_attn",
+        )
+        self.assertEqual(
+            by_layer[0]["spec"]["coordinate"]["tensor"],
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+        )
+        self.assertEqual(
+            by_layer[3]["spec"]["coordinate"]["module"],
+            "model.language_model.layers.3.self_attn",
+        )
+        self.assertEqual(
+            by_layer[3]["spec"]["coordinate"]["tensor"],
+            "model.language_model.layers.3.self_attn.q_proj.weight",
+        )
+        with self.assertRaisesRegex(
+            cartography.O1CartographyCliError,
+            "outside Qwen topology",
+        ):
+            cartography.qwen38_frontier_grid(
+                layers=(4,),
+                sites=("attention-q",),
+                layer_types=("full_attention",) * 4,
+            )
+
     def test_idle_runner_resumes_cycles_waits_and_consumes_later_extension(
         self,
     ) -> None:
