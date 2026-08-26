@@ -18,13 +18,26 @@ from .algebraic_crystals import (
     crystallize_map,
     fit_algebraic_map,
 )
+from .bvn_crystals import BirkhoffCrystalBank
+from .bvn_search import (
+    BehavioralElite,
+    BehavioralMAPElites,
+    ContextualThompsonMutation,
+    PermutationAtom,
+    fiedler_edge_novelty,
+    mixture_from_theta,
+)
 from .compute_crystals import (
     ComputeCrystal,
     ComputeCrystalBank,
     ComputeCrystalVM,
+    ComputeProgram,
 )
 from .compute_graph import ComputeOperatorGraph, OperatorEdge
+from .consensus import barbell_adjacency
 from .identity import canonical_json_bytes
+from .math_core import spectral_gap, tv_contraction
+from .residual_execution import ResidualRouteExecutor
 
 
 CRYSTAL_INTELLIGENCE_SCHEMA = "immer-ooe-crystal-intelligence/v1"
@@ -86,23 +99,31 @@ def _compute_experiment(seed: int) -> dict[str, Any]:
                 for index, crystal in enumerate(crystals)
             )
         )
+        prefix_decision = graph.plan_route(states[0], states[2])
+        if prefix_decision.abstained or prefix_decision.plan is None:
+            raise RuntimeError("verified affine prefix unexpectedly abstained")
+        prefix_charge = graph.charge_route(prefix_decision.plan)
+
         decision = graph.plan_route(states[0], states[-1])
         if decision.abstained or decision.plan is None:
             raise RuntimeError("verified affine route unexpectedly abstained")
         if decision.plan.finite_plan.horizon < len(crystals):
             raise RuntimeError("planned horizon cannot contain the affine route")
-        charge = graph.charge_route(decision.plan)
-
         # Values are generated only after charging.  They were unavailable to
         # the compiler and therefore cannot be cached answers.
         unseen = np.asarray(
             rng.normal(size=(128, dimension)),
             dtype=np.float64,
         )
-        primitive = ComputeCrystalVM(bank).execute(
-            charge.route.primitive_program_sha256,
-            unseen,
-        )
+        primitive_program = ComputeProgram.compose(crystals)
+        bank.publish_program(primitive_program)
+        primitive = ComputeCrystalVM(bank).execute(primitive_program, unseen)
+        residual = ResidualRouteExecutor(graph).execute(decision.plan, unseen)
+        residual_delta = float(np.max(np.abs(primitive.output - residual.output)))
+        if residual_delta > 1e-12:
+            raise RuntimeError("charged prefix changed residual unseen outputs")
+
+        charge = graph.charge_route(decision.plan)
         warm = graph.discharge(states[0], states[-1], unseen)
         max_delta = float(np.max(np.abs(primitive.output - warm.output)))
         if max_delta > 1e-12:
@@ -150,7 +171,23 @@ def _compute_experiment(seed: int) -> dict[str, Any]:
             "max_absolute_delta": max_delta,
             "multi_step_teacher_labels": 0,
             "placebo_abstained": placebo.abstained,
+            "prefix_charge_receipt_sha256": prefix_charge.sha256,
             "primitive_route_length": len(charge.route.primitive_edge_sha256s),
+            "residual_historical_work_released": (
+                residual.receipt.historical_work_released
+            ),
+            "residual_live_operator_count": sum(
+                receipt.executed_operator_count
+                for receipt in (
+                    residual.receipt.prefix_execution_receipt,
+                    residual.receipt.suffix_execution_receipt,
+                )
+                if receipt is not None
+            ),
+            "residual_max_absolute_delta": residual_delta,
+            "residual_prefix_length": residual.receipt.prefix_length,
+            "residual_suffix_length": residual.receipt.residual_length,
+            "residual_receipt_sha256": residual.receipt.sha256,
             "reopen_receipt_sha256": replay.receipt.sha256,
             "unseen_batch": int(unseen.shape[0]),
             "warm_receipt_sha256": warm.receipt.sha256,
@@ -253,12 +290,124 @@ def _algebra_experiment() -> dict[str, Any]:
     }
 
 
+def _operator_search_experiment(seed: int) -> dict[str, Any]:
+    """Exercise constructive operator space, diversity, and novelty learning."""
+
+    rng = np.random.default_rng(seed ^ 0xB17C0FFEE)
+    dimension = 8
+    atoms = tuple(
+        PermutationAtom(
+            tuple((index + shift) % dimension for index in range(dimension))
+        )
+        for shift in range(dimension)
+    )
+    theta = rng.normal(0.0, 1.25, size=len(atoms))
+    mixture = mixture_from_theta(theta, atoms)
+    kernel = mixture.reconstruct()
+    with tempfile.TemporaryDirectory() as temporary:
+        bank = ComputeCrystalBank(Path(temporary) / "bvn-bank")
+        basis = BirkhoffCrystalBank(bank)
+        publication = basis.publish(
+            kernel,
+            verifier_sha256=_hash({"kind": "bvn-verifier", "seed": seed}),
+            evidence_sha256s=tuple(
+                sorted(
+                    (
+                        _hash({"kind": "bvn-evidence", "replica": 0, "seed": seed}),
+                        _hash({"kind": "bvn-evidence", "replica": 1, "seed": seed}),
+                    )
+                )
+            ),
+        )
+        future = rng.normal(size=(96, dimension)).astype(np.float64)
+        atom_output = basis.apply_atoms(publication.receipt.sha256, future)
+        expected = np.einsum("...i,ij->...j", future, kernel, optimize=False)
+        basis_delta = float(np.max(np.abs(atom_output - expected)))
+
+    archive = BehavioralMAPElites(
+        (4, 4, 4),
+        objective_count=2,
+        max_elites_per_cell=2,
+    )
+    for ordinal in range(64):
+        candidate_theta = rng.normal(0.0, 1.5, size=len(atoms))
+        candidate = mixture_from_theta(candidate_theta, atoms)
+        candidate_kernel = candidate.reconstruct()
+        gap = spectral_gap(candidate_kernel)
+        contraction = tv_contraction(candidate_kernel)
+        dominant = int(np.argmax(candidate.weights)) % 4
+        descriptor = (
+            dominant,
+            min(3, int(max(0.0, gap) * 4.0)),
+            min(3, candidate.component_count // 2),
+        )
+        archive.add(
+            BehavioralElite(
+                candidate_sha256=_hash(
+                    {
+                        "kernel_sha256": candidate.kernel_sha256,
+                        "ordinal": ordinal,
+                        "seed": seed,
+                    }
+                ),
+                descriptor=descriptor,
+                objectives=(gap, 1.0 - contraction),
+            )
+        )
+
+    adjacency = barbell_adjacency(6, 6, bridge_weight=0.05)
+    missing = []
+    direct = []
+    for left in range(adjacency.shape[0]):
+        for right in range(left + 1, adjacency.shape[0]):
+            receipt = fiedler_edge_novelty(adjacency, left, right)
+            target = direct if receipt.direct_edge else missing
+            target.append(receipt)
+    best_missing = max(missing, key=lambda row: (row.priority(1.0), row.sha256))
+    best_direct = max(direct, key=lambda row: (row.priority(1.0), row.sha256))
+
+    bandit = ContextualThompsonMutation(
+        ("compose", "permute", "rescale"),
+        _hash({"kind": "mutation-bandit", "seed": seed}),
+    )
+    choices = []
+    for _ in range(96):
+        choice, bandit = bandit.choose("qwen.operator-graph")
+        success = choice.arm == "permute"
+        bandit = bandit.observe(
+            "qwen.operator-graph", choice.arm, success=success
+        )
+        choices.append(choice.arm)
+    late_window = choices[-32:]
+    preferred = sum(value == "permute" for value in late_window) / len(late_window)
+    return {
+        "archive_coverage": archive.coverage,
+        "archive_elite_count": archive.elite_count,
+        "archive_occupied_cells": archive.occupied_cells,
+        "archive_sha256": archive.sha256,
+        "basis_component_count": len(publication.receipt.atom_crystal_sha256s),
+        "basis_max_absolute_delta": basis_delta,
+        "basis_receipt_sha256": publication.receipt.sha256,
+        "basis_storage_bound": (dimension - 1) ** 2 + 1,
+        "fiedler_best_direct_priority": best_direct.priority(1.0),
+        "fiedler_best_missing_edge": [
+            best_missing.left_index,
+            best_missing.right_index,
+        ],
+        "fiedler_best_missing_priority": best_missing.priority(1.0),
+        "fiedler_receipt_sha256": best_missing.sha256,
+        "mutation_late_preferred_fraction": preferred,
+        "mutation_state_sha256": bandit.sha256,
+    }
+
+
 def run_crystal_intelligence_benchmark(
     *,
     seed: int = 20_260_826,
 ) -> dict[str, Any]:
     compute = _compute_experiment(seed)
     algebra = _algebra_experiment()
+    operator_search = _operator_search_experiment(seed)
     headline = {
         "algebraic_families_admitted": sum(
             algebra[name]["fit_score"] >= 0.95
@@ -276,8 +425,29 @@ def run_crystal_intelligence_benchmark(
             and algebra["placebo"]["outcome"] == REJECTED
         ),
         "primitive_route_length": compute["primitive_route_length"],
+        "residual_exact": compute["residual_max_absolute_delta"] <= 1e-12,
+        "residual_prefix_length": compute["residual_prefix_length"],
+        "residual_suffix_length": compute["residual_suffix_length"],
+        "bvn_basis_exact": operator_search["basis_max_absolute_delta"] <= 1e-12,
+        "bvn_basis_within_bound": (
+            operator_search["basis_component_count"]
+            <= operator_search["basis_storage_bound"]
+        ),
+        "fiedler_prefers_missing_bridge": (
+            operator_search["fiedler_best_missing_priority"]
+            > operator_search["fiedler_best_direct_priority"]
+        ),
+        "map_elites_occupied_cells": operator_search["archive_occupied_cells"],
+        "mutation_preference_learned": (
+            operator_search["mutation_late_preferred_fraction"] >= 0.75
+        ),
     }
-    body = {"algebra": algebra, "compute": compute, "seed": seed}
+    body = {
+        "algebra": algebra,
+        "compute": compute,
+        "operator_search": operator_search,
+        "seed": seed,
+    }
     report_body = {"body": body, "headline": headline}
     return {
         **report_body,

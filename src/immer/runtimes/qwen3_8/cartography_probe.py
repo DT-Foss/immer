@@ -19,8 +19,9 @@ from pathlib import Path
 import platform
 import re
 import stat
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, cast
 
+import numpy as np
 import torch
 
 from immer.knowledge import AccessTrace, AccessTraceRecorder
@@ -526,6 +527,55 @@ class TensorRangeReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextualHiddenTransition:
+    """One measured pre/post hidden sketch retained for operator harvesting."""
+
+    layer: int
+    projection_seed_sha256: str
+    output_dimensions: int
+    pre_sketch_sha256: str
+    post_sketch_sha256: str
+    pre_array: np.ndarray
+    post_array: np.ndarray
+
+    def __post_init__(self) -> None:
+        if isinstance(self.layer, bool) or not isinstance(self.layer, int) or self.layer < 0:
+            raise ValueError("contextual hidden layer must be non-negative")
+        seed = _sha(self.projection_seed_sha256, "projection_seed_sha256")
+        dimensions = _positive(self.output_dimensions, "output_dimensions")
+        pre_sha = _sha(self.pre_sketch_sha256, "pre_sketch_sha256")
+        post_sha = _sha(self.post_sketch_sha256, "post_sketch_sha256")
+        arrays = []
+        for field, value, expected_sha in (
+            ("pre_array", self.pre_array, pre_sha),
+            ("post_array", self.post_array, post_sha),
+        ):
+            if type(value) is not np.ndarray or value.dtype != np.dtype(np.float64):
+                raise TypeError(f"{field} must be an exact float64 numpy array")
+            if value.ndim != 2 or value.shape[1] != dimensions or value.shape[0] < 1:
+                raise ValueError(f"{field} has the wrong projected hidden shape")
+            if not np.isfinite(value).all():
+                raise ValueError(f"{field} contains non-finite values")
+            array = np.array(value, dtype="<f8", order="C", copy=True)
+            array[array == 0.0] = 0.0
+            actual_sha = hashlib.sha256(array.tobytes(order="C")).hexdigest()
+            if actual_sha != expected_sha:
+                raise Qwen38CartographyIntegrityError(
+                    f"{field} differs from its probe evidence hash"
+                )
+            array.flags.writeable = False
+            arrays.append(array)
+        if arrays[0].shape[:-1] != arrays[1].shape[:-1]:
+            raise ValueError("pre/post contextual hidden leading shapes differ")
+        object.__setattr__(self, "projection_seed_sha256", seed)
+        object.__setattr__(self, "output_dimensions", dimensions)
+        object.__setattr__(self, "pre_sketch_sha256", pre_sha)
+        object.__setattr__(self, "post_sketch_sha256", post_sha)
+        object.__setattr__(self, "pre_array", arrays[0])
+        object.__setattr__(self, "post_array", arrays[1])
+
+
+@dataclass(frozen=True, slots=True)
 class CartographyProbeResult:
     """Primary measurement plus optional paired control and raw proof objects."""
 
@@ -533,6 +583,7 @@ class CartographyProbeResult:
     evidence_document: dict[str, Any]
     access_trace: AccessTrace
     tensor_range_receipts: tuple[TensorRangeReceipt, ...]
+    contextual_hidden_transitions: tuple[ContextualHiddenTransition, ...] = ()
     control_measurement: MeasurementReceipt | None = None
     control_evidence_document: dict[str, Any] | None = None
     control_access_trace: AccessTrace | None = None
@@ -563,6 +614,50 @@ class CartographyProbeResult:
             raise Qwen38CartographyIntegrityError(
                 "measurement evidence digest does not match its document"
             )
+        layer_records = primary_body.get("layers")
+        if not isinstance(layer_records, list):
+            raise Qwen38CartographyIntegrityError(
+                "measurement evidence has no layer records"
+            )
+        layers_by_index = {
+            row.get("layer"): row for row in layer_records if isinstance(row, Mapping)
+        }
+        transitions = tuple(self.contextual_hidden_transitions)
+        if len({row.layer for row in transitions}) != len(transitions):
+            raise Qwen38CartographyIntegrityError(
+                "contextual hidden transitions contain duplicate layers"
+            )
+        for transition in transitions:
+            if not isinstance(transition, ContextualHiddenTransition):
+                raise Qwen38CartographyIntegrityError(
+                    "contextual hidden transition has the wrong type"
+                )
+            layer_record = layers_by_index.get(transition.layer)
+            if not isinstance(layer_record, Mapping):
+                raise Qwen38CartographyIntegrityError(
+                    "contextual hidden transition has no evidence layer"
+                )
+            pre = layer_record.get("pre_sketch")
+            post = layer_record.get("post_sketch")
+            if not isinstance(pre, Mapping) or not isinstance(post, Mapping):
+                raise Qwen38CartographyIntegrityError(
+                    "contextual hidden transition lacks sketch evidence"
+                )
+            pre_stats = pre.get("statistics")
+            post_stats = post.get("statistics")
+            if (
+                pre.get("seed_sha256") != transition.projection_seed_sha256
+                or post.get("seed_sha256") != transition.projection_seed_sha256
+                or pre.get("output_dimensions") != transition.output_dimensions
+                or post.get("output_dimensions") != transition.output_dimensions
+                or not isinstance(pre_stats, Mapping)
+                or not isinstance(post_stats, Mapping)
+                or pre_stats.get("sha256") != transition.pre_sketch_sha256
+                or post_stats.get("sha256") != transition.post_sketch_sha256
+            ):
+                raise Qwen38CartographyIntegrityError(
+                    "contextual hidden transition differs from sealed evidence"
+                )
         if self.control_measurement is None:
             if (
                 any(
@@ -613,6 +708,7 @@ class _ArmCapture:
     intervention_configuration: dict[str, Any]
     layers: list[dict[str, Any]]
     hidden_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]]
+    contextual_hidden_transitions: list[ContextualHiddenTransition]
     delta_probes: list[dict[str, Any]]
     crsa_evidence: list[dict[str, Any]]
     final_hidden_sha256: str
@@ -886,7 +982,7 @@ def _sketch_record(
     projection: HiddenSketchProjection,
     *,
     max_elements: int,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], np.ndarray]:
     rows = (
         value.detach()
         .contiguous()
@@ -911,11 +1007,17 @@ def _sketch_record(
     signs.mul_(2.0).sub_(1.0)
     projected = rows.matmul(signs).div_(math.sqrt(value.shape[-1]))
     stats = _hidden_statistics(projected)
-    return {
-        "output_dimensions": projection.output_dimensions,
-        "seed_sha256": projection.seed_sha256,
-        "statistics": stats,
-    }
+    array = projected.detach().contiguous().numpy().astype("<f8", copy=True)
+    array[array == 0.0] = 0.0
+    array.flags.writeable = False
+    return (
+        {
+            "output_dimensions": projection.output_dimensions,
+            "seed_sha256": projection.seed_sha256,
+            "statistics": stats,
+        },
+        array,
+    )
 
 
 def _paired_statistics(observed: torch.Tensor, control: torch.Tensor) -> dict[str, Any]:
@@ -1411,6 +1513,7 @@ def _execute_arm(
     hidden_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     layer_records: list[dict[str, Any]] = []
     summaries: list[NumericSummary] = []
+    contextual_hidden_transitions: list[ContextualHiddenTransition] = []
     crsa_rows: list[dict[str, Any]] = []
     restored_observer: Any | None = None
     try:
@@ -1453,15 +1556,32 @@ def _execute_arm(
                     "state": state_record,
                 }
                 if spec.hidden_sketch is not None:
-                    record["pre_sketch"] = _sketch_record(
+                    pre_sketch, pre_array = _sketch_record(
                         pre,
                         spec.hidden_sketch,
                         max_elements=spec.budget.max_sketch_elements,
                     )
-                    record["post_sketch"] = _sketch_record(
+                    post_sketch, post_array = _sketch_record(
                         post,
                         spec.hidden_sketch,
                         max_elements=spec.budget.max_sketch_elements,
+                    )
+                    record["pre_sketch"] = pre_sketch
+                    record["post_sketch"] = post_sketch
+                    contextual_hidden_transitions.append(
+                        ContextualHiddenTransition(
+                            layer=layer,
+                            projection_seed_sha256=spec.hidden_sketch.seed_sha256,
+                            output_dimensions=spec.hidden_sketch.output_dimensions,
+                            pre_sketch_sha256=cast(
+                                str, pre_sketch["statistics"]["sha256"]
+                            ),
+                            post_sketch_sha256=cast(
+                                str, post_sketch["statistics"]["sha256"]
+                            ),
+                            pre_array=pre_array,
+                            post_array=post_array,
+                        )
                     )
                 layer_records.append(record)
                 hidden_by_layer[layer] = (pre, post)
@@ -1531,6 +1651,7 @@ def _execute_arm(
         intervention_configuration=intervention_configuration,
         layers=layer_records,
         hidden_by_layer=hidden_by_layer,
+        contextual_hidden_transitions=contextual_hidden_transitions,
         delta_probes=delta.rows,
         crsa_evidence=crsa_rows,
         final_hidden_sha256=_tensor_record(final_hidden)["sha256"],
@@ -1858,7 +1979,10 @@ class Qwen38CartographyProbe:
             measurement=measurement,
             evidence_document=primary_evidence,
             access_trace=primary_capture.access_trace,
-            tensor_range_receipts=primary_capture.tensor_receipts,
+        tensor_range_receipts=primary_capture.tensor_receipts,
+        contextual_hidden_transitions=tuple(
+            primary_capture.contextual_hidden_transitions
+        ),
             control_measurement=control_measurement,
             control_evidence_document=control_evidence,
             control_access_trace=(
@@ -1877,6 +2001,7 @@ __all__ = [
     "CARTOGRAPHY_EVIDENCE_SCHEMA",
     "CARTOGRAPHY_PROMPT_SCHEMA",
     "CartographyProbeResult",
+    "ContextualHiddenTransition",
     "HiddenSketchProjection",
     "ProbeCoordinateSpec",
     "ProbeResourceBudget",

@@ -26,7 +26,7 @@
     },
     {
       "name": "Markov-OoE",
-      "role": "O1/Atlas learning, PS-Lifted consolidation, and executable Crystals",
+      "role": "O1/Atlas contextual operator harvest, PS-Lifted consolidation, autonomous search, demand learning, and executable Crystals",
       "repository": "https://github.com/DT-Foss/immer",
       "revision": "package:0.8.0",
       "status": "integrated runtime",

@@ -24,14 +24,21 @@ release surface.
   supplies deterministic parsing, verification, and explicit abstention.
 - **Organism of Experts.** O1 measurements become authenticated Atlas evidence;
   PS-Lifted Markov agents learn action-conditioned world models, compose
-  verified options, and publish executable Crystals while Qwen supplies cold
-  evidence and handles genuine novelty.
+  verified options, harvest real contextual Qwen transitions, and publish
+  executable Crystals while Qwen supplies cold evidence and handles genuine
+  novelty.
 - **Compute batteries.** Native Qwen continuation states are charged ahead of
   demand, restored by exact token prefix, and resumed without replaying the
   authenticated prefix.
 - **Stored compute.** `ComputeCrystal` programs materialize reusable numerical
   operators. The Markov operator graph charges verified routes, fuses compatible
-  chains, and later applies one stored operator to previously unseen values.
+  chains, applies the deepest charged prefix to previously unseen values, and
+  computes only the unknown residual suffix live.
+- **Autonomous operator search.** Constructive Birkhoff decomposition stores
+  only the permutation atoms an operator uses. Contextual Thompson mutation,
+  behavioral MAP-Elites, Fiedler-projector novelty, verified UCB1, PPM route
+  prediction, co-occurrence prefetch, and Ricci retention drive exploration and
+  demand.
 - **Exact result cells.** A `ResultCell` is the sealed special case for one
   complete Qwen/FERTIG result binding. It is distinct from a generic
   `ComputeCrystal` and executes only under exact prompt, model, provenance, and
@@ -52,9 +59,13 @@ release surface.
 | Action-conditioned Markov planning | 250/250 unseen tasks | 68 one-step observations only; 4–10-step tasks; 12-replica local cohort 226/3,000 (7.53%), shuffled-action placebo 89/250, no-memory 68/250 |
 | Continuous reservoir memory | 90.84% fused | delayed-state task; 82.16% local mean, 50.45% no-memory, 54.28% shuffled-label placebo |
 | Compositional stored compute | 4 operators → 1 exact discharge | 128 unseen vectors; 27,648 historical work units released; maximum delta 1.78e-15 |
+| Charged-prefix residual compute | 2 charged + 2 live suffix steps | 128 unseen vectors; 9,216 historical work units released; maximum delta 1.33e-15 |
+| Birkhoff operator basis | 33 atoms; exact bound 50 | weighted atom discharge matches the stored 8×8 Markov operator within 6.66e-16 |
+| Autonomous operator search | 12 MAP-Elites cells; late mutation preference 100% | 14 Pareto elites; Fiedler missing-bridge priority 0.409 vs. 0.121 for the best existing edge |
 | Algebraic crystallization | 3/3 families admitted and exact | additive, multiplicative, and cyclic length-12 execution; permuted placebo rejected |
 | Qwen compute battery | 1.4288x peak speed | 65-token charged prefix + unknown 33-token suffix; authenticated restore removes 30.01% of demand latency |
 | O1 → Atlas → OoE | 10/10 live jobs; 15 measurements | two real contextual Qwen sites, Atlas revision 15, crash-resumable promotion, exact zero-probe reuse |
+| Real Qwen context → operator harvest | 8/8 transitions grouped into 2 layer families | four distinct prompts through the committed causal-Qwen fixture; exact runtime receipts remain separate while stable families pool correctly |
 | Real Qwen ResultCell holdout | 5 → 0 Qwen forwards | four temporal train transitions; holdout transition absent; exact raw-Qwen and final-semantic parity; gold-correct under one frozen evaluator call; FERTIG abstained on both paths |
 | Qwen3.5 → Qwen3.8 live K=4 | 4/4 draft tokens accepted | fixed native Prefix-Sinkhorn trial; 32.39% fewer combined source bytes and 1.349x wall-time speedup versus 2×K=2 |
 | Qwen GC pressure policy | bit-identical; 134 → 2 collections | fixed causal CPU-BF16 A/B; 6.88% less process wall time and 1.074x speedup |

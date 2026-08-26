@@ -20,9 +20,11 @@ request -> CompositionRoot -> FERTIG exact first refusal
 
 continuous learning plane:
 
-Qwen probe -> exact WeightCoordinate -> SemanticWeightAtlas -> O1 signal
-     -> replicated Markov site agents -> PS-Lifted consensus
-     -> world model / options / operator graph -> Crystal stores
+Qwen probe -> exact WeightCoordinate + projected pre/post hidden states
+     -> SemanticWeightAtlas -> O1 signal -> contextual operator harvester
+     -> affine / permutation / Markov Crystals -> Birkhoff atom bases
+     -> replicated Markov agents -> world model / options / operator graph
+     -> demand scheduler -> charged prefix + live residual suffix
 ```
 
 ## 1. Immutable data plane
@@ -94,6 +96,13 @@ Hopfield energy supplies the calibrated novelty gate. Regime receipts make
 nonstationary retention changes explicit rather than silently rewriting the
 learned world.
 
+The same agents now learn operator demand. UCB1 explores every unseen
+materialized route before exploitation; verified negative evidence blocks the
+exact failed route/revision/ABI until a later verified success replaces it.
+PPM uses selection order rather than asynchronous verifier-completion order.
+Explicit episodes build co-occurrence prefetch, and Ricci retention ranks
+resident routes by `|R| exp(-alpha*logical_age)` while pins remain protected.
+
 The action alphabet is `restore_anchor`, `execute_fertig`, `mount_organ`,
 `probe_coordinate`, and `qwen_fallback`. Coverage is explicit. A partial
 Crystal executes covered sources and abstains everywhere else.
@@ -118,6 +127,28 @@ operator. Discharge applies the stored operator to values that did not exist
 when it was charged and records equivalent source work, live work, and released
 historical work. The bank and graph use content addresses, atomic manifests,
 generation checks, and crash recovery.
+
+Residual discharge extends full-route charging. A future plan selects the
+deepest compatible route that carries an authenticated charge basis, executes
+that stored prefix, and applies only the remaining primitive suffix. A
+materialized address without a charge basis receives no historical-work
+credit. One receipt binds the
+original plan, graph head, prefix route, both VM executions, tensor hashes,
+provenance, equivalent work, live work, and released work.
+
+Doubly-stochastic operators use constructive Birkhoff decomposition:
+
+```text
+measured kernel -> positive-support perfect matchings -> weighted atoms
+                -> executable permutation Crystals + Markov Crystal
+```
+
+The bank stores `O(Kn)` permutation images, never a factorial basis. The
+component count obeys `(n-1)^2+1`; weighted atom execution is checked against
+the Markov Crystal on future inputs. Behavioral MAP-Elites retains diverse
+Pareto operators, contextual Thompson sampling learns mutation families, and
+Fiedler-projector distance proposes missing graph bridges without eigenvector
+sign or basis ambiguity.
 
 Algebraic Crystals learn the coordinate system of an operator family rather
 than memorizing its outputs. Admission compares additive, multiplicative, and
@@ -158,6 +189,21 @@ maximum seen head; teacher transitions retain their independent temporal order.
 Crystal promotion uses a sealed two-phase transaction, so a crash during a
 multi-site publication batch resumes from prepared state without repeating a
 Qwen probe.
+
+The probe also returns the deterministic hidden projections it already used
+for evidence. Each float64 pre/post array is read-only and its byte hash must
+match the sealed layer record. The live cartography script converts those
+arrays into contextual transition receipts immediately after Atlas append and
+feeds a separate persistent ComputeCrystal bank. Exact per-prompt runtime
+receipts remain audit evidence; a stable runtime-family identity pools
+compatible prompts and coordinates under one layer/action family. Intervention
+mode and Qwen action schema prevent incompatible arms from sharing a fit.
+
+The harvester fits earlier cursor-ordered observations and reserves the newest
+one as holdout. It promotes affine, exact permutation, and stochastic Markov
+operators only after train and holdout execution match. Numeric summaries and
+placebo effects remain scalars; the runtime never reconstructs a hidden tensor
+from summary statistics.
 
 ## 7. DeepSeek-V4-Flash transport laboratory
 

@@ -22,6 +22,8 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
+
 from immer.runtimes.o1_state import O1Cartographer, ProbeJob, ProbeTarget
 from immer.runtimes.o1_state.plasticity import LearningStream
 from immer.runtimes.ooe.cartography import OoeCartographyBridge
@@ -32,6 +34,19 @@ from immer.runtimes.ooe.controller import (
     OoeControllerIntegrityError,
 )
 from immer.runtimes.ooe.crystal import CrystalStore
+from immer.runtimes.ooe.bvn_crystals import (
+    BirkhoffCrystalBank,
+    BirkhoffCrystalIntegrityError,
+)
+from immer.runtimes.ooe.compute_crystals import MARKOV_FLOAT64, ComputeCrystalBank
+from immer.runtimes.ooe.compute_graph import ComputeOperatorGraph
+from immer.runtimes.ooe.operator_harvester import (
+    ContinuousOperatorHarvester,
+    HarvesterConfig,
+    SingleBatchContextualProvider,
+    contextual_observations_from_probe_result,
+    probe_result_context_cursor,
+)
 from immer.runtimes.qwen3_8 import (
     GraphRevision,
     HiddenSketchProjection,
@@ -60,6 +75,7 @@ SCHEDULER_NAME = "scheduler.json"
 ATLAS_NAME = "atlas"
 O1_STATE_NAME = "o1-state.pt"
 OOE_NAME = "ooe"
+OPERATOR_COMPUTE_NAME = "operator-compute"
 OOE_PROMOTION_STATE_NAME = "qwen-o1-cartography-promotion-transaction"
 OOE_PROMOTION_TRANSACTION_SCHEMA = (
     "immer.qwen3.8-o1-cartography-ooe-promotion-transaction/v1"
@@ -173,6 +189,7 @@ def _contained(root: Path, name: str) -> Path:
         ATLAS_NAME,
         O1_STATE_NAME,
         OOE_NAME,
+        OPERATOR_COMPUTE_NAME,
     }:
         raise O1CartographyCliError("cartography output name is not allowlisted")
     candidate = root / name
@@ -1145,6 +1162,105 @@ def _append_probe_result(
     return _observation(job, spec, primary, reused=False), source_bytes
 
 
+def _harvest_probe_context(
+    root: Path,
+    *,
+    atlas: Any,
+    result: Any,
+) -> dict[str, Any] | None:
+    """Feed real projected Qwen states into the persistent operator graph."""
+
+    transitions = getattr(result, "contextual_hidden_transitions", ())
+    if not isinstance(transitions, tuple) or not transitions:
+        return None
+    atlas_revision = atlas.revision()
+    if not isinstance(atlas_revision, GraphRevision):
+        raise O1CartographyCliError("Atlas returned an invalid contextual head")
+    observations = contextual_observations_from_probe_result(
+        result,
+        atlas_revision=atlas_revision,
+    )
+    if not observations:
+        return None
+    measurement = getattr(result, "measurement", None)
+    if not isinstance(measurement, MeasurementReceipt):
+        raise O1CartographyCliError("contextual probe lost its measurement receipt")
+    provider = SingleBatchContextualProvider(
+        cursor=probe_result_context_cursor(measurement, atlas_revision),
+        observations=observations,
+    )
+    compute_root = _contained(root, OPERATOR_COMPUTE_NAME)
+    bank = ComputeCrystalBank(compute_root)
+    graph = ComputeOperatorGraph(bank)
+    harvester = ContinuousOperatorHarvester(
+        atlas=atlas,
+        provider=provider,
+        graph=graph,
+        config=HarvesterConfig(
+            minimum_observations=3,
+            minimum_fit_rows=4,
+            max_observations_per_step=128,
+            max_samples_per_group=1024,
+            max_groups=4096,
+            max_recent_receipts=65_536,
+            graph_cas_retries=16,
+        ),
+    )
+    harvested = harvester.step(limit=128)
+    bvn_receipt_sha256s = []
+    bvn_rejections = []
+    bvn_bank = BirkhoffCrystalBank(bank)
+    for promotion in harvested.promotions:
+        if promotion.candidate.operator_kind != MARKOV_FLOAT64:
+            continue
+        crystal = bank.restore_crystal(promotion.edge.crystal_sha256)
+        dimension = crystal.input_abi.trailing_shape[0]
+        kernel = crystal.apply(np.eye(dimension, dtype=np.float64))
+        try:
+            bvn_publication = bvn_bank.publish(
+                kernel,
+                verifier_sha256=promotion.edge.verifier_sha256,
+                evidence_sha256s=(promotion.edge.evidence_sha256,),
+                tolerance=1e-10,
+            )
+        except BirkhoffCrystalIntegrityError:
+            bvn_rejections.append(promotion.edge.sha256)
+        else:
+            bvn_receipt_sha256s.append(bvn_publication.receipt.sha256)
+    return {
+        "accepted_observations": harvested.accepted_observations,
+        "atlas_revision": harvested.atlas_revision.to_document(),
+        "candidate_statuses": [
+            {
+                "group_sha256": row.group_sha256,
+                "operator_kind": row.operator_kind,
+                "status": row.status,
+            }
+            for row in harvested.candidates
+        ],
+        "bvn_receipt_sha256s": sorted(bvn_receipt_sha256s),
+        "bvn_rejected_edge_sha256s": sorted(bvn_rejections),
+        "cursor_after": harvested.cursor_after,
+        "graph_state_sha256": harvested.graph_state_sha256,
+        "promotion_edge_sha256s": sorted(
+            row.edge.sha256 for row in harvested.promotions
+        ),
+        "promotion_crystal_sha256s": sorted(
+            row.candidate.crystal_sha256
+            for row in harvested.promotions
+            if row.candidate.crystal_sha256 is not None
+        ),
+        "rejections": [
+            {
+                "observation_receipt_sha256": row.observation_receipt_sha256,
+                "reason": row.reason,
+            }
+            for row in harvested.rejections
+        ],
+        "state_sha256": harvested.state_sha256,
+    }
+
+
 def _reconcile_receipts(
     scheduler: O1Cartographer,
     atlas: Any,
@@ -1855,6 +1971,7 @@ def run_cartography(
                 and outcome.atlas_receipt_sha256 is not None
             }
             outcomes = []
+            operator_harvest_receipts: list[dict[str, Any]] = []
             qwen_probe_calls = 0
             reused_atlas_proofs = 0
             started = time.monotonic()
@@ -1881,6 +1998,13 @@ def run_cartography(
                         spec=spec,
                         model_pin=model_pin,
                     )
+                    harvested = _harvest_probe_context(
+                        ooe_path,
+                        atlas=atlas,
+                        result=result,
+                    )
+                    if harvested is not None:
+                        operator_harvest_receipts.append(harvested)
                     from immer.runtimes.o1_state import ProbeOutcome
 
                     elapsed = time.monotonic() - before
@@ -1998,6 +2122,20 @@ def run_cartography(
                 "elapsed_seconds": elapsed,
                 "manifest_sha256": manifest["sha256"],
                 "ooe": ooe_report,
+                "operator_harvest": {
+                    "available": bool(operator_harvest_receipts),
+                    "accepted_observations": sum(
+                        row["accepted_observations"]
+                        for row in operator_harvest_receipts
+                    ),
+                    "promotion_edge_sha256s": sorted(
+                        edge
+                        for row in operator_harvest_receipts
+                        for edge in row["promotion_edge_sha256s"]
+                    ),
+                    "receipts": operator_harvest_receipts,
+                    "root": str(_contained(ooe_path, OPERATOR_COMPUTE_NAME)),
+                },
                 "receipts_reconciled": reconciled,
                 "stop_reason": stop_reason,
             }

@@ -4,6 +4,58 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-26
 
+### Continuous operator harvest, search, and residual discharge
+
+- Extended the real Qwen cartography probe with read-only float64 pre/post
+  hidden-state projections. Their arrays are hash-bound to the sealed layer
+  evidence and flow directly into the O1 operator harvester; static embedding
+  means are absent from this path.
+- Connected `scripts/qwen38_o1_cartography.py` to a persistent contextual
+  operator bank and graph. Each live probe appends its authenticated Atlas
+  measurement, emits contextual transitions, advances a monotonic cursor,
+  updates the harvester, and reports every promoted Crystal and edge.
+- Added prompt-independent runtime-family identity. Exact per-prompt runtime
+  receipts remain intact while code, model/weight revision, dependencies,
+  platform, intervention family, feature schema, and action schema determine
+  reusable operator groups. Audit coordinates remain provenance instead of
+  fragmenting one layer operator into separate groups.
+- Added deterministic affine, exact permutation, and row-stochastic Markov
+  discovery from contextual arrays with chronological fit/holdout separation.
+  Scalar Atlas summaries remain scalar evidence and are never inflated into
+  hidden tensors. Historical append-only Atlas heads accumulate continuously;
+  foreign heads, placebo arms, inactive measurements, replay, transplant,
+  nonlinear holdout failure, and state tamper reject.
+- Added NumPy-only constructive Birkhoff-von Neumann decomposition with the
+  exact `(n-1)^2+1` component bound, strict theta shape and gauge, O(Kn)
+  permutation storage, authenticated reconstruction receipts, and executable
+  Crystal publication. The runtime stores only the atoms used by the measured
+  operator and applies their weighted outputs with row-vector semantics.
+- Added contextual Thompson mutation, diagonal success-step adaptation,
+  behavioral Pareto MAP-Elites, matched empirical spectral filtering, and
+  basis-invariant Fiedler-projector edge novelty. The fixed operator trial
+  stores `33` atoms under the bound `50`, reconstructs within `6.6613e-16`,
+  occupies `12` MAP-Elites cells with `14` elites, and learns the successful
+  mutation arm on `32/32` late decisions.
+- Added verified demand learning for materialized routes: unseen-first UCB1,
+  exact negative route/revision/ABI evidence, selection-ordered PPM under
+  asynchronous verification, episode-scoped co-occurrence prefetch, and Ricci
+  retention `|R| exp(-alpha*age)` with protected pins and full artifact-byte
+  accounting. Every public receipt now passes typed semantic reconstruction.
+- Added charged-prefix residual execution. A future longer plan selects its
+  deepest authenticated charged prefix, executes that stored operator, and
+  computes only the primitive suffix. The fixed 128-input trial reuses two
+  charged steps, runs two residual steps, releases `9,216` historical work
+  units, and matches the four-step primitive path within `1.3323e-15`.
+- Closed the imported candidate defects instead of copying them: no silent
+  theta padding, no truncated BvN mass, no factorial basis cache, no mislabeled
+  CMA-ES, no worse-than-elite replacement, no false sequence learning from
+  verifier completion order, no fabricated global episode, and no metadata-only
+  byte budget.
+- Verified the complete repository with `1,626/1,626` tests under
+  `ResourceWarning`-as-error in `410.414 s`. Every changed source, script, and
+  test passes Ruff; the changed public files pass compile, JSON, diff,
+  link-target, anti-hedge, and private-path gates.
+
 ### Compositional crystal intelligence
 
 - Added a finite action-conditioned world model over authenticated one-step

@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import numpy as np
 import torch
 from safetensors.torch import save_file
 
@@ -19,6 +20,17 @@ from immer.runtimes.deepseek_v4.causal_weights import (
     LogicalModelIdentity,
     tensor_range_plan_from_source,
 )
+from immer.runtimes.ooe.operator_harvester import (
+    ContinuousOperatorHarvester,
+    HarvesterConfig,
+    OperatorHarvesterIntegrityError,
+    QWEN_CONTEXT_EMITTER_SHA256,
+    SingleBatchContextualProvider,
+    contextual_observations_from_probe_result,
+    probe_result_context_cursor,
+)
+from immer.runtimes.ooe.compute_crystals import ComputeCrystalBank
+from immer.runtimes.ooe.compute_graph import ComputeOperatorGraph
 from immer.runtimes.qwen3_8.cartography_probe import (
     HiddenSketchProjection,
     ProbeCoordinateSpec,
@@ -200,6 +212,44 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
             tensor_plans=plans,
         )
         atlas.append_measurement(first.measurement)
+        contextual = contextual_observations_from_probe_result(
+            first,
+            atlas_revision=atlas.revision(),
+        )
+        self.assertEqual(len(contextual), 2)
+        self.assertTrue(
+            all(
+                row.receipt.emitter_sha256 == QWEN_CONTEXT_EMITTER_SHA256
+                for row in contextual
+            )
+        )
+        cursor = probe_result_context_cursor(first.measurement, atlas.revision())
+        page = SingleBatchContextualProvider(
+            cursor=cursor,
+            observations=contextual,
+        ).poll(after_cursor=None, limit=2)
+        self.assertEqual(page.next_cursor, cursor)
+        self.assertEqual(page.observations, contextual)
+        provider = SingleBatchContextualProvider(
+            cursor=cursor,
+            observations=contextual,
+        )
+        with self.assertRaises(OperatorHarvesterIntegrityError):
+            provider.poll(after_cursor="foreign-cursor", limit=2)
+
+        class _ForgedResult:
+            measurement = first.measurement
+            contextual_hidden_transitions = first.contextual_hidden_transitions
+
+            @staticmethod
+            def verify() -> None:
+                return None
+
+        with self.assertRaises(TypeError):
+            contextual_observations_from_probe_result(
+                _ForgedResult(),
+                atlas_revision=atlas.revision(),
+            )
         second = self.executor.execute(
             self._spec(), atlas_head_revision=atlas.revision()
         )
@@ -226,9 +276,92 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
         )
         self.assertEqual(first.measurement.intervention.mode, "passive")
         self.assertIsNone(first.measurement.observed_semantic_label)
+        self.assertEqual(len(first.contextual_hidden_transitions), 2)
+        self.assertEqual(len(second.contextual_hidden_transitions), 2)
+        for left, right in zip(
+            first.contextual_hidden_transitions,
+            second.contextual_hidden_transitions,
+            strict=True,
+        ):
+            self.assertEqual(left.layer, right.layer)
+            self.assertEqual(left.output_dimensions, 5)
+            np.testing.assert_array_equal(left.pre_array, right.pre_array)
+            np.testing.assert_array_equal(left.post_array, right.post_array)
+            self.assertFalse(left.pre_array.flags.writeable)
+            self.assertFalse(left.post_array.flags.writeable)
+            with self.assertRaises(ValueError):
+                left.pre_array[0, 0] = 0.0
         self.assertEqual(_committed_state(self.model), before)
         first.verify()
         second.verify()
+
+    def test_real_qwen_contexts_accumulate_across_prompt_specific_runtime_receipts(
+        self,
+    ) -> None:
+        plans = tuple(
+            self.mount.resolve_tensor_plan(str(row["name"]))
+            for row in self.mount.source.inventory().get("tensors", ())
+        )
+        atlas = None
+        results = []
+        token_sets = ((1, 4, 9), (2, 5, 8), (3, 6, 10), (7, 11, 12))
+        for tokens in token_sets:
+            base = self._spec()
+            spec = replace(
+                base,
+                prompt_token_ids=tokens,
+                prompt_sha256=prompt_token_sha256(tokens),
+            )
+            head = self.atlas_head if atlas is None else atlas.revision()
+            result = self.executor.execute(spec, atlas_head_revision=head)
+            if atlas is None:
+                atlas = SemanticWeightAtlas(
+                    self.atlas_graph,
+                    model_pin=result.measurement.model_pin,
+                    tensor_plans=plans,
+                )
+            atlas.append_measurement(result.measurement)
+            results.append(result)
+        assert atlas is not None
+        final_head = atlas.revision()
+        observations = tuple(
+            observation
+            for result in results
+            for observation in contextual_observations_from_probe_result(
+                result,
+                atlas_revision=final_head,
+            )
+        )
+        bank = ComputeCrystalBank(Path(self.temporary.name) / "operator-compute")
+        graph = ComputeOperatorGraph(bank)
+        provider = SingleBatchContextualProvider(
+            cursor=probe_result_context_cursor(results[-1].measurement, final_head),
+            observations=observations,
+        )
+        harvester = ContinuousOperatorHarvester(
+            atlas=atlas,
+            provider=provider,
+            graph=graph,
+            config=HarvesterConfig(
+                minimum_observations=3,
+                minimum_fit_rows=4,
+                max_observations_per_step=16,
+                max_samples_per_group=16,
+                max_groups=16,
+                max_recent_receipts=32,
+                graph_cas_retries=4,
+            ),
+        )
+
+        harvested = harvester.step(limit=16)
+
+        self.assertEqual(harvested.accepted_observations, 8)
+        state = harvester.state()
+        self.assertEqual(len(state.groups), 2)
+        for _group_sha, rows in state.groups:
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(len({row.receipt.runtime_family_sha256 for row in rows}), 1)
+            self.assertEqual(len({row.receipt.runtime_sha256 for row in rows}), 4)
 
     def test_passive_external_label_is_recorded_and_evidence_bound(self) -> None:
         unlabeled = self._spec(hidden_sketch=None)

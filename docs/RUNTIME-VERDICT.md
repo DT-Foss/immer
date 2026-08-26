@@ -12,9 +12,11 @@ execution planes:
 2. O1-State measurement and experiment selection over an append-only
    SemanticWeightAtlas;
 3. replicated action-conditioned Markov world models, PS-Lifted consensus,
-   hierarchical options, continuous reservoir memory, and novelty admission;
+   hierarchical options, continuous reservoir memory, operator-demand
+   learning, and novelty admission;
 4. generic stored computation through ComputeCrystals, an authenticated
-   operator graph, algebraic crystallization, and exact warm discharge;
+   operator graph, contextual operator harvesting, Birkhoff atom bases,
+   algebraic crystallization, and charged-prefix residual discharge;
 5. deterministic FERTIG/S3 capability execution and sealed ResultCells under
    final parity accounting;
 6. LiveCausal addressing and exact Safetensors range execution, with the
@@ -49,6 +51,20 @@ later requests.
 - A generic four-operator ComputeCrystal route discharges as one operator on
   128 values created after charging, releases `27,648` authenticated historical
   work units, and matches primitive execution within `1.7764e-15`.
+- A two-step charged prefix executes inside a four-step future route, computes
+  only the two-step residual suffix, releases `9,216` historical work units,
+  and matches primitive execution within `1.3323e-15`.
+- The constructive 8×8 Birkhoff trial stores `33` permutation atoms under the
+  exact bound `50` and reproduces the Markov operator within `6.6613e-16`.
+  Behavioral MAP-Elites retains `14` Pareto operators across `12` cells; the
+  Thompson mutation agent selects the successful arm on all `32` late trials.
+- Fiedler-projector novelty ranks the strongest missing barbell bridge at
+  `0.409362` against `0.120790` for the strongest existing edge after its
+  direct-edge penalty.
+- Four distinct prompts through the committed causal-Qwen fixture yield eight
+  authenticated hidden transitions grouped into two reusable layer families.
+  Exact prompt runtime receipts remain distinct and the stable operator family
+  pools all four contexts.
 - Additive, multiplicative, and finite-cyclic maps all pass admission above
   `0.999998` and execute length-12 compositions exactly; the permuted placebo
   is rejected.
@@ -72,8 +88,8 @@ evidence surface for each result.
 |---|---|---|
 | local Qwen | `src/immer/runtimes/qwen3_8/` | authenticated causal mount, exact stateful inference, Prefix-Sinkhorn, anchors |
 | O1 and Atlas | `src/immer/runtimes/o1_state/`, `src/immer/runtimes/ooe/cartography.py` | persistent learning state, exact measurement identity, append-only revision membership |
-| Markov intelligence | `src/immer/runtimes/ooe/` | action-conditioned evidence, PS-Lifted fusion, planning, options, novelty, topology and regime receipts |
-| ComputeCrystal | `compute_crystals.py`, `compute_graph.py`, `algebraic_crystals.py` | typed unseen-input programs, authenticated charge basis, atomic persistence, exact discharge accounting |
+| Markov intelligence | `src/immer/runtimes/ooe/` | action-conditioned evidence, PS-Lifted fusion, planning, options, demand, novelty, topology and regime receipts |
+| ComputeCrystal | `compute_crystals.py`, `compute_graph.py`, `residual_execution.py`, `operator_harvester.py`, `bvn_search.py`, `bvn_crystals.py`, `algebraic_crystals.py` | real contextual operator discovery, typed unseen-input programs, constructive atom bases, authenticated charge basis, residual execution, atomic persistence, exact accounting |
 | ResultCell | `result_cells.py` | one complete cold-result binding, zero-forward warm execution, final semantic and evaluator parity |
 | exact execution | `src/immer/cognition/` | S3/FERTIG verification, grounded fallback, explicit abstention |
 | LiveCausal | `src/immer/knowledge/livecausal.py` | immutable payloads, append-only causal graph, lazy exact queries, recovery |

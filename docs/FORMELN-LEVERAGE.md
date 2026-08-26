@@ -143,6 +143,80 @@ The current four-operator affine route executes as one operator on 128 values
 created after charging, with 27,648 historical work units released and
 maximum output delta 1.7764e-15.
 
+### Charged prefix plus live residual
+
+For a planned primitive sequence (K_1,ldots,K_n), let the deepest charged
+terminal cover (K_1,ldots,K_m). Runtime execution is
+
+\[
+y=
+K_n\circ\cdots\circ K_{m+1}
+\left(K_{1:m}^{\mathrm{charged}}(x)\right).
+\]
+
+The joined receipt verifies the intermediate hash
+
+\[
+H\!\left(K_{1:m}^{\mathrm{charged}}(x)\right)
+=H(x_{\mathrm{suffix\ input}})
+\]
+
+and sums source/live work across both VM receipts. The fixed route reuses two
+charged steps, computes two suffix steps, releases 9,216 work units, and
+matches primitive execution within 1.3323e-15.
+
+### Constructive Birkhoff operator bases
+
+Every admitted doubly-stochastic kernel is represented as
+
+\[
+P=\sum_{k=1}^{M}w_k\Pi_k,
+\qquad
+w_k>0,quad \sum_k w_k=1,quad
+M\le (n-1)^2+1.
+\]
+
+Each iteration selects a perfect matching on the positive residual support,
+subtracts its minimum matched mass, and records one permutation atom. Persistent
+storage is (O(Mn)), not (O(n!)). Theta search stays inside the Birkhoff
+polytope by construction:
+
+\[
+P(\theta)=\sum_k \operatorname{softmax}(\theta)_k\Pi_k.
+\]
+
+The fixed 8×8 trial uses 33 atoms under the bound 50 and reconstructs future
+row-vector execution within 6.6613e-16.
+
+### Verified demand intelligence
+
+For materialized route (i), unseen-first UCB1 uses
+
+\[
+\operatorname{UCB}_i=
+\frac{R_i}{N_i}
++c\sqrt{\frac{2\log\sum_jN_j}{N_i}}.
+\]
+
+Verified failure blocks the exact tuple `(route, graph revision, input ABI)`;
+a later verified success on the same tuple restores eligibility. PPM predicts
+from the longest observed route suffix inside an explicit episode. Outcome
+arrival time never defines program order; the bound selection time does.
+Co-occurrence prefetch scores
+
+\[
+\operatorname{coScore}(j\mid A)=\sum_{i\in A}C_{ij},
+\]
+
+and resident retention uses David Foss's structural decay
+
+\[
+\operatorname{keep}(i)=|R_i|e^{-\alpha\,\operatorname{age}_i}.
+\]
+
+Logical time replaces wall-clock time, pins are never evicted, and byte budgets
+include route metadata, programs, Crystals, and charge receipts.
+
 ## 7. Novelty and structured kernels
 
 For site patterns \(X\), query \(q\), and inverse temperature \(\beta\), the
@@ -160,6 +234,18 @@ Structured action kernels use tensor-train/MPO factors only when the
 recomputed source error fits the authenticated budget. The current structured
 kernel stores 1,408 instead of 8,192 numeric bytes at 3.58e-16 relative
 error. Rank-budget overflow selects the exact dense representation.
+
+For graph-edge exploration, the Fiedler projector
+\(\Pi_F=B_FB_F^\top\) removes sign and degenerate-basis ambiguity:
+
+\[
+\operatorname{nov}(i,j)=
+\sqrt{\frac{(e_i-e_j)^\top\Pi_F(e_i-e_j)}{2}}.
+\]
+
+The proposal priority multiplies novelty by confidence and applies the direct
+edge penalty only when the edge already exists. In the fixed barbell trial the
+best missing bridge scores 0.409362; the best existing edge scores 0.120790.
 
 ## 8. Causal weight addressing
 

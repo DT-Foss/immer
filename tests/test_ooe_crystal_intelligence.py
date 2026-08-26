@@ -22,6 +22,11 @@ class CrystalIntelligenceBenchmarkTests(unittest.TestCase):
         self.assertEqual(headline["primitive_route_length"], 4)
         self.assertEqual(headline["live_operator_count"], 1)
         self.assertGreater(headline["historical_work_released"], 0)
+        self.assertTrue(headline["residual_exact"])
+        self.assertEqual(headline["residual_prefix_length"], 2)
+        self.assertEqual(headline["residual_suffix_length"], 2)
+        self.assertGreater(compute["residual_historical_work_released"], 0)
+        self.assertEqual(compute["residual_live_operator_count"], 3)
         self.assertEqual(compute["multi_step_teacher_labels"], 0)
         self.assertEqual(compute["unseen_batch"], 128)
         self.assertLess(compute["max_absolute_delta"], 1e-12)
@@ -45,6 +50,21 @@ class CrystalIntelligenceBenchmarkTests(unittest.TestCase):
                 algebra[family]["result"],
                 algebra[family]["expected"],
             )
+
+    def test_operator_search_learns_diverse_exact_and_topological_structure(
+        self,
+    ) -> None:
+        report = run_crystal_intelligence_benchmark(seed=20260826)
+        headline = report["headline"]
+        search = report["body"]["operator_search"]
+        self.assertTrue(headline["bvn_basis_exact"])
+        self.assertTrue(headline["bvn_basis_within_bound"])
+        self.assertTrue(headline["fiedler_prefers_missing_bridge"])
+        self.assertTrue(headline["mutation_preference_learned"])
+        self.assertGreaterEqual(headline["map_elites_occupied_cells"], 4)
+        self.assertGreaterEqual(search["mutation_late_preferred_fraction"], 0.75)
+        self.assertGreater(search["fiedler_best_missing_priority"], 0.0)
+        self.assertLessEqual(search["basis_max_absolute_delta"], 1e-12)
 
     def test_report_is_deterministic_json_and_self_sealed(self) -> None:
         first = run_crystal_intelligence_benchmark(seed=123)

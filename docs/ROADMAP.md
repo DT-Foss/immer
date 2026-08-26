@@ -19,6 +19,14 @@ around every domain that supports it.
   Sinkhorn assignment, and primitive-depth reduction.
 - [x] Generic ComputeCrystal VM, atomic bank, persistent operator graph,
   authenticated route charging, exact unseen-input discharge, and recovery.
+- [x] Real Qwen projected hidden transitions wired through Atlas into the
+  persistent affine/permutation/Markov operator harvester.
+- [x] Constructive Birkhoff atom banks, contextual Thompson mutation,
+  behavioral MAP-Elites, Fiedler-projector novelty, and matched spectral
+  filtering.
+- [x] Verified UCB1/PPM demand learning, episode-scoped co-occurrence prefetch,
+  Ricci retention, negative route evidence, and charged-prefix residual
+  discharge.
 - [x] Additive, multiplicative, and finite-cyclic algebraic crystallization with
   exact group accumulation and a rejected permuted placebo.
 - [x] Continuous PS-Lifted reservoir memory with delayed-state, no-memory,
@@ -67,8 +75,9 @@ around every domain that supports it.
   and planning contract.
 - [ ] Regenerate the five-seed and capacity local baselines across every
   replica, matching the corrected all-replica fixed-seed contract.
-- [ ] Carry generic ComputeCrystal charging from the deterministic operator
-  benchmark into live O1/Atlas-discovered numerical operators.
+- [ ] Run the extended local Qwen3.8 contextual frontier until the live
+  harvester publishes its first full-model held-out operator families and
+  materialized residual routes.
 - [ ] Broaden Qwen evaluation from fixed integration slices to frozen MMLU,
   GSM8K, and mixed-tool cohorts with exact dataset hashes.
 - [ ] Continue the retained DeepSeek split-rail and persistent-expert work only
