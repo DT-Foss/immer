@@ -252,7 +252,9 @@ The harvester fits earlier cursor-ordered observations and reserves the newest
 one as holdout. It promotes affine, exact permutation, and stochastic Markov
 operators only after train and holdout execution match. Numeric summaries and
 placebo effects remain scalars; the runtime never reconstructs a hidden tensor
-from summary statistics.
+from summary statistics. Weight-site measurements sharing one prompt remain
+separate Atlas records but count once inside an operator family, so fit and
+holdout evidence is prompt-diverse rather than coordinate-duplicated.
 
 Every promoted family crosses directly into the executable algebra catalog.
 The bridge rebinds the promotion to the current graph head, exact edge,

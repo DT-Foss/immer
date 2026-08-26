@@ -19,6 +19,12 @@ All notable changes to IMMER are recorded here.
   `attention-q` now resolves `linear_attn.in_proj_qkv` on DeltaNet layers and
   `self_attn.q_proj` on full-attention layers from the local bundle config;
   the first live L45 failure exposed and closed the stale all-softmax mapping.
+- Made contextual evidence prompt-diverse across the weight map. Multiple
+  coordinates from the same prompt still enter Atlas, but only the first
+  transition counts inside one operator family; later sites reject as
+  `duplicate-prompt-in-group`. Fit and temporal holdout therefore require three
+  distinct prompt signatures instead of three coordinate receipts carrying the
+  same hidden arrays.
 - Added the durable `idle` runner and weight-free `frontier-status`. Idle cycles
   resume after process failure, consume later frontier events, persist exact
   run/wait/error accounting, and reject a journal rollback once the scheduler
@@ -50,9 +56,12 @@ All notable changes to IMMER are recorded here.
   selects three executable affine/permutation/Markov families correctly on
   `174/180` decisions and `60/60` late decisions; the information-destroying
   shuffled-context placebo reaches `49/180` and `13/60` late.
-- Verified the complete repository with `1,708/1,708` tests under fatal
-  `ResourceWarning` in `590.926 s`. Ruff, formatting, compile, JSON, Markdown
-  links, private-path, diff, and anti-hedge gates pass.
+- Verified the complete repository through the prompt-diversity ingestion cut
+  with `1,709/1,709` tests under fatal `ResourceWarning` in `574.828 s`. The
+  reviewer-added fail-closed legacy-state invariant raises the discovered total
+  to `1,710`; the complete affected OoE block passes `368/368` in `162.255 s`.
+  Ruff, formatting, compile, JSON, Markdown links, private-path, diff, and
+  anti-hedge gates pass.
 
 ### Demand-routed execution and exact operator algebras
 

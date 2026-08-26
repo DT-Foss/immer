@@ -447,12 +447,8 @@ class ContextualTransitionReceipt:
                 ),
                 model_pin_sha256=cast(str, body.get("model_pin_sha256")),
                 runtime_sha256=cast(str, body.get("runtime_sha256")),
-                runtime_family_sha256=cast(
-                    str, body.get("runtime_family_sha256")
-                ),
-                intervention_sha256=cast(
-                    str, body.get("intervention_sha256")
-                ),
+                runtime_family_sha256=cast(str, body.get("runtime_family_sha256")),
+                intervention_sha256=cast(str, body.get("intervention_sha256")),
                 intervention_mode=cast(str, body.get("intervention_mode")),
                 coordinate_sha256=cast(str, body.get("coordinate_sha256")),
                 emitter_sha256=cast(str, body.get("emitter_sha256")),
@@ -681,9 +677,7 @@ class SingleBatchContextualProvider:
         rows = tuple(observations)
         if not rows or len(rows) > MAX_OBSERVATIONS_PER_BATCH:
             raise ValueError("single contextual page must be bounded and non-empty")
-        if any(
-            row.receipt.emitter_sha256 != self.emitter_sha256 for row in rows
-        ):
+        if any(row.receipt.emitter_sha256 != self.emitter_sha256 for row in rows):
             raise ValueError("single contextual page contains another emitter")
         self.observations = rows
 
@@ -1002,6 +996,10 @@ class HarvesterState:
                 raise ValueError("harvester group identity mismatch")
             if len({row.receipt.sha256 for row in rows}) != len(rows):
                 raise ValueError("harvester group contains duplicate observations")
+            if len({row.measurement.probe.prompt_signature for row in rows}) != len(
+                rows
+            ):
+                raise ValueError("harvester group contains duplicate prompt contexts")
         promotions = tuple(self.promotions)
         if tuple(sorted(promotions, key=lambda row: row.key)) != promotions or len(
             {row.key for row in promotions}
@@ -1317,6 +1315,7 @@ class ContinuousOperatorHarvester:
         recent: set[str],
         measurements_by_coordinate: dict[str, dict[str, MeasurementReceipt]],
         measurement_ids_by_group: Mapping[str, set[str]],
+        prompt_signatures_by_group: Mapping[str, set[str]],
     ) -> str | None:
         receipt = observation.receipt
         if receipt.emitter_sha256 != self.emitter_sha256:
@@ -1340,6 +1339,10 @@ class ContinuousOperatorHarvester:
             group_sha, set()
         ):
             return "duplicate-measurement-in-group"
+        if observation.measurement.probe.prompt_signature in (
+            prompt_signatures_by_group.get(group_sha, set())
+        ):
+            return "duplicate-prompt-in-group"
         coordinate = receipt.coordinate_sha256
         active = measurements_by_coordinate.get(coordinate)
         if active is None:
@@ -1734,6 +1737,10 @@ class ContinuousOperatorHarvester:
                 group_sha: {row.measurement.sha256 for row in rows}
                 for group_sha, rows in groups.items()
             }
+            prompt_signatures_by_group: dict[str, set[str]] = {
+                group_sha: {row.measurement.probe.prompt_signature for row in rows}
+                for group_sha, rows in groups.items()
+            }
             measurements_by_coordinate: dict[str, dict[str, MeasurementReceipt]] = {}
             accepted = 0
             rejections: list[HarvestRejection] = []
@@ -1744,6 +1751,7 @@ class ContinuousOperatorHarvester:
                     recent=recent,
                     measurements_by_coordinate=measurements_by_coordinate,
                     measurement_ids_by_group=measurement_ids_by_group,
+                    prompt_signatures_by_group=prompt_signatures_by_group,
                 )
                 if reason is not None:
                     rejections.append(
@@ -1764,6 +1772,9 @@ class ContinuousOperatorHarvester:
                     del rows[: len(rows) - self.config.max_samples_per_group]
                 measurement_ids_by_group.setdefault(group_sha, set()).add(
                     observation.measurement.sha256
+                )
+                prompt_signatures_by_group.setdefault(group_sha, set()).add(
+                    observation.measurement.probe.prompt_signature
                 )
                 recent.add(observation.receipt.sha256)
                 recent_order.append(observation.receipt.sha256)

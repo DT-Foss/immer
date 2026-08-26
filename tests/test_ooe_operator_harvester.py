@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -20,6 +21,7 @@ from immer.runtimes.ooe.compute_graph import (
     ComputeOperatorGraph,
     ComputeOperatorGraphConflictError,
 )
+from immer.runtimes.ooe.identity import canonical_json_bytes
 from immer.runtimes.ooe.operator_harvester import (
     ContextualObservationBatch,
     ContextualOperatorObservation,
@@ -554,9 +556,14 @@ class ContinuousOperatorHarvesterTests(unittest.TestCase):
             state_name="coordinate-pooling/v1",
         ).step()
 
-        self.assertEqual(len(self._harvester(
-            _ReplayProvider(()), state_name="coordinate-pooling/v1"
-        ).state().groups), 1)
+        self.assertEqual(
+            len(
+                self._harvester(_ReplayProvider(()), state_name="coordinate-pooling/v1")
+                .state()
+                .groups
+            ),
+            1,
+        )
         promoted = [
             row
             for row in result.promotions
@@ -568,6 +575,135 @@ class ContinuousOperatorHarvesterTests(unittest.TestCase):
             len(crystal.extensions["operator_harvester"]["coordinate_sha256s"]),
             4,
         )
+
+    def test_multiple_weight_sites_from_one_prompt_count_as_one_context(self) -> None:
+        shared_probe = ProbeIdentity(
+            question_sha256=_hash("shared-question"),
+            token_sha256=_hash("shared-tokens"),
+            family_sha256=_hash("context-family"),
+            label_source_sha256=_hash("label-free"),
+        )
+        repeated_measurements = []
+        for index in range(4):
+            measurement = replace(
+                self._measurement(
+                    index,
+                    append=False,
+                    coordinate=(_COORDINATE if index % 2 == 0 else _COORDINATE_ALT),
+                ),
+                probe=shared_probe,
+            )
+            self.atlas.append_measurement(measurement)
+            repeated_measurements.append(measurement)
+        matrix = np.array([[2.0, -1.0], [0.5, 3.0]], dtype=np.float64)
+        bias = np.array([0.25, -2.0], dtype=np.float64)
+        x = np.array(
+            [[-2.0, 1.0], [0.0, 0.5], [1.5, -3.0], [4.0, 2.0]],
+            dtype=np.float64,
+        )
+        repeated = tuple(
+            self._observation(
+                measurement,
+                x,
+                x @ matrix.T + bias,
+                source="prompt-diverse/raw",
+                target="prompt-diverse/final",
+                revision=self.atlas.revision(),
+            )
+            for measurement in repeated_measurements
+        )
+        first = self._harvester(
+            _ReplayProvider((repeated,)),
+            state_name="prompt-diverse-harvester/v1",
+        ).step()
+        self.assertEqual(first.accepted_observations, 1)
+        self.assertEqual(
+            [row.reason for row in first.rejections],
+            ["duplicate-prompt-in-group"] * 3,
+        )
+        self.assertFalse(first.promotions)
+
+        distinct_measurements = tuple(
+            self._measurement(20 + index) for index in range(2)
+        )
+        distinct = tuple(
+            self._observation(
+                measurement,
+                x + index,
+                (x + index) @ matrix.T + bias,
+                source="prompt-diverse/raw",
+                target="prompt-diverse/final",
+                revision=self.atlas.revision(),
+            )
+            for index, measurement in enumerate(distinct_measurements)
+        )
+        second = self._harvester(
+            _ReplayAgainProvider(distinct),
+            state_name="prompt-diverse-harvester/v1",
+        ).step()
+        self.assertEqual(second.accepted_observations, 2)
+        affine = [
+            row
+            for row in second.promotions
+            if row.candidate.operator_kind == AFFINE_FLOAT64
+        ]
+        self.assertEqual(len(affine), 1)
+        self.assertEqual(
+            len(affine[0].candidate.observation_receipt_sha256s),
+            3,
+        )
+
+    def test_legacy_persisted_same_prompt_group_rejects_on_resume(self) -> None:
+        first_measurement = self._measurement(0)
+        second_measurement = replace(
+            self._measurement(1, append=False, coordinate=_COORDINATE_ALT),
+            probe=first_measurement.probe,
+        )
+        self.atlas.append_measurement(second_measurement)
+        x = np.array(
+            [[-2.0, 1.0], [0.0, 0.5], [1.5, -3.0], [4.0, 2.0]],
+            dtype=np.float64,
+        )
+        first = self._observation(
+            first_measurement,
+            x,
+            2.0 * x + 1.0,
+            source="legacy-prompt/raw",
+            target="legacy-prompt/final",
+            revision=self.atlas.revision(),
+        )
+        second = self._observation(
+            second_measurement,
+            x,
+            2.0 * x + 1.0,
+            source="legacy-prompt/raw",
+            target="legacy-prompt/final",
+            revision=self.atlas.revision(),
+        )
+        name = "legacy-duplicate-prompt-state/v1"
+        harvester = self._harvester(
+            _ReplayProvider(((first,),)),
+            state_name=name,
+        )
+        harvester.step()
+        clean = self.bank.store.restore_state(name)
+        document = json.loads(clean)
+        document["body"]["groups"][0]["observations"].append(second.to_record())
+        document["body_sha256"] = hashlib.sha256(
+            canonical_json_bytes(document["body"])
+        ).hexdigest()
+        contaminated = canonical_json_bytes(document)
+        self.bank.store.publish_state(
+            name,
+            contaminated,
+            expected_sha256=hashlib.sha256(clean).hexdigest(),
+        )
+
+        with self.assertRaises(OperatorHarvesterIntegrityError):
+            self._harvester(
+                _ReplayProvider(()),
+                state_name=name,
+            ).step()
 
     def test_graph_cas_resume_and_replayed_receipts_are_idempotent(self) -> None:
         measurements = tuple(self._measurement(index) for index in range(4))
