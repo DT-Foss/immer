@@ -43,7 +43,7 @@ from .compute_crystals import (
     ComputeExecution,
     ComputeExecutionReceipt,
     ComputeProgram,
-    fuse_compatible_chain,
+    fuse_compatible_chain_with_provenance,
 )
 from .contraction_ledger import ContractionLedger
 from .crystal import CrystalStoreError, ManifestConflictError
@@ -2694,7 +2694,7 @@ class ComputeOperatorGraph:
             {MARKOV_FLOAT64},
             {CAUSAL_MIX_FLOAT64},
         ):
-            fused = fuse_compatible_chain(
+            fused = fuse_compatible_chain_with_provenance(
                 crystals,
                 extensions={
                     "compute_operator_graph": {

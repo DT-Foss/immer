@@ -4,6 +4,55 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-26
 
+### Production language bridge and continual self-extension
+
+- Added exact action-frontier builders for materialized ComputeOperatorGraph
+  routes and active algebra candidates. Route actions bind immutable route
+  receipts; algebra actions bind exact programs, candidate schemas, router
+  state, archive state, verifier, and a hashed reward policy.
+- Added `ConsequenceLanguageBridge`. A receiver-selected route now executes
+  through the real `DemandRoutedExecutor`; only the fully joined and persistently
+  committed `DemandRoutedExecutionReceipt` can create language feedback.
+  Rejection remains genuine negative evidence, while operational abort creates
+  no quality update.
+- Added atomic production-language persistence with CAS, rollback anchors,
+  transaction rollback after publication failure, exact bound-abort state, and
+  self-describing frontier restore. Macro-promotion metadata publishes before
+  the promoted state head and is recoverable by the promoted state SHA.
+- Added strict frontier migration. Q evidence transfers only for byte-identical
+  action bindings under the same reward policy and authenticated authority
+  transitions. Context-table evidence transfers only under the same context
+  schema. Changed actions, reward policies, or unproved authorities reset.
+- Added append-only route-frontier proofs carrying every canonical graph-state
+  payload. Restore replays every graph append, checks endpoint authorities,
+  retained/added route inventories, and the exact set of changed authority
+  names. Hand-built name-only proof objects cannot retain evidence.
+- Removed the vocabulary capacity cliff. Frontier migration preserves every
+  existing word and deterministically allocates unused opaque words until the
+  vocabulary covers the expanded action set; copied Q tables use exact old-word
+  slices and new words start unvisited.
+- Added verified word trajectories ordered by persisted Demand selection time.
+  Promotion requires the declared step count, all-positive joined outcomes,
+  one episode identity, and a terminal verification receipt whose verifier is
+  pinned by the frontier.
+- Added repeated-word discovery, route-word-to-program resolution, MacroOption
+  translation, local lexicon compilation, compiled-word action promotion, and
+  atomic language-frontier migration. The promotion receipt binds discovery,
+  definition, compiled artifact, parent/next frontier, migration, and persisted
+  state.
+- Added generalized snapshot compute resolution for direct Crystals, programs,
+  and materialized routes. A foreign graph state is rejected even when the
+  current snapshot contains only direct compute artifacts.
+- Five-seed continual-growth result: base actions `100%`; old-action retention
+  after promotion `100%`; new action initially abstains on every seed, reaches
+  learned execution after `328` episodes on average, and final four-action
+  accuracy returns to `100%`; a fresh no-memory model scores `0%`.
+- Context-schema shift discards local tables while global meaning remains
+  `100%`. Reward-policy shift resets `4/4` actions and scores `0%`. A
+  second-generation word compiles to one Crystal on every seed and increases
+  historical work released across 25 future states from `400` to `1,200` units.
+- Complete warning-fatal regression suite: `1,774/1,774`, `OK`, `733.121 s`.
+
 ### Consequence-grounded language and recursive compute words
 
 - Added a context-aware Markov signalling runtime. The receiver API accepts

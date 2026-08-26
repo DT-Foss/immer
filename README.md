@@ -36,6 +36,11 @@ release surface.
   Crystal children compile bottom-up without flattening, and the final word
   discharges one authenticated operator while retaining its complete
   transitive work provenance.
+- **Continual language growth.** Real `DemandRoutedExecutionReceipt` outcomes
+  update the language atomically. Verified episode sequences become compiled
+  words, compiled words become new frontier actions, unchanged actions retain
+  their evidence across proven append-only revisions, and new actions receive
+  deterministic unused words and begin behind abstention.
 - **Compute batteries.** Already-paid computation is retained at its natural
   granularity: results, continuation states, numerical operators,
   factorizations, routes, prefixes, and residual states. Native Qwen
@@ -95,6 +100,8 @@ release surface.
 | Markov-OoE PoC | 96.10% PS-Lifted; 100% warm | 17.28% local baseline, 13.50% shuffled-Crystal placebo, 338→64 consensus rounds, 588-byte raw kernel payload |
 | Consequence-grounded Markov language | 100% primitive, unseen-program, contextual-word, held-out grammar, option-word, cultural-transfer, and self-hosted execution | 5 seeds × 1,000 unseen programs; shuffled semantics 2.02%, fixed no-message policy 0.98%, no-action abstain 2.90%, shuffled grammar 5.00%, holistic held-out 0%, all in-vocabulary unknown words abstain |
 | Recursive executable word DAG | 8,191 actions → 36 references → one Crystal; 8.380x fair VM speedup | 99.5605% reference reduction, 99.9878% deployment-symbol reduction, exact future-input parity, 1,638,000 historical work units released across 25 states |
+| Continual executable-language growth | old actions 100% retained; promoted action learned in 328 episodes; final 100% | five seeds; initial promoted-action abstention 100%; no-memory 0%; context-schema shift keeps 100% global semantics and drops local evidence; reward-policy shift resets 4/4 actions |
+| Second-generation compute word | one promoted macro reused twice → one charged Crystal | five seeds; constant discharge 5/5; historical work released rises from 400 to 1,200 units across 25 future states |
 | Action-conditioned Markov planning | 250/250 unseen tasks | 68 one-step observations only; 4–10-step tasks; 12-replica local cohort 226/3,000 (7.53%), shuffled-action placebo 89/250, no-memory 68/250 |
 | Continuous reservoir memory | 90.84% fused | delayed-state task; 82.16% local mean, 50.45% no-memory, 54.28% shuffled-label placebo |
 | Compositional stored compute | 4 operators → 1 exact discharge | 128 unseen vectors; 27,648 historical work units released; maximum delta 1.78e-15 |

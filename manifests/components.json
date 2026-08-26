@@ -42,7 +42,10 @@
                 "src/immer/runtimes/ooe/contextual_sequence.py",
                 "src/immer/runtimes/ooe/markov_language.py",
                 "src/immer/runtimes/ooe/executable_lexicon.py",
-                "scripts/ooe_markov_language_benchmark.py"
+                "src/immer/runtimes/ooe/language_bridge.py",
+                "src/immer/runtimes/ooe/language_intelligence.py",
+                "scripts/ooe_markov_language_benchmark.py",
+                "scripts/ooe_language_growth_benchmark.py"
             ]
     },
     {

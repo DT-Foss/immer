@@ -58,6 +58,18 @@ around every domain that supports it.
 - [x] Depth-12 production-API trial: 8,191 primitive actions represented by 36
   definition references, exact one-Crystal discharge, 8.380x authenticated-VM
   speedup, and 1,638,000 historical work units released across 25 future states.
+- [x] Production consequence bridge from receiver-selected materialized routes
+  through `DemandRoutedExecutor`, persistent source settlement, hashed reward
+  policy, atomic language CAS, negative feedback, and neutral abort.
+- [x] Verified episode-to-word promotion with selection-time ordering, terminal
+  verifier, repeated-program discovery, local ComputeProgram resolution,
+  lexicon compilation, compiled-action promotion, and frontier migration.
+- [x] Proof-gated continual learning across append-only graph revisions,
+  deterministic vocabulary growth, self-describing promoted-state recovery,
+  and independent context/reward-policy reset behavior.
+- [x] Five-seed continual-growth mechanism: 100% old-skill retention, promoted
+  action learned after mean 328 episodes, final 100%, no-memory 0%, and
+  second-generation historical work release 400→1,200 units.
 - [x] Additive, multiplicative, and finite-cyclic algebraic crystallization with
   exact group accumulation and a rejected permuted placebo.
 - [x] Continuous PS-Lifted reservoir memory with delayed-state, no-memory,
@@ -108,6 +120,9 @@ around every domain that supports it.
   causal sites, residual plans, and the local Qwen fallback into successive
   action-frontier revisions; let verifier consequences grow the production
   dialect and compile recurring accepted word sequences.
+- [ ] Run the production language bridge on the first non-empty full-model
+  Qwen route frontier after the current O1 cartography process publishes a
+  verified operator; persist its first real dialect and promoted word action.
 - [ ] Extend the mechanism matrix with no-lift, shuffled-site,
   reversible-table, MLP, and RNN controls under the same authenticated evidence
   and planning contract.

@@ -879,6 +879,37 @@ class ConsequenceMarkovLanguage:
             if pending_receiver == decision:
                 del self._pending_receivers[decision.sha256]
 
+    def abort_bound_episode(
+        self,
+        sender: SenderDecision,
+        receiver: ReceiverDecision,
+    ) -> str:
+        """Abort one fully bound episode without creating quality evidence."""
+
+        if not isinstance(sender, SenderDecision) or not isinstance(
+            receiver, ReceiverDecision
+        ):
+            raise TypeError("sender and receiver decisions have invalid types")
+        if (
+            self._pending_senders.get(sender.sha256) != sender
+            or self._pending_receivers.get(receiver.sha256) != receiver
+            or sender.receiver_decision_sha256 != receiver.sha256
+        ):
+            raise MarkovLanguageConflictError(
+                "bound episode is stale, mismatched, or already settled"
+            )
+        del self._pending_senders[sender.sha256]
+        del self._pending_receivers[receiver.sha256]
+        self._transition_head_sha256 = _body_sha256(
+            {
+                "format": "immer-ooe-markov-language-bound-abort/v1",
+                "previous_sha256": self._transition_head_sha256,
+                "receiver_decision_sha256": receiver.sha256,
+                "sender_decision_sha256": sender.sha256,
+            }
+        )
+        return self._transition_head_sha256
+
     def observe_receiver(
         self,
         decision: ReceiverDecision,

@@ -154,6 +154,61 @@ The depth-12 trial binds 8,191 primitive actions to 36 references, releases
 units, and measures an 8.380x flat-versus-compiled speedup under the same
 authenticated VM boundary.
 
+### Continual frontier growth
+
+One learned action row transfers from frontier \(F_t\) to \(F_{t+1}\) exactly
+when all semantic authorities survive:
+
+\[
+\operatorname{retain}(a)=
+\mathbf 1[B_t(a)=B_{t+1}(a)]
+\mathbf 1[R_t=R_{t+1}]
+\mathbf 1[\Pi(F_t\rightarrow F_{t+1})=1],
+\]
+
+where \(B(a)\) is the complete action/artifact binding, \(R\) is the hashed
+reward policy, and \(\Pi\) is a typed transition proof. For route frontiers,
+\(\Pi\) embeds every graph-state payload and verifies each append transition,
+endpoint authority, and retained/added route inventory. Without that proof the
+old row resets.
+
+Context evidence has its own independent gate:
+
+\[
+Q_{R,t+1}^{c}=Q_{R,t}^{c}
+\quad\Longleftrightarrow\quad
+H(C_t)=H(C_{t+1}),
+\]
+
+so a context-schema shift drops local tables while globally stable word meaning
+survives. Vocabulary capacity grows deterministically:
+
+\[
+|V_{t+1}|=max(|V_t|,|A_{t+1}|),
+\]
+
+with old rows copied on the exact \(|V_t|\) slice and new words initialized
+unvisited.
+
+Verified macro discovery operates on selection-ordered positive episodes. A
+candidate word program \(u\) is admitted only when
+
+\[
+\operatorname{support}(u)\ge m,
+\qquad
+\operatorname{semantics}(u)=\{(a_1,\ldots,a_k)\},
+\]
+
+the declared episode length is complete, and a frontier-authorized terminal
+verifier seals the episode. Compilation, action promotion, frontier migration,
+and state publication form one revision receipt.
+
+In the five-seed growth trial, old-action accuracy remains 1.0, the promoted
+action begins behind abstention, becomes executable after 328 episodes on
+average, and final four-action accuracy returns to 1.0. A no-memory model scores
+0.0. A second-generation word uses the promoted macro twice and raises released
+historical work from 400 to 1,200 units.
+
 ## 5. Continuous PS-Lifted reservoir
 
 The fixed lifted recurrence carries temporal state:

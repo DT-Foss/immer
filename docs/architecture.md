@@ -136,6 +136,37 @@ materialized routes, options, organs, causal sites, residual plans, or Qwen
 paths. The frontier binds the schemas and authorities used by that specific
 action family; model-specific pins are present only for model-specific actions.
 
+Production feedback enters through a joined bridge:
+
+```text
+opaque word + context
+  -> ReceiverDecision
+  -> exact ActionFrontier binding
+  -> DemandRoutedExecutor / algebra verifier
+  -> persistently committed source outcome
+  -> hashed reward policy
+  -> atomic receiver + sender update
+  -> canonical language state CAS
+```
+
+Raw action labels and target values never enter receiver feedback. Demand
+training accepts only the full joined execution receipt after route selection,
+residual execution, external verification, outcome creation, and scheduler
+settlement all agree.
+
+Successful multi-step episodes are ordered by persisted selection time rather
+than verifier completion time. Promotion also requires the declared step count
+and a frontier-authorized terminal verifier. Repeated globally stable word
+programs become definitions, resolve to local ComputePrograms, compile, and
+enter the next action frontier under one promotion/migration receipt.
+
+Frontier migration retains a Q row only for an unchanged action binding under
+the same reward policy and a typed authority-transition proof. Route proofs
+carry the complete graph-state payload chain and replay every append. Context
+tables have a separate schema-identity gate. New actions receive deterministic
+unused words and remain non-executable until consequence evidence clears the
+normal visit/value/margin gates.
+
 ## 5. Stored compute and exact result cells
 
 IMMER stores completed computation at two different abstraction levels.
