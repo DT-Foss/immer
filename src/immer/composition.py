@@ -18,6 +18,7 @@ from .contracts import Component, Request, Result
 from .runtime import ImmerRuntime
 
 if TYPE_CHECKING:
+    from .runtimes.ooe.chat import OoeChatHook
     from .substrate.daemon import LifeStream
 
 
@@ -30,6 +31,8 @@ class CompositionRoot:
     grounded_chat: Component | None = None
     life_stream: LifeStream | None = None
     general_chat: Component | None = None
+    ooe_chat: OoeChatHook | None = None
+    qwen_anchor_cache: object | None = None
 
     @classmethod
     def build(
@@ -49,6 +52,8 @@ class CompositionRoot:
         qwen38_tokenizer: str | Path | None = None,
         qwen38_options: Mapping[str, Any] | None = None,
         qwen38_raw_chat: bool = False,
+        qwen38_ooe_hook: OoeChatHook | None = None,
+        qwen38_anchor_cache: str | Path | None = None,
     ) -> CompositionRoot:
         """Build without loading neural artifacts.
 
@@ -91,6 +96,16 @@ class CompositionRoot:
             raise ValueError(
                 "qwen38_raw_chat requires the local Qwen3.8 bundle/tokenizer"
             )
+        if qwen38_ooe_hook is not None and not qwen38_requested:
+            raise ValueError(
+                "qwen38_ooe_hook requires the local Qwen3.8 bundle/tokenizer"
+            )
+        if qwen38_ooe_hook is not None and qwen38_raw_chat:
+            raise ValueError("qwen38_ooe_hook requires the Qwen-FERTIG wrapper")
+        if qwen38_anchor_cache is not None and not qwen38_requested:
+            raise ValueError(
+                "qwen38_anchor_cache requires the local Qwen3.8 bundle/tokenizer"
+            )
 
         if s3_arithmetic is None:
             from .capabilities.s3_runtime import S3Arithmetic
@@ -126,6 +141,8 @@ class CompositionRoot:
                 "bundle_path",
                 "runtime_factory",
                 "tokenizer_path",
+                "ooe_hook",
+                "anchor_cache",
             }.intersection(options)
             if forbidden:
                 raise ValueError(
@@ -133,6 +150,14 @@ class CompositionRoot:
                 )
             assert qwen38_causal_bundle is not None
             assert qwen38_tokenizer is not None
+            anchor_cache = None
+            if qwen38_anchor_cache is not None:
+                from .runtimes.qwen3_8.semantic_state_cache import (
+                    SemanticStateAnchorCache,
+                )
+
+                anchor_cache = SemanticStateAnchorCache(qwen38_anchor_cache)
+                options["anchor_cache"] = anchor_cache
             raw_qwen = Qwen38CausalChat(
                 qwen38_causal_bundle,
                 qwen38_tokenizer,
@@ -143,7 +168,11 @@ class CompositionRoot:
             else:
                 from .cognition.qwen_fertig_chat import QwenFertigChat
 
-                general_chat = QwenFertigChat(raw_qwen, fertig)  # type: ignore[arg-type]
+                general_chat = QwenFertigChat(  # type: ignore[arg-type]
+                    raw_qwen,
+                    fertig,
+                    ooe_hook=qwen38_ooe_hook,
+                )
         components = tuple(
             component
             for component in (exact_math, grounded_chat, general_chat)
@@ -156,6 +185,10 @@ class CompositionRoot:
             grounded_chat=grounded_chat,
             general_chat=general_chat,
             life_stream=life_stream,
+            ooe_chat=qwen38_ooe_hook,
+            qwen_anchor_cache=(
+                anchor_cache if qwen38_requested else None
+            ),
         )
 
     def dispatch(
@@ -187,6 +220,8 @@ def compose_runtime(
     qwen38_tokenizer: str | Path | None = None,
     qwen38_options: Mapping[str, Any] | None = None,
     qwen38_raw_chat: bool = False,
+    qwen38_ooe_hook: OoeChatHook | None = None,
+    qwen38_anchor_cache: str | Path | None = None,
 ) -> CompositionRoot:
     """Functional alias for callers that do not need the classmethod syntax."""
 
@@ -205,6 +240,8 @@ def compose_runtime(
         qwen38_tokenizer=qwen38_tokenizer,
         qwen38_options=qwen38_options,
         qwen38_raw_chat=qwen38_raw_chat,
+        qwen38_ooe_hook=qwen38_ooe_hook,
+        qwen38_anchor_cache=qwen38_anchor_cache,
     )
 
 

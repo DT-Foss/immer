@@ -12,7 +12,10 @@ import os
 from pathlib import Path
 import stat
 import threading
+import time
 from typing import Any
+
+import torch
 
 from ...contracts import ExecutionStatus, Request, Result
 from ..deepseek_v4.causal_weights import CausalWeightMount, LogicalModelIdentity
@@ -21,6 +24,13 @@ from .config import OFFICIAL_REPO_ID, OFFICIAL_REVISION, Qwen38Config
 from .encoding import END_OF_TEXT_TOKEN_ID, IM_END_TOKEN_ID, Qwen38Tokenizer
 from .model import StreamedQwen38
 from .pager import Qwen38WeightPager
+from .semantic_state_cache import (
+    AnchorReceipt,
+    RestoredAnchor,
+    SEMANTIC_ANCHOR_SEED_SCHEMA,
+    SemanticStateAnchorCache,
+    token_prefix_sha256,
+)
 
 
 _SHA256 = frozenset("0123456789abcdef")
@@ -242,6 +252,153 @@ def _compact_generation_receipt(
     return compact
 
 
+def _anchor_model_state(model: object) -> tuple[int, bool, int, int | None]:
+    """Return the native state fields that make cache miss/hit mutation explicit."""
+
+    next_position = getattr(model, "next_position", None)
+    state_poisoned = getattr(model, "state_poisoned", None)
+    state_bytes = getattr(model, "state_bytes", None)
+    state_batch_size = getattr(model, "state_batch_size", None)
+    if (
+        isinstance(next_position, bool)
+        or not isinstance(next_position, int)
+        or next_position < 0
+        or not isinstance(state_poisoned, bool)
+        or isinstance(state_bytes, bool)
+        or not isinstance(state_bytes, int)
+        or state_bytes < 0
+        or (
+            state_batch_size is not None
+            and (
+                isinstance(state_batch_size, bool)
+                or not isinstance(state_batch_size, int)
+                or state_batch_size <= 0
+            )
+        )
+    ):
+        raise Qwen38ChatError("runtime model lacks the native anchor-state contract")
+    return next_position, state_poisoned, state_bytes, state_batch_size
+
+
+def _anchor_document(value: object) -> dict[str, Any]:
+    if type(value) is not AnchorReceipt:
+        raise Qwen38ChatError("anchor cache returned an unsealed receipt")
+    document = value.to_document()
+    try:
+        reconstructed = AnchorReceipt.from_document(document)
+    except Exception as exc:
+        raise Qwen38ChatError("anchor receipt authentication failed") from exc
+    if reconstructed != value:
+        raise Qwen38ChatError("anchor receipt reconstruction differs")
+    for key in ("prefix_sha256", "receipt_sha256"):
+        if not _is_sha256(document.get(key)):
+            raise Qwen38ChatError(f"anchor receipt {key} is invalid")
+    _positive_int(document.get("prefix_length"), "anchor receipt prefix_length")
+    for key in (
+        "hit_count",
+        "seed_hidden_bytes",
+        "snapshot_manifest_bytes",
+        "snapshot_payload_bytes",
+        "state_bytes",
+    ):
+        item = document.get(key)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise Qwen38ChatError(f"anchor receipt {key} is invalid")
+    try:
+        json.dumps(document, allow_nan=False, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise Qwen38ChatError("anchor receipt is not canonical JSON") from exc
+    return document
+
+
+def _anchor_seed_sha256(value: torch.Tensor) -> str:
+    if not isinstance(value, torch.Tensor):
+        raise Qwen38ChatError("anchor seed is not a tensor")
+    cpu = value.detach().to(device="cpu").contiguous()
+    raw = cpu.view(torch.uint8).numpy().reshape(-1).tobytes()
+    header = json.dumps(
+        {
+            "dtype": str(cpu.dtype).removeprefix("torch."),
+            "schema": SEMANTIC_ANCHOR_SEED_SCHEMA,
+            "shape": list(cpu.shape),
+        },
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(header + b"\0" + raw).hexdigest()
+
+
+def _anchor_hit_evidence(
+    restored: object,
+    *,
+    prompt_tokens: int,
+    generation: Mapping[str, Any],
+    restore_seconds: float,
+    n_layers: int,
+) -> dict[str, Any]:
+    if type(restored) is not RestoredAnchor:
+        raise Qwen38ChatError("anchor cache returned an unsealed restore result")
+    anchor = restored.anchor
+    receipt = _anchor_document(anchor)
+    prefix_tokens = receipt["prefix_length"]
+    exact_prefix = getattr(restored, "exact_prefix", None)
+    query_length = getattr(restored, "query_length", None)
+    suffix_start = getattr(restored, "suffix_start", None)
+    seed_hidden = getattr(restored, "seed_hidden", None)
+    if (
+        not isinstance(exact_prefix, bool)
+        or query_length != prompt_tokens
+        or suffix_start != prefix_tokens
+        or exact_prefix != (prefix_tokens == prompt_tokens)
+        or (exact_prefix and seed_hidden is None)
+        or (not exact_prefix and seed_hidden is not None)
+    ):
+        raise Qwen38ChatError("restored anchor differs from the prompt contract")
+    _positive_int(n_layers, "runtime model decoder depth")
+    forward_baseline = 1 + generation["generated_tokens"]
+    forward_executed = generation["forward_passes"]
+    suffix_tokens = prompt_tokens - prefix_tokens
+    prefill_sweeps_executed = int(suffix_tokens > 0)
+    expected_forwards = generation["generated_tokens"] + prefill_sweeps_executed
+    if forward_executed != expected_forwards:
+        raise Qwen38ChatError("anchor generation forward count is inconsistent")
+    snapshot_artifact_bytes = (
+        receipt["snapshot_manifest_bytes"]
+        + receipt["snapshot_payload_bytes"]
+        + (receipt["seed_hidden_bytes"] if exact_prefix else 0)
+    )
+    return {
+        "schema": "immer.qwen3.8-anchor-execution/v1",
+        "status": "hit",
+        "anchor": receipt,
+        "exact_prefix": exact_prefix,
+        "prompt_tokens": prompt_tokens,
+        "prefix_tokens": prefix_tokens,
+        "suffix_tokens": suffix_tokens,
+        "restore_seconds": restore_seconds,
+        # The cache first hashes every selected artifact, then the native
+        # loader reads it again to reconstruct state.  Exact-prefix seeds are
+        # likewise authenticated once and decoded once.
+        "snapshot_bytes_read": 2 * snapshot_artifact_bytes,
+        "forward_passes_baseline": forward_baseline,
+        "forward_passes_executed": forward_executed,
+        "forward_passes_saved": forward_baseline - forward_executed,
+        "prefill_weight_sweeps_baseline": 1,
+        "prefill_weight_sweeps_executed": prefill_sweeps_executed,
+        "prefill_weight_sweeps_saved": 1 - prefill_sweeps_executed,
+        "checkpoint_read_sweeps_baseline": 1,
+        "checkpoint_read_sweeps_executed": prefill_sweeps_executed,
+        "checkpoint_read_sweeps_saved": 1 - prefill_sweeps_executed,
+        "prompt_token_layer_evaluations_baseline": prompt_tokens * n_layers,
+        "prompt_token_layer_evaluations_executed": suffix_tokens * n_layers,
+        "prompt_token_layer_evaluations_saved": prefix_tokens * n_layers,
+        "checkpoint_source_body_bytes_read": generation["source_body_bytes"],
+        "checkpoint_linear_calls_executed": generation["linear_calls"],
+    }
+
+
 class _OwnedRuntime:
     """One fully verified local runtime and its ordered resource teardown."""
 
@@ -386,6 +543,7 @@ class Qwen38CausalChat:
         max_new_tokens: int = 64,
         max_context_tokens: int = 2048,
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
+        anchor_cache: SemanticStateAnchorCache | None = None,
     ) -> None:
         if not isinstance(bundle_path, (str, Path)):
             raise TypeError("bundle_path must be a local filesystem path")
@@ -405,6 +563,11 @@ class Qwen38CausalChat:
         max_new_tokens = _positive_int(max_new_tokens, "max_new_tokens")
         max_context_tokens = _positive_int(max_context_tokens, "max_context_tokens")
         head_block_rows = _positive_int(head_block_rows, "head_block_rows")
+        if (
+            anchor_cache is not None
+            and type(anchor_cache) is not SemanticStateAnchorCache
+        ):
+            raise TypeError("anchor_cache must be a SemanticStateAnchorCache or None")
         if max_prompt_tokens + max_new_tokens > max_context_tokens:
             raise ValueError(
                 "max_prompt_tokens plus max_new_tokens exceeds max_context_tokens"
@@ -420,6 +583,7 @@ class Qwen38CausalChat:
         self._max_new_tokens = max_new_tokens
         self._max_context_tokens = max_context_tokens
         self._head_block_rows = head_block_rows
+        self._anchor_cache = anchor_cache
         self._runtime: Any | None = None
         self._bundle_receipt: dict[str, Any] | None = None
         self._tokenizer_sha256: str | None = None
@@ -548,12 +712,83 @@ class Qwen38CausalChat:
         if any(token_id >= vocab_size for token_id in prompt_ids):
             raise _RequestRejected("prompt token is outside the checkpoint vocabulary")
 
+        restored = None
+        restore_seconds = 0.0
+        anchor_miss: dict[str, Any] | None = None
+        generation_options: dict[str, Any] = {
+            "max_new_tokens": self._max_new_tokens,
+            "prefill_tokenwise": False,
+            "eos_token_ids": (IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID),
+            "head_block_rows": self._head_block_rows,
+        }
+        if self._anchor_cache is not None:
+            before_restore = _anchor_model_state(runtime.model)
+            if before_restore != (0, False, 0, None):
+                raise Qwen38ChatError("anchor restore requires an empty released model")
+            restore_started = time.perf_counter()
+            restored = self._anchor_cache.restore_deepest(
+                runtime.model,
+                prompt_ids,
+            )
+            restore_seconds = time.perf_counter() - restore_started
+            if restored is None:
+                if _anchor_model_state(runtime.model) != before_restore:
+                    raise Qwen38ChatError("anchor-cache miss mutated model state")
+                anchor_miss = {
+                    "schema": "immer.qwen3.8-anchor-execution/v1",
+                    "status": "miss",
+                    "prompt_tokens": len(prompt_ids),
+                    "restore_seconds": restore_seconds,
+                }
+            else:
+                if type(restored) is not RestoredAnchor:
+                    raise Qwen38ChatError(
+                        "anchor cache returned an unsealed restore result"
+                    )
+                anchor = restored.anchor
+                anchor_document = _anchor_document(anchor)
+                prefix_length = anchor_document["prefix_length"]
+                exact_prefix = restored.exact_prefix
+                if (
+                    restored.query_length != len(prompt_ids)
+                    or restored.suffix_start != prefix_length
+                    or not isinstance(exact_prefix, bool)
+                    or exact_prefix != (prefix_length == len(prompt_ids))
+                    or anchor_document["prefix_sha256"]
+                    != token_prefix_sha256(prompt_ids[:prefix_length])
+                    or exact_prefix != (restored.seed_hidden is not None)
+                ):
+                    raise Qwen38ChatError(
+                        "restored anchor differs from the tokenized prompt"
+                    )
+                if exact_prefix and (
+                    anchor.seed_hidden_tensor_sha256 is None
+                    or _anchor_seed_sha256(restored.seed_hidden)
+                    != anchor.seed_hidden_tensor_sha256
+                ):
+                    raise Qwen38ChatError(
+                        "restored seed differs from the sealed anchor receipt"
+                    )
+                restored_state = _anchor_model_state(runtime.model)
+                if restored_state != (
+                    prefix_length,
+                    False,
+                    anchor_document["state_bytes"],
+                    1,
+                ):
+                    raise Qwen38ChatError(
+                        "restored model state differs from anchor receipt"
+                    )
+                generation_options.update(
+                    {
+                        "restored_prefix_length": prefix_length,
+                        "restored_seed_hidden": restored.seed_hidden,
+                    }
+                )
+
         raw_generated, raw_evidence = runtime.model.generate_greedy(
             [list(prompt_ids)],
-            max_new_tokens=self._max_new_tokens,
-            prefill_tokenwise=False,
-            eos_token_ids=(IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID),
-            head_block_rows=self._head_block_rows,
+            **generation_options,
         )
         generated_ids = _token_ids(raw_generated, "generated output")
         if len(generated_ids) > self._max_new_tokens:
@@ -585,6 +820,19 @@ class Qwen38CausalChat:
             "generation": receipt,
             "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
         }
+        if restored is not None:
+            evidence["anchor_cache"] = _anchor_hit_evidence(
+                restored,
+                prompt_tokens=len(prompt_ids),
+                generation=receipt,
+                restore_seconds=restore_seconds,
+                n_layers=_positive_int(
+                    getattr(config, "n_layers", None),
+                    "runtime model decoder depth",
+                ),
+            )
+        elif anchor_miss is not None:
+            evidence["anchor_cache"] = anchor_miss
         if not output:
             return Result(
                 ExecutionStatus.ABSTAINED,

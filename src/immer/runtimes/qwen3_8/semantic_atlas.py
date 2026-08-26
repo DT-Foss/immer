@@ -1828,6 +1828,24 @@ class SemanticWeightAtlas:
 
         return GraphRevision.from_live_revision(self.graph.store.revision())
 
+    def revision_history(self) -> tuple[GraphRevision, ...]:
+        """Return every exact authenticated append-only Atlas revision."""
+
+        return tuple(
+            GraphRevision(sequence, event_sha256)
+            for sequence, event_sha256 in self.graph.store.revision_history()
+        )
+
+    def contains_revision(self, revision: GraphRevision) -> bool:
+        """Authenticate exact membership of one revision in the Atlas chain."""
+
+        if not isinstance(revision, GraphRevision):
+            raise TypeError("revision must be a GraphRevision")
+        return self.graph.store.contains_revision(
+            revision.sequence,
+            revision.event_sha256,
+        )
+
     def drop_segments(self, shas: Iterable[str]) -> tuple[str, ...]:
         """Deactivate segments without orphaning active semantic evidence."""
 

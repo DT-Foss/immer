@@ -24,9 +24,19 @@ from typing import Any
 
 from immer.runtimes.o1_state import O1Cartographer, ProbeJob, ProbeTarget
 from immer.runtimes.o1_state.plasticity import LearningStream
+from immer.runtimes.ooe.cartography import OoeCartographyBridge
+from immer.runtimes.ooe.controller import (
+    CONTROLLER_STATE_NAME,
+    ControllerMetrics,
+    OoeController,
+    OoeControllerIntegrityError,
+)
+from immer.runtimes.ooe.crystal import CrystalStore
 from immer.runtimes.qwen3_8 import (
+    GraphRevision,
     HiddenSketchProjection,
     LogicalModelIdentity,
+    MeasurementReceipt,
     ModelPin,
     ProbeCoordinateSpec,
     ProbeResourceBudget,
@@ -49,6 +59,11 @@ MANIFEST_NAME = "manifest.json"
 SCHEDULER_NAME = "scheduler.json"
 ATLAS_NAME = "atlas"
 O1_STATE_NAME = "o1-state.pt"
+OOE_NAME = "ooe"
+OOE_PROMOTION_STATE_NAME = "qwen-o1-cartography-promotion-transaction"
+OOE_PROMOTION_TRANSACTION_SCHEMA = (
+    "immer.qwen3.8-o1-cartography-ooe-promotion-transaction/v1"
+)
 _MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _CODE_REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -152,7 +167,13 @@ def _plain_root(value: str | os.PathLike[str], *, create: bool) -> Path:
 
 
 def _contained(root: Path, name: str) -> Path:
-    if name not in {MANIFEST_NAME, SCHEDULER_NAME, ATLAS_NAME, O1_STATE_NAME}:
+    if name not in {
+        MANIFEST_NAME,
+        SCHEDULER_NAME,
+        ATLAS_NAME,
+        O1_STATE_NAME,
+        OOE_NAME,
+    }:
         raise O1CartographyCliError("cartography output name is not allowlisted")
     candidate = root / name
     if candidate.parent != root:
@@ -1156,11 +1177,638 @@ def _reconcile_receipts(
     return attached
 
 
+def _promotion_transaction_document(
+    *,
+    phase: str,
+    cartography_manifest_sha256: str,
+    model_pin_sha256: str,
+    weight_graph_revision_sha256: str,
+    pre_manifest_generation: int,
+    pre_manifest_sha256: str,
+    prepared_controller_snapshot_sha256: str,
+    committed_controller_snapshot_sha256: str | None,
+) -> dict[str, Any]:
+    if phase not in {"prepared", "committed"}:
+        raise ValueError("promotion transaction phase is invalid")
+    if (phase == "prepared") != (committed_controller_snapshot_sha256 is None):
+        raise ValueError("promotion transaction phase/snapshot binding is invalid")
+    body = {
+        "cartography_manifest_sha256": _sha(
+            cartography_manifest_sha256,
+            "cartography manifest SHA-256",
+        ),
+        "committed_controller_snapshot_sha256": (
+            None
+            if committed_controller_snapshot_sha256 is None
+            else _sha(
+                committed_controller_snapshot_sha256,
+                "committed controller snapshot SHA-256",
+            )
+        ),
+        "model_pin_sha256": _sha(model_pin_sha256, "model pin SHA-256"),
+        "phase": phase,
+        "pre_manifest_generation": _uint(
+            pre_manifest_generation,
+            "pre-promotion manifest generation",
+        ),
+        "pre_manifest_sha256": _sha(
+            pre_manifest_sha256,
+            "pre-promotion manifest SHA-256",
+        ),
+        "prepared_controller_snapshot_sha256": _sha(
+            prepared_controller_snapshot_sha256,
+            "prepared controller snapshot SHA-256",
+        ),
+        "weight_graph_revision_sha256": _sha(
+            weight_graph_revision_sha256,
+            "weight graph revision SHA-256",
+        ),
+    }
+    return {
+        "body": body,
+        "schema": OOE_PROMOTION_TRANSACTION_SCHEMA,
+        "sha256": _digest(body),
+    }
+
+
+def _load_promotion_transaction(
+    store: CrystalStore,
+) -> tuple[dict[str, Any], str] | None:
+    try:
+        raw = store.restore_state(OOE_PROMOTION_STATE_NAME)
+    except KeyError:
+        return None
+    document = _strict_json_bytes(raw, "OoE promotion transaction")
+    if raw != _canonical(document):
+        raise O1CartographyCliError(
+            "OoE promotion transaction is not canonical JSON"
+        )
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"body", "schema", "sha256"}
+        or document.get("schema") != OOE_PROMOTION_TRANSACTION_SCHEMA
+        or not isinstance(document.get("body"), Mapping)
+        or document.get("sha256") != _digest(document["body"])
+    ):
+        raise O1CartographyCliError("OoE promotion transaction seal is invalid")
+    body = document["body"]
+    expected = {
+        "cartography_manifest_sha256",
+        "committed_controller_snapshot_sha256",
+        "model_pin_sha256",
+        "phase",
+        "pre_manifest_generation",
+        "pre_manifest_sha256",
+        "prepared_controller_snapshot_sha256",
+        "weight_graph_revision_sha256",
+    }
+    if set(body) != expected:
+        raise O1CartographyCliError("OoE promotion transaction body is malformed")
+    normalized = _promotion_transaction_document(
+        phase=body["phase"],
+        cartography_manifest_sha256=body["cartography_manifest_sha256"],
+        model_pin_sha256=body["model_pin_sha256"],
+        weight_graph_revision_sha256=body["weight_graph_revision_sha256"],
+        pre_manifest_generation=body["pre_manifest_generation"],
+        pre_manifest_sha256=body["pre_manifest_sha256"],
+        prepared_controller_snapshot_sha256=(
+            body["prepared_controller_snapshot_sha256"]
+        ),
+        committed_controller_snapshot_sha256=(
+            body["committed_controller_snapshot_sha256"]
+        ),
+    )
+    if normalized != document:
+        raise O1CartographyCliError(
+            "OoE promotion transaction reconstruction mismatch"
+        )
+    return normalized, hashlib.sha256(raw).hexdigest()
+
+
+def _assert_promotion_transaction_bindings(
+    document: Mapping[str, Any],
+    *,
+    cartography_manifest_sha256: str,
+    model_pin_sha256: str,
+    weight_graph_revision_sha256: str,
+) -> None:
+    body = document["body"]
+    if (
+        body["cartography_manifest_sha256"] != cartography_manifest_sha256
+        or body["model_pin_sha256"] != model_pin_sha256
+        or body["weight_graph_revision_sha256"]
+        != weight_graph_revision_sha256
+    ):
+        raise O1CartographyCliError(
+            "OoE promotion transaction belongs to another sealed run"
+        )
+
+
+def _publish_promotion_transaction(
+    store: CrystalStore,
+    document: Mapping[str, Any],
+    *,
+    expected_sha256: str | None,
+) -> Any:
+    return store.publish_state(
+        OOE_PROMOTION_STATE_NAME,
+        _canonical(document),
+        expected_sha256=expected_sha256,
+    )
+
+
+@dataclass(slots=True)
+class _OoeCartographyRuntime:
+    root: Path
+    store: CrystalStore
+    controller: OoeController
+    bridge: OoeCartographyBridge
+    atlas_revision_membership: _AtlasRevisionMembership
+    expected_snapshot_sha256: str | None
+    ingested_evidence_sha256s: set[str]
+    promotion_transaction: dict[str, Any] | None
+    promotion_transaction_state_sha256: str | None
+    promotion_required: bool
+    recovery_receipt: Any | None
+
+
+def _ooe_root_path(
+    cartography_root: Path,
+    configured: str | os.PathLike[str] | None,
+) -> Path:
+    if configured is None:
+        return _contained(cartography_root, OOE_NAME)
+    return Path(configured).expanduser().absolute()
+
+
+class _AtlasRevisionMembership:
+    """Exact historical Atlas heads attested by active sealed measurements."""
+
+    def __init__(self, atlas: Any) -> None:
+        self.atlas = atlas
+
+    def authenticate_measurement(self, measurement: MeasurementReceipt) -> None:
+        if not isinstance(measurement, MeasurementReceipt):
+            raise TypeError("measurement must be a MeasurementReceipt")
+        head_before = self.atlas.revision()
+        if not isinstance(head_before, GraphRevision):
+            raise O1CartographyCliError("Atlas returned an invalid graph revision")
+        self.atlas.verify_or_raise()
+        if self.atlas.revision() != head_before:
+            raise O1CartographyCliError(
+                "Atlas head changed while OoE evidence was authenticated"
+            )
+        result = self.atlas.query_by_prompt_signature(
+            measurement.probe.prompt_signature
+        )
+        active = {
+            value.sha256: value
+            for value in result.measurements
+            if isinstance(value, MeasurementReceipt)
+            and value.model_pin == measurement.model_pin
+            and value.coordinate == measurement.coordinate
+            and value.probe == measurement.probe
+        }
+        if active.get(measurement.sha256) != measurement:
+            raise O1CartographyCliError(
+                "OoE Atlas revision evidence is not an active measurement"
+            )
+        head = self.atlas.revision()
+        if head != head_before:
+            raise O1CartographyCliError(
+                "Atlas head changed during OoE measurement authentication"
+            )
+        revision = measurement.atlas_head_revision
+        if not isinstance(head, GraphRevision) or revision.sequence > head.sequence:
+            raise O1CartographyCliError(
+                "measurement names a future Atlas graph revision"
+            )
+        if revision.sequence == head.sequence and revision != head:
+            raise O1CartographyCliError(
+                "measurement Atlas graph revision conflicts with the live head"
+            )
+        contains_revision = getattr(self.atlas, "contains_revision", None)
+        if not callable(contains_revision):
+            raise O1CartographyCliError(
+                "Atlas does not expose authenticated revision membership"
+            )
+        if not bool(contains_revision(revision)):
+            raise O1CartographyCliError(
+                "measurement Atlas revision is absent from the authenticated journal"
+            )
+
+    def __call__(self, revision: GraphRevision) -> bool:
+        if not isinstance(revision, GraphRevision):
+            return False
+        self.atlas.verify_or_raise()
+        head = self.atlas.revision()
+        if not isinstance(head, GraphRevision) or revision.sequence > head.sequence:
+            return False
+        contains_revision = getattr(self.atlas, "contains_revision", None)
+        return callable(contains_revision) and bool(contains_revision(revision))
+
+
+def _atlas_revision_verifier(
+    atlas: Any,
+    authenticated_measurements: Sequence[MeasurementReceipt] = (),
+) -> _AtlasRevisionMembership:
+    verifier = _AtlasRevisionMembership(atlas)
+    for measurement in authenticated_measurements:
+        verifier.authenticate_measurement(measurement)
+    return verifier
+
+
+def _open_ooe_runtime(
+    root: Path,
+    *,
+    atlas: Any,
+    measurements: Sequence[MeasurementReceipt],
+    cartography_manifest_sha256: str,
+) -> _OoeCartographyRuntime:
+    if not measurements:
+        raise ValueError("OoE runtime requires an authenticated measurement")
+    measurement = measurements[0]
+    managed_root = _plain_root(root, create=True)
+    store = CrystalStore(managed_root)
+    verifier = _atlas_revision_verifier(atlas, measurements)
+    transaction_state = _load_promotion_transaction(store)
+    transaction = None if transaction_state is None else transaction_state[0]
+    transaction_state_sha256 = (
+        None if transaction_state is None else transaction_state[1]
+    )
+    if transaction is not None:
+        _assert_promotion_transaction_bindings(
+            transaction,
+            cartography_manifest_sha256=cartography_manifest_sha256,
+            model_pin_sha256=measurement.model_pin.sha256,
+            weight_graph_revision_sha256=measurement.weight_rail_revision.sha256,
+        )
+    recovery_receipt = None
+    try:
+        prior_state = store.restore_state(CONTROLLER_STATE_NAME)
+    except KeyError:
+        controller = OoeController(
+            model_pin_sha256=measurement.model_pin.sha256,
+            weight_graph_revision_sha256=measurement.weight_rail_revision.sha256,
+            atlas_graph_revision=measurement.atlas_head_revision,
+            crystal_store=store,
+            atlas_revision_verifier=verifier,
+        )
+        expected_snapshot = None
+    else:
+        expected_snapshot = hashlib.sha256(prior_state).hexdigest()
+        try:
+            controller = OoeController.restore(
+                crystal_store=store,
+                atlas_revision_verifier=verifier,
+                expected_model_pin_sha256=measurement.model_pin.sha256,
+                expected_weight_graph_revision_sha256=(
+                    measurement.weight_rail_revision.sha256
+                ),
+            )
+        except OoeControllerIntegrityError as exc:
+            transaction_body = (
+                None if transaction is None else transaction["body"]
+            )
+            current_manifest = store.manifest()
+            recoverable = (
+                str(exc) == "CrystalStore manifest changed since snapshot"
+                and transaction_body is not None
+                and transaction_body["phase"] == "prepared"
+                and expected_snapshot
+                == transaction_body["prepared_controller_snapshot_sha256"]
+                and current_manifest.generation
+                > transaction_body["pre_manifest_generation"]
+                and current_manifest.sha256
+                != transaction_body["pre_manifest_sha256"]
+            )
+            if not recoverable:
+                raise
+            controller, recovery_receipt = OoeController.restore_recoverable(
+                crystal_store=store,
+                atlas_revision_verifier=verifier,
+                expected_model_pin_sha256=measurement.model_pin.sha256,
+                expected_weight_graph_revision_sha256=(
+                    measurement.weight_rail_revision.sha256
+                ),
+                expected_old_manifest_generation=(
+                    transaction_body["pre_manifest_generation"]
+                ),
+                expected_old_manifest_sha256=(
+                    transaction_body["pre_manifest_sha256"]
+                ),
+                expected_old_state_sha256=(
+                    transaction_body["prepared_controller_snapshot_sha256"]
+                ),
+            )
+            expected_snapshot = recovery_receipt.new_state_sha256
+    promotion_required = False
+    if transaction is not None and transaction["body"]["phase"] == "prepared":
+        current_manifest = store.manifest()
+        transaction_body = transaction["body"]
+        if (
+            current_manifest.generation
+            == transaction_body["pre_manifest_generation"]
+            and current_manifest.sha256
+            == transaction_body["pre_manifest_sha256"]
+        ):
+            promotion_required = True
+    return _OoeCartographyRuntime(
+        root=managed_root,
+        store=store,
+        controller=controller,
+        bridge=OoeCartographyBridge(controller),
+        atlas_revision_membership=verifier,
+        expected_snapshot_sha256=expected_snapshot,
+        ingested_evidence_sha256s=set(_controller_evidence_sha256s(controller)),
+        promotion_transaction=transaction,
+        promotion_transaction_state_sha256=transaction_state_sha256,
+        promotion_required=promotion_required,
+        recovery_receipt=recovery_receipt,
+    )
+
+
+def _controller_evidence_sha256s(controller: OoeController) -> frozenset[str]:
+    """Read the controller's own canonical snapshot to deduplicate attempts."""
+
+    document = json.loads(controller.snapshot_bytes())
+    try:
+        sites = document["body"]["sites"]
+        values = {
+            evidence
+            for site in sites
+            for row in site["history"]
+            for evidence in row["feature"]["body"]["evidence_sha256s"]
+        }
+    except (KeyError, TypeError) as exc:  # the controller already authenticated this
+        raise O1CartographyCliError("OoE controller history is malformed") from exc
+    return frozenset(_sha(value, "OoE history evidence SHA-256") for value in values)
+
+
+def _source_actions(
+    scheduler: O1Cartographer,
+    specs: Mapping[str, ProbeSpec],
+) -> dict[str, tuple[str, str]]:
+    current: dict[str, str] = {}
+    result: dict[str, tuple[str, str]] = {}
+    for outcome in scheduler.outcomes:
+        if outcome.status != "succeeded" or outcome.atlas_receipt_sha256 is None:
+            continue
+        prompt_sha256 = specs[outcome.job_id].prompt_sha256
+        source_action = current.get(prompt_sha256, "qwen_fallback")
+        result[outcome.attempt_id] = (source_action, prompt_sha256)
+        current[prompt_sha256] = "probe_coordinate"
+    return result
+
+
+def _active_outcome_measurement(
+    outcome: Any,
+    *,
+    atlas: Any,
+    spec: ProbeSpec,
+    model_pin: ModelPin,
+) -> Any:
+    observation = outcome.observation_document()
+    if observation is None:
+        raise O1CartographyCliError("attached outcome lost its atlas observation")
+    receipt_sha256 = _sha(
+        outcome.atlas_receipt_sha256,
+        "attached atlas receipt SHA-256",
+    )
+    if observation.get("atlas_receipt_sha256") != receipt_sha256:
+        raise O1CartographyCliError("attached outcome and observation receipts differ")
+    measurement = _find_reusable_measurement(atlas, spec, model_pin)
+    if measurement is None or measurement.sha256 != receipt_sha256:
+        raise O1CartographyCliError(
+            "attached outcome has no exact active Atlas measurement"
+        )
+    return measurement
+
+
+def _integrate_ooe_outcomes(
+    *,
+    root: Path,
+    scheduler: O1Cartographer,
+    atlas: Any,
+    specs: Mapping[str, ProbeSpec],
+    model_pin: ModelPin,
+    cartography_manifest_sha256: str,
+    outcomes: Sequence[Any] | None = None,
+    session: _OoeCartographyRuntime | None = None,
+    source_actions: Mapping[str, tuple[str, str]] | None = None,
+) -> tuple[_OoeCartographyRuntime | None, list[dict[str, Any]]]:
+    sources = (
+        _source_actions(scheduler, specs)
+        if source_actions is None
+        else source_actions
+    )
+    candidates: list[tuple[Any, MeasurementReceipt, str, str]] = []
+    selected = scheduler.outcomes if outcomes is None else outcomes
+    for outcome in selected:
+        if outcome.status != "succeeded" or outcome.atlas_receipt_sha256 is None:
+            continue
+        measurement = _active_outcome_measurement(
+            outcome,
+            atlas=atlas,
+            spec=specs[outcome.job_id],
+            model_pin=model_pin,
+        )
+        # Injected legacy/fake atlases remain supported.  The production path
+        # starts only from the actual immutable MeasurementReceipt contract.
+        if not isinstance(measurement, MeasurementReceipt):
+            continue
+        source_action, stream_sha256 = sources[outcome.attempt_id]
+        candidates.append((outcome, measurement, source_action, stream_sha256))
+    if not candidates:
+        return session, []
+    candidates.sort(
+        key=lambda row: (
+            row[1].atlas_head_revision.sequence,
+            row[1].atlas_head_revision.event_sha256,
+            row[0].attempt_id,
+        )
+    )
+    if session is None:
+        session = _open_ooe_runtime(
+            root,
+            atlas=atlas,
+            measurements=tuple(row[1] for row in candidates),
+            cartography_manifest_sha256=cartography_manifest_sha256,
+        )
+    else:
+        for _, measurement, _, _ in candidates:
+            session.atlas_revision_membership.authenticate_measurement(measurement)
+    ingested_evidence = session.ingested_evidence_sha256s
+    records: list[dict[str, Any]] = []
+    for outcome, measurement, source_action, stream_sha256 in candidates:
+        if outcome.attempt_id in ingested_evidence:
+            continue
+        observation = outcome.observation_document()
+        assert observation is not None
+        learning = session.bridge.ingest_authenticated(
+            atlas,
+            measurement,
+            source_action=source_action,
+            target_action="probe_coordinate",
+            o1_surprise=outcome.surprise,
+            o1_learning_progress=outcome.learning_progress,
+            evidence_sha256s=(outcome.attempt_id,),
+        )
+        records.append(
+            {
+                "attempt": outcome.attempt,
+                "attempt_id": outcome.attempt_id,
+                "job_id": outcome.job_id,
+                "learning_receipt": {
+                    **learning.as_record(),
+                    "sha256": learning.sha256,
+                },
+                "o1_learning_progress": outcome.learning_progress,
+                "o1_surprise": outcome.surprise,
+                "reused_atlas_proof": bool(
+                    observation.get("reused_atlas_proof")
+                ),
+                "stream_sha256": stream_sha256,
+            }
+        )
+        ingested_evidence.add(outcome.attempt_id)
+    return session, records
+
+
+def _finalize_ooe_runtime(
+    session: _OoeCartographyRuntime,
+    *,
+    cartography_manifest_sha256: str,
+    promote: bool,
+) -> tuple[tuple[Any, ...], Any, Any | None]:
+    """Two-phase Crystal promotion with a sealed crash-recovery intent."""
+
+    publications: tuple[Any, ...] = ()
+    transaction_publication = None
+    if promote or session.promotion_required:
+        pre_manifest = session.store.manifest()
+        prepared_snapshot_sha256 = hashlib.sha256(
+            session.controller.snapshot_bytes()
+        ).hexdigest()
+        prepared = _promotion_transaction_document(
+            phase="prepared",
+            cartography_manifest_sha256=cartography_manifest_sha256,
+            model_pin_sha256=session.controller.model_pin_sha256,
+            weight_graph_revision_sha256=(
+                session.controller.weight_graph_revision_sha256
+            ),
+            pre_manifest_generation=pre_manifest.generation,
+            pre_manifest_sha256=pre_manifest.sha256,
+            prepared_controller_snapshot_sha256=prepared_snapshot_sha256,
+            committed_controller_snapshot_sha256=None,
+        )
+        transaction_publication = _publish_promotion_transaction(
+            session.store,
+            prepared,
+            expected_sha256=session.promotion_transaction_state_sha256,
+        )
+        session.promotion_transaction = prepared
+        session.promotion_transaction_state_sha256 = (
+            transaction_publication.payload_sha256
+        )
+        prepared_snapshot = session.controller.save_snapshot(
+            expected_sha256=session.expected_snapshot_sha256,
+        )
+        if prepared_snapshot.payload_sha256 != prepared_snapshot_sha256:
+            raise O1CartographyCliError(
+                "prepared OoE controller snapshot changed before publication"
+            )
+        session.expected_snapshot_sha256 = prepared_snapshot.payload_sha256
+        publications = session.bridge.promote_ready()
+        snapshot = session.controller.save_snapshot(
+            expected_sha256=session.expected_snapshot_sha256,
+        )
+        session.expected_snapshot_sha256 = snapshot.payload_sha256
+        committed = _promotion_transaction_document(
+            phase="committed",
+            cartography_manifest_sha256=cartography_manifest_sha256,
+            model_pin_sha256=session.controller.model_pin_sha256,
+            weight_graph_revision_sha256=(
+                session.controller.weight_graph_revision_sha256
+            ),
+            pre_manifest_generation=pre_manifest.generation,
+            pre_manifest_sha256=pre_manifest.sha256,
+            prepared_controller_snapshot_sha256=prepared_snapshot_sha256,
+            committed_controller_snapshot_sha256=snapshot.payload_sha256,
+        )
+        transaction_publication = _publish_promotion_transaction(
+            session.store,
+            committed,
+            expected_sha256=session.promotion_transaction_state_sha256,
+        )
+        session.promotion_transaction = committed
+        session.promotion_transaction_state_sha256 = (
+            transaction_publication.payload_sha256
+        )
+        session.promotion_required = False
+        return publications, snapshot, transaction_publication
+
+    snapshot = session.controller.save_snapshot(
+        expected_sha256=session.expected_snapshot_sha256,
+    )
+    session.expected_snapshot_sha256 = snapshot.payload_sha256
+    transaction = session.promotion_transaction
+    if transaction is not None and transaction["body"]["phase"] == "prepared":
+        body = transaction["body"]
+        committed = _promotion_transaction_document(
+            phase="committed",
+            cartography_manifest_sha256=body["cartography_manifest_sha256"],
+            model_pin_sha256=body["model_pin_sha256"],
+            weight_graph_revision_sha256=body["weight_graph_revision_sha256"],
+            pre_manifest_generation=body["pre_manifest_generation"],
+            pre_manifest_sha256=body["pre_manifest_sha256"],
+            prepared_controller_snapshot_sha256=(
+                body["prepared_controller_snapshot_sha256"]
+            ),
+            committed_controller_snapshot_sha256=snapshot.payload_sha256,
+        )
+        transaction_publication = _publish_promotion_transaction(
+            session.store,
+            committed,
+            expected_sha256=session.promotion_transaction_state_sha256,
+        )
+        session.promotion_transaction = committed
+        session.promotion_transaction_state_sha256 = (
+            transaction_publication.payload_sha256
+        )
+    return publications, snapshot, transaction_publication
+
+
+def _empty_ooe_report(
+    root: Path,
+    *,
+    qwen_probe_calls: int,
+    reused_atlas_proofs: int,
+) -> dict[str, Any]:
+    return {
+        "available": False,
+        "controller_last_temporal_index": None,
+        "controller_metrics": ControllerMetrics().to_dict(),
+        "controller_snapshot": None,
+        "learning_receipts": [],
+        "learning_receipt_sha256s": [],
+        "promotions": [],
+        "promotion_transaction": None,
+        "qwen_probe_calls": qwen_probe_calls,
+        "recovery_receipt": None,
+        "reused_atlas_proofs": reused_atlas_proofs,
+        "root": str(root),
+        "saved_qwen_forwards": 0,
+        "site_identity_sha256s": [],
+    }
+
+
 def run_cartography(
     root: str | os.PathLike[str],
     *,
     max_jobs: int,
     max_seconds: float,
+    ooe_root: str | os.PathLike[str] | None = None,
     runtime_factory: RuntimeFactory | None = None,
     probe_factory: ProbeFactory = Qwen38CartographyProbe,
     atlas_factory: AtlasFactory = SemanticWeightAtlas,
@@ -1171,6 +1819,7 @@ def run_cartography(
     job_limit = _uint(max_jobs, "max_jobs")
     second_limit = _seconds(max_seconds, "max_seconds")
     root_path = _plain_root(root, create=False)
+    ooe_path = _ooe_root_path(root_path, ooe_root)
     with _root_lock(root_path):
         manifest, body = _load_manifest(root_path)
         scheduler = _scheduler(
@@ -1191,7 +1840,23 @@ def run_cartography(
             specs = {job.job_id: spec for job, spec in _manifest_jobs(body)}
             probe = probe_factory(runtime.model)
             reconciled = _reconcile_receipts(scheduler, atlas, specs, model_pin)
+            ooe_session, learning_receipts = _integrate_ooe_outcomes(
+                root=ooe_path,
+                scheduler=scheduler,
+                atlas=atlas,
+                specs=specs,
+                model_pin=model_pin,
+                cartography_manifest_sha256=manifest["sha256"],
+            )
+            stream_actions = {
+                specs[outcome.job_id].prompt_sha256: "probe_coordinate"
+                for outcome in scheduler.outcomes
+                if outcome.status == "succeeded"
+                and outcome.atlas_receipt_sha256 is not None
+            }
             outcomes = []
+            qwen_probe_calls = 0
+            reused_atlas_proofs = 0
             started = time.monotonic()
             stop_reason = "max-jobs"
             while job_limit == 0 or len(outcomes) < job_limit:
@@ -1200,10 +1865,13 @@ def run_cartography(
                     break
 
                 def execute(job: ProbeJob, _attempt: int):
+                    nonlocal qwen_probe_calls, reused_atlas_proofs
                     spec = specs[job.job_id]
                     reusable = _find_reusable_measurement(atlas, spec, model_pin)
                     if reusable is not None:
+                        reused_atlas_proofs += 1
                         return _observation(job, spec, reusable, reused=True)
+                    qwen_probe_calls += 1
                     before = time.monotonic()
                     result = probe.execute(spec, atlas_head_revision=atlas.revision())
                     observation, source_bytes = _append_probe_result(
@@ -1237,12 +1905,86 @@ def run_cartography(
                 if outcome.status == "succeeded":
                     observation = outcome.observation_document()
                     receipt = observation["atlas_receipt_sha256"]
-                    scheduler.attach_atlas_receipt(
+                    attached = scheduler.attach_atlas_receipt(
                         job_id=outcome.job_id,
                         attempt=outcome.attempt,
                         receipt_sha256=receipt,
                     )
+                    spec = specs[outcome.job_id]
+                    source_action = stream_actions.get(
+                        spec.prompt_sha256,
+                        "qwen_fallback",
+                    )
+                    stream_actions[spec.prompt_sha256] = "probe_coordinate"
+                    ooe_session, new_learning = _integrate_ooe_outcomes(
+                        root=ooe_path,
+                        scheduler=scheduler,
+                        atlas=atlas,
+                        specs=specs,
+                        model_pin=model_pin,
+                        cartography_manifest_sha256=manifest["sha256"],
+                        outcomes=(attached,),
+                        session=ooe_session,
+                        source_actions={
+                            attached.attempt_id: (
+                                source_action,
+                                spec.prompt_sha256,
+                            )
+                        },
+                    )
+                    learning_receipts.extend(new_learning)
             elapsed = time.monotonic() - started
+            ooe_report = _empty_ooe_report(
+                ooe_path,
+                qwen_probe_calls=qwen_probe_calls,
+                reused_atlas_proofs=reused_atlas_proofs,
+            )
+            if ooe_session is not None:
+                publications, snapshot, transaction_publication = (
+                    _finalize_ooe_runtime(
+                        ooe_session,
+                        cartography_manifest_sha256=manifest["sha256"],
+                        promote=bool(learning_receipts),
+                    )
+                )
+                ooe_report = {
+                    "available": True,
+                    "controller_last_temporal_index": (
+                        ooe_session.controller.last_temporal_index
+                    ),
+                    "controller_metrics": (
+                        ooe_session.controller.metrics.to_dict()
+                    ),
+                    "controller_snapshot": asdict(snapshot),
+                    "learning_receipts": learning_receipts,
+                    "learning_receipt_sha256s": sorted(
+                        row["learning_receipt"]["sha256"]
+                        for row in learning_receipts
+                    ),
+                    "promotions": [asdict(value) for value in publications],
+                    "promotion_transaction": (
+                        None
+                        if transaction_publication is None
+                        else asdict(transaction_publication)
+                    ),
+                    "qwen_probe_calls": qwen_probe_calls,
+                    "recovery_receipt": (
+                        None
+                        if ooe_session.recovery_receipt is None
+                        else {
+                            **ooe_session.recovery_receipt.to_dict(),
+                            "sha256": ooe_session.recovery_receipt.sha256,
+                        }
+                    ),
+                    "reused_atlas_proofs": reused_atlas_proofs,
+                    "root": str(ooe_session.root),
+                    "saved_qwen_forwards": (
+                        ooe_session.controller.metrics.saved_qwen_forwards
+                    ),
+                    "site_identity_sha256s": list(
+                        ooe_session.controller.site_identity_sha256s
+                    ),
+                }
             report = {
                 "attached_atlas_receipt_sha256s": sorted(
                     outcome.observation_document()["atlas_receipt_sha256"]
@@ -1255,6 +1997,7 @@ def run_cartography(
                 "coverage": scheduler.coverage().to_document(),
                 "elapsed_seconds": elapsed,
                 "manifest_sha256": manifest["sha256"],
+                "ooe": ooe_report,
                 "receipts_reconciled": reconciled,
                 "stop_reason": stop_reason,
             }
@@ -1549,6 +2292,10 @@ def _parser() -> argparse.ArgumentParser:
 
     run = commands.add_parser("run", help="run a bounded resumable probe slice")
     run.add_argument("--root", required=True)
+    run.add_argument(
+        "--ooe-root",
+        help="local CrystalStore root; defaults to <root>/ooe",
+    )
     run.add_argument("--max-jobs", type=_nonnegative_int_arg, default=1)
     run.add_argument(
         "--max-seconds",
@@ -1604,6 +2351,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
             args.root,
             max_jobs=args.max_jobs,
             max_seconds=args.max_seconds,
+            ooe_root=args.ooe_root,
         )
     if args.command == "status":
         return status_cartography(args.root)

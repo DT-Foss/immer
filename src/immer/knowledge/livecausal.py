@@ -353,6 +353,7 @@ class LiveStore:
         self._sequence = 0
         self._journal_offset = 0
         self._event_sha256 = ZERO_DIGEST
+        self._revision_events: dict[int, str] = {0: ZERO_DIGEST}
         self._record_offsets: dict[str, tuple[int, ...]] = {}
         self._verified_stats: dict[str, tuple[int, int, int, int, int]] = {}
         with _exclusive_store_lock(self.root):
@@ -532,6 +533,7 @@ class LiveStore:
         tombstones: set[str] = set()
         sequence = 0
         previous = ZERO_DIGEST
+        revision_events = {0: ZERO_DIGEST}
         consumed = 0
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
@@ -561,6 +563,7 @@ class LiveStore:
                     )
                     self._apply_event_to(event, active, active_set, tombstones)
                     previous = event["event_sha256"]
+                    revision_events[sequence] = previous
         finally:
             os.close(descriptor)
         if consumed != committed:
@@ -590,6 +593,7 @@ class LiveStore:
         self._sequence = sequence
         self._journal_offset = committed
         self._event_sha256 = previous
+        self._revision_events = revision_events
 
     def _reload_locked(self, *, verify_segments: bool) -> None:
         head = self._read_head_locked()
@@ -770,6 +774,7 @@ class LiveStore:
         self._sequence += 1
         self._journal_offset = new_offset
         self._event_sha256 = event["event_sha256"]
+        self._revision_events[self._sequence] = self._event_sha256
 
     def append_segment(self, records: Iterable[Mapping[str, Any]]) -> str:
         """Seal and activate one segment, idempotently.
@@ -834,6 +839,30 @@ class LiveStore:
         with _exclusive_store_lock(self.root):
             self._refresh_locked()
             return self._sequence, self._event_sha256
+
+    def revision_history(self) -> tuple[tuple[int, str], ...]:
+        """Return the authenticated committed hash-chain revisions, including zero."""
+
+        with _exclusive_store_lock(self.root):
+            self._refresh_locked()
+            expected = set(range(self._sequence + 1))
+            if set(self._revision_events) != expected:
+                raise LiveCausalIntegrityError("manifest revision history is incomplete")
+            return tuple(
+                (sequence, self._revision_events[sequence])
+                for sequence in range(self._sequence + 1)
+            )
+
+    def contains_revision(self, sequence: int, event_sha256: str) -> bool:
+        """Authenticate exact membership of one revision in the committed chain."""
+
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            raise LiveCausalValidationError("revision sequence must be non-negative")
+        if not isinstance(event_sha256, str) or _DIGEST.fullmatch(event_sha256) is None:
+            raise LiveCausalValidationError("revision event must be lowercase SHA-256")
+        with _exclusive_store_lock(self.root):
+            self._refresh_locked()
+            return self._revision_events.get(sequence) == event_sha256
 
     def _read_record_locked(self, sha: str, index: int) -> dict[str, Any]:
         offsets = self._verify_segment_locked(sha, force=False)

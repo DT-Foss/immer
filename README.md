@@ -22,6 +22,12 @@ release surface.
   K=2 and K=4 continuations that Qwen3.8 alone verifies and commits.
 - **Grounded composition.** [FERTIG](https://github.com/DT-Foss/FERTIG)
   supplies deterministic parsing, verification, and explicit abstention.
+- **Organism of Experts.** O1 measurements become authenticated Atlas evidence;
+  PS-Lifted Markov agents consolidate recurring runtime transitions into tiny,
+  executable, quantized Crystals while Qwen remains teacher and novelty path.
+- **Compute batteries.** Native Qwen continuation states are charged ahead of
+  demand, restored by exact token prefix, and resumed without replaying the
+  authenticated prefix.
 - **Transport intelligence.** Label-free route observations support held-out
   Markov and placebo studies while the model's official router remains
   authoritative.
@@ -34,6 +40,9 @@ release surface.
 | Trial | Result | Scope |
 |---|---:|---|
 | Qwen3.8 exact continuation | bit-identical K=1–4 state | exact transactional core with tokenwise hidden, KV, DeltaNet, and Prefix-Sinkhorn parity |
+| Markov-OoE PoC | 96.10% PS-Lifted; 100% warm | 17.28% local baseline, 13.50% shuffled-Crystal placebo, 338→64 consensus rounds, 588-byte raw kernel payload |
+| Qwen compute battery | 1.4288x peak speed | 65-token charged prefix + unknown 33-token suffix; authenticated restore removes 30.01% of demand latency |
+| O1 → Atlas → OoE | crash-resumable live loop | real contextual Qwen receipts, append-only revision membership, partial Crystal promotion, zero-probe Atlas reuse |
 | Qwen3.5 → Qwen3.8 live K=4 | 4/4 draft tokens accepted | fixed native Prefix-Sinkhorn trial; 32.39% fewer combined source bytes and 1.349x wall-time speedup versus 2×K=2 |
 | Qwen GC pressure policy | bit-identical; 134 → 2 collections | fixed causal CPU-BF16 A/B; 6.88% less process wall time and 1.074x speedup |
 | FERTIG exact frontier | 58/64 certified, 6 abstained | fixed gold-free development slice; holdout untouched |

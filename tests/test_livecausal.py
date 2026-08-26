@@ -37,6 +37,23 @@ def _process_writer(root: str, offset: int, count: int, queue: object) -> None:
 
 
 class LiveStoreTests(unittest.TestCase):
+    def test_revision_history_authenticates_exact_sequence_event_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = LiveStore(temporary)
+            self.assertEqual(store.revision_history(), ((0, "0" * 64),))
+            store.append_segment([{"trigger_key": "a", "outcome_key": "b"}])
+            first = store.revision()
+            store.append_segment([{"trigger_key": "b", "outcome_key": "c"}])
+            second = store.revision()
+
+            self.assertEqual(store.revision_history(), ((0, "0" * 64), first, second))
+            self.assertTrue(store.contains_revision(*first))
+            self.assertTrue(store.contains_revision(*second))
+            self.assertFalse(store.contains_revision(first[0], "f" * 64))
+
+            remounted = LiveStore(temporary)
+            self.assertEqual(remounted.revision_history(), store.revision_history())
+
     def test_append_remount_idempotency_and_journal_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

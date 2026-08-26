@@ -2,7 +2,48 @@
 
 All notable changes to IMMER are recorded here.
 
-## [Unreleased] — 2026-08-25
+## [Unreleased] — 2026-08-26
+
+### Organism of Experts and direct Qwen/O1 integration
+
+- Added the complete Markov-OoE runtime: calibrated attractor routing,
+  distributed Markov-PD agents, fading mobile reservoirs, Möbius rapidity,
+  PS-Lifted push-sum, quantized executable Crystals, and immutable
+  content-addressed publication.
+- Reproduced the original standalone experiment exactly: `96.10%` PS-Lifted
+  accuracy versus `17.28%` local, `49.84%` reversible, and `13.50%` shuffled
+  placebo; warm Crystal execution reaches `100%`, consensus falls from
+  `338` to `64` rounds, and the raw six-kernel payload is `588 B`.
+- Bound every learned site to the exact Qwen model pin, `.causal`
+  `WeightCoordinate`, action/feature schemas, append-only graph revisions,
+  coverage, calibration, verifier hashes, evidence hashes, and consensus
+  receipt. Numeric sketches come from real contextual Qwen measurements and
+  O1 surprise/progress, never static embedding means.
+- Wired the live chain directly:
+  `Qwen probe → SemanticWeightAtlas → O1 signal → Markov replicas → PS-Lifted Crystal`.
+  Historical Atlas reuse learns without another probe; partial Crystals execute
+  covered actions and abstain on every uncovered source.
+- Made Atlas history an exact authenticated revision set. Historical
+  `(sequence, event_sha256)` membership, concurrent-head changes, rollback,
+  forks, stale models, stale weight rails, and forged revisions fail closed.
+- Added controller-wide synchronization, execution-bound warm transactions,
+  and final `commit_warm`/`reject_warm` accounting. Saved Qwen forwards are
+  recorded only after the outer verifier accepts the final result; FERTIG
+  mismatch creates zero false savings.
+- Added a sealed two-phase promotion protocol and exact forward-drift recovery.
+  A crash after any durable Crystal publication resumes from the prepared
+  controller state, deterministically finishes the batch, and performs zero
+  duplicate Qwen probes.
+- Activated native semantic anchors in `Qwen38CausalChat`. Exact-prefix hits
+  use the authenticated final-hidden seed; shorter hits evaluate only the
+  suffix. Fresh and restored paths match generated tokens, every continuation
+  tensor, and final snapshot hashes bit-for-bit.
+- Added a verified warm-OoE hook before Qwen in `QwenFertigChat`, while keeping
+  FERTIG exact first refusal. Crystal tamper is a hard integrity error; novelty,
+  uncovered actions, and missing features fall through once to local Qwen.
+- Added direct CompositionRoot and CLI configuration for the local Qwen anchor
+  cache. Qwen remains the primary local teacher and novelty fallback.
+- Verified the repository with `1367/1367` tests.
 
 ### DeepSeek-V4 frontier streaming and live causal crystallization
 

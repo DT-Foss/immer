@@ -1,7 +1,7 @@
 {
   "schema": "immer.components.v2",
   "package_version": "0.8.0",
-  "released": "2026-08-23",
+  "released": "2026-08-26",
   "author": {
     "name": "David Tom Foss",
     "orcid": "https://orcid.org/0009-0004-0289-7154",
@@ -17,11 +17,43 @@
   },
   "components": [
     {
+      "name": "Qwen3.8-27B causal runtime",
+      "role": "primary local teacher, generator, and novelty fallback",
+      "repository": "https://huggingface.co/Qwen/Qwen3.8-27B",
+      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "status": "integrated primary runtime",
+      "integration": "src/immer/runtimes/qwen3_8/"
+    },
+    {
+      "name": "Markov-OoE",
+      "role": "O1/Atlas learning, PS-Lifted consolidation, and executable Crystals",
+      "repository": "https://github.com/DT-Foss/immer",
+      "revision": "package:0.8.0",
+      "status": "integrated runtime",
+      "integration": "src/immer/runtimes/ooe/",
+      "additional_integrations": [
+        "scripts/qwen38_o1_cartography.py",
+        "src/immer/cognition/qwen_fertig_chat.py"
+      ]
+    },
+    {
+      "name": "Qwen compute battery",
+      "role": "authenticated prefix-state charge, restore, and suffix continuation",
+      "repository": "https://github.com/DT-Foss/immer",
+      "revision": "package:0.8.0",
+      "status": "integrated Qwen path",
+      "integration": "src/immer/runtimes/qwen3_8/semantic_state_cache.py",
+      "additional_integrations": [
+        "src/immer/runtimes/qwen3_8/anchor_battery.py",
+        "src/immer/runtimes/qwen3_8/adapter.py"
+      ]
+    },
+    {
       "name": "DeepSeek-V4-Flash runtime",
-      "role": "active frontier decoder",
+      "role": "retained transport and control laboratory",
       "repository": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731",
       "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
-      "status": "integrated",
+      "status": "integrated retained backend",
       "integration": "src/immer/runtimes/deepseek_v4/",
       "evidence": "results/deepseek-v4-mmlu-off-4-exact-v4-window2x3-receipt.json"
     },

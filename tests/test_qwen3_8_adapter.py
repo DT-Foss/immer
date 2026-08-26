@@ -7,7 +7,9 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import torch
 
 from immer.cli import main
 from immer.cognition.fertig import FertigSolver
@@ -16,6 +18,12 @@ from immer.composition import CompositionRoot, compose_runtime
 from immer.contracts import ExecutionStatus, Request, Result
 from immer.runtimes.qwen3_8.adapter import Qwen38CausalChat, Qwen38ChatError
 from immer.runtimes.qwen3_8.encoding import Qwen38Tokenizer
+from immer.runtimes.qwen3_8.semantic_state_cache import (
+    AnchorReceipt,
+    RestoredAnchor,
+    SemanticStateAnchorCache,
+    token_prefix_sha256,
+)
 
 
 _DIGEST = "a" * 64
@@ -30,6 +38,45 @@ _BUNDLE_RECEIPT = {
     "tensor_bindings": 1199,
     "weights_layout": "flat/v1",
 }
+_ANCHOR_SEED = torch.tensor([[[3.0]]], dtype=torch.float32)
+_ANCHOR_PREFIX_SHA256 = token_prefix_sha256((11, 12))
+_ANCHOR_SEED_FILE_SHA256 = "8" * 64
+_ANCHOR_RECEIPT = AnchorReceipt.create(
+    prefix_length=2,
+    prefix_sha256=_ANCHOR_PREFIX_SHA256,
+    boundary_kind="turn",
+    semantic_label_sha256=None,
+    snapshot_manifest_name=f"{_ANCHOR_PREFIX_SHA256}.json",
+    snapshot_manifest_sha256="1" * 64,
+    snapshot_manifest_bytes=10,
+    snapshot_body_sha256="2" * 64,
+    snapshot_body_bytes=9,
+    snapshot_payload_name=f"{_ANCHOR_PREFIX_SHA256}.{'3' * 64}.npz",
+    snapshot_payload_sha256="3" * 64,
+    snapshot_payload_bytes=20,
+    seed_hidden_name=(
+        f"{_ANCHOR_PREFIX_SHA256}.{_ANCHOR_SEED_FILE_SHA256}.seed.safetensors"
+    ),
+    seed_hidden_sha256=_ANCHOR_SEED_FILE_SHA256,
+    seed_hidden_bytes=5,
+    seed_hidden_tensor_sha256=SemanticStateAnchorCache._seed_tensor_sha256(
+        _ANCHOR_SEED
+    ),
+    seed_hidden_dtype="float32",
+    seed_hidden_shape=(1, 1, 1),
+    seed_hidden_source_device="cpu",
+    state_bytes=321,
+    created_sequence=1,
+    last_access_sequence=2,
+    hit_count=1,
+    transport_neutral=False,
+)
+_RESTORED_ANCHOR = RestoredAnchor(
+    anchor=_ANCHOR_RECEIPT,
+    query_length=2,
+    exact_prefix=True,
+    seed_hidden=_ANCHOR_SEED,
+)
 
 
 class _Tokenizer:
@@ -89,6 +136,74 @@ class _Model:
         self.reset_calls.append(release)
         if self.cleanup_error is not None:
             raise self.cleanup_error
+
+
+class _AnchorModel(_Model):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(vocab_size=300_000, n_layers=64)
+        self.next_position = 0
+        self.state_poisoned = False
+        self.state_bytes = 0
+        self.state_batch_size = None
+
+    def generate_greedy(self, prompt, **kwargs):
+        if "restored_prefix_length" not in kwargs:
+            return super().generate_greedy(prompt, **kwargs)
+        self.calls.append((prompt, kwargs))
+        if kwargs.get("restored_prefix_length") != 2:
+            raise AssertionError("exact prefix was not passed to generation")
+        if kwargs.get("restored_seed_hidden") is not _RESTORED_ANCHOR.seed_hidden:
+            raise AssertionError("authenticated head seed was not passed through")
+        return self.generated, {
+            "prompt_token_ids": tuple(prompt[0]),
+            "generated_token_ids": self.generated,
+            "context_mode": "stateful_autoregressive",
+            "stateful_cache": True,
+            "general_generation": True,
+            "prefill_mode": "batched",
+            "forward_passes": 2,
+            "source_body_bytes": 600,
+            "linear_calls": 66,
+            "seconds": 0.75,
+            "state_bytes": 654,
+            "stopped_on_eos": False,
+        }
+
+    def reset_state(self, *, release=False):
+        super().reset_state(release=release)
+        self.next_position = 0
+        self.state_poisoned = False
+        self.state_bytes = 0
+        self.state_batch_size = None
+
+
+class _UnderreportedAnchorModel(_AnchorModel):
+    def generate_greedy(self, prompt, **kwargs):
+        generated, evidence = super().generate_greedy(prompt, **kwargs)
+        return generated, {**evidence, "forward_passes": 1}
+
+
+def _anchor_cache(
+    *,
+    failure: Exception | None = None,
+    miss: bool = False,
+    restored: RestoredAnchor = _RESTORED_ANCHOR,
+):
+    cache = object.__new__(SemanticStateAnchorCache)
+
+    def restore(model, _token_ids):
+        if miss:
+            return None
+        model.next_position = 2
+        model.state_bytes = _ANCHOR_RECEIPT.state_bytes
+        model.state_batch_size = 1
+        if failure is not None:
+            raise failure
+        return restored
+
+    cache.restore_deepest = Mock(side_effect=restore)
+    return cache
 
 
 class _Runtime:
@@ -184,6 +299,118 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(len(generation["token_trace_sha256"]), 64)
         self.assertNotIn("prompt_token_ids", generation)
         self.assertNotIn("generated_token_ids", generation)
+
+    def test_authenticated_exact_anchor_bypasses_prefill_with_identical_output(
+        self,
+    ) -> None:
+        baseline = _chat(_Runtime()).handle(Request("chat", "hello"))
+        model = _AnchorModel()
+        cache = _anchor_cache()
+        cached = _chat(
+            _Runtime(model=model),
+            anchor_cache=cache,
+        ).handle(Request("chat", "hello"))
+
+        self.assertIs(baseline.status, ExecutionStatus.OK)
+        self.assertIs(cached.status, ExecutionStatus.OK)
+        self.assertEqual(cached.output, baseline.output)
+        cache.restore_deepest.assert_called_once_with(model, (11, 12))
+        options = model.calls[0][1]
+        self.assertEqual(options["restored_prefix_length"], 2)
+        self.assertIs(
+            options["restored_seed_hidden"],
+            _RESTORED_ANCHOR.seed_hidden,
+        )
+        anchor = cached.evidence["anchor_cache"]
+        self.assertEqual(anchor["status"], "hit")
+        self.assertTrue(anchor["exact_prefix"])
+        self.assertEqual(anchor["prefix_tokens"], 2)
+        self.assertEqual(anchor["suffix_tokens"], 0)
+        self.assertEqual(anchor["snapshot_bytes_read"], 70)
+        self.assertEqual(anchor["forward_passes_baseline"], 3)
+        self.assertEqual(anchor["forward_passes_executed"], 2)
+        self.assertEqual(anchor["forward_passes_saved"], 1)
+        self.assertEqual(anchor["prefill_weight_sweeps_saved"], 1)
+        self.assertEqual(anchor["checkpoint_read_sweeps_saved"], 1)
+        self.assertEqual(anchor["prompt_token_layer_evaluations_saved"], 128)
+        self.assertEqual(anchor["checkpoint_source_body_bytes_read"], 600)
+        self.assertEqual(anchor["checkpoint_linear_calls_executed"], 66)
+        self.assertEqual(anchor["anchor"], _ANCHOR_RECEIPT.to_document())
+        self.assertEqual(model.reset_calls, [True])
+
+    def test_anchor_restore_failure_never_falls_back_and_resets_state(self) -> None:
+        model = _AnchorModel()
+        result = _chat(
+            _Runtime(model=model),
+            anchor_cache=_anchor_cache(failure=RuntimeError("tampered anchor")),
+        ).handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertIn("tampered anchor", result.reason)
+        self.assertEqual(model.calls, [])
+        self.assertEqual(model.reset_calls, [True])
+        self.assertEqual(model.next_position, 0)
+        self.assertEqual(model.state_bytes, 0)
+
+    def test_anchor_seed_must_match_the_sealed_receipt(self) -> None:
+        model = _AnchorModel()
+        tampered = RestoredAnchor(
+            anchor=_ANCHOR_RECEIPT,
+            query_length=2,
+            exact_prefix=True,
+            seed_hidden=_ANCHOR_SEED + 1.0,
+        )
+        result = _chat(
+            _Runtime(model=model),
+            anchor_cache=_anchor_cache(restored=tampered),
+        ).handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertIn("seed differs from the sealed anchor", result.reason)
+        self.assertEqual(model.calls, [])
+        self.assertEqual(model.reset_calls, [True])
+
+    def test_anchor_forward_savings_reject_underreported_execution(self) -> None:
+        model = _UnderreportedAnchorModel()
+        result = _chat(
+            _Runtime(model=model),
+            anchor_cache=_anchor_cache(),
+        ).handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertIn("forward count is inconsistent", result.reason)
+        self.assertEqual(model.reset_calls, [True])
+
+    def test_anchor_miss_preserves_the_existing_generation_path(self) -> None:
+        model = _AnchorModel()
+        result = _chat(
+            _Runtime(model=model),
+            anchor_cache=_anchor_cache(miss=True),
+        ).handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.OK)
+        self.assertEqual(result.output, "local answer")
+        self.assertEqual(
+            model.calls[0],
+            (
+                [[11, 12]],
+                {
+                    "max_new_tokens": 3,
+                    "prefill_tokenwise": False,
+                    "eos_token_ids": (248046, 248044),
+                    "head_block_rows": 17,
+                },
+            ),
+        )
+        self.assertEqual(result.evidence["anchor_cache"]["status"], "miss")
+        self.assertEqual(model.reset_calls, [True])
+
+    def test_anchor_cache_rejects_duck_typed_restore_provider(self) -> None:
+        with self.assertRaisesRegex(TypeError, "SemanticStateAnchorCache"):
+            _chat(
+                _Runtime(),
+                anchor_cache=SimpleNamespace(restore_deepest=lambda *_args: None),
+            )
 
     def test_rejections_do_not_open_the_runtime(self) -> None:
         calls = 0

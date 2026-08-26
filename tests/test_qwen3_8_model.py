@@ -18,6 +18,7 @@ from immer.runtimes.qwen3_8.draft_verification import (
 from immer.runtimes.qwen3_8.model import Qwen38RuntimeError, StreamedQwen38
 from immer.runtimes.qwen3_8.kernels import AttentionState, DeltaNetState
 from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+from immer.runtimes.qwen3_8.semantic_state_cache import SemanticStateAnchorCache
 from immer.runtimes.qwen3_8.graft import (
     STABLE_GRAFT_EVIDENCE_SCHEMA,
     Qwen38StableCrsaGraft,
@@ -1414,6 +1415,153 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertTrue(stopped_evidence.stopped_on_eos)
         self.assertEqual(stopped_evidence.forward_passes, 2)
         self.assertEqual(self.model.next_position, 3)
+
+    def test_greedy_generation_from_exact_anchor_skips_prompt_prefill(self) -> None:
+        prompt = [[1, 4]]
+        baseline, baseline_evidence = self.model.generate_greedy(
+            prompt,
+            max_new_tokens=2,
+            head_block_rows=7,
+        )
+        baseline_states = _clone_layer_states(self.model._layer_states)
+        baseline_snapshot_root = self.root / "exact-baseline"
+        baseline_snapshot_root.mkdir()
+        baseline_snapshot = self.model.save_state(baseline_snapshot_root / "state.json")
+        self.model.reset_state(release=True)
+        hidden, _ = self.model.prefill(prompt)
+        cache = SemanticStateAnchorCache(self.root / "generation-cache")
+        cache.store(
+            self.model,
+            prompt[0],
+            boundary_kind="turn",
+            seed_hidden=hidden[:, -1:],
+        )
+
+        restored_model = StreamedQwen38(
+            self.config,
+            self.pager,
+            max_batch_size=3,
+            max_seq_len=32,
+        )
+        restored = cache.restore_deepest(restored_model, prompt[0])
+        self.assertIsNotNone(restored)
+        assert restored is not None and restored.seed_hidden is not None
+        with mock.patch.object(
+            restored_model,
+            "prefill",
+            wraps=restored_model.prefill,
+        ) as prefill:
+            generated, evidence = restored_model.generate_greedy(
+                prompt,
+                max_new_tokens=2,
+                restored_prefix_length=restored.anchor.prefix_length,
+                restored_seed_hidden=restored.seed_hidden,
+                head_block_rows=7,
+            )
+
+        self.assertEqual(generated, baseline)
+        self.assertEqual(
+            evidence.generated_token_ids, baseline_evidence.generated_token_ids
+        )
+        self.assertEqual(evidence.forward_passes, 2)
+        self.assertEqual(baseline_evidence.forward_passes, 3)
+        self.assertLess(
+            evidence.source_body_bytes,
+            baseline_evidence.source_body_bytes,
+        )
+        self.assertEqual(restored_model.next_position, 4)
+        _assert_layer_states_equal(
+            self,
+            restored_model._layer_states,
+            baseline_states,
+        )
+        restored_snapshot_root = self.root / "exact-restored"
+        restored_snapshot_root.mkdir()
+        restored_snapshot = restored_model.save_state(
+            restored_snapshot_root / "state.json"
+        )
+        self.assertEqual(
+            restored_snapshot["payload_sha256"],
+            baseline_snapshot["payload_sha256"],
+        )
+        self.assertEqual(
+            restored_snapshot["manifest_body_sha256"],
+            baseline_snapshot["manifest_body_sha256"],
+        )
+        prefill.assert_not_called()
+
+    def test_greedy_generation_from_anchor_prefills_only_prompt_suffix(self) -> None:
+        prefix = [[1, 4]]
+        prompt = [[1, 4, 9]]
+        baseline, baseline_evidence = self.model.generate_greedy(
+            prompt,
+            max_new_tokens=1,
+            head_block_rows=7,
+        )
+        baseline_states = _clone_layer_states(self.model._layer_states)
+        baseline_snapshot_root = self.root / "suffix-baseline"
+        baseline_snapshot_root.mkdir()
+        baseline_snapshot = self.model.save_state(baseline_snapshot_root / "state.json")
+        self.model.reset_state(release=True)
+        hidden, _ = self.model.prefill(prefix)
+        cache = SemanticStateAnchorCache(self.root / "suffix-generation-cache")
+        cache.store(
+            self.model,
+            prefix[0],
+            boundary_kind="turn",
+            seed_hidden=hidden[:, -1:],
+        )
+
+        restored_model = StreamedQwen38(
+            self.config,
+            self.pager,
+            max_batch_size=3,
+            max_seq_len=32,
+        )
+        restored = cache.restore_deepest(restored_model, prompt[0])
+        self.assertIsNotNone(restored)
+        assert restored is not None
+        self.assertFalse(restored.exact_prefix)
+        self.assertIsNone(restored.seed_hidden)
+        with mock.patch.object(
+            restored_model,
+            "prefill",
+            wraps=restored_model.prefill,
+        ) as prefill:
+            generated, evidence = restored_model.generate_greedy(
+                prompt,
+                max_new_tokens=1,
+                restored_prefix_length=restored.anchor.prefix_length,
+                head_block_rows=7,
+            )
+
+        self.assertEqual(generated, baseline)
+        self.assertEqual(
+            evidence.generated_token_ids,
+            baseline_evidence.generated_token_ids,
+        )
+        self.assertEqual(evidence.forward_passes, 2)
+        prefill.assert_called_once()
+        self.assertTrue(torch.equal(prefill.call_args.args[0], torch.tensor([[9]])))
+        self.assertFalse(prefill.call_args.kwargs["reset"])
+        _assert_layer_states_equal(
+            self,
+            restored_model._layer_states,
+            baseline_states,
+        )
+        restored_snapshot_root = self.root / "suffix-restored"
+        restored_snapshot_root.mkdir()
+        restored_snapshot = restored_model.save_state(
+            restored_snapshot_root / "state.json"
+        )
+        self.assertEqual(
+            restored_snapshot["payload_sha256"],
+            baseline_snapshot["payload_sha256"],
+        )
+        self.assertEqual(
+            restored_snapshot["manifest_body_sha256"],
+            baseline_snapshot["manifest_body_sha256"],
+        )
 
     def test_gc_policy_preserves_generated_tokens_hidden_and_state(self) -> None:
         source = Streamer.from_local(self.root, budget_mb=20, use_cache=False)

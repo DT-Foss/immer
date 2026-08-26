@@ -1,6 +1,6 @@
 # Benchmarks
 
-Release: Unreleased · 2026-08-25
+Release: Unreleased · 2026-08-26
 
 Each row states its exact measurement scope and evidence boundary. Committed
 machine-readable receipts are linked directly. Model-weight execution receipts
@@ -23,6 +23,20 @@ remote-network results are separated from local execution.
 
 The four-item and eight-item rows are integration slices. Their claims stop at
 those exact item sets.
+
+## Markov-OoE and compute batteries
+
+| Benchmark | Result | Exact scope | Evidence boundary |
+|---|---:|---|---|
+| Standalone Markov-OoE | local `17.28%`; reversible `49.84%`; PS-Lifted `96.10%`; warm `100%`; shuffled Crystal `13.50%` | six finite operator families; local noisy one-step teacher transitions; 250 unseen plans and 5,000 longer unseen compositions | imported package manifest `28/28`; production port and regression tests in [`runtimes/ooe`](../src/immer/runtimes/ooe) |
+| PS-Lifted consensus | `338 → 64` rounds (`5.28125x` fewer) | original fixed barbell topology and tolerance; raw six-kernel payload `588 B` | [`test_ooe_math_consensus.py`](../tests/test_ooe_math_consensus.py); [`test_ooe_qwen_bridge_controller.py`](../tests/test_ooe_qwen_bridge_controller.py) |
+| Qwen native anchor battery | `130.457495 s → 91.304167 s`; `1.428823x`; `30.012326%` demand latency removed | one official local CPU-BF16 Qwen3.8 cell; 65-token charged invariant and previously unknown 33-token suffix | private sealed receipt; [`anchor_battery.py`](../src/immer/runtimes/qwen3_8/anchor_battery.py); [`test_qwen3_8_adapter.py`](../tests/test_qwen3_8_adapter.py) |
+| O1 → Atlas → OoE integration | zero duplicate probes on Atlas reuse; crash-resumable Crystal promotion | authentic `MeasurementReceipt` objects, exact live Atlas revision membership, O1 surprise/progress, partial source coverage | [`qwen38_o1_cartography.py`](../scripts/qwen38_o1_cartography.py); [`test_qwen38_o1_cartography.py`](../tests/test_qwen38_o1_cartography.py) |
+
+The warm controller test counts a Qwen forward only after an execution-bound
+result passes its final verifier. Anchor restoration reports prefix token-layer
+work and checkpoint reads separately; Atlas reuse reports avoided probe calls.
+These counters are not interchangeable.
 
 ## Local causal Qwen continuation
 

@@ -11,7 +11,18 @@ import tempfile
 import unittest
 from unittest import mock
 
-from immer.runtimes.qwen3_8 import GraphRevision, ModelPin, prompt_token_sha256
+from immer.runtimes.ooe.crystal import CrystalTamperError
+from immer.runtimes.qwen3_8 import (
+    AtlasQueryResult,
+    GraphRevision,
+    InterventionIdentity,
+    MeasurementReceipt,
+    ModelPin,
+    NumericSummary,
+    RuntimeProvenance,
+    WeightCoordinate,
+    prompt_token_sha256,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -127,7 +138,7 @@ class _FakeAppendReceipt:
 
 
 class _FakeResult:
-    def __init__(self, measurement: _FakeMeasurement) -> None:
+    def __init__(self, measurement: object) -> None:
         self.measurement = measurement
         self.measurements_in_append_order = (measurement,)
         operation = SimpleNamespace(source_bytes=7)
@@ -145,7 +156,8 @@ class _FakeResult:
 
 
 class _FakeAtlas:
-    stores: dict[str, dict[str, _FakeMeasurement]] = {}
+    stores: dict[str, dict[str, object]] = {}
+    histories: dict[str, list[GraphRevision]] = {}
 
     def __init__(self, path, *, model_pin, tensor_plans) -> None:
         self.path = str(Path(path).absolute())
@@ -153,6 +165,10 @@ class _FakeAtlas:
         if not tensor_plans:
             raise AssertionError("atlas requires injected plans")
         self.store = self.stores.setdefault(self.path, {})
+        self.history = self.histories.setdefault(
+            self.path,
+            [GraphRevision(0, _digest([]))],
+        )
 
     def verify_or_raise(self) -> bool:
         if any(value.model_pin != self.model_pin for value in self.store.values()):
@@ -160,10 +176,13 @@ class _FakeAtlas:
         return True
 
     def revision(self) -> GraphRevision:
-        return GraphRevision(
-            sequence=len(self.store),
-            event_sha256=_digest(sorted(self.store)),
-        )
+        return self.history[-1]
+
+    def revision_history(self) -> tuple[GraphRevision, ...]:
+        return tuple(self.history)
+
+    def contains_revision(self, revision: GraphRevision) -> bool:
+        return any(value == revision for value in self.history)
 
     def append_measurement(self, measurement):
         prior = self.store.get(measurement.sha256)
@@ -171,6 +190,13 @@ class _FakeAtlas:
             raise AssertionError("fake atlas identity collision")
         appended = prior is None
         self.store[measurement.sha256] = measurement
+        if appended:
+            self.history.append(
+                GraphRevision(
+                    sequence=self.history[-1].sequence + 1,
+                    event_sha256=_digest(sorted(self.store)),
+                )
+            )
         return _FakeAppendReceipt(
             record_kind="measurement",
             record_sha256=measurement.sha256,
@@ -179,7 +205,7 @@ class _FakeAtlas:
         )
 
     def _result(self, values):
-        return SimpleNamespace(
+        return AtlasQueryResult(
             measurements=tuple(sorted(values, key=lambda row: row.sha256)),
             promotions=(),
             replicas=(),
@@ -252,6 +278,77 @@ class _FakeProbe:
         )
 
 
+_WEIGHT_REVISION = GraphRevision(7, _digest({"graph": "qwen-weight-rail"}))
+_RUNTIME_PROVENANCE = RuntimeProvenance(
+    code_revision=CODE_REVISION,
+    source_manifest_sha256=_digest({"source": "local-causal-bundle"}),
+    dependency_manifest_sha256=_digest({"dependencies": "fixture"}),
+    runtime_configuration_sha256=_digest({"runtime": "fixture"}),
+    platform_sha256=_digest({"platform": "fixture"}),
+)
+
+
+class _AuthenticProbe:
+    calls: list[str] = []
+
+    def __init__(self, model: _FakeModel) -> None:
+        self.model = model
+
+    def execute(self, spec, *, atlas_head_revision):
+        if not isinstance(atlas_head_revision, GraphRevision):
+            raise AssertionError("probe did not receive the Atlas graph head")
+        self.calls.append(spec.sha256)
+        coordinate = WeightCoordinate(
+            layer=spec.coordinate.layer,
+            module=spec.coordinate.module,
+            tensor=spec.coordinate.tensor,
+            dtype="BF16",
+            shape=(2, 1),
+            shard=f"layer-{spec.coordinate.layer}.safetensors",
+            tensor_absolute_offset=spec.coordinate.layer * 16,
+            tensor_length=4,
+            range_absolute_offset=spec.coordinate.layer * 16,
+            range_length=4,
+            row_start=0,
+            row_end=2,
+        )
+        signal = float(spec.coordinate.layer + 1)
+        measurement = MeasurementReceipt(
+            model_pin=self.model.model_pin,
+            coordinate=coordinate,
+            probe=spec.probe_identity,
+            intervention=InterventionIdentity(
+                mode=str(spec.intervention_mode),
+                configuration_sha256=_digest(
+                    {"alpha": 0.0, "kind": "original-qwen-identity"}
+                ),
+            ),
+            observation_status="recorded",
+            observed_semantic_label=spec.semantic_label,
+            hidden_sha256=_digest({"hidden": spec.sha256}),
+            activation_sha256=_digest({"activation": spec.sha256}),
+            logits_sha256=_digest({"logits": spec.sha256}),
+            state_sha256=_digest({"state": spec.sha256}),
+            access_trace_sha256=_digest({"trace": spec.sha256}),
+            evidence_sha256=_digest({"evidence": spec.sha256}),
+            weight_rail_revision=_WEIGHT_REVISION,
+            atlas_head_revision=atlas_head_revision,
+            numeric_summaries=(
+                NumericSummary(
+                    metric="activation_rms",
+                    count=2,
+                    total=2.0 * signal,
+                    total_squares=2.0 * signal * signal,
+                    minimum=signal,
+                    maximum=signal,
+                ),
+            ),
+            placebo_effects=(),
+            runtime=_RUNTIME_PROVENANCE,
+        )
+        return _FakeResult(measurement)
+
+
 def _runtime_factory(body):
     pin = ModelPin.from_document(body["model_pin"])
     return cartography.CartographyRuntime(
@@ -294,7 +391,9 @@ def _jobs() -> list[dict[str, object]]:
 class Qwen38O1CartographyTests(unittest.TestCase):
     def setUp(self) -> None:
         _FakeAtlas.stores.clear()
+        _FakeAtlas.histories.clear()
         _FakeProbe.calls.clear()
+        _AuthenticProbe.calls.clear()
         _FakeProbe.failures_remaining = 0
         self.temporary = tempfile.TemporaryDirectory(
             prefix=".qwen-o1-loop-test-", dir=Path.cwd()
@@ -567,6 +666,59 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         self.assertEqual(len(_FakeProbe.calls), 2)
         self.assertEqual(resumed["coverage"]["promoted_jobs"], 2)
 
+    def test_crash_reconciliation_ingests_authentic_outcome_exactly_once(self) -> None:
+        run_root = self.base / "authentic-crash"
+        cartography.prepare_manifest(
+            run_root,
+            bundle_root=self.bundle,
+            model_pin=_pin(),
+            prompt_token_ids=self.tokens,
+            prompt_sha256=self.prompt_sha,
+            jobs=_jobs()[:1],
+            code_revision=CODE_REVISION,
+            seed=17,
+        )
+        original = cartography.O1Cartographer.attach_atlas_receipt
+        crashed = False
+
+        def crash_once(scheduler, **kwargs):
+            nonlocal crashed
+            if not crashed:
+                crashed = True
+                raise OSError("simulated crash before authentic attachment")
+            return original(scheduler, **kwargs)
+
+        with mock.patch.object(
+            cartography.O1Cartographer,
+            "attach_atlas_receipt",
+            autospec=True,
+            side_effect=crash_once,
+        ):
+            with self.assertRaisesRegex(OSError, "authentic attachment"):
+                self._run(
+                    run_root,
+                    max_jobs=1,
+                    probe_factory=_AuthenticProbe,
+                )
+        self.assertEqual(len(_AuthenticProbe.calls), 1)
+
+        resumed = self._run(
+            run_root,
+            probe_factory=_AuthenticProbe,
+        )
+        self.assertEqual(resumed["receipts_reconciled"], 1)
+        self.assertEqual(resumed["attempts_executed"], 0)
+        self.assertEqual(len(resumed["ooe"]["learning_receipts"]), 1)
+        self.assertEqual(resumed["ooe"]["controller_last_temporal_index"], 0)
+        self.assertEqual(len(_AuthenticProbe.calls), 1)
+
+        reopened = self._run(
+            run_root,
+            probe_factory=_AuthenticProbe,
+        )
+        self.assertEqual(reopened["ooe"]["learning_receipts"], [])
+        self.assertEqual(reopened["ooe"]["controller_last_temporal_index"], 0)
+
     def test_failed_probe_is_durable_and_retryable_on_reopen(self) -> None:
         run_root = self.base / "failure"
         self._prepare(run_root)
@@ -602,6 +754,282 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         )
         self.assertEqual(status["coverage"]["succeeded_jobs"], 1)
         self.assertEqual(tuple(run_root.glob("o1-state.*.pt")), sidecars)
+
+    def test_authentic_o1_measurements_resume_into_atomic_ooe_crystals(self) -> None:
+        run_root = self.base / "authentic-ooe"
+        ooe_root = self.base / "custom-ooe-store"
+        self._prepare(run_root)
+
+        first = self._run(
+            run_root,
+            max_jobs=1,
+            probe_factory=_AuthenticProbe,
+            ooe_root=ooe_root,
+        )
+        self.assertEqual(first["ooe"]["qwen_probe_calls"], 1)
+        self.assertEqual(first["ooe"]["reused_atlas_proofs"], 0)
+        self.assertEqual(len(first["ooe"]["learning_receipts"]), 1)
+        self.assertEqual(len(first["ooe"]["promotions"]), 1)
+        self.assertEqual(first["ooe"]["saved_qwen_forwards"], 0)
+        first_learning = first["ooe"]["learning_receipts"][0]
+        self.assertEqual(
+            first_learning["learning_receipt"]["source_action"],
+            "qwen_fallback",
+        )
+        self.assertEqual(
+            first_learning["learning_receipt"]["target_action"],
+            "probe_coordinate",
+        )
+        self.assertEqual(first["ooe"]["root"], str(ooe_root.absolute()))
+
+        second = self._run(
+            run_root,
+            max_jobs=1,
+            probe_factory=_AuthenticProbe,
+            ooe_root=ooe_root,
+        )
+        self.assertEqual(second["ooe"]["qwen_probe_calls"], 1)
+        self.assertEqual(len(second["ooe"]["learning_receipts"]), 1)
+        self.assertEqual(
+            second["ooe"]["learning_receipts"][0]["learning_receipt"][
+                "source_action"
+            ],
+            "probe_coordinate",
+        )
+        self.assertEqual(second["ooe"]["controller_last_temporal_index"], 1)
+        self.assertEqual(len(second["ooe"]["site_identity_sha256s"]), 2)
+
+        reopened = self._run(
+            run_root,
+            probe_factory=_AuthenticProbe,
+            ooe_root=ooe_root,
+        )
+        self.assertEqual(reopened["attempts_executed"], 0)
+        self.assertEqual(reopened["ooe"]["learning_receipts"], [])
+        self.assertEqual(reopened["ooe"]["qwen_probe_calls"], 0)
+        self.assertFalse(reopened["ooe"]["controller_snapshot"]["changed"])
+        self.assertEqual(len(_AuthenticProbe.calls), 2)
+
+    def test_reused_atlas_proof_learns_without_probe_or_forward_savings(self) -> None:
+        run_root = self.base / "ooe-reuse"
+        manifest = self._prepare(run_root)
+        atlas_path = run_root / cartography.ATLAS_NAME
+        atlas_path.mkdir()
+        atlas = _FakeAtlas(
+            atlas_path,
+            model_pin=_pin(),
+            tensor_plans=(object(),),
+        )
+        for row in manifest["body"]["jobs"]:
+            spec = cartography._spec_from_record(row["spec"])
+            precomputed = _AuthenticProbe(_FakeModel(_pin())).execute(
+                spec,
+                atlas_head_revision=atlas.revision(),
+            ).measurement
+            atlas.append_measurement(precomputed)
+        _AuthenticProbe.calls.clear()
+
+        report = self._run(
+            run_root,
+            max_jobs=1,
+            probe_factory=_AuthenticProbe,
+        )
+        self.assertEqual(report["ooe"]["qwen_probe_calls"], 0)
+        self.assertEqual(report["ooe"]["reused_atlas_proofs"], 1)
+        self.assertEqual(len(report["ooe"]["learning_receipts"]), 1)
+        self.assertTrue(
+            report["ooe"]["learning_receipts"][0]["reused_atlas_proof"]
+        )
+        self.assertEqual(report["ooe"]["saved_qwen_forwards"], 0)
+        self.assertEqual(_AuthenticProbe.calls, [])
+
+    def test_ooe_atlas_verifier_rejects_forged_historical_event(self) -> None:
+        run_root = self.base / "ooe-historical-revision"
+        manifest = self._prepare(run_root)
+        atlas_path = run_root / cartography.ATLAS_NAME
+        atlas_path.mkdir()
+        atlas = _FakeAtlas(
+            atlas_path,
+            model_pin=_pin(),
+            tensor_plans=(object(),),
+        )
+        measurements = []
+        for row in manifest["body"]["jobs"]:
+            spec = cartography._spec_from_record(row["spec"])
+            measurement = _AuthenticProbe(_FakeModel(_pin())).execute(
+                spec,
+                atlas_head_revision=atlas.revision(),
+            ).measurement
+            atlas.append_measurement(measurement)
+            measurements.append(measurement)
+
+        verifier = cartography._atlas_revision_verifier(atlas, measurements)
+        historical = measurements[0].atlas_head_revision
+        self.assertLess(historical.sequence, atlas.revision().sequence)
+        self.assertTrue(verifier(historical))
+        forged = GraphRevision(
+            historical.sequence,
+            _digest({"forged-event": historical.sequence}),
+        )
+        self.assertFalse(verifier(forged))
+
+    def test_ooe_atlas_measurement_auth_rejects_concurrent_head_change(self) -> None:
+        run_root = self.base / "ooe-concurrent-atlas-head"
+        manifest = self._prepare(run_root)
+        atlas_path = run_root / cartography.ATLAS_NAME
+        atlas_path.mkdir()
+        atlas = _FakeAtlas(atlas_path, model_pin=_pin(), tensor_plans=(object(),))
+        spec = cartography._spec_from_record(manifest["body"]["jobs"][0]["spec"])
+        measurement = _AuthenticProbe(_FakeModel(_pin())).execute(
+            spec,
+            atlas_head_revision=atlas.revision(),
+        ).measurement
+        atlas.append_measurement(measurement)
+        original_query = atlas.query_by_prompt_signature
+
+        def moving_query(prompt_sha256):
+            result = original_query(prompt_sha256)
+            atlas.history.append(
+                GraphRevision(
+                    atlas.history[-1].sequence + 1,
+                    _digest({"concurrent": atlas.history[-1].sequence + 1}),
+                )
+            )
+            return result
+
+        atlas.query_by_prompt_signature = moving_query
+        verifier = cartography._AtlasRevisionMembership(atlas)
+        with self.assertRaisesRegex(
+            cartography.O1CartographyCliError,
+            "head changed during",
+        ):
+            verifier.authenticate_measurement(measurement)
+
+    def test_ooe_snapshot_tamper_is_rejected_on_exact_resume(self) -> None:
+        run_root = self.base / "ooe-tamper"
+        self._prepare(run_root)
+        first = self._run(
+            run_root,
+            probe_factory=_AuthenticProbe,
+        )
+        snapshot_sha256 = first["ooe"]["controller_snapshot"]["payload_sha256"]
+        clean_resume = self._run(
+            run_root,
+            max_jobs=0,
+            probe_factory=_AuthenticProbe,
+        )
+        self.assertEqual(
+            clean_resume["ooe"]["controller_snapshot"]["payload_sha256"],
+            snapshot_sha256,
+        )
+        state_name = hashlib.sha256(
+            cartography.CONTROLLER_STATE_NAME.encode("utf-8")
+        ).hexdigest()
+        state_path = (
+            run_root / cartography.OOE_NAME / "state" / f"{state_name}.state"
+        )
+        envelope = json.loads(state_path.read_text())
+        envelope["payload_sha256"] = "0" * 64
+        state_path.chmod(0o600)
+        state_path.write_bytes(
+            json.dumps(
+                envelope,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        with self.assertRaises(CrystalTamperError):
+            self._run(
+                run_root,
+                max_jobs=0,
+                probe_factory=_AuthenticProbe,
+            )
+
+    def test_crash_between_crystal_promotion_and_snapshot_recovers_exactly(
+        self,
+    ) -> None:
+        run_root = self.base / "ooe-promotion-crash"
+        self._prepare(run_root)
+        original = cartography.OoeController.save_snapshot
+        calls = 0
+
+        def crash_second_save(controller, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("simulated crash after Crystal promotion")
+            return original(controller, **kwargs)
+
+        with mock.patch.object(
+            cartography.OoeController,
+            "save_snapshot",
+            autospec=True,
+            side_effect=crash_second_save,
+        ):
+            with self.assertRaisesRegex(OSError, "after Crystal promotion"):
+                self._run(
+                    run_root,
+                    probe_factory=_AuthenticProbe,
+                )
+        self.assertEqual(len(_AuthenticProbe.calls), 2)
+        transaction = cartography._load_promotion_transaction(
+            cartography.CrystalStore(run_root / cartography.OOE_NAME)
+        )
+        self.assertIsNotNone(transaction)
+        self.assertEqual(transaction[0]["body"]["phase"], "prepared")
+
+        resumed = self._run(
+            run_root,
+            probe_factory=_AuthenticProbe,
+        )
+        recovery = resumed["ooe"]["recovery_receipt"]
+        self.assertIsNotNone(recovery)
+        self.assertGreater(
+            recovery["new_manifest_generation"],
+            recovery["old_manifest_generation"],
+        )
+        self.assertEqual(len(recovery["recovered_site_sha256s"]), 2)
+        self.assertEqual(resumed["ooe"]["learning_receipts"], [])
+        self.assertEqual(resumed["ooe"]["qwen_probe_calls"], 0)
+        self.assertEqual(len(_AuthenticProbe.calls), 2)
+        committed = cartography._load_promotion_transaction(
+            cartography.CrystalStore(run_root / cartography.OOE_NAME)
+        )
+        self.assertEqual(committed[0]["body"]["phase"], "committed")
+
+        reopened = self._run(
+            run_root,
+            probe_factory=_AuthenticProbe,
+        )
+        self.assertIsNone(reopened["ooe"]["recovery_receipt"])
+        self.assertFalse(reopened["ooe"]["controller_snapshot"]["changed"])
+
+    def test_promotion_transaction_tamper_cannot_authorize_recovery(self) -> None:
+        run_root = self.base / "ooe-transaction-tamper"
+        self._prepare(run_root)
+        self._run(run_root, probe_factory=_AuthenticProbe)
+        state_name = hashlib.sha256(
+            cartography.OOE_PROMOTION_STATE_NAME.encode("utf-8")
+        ).hexdigest()
+        state_path = (
+            run_root / cartography.OOE_NAME / "state" / f"{state_name}.state"
+        )
+        envelope = json.loads(state_path.read_text())
+        envelope["payload_sha256"] = "0" * 64
+        state_path.chmod(0o600)
+        state_path.write_bytes(
+            json.dumps(
+                envelope,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        with self.assertRaises(CrystalTamperError):
+            self._run(run_root, probe_factory=_AuthenticProbe)
 
     def test_stream_factory_type_error_is_not_retried_or_weakened(self) -> None:
         calls = []

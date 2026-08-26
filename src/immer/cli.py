@@ -17,8 +17,11 @@ COMPONENTS = (
     ("CRSA", "Causal Prefix Sinkhorn Attention", "integrated operators"),
     ("WorldStream", "exact local and pinned-remote Safetensors ranges", "integrated tensor source"),
     ("LiveCausal", "append-only causal control plane", "integrated lazy graph"),
-    ("CausalWeights", "local weight bundle and exact causal range routes", "integrated DeepSeek pager path"),
-    ("DeepSeekV4", "complete 43-layer frontier decoder", "active local runtime"),
+    ("CausalWeights", "local weight bundle and exact causal range routes", "integrated Qwen pager path"),
+    ("Qwen3.8", "complete local causal teacher and novelty fallback", "primary runtime"),
+    ("OoE", "persistent PS-Lifted Markov agents and executable Crystals", "integrated runtime"),
+    ("AnchorBattery", "authenticated prefix-state restoration", "integrated Qwen path"),
+    ("DeepSeekV4", "complete 43-layer frontier decoder", "retained backend"),
     ("MarkovRouter", "label-free next-layer expert transport hints", "integrated evaluation path"),
     ("OrganBank", "digest-addressed exact capabilities", "integrated artifact registry"),
     ("o1-state", "persistent life stream outside frozen execution", "integrated runtime"),
@@ -80,6 +83,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         composition = CompositionRoot.build(
             qwen38_causal_bundle=args.qwen38_causal_bundle,
             qwen38_tokenizer=args.qwen38_tokenizer,
+            qwen38_anchor_cache=args.qwen38_anchor_cache,
             qwen38_options={
                 "system_prompt": args.system_prompt,
                 "device": args.device,
@@ -687,6 +691,11 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("message")
     chat.add_argument("--qwen38-causal-bundle", required=True)
     chat.add_argument("--qwen38-tokenizer", required=True)
+    chat.add_argument(
+        "--qwen38-anchor-cache",
+        default=os.environ.get("IMMER_QWEN38_ANCHOR_CACHE"),
+        help="local authenticated semantic anchor cache",
+    )
     chat.add_argument("--system-prompt", default="")
     chat.add_argument("--device", choices=("auto", "cpu", "mps"), default="auto")
     chat.add_argument(

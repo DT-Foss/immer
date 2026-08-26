@@ -12,7 +12,7 @@ import json
 import math
 import threading
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..contracts import Component, ExecutionStatus, Request, Result
 from .fertig.adapter import (
@@ -22,6 +22,9 @@ from .fertig.adapter import (
     FertigSolver,
     canonical_numeric_candidate,
 )
+
+if TYPE_CHECKING:
+    from ..runtimes.ooe.chat import OoeChatHook
 
 
 _EXACT_CERTIFICATE_KINDS = frozenset({"fraction_rref/v1", "guarded_formula/v1"})
@@ -349,7 +352,13 @@ class QwenFertigChat:
     name = "qwen3.8.fertig-chat"
     capabilities = frozenset({"chat"})
 
-    def __init__(self, qwen: Component, fertig: FertigSolver) -> None:
+    def __init__(
+        self,
+        qwen: Component,
+        fertig: FertigSolver,
+        *,
+        ooe_hook: OoeChatHook | None = None,
+    ) -> None:
         qwen_capabilities = getattr(qwen, "capabilities", frozenset())
         if "chat" not in qwen_capabilities:
             raise TypeError("qwen component must own the chat capability")
@@ -359,8 +368,14 @@ class QwenFertigChat:
             raise TypeError("qwen component must provide handle(request)")
         if type(fertig) is not FertigSolver:
             raise TypeError("fertig must be the production FertigSolver")
+        if ooe_hook is not None:
+            from ..runtimes.ooe.chat import OoeChatHook as ProductionOoeChatHook
+
+            if type(ooe_hook) is not ProductionOoeChatHook:
+                raise TypeError("ooe_hook must be the production OoeChatHook")
         self._qwen = qwen
         self._fertig = fertig
+        self._ooe_hook = ooe_hook
         self._closed = False
         self._close_error: str | None = None
         self._lock = threading.RLock()
@@ -372,6 +387,10 @@ class QwenFertigChat:
     @property
     def fertig(self) -> FertigSolver:
         return self._fertig
+
+    @property
+    def ooe_hook(self) -> OoeChatHook | None:
+        return self._ooe_hook
 
     @property
     def loaded(self) -> bool:
@@ -403,6 +422,7 @@ class QwenFertigChat:
         candidate: str | None,
         qwen: dict[str, Any] | None,
         fertig: dict[str, Any],
+        ooe: dict[str, Any] | None = None,
     ) -> Result:
         stable_output = _stable_value(output)
         output_sha256 = (
@@ -419,6 +439,8 @@ class QwenFertigChat:
             "qwen": qwen,
             "route": route,
         }
+        if ooe is not None:
+            core["ooe"] = _stable_value(ooe)
         receipt = {**core, "receipt_sha256": _sha256(_canonical_json(core))}
         return Result(
             status,
@@ -426,6 +448,47 @@ class QwenFertigChat:
             output=output,
             reason=reason,
             evidence={"receipt": receipt},
+        )
+
+    def _attach_cold_observation(
+        self,
+        result: Result,
+        *,
+        question: str,
+        metadata: Mapping[str, Any],
+        qwen_result: Result,
+        qwen_called: bool,
+    ) -> Result:
+        if self._ooe_hook is None or not qwen_called:
+            return result
+        try:
+            observation = self._ooe_hook.observe_cold(
+                question,
+                metadata,
+                qwen_result,
+                result,
+            )
+            stable_observation = _stable_value(observation)
+        except Exception as exc:
+            stable_observation = {"status": "error", **_failure(exc)}
+        evidence = dict(result.evidence)
+        raw_receipt = evidence.get("receipt")
+        if not isinstance(raw_receipt, Mapping):
+            return result
+        receipt = dict(raw_receipt)
+        ooe = receipt.get("ooe")
+        ooe_evidence = {} if not isinstance(ooe, Mapping) else dict(ooe)
+        ooe_evidence["cold_observer"] = stable_observation
+        receipt["ooe"] = ooe_evidence
+        core = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+        receipt["receipt_sha256"] = _sha256(_canonical_json(core))
+        evidence["receipt"] = receipt
+        return Result(
+            result.status,
+            result.component,
+            output=result.output,
+            reason=result.reason,
+            evidence=evidence,
         )
 
     @staticmethod
@@ -529,19 +592,64 @@ class QwenFertigChat:
                     fertig={"certificate": certified, "status": "certified"},
                 )
 
-            qwen_request = Request("chat", question, request.metadata)
-            try:
-                raw_qwen_result = self._qwen.handle(qwen_request)
-                if not isinstance(raw_qwen_result, Result):
-                    raise TypeError("Qwen handle returned a non-Result value")
-                qwen_result = raw_qwen_result
-            except Exception as exc:
-                qwen_result = Result(
-                    ExecutionStatus.ERROR,
-                    str(getattr(self._qwen, "name", "qwen")),
-                    reason=f"Qwen chat failed: {type(exc).__name__}: {exc}",
-                    evidence={"failure": _failure(exc)},
-                )
+            qwen_called = False
+            candidate_origin = "qwen"
+            ooe_summary: dict[str, Any] | None = None
+            warm_result: Result | None = None
+            warm_attempt: object | None = None
+            if self._ooe_hook is not None:
+                try:
+                    attempt = self._ooe_hook.try_warm(question, request.metadata)
+                    attempt_evidence = getattr(attempt, "evidence", None)
+                    if isinstance(attempt_evidence, Mapping):
+                        ooe_summary = {"warm": _stable_value(attempt_evidence)}
+                    candidate_result = getattr(attempt, "result", None)
+                    if isinstance(candidate_result, Result) and candidate_result.ok:
+                        warm_result = candidate_result
+                        warm_attempt = attempt
+                except Exception as exc:
+                    from ..runtimes.ooe.chat import OoeChatIntegrityError
+
+                    if isinstance(exc, OoeChatIntegrityError):
+                        return self._result(
+                            question=question,
+                            route="ooe_integrity_error",
+                            output=None,
+                            status=ExecutionStatus.ERROR,
+                            reason="warm OoE integrity verification failed",
+                            candidate=None,
+                            qwen=None,
+                            fertig={"preflight": preflight, "status": "not_run"},
+                            ooe={
+                                "warm": {
+                                    "error": (
+                                        f"{type(exc).__module__}."
+                                        f"{type(exc).__qualname__}"
+                                    ),
+                                    "status": "integrity-error",
+                                }
+                            },
+                        )
+                    ooe_summary = {"warm": {"status": "error", **_failure(exc)}}
+
+            if warm_result is not None:
+                qwen_result = warm_result
+                candidate_origin = "ooe"
+            else:
+                qwen_called = True
+                qwen_request = Request("chat", question, request.metadata)
+                try:
+                    raw_qwen_result = self._qwen.handle(qwen_request)
+                    if not isinstance(raw_qwen_result, Result):
+                        raise TypeError("Qwen handle returned a non-Result value")
+                    qwen_result = raw_qwen_result
+                except Exception as exc:
+                    qwen_result = Result(
+                        ExecutionStatus.ERROR,
+                        str(getattr(self._qwen, "name", "qwen")),
+                        reason=f"Qwen chat failed: {type(exc).__name__}: {exc}",
+                        evidence={"failure": _failure(exc)},
+                    )
             try:
                 qwen_summary = _qwen_summary(qwen_result)
             except Exception as exc:
@@ -556,31 +664,90 @@ class QwenFertigChat:
                     "reason": qwen_result.reason,
                     "status": qwen_result.status.value,
                 }
-            if not qwen_result.ok:
-                return self._result(
+
+            def finish(result: Result) -> Result:
+                return self._attach_cold_observation(
+                    result,
                     question=question,
-                    route="qwen_failure",
-                    output=qwen_result.output,
-                    status=qwen_result.status,
-                    reason=qwen_result.reason,
-                    candidate=(
-                        qwen_result.output
-                        if isinstance(qwen_result.output, str)
-                        else None
-                    ),
-                    qwen=qwen_summary,
-                    fertig={"preflight": preflight, "status": "not_run"},
+                    metadata=request.metadata,
+                    qwen_result=qwen_result,
+                    qwen_called=qwen_called,
+                )
+
+            def settle_warm(*, accept: bool) -> Result | None:
+                nonlocal ooe_summary
+                if candidate_origin != "ooe":
+                    return None
+                assert self._ooe_hook is not None
+                assert warm_attempt is not None
+                try:
+                    accounting = (
+                        self._ooe_hook.commit_warm(warm_attempt)
+                        if accept
+                        else self._ooe_hook.reject_warm(warm_attempt)
+                    )
+                except Exception as exc:
+                    return self._result(
+                        question=question,
+                        route="ooe_integrity_error",
+                        output=None,
+                        status=ExecutionStatus.ERROR,
+                        reason="warm OoE accounting verification failed",
+                        candidate=None,
+                        qwen=None,
+                        fertig={"preflight": preflight, "status": "not_run"},
+                        ooe={
+                            "warm": {
+                                "error": (
+                                    f"{type(exc).__module__}."
+                                    f"{type(exc).__qualname__}"
+                                ),
+                                "status": "integrity-error",
+                            }
+                        },
+                    )
+                if ooe_summary is None:
+                    ooe_summary = {}
+                ooe_summary["accounting"] = {
+                    **accounting.to_dict(),
+                    "sha256": accounting.sha256,
+                }
+                return None
+
+            if not qwen_result.ok:
+                return finish(
+                    self._result(
+                        question=question,
+                        route=f"{candidate_origin}_failure",
+                        output=qwen_result.output,
+                        status=qwen_result.status,
+                        reason=qwen_result.reason,
+                        candidate=(
+                            qwen_result.output
+                            if isinstance(qwen_result.output, str)
+                            else None
+                        ),
+                        qwen=qwen_summary,
+                        fertig={"preflight": preflight, "status": "not_run"},
+                        ooe=ooe_summary,
+                    )
                 )
             if not isinstance(qwen_result.output, str) or not qwen_result.output:
-                return self._result(
-                    question=question,
-                    route="qwen_failure",
-                    output=None,
-                    status=ExecutionStatus.ERROR,
-                    reason="Qwen chat returned an invalid successful output",
-                    candidate=None,
-                    qwen=qwen_summary,
-                    fertig={"preflight": preflight, "status": "not_run"},
+                return finish(
+                    self._result(
+                        question=question,
+                        route=f"{candidate_origin}_failure",
+                        output=None,
+                        status=ExecutionStatus.ERROR,
+                        reason=(
+                            f"{candidate_origin} chat returned an invalid "
+                            "successful output"
+                        ),
+                        candidate=None,
+                        qwen=qwen_summary,
+                        fertig={"preflight": preflight, "status": "not_run"},
+                        ooe=ooe_summary,
+                    )
                 )
 
             candidate = qwen_result.output
@@ -591,19 +758,25 @@ class QwenFertigChat:
                     question=question,
                 )
             except Exception as exc:
-                return self._result(
-                    question=question,
-                    route="qwen_fertig_error",
-                    output=candidate,
-                    status=ExecutionStatus.OK,
-                    reason=None,
-                    candidate=candidate,
-                    qwen=qwen_summary,
-                    fertig={
-                        "preflight": preflight,
-                        "status": "error",
-                        **_failure(exc),
-                    },
+                settlement_error = settle_warm(accept=False)
+                if settlement_error is not None:
+                    return settlement_error
+                return finish(
+                    self._result(
+                        question=question,
+                        route=f"{candidate_origin}_fertig_error",
+                        output=candidate,
+                        status=ExecutionStatus.OK,
+                        reason=None,
+                        candidate=candidate,
+                        qwen=qwen_summary,
+                        fertig={
+                            "preflight": preflight,
+                            "status": "error",
+                            **_failure(exc),
+                        },
+                        ooe=ooe_summary,
+                    )
                 )
 
             fertig_receipt = {
@@ -612,37 +785,59 @@ class QwenFertigChat:
                 "verification": _stable_value(verification.to_dict()),
             }
             if verification.status is CandidateVerificationStatus.VERIFIED:
-                return self._result(
+                settlement_error = settle_warm(accept=True)
+                if settlement_error is not None:
+                    return settlement_error
+                return finish(
+                    self._result(
+                        question=question,
+                        route=f"{candidate_origin}_verified",
+                        output=candidate,
+                        status=ExecutionStatus.OK,
+                        reason=None,
+                        candidate=candidate,
+                        qwen=qwen_summary,
+                        fertig=fertig_receipt,
+                        ooe=ooe_summary,
+                    )
+                )
+            if verification.status is CandidateVerificationStatus.MISMATCH:
+                assert verification.expected is not None
+                settlement_error = settle_warm(accept=False)
+                if settlement_error is not None:
+                    return settlement_error
+                return finish(
+                    self._result(
+                        question=question,
+                        route=(
+                            "fertig_mismatch_override"
+                            if candidate_origin == "qwen"
+                            else "ooe_fertig_mismatch_override"
+                        ),
+                        output=verification.expected,
+                        status=ExecutionStatus.OK,
+                        reason=None,
+                        candidate=candidate,
+                        qwen=qwen_summary,
+                        fertig=fertig_receipt,
+                        ooe=ooe_summary,
+                    )
+                )
+            settlement_error = settle_warm(accept=False)
+            if settlement_error is not None:
+                return settlement_error
+            return finish(
+                self._result(
                     question=question,
-                    route="qwen_verified",
+                    route=f"{candidate_origin}_verification_abstained",
                     output=candidate,
                     status=ExecutionStatus.OK,
                     reason=None,
                     candidate=candidate,
                     qwen=qwen_summary,
                     fertig=fertig_receipt,
+                    ooe=ooe_summary,
                 )
-            if verification.status is CandidateVerificationStatus.MISMATCH:
-                assert verification.expected is not None
-                return self._result(
-                    question=question,
-                    route="fertig_mismatch_override",
-                    output=verification.expected,
-                    status=ExecutionStatus.OK,
-                    reason=None,
-                    candidate=candidate,
-                    qwen=qwen_summary,
-                    fertig=fertig_receipt,
-                )
-            return self._result(
-                question=question,
-                route="qwen_verification_abstained",
-                output=candidate,
-                status=ExecutionStatus.OK,
-                reason=None,
-                candidate=candidate,
-                qwen=qwen_summary,
-                fertig=fertig_receipt,
             )
 
     def close(self) -> None:

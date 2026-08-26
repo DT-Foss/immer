@@ -2685,12 +2685,22 @@ class StreamedQwen38:
         *,
         max_new_tokens: int = 1,
         prefill_tokenwise: bool = False,
+        restored_prefix_length: int | None = None,
+        restored_seed_hidden: torch.Tensor | None = None,
         eos_token_ids: Iterable[int] = (),
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
         progress: Callable[[dict[str, Any]], None] | None = None,
         head_progress: Callable[[dict[str, int]], None] | None = None,
     ) -> tuple[tuple[int, ...], GenerationEvidence]:
-        """Run exact greedy autoregressive generation through the streamed head."""
+        """Run exact greedy generation, optionally from an authenticated prefix.
+
+        ``restored_prefix_length`` declares that native continuation state for
+        exactly that many leading prompt tokens is already committed.  Only the
+        remaining prompt suffix is evaluated.  An exact-prefix restore has no
+        suffix, so it must provide the authenticated final hidden row used by
+        the first head scan.  The emitted-token scan/decode loop is shared with
+        the ordinary fresh-prefill path.
+        """
 
         if (
             isinstance(max_new_tokens, bool)
@@ -2723,17 +2733,70 @@ class StreamedQwen38:
             raise TypeError("progress must be callable or None")
         if head_progress is not None and not callable(head_progress):
             raise TypeError("head_progress must be callable or None")
+        if restored_prefix_length is None:
+            if restored_seed_hidden is not None:
+                raise ValueError("restored_seed_hidden requires restored_prefix_length")
+        else:
+            if (
+                isinstance(restored_prefix_length, bool)
+                or not isinstance(restored_prefix_length, int)
+                or not 1 <= restored_prefix_length <= prompt.shape[1]
+            ):
+                raise ValueError(
+                    "restored_prefix_length must identify a non-empty prompt prefix"
+                )
+            if self._state_poisoned:
+                raise Qwen38RuntimeError(
+                    "decoder state is poisoned; call reset_state()"
+                )
+            if self._next_position != restored_prefix_length:
+                raise Qwen38RuntimeError(
+                    "restored prefix cursor differs from generation prompt"
+                )
+            if self._state_batch_size != 1:
+                raise Qwen38RuntimeError("restored prefix must own batch size one")
 
         source = self.pager.source
         start_bytes = self._metric(source, "network_or_source_body_bytes")
         start_linears = self._metric(self.pager, "linear_calls")
         started = time.perf_counter()
-        hidden, forwards = self.prefill(
-            prompt,
-            tokenwise=prefill_tokenwise,
-            reset=True,
-            progress=progress,
-        )
+        if restored_prefix_length is None:
+            hidden, forwards = self.prefill(
+                prompt,
+                tokenwise=prefill_tokenwise,
+                reset=True,
+                progress=progress,
+            )
+        else:
+            suffix = prompt[:, restored_prefix_length:]
+            if suffix.shape[1]:
+                if restored_seed_hidden is not None:
+                    raise ValueError(
+                        "a suffix restore may not provide an exact-prefix seed"
+                    )
+                hidden, forwards = self.prefill(
+                    suffix,
+                    tokenwise=prefill_tokenwise,
+                    reset=False,
+                    progress=progress,
+                )
+            else:
+                if not isinstance(restored_seed_hidden, torch.Tensor):
+                    raise TypeError(
+                        "an exact-prefix restore requires a hidden-state tensor"
+                    )
+                if (
+                    not restored_seed_hidden.is_floating_point()
+                    or tuple(restored_seed_hidden.shape) != (1, 1, self.config.dim)
+                    or restored_seed_hidden.dtype != self.pager.compute_dtype
+                    or not self._on_pager_device(restored_seed_hidden)
+                    or not bool(torch.isfinite(restored_seed_hidden).all().item())
+                ):
+                    raise Qwen38RuntimeError(
+                        "restored exact-prefix seed differs from model execution"
+                    )
+                hidden = restored_seed_hidden.detach()
+                forwards = ()
         generated: list[int] = []
         stopped_on_eos = False
         forward_count = len(forwards)

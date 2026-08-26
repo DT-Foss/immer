@@ -210,6 +210,28 @@ class SemanticWeightAtlasTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_revision_history_exposes_exact_authenticated_membership(self) -> None:
+        self.assertEqual(self.atlas.revision_history(), (_ATLAS_CAPTURE_REVISION,))
+        measurement = _measurement(
+            mode="native",
+            status="recorded",
+            label=None,
+            value=1.0,
+            suffix="revision-history",
+        )
+        self.atlas.append_measurement(measurement)
+        head = self.atlas.revision()
+
+        self.assertEqual(
+            self.atlas.revision_history(),
+            (_ATLAS_CAPTURE_REVISION, head),
+        )
+        self.assertTrue(self.atlas.contains_revision(_ATLAS_CAPTURE_REVISION))
+        self.assertTrue(self.atlas.contains_revision(head))
+        self.assertFalse(
+            self.atlas.contains_revision(GraphRevision(head.sequence, "f" * 64))
+        )
+
     def _append_candidate(
         self,
         *,

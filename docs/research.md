@@ -1,8 +1,8 @@
 # Research Foundations
 
-IMMER joins five research lines: sparse expert computation, contextual
-sparsity, Causal Prefix Sinkhorn Attention, reservoir-style state, and deterministic causal
-knowledge execution.
+IMMER joins six research lines: sparse expert computation, contextual
+sparsity, Causal Prefix Sinkhorn Attention, lifted Markov consensus,
+reservoir-style state, and deterministic causal knowledge execution.
 
 ## David Tom Foss: causal knowledge and deterministic validation
 
@@ -51,6 +51,23 @@ distribution around it.
 IMMER's Markov controller addresses a different layer of the stack: it predicts
 next-layer expert payloads for transport while official DeepSeek routing and
 all transformer layers remain unchanged.
+
+## Lifted Markov consensus and Organism of Experts
+
+The current OoE branch treats large-model execution as an expensive teacher
+process whose verified local transitions can be consolidated into many small
+site-bound Markov kernels. O1-State selects measurements, the
+SemanticWeightAtlas binds them to exact `.causal` weight coordinates, and a
+PS-Lifted push-sum fuses replicated transition evidence before quantized
+Crystal publication. Mobile fading reservoirs and Möbius rapidity remain part
+of the executable acceptance gate.
+
+This is distinct from caching an answer and from replacing Qwen's internal
+router. The learned alphabet selects runtime actions such as restoring a
+charged continuation, invoking deterministic FERTIG, mounting an organ,
+probing a coordinate, or returning to Qwen. Each Crystal remains pinned to its
+model, coordinate, graph revision, schemas, coverage, calibration, and
+verifier evidence.
 
 ## Reservoir computing and persistent state
 
