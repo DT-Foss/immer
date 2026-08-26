@@ -56,6 +56,7 @@ def frontier(
     families=("arithmetic", "coreference"),
     interventions=("baseline",),
     read_budget_bytes=None,
+    model_budget_seconds=None,
 ):
     return build_probe_frontier(
         layers=layers,
@@ -66,6 +67,7 @@ def frontier(
         model_pin=MODEL_PIN,
         seed=17,
         read_budget_bytes=read_budget_bytes,
+        model_budget_seconds=model_budget_seconds,
     )
 
 
@@ -164,6 +166,277 @@ class O1CartographerTests(unittest.TestCase):
             self.assertEqual(report.stop_reason, "coverage-complete")
             self.assertEqual(len(calls), len(set(calls)))
             self.assertIsNone(scheduler.step(execute))
+
+    def test_completed_frontier_extends_additively_and_resumes_exactly(self) -> None:
+        initial = frontier(layers=(0,), families=("a",))
+        extension = frontier(layers=(7, 8), families=("b",))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scheduler = self.make_scheduler(root, jobs=initial)
+            initial_generation = scheduler.generation
+            first_report = scheduler.run(
+                lambda job, _attempt: {"layer": job.layer},
+                max_jobs=10,
+                max_seconds=10,
+            )
+            self.assertTrue(first_report.coverage.complete)
+            old_outcomes = scheduler.outcomes
+            completed_generation = scheduler.generation
+            self.assertGreater(completed_generation, initial_generation)
+
+            added = scheduler.extend_jobs(extension)
+            self.assertEqual(
+                added, tuple(sorted(extension, key=lambda job: job.job_id))
+            )
+            self.assertEqual(scheduler.outcomes, old_outcomes)
+            self.assertEqual(scheduler.coverage().total_jobs, 3)
+            self.assertEqual(scheduler.coverage().succeeded_jobs, 1)
+            self.assertEqual(scheduler.coverage().uncovered_jobs, 2)
+            self.assertFalse(scheduler.coverage().complete)
+            self.assertEqual(scheduler.generation, completed_generation + 1)
+            with self.assertRaises(AttributeError):
+                setattr(scheduler, "generation", 0)
+
+            resumed = O1Cartographer.restore(
+                scheduler.state_path,
+                code_pin=CODE_PIN,
+                model_pin=MODEL_PIN,
+                stream=FakeO1Stream(),
+            )
+            self.assertEqual(resumed.jobs, scheduler.jobs)
+            self.assertEqual(resumed.outcomes, old_outcomes)
+            self.assertEqual(resumed.generation, scheduler.generation)
+            second_report = resumed.run(
+                lambda job, _attempt: {"layer": job.layer},
+                max_jobs=10,
+                max_seconds=10,
+            )
+            self.assertEqual(len(second_report.outcomes), 2)
+            self.assertTrue(second_report.coverage.complete)
+            self.assertEqual(
+                {row.job_id for row in resumed.outcomes},
+                {row.job_id for row in (*initial, *extension)},
+            )
+
+    def test_frontier_extension_is_idempotent_and_collapses_exact_duplicates(
+        self,
+    ) -> None:
+        initial = frontier(layers=(0,), families=("a",))
+        extension = frontier(layers=(9,), families=("b",))
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = self.make_scheduler(Path(tmp), jobs=initial)
+            before = scheduler.state_path.read_bytes()
+            self.assertEqual(scheduler.extend_jobs((*initial, *initial)), ())
+            self.assertEqual(scheduler.state_path.read_bytes(), before)
+
+            added = scheduler.extend_jobs((*extension, *extension))
+            self.assertEqual(added, extension)
+            committed = scheduler.state_path.read_bytes()
+            self.assertEqual(scheduler.extend_jobs(extension), ())
+            self.assertEqual(scheduler.state_path.read_bytes(), committed)
+            self.assertEqual(len(scheduler.jobs), 2)
+
+    def test_frontier_extension_rejects_wrong_pins_payload_collisions_and_policy_breaks(
+        self,
+    ) -> None:
+        initial = frontier(
+            layers=(0,),
+            families=("a",),
+            read_budget_bytes=10,
+            model_budget_seconds=1.0,
+        )
+        wrong_pin = ProbeJob.create(
+            layer=1,
+            target=ProbeTarget("attention", "head", 0),
+            probe_family="b",
+            intervention="baseline",
+            code_pin="other-code-pin",
+            model_pin=MODEL_PIN,
+            seed=19,
+            read_budget_bytes=10,
+            model_budget_seconds=1.0,
+        )
+        without_caps = frontier(layers=(2,), families=("c",))[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = self.make_scheduler(
+                Path(tmp),
+                jobs=initial,
+                budget=CartographyBudget(
+                    max_total_read_bytes=100,
+                    max_total_model_seconds=10.0,
+                ),
+            )
+            original = scheduler.state_path.read_bytes()
+            with self.assertRaises(CartographyIdentityError):
+                scheduler.extend_jobs((wrong_pin,))
+            with self.assertRaisesRegex(CartographyError, "read cap"):
+                scheduler.extend_jobs((without_caps,))
+            self.assertEqual(scheduler.state_path.read_bytes(), original)
+
+        model_capped_initial = frontier(
+            layers=(0,), families=("a",), model_budget_seconds=1.0
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = self.make_scheduler(
+                Path(tmp),
+                jobs=model_capped_initial,
+                budget=CartographyBudget(max_total_model_seconds=10.0),
+            )
+            with self.assertRaisesRegex(CartographyError, "model-time cap"):
+                scheduler.extend_jobs((without_caps,))
+
+        prompt = "same identity, different persisted carrier"
+        prompt_sha256 = hashlib.sha256(prompt.encode()).hexdigest()
+        identity = dict(
+            layer=3,
+            target=ProbeTarget("mlp", "block", 0),
+            probe_family="collision",
+            intervention="baseline",
+            code_pin=CODE_PIN,
+            model_pin=MODEL_PIN,
+            seed=23,
+            prompt_sha256=prompt_sha256,
+        )
+        hash_only = ProbeJob.create(**identity)
+        with_prompt = ProbeJob.create(**identity, prompt=prompt)
+        self.assertEqual(hash_only.job_id, with_prompt.job_id)
+        self.assertNotEqual(hash_only, with_prompt)
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = self.make_scheduler(
+                Path(tmp), jobs=(hash_only,), allow_raw_prompts=True
+            )
+            with self.assertRaisesRegex(
+                CartographyIntegrityError, "collides with an existing job id"
+            ):
+                scheduler.extend_jobs((with_prompt,))
+
+    def test_frontier_extension_preserves_histories_replay_and_stream_snapshot(
+        self,
+    ) -> None:
+        initial = frontier(layers=(0,), families=("a",))
+        extension = frontier(layers=(4,), families=("b",))
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = self.make_scheduler(
+                Path(tmp), jobs=initial, stream=FakeO1Stream([6.0])
+            )
+            scheduler.step(lambda job, _attempt: {"layer": job.layer, "norm": 3.0})
+            _, before = O1Cartographer._read_document(scheduler.state_path)
+
+            scheduler.extend_jobs(extension)
+            _, after = O1Cartographer._read_document(scheduler.state_path)
+            for field in ("histories", "outcomes", "replay", "stream_state"):
+                self.assertEqual(after[field], before[field], field)
+            self.assertEqual(after["generation"], before["generation"] + 1)
+            self.assertEqual(scheduler.replay_count, 1)
+            self.assertEqual(scheduler.outcomes[0].job_id, initial[0].job_id)
+
+    def test_frontier_extension_is_crash_safe_before_and_after_atomic_replace(
+        self,
+    ) -> None:
+        initial = frontier(layers=(0,), families=("a",))
+        extension = frontier(layers=(5,), families=("b",))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scheduler = self.make_scheduler(root, jobs=initial)
+            original = scheduler.state_path.read_bytes()
+            with mock.patch.object(
+                cartographer_module.os,
+                "replace",
+                side_effect=OSError("simulated pre-replace power loss"),
+            ):
+                with self.assertRaises(OSError):
+                    scheduler.extend_jobs(extension)
+            self.assertEqual(scheduler.jobs, initial)
+            self.assertEqual(scheduler.state_path.read_bytes(), original)
+            self.assertFalse(tuple(root.glob("*.pending")))
+            restored_old = O1Cartographer.restore(
+                scheduler.state_path,
+                code_pin=CODE_PIN,
+                model_pin=MODEL_PIN,
+                stream=FakeO1Stream(),
+            )
+            self.assertEqual(restored_old.jobs, initial)
+
+            original_atomic_write = O1Cartographer._atomic_write
+
+            def commit_then_interrupt(path, data):
+                original_atomic_write(path, data)
+                raise OSError("simulated post-replace durability interruption")
+
+            with mock.patch.object(
+                O1Cartographer,
+                "_atomic_write",
+                staticmethod(commit_then_interrupt),
+            ):
+                with self.assertRaises(OSError):
+                    scheduler.extend_jobs(extension)
+            self.assertEqual(set(scheduler.jobs), set((*initial, *extension)))
+            restored_new = O1Cartographer.restore(
+                scheduler.state_path,
+                code_pin=CODE_PIN,
+                model_pin=MODEL_PIN,
+                stream=FakeO1Stream(),
+            )
+            self.assertEqual(restored_new.jobs, scheduler.jobs)
+            committed = scheduler.state_path.read_bytes()
+            self.assertEqual(scheduler.extend_jobs(extension), ())
+            self.assertEqual(scheduler.state_path.read_bytes(), committed)
+
+    def test_stale_frontier_extender_cannot_overwrite_a_committed_extension(
+        self,
+    ) -> None:
+        initial = frontier(layers=(0,), families=("a",))
+        first_extension = frontier(layers=(1,), families=("b",))
+        stale_extension = frontier(layers=(2,), families=("c",))
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = self.make_scheduler(Path(tmp), jobs=initial)
+            stale = O1Cartographer.restore(
+                scheduler.state_path,
+                code_pin=CODE_PIN,
+                model_pin=MODEL_PIN,
+                stream=FakeO1Stream(),
+            )
+            scheduler.extend_jobs(first_extension)
+            with self.assertRaisesRegex(
+                CartographyIntegrityError, "changed since the last checkpoint"
+            ):
+                stale.extend_jobs(stale_extension)
+
+            final = O1Cartographer.restore(
+                scheduler.state_path,
+                code_pin=CODE_PIN,
+                model_pin=MODEL_PIN,
+                stream=FakeO1Stream(),
+            )
+            self.assertEqual(set(final.jobs), set((*initial, *first_extension)))
+
+    def test_frontier_extension_has_no_job_count_cap_below_sidecar_limit(self) -> None:
+        initial = frontier(layers=(0,), families=("a",))
+        extension = frontier(layers=range(1, 1026), families=("bulk",))
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = self.make_scheduler(Path(tmp), jobs=initial)
+            self.assertEqual(len(scheduler.extend_jobs(extension)), 1025)
+            self.assertEqual(scheduler.coverage().total_jobs, 1026)
+            self.assertLess(
+                len(scheduler.state_path.read_bytes()),
+                cartographer_module._MAX_STATE_BYTES,
+            )
+
+    def test_frontier_extension_rejects_only_when_sidecar_resource_limit_is_hit(
+        self,
+    ) -> None:
+        initial = frontier(layers=(0,), families=("a",))
+        extension = frontier(layers=(1,), families=("b",))
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = self.make_scheduler(Path(tmp), jobs=initial)
+            original = scheduler.state_path.read_bytes()
+            with mock.patch.object(
+                cartographer_module, "_MAX_STATE_BYTES", len(original) + 1
+            ):
+                with self.assertRaisesRegex(CartographyError, "state exceeds"):
+                    scheduler.extend_jobs(extension)
+            self.assertEqual(scheduler.jobs, initial)
+            self.assertEqual(scheduler.state_path.read_bytes(), original)
 
     def test_surprise_reprioritizes_uncovered_sibling_family(self) -> None:
         jobs = frontier(layers=(0, 1), families=("a", "b"))

@@ -113,6 +113,180 @@ class ComputeOperatorGraphTests(unittest.TestCase):
         # No multi-step evidence can exist: the world contains exactly four events.
         self.assertEqual(self.graph.build_world_model().total_events, 4)
 
+    def test_exact_path_selects_requested_parallel_edge_and_charges_roundtrip(
+        self,
+    ) -> None:
+        alternatives = (
+            ComputeCrystal.affine([[2.0]], [1.0]),
+            ComputeCrystal.affine([[-5.0]], [7.0]),
+        )
+        tail = ComputeCrystal.affine([[3.0]], [-2.0])
+        for crystal in (*alternatives, tail):
+            self.bank.publish_crystal(crystal)
+        parallel = (
+            _edge("raw", "hidden", alternatives[0], 200),
+            _edge("raw", "hidden", alternatives[1], 201),
+        )
+        tail_edge = _edge("hidden", "answer", tail, 202)
+        self.graph.append_edges((*parallel, tail_edge))
+
+        canonical = self.graph.plan_route("raw", "answer")
+        assert canonical.plan is not None
+        canonical_first = canonical.plan.primitive_edge_sha256s[0]
+        requested = next(edge for edge in parallel if edge.sha256 != canonical_first)
+        plan = self.graph.plan_exact_path((requested.sha256, tail_edge.sha256))
+
+        self.assertEqual(
+            plan.primitive_edge_sha256s,
+            (requested.sha256, tail_edge.sha256),
+        )
+        self.assertEqual(plan.finite_plan.expected_states, ("raw", "hidden", "answer"))
+        self.assertEqual(
+            tuple(entry.action for entry in plan.finite_plan.policy),
+            plan.primitive_edge_sha256s,
+        )
+        self.assertEqual(ComputeRoutePlan.from_bytes(plan.to_bytes()), plan)
+        reopened = ComputeOperatorGraph(ComputeCrystalBank(self.temporary.name))
+        self.assertEqual(
+            reopened.plan_exact_path(plan.primitive_edge_sha256s),
+            plan,
+        )
+
+        charged = self.graph.charge_route(plan)
+        self.assertEqual(
+            charged.route.primitive_edge_sha256s,
+            plan.primitive_edge_sha256s,
+        )
+        self.assertIsNotNone(charged.route.charge_basis_sha256)
+        self.assertTrue(charged.charge_basis_created)
+        value = np.array([[-4.0], [0.25], [19.0]], dtype=np.float64)
+        requested_crystal = self.bank.restore_crystal(requested.crystal_sha256)
+        expected = tail.apply(requested_crystal.apply(value))
+        discharged = self.graph.discharge("raw", "answer", value)
+        np.testing.assert_array_equal(discharged.output, expected)
+        self.assertEqual(
+            discharged.route.primitive_edge_sha256s,
+            plan.primitive_edge_sha256s,
+        )
+        self.assertGreater(discharged.receipt.historical_work_released, 0)
+
+        canonical_charge = self.graph.charge_route(canonical.plan)
+        endpoint_routes = tuple(
+            route
+            for route in self.graph.state().materialized_routes
+            if route.source_state == "raw" and route.goal_state == "answer"
+        )
+        self.assertEqual(len(endpoint_routes), 2)
+        exact_discharge = self.graph.discharge_exact(charged.route.sha256, value)
+        np.testing.assert_array_equal(exact_discharge.output, expected)
+        self.assertEqual(exact_discharge.route.sha256, charged.route.sha256)
+        self.assertEqual(
+            exact_discharge.receipt.route_sha256,
+            charged.route.sha256,
+        )
+        canonical_edge = next(
+            edge for edge in parallel if edge.sha256 == canonical_first
+        )
+        canonical_crystal = self.bank.restore_crystal(canonical_edge.crystal_sha256)
+        canonical_expected = tail.apply(canonical_crystal.apply(value))
+        canonical_discharge = self.graph.query_exact(
+            canonical_charge.route.sha256,
+            value,
+        )
+        np.testing.assert_array_equal(canonical_discharge.output, canonical_expected)
+        self.assertEqual(
+            canonical_discharge.route.sha256,
+            canonical_charge.route.sha256,
+        )
+        self.assertNotEqual(
+            canonical_discharge.route.sha256,
+            exact_discharge.route.sha256,
+        )
+        with self.assertRaisesRegex(ComputeRouteUnavailableError, "absent"):
+            self.graph.discharge_exact(_digest("missing-route"), value)
+
+        single = self.graph.plan_exact_path((requested.sha256,))
+        single_charge = self.graph.charge_route(single)
+        self.assertIsNone(single_charge.route.charge_basis_sha256)
+        self.assertFalse(single_charge.charge_basis_created)
+        self.assertEqual(
+            single_charge.route.equivalent_source_work_units,
+            single_charge.route.live_work_units,
+        )
+
+    def test_exact_path_rejects_missing_disconnected_tampered_and_stale_head(
+        self,
+    ) -> None:
+        crystals = (
+            ComputeCrystal.affine([[2.0]], [1.0]),
+            ComputeCrystal.affine([[3.0]], [2.0]),
+            ComputeCrystal.affine([[5.0]], [-4.0]),
+        )
+        for crystal in crystals:
+            self.bank.publish_crystal(crystal)
+        connected = (
+            _edge("a", "b", crystals[0], 210),
+            _edge("b", "c", crystals[1], 211),
+        )
+        detached = _edge("x", "y", crystals[2], 212)
+        head, _changed = self.graph.append_edges((*connected, detached))
+
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            self.graph.plan_exact_path(())
+        with self.assertRaisesRegex(ComputeRouteUnavailableError, "absent"):
+            self.graph.plan_exact_path((_digest("missing-edge"),))
+        with self.assertRaisesRegex(ComputeRouteUnavailableError, "disconnected"):
+            self.graph.plan_exact_path((connected[0].sha256, detached.sha256))
+
+        plan = self.graph.plan_exact_path(tuple(edge.sha256 for edge in connected))
+        tampered_finite = replace(
+            plan.finite_plan,
+            evidence_hashes=(_digest("forged-evidence"),),
+        )
+        tampered = ComputeRoutePlan(
+            graph_generation=plan.graph_generation,
+            graph_state_sha256=plan.graph_state_sha256,
+            finite_plan=tampered_finite,
+            primitive_edge_sha256s=plan.primitive_edge_sha256s,
+        )
+        with self.assertRaisesRegex(
+            ComputeOperatorGraphIntegrityError, "not reproducible"
+        ):
+            self.graph.charge_route(tampered)
+
+        anchored = ComputeOperatorGraph(
+            self.bank,
+            trusted_graph_state_sha256=head.sha256,
+        )
+        extension = ComputeCrystal.affine([[7.0]], [0.0])
+        self.bank.publish_crystal(extension)
+        self.graph.append_edge(_edge("c", "d", extension, 213))
+        with self.assertRaisesRegex(
+            ComputeOperatorGraphIntegrityError, "trusted anchor"
+        ):
+            anchored.plan_exact_path(tuple(edge.sha256 for edge in connected))
+
+    def test_exact_path_rejects_restored_crystal_abi_and_weak_evidence(self) -> None:
+        wide = ComputeCrystal.affine(np.eye(2), np.zeros(2))
+        narrow = ComputeCrystal.affine([[1.0]], [0.0])
+        weak = ComputeCrystal.affine([[2.0]], [1.0])
+        for crystal in (wide, narrow, weak):
+            self.bank.publish_crystal(crystal)
+        incompatible = (
+            _edge("a", "b", wide, 220),
+            _edge("b", "c", narrow, 221),
+        )
+        weak_edge = replace(_edge("u", "v", weak, 222), weight=0.5)
+        self.graph.append_edges((*incompatible, weak_edge))
+
+        with self.assertRaisesRegex(ComputeCrystalABIError, "ABI mismatch"):
+            self.graph.plan_exact_path(tuple(edge.sha256 for edge in incompatible))
+        with self.assertRaisesRegex(
+            ComputeOperatorGraphIntegrityError, "one-step evidence"
+        ):
+            self.graph.plan_exact_path((weak_edge.sha256,))
+        self.assertEqual(self.graph.state().materialized_routes, ())
+
     def test_affine_segment_monoid_runs_future_inputs_as_one_live_operator(
         self,
     ) -> None:

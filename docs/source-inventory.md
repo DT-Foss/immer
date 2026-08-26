@@ -12,7 +12,7 @@ are outside the repository record.
 | FERTIG | [DT-Foss/FERTIG](https://github.com/DT-Foss/FERTIG) | grounded deterministic execution and verification |
 | o1-state | [DT-Foss/o1-state](https://github.com/DT-Foss/o1-state) | persistent O(1)-state lineage and external knowledge index |
 | dotcausal | [DT-Foss/dotcausal](https://github.com/DT-Foss/dotcausal) | public `.causal` format lineage |
-| Qwen3.8-27B | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | primary local teacher, causal execution target, cartography source, and novelty path; weights remain external |
+| Qwen3.8-27B | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | primary local weight substrate, causal execution rail, cartography source, and full-model path; weights remain external |
 | Qwen3.5-0.8B | [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) | local transactional drafter for exact Qwen3.8 verification; weights remain external |
 | DeepSeek-V4-Flash-0731 | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | transport, paging, causal-append, and control laboratory; weights remain external |
 | safetensors | [huggingface/safetensors](https://github.com/huggingface/safetensors) | immutable tensor container and range layout |
@@ -31,6 +31,8 @@ are outside the repository record.
 | ComputeCrystal VM and operator graph | `src/immer/runtimes/ooe/compute_crystals.py`, `src/immer/runtimes/ooe/compute_graph.py` |
 | charged-prefix residual execution | `src/immer/runtimes/ooe/residual_execution.py` |
 | real contextual operator harvesting and demand | `src/immer/runtimes/ooe/operator_harvester.py`, `src/immer/runtimes/ooe/demand_scheduler.py` |
+| living O1/Qwen frontier and idle runner | `src/immer/runtimes/o1_state/cartographer.py`, `scripts/qwen38_o1_cartography.py` |
+| harvested-program algebra admission and execution | `src/immer/runtimes/ooe/harvest_algebra_bridge.py`, `src/immer/runtimes/ooe/harvest_algebra_intelligence.py`, `scripts/ooe_harvest_algebra_benchmark.py` |
 | joined demand execution and feedback | `src/immer/runtimes/ooe/demand_execution.py`, `src/immer/runtimes/ooe/residual_execution.py` |
 | constructive Birkhoff search and Crystal bases | `src/immer/runtimes/ooe/bvn_search.py`, `src/immer/runtimes/ooe/bvn_crystals.py` |
 | exact guarded affine monoids and contextual algebra agents | `src/immer/runtimes/ooe/affine_monoid.py`, `src/immer/runtimes/ooe/algebra_agents.py`, `src/immer/runtimes/ooe/affine_intelligence.py` |

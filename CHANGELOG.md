@@ -4,6 +4,52 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-26
 
+### Living O1 frontier and executable harvested algebras
+
+- Replaced one-shot cartography closure with additive frontier growth. The
+  immutable initial Qwen manifest now accepts hash-chained prompt/job events;
+  `O1Cartographer.extend_jobs()` atomically reconciles those cells into the
+  existing scheduler while retaining every outcome, feature history, replay
+  item, stream snapshot, and Atlas record.
+- Added deterministic Qwen layer/site grids and full cross-product expansion.
+  Mixed prompt-plus-job appends materialize both `new prompt × old jobs` and
+  `all prompts × new jobs`; inherited job-specific family and semantic evidence
+  bindings remain exact.
+- Added the durable `idle` runner and weight-free `frontier-status`. Idle cycles
+  resume after process failure, consume later frontier events, persist exact
+  run/wait/error accounting, and reject a journal rollback once the scheduler
+  has anchored the added cells.
+- Generalized `OperatorAlgebraCandidate` from exact affine monoids to the strict
+  union `AffineProgram | ComputeProgram`. New v2 candidates bind their runtime,
+  program bytes, endpoint ABI contract, discovery verifier, execution verifier,
+  and program receipt; legacy v1 affine candidates restore byte- and
+  hash-identically.
+- Added the authenticated harvest-to-algebra bridge. A held-out affine,
+  permutation, or Markov promotion is rebound to its exact graph edge and bank
+  artifact, published as a `ComputeProgram`, admitted into the contextual
+  Thompson/MAP-Elites catalog, executed by `ComputeCrystalVM`, externally
+  verified, and returned to the router as exact positive or negative feedback.
+- Persisted the bridge itself. Profiles, graph/edge/program bridge receipts,
+  and candidate admission records are content-addressed before router CAS;
+  restart audit reconstructs every active routed candidate. A fault-injected
+  router-CAS failure leaves reusable immutable artifacts and completes exactly
+  on retry.
+- Derived execution-verifier identity per harvested family from discovery
+  group, source/target state, operator kind, and input/output ABI. Discovery
+  fitting and runtime result judgment remain separate contracts.
+- Added explicit-path planning and discharge. `plan_exact_path()` preserves the
+  selected edge sequence across parallel same-endpoint alternatives, and
+  `discharge_exact(route_sha256, value)` executes that authenticated route
+  instead of reselecting the canonical cheapest path. One-edge programs never
+  claim charge savings; multi-edge charged routes retain exact work accounting.
+- Added the fixed harvested-program intelligence trial. The contextual agent
+  selects three executable affine/permutation/Markov families correctly on
+  `174/180` decisions and `60/60` late decisions; the information-destroying
+  shuffled-context placebo reaches `49/180` and `13/60` late.
+- Verified the complete repository with `1,707/1,707` tests under fatal
+  `ResourceWarning` in `591.411 s`. Ruff, formatting, compile, JSON, Markdown
+  links, private-path, diff, and anti-hedge gates pass.
+
 ### Demand-routed execution and exact operator algebras
 
 - Added `DemandRoutedExecutor`, the production feedback loop over materialized
@@ -236,7 +282,7 @@ All notable changes to IMMER are recorded here.
   FERTIG exact first refusal. Crystal tamper is a hard integrity error; novelty,
   uncovered actions, and missing features fall through once to local Qwen.
 - Added direct CompositionRoot and CLI configuration for the local Qwen anchor
-  cache. Qwen remains the primary local teacher and novelty fallback.
+  cache. Qwen remains the primary local full-model substrate and novelty path.
 - Verified the repository with `1367/1367` tests.
 
 ### DeepSeek-V4 frontier streaming and live causal crystallization

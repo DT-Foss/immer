@@ -11,7 +11,19 @@ import tempfile
 import unittest
 from unittest import mock
 
-from immer.runtimes.ooe.crystal import CrystalTamperError
+import numpy as np
+
+from immer.runtimes.ooe.compute_crystals import (
+    AFFINE_FLOAT64,
+    ComputeCrystal,
+    ComputeCrystalBank,
+)
+from immer.runtimes.ooe.compute_graph import ComputeOperatorGraph, OperatorEdge
+from immer.runtimes.ooe.crystal import CrystalTamperError, ManifestConflictError
+from immer.runtimes.ooe.operator_harvester import (
+    CandidateEvidenceStream,
+    HarvestPromotion,
+)
 from immer.runtimes.qwen3_8 import (
     AtlasQueryResult,
     GraphRevision,
@@ -599,6 +611,384 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         ):
             cartography.status_cartography(run_root)
 
+    def test_additive_frontier_preserves_history_and_runs_only_new_cells(self) -> None:
+        run_root = self.base / "additive-frontier"
+        cartography.prepare_manifest(
+            run_root,
+            bundle_root=self.bundle,
+            model_pin=_pin(),
+            prompt_token_ids=self.tokens,
+            prompt_sha256=self.prompt_sha,
+            jobs=_jobs()[:1],
+            code_revision=CODE_REVISION,
+            seed=17,
+        )
+        original_manifest = (run_root / cartography.MANIFEST_NAME).read_bytes()
+        first = self._run(run_root)
+        self.assertEqual(first["attempts_executed"], 1)
+        self.assertEqual(len(_FakeProbe.calls), 1)
+
+        extension = cartography.extend_frontier(
+            run_root,
+            jobs=_jobs()[1:],
+        )
+        self.assertTrue(extension["changed"])
+        self.assertEqual(extension["generation"], 1)
+        self.assertEqual(extension["total_jobs"], 2)
+        self.assertEqual(
+            (run_root / cartography.MANIFEST_NAME).read_bytes(),
+            original_manifest,
+        )
+        light = cartography.frontier_status(
+            run_root,
+            stream_factory=_FakeStream,
+        )
+        self.assertEqual(light["coverage"]["succeeded_jobs"], 1)
+        self.assertEqual(light["coverage"]["uncovered_jobs"], 1)
+
+        resumed = self._run(run_root)
+        self.assertEqual(resumed["attempts_executed"], 1)
+        self.assertEqual(resumed["coverage"]["succeeded_jobs"], 2)
+        self.assertTrue(resumed["coverage"]["complete"])
+        self.assertEqual(len(_FakeProbe.calls), 2)
+        repeated = cartography.extend_frontier(
+            run_root,
+            jobs=_jobs()[1:],
+        )
+        self.assertFalse(repeated["changed"])
+        self.assertEqual(repeated["generation"], 1)
+
+    def test_new_prompt_inherits_existing_measurement_grid(self) -> None:
+        run_root = self.base / "prompt-extension"
+        cartography.prepare_manifest(
+            run_root,
+            bundle_root=self.bundle,
+            model_pin=_pin(),
+            prompt_token_ids=self.tokens,
+            prompt_sha256=self.prompt_sha,
+            jobs=_jobs()[:1],
+            code_revision=CODE_REVISION,
+            seed=17,
+        )
+        other_tokens = (3, 5, 8, 13)
+        other_sha = prompt_token_sha256(other_tokens)
+        extension = cartography.extend_frontier(
+            run_root,
+            prompts=({"sha256": other_sha, "token_ids": list(other_tokens)},),
+            inherit_jobs=True,
+        )
+        self.assertEqual(extension["total_prompts"], 2)
+        self.assertEqual(extension["total_jobs"], 2)
+        report = self._run(run_root)
+        self.assertEqual(report["attempts_executed"], 2)
+        for prompt_sha in (self.prompt_sha, other_sha):
+            queried = cartography.query_cartography(
+                run_root,
+                prompt_sha256=prompt_sha,
+                runtime_factory=_runtime_factory,
+                atlas_factory=_FakeAtlas,
+            )
+            self.assertEqual(len(queried["measurements"]), 1)
+
+    def test_mixed_prompt_and_job_extension_closes_the_full_cross_product(self) -> None:
+        run_root = self.base / "mixed-extension"
+        cartography.prepare_manifest(
+            run_root,
+            bundle_root=self.bundle,
+            model_pin=_pin(),
+            prompt_token_ids=self.tokens,
+            prompt_sha256=self.prompt_sha,
+            jobs=_jobs()[:1],
+            code_revision=CODE_REVISION,
+            seed=17,
+        )
+        other_tokens = (21, 34, 55)
+        other_sha = prompt_token_sha256(other_tokens)
+        extension = cartography.extend_frontier(
+            run_root,
+            prompts=({"sha256": other_sha, "token_ids": list(other_tokens)},),
+            jobs=_jobs()[1:],
+        )
+        self.assertEqual(extension["total_prompts"], 2)
+        self.assertEqual(extension["total_jobs"], 4)
+        report = self._run(run_root)
+        self.assertEqual(report["attempts_executed"], 4)
+        specs = cartography._manifest_jobs(cartography._effective_manifest(run_root)[1])
+        self.assertEqual(
+            {(spec.prompt_sha256, spec.coordinate.layer) for _job, spec in specs},
+            {
+                (self.prompt_sha, 0),
+                (self.prompt_sha, 1),
+                (other_sha, 0),
+                (other_sha, 1),
+            },
+        )
+
+    def test_inherited_grid_retains_job_scoped_semantic_bindings(self) -> None:
+        run_root = self.base / "semantic-grid-extension"
+        job = dict(_jobs()[0])
+        family = _digest({"family": "exact-arithmetic"})
+        label_source = _digest({"source": "external-verifier"})
+        label_evidence = _digest({"evidence": "verified-family"})
+        job.update(
+            {
+                "family_sha256": family,
+                "label_evidence_sha256": label_evidence,
+                "label_source_sha256": label_source,
+                "semantic_label": "arithmetic/exact",
+            }
+        )
+        cartography.prepare_manifest(
+            run_root,
+            bundle_root=self.bundle,
+            model_pin=_pin(),
+            prompt_token_ids=self.tokens,
+            prompt_sha256=self.prompt_sha,
+            jobs=(job,),
+            code_revision=CODE_REVISION,
+            seed=17,
+        )
+        other_tokens = (89, 144)
+        other_sha = prompt_token_sha256(other_tokens)
+        cartography.extend_frontier(
+            run_root,
+            prompts=({"sha256": other_sha, "token_ids": list(other_tokens)},),
+            inherit_jobs=True,
+        )
+        specs = tuple(
+            spec
+            for _job, spec in cartography._manifest_jobs(
+                cartography._effective_manifest(run_root)[1]
+            )
+            if spec.prompt_sha256 == other_sha
+        )
+        self.assertEqual(len(specs), 1)
+        inherited = specs[0]
+        self.assertEqual(inherited.family_sha256, family)
+        self.assertEqual(inherited.label_source_sha256, label_source)
+        self.assertEqual(inherited.label_evidence_sha256, label_evidence)
+        self.assertEqual(inherited.semantic_label, "arithmetic/exact")
+
+    def test_prompt_only_extension_is_rejected(self) -> None:
+        run_root = self.base / "prompt-only-extension"
+        self._prepare(run_root)
+        tokens = (233, 377)
+        with self.assertRaisesRegex(
+            cartography.O1CartographyCliError,
+            "require inherited or explicit",
+        ):
+            cartography.extend_frontier(
+                run_root,
+                prompts=(
+                    {
+                        "sha256": prompt_token_sha256(tokens),
+                        "token_ids": list(tokens),
+                    },
+                ),
+            )
+        self.assertFalse((run_root / cartography.FRONTIER_NAME).exists())
+
+    def test_scheduler_anchor_rejects_frontier_journal_rollback(self) -> None:
+        run_root = self.base / "frontier-rollback"
+        cartography.prepare_manifest(
+            run_root,
+            bundle_root=self.bundle,
+            model_pin=_pin(),
+            prompt_token_ids=self.tokens,
+            prompt_sha256=self.prompt_sha,
+            jobs=_jobs()[:1],
+            code_revision=CODE_REVISION,
+            seed=17,
+        )
+        self._run(run_root)
+        cartography.extend_frontier(run_root, jobs=_jobs()[1:])
+        cartography.frontier_status(run_root, stream_factory=_FakeStream)
+        manifest = cartography._load_manifest(run_root)[0]
+        rolled_back = cartography._frontier_document(manifest["sha256"], ())
+        (run_root / cartography.FRONTIER_NAME).write_bytes(
+            json.dumps(
+                rolled_back,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        with self.assertRaisesRegex(
+            cartography.O1CartographyCliError,
+            "outside the active frontier",
+        ):
+            cartography.frontier_status(run_root, stream_factory=_FakeStream)
+
+    def test_qwen_grid_is_deterministic_and_crosses_every_axis(self) -> None:
+        first = cartography.qwen38_frontier_grid(
+            layers=(0, 27),
+            sites=("attention-q", "mlp-gate"),
+            interventions=("native", "passive"),
+            hidden_dimensions=32,
+        )
+        second = cartography.qwen38_frontier_grid(
+            layers=(0, 27),
+            sites=("attention-q", "mlp-gate"),
+            interventions=("native", "passive"),
+            hidden_dimensions=32,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 8)
+        native = [row for row in first if row["spec"]["intervention_mode"] == "native"]
+        passive = [
+            row for row in first if row["spec"]["intervention_mode"] == "passive"
+        ]
+        self.assertEqual(len(native), 4)
+        self.assertEqual(len(passive), 4)
+        self.assertTrue(all(row["spec"]["native_head_crsa"] for row in native))
+        self.assertTrue(all("native_head_crsa" not in row["spec"] for row in passive))
+        self.assertEqual(
+            {row["spec"]["hidden_sketch"]["output_dimensions"] for row in first},
+            {32},
+        )
+
+    def test_idle_runner_resumes_cycles_waits_and_consumes_later_extension(
+        self,
+    ) -> None:
+        run_root = self.base / "idle-runner"
+        self._prepare(run_root)
+        options = {
+            "cycle_max_jobs": 1,
+            "cycle_max_seconds": 10.0,
+            "max_cycles": 1,
+            "poll_seconds": 0.0,
+            "runtime_factory": _runtime_factory,
+            "probe_factory": _FakeProbe,
+            "atlas_factory": _FakeAtlas,
+            "stream_factory": _FakeStream,
+        }
+        first = cartography.idle_cartography(run_root, **options)
+        self.assertEqual(first["invocation_cycles"], 1)
+        self.assertEqual(first["state"]["body"]["run_cycles"], 1)
+        self.assertEqual(first["state"]["body"]["attempts_executed"], 1)
+
+        second = cartography.idle_cartography(
+            run_root,
+            **{**options, "max_cycles": 2},
+        )
+        self.assertEqual(second["state"]["body"]["run_cycles"], 2)
+        self.assertEqual(second["state"]["body"]["wait_cycles"], 1)
+        self.assertEqual(second["state"]["body"]["attempts_executed"], 2)
+        self.assertEqual(len(_FakeProbe.calls), 2)
+
+        third_job = dict(_jobs()[1])
+        third_job["coordinate"] = dict(third_job["coordinate"])
+        third_job["coordinate"]["layer"] = 2
+        third_job["coordinate"]["module"] = (
+            "model.language_model.layers.2.mlp.gate_proj"
+        )
+        third_job["coordinate"]["tensor"] = (
+            "model.language_model.layers.2.mlp.gate_proj.weight"
+        )
+        third_job["stop_layer"] = 3
+        extension = cartography.extend_frontier(run_root, jobs=(third_job,))
+        third = cartography.idle_cartography(run_root, **options)
+        self.assertEqual(third["state"]["body"]["run_cycles"], 3)
+        self.assertEqual(third["state"]["body"]["attempts_executed"], 3)
+        self.assertEqual(
+            third["state"]["body"]["frontier_head_sha256"],
+            extension["head_sha256"],
+        )
+        self.assertEqual(len(_FakeProbe.calls), 3)
+
+    def test_harvest_promotions_enter_persistent_algebra_catalog_idempotently(
+        self,
+    ) -> None:
+        bank = ComputeCrystalBank(self.base / "operator-compute")
+        graph = ComputeOperatorGraph(bank)
+        crystal = ComputeCrystal.affine(
+            np.array([[2.0]], dtype=np.float64),
+            np.array([1.0], dtype=np.float64),
+            extensions={
+                "operator_harvester": {
+                    "granularity": "operator",
+                    "group_sha256": _digest({"group": "qwen-layer-18"}),
+                }
+            },
+        )
+        publication = bank.publish_crystal(crystal)
+        verifier = _digest({"verifier": "heldout"})
+        evidence = _digest({"evidence": "contexts"})
+        edge = OperatorEdge(
+            source_state="qwen.layer18.pre",
+            target_state="qwen.layer18.post",
+            crystal_sha256=crystal.sha256,
+            verifier_sha256=verifier,
+            evidence_sha256=evidence,
+            weight=4.0,
+        )
+        initial = graph.state()
+        graph_state, _changed = graph.append_edges(
+            (edge,),
+            expected_generation=initial.generation,
+            expected_state_sha256=initial.sha256,
+        )
+        contexts = tuple(sorted(_digest({"context": index}) for index in range(4)))
+        stream = CandidateEvidenceStream(
+            group_sha256=_digest({"group": "qwen-layer-18"}),
+            operator_kind=AFFINE_FLOAT64,
+            status="promoted",
+            reason="heldout-pass",
+            observation_receipt_sha256s=contexts,
+            fit_receipt_sha256s=tuple(sorted(contexts[:3])),
+            holdout_receipt_sha256=contexts[-1],
+            verifier_sha256=verifier,
+            crystal_sha256=crystal.sha256,
+            evidence_sha256=evidence,
+        )
+        promotion = HarvestPromotion(
+            candidate=stream,
+            edge=edge,
+            bank_publication=publication,
+            graph_changed=True,
+            graph_state_sha256=graph_state.sha256,
+        )
+
+        def fail_router_publish_once(*args, **kwargs):
+            raise ManifestConflictError("injected router CAS failure")
+
+        with mock.patch.object(
+            cartography.AlgebraRouterBank,
+            "publish",
+            autospec=True,
+            side_effect=fail_router_publish_once,
+        ):
+            with self.assertRaisesRegex(ManifestConflictError, "router CAS"):
+                cartography._admit_harvested_algebras(
+                    bank=bank,
+                    graph=graph,
+                    promotions=(promotion,),
+                )
+        first = cartography._admit_harvested_algebras(
+            bank=bank,
+            graph=graph,
+            promotions=(promotion,),
+        )
+        second = cartography._admit_harvested_algebras(
+            bank=bank,
+            graph=graph,
+            promotions=(promotion,),
+        )
+        self.assertTrue(first["available"])
+        self.assertTrue(first["records"][0]["bootstrap"])
+        self.assertFalse(
+            first["records"][0]["artifact_publications"]["catalog"]["changed"]
+        )
+        self.assertFalse(second["records"][0]["bootstrap"])
+        self.assertFalse(second["records"][0]["admission"]["admitted"])
+        self.assertEqual(
+            first["active_candidate_sha256s"],
+            second["active_candidate_sha256s"],
+        )
+        self.assertEqual(first["router_sha256"], second["router_sha256"])
+
     def test_external_prompt_label_reaches_atlas_label_query(self) -> None:
         run_root = self.base / "external-label"
         label = "arithmetic/subtraction"
@@ -791,9 +1181,7 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         self.assertEqual(second["ooe"]["qwen_probe_calls"], 1)
         self.assertEqual(len(second["ooe"]["learning_receipts"]), 1)
         self.assertEqual(
-            second["ooe"]["learning_receipts"][0]["learning_receipt"][
-                "source_action"
-            ],
+            second["ooe"]["learning_receipts"][0]["learning_receipt"]["source_action"],
             "probe_coordinate",
         )
         self.assertEqual(second["ooe"]["controller_last_temporal_index"], 1)
@@ -822,10 +1210,14 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         )
         for row in manifest["body"]["jobs"]:
             spec = cartography._spec_from_record(row["spec"])
-            precomputed = _AuthenticProbe(_FakeModel(_pin())).execute(
-                spec,
-                atlas_head_revision=atlas.revision(),
-            ).measurement
+            precomputed = (
+                _AuthenticProbe(_FakeModel(_pin()))
+                .execute(
+                    spec,
+                    atlas_head_revision=atlas.revision(),
+                )
+                .measurement
+            )
             atlas.append_measurement(precomputed)
         _AuthenticProbe.calls.clear()
 
@@ -837,9 +1229,7 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         self.assertEqual(report["ooe"]["qwen_probe_calls"], 0)
         self.assertEqual(report["ooe"]["reused_atlas_proofs"], 1)
         self.assertEqual(len(report["ooe"]["learning_receipts"]), 1)
-        self.assertTrue(
-            report["ooe"]["learning_receipts"][0]["reused_atlas_proof"]
-        )
+        self.assertTrue(report["ooe"]["learning_receipts"][0]["reused_atlas_proof"])
         self.assertEqual(report["ooe"]["saved_qwen_forwards"], 0)
         self.assertEqual(_AuthenticProbe.calls, [])
 
@@ -856,10 +1246,14 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         measurements = []
         for row in manifest["body"]["jobs"]:
             spec = cartography._spec_from_record(row["spec"])
-            measurement = _AuthenticProbe(_FakeModel(_pin())).execute(
-                spec,
-                atlas_head_revision=atlas.revision(),
-            ).measurement
+            measurement = (
+                _AuthenticProbe(_FakeModel(_pin()))
+                .execute(
+                    spec,
+                    atlas_head_revision=atlas.revision(),
+                )
+                .measurement
+            )
             atlas.append_measurement(measurement)
             measurements.append(measurement)
 
@@ -880,10 +1274,14 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         atlas_path.mkdir()
         atlas = _FakeAtlas(atlas_path, model_pin=_pin(), tensor_plans=(object(),))
         spec = cartography._spec_from_record(manifest["body"]["jobs"][0]["spec"])
-        measurement = _AuthenticProbe(_FakeModel(_pin())).execute(
-            spec,
-            atlas_head_revision=atlas.revision(),
-        ).measurement
+        measurement = (
+            _AuthenticProbe(_FakeModel(_pin()))
+            .execute(
+                spec,
+                atlas_head_revision=atlas.revision(),
+            )
+            .measurement
+        )
         atlas.append_measurement(measurement)
         original_query = atlas.query_by_prompt_signature
 
@@ -925,9 +1323,7 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         state_name = hashlib.sha256(
             cartography.CONTROLLER_STATE_NAME.encode("utf-8")
         ).hexdigest()
-        state_path = (
-            run_root / cartography.OOE_NAME / "state" / f"{state_name}.state"
-        )
+        state_path = run_root / cartography.OOE_NAME / "state" / f"{state_name}.state"
         envelope = json.loads(state_path.read_text())
         envelope["payload_sha256"] = "0" * 64
         state_path.chmod(0o600)
@@ -1013,9 +1409,7 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         state_name = hashlib.sha256(
             cartography.OOE_PROMOTION_STATE_NAME.encode("utf-8")
         ).hexdigest()
-        state_path = (
-            run_root / cartography.OOE_NAME / "state" / f"{state_name}.state"
-        )
+        state_path = run_root / cartography.OOE_NAME / "state" / f"{state_name}.state"
         envelope = json.loads(state_path.read_text())
         envelope["payload_sha256"] = "0" * 64
         state_path.chmod(0o600)

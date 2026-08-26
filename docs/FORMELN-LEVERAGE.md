@@ -69,8 +69,9 @@ gates. For evidence threshold \(m_0\),
 \cdot\bigl(1-H_{\mathrm{norm}}(P)\bigr).
 \]
 
-A finite-horizon dynamic program composes the admitted rows into new plans; the
-teacher supplies one-step transitions and zero multi-step labels.
+A finite-horizon dynamic program composes the admitted rows into new plans;
+authenticated execution sources supply one-step transitions and zero
+multi-step labels.
 
 PS-Lifted fusion exchanges sufficient statistics across the replica topology.
 The self-calibrated continuation parameter starts from the Fiedler proposal
@@ -118,9 +119,12 @@ permuted placebo is rejected.
 
 ## 6. Authenticated stored compute
 
-A ComputeCrystal is an affine, permutation, lookup, or row-stochastic Markov
-operator. Homogeneous affine, permutation, and Markov chains admit exact
-fusion:
+A compute battery moves already-performed work across time. Its stored unit can
+be a final result, continuation state, operator, factorization, route, prefix,
+search state, or residual state. `ComputeCrystal` is the numerical operator
+form currently executed by the generic VM: affine, permutation, lookup, or
+row-stochastic Markov. Homogeneous affine, permutation, and Markov chains admit
+exact fusion:
 
 \[
 \mathcal K_{\mathrm{fused}}=
@@ -315,6 +319,45 @@ F(x_1,\ldots,x_m)=
 
 with independent ABIs and one receipt joining the lane proofs. No sequential
 ABI is asserted.
+
+### Harvested-program routing
+
+A contextual discovery becomes a routed program only after an exact bridge:
+
+\[
+H_{\rm bridge}=H(G_t,e,K,E_{\rm fit},E_{\rm holdout},V_{\rm discover},P),
+\]
+
+where \(G_t\) is the operator-graph head, \(e\) the selected edge, \(K\) the
+published Crystal, and \(P\) its tagged `ComputeProgram`. Runtime verification
+is a separate family-specific contract:
+
+\[
+V_{\rm execute}=H(g, s_{\rm src},s_{\rm dst},
+\operatorname{ABI}_{\rm in},\operatorname{ABI}_{\rm out},
+\operatorname{kind},\operatorname{checker}).
+\]
+
+This prevents a fit/holdout verifier from being reused as result-quality
+authority and prevents unrelated families from sharing one verifier identity.
+The selected program executes through the Crystal VM; its VM receipt and
+consumer-verifier payload form one `VerifierBoundOutcome` that updates the
+same contextual Thompson posterior.
+
+The fixed three-family trial reaches \(174/180\) total, \(60/60\) late, and
+\(30/30\) final correct choices. Circularly destroying the context signal
+reaches \(49/180\), \(13/60\) late, and \(5/30\) final.
+
+When parallel routes share endpoints, the selected path is the ordered edge
+identity rather than only \((s_{\rm src},s_{\rm dst})\):
+
+\[
+r=H(e_1,\ldots,e_m,G_t),\qquad
+y=\operatorname{dischargeExact}(r,x).
+\]
+
+Canonical cost planning remains available; exact discharge preserves an
+algebra agent's explicit alternative.
 
 ## 7. Novelty and structured kernels
 

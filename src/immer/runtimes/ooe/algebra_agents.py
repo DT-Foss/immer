@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import base64
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
@@ -41,10 +41,16 @@ from .crystal import (
     ManifestConflictError,
     StatePublication,
 )
+from .compute_crystals import (
+    ComputeCrystalIntegrityError,
+    ComputeProgram,
+)
 from .identity import canonical_json_bytes, require_sha256
 
 
 OPERATOR_ALGEBRA_CANDIDATE_SCHEMA = "immer-ooe-operator-algebra-candidate/v1"
+OPERATOR_ALGEBRA_CANDIDATE_V2_SCHEMA = "immer-ooe-operator-algebra-candidate/v2"
+COMPUTE_PROGRAM_BINDING_SCHEMA = "immer-ooe-compute-program-binding/v1"
 ALGEBRA_SELECTION_SCHEMA = "immer-ooe-algebra-selection/v1"
 VERIFIER_OUTCOME_SCHEMA = "immer-ooe-algebra-verifier-outcome/v1"
 ALGEBRA_UPDATE_SCHEMA = "immer-ooe-algebra-update/v1"
@@ -66,6 +72,10 @@ MAX_VERIFIERS_PER_LANE = 64
 MAX_IDENTIFIER_BYTES = 256
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}")
+
+AFFINE_MONOID_RUNTIME = "affine-monoid"
+COMPUTE_CRYSTAL_VM_RUNTIME = "compute-crystal-vm"
+_PROGRAM_RUNTIMES = frozenset((AFFINE_MONOID_RUNTIME, COMPUTE_CRYSTAL_VM_RUNTIME))
 
 
 class AlgebraAgentError(ValueError):
@@ -199,25 +209,138 @@ def _parse_hex_floats(
     return tuple(parsed)
 
 
+def _compute_schema_contract_sha256(program: ComputeProgram) -> str:
+    return _digest(
+        {
+            "input_abi": program.input_abi.to_record(),
+            "output_abi": program.output_abi.to_record(),
+            "program_runtime": COMPUTE_CRYSTAL_VM_RUNTIME,
+            "schema": "immer-ooe-program-schema-contract/v1",
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ComputeProgramBindingReceipt:
+    """Self-contained binding for a ComputeProgram and its exact tensor ABI."""
+
+    program: ComputeProgram
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.program, ComputeProgram):
+            raise TypeError("program must be a ComputeProgram")
+        ComputeProgram.from_bytes(self.program.to_bytes())
+
+    @classmethod
+    def issue(cls, program: ComputeProgram) -> "ComputeProgramBindingReceipt":
+        return cls(program)
+
+    @property
+    def program_sha256(self) -> str:
+        return self.program.sha256
+
+    @property
+    def program_bytes_sha256(self) -> str:
+        return hashlib.sha256(self.program.to_bytes()).hexdigest()
+
+    @property
+    def schema_contract_sha256(self) -> str:
+        return _compute_schema_contract_sha256(self.program)
+
+    def _body(self) -> dict[str, object]:
+        return {
+            "crystal_sha256s": list(self.program.crystal_sha256s),
+            "input_abi_sha256": self.program.input_abi.sha256,
+            "output_abi_sha256": self.program.output_abi.sha256,
+            "program_base64": _b64(self.program.to_bytes()),
+            "program_bytes_sha256": self.program_bytes_sha256,
+            "program_runtime": COMPUTE_CRYSTAL_VM_RUNTIME,
+            "program_sha256": self.program_sha256,
+            "schema_contract_sha256": self.schema_contract_sha256,
+        }
+
+    def to_bytes(self) -> bytes:
+        return _seal(COMPUTE_PROGRAM_BINDING_SCHEMA, self._body())
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.to_bytes()).hexdigest()
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ComputeProgramBindingReceipt":
+        body = _open(data, schema=COMPUTE_PROGRAM_BINDING_SCHEMA)
+        _exact_keys(
+            body,
+            {
+                "crystal_sha256s",
+                "input_abi_sha256",
+                "output_abi_sha256",
+                "program_base64",
+                "program_bytes_sha256",
+                "program_runtime",
+                "program_sha256",
+                "schema_contract_sha256",
+            },
+            field="compute program binding",
+        )
+        if not isinstance(body["crystal_sha256s"], list):
+            raise AlgebraAgentIntegrityError(
+                "compute binding crystal addresses must be an array"
+            )
+        try:
+            result = cls(
+                ComputeProgram.from_bytes(
+                    _unb64(body["program_base64"], field="program_base64")
+                )
+            )
+        except (TypeError, ValueError, ComputeCrystalIntegrityError) as exc:
+            raise AlgebraAgentIntegrityError("invalid compute program binding") from exc
+        if result._body() != body:
+            raise AlgebraAgentIntegrityError("compute program bindings changed")
+        return result
+
+
 @dataclass(frozen=True, slots=True)
 class OperatorAlgebraCandidate:
     """One verified algebra program and all evidence needed to route to it."""
 
     family: str
-    program: AffineProgram
+    program: AffineProgram | ComputeProgram
     verifier_sha256: str
     evidence_sha256s: tuple[str, ...]
     behavior_descriptor: tuple[int, ...]
     objectives: tuple[float, ...]
+    discovery_verifier_sha256: str | None = None
+    _serialization_schema: str = field(
+        default=OPERATOR_ALGEBRA_CANDIDATE_V2_SCHEMA,
+        repr=False,
+        kw_only=True,
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "family", _identifier(self.family, field="family"))
-        if not isinstance(self.program, AffineProgram):
-            raise TypeError("program must be an AffineProgram")
+        if not isinstance(self.program, (AffineProgram, ComputeProgram)):
+            raise TypeError("program must be an AffineProgram or ComputeProgram")
+        if self._serialization_schema not in {
+            OPERATOR_ALGEBRA_CANDIDATE_SCHEMA,
+            OPERATOR_ALGEBRA_CANDIDATE_V2_SCHEMA,
+        }:
+            raise AlgebraAgentError("candidate serialization schema is unknown")
+        execution_verifier = require_sha256(
+            self.verifier_sha256, field="verifier_sha256"
+        )
+        object.__setattr__(self, "verifier_sha256", execution_verifier)
+        discovery_verifier = self.discovery_verifier_sha256
+        if discovery_verifier is None:
+            if not isinstance(self.program, AffineProgram):
+                raise AlgebraAgentError(
+                    "ComputeProgram candidates require a discovery verifier"
+                )
+            discovery_verifier = execution_verifier
         object.__setattr__(
             self,
-            "verifier_sha256",
-            require_sha256(self.verifier_sha256, field="verifier_sha256"),
+            "discovery_verifier_sha256",
+            require_sha256(discovery_verifier, field="discovery_verifier_sha256"),
         )
         object.__setattr__(
             self,
@@ -244,22 +367,57 @@ class OperatorAlgebraCandidate:
         if not 1 <= len(objectives) <= MAX_OBJECTIVES:
             raise AlgebraAgentError("objectives have an invalid dimension")
         object.__setattr__(self, "objectives", objectives)
-        # Issuance is also a complete program/schema/action consistency check.
-        ProgramReceipt.issue(self.program)
+        if isinstance(self.program, AffineProgram):
+            ProgramReceipt.issue(self.program)
+        else:
+            ComputeProgramBindingReceipt.issue(self.program)
+        if self._serialization_schema == OPERATOR_ALGEBRA_CANDIDATE_SCHEMA and (
+            not isinstance(self.program, AffineProgram)
+            or self.discovery_verifier_sha256 != self.verifier_sha256
+        ):
+            raise AlgebraAgentError(
+                "v1 candidate serialization only supports its legacy affine contract"
+            )
+
+    @property
+    def program_runtime(self) -> str:
+        if isinstance(self.program, AffineProgram):
+            return AFFINE_MONOID_RUNTIME
+        return COMPUTE_CRYSTAL_VM_RUNTIME
+
+    @property
+    def schema_contract_sha256(self) -> str:
+        if isinstance(self.program, AffineProgram):
+            return self.program.schema.sha256
+        return _compute_schema_contract_sha256(self.program)
 
     @property
     def schema_sha256(self) -> str:
-        return self.program.schema.sha256
+        """Compatibility alias for the runtime-specific schema contract."""
+
+        return self.schema_contract_sha256
 
     @property
     def program_sha256(self) -> str:
         return self.program.sha256
 
     @property
-    def program_receipt(self) -> ProgramReceipt:
-        return ProgramReceipt.issue(self.program)
+    def program_bytes_sha256(self) -> str:
+        return hashlib.sha256(self.program.to_bytes()).hexdigest()
 
-    def _body(self) -> dict[str, object]:
+    @property
+    def program_receipt(self) -> ProgramReceipt | ComputeProgramBindingReceipt:
+        if isinstance(self.program, AffineProgram):
+            return ProgramReceipt.issue(self.program)
+        return ComputeProgramBindingReceipt.issue(self.program)
+
+    @property
+    def _uses_legacy_v1(self) -> bool:
+        return self._serialization_schema == OPERATOR_ALGEBRA_CANDIDATE_SCHEMA
+
+    def _legacy_v1_body(self) -> dict[str, object]:
+        if not isinstance(self.program, AffineProgram):
+            raise AlgebraAgentIntegrityError("v1 candidates require an AffineProgram")
         return {
             "behavior_descriptor": list(self.behavior_descriptor),
             "evidence_sha256s": list(self.evidence_sha256s),
@@ -272,8 +430,34 @@ class OperatorAlgebraCandidate:
             "verifier_sha256": self.verifier_sha256,
         }
 
+    def _v2_body(self) -> dict[str, object]:
+        receipt = self.program_receipt
+        return {
+            "behavior_descriptor": list(self.behavior_descriptor),
+            "discovery_verifier_sha256": self.discovery_verifier_sha256,
+            "evidence_sha256s": list(self.evidence_sha256s),
+            "family": self.family,
+            "objectives_hex": _hex_floats(self.objectives),
+            "program_base64": _b64(self.program.to_bytes()),
+            "program_bytes_sha256": self.program_bytes_sha256,
+            "program_receipt_base64": _b64(receipt.to_bytes()),
+            "program_receipt_sha256": receipt.sha256,
+            "program_runtime": self.program_runtime,
+            "program_sha256": self.program_sha256,
+            "schema_contract_sha256": self.schema_contract_sha256,
+            "verifier_sha256": self.verifier_sha256,
+        }
+
+    def _body(self) -> dict[str, object]:
+        return self._legacy_v1_body() if self._uses_legacy_v1 else self._v2_body()
+
     def to_bytes(self) -> bytes:
-        return _seal(OPERATOR_ALGEBRA_CANDIDATE_SCHEMA, self._body())
+        schema = (
+            OPERATOR_ALGEBRA_CANDIDATE_SCHEMA
+            if self._uses_legacy_v1
+            else OPERATOR_ALGEBRA_CANDIDATE_V2_SCHEMA
+        )
+        return _seal(schema, self._body())
 
     @property
     def sha256(self) -> str:
@@ -281,7 +465,27 @@ class OperatorAlgebraCandidate:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "OperatorAlgebraCandidate":
-        body = _open(data, schema=OPERATOR_ALGEBRA_CANDIDATE_SCHEMA)
+        if not isinstance(data, bytes) or len(data) > MAX_SERIALIZED_BYTES:
+            raise AlgebraAgentIntegrityError("candidate must be bounded bytes")
+        try:
+            envelope = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AlgebraAgentIntegrityError("candidate is not JSON") from exc
+        if not isinstance(envelope, dict):
+            raise AlgebraAgentIntegrityError("candidate envelope must be an object")
+        schema = envelope.get("schema")
+        if schema == OPERATOR_ALGEBRA_CANDIDATE_SCHEMA:
+            return cls._from_v1_body(
+                _open(data, schema=OPERATOR_ALGEBRA_CANDIDATE_SCHEMA)
+            )
+        if schema == OPERATOR_ALGEBRA_CANDIDATE_V2_SCHEMA:
+            return cls._from_v2_body(
+                _open(data, schema=OPERATOR_ALGEBRA_CANDIDATE_V2_SCHEMA)
+            )
+        raise AlgebraAgentIntegrityError("candidate program runtime schema is unknown")
+
+    @classmethod
+    def _from_v1_body(cls, body: dict[str, Any]) -> "OperatorAlgebraCandidate":
         _exact_keys(
             body,
             {
@@ -313,10 +517,82 @@ class OperatorAlgebraCandidate:
                 objectives=_parse_hex_floats(
                     body["objectives_hex"], field="objectives"
                 ),
+                _serialization_schema=OPERATOR_ALGEBRA_CANDIDATE_SCHEMA,
             )
         except (TypeError, ValueError, AffineIntegrityError) as exc:
-            raise AlgebraAgentIntegrityError("invalid operator algebra candidate") from exc
-        if candidate._body() != body:
+            raise AlgebraAgentIntegrityError(
+                "invalid operator algebra candidate"
+            ) from exc
+        if candidate._legacy_v1_body() != body:
+            raise AlgebraAgentIntegrityError("candidate derived bindings changed")
+        return candidate
+
+    @classmethod
+    def _from_v2_body(cls, body: dict[str, Any]) -> "OperatorAlgebraCandidate":
+        _exact_keys(
+            body,
+            {
+                "behavior_descriptor",
+                "discovery_verifier_sha256",
+                "evidence_sha256s",
+                "family",
+                "objectives_hex",
+                "program_base64",
+                "program_bytes_sha256",
+                "program_receipt_base64",
+                "program_receipt_sha256",
+                "program_runtime",
+                "program_sha256",
+                "schema_contract_sha256",
+                "verifier_sha256",
+            },
+            field="operator algebra candidate v2",
+        )
+        if not isinstance(body["behavior_descriptor"], list) or not isinstance(
+            body["evidence_sha256s"], list
+        ):
+            raise AlgebraAgentIntegrityError("candidate vectors must be arrays")
+        runtime = body["program_runtime"]
+        if runtime not in _PROGRAM_RUNTIMES:
+            raise AlgebraAgentIntegrityError("candidate program runtime is unknown")
+        try:
+            program_data = _unb64(body["program_base64"], field="program_base64")
+            receipt_data = _unb64(
+                body["program_receipt_base64"], field="program_receipt_base64"
+            )
+            if runtime == AFFINE_MONOID_RUNTIME:
+                program: AffineProgram | ComputeProgram = AffineProgram.from_bytes(
+                    program_data
+                )
+                embedded_receipt: ProgramReceipt | ComputeProgramBindingReceipt = (
+                    ProgramReceipt.from_bytes(receipt_data)
+                )
+            else:
+                program = ComputeProgram.from_bytes(program_data)
+                embedded_receipt = ComputeProgramBindingReceipt.from_bytes(receipt_data)
+            candidate = cls(
+                family=body["family"],
+                program=program,
+                verifier_sha256=body["verifier_sha256"],
+                evidence_sha256s=tuple(body["evidence_sha256s"]),
+                behavior_descriptor=tuple(body["behavior_descriptor"]),
+                objectives=_parse_hex_floats(
+                    body["objectives_hex"], field="objectives"
+                ),
+                discovery_verifier_sha256=body["discovery_verifier_sha256"],
+            )
+        except (
+            TypeError,
+            ValueError,
+            AffineIntegrityError,
+            ComputeCrystalIntegrityError,
+        ) as exc:
+            raise AlgebraAgentIntegrityError(
+                "invalid operator algebra candidate"
+            ) from exc
+        if embedded_receipt.to_bytes() != candidate.program_receipt.to_bytes():
+            raise AlgebraAgentIntegrityError("candidate program receipt was spliced")
+        if candidate._v2_body() != body:
             raise AlgebraAgentIntegrityError("candidate derived bindings changed")
         return candidate
 
@@ -359,7 +635,9 @@ class AlgebraSelectionReceipt:
             for arm, score in self.scores
         )
         if not scores or scores != tuple(sorted(scores)):
-            raise AlgebraAgentError("selection scores must be a sorted non-empty vector")
+            raise AlgebraAgentError(
+                "selection scores must be a sorted non-empty vector"
+            )
         if len({arm for arm, _ in scores}) != len(scores):
             raise AlgebraAgentError("selection scores contain duplicate candidates")
         if self.candidate_sha256 not in {arm for arm, _ in scores}:
@@ -747,9 +1025,12 @@ class AlgebraRouterState:
         if any(len(item.objectives) != self.objective_count for item in candidates):
             raise AlgebraAgentError("candidate objective dimension mismatch")
         if any(
-            any(not 0 <= coordinate < count for coordinate, count in zip(
-                item.behavior_descriptor, bins, strict=True
-            ))
+            any(
+                not 0 <= coordinate < count
+                for coordinate, count in zip(
+                    item.behavior_descriptor, bins, strict=True
+                )
+            )
             for item in candidates
         ):
             raise AlgebraAgentError("candidate descriptor lies outside the grid")
@@ -765,7 +1046,9 @@ class AlgebraRouterState:
         try:
             archive = BehavioralMAPElites.from_bytes(self.archive_payload)
         except (TypeError, ValueError) as exc:
-            raise AlgebraAgentIntegrityError("invalid embedded MAP-Elites archive") from exc
+            raise AlgebraAgentIntegrityError(
+                "invalid embedded MAP-Elites archive"
+            ) from exc
         if (
             archive.bin_counts != bins
             or archive.objective_count != self.objective_count
@@ -779,7 +1062,9 @@ class AlgebraRouterState:
         )
         elite_hashes = tuple(sorted(elite.candidate_sha256 for elite in archive_elites))
         if elite_hashes != hashes:
-            raise AlgebraAgentIntegrityError("catalog does not equal archive Pareto frontier")
+            raise AlgebraAgentIntegrityError(
+                "catalog does not equal archive Pareto frontier"
+            )
         by_hash = {item.sha256: item for item in candidates}
         for elite in archive_elites:
             candidate = by_hash[elite.candidate_sha256]
@@ -787,7 +1072,9 @@ class AlgebraRouterState:
                 elite.descriptor != candidate.behavior_descriptor
                 or elite.objectives != candidate.objectives
             ):
-                raise AlgebraAgentIntegrityError("archive elite changed candidate behavior")
+                raise AlgebraAgentIntegrityError(
+                    "archive elite changed candidate behavior"
+                )
 
     @classmethod
     def bootstrap(
@@ -870,7 +1157,9 @@ class AlgebraRouterState:
         try:
             active = tuple(candidate_by_hash[digest] for digest in active_hashes)
         except KeyError as exc:
-            raise AlgebraAgentIntegrityError("archive references an unknown candidate") from exc
+            raise AlgebraAgentIntegrityError(
+                "archive references an unknown candidate"
+            ) from exc
         posteriors = tuple(
             item for item in self.bandit.posteriors if item.arm in set(active_hashes)
         )
@@ -915,9 +1204,7 @@ class AlgebraRouterState:
                 candidate_sha256=candidate.sha256,
                 admitted=False,
                 evicted_candidate_sha256s=(),
-                active_candidate_sha256s=tuple(
-                    item.sha256 for item in self.candidates
-                ),
+                active_candidate_sha256s=tuple(item.sha256 for item in self.candidates),
             )
             return self, receipt
         known = {item.sha256: item for item in self.candidates}
@@ -1095,9 +1382,7 @@ class AlgebraRouterState:
                 bandit=ContextualThompsonMutation.from_bytes(
                     _unb64(body["bandit_base64"], field="bandit_base64")
                 ),
-                archive_payload=_unb64(
-                    body["archive_base64"], field="archive_base64"
-                ),
+                archive_payload=_unb64(body["archive_base64"], field="archive_base64"),
             )
         except (TypeError, ValueError) as exc:
             raise AlgebraAgentIntegrityError("invalid algebra router") from exc
@@ -1147,7 +1432,9 @@ class AlgebraRouterBank:
         except KeyError:
             raise
         except CrystalStoreError as exc:
-            raise AlgebraAgentIntegrityError("router state failed store integrity") from exc
+            raise AlgebraAgentIntegrityError(
+                "router state failed store integrity"
+            ) from exc
         return AlgebraRouterState.from_bytes(payload)
 
 
@@ -1279,9 +1566,7 @@ class ParallelProgramLane:
                 lane_id=value["lane_id"],
                 program=program,
                 initial_state=AffineState.from_bytes(
-                    _unb64(
-                        value["initial_state_base64"], field="initial_state_base64"
-                    ),
+                    _unb64(value["initial_state_base64"], field="initial_state_base64"),
                     schema=program.schema,
                 ),
                 verifier_sha256s=tuple(value["verifier_sha256s"]),
@@ -1328,11 +1613,9 @@ class ParallelLaneResult:
             or self.final_state.schema_sha256 != self.program.schema.sha256
             or self.program_receipt.schema_sha256 != self.final_state.schema_sha256
             or self.execution_receipt.schema_sha256 != self.final_state.schema_sha256
-            or self.program_receipt.program_sha256
-            != self.program.sha256
+            or self.program_receipt.program_sha256 != self.program.sha256
             or self.execution_receipt.program_sha256 != self.program.sha256
-            or self.execution_receipt.initial_state_sha256
-            != self.initial_state.sha256
+            or self.execution_receipt.initial_state_sha256 != self.initial_state.sha256
             or self.execution_receipt.final_state_sha256 != self.final_state.sha256
             or self.execution_receipt.verifier_sha256s != artifact_hashes
         ):
@@ -1407,7 +1690,9 @@ class ParallelLaneResult:
         if not isinstance(value["verifier_artifacts_base64"], list) or not isinstance(
             value["verifier_artifact_sha256s"], list
         ):
-            raise AlgebraAgentIntegrityError("lane result verifier vectors must be arrays")
+            raise AlgebraAgentIntegrityError(
+                "lane result verifier vectors must be arrays"
+            )
         try:
             embedded_program = AffineProgram.from_bytes(
                 _unb64(value["program_base64"], field="program_base64")
@@ -1526,7 +1811,9 @@ class HeterogeneousProgramEnsemble:
         try:
             result = cls(
                 name=body["name"],
-                lanes=tuple(ParallelProgramLane.from_record(item) for item in body["lanes"]),
+                lanes=tuple(
+                    ParallelProgramLane.from_record(item) for item in body["lanes"]
+                ),
             )
         except (TypeError, ValueError) as exc:
             raise AlgebraAgentIntegrityError("invalid heterogeneous ensemble") from exc
@@ -1575,11 +1862,15 @@ class HeterogeneousProgramEnsemble:
                 verifier_artifacts=artifacts,
             )
 
-        worker_count = len(self.lanes) if max_workers is None else _integer(
-            max_workers,
-            field="max_workers",
-            minimum=1,
-            maximum=MAX_ENSEMBLE_LANES,
+        worker_count = (
+            len(self.lanes)
+            if max_workers is None
+            else _integer(
+                max_workers,
+                field="max_workers",
+                minimum=1,
+                maximum=MAX_ENSEMBLE_LANES,
+            )
         )
         worker_count = min(worker_count, len(self.lanes))
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
@@ -1591,9 +1882,7 @@ class HeterogeneousProgramEnsemble:
 @dataclass(frozen=True, slots=True)
 class HeterogeneousEnsembleReceipt:
     ensemble_sha256: str
-    lane_joins: tuple[
-        tuple[str, str, str, str, tuple[str, ...]], ...
-    ]
+    lane_joins: tuple[tuple[str, str, str, str, tuple[str, ...]], ...]
     total_work_units: int
 
     def __post_init__(self) -> None:
@@ -1603,7 +1892,13 @@ class HeterogeneousEnsembleReceipt:
             require_sha256(self.ensemble_sha256, field="ensemble_sha256"),
         )
         joins: list[tuple[str, str, str, str, tuple[str, ...]]] = []
-        for lane_id, program_sha, execution_sha, final_sha, artifact_hashes in self.lane_joins:
+        for (
+            lane_id,
+            program_sha,
+            execution_sha,
+            final_sha,
+            artifact_hashes,
+        ) in self.lane_joins:
             exact_id = _identifier(lane_id, field="lane_id")
             exact_hashes = tuple(
                 require_sha256(value, field="lane join SHA-256")
@@ -1621,7 +1916,9 @@ class HeterogeneousEnsembleReceipt:
         ) != len(normalized):
             raise AlgebraAgentError("ensemble joins must be unique and lane-sorted")
         object.__setattr__(self, "lane_joins", normalized)
-        _integer(self.total_work_units, field="total_work_units", maximum=(1 << 127) - 1)
+        _integer(
+            self.total_work_units, field="total_work_units", maximum=(1 << 127) - 1
+        )
 
     @classmethod
     def issue(
@@ -1695,7 +1992,9 @@ class HeterogeneousEnsembleReceipt:
                 field="ensemble join",
             )
             if not isinstance(item["verifier_artifact_sha256s"], list):
-                raise AlgebraAgentIntegrityError("join verifier vector must be an array")
+                raise AlgebraAgentIntegrityError(
+                    "join verifier vector must be an array"
+                )
             joins.append(
                 (
                     item["lane_id"],
@@ -1733,17 +2032,24 @@ class HeterogeneousEnsembleResult:
         if tuple(item.lane_id for item in results) != tuple(
             lane.lane_id for lane in self.ensemble.lanes
         ):
-            raise AlgebraAgentIntegrityError("ensemble results are missing, extra, or swapped")
+            raise AlgebraAgentIntegrityError(
+                "ensemble results are missing, extra, or swapped"
+            )
         object.__setattr__(self, "lane_results", results)
         if not isinstance(self.receipt, HeterogeneousEnsembleReceipt):
             raise TypeError("receipt must be a HeterogeneousEnsembleReceipt")
         for lane, result in zip(self.ensemble.lanes, results, strict=True):
             artifacts = result.verifier_artifacts
-            if tuple(sorted(item.verifier_sha256 for item in artifacts)) != lane.verifier_sha256s:
+            if (
+                tuple(sorted(item.verifier_sha256 for item in artifacts))
+                != lane.verifier_sha256s
+            ):
                 raise AlgebraAgentIntegrityError("lane verifier identities changed")
             expected_artifact_hashes = tuple(item.sha256 for item in artifacts)
             if result.execution_receipt.verifier_sha256s != expected_artifact_hashes:
-                raise AlgebraAgentIntegrityError("execution omitted or swapped exact verifier receipts")
+                raise AlgebraAgentIntegrityError(
+                    "execution omitted or swapped exact verifier receipts"
+                )
             replay = AffineMonoidRuntime.execute(
                 lane.program,
                 initial_state=lane.initial_state,
@@ -1803,9 +2109,7 @@ class HeterogeneousEnsembleResult:
                 raise AlgebraAgentIntegrityError("lane result count mismatch")
             results = tuple(
                 ParallelLaneResult.from_record(item, schema_program=lane.program)
-                for item, lane in zip(
-                    body["lane_results"], ensemble.lanes, strict=True
-                )
+                for item, lane in zip(body["lane_results"], ensemble.lanes, strict=True)
             )
             result = cls(
                 ensemble=ensemble,
@@ -1831,6 +2135,7 @@ __all__ = [
     "AlgebraRouterState",
     "AlgebraSelectionReceipt",
     "AlgebraUpdateReceipt",
+    "ComputeProgramBindingReceipt",
     "ExactVerifierArtifact",
     "HeterogeneousABIError",
     "HeterogeneousEnsembleReceipt",

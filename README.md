@@ -23,13 +23,14 @@ release surface.
 - **Grounded composition.** [FERTIG](https://github.com/DT-Foss/FERTIG)
   supplies deterministic parsing, verification, and explicit abstention.
 - **Organism of Experts.** O1 measurements become authenticated Atlas evidence;
-  PS-Lifted Markov agents learn action-conditioned world models, compose
-  verified options, harvest real contextual Qwen transitions, and publish
-  executable Crystals while Qwen supplies cold evidence and handles genuine
-  novelty.
-- **Compute batteries.** Native Qwen continuation states are charged ahead of
-  demand, restored by exact token prefix, and resumed without replaying the
-  authenticated prefix.
+  PS-Lifted Markov agents learn action-conditioned world models, continuously
+  expand the live weight frontier, harvest real contextual transitions, choose
+  executable operator algebras, and learn from verified execution outcomes.
+- **Compute batteries.** Already-paid computation is retained at its natural
+  granularity: results, continuation states, numerical operators,
+  factorizations, routes, prefixes, and residual states. Native Qwen
+  continuation restore is one executable instance of this wider stored-compute
+  system.
 - **Stored compute.** `ComputeCrystal` programs materialize reusable numerical
   operators. The Markov operator graph charges verified routes, fuses compatible
   chains, applies the deepest charged prefix to previously unseen values, and
@@ -44,6 +45,14 @@ release surface.
   maps over exact integer or modular rings. A contextual Markov meta-agent
   learns which algebra fits each task and joins incompatible programs only as
   independent parallel lanes.
+- **Living cartography.** An append-only frontier journal adds prompts, layers,
+  weight sites, and interventions without rebuilding the Atlas or losing O1
+  replay. A durable idle runner consumes new cells whenever compute is free.
+- **Harvest-to-execution routing.** Held-out affine, permutation, and Markov
+  discoveries become tagged `ComputeProgram` candidates in the same
+  Thompson/MAP-Elites router. Exact edge choice survives materialization and
+  discharge; profile, bridge, admission, program, and verifier evidence remain
+  restorable after a crash.
 - **Exact result cells.** A `ResultCell` is the sealed special case for one
   complete Qwen/FERTIG result binding. It is distinct from a generic
   `ComputeCrystal` and executes only under exact prompt, model, provenance, and
@@ -70,6 +79,8 @@ release surface.
 | Demand-routed residual execution | rewards 1.25 vs. 1.50; deeper prefix selected on decision 3 | persisted PPM/UCB selection → forced charged prefix → live suffix → external verifier → exact positive/negative feedback in one joined receipt |
 | Exact guarded affine monoids | Stack depth 53/64 exact; `aⁿbⁿcⁿ` 4/4; placebos 7/7 rejected | exact integer/modular `(A,b)` atoms, guard-preserving fusion, 128-digit Horner, fingerprint collision contained by byte verifier, atomic replay-verified bundle |
 | Contextual algebra agent | 120/120 correct; shuffled-context placebo 0/90 | Stack/Fingerprint/Decimal choice; Stack→Decimal regime recovery 30/30; three incompatible ABIs execute as one receipt-joined parallel ensemble |
+| Harvested-program algebra routing | 174/180 correct; late 60/60 | three executable affine/permutation/Markov `ComputeProgram` families; shuffled-context placebo 49/180 and late 13/60; every result returns verifier-bound Thompson feedback |
+| Living O1/Qwen frontier | additive prompt × layer × site growth | immutable initial manifest plus append-only frontier events, exact scheduler reconciliation, persistent idle cycles, rollback rejection, and zero loss of Atlas/O1 history |
 | Algebraic crystallization | 3/3 families admitted and exact | additive, multiplicative, and cyclic length-12 execution; permuted placebo rejected |
 | Qwen compute battery | 1.4288x peak speed | 65-token charged prefix + unknown 33-token suffix; authenticated restore removes 30.01% of demand latency |
 | O1 → Atlas → OoE | 10/10 live jobs; 15 measurements | two real contextual Qwen sites, Atlas revision 15, crash-resumable promotion, exact zero-probe reuse |

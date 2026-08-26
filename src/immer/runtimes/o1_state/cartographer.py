@@ -1170,6 +1170,128 @@ class O1Cartographer:
         with self._lock:
             return len(self._replay)
 
+    @property
+    def generation(self) -> int:
+        """Return the current cartography-state generation."""
+
+        with self._lock:
+            return self._generation
+
+    def extend_jobs(self, new_jobs: Iterable[ProbeJob]) -> tuple[ProbeJob, ...]:
+        """Atomically add previously unknown cells to the persisted frontier.
+
+        Exact repeats are idempotent.  A repeated job id carrying any different
+        payload is an integrity failure: one content address can never name two
+        probe descriptions.  The extension retains every outcome, history,
+        replay item, stream snapshot, and in-flight attempt byte-for-byte.
+        """
+
+        try:
+            incoming = tuple(new_jobs)
+        except TypeError as exc:
+            raise CartographyError("cartography extension must be iterable") from exc
+
+        with self._lock:
+            unique: dict[str, ProbeJob] = {}
+            for job in incoming:
+                if not isinstance(job, ProbeJob):
+                    raise CartographyError(
+                        "cartography extension jobs must be ProbeJob instances"
+                    )
+                if job.code_pin != self.code_pin or job.model_pin != self.model_pin:
+                    raise CartographyIdentityError(
+                        "probe extension pins do not match scheduler pins"
+                    )
+                if not self.allow_raw_prompts and job.prompt is not None:
+                    raise CartographyError(
+                        "raw probe prompts are disabled; provide only hashes"
+                    )
+                if (
+                    self.budget.max_total_read_bytes is not None
+                    and job.read_budget_bytes is None
+                ):
+                    raise CartographyError(
+                        "a total read budget requires a read cap on every probe job"
+                    )
+                if (
+                    self.budget.max_total_model_seconds is not None
+                    and job.model_budget_seconds is None
+                ):
+                    raise CartographyError(
+                        "a total model-time budget requires a model-time cap on every probe job"
+                    )
+                duplicate = unique.get(job.job_id)
+                if duplicate is not None and duplicate != job:
+                    raise CartographyIntegrityError(
+                        "probe extension contains a job-id collision"
+                    )
+                unique[job.job_id] = job
+
+            additions: list[ProbeJob] = []
+            for job_id, job in unique.items():
+                existing = self._jobs_by_id.get(job_id)
+                if existing is None:
+                    additions.append(job)
+                elif existing != job:
+                    raise CartographyIntegrityError(
+                        "probe extension collides with an existing job id"
+                    )
+            if not additions:
+                return ()
+
+            added = tuple(sorted(additions, key=lambda job: job.job_id))
+            candidate_jobs = tuple(
+                sorted((*self.jobs, *added), key=lambda job: job.job_id)
+            )
+            candidate_generation = self._generation + 1
+            body = self._state_body()
+            body["generation"] = candidate_generation
+            body["jobs"] = [
+                job.to_document(include_raw_prompt=self.allow_raw_prompts)
+                for job in candidate_jobs
+            ]
+            body["last_stop_reason"] = "ready"
+            encoded, _ = self._encode_state_body(body)
+
+            def adopt_committed_extension() -> None:
+                self.jobs = candidate_jobs
+                self._jobs_by_id = {job.job_id: job for job in candidate_jobs}
+                self._generation = candidate_generation
+                self._last_stop_reason = "ready"
+                self._file_sha256 = _sha256_bytes(encoded)
+
+            with _exclusive_state_lock(self.state_path):
+                current, _ = self._read_document(self.state_path)
+                if (
+                    self._file_sha256 is None
+                    or _sha256_bytes(current) != self._file_sha256
+                ):
+                    raise CartographyIntegrityError(
+                        "cartography sidecar changed since the last checkpoint"
+                    )
+                try:
+                    self._atomic_write(self.state_path, encoded)
+                except BaseException:
+                    # A failure after os.replace can leave the complete new
+                    # generation visible.  Match the live object to that valid
+                    # sidecar before propagating the durability failure.
+                    try:
+                        visible, _ = self._read_document(self.state_path)
+                    except CartographyError:
+                        pass
+                    else:
+                        if visible == encoded:
+                            adopt_committed_extension()
+                    raise
+                committed, _ = self._read_document(self.state_path)
+                if committed != encoded:
+                    raise CartographyIntegrityError(
+                        "cartography frontier extension did not commit exactly"
+                    )
+
+            adopt_committed_extension()
+            return added
+
     def _config_document(self) -> dict[str, Any]:
         return {
             "allow_raw_prompts": self.allow_raw_prompts,
@@ -1599,12 +1721,7 @@ class O1Cartographer:
             ):
                 raise CartographyError("O1 stream snapshot contains a raw-text field")
         body = self._state_body()
-        document = {**body, "state_sha256": _sha256_document(body)}
-        encoded = _canonical_json(document) + b"\n"
-        if len(encoded) > _MAX_STATE_BYTES:
-            raise CartographyError(
-                f"cartography state exceeds {_MAX_STATE_BYTES} bytes"
-            )
+        encoded, state_sha256 = self._encode_state_body(body)
         existing_document = self._read_document_if_present(self.state_path)
         if existing_document is not None:
             existing, _ = existing_document
@@ -1619,7 +1736,7 @@ class O1Cartographer:
                 if existing == encoded:
                     self._file_sha256 = _sha256_bytes(existing)
                     self._commit_stream_snapshot()
-                    return document["state_sha256"]
+                    return state_sha256
                 raise CartographyIntegrityError(
                     "cartography sidecar appeared during initialization"
                 )
@@ -1635,7 +1752,17 @@ class O1Cartographer:
             )
         self._file_sha256 = _sha256_bytes(committed)
         self._commit_stream_snapshot()
-        return document["state_sha256"]
+        return state_sha256
+
+    @staticmethod
+    def _encode_state_body(body: Mapping[str, Any]) -> tuple[bytes, str]:
+        state_sha256 = _sha256_document(body)
+        encoded = _canonical_json({**body, "state_sha256": state_sha256}) + b"\n"
+        if len(encoded) > _MAX_STATE_BYTES:
+            raise CartographyError(
+                f"cartography state exceeds {_MAX_STATE_BYTES} bytes"
+            )
+        return encoded, state_sha256
 
     def _commit_stream_snapshot(self) -> None:
         if self._stream_state is None:

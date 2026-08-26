@@ -18,7 +18,7 @@
   "components": [
     {
       "name": "Qwen3.8-27B causal runtime",
-      "role": "primary local teacher, generator, and novelty fallback",
+      "role": "primary local weight substrate, causal generator, cartography source, and full-model execution rail",
       "repository": "https://huggingface.co/Qwen/Qwen3.8-27B",
       "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
       "status": "integrated primary runtime",
@@ -36,7 +36,9 @@
         "src/immer/cognition/qwen_fertig_chat.py",
         "src/immer/runtimes/ooe/demand_execution.py",
         "src/immer/runtimes/ooe/affine_monoid.py",
-        "src/immer/runtimes/ooe/algebra_agents.py"
+        "src/immer/runtimes/ooe/algebra_agents.py",
+        "src/immer/runtimes/ooe/harvest_algebra_bridge.py",
+        "src/immer/runtimes/ooe/harvest_algebra_intelligence.py"
       ]
     },
     {
@@ -138,11 +140,14 @@
     },
     {
       "name": "o1-state",
-      "role": "persistent life stream separated from frozen execution",
+      "role": "persistent life stream, additive model cartography, and idle experiment scheduling",
       "repository": "https://github.com/DT-Foss/o1-state",
       "revision": "bb5e443f1b101dac0faedc25d3450343b59c93cd",
       "status": "ported into runtime core",
-      "integration": "src/immer/runtimes/o1_state/"
+      "integration": "src/immer/runtimes/o1_state/",
+      "additional_integrations": [
+        "scripts/qwen38_o1_cartography.py"
+      ]
     }
   ]
 }

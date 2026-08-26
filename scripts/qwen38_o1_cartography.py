@@ -40,6 +40,13 @@ from immer.runtimes.ooe.bvn_crystals import (
 )
 from immer.runtimes.ooe.compute_crystals import MARKOV_FLOAT64, ComputeCrystalBank
 from immer.runtimes.ooe.compute_graph import ComputeOperatorGraph
+from immer.runtimes.ooe.algebra_agents import AlgebraRouterBank, AlgebraRouterState
+from immer.runtimes.ooe.harvest_algebra_bridge import (
+    HarvestAlgebraArtifactBank,
+    execution_verifier_sha256_for_harvest,
+    harvest_promotion_to_algebra_candidate,
+    profile_harvested_candidate,
+)
 from immer.runtimes.ooe.operator_harvester import (
     ContinuousOperatorHarvester,
     HarvesterConfig,
@@ -71,11 +78,22 @@ from immer.runtimes.qwen3_8.bundle import QWEN38_BUNDLE_SCHEMA
 MANIFEST_SCHEMA_V1 = "immer.qwen3.8-o1-cartography-run/v1"
 MANIFEST_SCHEMA = "immer.qwen3.8-o1-cartography-run/v2"
 MANIFEST_NAME = "manifest.json"
+FRONTIER_NAME = "frontier.json"
 SCHEDULER_NAME = "scheduler.json"
 ATLAS_NAME = "atlas"
 O1_STATE_NAME = "o1-state.pt"
+IDLE_STATE_NAME = "idle-state.json"
 OOE_NAME = "ooe"
 OPERATOR_COMPUTE_NAME = "operator-compute"
+OPERATOR_ALGEBRA_ROUTER_NAME = "qwen-contextual-operators"
+OPERATOR_ALGEBRA_BIN_COUNTS = (3, 16, 2)
+OPERATOR_ALGEBRA_OBJECTIVE_COUNT = 4
+OPERATOR_ALGEBRA_ROUTER_SEED_SHA256 = hashlib.sha256(
+    b"immer:qwen-contextual-operator-router/v1"
+).hexdigest()
+FRONTIER_SCHEMA = "immer.qwen3.8-o1-cartography-frontier/v1"
+FRONTIER_EVENT_SCHEMA = "immer.qwen3.8-o1-cartography-frontier-event/v1"
+IDLE_STATE_SCHEMA = "immer.qwen3.8-o1-cartography-idle-state/v1"
 OOE_PROMOTION_STATE_NAME = "qwen-o1-cartography-promotion-transaction"
 OOE_PROMOTION_TRANSACTION_SCHEMA = (
     "immer.qwen3.8-o1-cartography-ooe-promotion-transaction/v1"
@@ -185,9 +203,11 @@ def _plain_root(value: str | os.PathLike[str], *, create: bool) -> Path:
 def _contained(root: Path, name: str) -> Path:
     if name not in {
         MANIFEST_NAME,
+        FRONTIER_NAME,
         SCHEDULER_NAME,
         ATLAS_NAME,
         O1_STATE_NAME,
+        IDLE_STATE_NAME,
         OOE_NAME,
         OPERATOR_COMPUTE_NAME,
     }:
@@ -316,6 +336,64 @@ def _atomic_new(path: Path, value: bytes) -> None:
             os.close(directory)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def _atomic_replace(
+    path: Path,
+    value: bytes,
+    *,
+    expected_sha256: str | None,
+    label: str,
+) -> str:
+    """Atomically publish one bounded sidecar after an exact content CAS."""
+
+    if len(value) > _MAX_DOCUMENT_BYTES:
+        raise O1CartographyCliError(f"{label} exceeds its byte bound")
+    current: bytes | None
+    try:
+        current = _stable_regular_bytes(path, label)
+    except O1CartographyCliError:
+        if path.exists() or path.is_symlink():
+            raise
+        current = None
+    current_sha = None if current is None else hashlib.sha256(current).hexdigest()
+    if current_sha != expected_sha256:
+        raise O1CartographyCliError(f"{label} changed before publication")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".pending", dir=path.parent
+    )
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if current is None:
+            try:
+                os.link(temporary_path, path, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise O1CartographyCliError(
+                    f"{label} appeared before publication"
+                ) from exc
+        else:
+            if (
+                hashlib.sha256(_stable_regular_bytes(path, label)).hexdigest()
+                != expected_sha256
+            ):
+                raise O1CartographyCliError(f"{label} changed before publication")
+            os.replace(temporary_path, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    committed = _stable_regular_bytes(path, label)
+    if committed != value:
+        raise O1CartographyCliError(f"{label} publication changed")
+    return hashlib.sha256(committed).hexdigest()
 
 
 def _contains_forbidden_job_key(value: object) -> bool:
@@ -603,7 +681,7 @@ def prepare_manifest(
     seed: int = 0,
     runtime: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Atomically create one immutable, question-only finite run manifest."""
+    """Atomically create one immutable, question-only initial run manifest."""
 
     root_path = _plain_root(root, create=True)
     bundle_path = _plain_root(bundle_root, create=False)
@@ -639,8 +717,8 @@ def prepare_manifest(
                 "prompt registry must be non-empty and duplicate-free"
             )
         registry = tuple(sorted(registry, key=lambda row: row["sha256"]))
-    if not jobs or len(jobs) * len(registry) > 1_000_000:
-        raise O1CartographyCliError("finite job frontier must be non-empty and bounded")
+    if not jobs:
+        raise O1CartographyCliError("initial job frontier must be non-empty")
     if len(registry) > 1 and any(
         isinstance(value, ProbeSpec)
         or (
@@ -669,11 +747,11 @@ def prepare_manifest(
             )
     ids = [row["job"]["job_id"] for row in prepared]
     if len(ids) != len(set(ids)):
-        raise O1CartographyCliError("finite job frontier contains duplicate jobs")
+        raise O1CartographyCliError("initial job frontier contains duplicate jobs")
     spec_ids = [row["spec"] for row in prepared]
     if len({_digest(spec) for spec in spec_ids}) != len(spec_ids):
         raise O1CartographyCliError(
-            "finite job frontier repeats an identical probe spec"
+            "initial job frontier repeats an identical probe spec"
         )
     runtime_body = {
         "compute_dtype": "bfloat16",
@@ -790,6 +868,413 @@ def _manifest_jobs(body: Mapping[str, Any]) -> tuple[tuple[ProbeJob, ProbeSpec],
     if len({spec.sha256 for _job, spec in rows}) != len(rows):
         raise O1CartographyCliError("run job frontier repeats a probe spec")
     return tuple(rows)
+
+
+def _frontier_event(
+    *,
+    generation: int,
+    parent_sha256: str,
+    added_prompts: Sequence[Mapping[str, Any]],
+    added_jobs: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    body = {
+        "added_jobs": [dict(value) for value in added_jobs],
+        "added_prompts": [dict(value) for value in added_prompts],
+        "generation": _uint(generation, "frontier generation", positive=True),
+        "parent_sha256": _sha(parent_sha256, "frontier parent SHA-256"),
+    }
+    return {
+        "body": body,
+        "schema": FRONTIER_EVENT_SCHEMA,
+        "sha256": _digest(body),
+    }
+
+
+def _frontier_document(
+    manifest_sha256: str,
+    events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    body = {
+        "base_manifest_sha256": _sha(manifest_sha256, "base manifest SHA-256"),
+        "events": [dict(value) for value in events],
+    }
+    return {"body": body, "schema": FRONTIER_SCHEMA, "sha256": _digest(body)}
+
+
+def _load_frontier_document(
+    root: Path,
+    *,
+    manifest_sha256: str,
+) -> tuple[dict[str, Any], str | None]:
+    path = _contained(root, FRONTIER_NAME)
+    try:
+        raw = _stable_regular_bytes(path, "frontier journal")
+    except O1CartographyCliError:
+        if path.exists() or path.is_symlink():
+            raise
+        return _frontier_document(manifest_sha256, ()), None
+    document = _strict_json_bytes(raw, "frontier journal")
+    if raw != _canonical(document) + b"\n":
+        raise O1CartographyCliError("frontier journal is not canonical JSONL")
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"body", "schema", "sha256"}
+        or document.get("schema") != FRONTIER_SCHEMA
+        or not isinstance(document.get("body"), Mapping)
+        or document.get("sha256") != _digest(document["body"])
+    ):
+        raise O1CartographyCliError("frontier journal seal is invalid")
+    body = document["body"]
+    if (
+        set(body) != {"base_manifest_sha256", "events"}
+        or body.get("base_manifest_sha256") != manifest_sha256
+        or not isinstance(body.get("events"), list)
+    ):
+        raise O1CartographyCliError("frontier journal belongs to another run")
+    parent = manifest_sha256
+    for index, event in enumerate(body["events"], start=1):
+        if (
+            not isinstance(event, Mapping)
+            or set(event) != {"body", "schema", "sha256"}
+            or event.get("schema") != FRONTIER_EVENT_SCHEMA
+            or not isinstance(event.get("body"), Mapping)
+            or event.get("sha256") != _digest(event["body"])
+        ):
+            raise O1CartographyCliError("frontier event seal is invalid")
+        event_body = event["body"]
+        if (
+            set(event_body)
+            != {"added_jobs", "added_prompts", "generation", "parent_sha256"}
+            or event_body.get("generation") != index
+            or event_body.get("parent_sha256") != parent
+            or not isinstance(event_body.get("added_jobs"), list)
+            or not isinstance(event_body.get("added_prompts"), list)
+            or not event_body["added_jobs"]
+            and not event_body["added_prompts"]
+        ):
+            raise O1CartographyCliError("frontier event chain is malformed")
+        parent = event["sha256"]
+    return document, hashlib.sha256(raw).hexdigest()
+
+
+def _effective_manifest(
+    root: Path,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    manifest, base_body = _load_manifest(root)
+    frontier, _raw_sha = _load_frontier_document(
+        root, manifest_sha256=manifest["sha256"]
+    )
+    prompts = list(_manifest_prompts(base_body))
+    jobs = [dict(value) for value in base_body["jobs"]]
+    prompt_ids = {row["sha256"] for row in prompts}
+    job_ids = {row["job"]["job_id"] for row in jobs}
+    spec_ids = {_digest(row["spec"]) for row in jobs}
+    for event in frontier["body"]["events"]:
+        event_body = event["body"]
+        for raw_prompt in event_body["added_prompts"]:
+            prompt = _prompt_record(raw_prompt)
+            if prompt["sha256"] in prompt_ids:
+                raise O1CartographyCliError(
+                    "frontier journal repeats a prompt identity"
+                )
+            prompt_ids.add(prompt["sha256"])
+            prompts.append(prompt)
+        for raw_job in event_body["added_jobs"]:
+            if not isinstance(raw_job, Mapping) or set(raw_job) != {"job", "spec"}:
+                raise O1CartographyCliError("frontier event job is malformed")
+            job_id = (
+                raw_job["job"].get("job_id")
+                if isinstance(raw_job["job"], Mapping)
+                else None
+            )
+            spec_id = _digest(raw_job["spec"])
+            if job_id in job_ids or spec_id in spec_ids:
+                raise O1CartographyCliError("frontier journal repeats a job")
+            job_ids.add(job_id)
+            spec_ids.add(spec_id)
+            jobs.append(dict(raw_job))
+    effective = dict(base_body)
+    effective.pop("prompt", None)
+    effective["prompts"] = sorted(prompts, key=lambda row: row["sha256"])
+    effective["jobs"] = jobs
+    _manifest_prompts(effective)
+    _manifest_jobs(effective)
+    events = frontier["body"]["events"]
+    status = {
+        "added_jobs": len(jobs) - len(base_body["jobs"]),
+        "added_prompts": len(prompts) - len(_manifest_prompts(base_body)),
+        "base_jobs": len(base_body["jobs"]),
+        "base_manifest_sha256": manifest["sha256"],
+        "base_prompts": len(_manifest_prompts(base_body)),
+        "generation": len(events),
+        "head_sha256": (manifest["sha256"] if not events else events[-1]["sha256"]),
+        "schema": FRONTIER_SCHEMA,
+        "total_jobs": len(jobs),
+        "total_prompts": len(prompts),
+    }
+    return manifest, effective, status
+
+
+def _operational_job_template(
+    prepared: Mapping[str, Any],
+    *,
+    prompt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recover the prompt-independent operational part of one prepared job."""
+
+    if not isinstance(prepared, Mapping) or set(prepared) != {"job", "spec"}:
+        raise O1CartographyCliError("prepared job template is malformed")
+    job = prepared["job"]
+    spec = prepared["spec"]
+    if not isinstance(job, Mapping) or not isinstance(spec, Mapping):
+        raise O1CartographyCliError("prepared job template is malformed")
+    if not isinstance(prompt, Mapping):
+        raise O1CartographyCliError("prepared job prompt is malformed")
+    defaults = dict(prompt["spec_defaults"])
+    scoped_defaults = {
+        "family_sha256": hashlib.sha256(b"immer:unlabeled-family/v1").hexdigest(),
+        "label_evidence_sha256": None,
+        "label_source_sha256": hashlib.sha256(b"immer:no-label-source/v1").hexdigest(),
+        "question_sha256": prompt["sha256"],
+        "semantic_label": None,
+    }
+    scoped_defaults.update(defaults)
+    operational_spec = {
+        "budget": spec["budget"],
+        "coordinate": spec["coordinate"],
+        "hidden_sketch": spec["hidden_sketch"],
+        "intervention_mode": spec["intervention_mode"],
+        "native_head_crsa": spec["native_head_crsa"],
+        "start_layer": spec["start_layer"],
+        "stop_layer": spec["stop_layer"],
+    }
+    for name, expected in scoped_defaults.items():
+        if spec[name] != expected:
+            operational_spec[name] = spec[name]
+    return {
+        "model_budget_seconds": job.get("model_budget_seconds"),
+        "probe_family": job.get("probe_family", "unlabeled"),
+        "read_budget_bytes": job.get("read_budget_bytes"),
+        "spec": operational_spec,
+        "target": job["target"],
+    }
+
+
+def extend_frontier(
+    root: str | os.PathLike[str],
+    *,
+    jobs: Sequence[Mapping[str, Any]] | None = None,
+    prompts: Sequence[Mapping[str, Any]] = (),
+    inherit_jobs: bool = False,
+) -> dict[str, Any]:
+    """Append new prompts/jobs to one live run without rewriting its history."""
+
+    if jobs is not None and inherit_jobs:
+        raise O1CartographyCliError("explicit jobs and inherit_jobs are exclusive")
+    root_path = _plain_root(root, create=False)
+    with _root_lock(root_path):
+        manifest, effective, before = _effective_manifest(root_path)
+        frontier, expected_sha = _load_frontier_document(
+            root_path, manifest_sha256=manifest["sha256"]
+        )
+        current_prompts = list(_manifest_prompts(effective))
+        known_prompts = {row["sha256"]: row for row in current_prompts}
+        additions: list[dict[str, Any]] = []
+        for raw in prompts:
+            prompt = _prompt_record(raw)
+            prior = known_prompts.get(prompt["sha256"])
+            if prior is not None:
+                if prior != prompt:
+                    raise O1CartographyCliError(
+                        "prompt identity collides with different metadata"
+                    )
+                continue
+            known_prompts[prompt["sha256"]] = prompt
+            additions.append(prompt)
+        registry = tuple(sorted(known_prompts.values(), key=lambda row: row["sha256"]))
+        prompt_by_sha = {row["sha256"]: row for row in registry}
+        inherited_by_sha: dict[str, dict[str, Any]] = {}
+        for prepared in effective["jobs"]:
+            prompt_sha = prepared["spec"]["prompt_sha256"]
+            template = _operational_job_template(
+                prepared,
+                prompt=prompt_by_sha[prompt_sha],
+            )
+            inherited_by_sha.setdefault(_digest(template), template)
+        inherited_templates = tuple(
+            inherited_by_sha[key] for key in sorted(inherited_by_sha)
+        )
+        explicit_templates = tuple(jobs or ())
+        if additions and not inherit_jobs and not explicit_templates:
+            raise O1CartographyCliError(
+                "new prompts require inherited or explicit measurement jobs"
+            )
+        if not explicit_templates and not additions:
+            return {**before, "changed": False, "event_sha256": None}
+        existing_jobs = {row["job"]["job_id"]: row for row in effective["jobs"]}
+        existing_specs = {_digest(row["spec"]) for row in effective["jobs"]}
+        prepared_additions: list[dict[str, Any]] = []
+        model_pin = ModelPin.from_document(effective["model_pin"])
+        seed = _uint(effective["scheduler"]["seed"], "scheduler seed")
+        added_prompt_ids = {row["sha256"] for row in additions}
+        for prompt in registry:
+            prompt_templates = list(explicit_templates)
+            if prompt["sha256"] in added_prompt_ids:
+                prompt_templates.extend(inherited_templates)
+            templates_by_sha = {
+                _digest(template): template for template in prompt_templates
+            }
+            for template_sha in sorted(templates_by_sha):
+                template = templates_by_sha[template_sha]
+                prepared = _prepared_job(
+                    template,
+                    prompt_token_ids=tuple(prompt["token_ids"]),
+                    prompt_sha256=prompt["sha256"],
+                    code_revision=effective["code_revision"],
+                    model_pin_sha256=model_pin.sha256,
+                    base_seed=seed,
+                    prompt_defaults=prompt["spec_defaults"],
+                )
+                job_id = prepared["job"]["job_id"]
+                spec_id = _digest(prepared["spec"])
+                prior = existing_jobs.get(job_id)
+                if prior is not None:
+                    if prior != prepared:
+                        raise O1CartographyCliError(
+                            "job identity collides with different payload"
+                        )
+                    continue
+                if spec_id in existing_specs:
+                    raise O1CartographyCliError(
+                        "new frontier repeats an existing probe spec"
+                    )
+                existing_jobs[job_id] = prepared
+                existing_specs.add(spec_id)
+                prepared_additions.append(prepared)
+        if not prepared_additions and not additions:
+            return {**before, "changed": False, "event_sha256": None}
+        generation = before["generation"] + 1
+        event = _frontier_event(
+            generation=generation,
+            parent_sha256=before["head_sha256"],
+            added_prompts=tuple(sorted(additions, key=lambda row: row["sha256"])),
+            added_jobs=tuple(
+                sorted(
+                    prepared_additions,
+                    key=lambda row: row["job"]["job_id"],
+                )
+            ),
+        )
+        events = [*frontier["body"]["events"], event]
+        updated = _frontier_document(manifest["sha256"], events)
+        _atomic_replace(
+            _contained(root_path, FRONTIER_NAME),
+            _canonical(updated) + b"\n",
+            expected_sha256=expected_sha,
+            label="frontier journal",
+        )
+        _manifest, _body, after = _effective_manifest(root_path)
+        return {**after, "changed": True, "event_sha256": event["sha256"]}
+
+
+_GRID_SITES: dict[str, tuple[str, str]] = {
+    "input-layernorm": ("input_layernorm", "input_layernorm.weight"),
+    "attention-q": ("self_attn", "self_attn.q_proj.weight"),
+    "mlp-gate": ("mlp.gate_proj", "mlp.gate_proj.weight"),
+    "mlp-down": ("mlp.down_proj", "mlp.down_proj.weight"),
+}
+
+
+def qwen38_frontier_grid(
+    *,
+    layers: Sequence[int],
+    sites: Sequence[str] = ("input-layernorm", "attention-q", "mlp-gate", "mlp-down"),
+    interventions: Sequence[str] = ("passive",),
+    hidden_dimensions: int = 16,
+    hidden_seed_sha256: str | None = None,
+    native_head_indices: Sequence[int] = (2, 8, 14, 20),
+    native_alpha: float = 0.01,
+    native_balance_alpha: float = 1.0,
+    native_diagonal_debit: float = 3.0,
+) -> tuple[dict[str, Any], ...]:
+    """Build a deterministic Qwen layer/site/intervention measurement grid."""
+
+    layer_axis = tuple(_uint(value, "grid layer") for value in layers)
+    site_axis = tuple(str(value) for value in sites)
+    intervention_axis = tuple(str(value) for value in interventions)
+    if (
+        not layer_axis
+        or not site_axis
+        or not intervention_axis
+        or len(set(layer_axis)) != len(layer_axis)
+        or len(set(site_axis)) != len(site_axis)
+        or len(set(intervention_axis)) != len(intervention_axis)
+    ):
+        raise O1CartographyCliError("grid axes must be non-empty and duplicate-free")
+    unknown_sites = set(site_axis) - set(_GRID_SITES)
+    if unknown_sites:
+        raise O1CartographyCliError(
+            f"unknown Qwen grid site: {sorted(unknown_sites)[0]}"
+        )
+    unknown_modes = set(intervention_axis) - {"passive", "off", "native", "placebo"}
+    if unknown_modes:
+        raise O1CartographyCliError(
+            f"unknown Qwen grid intervention: {sorted(unknown_modes)[0]}"
+        )
+    sketch = HiddenSketchProjection(
+        seed_sha256=(
+            _digest(
+                {
+                    "purpose": "qwen3.8-contextual-frontier",
+                    "schema": FRONTIER_SCHEMA,
+                }
+            )
+            if hidden_seed_sha256 is None
+            else _sha(hidden_seed_sha256, "hidden sketch seed SHA-256")
+        ),
+        output_dimensions=_uint(
+            hidden_dimensions, "hidden sketch dimensions", positive=True
+        ),
+    )
+    heads = tuple(_uint(value, "native head index") for value in native_head_indices)
+    if not heads or len(set(heads)) != len(heads):
+        raise O1CartographyCliError(
+            "native head indices must be non-empty and duplicate-free"
+        )
+    templates: list[dict[str, Any]] = []
+    for layer in sorted(layer_axis):
+        prefix = f"model.language_model.layers.{layer}"
+        for site in sorted(site_axis):
+            module_suffix, tensor_suffix = _GRID_SITES[site]
+            module = f"{prefix}.{module_suffix}"
+            tensor = f"{prefix}.{tensor_suffix}"
+            for mode in sorted(intervention_axis):
+                raw_spec: dict[str, Any] = {
+                    "coordinate": {
+                        "layer": layer,
+                        "module": module,
+                        "tensor": tensor,
+                    },
+                    "hidden_sketch": sketch.as_record(),
+                    "intervention_mode": mode,
+                    "start_layer": layer,
+                    "stop_layer": layer + 1,
+                }
+                if mode in {"native", "placebo"}:
+                    raw_spec["native_head_crsa"] = {
+                        "alpha": float(native_alpha),
+                        "balance_alpha": float(native_balance_alpha),
+                        "diagonal_debit": float(native_diagonal_debit),
+                        "head_indices": list(heads),
+                        "layer": layer,
+                    }
+                templates.append(
+                    {
+                        "probe_family": f"contextual.{site}",
+                        "spec": raw_spec,
+                    }
+                )
+    return tuple(templates)
 
 
 def _bundle_document(body: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -950,17 +1435,33 @@ def _scheduler(
         seed=seed,
         sidecar=_contained(root, O1_STATE_NAME),
     )
+    expected_jobs = tuple(job for job, _spec in _manifest_jobs(body))
     if state_path.exists() or state_path.is_symlink():
-        return O1Cartographer.restore(
+        scheduler = O1Cartographer.restore(
             state_path,
             code_pin=body["code_revision"],
             model_pin=body["model_pin_sha256"],
             stream=stream,
         )
+        expected_by_id = {job.job_id: job for job in expected_jobs}
+        persisted_by_id = {job.job_id: job for job in scheduler.jobs}
+        for job_id, persisted in persisted_by_id.items():
+            expected = expected_by_id.get(job_id)
+            if expected is None or expected != persisted:
+                raise O1CartographyCliError(
+                    "scheduler contains a job outside the active frontier journal"
+                )
+        missing = tuple(
+            expected_by_id[job_id]
+            for job_id in sorted(set(expected_by_id) - set(persisted_by_id))
+        )
+        if missing:
+            scheduler.extend_jobs(missing)
+        return scheduler
     if not create:
         return None
     return O1Cartographer(
-        jobs=tuple(job for job, _spec in _manifest_jobs(body)),
+        jobs=expected_jobs,
         code_pin=body["code_revision"],
         model_pin=body["model_pin_sha256"],
         state_path=state_path,
@@ -1162,6 +1663,115 @@ def _append_probe_result(
     return _observation(job, spec, primary, reused=False), source_bytes
 
 
+def _admit_harvested_algebras(
+    *,
+    bank: ComputeCrystalBank,
+    graph: ComputeOperatorGraph,
+    promotions: Sequence[Any],
+) -> dict[str, Any]:
+    """Persist every promoted numerical family in the live algebra catalog."""
+
+    exact_promotions = tuple(promotions)
+    router_bank = AlgebraRouterBank(bank.store)
+    artifact_bank = HarvestAlgebraArtifactBank(bank.store)
+    try:
+        router = router_bank.restore(OPERATOR_ALGEBRA_ROUTER_NAME)
+    except KeyError:
+        router = None
+    else:
+        artifact_bank.audit_router(router)
+    records: list[dict[str, Any]] = []
+    state_publication = None
+    for promotion in exact_promotions:
+        crystal = bank.restore_crystal(promotion.edge.crystal_sha256)
+        bins = OPERATOR_ALGEBRA_BIN_COUNTS if router is None else router.bin_counts
+        objectives = (
+            OPERATOR_ALGEBRA_OBJECTIVE_COUNT
+            if router is None
+            else router.objective_count
+        )
+        profile = profile_harvested_candidate(
+            promotion,
+            crystal,
+            bin_counts=bins,
+            objective_count=objectives,
+            execution_verifier_sha256=execution_verifier_sha256_for_harvest(
+                promotion,
+                crystal,
+            ),
+        )
+        candidate, program_publication, bridge = harvest_promotion_to_algebra_candidate(
+            promotion,
+            graph=graph,
+            profile=profile,
+        )
+        if router is None:
+            updated = AlgebraRouterState.bootstrap(
+                (candidate,),
+                seed_sha256=OPERATOR_ALGEBRA_ROUTER_SEED_SHA256,
+                bin_counts=bins,
+                objective_count=objectives,
+            )
+            admission = None
+            bootstrap = True
+        else:
+            updated, admission = router.admit(candidate)
+            bootstrap = False
+        artifact_publication = artifact_bank.publish(
+            candidate,
+            profile,
+            bridge,
+            admission_router_sha256=updated.sha256,
+            admission_receipt_sha256=(None if admission is None else admission.sha256),
+            bootstrap=bootstrap,
+        )
+        state_publication = router_bank.publish(
+            OPERATOR_ALGEBRA_ROUTER_NAME,
+            updated,
+            expected_sha256=None if router is None else router.sha256,
+        )
+        router = updated
+        records.append(
+            {
+                "admission": (
+                    None
+                    if admission is None
+                    else {
+                        "admitted": admission.admitted,
+                        "sha256": admission.sha256,
+                    }
+                ),
+                "artifact_publications": {
+                    "bridge": asdict(artifact_publication.bridge),
+                    "catalog": asdict(artifact_publication.catalog),
+                    "profile": asdict(artifact_publication.profile),
+                },
+                "bootstrap": bootstrap,
+                "bridge_receipt_sha256": (
+                    artifact_publication.record.bridge_receipt_sha256
+                ),
+                "catalog_record_sha256": artifact_publication.record.sha256,
+                "candidate_sha256": candidate.sha256,
+                "family": candidate.family,
+                "profile_sha256": profile.sha256,
+                "program_publication": asdict(program_publication),
+                "program_sha256": candidate.program_sha256,
+                "router_sha256": router.sha256,
+            }
+        )
+    return {
+        "active_candidate_sha256s": (
+            [] if router is None else [row.sha256 for row in router.candidates]
+        ),
+        "available": router is not None,
+        "records": records,
+        "router_sha256": None if router is None else router.sha256,
+        "state_publication": (
+            None if state_publication is None else asdict(state_publication)
+        ),
+    }
+
+
 def _harvest_probe_context(
     root: Path,
     *,
@@ -1227,6 +1837,11 @@ def _harvest_probe_context(
             bvn_rejections.append(promotion.edge.sha256)
         else:
             bvn_receipt_sha256s.append(bvn_publication.receipt.sha256)
+    algebra_catalog = _admit_harvested_algebras(
+        bank=bank,
+        graph=graph,
+        promotions=harvested.promotions,
+    )
     return {
         "accepted_observations": harvested.accepted_observations,
         "atlas_revision": harvested.atlas_revision.to_document(),
@@ -1240,6 +1855,7 @@ def _harvest_probe_context(
         ],
         "bvn_receipt_sha256s": sorted(bvn_receipt_sha256s),
         "bvn_rejected_edge_sha256s": sorted(bvn_rejections),
+        "algebra_catalog": algebra_catalog,
         "cursor_after": harvested.cursor_after,
         "graph_state_sha256": harvested.graph_state_sha256,
         "promotion_edge_sha256s": sorted(
@@ -1356,9 +1972,7 @@ def _load_promotion_transaction(
         return None
     document = _strict_json_bytes(raw, "OoE promotion transaction")
     if raw != _canonical(document):
-        raise O1CartographyCliError(
-            "OoE promotion transaction is not canonical JSON"
-        )
+        raise O1CartographyCliError("OoE promotion transaction is not canonical JSON")
     if (
         not isinstance(document, dict)
         or set(document) != {"body", "schema", "sha256"}
@@ -1395,9 +2009,7 @@ def _load_promotion_transaction(
         ),
     )
     if normalized != document:
-        raise O1CartographyCliError(
-            "OoE promotion transaction reconstruction mismatch"
-        )
+        raise O1CartographyCliError("OoE promotion transaction reconstruction mismatch")
     return normalized, hashlib.sha256(raw).hexdigest()
 
 
@@ -1412,8 +2024,7 @@ def _assert_promotion_transaction_bindings(
     if (
         body["cartography_manifest_sha256"] != cartography_manifest_sha256
         or body["model_pin_sha256"] != model_pin_sha256
-        or body["weight_graph_revision_sha256"]
-        != weight_graph_revision_sha256
+        or body["weight_graph_revision_sha256"] != weight_graph_revision_sha256
     ):
         raise O1CartographyCliError(
             "OoE promotion transaction belongs to another sealed run"
@@ -1583,9 +2194,7 @@ def _open_ooe_runtime(
                 ),
             )
         except OoeControllerIntegrityError as exc:
-            transaction_body = (
-                None if transaction is None else transaction["body"]
-            )
+            transaction_body = None if transaction is None else transaction["body"]
             current_manifest = store.manifest()
             recoverable = (
                 str(exc) == "CrystalStore manifest changed since snapshot"
@@ -1595,8 +2204,7 @@ def _open_ooe_runtime(
                 == transaction_body["prepared_controller_snapshot_sha256"]
                 and current_manifest.generation
                 > transaction_body["pre_manifest_generation"]
-                and current_manifest.sha256
-                != transaction_body["pre_manifest_sha256"]
+                and current_manifest.sha256 != transaction_body["pre_manifest_sha256"]
             )
             if not recoverable:
                 raise
@@ -1610,9 +2218,7 @@ def _open_ooe_runtime(
                 expected_old_manifest_generation=(
                     transaction_body["pre_manifest_generation"]
                 ),
-                expected_old_manifest_sha256=(
-                    transaction_body["pre_manifest_sha256"]
-                ),
+                expected_old_manifest_sha256=(transaction_body["pre_manifest_sha256"]),
                 expected_old_state_sha256=(
                     transaction_body["prepared_controller_snapshot_sha256"]
                 ),
@@ -1623,10 +2229,8 @@ def _open_ooe_runtime(
         current_manifest = store.manifest()
         transaction_body = transaction["body"]
         if (
-            current_manifest.generation
-            == transaction_body["pre_manifest_generation"]
-            and current_manifest.sha256
-            == transaction_body["pre_manifest_sha256"]
+            current_manifest.generation == transaction_body["pre_manifest_generation"]
+            and current_manifest.sha256 == transaction_body["pre_manifest_sha256"]
         ):
             promotion_required = True
     return _OoeCartographyRuntime(
@@ -1714,9 +2318,7 @@ def _integrate_ooe_outcomes(
     source_actions: Mapping[str, tuple[str, str]] | None = None,
 ) -> tuple[_OoeCartographyRuntime | None, list[dict[str, Any]]]:
     sources = (
-        _source_actions(scheduler, specs)
-        if source_actions is None
-        else source_actions
+        _source_actions(scheduler, specs) if source_actions is None else source_actions
     )
     candidates: list[tuple[Any, MeasurementReceipt, str, str]] = []
     selected = scheduler.outcomes if outcomes is None else outcomes
@@ -1781,9 +2383,7 @@ def _integrate_ooe_outcomes(
                 },
                 "o1_learning_progress": outcome.learning_progress,
                 "o1_surprise": outcome.surprise,
-                "reused_atlas_proof": bool(
-                    observation.get("reused_atlas_proof")
-                ),
+                "reused_atlas_proof": bool(observation.get("reused_atlas_proof")),
                 "stream_sha256": stream_sha256,
             }
         )
@@ -1937,7 +2537,7 @@ def run_cartography(
     root_path = _plain_root(root, create=False)
     ooe_path = _ooe_root_path(root_path, ooe_root)
     with _root_lock(root_path):
-        manifest, body = _load_manifest(root_path)
+        manifest, body, frontier_status = _effective_manifest(root_path)
         scheduler = _scheduler(
             root_path, body, create=True, stream_factory=stream_factory
         )
@@ -2064,26 +2664,21 @@ def run_cartography(
                 reused_atlas_proofs=reused_atlas_proofs,
             )
             if ooe_session is not None:
-                publications, snapshot, transaction_publication = (
-                    _finalize_ooe_runtime(
-                        ooe_session,
-                        cartography_manifest_sha256=manifest["sha256"],
-                        promote=bool(learning_receipts),
-                    )
+                publications, snapshot, transaction_publication = _finalize_ooe_runtime(
+                    ooe_session,
+                    cartography_manifest_sha256=manifest["sha256"],
+                    promote=bool(learning_receipts),
                 )
                 ooe_report = {
                     "available": True,
                     "controller_last_temporal_index": (
                         ooe_session.controller.last_temporal_index
                     ),
-                    "controller_metrics": (
-                        ooe_session.controller.metrics.to_dict()
-                    ),
+                    "controller_metrics": (ooe_session.controller.metrics.to_dict()),
                     "controller_snapshot": asdict(snapshot),
                     "learning_receipts": learning_receipts,
                     "learning_receipt_sha256s": sorted(
-                        row["learning_receipt"]["sha256"]
-                        for row in learning_receipts
+                        row["learning_receipt"]["sha256"] for row in learning_receipts
                     ),
                     "promotions": [asdict(value) for value in publications],
                     "promotion_transaction": (
@@ -2120,6 +2715,7 @@ def run_cartography(
                 "attempts_executed": len(outcomes),
                 "coverage": scheduler.coverage().to_document(),
                 "elapsed_seconds": elapsed,
+                "frontier": frontier_status,
                 "manifest_sha256": manifest["sha256"],
                 "ooe": ooe_report,
                 "operator_harvest": {
@@ -2173,7 +2769,7 @@ def status_cartography(
 
     root_path = _plain_root(root, create=False)
     with _root_lock(root_path):
-        manifest, body = _load_manifest(root_path)
+        manifest, body, frontier_status = _effective_manifest(root_path)
         scheduler = _scheduler(
             root_path, body, create=False, stream_factory=stream_factory
         )
@@ -2209,8 +2805,310 @@ def status_cartography(
                 if outcome.atlas_receipt_sha256 is not None
             ),
             "coverage": coverage,
+            "frontier": frontier_status,
             "manifest_sha256": manifest["sha256"],
         }
+
+
+def frontier_status(
+    root: str | os.PathLike[str],
+    *,
+    stream_factory: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Authenticate the active additive frontier without opening model weights."""
+
+    root_path = _plain_root(root, create=False)
+    with _root_lock(root_path):
+        manifest, body, frontier = _effective_manifest(root_path)
+        scheduler = _scheduler(
+            root_path,
+            body,
+            create=False,
+            stream_factory=stream_factory,
+        )
+        coverage = (
+            _empty_coverage(len(_manifest_jobs(body)))
+            if scheduler is None
+            else scheduler.coverage().to_document()
+        )
+        return {
+            "coverage": coverage,
+            "frontier": frontier,
+            "manifest_sha256": manifest["sha256"],
+            "scheduler_generation": (
+                None if scheduler is None else scheduler.generation
+            ),
+        }
+
+
+def _idle_state_default(
+    manifest_sha256: str, frontier_head_sha256: str
+) -> dict[str, Any]:
+    return {
+        "accepted_observations": 0,
+        "attempts_executed": 0,
+        "base_manifest_sha256": _sha(manifest_sha256, "idle base manifest SHA-256"),
+        "cycles": 0,
+        "frontier_head_sha256": _sha(
+            frontier_head_sha256, "idle frontier head SHA-256"
+        ),
+        "last_coverage_sha256": None,
+        "last_error_sha256": None,
+        "last_error_type": None,
+        "last_stop_reason": "not-started",
+        "qwen_probe_calls": 0,
+        "run_cycles": 0,
+        "wait_cycles": 0,
+    }
+
+
+def _idle_state_document(body: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = dict(body)
+    expected = {
+        "accepted_observations",
+        "attempts_executed",
+        "base_manifest_sha256",
+        "cycles",
+        "frontier_head_sha256",
+        "last_coverage_sha256",
+        "last_error_sha256",
+        "last_error_type",
+        "last_stop_reason",
+        "qwen_probe_calls",
+        "run_cycles",
+        "wait_cycles",
+    }
+    if set(normalized) != expected:
+        raise O1CartographyCliError("idle state fields are malformed")
+    for name in (
+        "accepted_observations",
+        "attempts_executed",
+        "cycles",
+        "qwen_probe_calls",
+        "run_cycles",
+        "wait_cycles",
+    ):
+        normalized[name] = _uint(normalized[name], name)
+    for name in ("base_manifest_sha256", "frontier_head_sha256"):
+        normalized[name] = _sha(normalized[name], name)
+    for name in ("last_coverage_sha256", "last_error_sha256"):
+        if normalized[name] is not None:
+            normalized[name] = _sha(normalized[name], name)
+    for name in ("last_error_type", "last_stop_reason"):
+        value = normalized[name]
+        if value is not None and (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or "\x00" in value
+            or len(value) > 512
+        ):
+            raise O1CartographyCliError(f"{name} is invalid")
+    if normalized["cycles"] != normalized["run_cycles"] + normalized["wait_cycles"]:
+        raise O1CartographyCliError("idle cycle accounting is inconsistent")
+    return {
+        "body": normalized,
+        "schema": IDLE_STATE_SCHEMA,
+        "sha256": _digest(normalized),
+    }
+
+
+def _load_idle_state(
+    root: Path,
+    *,
+    manifest_sha256: str,
+    frontier_head_sha256: str,
+) -> tuple[dict[str, Any], str | None]:
+    path = _contained(root, IDLE_STATE_NAME)
+    try:
+        raw = _stable_regular_bytes(path, "idle state")
+    except O1CartographyCliError:
+        if path.exists() or path.is_symlink():
+            raise
+        return (
+            _idle_state_document(
+                _idle_state_default(manifest_sha256, frontier_head_sha256)
+            ),
+            None,
+        )
+    document = _strict_json_bytes(raw, "idle state")
+    if (
+        raw != _canonical(document) + b"\n"
+        or not isinstance(document, Mapping)
+        or set(document) != {"body", "schema", "sha256"}
+        or document.get("schema") != IDLE_STATE_SCHEMA
+        or not isinstance(document.get("body"), Mapping)
+        or document.get("sha256") != _digest(document["body"])
+    ):
+        raise O1CartographyCliError("idle state seal is invalid")
+    normalized = _idle_state_document(document["body"])
+    if normalized != document:
+        raise O1CartographyCliError("idle state reconstruction changed")
+    if document["body"]["base_manifest_sha256"] != manifest_sha256:
+        raise O1CartographyCliError("idle state belongs to another run")
+    return dict(document), hashlib.sha256(raw).hexdigest()
+
+
+def _publish_idle_state(
+    root: Path,
+    *,
+    manifest_sha256: str,
+    frontier_head_sha256: str,
+    update: Callable[[dict[str, Any]], None],
+) -> dict[str, Any]:
+    with _root_lock(root):
+        current, expected_sha = _load_idle_state(
+            root,
+            manifest_sha256=manifest_sha256,
+            frontier_head_sha256=frontier_head_sha256,
+        )
+        body = dict(current["body"])
+        update(body)
+        body["frontier_head_sha256"] = frontier_head_sha256
+        document = _idle_state_document(body)
+        _atomic_replace(
+            _contained(root, IDLE_STATE_NAME),
+            _canonical(document) + b"\n",
+            expected_sha256=expected_sha,
+            label="idle state",
+        )
+        return document
+
+
+def idle_cartography(
+    root: str | os.PathLike[str],
+    *,
+    cycle_max_jobs: int = 0,
+    cycle_max_seconds: float = 1800.0,
+    max_cycles: int = 0,
+    max_total_seconds: float = 0.0,
+    poll_seconds: float = 5.0,
+    ooe_root: str | os.PathLike[str] | None = None,
+    runtime_factory: RuntimeFactory | None = None,
+    probe_factory: ProbeFactory = Qwen38CartographyProbe,
+    atlas_factory: AtlasFactory = SemanticWeightAtlas,
+    stream_factory: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Continuously consume newly appended frontier work with durable cycles."""
+
+    job_limit = _uint(cycle_max_jobs, "cycle_max_jobs")
+    cycle_seconds = _seconds(cycle_max_seconds, "cycle_max_seconds", positive=True)
+    cycle_limit = _uint(max_cycles, "max_cycles")
+    total_seconds = _seconds(max_total_seconds, "max_total_seconds")
+    poll = _seconds(poll_seconds, "poll_seconds")
+    root_path = _plain_root(root, create=False)
+    started = time.monotonic()
+    invocation_cycles = 0
+    final_reason = "max-cycles"
+    last_run: dict[str, Any] | None = None
+    while cycle_limit == 0 or invocation_cycles < cycle_limit:
+        if total_seconds and time.monotonic() - started >= total_seconds:
+            final_reason = "max-total-seconds"
+            break
+        light = frontier_status(root_path, stream_factory=stream_factory)
+        frontier = light["frontier"]
+        manifest_sha = light["manifest_sha256"]
+        coverage = light["coverage"]
+        invocation_cycles += 1
+        if coverage["complete"]:
+
+            def record_wait(body: dict[str, Any]) -> None:
+                body["cycles"] += 1
+                body["wait_cycles"] += 1
+                body["last_coverage_sha256"] = _digest(coverage)
+                body["last_error_sha256"] = None
+                body["last_error_type"] = None
+                body["last_stop_reason"] = "waiting-for-frontier"
+
+            state = _publish_idle_state(
+                root_path,
+                manifest_sha256=manifest_sha,
+                frontier_head_sha256=frontier["head_sha256"],
+                update=record_wait,
+            )
+            final_reason = "waiting-for-frontier"
+            if cycle_limit and invocation_cycles >= cycle_limit:
+                break
+            delay = poll
+            if total_seconds:
+                delay = min(
+                    delay, max(0.0, total_seconds - (time.monotonic() - started))
+                )
+            if delay:
+                time.sleep(delay)
+            continue
+        try:
+            report = run_cartography(
+                root_path,
+                max_jobs=job_limit,
+                max_seconds=cycle_seconds,
+                ooe_root=ooe_root,
+                runtime_factory=runtime_factory,
+                probe_factory=probe_factory,
+                atlas_factory=atlas_factory,
+                stream_factory=stream_factory,
+            )
+        except Exception as exc:
+            error_type = f"{type(exc).__module__}.{type(exc).__qualname__}"
+            error_sha = _digest(
+                {
+                    "error_type": error_type,
+                    "frontier_head_sha256": frontier["head_sha256"],
+                    "schema": IDLE_STATE_SCHEMA,
+                }
+            )
+
+            def record_error(body: dict[str, Any]) -> None:
+                body["cycles"] += 1
+                body["run_cycles"] += 1
+                body["last_coverage_sha256"] = _digest(coverage)
+                body["last_error_sha256"] = error_sha
+                body["last_error_type"] = error_type
+                body["last_stop_reason"] = "run-error"
+
+            _publish_idle_state(
+                root_path,
+                manifest_sha256=manifest_sha,
+                frontier_head_sha256=frontier["head_sha256"],
+                update=record_error,
+            )
+            raise
+        last_run = report
+
+        def record_run(body: dict[str, Any]) -> None:
+            body["accepted_observations"] += report["operator_harvest"][
+                "accepted_observations"
+            ]
+            body["attempts_executed"] += report["attempts_executed"]
+            body["cycles"] += 1
+            body["last_coverage_sha256"] = _digest(report["coverage"])
+            body["last_error_sha256"] = None
+            body["last_error_type"] = None
+            body["last_stop_reason"] = report["stop_reason"]
+            body["qwen_probe_calls"] += report["ooe"]["qwen_probe_calls"]
+            body["run_cycles"] += 1
+
+        state = _publish_idle_state(
+            root_path,
+            manifest_sha256=manifest_sha,
+            frontier_head_sha256=report["frontier"]["head_sha256"],
+            update=record_run,
+        )
+        final_reason = report["stop_reason"]
+    if "state" not in locals():
+        light = frontier_status(root_path, stream_factory=stream_factory)
+        state, _state_sha = _load_idle_state(
+            root_path,
+            manifest_sha256=light["manifest_sha256"],
+            frontier_head_sha256=light["frontier"]["head_sha256"],
+        )
+    return {
+        "elapsed_seconds": time.monotonic() - started,
+        "invocation_cycles": invocation_cycles,
+        "last_run": last_run,
+        "state": state,
+        "stop_reason": final_reason,
+    }
 
 
 def _query_document(result: Any) -> dict[str, Any]:
@@ -2244,9 +3142,10 @@ def query_cartography(
         )
     root_path = _plain_root(root, create=False)
     with _root_lock(root_path):
-        manifest, body = _load_manifest(root_path)
+        manifest, body, frontier_status = _effective_manifest(root_path)
         if _atlas_path(root_path, create=False) is None:
             return {
+                "frontier": frontier_status,
                 "manifest_sha256": manifest["sha256"],
                 "measurements": [],
                 "promotions": [],
@@ -2300,7 +3199,11 @@ def query_cartography(
                     promotions=tuple(promotions[key] for key in sorted(promotions)),
                     replicas=tuple(replicas[key] for key in sorted(replicas)),
                 )
-            return {"manifest_sha256": manifest["sha256"], **_query_document(result)}
+            return {
+                "frontier": frontier_status,
+                "manifest_sha256": manifest["sha256"],
+                **_query_document(result),
+            }
         finally:
             runtime.close()
 
@@ -2336,6 +3239,27 @@ def _positive_float_arg(raw: str) -> float:
     if value == 0.0:
         raise argparse.ArgumentTypeError("must be positive")
     return value
+
+
+def _csv_nonnegative_ints(raw: str) -> tuple[int, ...]:
+    try:
+        values = tuple(int(part.strip()) for part in raw.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "values must be comma-separated integers"
+        ) from exc
+    if not values or any(value < 0 for value in values):
+        raise argparse.ArgumentTypeError("values must be non-negative integers")
+    return values
+
+
+def _csv_text(raw: str) -> tuple[str, ...]:
+    values = tuple(part.strip() for part in raw.split(","))
+    if not values or any(not value for value in values):
+        raise argparse.ArgumentTypeError(
+            "values must be non-empty comma-separated text"
+        )
+    return values
 
 
 def _jobs_input(args: argparse.Namespace) -> list[Mapping[str, Any]]:
@@ -2374,7 +3298,11 @@ def _prompts_input(args: argparse.Namespace) -> list[Mapping[str, Any]] | None:
         raise O1CartographyCliError(
             "--prompt-sha256 cannot be combined with --prompts-json"
         )
-    source = Path(args.prompts_json).expanduser().absolute()
+    return _prompt_registry_file(args.prompts_json)
+
+
+def _prompt_registry_file(value: str) -> list[Mapping[str, Any]]:
+    source = Path(value).expanduser().absolute()
     if any(
         marker in part.casefold()
         for part in source.parts
@@ -2397,7 +3325,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    prepare = commands.add_parser("prepare", help="seal a finite question-only run")
+    prepare = commands.add_parser(
+        "prepare", help="seal the initial question-only frontier"
+    )
     prepare.add_argument("--root", required=True)
     prepare.add_argument("--bundle-root", required=True)
     prepare.add_argument("--repo-id", required=True)
@@ -2428,6 +3358,38 @@ def _parser() -> argparse.ArgumentParser:
     )
     prepare.add_argument("--allow-nonofficial-config", action="store_true")
 
+    extend = commands.add_parser(
+        "extend",
+        help="append prompts or measurements to the live frontier",
+    )
+    extend.add_argument("--root", required=True)
+    extend.add_argument("--prompts-json")
+    extension_input = extend.add_mutually_exclusive_group(required=True)
+    extension_input.add_argument("--jobs-json")
+    extension_input.add_argument("--job", action="append")
+    extension_input.add_argument("--inherit-jobs", action="store_true")
+    extension_input.add_argument("--grid-layers", type=_csv_nonnegative_ints)
+    extend.add_argument(
+        "--grid-sites",
+        type=_csv_text,
+        default=tuple(_GRID_SITES),
+    )
+    extend.add_argument(
+        "--grid-interventions",
+        type=_csv_text,
+        default=("passive",),
+    )
+    extend.add_argument("--hidden-dimensions", type=_nonnegative_int_arg, default=16)
+    extend.add_argument("--hidden-seed-sha256")
+    extend.add_argument(
+        "--native-head-indices",
+        type=_csv_nonnegative_ints,
+        default=(2, 8, 14, 20),
+    )
+    extend.add_argument("--native-alpha", type=float, default=0.01)
+    extend.add_argument("--native-balance-alpha", type=float, default=1.0)
+    extend.add_argument("--native-diagonal-debit", type=float, default=3.0)
+
     run = commands.add_parser("run", help="run a bounded resumable probe slice")
     run.add_argument("--root", required=True)
     run.add_argument(
@@ -2442,8 +3404,26 @@ def _parser() -> argparse.ArgumentParser:
         help="wall-time bound; 0 disables it",
     )
 
+    idle = commands.add_parser(
+        "idle",
+        help="continuously consume the live frontier and wait for extensions",
+    )
+    idle.add_argument("--root", required=True)
+    idle.add_argument("--ooe-root")
+    idle.add_argument("--cycle-max-jobs", type=_nonnegative_int_arg, default=0)
+    idle.add_argument("--cycle-max-seconds", type=_positive_float_arg, default=1800.0)
+    idle.add_argument("--max-cycles", type=_nonnegative_int_arg, default=0)
+    idle.add_argument("--max-total-seconds", type=_nonnegative_float_arg, default=0.0)
+    idle.add_argument("--poll-seconds", type=_nonnegative_float_arg, default=5.0)
+
     status = commands.add_parser("status", help="authenticate and print coverage")
     status.add_argument("--root", required=True)
+
+    frontier = commands.add_parser(
+        "frontier-status",
+        help="authenticate frontier and scheduler without opening Qwen weights",
+    )
+    frontier.add_argument("--root", required=True)
 
     query = commands.add_parser("query", help="query the authenticated atlas")
     query.add_argument("--root", required=True)
@@ -2491,8 +3471,49 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
             max_seconds=args.max_seconds,
             ooe_root=args.ooe_root,
         )
+    if args.command == "extend":
+        prompts = (
+            ()
+            if args.prompts_json is None
+            else _prompt_registry_file(args.prompts_json)
+        )
+        jobs: Sequence[Mapping[str, Any]] | None
+        if args.grid_layers is not None:
+            jobs = qwen38_frontier_grid(
+                layers=args.grid_layers,
+                sites=args.grid_sites,
+                interventions=args.grid_interventions,
+                hidden_dimensions=args.hidden_dimensions,
+                hidden_seed_sha256=args.hidden_seed_sha256,
+                native_head_indices=args.native_head_indices,
+                native_alpha=args.native_alpha,
+                native_balance_alpha=args.native_balance_alpha,
+                native_diagonal_debit=args.native_diagonal_debit,
+            )
+        elif args.inherit_jobs:
+            jobs = None
+        else:
+            jobs = _jobs_input(args)
+        return extend_frontier(
+            args.root,
+            jobs=jobs,
+            prompts=prompts,
+            inherit_jobs=args.inherit_jobs,
+        )
+    if args.command == "idle":
+        return idle_cartography(
+            args.root,
+            cycle_max_jobs=args.cycle_max_jobs,
+            cycle_max_seconds=args.cycle_max_seconds,
+            max_cycles=args.max_cycles,
+            max_total_seconds=args.max_total_seconds,
+            poll_seconds=args.poll_seconds,
+            ooe_root=args.ooe_root,
+        )
     if args.command == "status":
         return status_cartography(args.root)
+    if args.command == "frontier-status":
+        return frontier_status(args.root)
     if args.command == "query":
         return query_cartography(
             args.root,

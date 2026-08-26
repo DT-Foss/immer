@@ -47,6 +47,7 @@ from .compute_crystals import (
 from .contraction_ledger import ContractionLedger
 from .crystal import CrystalStoreError, ManifestConflictError
 from .identity import canonical_json_bytes, require_sha256
+from .math_core import array_sha256
 from .planning import FiniteHorizonPlan, FiniteHorizonPlanner, PlanDecision, PolicyEntry
 from .world_model import ActionConditionedWorldModel, TransitionEvidence
 
@@ -1769,24 +1770,6 @@ class ComputeOperatorGraph:
             raise ComputeOperatorGraphIntegrityError(
                 "finite plan world model does not match its graph revision"
             )
-        planner = FiniteHorizonPlanner(
-            planning_world,
-            min_evidence_mass=finite.min_evidence_mass,
-            max_normalized_entropy=finite.max_normalized_entropy,
-            min_peak_probability=finite.min_peak_probability,
-            min_predicted_success=finite.min_predicted_success,
-            max_horizon=MAX_PROGRAM_STEPS,
-            max_policy_entries=max(1, MAX_PROGRAM_STEPS * len(planning_world.states)),
-        )
-        replanned = planner.plan_goal(
-            finite.start_state,
-            goal_state,
-            horizon=finite.horizon,
-        )
-        if replanned.plan is None or replanned.plan.to_dict() != finite.to_dict():
-            raise ComputeOperatorGraphIntegrityError(
-                "finite plan is not reproducible from one-step evidence"
-            )
         planning_edges = {edge.sha256: edge for edge in planning_state.edges}
         try:
             edges = tuple(planning_edges[digest] for digest in primitive_edge_sha256s)
@@ -1813,7 +1796,115 @@ class ComputeOperatorGraph:
             raise ComputeOperatorGraphIntegrityError(
                 "finite plan endpoint binding mismatch"
             )
+        planner = FiniteHorizonPlanner(
+            planning_world,
+            min_evidence_mass=finite.min_evidence_mass,
+            max_normalized_entropy=finite.max_normalized_entropy,
+            min_peak_probability=finite.min_peak_probability,
+            min_predicted_success=finite.min_predicted_success,
+            max_horizon=MAX_PROGRAM_STEPS,
+            max_policy_entries=max(1, MAX_PROGRAM_STEPS * len(planning_world.states)),
+        )
+        replanned = planner.plan_goal(
+            finite.start_state,
+            goal_state,
+            horizon=finite.horizon,
+        )
+        canonical = (
+            replanned.plan is not None and replanned.plan.to_dict() == finite.to_dict()
+        )
+        if not canonical:
+            exact = self._exact_finite_plan(planning_world, edges)
+            if exact.to_dict() != finite.to_dict():
+                raise ComputeOperatorGraphIntegrityError(
+                    "finite plan is not reproducible from one-step evidence"
+                )
         return edges
+
+    @staticmethod
+    def _exact_finite_plan(
+        world: ActionConditionedWorldModel,
+        edges: Sequence[OperatorEdge],
+    ) -> FiniteHorizonPlan:
+        """Reconstruct one explicit, evidence-gated trajectory exactly."""
+
+        path = tuple(edges)
+        if not path:
+            raise ValueError("exact operator path must not be empty")
+        if len(path) > MAX_PROGRAM_STEPS:
+            raise ValueError("exact operator path exceeds the program step bound")
+        expected_states = [path[0].source_state]
+        policy: list[PolicyEntry] = []
+        coverages: list[float] = []
+        state_index = {label: index for index, label in enumerate(world.states)}
+        for index, edge in enumerate(path):
+            if index and path[index - 1].target_state != edge.source_state:
+                raise ComputeOperatorGraphIntegrityError(
+                    "exact operator path is topologically disconnected"
+                )
+            prediction = world.predict(
+                edge.source_state,
+                edge.sha256,
+                min_evidence_mass=1.0,
+                max_normalized_entropy=0.0,
+                min_peak_probability=1.0,
+            )
+            target_index = state_index.get(edge.target_state)
+            if (
+                prediction.abstained
+                or target_index is None
+                or prediction.event_count != 1
+                or prediction.evidence_mass != edge.weight
+                or prediction.probabilities[target_index] != 1.0
+            ):
+                raise ComputeOperatorGraphIntegrityError(
+                    "exact operator path lacks deterministic one-step evidence"
+                )
+            policy.append(
+                PolicyEntry(
+                    remaining_horizon=len(path) - index,
+                    state=edge.source_state,
+                    action=edge.sha256,
+                    predicted_value=1.0,
+                    coverage=prediction.coverage,
+                    transition_row_sha256=prediction.row_sha256,
+                )
+            )
+            coverages.append(prediction.coverage)
+            expected_states.append(edge.target_state)
+        gate_config_sha256 = _sha256(
+            {
+                "schema": "immer-ooe-planning-gates/v1",
+                "min_evidence_mass": 1.0,
+                "max_normalized_entropy": 0.0,
+                "min_peak_probability": 1.0,
+                "min_predicted_success": 1.0,
+            }
+        )
+        return FiniteHorizonPlan(
+            world_model_sha256=world.sha256,
+            counts_sha256=array_sha256(world.counts),
+            start_state=path[0].source_state,
+            goal_state=path[-1].target_state,
+            horizon=len(path),
+            min_evidence_mass=1.0,
+            max_normalized_entropy=0.0,
+            min_peak_probability=1.0,
+            min_predicted_success=1.0,
+            gate_config_sha256=gate_config_sha256,
+            terminal_rewards=((path[-1].target_state, 1.0),),
+            predicted_success=1.0,
+            minimum_coverage=min(coverages),
+            expected_states=tuple(expected_states),
+            expected_actions=tuple(edge.sha256 for edge in path),
+            policy=tuple(policy),
+            kernel_hashes=tuple(
+                (action, array_sha256(world.action_kernel(action)))
+                for action in world.actions
+            ),
+            verifier_hashes=world.verifier_hashes,
+            evidence_hashes=world.evidence_hashes,
+        )
 
     def _validate_materialized_route(
         self,
@@ -2449,6 +2540,55 @@ class ComputeOperatorGraph:
             predicted_success=decision.predicted_success,
         )
 
+    def plan_exact_path(
+        self,
+        primitive_edge_sha256s: Sequence[str],
+    ) -> ComputeRoutePlan:
+        """Bind one caller-selected ordered edge path to the current graph head.
+
+        Unlike :meth:`plan_route`, this does not choose among alternatives.  It
+        authenticates and reconstructs the exact requested trajectory, while
+        retaining the same world-model, count, kernel, gate, and provenance
+        contract used by every other compute route.
+        """
+
+        addresses = _hash_tuple(
+            primitive_edge_sha256s,
+            field="primitive_edge_sha256s",
+        )
+        if not addresses:
+            raise ValueError("exact operator path must not be empty")
+        if len(addresses) > MAX_PROGRAM_STEPS:
+            raise ValueError("exact operator path exceeds the program step bound")
+        with self._locked():
+            state = self._validated_state_unlocked()
+            edge_by_sha = {edge.sha256: edge for edge in state.edges}
+            try:
+                edges = tuple(edge_by_sha[address] for address in addresses)
+            except KeyError as exc:
+                raise ComputeRouteUnavailableError(
+                    "exact operator path references an edge absent from the current graph head"
+                ) from exc
+            for index, edge in enumerate(edges[1:], start=1):
+                if edges[index - 1].target_state != edge.source_state:
+                    raise ComputeRouteUnavailableError(
+                        f"exact operator path is disconnected at edge {index}"
+                    )
+            crystals = tuple(
+                self.bank.restore_crystal(edge.crystal_sha256) for edge in edges
+            )
+            # This is a planning-time gate for an explicit path: no graph route is
+            # promised if its restored numerical operators cannot execute in order.
+            ComputeProgram.compose(crystals)
+            world = self._world_model(state)
+            finite = self._exact_finite_plan(world, edges)
+            return ComputeRoutePlan(
+                graph_generation=state.generation,
+                graph_state_sha256=state.sha256,
+                finite_plan=finite,
+                primitive_edge_sha256s=addresses,
+            )
+
     @staticmethod
     def _publication_created(publication: ComputeBankPublication) -> bool:
         return publication.object_created or publication.manifest_changed
@@ -2682,6 +2822,53 @@ class ComputeOperatorGraph:
                 item[0].sha256,
             ),
         )
+        return self._execute_materialized_route(
+            state,
+            route,
+            program,
+            applications,
+            value,
+        )
+
+    def discharge_exact(
+        self,
+        route_sha256: str,
+        value: object,
+    ) -> RouteDischarge:
+        """Execute exactly one authenticated materialized route by address."""
+
+        address = require_sha256(route_sha256, field="route_sha256")
+        state = self.state()
+        route = next(
+            (
+                candidate
+                for candidate in state.materialized_routes
+                if candidate.sha256 == address
+            ),
+            None,
+        )
+        if route is None:
+            raise ComputeRouteUnavailableError(
+                "exact materialized route is absent from the current graph head"
+            )
+        program = self.bank.restore_program(route.executable_program_sha256)
+        applications = program.input_abi.application_count(value)
+        return self._execute_materialized_route(
+            state,
+            route,
+            program,
+            applications,
+            value,
+        )
+
+    def _execute_materialized_route(
+        self,
+        state: ComputeOperatorGraphState,
+        route: MaterializedRoute,
+        program: ComputeProgram,
+        applications: int,
+        value: object,
+    ) -> RouteDischarge:
         execution: ComputeExecution = ComputeCrystalVM(self.bank).execute(
             program,
             value,
@@ -2718,6 +2905,7 @@ class ComputeOperatorGraph:
         return RouteDischarge(output=execution.output, receipt=receipt, route=route)
 
     query = discharge
+    query_exact = discharge_exact
 
 
 __all__ = [

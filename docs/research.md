@@ -55,7 +55,8 @@ all transformer layers remain unchanged.
 
 ## Lifted Markov consensus and Organism of Experts
 
-The OoE runtime treats local Qwen execution as the cold teacher process.
+The OoE runtime records local Qwen execution as one authenticated cold-evidence
+source inside the wider operator system.
 O1-State selects measurements, SemanticWeightAtlas binds them to exact
 `.causal` weight coordinates, and PS-Lifted push-sum fuses replicated
 action-conditioned transition statistics. The finite world model plans unseen

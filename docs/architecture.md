@@ -20,11 +20,13 @@ request -> CompositionRoot -> FERTIG exact first refusal
 
 continuous learning plane:
 
-Qwen probe -> exact WeightCoordinate + projected pre/post hidden states
+living frontier -> Qwen probe -> exact WeightCoordinate + projected pre/post hidden states
      -> SemanticWeightAtlas -> O1 signal -> contextual operator harvester
      -> affine / permutation / Markov Crystals -> Birkhoff atom bases
+     -> persistent algebra catalog -> Thompson/MAP-Elites selection -> Crystal VM
      -> replicated Markov agents -> world model / options / operator graph
      -> demand scheduler -> charged prefix + live residual suffix
+     -> verifier outcome -> algebra and demand feedback
 ```
 
 ## 1. Immutable data plane
@@ -109,9 +111,12 @@ Crystal executes covered sources and abstains everywhere else.
 
 Warm results are transactions. Executor-local verification creates a pending
 decision; only final FERTIG adjudication commits saved Qwen forwards. Rejection
-records zero savings. Crystal corruption is a hard integrity error. Qwen is the
-cold teacher and novelty executor while the verified operator graph grows; it
-is not part of a warm action that already has an admitted executor.
+records zero savings. Crystal corruption is a hard integrity error. The local
+causal Qwen bundle is the full neural weight substrate, one source of
+cartography evidence, and an execution rail for unresolved neural work. The
+stored-compute system has no mandatory teacher hierarchy: an admitted Crystal,
+exact organ, continuation state, materialized route, or Qwen path executes
+according to the selected contract.
 
 ## 5. Stored compute and exact result cells
 
@@ -213,6 +218,14 @@ Qwen probe outcomes. The Atlas stores each immutable `MeasurementReceipt`
 under its prompt, coordinate, intervention, model, weight-rail revision, and
 append-only Atlas head.
 
+The initial cartography manifest stays immutable while a separate hash-chained
+frontier journal appends prompts, layers, weight sites, and interventions. Each
+event expands the full prompt × job product. The scheduler atomically adopts
+new cells without losing outcomes, histories, replay, stream state, or Atlas
+coverage. `frontier-status` authenticates this state without opening model
+weights; the durable idle runner waits for later events and records every run,
+wait, failure, probe call, and harvested observation across restarts.
+
 Atlas revisions expose exact hash-chain membership. Rollback, fork, forged
 historical events, and a head change during proof construction fail closed.
 Scheduler observation order can traverse authenticated historical revisions in
@@ -237,6 +250,16 @@ one as holdout. It promotes affine, exact permutation, and stochastic Markov
 operators only after train and holdout execution match. Numeric summaries and
 placebo effects remain scalars; the runtime never reconstructs a hidden tensor
 from summary statistics.
+
+Every promoted family crosses directly into the executable algebra catalog.
+The bridge rebinds the promotion to the current graph head, exact edge,
+published Crystal, fit/holdout evidence, and a family-specific runtime verifier;
+then it publishes a tagged `ComputeProgram`. Profile, bridge, candidate index,
+and admission-time router head persist before router CAS and are audited on
+restart. A selected program executes through `ComputeCrystalVM`; its joined VM
+and verifier receipt becomes exact Thompson feedback. Parallel edges remain
+individually addressable through `plan_exact_path()` and
+`discharge_exact(route_sha256, value)`.
 
 ## 7. DeepSeek-V4-Flash transport laboratory
 
@@ -303,7 +326,8 @@ bit-exact with causal softmax for the same logits.
 
 The O(1)-state runtime maintains a separate life stream with surprise-gated
 updates, replay, and sleep consolidation. It can learn without rewriting the
-frozen exact host or the immutable frontier checkpoint.
+frozen exact host or the immutable initial frontier. Frontier events extend its
+measurement work while preserving the complete prior learning stream.
 
 ## Invariants
 

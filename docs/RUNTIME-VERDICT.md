@@ -10,13 +10,15 @@ execution planes:
 1. local Qwen3.8 inference from immutable causalized weights with native Causal
    Prefix Sinkhorn Attention, exact continuation, and semantic state restore;
 2. O1-State measurement and experiment selection over an append-only
-   SemanticWeightAtlas;
+   SemanticWeightAtlas and a living prompt/layer/site frontier consumed by a
+   durable idle scheduler;
 3. replicated action-conditioned Markov world models, PS-Lifted consensus,
    hierarchical options, continuous reservoir memory, operator-demand
    learning, contextual algebra selection, and novelty admission;
 4. generic stored computation through ComputeCrystals, an authenticated
    operator graph, contextual operator harvesting, Birkhoff atom bases,
-   exact guarded affine monoids, algebraic crystallization, and demand-routed
+   exact guarded affine monoids, algebraic crystallization, harvested-program
+   algebra routing, exact parallel-route choice, and demand-routed
    charged-prefix residual discharge;
 5. deterministic FERTIG/S3 capability execution and sealed ResultCells under
    final parity accounting;
@@ -76,6 +78,22 @@ later requests.
   placebo, and recovers Stack→Decimal on `30/30` late decisions. Three
   incompatible program schemas execute as independent replay-verified lanes
   under one joined receipt.
+- The harvested-program router executes affine, permutation, and Markov
+  ComputePrograms and selects the correct contextual family on `174/180`
+  decisions, including `60/60` late and `30/30` final decisions. Destroying the
+  context signal yields `49/180`, `13/60` late, and `5/30` final.
+- O1 cartography now grows in place. Hash-chained frontier events add prompts,
+  layers, sites, and interventions while the scheduler preserves every prior
+  outcome, replay item, surprise history, and Atlas measurement. The idle
+  runner resumes its own cycle ledger and consumes later events without
+  reopening model weights solely to check for work.
+- A routed harvested family restores with its profile, discovery bridge,
+  program publication, admission-time router head, and family-specific runtime
+  verifier. A router-CAS crash after artifact publication completes from those
+  same immutable objects on retry.
+- Parallel routes with the same endpoints remain independently addressable.
+  `discharge_exact(route_sha256, value)` executes the selected route instead of
+  falling back to canonical cost ordering.
 - Four distinct prompts through the committed causal-Qwen fixture yield eight
   authenticated hidden transitions grouped into two reusable layer families.
   Exact prompt runtime receipts remain distinct and the stable operator family
@@ -104,7 +122,7 @@ evidence surface for each result.
 | local Qwen | `src/immer/runtimes/qwen3_8/` | authenticated causal mount, exact stateful inference, Prefix-Sinkhorn, anchors |
 | O1 and Atlas | `src/immer/runtimes/o1_state/`, `src/immer/runtimes/ooe/cartography.py` | persistent learning state, exact measurement identity, append-only revision membership |
 | Markov intelligence | `src/immer/runtimes/ooe/` | action-conditioned evidence, PS-Lifted fusion, planning, options, demand execution, contextual algebra routing, novelty, topology and regime receipts |
-| Stored operators | `compute_crystals.py`, `compute_graph.py`, `residual_execution.py`, `demand_execution.py`, `operator_harvester.py`, `bvn_search.py`, `bvn_crystals.py`, `affine_monoid.py`, `algebra_agents.py`, `algebraic_crystals.py` | real contextual discovery, typed unseen-input programs, constructive atom bases, exact integer/modular recurrence, authenticated charge and feedback, heterogeneous parallel execution, atomic persistence, exact accounting |
+| Stored operators | `compute_crystals.py`, `compute_graph.py`, `residual_execution.py`, `demand_execution.py`, `operator_harvester.py`, `harvest_algebra_bridge.py`, `bvn_search.py`, `bvn_crystals.py`, `affine_monoid.py`, `algebra_agents.py`, `algebraic_crystals.py` | real contextual discovery, typed unseen-input programs, persistent harvest-to-router admission, constructive atom bases, exact integer/modular recurrence, authenticated charge and feedback, exact route addressing, heterogeneous parallel execution, atomic persistence, exact accounting |
 | ResultCell | `result_cells.py` | one complete cold-result binding, zero-forward warm execution, final semantic and evaluator parity |
 | exact execution | `src/immer/cognition/` | S3/FERTIG verification, grounded fallback, explicit abstention |
 | LiveCausal | `src/immer/knowledge/livecausal.py` | immutable payloads, append-only causal graph, lazy exact queries, recovery |

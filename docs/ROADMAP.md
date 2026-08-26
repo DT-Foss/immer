@@ -34,6 +34,14 @@ around every domain that supports it.
   group maps.
 - [x] Contextual algebra meta-agent, MAP-Elites catalog, regime adaptation, and
   receipt-joined heterogeneous parallel ensembles.
+- [x] Additive O1/Qwen frontier journal, deterministic layer/site grids,
+  scheduler reconciliation, weight-free status, and durable idle execution.
+- [x] Harvest-to-algebra promotion from real contextual operator evidence into
+  tagged ComputePrograms with separate discovery/runtime verifiers,
+  content-addressed admission artifacts, restart audit, VM execution, and exact
+  Thompson feedback.
+- [x] Explicit-path planning and route-keyed discharge across parallel
+  same-endpoint operator alternatives.
 - [x] Additive, multiplicative, and finite-cyclic algebraic crystallization with
   exact group accumulation and a rejected permuted placebo.
 - [x] Continuous PS-Lifted reservoir memory with delayed-state, no-memory,
@@ -73,8 +81,8 @@ around every domain that supports it.
 
 ## Active
 
-- [ ] Extend O1 cartography from the current prompt/coordinate frontier into a
-  continuous idle scheduler over the local weight map.
+- [ ] Keep the live O1 frontier expanding across additional prompt families,
+  Qwen layers, weight sites, and interventions on the local causal bundle.
 - [ ] Connect production OrganBank and anchor executors to the learned action
   alphabet for non-chat workloads.
 - [ ] Extend the mechanism matrix with no-lift, shuffled-site,
@@ -84,7 +92,8 @@ around every domain that supports it.
   replica, matching the corrected all-replica fixed-seed contract.
 - [ ] Run the extended local Qwen3.8 contextual frontier until the live
   harvester publishes its first full-model held-out operator families and
-  materialized residual routes.
+  materialized residual routes; route every promotion through the persistent
+  algebra catalog and record its verified demand history.
 - [ ] Broaden Qwen evaluation from fixed integration slices to frozen MMLU,
   GSM8K, and mixed-tool cohorts with exact dataset hashes.
 - [ ] Continue the retained DeepSeek split-rail and persistent-expert work only

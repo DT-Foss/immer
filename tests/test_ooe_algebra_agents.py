@@ -19,6 +19,7 @@ from immer.runtimes.ooe.algebra_agents import (
     AlgebraRouterState,
     AlgebraSelectionReceipt,
     AlgebraUpdateReceipt,
+    ComputeProgramBindingReceipt,
     ExactVerifierArtifact,
     HeterogeneousABIError,
     HeterogeneousEnsembleResult,
@@ -28,6 +29,7 @@ from immer.runtimes.ooe.algebra_agents import (
     ParallelProgramLane,
     VerifierBoundOutcome,
 )
+from immer.runtimes.ooe.compute_crystals import ComputeCrystal, ComputeProgram
 from immer.runtimes.ooe.crystal import CrystalStore, ManifestConflictError
 from immer.runtimes.ooe.identity import canonical_json_bytes
 
@@ -88,6 +90,27 @@ def _candidates() -> tuple[OperatorAlgebraCandidate, ...]:
             objectives=(1.0, 1.0),
         )
         for family in ("stack", "fingerprint", "decimal")
+    )
+
+
+def _compute_program() -> ComputeProgram:
+    return ComputeProgram.compose(
+        (
+            ComputeCrystal.markov(((0.75, 0.25), (0.125, 0.875))),
+            ComputeCrystal.markov(((0.9, 0.1), (0.2, 0.8))),
+        )
+    )
+
+
+def _compute_candidate() -> OperatorAlgebraCandidate:
+    return OperatorAlgebraCandidate(
+        family="markov-kernel",
+        program=_compute_program(),
+        verifier_sha256=_hash("markov-execution-verifier"),
+        discovery_verifier_sha256=_hash("markov-discovery-verifier"),
+        evidence_sha256s=(_hash("markov-discovery-evidence"),),
+        behavior_descriptor=(0,),
+        objectives=(1.0,),
     )
 
 
@@ -160,16 +183,20 @@ def _evaluate(
 
 
 class OperatorAlgebraCandidateTests(unittest.TestCase):
-    def test_candidate_binds_program_schema_verifier_evidence_and_behavior(self) -> None:
+    def test_candidate_binds_program_schema_verifier_evidence_and_behavior(
+        self,
+    ) -> None:
         candidate = _candidates()[0]
         restored = OperatorAlgebraCandidate.from_bytes(candidate.to_bytes())
         self.assertEqual(restored, candidate)
         self.assertEqual(restored.program_sha256, candidate.program.sha256)
         self.assertEqual(restored.schema_sha256, candidate.program.schema.sha256)
-        self.assertEqual(restored.program_receipt.program_sha256, candidate.program.sha256)
+        self.assertEqual(
+            restored.program_receipt.program_sha256, candidate.program.sha256
+        )
 
         tampered = json.loads(candidate.to_bytes())
-        tampered["body"]["schema_sha256"] = _hash("foreign-schema")
+        tampered["body"]["schema_contract_sha256"] = _hash("foreign-schema")
         tampered["body_sha256"] = hashlib.sha256(
             canonical_json_bytes(tampered["body"])
         ).hexdigest()
@@ -185,9 +212,134 @@ class OperatorAlgebraCandidateTests(unittest.TestCase):
         with self.assertRaises(AlgebraAgentIntegrityError):
             OperatorAlgebraCandidate.from_bytes(candidate.to_bytes() + b"\n")
 
+    def test_affine_v1_hash_and_default_discovery_verifier_remain_exact(self) -> None:
+        candidate = _candidates()[0]
+        self.assertEqual(candidate.discovery_verifier_sha256, candidate.verifier_sha256)
+        document = json.loads(candidate.to_bytes())
+        self.assertEqual(document["schema"], "immer-ooe-operator-algebra-candidate/v2")
+        self.assertEqual(document["body"]["program_runtime"], "affine-monoid")
+
+        legacy_body = {
+            "behavior_descriptor": list(candidate.behavior_descriptor),
+            "evidence_sha256s": list(candidate.evidence_sha256s),
+            "family": candidate.family,
+            "objectives_hex": [value.hex() for value in candidate.objectives],
+            "program_base64": document["body"]["program_base64"],
+            "program_receipt_sha256": candidate.program_receipt.sha256,
+            "program_sha256": candidate.program_sha256,
+            "schema_sha256": candidate.schema_sha256,
+            "verifier_sha256": candidate.verifier_sha256,
+        }
+        legacy_payload = canonical_json_bytes(
+            {
+                "body": legacy_body,
+                "body_sha256": hashlib.sha256(
+                    canonical_json_bytes(legacy_body)
+                ).hexdigest(),
+                "schema": "immer-ooe-operator-algebra-candidate/v1",
+            }
+        )
+        legacy = OperatorAlgebraCandidate.from_bytes(legacy_payload)
+        self.assertEqual(legacy.to_bytes(), legacy_payload)
+        self.assertEqual(
+            legacy.sha256,
+            "1f068f3b22059b5f66a08503a6113770686d69186cef70ed3077addd03b7028d",
+        )
+
+        separated = replace(
+            candidate,
+            discovery_verifier_sha256=_hash("separate-affine-discovery-verifier"),
+        )
+        self.assertEqual(
+            json.loads(separated.to_bytes())["body"]["program_runtime"],
+            "affine-monoid",
+        )
+        self.assertEqual(
+            OperatorAlgebraCandidate.from_bytes(separated.to_bytes()), separated
+        )
+
+    def test_compute_candidate_and_program_binding_roundtrip_exactly(self) -> None:
+        candidate = _compute_candidate()
+        self.assertEqual(candidate.program_runtime, "compute-crystal-vm")
+        self.assertNotEqual(
+            candidate.discovery_verifier_sha256, candidate.verifier_sha256
+        )
+        self.assertIsInstance(candidate.program_receipt, ComputeProgramBindingReceipt)
+        receipt = candidate.program_receipt
+        self.assertEqual(
+            ComputeProgramBindingReceipt.from_bytes(receipt.to_bytes()), receipt
+        )
+        self.assertEqual(receipt.program_sha256, candidate.program_sha256)
+        self.assertEqual(
+            receipt.schema_contract_sha256, candidate.schema_contract_sha256
+        )
+        self.assertEqual(receipt.program_bytes_sha256, candidate.program_bytes_sha256)
+        restored = OperatorAlgebraCandidate.from_bytes(candidate.to_bytes())
+        self.assertEqual(restored, candidate)
+        document = json.loads(candidate.to_bytes())
+        self.assertEqual(document["schema"], "immer-ooe-operator-algebra-candidate/v2")
+        self.assertEqual(document["body"]["program_runtime"], "compute-crystal-vm")
+
+    def test_compute_candidate_rejects_resealed_binding_and_runtime_tag_tamper(
+        self,
+    ) -> None:
+        candidate = _compute_candidate()
+        document = json.loads(candidate.to_bytes())
+        document["body"]["schema_contract_sha256"] = _hash("foreign-contract")
+        document["body_sha256"] = hashlib.sha256(
+            canonical_json_bytes(document["body"])
+        ).hexdigest()
+        with self.assertRaisesRegex(AlgebraAgentIntegrityError, "derived"):
+            OperatorAlgebraCandidate.from_bytes(canonical_json_bytes(document))
+
+        document = json.loads(candidate.to_bytes())
+        document["body"]["program_runtime"] = "affine-monoid"
+        document["body_sha256"] = hashlib.sha256(
+            canonical_json_bytes(document["body"])
+        ).hexdigest()
+        with self.assertRaisesRegex(AlgebraAgentIntegrityError, "invalid"):
+            OperatorAlgebraCandidate.from_bytes(canonical_json_bytes(document))
+
+        with self.assertRaisesRegex(ValueError, "discovery verifier"):
+            OperatorAlgebraCandidate(
+                family="unbound-compute",
+                program=_compute_program(),
+                verifier_sha256=_hash("execution-only"),
+                evidence_sha256s=(_hash("evidence"),),
+                behavior_descriptor=(0,),
+                objectives=(1.0,),
+            )
+
 
 class ContextualAlgebraRouterTests(unittest.TestCase):
-    def test_contexts_learn_different_stack_fingerprint_and_decimal_winners(self) -> None:
+    def test_compute_candidate_router_choose_observe_and_restart(self) -> None:
+        candidate = _compute_candidate()
+        state = AlgebraRouterState.bootstrap(
+            (candidate,),
+            seed_sha256=_hash("compute-router-seed"),
+            bin_counts=(1,),
+            objective_count=1,
+        )
+        chosen, selection, advanced = state.choose("compute-context")
+        self.assertEqual(chosen, candidate)
+        self.assertEqual(selection.program_sha256, candidate.program_sha256)
+        self.assertEqual(selection.schema_sha256, candidate.schema_contract_sha256)
+        outcome = VerifierBoundOutcome.issue(
+            selection,
+            chosen,
+            receipt_payload=b"compute-vm-execution-receipt",
+            success=True,
+        )
+        updated, receipt = advanced.observe(selection, outcome)
+        self.assertEqual(receipt.posterior_successes, 1)
+        restored = AlgebraRouterState.from_bytes(updated.to_bytes())
+        self.assertEqual(restored, updated)
+        next_candidate, _, _ = restored.choose("compute-context")
+        self.assertEqual(next_candidate, candidate)
+
+    def test_contexts_learn_different_stack_fingerprint_and_decimal_winners(
+        self,
+    ) -> None:
         winners = {
             "context-stack": "stack",
             "context-fingerprint": "fingerprint",
@@ -197,7 +349,9 @@ class ContextualAlgebraRouterTests(unittest.TestCase):
         correct, _ = _evaluate(trained, winners, rounds=40)
         self.assertGreaterEqual(correct, 116)
         for context, family in winners.items():
-            candidate = next(item for item in trained.candidates if item.family == family)
+            candidate = next(
+                item for item in trained.candidates if item.family == family
+            )
             posterior = trained.bandit.posterior(context, candidate.sha256)
             self.assertGreater(posterior.successes, posterior.failures)
 
@@ -209,14 +363,18 @@ class ContextualAlgebraRouterTests(unittest.TestCase):
         for _ in range(32):
             candidate, selection, first = first.choose("unseen-context")
             first_families.append(candidate.family)
-            self.assertEqual(AlgebraSelectionReceipt.from_bytes(selection.to_bytes()), selection)
+            self.assertEqual(
+                AlgebraSelectionReceipt.from_bytes(selection.to_bytes()), selection
+            )
             candidate, _, second = second.choose("unseen-context")
             second_families.append(candidate.family)
         self.assertGreaterEqual(len(set(first_families)), 2)
         self.assertEqual(first_families, second_families)
         self.assertEqual(first, second)
 
-    def test_verifier_bound_updates_reject_swap_replay_and_recover_from_failure(self) -> None:
+    def test_verifier_bound_updates_reject_swap_replay_and_recover_from_failure(
+        self,
+    ) -> None:
         state = _train(_router(), {"recovering-context": "stack"}, rounds=45)
         before_correct, state = _evaluate(
             state, {"recovering-context": "stack"}, rounds=20
@@ -317,7 +475,9 @@ class ContextualAlgebraRouterTests(unittest.TestCase):
         replaced_state, admitted = state.admit(dominant)
         self.assertTrue(admitted.admitted)
         self.assertIn(stack.sha256, admitted.evicted_candidate_sha256s)
-        self.assertNotIn(stack.sha256, {item.sha256 for item in replaced_state.candidates})
+        self.assertNotIn(
+            stack.sha256, {item.sha256 for item in replaced_state.candidates}
+        )
 
         diverse = OperatorAlgebraCandidate(
             family="diverse-decimal",
@@ -356,7 +516,9 @@ class ContextualAlgebraRouterTests(unittest.TestCase):
         with self.assertRaisesRegex(AlgebraAgentIntegrityError, "derived"):
             AlgebraRouterState.from_bytes(canonical_json_bytes(document))
 
-    def test_crystal_store_atomically_persists_router_and_catalog_with_cas(self) -> None:
+    def test_crystal_store_atomically_persists_router_and_catalog_with_cas(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = CrystalStore(temporary)
             bank = AlgebraRouterBank(store)
@@ -413,7 +575,9 @@ class HeterogeneousEnsembleTests(unittest.TestCase):
         )
         return HeterogeneousProgramEnsemble("ThreeIndependentABIs", lanes), artifact
 
-    def test_parallel_ensemble_exact_outputs_receipts_and_no_sequential_abi(self) -> None:
+    def test_parallel_ensemble_exact_outputs_receipts_and_no_sequential_abi(
+        self,
+    ) -> None:
         ensemble, artifact = self._ensemble()
         self.assertTrue(ensemble.heterogeneous)
         self.assertEqual(ensemble.abi_mode, "parallel-independent")
@@ -440,6 +604,15 @@ class HeterogeneousEnsembleTests(unittest.TestCase):
             sum(item.execution_receipt.work_units for item in result.lane_results),
         )
 
+    def test_parallel_affine_ensemble_rejects_compute_program_lanes(self) -> None:
+        stack = _programs()["stack"]
+        with self.assertRaisesRegex(TypeError, "AffineProgram"):
+            ParallelProgramLane(
+                "compute",
+                _compute_program(),  # type: ignore[arg-type]
+                stack.schema.state(),
+            )
+
     def test_ensemble_roundtrip_deterministic_replay_and_artifact_join(self) -> None:
         ensemble, artifact = self._ensemble()
         first = ensemble.execute({"fingerprint": (artifact,)}, max_workers=1)
@@ -448,7 +621,9 @@ class HeterogeneousEnsembleTests(unittest.TestCase):
         self.assertEqual(
             HeterogeneousProgramEnsemble.from_bytes(ensemble.to_bytes()), ensemble
         )
-        self.assertEqual(HeterogeneousEnsembleResult.from_bytes(first.to_bytes()), first)
+        self.assertEqual(
+            HeterogeneousEnsembleResult.from_bytes(first.to_bytes()), first
+        )
         fingerprint = next(
             item for item in first.lane_results if item.lane_id == "fingerprint"
         )
@@ -478,9 +653,13 @@ class HeterogeneousEnsembleTests(unittest.TestCase):
     def test_standalone_lane_result_rejects_cross_program_receipt_splice(self) -> None:
         ensemble, artifact = self._ensemble()
         result = ensemble.execute({"fingerprint": (artifact,)})
-        decimal = next(item for item in result.lane_results if item.lane_id == "decimal")
+        decimal = next(
+            item for item in result.lane_results if item.lane_id == "decimal"
+        )
         stack = next(item for item in result.lane_results if item.lane_id == "stack")
-        decimal_lane = next(lane for lane in ensemble.lanes if lane.lane_id == "decimal")
+        decimal_lane = next(
+            lane for lane in ensemble.lanes if lane.lane_id == "decimal"
+        )
         with self.assertRaisesRegex(AlgebraAgentIntegrityError, "spliced"):
             ParallelLaneResult(
                 lane_id="decimal",
@@ -513,7 +692,9 @@ class HeterogeneousEnsembleTests(unittest.TestCase):
                 schema_program=expected_lane.program,
             )
 
-    def test_serialized_missing_lane_and_rehashed_output_tamper_fail_closed(self) -> None:
+    def test_serialized_missing_lane_and_rehashed_output_tamper_fail_closed(
+        self,
+    ) -> None:
         ensemble, artifact = self._ensemble()
         result = ensemble.execute({"fingerprint": (artifact,)})
         document = json.loads(result.to_bytes())
