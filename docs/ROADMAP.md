@@ -118,18 +118,19 @@ around every domain that supports it.
 
 - [ ] Keep the live O1 frontier expanding across additional prompt families,
   Qwen layers, weight sites, and interventions on the local causal bundle.
-- [ ] Run the sublayer frontier on the official local 27B bundle and use its
-  predictive error classes to select the next exact Attention/DeltaNet/MLP
-  operator family.
+- [x] Run the first 40-cell sublayer frontier on the official local 27B bundle:
+  200 authenticated boundary observations and eight persistent controller
+  Crystal promotions with zero errors.
 - [ ] Connect production OrganBank and anchor executors to the learned action
   alphabet for non-chat workloads.
-- [ ] Feed live O1/Atlas promotions, materialized routes, OrganBank actions,
-  causal sites, residual plans, and the local Qwen fallback into successive
-  action-frontier revisions; let verifier consequences grow the production
-  dialect and compile recurring accepted word sequences.
-- [ ] Run the production language bridge on the first non-empty full-model
-  Qwen route frontier after the current O1 cartography process publishes a
-  verified operator; persist its first real dialect and promoted word action.
+- [x] Export the first eight live O1/Atlas controller promotions into an exact
+  ComputeCrystal ActionFrontier with source snapshot, Atlas/model/coverage,
+  verifier/evidence, quantized-kernel, and append-only bank receipts.
+- [x] Persist the first real full-model dialect: 100% frozen accuracy,
+  1,000/1,000 unseen greedy operator executions, three repeated four-action
+  supports, and one charged compiled word with 3,375 work units released.
+- [ ] Extend that proven path across materialized routes, OrganBank actions,
+  causal sites, residual plans, and successive live frontier revisions.
 - [ ] Add the first real promoted 27B dialect to the mesh and transfer its first
   verified macro into a separately grounded sibling dialect.
 - [ ] Extend the mechanism matrix with no-lift, shuffled-site,

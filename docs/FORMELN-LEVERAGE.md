@@ -209,6 +209,43 @@ average, and final four-action accuracy returns to 1.0. A no-memory model scores
 0.0. A second-generation word uses the promoted macro twice and raises released
 historical work from 400 to 1,200 units.
 
+### Live controller-Crystal language
+
+For promoted controller site (s), the stored uint16 kernel is restored as
+
+\[
+K_s=\frac{Q_s}{L},
+\qquad
+\sum_j K_s[i,j]=1,
+\]
+
+then published as a row-Markov ComputeCrystal only when identity-basis
+execution reproduces the source kernel exactly:
+
+\[
+\operatorname{Crystal}_s(I)=K_s.
+\]
+
+The export authority is the joint digest of controller snapshot, model pin,
+weight and Atlas revisions, calibration, source manifest, verifier/evidence
+sets, quantized kernel, and append-only ComputeBank anchor. A language outcome
+for intended site (i), selected site (s), and state vector (x) receives
+
+\[
+r(i,s,x)=
+\begin{cases}
++1,&i=s\land H(C_i)=H(C_s)\land H(xK_i)=H(xK_s),\\
+-1,&\text{otherwise}.
+\end{cases}
+\]
+
+The receiver sees only its opaque word and context; the verifier replays both
+artifacts. On the first live eight-action frontier, frozen vocabulary accuracy
+is 1.0 and post-persistence greedy execution is 1,000/1,000. Three verified
+repetitions of a four-action word program compile to one Crystal. Across 25
+future vectors it releases 3,375 historical work units with maximum flat-chain
+error (1.110223\times10^{-16}).
+
 ### Dialect quotient and portable programs
 
 Two opaque words from independently learned dialects are equivalent only

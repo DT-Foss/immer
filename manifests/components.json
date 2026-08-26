@@ -44,10 +44,13 @@
                 "src/immer/runtimes/ooe/executable_lexicon.py",
                 "src/immer/runtimes/ooe/language_bridge.py",
                 "src/immer/runtimes/ooe/language_intelligence.py",
+                "src/immer/runtimes/ooe/controller_crystal_bridge.py",
+                "src/immer/runtimes/ooe/controller_language_intelligence.py",
                 "src/immer/runtimes/ooe/dialect_mesh.py",
                 "src/immer/runtimes/ooe/dialect_intelligence.py",
                 "scripts/ooe_markov_language_benchmark.py",
                 "scripts/ooe_language_growth_benchmark.py",
+                "scripts/ooe_controller_language_bootstrap.py",
                 "scripts/ooe_dialect_mesh_benchmark.py"
             ]
     },

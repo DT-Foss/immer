@@ -70,6 +70,18 @@ later requests.
   second-generation definition uses it twice, compiles to one charged Crystal
   on every seed, and raises historical work released from `400` to `1,200`
   units across 25 future states.
+- The completed 40-cell local-Qwen frontier contributes 200 authenticated
+  whole-layer and sublayer observations to the live controller. Eight sites
+  pass PS-Lifted promotion and export as exact row-Markov ComputeCrystals under
+  one source-snapshot/Atlas/model/coverage/calibration/bank receipt.
+- A fresh agent grounds an opaque eight-action language on those live operators,
+  freezes at `100%`, and passes `1,000/1,000` post-persistence greedy
+  executions. Fake controller authorities, replaced banks, forged ancestors,
+  output tamper, replay, and wrong-site choices fail before language feedback.
+- Three sealed repetitions support the first live four-action compute word. It
+  compiles to one charged Crystal, releases `3,375` historical work units on 25
+  future states, and matches the flat controller-operator chain within
+  `1.110223e-16`.
 - Five independently grounded agents retain five distinct opaque dialects over
   one fully shared token inventory. Their three contexts are learned by
   separate Markov agents. All four target dialects have three distinct context

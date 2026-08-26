@@ -41,6 +41,10 @@ release surface.
   words, compiled words become new frontier actions, unchanged actions retain
   their evidence across proven append-only revisions, and new actions receive
   deterministic unused words and begin behind abstention.
+- **Live O1 vocabulary.** Promoted PS-Lifted controller kernels export into an
+  append-only ComputeBank with their complete Atlas/model/coverage provenance.
+  Markov agents ground opaque words by executing those real operators; repeated
+  accepted word programs compile into charged Crystals without flattening.
 - **Portable dialect mesh.** Independently grounded agents retain their own
   opaque surface conventions while translating through identical executable
   ActionBindings. Verified macro programs move as semantic action sequences,
@@ -107,6 +111,9 @@ release surface.
 | Recursive executable word DAG | 8,191 actions → 36 references → one Crystal; 8.380x fair VM speedup | 99.5605% reference reduction, 99.9878% deployment-symbol reduction, exact future-input parity, 1,638,000 historical work units released across 25 states |
 | Continual executable-language growth | old actions 100% retained; promoted action learned in 328 episodes; final 100% | five seeds; initial promoted-action abstention 100%; no-memory 0%; context-schema shift keeps 100% global semantics and drops local evidence; reward-policy shift resets 4/4 actions |
 | Second-generation compute word | one promoted macro reused twice → one charged Crystal | five seeds; constant discharge 5/5; historical work released rises from 400 to 1,200 units across 25 future states |
+| Live O1 controller frontier | 40/40 probes → 200 observations → 8 promoted ComputeCrystals | official local Qwen bundle; exact controller snapshot, Atlas revision, model/weight pins, coverage, calibration, evidence, verifier, kernel, and append-only bank receipt |
+| First live executable dialect | 100% frozen vocabulary; 1,000/1,000 greedy executions | eight real O1 site-policy actions; receiver reward comes only from replayed action/artifact/output parity |
+| First live compiled word | 4 real actions → 1 charged Crystal; 3,375 work units released | three sealed support executions; 25 future vectors; maximum flat-versus-compiled delta 1.11e-16 |
 | Executable dialect mesh | semantic translation 60,000/60,000; worst target context 100% | five seeds × five dialects × three independently learned contexts; four target dialects have 3/3 distinct mappings and zero global action words; shared-vocabulary direct transfer 6.84%, permutation placebo 1.42% |
 | Portable cross-dialect macro | localization and compilation 75/75; binding/authority changes rejected 5/5 | one discovered four-action program moves into every dialect-context without Q-table copying; context-bound exact execution; mean 150 historical work units released |
 | Action-conditioned Markov planning | 250/250 unseen tasks | 68 one-step observations only; 4–10-step tasks; 12-replica local cohort 226/3,000 (7.53%), shuffled-action placebo 89/250, no-memory 68/250 |

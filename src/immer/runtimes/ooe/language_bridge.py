@@ -16,6 +16,8 @@ from pathlib import Path
 import stat
 from typing import Iterator, cast
 
+import numpy as np
+
 from .algebra_agents import (
     AlgebraRouterState,
     AlgebraSelectionReceipt,
@@ -23,6 +25,11 @@ from .algebra_agents import (
     VerifierBoundOutcome,
 )
 from .compute_graph import ComputeOperatorGraph, ComputeOperatorGraphState
+from .compute_crystals import ComputeCrystalBank, ComputeCrystalError, tensor_sha256
+from .controller_crystal_bridge import (
+    CONTROLLER_CRYSTAL_LANGUAGE_REWARD_POLICY_SHA256,
+    ControllerCrystalExportReceipt,
+)
 from .crystal import CrystalStore, CrystalStoreError, ManifestConflictError
 from .demand_execution import DemandRoutedExecutionReceipt
 from .executable_lexicon import (
@@ -47,6 +54,7 @@ from .options import MacroOption
 
 LANGUAGE_ROUTING_DECISION_SCHEMA = "immer-ooe-language-routing-decision/v1"
 LANGUAGE_OUTCOME_COMMIT_SCHEMA = "immer-ooe-language-outcome-commit/v1"
+CONTROLLER_CRYSTAL_OUTCOME_SCHEMA = "immer-ooe-controller-crystal-outcome/v1"
 FRONTIER_MIGRATION_SCHEMA = "immer-ooe-language-frontier-migration/v1"
 VERIFIED_WORD_TRAJECTORY_SCHEMA = "immer-ooe-verified-word-trajectory/v1"
 LANGUAGE_MACRO_DISCOVERY_SCHEMA = "immer-ooe-language-macro-discovery/v1"
@@ -92,6 +100,14 @@ ALGEBRA_LANGUAGE_REWARD_POLICY_SHA256 = _sha256(
         "failure": -1,
         "format": "immer-ooe-algebra-language-reward/v1",
         "success": 1,
+    }
+)
+CONTROLLER_CRYSTAL_OUTCOME_VERIFIER_SHA256 = _sha256(
+    {
+        "accepted": "intended-action-and-output-sha256-equal-selected",
+        "execution": "restore-both-compute-crystals-and-recompute",
+        "format": "immer-ooe-controller-crystal-outcome-verifier/v1",
+        "input": "canonical-float64-vector",
     }
 )
 
@@ -884,6 +900,383 @@ class LanguageOutcomeCommitReceipt:
         return result
 
 
+@dataclass(frozen=True, slots=True)
+class ControllerCrystalOutcomeReceipt:
+    routing_decision_sha256: str
+    frontier_sha256: str
+    authorized_bank_anchor_sha256: str
+    intended_action_id: str
+    selected_action_id: str
+    intended_crystal_sha256: str
+    selected_crystal_sha256: str
+    input_values_hex: tuple[str, ...]
+    input_sha256: str
+    intended_output_sha256: str
+    selected_output_sha256: str
+    accepted: bool
+    verifier_sha256: str = CONTROLLER_CRYSTAL_OUTCOME_VERIFIER_SHA256
+
+    FORMAT = CONTROLLER_CRYSTAL_OUTCOME_SCHEMA
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "routing_decision_sha256",
+            "frontier_sha256",
+            "authorized_bank_anchor_sha256",
+            "intended_crystal_sha256",
+            "selected_crystal_sha256",
+            "input_sha256",
+            "intended_output_sha256",
+            "selected_output_sha256",
+            "verifier_sha256",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                require_sha256(getattr(self, field_name), field=field_name),
+            )
+        for field_name in ("intended_action_id", "selected_action_id"):
+            object.__setattr__(
+                self,
+                field_name,
+                _identifier(getattr(self, field_name), field=field_name),
+            )
+        values = tuple(self.input_values_hex)
+        if not 1 <= len(values) <= 4_096:
+            raise ValueError("controller-Crystal input vector length is invalid")
+        for value in values:
+            if not isinstance(value, str):
+                raise TypeError("controller-Crystal input values must be hex strings")
+            decoded = float.fromhex(value)
+            if not math.isfinite(decoded) or decoded.hex() != value:
+                raise ValueError("controller-Crystal input value is not canonical")
+        object.__setattr__(self, "input_values_hex", values)
+        if not isinstance(self.accepted, bool):
+            raise TypeError("accepted must be bool")
+        if self.verifier_sha256 != CONTROLLER_CRYSTAL_OUTCOME_VERIFIER_SHA256:
+            raise ValueError("controller-Crystal outcome uses another verifier")
+        expected_acceptance = (
+            self.intended_action_id == self.selected_action_id
+            and self.intended_crystal_sha256 == self.selected_crystal_sha256
+            and self.intended_output_sha256 == self.selected_output_sha256
+        )
+        if self.accepted != expected_acceptance:
+            raise ValueError("controller-Crystal acceptance differs from exact parity")
+
+    @property
+    def input_array(self) -> np.ndarray:
+        return np.asarray(
+            [float.fromhex(value) for value in self.input_values_hex],
+            dtype=np.float64,
+        )
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "accepted": self.accepted,
+            "authorized_bank_anchor_sha256": self.authorized_bank_anchor_sha256,
+            "format": self.FORMAT,
+            "frontier_sha256": self.frontier_sha256,
+            "input_sha256": self.input_sha256,
+            "input_values_hex": list(self.input_values_hex),
+            "intended_action_id": self.intended_action_id,
+            "intended_crystal_sha256": self.intended_crystal_sha256,
+            "intended_output_sha256": self.intended_output_sha256,
+            "routing_decision_sha256": self.routing_decision_sha256,
+            "selected_action_id": self.selected_action_id,
+            "selected_crystal_sha256": self.selected_crystal_sha256,
+            "selected_output_sha256": self.selected_output_sha256,
+            "verifier_sha256": self.verifier_sha256,
+        }
+
+    def to_bytes(self) -> bytes:
+        return _seal(self.FORMAT, self.to_record())
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.to_bytes()).hexdigest()
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ControllerCrystalOutcomeReceipt":
+        body = _open(data, schema=cls.FORMAT, label="controller-Crystal outcome")
+        expected = {
+            "accepted",
+            "authorized_bank_anchor_sha256",
+            "format",
+            "frontier_sha256",
+            "input_sha256",
+            "input_values_hex",
+            "intended_action_id",
+            "intended_crystal_sha256",
+            "intended_output_sha256",
+            "routing_decision_sha256",
+            "selected_action_id",
+            "selected_crystal_sha256",
+            "selected_output_sha256",
+            "verifier_sha256",
+        }
+        values = body.get("input_values_hex")
+        if (
+            set(body) != expected
+            or body.get("format") != cls.FORMAT
+            or not isinstance(values, list)
+        ):
+            raise LanguageBridgeIntegrityError(
+                "controller-Crystal outcome body is invalid"
+            )
+        try:
+            result = cls(
+                routing_decision_sha256=cast(str, body.get("routing_decision_sha256")),
+                frontier_sha256=cast(str, body.get("frontier_sha256")),
+                authorized_bank_anchor_sha256=cast(
+                    str, body.get("authorized_bank_anchor_sha256")
+                ),
+                intended_action_id=cast(str, body.get("intended_action_id")),
+                selected_action_id=cast(str, body.get("selected_action_id")),
+                intended_crystal_sha256=cast(str, body.get("intended_crystal_sha256")),
+                selected_crystal_sha256=cast(str, body.get("selected_crystal_sha256")),
+                input_values_hex=tuple(values),
+                input_sha256=cast(str, body.get("input_sha256")),
+                intended_output_sha256=cast(str, body.get("intended_output_sha256")),
+                selected_output_sha256=cast(str, body.get("selected_output_sha256")),
+                accepted=cast(bool, body.get("accepted")),
+                verifier_sha256=cast(str, body.get("verifier_sha256")),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise LanguageBridgeIntegrityError(
+                "controller-Crystal outcome reconstruction failed"
+            ) from exc
+        if result.to_bytes() != data:
+            raise LanguageBridgeIntegrityError(
+                "controller-Crystal outcome failed canonical reconstruction"
+            )
+        return result
+
+
+class ControllerCrystalLanguageExecutor:
+    """One verified export mounted once for repeated consequence episodes."""
+
+    def __init__(
+        self,
+        export_receipt: ControllerCrystalExportReceipt,
+        compute_bank: ComputeCrystalBank,
+    ) -> None:
+        if not isinstance(export_receipt, ControllerCrystalExportReceipt):
+            raise TypeError("export_receipt must be a ControllerCrystalExportReceipt")
+        if not isinstance(compute_bank, ComputeCrystalBank):
+            raise TypeError("compute_bank must be a ComputeCrystalBank")
+        try:
+            crystals = export_receipt.restore_crystals(compute_bank)
+        except Exception as exc:
+            raise LanguageBridgeIntegrityError(
+                "controller-Crystal export provenance failed restore"
+            ) from exc
+        self.export_receipt = export_receipt
+        self.compute_bank = compute_bank
+        self._crystals = crystals
+        self._issued: dict[str, ControllerCrystalOutcomeReceipt] = {}
+
+    def execute(
+        self,
+        decision: LanguageRoutingDecision,
+        input_value: object,
+    ) -> ControllerCrystalOutcomeReceipt:
+        outcome = _execute_controller_crystal_choice(
+            decision,
+            self.export_receipt,
+            self.compute_bank,
+            input_value,
+            self._crystals,
+        )
+        if outcome.sha256 in self._issued:
+            raise LanguageBridgeConflictError(
+                "controller-Crystal outcome is already pending"
+            )
+        if len(self._issued) >= 100_000:
+            raise LanguageBridgeError(
+                "controller-Crystal pending outcome inventory is full"
+            )
+        self._issued[outcome.sha256] = outcome
+        return outcome
+
+    def verify_and_consume(
+        self,
+        decision: LanguageRoutingDecision,
+        outcome: ControllerCrystalOutcomeReceipt,
+    ) -> None:
+        if not isinstance(decision, LanguageRoutingDecision):
+            raise TypeError("decision must be a LanguageRoutingDecision")
+        if not isinstance(outcome, ControllerCrystalOutcomeReceipt):
+            raise TypeError("outcome must be a ControllerCrystalOutcomeReceipt")
+        if (
+            outcome.routing_decision_sha256 != decision.sha256
+            or self._issued.get(outcome.sha256) != outcome
+        ):
+            raise LanguageBridgeIntegrityError(
+                "controller-Crystal outcome was not issued by this executor"
+            )
+        try:
+            self.compute_bank.assert_descends_from(
+                outcome.authorized_bank_anchor_sha256
+            )
+        except ComputeCrystalError as exc:
+            raise LanguageBridgeIntegrityError(
+                "controller-Crystal outcome bank anchor is not an ancestor"
+            ) from exc
+        if outcome.authorized_bank_anchor_sha256 != (
+            self.export_receipt.final_bank_anchor_sha256
+        ):
+            raise LanguageBridgeIntegrityError(
+                "controller-Crystal outcome names another authorized bank anchor"
+            )
+        del self._issued[outcome.sha256]
+
+
+def execute_controller_crystal_choice(
+    decision: LanguageRoutingDecision,
+    export_receipt: ControllerCrystalExportReceipt,
+    compute_bank: ComputeCrystalBank,
+    input_value: object,
+) -> ControllerCrystalOutcomeReceipt:
+    """Replay-safe one-shot execution over an authenticated controller export."""
+
+    return ControllerCrystalLanguageExecutor(export_receipt, compute_bank).execute(
+        decision, input_value
+    )
+
+
+def _execute_controller_crystal_choice(
+    decision: LanguageRoutingDecision,
+    export_receipt: ControllerCrystalExportReceipt,
+    compute_bank: ComputeCrystalBank,
+    input_value: object,
+    exported_crystals: Sequence[object],
+) -> ControllerCrystalOutcomeReceipt:
+    """Execute intended and receiver-selected live controller policies exactly."""
+
+    if not isinstance(decision, LanguageRoutingDecision):
+        raise TypeError("decision must be a LanguageRoutingDecision")
+    if not isinstance(export_receipt, ControllerCrystalExportReceipt):
+        raise TypeError("export_receipt must be a ControllerCrystalExportReceipt")
+    if not isinstance(compute_bank, ComputeCrystalBank):
+        raise TypeError("compute_bank must be a ComputeCrystalBank")
+    frontier = export_receipt.frontier
+    if decision.frontier_sha256 != frontier.sha256:
+        raise LanguageBridgeIntegrityError("routing decision uses another frontier")
+    if type(input_value) is not np.ndarray:
+        raise TypeError("controller-Crystal input must be an exact numpy.ndarray")
+    value = cast(np.ndarray, input_value)
+    if value.dtype != np.dtype(np.float64) or value.ndim != 1:
+        raise ValueError("controller-Crystal input must be one float64 vector")
+    if not np.all(np.isfinite(value)):
+        raise ValueError("controller-Crystal input contains non-finite values")
+
+    authorities = dict(frontier.authority_hashes)
+    required_authorities = {
+        "controller-atlas-graph",
+        "controller-calibration",
+        "controller-crystal-manifest",
+        "controller-model-pin",
+        "controller-state",
+        "controller-weight-graph",
+        "compute-bank-anchor",
+        "language-reward-policy",
+    }
+    if not required_authorities <= set(authorities):
+        raise LanguageBridgeIntegrityError(
+            "controller-Crystal frontier lacks exact authorities"
+        )
+    frontier_bank_anchor = authorities["compute-bank-anchor"]
+    if frontier_bank_anchor != export_receipt.final_bank_anchor_sha256:
+        raise LanguageBridgeIntegrityError(
+            "controller-Crystal frontier differs from its export receipt"
+        )
+    crystals = tuple(exported_crystals)
+    if len(crystals) != len(export_receipt.sites) or tuple(
+        getattr(crystal, "sha256", None) for crystal in crystals
+    ) != tuple(site.compute_crystal_sha256 for site in export_receipt.sites):
+        raise LanguageBridgeIntegrityError(
+            "controller-Crystal runtime artifacts differ from their export receipt"
+        )
+    if authorities["language-reward-policy"] != (
+        CONTROLLER_CRYSTAL_LANGUAGE_REWARD_POLICY_SHA256
+    ):
+        raise LanguageBridgeIntegrityError(
+            "controller-Crystal reward authority changed"
+        )
+
+    intended_action = decision.emission.intent_action_id
+    selected_action = decision.receiver.action_id
+    try:
+        intended_binding = frontier.binding(intended_action)
+        selected_binding = frontier.binding(selected_action)
+    except KeyError as exc:
+        raise LanguageBridgeIntegrityError(
+            "controller-Crystal decision names an unknown action"
+        ) from exc
+    if (
+        intended_binding.artifact_kind != "crystal"
+        or selected_binding.artifact_kind != "crystal"
+        or decision.selected_artifact_kind != selected_binding.artifact_kind
+        or decision.selected_artifact_sha256 != selected_binding.artifact_sha256
+    ):
+        raise LanguageBridgeIntegrityError(
+            "controller-Crystal decision artifact binding changed"
+        )
+    crystals_by_action = {
+        site.action_id: crystal
+        for site, crystal in zip(export_receipt.sites, crystals, strict=True)
+    }
+    try:
+        intended = crystals_by_action[intended_action]
+        selected = crystals_by_action[selected_action]
+    except KeyError as exc:
+        raise LanguageBridgeIntegrityError(
+            "controller-Crystal action is absent from its export receipt"
+        ) from exc
+    if (
+        intended.sha256 != intended_binding.artifact_sha256
+        or selected.sha256 != selected_binding.artifact_sha256
+    ):
+        raise LanguageBridgeIntegrityError(
+            "controller-Crystal binding differs from its exported artifact"
+        )
+    if (
+        intended.input_abi != selected.input_abi
+        or intended.output_abi != selected.output_abi
+        or intended.input_abi != intended.output_abi
+    ):
+        raise LanguageBridgeIntegrityError(
+            "controller-Crystal policies have incompatible numerical ABIs"
+        )
+    canonical_input = intended.input_abi.validate(
+        value, field="controller-Crystal input"
+    )
+    selected.input_abi.validate(canonical_input, field="controller-Crystal input")
+    intended_output = intended.apply(canonical_input)
+    selected_output = selected.apply(canonical_input)
+    input_sha = tensor_sha256(canonical_input, intended.input_abi)
+    intended_output_sha = tensor_sha256(intended_output, intended.output_abi)
+    selected_output_sha = tensor_sha256(selected_output, selected.output_abi)
+    return ControllerCrystalOutcomeReceipt(
+        routing_decision_sha256=decision.sha256,
+        frontier_sha256=frontier.sha256,
+        authorized_bank_anchor_sha256=frontier_bank_anchor,
+        intended_action_id=intended_action,
+        selected_action_id=selected_action,
+        intended_crystal_sha256=intended.sha256,
+        selected_crystal_sha256=selected.sha256,
+        input_values_hex=tuple(float(item).hex() for item in canonical_input),
+        input_sha256=input_sha,
+        intended_output_sha256=intended_output_sha,
+        selected_output_sha256=selected_output_sha,
+        accepted=(
+            intended_action == selected_action
+            and intended.sha256 == selected.sha256
+            and intended_output_sha == selected_output_sha
+        ),
+    )
+
+
 class ConsequenceLanguageStateBank:
     """Atomic language-state pointer with caller-persisted rollback anchor."""
 
@@ -1347,6 +1740,72 @@ class ConsequenceLanguageBridge:
             decision,
             feedback,
             outcome_kind="algebra-outcome",
+            outcome_sha256=outcome.sha256,
+            learning_rate=learning_rate,
+        )
+
+    def settle_controller_crystal(
+        self,
+        decision: LanguageRoutingDecision,
+        outcome: ControllerCrystalOutcomeReceipt,
+        export_receipt: ControllerCrystalExportReceipt,
+        compute_bank: ComputeCrystalBank,
+        *,
+        learning_rate: float = 0.15,
+        executor: ControllerCrystalLanguageExecutor | None = None,
+    ) -> LanguageOutcomeCommitReceipt:
+        """Commit reward only after replaying an exact promoted-policy choice."""
+
+        if not isinstance(outcome, ControllerCrystalOutcomeReceipt):
+            raise TypeError("outcome must be a ControllerCrystalOutcomeReceipt")
+        if not isinstance(export_receipt, ControllerCrystalExportReceipt):
+            raise TypeError("export_receipt must be a ControllerCrystalExportReceipt")
+        frontier = export_receipt.frontier
+        if frontier != self.language.frontier:
+            raise LanguageBridgeIntegrityError(
+                "controller-Crystal settlement uses another language frontier"
+            )
+        if executor is not None:
+            if not isinstance(executor, ControllerCrystalLanguageExecutor):
+                raise TypeError("executor must be a ControllerCrystalLanguageExecutor")
+            if (
+                executor.export_receipt != export_receipt
+                or executor.compute_bank is not compute_bank
+            ):
+                raise LanguageBridgeIntegrityError(
+                    "controller-Crystal executor uses another export or bank"
+                )
+            executor.verify_and_consume(decision, outcome)
+        else:
+            try:
+                compute_bank.assert_descends_from(outcome.authorized_bank_anchor_sha256)
+            except ComputeCrystalError as exc:
+                raise LanguageBridgeIntegrityError(
+                    "controller-Crystal outcome bank anchor is not an ancestor"
+                ) from exc
+            if outcome.authorized_bank_anchor_sha256 != (
+                export_receipt.final_bank_anchor_sha256
+            ):
+                raise LanguageBridgeIntegrityError(
+                    "controller-Crystal outcome names another authorized bank anchor"
+                )
+            expected = execute_controller_crystal_choice(
+                decision, export_receipt, compute_bank, outcome.input_array
+            )
+            if expected != outcome:
+                raise LanguageBridgeIntegrityError(
+                    "controller-Crystal outcome differs from exact replay"
+                )
+        feedback = ConsequenceFeedback.for_decision(
+            decision.receiver,
+            reward=1.0 if outcome.accepted else -1.0,
+            accepted=outcome.accepted,
+            outcome_receipt_sha256=outcome.sha256,
+        )
+        return self._commit_feedback(
+            decision,
+            feedback,
+            outcome_kind="controller-crystal-choice",
             outcome_sha256=outcome.sha256,
             learning_rate=learning_rate,
         )
@@ -3125,6 +3584,9 @@ def definition_from_macro_option(
 
 __all__ = [
     "ALGEBRA_LANGUAGE_REWARD_POLICY_SHA256",
+    "CONTROLLER_CRYSTAL_LANGUAGE_REWARD_POLICY_SHA256",
+    "CONTROLLER_CRYSTAL_OUTCOME_SCHEMA",
+    "CONTROLLER_CRYSTAL_OUTCOME_VERIFIER_SHA256",
     "DEMAND_LANGUAGE_REWARD_POLICY_SHA256",
     "FRONTIER_MIGRATION_SCHEMA",
     "LANGUAGE_MACRO_DISCOVERY_SCHEMA",
@@ -3139,6 +3601,8 @@ __all__ = [
     "VERIFIED_WORD_TRAJECTORY_SCHEMA",
     "ConsequenceLanguageBridge",
     "ConsequenceLanguageStateBank",
+    "ControllerCrystalLanguageExecutor",
+    "ControllerCrystalOutcomeReceipt",
     "FrontierMigrationReceipt",
     "LanguageBridgeConflictError",
     "LanguageBridgeError",
@@ -3157,6 +3621,7 @@ __all__ = [
     "candidate_action_id",
     "definition_from_macro_option",
     "discover_language_macros",
+    "execute_controller_crystal_choice",
     "migrate_language_frontier",
     "promote_compiled_word_action",
     "promote_and_migrate_language_revision",

@@ -167,6 +167,28 @@ tables have a separate schema-identity gate. New actions receive deterministic
 unused words and remain non-executable until consequence evidence clears the
 normal visit/value/margin gates.
 
+The live controller closes the O1-to-language gap without treating its compact
+PS-Lifted kernels as anonymous matrices:
+
+```text
+O1 probe + Atlas membership
+  -> persistent controller site + verified coverage
+  -> quantized controller CrystalPayload
+  -> source-bound row-Markov ComputeCrystal
+  -> eight-action controller frontier
+  -> opaque consequence-grounded words
+  -> repeated verified word program
+  -> one charged compiled Crystal
+```
+
+The export receipt embeds the exact controller snapshot and source manifest,
+then binds model pin, weight/Atlas revisions, calibration, evidence/verifier
+sets, kernel bytes, every sequential ComputeBank publication, and the resulting
+frontier. Runtime outcomes restore that receipt and consume each selected
+operator result once. Later append-only bank growth remains valid; replacement,
+rollback, invented controller authorities, or a forged older authorized anchor
+does not.
+
 Different agents never need to share surface words. A dialect mesh aligns two
 frozen languages only where both map their local words to the same immutable
 ActionBinding. The translation receipt binds both snapshots, both frontiers,

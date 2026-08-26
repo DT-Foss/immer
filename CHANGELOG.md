@@ -2,7 +2,43 @@
 
 All notable changes to IMMER are recorded here.
 
-## [Unreleased] — 2026-08-26
+## [Unreleased] — 2026-08-27
+
+### First live O1 language frontier
+
+- Completed the official local-Qwen frontier: `40/40` layer probes produced
+  `200` authenticated whole-layer/Attention/MLP observations and eight
+  persistent PS-Lifted controller Crystal promotions with zero runtime errors.
+- Added the exact controller-Crystal export bridge. It replays the persisted
+  controller snapshot, Atlas revision membership, model/weight pins, source
+  CrystalStore manifest, coverage, calibration, verifier/evidence sets, and
+  quantized kernels before publishing eight `ComputeCrystal.markov` artifacts.
+- The export receipt embeds the source snapshot and manifest, binds every
+  sequential ComputeBank publication, persists its frontier, and restores only
+  while source extensions and the append-only bank anchor remain valid.
+- Added controller-Crystal language outcomes. The receiver-selected opaquely
+  named action and the intended action execute the real stored operators on the
+  same float64 state vector. Positive reward requires exact action, artifact,
+  and output parity; wrong-site execution is verified negative evidence.
+- A mounted executor consumes outcome receipts once, accepts later append-only
+  bank growth, rejects forged ancestors, fake controller authorities, replaced
+  banks, replay, output tamper, and stale export provenance before any Q update.
+- Live result: eight promoted Qwen/O1 site policies became an eight-action
+  `ActionFrontier`; a fresh Markov agent reached `100%` frozen vocabulary
+  accuracy and then executed `1,000/1,000` unseen greedy operator choices.
+- The first live four-action word program has three independently sealed
+  support executions. Its recursive lexicon definition compiles to one charged
+  Crystal, expands to four real controller actions, releases `3,375` historical
+  work units across 25 future states, and matches flat execution within
+  `1.110223e-16`.
+- Live report body SHA-256:
+  `ce5515d29f3fc79e29f1fd37cfae6ea31626ea4e66b0fa616446d1104ff3005e`.
+- The reusable Atlas-authenticated CLI independently converges after `2,023`
+  episodes, proves three stable greedy cycles, keeps its frozen learner unchanged
+  across `12/12` held-out support executions, rematerializes on equivalent bank
+  roots, and resumes byte-identically. Report body SHA-256:
+  `a2311ccfd0c8a9caf2e74553b6cab3b26b2e75fbfd3f242f6294d868a0f95e8f`.
+- Complete warning-fatal regression suite: `1,793/1,793`, `OK`, `617.930 s`.
 
 ### Portable executable dialect mesh
 

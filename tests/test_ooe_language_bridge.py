@@ -23,6 +23,15 @@ from immer.runtimes.ooe.compute_graph import (
     ComputeOperatorGraphState,
     OperatorEdge,
 )
+from immer.runtimes.ooe.controller import (
+    ControllerConfig,
+    OoeController,
+    VerifiedTeacherTransition,
+)
+from immer.runtimes.ooe.controller_crystal_bridge import (
+    ControllerCrystalExport,
+    export_controller_crystals,
+)
 from immer.runtimes.ooe.crystal import CrystalStore
 from immer.runtimes.ooe.demand_execution import (
     DemandExecutionVerification,
@@ -39,6 +48,8 @@ from immer.runtimes.ooe.language_bridge import (
     DEMAND_LANGUAGE_REWARD_POLICY_SHA256,
     ConsequenceLanguageBridge,
     ConsequenceLanguageStateBank,
+    ControllerCrystalLanguageExecutor,
+    ControllerCrystalOutcomeReceipt,
     FrontierMigrationReceipt,
     LanguageBridgeConflictError,
     LanguageBridgeIntegrityError,
@@ -56,6 +67,7 @@ from immer.runtimes.ooe.language_bridge import (
     candidate_action_id,
     definition_from_macro_option,
     discover_language_macros,
+    execute_controller_crystal_choice,
     migrate_language_frontier,
     promote_and_migrate_language_revision,
     promote_compiled_word_action,
@@ -72,10 +84,105 @@ from immer.runtimes.ooe.markov_language import (
     MarkovLanguageConflictError,
 )
 from immer.runtimes.ooe.options import MacroOption, OptionIdentity
+from immer.runtimes.ooe.qwen_bridge import (
+    ACTION_SCHEMA_SHA256,
+    OOE_ACTIONS,
+    QwenOoeFeatureReceipt,
+    feature_schema_sha256,
+)
+from immer.runtimes.qwen3_8.semantic_atlas import GraphRevision, ProbeIdentity
 
 
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+_CONTROLLER_MODEL_PIN = _sha("language-controller-model")
+_CONTROLLER_WEIGHT_GRAPH = GraphRevision(3, _sha("language-controller-weight"))
+_CONTROLLER_ATLAS_GRAPH = GraphRevision(5, _sha("language-controller-atlas"))
+_CONTROLLER_VERIFIER = _sha("language-controller-verifier")
+
+
+def _controller_feature(
+    temporal: int, *, site: int, source: int
+) -> QwenOoeFeatureReceipt:
+    sketch = [0.0] * 8
+    sketch[site] = 0.8
+    sketch[2 + source] = 0.1 + source * 0.01
+    return QwenOoeFeatureReceipt(
+        temporal_index=temporal,
+        measurement_sha256=_sha(f"language-measurement-{site}-{source}-{temporal}"),
+        model_pin_sha256=_CONTROLLER_MODEL_PIN,
+        weight_coordinate_sha256=_sha(f"language-coordinate-{site}"),
+        weight_graph_revision=_CONTROLLER_WEIGHT_GRAPH,
+        atlas_graph_revision=_CONTROLLER_ATLAS_GRAPH,
+        probe=ProbeIdentity(
+            question_sha256=_sha(f"language-question-{site}-{source}-{temporal}"),
+            token_sha256=_sha(f"language-tokens-{site}-{source}-{temporal}"),
+            family_sha256=_sha(f"language-family-{site}"),
+            label_source_sha256=_sha("language-label-source"),
+        ),
+        feature_schema_sha256=feature_schema_sha256(8),
+        action_schema_sha256=ACTION_SCHEMA_SHA256,
+        verifier_sha256s=(_CONTROLLER_VERIFIER,),
+        evidence_sha256s=(_sha(f"language-evidence-{site}-{source}-{temporal}"),),
+        o1_surprise=0.25,
+        o1_learning_progress=0.5,
+        feature_sketch=tuple(sketch),
+    )
+
+
+def _controller_export_fixture(
+    root: Path,
+) -> tuple[ComputeCrystalBank, ControllerCrystalExport]:
+    source_store = CrystalStore(root / "controller-source")
+    controller = OoeController(
+        model_pin_sha256=_CONTROLLER_MODEL_PIN,
+        weight_graph_revision_sha256=_CONTROLLER_WEIGHT_GRAPH.sha256,
+        atlas_graph_revision=_CONTROLLER_ATLAS_GRAPH,
+        crystal_store=source_store,
+        config=ControllerConfig(
+            replicas=4,
+            replica_fanout=4,
+            min_coverage_per_source=1,
+            min_promoted_sources=len(OOE_ACTIONS),
+            router_radius=2.0,
+            router_min_margin=0.0,
+            token_min_confidence=0.01,
+            consensus_tolerance=1e-6,
+            consensus_max_rounds=1024,
+            quantization_levels=65_535,
+            reservoir_size=8,
+        ),
+    )
+    temporal = 0
+    sites = []
+    for site in range(2):
+        for source in range(len(OOE_ACTIONS)):
+            feature = _controller_feature(temporal, site=site, source=source)
+            transition = VerifiedTeacherTransition(
+                feature_receipt_sha256=feature.sha256,
+                site_identity_sha256=feature.site_identity.sha256,
+                source_action=OOE_ACTIONS[source],
+                target_action=OOE_ACTIONS[(source + site + 1) % len(OOE_ACTIONS)],
+                verifier_sha256=_CONTROLLER_VERIFIER,
+                evidence_sha256=feature.evidence_sha256s[0],
+                quality_sha256=_sha(f"language-quality-{feature.sha256}"),
+            )
+            controller.ingest_teacher(feature, transition)
+            temporal += 1
+        sites.append(feature.site_identity.sha256)
+    for site in sites:
+        coverage = controller.coverage_receipt(site)
+        controller.promote(
+            site,
+            coverage_sha256=coverage.sha256,
+            verifier_sha256s=coverage.verifier_sha256s,
+        )
+    controller.save_snapshot()
+    restored = OoeController.restore(crystal_store=source_store)
+    bank = ComputeCrystalBank(root / "controller-compute")
+    return bank, export_controller_crystals(restored, bank)
 
 
 class _RouteFixture:
@@ -399,6 +506,173 @@ class AlgebraLanguageBridgeTests(unittest.TestCase):
             dict(frontier.authority_hashes)["language-reward-policy"],
             ALGEBRA_LANGUAGE_REWARD_POLICY_SHA256,
         )
+
+
+class ControllerCrystalLanguageBridgeTests(unittest.TestCase):
+    @staticmethod
+    def _fixture(
+        root: Path,
+    ) -> tuple[ComputeCrystalBank, ControllerCrystalExport, tuple[str, str]]:
+        bank, exported = _controller_export_fixture(root)
+        actions = exported.frontier.action_ids
+        if len(actions) != 2:
+            raise AssertionError("controller fixture did not export two actions")
+        return bank, exported, (actions[0], actions[1])
+
+    def test_exact_promoted_policy_choice_replays_before_positive_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bank, exported, actions = self._fixture(Path(temporary))
+            frontier = exported.frontier
+            language = ConsequenceMarkovLanguage(
+                frontier, ("controller-word-0", "controller-word-1"), seed=81
+            )
+            language.sender_q.fill(-1.0)
+            language.receiver_q.fill(-1.0)
+            language.receiver_visits.fill(0)
+            for index in range(2):
+                language.sender_q[index, index] = 1.0
+                language.receiver_q[index, index] = 1.0
+                language.receiver_visits[index, index] = 20
+            bridge = ConsequenceLanguageBridge(language)
+            decision = bridge.begin(actions[0], "controller-context", epsilon=0.0)
+            outcome = execute_controller_crystal_choice(
+                decision,
+                exported.receipt,
+                bank,
+                np.array([1.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+            )
+            self.assertTrue(outcome.accepted)
+            self.assertEqual(
+                ControllerCrystalOutcomeReceipt.from_bytes(outcome.to_bytes()),
+                outcome,
+            )
+            prior_anchor = bank.manifest().previous_manifest_sha256
+            self.assertIsNotNone(prior_anchor)
+            forged_anchor = replace(
+                outcome,
+                authorized_bank_anchor_sha256=str(prior_anchor),
+            )
+            with self.assertRaisesRegex(
+                LanguageBridgeIntegrityError, "another authorized bank anchor"
+            ):
+                bridge.settle_controller_crystal(
+                    decision, forged_anchor, exported.receipt, bank
+                )
+            forged = replace(
+                outcome,
+                selected_output_sha256=_sha("forged-controller-output"),
+                accepted=False,
+            )
+            with self.assertRaisesRegex(
+                LanguageBridgeIntegrityError, "differs from exact replay"
+            ):
+                bridge.settle_controller_crystal(
+                    decision, forged, exported.receipt, bank
+                )
+            commit = bridge.settle_controller_crystal(
+                decision, outcome, exported.receipt, bank
+            )
+            self.assertTrue(commit.accepted)
+            self.assertEqual(commit.reward, 1.0)
+            self.assertEqual(commit.external_outcome_kind, "controller-crystal-choice")
+
+            forged_authorities = dict(frontier.authority_hashes)
+            forged_authorities["controller-state"] = _sha("forged-controller-state")
+            forged_frontier = ActionFrontier.create(
+                frontier.actions,
+                action_schema_sha256=frontier.action_schema_sha256,
+                context_schema_sha256=frontier.context_schema_sha256,
+                authority_hashes=forged_authorities,
+            )
+            forged_language = ConsequenceMarkovLanguage(
+                forged_frontier,
+                ("forged-word-0", "forged-word-1"),
+                seed=84,
+            )
+            forged_language.sender_q.fill(-1.0)
+            forged_language.receiver_q.fill(-1.0)
+            forged_language.receiver_visits.fill(0)
+            forged_language.sender_q[0, 0] = 1.0
+            forged_language.receiver_q[0, 0] = 1.0
+            forged_language.receiver_visits[0, 0] = 20
+            forged_decision = ConsequenceLanguageBridge(forged_language).begin(
+                forged_frontier.action_ids[0],
+                "controller-context",
+                epsilon=0.0,
+            )
+            with self.assertRaisesRegex(
+                LanguageBridgeIntegrityError, "another frontier"
+            ):
+                execute_controller_crystal_choice(
+                    forged_decision,
+                    exported.receipt,
+                    bank,
+                    np.array([1.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+                )
+
+    def test_wrong_site_is_negative_even_for_a_valid_operator_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bank, exported, actions = self._fixture(Path(temporary))
+            frontier = exported.frontier
+            language = ConsequenceMarkovLanguage(
+                frontier, ("controller-word-0", "controller-word-1"), seed=82
+            )
+            language.sender_q.fill(-1.0)
+            language.receiver_q.fill(-1.0)
+            language.receiver_visits.fill(0)
+            language.sender_q[0, 0] = 1.0
+            language.receiver_q[0, 1] = 1.0
+            language.receiver_visits[0, 1] = 20
+            bridge = ConsequenceLanguageBridge(language)
+            decision = bridge.begin(actions[0], "controller-context", epsilon=0.0)
+            self.assertEqual(decision.receiver.action_id, actions[1])
+            outcome = execute_controller_crystal_choice(
+                decision,
+                exported.receipt,
+                bank,
+                np.array([0.25, 0.75, 0.0, 0.0, 0.0], dtype=np.float64),
+            )
+            self.assertFalse(outcome.accepted)
+            commit = bridge.settle_controller_crystal(
+                decision, outcome, exported.receipt, bank
+            )
+            self.assertFalse(commit.accepted)
+            self.assertEqual(commit.reward, -1.0)
+
+            next_decision = bridge.begin(actions[0], "controller-context", epsilon=0.0)
+            executor = ControllerCrystalLanguageExecutor(exported.receipt, bank)
+            before_append = executor.execute(
+                next_decision,
+                np.array([0.5, 0.5, 0.0, 0.0, 0.0], dtype=np.float64),
+            )
+            bank.publish_crystal(ComputeCrystal.markov([[0.5, 0.5], [0.5, 0.5]]))
+            settled_after_append = bridge.settle_controller_crystal(
+                next_decision,
+                before_append,
+                exported.receipt,
+                bank,
+                executor=executor,
+            )
+            self.assertFalse(settled_after_append.accepted)
+
+            replacement = ComputeCrystalBank(Path(temporary) / "replacement")
+            replacement_language = ConsequenceMarkovLanguage(
+                frontier,
+                ("replacement-word-0", "replacement-word-1"),
+                seed=83,
+            )
+            replacement_decision = ConsequenceLanguageBridge(
+                replacement_language
+            ).begin(actions[0], "controller-context", epsilon=0.0)
+            with self.assertRaisesRegex(
+                LanguageBridgeIntegrityError, "export provenance"
+            ):
+                execute_controller_crystal_choice(
+                    replacement_decision,
+                    exported.receipt,
+                    replacement,
+                    np.array([0.5, 0.5, 0.0, 0.0, 0.0], dtype=np.float64),
+                )
 
 
 class FrontierMigrationTests(unittest.TestCase):

@@ -38,6 +38,7 @@ are outside the repository record.
 | self-hosting executable word DAG and compiler | `src/immer/runtimes/ooe/executable_lexicon.py`, `src/immer/runtimes/ooe/compute_crystals.py` |
 | production language outcome bridge and frontier promotion | `src/immer/runtimes/ooe/language_bridge.py` |
 | continual language-growth intelligence | `src/immer/runtimes/ooe/language_intelligence.py`, `scripts/ooe_language_growth_benchmark.py` |
+| live controller-Crystal export and language bootstrap | `src/immer/runtimes/ooe/controller_crystal_bridge.py`, `src/immer/runtimes/ooe/controller_language_intelligence.py`, `scripts/ooe_controller_language_bootstrap.py` |
 | executable dialect mesh and portable macros | `src/immer/runtimes/ooe/dialect_mesh.py`, `src/immer/runtimes/ooe/dialect_intelligence.py`, `scripts/ooe_dialect_mesh_benchmark.py` |
 | joined demand execution and feedback | `src/immer/runtimes/ooe/demand_execution.py`, `src/immer/runtimes/ooe/residual_execution.py` |
 | constructive Birkhoff search and Crystal bases | `src/immer/runtimes/ooe/bvn_search.py`, `src/immer/runtimes/ooe/bvn_crystals.py` |
