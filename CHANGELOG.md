@@ -4,6 +4,86 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-26
 
+### Consequence-grounded language and recursive compute words
+
+- Added a context-aware Markov signalling runtime. The receiver API accepts
+  only an opaque word, a context ID, and exploration; one-shot verifier
+  feedback contains the chosen-action receipt and scalar consequence but no
+  sender intent, target action, target state, or semantic label.
+- Combined a shared word/action table with context residual tables. Stable
+  meaning transfers into unseen contexts while the same word can learn
+  different actions in different authenticated contexts. Valid in-vocabulary
+  words abstain when unvisited, low-value, or ambiguous.
+- Added immutable action frontiers for Crystal, program, route, option, organ,
+  causal-site, residual-plan, and Qwen-path actions. Each frontier binds its
+  actual action/context schemas and named authorities without imposing a
+  universal model-specific checklist.
+- Added canonical learner state, deterministic RNG resume, frozen language
+  snapshots, one-shot pending-decision replay rejection, fixed-teacher cultural
+  induction, and arbitrary multi-slot factorized grammar trained from one
+  whole-action consequence.
+- Added the self-hosting executable lexicon. Definitions bind snapshot,
+  frontier, and authority hashes; primitives are immutable; unknown
+  dependencies, cycles, conflicts, stale definitions, tamper, and namespace
+  collisions fail closed. Recursive repair installs each missing definition
+  once.
+- Added bottom-up word-DAG compilation into the real `ComputeCrystalBank`.
+  Homogeneous children use duplicate-preserving exact fusion; mixed families
+  retain a bounded ordered `ComputeProgram`. A word claims constant discharge
+  only when the compiler produces one charged Crystal.
+- Added opt-in transitive fusion-work provenance. Legacy Crystal bytes remain
+  unchanged; recursively fused words carry the complete authenticated source
+  work into `ComputeChargeReceipt` and VM discharge accounting. Forged
+  rehashed work metadata fails parent-chain reconstruction. Legacy fused
+  parents remain executable but cannot mint a new transitive charge until their
+  primitive lineage is recompiled with provenance.
+- Added an append-only lexicon bank with immutable history objects, commit
+  markers, CAS head, crash recovery, concurrent-writer exclusion, rollback and
+  fork detection, and optional external trusted-head anchoring.
+- Fresh five-seed runtime benchmark: primitive language, 1,000 unseen programs,
+  context-dependent meaning, held-out grammar, option words, cultural transfer,
+  and self-hosted macros all score `100%`; shuffled semantics score `2.02%`,
+  a fixed no-message policy scores `0.98%`, no-action abstention `2.90%`,
+  shuffled grammar `5.00%`, and the holistic held-out table `0%`. Every
+  unassigned in-vocabulary word abstains.
+- The depth-12 word DAG stores `36` references for `8,191` primitive actions,
+  compiles to one constant-discharge Crystal, matches the flat program exactly,
+  and measures `8.380x` faster under the same authenticated VM boundary. Across
+  25 future states it releases `1,638,000` historical work units and performs
+  `200` live work units.
+- Complete warning-fatal regression suite: `1,763/1,763`, `OK`, `628.021 s`.
+
+### Causal sublayer and prompt-preserving sequence intelligence
+
+- Added an isolated Qwen layer-boundary observer. Cartography now records five
+  projected boundaries per measured layer: normalized Attention input,
+  Attention output, Attention residual, normalized MLP input, and down-projected
+  MLP output. The observer receives clones, cannot mutate model math, filters
+  stages before allocation, and changes neither checkpoint reads nor committed
+  continuation state.
+- Converted those boundaries into four prompt-diverse operator families:
+  Attention core, Attention residual, MLP core, and MLP residual. The existing
+  whole-layer transition remains a fifth family; every array is hash-bound to
+  the sealed Qwen evidence document.
+- Added `CAUSAL_MIX_FLOAT64`, a strict lower-triangular row-normalized sequence
+  operator with ABI `[..., T]` and left action `...k,qk->...q`. Homogeneous
+  kernels fuse as `K_following @ K_current`, retain exact zero future mass, use
+  a dedicated fusion verifier, and enter graph charging without inheriting the
+  semantically different Markov contraction ledger.
+- Added the prompt-preserving contextual sequence instrument. It predicts
+  `Y = X + ΨC` from RMS-normalized input, a fixed seeded multi-timescale
+  recurrence, and optional quadratic reservoir features. Recurrence resets per
+  prompt; training prompts fit the readout, one later prompt selects the feature
+  map/ridge, and a separate final prompt produces the holdout receipt.
+- Bound raw X/Y content independently of prompt/evidence labels, rejected
+  renamed duplicate feature maps, and added a deterministic aggregate memory
+  preflight before substrate, feature, or Gram allocation. Fits and holdout
+  receipts enforce `predictive_only=True` and never enter the executable
+  ComputeOperatorGraph.
+- Fixed synthetic holdout: selected sequence MSE `6.726089e-05` versus tuned
+  pointwise `5.803816e-02` (`862.881x` lower); shuffled-token and shuffled-output
+  placebos score `3.1959` and `3.1541`.
+
 ### Living O1 frontier and executable harvested algebras
 
 - Replaced one-shot cartography closure with additive frontier growth. The

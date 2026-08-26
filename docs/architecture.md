@@ -22,11 +22,15 @@ continuous learning plane:
 
 living frontier -> Qwen probe -> exact WeightCoordinate + projected pre/post hidden states
      -> SemanticWeightAtlas -> O1 signal -> contextual operator harvester
+     -> whole / Attention core+residual / MLP core+residual families
      -> affine / permutation / Markov Crystals -> Birkhoff atom bases
+     -> prompt-preserving sequence predictor -> O1 novelty/error evidence
      -> persistent algebra catalog -> Thompson/MAP-Elites selection -> Crystal VM
      -> replicated Markov agents -> world model / options / operator graph
      -> demand scheduler -> charged prefix + live residual suffix
      -> verifier outcome -> algebra and demand feedback
+     -> opaque consequence word -> context-aware executable language
+     -> self-hosted definition DAG -> compiled Crystal / bounded program
 ```
 
 ## 1. Immutable data plane
@@ -118,13 +122,27 @@ stored-compute system has no mandatory teacher hierarchy: an admitted Crystal,
 exact organ, continuation state, materialized route, or Qwen path executes
 according to the selected contract.
 
+The executable language sits above that action frontier. The sender sees the
+intended action and emits an opaque word. The receiver sees only that word and
+an authenticated context, chooses an action, and receives a one-shot verifier
+consequence. Shared word/action evidence carries stable meaning across states;
+context residual tables override it when consequences differ by state. Visit,
+value, and margin gates reject valid but ungrounded or ambiguous words.
+
+Factorized word slots learn from one whole-action consequence and recombine
+held-out Cartesian action tuples. A frozen language snapshot maps admitted
+words to the exact frontier artifacts they name: Crystals, programs,
+materialized routes, options, organs, causal sites, residual plans, or Qwen
+paths. The frontier binds the schemas and authorities used by that specific
+action family; model-specific pins are present only for model-specific actions.
+
 ## 5. Stored compute and exact result cells
 
 IMMER stores completed computation at two different abstraction levels.
 
 `ComputeCrystal` is the general mechanism. It is a canonical typed program over
-numerical values: affine, permutation, lookup, and row-stochastic Markov
-operators share one bounded VM. Homogeneous affine, permutation, and Markov
+numerical values: affine, permutation, lookup, row-stochastic Markov, and
+left-acting causal-mix operators share one bounded VM. Compatible homogeneous
 chains fuse exactly. A `ComputeOperatorGraph` connects
 verified one-step state transitions, plans a compatible route, and charges that
 route under an authenticated charge basis. Charging fuses the route into a new
@@ -132,6 +150,19 @@ operator. Discharge applies the stored operator to values that did not exist
 when it was charged and records equivalent source work, live work, and released
 historical work. The bank and graph use content addresses, atomic manifests,
 generation checks, and crash recovery.
+
+Executable words reuse this substrate without flattening their definition
+graph. A definition stores direct word references under the frozen language,
+frontier, and named authority hashes. Missing dependencies repair recursively;
+conflict, cycle, stale authority, and primitive redefinition fail closed. The
+lexicon persists immutable histories and commits behind a CAS head.
+
+For a homogeneous word, the compiler resolves each distinct child once and
+fuses direct child Crystals bottom-up. Duplicate child hashes remain duplicate
+execution positions. A reserved work-provenance extension carries the complete
+transitive source work into the next level, so the root charge reports the
+entire computation it replaces. Mixed operator families remain an ordered
+bounded `ComputeProgram`; they never receive constant-discharge credit.
 
 Residual discharge extends full-route charging. A future plan selects the
 deepest compatible route that carries an authenticated charge basis, executes
@@ -256,6 +287,21 @@ from summary statistics. Weight-site measurements sharing one prompt remain
 separate Atlas records but count once inside an operator family, so fit and
 holdout evidence is prompt-diverse rather than coordinate-duplicated.
 
+The probe also captures five internal boundaries during the same layer
+execution: normalized Attention input, Attention output, Attention residual,
+normalized MLP input, and down-projected MLP output. These form Attention
+core/residual and MLP core/residual transition families beside the whole-layer
+pair. Stage filtering occurs before cloning; unused gate/up/activation tensors
+never enter the cartography payload.
+
+Signed projected sequences retain their prompt boundaries in a separate
+predictive plane. A fixed seeded multi-timescale recurrence constructs
+features per prompt, a ridge readout predicts the layer residual, one later
+prompt selects feature/ridge configuration, and a separate final prompt yields
+the holdout receipt. Raw X/Y content hashes block relabeled duplication. This
+artifact's authority is restricted to error, novelty, and experiment-selection
+evidence; executable replacement remains behind the exact Crystal verifier.
+
 Every promoted family crosses directly into the executable algebra catalog.
 The bridge rebinds the promotion to the current graph head, exact edge,
 published Crystal, fit/holdout evidence, and a family-specific runtime verifier;
@@ -265,6 +311,12 @@ restart. A selected program executes through `ComputeCrystalVM`; its joined VM
 and verifier receipt becomes exact Thompson feedback. Parallel edges remain
 individually addressable through `plan_exact_path()` and
 `discharge_exact(route_sha256, value)`.
+
+Realized causal sequence kernels use a distinct executable algebra.
+`CAUSAL_MIX_FLOAT64` applies `K·V` on the final sequence axis, validates exact
+zero future mass and row normalization, fuses kernels in execution order, and
+charges under a causal-mix-specific verifier. Its left-action value semantics
+remain separate from row-vector Markov probability transport.
 
 ## 7. DeepSeek-V4-Flash transport laboratory
 

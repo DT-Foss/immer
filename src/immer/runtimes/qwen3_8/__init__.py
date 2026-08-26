@@ -23,6 +23,7 @@ from .cartography_probe import (
     CARTOGRAPHY_EVIDENCE_SCHEMA,
     CARTOGRAPHY_PROMPT_SCHEMA,
     CartographyProbeResult,
+    ContextualBoundarySketch,
     ContextualHiddenTransition,
     HiddenSketchProjection,
     ProbeCoordinateSpec,
@@ -57,6 +58,8 @@ from .local_draft import (
 )
 from .model import (
     GenerationEvidence,
+    LAYER_BOUNDARY_STAGES,
+    LayerBoundaryObserver,
     PrefillEvidence,
     Qwen38RuntimeError,
     StatefulEvidence,
@@ -201,6 +204,7 @@ __all__ = [
     "CausalTensorReader",
     "CausalWeightMount",
     "CartographyProbeResult",
+    "ContextualBoundarySketch",
     "ContextualHiddenTransition",
     "CONSENSUS_SNAPSHOT_SCHEMA",
     "COVERAGE_MATRIX_SCHEMA",
@@ -217,6 +221,8 @@ __all__ = [
     "K4DraftProvider",
     "K4ReconciledDraftProvider",
     "GenerationEvidence",
+    "LAYER_BOUNDARY_STAGES",
+    "LayerBoundaryObserver",
     "GRAPH_REVISION_SCHEMA",
     "GraphRevision",
     "HiddenSketchProjection",

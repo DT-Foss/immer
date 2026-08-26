@@ -20,6 +20,7 @@ from immer.runtimes.ooe.algebra_agents import (
 )
 from immer.runtimes.ooe.compute_crystals import (
     AFFINE_FLOAT64,
+    CAUSAL_MIX_FLOAT64,
     ComputeCrystal,
     ComputeCrystalBank,
 )
@@ -281,6 +282,69 @@ class HarvestAlgebraBridgeTests(unittest.TestCase):
         )
         second = execution_verifier_sha256_for_harvest(other, self.crystal)
         self.assertNotEqual(first, second)
+
+    def test_dedicated_causal_mix_promotion_enters_compute_algebra(self) -> None:
+        kernel = np.array(
+            [[1.0, 0.0, 0.0], [0.6, 0.4, 0.0], [0.2, 0.3, 0.5]],
+            dtype=np.float64,
+        )
+        crystal = ComputeCrystal.causal_mix(kernel)
+        publication = self.bank.publish_crystal(crystal)
+        verifier = _hash("causal-mix-discovery")
+        evidence = _hash("causal-mix-evidence")
+        edge = OperatorEdge(
+            source_state="prefix.values.before",
+            target_state="prefix.values.after",
+            crystal_sha256=crystal.sha256,
+            verifier_sha256=verifier,
+            evidence_sha256=evidence,
+            weight=3.0,
+        )
+        state = self.graph.state()
+        graph_state, _changed = self.graph.append_edges(
+            (edge,),
+            expected_generation=state.generation,
+            expected_state_sha256=state.sha256,
+        )
+        observations = tuple(sorted(_hash(f"causal-context-{i}") for i in range(3)))
+        stream = CandidateEvidenceStream(
+            group_sha256=_hash("causal-mix-group"),
+            operator_kind=CAUSAL_MIX_FLOAT64,
+            status="promoted",
+            reason="causal-kernel-contract-passed",
+            observation_receipt_sha256s=observations,
+            fit_receipt_sha256s=tuple(sorted(observations[:2])),
+            holdout_receipt_sha256=observations[-1],
+            verifier_sha256=verifier,
+            crystal_sha256=crystal.sha256,
+            evidence_sha256=evidence,
+        )
+        promotion = HarvestPromotion(
+            candidate=stream,
+            edge=edge,
+            bank_publication=publication,
+            graph_changed=True,
+            graph_state_sha256=graph_state.sha256,
+        )
+        profile = profile_harvested_candidate(
+            promotion,
+            crystal,
+            bin_counts=(4, 4),
+            objective_count=2,
+            execution_verifier_sha256=execution_verifier_sha256_for_harvest(
+                promotion, crystal
+            ),
+        )
+        candidate, _program_publication, bridge = (
+            harvest_promotion_to_algebra_candidate(
+                promotion,
+                graph=self.graph,
+                profile=profile,
+            )
+        )
+        self.assertEqual(candidate.program.crystal_sha256s, (crystal.sha256,))
+        self.assertEqual(candidate.behavior_descriptor[0], 3)
+        self.assertEqual(bridge.crystal_sha256, crystal.sha256)
 
     def test_negative_execution_is_real_router_feedback_not_a_crash(self) -> None:
         candidate, _publication, _bridge = self._candidate()

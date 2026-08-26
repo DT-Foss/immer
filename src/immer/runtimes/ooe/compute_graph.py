@@ -28,6 +28,7 @@ from numpy.typing import NDArray
 
 from .compute_crystals import (
     AFFINE_FLOAT64,
+    CAUSAL_MIX_FLOAT64,
     MARKOV_FLOAT64,
     MAX_PROGRAM_STEPS,
     PERMUTATION,
@@ -102,6 +103,13 @@ EXACT_FUSION_VERIFIER_SHA256 = _sha256(
         "schema": "immer-ooe-exact-fusion-verifier/v1",
         "operator": "fuse_compatible_chain",
         "criterion": "canonical-byte-equality",
+    }
+)
+CAUSAL_MIX_FUSION_VERIFIER_SHA256 = _sha256(
+    {
+        "schema": "immer-ooe-causal-mix-fusion-verifier/v1",
+        "operator": "fuse_causal_mix_chain",
+        "criterion": "canonical-causal-left-action-fusion",
     }
 )
 
@@ -193,13 +201,17 @@ def _checked_sum(values: Sequence[int], *, field: str) -> int:
 def _fusion_verification_sha256(
     source_program: ComputeProgram,
     fused_crystal: ComputeCrystal,
+    *,
+    verifier_sha256: str = EXACT_FUSION_VERIFIER_SHA256,
 ) -> str:
     """Hash the exact fusion check that authorizes a compute charge."""
 
     return _sha256(
         {
             "schema": FUSION_VERIFICATION_SCHEMA,
-            "verifier_sha256": EXACT_FUSION_VERIFIER_SHA256,
+            "verifier_sha256": require_sha256(
+                verifier_sha256, field="fusion verifier SHA-256"
+            ),
             "source_program_sha256": source_program.sha256,
             "source_crystal_sha256s": list(source_program.crystal_sha256s),
             "fused_crystal_sha256": fused_crystal.sha256,
@@ -208,6 +220,32 @@ def _fusion_verification_sha256(
             "canonical_fusion_verified": True,
         }
     )
+
+
+def _fusion_verifier_for_kinds(kinds: set[str]) -> str:
+    if kinds == {CAUSAL_MIX_FLOAT64}:
+        return CAUSAL_MIX_FUSION_VERIFIER_SHA256
+    if kinds in ({AFFINE_FLOAT64}, {PERMUTATION}, {MARKOV_FLOAT64}):
+        return EXACT_FUSION_VERIFIER_SHA256
+    raise ComputeOperatorGraphIntegrityError(
+        "operator kinds have no registered fusion verifier"
+    )
+
+
+def _contraction_kernels(
+    crystals: Sequence[ComputeCrystal],
+    kinds: set[str],
+) -> tuple[NDArray[np.float64], ...]:
+    if kinds != {MARKOV_FLOAT64}:
+        raise ComputeOperatorGraphIntegrityError(
+            "operator kinds have no contraction-kernel representation"
+        )
+    kernels = []
+    for crystal in crystals:
+        dimension = crystal.input_abi.trailing_shape[0]
+        recovered = crystal.apply(np.eye(dimension, dtype=np.float64))
+        kernels.append(np.asarray(recovered, dtype=np.float64))
+    return tuple(kernels)
 
 
 def _graph_commit_bytes(graph_state_sha256: str) -> bytes:
@@ -1963,6 +2001,7 @@ class ComputeOperatorGraph:
             {AFFINE_FLOAT64},
             {PERMUTATION},
             {MARKOV_FLOAT64},
+            {CAUSAL_MIX_FLOAT64},
         )
         if fusible:
             if route.fused_crystal_sha256 is None or route.charge_basis_sha256 is None:
@@ -1984,12 +2023,17 @@ class ComputeOperatorGraph:
                 raise ComputeOperatorGraphIntegrityError(
                     "materialized route compute charge restore failed"
                 ) from exc
-            verification_sha = _fusion_verification_sha256(primitive, fused)
+            fusion_verifier = _fusion_verifier_for_kinds(kinds)
+            verification_sha = _fusion_verification_sha256(
+                primitive,
+                fused,
+                verifier_sha256=fusion_verifier,
+            )
             expected_charge = ComputeChargeReceipt.create(
                 source_program=primitive,
                 source_crystals=crystals,
                 fused_crystal=fused,
-                charge_verifier_sha256=EXACT_FUSION_VERIFIER_SHA256,
+                charge_verifier_sha256=fusion_verifier,
                 verification_receipt_sha256=verification_sha,
             )
             if charge.to_bytes() != expected_charge.to_bytes():
@@ -1997,7 +2041,7 @@ class ComputeOperatorGraph:
                     "materialized route compute charge basis mismatch"
                 )
             if (
-                route.charge_verifier_sha256 != EXACT_FUSION_VERIFIER_SHA256
+                route.charge_verifier_sha256 != fusion_verifier
                 or route.verification_receipt_sha256 != verification_sha
             ):
                 raise ComputeOperatorGraphIntegrityError(
@@ -2037,14 +2081,9 @@ class ComputeOperatorGraph:
             raise ComputeOperatorGraphIntegrityError(
                 "materialized route provenance lineage mismatch"
             )
-        all_markov = kinds == {MARKOV_FLOAT64}
-        if all_markov:
-            kernels = tuple(
-                crystal.apply(
-                    np.eye(crystal.input_abi.trailing_shape[0], dtype=np.float64)
-                )
-                for crystal in crystals
-            )
+        contracting = kinds == {MARKOV_FLOAT64}
+        if contracting:
+            kernels = _contraction_kernels(crystals, kinds)
             expected_ledger = ContractionLedger.from_kernels(kernels)
             if route.contraction_ledger != expected_ledger:
                 raise ComputeOperatorGraphIntegrityError(
@@ -2052,16 +2091,14 @@ class ComputeOperatorGraph:
                 )
             if route.fused_crystal_sha256 is not None:
                 fused = self.bank.restore_crystal(route.fused_crystal_sha256)
-                dimension = fused.input_abi.trailing_shape[0]
-                if not expected_ledger.verifies(
-                    fused.apply(np.eye(dimension, dtype=np.float64))
-                ):
+                (fused_kernel,) = _contraction_kernels((fused,), kinds)
+                if not expected_ledger.verifies(fused_kernel):
                     raise ComputeOperatorGraphIntegrityError(
-                        "fused Markov route violates its contraction bound"
+                        "fused stochastic route violates its contraction bound"
                     )
         elif route.contraction_ledger is not None:
             raise ComputeOperatorGraphIntegrityError(
-                "non-Markov route carries a contraction ledger"
+                "non-contracting route carries a contraction ledger"
             )
 
     def _validated_state_unlocked(
@@ -2655,6 +2692,7 @@ class ComputeOperatorGraph:
             {AFFINE_FLOAT64},
             {PERMUTATION},
             {MARKOV_FLOAT64},
+            {CAUSAL_MIX_FLOAT64},
         ):
             fused = fuse_compatible_chain(
                 crystals,
@@ -2670,14 +2708,17 @@ class ComputeOperatorGraph:
             fused_publication = self.bank.publish_crystal(fused)
             executable_program = ComputeProgram.compose((fused,))
             executable_publication = self.bank.publish_program(executable_program)
+            fusion_verifier = _fusion_verifier_for_kinds(kinds)
             verification_receipt_sha256 = _fusion_verification_sha256(
-                primitive_program, fused
+                primitive_program,
+                fused,
+                verifier_sha256=fusion_verifier,
             )
             charge = ComputeChargeReceipt.create(
                 source_program=primitive_program,
                 source_crystals=crystals,
                 fused_crystal=fused,
-                charge_verifier_sha256=EXACT_FUSION_VERIFIER_SHA256,
+                charge_verifier_sha256=fusion_verifier,
                 verification_receipt_sha256=verification_receipt_sha256,
             )
             charge_publication = self.bank.publish_charge(charge)
@@ -2689,20 +2730,13 @@ class ComputeOperatorGraph:
             live_work = primitive_live
         ledger: ContractionLedger | None = None
         if kinds == {MARKOV_FLOAT64}:
-            kernels = tuple(
-                crystal.apply(
-                    np.eye(crystal.input_abi.trailing_shape[0], dtype=np.float64)
-                )
-                for crystal in crystals
-            )
+            kernels = _contraction_kernels(crystals, kinds)
             ledger = ContractionLedger.from_kernels(kernels)
             if fused is not None:
-                dimension = fused.input_abi.trailing_shape[0]
-                if not ledger.verifies(
-                    fused.apply(np.eye(dimension, dtype=np.float64))
-                ):
+                (fused_kernel,) = _contraction_kernels((fused,), kinds)
+                if not ledger.verifies(fused_kernel):
                     raise ComputeOperatorGraphIntegrityError(
-                        "fused Markov operator violates the contraction ledger"
+                        "fused stochastic operator violates the contraction ledger"
                     )
         route = MaterializedRoute(
             source_state=plan.source_state,

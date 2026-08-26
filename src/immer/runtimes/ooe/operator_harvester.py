@@ -39,6 +39,7 @@ from ..qwen3_8.semantic_atlas import (
 )
 from .compute_crystals import (
     AFFINE_FLOAT64,
+    CAUSAL_MIX_FLOAT64,
     MARKOV_FLOAT64,
     PERMUTATION,
     ComputeBankPublication,
@@ -729,6 +730,7 @@ def contextual_observations_from_probe_result(
         raise TypeError("atlas_revision must be a GraphRevision")
     from ..qwen3_8.cartography_probe import (
         CartographyProbeResult,
+        ContextualBoundarySketch,
         ContextualHiddenTransition,
     )
 
@@ -736,6 +738,7 @@ def contextual_observations_from_probe_result(
         raise TypeError("result must be a verified Qwen CartographyProbeResult")
     measurement = result.measurement
     transitions = result.contextual_hidden_transitions
+    boundary_sketches = result.contextual_boundary_sketches
     result.verify()
     observations = []
     for transition in transitions:
@@ -778,6 +781,86 @@ def contextual_observations_from_probe_result(
                 output_array=cast(NDArray[np.float64], post_array),
             )
         )
+    transition_by_layer = {row.layer: row for row in transitions}
+    boundary_by_key: dict[tuple[int, str], ContextualBoundarySketch] = {}
+    for boundary in boundary_sketches:
+        if not isinstance(boundary, ContextualBoundarySketch):
+            raise OperatorHarvesterIntegrityError(
+                "Qwen contextual boundary sketch is malformed"
+            )
+        boundary_by_key[(boundary.layer, boundary.stage)] = boundary
+    boundary_pairs = (
+        ("attention.input", "attention.output"),
+        ("layer.input", "attention.residual"),
+        ("mlp.input", "mlp.output"),
+        ("attention.residual", "layer.output"),
+    )
+    for layer, whole in sorted(transition_by_layer.items()):
+        for source_stage, target_stage in boundary_pairs:
+            source = boundary_by_key.get((layer, source_stage))
+            target = boundary_by_key.get((layer, target_stage))
+            if (source_stage != "layer.input" and source is None) or (
+                target_stage != "layer.output" and target is None
+            ):
+                raise OperatorHarvesterIntegrityError(
+                    "Qwen contextual boundary pair is incomplete"
+                )
+            source_array = (
+                whole.pre_array if source_stage == "layer.input" else source.array
+            )
+            target_array = (
+                whole.post_array if target_stage == "layer.output" else target.array
+            )
+            source_seed = (
+                whole.projection_seed_sha256
+                if source_stage == "layer.input"
+                else source.projection_seed_sha256
+            )
+            target_seed = (
+                whole.projection_seed_sha256
+                if target_stage == "layer.output"
+                else target.projection_seed_sha256
+            )
+            if (
+                source_array.shape != target_array.shape
+                or source_seed != target_seed
+                or source_seed != whole.projection_seed_sha256
+            ):
+                raise OperatorHarvesterIntegrityError(
+                    "Qwen contextual boundary pair has incompatible projections"
+                )
+            feature_schema = _digest(
+                {
+                    "dimensions": whole.output_dimensions,
+                    "projection_seed_sha256": source_seed,
+                    "source_stage": source_stage,
+                    "target_stage": target_stage,
+                    "schema": "immer-ooe-qwen-boundary-sketch-feature/v1",
+                }
+            )
+            action_schema = _digest(
+                {
+                    "intervention_sha256": measurement.intervention.sha256,
+                    "layer": layer,
+                    "operator": "decoder-sublayer-boundary-transition",
+                    "source_stage": source_stage,
+                    "target_stage": target_stage,
+                    "schema": "immer-ooe-qwen-boundary-transition-action/v1",
+                }
+            )
+            observations.append(
+                ContextualOperatorObservation.capture(
+                    measurement,
+                    atlas_revision=atlas_revision,
+                    emitter_sha256=QWEN_CONTEXT_EMITTER_SHA256,
+                    feature_schema_sha256=feature_schema,
+                    action_schema_sha256=action_schema,
+                    source_state=f"qwen.layer.{layer}.{source_stage}-sketch",
+                    target_state=f"qwen.layer.{layer}.{target_stage}-sketch",
+                    input_array=cast(NDArray[np.float64], source_array),
+                    output_array=cast(NDArray[np.float64], target_array),
+                )
+            )
     return tuple(observations)
 
 
@@ -923,7 +1006,12 @@ class PromotionCheckpoint:
             "group_sha256",
             require_sha256(self.group_sha256, field="group_sha256"),
         )
-        if self.operator_kind not in (AFFINE_FLOAT64, PERMUTATION, MARKOV_FLOAT64):
+        if self.operator_kind not in (
+            AFFINE_FLOAT64,
+            PERMUTATION,
+            MARKOV_FLOAT64,
+            CAUSAL_MIX_FLOAT64,
+        ):
             raise ValueError("checkpoint operator kind is invalid")
         for field in ("crystal_sha256", "evidence_sha256", "edge_sha256"):
             object.__setattr__(
@@ -1161,7 +1249,12 @@ class CandidateEvidenceStream:
     def __post_init__(self) -> None:
         require_sha256(self.group_sha256, field="group_sha256")
         require_sha256(self.verifier_sha256, field="verifier_sha256")
-        if self.operator_kind not in (AFFINE_FLOAT64, PERMUTATION, MARKOV_FLOAT64):
+        if self.operator_kind not in (
+            AFFINE_FLOAT64,
+            PERMUTATION,
+            MARKOV_FLOAT64,
+            CAUSAL_MIX_FLOAT64,
+        ):
             raise ValueError("candidate operator kind is invalid")
         if self.status not in ("pending", "rejected", "promoted", "verified-existing"):
             raise ValueError("candidate status is invalid")

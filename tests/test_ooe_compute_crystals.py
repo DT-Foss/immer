@@ -17,7 +17,9 @@ import numpy as np
 
 from immer.runtimes.ooe.compute_crystals import (
     AFFINE_FLOAT64,
+    CAUSAL_MIX_FLOAT64,
     COMPUTE_BANK_MANIFEST_STATE,
+    FUSION_WORK_PROVENANCE_EXTENSION,
     ComputeBankManifest,
     ComputeChargeReceipt,
     ComputeCrystal,
@@ -31,8 +33,11 @@ from immer.runtimes.ooe.compute_crystals import (
     ComputeExecutionReceipt,
     ComputeProgram,
     NumericalABI,
+    equivalent_unfused_work_units,
     fuse_affine_chain,
+    fuse_causal_mix_chain,
     fuse_compatible_chain,
+    fuse_compatible_chain_with_provenance,
     fuse_markov_chain,
     fuse_permutation_chain,
     tensor_sha256,
@@ -102,7 +107,58 @@ def _affine_chain() -> tuple[ComputeCrystal, ComputeCrystal, ComputeCrystal]:
     )
 
 
+def _causal_mix_chain() -> tuple[ComputeCrystal, ComputeCrystal, ComputeCrystal]:
+    return (
+        ComputeCrystal.causal_mix(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.25, 0.75, 0.0, 0.0],
+                [0.10, 0.20, 0.70, 0.0],
+                [0.05, 0.15, 0.30, 0.50],
+            ]
+        ),
+        ComputeCrystal.causal_mix(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.40, 0.60, 0.0, 0.0],
+                [0.20, 0.30, 0.50, 0.0],
+                [0.10, 0.20, 0.30, 0.40],
+            ]
+        ),
+        ComputeCrystal.causal_mix(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.15, 0.85, 0.0, 0.0],
+                [0.05, 0.25, 0.70, 0.0],
+                [0.20, 0.10, 0.25, 0.45],
+            ]
+        ),
+    )
+
+
+def _stored_float64_kernel(crystal: ComputeCrystal) -> np.ndarray:
+    descriptor = crystal.payload["kernel"]
+    assert isinstance(descriptor, dict)
+    shape = descriptor["shape"]
+    encoded = descriptor["data_base64"]
+    assert isinstance(shape, list)
+    assert isinstance(encoded, str)
+    return np.frombuffer(base64.b64decode(encoded), dtype="<f8").reshape(shape)
+
+
 class ComputeCrystalArtifactTests(unittest.TestCase):
+    def test_primitive_cannot_forge_transitive_work_provenance(self) -> None:
+        with self.assertRaisesRegex(ValueError, "primitive crystal"):
+            ComputeCrystal.affine(
+                [[1.0]],
+                [0.0],
+                extensions={
+                    FUSION_WORK_PROVENANCE_EXTENSION: {
+                        "format": "forged",
+                    }
+                },
+            )
+
     def test_crystal_roundtrip_is_canonical_task_and_model_agnostic(self) -> None:
         crystal = ComputeCrystal.affine(
             [[1.0, 2.0], [3.0, 4.0]],
@@ -131,9 +187,9 @@ class ComputeCrystalArtifactTests(unittest.TestCase):
     def test_resealed_payload_tamper_and_nonfinite_values_are_rejected(self) -> None:
         crystal = ComputeCrystal.affine([[1.0, 2.0]], [3.0])
         document = json.loads(crystal.to_bytes())
-        document["body"]["payload"]["matrix"][
-            "data_base64"
-        ] = "AAAAAAAA8H8AAAAAAAAAQA=="
+        document["body"]["payload"]["matrix"]["data_base64"] = (
+            "AAAAAAAA8H8AAAAAAAAAQA=="
+        )
         document["body_sha256"] = hashlib.sha256(
             canonical_json_bytes(document["body"])
         ).hexdigest()
@@ -236,6 +292,64 @@ class ComputeCrystalArtifactTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ComputeCrystal.markov([[1.1, -0.1], [0.0, 1.0]])
 
+    def test_causal_mix_is_strictly_causal_and_mixes_batched_future_values(
+        self,
+    ) -> None:
+        crystal = _causal_mix_chain()[0]
+        values = np.random.default_rng(8128).normal(size=(2, 3, 4)).astype(np.float64)
+        kernel = _stored_float64_kernel(crystal)
+        expected = np.einsum("...k,qk->...q", values, kernel, optimize=False)
+        np.testing.assert_array_equal(crystal.apply(values), expected)
+        self.assertEqual(crystal.operator_kind, CAUSAL_MIX_FLOAT64)
+        self.assertEqual(crystal.input_abi, NumericalABI("float64", (4,)))
+        self.assertEqual(crystal.output_abi, NumericalABI("float64", (4,)))
+        self.assertEqual(crystal.discharge_work_units, 4 * (2 * 4 - 1))
+
+        for query in range(3):
+            changed = values.copy()
+            changed[..., query + 1 :] += 1_000_000.0
+            np.testing.assert_array_equal(
+                crystal.apply(changed)[..., : query + 1],
+                expected[..., : query + 1],
+            )
+
+    def test_causal_mix_roundtrip_and_causality_tamper_rejection(self) -> None:
+        crystal = _causal_mix_chain()[0]
+        encoded = crystal.to_bytes()
+        restored = ComputeCrystal.from_bytes(encoded)
+        self.assertEqual(restored, crystal)
+        self.assertEqual(restored.to_bytes(), encoded)
+        np.testing.assert_array_equal(
+            np.triu(_stored_float64_kernel(restored), k=1),
+            np.zeros((4, 4), dtype=np.float64),
+        )
+
+        with self.assertRaises(ValueError):
+            ComputeCrystal.causal_mix([[0.9, 0.1], [0.0, 1.0]])
+        with self.assertRaises(ValueError):
+            ComputeCrystal.causal_mix([[1.0, 0.0], [-0.1, 1.1]])
+        with self.assertRaises(ValueError):
+            ComputeCrystal.causal_mix([[1.0, 0.0], [0.2, 0.7]])
+        with self.assertRaises(ValueError):
+            ComputeCrystal.causal_mix([[1.0, 0.0, 0.0], [0.5, 0.5, 0.0]])
+
+        document = json.loads(encoded)
+        descriptor = document["body"]["payload"]["kernel"]
+        kernel = np.frombuffer(
+            base64.b64decode(descriptor["data_base64"]), dtype="<f8"
+        ).copy()
+        kernel = kernel.reshape(descriptor["shape"])
+        kernel[0, 0] = 0.875
+        kernel[0, 1] = 0.125
+        descriptor["data_base64"] = base64.b64encode(
+            kernel.astype("<f8", copy=False).tobytes(order="C")
+        ).decode("ascii")
+        document["body_sha256"] = hashlib.sha256(
+            canonical_json_bytes(document["body"])
+        ).hexdigest()
+        with self.assertRaises(ComputeCrystalIntegrityError):
+            ComputeCrystal.from_bytes(canonical_json_bytes(document))
+
 
 class ComputeProgramAndFusionTests(unittest.TestCase):
     def test_program_composes_by_abi_and_rejects_mixed_invalid_edges(self) -> None:
@@ -265,6 +379,30 @@ class ComputeProgramAndFusionTests(unittest.TestCase):
             unfused = crystal.apply(unfused)
         np.testing.assert_allclose(fused.apply(unseen), unfused, rtol=1e-13, atol=1e-13)
         self.assertNotIn("equivalent_source_work_units", fused.as_record())
+
+    def test_legacy_fused_parent_cannot_mint_partial_transitive_work(self) -> None:
+        first = ComputeCrystal.affine([[1.0]], [1.0])
+        second = ComputeCrystal.affine([[1.0]], [2.0])
+        legacy = fuse_affine_chain((first, second))
+        with self.assertRaisesRegex(
+            ComputeCrystalFusionError,
+            "lacks transitive work provenance",
+        ):
+            fuse_compatible_chain_with_provenance((legacy, first))
+
+        source = ComputeProgram.compose((legacy, first))
+        fused = fuse_affine_chain((legacy, first))
+        with self.assertRaisesRegex(
+            ComputeCrystalFusionError,
+            "lacks transitive work provenance",
+        ):
+            ComputeChargeReceipt.create(
+                source_program=source,
+                source_crystals=(legacy, first),
+                fused_crystal=fused,
+                charge_verifier_sha256=_sha("legacy-charge-verifier"),
+                verification_receipt_sha256=_sha("legacy-charge-receipt"),
+            )
 
     def test_permutation_fusion_is_bit_exact(self) -> None:
         chain = (
@@ -311,6 +449,29 @@ class ComputeProgramAndFusionTests(unittest.TestCase):
             result = fused.apply(np.eye(32, dtype=np.float64))
         self.assertEqual(result.shape, (32, 32))
         np.testing.assert_allclose(result.sum(axis=1), 1.0, rtol=0.0, atol=1e-12)
+
+    def test_causal_mix_fusion_matches_sequential_left_actions(self) -> None:
+        chain = _causal_mix_chain()
+        fused = fuse_causal_mix_chain(chain)
+        values = np.random.default_rng(65537).normal(size=(5, 7, 4)).astype(np.float64)
+        expected = values
+        for crystal in chain:
+            expected = crystal.apply(expected)
+        np.testing.assert_allclose(
+            fused.apply(values), expected, rtol=1e-15, atol=1e-15
+        )
+        kernel = _stored_float64_kernel(fused)
+        np.testing.assert_array_equal(np.triu(kernel, k=1), np.zeros_like(kernel))
+        np.testing.assert_allclose(kernel.sum(axis=1), np.ones(4), rtol=0.0, atol=1e-12)
+        self.assertEqual(fused, fuse_compatible_chain(chain))
+        self.assertEqual(fused.parent_sha256s, tuple(item.sha256 for item in chain))
+
+        with self.assertRaises(ComputeCrystalFusionError):
+            fuse_causal_mix_chain((chain[0],))
+        with self.assertRaises(ComputeCrystalFusionError):
+            fuse_compatible_chain(
+                (chain[0], ComputeCrystal.markov(np.eye(4, dtype=np.float64)))
+            )
 
 
 class ComputeCrystalBankAndVMTests(unittest.TestCase):
@@ -425,6 +586,83 @@ class ComputeCrystalBankAndVMTests(unittest.TestCase):
                 discharged.receipt.live_discharge_work,
                 23 * fused.discharge_work_units,
             )
+
+    def test_recursive_fusion_preserves_transitive_work_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = ComputeCrystalBank(Path(temporary) / "bank")
+            primitive = ComputeCrystal.affine([[1.0]], [1.0])
+            bank.publish_crystal(primitive)
+            current = primitive
+            final_sources: tuple[ComputeCrystal, ...] | None = None
+            for depth in range(1, 13):
+                final_sources = (current, primitive, current)
+                current = fuse_compatible_chain_with_provenance(
+                    final_sources,
+                    extensions={"word_depth": depth},
+                )
+                bank.publish_crystal(current)
+
+            self.assertIsNotNone(final_sources)
+            assert final_sources is not None
+            expanded_steps = 2**13 - 1
+            self.assertEqual(
+                equivalent_unfused_work_units(current),
+                expanded_steps * primitive.discharge_work_units,
+            )
+            self.assertEqual(len(bank.manifest().crystal_sha256s), 13)
+
+            source_program = ComputeProgram.compose(final_sources)
+            fused_program = ComputeProgram.compose((current,))
+            bank.publish_program(source_program)
+            bank.publish_program(fused_program)
+            charge = ComputeChargeReceipt.create(
+                source_program=source_program,
+                source_crystals=final_sources,
+                fused_crystal=current,
+                charge_verifier_sha256=_sha("recursive-word-charge-verifier"),
+                verification_receipt_sha256=_sha("recursive-word-exact-parity"),
+            )
+            bank.publish_charge(charge)
+
+            reopened = ComputeCrystalBank(Path(temporary) / "bank")
+            restored = reopened.restore_crystal(current.sha256)
+            self.assertEqual(restored, current)
+            execution = ComputeCrystalVM(reopened).execute(
+                fused_program.sha256,
+                np.array([3.0], dtype=np.float64),
+                charge_basis_sha256=charge.sha256,
+            )
+            np.testing.assert_array_equal(
+                execution.output,
+                np.array([3.0 + expanded_steps], dtype=np.float64),
+            )
+            self.assertEqual(
+                execution.receipt.equivalent_unfused_source_work,
+                expanded_steps * primitive.discharge_work_units,
+            )
+            self.assertEqual(
+                execution.receipt.historical_work_released,
+                expanded_steps * primitive.discharge_work_units
+                - current.discharge_work_units,
+            )
+
+            extensions = current.extensions
+            forged_record = dict(extensions[FUSION_WORK_PROVENANCE_EXTENSION])
+            forged_sources = list(forged_record["source_equivalent_work_units"])
+            forged_sources[0] += 1
+            forged_record["source_equivalent_work_units"] = forged_sources
+            forged_record["equivalent_unfused_source_work"] += 1
+            forged_record["historical_work_released"] += 1
+            extensions[FUSION_WORK_PROVENANCE_EXTENSION] = forged_record
+            forged = replace(
+                current,
+                extensions_json=canonical_json_bytes(extensions),
+            )
+            with self.assertRaisesRegex(
+                ComputeCrystalIntegrityError,
+                "provenance disagrees",
+            ):
+                bank.publish_crystal(forged)
 
     def test_identity_and_permutation_padding_cannot_mint_saved_work(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -543,6 +781,58 @@ class ComputeCrystalBankAndVMTests(unittest.TestCase):
                 execution.receipt.equivalent_unfused_source_work,
                 sum(crystal.discharge_work_units for crystal in chain),
             )
+            self.assertGreater(execution.receipt.historical_work_released, 0)
+
+    def test_causal_mix_bank_vm_and_charge_are_atomic_primitives(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = ComputeCrystalBank(Path(temporary) / "bank")
+            chain = _causal_mix_chain()
+            self._publish_chain(bank, chain)
+            fused = fuse_causal_mix_chain(chain)
+            bank.publish_crystal(fused)
+            source_program = ComputeProgram.compose(chain)
+            fused_program = ComputeProgram.compose((fused,))
+            bank.publish_program(source_program)
+            bank.publish_program(fused_program)
+            charge = ComputeChargeReceipt.create(
+                source_program=source_program,
+                source_crystals=chain,
+                fused_crystal=fused,
+                charge_verifier_sha256=_sha("causal-mix-charge-verifier"),
+                verification_receipt_sha256=_sha("causal-mix-verification-receipt"),
+            )
+            bank.publish_charge(charge)
+
+            reopened = ComputeCrystalBank(Path(temporary) / "bank")
+            self.assertEqual(reopened.restore_crystal(fused.sha256), fused)
+            self.assertEqual(
+                reopened.restore_program(fused_program.sha256), fused_program
+            )
+            self.assertEqual(reopened.restore_charge(charge.sha256), charge)
+            values = (
+                np.random.default_rng(144).normal(size=(2, 3, 4)).astype(np.float64)
+            )
+            expected = values
+            for crystal in chain:
+                expected = crystal.apply(expected)
+            execution = ComputeCrystalVM(reopened).execute(
+                fused_program.sha256,
+                values,
+                charge_basis_sha256=charge.sha256,
+            )
+            np.testing.assert_allclose(
+                execution.output, expected, rtol=1e-15, atol=1e-15
+            )
+            applications = 2 * 3
+            self.assertEqual(
+                execution.receipt.equivalent_unfused_source_work,
+                applications * sum(item.discharge_work_units for item in chain),
+            )
+            self.assertEqual(
+                execution.receipt.live_discharge_work,
+                applications * fused.discharge_work_units,
+            )
+            self.assertEqual(execution.receipt.charge_basis_sha256, charge.sha256)
             self.assertGreater(execution.receipt.historical_work_released, 0)
 
     def test_manifest_stale_cas_and_concurrent_append_are_safe(self) -> None:

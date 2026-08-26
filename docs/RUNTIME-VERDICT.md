@@ -14,12 +14,15 @@ execution planes:
    durable idle scheduler;
 3. replicated action-conditioned Markov world models, PS-Lifted consensus,
    hierarchical options, continuous reservoir memory, operator-demand
-   learning, contextual algebra selection, and novelty admission;
+   learning, contextual algebra selection, consequence-grounded executable
+   language, self-hosting word definitions, and novelty admission;
 4. generic stored computation through ComputeCrystals, an authenticated
    operator graph, contextual operator harvesting, Birkhoff atom bases,
    exact guarded affine monoids, algebraic crystallization, harvested-program
-   algebra routing, exact parallel-route choice, and demand-routed
-   charged-prefix residual discharge;
+   algebra routing, Qwen sublayer cartography, left-acting causal sequence
+   Crystals, prompt-preserving residual prediction, recursive word-DAG
+   compilation, transitive work accounting, exact parallel-route choice, and
+   demand-routed charged-prefix residual discharge;
 5. deterministic FERTIG/S3 capability execution and sealed ResultCells under
    final parity accounting;
 6. LiveCausal addressing and exact Safetensors range execution, with the
@@ -40,6 +43,17 @@ later requests.
 - The original Markov-OoE experiment reaches `96.10%` PS-Lifted accuracy and
   `100%` warm execution against `17.28%` local and `13.50%` shuffled-Crystal
   controls.
+- The consequence-grounded language scores `100%` on primitive grounding,
+  1,000 unseen programs, context-dependent meaning, held-out factor grammar,
+  option words, cultural transfer, and self-hosted macro execution across five
+  seeds. Shuffled semantics score `2.02%`, a fixed no-message policy `0.98%`,
+  no-action abstention `2.90%`, shuffled grammar `5.00%`, and the holistic
+  held-out table `0%`; every unassigned in-vocabulary word abstains.
+- The recursive executable word stores `36` references for `8,191` primitive
+  actions and compiles into one charged Crystal. Under the same authenticated
+  VM boundary it runs `8.380x` faster than the flat program, matches every
+  future-state result exactly, and releases `1,638,000` historical work units
+  against `200` live work units.
 - The action-conditioned world-model benchmark solves `250/250` unseen
   4–10-step tasks from 68 one-step observations. Across all 12 local replicas,
   local coverage solves `226/3,000 = 7.5333%`; the shuffled-action placebo
@@ -82,6 +96,16 @@ later requests.
   ComputePrograms and selects the correct contextual family on `174/180`
   decisions, including `60/60` late and `30/30` final decisions. Destroying the
   context signal yields `49/180`, `13/60` late, and `5/30` final.
+- `CAUSAL_MIX_FLOAT64` executes realized causal sequence kernels in Attention
+  orientation, preserves exact zero future mass, and fuses eight randomized
+  operators through dimension 32 with maximum delta `1.3323e-15`.
+- The prompt-preserving sequence instrument reaches holdout MSE
+  `6.726089e-05` against tuned pointwise `5.803816e-02`, a `862.881x` reduction,
+  while shuffled-token/output controls reach `3.1959/3.1541`. Its authority is
+  predictive-only and supplies O1 error/novelty evidence.
+- Each measured Qwen layer now emits five prompt-diverse transition families:
+  whole-layer, Attention core/residual, and MLP core/residual. Boundary capture
+  adds no checkpoint reads and cannot mutate model math.
 - O1 cartography now grows in place. Hash-chained frontier events add prompts,
   layers, sites, and interventions while the scheduler preserves every prior
   outcome, replay item, surprise history, and Atlas measurement. The idle
@@ -121,8 +145,8 @@ evidence surface for each result.
 |---|---|---|
 | local Qwen | `src/immer/runtimes/qwen3_8/` | authenticated causal mount, exact stateful inference, Prefix-Sinkhorn, anchors |
 | O1 and Atlas | `src/immer/runtimes/o1_state/`, `src/immer/runtimes/ooe/cartography.py` | persistent learning state, exact measurement identity, append-only revision membership |
-| Markov intelligence | `src/immer/runtimes/ooe/` | action-conditioned evidence, PS-Lifted fusion, planning, options, demand execution, contextual algebra routing, novelty, topology and regime receipts |
-| Stored operators | `compute_crystals.py`, `compute_graph.py`, `residual_execution.py`, `demand_execution.py`, `operator_harvester.py`, `harvest_algebra_bridge.py`, `bvn_search.py`, `bvn_crystals.py`, `affine_monoid.py`, `algebra_agents.py`, `algebraic_crystals.py` | real contextual discovery, typed unseen-input programs, persistent harvest-to-router admission, constructive atom bases, exact integer/modular recurrence, authenticated charge and feedback, exact route addressing, heterogeneous parallel execution, atomic persistence, exact accounting |
+| Markov intelligence | `src/immer/runtimes/ooe/` | action-conditioned evidence, PS-Lifted fusion, planning, options, demand execution, contextual algebra routing, consequence-grounded language, factor grammar, novelty, topology and regime receipts |
+| Stored operators | `compute_crystals.py`, `compute_graph.py`, `executable_lexicon.py`, `residual_execution.py`, `demand_execution.py`, `operator_harvester.py`, `harvest_algebra_bridge.py`, `contextual_sequence.py`, `bvn_search.py`, `bvn_crystals.py`, `affine_monoid.py`, `algebra_agents.py`, `algebraic_crystals.py` | real whole-layer/sublayer discovery, typed unseen-input and causal sequence programs, recursive compute words, transitive work provenance, predictive prompt-preserving residuals, persistent harvest-to-router admission, constructive atom bases, exact integer/modular recurrence, authenticated charge and feedback, exact route addressing, heterogeneous parallel execution, atomic persistence, exact accounting |
 | ResultCell | `result_cells.py` | one complete cold-result binding, zero-forward warm execution, final semantic and evaluator parity |
 | exact execution | `src/immer/cognition/` | S3/FERTIG verification, grounded fallback, explicit abstention |
 | LiveCausal | `src/immer/knowledge/livecausal.py` | immutable payloads, append-only causal graph, lazy exact queries, recovery |

@@ -15,7 +15,11 @@ from immer.runtimes.qwen3_8.draft_verification import (
     DRAFT_VERIFICATION_SCHEMA,
     Qwen38DraftVerifier,
 )
-from immer.runtimes.qwen3_8.model import Qwen38RuntimeError, StreamedQwen38
+from immer.runtimes.qwen3_8.model import (
+    LAYER_BOUNDARY_STAGES,
+    Qwen38RuntimeError,
+    StreamedQwen38,
+)
 from immer.runtimes.qwen3_8.kernels import AttentionState, DeltaNetState
 from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
 from immer.runtimes.qwen3_8.semantic_state_cache import SemanticStateAnchorCache
@@ -372,6 +376,81 @@ class Qwen38ModelTests(unittest.TestCase):
                 [getattr(row, name) for name in row.__dataclass_fields__]
             )
             self.assertTrue(torch.isfinite(values).all())
+
+    def test_layer_boundary_observer_is_ordered_and_cannot_mutate_math(self) -> None:
+        token_ids = torch.tensor([[1, 4, 9]])
+        baseline, _ = self.model.forward_prefill(token_ids)
+        records: list[tuple[int, str, tuple[int, ...]]] = []
+
+        def observer(layer: int, stage: str, value: torch.Tensor) -> None:
+            records.append((layer, stage, tuple(value.shape)))
+            value.fill_(float("nan"))
+
+        observed_model = StreamedQwen38(
+            self.config,
+            self.pager,
+            layer_boundary_observer=observer,
+            max_batch_size=3,
+            max_seq_len=32,
+        )
+        observed, _ = observed_model.forward_prefill(token_ids)
+
+        torch.testing.assert_close(observed, baseline, rtol=0.0, atol=0.0)
+        self.assertEqual(
+            len(records), self.config.n_layers * len(LAYER_BOUNDARY_STAGES)
+        )
+        for layer in range(self.config.n_layers):
+            layer_rows = records[
+                layer * len(LAYER_BOUNDARY_STAGES) : (layer + 1)
+                * len(LAYER_BOUNDARY_STAGES)
+            ]
+            self.assertEqual(
+                [stage for _layer, stage, _shape in layer_rows],
+                list(LAYER_BOUNDARY_STAGES),
+            )
+            self.assertTrue(all(row[0] == layer for row in layer_rows))
+            for _layer, stage, shape in layer_rows:
+                expected_width = (
+                    self.config.intermediate_size
+                    if stage in {"mlp.gate", "mlp.up", "mlp.activated"}
+                    else self.config.dim
+                )
+                self.assertEqual(shape, (1, 3, expected_width))
+        with self.assertRaisesRegex(TypeError, "layer_boundary_observer"):
+            StreamedQwen38(
+                self.config,
+                self.pager,
+                layer_boundary_observer=object(),  # type: ignore[arg-type]
+                max_seq_len=32,
+            )
+        filtered: list[tuple[int, str]] = []
+        filtered_model = StreamedQwen38(
+            self.config,
+            self.pager,
+            layer_boundary_observer=(
+                lambda layer, stage, _value: filtered.append((layer, stage))
+            ),
+            layer_boundary_stages=("attention.output", "mlp.output"),
+            max_batch_size=3,
+            max_seq_len=32,
+        )
+        filtered_model.forward_prefill(token_ids)
+        self.assertEqual(
+            filtered,
+            [
+                (layer, stage)
+                for layer in range(self.config.n_layers)
+                for stage in ("attention.output", "mlp.output")
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "duplicated"):
+            StreamedQwen38(
+                self.config,
+                self.pager,
+                layer_boundary_observer=lambda *_args: None,
+                layer_boundary_stages=("mlp.output", "mlp.output"),
+                max_seq_len=32,
+            )
 
     @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
     def test_deltanet_probe_reductions_run_from_mps_without_changing_output(

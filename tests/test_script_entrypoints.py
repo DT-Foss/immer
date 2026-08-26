@@ -25,6 +25,7 @@ SCRIPTS = (
     "qwen38_ooe_cold_warm_cohort.py",
     "qwen38_ooe_chat_cohort.py",
     "ooe_intelligence_benchmark.py",
+    "ooe_markov_language_benchmark.py",
 )
 FORBIDDEN_RESEARCH_IMPORTS = (
     "vendor/mitglm",

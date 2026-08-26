@@ -39,13 +39,22 @@ COMPUTE_RECEIPT_SCHEMA = "immer-ooe-compute-discharge/v1"
 COMPUTE_BANK_MANIFEST_SCHEMA = "immer-ooe-compute-bank-manifest/v1"
 COMPUTE_BANK_MANIFEST_STATE = "ooe-compute-crystal-bank-manifest/v1"
 COMPUTE_BANK_MANIFEST_COMMIT_SCHEMA = "immer-ooe-compute-bank-commit/v1"
+FUSION_WORK_PROVENANCE_SCHEMA = "immer-ooe-fusion-work-provenance/v1"
+FUSION_WORK_PROVENANCE_EXTENSION = "immer.fusion-work-provenance"
 
 AFFINE_FLOAT64 = "affine.float64/v1"
 PERMUTATION = "permutation/v1"
 LOOKUP_FLOAT64 = "lookup.float64/v1"
 MARKOV_FLOAT64 = "markov.float64/v1"
+CAUSAL_MIX_FLOAT64 = "causal-mix.float64/v1"
 OPERATOR_KINDS = frozenset(
-    (AFFINE_FLOAT64, PERMUTATION, LOOKUP_FLOAT64, MARKOV_FLOAT64)
+    (
+        AFFINE_FLOAT64,
+        PERMUTATION,
+        LOOKUP_FLOAT64,
+        MARKOV_FLOAT64,
+        CAUSAL_MIX_FLOAT64,
+    )
 )
 
 MAX_CRYSTAL_BYTES = 32 * 1024 * 1024
@@ -471,6 +480,31 @@ def _operator_contract(
         abi = NumericalABI(_FLOAT64, (dimension,))
         return abi, abi, work
 
+    if operator_kind == CAUSAL_MIX_FLOAT64:
+        if set(payload) != {"kernel"}:
+            raise ValueError("causal-mix payload fields are invalid")
+        kernel = _decode_array(
+            payload["kernel"],
+            dtype=_FLOAT64,
+            field="causal-mix.kernel",
+            allow_scalar=False,
+        )
+        if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+            raise ValueError("causal-mix kernel must be a square matrix")
+        if np.any(kernel < 0.0):
+            raise ValueError("causal-mix kernel must be non-negative")
+        dimension = int(kernel.shape[0])
+        if any(np.any(kernel[row, row + 1 :] != 0.0) for row in range(dimension)):
+            raise ValueError("causal-mix kernel must be exactly causal")
+        if not np.allclose(kernel.sum(axis=1), 1.0, rtol=0.0, atol=1e-12):
+            raise ValueError("causal-mix kernel rows must sum to one")
+        work = _checked_work(
+            dimension * (2 * dimension - 1),
+            field="causal-mix discharge work",
+        )
+        abi = NumericalABI(_FLOAT64, (dimension,))
+        return abi, abi, work
+
     raise ValueError("unsupported compute-crystal operator kind")
 
 
@@ -515,6 +549,15 @@ def _operator_arrays(crystal: "ComputeCrystal") -> tuple[NDArray[Any], ...]:
                 payload["kernel"],
                 dtype=_FLOAT64,
                 field="markov.kernel",
+                allow_scalar=False,
+            ),
+        )
+    if crystal.operator_kind == CAUSAL_MIX_FLOAT64:
+        return (
+            _decode_array(
+                payload["kernel"],
+                dtype=_FLOAT64,
+                field="causal-mix.kernel",
                 allow_scalar=False,
             ),
         )
@@ -578,6 +621,8 @@ class ComputeCrystal:
             raise ValueError("compute-crystal extensions must be a JSON object")
         if _canonical_extensions(extensions) != self.extensions_json:
             raise ValueError("compute-crystal extensions are not canonical")
+        if not parents and FUSION_WORK_PROVENANCE_EXTENSION in extensions:
+            raise ValueError("a primitive crystal cannot carry fusion-work provenance")
         object.__setattr__(self, "parent_sha256s", parents)
         object.__setattr__(self, "discharge_work_units", discharge)
 
@@ -681,6 +726,20 @@ class ComputeCrystal:
         transition = _canonical_float64(kernel, field="Markov kernel")
         return cls._from_operator(
             operator_kind=MARKOV_FLOAT64,
+            payload={"kernel": _array_document(transition, dtype=_FLOAT64)},
+            extensions=extensions,
+        )
+
+    @classmethod
+    def causal_mix(
+        cls,
+        kernel: object,
+        *,
+        extensions: Mapping[str, object] | None = None,
+    ) -> "ComputeCrystal":
+        transition = _canonical_float64(kernel, field="causal-mix kernel")
+        return cls._from_operator(
+            operator_kind=CAUSAL_MIX_FLOAT64,
             payload={"kernel": _array_document(transition, dtype=_FLOAT64)},
             extensions=extensions,
         )
@@ -814,6 +873,9 @@ class ComputeCrystal:
         elif self.operator_kind == MARKOV_FLOAT64:
             (kernel,) = operator
             output = np.einsum("...i,ij->...j", array, kernel, optimize=False)
+        elif self.operator_kind == CAUSAL_MIX_FLOAT64:
+            (kernel,) = operator
+            output = np.einsum("...k,qk->...q", array, kernel, optimize=False)
         else:
             raise AssertionError("validated operator kind changed")
         result = np.asarray(output)
@@ -960,6 +1022,149 @@ class ComputeProgram:
         return program
 
 
+def _fusion_work_record(
+    chain: Sequence[ComputeCrystal],
+    *,
+    live_work_units: int,
+) -> dict[str, object]:
+    sources = _validate_chain(chain)
+    source_work_units = tuple(
+        _provenance_source_work_units(crystal) for crystal in sources
+    )
+    equivalent = 0
+    for work in source_work_units:
+        equivalent = _checked_add(
+            equivalent,
+            work,
+            field="fusion equivalent source work",
+        )
+    live = _bounded_uint(
+        live_work_units,
+        field="fusion live discharge work",
+        positive=True,
+    )
+    return {
+        "equivalent_unfused_source_work": equivalent,
+        "format": FUSION_WORK_PROVENANCE_SCHEMA,
+        "historical_work_released": max(0, equivalent - live),
+        "live_discharge_work": live,
+        "source_crystal_sha256s": [crystal.sha256 for crystal in sources],
+        "source_equivalent_work_units": list(source_work_units),
+    }
+
+
+def fusion_work_provenance(crystal: ComputeCrystal) -> dict[str, object] | None:
+    """Return sealed transitive fusion-work metadata when it is present.
+
+    Legacy fused crystals without this optional extension retain their original
+    immediate-parent accounting.  Fusion and bank-lineage reconstruction derive
+    this record again from the direct parents before a charge can be published.
+    """
+
+    if not isinstance(crystal, ComputeCrystal):
+        raise TypeError("crystal must be a ComputeCrystal")
+    record = crystal.extensions.get(FUSION_WORK_PROVENANCE_EXTENSION)
+    if record is None:
+        return None
+    if not crystal.parent_sha256s:
+        raise ComputeCrystalIntegrityError(
+            "a primitive crystal cannot claim fusion-work provenance"
+        )
+    if not isinstance(record, Mapping):
+        raise ComputeCrystalIntegrityError(
+            "fusion-work provenance must be a JSON object"
+        )
+    expected_fields = {
+        "equivalent_unfused_source_work",
+        "format",
+        "historical_work_released",
+        "live_discharge_work",
+        "source_crystal_sha256s",
+        "source_equivalent_work_units",
+    }
+    if set(record) != expected_fields or record.get("format") != (
+        FUSION_WORK_PROVENANCE_SCHEMA
+    ):
+        raise ComputeCrystalIntegrityError("fusion-work provenance fields are invalid")
+    sources = record.get("source_crystal_sha256s")
+    work_units = record.get("source_equivalent_work_units")
+    if not isinstance(sources, list) or not isinstance(work_units, list):
+        raise ComputeCrystalIntegrityError(
+            "fusion-work provenance source inventory is invalid"
+        )
+    try:
+        normalized_sources = tuple(
+            require_sha256(value, field="fusion source crystal") for value in sources
+        )
+        normalized_work = tuple(
+            _bounded_uint(value, field="fusion source work", positive=True)
+            for value in work_units
+        )
+        equivalent = _bounded_uint(
+            record.get("equivalent_unfused_source_work"),
+            field="fusion equivalent source work",
+            positive=True,
+        )
+        live = _bounded_uint(
+            record.get("live_discharge_work"),
+            field="fusion live discharge work",
+            positive=True,
+        )
+        released = _bounded_uint(
+            record.get("historical_work_released"),
+            field="fusion historical work released",
+        )
+    except (TypeError, ValueError) as exc:
+        raise ComputeCrystalIntegrityError(
+            "fusion-work provenance values are invalid"
+        ) from exc
+    if (
+        normalized_sources != crystal.parent_sha256s
+        or len(normalized_work) != len(normalized_sources)
+        or equivalent != sum(normalized_work)
+        or live != crystal.discharge_work_units
+        or released != max(0, equivalent - live)
+    ):
+        raise ComputeCrystalIntegrityError(
+            "fusion-work provenance disagrees with the crystal"
+        )
+    return dict(record)
+
+
+def equivalent_unfused_work_units(crystal: ComputeCrystal) -> int:
+    """Return the sealed source-work total represented by one crystal."""
+
+    record = fusion_work_provenance(crystal)
+    if record is None:
+        return crystal.discharge_work_units
+    return cast(int, record["equivalent_unfused_source_work"])
+
+
+def _provenance_source_work_units(crystal: ComputeCrystal) -> int:
+    if crystal.is_fused and fusion_work_provenance(crystal) is None:
+        raise ComputeCrystalFusionError(
+            "legacy fused source lacks transitive work provenance"
+        )
+    return equivalent_unfused_work_units(crystal)
+
+
+def _validate_fusion_work_provenance(
+    result: ComputeCrystal,
+    chain: Sequence[ComputeCrystal],
+) -> None:
+    record = fusion_work_provenance(result)
+    if record is None:
+        return
+    expected = _fusion_work_record(
+        chain,
+        live_work_units=result.discharge_work_units,
+    )
+    if record != expected:
+        raise ComputeCrystalIntegrityError(
+            "fusion-work provenance disagrees with its direct source chain"
+        )
+
+
 def fuse_affine_chain(
     crystals: Sequence[ComputeCrystal],
     *,
@@ -985,12 +1190,14 @@ def fuse_affine_chain(
         "bias": _array_document(bias, dtype=_FLOAT64),
         "matrix": _array_document(matrix, dtype=_FLOAT64),
     }
-    return ComputeCrystal._from_operator(
+    result = ComputeCrystal._from_operator(
         operator_kind=AFFINE_FLOAT64,
         payload=payload,
         parents=chain,
         extensions=extensions,
     )
+    _validate_fusion_work_provenance(result, chain)
+    return result
 
 
 def fuse_permutation_chain(
@@ -1012,12 +1219,14 @@ def fuse_permutation_chain(
         "dtype": chain[0].input_abi.dtype,
         "indices": _array_document(indices, dtype=_INT64),
     }
-    return ComputeCrystal._from_operator(
+    result = ComputeCrystal._from_operator(
         operator_kind=PERMUTATION,
         payload=payload,
         parents=chain,
         extensions=extensions,
     )
+    _validate_fusion_work_provenance(result, chain)
+    return result
 
 
 def fuse_markov_chain(
@@ -1037,12 +1246,45 @@ def fuse_markov_chain(
         kernel = np.einsum("ij,jk->ik", kernel, following, optimize=False)
     kernel[kernel == 0.0] = 0.0
     payload = {"kernel": _array_document(kernel, dtype=_FLOAT64)}
-    return ComputeCrystal._from_operator(
+    result = ComputeCrystal._from_operator(
         operator_kind=MARKOV_FLOAT64,
         payload=payload,
         parents=chain,
         extensions=extensions,
     )
+    _validate_fusion_work_provenance(result, chain)
+    return result
+
+
+def fuse_causal_mix_chain(
+    crystals: Sequence[ComputeCrystal],
+    *,
+    extensions: Mapping[str, object] | None = None,
+) -> ComputeCrystal:
+    chain = _validate_chain(crystals)
+    if len(chain) < 2 or any(
+        crystal.operator_kind != CAUSAL_MIX_FLOAT64 for crystal in chain
+    ):
+        raise ComputeCrystalFusionError(
+            "causal-mix fusion needs two or more causal kernels"
+        )
+    (first,) = _operator_arrays(chain[0])
+    kernel = np.array(first, dtype=np.float64, copy=True)
+    for crystal in chain[1:]:
+        (following,) = _operator_arrays(crystal)
+        kernel = np.einsum("qj,jk->qk", following, kernel, optimize=False)
+        for row in range(kernel.shape[0]):
+            kernel[row, row + 1 :] = 0.0
+    kernel[kernel == 0.0] = 0.0
+    payload = {"kernel": _array_document(kernel, dtype=_FLOAT64)}
+    result = ComputeCrystal._from_operator(
+        operator_kind=CAUSAL_MIX_FLOAT64,
+        payload=payload,
+        parents=chain,
+        extensions=extensions,
+    )
+    _validate_fusion_work_provenance(result, chain)
+    return result
 
 
 def fuse_compatible_chain(
@@ -1058,9 +1300,37 @@ def fuse_compatible_chain(
         return fuse_permutation_chain(chain, extensions=extensions)
     if kinds == {MARKOV_FLOAT64}:
         return fuse_markov_chain(chain, extensions=extensions)
+    if kinds == {CAUSAL_MIX_FLOAT64}:
+        return fuse_causal_mix_chain(chain, extensions=extensions)
     raise ComputeCrystalFusionError(
-        "only homogeneous affine, permutation, or Markov chains are fusible"
+        "only homogeneous affine, permutation, Markov, or causal-mix chains are fusible"
     )
+
+
+def fuse_compatible_chain_with_provenance(
+    crystals: Sequence[ComputeCrystal],
+    *,
+    extensions: Mapping[str, object] | None = None,
+) -> ComputeCrystal:
+    """Fuse a chain and bind its complete transitive work representation.
+
+    This opt-in path preserves byte compatibility for existing crystals.  New
+    recursive compilers use it so a compact DAG does not lose the amount of
+    primitive work represented by already-fused child nodes.
+    """
+
+    chain = _validate_chain(crystals)
+    document = {} if extensions is None else dict(extensions)
+    if FUSION_WORK_PROVENANCE_EXTENSION in document:
+        raise ValueError(
+            f"{FUSION_WORK_PROVENANCE_EXTENSION!r} is a reserved extension"
+        )
+    preliminary = fuse_compatible_chain(chain, extensions=document)
+    document[FUSION_WORK_PROVENANCE_EXTENSION] = _fusion_work_record(
+        chain,
+        live_work_units=preliminary.discharge_work_units,
+    )
+    return fuse_compatible_chain(chain, extensions=document)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1164,7 +1434,7 @@ class ComputeChargeReceipt:
         for crystal in chain:
             source_work = _checked_add(
                 source_work,
-                crystal.discharge_work_units,
+                _provenance_source_work_units(crystal),
                 field="charged source work",
             )
         return cls(
@@ -2021,6 +2291,26 @@ class ComputeCrystalBank:
         """Return the head digest that callers persist outside this store."""
 
         return self.manifest().sha256
+
+    def assert_descends_from(self, manifest_sha256: str) -> str:
+        """Verify one external manifest anchor against the current history."""
+
+        anchor = require_sha256(manifest_sha256, field="manifest_sha256")
+        with self._locked():
+            head = self._manifest_unlocked()
+            if anchor == ComputeBankManifest.empty().sha256:
+                return head.sha256
+            histories, commits = self._history_inventory_unlocked()
+            ancestor = histories.get(anchor)
+            if (
+                ancestor is None
+                or anchor not in commits
+                or ancestor.generation > head.generation
+            ):
+                raise ComputeCrystalIntegrityError(
+                    "compute bank does not descend from the supplied manifest anchor"
+                )
+            return head.sha256
 
     @staticmethod
     def _check_expected_generation(

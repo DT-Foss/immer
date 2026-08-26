@@ -9,7 +9,7 @@ path.  MTP can later draft tokens, but it must never alter base-model parity.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, is_dataclass, replace
 import hashlib
 import json
@@ -45,6 +45,21 @@ from .snapshot import (
 
 class Qwen38RuntimeError(RuntimeError):
     """The streamed checkpoint violates the executable text-model contract."""
+
+
+LAYER_BOUNDARY_STAGES = (
+    "layer.input",
+    "attention.input",
+    "attention.output",
+    "attention.residual",
+    "mlp.input",
+    "mlp.gate",
+    "mlp.up",
+    "mlp.activated",
+    "mlp.output",
+    "layer.output",
+)
+LayerBoundaryObserver = Callable[[int, str, torch.Tensor], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +209,8 @@ class StreamedQwen38:
         native_head_crsa: Qwen38NativeHeadCrsa | None = None,
         native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None]
         | None = None,
+        layer_boundary_observer: LayerBoundaryObserver | None = None,
+        layer_boundary_stages: Sequence[str] | None = None,
         max_batch_size: int = 8,
         max_seq_len: int = 4096,
     ) -> None:
@@ -229,6 +246,25 @@ class StreamedQwen38:
             raise ValueError("an active graft requires graft_layer")
         if delta_probe is not None and not callable(delta_probe):
             raise TypeError("delta_probe must be callable")
+        if layer_boundary_observer is not None and not callable(
+            layer_boundary_observer
+        ):
+            raise TypeError("layer_boundary_observer must be callable or None")
+        if layer_boundary_observer is None and layer_boundary_stages is not None:
+            raise ValueError("layer_boundary_stages require a layer_boundary_observer")
+        selected_boundary_stages = (
+            ()
+            if layer_boundary_observer is None
+            else (
+                LAYER_BOUNDARY_STAGES
+                if layer_boundary_stages is None
+                else tuple(layer_boundary_stages)
+            )
+        )
+        if len(set(selected_boundary_stages)) != len(selected_boundary_stages) or any(
+            stage not in LAYER_BOUNDARY_STAGES for stage in selected_boundary_stages
+        ):
+            raise ValueError("layer_boundary_stages are invalid or duplicated")
         if native_head_crsa is not None and not isinstance(
             native_head_crsa, Qwen38NativeHeadCrsa
         ):
@@ -264,6 +300,8 @@ class StreamedQwen38:
         self.delta_probe = delta_probe
         self.native_head_crsa = native_head_crsa
         self.native_head_crsa_observer = native_head_crsa_observer
+        self.layer_boundary_observer = layer_boundary_observer
+        self.layer_boundary_stages = tuple(selected_boundary_stages)
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self._layer_states: list[LayerState | None] = [
@@ -1052,6 +1090,19 @@ class StreamedQwen38:
     ) -> torch.Tensor:
         return self.pager.tensor_torch(name, dtype=dtype, device=self.pager.device)
 
+    def _observe_layer_boundary(
+        self,
+        layer: int,
+        stage: str,
+        value: torch.Tensor,
+    ) -> None:
+        observer = self.layer_boundary_observer
+        if observer is None or stage not in self.layer_boundary_stages:
+            return
+        if stage not in LAYER_BOUNDARY_STAGES:
+            raise Qwen38RuntimeError("layer boundary stage is not registered")
+        observer(layer, stage, value.detach().clone())
+
     def _norm(self, hidden: torch.Tensor, name: str) -> torch.Tensor:
         weight = self._control(name)
         try:
@@ -1178,12 +1229,17 @@ class StreamedQwen38:
     def _mlp(self, hidden: torch.Tensor, *, layer: int) -> torch.Tensor:
         base = f"model.language_model.layers.{layer}.mlp"
         gate = self.pager.linear(hidden, f"{base}.gate_proj")
+        self._observe_layer_boundary(layer, "mlp.gate", gate)
         up = self.pager.linear(hidden, f"{base}.up_proj")
+        self._observe_layer_boundary(layer, "mlp.up", up)
         try:
             activated = swiglu(gate, up)
+            self._observe_layer_boundary(layer, "mlp.activated", activated)
         finally:
             del gate, up
-        return self.pager.linear(activated, f"{base}.down_proj")
+        output = self.pager.linear(activated, f"{base}.down_proj")
+        self._observe_layer_boundary(layer, "mlp.output", output)
+        return output
 
     def _linear_token_rows(
         self,
@@ -1520,7 +1576,9 @@ class StreamedQwen38:
 
         prefix = f"model.language_model.layers.{layer}"
         residual = hidden
+        self._observe_layer_boundary(layer, "layer.input", residual)
         mixed_input = self._norm(hidden, f"{prefix}.input_layernorm.weight")
+        self._observe_layer_boundary(layer, "attention.input", mixed_input)
         if self.config.is_full_attention(layer):
             if state is not None and not isinstance(state, AttentionState):
                 raise Qwen38RuntimeError("full-attention layer received DeltaNet state")
@@ -1542,7 +1600,9 @@ class StreamedQwen38:
                 token_mask=token_mask,
                 state=state,
             )
+        self._observe_layer_boundary(layer, "attention.output", mixed)
         hidden = residual + mixed
+        self._observe_layer_boundary(layer, "attention.residual", hidden)
         retained_state: LayerState | None = next_state
         if not stateful:
             retained_state = None
@@ -1550,7 +1610,9 @@ class StreamedQwen38:
 
         residual = hidden
         mlp_input = self._norm(hidden, f"{prefix}.post_attention_layernorm.weight")
+        self._observe_layer_boundary(layer, "mlp.input", mlp_input)
         hidden = residual + self._mlp(mlp_input, layer=layer)
+        self._observe_layer_boundary(layer, "layer.output", hidden)
         return hidden, retained_state
 
     def forward_prefill_layer(
@@ -1643,6 +1705,12 @@ class StreamedQwen38:
                 "delta_probe": None
                 if self.delta_probe is None
                 else id(self.delta_probe),
+                "layer_boundary_observer": (
+                    None
+                    if self.layer_boundary_observer is None
+                    else id(self.layer_boundary_observer)
+                ),
+                "layer_boundary_stages": list(self.layer_boundary_stages),
                 "graft": self._graft_snapshot_identity(),
                 "native_head_crsa": native,
             }
@@ -3034,6 +3102,8 @@ class StreamedQwen38:
 
 __all__ = [
     "GenerationEvidence",
+    "LAYER_BOUNDARY_STAGES",
+    "LayerBoundaryObserver",
     "PrefillEvidence",
     "Qwen38RuntimeError",
     "StatefulEvidence",

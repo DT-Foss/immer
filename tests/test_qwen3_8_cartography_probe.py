@@ -216,18 +216,33 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
             first,
             atlas_revision=atlas.revision(),
         )
-        self.assertEqual(len(contextual), 2)
+        self.assertEqual(len(contextual), 10)
         self.assertTrue(
             all(
                 row.receipt.emitter_sha256 == QWEN_CONTEXT_EMITTER_SHA256
                 for row in contextual
             )
         )
+        self.assertEqual(
+            {row.receipt.source_state for row in contextual},
+            {
+                "qwen.layer.0.pre-hidden-sketch",
+                "qwen.layer.0.attention.input-sketch",
+                "qwen.layer.0.layer.input-sketch",
+                "qwen.layer.0.mlp.input-sketch",
+                "qwen.layer.0.attention.residual-sketch",
+                "qwen.layer.1.pre-hidden-sketch",
+                "qwen.layer.1.attention.input-sketch",
+                "qwen.layer.1.layer.input-sketch",
+                "qwen.layer.1.mlp.input-sketch",
+                "qwen.layer.1.attention.residual-sketch",
+            },
+        )
         cursor = probe_result_context_cursor(first.measurement, atlas.revision())
         page = SingleBatchContextualProvider(
             cursor=cursor,
             observations=contextual,
-        ).poll(after_cursor=None, limit=2)
+        ).poll(after_cursor=None, limit=10)
         self.assertEqual(page.next_cursor, cursor)
         self.assertEqual(page.observations, contextual)
         provider = SingleBatchContextualProvider(
@@ -278,6 +293,8 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
         self.assertIsNone(first.measurement.observed_semantic_label)
         self.assertEqual(len(first.contextual_hidden_transitions), 2)
         self.assertEqual(len(second.contextual_hidden_transitions), 2)
+        self.assertEqual(len(first.contextual_boundary_sketches), 10)
+        self.assertEqual(len(second.contextual_boundary_sketches), 10)
         for left, right in zip(
             first.contextual_hidden_transitions,
             second.contextual_hidden_transitions,
@@ -291,6 +308,14 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
             self.assertFalse(left.post_array.flags.writeable)
             with self.assertRaises(ValueError):
                 left.pre_array[0, 0] = 0.0
+        for left, right in zip(
+            first.contextual_boundary_sketches,
+            second.contextual_boundary_sketches,
+            strict=True,
+        ):
+            self.assertEqual((left.layer, left.stage), (right.layer, right.stage))
+            np.testing.assert_array_equal(left.array, right.array)
+            self.assertFalse(left.array.flags.writeable)
         self.assertEqual(_committed_state(self.model), before)
         first.verify()
         second.verify()
@@ -345,7 +370,7 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
             config=HarvesterConfig(
                 minimum_observations=3,
                 minimum_fit_rows=4,
-                max_observations_per_step=16,
+                max_observations_per_step=64,
                 max_samples_per_group=16,
                 max_groups=16,
                 max_recent_receipts=32,
@@ -353,14 +378,16 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
             ),
         )
 
-        harvested = harvester.step(limit=16)
+        harvested = harvester.step(limit=64)
 
-        self.assertEqual(harvested.accepted_observations, 8)
+        self.assertEqual(harvested.accepted_observations, 40)
         state = harvester.state()
-        self.assertEqual(len(state.groups), 2)
+        self.assertEqual(len(state.groups), 10)
         for _group_sha, rows in state.groups:
             self.assertEqual(len(rows), 4)
-            self.assertEqual(len({row.receipt.runtime_family_sha256 for row in rows}), 1)
+            self.assertEqual(
+                len({row.receipt.runtime_family_sha256 for row in rows}), 1
+            )
             self.assertEqual(len({row.receipt.runtime_sha256 for row in rows}), 4)
 
     def test_passive_external_label_is_recorded_and_evidence_bound(self) -> None:

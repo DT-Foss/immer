@@ -86,7 +86,7 @@ IDLE_STATE_NAME = "idle-state.json"
 OOE_NAME = "ooe"
 OPERATOR_COMPUTE_NAME = "operator-compute"
 OPERATOR_ALGEBRA_ROUTER_NAME = "qwen-contextual-operators"
-OPERATOR_ALGEBRA_BIN_COUNTS = (3, 16, 2)
+OPERATOR_ALGEBRA_BIN_COUNTS = (4, 16, 2)
 OPERATOR_ALGEBRA_OBJECTIVE_COUNT = 4
 OPERATOR_ALGEBRA_ROUTER_SEED_SHA256 = hashlib.sha256(
     b"immer:qwen-contextual-operator-router/v1"

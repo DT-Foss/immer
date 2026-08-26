@@ -29,6 +29,7 @@ from .algebra_agents import (
 )
 from .compute_crystals import (
     AFFINE_FLOAT64,
+    CAUSAL_MIX_FLOAT64,
     MARKOV_FLOAT64,
     PERMUTATION,
     ComputeBankPublication,
@@ -63,6 +64,7 @@ _KIND_INDEX = {
     AFFINE_FLOAT64: 0,
     PERMUTATION: 1,
     MARKOV_FLOAT64: 2,
+    CAUSAL_MIX_FLOAT64: 3,
 }
 
 

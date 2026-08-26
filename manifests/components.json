@@ -38,8 +38,12 @@
         "src/immer/runtimes/ooe/affine_monoid.py",
         "src/immer/runtimes/ooe/algebra_agents.py",
         "src/immer/runtimes/ooe/harvest_algebra_bridge.py",
-        "src/immer/runtimes/ooe/harvest_algebra_intelligence.py"
-      ]
+                "src/immer/runtimes/ooe/harvest_algebra_intelligence.py",
+                "src/immer/runtimes/ooe/contextual_sequence.py",
+                "src/immer/runtimes/ooe/markov_language.py",
+                "src/immer/runtimes/ooe/executable_lexicon.py",
+                "scripts/ooe_markov_language_benchmark.py"
+            ]
     },
     {
       "name": "Qwen compute battery",

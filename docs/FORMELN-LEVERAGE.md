@@ -86,7 +86,75 @@ and selects the candidate with the largest measured lifted spectral gap on
 bounded graphs. The fixed-\(p_c\) barbell needs 96 rounds in the current trial;
 self-calibration needs 58, while the complete topology needs 28.
 
-## 4. Continuous PS-Lifted reservoir
+## 4. Consequence-grounded executable language
+
+The sender and receiver retain separate policies:
+
+\[
+Q_S(a,w),
+\qquad
+Q_R^{G}(w,a),
+\qquad
+Q_R^{c}(c,w,a).
+\]
+
+The receiver sees only the opaque word \(w\) and authenticated context \(c\).
+For local context visit count \(n_{c,w}\), its action score is
+
+\[
+\lambda_{c,w}=\min\!\left(1,\frac{n_{c,w}}{n_{\mathrm{full}}}\right),
+\qquad
+s(c,w,a)=(1-\lambda_{c,w})Q_R^G(w,a)
++\lambda_{c,w}Q_R^c(c,w,a).
+\]
+
+After the verifier returns scalar consequence \(r\), only the cells selected
+by the sender and receiver update:
+
+\[
+Q\leftarrow Q+\alpha(r-Q).
+\]
+
+The receiver update contains no intent, target action, target state, or
+semantic label. A word executes only when visit count, winning value, and
+top-two margin all pass their gates. Shared evidence transfers stable meaning
+into unseen contexts; the context residual learns a different action when the
+same word has a different consequence in another state.
+
+For a factorized message with slots \((w_1,\ldots,w_k)\), each slot owns its
+sender and receiver tables. One whole-action consequence updates every selected
+slot cell. Holding out Cartesian action tuples therefore tests recombination of
+the learned factors rather than lookup of complete messages.
+
+Executable definitions form a DAG:
+
+\[
+W_{d+1}=W_d\;b_d\;W_d,
+\qquad
+L_{d+1}=2L_d+1,
+\qquad
+L_d=2^{d+1}-1.
+\]
+
+Each level stores three direct references. Bottom-up Crystal fusion evaluates
+every distinct DAG node once, preserves repeated parent hashes, and emits one
+operator for the root. Transitive work provenance obeys
+
+\[
+E(K)=
+\begin{cases}
+W_{\mathrm{live}}(K), & K\text{ primitive},\\
+\sum_i E(K_i), & K=K_m\circ\cdots\circ K_1
+\text{ with provenance}.
+\end{cases}
+\]
+
+The depth-12 trial binds 8,191 primitive actions to 36 references, releases
+1,638,000 historical work units across 25 future states, performs 200 live work
+units, and measures an 8.380x flat-versus-compiled speedup under the same
+authenticated VM boundary.
+
+## 5. Continuous PS-Lifted reservoir
 
 The fixed lifted recurrence carries temporal state:
 
@@ -100,7 +168,7 @@ PS-Lifted consensus fuses those statistics, then solves one readout. The
 delayed-state benchmark reaches 90.8359% fused accuracy against 50.4532%
 with zero state and 54.2800% under circularly shuffled temporal labels.
 
-## 5. Algebraic crystallization
+## 6. Algebraic crystallization
 
 Algebraic Crystals fit the coordinate system in which a family composes:
 
@@ -117,7 +185,7 @@ accumulator performs exact long composition. Additive, multiplicative, and
 \(\mathbb Z_3\) families all execute length 12 exactly in the fixed trial; the
 permuted placebo is rejected.
 
-## 6. Authenticated stored compute
+## 7. Authenticated stored compute
 
 A compute battery moves already-performed work across time. Its stored unit can
 be a final result, continuation state, operator, factorization, route, prefix,
@@ -320,6 +388,64 @@ F(x_1,\ldots,x_m)=
 with independent ABIs and one receipt joining the lane proofs. No sequential
 ABI is asserted.
 
+### Prompt-preserving residual substrate
+
+Whole-layer point fits discard the exact variable a causal model needs: token
+order inside each prompt. The sequence instrument keeps every prompt separate
+and predicts the residual
+
+\[
+\Delta_{p,t}=Y_{p,t}-X_{p,t}.
+\]
+
+After per-token RMS normalization, each fixed timescale advances
+
+\[
+r^{(\eta)}_{p,t}=(1-\eta)r^{(\eta)}_{p,t-1}
++\eta\tanh\!\left(W_r r^{(\eta)}_{p,t-1}+W_{in}\bar X_{p,t}\right).
+\]
+
+The readout features are
+
+\[
+\psi_{p,t}=\left[1,\bar X_{p,t},r^{(\eta_1)}_{p,t},\ldots,
+r^{(\eta_m)}_{p,t},(r^{(\eta_1)}_{p,t})^{\odot2},\ldots\right],
+\]
+
+and ridge solves
+
+\[
+C=(\Psi^\top\Psi+\lambda I)^{-1}\Psi^\top\Delta,
+\qquad \widehat Y=X+\Psi C.
+\]
+
+Recurrence resets at each prompt. Earlier prompts fit \(C\), one later prompt
+selects feature semantics and \(\lambda\), and the final prompt is opened only
+by the holdout evaluator. Raw X/Y content identity blocks the same sequence
+from re-entering under renamed prompt/evidence hashes. The fixed synthetic
+trial reaches MSE \(6.726089\times10^{-5}\) against tuned pointwise
+\(5.803816\times10^{-2}\); token/output placebos reach \(3.1959/3.1541\).
+
+### Left-acting causal sequence Crystals
+
+For a realized causal kernel \(K\in\mathbb R^{T\times T}\),
+
+\[
+K_{qk}=0\quad(k>q),\qquad K\mathbf1=\mathbf1,
+\qquad Y_{\ldots q}=\sum_k K_{qk}V_{\ldots k}.
+\]
+
+`CAUSAL_MIX_FLOAT64` fixes \(T\) as the final ABI axis and leaves batch, head,
+and value-channel axes as independent applications. Two stored sequence
+operators compose in execution order:
+
+\[
+K_{2\circ1}=K_2K_1.
+\]
+
+This is the native orientation of Attention value mixing. Its verifier and
+work receipt are separate from Markov row-vector probability transport.
+
 ### Harvested-program routing
 
 A contextual discovery becomes a routed program only after an exact bridge:
@@ -359,7 +485,7 @@ y=\operatorname{dischargeExact}(r,x).
 Canonical cost planning remains available; exact discharge preserves an
 algebra agent's explicit alternative.
 
-## 7. Novelty and structured kernels
+## 8. Novelty and structured kernels
 
 For site patterns \(X\), query \(q\), and inverse temperature \(\beta\), the
 novelty gate uses
@@ -389,7 +515,7 @@ The proposal priority multiplies novelty by confidence and applies the direct
 edge penalty only when the edge already exists. In the fixed barbell trial the
 best missing bridge scores 0.409362; the best existing edge scores 0.120790.
 
-## 8. Causal weight addressing
+## 9. Causal weight addressing
 
 Let \(x=(m,\ell,e)\) identify logical model \(m\), layer \(\ell\), and expert
 \(e\). Let \(L\) identify one exact Safetensors layout. The causal reader
@@ -403,7 +529,7 @@ where each tuple names a shard, absolute offset, and byte length. The layout
 identity makes \(R_L\) fail closed under checkpoint drift. Live append extends
 the address map while the tensor body stays immutable.
 
-## 9. Exact capability projection
+## 10. Exact capability projection
 
 The frozen host routes an input state \(h\) into a small capability bank:
 

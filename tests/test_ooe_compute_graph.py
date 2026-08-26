@@ -13,11 +13,13 @@ from unittest import mock
 import numpy as np
 
 from immer.runtimes.ooe.compute_crystals import (
+    CAUSAL_MIX_FLOAT64,
     ComputeCrystal,
     ComputeCrystalABIError,
     ComputeCrystalBank,
 )
 from immer.runtimes.ooe.compute_graph import (
+    CAUSAL_MIX_FUSION_VERIFIER_SHA256,
     OPERATOR_GRAPH_COMMIT_PREFIX,
     OPERATOR_GRAPH_STATE_NAME,
     ComputeOperatorGraph,
@@ -112,6 +114,73 @@ class ComputeOperatorGraphTests(unittest.TestCase):
         self.assertEqual(ComputeRoutePlan.from_bytes(plan.to_bytes()), plan)
         # No multi-step evidence can exist: the world contains exactly four events.
         self.assertEqual(self.graph.build_world_model().total_events, 4)
+
+    def test_causal_mix_route_fuses_and_charges_without_markov_ledger(self) -> None:
+        kernels = (
+            np.array(
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.7, 0.3, 0.0, 0.0],
+                    [0.2, 0.5, 0.3, 0.0],
+                    [0.1, 0.2, 0.3, 0.4],
+                ],
+                dtype=np.float64,
+            ),
+            np.array(
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.4, 0.6, 0.0, 0.0],
+                    [0.1, 0.2, 0.7, 0.0],
+                    [0.25, 0.25, 0.25, 0.25],
+                ],
+                dtype=np.float64,
+            ),
+            np.array(
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.8, 0.2, 0.0, 0.0],
+                    [0.4, 0.2, 0.4, 0.0],
+                    [0.1, 0.3, 0.2, 0.4],
+                ],
+                dtype=np.float64,
+            ),
+        )
+        crystals = tuple(ComputeCrystal.causal_mix(kernel) for kernel in kernels)
+        self._publish_edges(crystals, ("p0", "p1", "p2", "p3"))
+        decision = self.graph.plan_route("p0", "p3")
+        assert decision.plan is not None
+        charged = self.graph.charge_route(decision.plan)
+
+        self.assertEqual(
+            charged.route.charge_verifier_sha256,
+            CAUSAL_MIX_FUSION_VERIFIER_SHA256,
+        )
+        self.assertIsNone(charged.route.contraction_ledger)
+        assert charged.route.fused_crystal_sha256 is not None
+        fused = self.bank.restore_crystal(charged.route.fused_crystal_sha256)
+        self.assertEqual(fused.operator_kind, CAUSAL_MIX_FLOAT64)
+        values = (
+            np.random.default_rng(20260826).normal(size=(2, 3, 4)).astype(np.float64)
+        )
+        expected = values
+        for crystal in crystals:
+            expected = crystal.apply(expected)
+        discharged = self.graph.discharge_exact(charged.route.sha256, values)
+        np.testing.assert_allclose(
+            discharged.output,
+            expected,
+            rtol=1e-15,
+            atol=1e-15,
+        )
+        self.assertGreater(discharged.receipt.historical_work_released, 0)
+        reopened = ComputeOperatorGraph(ComputeCrystalBank(self.temporary.name))
+        self.assertEqual(reopened.state(), self.graph.state())
+        np.testing.assert_allclose(
+            reopened.discharge_exact(charged.route.sha256, values).output,
+            expected,
+            rtol=1e-15,
+            atol=1e-15,
+        )
 
     def test_exact_path_selects_requested_parallel_edge_and_charges_roundtrip(
         self,

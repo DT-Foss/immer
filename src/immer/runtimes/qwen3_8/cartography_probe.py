@@ -28,7 +28,7 @@ from immer.knowledge import AccessTrace, AccessTraceRecorder
 
 from .bundle import QWEN38_BUNDLE_SCHEMA
 from .kernels import AttentionState, DeltaNetProbe, DeltaNetState
-from .model import LayerState, StreamedQwen38
+from .model import LAYER_BOUNDARY_STAGES, LayerState, StreamedQwen38
 from .native_crsa import (
     NATIVE_HEAD_CRSA_LAYER,
     Qwen38NativeHeadCrsa,
@@ -57,6 +57,15 @@ _UNLABELED_FAMILY_SHA256 = hashlib.sha256(b"immer:unlabeled-family/v1").hexdiges
 _NO_LABEL_SOURCE_SHA256 = hashlib.sha256(b"immer:no-label-source/v1").hexdigest()
 _MAX_BUNDLE_MANIFEST_BYTES = 64 * 1024**2
 _MAX_RUNTIME_SOURCE_BYTES = 64 * 1024**2
+_CARTOGRAPHY_BOUNDARY_STAGES = frozenset(
+    {
+        "attention.input",
+        "attention.output",
+        "attention.residual",
+        "mlp.input",
+        "mlp.output",
+    }
+)
 
 
 class Qwen38CartographyProbeError(RuntimeError):
@@ -539,7 +548,11 @@ class ContextualHiddenTransition:
     post_array: np.ndarray
 
     def __post_init__(self) -> None:
-        if isinstance(self.layer, bool) or not isinstance(self.layer, int) or self.layer < 0:
+        if (
+            isinstance(self.layer, bool)
+            or not isinstance(self.layer, int)
+            or self.layer < 0
+        ):
             raise ValueError("contextual hidden layer must be non-negative")
         seed = _sha(self.projection_seed_sha256, "projection_seed_sha256")
         dimensions = _positive(self.output_dimensions, "output_dimensions")
@@ -576,6 +589,49 @@ class ContextualHiddenTransition:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextualBoundarySketch:
+    """One hash-bound projected Qwen sublayer boundary."""
+
+    layer: int
+    stage: str
+    projection_seed_sha256: str
+    output_dimensions: int
+    sketch_sha256: str
+    array: np.ndarray
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.layer, bool)
+            or not isinstance(self.layer, int)
+            or self.layer < 0
+        ):
+            raise ValueError("contextual boundary layer must be non-negative")
+        if self.stage not in _CARTOGRAPHY_BOUNDARY_STAGES:
+            raise ValueError("contextual boundary stage is not persisted")
+        seed = _sha(self.projection_seed_sha256, "projection_seed_sha256")
+        dimensions = _positive(self.output_dimensions, "output_dimensions")
+        sketch_sha = _sha(self.sketch_sha256, "sketch_sha256")
+        value = self.array
+        if type(value) is not np.ndarray or value.dtype != np.dtype(np.float64):
+            raise TypeError("boundary array must be an exact float64 numpy array")
+        if value.ndim != 2 or value.shape[1] != dimensions or value.shape[0] < 1:
+            raise ValueError("boundary array has the wrong projected shape")
+        if not np.isfinite(value).all():
+            raise ValueError("boundary array contains non-finite values")
+        array = np.array(value, dtype="<f8", order="C", copy=True)
+        array[array == 0.0] = 0.0
+        if hashlib.sha256(array.tobytes(order="C")).hexdigest() != sketch_sha:
+            raise Qwen38CartographyIntegrityError(
+                "boundary array differs from its probe evidence hash"
+            )
+        array.flags.writeable = False
+        object.__setattr__(self, "projection_seed_sha256", seed)
+        object.__setattr__(self, "output_dimensions", dimensions)
+        object.__setattr__(self, "sketch_sha256", sketch_sha)
+        object.__setattr__(self, "array", array)
+
+
+@dataclass(frozen=True, slots=True)
 class CartographyProbeResult:
     """Primary measurement plus optional paired control and raw proof objects."""
 
@@ -584,6 +640,7 @@ class CartographyProbeResult:
     access_trace: AccessTrace
     tensor_range_receipts: tuple[TensorRangeReceipt, ...]
     contextual_hidden_transitions: tuple[ContextualHiddenTransition, ...] = ()
+    contextual_boundary_sketches: tuple[ContextualBoundarySketch, ...] = ()
     control_measurement: MeasurementReceipt | None = None
     control_evidence_document: dict[str, Any] | None = None
     control_access_trace: AccessTrace | None = None
@@ -658,6 +715,52 @@ class CartographyProbeResult:
                 raise Qwen38CartographyIntegrityError(
                     "contextual hidden transition differs from sealed evidence"
                 )
+        boundaries = tuple(self.contextual_boundary_sketches)
+        boundary_keys = tuple((row.layer, row.stage) for row in boundaries)
+        if len(set(boundary_keys)) != len(boundary_keys):
+            raise Qwen38CartographyIntegrityError(
+                "contextual boundary sketches contain duplicate stages"
+            )
+        for boundary in boundaries:
+            if not isinstance(boundary, ContextualBoundarySketch):
+                raise Qwen38CartographyIntegrityError(
+                    "contextual boundary sketch has the wrong type"
+                )
+            layer_record = layers_by_index.get(boundary.layer)
+            if not isinstance(layer_record, Mapping):
+                raise Qwen38CartographyIntegrityError(
+                    "contextual boundary sketch has no evidence layer"
+                )
+            stage_records = layer_record.get("boundary_sketches")
+            stage_record = (
+                None
+                if not isinstance(stage_records, Mapping)
+                else stage_records.get(boundary.stage)
+            )
+            statistics = (
+                None
+                if not isinstance(stage_record, Mapping)
+                else stage_record.get("statistics")
+            )
+            if (
+                not isinstance(stage_record, Mapping)
+                or not isinstance(statistics, Mapping)
+                or stage_record.get("seed_sha256") != boundary.projection_seed_sha256
+                or stage_record.get("output_dimensions") != boundary.output_dimensions
+                or statistics.get("sha256") != boundary.sketch_sha256
+            ):
+                raise Qwen38CartographyIntegrityError(
+                    "contextual boundary sketch differs from sealed evidence"
+                )
+        expected_boundary_keys = {
+            (transition.layer, stage)
+            for transition in transitions
+            for stage in _CARTOGRAPHY_BOUNDARY_STAGES
+        }
+        if set(boundary_keys) != expected_boundary_keys:
+            raise Qwen38CartographyIntegrityError(
+                "contextual boundary sketch inventory is incomplete"
+            )
         if self.control_measurement is None:
             if (
                 any(
@@ -709,6 +812,7 @@ class _ArmCapture:
     layers: list[dict[str, Any]]
     hidden_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]]
     contextual_hidden_transitions: list[ContextualHiddenTransition]
+    contextual_boundary_sketches: list[ContextualBoundarySketch]
     delta_probes: list[dict[str, Any]]
     crsa_evidence: list[dict[str, Any]]
     final_hidden_sha256: str
@@ -963,6 +1067,12 @@ def _model_attachment_stamp(model: StreamedQwen38) -> str:
         "delta_probe_id": None if model.delta_probe is None else id(model.delta_probe),
         "graft_id": None if model.graft is None else id(model.graft),
         "graft_layer": model.graft_layer,
+        "layer_boundary_observer_id": (
+            None
+            if model.layer_boundary_observer is None
+            else id(model.layer_boundary_observer)
+        ),
+        "layer_boundary_stages": list(model.layer_boundary_stages),
         "max_batch_size": model.max_batch_size,
         "max_seq_len": model.max_seq_len,
         "native_head_crsa": native,
@@ -1494,11 +1604,44 @@ def _execute_arm(
 ) -> _ArmCapture:
     native, intervention_mode, intervention_configuration = _arm_intervention(spec, arm)
     delta = _DeltaRecorder()
+    boundary_rows: dict[int, dict[str, tuple[dict[str, Any], np.ndarray]]] = {}
+
+    def boundary_observer(layer: int, stage: str, value: torch.Tensor) -> None:
+        if (
+            spec.hidden_sketch is None
+            or layer < spec.start_layer
+            or layer >= spec.stop_layer
+            or stage not in _CARTOGRAPHY_BOUNDARY_STAGES
+        ):
+            return
+        layer_rows = boundary_rows.setdefault(layer, {})
+        if stage in layer_rows:
+            raise Qwen38CartographyIntegrityError(
+                "layer boundary observer repeated a stage"
+            )
+        layer_rows[stage] = _sketch_record(
+            value,
+            spec.hidden_sketch,
+            max_elements=spec.budget.max_sketch_elements,
+        )
+
     child = StreamedQwen38(
         model.config,
         model.pager,
         delta_probe=delta,
         native_head_crsa=native,
+        layer_boundary_observer=(
+            None if spec.hidden_sketch is None else boundary_observer
+        ),
+        layer_boundary_stages=(
+            None
+            if spec.hidden_sketch is None
+            else tuple(
+                stage
+                for stage in LAYER_BOUNDARY_STAGES
+                if stage in _CARTOGRAPHY_BOUNDARY_STAGES
+            )
+        ),
         max_batch_size=1,
         max_seq_len=model.max_seq_len,
     )
@@ -1514,6 +1657,7 @@ def _execute_arm(
     layer_records: list[dict[str, Any]] = []
     summaries: list[NumericSummary] = []
     contextual_hidden_transitions: list[ContextualHiddenTransition] = []
+    contextual_boundary_sketches: list[ContextualBoundarySketch] = []
     crsa_rows: list[dict[str, Any]] = []
     restored_observer: Any | None = None
     try:
@@ -1583,6 +1727,35 @@ def _execute_arm(
                             post_array=post_array,
                         )
                     )
+                    staged_boundaries = boundary_rows.get(layer, {})
+                    if set(staged_boundaries) != _CARTOGRAPHY_BOUNDARY_STAGES:
+                        raise Qwen38CartographyIntegrityError(
+                            "measured layer omitted a contextual boundary stage"
+                        )
+                    record["boundary_sketches"] = {
+                        stage: staged_boundaries[stage][0]
+                        for stage in sorted(staged_boundaries)
+                    }
+                    for stage in sorted(staged_boundaries):
+                        sketch, array = staged_boundaries[stage]
+                        contextual_boundary_sketches.append(
+                            ContextualBoundarySketch(
+                                layer=layer,
+                                stage=stage,
+                                projection_seed_sha256=(spec.hidden_sketch.seed_sha256),
+                                output_dimensions=(
+                                    spec.hidden_sketch.output_dimensions
+                                ),
+                                sketch_sha256=cast(str, sketch["statistics"]["sha256"]),
+                                array=array,
+                            )
+                        )
+                        summaries.append(
+                            _numeric_summary(
+                                f"layer.{layer}.boundary.{stage}",
+                                sketch["statistics"],
+                            )
+                        )
                 layer_records.append(record)
                 hidden_by_layer[layer] = (pre, post)
                 summaries.extend(
@@ -1642,6 +1815,10 @@ def _execute_arm(
                 if "pre_sketch" not in row
                 else row["pre_sketch"]["statistics"]["sha256"]
             ),
+            "boundary_sketch_sha256s": {
+                stage: sketch["statistics"]["sha256"]
+                for stage, sketch in row.get("boundary_sketches", {}).items()
+            },
         }
         for row in layer_records
     ]
@@ -1652,6 +1829,7 @@ def _execute_arm(
         layers=layer_records,
         hidden_by_layer=hidden_by_layer,
         contextual_hidden_transitions=contextual_hidden_transitions,
+        contextual_boundary_sketches=contextual_boundary_sketches,
         delta_probes=delta.rows,
         crsa_evidence=crsa_rows,
         final_hidden_sha256=_tensor_record(final_hidden)["sha256"],
@@ -1979,10 +2157,13 @@ class Qwen38CartographyProbe:
             measurement=measurement,
             evidence_document=primary_evidence,
             access_trace=primary_capture.access_trace,
-        tensor_range_receipts=primary_capture.tensor_receipts,
-        contextual_hidden_transitions=tuple(
-            primary_capture.contextual_hidden_transitions
-        ),
+            tensor_range_receipts=primary_capture.tensor_receipts,
+            contextual_hidden_transitions=tuple(
+                primary_capture.contextual_hidden_transitions
+            ),
+            contextual_boundary_sketches=tuple(
+                primary_capture.contextual_boundary_sketches
+            ),
             control_measurement=control_measurement,
             control_evidence_document=control_evidence,
             control_access_trace=(
@@ -2001,6 +2182,7 @@ __all__ = [
     "CARTOGRAPHY_EVIDENCE_SCHEMA",
     "CARTOGRAPHY_PROMPT_SCHEMA",
     "CartographyProbeResult",
+    "ContextualBoundarySketch",
     "ContextualHiddenTransition",
     "HiddenSketchProjection",
     "ProbeCoordinateSpec",

@@ -42,6 +42,22 @@ around every domain that supports it.
   Thompson feedback.
 - [x] Explicit-path planning and route-keyed discharge across parallel
   same-endpoint operator alternatives.
+- [x] Qwen sublayer boundary cartography for whole-layer, Attention core and
+  residual, and MLP core and residual transition families.
+- [x] Left-acting `CAUSAL_MIX_FLOAT64` execution, fusion, dedicated verification,
+  charging, and exact-route discharge.
+- [x] Prompt-preserving multi-timescale residual prediction with chronological
+  train/validation/holdout, content-level leakage rejection, shuffled placebos,
+  aggregate memory preflight, and content-addressed persistence.
+- [x] Consequence-grounded context-aware Markov language with strict receiver
+  information boundary, in-vocabulary abstention, deterministic resume,
+  fixed-teacher cultural transfer, and held-out factor grammar.
+- [x] Self-hosting executable word DAG with recursive dependency repair,
+  immutable CAS history, bottom-up Crystal compilation, bounded mixed-program
+  fallback, and complete transitive work-release accounting.
+- [x] Depth-12 production-API trial: 8,191 primitive actions represented by 36
+  definition references, exact one-Crystal discharge, 8.380x authenticated-VM
+  speedup, and 1,638,000 historical work units released across 25 future states.
 - [x] Additive, multiplicative, and finite-cyclic algebraic crystallization with
   exact group accumulation and a rejected permuted placebo.
 - [x] Continuous PS-Lifted reservoir memory with delayed-state, no-memory,
@@ -83,8 +99,15 @@ around every domain that supports it.
 
 - [ ] Keep the live O1 frontier expanding across additional prompt families,
   Qwen layers, weight sites, and interventions on the local causal bundle.
+- [ ] Run the sublayer frontier on the official local 27B bundle and use its
+  predictive error classes to select the next exact Attention/DeltaNet/MLP
+  operator family.
 - [ ] Connect production OrganBank and anchor executors to the learned action
   alphabet for non-chat workloads.
+- [ ] Feed live O1/Atlas promotions, materialized routes, OrganBank actions,
+  causal sites, residual plans, and the local Qwen fallback into successive
+  action-frontier revisions; let verifier consequences grow the production
+  dialect and compile recurring accepted word sequences.
 - [ ] Extend the mechanism matrix with no-lift, shuffled-site,
   reversible-table, MLP, and RNN controls under the same authenticated evidence
   and planning contract.

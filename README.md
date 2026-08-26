@@ -26,6 +26,16 @@ release surface.
   PS-Lifted Markov agents learn action-conditioned world models, continuously
   expand the live weight frontier, harvest real contextual transitions, choose
   executable operator algebras, and learn from verified execution outcomes.
+- **Consequence-grounded executable language.** Separate sender and receiver
+  policies ground opaque words from authenticated action consequences alone.
+  Shared semantics generalize across contexts, context residuals learn genuine
+  state-dependent meaning, factorized word slots recombine unseen actions, and
+  valid but unvisited or ambiguous words abstain.
+- **Self-hosting compute words.** Known executable words define new words as an
+  immutable DAG. Missing definitions repair recursively, homogeneous
+  Crystal children compile bottom-up without flattening, and the final word
+  discharges one authenticated operator while retaining its complete
+  transitive work provenance.
 - **Compute batteries.** Already-paid computation is retained at its natural
   granularity: results, continuation states, numerical operators,
   factorizations, routes, prefixes, and residual states. Native Qwen
@@ -53,6 +63,19 @@ release surface.
   Thompson/MAP-Elites router. Exact edge choice survives materialization and
   discharge; profile, bridge, admission, program, and verifier evidence remain
   restorable after a crash.
+- **Sublayer cartography.** The Qwen probe captures hash-bound projected
+  Attention input/output/residual and MLP input/down-projection/residual
+  boundaries during the existing forward. The observer is filtered before
+  cloning and adds no checkpoint reads or model-state mutation.
+- **Causal sequence compute.** `CAUSAL_MIX_FLOAT64` stores a realized causal
+  sequence kernel as the left action `K·V`, preserves exact zero future mass,
+  fuses in execution order, and participates in ordinary route charging under
+  its own verifier identity.
+- **Prompt-preserving prediction.** A fixed multi-timescale recurrent substrate
+  plus quadratic readout predicts Qwen residual sketches without flattening
+  prompt boundaries. Train, validation, and final holdout are separate,
+  content-duplicate relabeling rejects, and the artifact is explicitly
+  predictive-only.
 - **Exact result cells.** A `ResultCell` is the sealed special case for one
   complete Qwen/FERTIG result binding. It is distinct from a generic
   `ComputeCrystal` and executes only under exact prompt, model, provenance, and
@@ -70,6 +93,8 @@ release surface.
 |---|---:|---|
 | Qwen3.8 exact continuation | bit-identical K=1–4 state | exact transactional core with tokenwise hidden, KV, DeltaNet, and Prefix-Sinkhorn parity |
 | Markov-OoE PoC | 96.10% PS-Lifted; 100% warm | 17.28% local baseline, 13.50% shuffled-Crystal placebo, 338→64 consensus rounds, 588-byte raw kernel payload |
+| Consequence-grounded Markov language | 100% primitive, unseen-program, contextual-word, held-out grammar, option-word, cultural-transfer, and self-hosted execution | 5 seeds × 1,000 unseen programs; shuffled semantics 2.02%, fixed no-message policy 0.98%, no-action abstain 2.90%, shuffled grammar 5.00%, holistic held-out 0%, all in-vocabulary unknown words abstain |
+| Recursive executable word DAG | 8,191 actions → 36 references → one Crystal; 8.380x fair VM speedup | 99.5605% reference reduction, 99.9878% deployment-symbol reduction, exact future-input parity, 1,638,000 historical work units released across 25 states |
 | Action-conditioned Markov planning | 250/250 unseen tasks | 68 one-step observations only; 4–10-step tasks; 12-replica local cohort 226/3,000 (7.53%), shuffled-action placebo 89/250, no-memory 68/250 |
 | Continuous reservoir memory | 90.84% fused | delayed-state task; 82.16% local mean, 50.45% no-memory, 54.28% shuffled-label placebo |
 | Compositional stored compute | 4 operators → 1 exact discharge | 128 unseen vectors; 27,648 historical work units released; maximum delta 1.78e-15 |
@@ -80,11 +105,13 @@ release surface.
 | Exact guarded affine monoids | Stack depth 53/64 exact; `aⁿbⁿcⁿ` 4/4; placebos 7/7 rejected | exact integer/modular `(A,b)` atoms, guard-preserving fusion, 128-digit Horner, fingerprint collision contained by byte verifier, atomic replay-verified bundle |
 | Contextual algebra agent | 120/120 correct; shuffled-context placebo 0/90 | Stack/Fingerprint/Decimal choice; Stack→Decimal regime recovery 30/30; three incompatible ABIs execute as one receipt-joined parallel ensemble |
 | Harvested-program algebra routing | 174/180 correct; late 60/60 | three executable affine/permutation/Markov `ComputeProgram` families; shuffled-context placebo 49/180 and late 13/60; every result returns verifier-bound Thompson feedback |
+| Causal sequence Crystal | exact future-mass zero; maximum fused delta 1.33e-15 | 32-dimensional, eight-operator randomized audit of left-acting causal kernels; dedicated fusion verifier and charge accounting |
+| Contextual sequence predictor | MSE 6.73e-05 vs. tuned pointwise 5.80e-02 | untouched synthetic sequence holdout; 862.9x lower MSE; shuffled-token/output placebos 3.20/3.15; predictive-only artifact |
 | Living O1/Qwen frontier | additive prompt × layer × site growth | immutable initial manifest plus append-only frontier events, exact scheduler reconciliation, persistent idle cycles, rollback rejection, and zero loss of Atlas/O1 history |
 | Algebraic crystallization | 3/3 families admitted and exact | additive, multiplicative, and cyclic length-12 execution; permuted placebo rejected |
 | Qwen compute battery | 1.4288x peak speed | 65-token charged prefix + unknown 33-token suffix; authenticated restore removes 30.01% of demand latency |
 | O1 → Atlas → OoE | 10/10 live jobs; 15 measurements | two real contextual Qwen sites, Atlas revision 15, crash-resumable promotion, exact zero-probe reuse |
-| Real Qwen context → operator harvest | 8/8 transitions grouped into 2 layer families | four distinct prompts through the committed causal-Qwen fixture; exact runtime receipts remain separate while stable families pool correctly |
+| Real Qwen context → operator harvest | 40/40 transitions grouped into 10 layer/sublayer families | four distinct prompts through the committed causal-Qwen fixture; whole, Attention-core/residual, and MLP-core/residual receipts remain separate and prompt-diverse |
 | Real Qwen ResultCell holdout | 5 → 0 Qwen forwards | four temporal train transitions; holdout transition absent; exact raw-Qwen and final-semantic parity; gold-correct under one frozen evaluator call; FERTIG abstained on both paths |
 | Qwen3.5 → Qwen3.8 live K=4 | 4/4 draft tokens accepted | fixed native Prefix-Sinkhorn trial; 32.39% fewer combined source bytes and 1.349x wall-time speedup versus 2×K=2 |
 | Qwen GC pressure policy | bit-identical; 134 → 2 collections | fixed causal CPU-BF16 A/B; 6.88% less process wall time and 1.074x speedup |
