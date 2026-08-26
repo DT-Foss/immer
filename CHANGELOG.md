@@ -60,6 +60,11 @@ All notable changes to IMMER are recorded here.
   Split cache capacity and both immutable plane identities are sealed into the
   run identity only when the mode is active, preserving byte-for-byte default
   resume identities while enabling one weight pass across an MMLU cohort.
+- Completed the four-item layerwise split cohort in one 43-layer microbatch
+  pass. All `4/4` predictions match the sealed full-remote MPS baseline; both
+  score `3/4` and fail only the same fourth item. The CPU split run finishes in
+  `2,916.11 s` with a sampled peak RSS of `1.46 GiB`, demonstrating prediction
+  parity across device arithmetic without claiming cross-device logit identity.
 - Routed every dense, control, embedding, I64 router, candidate-head, scalar
   head, and batched full-head read through the revision-bound causal tensor
   reader. Expert and dense rails remain separate, missing bindings have no
