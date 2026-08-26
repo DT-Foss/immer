@@ -167,6 +167,30 @@ tables have a separate schema-identity gate. New actions receive deterministic
 unused words and remain non-executable until consequence evidence clears the
 normal visit/value/margin gates.
 
+Different agents never need to share surface words. A dialect mesh aligns two
+frozen languages only where both map their local words to the same immutable
+ActionBinding. The translation receipt binds both snapshots, both frontiers,
+both contexts, the word mapping, and its action semantics; translation
+recomputes that receipt before use.
+
+Macro transport happens one level below surface language:
+
+```text
+source verified definition
+  -> semantic action sequence + exact ActionBindings + support evidence
+  -> portable word program
+  -> target snapshot encodes each action in its own dialect
+  -> target-native definition
+  -> local ComputeCrystal compilation and bank anchor
+```
+
+This transports acquired executable structure without copying sender/receiver
+Q-tables. Target verifier authorities must equal the portable source contract.
+The localized definition and lexicon state bind the exact target context, so a
+context-local word can never be compiled against global or sibling-context
+primitives. Any changed target artifact or authority, missing action, ambiguous
+word, or stale snapshot aborts localization before the target lexicon changes.
+
 ## 5. Stored compute and exact result cells
 
 IMMER stores completed computation at two different abstraction levels.

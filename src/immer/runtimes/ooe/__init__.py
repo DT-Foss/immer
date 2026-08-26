@@ -270,6 +270,25 @@ from .language_intelligence import (
     run_language_growth_intelligence_benchmark,
     run_language_growth_seed,
 )
+from .dialect_mesh import (
+    DIALECT_TRANSLATION_SCHEMA,
+    PORTABLE_WORD_LOCALIZATION_SCHEMA,
+    PORTABLE_WORD_PROGRAM_SCHEMA,
+    DialectMeshError,
+    DialectMeshIntegrityError,
+    DialectTranslationReceipt,
+    PortableWordLocalizationReceipt,
+    PortableWordProgram,
+    align_dialects,
+    localize_portable_program,
+    portable_program_from_discovery,
+    translate_words,
+)
+from .dialect_intelligence import (
+    DIALECT_MESH_INTELLIGENCE_SCHEMA,
+    run_dialect_mesh_intelligence_benchmark,
+    run_dialect_mesh_seed,
+)
 from .bvn_search import (
     BvNSearchIntegrityError,
     BehavioralElite,
@@ -1136,4 +1155,19 @@ __all__ = [
     "TERMINAL_EPISODE_VERIFIER_SHA256",
     "run_language_growth_intelligence_benchmark",
     "run_language_growth_seed",
+    "DIALECT_TRANSLATION_SCHEMA",
+    "PORTABLE_WORD_LOCALIZATION_SCHEMA",
+    "PORTABLE_WORD_PROGRAM_SCHEMA",
+    "DialectMeshError",
+    "DialectMeshIntegrityError",
+    "DialectTranslationReceipt",
+    "PortableWordLocalizationReceipt",
+    "PortableWordProgram",
+    "align_dialects",
+    "localize_portable_program",
+    "portable_program_from_discovery",
+    "translate_words",
+    "DIALECT_MESH_INTELLIGENCE_SCHEMA",
+    "run_dialect_mesh_intelligence_benchmark",
+    "run_dialect_mesh_seed",
 ]

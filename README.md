@@ -41,6 +41,11 @@ release surface.
   words, compiled words become new frontier actions, unchanged actions retain
   their evidence across proven append-only revisions, and new actions receive
   deterministic unused words and begin behind abstention.
+- **Portable dialect mesh.** Independently grounded agents retain their own
+  opaque surface conventions while translating through identical executable
+  ActionBindings. Verified macro programs move as semantic action sequences,
+  localize into each target vocabulary, and compile locally without copying
+  sender Q-tables or requiring shared word IDs.
 - **Compute batteries.** Already-paid computation is retained at its natural
   granularity: results, continuation states, numerical operators,
   factorizations, routes, prefixes, and residual states. Native Qwen
@@ -102,6 +107,8 @@ release surface.
 | Recursive executable word DAG | 8,191 actions → 36 references → one Crystal; 8.380x fair VM speedup | 99.5605% reference reduction, 99.9878% deployment-symbol reduction, exact future-input parity, 1,638,000 historical work units released across 25 states |
 | Continual executable-language growth | old actions 100% retained; promoted action learned in 328 episodes; final 100% | five seeds; initial promoted-action abstention 100%; no-memory 0%; context-schema shift keeps 100% global semantics and drops local evidence; reward-policy shift resets 4/4 actions |
 | Second-generation compute word | one promoted macro reused twice → one charged Crystal | five seeds; constant discharge 5/5; historical work released rises from 400 to 1,200 units across 25 future states |
+| Executable dialect mesh | semantic translation 60,000/60,000; worst target context 100% | five seeds × five dialects × three independently learned contexts; four target dialects have 3/3 distinct mappings and zero global action words; shared-vocabulary direct transfer 6.84%, permutation placebo 1.42% |
+| Portable cross-dialect macro | localization and compilation 75/75; binding/authority changes rejected 5/5 | one discovered four-action program moves into every dialect-context without Q-table copying; context-bound exact execution; mean 150 historical work units released |
 | Action-conditioned Markov planning | 250/250 unseen tasks | 68 one-step observations only; 4–10-step tasks; 12-replica local cohort 226/3,000 (7.53%), shuffled-action placebo 89/250, no-memory 68/250 |
 | Continuous reservoir memory | 90.84% fused | delayed-state task; 82.16% local mean, 50.45% no-memory, 54.28% shuffled-label placebo |
 | Compositional stored compute | 4 operators → 1 exact discharge | 128 unseen vectors; 27,648 historical work units released; maximum delta 1.78e-15 |

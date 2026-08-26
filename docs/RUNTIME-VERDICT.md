@@ -16,7 +16,8 @@ execution planes:
    hierarchical options, continuous reservoir memory, operator-demand
    learning, contextual algebra selection, consequence-grounded executable
    language, proof-gated frontier migration, self-hosting word definitions,
-   continual compiled-action promotion, and novelty admission;
+   continual compiled-action promotion, cross-agent dialect portability, and
+   novelty admission;
 4. generic stored computation through ComputeCrystals, an authenticated
    operator graph, contextual operator harvesting, Birkhoff atom bases,
    exact guarded affine monoids, algebraic crystallization, harvested-program
@@ -69,6 +70,16 @@ later requests.
   second-generation definition uses it twice, compiles to one charged Crystal
   on every seed, and raises historical work released from `400` to `1,200`
   units across 25 future states.
+- Five independently grounded agents retain five distinct opaque dialects over
+  one fully shared token inventory. Their three contexts are learned by
+  separate Markov agents. All four target dialects have three distinct context
+  maps and no globally stable action words, yet receipt-reverified semantic
+  translation scores `60,000/60,000` with `100%` worst-context accuracy.
+  Direct surface reuse scores `6.84%` programs / `23.41%` tokens and the
+  permutation placebo `1.42%` / `19.58%`. One verified four-action macro
+  localizes, compiles, and executes exactly in all `75/75` dialect-context
+  targets without copying Q-tables; altered bindings or authorities are
+  rejected on `5/5` seeds.
 - The action-conditioned world-model benchmark solves `250/250` unseen
   4–10-step tasks from 68 one-step observations. Across all 12 local replicas,
   local coverage solves `226/3,000 = 7.5333%`; the shuffled-action placebo
@@ -160,7 +171,7 @@ evidence surface for each result.
 |---|---|---|
 | local Qwen | `src/immer/runtimes/qwen3_8/` | authenticated causal mount, exact stateful inference, Prefix-Sinkhorn, anchors |
 | O1 and Atlas | `src/immer/runtimes/o1_state/`, `src/immer/runtimes/ooe/cartography.py` | persistent learning state, exact measurement identity, append-only revision membership |
-| Markov intelligence | `src/immer/runtimes/ooe/` | action-conditioned evidence, PS-Lifted fusion, planning, options, demand execution, contextual algebra routing, consequence-grounded language, production outcome bridge, proof-gated frontier migration, compiled-action promotion, factor grammar, novelty, topology and regime receipts |
+| Markov intelligence | `src/immer/runtimes/ooe/` | action-conditioned evidence, PS-Lifted fusion, planning, options, demand execution, contextual algebra routing, consequence-grounded language, production outcome bridge, proof-gated frontier migration, compiled-action promotion, dialect translation, portable semantic macros, factor grammar, novelty, topology and regime receipts |
 | Stored operators | `compute_crystals.py`, `compute_graph.py`, `executable_lexicon.py`, `residual_execution.py`, `demand_execution.py`, `operator_harvester.py`, `harvest_algebra_bridge.py`, `contextual_sequence.py`, `bvn_search.py`, `bvn_crystals.py`, `affine_monoid.py`, `algebra_agents.py`, `algebraic_crystals.py` | real whole-layer/sublayer discovery, typed unseen-input and causal sequence programs, recursive compute words, transitive work provenance, predictive prompt-preserving residuals, persistent harvest-to-router admission, constructive atom bases, exact integer/modular recurrence, authenticated charge and feedback, exact route addressing, heterogeneous parallel execution, atomic persistence, exact accounting |
 | ResultCell | `result_cells.py` | one complete cold-result binding, zero-forward warm execution, final semantic and evaluator parity |
 | exact execution | `src/immer/cognition/` | S3/FERTIG verification, grounded fallback, explicit abstention |

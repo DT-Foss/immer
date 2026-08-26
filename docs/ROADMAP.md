@@ -70,6 +70,13 @@ around every domain that supports it.
 - [x] Five-seed continual-growth mechanism: 100% old-skill retention, promoted
   action learned after mean 328 episodes, final 100%, no-memory 0%, and
   second-generation historical work release 400→1,200 units.
+- [x] Cross-agent dialect quotient, receipt-reverified word translation, and
+  portable semantic macro localization without Q-table or vocabulary copying.
+- [x] Five-seed × five-dialect × three-context mesh: 60,000/60,000 translated
+  unseen programs, 100% worst-context accuracy, 75/75 portable macro
+  executions, and 5/5 exact binding/authority-change rejection. All four target
+  dialects have 3/3 separately learned mappings and zero global action words;
+  fully shared-token direct transfer is 6.84% versus 1.42% permutation placebo.
 - [x] Additive, multiplicative, and finite-cyclic algebraic crystallization with
   exact group accumulation and a rejected permuted placebo.
 - [x] Continuous PS-Lifted reservoir memory with delayed-state, no-memory,
@@ -123,6 +130,8 @@ around every domain that supports it.
 - [ ] Run the production language bridge on the first non-empty full-model
   Qwen route frontier after the current O1 cartography process publishes a
   verified operator; persist its first real dialect and promoted word action.
+- [ ] Add the first real promoted 27B dialect to the mesh and transfer its first
+  verified macro into a separately grounded sibling dialect.
 - [ ] Extend the mechanism matrix with no-lift, shuffled-site,
   reversible-table, MLP, and RNN controls under the same authenticated evidence
   and planning contract.

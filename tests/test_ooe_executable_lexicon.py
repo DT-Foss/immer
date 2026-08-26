@@ -115,6 +115,34 @@ class DefinitionProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ExecutableLexiconConflictError, "stale"):
             state.with_definition(stale)
 
+    def test_contextual_definition_requires_its_exact_contextual_lexicon(self) -> None:
+        snapshot, frontier, authorities = _contract()
+        contextual = ExecutableWordDefinition.create(
+            "tau-contextual",
+            ("tau-0", "tau-1"),
+            language_snapshot_sha256=snapshot,
+            frontier_sha256=frontier,
+            authority_hashes=authorities,
+            context_id="context-red",
+        )
+        self.assertEqual(
+            ExecutableWordDefinition.from_bytes(contextual.to_bytes()), contextual
+        )
+        contextual_state = ExecutableLexiconState.initial(
+            _initial().primitive_bindings,
+            language_snapshot_sha256=snapshot,
+            frontier_sha256=frontier,
+            authority_hashes=authorities,
+            context_id="context-red",
+        ).with_definition(contextual)
+        self.assertEqual(contextual_state.context_id, "context-red")
+        self.assertEqual(
+            ExecutableLexiconState.from_bytes(contextual_state.to_bytes()),
+            contextual_state,
+        )
+        with self.assertRaisesRegex(ExecutableLexiconConflictError, "stale"):
+            _initial().with_definition(contextual)
+
     def test_nested_definition_repair_happens_only_on_first_use(self) -> None:
         sender = ExecutableLexicon(_initial())
         sender.coin("tau-inner", ("tau-0", "tau-1", "tau-0"))

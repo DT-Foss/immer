@@ -209,6 +209,54 @@ average, and final four-action accuracy returns to 1.0. A no-memory model scores
 0.0. A second-generation word uses the promoted macro twice and raises released
 historical work from 400 to 1,200 units.
 
+### Dialect quotient and portable programs
+
+Two opaque words from independently learned dialects are equivalent only
+through the executable consequence they acquired:
+
+\[
+w_i \sim w_j
+\quad\Longleftrightarrow\quad
+a_i=a_j
+\;\land\;
+B_i(a_i)=B_j(a_j)
+\;\land\;
+H_i^{\mathrm{authority}}=H_j^{\mathrm{authority}},
+\]
+
+where \(B(a)\) is the complete action/artifact binding. Translation therefore
+operates on the quotient \(V/{\sim}\), not on token spelling. Before execution,
+the translation receipt is reconstructed from both frozen snapshots and both
+frontiers; a handcrafted surface permutation cannot become authority.
+
+A portable word program stores
+
+\[
+P=(a_1,\ldots,a_k;
+B(a_1),\ldots,B(a_k);
+H_{\mathrm{discovery}},H_{\mathrm{definition}},E),
+\]
+
+with supporting trajectory set \(E\). Target dialect \(j\) localizes it as
+
+\[
+D_j(P)=
+(\operatorname{encode}_j(a_1),\ldots,
+ \operatorname{encode}_j(a_k)),
+\]
+
+only after every target binding and verifier authority equals its source
+contract. The localized definition and lexicon state both bind the target
+context before compilation in the target bank.
+
+Across five seeds, five dialects, and three independently learned contexts per
+dialect, quotient translation scores 60,000/60,000 unseen programs and 100% in
+the worst target context. All four target dialects have three distinct context
+mappings and zero globally stable action words. The shared-token direct baseline
+scores 6.84% program accuracy while a non-identity permutation placebo scores
+1.42%. The same portable macro localizes and executes in all 75
+dialect-context targets; changed bindings and authorities are rejected.
+
 ## 5. Continuous PS-Lifted reservoir
 
 The fixed lifted recurrence carries temporal state:

@@ -4,6 +4,40 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-26
 
+### Portable executable dialect mesh
+
+- Added pairwise dialect alignment over consequence-grounded action semantics.
+  Agents keep independent opaque words; translation matches only actions whose
+  complete `ActionBinding` is byte-identical in source and target frontiers.
+- Translation receipts bind both snapshot/frontier pairs, both explicit
+  contexts, every source/target word pair, its executable action, and all
+  unmapped actions. Execution recomputes the alignment from the bound snapshots
+  before translating, so a rehashed handcrafted word permutation is rejected.
+- Added portable semantic word programs. A verified discovery is converted from
+  source words into an ordered action program plus exact action bindings,
+  discovery/definition hashes, authorities, and supporting trajectory hashes.
+- A target dialect localizes the semantic program through its own learned
+  words, verifies every target ActionBinding against the source semantics,
+  creates a context-bound target-native `ExecutableWordDefinition`, and
+  compiles against context-local primitives in the target ComputeCrystal bank.
+- Target authorities must equal the portable program's verifier authorities.
+  Changed, missing, context-unexpressible, non-identical, or authority-rebound
+  target actions fail before definition installation. Context identity is part
+  of definition/state hashes and every append-only lexicon transition.
+- The benchmark uses a fully shared six-token inventory, so direct transfer is
+  not an out-of-vocabulary trick. Every context is learned by an independent
+  `ConsequenceMarkovLanguage` and merged only through exact snapshot hashes.
+- Five-seed mesh result: `5/5` surface dialects are unique; all four target
+  dialects have three distinct context mappings and zero globally stable action
+  words. Verified translation scores `60,000/60,000` unseen programs, including
+  `100%` in the worst target context. Direct surface transfer scores `6.84%`
+  programs / `23.41%` tokens; a non-identity permutation placebo scores
+  `1.42%` / `19.58%`.
+- One portable macro localizes, compiles, and executes exactly in `75/75`
+  dialect-context targets. Altered bindings are rejected on `5/5` seeds and
+  discharge releases mean `150` historical work units across 25 future inputs.
+- Complete warning-fatal regression suite: `1,778/1,778`, `OK`, `905.252 s`.
+
 ### Production language bridge and continual self-extension
 
 - Added exact action-frontier builders for materialized ComputeOperatorGraph

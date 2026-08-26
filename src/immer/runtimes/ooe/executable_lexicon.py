@@ -198,6 +198,7 @@ class ExecutableWordDefinition:
     language_snapshot_sha256: str
     frontier_sha256: str
     authority_hashes: tuple[tuple[str, str], ...]
+    context_id: str | None = None
 
     FORMAT = WORD_DEFINITION_SCHEMA
 
@@ -222,6 +223,10 @@ class ExecutableWordDefinition:
             "authority_hashes",
             _hash_items(self.authority_hashes, field="authority_hashes"),
         )
+        context = self.context_id
+        if context is not None:
+            context = _identifier(context, field="context_id")
+        object.__setattr__(self, "context_id", context)
 
     @classmethod
     def create(
@@ -232,6 +237,7 @@ class ExecutableWordDefinition:
         language_snapshot_sha256: str,
         frontier_sha256: str,
         authority_hashes: Mapping[str, str] | Sequence[tuple[str, str]],
+        context_id: str | None = None,
     ) -> "ExecutableWordDefinition":
         return cls(
             new_word_id=new_word_id,
@@ -239,10 +245,11 @@ class ExecutableWordDefinition:
             language_snapshot_sha256=language_snapshot_sha256,
             frontier_sha256=frontier_sha256,
             authority_hashes=_hash_items(authority_hashes, field="authority_hashes"),
+            context_id=context_id,
         )
 
     def to_record(self) -> dict[str, object]:
-        return {
+        record: dict[str, object] = {
             "authority_hashes": dict(self.authority_hashes),
             "child_word_ids": list(self.child_word_ids),
             "format": self.FORMAT,
@@ -250,6 +257,9 @@ class ExecutableWordDefinition:
             "language_snapshot_sha256": self.language_snapshot_sha256,
             "new_word_id": self.new_word_id,
         }
+        if self.context_id is not None:
+            record["context_id"] = self.context_id
+        return record
 
     def to_bytes(self) -> bytes:
         body = self.to_record()
@@ -285,14 +295,25 @@ class ExecutableWordDefinition:
             or value.get("body_sha256")
             != _body_sha256(cast(Mapping[str, object], body))
             or set(body)
-            != {
-                "authority_hashes",
-                "child_word_ids",
-                "format",
-                "frontier_sha256",
-                "language_snapshot_sha256",
-                "new_word_id",
-            }
+            not in (
+                {
+                    "authority_hashes",
+                    "child_word_ids",
+                    "format",
+                    "frontier_sha256",
+                    "language_snapshot_sha256",
+                    "new_word_id",
+                },
+                {
+                    "authority_hashes",
+                    "child_word_ids",
+                    "context_id",
+                    "format",
+                    "frontier_sha256",
+                    "language_snapshot_sha256",
+                    "new_word_id",
+                },
+            )
             or body.get("format") != cls.FORMAT
         ):
             raise ExecutableLexiconIntegrityError("definition body is invalid")
@@ -312,6 +333,7 @@ class ExecutableWordDefinition:
                     cast(Mapping[str, str], authorities),
                     field="authority_hashes",
                 ),
+                context_id=cast(str | None, body.get("context_id")),
             )
         except (TypeError, ValueError) as exc:
             raise ExecutableLexiconIntegrityError(
@@ -540,6 +562,7 @@ class ExecutableLexiconState:
     primitive_bindings: tuple[PrimitiveWordBinding, ...]
     definitions: tuple[ExecutableWordDefinition, ...]
     compiled_receipts: tuple[CompiledWordReceipt, ...] = ()
+    context_id: str | None = None
 
     FORMAT = LEXICON_STATE_SCHEMA
 
@@ -569,6 +592,10 @@ class ExecutableLexiconState:
             "authority_hashes",
             _hash_items(self.authority_hashes, field="authority_hashes"),
         )
+        context = self.context_id
+        if context is not None:
+            context = _identifier(context, field="context_id")
+        object.__setattr__(self, "context_id", context)
         primitives = tuple(self.primitive_bindings)
         if not primitives or len(primitives) > MAX_DEFINITIONS:
             raise ValueError("primitive binding inventory is invalid")
@@ -595,6 +622,7 @@ class ExecutableLexiconState:
                 definition.language_snapshot_sha256 != self.language_snapshot_sha256
                 or definition.frontier_sha256 != self.frontier_sha256
                 or definition.authority_hashes != self.authority_hashes
+                or definition.context_id != self.context_id
             ):
                 raise ValueError("definition execution contract is stale")
         receipts = tuple(self.compiled_receipts)
@@ -630,6 +658,7 @@ class ExecutableLexiconState:
         language_snapshot_sha256: str,
         frontier_sha256: str,
         authority_hashes: Mapping[str, str] | Sequence[tuple[str, str]],
+        context_id: str | None = None,
     ) -> "ExecutableLexiconState":
         return cls(
             generation=1,
@@ -642,6 +671,7 @@ class ExecutableLexiconState:
             ),
             definitions=(),
             compiled_receipts=(),
+            context_id=context_id,
         )
 
     @property
@@ -761,6 +791,7 @@ class ExecutableLexiconState:
             definition.language_snapshot_sha256 != self.language_snapshot_sha256
             or definition.frontier_sha256 != self.frontier_sha256
             or definition.authority_hashes != self.authority_hashes
+            or definition.context_id != self.context_id
         ):
             raise ExecutableLexiconConflictError("definition contract is stale")
         if definition.new_word_id in self.primitive_map:
@@ -796,6 +827,7 @@ class ExecutableLexiconState:
                     )
                 ),
                 compiled_receipts=self.compiled_receipts,
+                context_id=self.context_id,
             )
         except ValueError as exc:
             raise ExecutableLexiconConflictError(
@@ -832,10 +864,11 @@ class ExecutableLexiconState:
                     key=lambda item: item.word_id,
                 )
             ),
+            context_id=self.context_id,
         )
 
     def to_document(self) -> dict[str, object]:
-        body = {
+        body: dict[str, object] = {
             "authority_hashes": dict(self.authority_hashes),
             "compiled_receipts": [item.to_record() for item in self.compiled_receipts],
             "definitions": [item.to_record() for item in self.definitions],
@@ -847,6 +880,8 @@ class ExecutableLexiconState:
                 item.to_record() for item in self.primitive_bindings
             ],
         }
+        if self.context_id is not None:
+            body["context_id"] = self.context_id
         return {
             "body": body,
             "body_sha256": _body_sha256(body),
@@ -890,7 +925,7 @@ class ExecutableLexiconState:
         }
         if (
             not isinstance(body, Mapping)
-            or set(body) != expected
+            or set(body) not in (expected, expected | {"context_id"})
             or value.get("body_sha256")
             != _body_sha256(cast(Mapping[str, object], body))
         ):
@@ -952,6 +987,7 @@ class ExecutableLexiconState:
                 ),
                 definitions=definition_objects,
                 compiled_receipts=compiled_objects,
+                context_id=cast(str | None, body.get("context_id")),
             )
         except ExecutableLexiconError:
             raise
@@ -991,6 +1027,7 @@ class ExecutableLexicon:
             language_snapshot_sha256=self.state.language_snapshot_sha256,
             frontier_sha256=self.state.frontier_sha256,
             authority_hashes=self.state.authority_hashes,
+            context_id=self.state.context_id,
         )
         self.install(definition)
         return definition
@@ -1567,6 +1604,7 @@ class ExecutableLexiconBank:
             or current.language_snapshot_sha256 != previous.language_snapshot_sha256
             or current.frontier_sha256 != previous.frontier_sha256
             or current.authority_hashes != previous.authority_hashes
+            or current.context_id != previous.context_id
             or current.primitive_bindings != previous.primitive_bindings
             or not set(previous.definitions) <= set(current.definitions)
             or not set(previous.compiled_receipts) <= set(current.compiled_receipts)
@@ -1641,6 +1679,7 @@ class ExecutableLexiconBank:
                     != initial_state.language_snapshot_sha256
                     or current.frontier_sha256 != initial_state.frontier_sha256
                     or current.authority_hashes != initial_state.authority_hashes
+                    or current.context_id != initial_state.context_id
                     or current.primitive_bindings != initial_state.primitive_bindings
                 ):
                     raise ExecutableLexiconConflictError(
