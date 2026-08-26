@@ -488,6 +488,13 @@ class OoeControllerTests(unittest.TestCase):
             ).consensus_receipt["topology"],
             "ps-lifted",
         )
+        lift = controller.crystal_store.restore(
+            publication.payload_sha256
+        ).consensus_receipt["adaptive_lift"]
+        self.assertEqual(
+            lift["formula"],
+            "clip(0.85-0.05*log(lambda2),floor,ceiling)",
+        )
         return site_sha256, temporal_start + len(OOE_ACTIONS)
 
     def test_cold_teacher_then_warm_crystal_saves_qwen_forwards(self) -> None:
@@ -732,15 +739,20 @@ class OoeControllerTests(unittest.TestCase):
             self.assertEqual(missing.metrics.saved_qwen_forwards, 0)
             self.assertEqual(missing.metrics.executed_qwen_forwards, 0)
 
-    def test_live_atlas_accepts_forward_append_and_rejects_rollback_or_fork(
+    def test_live_atlas_accepts_authenticated_history_and_rejects_unknown_or_fork(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             accepted_head = GraphRevision(94, _hash("atlas-graph-94"))
+            valid_atlas_events = {
+                _ATLAS_GRAPH.sequence: _ATLAS_GRAPH.event_sha256,
+                accepted_head.sequence: accepted_head.event_sha256,
+            }
             controller = self._controller(
                 Path(tmp),
                 atlas_revision_verifier=lambda revision: (
-                    revision.event_sha256 == accepted_head.event_sha256
+                    valid_atlas_events.get(revision.sequence)
+                    == revision.event_sha256
                 ),
             )
             _, temporal = self._train_site(
@@ -763,19 +775,43 @@ class OoeControllerTests(unittest.TestCase):
             )
             self.assertEqual(controller.atlas_graph_revision, accepted_head)
 
-            rollback, _ = _feature(
+            historical, _ = _feature(
                 temporal + 1,
                 site=0,
                 source=0,
                 signal=2.0,
                 atlas_graph=_ATLAS_GRAPH,
             )
-            with self.assertRaisesRegex(OoeControllerStaleError, "rolled back"):
-                controller.decide(rollback, OOE_ACTIONS[0])
+            self.assertEqual(
+                controller.decide(historical, OOE_ACTIONS[0]).origin,
+                "crystal",
+            )
+            controller.ingest_teacher(
+                historical,
+                _transition(historical, OOE_ACTIONS[0], OOE_ACTIONS[1]),
+            )
+            self.assertEqual(controller.atlas_graph_revision, accepted_head)
+
+            unknown_revision = GraphRevision(92, _hash("atlas-graph-92-unknown"))
+            unknown, _ = _feature(
+                temporal + 2,
+                site=0,
+                source=0,
+                signal=2.0,
+                atlas_graph=unknown_revision,
+            )
+            with self.assertRaisesRegex(
+                OoeControllerIntegrityError,
+                "rejected the historical head",
+            ):
+                controller.ingest_teacher(
+                    unknown,
+                    _transition(unknown, OOE_ACTIONS[0], OOE_ACTIONS[1]),
+                )
 
             fork = GraphRevision(94, _hash("atlas-graph-94-fork"))
             forked, _ = _feature(
-                temporal + 2,
+                temporal + 3,
                 site=0,
                 source=0,
                 signal=2.0,
@@ -796,6 +832,75 @@ class OoeControllerTests(unittest.TestCase):
                 expected_atlas_graph_revision=accepted_head,
             )
             self.assertEqual(restored.atlas_graph_revision, accepted_head)
+
+    def test_snapshot_restores_historical_revision_older_than_initial_head(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            historical = GraphRevision(0, "0" * 64)
+            initial = GraphRevision(3, _hash("atlas-graph-3"))
+            forward = GraphRevision(5, _hash("atlas-graph-5"))
+            members = {
+                revision.sequence: revision.event_sha256
+                for revision in (historical, initial, forward)
+            }
+
+            def verifier(revision: GraphRevision) -> bool:
+                return members.get(revision.sequence) == revision.event_sha256
+
+            store = CrystalStore(Path(tmp))
+            controller = OoeController(
+                model_pin_sha256=_PIN.sha256,
+                weight_graph_revision_sha256=_WEIGHT_GRAPH.sha256,
+                atlas_graph_revision=initial,
+                crystal_store=store,
+                config=ControllerConfig(
+                    replicas=4,
+                    replica_fanout=4,
+                    min_coverage_per_source=1,
+                    min_promoted_sources=1,
+                    router_radius=1.0e6,
+                    router_min_margin=0.0,
+                    token_min_confidence=1e-9,
+                    consensus_tolerance=1e-7,
+                    consensus_max_rounds=4096,
+                    reservoir_size=8,
+                ),
+                atlas_revision_verifier=verifier,
+            )
+            revisions = (initial, forward, historical)
+            for temporal, revision in enumerate(revisions):
+                receipt, _ = _feature(
+                    temporal,
+                    site=0,
+                    source=temporal,
+                    signal=2.0,
+                    atlas_graph=revision,
+                )
+                controller.ingest_teacher(
+                    receipt,
+                    _transition(
+                        receipt,
+                        OOE_ACTIONS[temporal],
+                        OOE_ACTIONS[(temporal + 1) % len(OOE_ACTIONS)],
+                    ),
+                )
+            self.assertEqual(controller.atlas_graph_revision, forward)
+            controller.save_snapshot()
+            restored = OoeController.restore(
+                crystal_store=store,
+                atlas_revision_verifier=verifier,
+                expected_atlas_graph_revision=forward,
+            )
+            self.assertEqual(restored.atlas_graph_revision, forward)
+            snapshot = json.loads(restored.snapshot_bytes())
+            self.assertEqual(
+                [
+                    row["body"]["sequence"]
+                    for row in snapshot["body"]["atlas_seen_revisions"]
+                ],
+                [0, 3, 5],
+            )
 
     def test_resealed_router_threshold_tamper_cannot_change_execution_gate(
         self,

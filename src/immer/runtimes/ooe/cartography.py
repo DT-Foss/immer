@@ -20,13 +20,15 @@ from immer.runtimes.qwen3_8.semantic_atlas import (
     MeasurementReceipt,
 )
 
-from .controller import OoeController, VerifiedTeacherTransition
+from .controller import ActionExecution, OoeController, VerifiedTeacherTransition
 from .crystal import CrystalPublication
 from .identity import canonical_json_bytes, require_sha256
 from .qwen_bridge import OoeAction, QwenOoeFeatureReceipt, validate_action
 
 
 ATLAS_MEASUREMENT_VERIFIER_SCHEMA = "immer-ooe-atlas-measurement-verifier/v1"
+ATLAS_PROBE_EXECUTOR_SCHEMA = "immer-ooe-atlas-probe-executor/v1"
+ATLAS_PROBE_QUALITY_SCHEMA = "immer-ooe-atlas-probe-quality/v1"
 CARTOGRAPHY_LEARNING_SCHEMA = "immer-ooe-cartography-learning/v1"
 
 
@@ -86,6 +88,123 @@ def authenticated_measurement_verifier_sha256(
             "schema": ATLAS_MEASUREMENT_VERIFIER_SCHEMA,
             "weight_graph_revision": measurement.weight_rail_revision.to_document(),
         }
+    )
+
+
+def atlas_probe_quality_sha256(
+    receipt: QwenOoeFeatureReceipt,
+    measurement: MeasurementReceipt,
+    verifier_sha256: str,
+) -> str:
+    """Bind a zero-forward Atlas discharge to its exact feature and proof."""
+
+    if not isinstance(receipt, QwenOoeFeatureReceipt):
+        raise TypeError("receipt must be a QwenOoeFeatureReceipt")
+    if not isinstance(measurement, MeasurementReceipt):
+        raise TypeError("measurement must be a MeasurementReceipt")
+    verifier = require_sha256(verifier_sha256, field="verifier_sha256")
+    receipt.validate_measurement(measurement)
+    if verifier not in receipt.verifier_sha256s:
+        raise ValueError("Atlas verifier is not feature-bound")
+    return _digest(
+        {
+            "feature_receipt_sha256": receipt.sha256,
+            "measurement_sha256": measurement.sha256,
+            "model_pin_sha256": measurement.model_pin.sha256,
+            "schema": ATLAS_PROBE_QUALITY_SCHEMA,
+            "verifier_sha256": verifier,
+        }
+    )
+
+
+class AtlasProbeExecutor:
+    """Discharge an already authenticated Atlas measurement with zero Qwen probes."""
+
+    def __init__(self, atlas: _Atlas) -> None:
+        for name in ("verify_or_raise", "revision", "query_by_prompt_signature"):
+            if not callable(getattr(atlas, name, None)):
+                raise TypeError("atlas must provide verify/query/revision")
+        self.atlas = atlas
+
+    def _measurement(self, receipt: QwenOoeFeatureReceipt) -> MeasurementReceipt:
+        result = self.atlas.query_by_prompt_signature(receipt.probe.prompt_signature)
+        if not isinstance(result, AtlasQueryResult):
+            raise TypeError("atlas query must return AtlasQueryResult")
+        matches = {
+            measurement.sha256: measurement
+            for measurement in result.measurements
+            if isinstance(measurement, MeasurementReceipt)
+            and measurement.model_pin.sha256 == receipt.model_pin_sha256
+            and measurement.coordinate.sha256 == receipt.weight_coordinate_sha256
+            and measurement.probe == receipt.probe
+        }
+        measurement = matches.get(receipt.measurement_sha256)
+        if measurement is None:
+            raise ValueError("feature measurement is not active in Atlas")
+        receipt.validate_measurement(measurement)
+        return measurement
+
+    def __call__(self, receipt: QwenOoeFeatureReceipt) -> ActionExecution:
+        if not isinstance(receipt, QwenOoeFeatureReceipt):
+            raise TypeError("receipt must be a QwenOoeFeatureReceipt")
+        measurement = self._measurement(receipt)
+        verifier = authenticated_measurement_verifier_sha256(self.atlas, measurement)
+        if verifier not in receipt.verifier_sha256s:
+            raise ValueError("current Atlas proof is not feature-bound")
+        quality = atlas_probe_quality_sha256(receipt, measurement, verifier)
+        executor_sha256 = _digest(
+            {
+                "action": "probe_coordinate",
+                "model_pin_sha256": measurement.model_pin.sha256,
+                "schema": ATLAS_PROBE_EXECUTOR_SCHEMA,
+                "weight_graph_revision_sha256": (
+                    measurement.weight_rail_revision.sha256
+                ),
+            }
+        )
+        return ActionExecution(
+            feature_receipt_sha256=receipt.sha256,
+            action="probe_coordinate",
+            executor_sha256=executor_sha256,
+            verifier_sha256=verifier,
+            evidence_sha256=measurement.evidence_sha256,
+            quality_sha256=quality,
+            result=measurement.to_document(),
+            quality_verified=True,
+            qwen_forwards=0,
+            # One schedule row is one authenticated, complete cartography probe.
+            # The cohort verifier re-derives this unit from the immutable
+            # scheduler instead of trusting persisted execution counters.
+            teacher_baseline_qwen_forwards=1,
+        )
+
+
+def verify_atlas_probe_execution(
+    atlas: _Atlas,
+    receipt: QwenOoeFeatureReceipt,
+    execution: ActionExecution,
+) -> bool:
+    """Final exact verifier for a zero-forward Atlas probe discharge."""
+
+    if not isinstance(receipt, QwenOoeFeatureReceipt) or not isinstance(
+        execution, ActionExecution
+    ):
+        return False
+    execution.assert_bound(receipt, "probe_coordinate")
+    if not execution.quality_verified or execution.qwen_forwards != 0:
+        return False
+    try:
+        measurement = MeasurementReceipt.from_document(execution.result)
+        receipt.validate_measurement(measurement)
+    except (TypeError, ValueError):
+        return False
+    verifier = authenticated_measurement_verifier_sha256(atlas, measurement)
+    if execution.verifier_sha256 != verifier:
+        return False
+    return execution.quality_sha256 == atlas_probe_quality_sha256(
+        receipt,
+        measurement,
+        verifier,
     )
 
 
@@ -297,8 +416,13 @@ class OoeCartographyBridge:
 
 __all__ = [
     "ATLAS_MEASUREMENT_VERIFIER_SCHEMA",
+    "ATLAS_PROBE_EXECUTOR_SCHEMA",
+    "ATLAS_PROBE_QUALITY_SCHEMA",
+    "AtlasProbeExecutor",
     "CARTOGRAPHY_LEARNING_SCHEMA",
     "CartographyLearningReceipt",
     "OoeCartographyBridge",
+    "atlas_probe_quality_sha256",
     "authenticated_measurement_verifier_sha256",
+    "verify_atlas_probe_execution",
 ]

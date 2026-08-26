@@ -13,6 +13,27 @@ around every domain that supports it.
 - [x] Append-only SemanticWeightAtlas with exact historical revision proofs.
 - [x] Markov-OoE site agents, mobile reservoirs, Möbius rapidity, PS-Lifted
   consensus, quantized Crystals, and partial-coverage abstention.
+- [x] Action-conditioned finite world models with uncertainty-aware multi-step
+  planning from authenticated one-step evidence.
+- [x] Hierarchical option discovery, exact contraction ledgers, balanced
+  Sinkhorn assignment, and primitive-depth reduction.
+- [x] Generic ComputeCrystal VM, atomic bank, persistent operator graph,
+  authenticated route charging, exact unseen-input discharge, and recovery.
+- [x] Additive, multiplicative, and finite-cyclic algebraic crystallization with
+  exact group accumulation and a rejected permuted placebo.
+- [x] Continuous PS-Lifted reservoir memory with delayed-state, no-memory,
+  shuffled-label, and topology-shift controls.
+- [x] Hopfield novelty admission, explicit regime-change receipts, and
+  structured MPO storage with exact dense fallback.
+- [x] Five-seed and 7–127-state capacity sweeps with PS-Lifted success `1.0`
+  throughout.
+- [x] Sealed ResultCell bank and final benchmark layer for zero-forward replay
+  of one exact cold Qwen/FERTIG binding.
+- [x] Frozen real-Qwen temporal holdout: authenticated baseline `5 → 0` warm
+  forwards, exact raw-document and final-semantic parity, one gold-correct
+  evaluator call, and non-executing shuffled controls.
+- [x] Historical Atlas restoration with arbitrary authenticated scheduler
+  membership order and monotone current-head enforcement.
 - [x] Execution-bound warm transactions with final FERTIG commit/reject.
 - [x] Crash-safe two-phase Crystal promotion and partial-batch recovery.
 - [x] Native Qwen semantic anchor restore in the production chat path.
@@ -37,16 +58,17 @@ around every domain that supports it.
 
 ## Active
 
-- [ ] Run the first frozen real-Qwen cold-teacher → warm-Crystal cohort and
-  report saved complete Qwen forwards at identical final verified quality.
 - [ ] Extend O1 cartography from the current prompt/coordinate frontier into a
   continuous idle scheduler over the local weight map.
 - [ ] Connect production OrganBank and anchor executors to the learned action
   alphabet for non-chat workloads.
-- [ ] Measure OoE capacity and transfer across more operator families,
-  nonstationary transitions, topology shifts, and novel families.
-- [ ] Run the registered no-memory, no-lift, shuffled-site, shuffled-Crystal,
-  reversible-table, central-table, MLP, and RNN mechanism matrix.
+- [ ] Extend the mechanism matrix with no-lift, shuffled-site,
+  reversible-table, MLP, and RNN controls under the same authenticated evidence
+  and planning contract.
+- [ ] Regenerate the five-seed and capacity local baselines across every
+  replica, matching the corrected all-replica fixed-seed contract.
+- [ ] Carry generic ComputeCrystal charging from the deterministic operator
+  benchmark into live O1/Atlas-discovered numerical operators.
 - [ ] Broaden Qwen evaluation from fixed integration slices to frozen MMLU,
   GSM8K, and mixed-tool cohorts with exact dataset hashes.
 - [ ] Continue the retained DeepSeek split-rail and persistent-expert work only

@@ -22,6 +22,9 @@ SCRIPTS = (
     "qwen38_causal_bundle.py",
     "qwen38_direct_decode_benchmark.py",
     "qwen38_fertig_arm_compare.py",
+    "qwen38_ooe_cold_warm_cohort.py",
+    "qwen38_ooe_chat_cohort.py",
+    "ooe_intelligence_benchmark.py",
 )
 FORBIDDEN_RESEARCH_IMPORTS = (
     "vendor/mitglm",

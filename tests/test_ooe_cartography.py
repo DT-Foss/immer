@@ -7,8 +7,10 @@ import unittest
 
 from immer.runtimes.deepseek_v4.causal_weights import TensorRangePlan
 from immer.runtimes.ooe.cartography import (
+    AtlasProbeExecutor,
     OoeCartographyBridge,
     authenticated_measurement_verifier_sha256,
+    verify_atlas_probe_execution,
 )
 from immer.runtimes.ooe.controller import (
     ControllerConfig,
@@ -148,12 +150,13 @@ class _MovingAtlas(_Atlas):
 
 
 class OoeCartographyBridgeTests(unittest.TestCase):
-    def _controller(self, root: Path) -> OoeController:
+    def _controller(self, root: Path, *, action_executors=None) -> OoeController:
         return OoeController(
             model_pin_sha256=_PIN.sha256,
             weight_graph_revision_sha256=_WEIGHT_REVISION.sha256,
             atlas_graph_revision=_ATLAS_REVISION,
             crystal_store=CrystalStore(root),
+            action_executors=action_executors,
             config=ControllerConfig(
                 replicas=4,
                 replica_fanout=4,
@@ -253,6 +256,50 @@ class OoeCartographyBridgeTests(unittest.TestCase):
         atlas = _MovingAtlas((measurement,), GraphRevision(21, _hash("atlas-21")))
         with self.assertRaisesRegex(RuntimeError, "changed during"):
             authenticated_measurement_verifier_sha256(atlas, measurement)
+
+    def test_promoted_probe_action_discharge_saves_real_teacher_probe(self) -> None:
+        measurement = _measurement(0, _ATLAS_REVISION)
+        atlas = _Atlas((measurement,), GraphRevision(21, _hash("atlas-21")))
+        executor = AtlasProbeExecutor(atlas)
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = self._controller(
+                Path(tmp),
+                action_executors={"probe_coordinate": executor},
+            )
+            bridge = OoeCartographyBridge(controller)
+            learning = bridge.ingest_authenticated(
+                atlas,
+                measurement,
+                source_action="qwen_fallback",
+                target_action="probe_coordinate",
+                o1_surprise=0.25,
+                o1_learning_progress=1.5,
+            )
+            bridge.promote_ready()
+            warm = QwenOoeFeatureReceipt.from_measurement(
+                measurement,
+                temporal_index=1,
+                verifier_sha256s=(learning.verifier_sha256,),
+                o1_surprise=0.25,
+                o1_learning_progress=1.5,
+            )
+            decision = controller.try_warm(
+                warm,
+                "qwen_fallback",
+                quality_verifier=lambda receipt, execution: (
+                    verify_atlas_probe_execution(atlas, receipt, execution)
+                ),
+                stream_id="real-probe-discharge",
+            )
+
+            self.assertEqual(decision.origin, "crystal")
+            self.assertEqual(decision.action, "probe_coordinate")
+            self.assertTrue(decision.quality_verified)
+            self.assertEqual(controller.metrics.saved_qwen_forwards, 0)
+            accounting = controller.commit_warm(decision)
+            self.assertEqual(accounting.saved_qwen_forwards, 1)
+            self.assertEqual(controller.metrics.saved_qwen_forwards, 1)
+            self.assertEqual(controller.metrics.executed_qwen_forwards, 0)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
 # Research Foundations
 
-IMMER joins six research lines: sparse expert computation, contextual
-sparsity, Causal Prefix Sinkhorn Attention, lifted Markov consensus,
-reservoir-style state, and deterministic causal knowledge execution.
+IMMER joins sparse expert computation, contextual sparsity, Causal Prefix
+Sinkhorn Attention, lifted Markov consensus, reservoir state, hierarchical
+options, algebraic composition, associative novelty, structured tensors, and
+deterministic causal knowledge execution.
 
 ## David Tom Foss: causal knowledge and deterministic validation
 
@@ -54,20 +55,52 @@ all transformer layers remain unchanged.
 
 ## Lifted Markov consensus and Organism of Experts
 
-The current OoE branch treats large-model execution as an expensive teacher
-process whose verified local transitions can be consolidated into many small
-site-bound Markov kernels. O1-State selects measurements, the
-SemanticWeightAtlas binds them to exact `.causal` weight coordinates, and a
-PS-Lifted push-sum fuses replicated transition evidence before quantized
-Crystal publication. Mobile fading reservoirs and Möbius rapidity remain part
-of the executable acceptance gate.
+The OoE runtime treats local Qwen execution as the cold teacher process.
+O1-State selects measurements, SemanticWeightAtlas binds them to exact
+`.causal` weight coordinates, and PS-Lifted push-sum fuses replicated
+action-conditioned transition statistics. The finite world model plans unseen
+multi-step paths from one-step evidence. Verified repeated trajectories become
+hierarchical options; the continuous reservoir supplies delayed state;
+Möbius rapidity and Hopfield energy remain explicit execution gates.
 
-This is distinct from caching an answer and from replacing Qwen's internal
-router. The learned alphabet selects runtime actions such as restoring a
-charged continuation, invoking deterministic FERTIG, mounting an organ,
-probing a coordinate, or returning to Qwen. Each Crystal remains pinned to its
-model, coordinate, graph revision, schemas, coverage, calibration, and
+The learned alphabet selects runtime actions such as restoring a charged
+continuation, invoking deterministic FERTIG, mounting an organ, probing a
+coordinate, or returning to Qwen. Every learned action kernel remains pinned
+to its model, coordinate, graph revision, schemas, coverage, calibration, and
 verifier evidence.
+
+Generic ComputeCrystals and sealed ResultCells preserve two separate reuse
+contracts. ComputeCrystals store affine, permutation, lookup, and
+row-stochastic Markov operators for values created after charging. ResultCells
+store one complete cold Qwen/FERTIG execution identity, execute with zero Qwen
+forwards, and release savings only from an authenticated cold baseline after
+exact final parity.
+
+The first real temporal holdout exercises that contract: four teacher
+transitions drive a fifth-row warm action with the holdout transition absent,
+reducing five authenticated Qwen forwards to zero under exact raw-document and
+final-semantic parity. Its quality authority is one frozen evaluator call;
+FERTIG abstains on both paths and contributes no semantic certificate.
+
+## Hierarchical composition, associative novelty, and tensor structure
+
+- Richard S. Sutton, Doina Precup, and Satinder Singh,
+  [Between MDPs and Semi-MDPs: A Framework for Temporal Abstraction in Reinforcement Learning](https://doi.org/10.1016/S0004-3702(99)00052-1),
+  Artificial Intelligence 112, 1999. Peer-reviewed foundation for options and
+  temporally extended actions.
+- Hubert Ramsauer et al.,
+  [Hopfield Networks is All You Need](https://openreview.net/forum?id=tL89RnzIiCd),
+  ICLR 2021. Peer-reviewed continuous Hopfield energy and associative-memory
+  lineage for the novelty gate.
+- Ivan V. Oseledets,
+  [Tensor-Train Decomposition](https://epubs.siam.org/doi/10.1137/090752286),
+  SIAM Journal on Scientific Computing 33, 2011. Peer-reviewed tensor-train
+  foundation for structured action-kernel storage.
+
+IMMER binds option discovery to verified trajectories and exact matching,
+recomputes Hopfield calibration from stored patterns, and admits MPO storage
+only after source-bound error verification. The compact runtime derivations are
+recorded in [FORMELN-LEVERAGE.md](FORMELN-LEVERAGE.md).
 
 ## Reservoir computing and persistent state
 

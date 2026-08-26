@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,8 +17,16 @@ from immer.cognition.fertig import FertigSolver
 from immer.cognition.qwen_fertig_chat import QwenFertigChat
 from immer.composition import CompositionRoot, compose_runtime
 from immer.contracts import ExecutionStatus, Request, Result
+from immer.runtimes.ooe.result_cells import (
+    ResultCell,
+    ResultCellBinding,
+    attach_cold_qwen_generation_receipt,
+    qwen_result_binding_evidence,
+)
 from immer.runtimes.qwen3_8.adapter import Qwen38CausalChat, Qwen38ChatError
+from immer.runtimes.qwen3_8.cartography_probe import prompt_token_sha256
 from immer.runtimes.qwen3_8.encoding import Qwen38Tokenizer
+from immer.runtimes.qwen3_8.semantic_atlas import ModelPin
 from immer.runtimes.qwen3_8.semantic_state_cache import (
     AnchorReceipt,
     RestoredAnchor,
@@ -299,6 +308,68 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(len(generation["token_trace_sha256"]), 64)
         self.assertNotIn("prompt_token_ids", generation)
         self.assertNotIn("generated_token_ids", generation)
+        self.assertNotIn("result_cell_binding_receipt", result.evidence)
+
+    def test_opt_in_result_cell_binding_is_runtime_derived_and_chargeable(
+        self,
+    ) -> None:
+        runtime = _Runtime()
+        code_revision = "f" * 40
+        chat = _chat(
+            runtime,
+            system_prompt=" local system ",
+            result_cell_code_revision=code_revision,
+        )
+        result = chat.handle(Request("chat", "  hello  "))
+
+        self.assertIs(result.status, ExecutionStatus.OK)
+        document = result.evidence["result_cell_binding_receipt"]
+        body = document["body"]
+        rendered = Qwen38Tokenizer.render_no_thinking_prompt(
+            "local system",
+            "hello",
+        )
+        pin = ModelPin(
+            repo_id=result.evidence["model"],
+            revision=result.evidence["revision"],
+            bundle_fingerprint=_BUNDLE_RECEIPT["layout_fingerprint"],
+            bundle_manifest_sha256=_BUNDLE_RECEIPT["manifest_sha256"],
+            code_revision=code_revision,
+        )
+        binding = ResultCellBinding(
+            model_pin=pin,
+            tokenizer_sha256=_DIGEST,
+            question_sha256=hashlib.sha256(b"hello").hexdigest(),
+            rendered_prompt_sha256=hashlib.sha256(rendered.encode()).hexdigest(),
+            rendered_prompt_token_sha256=prompt_token_sha256((11, 12)),
+            system_prompt_sha256=hashlib.sha256(b"local system").hexdigest(),
+            generation_policy_sha256=chat._result_cell_generation_policy_sha256(),
+        )
+        self.assertEqual(body["binding_sha256"], binding.sha256)
+        self.assertEqual(document, qwen_result_binding_evidence(binding))
+        self.assertNotIn("hello", json.dumps(document, sort_keys=True))
+        cold = attach_cold_qwen_generation_receipt(result, binding=binding)
+        final = Result(
+            ExecutionStatus.OK,
+            "qwen-fertig-chat",
+            output=result.output,
+            evidence={"route": "qwen_verified"},
+        )
+        cell = ResultCell.from_cold(
+            binding=binding,
+            cold_qwen_result=cold,
+            cold_final_result=final,
+            cold_fertig_judgment={"status": "verified"},
+            cold_fertig_status="verified",
+            evaluator_quality_contract_sha256="9" * 64,
+        )
+        self.assertEqual(cell.teacher_forward_count, 3)
+        self.assertEqual(cell.cold_qwen_result, cold)
+
+    def test_result_cell_code_revision_is_full_or_disabled(self) -> None:
+        _chat(_Runtime())
+        with self.assertRaisesRegex(ValueError, "full lowercase"):
+            _chat(_Runtime(), result_cell_code_revision="short")
 
     def test_authenticated_exact_anchor_bypasses_prefill_with_identical_output(
         self,

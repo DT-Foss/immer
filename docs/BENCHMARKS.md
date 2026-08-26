@@ -30,13 +30,35 @@ those exact item sets.
 |---|---:|---|---|
 | Standalone Markov-OoE | local `17.28%`; reversible `49.84%`; PS-Lifted `96.10%`; warm `100%`; shuffled Crystal `13.50%` | six finite operator families; local noisy one-step teacher transitions; 250 unseen plans and 5,000 longer unseen compositions | imported package manifest `28/28`; production port and regression tests in [`runtimes/ooe`](../src/immer/runtimes/ooe) |
 | PS-Lifted consensus | `338 → 64` rounds (`5.28125x` fewer) | original fixed barbell topology and tolerance; raw six-kernel payload `588 B` | [`test_ooe_math_consensus.py`](../tests/test_ooe_math_consensus.py); [`test_ooe_qwen_bridge_controller.py`](../tests/test_ooe_qwen_bridge_controller.py) |
+| Action-conditioned world model | PS-Lifted `250/250`; central table `250/250`; 12-replica local cohort `226/3,000 = 7.5333%`; shuffled-action placebo `89/250`; no-memory `68/250` | 17 states, four actions, 12 replicas, 68 authenticated one-step observations, 250 unseen 4–10-step tasks per policy evaluation, zero multi-step labels | [`intelligence.py`](../src/immer/runtimes/ooe/intelligence.py); [`ooe_intelligence_benchmark.py`](../scripts/ooe_intelligence_benchmark.py); [`test_ooe_intelligence_benchmark.py`](../tests/test_ooe_intelligence_benchmark.py) |
+| Markov self-calibration and topology shift | fixed-`pc` barbell `96` rounds → self-calibrated barbell `58`; complete topology `28`; success `100%` throughout; maximum fused-count delta `6.02e-9` | same fixed-seed world-model trial; self-calibration changes the consensus envelope, then topology changes after evidence collection | [`consensus.py`](../src/immer/runtimes/ooe/consensus.py); [`test_ooe_math_consensus.py`](../tests/test_ooe_math_consensus.py) |
+| Hierarchical options | primitive depth `8 → 1`; success probability `1.0` | seven discovered options from four verified trajectories; exact contraction ledger; no multi-step teacher labels | [`options.py`](../src/immer/runtimes/ooe/options.py); [`contraction_ledger.py`](../src/immer/runtimes/ooe/contraction_ledger.py); [`test_ooe_options_mpo.py`](../tests/test_ooe_options_mpo.py) |
+| Continuous PS-Lifted reservoir | fused `90.8359%`; local mean `82.1626%`; no-memory `50.4532%`; shuffled-label placebo `54.2800%` | eight replicas, 32-node fixed reservoir, 500 training steps per replica, 1,000-step test, delayed-state target at lag seven | [`reservoir.py`](../src/immer/runtimes/ooe/reservoir.py); [`reservoir_intelligence.py`](../src/immer/runtimes/ooe/reservoir_intelligence.py); [`test_ooe_reservoir_intelligence.py`](../tests/test_ooe_reservoir_intelligence.py) |
+| Generic ComputeCrystal discharge | four primitive operators → one live operator; `27,648` authenticated historical work units released; maximum delta `1.7764e-15` | route charged before 128 unseen six-dimensional inputs existed; exact reopen/replay; disconnected placebo abstains | [`compute_crystals.py`](../src/immer/runtimes/ooe/compute_crystals.py); [`compute_graph.py`](../src/immer/runtimes/ooe/compute_graph.py); [`test_ooe_crystal_intelligence.py`](../tests/test_ooe_crystal_intelligence.py) |
+| Algebraic Crystals | additive `0.999999985`, multiplicative `0.999999844`, cyclic `0.999998261`; all length-12 results exact | nine support points per continuous family, 12 cyclic supports, unseen length-12 composition; permuted placebo score `0.155535` and rejected | [`algebraic_crystals.py`](../src/immer/runtimes/ooe/algebraic_crystals.py); [`test_ooe_algebraic_crystals.py`](../tests/test_ooe_algebraic_crystals.py) |
+| Structured MPO kernel | `1,408 / 8,192` numeric bytes (`0.171875`); relative error `3.58e-16` | structured action-conditioned tensor; unstructured tensor selects authenticated exact-dense fallback when rank budget is exceeded | [`mpo.py`](../src/immer/runtimes/ooe/mpo.py); [`test_ooe_options_mpo.py`](../tests/test_ooe_options_mpo.py) |
+| Hopfield novelty gate | `2/2` in-distribution accepted; `0/3` out-of-distribution false accepts | calibrated per-site energy and gap thresholds; removing the novelty gate accepts all three OOD cases | [`novelty.py`](../src/immer/runtimes/ooe/novelty.py); [`test_ooe_novelty.py`](../tests/test_ooe_novelty.py) |
 | Qwen native anchor battery | `130.457495 s → 91.304167 s`; `1.428823x`; `30.012326%` demand latency removed | one official local CPU-BF16 Qwen3.8 cell; 65-token charged invariant and previously unknown 33-token suffix | private sealed receipt; [`anchor_battery.py`](../src/immer/runtimes/qwen3_8/anchor_battery.py); [`test_qwen3_8_adapter.py`](../tests/test_qwen3_8_adapter.py) |
-| O1 → Atlas → OoE integration | zero duplicate probes on Atlas reuse; crash-resumable Crystal promotion | authentic `MeasurementReceipt` objects, exact live Atlas revision membership, O1 surprise/progress, partial source coverage | [`qwen38_o1_cartography.py`](../scripts/qwen38_o1_cartography.py); [`test_qwen38_o1_cartography.py`](../tests/test_qwen38_o1_cartography.py) |
+| O1 → Atlas → OoE integration | live `10/10` jobs, `15` measurements, two sites, Atlas revision `15`, `501.95 s`; zero duplicate probes on Atlas reuse | five frozen public-GSM8K prompt identities; real contextual local-Qwen measurements at passive layer 0 and native Sinkhorn layer 27 | [`qwen38_o1_cartography.py`](../scripts/qwen38_o1_cartography.py); [`test_qwen38_o1_cartography.py`](../tests/test_qwen38_o1_cartography.py) |
+| Real Qwen ResultCell holdout | authenticated baseline `5` Qwen forwards → warm `0`; saved `5/5`; exact raw-Qwen document and final-semantic parity; evaluator-quality verified; gold-correct | five cold cells with counts `[6,7,7,6,5]`; four temporal teacher transitions; fifth-row transition absent; evaluator opens exactly once; FERTIG abstains cold and warm | private sealed result and verification receipts; [`qwen38_ooe_chat_cohort.py`](../scripts/qwen38_ooe_chat_cohort.py); [`test_qwen38_ooe_chat_cohort.py`](../tests/test_qwen38_ooe_chat_cohort.py) |
+| ResultCell contract | zero-forward exact replay; forged baseline, mixed provenance, stale binding, prompt leakage, crash, and payload tamper rejected | synthetic and authenticated-fixture contract tests only; complete cold Qwen/FERTIG binding and final parity gate | [`result_cells.py`](../src/immer/runtimes/ooe/result_cells.py); [`test_ooe_result_cells.py`](../tests/test_ooe_result_cells.py) |
 
-The warm controller test counts a Qwen forward only after an execution-bound
+The warm controller counts a saved Qwen forward only after an execution-bound
 result passes its final verifier. Anchor restoration reports prefix token-layer
-work and checkpoint reads separately; Atlas reuse reports avoided probe calls.
-These counters are not interchangeable.
+work and checkpoint reads separately; Atlas reuse reports avoided probe calls;
+ComputeCrystal discharge reports released operator work. These counters measure
+different execution planes and remain separate.
+
+`ComputeCrystal` is the general unseen-input operator path. `ResultCell` is the
+exact-binding path for a complete cold Qwen/FERTIG result. The real holdout
+above establishes zero-forward replay under exact raw-document parity, exact
+final-semantic parity, and one frozen evaluator call. Its FERTIG certificate
+flags are false because both paths abstain; its verified quality authority is
+the frozen evaluator plus exact parity.
+
+The shuffled-site and shuffled-Crystal controls both remain non-executing. The
+Crystal and ResultCell stores audit clean. An exact rerun resumes from all five
+durable cold cells and performs no repeated cold Qwen generation.
 
 ## Local causal Qwen continuation
 

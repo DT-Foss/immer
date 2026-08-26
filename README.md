@@ -23,11 +23,19 @@ release surface.
 - **Grounded composition.** [FERTIG](https://github.com/DT-Foss/FERTIG)
   supplies deterministic parsing, verification, and explicit abstention.
 - **Organism of Experts.** O1 measurements become authenticated Atlas evidence;
-  PS-Lifted Markov agents consolidate recurring runtime transitions into tiny,
-  executable, quantized Crystals while Qwen remains teacher and novelty path.
+  PS-Lifted Markov agents learn action-conditioned world models, compose
+  verified options, and publish executable Crystals while Qwen supplies cold
+  evidence and handles genuine novelty.
 - **Compute batteries.** Native Qwen continuation states are charged ahead of
   demand, restored by exact token prefix, and resumed without replaying the
   authenticated prefix.
+- **Stored compute.** `ComputeCrystal` programs materialize reusable numerical
+  operators. The Markov operator graph charges verified routes, fuses compatible
+  chains, and later applies one stored operator to previously unseen values.
+- **Exact result cells.** A `ResultCell` is the sealed special case for one
+  complete Qwen/FERTIG result binding. It is distinct from a generic
+  `ComputeCrystal` and executes only under exact prompt, model, provenance, and
+  final-parity contracts.
 - **Transport intelligence.** Label-free route observations support held-out
   Markov and placebo studies while the model's official router remains
   authoritative.
@@ -41,8 +49,13 @@ release surface.
 |---|---:|---|
 | Qwen3.8 exact continuation | bit-identical K=1–4 state | exact transactional core with tokenwise hidden, KV, DeltaNet, and Prefix-Sinkhorn parity |
 | Markov-OoE PoC | 96.10% PS-Lifted; 100% warm | 17.28% local baseline, 13.50% shuffled-Crystal placebo, 338→64 consensus rounds, 588-byte raw kernel payload |
+| Action-conditioned Markov planning | 250/250 unseen tasks | 68 one-step observations only; 4–10-step tasks; 12-replica local cohort 226/3,000 (7.53%), shuffled-action placebo 89/250, no-memory 68/250 |
+| Continuous reservoir memory | 90.84% fused | delayed-state task; 82.16% local mean, 50.45% no-memory, 54.28% shuffled-label placebo |
+| Compositional stored compute | 4 operators → 1 exact discharge | 128 unseen vectors; 27,648 historical work units released; maximum delta 1.78e-15 |
+| Algebraic crystallization | 3/3 families admitted and exact | additive, multiplicative, and cyclic length-12 execution; permuted placebo rejected |
 | Qwen compute battery | 1.4288x peak speed | 65-token charged prefix + unknown 33-token suffix; authenticated restore removes 30.01% of demand latency |
-| O1 → Atlas → OoE | crash-resumable live loop | real contextual Qwen receipts, append-only revision membership, partial Crystal promotion, zero-probe Atlas reuse |
+| O1 → Atlas → OoE | 10/10 live jobs; 15 measurements | two real contextual Qwen sites, Atlas revision 15, crash-resumable promotion, exact zero-probe reuse |
+| Real Qwen ResultCell holdout | 5 → 0 Qwen forwards | four temporal train transitions; holdout transition absent; exact raw-Qwen and final-semantic parity; gold-correct under one frozen evaluator call; FERTIG abstained on both paths |
 | Qwen3.5 → Qwen3.8 live K=4 | 4/4 draft tokens accepted | fixed native Prefix-Sinkhorn trial; 32.39% fewer combined source bytes and 1.349x wall-time speedup versus 2×K=2 |
 | Qwen GC pressure policy | bit-identical; 134 → 2 collections | fixed causal CPU-BF16 A/B; 6.88% less process wall time and 1.074x speedup |
 | FERTIG exact frontier | 58/64 certified, 6 abstained | fixed gold-free development slice; holdout untouched |
@@ -60,6 +73,9 @@ for every released number: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
   [davidtomfoss.com](https://davidtomfoss.com/talks/deterministic-validation-llm-causal-extraction/).
 - Mathematical lineage and related peer-reviewed work:
   [docs/research.md](docs/research.md).
+- Runtime equations for Sinkhorn attention, Markov transport, PS-Lifted world
+  models, reservoirs, algebraic Crystals, stored compute, and novelty:
+  [docs/FORMELN-LEVERAGE.md](docs/FORMELN-LEVERAGE.md).
 
 ## Related repositories
 

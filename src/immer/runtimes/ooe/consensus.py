@@ -416,6 +416,184 @@ def ps_lifted_matrix(
     return np.ascontiguousarray(transition)
 
 
+@dataclass(frozen=True, slots=True)
+class AdaptiveLiftParameters:
+    """Topology-derived PS-Lift parameters from the Foss gap schedule."""
+
+    adjacency_sha256: str
+    fiedler_eigenvalue: float
+    pc: float
+    ps: float
+    pc_floor: float
+    pc_ceiling: float
+    formula_pc: float
+    selection: str
+    spectral_candidates: tuple[tuple[float, float], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "immer-ooe-adaptive-ps-lift/v1",
+            "adjacency_sha256": self.adjacency_sha256,
+            "fiedler_eigenvalue": self.fiedler_eigenvalue,
+            "pc": self.pc,
+            "ps": self.ps,
+            "pc_floor": self.pc_floor,
+            "pc_ceiling": self.pc_ceiling,
+            "formula_pc": self.formula_pc,
+            "selection": self.selection,
+            "spectral_candidates": [
+                {"gap": gap, "pc": candidate_pc}
+                for candidate_pc, gap in self.spectral_candidates
+            ],
+            "formula": "clip(0.85-0.05*log(lambda2),floor,ceiling)",
+        }
+
+    @property
+    def sha256(self) -> str:
+        import hashlib
+
+        from .identity import canonical_json_bytes
+
+        return hashlib.sha256(canonical_json_bytes(self.to_dict())).hexdigest()
+
+
+def adaptive_lift_parameters(
+    adjacency: ArrayLike,
+    *,
+    ps: float = 0.003,
+    pc_floor: float = 0.50,
+    pc_ceiling: float = 0.97,
+    spectral_calibration_nodes: int = 128,
+    max_nodes: int = DEFAULT_MAX_NODES,
+    max_bytes: int = DEFAULT_MAX_DENSE_BYTES,
+) -> AdaptiveLiftParameters:
+    """Derive ``pc`` from the current topology instead of fixing it globally."""
+
+    stay = _finite_nonnegative(ps, name="ps")
+    floor = _finite_nonnegative(pc_floor, name="pc_floor", positive=True)
+    ceiling = _finite_nonnegative(pc_ceiling, name="pc_ceiling", positive=True)
+    if not floor <= ceiling < 1.0 or ceiling + stay >= 1.0:
+        raise ValueError("require 0 < pc_floor <= pc_ceiling and pc_ceiling+ps < 1")
+    graph = validate_adjacency(
+        adjacency,
+        max_nodes=max_nodes,
+        max_bytes=max_bytes,
+    )
+    fiedler, _ = fiedler_vector(
+        graph,
+        max_nodes=max_nodes,
+        max_bytes=max_bytes,
+    )
+    raw = 0.85 - 0.05 * math.log(fiedler)
+    formula_pc = float(np.clip(raw, floor, ceiling))
+    degrees = graph.sum(axis=1)
+    degree_ratio = float(degrees.max() / degrees.mean())
+    if degree_ratio > 5.0:
+        formula_pc = min(formula_pc, 0.90)
+    if formula_pc == ceiling and ceiling >= 0.97:
+        formula_pc = min(formula_pc, 0.90)
+    calibration_limit = _integer(
+        spectral_calibration_nodes,
+        name="spectral_calibration_nodes",
+        minimum=2,
+    )
+    spectral_candidates: tuple[tuple[float, float], ...] = ()
+    if graph.shape[0] <= calibration_limit:
+        grid = np.linspace(floor, min(ceiling, 0.95), num=12)
+        candidates = tuple(
+            sorted(
+                {
+                    formula_pc,
+                    float(np.clip(0.65, floor, ceiling)),
+                    *(float(value) for value in grid),
+                }
+            )
+        )
+        measured = []
+        for candidate in candidates:
+            transition = ps_lifted_matrix(
+                graph,
+                pc=candidate,
+                ps=stay,
+                max_nodes=max_nodes,
+                max_bytes=max_bytes,
+            )
+            measured.append(
+                (
+                    candidate,
+                    spectral_gap(
+                        transition,
+                        max_nodes=2 * max_nodes,
+                        max_bytes=max_bytes,
+                    ),
+                )
+            )
+        spectral_candidates = tuple(measured)
+        pc = max(
+            measured,
+            key=lambda item: (
+                item[1],
+                -abs(item[0] - formula_pc),
+                -item[0],
+            ),
+        )[0]
+        selection = "formula-proposal+spectral-self-calibration"
+    else:
+        pc = formula_pc
+        selection = "formula-proposal"
+    return AdaptiveLiftParameters(
+        adjacency_sha256=array_sha256(graph),
+        fiedler_eigenvalue=fiedler,
+        pc=pc,
+        ps=stay,
+        pc_floor=floor,
+        pc_ceiling=ceiling,
+        formula_pc=formula_pc,
+        selection=selection,
+        spectral_candidates=spectral_candidates,
+    )
+
+
+def adaptive_ps_lift_matrix(
+    adjacency: ArrayLike,
+    *,
+    ps: float = 0.003,
+    pc_floor: float = 0.50,
+    pc_ceiling: float = 0.97,
+    spectral_calibration_nodes: int = 128,
+    fiedler_tolerance: float = 1e-12,
+    max_nodes: int = DEFAULT_MAX_NODES,
+    max_bytes: int = DEFAULT_MAX_DENSE_BYTES,
+) -> tuple[FloatArray, AdaptiveLiftParameters]:
+    """Return the topology-calibrated lift and its canonical parameters."""
+
+    graph = validate_adjacency(
+        adjacency,
+        max_nodes=max_nodes,
+        max_bytes=max_bytes,
+    )
+    parameters = adaptive_lift_parameters(
+        graph,
+        ps=ps,
+        pc_floor=pc_floor,
+        pc_ceiling=pc_ceiling,
+        spectral_calibration_nodes=spectral_calibration_nodes,
+        max_nodes=max_nodes,
+        max_bytes=max_bytes,
+    )
+    return (
+        ps_lifted_matrix(
+            graph,
+            pc=parameters.pc,
+            ps=parameters.ps,
+            fiedler_tolerance=fiedler_tolerance,
+            max_nodes=max_nodes,
+            max_bytes=max_bytes,
+        ),
+        parameters,
+    )
+
+
 def _validate_transition(
     row_transition: ArrayLike,
     *,
@@ -979,6 +1157,7 @@ class TopologyRouter:
 
 
 __all__ = [
+    "AdaptiveLiftParameters",
     "ConsensusMassError",
     "ConsensusReceipt",
     "ConsensusResult",
@@ -986,6 +1165,8 @@ __all__ = [
     "TopologyDecision",
     "TopologyRouter",
     "adjacency_from_edges",
+    "adaptive_lift_parameters",
+    "adaptive_ps_lift_matrix",
     "barbell_adjacency",
     "complete_adjacency",
     "consensus_at_entry",

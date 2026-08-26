@@ -10,6 +10,8 @@ from immer.runtimes.ooe.consensus import (
     ConsensusMassError,
     TopologyRouter,
     adjacency_from_edges,
+    adaptive_lift_parameters,
+    adaptive_ps_lift_matrix,
     barbell_adjacency,
     complete_adjacency,
     fiedler_eigenspace,
@@ -192,6 +194,63 @@ class OoEConsensusTests(unittest.TestCase):
         self.assertEqual(reversible_rounds, 338)
         self.assertEqual(lifted_rounds, 64)
         self.assertLess(lifted_rounds, reversible_rounds * 0.6)
+
+    def test_adaptive_lift_binds_foss_topology_schedule(self) -> None:
+        barbell = barbell_adjacency(6, 6)
+        complete = complete_adjacency(12)
+        slow = adaptive_lift_parameters(barbell)
+        fast = adaptive_lift_parameters(complete)
+        self.assertAlmostEqual(
+            slow.formula_pc,
+            float(
+                np.clip(
+                    0.85 - 0.05 * math.log(slow.fiedler_eigenvalue),
+                    0.5,
+                    0.97,
+                )
+            ),
+        )
+        self.assertAlmostEqual(
+            fast.formula_pc,
+            float(
+                np.clip(
+                    0.85 - 0.05 * math.log(fast.fiedler_eigenvalue),
+                    0.5,
+                    0.97,
+                )
+            ),
+        )
+        self.assertGreater(slow.pc, fast.pc)
+        self.assertEqual(
+            slow.selection,
+            "formula-proposal+spectral-self-calibration",
+        )
+        self.assertEqual(
+            slow.pc,
+            max(slow.spectral_candidates, key=lambda item: item[1])[0],
+        )
+        lifted, bound = adaptive_ps_lift_matrix(barbell)
+        self.assertEqual(bound, slow)
+        np.testing.assert_allclose(
+            lifted.sum(axis=1), 1.0, atol=1e-12, rtol=0.0
+        )
+        self.assertEqual(len(bound.sha256), 64)
+        values = np.arange(12, dtype=np.float64)[:, None]
+        adaptive_rounds = rounds_to_consensus(
+            lifted,
+            values,
+            tolerance=1e-5,
+            max_rounds=2_000,
+            lifted_nodes=12,
+        )
+        fixed_rounds = rounds_to_consensus(
+            ps_lifted_matrix(barbell, pc=0.65, ps=0.003),
+            values,
+            tolerance=1e-5,
+            max_rounds=2_000,
+            lifted_nodes=12,
+        )
+        self.assertLess(adaptive_rounds, fixed_rounds)
 
     def test_push_sum_recovers_vector_average_and_receipts_it(self) -> None:
         adjacency = barbell_adjacency(5, 5)

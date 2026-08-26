@@ -4,6 +4,95 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-26
 
+### Compositional crystal intelligence
+
+- Added a finite action-conditioned world model over authenticated one-step
+  transition evidence. Distributional planning now composes unseen multi-step
+  solutions and gates execution by coverage, entropy, peak probability, model
+  revision, and the exact resolved planning policy.
+- Added hierarchical Markov options from verified trajectories. Balanced
+  Sinkhorn assignment is bound to an exact discrete matching, option kernels
+  compose without visited-state bias, and a contraction ledger records the
+  primitive depth and accumulated contraction bound.
+- Added the generic `ComputeCrystal` VM and content-addressed bank. Typed
+  affine, permutation, lookup, and row-stochastic Markov operators execute
+  bounded numerical work under canonical schemas, atomic manifests,
+  generation/CAS checks, reopen verification, and deterministic recovery.
+  Homogeneous affine, permutation, and Markov chains fuse exactly.
+- Added the persistent `ComputeOperatorGraph`. It learns only verified one-step
+  edges, plans compatible routes, authenticates the full primitive charge basis
+  and fusion check, materializes a fused operator, and discharges it later on
+  values that did not exist during charging.
+- Added algebraic crystallization for additive, multiplicative, and finite
+  cyclic invariants. Exact group accumulators execute long compositions after
+  score-and-margin admission; ambiguous fits and permuted placebos are rejected.
+- Added a continuous PS-Lifted reservoir whose fixed sparse recurrence retains
+  delayed state while replicas exchange only ridge sufficient statistics.
+  Persistence, duplicate-evidence rejection, barbell/complete topology fusion,
+  and shuffled-temporal-label controls are receipt-bound.
+- Added calibrated Hopfield novelty energy, explicit regime-change retention,
+  and action-conditioned tensor-train/MPO kernels with authenticated error
+  recomputation and exact dense fallback.
+- Extended the fixed-seed intelligence benchmark. PS-Lifted planning solves
+  `250/250` unseen 4–10-step tasks from 68 one-step observations versus
+  `226/3,000 = 7.5333%` across all 12 local replicas, `89/250`
+  shuffled-action placebo, and `68/250` no-memory. Hierarchical depth falls
+  `8 → 1`; topology-shift success remains `100%`. Spectral self-calibration
+  cuts the fixed-`pc` barbell consensus from `96` to `58` rounds; the complete
+  topology converges in `28`.
+- Added the continuous-memory benchmark: fused accuracy is `90.8359%` versus
+  `82.1626%` local mean, `50.4532%` no-memory, and `54.2800%` shuffled-label
+  placebo on the fixed delayed-state task.
+- Added the stored-compute benchmark. A four-edge route charged before its
+  inputs existed executes as one operator over 128 unseen vectors, releases
+  `27,648` authenticated historical work units, and matches primitive execution
+  within `1.7764e-15`. All three algebraic families execute length 12 exactly;
+  the disconnected and permuted controls reject.
+
+### Exact ResultCells and live Qwen cohort harness
+
+- Added `ResultCellBinding`, `ColdQwenGenerationReceipt`, `ProvenanceUnit`, the
+  atomic `ResultCellBank`, zero-forward `ResultCellExecutor`, and the final
+  benchmark layer. Model, code, tokenizer, raw-question hash, rendered-prompt
+  hash, token-stream hash, system-prompt hash, generation policy, feature
+  evidence, verifier tuple, cold result, and FERTIG judgment form one exact
+  binding.
+- Derived every teacher-forward baseline from authenticated raw Qwen generation
+  evidence. Caller-supplied inflation, mixed provenance, stale identities,
+  prompt leakage, resealed tamper, crash boundaries, and forged parity receipts
+  fail authentication.
+- Added a transient S3/FERTIG executor with a bounded thread-local registry
+  keyed by exact feature receipt. It consumes each feature-bound question once,
+  persists a prompt-free result document, and reports zero Qwen forwards under
+  the exact S3 provenance pair. Without an authenticated cold Qwen-generation
+  baseline it records zero saved Qwen forwards.
+- Added the frozen real-Qwen cold-then-warm cohort harness with separate
+  gold-free `prepare`/`execute` and final `verify` phases. The release cut has
+  completed its measurement input: `10/10` local-Qwen cartography jobs,
+  `15` authenticated measurements across two sites, Atlas revision `15`, and
+  `501.95 s` of model execution.
+- Completed the five-cell real-Qwen cohort. Cold generation uses authenticated
+  forward counts `[6, 7, 7, 6, 5]`, totaling `31`. The first four rows supply
+  exactly four temporal teacher transitions; the fifth holdout transition is
+  absent from training.
+- Executed the unseen temporal holdout through the learned `mount_organ`
+  action. Its authenticated cold baseline is five Qwen forwards; warm execution
+  performs zero and commits all `5/5` as saved. Raw Qwen result documents match
+  exactly, the final semantic core matches exactly, and the frozen evaluator
+  opens once and verifies the gold-correct output.
+- Bound the result's certification boundary exactly. FERTIG abstains on the
+  holdout in both cold and warm paths, so `fertig_exact_judgment` and
+  `fertig_semantic_certified` are false. The quality authority for this result
+  is frozen-evaluator correctness plus exact cold/warm parity.
+- Confirmed that shuffled-site and shuffled-Crystal controls do not execute,
+  both persistent stores audit clean, and exact resume reuses all five durable
+  cold ResultCells without repeating Qwen generation.
+- Corrected historical Atlas restoration. Scheduler measurement order
+  `3, 5, 0, 9, 4` is authenticated as append-history membership while teacher
+  transitions retain temporal order `0..3`. Restore now authenticates every
+  seen Atlas revision, accepts the initial revision as any authenticated
+  member, and requires the current revision to remain the maximum seen head.
+
 ### Organism of Experts and direct Qwen/O1 integration
 
 - Added the complete Markov-OoE runtime: calibrated attractor routing,
@@ -104,8 +193,9 @@ All notable changes to IMMER are recorded here.
 - Completed the four-item layerwise split cohort in one 43-layer microbatch
   pass. All `4/4` predictions match the sealed full-remote MPS baseline; both
   score `3/4` and fail only the same fourth item. The CPU split run finishes in
-  `2,916.11 s` with a sampled peak RSS of `1.46 GiB`, demonstrating prediction
-  parity across device arithmetic without claiming cross-device logit identity.
+  `2,916.11 s` with a sampled peak RSS of `1.46 GiB`. Prediction parity is
+  exact across the two device runs; logit identity is evaluated only within a
+  single device arithmetic.
 - Routed every dense, control, embedding, I64 router, candidate-head, scalar
   head, and batched full-head read through the revision-bound causal tensor
   reader. Expert and dense rails remain separate, missing bindings have no

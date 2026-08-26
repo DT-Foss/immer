@@ -22,7 +22,7 @@ from typing import Any, Literal
 import numpy as np
 
 from .agents import AttractorRouter, MarkovPDAgent, MobileMarkovToken
-from .consensus import barbell_adjacency, measure_consensus, ps_lifted_matrix
+from .consensus import adaptive_ps_lift_matrix, barbell_adjacency, measure_consensus
 from .crystal import (
     CrystalManifest,
     CrystalPayload,
@@ -316,7 +316,6 @@ class ActionExecution:
         baseline = _uint(
             self.teacher_baseline_qwen_forwards,
             field="teacher_baseline_qwen_forwards",
-            positive=True,
         )
         if qwen_forwards > 1_000_000 or baseline > 1_000_000:
             raise ValueError("execution forward counts exceed the bounded contract")
@@ -743,7 +742,10 @@ class OoeController:
         )
         half = self.config.replicas // 2
         self._adjacency = barbell_adjacency(half, half)
-        self._lifted = ps_lifted_matrix(self._adjacency, pc=0.65, ps=0.003)
+        self._lifted, self._lift_parameters = adaptive_ps_lift_matrix(
+            self._adjacency,
+            ps=0.003,
+        )
         self._sites: dict[str, _SiteState] = {}
         self._tokens: dict[str, MobileMarkovToken] = {}
         self._warm_transactions: dict[str, _WarmTransaction] = {}
@@ -811,6 +813,31 @@ class OoeController:
         self._assert_pins(receipt)
         self._accept_atlas_revision(receipt.atlas_graph_revision)
 
+    def _assert_executable_atlas_revision(self, revision: GraphRevision) -> None:
+        """Accept an authenticated historical append-only head for warm replay."""
+
+        if not isinstance(revision, GraphRevision):
+            raise TypeError("revision must be a GraphRevision")
+        if revision.sequence >= self._atlas_head.sequence:
+            self._accept_atlas_revision(revision)
+            return
+        known = self._atlas_events.get(revision.sequence)
+        if known is not None:
+            if known != revision.event_sha256:
+                raise OoeControllerStaleError(
+                    "atlas graph fork: one sequence has two event hashes"
+                )
+            return
+        if self._atlas_revision_verifier is None:
+            raise OoeControllerStaleError(
+                "historical Atlas revision has no authenticated chain membership"
+            )
+        if not bool(self._atlas_revision_verifier(revision)):
+            raise OoeControllerIntegrityError(
+                "atlas revision verifier rejected the historical head"
+            )
+        self._atlas_events[revision.sequence] = revision.event_sha256
+
     def _new_site(self, receipt: QwenOoeFeatureReceipt) -> _SiteState:
         return _SiteState(
             identity=receipt.site_identity,
@@ -866,7 +893,8 @@ class OoeController:
         site = self._sites.get(site_sha256)
         if site is not None and site.identity != receipt.site_identity:
             raise OoeControllerStaleError("site identity changed")
-        self._assert_current(receipt)
+        self._assert_pins(receipt)
+        self._assert_executable_atlas_revision(receipt.atlas_graph_revision)
         if site is None:
             site = self._new_site(receipt)
             self._sites[site_sha256] = site
@@ -1025,6 +1053,8 @@ class OoeController:
             {
                 "fused_kernel_sha256": array_sha256(fused),
                 "fusion_entry": 0,
+                "adaptive_lift": self._lift_parameters.to_dict(),
+                "adaptive_lift_sha256": self._lift_parameters.sha256,
                 "replica_count": self.config.replicas,
                 "replica_fanout": self.config.replica_fanout,
             }
@@ -1176,7 +1206,7 @@ class OoeController:
         source = validate_action(source_action)
         input_site = receipt.site_identity.sha256
         route = self.router.decision(receipt.sketch_array)
-        self._accept_atlas_revision(receipt.atlas_graph_revision)
+        self._assert_executable_atlas_revision(receipt.atlas_graph_revision)
         if not route.accepted or route.label != input_site:
             self.metrics.novelty_abstentions += 1
             return OoeDecision(
@@ -1831,7 +1861,7 @@ class OoeController:
             not seen_atlas
             or tuple(sorted(seen_atlas, key=lambda row: row.sequence)) != seen_atlas
             or len({row.sequence for row in seen_atlas}) != len(seen_atlas)
-            or seen_atlas[0] != initial_atlas
+            or initial_atlas not in seen_atlas
             or seen_atlas[-1] != current_atlas
         ):
             raise OoeControllerIntegrityError(
@@ -1852,7 +1882,7 @@ class OoeController:
             if expected_atlas_graph_revision != current_atlas:
                 raise OoeControllerStaleError("snapshot atlas graph head is stale")
         if atlas_revision_verifier is not None:
-            for revision in seen_atlas[1:]:
+            for revision in seen_atlas:
                 if not bool(atlas_revision_verifier(revision)):
                     raise OoeControllerIntegrityError(
                         "atlas revision verifier rejected snapshot history"

@@ -13,15 +13,16 @@ request -> CompositionRoot -> FERTIG exact first refusal
                          warm OoE hook
                     / verified       \ miss / novelty
                    v                  v
-       Crystal action executor    local causal Qwen3.8
-       Battery / FERTIG / Organ       |
+       Markov action executor     local causal Qwen3.8
+       Crystal / Battery / Organ      |
                    |                  v
                    +----------> final FERTIG adjudication
 
 continuous learning plane:
 
 Qwen probe -> exact WeightCoordinate -> SemanticWeightAtlas -> O1 signal
-     -> replicated Markov site agents -> PS-Lifted consensus -> CrystalStore
+     -> replicated Markov site agents -> PS-Lifted consensus
+     -> world model / options / operator graph -> Crystal stores
 ```
 
 ## 1. Immutable data plane
@@ -73,10 +74,25 @@ model pin + weight coordinate + weight graph revision
 ```
 
 O1/Atlas measurements provide contextual numeric sketches and verifier-bound
-teacher transitions. Replicated `MarkovPDAgent` kernels are fused by an
-executed PS-Lifted push-sum, quantized, and published as immutable Crystals.
+teacher transitions. Replicated agents retain action-conditioned sufficient
+statistics. Executed PS-Lifted push-sum fuses those statistics into a finite
+world model `P(s' | s, a)`. The planner builds previously unseen multi-step
+solutions from one-step evidence and abstains when coverage, entropy, or peak
+probability falls outside its authenticated gates.
+
+Repeated verified trajectories become hierarchical options. Exact option
+composition reduces primitive depth without adding multi-step teacher labels.
+Balanced Sinkhorn assignment keeps option discovery one-to-one, and the
+resulting option catalog remains receipt-bound. Structured transition tensors
+can be stored as tensor-train/MPO factors; unsupported rank or error budgets
+select the exact dense representation.
+
 A mobile Markov token carries fading reservoir state and a Möbius rapidity
-ledger; both participate in the execution gate.
+ledger. The continuous PS-Lifted reservoir retains delayed state across raw
+fragments, fuses ridge sufficient statistics, and survives topology changes.
+Hopfield energy supplies the calibrated novelty gate. Regime receipts make
+nonstationary retention changes explicit rather than silently rewriting the
+learned world.
 
 The action alphabet is `restore_anchor`, `execute_fertig`, `mount_organ`,
 `probe_coordinate`, and `qwen_fallback`. Coverage is explicit. A partial
@@ -84,9 +100,49 @@ Crystal executes covered sources and abstains everywhere else.
 
 Warm results are transactions. Executor-local verification creates a pending
 decision; only final FERTIG adjudication commits saved Qwen forwards. Rejection
-records zero savings. Crystal corruption is a hard integrity error.
+records zero savings. Crystal corruption is a hard integrity error. Qwen is the
+cold teacher and novelty executor while the verified operator graph grows; it
+is not part of a warm action that already has an admitted executor.
 
-## 5. O1 cartography and SemanticWeightAtlas
+## 5. Stored compute and exact result cells
+
+IMMER stores completed computation at two different abstraction levels.
+
+`ComputeCrystal` is the general mechanism. It is a canonical typed program over
+numerical values: affine, permutation, lookup, and row-stochastic Markov
+operators share one bounded VM. Homogeneous affine, permutation, and Markov
+chains fuse exactly. A `ComputeOperatorGraph` connects
+verified one-step state transitions, plans a compatible route, and charges that
+route under an authenticated charge basis. Charging fuses the route into a new
+operator. Discharge applies the stored operator to values that did not exist
+when it was charged and records equivalent source work, live work, and released
+historical work. The bank and graph use content addresses, atomic manifests,
+generation checks, and crash recovery.
+
+Algebraic Crystals learn the coordinate system of an operator family rather
+than memorizing its outputs. Admission compares additive, multiplicative, and
+finite-cyclic invariants under explicit score and margin gates. An exact group
+accumulator snaps new measurements into the admitted group and executes long
+compositions without replaying every primitive observation.
+
+`ResultCell` is the sealed endpoint-specific class. It stores one complete cold
+Qwen/FERTIG result under the exact model pin, code revision, tokenizer,
+question hash, rendered-prompt hash, token-stream hash, system-prompt hash,
+generation policy, feature receipt, verifier/evidence tuple, and final
+judgment. Its warm executor
+performs zero Qwen forwards and releases savings only after exact output,
+FERTIG-status, and frozen-evaluator parity. A ResultCell cannot substitute for
+a generic ComputeCrystal; its narrow binding is the reason it can return a
+complete cached result safely.
+
+The first real temporal holdout proves this endpoint: an authenticated
+five-forward cold baseline executes warm with zero Qwen forwards while the raw
+Qwen document and final semantic core remain exact. The frozen evaluator opens
+once and verifies the output. FERTIG abstains on both paths, so the result is
+evaluator-verified exact replay and its FERTIG semantic-certificate flag is
+false.
+
+## 6. O1 cartography and SemanticWeightAtlas
 
 O1-State continuously measures surprise and learning progress over authentic
 Qwen probe outcomes. The Atlas stores each immutable `MeasurementReceipt`
@@ -95,11 +151,15 @@ append-only Atlas head.
 
 Atlas revisions expose exact hash-chain membership. Rollback, fork, forged
 historical events, and a head change during proof construction fail closed.
+Scheduler observation order can traverse authenticated historical revisions in
+any order. Restore authenticates every seen revision, requires the initial
+revision to be a history member, and requires the current revision to equal the
+maximum seen head; teacher transitions retain their independent temporal order.
 Crystal promotion uses a sealed two-phase transaction, so a crash during a
 multi-site publication batch resumes from prepared state without repeating a
 Qwen probe.
 
-## 6. DeepSeek-V4-Flash transport laboratory
+## 7. DeepSeek-V4-Flash transport laboratory
 
 `src/immer/runtimes/deepseek_v4/` implements the checkpoint math directly:
 
@@ -118,7 +178,7 @@ rails, exact range accounting, causal append machinery, state transport, and
 placebo discipline feed the primary Qwen architecture. It is not the default
 teacher path.
 
-## 7. Markov transport controller
+## 8. Markov transport controller
 
 DeepSeek's official router emits selected expert IDs for every active token
 row. IMMER records those rows without labels and estimates layer-to-layer
@@ -136,7 +196,7 @@ runtime can evaluate any \(k\), compare against target-layer marginals and a
 label-preserving placebo, and convert ranked candidates into exact range
 plans. Official router output remains authoritative.
 
-## 8. Exact execution plane
+## 9. Exact execution plane
 
 The `ExactCascade` owns exact arithmetic routing:
 
@@ -147,7 +207,7 @@ The `ExactCascade` owns exact arithmetic routing:
 No online learning step can mutate this path. This makes exact results usable
 as certificates around neural inference.
 
-## 9. Causal Prefix Sinkhorn Attention
+## 10. Causal Prefix Sinkhorn Attention
 
 CRSA is IMMER's Causal Prefix Sinkhorn Attention mechanism. It assigns heads
 explicit causal roles:
@@ -160,7 +220,7 @@ The deployed role-complete program is two Local heads, one Balanced head, and
 one Free head. The Free head preserves unrestricted causal reach and is
 bit-exact with causal softmax for the same logits.
 
-## 10. Persistent state
+## 11. Persistent state
 
 The O(1)-state runtime maintains a separate life stream with surprise-gated
 updates, replay, and sleep consolidation. It can learn without rewriting the
@@ -175,6 +235,11 @@ frozen exact host or the immutable frontier checkpoint.
 - Every range read is identity-bound and byte-accounted.
 - Transport hints never change official router decisions.
 - OoE executes only covered, calibrated, verifier-bound Crystal actions.
+- ComputeChargeReceipt binds the source program, parent operators, fused
+  operator, exact fusion check, and verifier receipt; the materialized charged
+  route adds the durable bank publication and graph revision.
+- Generic ComputeCrystals accept unseen runtime values; exact ResultCells accept
+  only their complete sealed cold binding.
 - Saved Qwen forwards commit only after final result verification.
 - Exact capability execution either returns a verified answer or abstains.
 - Private state and operational topology stay outside the public repository.

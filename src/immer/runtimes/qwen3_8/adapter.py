@@ -57,6 +57,10 @@ _GENERATION_RECEIPT_FIELDS = (
     "state_bytes",
     "stopped_on_eos",
 )
+RESULT_CELL_GENERATION_POLICY_SCHEMA = (
+    "immer.qwen3.8-result-cell-generation-policy/v1"
+)
+_RESULT_CELL_CODE_REVISION_LENGTHS = frozenset((40, 64))
 
 
 class Qwen38ChatError(RuntimeError):
@@ -544,6 +548,7 @@ class Qwen38CausalChat:
         max_context_tokens: int = 2048,
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
         anchor_cache: SemanticStateAnchorCache | None = None,
+        result_cell_code_revision: str | None = None,
     ) -> None:
         if not isinstance(bundle_path, (str, Path)):
             raise TypeError("bundle_path must be a local filesystem path")
@@ -568,6 +573,15 @@ class Qwen38CausalChat:
             and type(anchor_cache) is not SemanticStateAnchorCache
         ):
             raise TypeError("anchor_cache must be a SemanticStateAnchorCache or None")
+        if result_cell_code_revision is not None and (
+            not isinstance(result_cell_code_revision, str)
+            or len(result_cell_code_revision)
+            not in _RESULT_CELL_CODE_REVISION_LENGTHS
+            or set(result_cell_code_revision) - _SHA256
+        ):
+            raise ValueError(
+                "result_cell_code_revision must be a full lowercase Git/SHA revision"
+            )
         if max_prompt_tokens + max_new_tokens > max_context_tokens:
             raise ValueError(
                 "max_prompt_tokens plus max_new_tokens exceeds max_context_tokens"
@@ -584,6 +598,7 @@ class Qwen38CausalChat:
         self._max_context_tokens = max_context_tokens
         self._head_block_rows = head_block_rows
         self._anchor_cache = anchor_cache
+        self._result_cell_code_revision = result_cell_code_revision
         self._runtime: Any | None = None
         self._bundle_receipt: dict[str, Any] | None = None
         self._tokenizer_sha256: str | None = None
@@ -591,6 +606,75 @@ class Qwen38CausalChat:
         self._close_error: str | None = None
         self._closed = False
         self._lock = threading.RLock()
+
+    def _result_cell_generation_policy_sha256(self) -> str:
+        return _digest(
+            {
+                "anchor_cache_enabled": self._anchor_cache is not None,
+                "compute_dtype": self._compute_dtype,
+                "decoding": "greedy",
+                "device": self._device,
+                "eos_token_ids": [IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID],
+                "head_block_rows": self._head_block_rows,
+                "max_context_tokens": self._max_context_tokens,
+                "max_new_tokens": self._max_new_tokens,
+                "max_prompt_tokens": self._max_prompt_tokens,
+                "max_resident_bytes": self._max_resident_bytes,
+                "prefill_tokenwise": False,
+                "schema": RESULT_CELL_GENERATION_POLICY_SCHEMA,
+                "source_budget_mb": self._source_budget_mb,
+                "thinking": False,
+            }
+        )
+
+    def _result_cell_binding_receipt(
+        self,
+        *,
+        question: str,
+        rendered_prompt: str,
+        prompt_ids: tuple[int, ...],
+    ) -> dict[str, Any] | None:
+        code_revision = self._result_cell_code_revision
+        if code_revision is None:
+            return None
+        # Imported only for the explicitly enabled OoE path.  The default Qwen
+        # facade remains dependency- and evidence-compatible with prior runs.
+        from ..ooe.result_cells import (
+            ResultCellBinding,
+            qwen_result_binding_evidence,
+        )
+        from .cartography_probe import prompt_token_sha256
+        from .semantic_atlas import ModelPin
+
+        bundle = self._bundle_receipt
+        tokenizer_sha256 = self._tokenizer_sha256
+        if bundle is None:
+            raise Qwen38ChatError("authenticated runtime bundle receipt is missing")
+        if not _is_sha256(tokenizer_sha256):
+            raise Qwen38ChatError("runtime tokenizer receipt is invalid")
+        pin = ModelPin(
+            repo_id=OFFICIAL_REPO_ID,
+            revision=OFFICIAL_REVISION,
+            bundle_fingerprint=bundle["layout_fingerprint"],
+            bundle_manifest_sha256=bundle["manifest_sha256"],
+            code_revision=code_revision,
+        )
+        binding = ResultCellBinding(
+            model_pin=pin,
+            tokenizer_sha256=tokenizer_sha256,
+            question_sha256=hashlib.sha256(question.encode("utf-8")).hexdigest(),
+            rendered_prompt_sha256=hashlib.sha256(
+                rendered_prompt.encode("utf-8")
+            ).hexdigest(),
+            rendered_prompt_token_sha256=prompt_token_sha256(prompt_ids),
+            system_prompt_sha256=hashlib.sha256(
+                self._system_prompt.encode("utf-8")
+            ).hexdigest(),
+            generation_policy_sha256=(
+                self._result_cell_generation_policy_sha256()
+            ),
+        )
+        return qwen_result_binding_evidence(binding)
 
     @property
     def model_id(self) -> str:
@@ -820,6 +904,13 @@ class Qwen38CausalChat:
             "generation": receipt,
             "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
         }
+        result_cell_binding = self._result_cell_binding_receipt(
+            question=text,
+            rendered_prompt=prompt,
+            prompt_ids=prompt_ids,
+        )
+        if result_cell_binding is not None:
+            evidence["result_cell_binding_receipt"] = result_cell_binding
         if restored is not None:
             evidence["anchor_cache"] = _anchor_hit_evidence(
                 restored,
@@ -948,4 +1039,9 @@ class Qwen38CausalChat:
 Qwen38Chat = Qwen38CausalChat
 
 
-__all__ = ["Qwen38CausalChat", "Qwen38Chat", "Qwen38ChatError"]
+__all__ = [
+    "RESULT_CELL_GENERATION_POLICY_SCHEMA",
+    "Qwen38CausalChat",
+    "Qwen38Chat",
+    "Qwen38ChatError",
+]
