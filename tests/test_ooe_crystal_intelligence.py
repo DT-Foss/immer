@@ -27,6 +27,17 @@ class CrystalIntelligenceBenchmarkTests(unittest.TestCase):
         self.assertEqual(headline["residual_suffix_length"], 2)
         self.assertGreater(compute["residual_historical_work_released"], 0)
         self.assertEqual(compute["residual_live_operator_count"], 3)
+        self.assertTrue(compute["demand_final_selected_deeper"])
+        self.assertEqual(compute["demand_scheduler_generation"], 6)
+        self.assertEqual(len(set(compute["demand_selected_prefix_sha256s"][:2])), 2)
+        self.assertEqual(
+            compute["demand_selected_prefix_sha256s"][-1],
+            compute["demand_selected_prefix_sha256s"][
+                compute["demand_outcome_rewards"].index(
+                    max(compute["demand_outcome_rewards"][:2])
+                )
+            ],
+        )
         self.assertEqual(compute["multi_step_teacher_labels"], 0)
         self.assertEqual(compute["unseen_batch"], 128)
         self.assertLess(compute["max_absolute_delta"], 1e-12)

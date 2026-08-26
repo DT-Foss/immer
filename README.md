@@ -39,6 +39,11 @@ release surface.
   behavioral MAP-Elites, Fiedler-projector novelty, verified UCB1, PPM route
   prediction, co-occurrence prefetch, and Ricci retention drive exploration and
   demand.
+- **Exact operator algebras.** One guarded affine-monoid runtime executes stack
+  shifts, multi-counter DFAs, rolling fingerprints, Decimal-Horner, and group
+  maps over exact integer or modular rings. A contextual Markov meta-agent
+  learns which algebra fits each task and joins incompatible programs only as
+  independent parallel lanes.
 - **Exact result cells.** A `ResultCell` is the sealed special case for one
   complete Qwen/FERTIG result binding. It is distinct from a generic
   `ComputeCrystal` and executes only under exact prompt, model, provenance, and
@@ -62,6 +67,9 @@ release surface.
 | Charged-prefix residual compute | 2 charged + 2 live suffix steps | 128 unseen vectors; 9,216 historical work units released; maximum delta 1.33e-15 |
 | Birkhoff operator basis | 33 atoms; exact bound 50 | weighted atom discharge matches the stored 8×8 Markov operator within 6.66e-16 |
 | Autonomous operator search | 12 MAP-Elites cells; late mutation preference 100% | 14 Pareto elites; Fiedler missing-bridge priority 0.409 vs. 0.121 for the best existing edge |
+| Demand-routed residual execution | rewards 1.25 vs. 1.50; deeper prefix selected on decision 3 | persisted PPM/UCB selection → forced charged prefix → live suffix → external verifier → exact positive/negative feedback in one joined receipt |
+| Exact guarded affine monoids | Stack depth 53/64 exact; `aⁿbⁿcⁿ` 4/4; placebos 7/7 rejected | exact integer/modular `(A,b)` atoms, guard-preserving fusion, 128-digit Horner, fingerprint collision contained by byte verifier, atomic replay-verified bundle |
+| Contextual algebra agent | 120/120 correct; shuffled-context placebo 0/90 | Stack/Fingerprint/Decimal choice; Stack→Decimal regime recovery 30/30; three incompatible ABIs execute as one receipt-joined parallel ensemble |
 | Algebraic crystallization | 3/3 families admitted and exact | additive, multiplicative, and cyclic length-12 execution; permuted placebo rejected |
 | Qwen compute battery | 1.4288x peak speed | 65-token charged prefix + unknown 33-token suffix; authenticated restore removes 30.01% of demand latency |
 | O1 → Atlas → OoE | 10/10 live jobs; 15 measurements | two real contextual Qwen sites, Atlas revision 15, crash-resumable promotion, exact zero-probe reuse |

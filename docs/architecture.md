@@ -150,6 +150,39 @@ Pareto operators, contextual Thompson sampling learns mutation families, and
 Fiedler-projector distance proposes missing graph bridges without eigenvector
 sign or basis ambiguity.
 
+Demand-routed execution closes the learning loop:
+
+```text
+PPM context -> persisted UCB choice -> forced charged prefix
+            -> live residual suffix -> external verifier
+            -> positive/negative outcome -> next demand decision
+```
+
+The joined receipt binds every arrow and its scheduler state transition.
+Operational exceptions create neutral abort events that remove unfinished
+pulls; they never become fabricated quality failures. Verified success reward
+is `1 + historical_work_released / equivalent_source_work`, so equal-quality
+routes compete on computation returned from the past.
+
+The exact affine-monoid plane generalizes stored operators beyond float64
+matrices. An action carries an exact pair `(A,b)` over integer or modular state,
+plus declarative phase and domain guards. Guarded fusion computes
+`(A₂A₁, A₂b₁+b₂)` while retaining every intermediate guard stage. One runtime
+therefore covers:
+
+- explicit-depth LIFO stacks with overflow and underflow states;
+- vector counters plus DFA phase for genuine `aⁿbⁿcⁿ`;
+- length-, separator-, and phase-bound rolling fingerprints;
+- strict signed Decimal-Horner;
+- additive, multiplicative, and cyclic group-map actions.
+
+Programs, initial/final states, and all execution receipts persist as one
+replay-verified atomic bundle. The contextual algebra router selects among
+verified programs with Thompson posteriors and keeps a Pareto MAP-Elites
+catalog. Different state schemas compose as independent parallel lanes under a
+joined ensemble receipt; the runtime rejects every attempt to reinterpret them
+as one sequential ABI.
+
 Algebraic Crystals learn the coordinate system of an operator family rather
 than memorizing its outputs. Admission compares additive, multiplicative, and
 finite-cyclic invariants under explicit score and margin gates. An exact group

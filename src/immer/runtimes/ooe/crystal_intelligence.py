@@ -35,6 +35,11 @@ from .compute_crystals import (
 )
 from .compute_graph import ComputeOperatorGraph, OperatorEdge
 from .consensus import barbell_adjacency
+from .demand_execution import (
+    DemandExecutionVerification,
+    DemandRoutedExecutor,
+)
+from .demand_scheduler import OperatorDemandScheduler
 from .identity import canonical_json_bytes
 from .math_core import spectral_gap, tv_contraction
 from .residual_execution import ResidualRouteExecutor
@@ -104,6 +109,11 @@ def _compute_experiment(seed: int) -> dict[str, Any]:
             raise RuntimeError("verified affine prefix unexpectedly abstained")
         prefix_charge = graph.charge_route(prefix_decision.plan)
 
+        deeper_decision = graph.plan_route(states[0], states[3])
+        if deeper_decision.abstained or deeper_decision.plan is None:
+            raise RuntimeError("verified deeper affine prefix unexpectedly abstained")
+        deeper_charge = graph.charge_route(deeper_decision.plan)
+
         decision = graph.plan_route(states[0], states[-1])
         if decision.abstained or decision.plan is None:
             raise RuntimeError("verified affine route unexpectedly abstained")
@@ -118,10 +128,69 @@ def _compute_experiment(seed: int) -> dict[str, Any]:
         primitive_program = ComputeProgram.compose(crystals)
         bank.publish_program(primitive_program)
         primitive = ComputeCrystalVM(bank).execute(primitive_program, unseen)
-        residual = ResidualRouteExecutor(graph).execute(decision.plan, unseen)
+        residual = ResidualRouteExecutor(graph).execute(
+            decision.plan,
+            unseen,
+            prefix_route_sha256=prefix_charge.route.sha256,
+        )
         residual_delta = float(np.max(np.abs(primitive.output - residual.output)))
         if residual_delta > 1e-12:
             raise RuntimeError("charged prefix changed residual unseen outputs")
+
+        demand_scheduler = OperatorDemandScheduler(bank.store)
+        verification_index = 0
+
+        def verify_demand(execution):
+            nonlocal verification_index
+            verification_index += 1
+            exact = bool(
+                np.allclose(
+                    execution.output,
+                    primitive.output,
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+            )
+            return DemandExecutionVerification.create(
+                execution,
+                accepted=exact,
+                verifier_sha256=_hash(
+                    {"kind": "demand-output-verifier", "seed": seed}
+                ),
+                evidence_sha256=_hash(
+                    {
+                        "exact": exact,
+                        "kind": "demand-output-evidence",
+                        "ordinal": verification_index,
+                        "seed": seed,
+                    }
+                ),
+                reason="exact-primitive-parity" if exact else "parity-failure",
+            )
+
+        demand_executor = DemandRoutedExecutor(
+            graph=graph,
+            scheduler=demand_scheduler,
+            verifier=verify_demand,
+        )
+        demand_candidates = tuple(
+            sorted((prefix_charge.route.sha256, deeper_charge.route.sha256))
+        )
+        demand_runs = tuple(
+            demand_executor.execute(
+                decision.plan,
+                unseen,
+                candidate_route_sha256s=demand_candidates,
+                episode_sha256=_hash(
+                    {"kind": "demand-execution-episode", "seed": seed}
+                ),
+            )
+            for _ in range(3)
+        )
+        if demand_runs[-1].receipt.selected_prefix_route_sha256 != (
+            deeper_charge.route.sha256
+        ):
+            raise RuntimeError("demand agent did not learn the higher-work prefix")
 
         charge = graph.charge_route(decision.plan)
         warm = graph.discharge(states[0], states[-1], unseen)
@@ -172,6 +241,7 @@ def _compute_experiment(seed: int) -> dict[str, Any]:
             "multi_step_teacher_labels": 0,
             "placebo_abstained": placebo.abstained,
             "prefix_charge_receipt_sha256": prefix_charge.sha256,
+            "deeper_prefix_charge_receipt_sha256": deeper_charge.sha256,
             "primitive_route_length": len(charge.route.primitive_edge_sha256s),
             "residual_historical_work_released": (
                 residual.receipt.historical_work_released
@@ -188,6 +258,17 @@ def _compute_experiment(seed: int) -> dict[str, Any]:
             "residual_prefix_length": residual.receipt.prefix_length,
             "residual_suffix_length": residual.receipt.residual_length,
             "residual_receipt_sha256": residual.receipt.sha256,
+            "demand_selected_prefix_sha256s": [
+                run.receipt.selected_prefix_route_sha256 for run in demand_runs
+            ],
+            "demand_outcome_rewards": [
+                run.receipt.outcome.reward for run in demand_runs
+            ],
+            "demand_final_selected_deeper": True,
+            "demand_joined_receipt_sha256s": [
+                run.receipt.sha256 for run in demand_runs
+            ],
+            "demand_scheduler_generation": demand_scheduler.state().generation,
             "reopen_receipt_sha256": replay.receipt.sha256,
             "unseen_batch": int(unseen.shape[0]),
             "warm_receipt_sha256": warm.receipt.sha256,

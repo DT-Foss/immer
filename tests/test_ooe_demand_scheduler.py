@@ -24,6 +24,7 @@ from immer.runtimes.ooe.demand_scheduler import (
     OperatorDemandIntegrityError,
     OperatorDemandScheduler,
     OperatorDemandState,
+    SelectionAbortEvent,
     verify_demand_receipt,
 )
 from immer.runtimes.ooe.identity import canonical_json_bytes
@@ -296,6 +297,45 @@ class OperatorDemandSchedulerTests(unittest.TestCase):
         self.scheduler.record_outcome(first, self.graph_state)
         with self.assertRaisesRegex(OperatorDemandConflictError, "already"):
             self.scheduler.record_outcome(second, self.graph_state)
+
+    def test_operational_abort_neutralizes_pull_and_is_idempotent(self) -> None:
+        alpha = self.routes_by_source["alpha"]
+        selection = self.scheduler.select_ucb1(
+            self.graph_state,
+            input_abi_sha256=self.input_abi,
+            candidate_routes_or_plans=(alpha,),
+        )
+        kwargs = {
+            "abort_evidence_sha256": _digest("abort-evidence"),
+            "abort_verifier_sha256": _digest("abort-verifier"),
+            "reason_code": "synthetic-operational-failure",
+        }
+        first = self.scheduler.abort_selection(
+            selection,
+            self.graph_state,
+            **kwargs,
+        )
+        second = self.scheduler.abort_selection(
+            selection,
+            self.graph_state,
+            **kwargs,
+        )
+        self.assertTrue(first.changed)
+        self.assertFalse(second.changed)
+        state = self.scheduler.state()
+        self.assertIsInstance(state.events[-1], SelectionAbortEvent)
+        retry = self.scheduler.select_ucb1(
+            self.graph_state,
+            input_abi_sha256=self.input_abi,
+            candidate_routes_or_plans=(alpha,),
+        )
+        self.assertEqual(retry.event.scores[0].pulls, 0)
+        outcome = self._make_outcome(
+            alpha,
+            selection_event_sha256=selection.selection_event_sha256,
+        )
+        with self.assertRaisesRegex(OperatorDemandIntegrityError, "aborted"):
+            self.scheduler.record_outcome(outcome, self.graph_state)
 
     def test_selection_outcome_cannot_cross_graph_revisions(self) -> None:
         alpha = self.routes_by_source["alpha"]

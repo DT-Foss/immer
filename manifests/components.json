@@ -33,7 +33,10 @@
       "integration": "src/immer/runtimes/ooe/",
       "additional_integrations": [
         "scripts/qwen38_o1_cartography.py",
-        "src/immer/cognition/qwen_fertig_chat.py"
+        "src/immer/cognition/qwen_fertig_chat.py",
+        "src/immer/runtimes/ooe/demand_execution.py",
+        "src/immer/runtimes/ooe/affine_monoid.py",
+        "src/immer/runtimes/ooe/algebra_agents.py"
       ]
     },
     {

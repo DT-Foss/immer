@@ -31,7 +31,9 @@ are outside the repository record.
 | ComputeCrystal VM and operator graph | `src/immer/runtimes/ooe/compute_crystals.py`, `src/immer/runtimes/ooe/compute_graph.py` |
 | charged-prefix residual execution | `src/immer/runtimes/ooe/residual_execution.py` |
 | real contextual operator harvesting and demand | `src/immer/runtimes/ooe/operator_harvester.py`, `src/immer/runtimes/ooe/demand_scheduler.py` |
+| joined demand execution and feedback | `src/immer/runtimes/ooe/demand_execution.py`, `src/immer/runtimes/ooe/residual_execution.py` |
 | constructive Birkhoff search and Crystal bases | `src/immer/runtimes/ooe/bvn_search.py`, `src/immer/runtimes/ooe/bvn_crystals.py` |
+| exact guarded affine monoids and contextual algebra agents | `src/immer/runtimes/ooe/affine_monoid.py`, `src/immer/runtimes/ooe/algebra_agents.py`, `src/immer/runtimes/ooe/affine_intelligence.py` |
 | algebraic Crystals | `src/immer/runtimes/ooe/algebraic_crystals.py` |
 | exact ResultCells and S3 executor | `src/immer/runtimes/ooe/result_cells.py`, `src/immer/runtimes/ooe/s3_executor.py` |
 | DeepSeek V4 runtime | `src/immer/runtimes/deepseek_v4/` |

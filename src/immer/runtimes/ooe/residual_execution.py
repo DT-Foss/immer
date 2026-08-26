@@ -488,8 +488,21 @@ class ResidualRouteExecutor:
             == plan.primitive_edge_sha256s[:length]
         )
 
-    def execute(self, plan: ComputeRoutePlan, value: object) -> ResidualRouteExecution:
+    def execute(
+        self,
+        plan: ComputeRoutePlan,
+        value: object,
+        *,
+        prefix_route_sha256: str | None = None,
+    ) -> ResidualRouteExecution:
         state = self._validate_current_plan(plan)
+        requested_prefix = (
+            None
+            if prefix_route_sha256 is None
+            else require_sha256(
+                prefix_route_sha256, field="prefix_route_sha256"
+            )
+        )
         edge_by_sha = {edge.sha256: edge for edge in state.edges}
         edges = tuple(edge_by_sha.get(address) for address in plan.primitive_edge_sha256s)
         if any(edge is None for edge in edges):
@@ -520,18 +533,30 @@ class ResidualRouteExecutor:
             except ComputeCrystalABIError:
                 continue
             compatible.append((route, len(route.primitive_edge_sha256s), applications))
-        prefix_route = (
-            None
-            if not compatible
-            else min(
-                compatible,
-                key=lambda item: (
-                    -item[1],
-                    item[0].live_work_units * item[2],
-                    item[0].sha256,
-                ),
-            )[0]
-        )
+        if requested_prefix is None:
+            prefix_route = (
+                None
+                if not compatible
+                else min(
+                    compatible,
+                    key=lambda item: (
+                        -item[1],
+                        item[0].live_work_units * item[2],
+                        item[0].sha256,
+                    ),
+                )[0]
+            )
+        else:
+            selected = tuple(
+                route
+                for route, _length, _applications in compatible
+                if route.sha256 == requested_prefix
+            )
+            if len(selected) != 1:
+                raise ResidualExecutionIntegrityError(
+                    "requested demand prefix is not one charged compatible plan prefix"
+                )
+            prefix_route = selected[0]
         prefix_length = (
             0 if prefix_route is None else len(prefix_route.primitive_edge_sha256s)
         )

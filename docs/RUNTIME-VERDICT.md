@@ -13,10 +13,11 @@ execution planes:
    SemanticWeightAtlas;
 3. replicated action-conditioned Markov world models, PS-Lifted consensus,
    hierarchical options, continuous reservoir memory, operator-demand
-   learning, and novelty admission;
+   learning, contextual algebra selection, and novelty admission;
 4. generic stored computation through ComputeCrystals, an authenticated
    operator graph, contextual operator harvesting, Birkhoff atom bases,
-   algebraic crystallization, and charged-prefix residual discharge;
+   exact guarded affine monoids, algebraic crystallization, and demand-routed
+   charged-prefix residual discharge;
 5. deterministic FERTIG/S3 capability execution and sealed ResultCells under
    final parity accounting;
 6. LiveCausal addressing and exact Safetensors range execution, with the
@@ -61,6 +62,20 @@ later requests.
 - Fiedler-projector novelty ranks the strongest missing barbell bridge at
   `0.409362` against `0.120790` for the strongest existing edge after its
   direct-edge penalty.
+- The joined demand executor explores two charged prefixes, verifies exact
+  residual parity, receives rewards `1.25` and `1.50`, and selects the deeper
+  prefix on decision three. Operational verifier failure produces a neutral
+  abort event and leaves the arm's reward untouched.
+- The exact stack recovers unique buried symbols at depth `53/64` and enters
+  dead at depth `65`. The genuine `aⁿbⁿcⁿ` machine accepts `4/4` unseen counts
+  through `n=100` and rejects `7/7` order/count placebos. Decimal-Horner is
+  exact through 128 digits; the dual-modular collision stays behind the exact
+  byte-verifier boundary.
+- The contextual algebra agent chooses Stack, Fingerprint, and Decimal
+  correctly on `120/120` decisions, scores `0/90` on the shuffled-context
+  placebo, and recovers Stack→Decimal on `30/30` late decisions. Three
+  incompatible program schemas execute as independent replay-verified lanes
+  under one joined receipt.
 - Four distinct prompts through the committed causal-Qwen fixture yield eight
   authenticated hidden transitions grouped into two reusable layer families.
   Exact prompt runtime receipts remain distinct and the stable operator family
@@ -88,8 +103,8 @@ evidence surface for each result.
 |---|---|---|
 | local Qwen | `src/immer/runtimes/qwen3_8/` | authenticated causal mount, exact stateful inference, Prefix-Sinkhorn, anchors |
 | O1 and Atlas | `src/immer/runtimes/o1_state/`, `src/immer/runtimes/ooe/cartography.py` | persistent learning state, exact measurement identity, append-only revision membership |
-| Markov intelligence | `src/immer/runtimes/ooe/` | action-conditioned evidence, PS-Lifted fusion, planning, options, demand, novelty, topology and regime receipts |
-| ComputeCrystal | `compute_crystals.py`, `compute_graph.py`, `residual_execution.py`, `operator_harvester.py`, `bvn_search.py`, `bvn_crystals.py`, `algebraic_crystals.py` | real contextual operator discovery, typed unseen-input programs, constructive atom bases, authenticated charge basis, residual execution, atomic persistence, exact accounting |
+| Markov intelligence | `src/immer/runtimes/ooe/` | action-conditioned evidence, PS-Lifted fusion, planning, options, demand execution, contextual algebra routing, novelty, topology and regime receipts |
+| Stored operators | `compute_crystals.py`, `compute_graph.py`, `residual_execution.py`, `demand_execution.py`, `operator_harvester.py`, `bvn_search.py`, `bvn_crystals.py`, `affine_monoid.py`, `algebra_agents.py`, `algebraic_crystals.py` | real contextual discovery, typed unseen-input programs, constructive atom bases, exact integer/modular recurrence, authenticated charge and feedback, heterogeneous parallel execution, atomic persistence, exact accounting |
 | ResultCell | `result_cells.py` | one complete cold-result binding, zero-forward warm execution, final semantic and evaluator parity |
 | exact execution | `src/immer/cognition/` | S3/FERTIG verification, grounded fallback, explicit abstention |
 | LiveCausal | `src/immer/knowledge/livecausal.py` | immutable payloads, append-only causal graph, lazy exact queries, recovery |

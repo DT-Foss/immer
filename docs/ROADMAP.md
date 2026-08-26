@@ -27,6 +27,13 @@ around every domain that supports it.
 - [x] Verified UCB1/PPM demand learning, episode-scoped co-occurrence prefetch,
   Ricci retention, negative route evidence, and charged-prefix residual
   discharge.
+- [x] Joined demand execution from PPM/UCB selection through forced prefix,
+  residual VM, external verifier, exact feedback, and neutral operational abort.
+- [x] Exact guarded affine monoids over integer/modular rings with atomic
+  replay-verified bundles: Stack, `aⁿbⁿcⁿ`, Fingerprint, Decimal-Horner, and
+  group maps.
+- [x] Contextual algebra meta-agent, MAP-Elites catalog, regime adaptation, and
+  receipt-joined heterogeneous parallel ensembles.
 - [x] Additive, multiplicative, and finite-cyclic algebraic crystallization with
   exact group accumulation and a rejected permuted placebo.
 - [x] Continuous PS-Lifted reservoir memory with delayed-state, no-memory,

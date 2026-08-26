@@ -4,6 +4,59 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-26
 
+### Demand-routed execution and exact operator algebras
+
+- Added `DemandRoutedExecutor`, the production feedback loop over materialized
+  compute. One canonical receipt joins PPM prediction, persisted UCB1 choice,
+  the exactly forced charged prefix, live residual suffix, both VM receipts,
+  external quality verification, computed savings reward, and the committed
+  positive or negative demand outcome.
+- Made operational failure neutral. VM exceptions, verifier crashes, stale PPM
+  state, and pre-outcome commit failures append a verifier-bound
+  `SelectionAbortEvent`; the event removes the unfinished pull without
+  manufacturing negative quality evidence. Aborted selections cannot later
+  accept an outcome.
+- Bound the joined state chain exactly. PPM state equals the selection pre-state;
+  selection post-state equals outcome-transition pre-state; the transition
+  generation and deterministic `OutcomeEvent` hash must match the embedded
+  outcome. Same-length fork and receipt-splice attacks reject.
+- Added the exact guarded affine-monoid runtime. Every action is an integer or
+  per-coordinate modular pair `(A,b)`; composition is
+  `(A₂A₁, A₂b₁+b₂)`. Guard-stage traces preserve partial domains through
+  fusion, and explicit phase, depth, dead, bit, and logical-capacity fields
+  replace the old learned/float approximations.
+- Added an explicit LIFO stack, a genuine two-counter `aⁿbⁿcⁿ` DFA, dual
+  modular rolling fingerprints with length/separator/phase binding, strict
+  signed Decimal-Horner through 128 digits, and additive/multiplicative/cyclic
+  group-map bridges. Multiplicative zero, stack overflow/underflow, malformed
+  grammar, out-of-order equal-count strings, and bit-bound overflow fail closed.
+- Added the mandatory exact fingerprint boundary. Modular equality creates a
+  candidate only; a byte-verifier receipt decides exact equality. The fixed
+  collision trial reaches the candidate state and is correctly rejected by the
+  exact verifier.
+- Added one replay-verified `ExecutionBundle` and `AffineMonoidBank`. Program,
+  initial/final state, state/program/execution receipts, and verifier lineage
+  persist as a single atomic content-addressed payload with crash retry,
+  idempotence, tamper detection, and exact replay on restore.
+- Added the contextual algebra meta-agent. Verified Stack, Fingerprint, and
+  Decimal candidates live in a Pareto MAP-Elites catalog; contextual Thompson
+  updates learn the correct algebra per task and recover after regime change.
+  Handcrafted selections cannot poison posteriors because every update
+  reconstructs the exact parent router and deterministic Thompson choice.
+- Added receipt-joined heterogeneous ensembles. Programs with different state
+  schemas execute as independent parallel lanes; no sequential/common ABI is
+  claimed. Each lane embeds its exact program and initial state, replays
+  standalone, and rejects cross-program, same-schema, swapped, missing, or
+  verifier-artifact splices.
+- Fixed-seed results: demand rewards `1.25` and `1.50`, with the deeper prefix
+  selected on decision three; stack depth `53/64` exact and depth `65` dead;
+  `aⁿbⁿcⁿ` unseen counts `4/4`, placebos `7/7`; contextual algebra routing
+  `120/120`, shuffled-context placebo `0/90`, Stack→Decimal recovery `30/30`;
+  three heterogeneous lanes replay exactly under one joined receipt.
+- Verified the complete repository with `1,673/1,673` tests under
+  `ResourceWarning`-as-error in `549.699 s`. All changed files pass Ruff,
+  compile, diff, anti-hedge, link-target, JSON, and private-path gates.
+
 ### Continuous operator harvest, search, and residual discharge
 
 - Extended the real Qwen cartography probe with read-only float64 pre/post

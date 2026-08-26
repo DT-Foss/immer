@@ -172,13 +172,13 @@ Every admitted doubly-stochastic kernel is represented as
 \[
 P=\sum_{k=1}^{M}w_k\Pi_k,
 \qquad
-w_k>0,quad \sum_k w_k=1,quad
+w_k>0,\quad \sum_k w_k=1,\quad
 M\le (n-1)^2+1.
 \]
 
 Each iteration selects a perfect matching on the positive residual support,
 subtracts its minimum matched mass, and records one permutation atom. Persistent
-storage is (O(Mn)), not (O(n!)). Theta search stays inside the Birkhoff
+storage is \(O(Mn)\), not \(O(n!)\). Theta search stays inside the Birkhoff
 polytope by construction:
 
 \[
@@ -216,6 +216,105 @@ and resident retention uses David Foss's structural decay
 
 Logical time replaces wall-clock time, pins are never evicted, and byte budgets
 include route metadata, programs, Crystals, and charge receipts.
+
+Verified execution closes the demand loop with
+
+\[
+r_{\rm success}=1+
+\frac{W_{\rm released}}{W_{\rm source}},
+\qquad
+r_{\rm quality\ failure}=-1.
+\]
+
+An operational abort carries no quality reward. Its append-only abort event
+removes the unfinished pull, so infrastructure failure cannot silently lower an
+operator's empirical value.
+
+### Exact guarded affine monoids
+
+Stack, counter, fingerprint, Decimal-Horner, and group maps share one exact
+transition law over declared integer or modular coordinate rings:
+
+\[
+T_{A,b}(s)=As+b,
+\qquad
+T_{A_2,b_2}\circ T_{A_1,b_1}
+=T_{A_2A_1,\,A_2b_1+b_2}.
+\]
+
+Each action also carries phase and domain guards. Fusion combines the numerical
+pair and retains every intermediate guard stage, preserving the partial-action
+domain exactly.
+
+For a stack with \(k\) slots,
+
+\[
+\operatorname{push}_x(s)=S_\downarrow s+Bx,
+\qquad
+\operatorname{pop}(s)=S_\uparrow s.
+\]
+
+Depth \(k\) is live and depth \(k+1\) enters the absorbing dead state. The
+fixed trial recovers unique buried symbols at depth 53 inside a 64-slot stack.
+
+For the context-sensitive language,
+
+\[
+c_1=\#a-\#b,\qquad c_2=\#b-\#c,
+\]
+
+with actions
+
+\[
+\Delta_a=(1,0),\quad
+\Delta_b=(-1,1),\quad
+\Delta_c=(0,-1).
+\]
+
+A phase register \(q\in\{A,B,C,\bot\}\) enforces monotone
+\(A\rightarrow B\rightarrow C\); acceptance requires both counters zero and
+\(q\neq\bot\). This rejects equal-count order confusers such as `acb` and
+`abcabc`.
+
+Rolling fingerprints use two modular registers per side,
+
+\[
+h_j\leftarrow rh_j+v(x)\pmod {p_j},
+\]
+
+plus left/right lengths, separator phase, and dead state. Modular equality is
+only a candidate; exact byte equality produces the final verifier receipt.
+
+Decimal parsing uses exact Horner recurrence
+
+\[
+h\leftarrow10h+d,
+\]
+
+under the strict grammar `[+-]?(0|[1-9][0-9]*)`. The committed capacity is 128
+digits; digit 129 enters dead rather than overflowing a float.
+
+### Contextual algebra selection
+
+The meta-agent treats each verified algebra program as a contextual Thompson
+arm. For context \(c\) and program \(a\),
+
+\[
+z_a\sim\operatorname{Beta}(1+s_{c,a},1+f_{c,a}),
+\qquad a^*=\arg\max_a z_a.
+\]
+
+Every update reconstructs the exact parent router and deterministic Thompson
+choice before changing a posterior. Behavioral MAP-Elites controls the active
+Pareto catalog. Incompatible program schemas form a direct-product execution:
+
+\[
+F(x_1,\ldots,x_m)=
+(F_1(x_1),\ldots,F_m(x_m)),
+\]
+
+with independent ABIs and one receipt joining the lane proofs. No sequential
+ABI is asserted.
 
 ## 7. Novelty and structured kernels
 

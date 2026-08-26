@@ -142,6 +142,38 @@ class ResidualRouteExecutorTests(unittest.TestCase):
         self.assertEqual(result.receipt.residual_length, 1)
         self.assertEqual(result.receipt.prefix_route_sha256, deep.sha256)
 
+    def test_demand_can_force_a_shorter_authenticated_charged_prefix(self) -> None:
+        crystals = self._affine_chain()
+        self._append_chain(crystals, ("s0", "s1", "s2", "s3", "s4"))
+        two_plan = self.graph.plan_route("s0", "s2").plan
+        assert two_plan is not None
+        two = self.graph.charge_route(two_plan).route
+        three_plan = self.graph.plan_route("s0", "s3").plan
+        assert three_plan is not None
+        self.graph.charge_route(three_plan)
+        full = self.graph.plan_route("s0", "s4").plan
+        assert full is not None
+        value = np.array([[-4.0], [17.5]], dtype=np.float64)
+
+        result = ResidualRouteExecutor(self.graph).execute(
+            full,
+            value,
+            prefix_route_sha256=two.sha256,
+        )
+
+        np.testing.assert_array_equal(result.output, self._direct(crystals, value))
+        self.assertEqual(result.receipt.prefix_route_sha256, two.sha256)
+        self.assertEqual(result.receipt.prefix_length, 2)
+        self.assertEqual(result.receipt.residual_length, 2)
+        with self.assertRaisesRegex(
+            ResidualExecutionIntegrityError, "demand prefix"
+        ):
+            ResidualRouteExecutor(self.graph).execute(
+                full,
+                value,
+                prefix_route_sha256=_digest("unknown-prefix"),
+            )
+
     def test_fully_charged_route_needs_no_residual_program(self) -> None:
         crystals = self._affine_chain()[:3]
         self._append_chain(crystals, ("s0", "s1", "s2", "s3"))

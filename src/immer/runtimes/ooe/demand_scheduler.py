@@ -40,6 +40,7 @@ from .identity import canonical_json_bytes, require_sha256
 DEMAND_OUTCOME_SCHEMA = "immer-ooe-operator-demand-outcome/v1"
 DEMAND_SELECTION_EVENT_SCHEMA = "immer-ooe-operator-demand-selection-event/v1"
 DEMAND_OUTCOME_EVENT_SCHEMA = "immer-ooe-operator-demand-outcome-event/v1"
+DEMAND_ABORT_EVENT_SCHEMA = "immer-ooe-operator-demand-abort-event/v1"
 DEMAND_PINS_EVENT_SCHEMA = "immer-ooe-operator-demand-pins-event/v1"
 DEMAND_STATE_SCHEMA = "immer-ooe-operator-demand-state/v1"
 DEMAND_COMMIT_SCHEMA = "immer-ooe-operator-demand-commit/v1"
@@ -669,6 +670,65 @@ class OutcomeEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class SelectionAbortEvent:
+    """Operationally cancel one persisted pull without quality feedback."""
+
+    logical_time: int
+    selection_event_sha256: str
+    route_sha256: str
+    graph_generation: int
+    graph_state_sha256: str
+    input_abi_sha256: str
+    abort_evidence_sha256: str
+    abort_verifier_sha256: str
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "logical_time",
+            _uint(self.logical_time, field="logical_time", positive=True),
+        )
+        object.__setattr__(
+            self,
+            "graph_generation",
+            _uint(self.graph_generation, field="graph_generation"),
+        )
+        for field in (
+            "selection_event_sha256",
+            "route_sha256",
+            "graph_state_sha256",
+            "input_abi_sha256",
+            "abort_evidence_sha256",
+            "abort_verifier_sha256",
+        ):
+            object.__setattr__(
+                self, field, require_sha256(getattr(self, field), field=field)
+            )
+        object.__setattr__(
+            self, "reason_code", _text(self.reason_code, field="reason_code")
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": DEMAND_ABORT_EVENT_SCHEMA,
+            "logical_time": self.logical_time,
+            "selection_event_sha256": self.selection_event_sha256,
+            "route_sha256": self.route_sha256,
+            "graph_generation": self.graph_generation,
+            "graph_state_sha256": self.graph_state_sha256,
+            "input_abi_sha256": self.input_abi_sha256,
+            "abort_evidence_sha256": self.abort_evidence_sha256,
+            "abort_verifier_sha256": self.abort_verifier_sha256,
+            "reason_code": self.reason_code,
+        }
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
 class PinsEvent:
     logical_time: int
     graph_generation: int
@@ -709,7 +769,7 @@ class PinsEvent:
         return _sha256(self.to_dict())
 
 
-DemandEvent = SelectionEvent | OutcomeEvent | PinsEvent
+DemandEvent = SelectionEvent | OutcomeEvent | SelectionAbortEvent | PinsEvent
 
 
 def _event_from_dict(value: object) -> DemandEvent:
@@ -776,6 +836,38 @@ def _event_from_dict(value: object) -> DemandEvent:
             event = OutcomeEvent(
                 logical_time=cast(int, value.get("logical_time")), outcome=outcome
             )
+        elif schema == DEMAND_ABORT_EVENT_SCHEMA:
+            expected = {
+                "schema",
+                "logical_time",
+                "selection_event_sha256",
+                "route_sha256",
+                "graph_generation",
+                "graph_state_sha256",
+                "input_abi_sha256",
+                "abort_evidence_sha256",
+                "abort_verifier_sha256",
+                "reason_code",
+            }
+            if set(value) != expected:
+                raise ValueError("invalid selection-abort event fields")
+            event = SelectionAbortEvent(
+                logical_time=cast(int, value.get("logical_time")),
+                selection_event_sha256=cast(
+                    str, value.get("selection_event_sha256")
+                ),
+                route_sha256=cast(str, value.get("route_sha256")),
+                graph_generation=cast(int, value.get("graph_generation")),
+                graph_state_sha256=cast(str, value.get("graph_state_sha256")),
+                input_abi_sha256=cast(str, value.get("input_abi_sha256")),
+                abort_evidence_sha256=cast(
+                    str, value.get("abort_evidence_sha256")
+                ),
+                abort_verifier_sha256=cast(
+                    str, value.get("abort_verifier_sha256")
+                ),
+                reason_code=cast(str, value.get("reason_code")),
+            )
         elif schema == DEMAND_PINS_EVENT_SCHEMA:
             if set(value) != {
                 "schema",
@@ -828,7 +920,10 @@ class OperatorDemandState:
         if generation > 0 and previous is None:
             raise ValueError("non-empty demand state requires a predecessor")
         for logical_time, event in enumerate(events, start=1):
-            if not isinstance(event, (SelectionEvent, OutcomeEvent, PinsEvent)):
+            if not isinstance(
+                event,
+                (SelectionEvent, OutcomeEvent, SelectionAbortEvent, PinsEvent),
+            ):
                 raise TypeError("events must be immutable demand-event values")
             if event.logical_time != logical_time:
                 raise ValueError("demand-event logical times must be contiguous")
@@ -913,6 +1008,8 @@ class OperatorDemandState:
 def _validate_event_semantics(events: Sequence[DemandEvent]) -> None:
     selections: dict[str, SelectionEvent] = {}
     settled: set[str] = set()
+    aborted: set[str] = set()
+    abort_evidence: set[str] = set()
     outcomes: dict[str, DemandOutcomeReceipt] = {}
     evidence: dict[str, str] = {}
     pulls: dict[str, int] = defaultdict(int)
@@ -942,6 +1039,29 @@ def _validate_event_semantics(events: Sequence[DemandEvent]) -> None:
             selections[event.sha256] = event
             pulls[event.route_sha256] += 1
             continue
+        if isinstance(event, SelectionAbortEvent):
+            selection = selections.get(event.selection_event_sha256)
+            if selection is None:
+                raise ValueError("abort references an unknown or future selection")
+            if event.selection_event_sha256 in settled:
+                raise ValueError("a settled selection cannot be aborted")
+            if event.selection_event_sha256 in aborted:
+                raise ValueError("a selection cannot be aborted twice")
+            if event.abort_evidence_sha256 in abort_evidence:
+                raise ValueError("abort evidence cannot settle two selections")
+            if (
+                selection.route_sha256 != event.route_sha256
+                or selection.graph_generation != event.graph_generation
+                or selection.graph_state_sha256 != event.graph_state_sha256
+                or selection.input_abi_sha256 != event.input_abi_sha256
+            ):
+                raise ValueError("abort differs from its selection binding")
+            pulls[event.route_sha256] -= 1
+            if pulls[event.route_sha256] < 0:
+                raise ValueError("selection abort produced negative pull count")
+            aborted.add(event.selection_event_sha256)
+            abort_evidence.add(event.abort_evidence_sha256)
+            continue
         if not isinstance(event, OutcomeEvent):
             continue
         outcome = event.outcome
@@ -961,6 +1081,8 @@ def _validate_event_semantics(events: Sequence[DemandEvent]) -> None:
         selection = selections.get(selection_sha)
         if selection is None:
             raise ValueError("outcome references an unknown or future selection")
+        if selection_sha in aborted:
+            raise ValueError("outcome references an aborted selection")
         if selection.route_sha256 != outcome.route_sha256:
             raise ValueError("outcome settles another route's selection")
         if (
@@ -999,6 +1121,7 @@ class ArmStatistics:
 
 def _arm_statistics(state: OperatorDemandState) -> dict[str, ArmStatistics]:
     selected: dict[str, int] = defaultdict(int)
+    selections: dict[str, str] = {}
     successes: dict[str, int] = defaultdict(int)
     failures: dict[str, int] = defaultdict(int)
     rewards: dict[str, float] = defaultdict(float)
@@ -1006,7 +1129,16 @@ def _arm_statistics(state: OperatorDemandState) -> dict[str, ArmStatistics]:
     for event in state.events:
         if isinstance(event, SelectionEvent):
             selected[event.route_sha256] += 1
+            selections[event.sha256] = event.route_sha256
             last[event.route_sha256] = event.logical_time
+        elif isinstance(event, SelectionAbortEvent):
+            route = selections[event.selection_event_sha256]
+            selected[route] -= 1
+            if selected[route] < 0:
+                raise OperatorDemandIntegrityError(
+                    "aborted selection produced negative arm pulls"
+                )
+            last[route] = event.logical_time
         elif isinstance(event, OutcomeEvent):
             outcome = event.outcome
             if outcome.selection_event_sha256 is None:
@@ -1153,6 +1285,20 @@ class DemandStateTransitionReceipt:
     def to_bytes(self) -> bytes:
         return canonical_json_bytes(self.to_dict())
 
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "DemandStateTransitionReceipt":
+        value = _strict_json(
+            data,
+            label="demand transition",
+            maximum=256 * 1024,
+        )
+        result = _transition_from_document(value)
+        if result.to_bytes() != data:
+            raise OperatorDemandIntegrityError(
+                "demand transition bytes changed during reconstruction"
+            )
+        return result
+
 
 @dataclass(frozen=True, slots=True)
 class UCBSelectionReceipt:
@@ -1194,6 +1340,54 @@ class UCBSelectionReceipt:
 
     def to_bytes(self) -> bytes:
         return canonical_json_bytes(self.to_dict())
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "UCBSelectionReceipt":
+        value = _strict_json(
+            data,
+            label="UCB selection",
+            maximum=MAX_DEMAND_STATE_BYTES,
+        )
+        body = _decode_sealed(
+            value,
+            schema=UCB_SELECTION_SCHEMA,
+            label="UCB selection",
+        )
+        expected = {
+            "event",
+            "event_sha256",
+            "transition",
+            "transition_sha256",
+        }
+        if set(body) != expected:
+            raise OperatorDemandIntegrityError("invalid UCB selection body")
+        event = _event_from_dict(body.get("event"))
+        if not isinstance(event, SelectionEvent):
+            raise OperatorDemandIntegrityError(
+                "UCB receipt does not contain a selection event"
+            )
+        transition = _transition_from_document(body.get("transition"))
+        try:
+            event_sha = require_sha256(
+                body.get("event_sha256"), field="event_sha256"
+            )
+            transition_sha = require_sha256(
+                body.get("transition_sha256"), field="transition_sha256"
+            )
+        except ValueError as exc:
+            raise OperatorDemandIntegrityError(
+                "UCB nested receipt address is invalid"
+            ) from exc
+        result = cls(event, transition)
+        if (
+            event_sha != event.sha256
+            or transition_sha != transition.sha256
+            or result.to_bytes() != data
+        ):
+            raise OperatorDemandIntegrityError(
+                "UCB selection failed canonical reconstruction"
+            )
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -2779,6 +2973,15 @@ class OperatorDemandScheduler:
                         "outcome selection revision or ABI binding mismatch"
                     )
                 if any(
+                    isinstance(event, SelectionAbortEvent)
+                    and event.selection_event_sha256
+                    == outcome.selection_event_sha256
+                    for event in current.events
+                ):
+                    raise OperatorDemandIntegrityError(
+                        "outcome selection was already aborted"
+                    )
+                if any(
                     item.selection_event_sha256 == outcome.selection_event_sha256
                     for item in prior_outcomes
                 ):
@@ -2795,6 +2998,113 @@ class OperatorDemandScheduler:
                 for event in state.events
                 if isinstance(event, OutcomeEvent)
                 and event.outcome.sha256 == outcome.sha256
+            ),
+            expected_state_sha256=expected_state_sha256,
+        )
+        return transition
+
+    def abort_selection(
+        self,
+        selection: UCBSelectionReceipt,
+        graph_state: ComputeOperatorGraphState,
+        *,
+        abort_evidence_sha256: str,
+        abort_verifier_sha256: str,
+        reason_code: str,
+        expected_state_sha256: str | None = None,
+    ) -> DemandStateTransitionReceipt:
+        """Neutralize one operationally failed pull without quality feedback."""
+
+        if not isinstance(selection, UCBSelectionReceipt):
+            raise TypeError("selection must be a UCBSelectionReceipt")
+        event = selection.event
+        if (
+            event.graph_generation != graph_state.generation
+            or event.graph_state_sha256 != graph_state.sha256
+        ):
+            raise OperatorDemandIntegrityError(
+                "selection abort names another graph revision"
+            )
+        route = _require_route(graph_state, event.route_sha256)
+        if route.input_abi_sha256 != event.input_abi_sha256:
+            raise OperatorDemandIntegrityError(
+                "selection abort route input ABI mismatch"
+            )
+        evidence = require_sha256(
+            abort_evidence_sha256, field="abort_evidence_sha256"
+        )
+        verifier = require_sha256(
+            abort_verifier_sha256, field="abort_verifier_sha256"
+        )
+        reason = _text(reason_code, field="reason_code")
+
+        def create(current: OperatorDemandState) -> SelectionAbortEvent | None:
+            selections = {
+                row.sha256: row
+                for row in current.events
+                if isinstance(row, SelectionEvent)
+            }
+            stored = selections.get(selection.selection_event_sha256)
+            if stored is None or stored.to_dict() != event.to_dict():
+                raise OperatorDemandIntegrityError(
+                    "selection abort target is absent or altered"
+                )
+            prior_aborts = tuple(
+                row
+                for row in current.events
+                if isinstance(row, SelectionAbortEvent)
+            )
+            prior = next(
+                (
+                    row
+                    for row in prior_aborts
+                    if row.selection_event_sha256 == selection.selection_event_sha256
+                ),
+                None,
+            )
+            if prior is not None:
+                if (
+                    prior.abort_evidence_sha256 == evidence
+                    and prior.abort_verifier_sha256 == verifier
+                    and prior.reason_code == reason
+                ):
+                    return None
+                raise OperatorDemandConflictError(
+                    "selection already has another abort receipt"
+                )
+            if any(
+                isinstance(row, OutcomeEvent)
+                and row.outcome.selection_event_sha256
+                == selection.selection_event_sha256
+                for row in current.events
+            ):
+                raise OperatorDemandConflictError(
+                    "selection already has a verified outcome"
+                )
+            if any(row.abort_evidence_sha256 == evidence for row in prior_aborts):
+                raise OperatorDemandConflictError(
+                    "abort evidence already authenticates another selection"
+                )
+            return SelectionAbortEvent(
+                logical_time=current.logical_clock + 1,
+                selection_event_sha256=selection.selection_event_sha256,
+                route_sha256=event.route_sha256,
+                graph_generation=event.graph_generation,
+                graph_state_sha256=event.graph_state_sha256,
+                input_abi_sha256=event.input_abi_sha256,
+                abort_evidence_sha256=evidence,
+                abort_verifier_sha256=verifier,
+                reason_code=reason,
+            )
+
+        _state, transition = self._append_event(
+            create,
+            operation="abort-selection",
+            duplicate_event_sha256=lambda state: next(
+                row.sha256
+                for row in state.events
+                if isinstance(row, SelectionAbortEvent)
+                and row.selection_event_sha256 == selection.selection_event_sha256
             ),
             expected_state_sha256=expected_state_sha256,
         )
@@ -3220,7 +3530,9 @@ __all__ = [
     "CooccurrenceEntry",
     "CooccurrenceReceipt",
     "DEMAND_COMMIT_PREFIX",
+    "DEMAND_ABORT_EVENT_SCHEMA",
     "DEMAND_HISTORY_PREFIX",
+    "DEMAND_OUTCOME_EVENT_SCHEMA",
     "DEMAND_STATE_NAME",
     "DemandOutcomeReceipt",
     "DemandStateTransitionReceipt",
@@ -3237,6 +3549,7 @@ __all__ = [
     "PrefetchReceipt",
     "RetentionItem",
     "RetentionReceipt",
+    "SelectionAbortEvent",
     "UCBScore",
     "UCBSelectionReceipt",
     "verify_demand_receipt",
