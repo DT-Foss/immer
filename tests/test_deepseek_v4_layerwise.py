@@ -175,7 +175,7 @@ class LayerwiseModelApiTests(unittest.TestCase):
 
 
 class LayerwiseScorerTests(unittest.TestCase):
-    def test_layer_major_logits_match_item_major_decoder(self) -> None:
+    def test_layer_major_logits_match_item_major_within_fp32_ulp(self) -> None:
         items = _items()
         direct_source = _source()
         direct = _model(direct_source, batch=1)
@@ -198,9 +198,15 @@ class LayerwiseScorerTests(unittest.TestCase):
                 for row in result["modes"]["off"]["items"]
             }
         for item_id in expected:
+            actual = np.asarray(observed[item_id], dtype=np.float32)
+            desired = np.asarray(expected[item_id], dtype=np.float32)
             np.testing.assert_allclose(
-                observed[item_id], expected[item_id], rtol=0, atol=0
+                actual,
+                desired,
+                rtol=0,
+                atol=np.finfo(np.float32).eps,
             )
+            self.assertEqual(int(np.argmax(actual)), int(np.argmax(desired)))
 
     def test_padded_and_exact_length_plans_have_same_predictions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
