@@ -83,6 +83,9 @@ def _scorer(
     alpha: float = 0.05,
     padding: str = "right",
     microbatch_size: int = 2,
+    local_causal_layout_fingerprint: str | None = None,
+    remote_pinned_inventory_fingerprint: str | None = None,
+    remote_pinned_inventory_sha256: str | None = None,
 ) -> LayerwiseScorer:
     return LayerwiseScorer(
         model,
@@ -97,6 +100,9 @@ def _scorer(
         dataset_sha256=_SHA,
         config_sha256=_SHA,
         disk_margin_bytes=0,
+        local_causal_layout_fingerprint=local_causal_layout_fingerprint,
+        remote_pinned_inventory_fingerprint=remote_pinned_inventory_fingerprint,
+        remote_pinned_inventory_sha256=remote_pinned_inventory_sha256,
     )
 
 
@@ -254,6 +260,15 @@ class LayerwiseScorerTests(unittest.TestCase):
             )
             self.assertEqual(execution["source_transport_policy"], "unreported")
             self.assertEqual(execution["source_transport_connection_limit"], 0)
+            for split_field in (
+                "remote_expert_split_rail",
+                "expert_address_plane",
+                "causal_tensor_reader_attached",
+                "local_causal_layout_fingerprint",
+                "remote_pinned_inventory_fingerprint",
+                "remote_pinned_inventory_sha256",
+            ):
+                self.assertNotIn(split_field, execution)
             adjacent_execution = _scorer(
                 _model(
                     _source(),
@@ -297,6 +312,51 @@ class LayerwiseScorerTests(unittest.TestCase):
             incompatible_prefetch.pager.expert_prefetch_enabled = False
             with self.assertRaisesRegex(LayerwiseError, "identity differs"):
                 _scorer(incompatible_prefetch, run_dir).run(resume=True)
+
+    def test_split_rail_identity_binds_both_planes_and_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            default = _scorer(
+                _model(_source(), batch=2), Path(temporary) / "default"
+            )
+            model = _model(_source(), batch=2)
+            fingerprint = "2" * 64
+            source_metrics = model.pager.source.metrics
+            model.pager.source.metrics = lambda: {
+                **source_metrics(),
+                "inventory_source_fingerprint": fingerprint,
+            }
+            model.pager._remote_expert_split_rail = True
+            model.pager._causal_tensor_reader = object()
+            split = _scorer(
+                model,
+                Path(temporary) / "split",
+                local_causal_layout_fingerprint=fingerprint,
+                remote_pinned_inventory_fingerprint=fingerprint,
+                remote_pinned_inventory_sha256="3" * 64,
+            )
+        execution = split.identity["execution"]
+        self.assertTrue(execution["remote_expert_split_rail"])
+        self.assertEqual(
+            execution["expert_address_plane"], "remote-pinned-streamer/v1"
+        )
+        self.assertTrue(execution["causal_tensor_reader_attached"])
+        self.assertEqual(execution["local_causal_layout_fingerprint"], fingerprint)
+        self.assertEqual(
+            execution["remote_pinned_inventory_fingerprint"], fingerprint
+        )
+        self.assertEqual(execution["remote_pinned_inventory_sha256"], "3" * 64)
+        self.assertNotEqual(split.identity_sha256, default.identity_sha256)
+        self.assertEqual(split.plan_dict()["identity"], split.identity)
+
+    def test_split_rail_identity_rejects_unbound_planes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            model = _model(_source(), batch=2)
+            model.pager._remote_expert_split_rail = True
+            model.pager._causal_tensor_reader = object()
+            with self.assertRaisesRegex(
+                LayerwiseError, "requires bound local and remote identities"
+            ):
+                _scorer(model, Path(temporary) / "split")
 
     def test_non_bfloat16_compute_fails_before_creating_run_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

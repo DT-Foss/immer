@@ -766,6 +766,9 @@ class LayerwiseScorer:
         require_full_source_disk: bool = False,
         source_cache_reserve_bytes: int = 0,
         disk_margin_bytes: int = 1024**3,
+        local_causal_layout_fingerprint: str | None = None,
+        remote_pinned_inventory_fingerprint: str | None = None,
+        remote_pinned_inventory_sha256: str | None = None,
     ) -> None:
         self.model = model
         self.items = tuple(items)
@@ -798,6 +801,59 @@ class LayerwiseScorer:
         fingerprint = source_metrics.get("inventory_source_fingerprint")
         if not isinstance(fingerprint, str) or not fingerprint:
             raise LayerwiseError("source has no verified inventory fingerprint")
+        for name, value in (
+            ("local_causal_layout_fingerprint", local_causal_layout_fingerprint),
+            (
+                "remote_pinned_inventory_fingerprint",
+                remote_pinned_inventory_fingerprint,
+            ),
+            ("remote_pinned_inventory_sha256", remote_pinned_inventory_sha256),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or _DIGEST.fullmatch(value) is None
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 or None")
+        if (remote_pinned_inventory_fingerprint is None) != (
+            remote_pinned_inventory_sha256 is None
+        ):
+            raise LayerwiseError(
+                "remote pinned inventory fingerprint and SHA-256 must be bound together"
+            )
+        if (
+            local_causal_layout_fingerprint is not None
+            and local_causal_layout_fingerprint != fingerprint
+        ):
+            raise LayerwiseError(
+                "local causal layout fingerprint differs from source identity"
+            )
+        if (
+            remote_pinned_inventory_fingerprint is not None
+            and remote_pinned_inventory_fingerprint != fingerprint
+        ):
+            raise LayerwiseError(
+                "remote pinned inventory fingerprint differs from source identity"
+            )
+        split_rail = model.pager.remote_expert_split_rail
+        causal_tensor_attached = model.pager.causal_tensor_reader_attached
+        if split_rail and (
+            not causal_tensor_attached
+            or local_causal_layout_fingerprint is None
+            or remote_pinned_inventory_fingerprint is None
+        ):
+            raise LayerwiseError(
+                "remote expert split rail requires bound local and remote identities"
+            )
+        if not split_rail and any(
+            value is not None
+            for value in (
+                local_causal_layout_fingerprint,
+                remote_pinned_inventory_fingerprint,
+                remote_pinned_inventory_sha256,
+            )
+        ):
+            raise LayerwiseError(
+                "split-rail identity fields require remote expert split rail"
+            )
         runtime_sources = _runtime_source_manifest()
         runtime_dependencies = _runtime_dependency_versions()
         self.identity = {
@@ -875,6 +931,23 @@ class LayerwiseScorer:
                 ),
             },
         }
+        if split_rail:
+            self.identity["execution"].update(
+                {
+                    "remote_expert_split_rail": True,
+                    "expert_address_plane": model.pager.expert_address_plane,
+                    "causal_tensor_reader_attached": causal_tensor_attached,
+                    "local_causal_layout_fingerprint": (
+                        local_causal_layout_fingerprint
+                    ),
+                    "remote_pinned_inventory_fingerprint": (
+                        remote_pinned_inventory_fingerprint
+                    ),
+                    "remote_pinned_inventory_sha256": (
+                        remote_pinned_inventory_sha256
+                    ),
+                }
+            )
         self.identity_sha256 = _digest(self.identity)
         self.graft_alpha = float(graft_alpha)
         self.graft_seed = int(graft_seed)

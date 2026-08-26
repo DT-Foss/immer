@@ -214,8 +214,45 @@ class LayerwiseScriptTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
         self.assertIn("--causal-bundle", output.getvalue())
         self.assertIn("--logical-repo-id", output.getvalue())
+        self.assertIn("--remote-pinned-inventory", output.getvalue())
+        self.assertIn("--remote-expert-split-rail", output.getvalue())
 
-    def test_run_forwards_both_causal_readers_to_runtime_builder(self) -> None:
+    def test_source_forwards_remote_expert_split_contract_to_factory(self) -> None:
+        args = MODULE._parser().parse_args(
+            [
+                "--causal-bundle",
+                "/tmp/model.causal",
+                "--remote-pinned-inventory",
+                "/tmp/inventory.json",
+                "--remote-expert-split-rail",
+            ]
+        )
+        owner = object()
+        with mock.patch.object(
+            MODULE, "open_deepseek_runtime_source", return_value=owner
+        ) as opened:
+            self.assertIs(MODULE._source(args), owner)
+        self.assertEqual(
+            opened.call_args.kwargs["remote_pinned_inventory"],
+            "/tmp/inventory.json",
+        )
+        self.assertTrue(opened.call_args.kwargs["remote_expert_split_rail"])
+
+    def test_source_surfaces_factory_split_contract_rejection(self) -> None:
+        args = MODULE._parser().parse_args(["--remote-expert-split-rail"])
+        with (
+            mock.patch.object(
+                MODULE,
+                "open_deepseek_runtime_source",
+                side_effect=MODULE.DeepSeekRuntimeSourceError(
+                    "remote expert split rail requires a general causal bundle"
+                ),
+            ),
+            self.assertRaisesRegex(MODULE.CliError, "requires a general causal bundle"),
+        ):
+            MODULE._source(args)
+
+    def test_run_forwards_split_tensor_reader_without_causal_expert_reader(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             dataset = root / "dataset.parquet"
@@ -224,13 +261,16 @@ class LayerwiseScriptTests(unittest.TestCase):
                 ["--dataset", str(dataset), "--limit", "1"]
             )
             source = object()
-            expert_reader = object()
             tensor_reader = object()
             owner = mock.Mock(
                 source=source,
                 label="causal:fixture",
-                causal_weight_reader=expert_reader,
+                causal_weight_reader=None,
                 causal_tensor_reader=tensor_reader,
+                remote_expert_split_rail=True,
+                local_causal_layout_fingerprint="2" * 64,
+                remote_pinned_inventory_fingerprint="2" * 64,
+                remote_pinned_inventory_sha256="3" * 64,
             )
             rows = [{"id": "row-0"}]
             with (
@@ -242,13 +282,92 @@ class LayerwiseScriptTests(unittest.TestCase):
                 ) as execute,
             ):
                 self.assertEqual(MODULE.run(args), {"status": "ok"})
-            self.assertIs(
-                execute.call_args.kwargs["causal_weight_reader"], expert_reader
-            )
+            self.assertIsNone(execute.call_args.kwargs["causal_weight_reader"])
             self.assertIs(
                 execute.call_args.kwargs["causal_tensor_reader"], tensor_reader
             )
+            self.assertTrue(execute.call_args.kwargs["remote_expert_split_rail"])
+            self.assertEqual(
+                execute.call_args.kwargs["local_causal_layout_fingerprint"],
+                "2" * 64,
+            )
+            self.assertEqual(
+                execute.call_args.kwargs["remote_pinned_inventory_fingerprint"],
+                "2" * 64,
+            )
+            self.assertEqual(
+                execute.call_args.kwargs["remote_pinned_inventory_sha256"],
+                "3" * 64,
+            )
             owner.close.assert_called_once_with()
+
+    def test_split_runner_enables_pager_and_preserves_remote_cache_reserve(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset.parquet"
+            dataset.write_bytes(b"fixture")
+            args = MODULE._parser().parse_args(
+                [
+                    "--dataset",
+                    str(dataset),
+                    "--run-dir",
+                    str(root / "run"),
+                    "--causal-bundle",
+                    str(root / "model.causal"),
+                    "--remote-pinned-inventory",
+                    str(root / "inventory.json"),
+                    "--remote-expert-split-rail",
+                    "--cache-budget-gb",
+                    "2",
+                    "--microbatch-size",
+                    "1",
+                    "--dry-run",
+                    "--disk-margin-gb",
+                    "0",
+                ]
+            )
+            pager = mock.Mock()
+            scorer = mock.Mock()
+            scorer.plan.official_source_safe_bytes = 0
+            scorer.plan_dict.return_value = {"plan": {}}
+            with (
+                mock.patch.object(
+                    MODULE, "_config", return_value=(_config(), "2" * 64)
+                ),
+                mock.patch.object(MODULE, "_items", return_value=()),
+                mock.patch.object(
+                    MODULE, "DeepSeekWeightPager", return_value=pager
+                ) as pager_type,
+                mock.patch.object(MODULE, "StreamedDeepSeekV4", return_value=object()),
+                mock.patch.object(
+                    MODULE, "LayerwiseScorer", return_value=scorer
+                ) as scorer_type,
+            ):
+                receipt = MODULE._run_with_source(
+                    args,
+                    dataset=dataset,
+                    rows=[],
+                    tokenizer=_ContextTokenizer(),
+                    source=mock.Mock(),
+                    source_label="split",
+                    causal_tensor_reader=object(),
+                    remote_expert_split_rail=True,
+                    local_causal_layout_fingerprint="2" * 64,
+                    remote_pinned_inventory_fingerprint="2" * 64,
+                    remote_pinned_inventory_sha256="3" * 64,
+                )
+        self.assertEqual(receipt["status"], "planned")
+        self.assertTrue(pager_type.call_args.kwargs["remote_expert_split_rail"])
+        self.assertEqual(
+            scorer_type.call_args.kwargs["source_cache_reserve_bytes"], 2 * 1024**3
+        )
+        self.assertEqual(
+            scorer_type.call_args.kwargs["local_causal_layout_fingerprint"],
+            "2" * 64,
+        )
+        pager.release.assert_called_once_with()
 
 
 if __name__ == "__main__":

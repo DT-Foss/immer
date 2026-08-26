@@ -56,6 +56,10 @@ All notable changes to IMMER are recorded here.
   remote bytes fall by `5,627,335,452` (`11.203862%`). The split reads exactly
   those saved bytes through the local causal dense rail, so total logical
   bytes are conserved exactly with zero fallback and zero rejected charges.
+- Wired the same split rail into the resumable layerwise microbatch scorer.
+  Split cache capacity and both immutable plane identities are sealed into the
+  run identity only when the mode is active, preserving byte-for-byte default
+  resume identities while enabling one weight pass across an MMLU cohort.
 - Routed every dense, control, embedding, I64 router, candidate-head, scalar
   head, and batched full-head read through the revision-bound causal tensor
   reader. Expert and dense rails remain separate, missing bindings have no
@@ -75,8 +79,8 @@ All notable changes to IMMER are recorded here.
   transported state remains a proposal. Target adjudication selected the same
   top token on both paths: token `12747`, decoded as the FERTIG-certified exact
   answer `450`; their Top-10 sets are identical with eight equal rank slots.
-- Verified the complete repository with `1279/1279` tests, the expanded
-  DeepSeek scope with `454/454` tests, and the Qwen causal regression scope
+- Verified the complete repository with `1284/1284` tests, the expanded
+  DeepSeek scope with `459/459` tests, and the Qwen causal regression scope
   with `54/54` tests.
 
 ### Qwen compute batteries

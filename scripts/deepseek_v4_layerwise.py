@@ -94,6 +94,15 @@ def _parser() -> argparse.ArgumentParser:
         "--causal-bundle",
         help="local bundle with authenticated complete dense-weight coverage",
     )
+    parser.add_argument(
+        "--remote-pinned-inventory",
+        help="sealed inventory used to authenticate the remote tensor source",
+    )
+    parser.add_argument(
+        "--remote-expert-split-rail",
+        action="store_true",
+        help="read dense tensors from the causal bundle and experts remotely",
+    )
     parser.add_argument("--logical-repo-id", default=OFFICIAL_SOURCE)
     parser.add_argument("--revision", default=OFFICIAL_REVISION)
     parser.add_argument("--config")
@@ -174,6 +183,8 @@ def _source(args: argparse.Namespace) -> DeepSeekRuntimeSource:
             use_cache=not args.no_cache,
             max_cache_bytes=int(args.cache_budget_gb * 1024**3),
             require_remote_pinned_revision=True,
+            remote_pinned_inventory=args.remote_pinned_inventory,
+            remote_expert_split_rail=args.remote_expert_split_rail,
         )
     except (DeepSeekRuntimeSourceError, FileNotFoundError) as exc:
         raise CliError(str(exc)) from exc
@@ -311,6 +322,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     tokenizer = LocalTokenizer(Path(args.tokenizer_json))
     runtime_source = _source(args)
     try:
+        split_rail = runtime_source.remote_expert_split_rail is True
         return _run_with_source(
             args,
             dataset=dataset,
@@ -320,6 +332,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             source_label=runtime_source.label,
             causal_weight_reader=runtime_source.causal_weight_reader,
             causal_tensor_reader=runtime_source.causal_tensor_reader,
+            remote_expert_split_rail=split_rail,
+            local_causal_layout_fingerprint=(
+                runtime_source.local_causal_layout_fingerprint if split_rail else None
+            ),
+            remote_pinned_inventory_fingerprint=(
+                runtime_source.remote_pinned_inventory_fingerprint
+                if split_rail
+                else None
+            ),
+            remote_pinned_inventory_sha256=(
+                runtime_source.remote_pinned_inventory_sha256
+                if split_rail
+                else None
+            ),
         )
     finally:
         runtime_source.close()
@@ -335,6 +361,10 @@ def _run_with_source(
     source_label: str,
     causal_weight_reader: Any | None = None,
     causal_tensor_reader: Any | None = None,
+    remote_expert_split_rail: bool = False,
+    local_causal_layout_fingerprint: str | None = None,
+    remote_pinned_inventory_fingerprint: str | None = None,
+    remote_pinned_inventory_sha256: str | None = None,
 ) -> dict[str, Any]:
     config, config_sha256 = _config(args, source)
     items = _items(rows, tokenizer, config, args)
@@ -347,6 +377,7 @@ def _run_with_source(
         causal_weight_reader=causal_weight_reader,
         causal_tensor_reader=causal_tensor_reader,
         causal_missing_fallback=False,
+        remote_expert_split_rail=remote_expert_split_rail,
     )
     try:
         model = StreamedDeepSeekV4(
@@ -375,10 +406,15 @@ def _run_with_source(
             require_full_source_disk=args.require_full_source_disk,
             source_cache_reserve_bytes=(
                 0
-                if args.causal_bundle is not None
+                if args.causal_bundle is not None and not remote_expert_split_rail
                 else int(args.cache_budget_gb * 1024**3)
             ),
             disk_margin_bytes=int(args.disk_margin_gb * 1024**3),
+            local_causal_layout_fingerprint=local_causal_layout_fingerprint,
+            remote_pinned_inventory_fingerprint=(
+                remote_pinned_inventory_fingerprint
+            ),
+            remote_pinned_inventory_sha256=remote_pinned_inventory_sha256,
         )
     except BaseException:
         pager.release()
