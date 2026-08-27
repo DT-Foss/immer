@@ -82,6 +82,11 @@ later requests.
   compiles to one charged Crystal, releases `3,375` historical work units on 25
   future states, and matches the flat controller-operator chain within
   `1.110223e-16`.
+- A separately seeded sibling learns a completely different surface mapping on
+  the same live frontier: all `8/8` action words change. Receipt-recomputed
+  semantic translation remains `8/8`; the supported four-action word localizes
+  into four sibling-native words and recompiles to one charged Crystal with
+  `3,375` work units released and `2^-52` maximum parity error.
 - Five independently grounded agents retain five distinct opaque dialects over
   one fully shared token inventory. Their three contexts are learned by
   separate Markov agents. All four target dialects have three distinct context

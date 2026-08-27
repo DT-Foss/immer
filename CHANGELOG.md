@@ -39,6 +39,18 @@ All notable changes to IMMER are recorded here.
   roots, and resumes byte-identically. Report body SHA-256:
   `a2311ccfd0c8a9caf2e74553b6cab3b26b2e75fbfd3f242f6294d868a0f95e8f`.
 - Complete warning-fatal regression suite: `1,793/1,793`, `OK`, `617.930 s`.
+- Added the typed controller-support portability bridge. Three isolated
+  four-step occurrence chains now authorize one generic macro-discovery receipt
+  only when their frozen snapshot, global words, actions, definition,
+  controller export, numerical replay, and verifier authorities all agree.
+- A second independently initialized live agent converges on the same eight
+  O1 actions with `8/8` different word assignments. Semantic translation remains
+  `8/8`; the first live macro localizes into four sibling-native words, compiles
+  locally to one charged Crystal, releases `3,375` historical work units, and
+  matches flat execution within `2^-52`. Live transfer report SHA-256:
+  `7b4a026da4091b7cae010c354512a9a7fc2e7b80aa86dadda8c50e9ecb4a5334`.
+- Complete warning-fatal suite with enforced controller authorization:
+  `1,794/1,794`, `OK`, `559.730 s`.
 
 ### Portable executable dialect mesh
 

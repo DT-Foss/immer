@@ -294,6 +294,13 @@ scores 6.84% program accuracy while a non-identity permutation placebo scores
 1.42%. The same portable macro localizes and executes in all 75
 dialect-context targets; changed bindings and authorities are rejected.
 
+The first live instance uses two independently seeded languages over eight
+promoted Qwen/O1 site policies. Their action-word maps disagree on all eight
+actions, while quotient translation is exact on all eight. Three isolated
+support chains authorize a four-action portable program; its sibling
+localization recompiles to one charged Crystal, releases 3,375 historical work
+units across 25 future vectors, and stays within (2^{-52}) of flat execution.
+
 ## 5. Continuous PS-Lifted reservoir
 
 The fixed lifted recurrence carries temporal state:

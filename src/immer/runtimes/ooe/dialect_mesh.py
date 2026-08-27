@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from typing import cast
@@ -362,6 +362,8 @@ class PortableWordProgram:
     action_sequence: tuple[str, ...]
     source_word_sequence: tuple[str, ...]
     support_trajectory_sha256s: tuple[str, ...]
+    source_authorization_kind: str | None = None
+    source_authorization_sha256: str | None = None
 
     FORMAT = PORTABLE_WORD_PROGRAM_SCHEMA
 
@@ -415,9 +417,22 @@ class PortableWordProgram:
         if not supports or len(set(supports)) != len(supports):
             raise ValueError("portable support trajectories are invalid")
         object.__setattr__(self, "support_trajectory_sha256s", supports)
+        authorization_kind = self.source_authorization_kind
+        authorization_sha256 = self.source_authorization_sha256
+        if (authorization_kind is None) != (authorization_sha256 is None):
+            raise ValueError("portable source authorization is incomplete")
+        if authorization_kind is not None:
+            authorization_kind = _identifier(
+                authorization_kind, field="source_authorization_kind"
+            )
+            authorization_sha256 = require_sha256(
+                authorization_sha256, field="source_authorization_sha256"
+            )
+        object.__setattr__(self, "source_authorization_kind", authorization_kind)
+        object.__setattr__(self, "source_authorization_sha256", authorization_sha256)
 
     def to_record(self) -> dict[str, object]:
-        return {
+        record: dict[str, object] = {
             "action_bindings": [item.to_record() for item in self.action_bindings],
             "action_sequence": list(self.action_sequence),
             "authority_hashes": dict(self.authority_hashes),
@@ -429,6 +444,10 @@ class PortableWordProgram:
             "source_word_sequence": list(self.source_word_sequence),
             "support_trajectory_sha256s": list(self.support_trajectory_sha256s),
         }
+        if self.source_authorization_kind is not None:
+            record["source_authorization_kind"] = self.source_authorization_kind
+            record["source_authorization_sha256"] = self.source_authorization_sha256
+        return record
 
     def to_bytes(self) -> bytes:
         return _seal(self.FORMAT, self.to_record())
@@ -452,7 +471,14 @@ class PortableWordProgram:
             "source_word_sequence",
             "support_trajectory_sha256s",
         }
-        if set(body) != expected or body.get("format") != cls.FORMAT:
+        authorized_expected = expected | {
+            "source_authorization_kind",
+            "source_authorization_sha256",
+        }
+        if (
+            set(body) not in (expected, authorized_expected)
+            or body.get("format") != cls.FORMAT
+        ):
             raise DialectMeshIntegrityError("portable word body is invalid")
         raw_bindings = body.get("action_bindings")
         authorities = body.get("authority_hashes")
@@ -490,6 +516,12 @@ class PortableWordProgram:
                 ),
                 support_trajectory_sha256s=tuple(
                     cast(list[str], collections["support_trajectory_sha256s"])
+                ),
+                source_authorization_kind=cast(
+                    str | None, body.get("source_authorization_kind")
+                ),
+                source_authorization_sha256=cast(
+                    str | None, body.get("source_authorization_sha256")
                 ),
             )
         except (TypeError, ValueError) as exc:
@@ -687,6 +719,7 @@ def localize_portable_program(
     source_snapshot: LanguageSnapshot,
     source_frontier: ActionFrontier,
     target_context_id: str,
+    source_authorization: bytes | None = None,
 ) -> tuple[ExecutableWordDefinition, PortableWordLocalizationReceipt]:
     if not isinstance(portable, PortableWordProgram):
         raise TypeError("portable must be a PortableWordProgram")
@@ -694,13 +727,33 @@ def localize_portable_program(
         raise TypeError("target_snapshot must be a LanguageSnapshot")
     if not isinstance(target_frontier, ActionFrontier):
         raise TypeError("target_frontier must be an ActionFrontier")
+    authorization_sha256 = portable.source_authorization_sha256
+    if authorization_sha256 is None:
+        if source_authorization is not None:
+            raise DialectMeshIntegrityError(
+                "portable program does not declare source authorization"
+            )
+        base_portable = portable
+    else:
+        if (
+            not isinstance(source_authorization, bytes)
+            or hashlib.sha256(source_authorization).hexdigest() != authorization_sha256
+        ):
+            raise DialectMeshIntegrityError(
+                "portable program source authorization is missing or changed"
+            )
+        base_portable = replace(
+            portable,
+            source_authorization_kind=None,
+            source_authorization_sha256=None,
+        )
     expected_portable = portable_program_from_discovery(
         source_discovery,
         source_definition,
         source_snapshot,
         source_frontier,
     )
-    if expected_portable != portable:
+    if expected_portable != base_portable:
         raise DialectMeshIntegrityError(
             "portable program differs from its source discovery evidence"
         )

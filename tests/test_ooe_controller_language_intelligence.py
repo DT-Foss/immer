@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import numpy as np
+
 from immer.runtimes.ooe.compute_crystals import ComputeCrystalBank
 from immer.runtimes.ooe.controller import (
     ControllerConfig,
@@ -23,11 +25,23 @@ from immer.runtimes.ooe.controller_language_intelligence import (
     ControllerLanguageBootstrapIntegrityError,
     ControllerLanguageBootstrapReport,
     ControllerLanguageConvergenceError,
+    ControllerPortableMacroBridgeReceipt,
     ControllerProgramSupportReceipt,
     bootstrap_controller_crystal_language,
+    controller_support_to_portable_program,
+    localize_controller_supported_program,
 )
 from immer.runtimes.ooe.crystal import CrystalStore
+from immer.runtimes.ooe.dialect_mesh import (
+    DialectMeshIntegrityError,
+    localize_portable_program,
+)
+from immer.runtimes.ooe.executable_lexicon import (
+    ExecutableLexiconState,
+    ExecutableWordCompiler,
+)
 from immer.runtimes.ooe.identity import canonical_json_bytes
+from immer.runtimes.ooe.language_bridge import resolve_snapshot_compute_bindings
 from immer.runtimes.ooe.qwen_bridge import (
     ACTION_SCHEMA_SHA256,
     OOE_ACTIONS,
@@ -238,6 +252,134 @@ class ControllerLanguageIntelligenceTests(unittest.TestCase):
                 )
                 reports.append(result.report.to_bytes())
         self.assertEqual(reports[0], reports[1])
+
+    def test_supported_word_portably_localizes_into_independent_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bank, export = _fixture(root)
+            source = bootstrap_controller_crystal_language(
+                export,
+                bank,
+                state_store=root / "source-language",
+                lexicon_store=root / "source-lexicon",
+                config=ControllerLanguageBootstrapConfig(seed=17),
+            )
+            sibling = bootstrap_controller_crystal_language(
+                export,
+                bank,
+                state_store=root / "sibling-language",
+                lexicon_store=root / "sibling-lexicon",
+                config=ControllerLanguageBootstrapConfig(seed=18),
+            )
+            source_map = dict(source.snapshot.sender_action_words)
+            sibling_map = dict(sibling.snapshot.sender_action_words)
+            self.assertNotEqual(source_map, sibling_map)
+
+            portable, discovery, bridge_receipt = (
+                controller_support_to_portable_program(
+                    source.support,
+                    source.definition,
+                    export.receipt,
+                    bank,
+                )
+            )
+            self.assertEqual(
+                ControllerPortableMacroBridgeReceipt.from_bytes(
+                    bridge_receipt.to_bytes()
+                ),
+                bridge_receipt,
+            )
+            self.assertEqual(bridge_receipt.discovery, discovery)
+            bridge_receipt.verify(
+                source.support,
+                source.definition,
+                export.receipt,
+                bank,
+            )
+            with self.assertRaises(ControllerLanguageBootstrapIntegrityError):
+                replace(
+                    bridge_receipt,
+                    definition_sha256=_sha("another-definition"),
+                ).verify(
+                    source.support,
+                    source.definition,
+                    export.receipt,
+                    bank,
+                )
+
+            context = "controller-language-train"
+            with self.assertRaisesRegex(
+                DialectMeshIntegrityError, "authorization is missing"
+            ):
+                localize_portable_program(
+                    portable,
+                    sibling.snapshot,
+                    export.frontier,
+                    source_discovery=discovery,
+                    source_definition=source.definition,
+                    source_snapshot=source.snapshot,
+                    source_frontier=export.frontier,
+                    target_context_id=context,
+                )
+            localized, _localization = localize_controller_supported_program(
+                portable,
+                bridge_receipt,
+                source.support,
+                source.definition,
+                export.receipt,
+                bank,
+                sibling.snapshot,
+                export.frontier,
+                target_context_id=context,
+            )
+            forged_portable = replace(
+                portable,
+                action_sequence=tuple(reversed(portable.action_sequence)),
+                source_word_sequence=tuple(reversed(portable.source_word_sequence)),
+            )
+            with self.assertRaises(ControllerLanguageBootstrapIntegrityError):
+                localize_controller_supported_program(
+                    forged_portable,
+                    bridge_receipt,
+                    source.support,
+                    source.definition,
+                    export.receipt,
+                    bank,
+                    sibling.snapshot,
+                    export.frontier,
+                    target_context_id=context,
+                )
+            self.assertEqual(
+                localized.child_word_ids,
+                tuple(
+                    sibling.snapshot.encode_action(action, context)
+                    for action in portable.action_sequence
+                ),
+            )
+            primitives, _resolution = resolve_snapshot_compute_bindings(
+                sibling.snapshot,
+                export.frontier,
+                context_id=context,
+            )
+            state = ExecutableLexiconState.initial(
+                primitives,
+                language_snapshot_sha256=sibling.snapshot.sha256,
+                frontier_sha256=export.frontier.sha256,
+                authority_hashes=export.frontier.authority_hashes,
+                context_id=context,
+            ).with_definition(localized)
+            compiler = ExecutableWordCompiler(state, bank)
+            compiled = compiler.compile(localized.new_word_id)
+            value = np.asarray([0.05, 0.15, 0.25, 0.20, 0.35], dtype=np.float64)
+            expected = value
+            for action in portable.action_sequence:
+                expected = bank.restore_crystal(
+                    export.frontier.binding(action).artifact_sha256
+                ).apply(expected)
+            execution = compiler.execute(compiled, value)
+            np.testing.assert_allclose(execution.output, expected, rtol=0.0, atol=1e-12)
+            self.assertTrue(compiled.constant_discharge)
+            self.assertGreater(execution.receipt.historical_work_released, 0)
 
     def test_equivalent_bank_rebuild_and_atomic_publication_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -31,6 +31,12 @@ from .controller_crystal_bridge import (
     ControllerCrystalExportReceipt,
 )
 from .crystal import CrystalStore, CrystalStoreError, ManifestConflictError
+from .dialect_mesh import (
+    PortableWordLocalizationReceipt,
+    PortableWordProgram,
+    localize_portable_program,
+    portable_program_from_discovery,
+)
 from .executable_lexicon import (
     CompiledWordReceipt,
     ExecutableLexiconBank,
@@ -45,11 +51,13 @@ from .language_bridge import (
     ConsequenceLanguageStateBank,
     ControllerCrystalLanguageExecutor,
     ControllerCrystalOutcomeReceipt,
+    LanguageMacroDiscoveryReceipt,
     LanguageOutcomeCommitReceipt,
     SnapshotComputeResolutionReceipt,
     resolve_snapshot_compute_bindings,
 )
 from .markov_language import (
+    ActionFrontier,
     ConsequenceMarkovLanguage,
     LanguageSnapshot,
     MarkovLanguageError,
@@ -58,6 +66,9 @@ from .qwen_bridge import OOE_ACTIONS
 
 
 CONTROLLER_PROGRAM_SUPPORT_SCHEMA = "immer-ooe-controller-program-support/v1"
+CONTROLLER_PORTABLE_MACRO_BRIDGE_SCHEMA = (
+    "immer-ooe-controller-portable-macro-bridge/v1"
+)
 CONTROLLER_LANGUAGE_BOOTSTRAP_REPORT_SCHEMA = (
     "immer-ooe-controller-language-bootstrap-report/v1"
 )
@@ -83,6 +94,15 @@ CONTROLLER_PROGRAM_SUPPORT_VERIFIER_SHA256 = hashlib.sha256(
             "numerical_replay": "exact-float64-controller-crystal",
             "program_steps": 4,
             "support_occurrences": 3,
+        }
+    )
+).hexdigest()
+CONTROLLER_PORTABLE_MACRO_BRIDGE_VERIFIER_SHA256 = hashlib.sha256(
+    canonical_json_bytes(
+        {
+            "format": "immer-ooe-controller-portable-macro-bridge-verifier/v1",
+            "source": CONTROLLER_PROGRAM_SUPPORT_SCHEMA,
+            "target": "immer-ooe-language-macro-discovery/v1",
         }
     )
 ).hexdigest()
@@ -728,6 +748,301 @@ class ControllerProgramSupportReceipt:
                     raise ControllerLanguageBootstrapIntegrityError(
                         "support numerical proof differs from exact replay"
                     )
+
+
+def _occurrence_sha256(occurrence: ControllerProgramOccurrence) -> str:
+    if not isinstance(occurrence, ControllerProgramOccurrence):
+        raise TypeError("occurrence must be a ControllerProgramOccurrence")
+    return _digest(occurrence.to_record())
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerPortableMacroBridgeReceipt:
+    """Exact bridge from controller holdout support to generic portability."""
+
+    support_receipt_sha256: str
+    definition_sha256: str
+    occurrence_sha256s: tuple[str, ...]
+    discovery: LanguageMacroDiscoveryReceipt
+    base_portable_program_sha256: str
+    verifier_sha256: str = CONTROLLER_PORTABLE_MACRO_BRIDGE_VERIFIER_SHA256
+
+    FORMAT = CONTROLLER_PORTABLE_MACRO_BRIDGE_SCHEMA
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "support_receipt_sha256",
+            "definition_sha256",
+            "base_portable_program_sha256",
+            "verifier_sha256",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                require_sha256(getattr(self, field_name), field=field_name),
+            )
+        occurrences = tuple(
+            require_sha256(value, field="occurrence_sha256")
+            for value in self.occurrence_sha256s
+        )
+        if len(occurrences) != _SUPPORT_OCCURRENCES or len(set(occurrences)) != len(
+            occurrences
+        ):
+            raise ValueError("portable bridge occurrence inventory is invalid")
+        object.__setattr__(self, "occurrence_sha256s", occurrences)
+        if not isinstance(self.discovery, LanguageMacroDiscoveryReceipt):
+            raise TypeError("discovery must be a LanguageMacroDiscoveryReceipt")
+        if self.verifier_sha256 != (CONTROLLER_PORTABLE_MACRO_BRIDGE_VERIFIER_SHA256):
+            raise ValueError("portable bridge uses another verifier")
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "definition_sha256": self.definition_sha256,
+            "discovery": _bound_bytes(self.discovery.to_bytes()),
+            "format": self.FORMAT,
+            "occurrence_sha256s": list(self.occurrence_sha256s),
+            "base_portable_program_sha256": self.base_portable_program_sha256,
+            "support_receipt_sha256": self.support_receipt_sha256,
+            "verifier_sha256": self.verifier_sha256,
+        }
+
+    def to_bytes(self) -> bytes:
+        return _seal(self.FORMAT, self.to_record())
+
+    @property
+    def sha256(self) -> str:
+        return _sha256_bytes(self.to_bytes())
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ControllerPortableMacroBridgeReceipt":
+        body = _open(data, schema=cls.FORMAT, label="controller portable bridge")
+        expected = {
+            "definition_sha256",
+            "discovery",
+            "format",
+            "occurrence_sha256s",
+            "base_portable_program_sha256",
+            "support_receipt_sha256",
+            "verifier_sha256",
+        }
+        occurrences = body.get("occurrence_sha256s")
+        if (
+            set(body) != expected
+            or body.get("format") != cls.FORMAT
+            or not isinstance(occurrences, list)
+        ):
+            raise ControllerLanguageBootstrapIntegrityError(
+                "controller portable bridge body is invalid"
+            )
+        try:
+            result = cls(
+                support_receipt_sha256=cast(str, body.get("support_receipt_sha256")),
+                definition_sha256=cast(str, body.get("definition_sha256")),
+                occurrence_sha256s=tuple(occurrences),
+                discovery=LanguageMacroDiscoveryReceipt.from_bytes(
+                    _decode_bound_bytes(body.get("discovery"), label="macro discovery")
+                ),
+                base_portable_program_sha256=cast(
+                    str, body.get("base_portable_program_sha256")
+                ),
+                verifier_sha256=cast(str, body.get("verifier_sha256")),
+            )
+        except ControllerLanguageBootstrapIntegrityError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise ControllerLanguageBootstrapIntegrityError(
+                "controller portable bridge reconstruction failed"
+            ) from exc
+        if result.to_bytes() != data:
+            raise ControllerLanguageBootstrapIntegrityError(
+                "controller portable bridge failed canonical reconstruction"
+            )
+        return result
+
+    def verify(
+        self,
+        support: ControllerProgramSupportReceipt,
+        definition: ExecutableWordDefinition,
+        export_receipt: ControllerCrystalExportReceipt,
+        compute_bank: ComputeCrystalBank,
+    ) -> None:
+        if not isinstance(support, ControllerProgramSupportReceipt):
+            raise TypeError("support must be a ControllerProgramSupportReceipt")
+        if not isinstance(definition, ExecutableWordDefinition):
+            raise TypeError("definition must be an ExecutableWordDefinition")
+        support.verify(export_receipt, compute_bank)
+        occurrences = tuple(_occurrence_sha256(value) for value in support.occurrences)
+        snapshot = support.language_snapshot
+        if (
+            self.support_receipt_sha256 != support.sha256
+            or self.definition_sha256 != definition.sha256
+            or self.occurrence_sha256s != occurrences
+            or definition.context_id is not None
+            or definition.language_snapshot_sha256 != snapshot.sha256
+            or definition.frontier_sha256 != export_receipt.frontier.sha256
+            or definition.authority_hashes != export_receipt.frontier.authority_hashes
+            or definition.child_word_ids != support.word_ids
+            or any(
+                dict(snapshot.global_word_actions).get(word) != action
+                for word, action in zip(
+                    support.word_ids, support.action_ids, strict=True
+                )
+            )
+        ):
+            raise ControllerLanguageBootstrapIntegrityError(
+                "controller support cannot authorize this portable definition"
+            )
+        expected = LanguageMacroDiscoveryReceipt(
+            language_snapshot_sha256=snapshot.sha256,
+            frontier_sha256=export_receipt.frontier.sha256,
+            authority_hashes=export_receipt.frontier.authority_hashes,
+            trajectory_sha256s=occurrences,
+            min_support=_SUPPORT_OCCURRENCES,
+            min_macro_length=_PROGRAM_STEPS,
+            max_macro_length=_PROGRAM_STEPS,
+            candidate_count=1,
+            definitions=(definition,),
+            definition_supports=((definition.sha256, occurrences),),
+        )
+        if self.discovery != expected:
+            raise ControllerLanguageBootstrapIntegrityError(
+                "portable discovery differs from controller support"
+            )
+        portable = portable_program_from_discovery(
+            expected,
+            definition,
+            snapshot,
+            export_receipt.frontier,
+        )
+        if self.base_portable_program_sha256 != portable.sha256:
+            raise ControllerLanguageBootstrapIntegrityError(
+                "portable program differs from controller support"
+            )
+
+
+def _controller_support_to_macro_discovery(
+    support: ControllerProgramSupportReceipt,
+    definition: ExecutableWordDefinition,
+    export_receipt: ControllerCrystalExportReceipt,
+    compute_bank: ComputeCrystalBank,
+) -> tuple[LanguageMacroDiscoveryReceipt, ControllerPortableMacroBridgeReceipt]:
+    """Promote three held-out controller executions into portable evidence."""
+
+    occurrences = tuple(_occurrence_sha256(value) for value in support.occurrences)
+    discovery = LanguageMacroDiscoveryReceipt(
+        language_snapshot_sha256=support.language_snapshot.sha256,
+        frontier_sha256=export_receipt.frontier.sha256,
+        authority_hashes=export_receipt.frontier.authority_hashes,
+        trajectory_sha256s=occurrences,
+        min_support=_SUPPORT_OCCURRENCES,
+        min_macro_length=_PROGRAM_STEPS,
+        max_macro_length=_PROGRAM_STEPS,
+        candidate_count=1,
+        definitions=(definition,),
+        definition_supports=((definition.sha256, occurrences),),
+    )
+    base_portable = portable_program_from_discovery(
+        discovery,
+        definition,
+        support.language_snapshot,
+        export_receipt.frontier,
+    )
+    receipt = ControllerPortableMacroBridgeReceipt(
+        support_receipt_sha256=support.sha256,
+        definition_sha256=definition.sha256,
+        occurrence_sha256s=occurrences,
+        discovery=discovery,
+        base_portable_program_sha256=base_portable.sha256,
+    )
+    receipt.verify(support, definition, export_receipt, compute_bank)
+    return discovery, receipt
+
+
+def controller_support_to_portable_program(
+    support: ControllerProgramSupportReceipt,
+    definition: ExecutableWordDefinition,
+    export_receipt: ControllerCrystalExportReceipt,
+    compute_bank: ComputeCrystalBank,
+) -> tuple[
+    PortableWordProgram,
+    LanguageMacroDiscoveryReceipt,
+    ControllerPortableMacroBridgeReceipt,
+]:
+    """Create the only controller-authorized portable-program entry point."""
+
+    discovery, receipt = _controller_support_to_macro_discovery(
+        support,
+        definition,
+        export_receipt,
+        compute_bank,
+    )
+    base_portable = portable_program_from_discovery(
+        discovery,
+        definition,
+        support.language_snapshot,
+        export_receipt.frontier,
+    )
+    if base_portable.sha256 != receipt.base_portable_program_sha256:
+        raise ControllerLanguageBootstrapIntegrityError(
+            "portable program changed after controller authorization"
+        )
+    portable = replace(
+        base_portable,
+        source_authorization_kind=ControllerPortableMacroBridgeReceipt.FORMAT,
+        source_authorization_sha256=receipt.sha256,
+    )
+    return portable, discovery, receipt
+
+
+def localize_controller_supported_program(
+    portable: PortableWordProgram,
+    bridge_receipt: ControllerPortableMacroBridgeReceipt,
+    support: ControllerProgramSupportReceipt,
+    source_definition: ExecutableWordDefinition,
+    export_receipt: ControllerCrystalExportReceipt,
+    compute_bank: ComputeCrystalBank,
+    target_snapshot: LanguageSnapshot,
+    target_frontier: ActionFrontier,
+    *,
+    target_context_id: str,
+) -> tuple[ExecutableWordDefinition, PortableWordLocalizationReceipt]:
+    """Localize only after replaying the controller-specific proof chain."""
+
+    if not isinstance(portable, PortableWordProgram):
+        raise TypeError("portable must be a PortableWordProgram")
+    if not isinstance(bridge_receipt, ControllerPortableMacroBridgeReceipt):
+        raise TypeError("bridge_receipt must be a ControllerPortableMacroBridgeReceipt")
+    bridge_receipt.verify(
+        support,
+        source_definition,
+        export_receipt,
+        compute_bank,
+    )
+    base_portable = replace(
+        portable,
+        source_authorization_kind=None,
+        source_authorization_sha256=None,
+    )
+    if (
+        portable.source_authorization_kind
+        != ControllerPortableMacroBridgeReceipt.FORMAT
+        or portable.source_authorization_sha256 != bridge_receipt.sha256
+        or base_portable.sha256 != bridge_receipt.base_portable_program_sha256
+    ):
+        raise ControllerLanguageBootstrapIntegrityError(
+            "portable program is not authorized by controller support"
+        )
+    return localize_portable_program(
+        portable,
+        target_snapshot,
+        target_frontier,
+        source_discovery=bridge_receipt.discovery,
+        source_definition=source_definition,
+        source_snapshot=support.language_snapshot,
+        source_frontier=export_receipt.frontier,
+        target_context_id=target_context_id,
+        source_authorization=bridge_receipt.to_bytes(),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1680,6 +1995,8 @@ __all__ = [
     "CONTROLLER_LANGUAGE_BOOTSTRAP_ALGORITHM_SHA256",
     "CONTROLLER_LANGUAGE_BOOTSTRAP_CONFIG_SCHEMA",
     "CONTROLLER_LANGUAGE_BOOTSTRAP_REPORT_SCHEMA",
+    "CONTROLLER_PORTABLE_MACRO_BRIDGE_SCHEMA",
+    "CONTROLLER_PORTABLE_MACRO_BRIDGE_VERIFIER_SHA256",
     "CONTROLLER_PROGRAM_SUPPORT_SCHEMA",
     "CONTROLLER_PROGRAM_SUPPORT_VERIFIER_SHA256",
     "ControllerLanguageBootstrapConfig",
@@ -1689,7 +2006,10 @@ __all__ = [
     "ControllerLanguageBootstrapReport",
     "ControllerLanguageBootstrapResult",
     "ControllerLanguageConvergenceError",
+    "ControllerPortableMacroBridgeReceipt",
     "ControllerProgramOccurrence",
     "ControllerProgramSupportReceipt",
     "bootstrap_controller_crystal_language",
+    "controller_support_to_portable_program",
+    "localize_controller_supported_program",
 ]

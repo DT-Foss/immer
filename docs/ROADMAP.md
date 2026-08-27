@@ -131,8 +131,10 @@ around every domain that supports it.
   supports, and one charged compiled word with 3,375 work units released.
 - [ ] Extend that proven path across materialized routes, OrganBank actions,
   causal sites, residual plans, and successive live frontier revisions.
-- [ ] Add the first real promoted 27B dialect to the mesh and transfer its first
-  verified macro into a separately grounded sibling dialect.
+- [x] Add the first real promoted 27B dialect to the mesh and transfer its first
+  verified macro into a separately grounded sibling: 8/8 different surface
+  assignments, 8/8 exact translation, four sibling-native macro words, one
+  charged Crystal, 3,375 work units, and `2^-52` maximum parity error.
 - [ ] Extend the mechanism matrix with no-lift, shuffled-site,
   reversible-table, MLP, and RNN controls under the same authenticated evidence
   and planning contract.
