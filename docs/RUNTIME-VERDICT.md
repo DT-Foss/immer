@@ -118,6 +118,9 @@ later requests.
   and full MLP stages are persisted in bounded binary sidecars tied to Atlas
   measurements. Sidecars control reuse and crash repair; fixture evidence is
   permanently barred from production corpus construction.
+- The first real five-prompt L27 wave finds one stable transport, `20→8`.
+  Held-out residual falls from Identity `0.2373913654` to `0.0248507190`; pair
+  selection uses structural and calibration evidence only, before holdout.
 - Exact Store forks preserve every historical object, manifest-chain byte, and
   state generation behind a source-pinned no-replace intent. Restore accepts a
   promoted policy only after rebuilding its kernel from authenticated history;

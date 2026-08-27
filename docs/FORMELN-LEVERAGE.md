@@ -132,6 +132,12 @@ Both are stored as measurement-bound binary sidecars. Atlas and O1 status carry
 only their receipt hashes; exact tensor bytes never become semantic labels or
 status payloads.
 
+The first real operator wave isolates one admissible directed pair, `20→8`.
+Its held-out intertwining residual is `0.0248507190`, compared with
+`0.2373913654` for `C=I` and `0.2729029466` for the deterministic random
+orthogonal placebo. All other directed pairs fail invertibility/conditioning
+before the holdout is opened.
+
 The next formula-derived stack is:
 
 \[

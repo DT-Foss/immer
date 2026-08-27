@@ -31,6 +31,15 @@ All notable changes to IMMER are recorded here.
   control because GEMM/GEMV shape changes can differ by float32 ULPs. The test
   still requires bit-exact layer state and snapshot parity on the valid
   iso-boundary comparison.
+- Completed the first official local-Qwen operator sidecar wave: five prompts,
+  four native heads, 32×32 pre-blend Prefix-Sinkhorn matrices, Atlas revision
+  `50`, five capture receipts, inventory `b3ca4b6e…`, and a clean zero-orphan
+  audit. Eleven of twelve directed head pairs fail the training condition gate.
+  The sole admissible pair `20→8` is selected without holdout access and reaches
+  held-out residual `0.0248507190` versus Identity `0.2373913654` and Random
+  `0.2729029466` (`9.55×` and `10.98×` improvements). Fit SHA `5c13d631…`;
+  holdout SHA `e1f2362a…`; report body `3cd2584b…`; report file
+  `6f8cde35…`.
 
 ### Exact Markov blankets
 

@@ -34,6 +34,7 @@ SCRIPTS = (
     "ooe_fertig_action_learning.py",
     "ooe_language_growth_benchmark.py",
     "ooe_markov_language_benchmark.py",
+    "ooe_operator_transport_live.py",
     "ooe_predictive_quotient.py",
     "ooe_router_blanket.py",
 )

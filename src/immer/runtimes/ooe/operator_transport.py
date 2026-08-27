@@ -2398,6 +2398,38 @@ class QwenPrefixSinkhornCaptureBank:
             raise OperatorTransportIntegrityError("capture differs from inventory")
         return receipt
 
+    def receipts(self) -> tuple[QwenPrefixSinkhornCaptureReceipt, ...]:
+        """Restore the complete authenticated inventory in temporal order."""
+
+        try:
+            with self._locked():
+                entries, _inventory = self._read_inventory()
+                rows = []
+                for key, expected in sorted(entries.items()):
+                    data = self.store.restore_state(self._capture_state_name(key))
+                    receipt = QwenPrefixSinkhornCaptureReceipt.from_bytes(data)
+                    if receipt.capture_key_sha256 != key or receipt.sha256 != expected:
+                        raise OperatorTransportIntegrityError(
+                            "capture inventory differs during complete restore"
+                        )
+                    rows.append(receipt)
+        except OperatorTransportError:
+            raise
+        except (CrystalStoreError, CrystalTamperError, OSError, ValueError) as exc:
+            raise OperatorTransportIntegrityError(
+                "complete capture restore failed"
+            ) from exc
+        return tuple(
+            sorted(
+                rows,
+                key=lambda row: (
+                    row.atlas_revision.sequence,
+                    row.prompt_sha256,
+                    row.capture_key_sha256,
+                ),
+            )
+        )
+
     def audit(self) -> QwenPrefixSinkhornCaptureAudit:
         try:
             with self._locked():

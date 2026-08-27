@@ -156,8 +156,9 @@ around every domain that supports it.
   singular/ill-conditioned, temporal-leakage, and rebound-evidence rejection.
 - [x] Implement bounded pre-native-blend Prefix-Sinkhorn capture, atomic
   measurement sidecars, O1 reuse/crash repair, and truthful orphan audits.
-- [ ] Execute the first multi-prompt operator sidecar wave on local Qwen and run
-  the transport diagnostic on its strict held-out groups.
+- [x] Execute the first five-prompt operator sidecar wave on local Qwen and run
+  the strict transport holdout: pair `20→8` beats Identity `9.55×` and Random
+  `10.98×`; the other `11/12` directed pairs fail the training condition gate.
 - [x] Build the exact joint `gate_proj/up_proj` quantized subspace collision
   evaluator with train-only basis/scale and zero-wrong promotion.
 - [x] Add the crash-safe exact MLP binary evidence bank, projection-verifier

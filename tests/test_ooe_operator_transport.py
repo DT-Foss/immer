@@ -446,6 +446,10 @@ class OperatorTransportTests(unittest.TestCase):
             self.assertEqual(audit.receipt_count, 1)
             self.assertEqual(audit.receipt_sha256s, (receipt.sha256,))
             self.assertFalse(audit.orphan_state_filenames)
+            self.assertEqual(
+                tuple(row.sha256 for row in reopened.receipts()),
+                (receipt.sha256,),
+            )
 
             conflicting = replace(
                 receipt,
