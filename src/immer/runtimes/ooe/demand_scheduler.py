@@ -2572,6 +2572,62 @@ class OperatorDemandScheduler:
             return self._last_authorized_head_sha256
         return self.state().sha256
 
+    def is_state_ancestor(
+        self,
+        ancestor_state_sha256: str,
+        descendant_state_sha256: str | None = None,
+    ) -> bool:
+        """Return whether two addresses lie on the authenticated current chain.
+
+        The immutable history is validated before either address is considered.
+        A historical model may consequently remain usable after append-only
+        scheduler growth, while a foreign state, fork, or future head cannot be
+        mistaken for an ancestor.  Equality counts as ancestry.
+        """
+
+        ancestor = require_sha256(
+            ancestor_state_sha256, field="ancestor_state_sha256"
+        )
+        descendant = (
+            None
+            if descendant_state_sha256 is None
+            else require_sha256(
+                descendant_state_sha256, field="descendant_state_sha256"
+            )
+        )
+        with self._locked():
+            current = self._validated_state_unlocked()
+            chain: dict[str, OperatorDemandState] = {}
+            node = current
+            while True:
+                chain[node.sha256] = node
+                if node.generation == 0:
+                    break
+                previous_sha = node.previous_state_sha256
+                if previous_sha is None:  # already checked by full validation
+                    raise OperatorDemandIntegrityError(
+                        "scheduler predecessor was lost"
+                    )
+                try:
+                    previous_bytes = self._restore_raw(
+                        self.history_state_name(previous_sha)
+                    )
+                except KeyError as exc:
+                    raise OperatorDemandIntegrityError(
+                        "scheduler predecessor history is missing"
+                    ) from exc
+                previous = OperatorDemandState.from_bytes(previous_bytes)
+                _validate_extension(previous, node)
+                node = previous
+            descendant_address = current.sha256 if descendant is None else descendant
+            descendant_state = chain.get(descendant_address)
+            ancestor_state = chain.get(ancestor)
+            return bool(
+                descendant_state is not None
+                and ancestor_state is not None
+                and ancestor_state.generation <= descendant_state.generation
+            )
+
     def _publish_history_unlocked(self, state: OperatorDemandState) -> None:
         name = self.history_state_name(state.sha256)
         data = state.to_bytes()

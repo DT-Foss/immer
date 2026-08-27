@@ -25,6 +25,7 @@ from immer.runtimes.ooe.controller import (
 from immer.runtimes.ooe.crystal import CrystalPayload, CrystalStore, CrystalTamperError
 from immer.runtimes.ooe.identity import canonical_json_bytes
 from immer.runtimes.ooe.math_core import array_sha256
+from immer.runtimes.ooe.predictive_blanket import ExactRouterBlanketReceipt
 from immer.runtimes.ooe.qwen_bridge import (
     ACTION_SCHEMA_SHA256,
     OOE_ACTIONS,
@@ -567,6 +568,78 @@ class OoeControllerTests(unittest.TestCase):
                 publication.payload_sha256,
             )
 
+    def test_exact_router_blanket_crosses_resolve_once_without_double_update(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = self._controller(Path(tmp))
+            self._train_site(
+                controller,
+                temporal_start=0,
+                site=0,
+                shift=1,
+                signal=2.0,
+            )
+            feature, _ = _feature(0, site=0, source=0, signal=2.0)
+            blanket = controller.build_router_blanket(feature)
+            self.assertEqual(
+                ExactRouterBlanketReceipt.from_bytes(blanket.to_bytes()),
+                blanket,
+            )
+            before_requests = controller.metrics.requests
+            before_saved = controller.metrics.saved_qwen_forwards
+
+            def forbidden_teacher(
+                _feature: QwenOoeFeatureReceipt,
+                _source: str,
+            ) -> VerifiedTeacherTransition:
+                raise AssertionError("exact blanket warm path called Qwen")
+
+            decision = controller.resolve(
+                feature,
+                OOE_ACTIONS[0],
+                teacher=forbidden_teacher,
+                quality_verifier=lambda _feature, execution: (
+                    execution.quality_verified
+                ),
+                stream_id="blanket-once",
+                router_blanket=blanket,
+            )
+            self.assertEqual(decision.origin, "crystal")
+            self.assertEqual(controller.metrics.requests, before_requests + 1)
+            self.assertEqual(controller.metrics.saved_qwen_forwards, before_saved + 1)
+            self.assertEqual(len(controller._tokens["blanket-once"].route), 1)
+
+            metrics_before_failure = controller.metrics.to_dict()
+            wrong_feature = replace(feature, temporal_index=999)
+            with self.assertRaisesRegex(
+                OoeControllerIntegrityError,
+                "blanket validation",
+            ):
+                controller.try_warm(
+                    wrong_feature,
+                    OOE_ACTIONS[0],
+                    quality_verifier=lambda _feature, execution: (
+                        execution.quality_verified
+                    ),
+                    stream_id="wrong-blanket-feature",
+                    router_blanket=blanket,
+                )
+            self.assertNotIn("wrong-blanket-feature", controller._tokens)
+            self.assertEqual(controller.metrics.to_dict(), metrics_before_failure)
+
+            tampered = ExactRouterBlanketReceipt.from_bytes(blanket.to_bytes())
+            object.__setattr__(tampered, "seal_sha256", _hash("tampered-blanket"))
+            with self.assertRaises(OoeControllerIntegrityError):
+                controller.decide(
+                    feature,
+                    OOE_ACTIONS[0],
+                    stream_id="tampered-blanket",
+                    router_blanket=tampered,
+                )
+            self.assertNotIn("tampered-blanket", controller._tokens)
+            self.assertEqual(controller.metrics.to_dict(), metrics_before_failure)
+
     def test_partial_promotion_executes_covered_source_and_abstains_elsewhere(
         self,
     ) -> None:
@@ -685,6 +758,7 @@ class OoeControllerTests(unittest.TestCase):
                 signal=2.0,
             )
             receipt, _ = _feature(next_temporal, source=0, signal=2.0)
+            self.assertEqual(controller._tokens, {})
 
             def teacher(
                 feature: QwenOoeFeatureReceipt, source: str
@@ -703,6 +777,7 @@ class OoeControllerTests(unittest.TestCase):
             self.assertEqual(controller.metrics.saved_qwen_forwards, 0)
             self.assertEqual(controller.metrics.teacher_calls, 6)
             self.assertEqual(controller.metrics.quality_failures, 1)
+            self.assertEqual(controller._tokens, {})
 
     def test_partial_executor_and_missing_executor_never_claim_savings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -768,6 +843,7 @@ class OoeControllerTests(unittest.TestCase):
             )
             receipt, _ = _feature(temporal, source=0, signal=2.0)
             expected = self._target(0)
+            self.assertEqual(missing._tokens, {})
             warm_miss = missing.try_warm(
                 receipt,
                 OOE_ACTIONS[0],
@@ -775,6 +851,7 @@ class OoeControllerTests(unittest.TestCase):
             )
             self.assertEqual(warm_miss.origin, "abstention")
             self.assertEqual(warm_miss.reason, "missing-action-executor")
+            self.assertEqual(missing._tokens, {})
             self.assertEqual(missing.metrics.teacher_calls, len(OOE_ACTIONS))
             self.assertEqual(
                 len(missing._sites[receipt.site_identity.sha256].history),
@@ -790,6 +867,46 @@ class OoeControllerTests(unittest.TestCase):
             self.assertEqual(fallback.reason, "missing-action-executor")
             self.assertEqual(missing.metrics.saved_qwen_forwards, 0)
             self.assertEqual(missing.metrics.executed_qwen_forwards, 0)
+            self.assertEqual(missing._tokens, {})
+
+    def test_executor_and_quality_exceptions_restore_mobile_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = self._controller(Path(tmp))
+            _, temporal = self._train_site(
+                controller,
+                temporal_start=0,
+                site=0,
+                shift=1,
+                signal=2.0,
+            )
+            receipt, _ = _feature(temporal, source=0, signal=2.0)
+            expected = self._target(0)
+            original = controller._executors[expected]
+
+            def executor_failure(_feature):
+                raise RuntimeError("injected executor failure")
+
+            controller._executors[expected] = executor_failure
+            with self.assertRaisesRegex(RuntimeError, "executor failure"):
+                controller.try_warm(
+                    receipt,
+                    OOE_ACTIONS[0],
+                    quality_verifier=lambda _feature, _execution: True,
+                )
+            self.assertEqual(controller._tokens, {})
+
+            controller._executors[expected] = original
+
+            def verifier_failure(_feature, _execution):
+                raise RuntimeError("injected verifier failure")
+
+            with self.assertRaisesRegex(RuntimeError, "verifier failure"):
+                controller.try_warm(
+                    receipt,
+                    OOE_ACTIONS[0],
+                    quality_verifier=verifier_failure,
+                )
+            self.assertEqual(controller._tokens, {})
 
     def test_live_atlas_accepts_authenticated_history_and_rejects_unknown_or_fork(
         self,

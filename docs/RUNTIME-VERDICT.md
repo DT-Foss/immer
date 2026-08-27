@@ -93,6 +93,27 @@ later requests.
   exact rational `2/3`–`1/3` law, scores held-out total variation `0`, separates
   a disturbed law at total variation `1`, and is byte-identical under reversed
   input order.
+- Exact categorical blankets now delete context only after complete bounded
+  power-set enumeration and chronological group validation. Capacity-limited
+  or higher-order-unresolved searches cannot authorize runtime prediction.
+- Verified Demand episodes learn non-contiguous route lags `(1,3)`. A validated
+  high-confidence singleton may precede PPM, but never deletes UCB arms; plan
+  membership, residual completion, and external output verification still gate
+  every result. The complete benchmark rebuilds all evidence and releases
+  `144/336` historical work units with Selected/Full `9/10` against contiguous
+  PPM `4/5`.
+- The live exact-feature router blanket reduces eight calibrated centroids to
+  the proven input/nearest/runner-up closure of two. Across 16 FERTIG features,
+  distance work falls `128→32` with identical decisions and no generalization
+  to unseen receipts.
+- The live Qwen boundary graph selects
+  `attention_residual + mlp_output → layer_output` as a fixed `2/6` blanket.
+  It beats Full-6 on later unseen layer L54 and repeats in all `5/5` prompt
+  holdout folds.
+- Causal operator transport and joint gate/up collision limits now have exact,
+  replayed evaluators. They accept only pre-native-blend Prefix-Sinkhorn head
+  matrices and contextual RMSNormed gate/up projections respectively. Existing
+  Atlas sketches are named as missing evidence and cannot produce a live fit.
 - Exact Store forks preserve every historical object, manifest-chain byte, and
   state generation behind a source-pinned no-replace intent. Restore accepts a
   promoted policy only after rebuilding its kernel from authenticated history;

@@ -57,6 +57,63 @@ route-demand episodes, and battery compatibility domains. It preserves the
 future distribution that matters and deletes historical distinctions that do
 not.
 
+The next contraction is its conditional-independence blanket:
+
+\[
+Y \perp X_{\setminus B}\mid B,
+\qquad
+P(Y\mid X)=P(Y\mid X_B).
+\]
+
+IMMER searches the complete bounded feature power set with exact rational
+probabilities and group-macro Brier scores. Truncated searches explicitly
+abstain; singleton and pair checks remain diagnostics, never a proof against
+higher-order XOR-like synergy. In the Demand route world this recovers the
+non-contiguous causal lags `{1,3}` and safely precedes PPM/UCB. The complete
+receipt replay scores Selected/Full `9/10`, contiguous PPM `4/5`, Random
+`1/2`, and Marginal `2/5`, while four verified discharges release `144/336`
+historical work units.
+
+For Qwen boundaries, the learned blanket crystallizes the residual equation
+
+\[
+h_{layer\_out}=h_{attention\_residual}+h_{mlp\_out}.
+\]
+
+The fixed formula is selected from six authenticated boundary candidates,
+holds on an unseen layer with NRMSE `0.0016575120`, and is selected in every
+leave-one-question-out fold. Separately, exact-feature router blankets prove
+that only the global top two centroids affect radius/margin routing, reducing
+live distance work by `75%` without changing one decision.
+
+Cross-layer/head transport now has an executable diagnostic in the causal
+attention basis:
+
+\[
+C A = B C,
+\qquad
+\operatorname{vec}(CA-BC)
+= (A^\top\otimes I-I\otimes B)\operatorname{vec}(C).
+\]
+
+IMMER fits the identifiable causal mass-preserving class, then rejects rank
+deficiency, a missing identification gap, excessive system condition, or a
+singular transport. It reads Prefix-Sinkhorn operators before native head
+blending; archive Softmax matrices are not compatible evidence.
+
+The MLP battery key is likewise joint rather than gate-only:
+
+\[
+K_{k,b}(h)=Q_b\!\left(
+[\,W^{gate}_{I_k}h\;\Vert\;W^{up}_{I_k}h\,];s_{train}
+\right).
+\]
+
+`I_k` and the symmetric channel scales are learned from training groups only.
+A dimension/quantizer pair can promote only when train, calibration, and
+holdout contain zero wrong-output collisions and at least one exact verified
+hit.
+
 The next formula-derived stack is:
 
 \[

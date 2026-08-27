@@ -4,6 +4,53 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-27
 
+### Exact Markov blankets
+
+- Added a categorical conditional-independence blanket with exhaustive bounded
+  power-set search, exact `Fraction` probabilities and Brier scores,
+  equal-weight episode metrics, strict chronological train/calibration/holdout
+  isolation, singleton/pair synergy checks, Full/Selected/Random/Marginal arms,
+  and fail-closed capacity exhaustion. XOR and higher-order interaction controls
+  prevent marginal or truncated searches from authorizing a runtime model.
+- Added a verified Demand lag blanket. Successful explicit episodes are rebuilt
+  in selection/execution order, split only at episode boundaries, and mapped to
+  non-contiguous lag atoms. The exact XOR world selects lags `(1, 3)`. Runtime
+  priority is validated Blanket singleton, then PPM, then the complete UCB arm
+  inventory; residual completion and the external output verifier remain
+  mandatory. The receipt-complete E2E benchmark scores Selected/Full `9/10`,
+  contiguous PPM `4/5`, Random `1/2`, and Marginal `2/5`, then releases
+  `144/336` historical work units through four independently replayed runtime
+  paths. Report file SHA:
+  `021d54d70c59500bca42e65a20fb81d27241f36c9814eb251cf9176e227d6038`.
+- Added exact feature-bound router blankets. A full centroid scan seals the
+  input site, global nearest and runner-up before a sparse replay is permitted.
+  On all 16 live FERTIG features, the closure is `2/8`: centroid-distance work
+  falls from `128` to `32` (`75%`) with bit-exact RouteDecision parity. Live
+  report body SHA: `d27cc87e943cbf08512f9863d95964e1e5f8702557145f9659ee9c0e3cac18dd`;
+  file SHA: `ee5c7fadc1656522e701c581901bc3339aee93e77a59bdf6b262b40dc527a4b1`.
+- Added the Qwen boundary blanket over 200 authenticated transition arrays.
+  The selected model is the fixed residual identity
+  `layer_output = attention_residual + mlp_output`, reducing six boundary
+  candidates to two. Calibration NRMSE is `0.0016464655`; on unseen layer L54
+  it is `0.0016575120` versus `0.0017912050` for Full-6 and ranks `1/16` among
+  equal-size candidates. All `5/5` leave-one-question-out folds select the same
+  fixed `2/6` blanket. Live report file SHA:
+  `ed30426134d0d412cac74c3d48fa35fe74c476d2e3ae51a033a41049fed990eb`.
+- Added receipt-bound operator transport for IMMER's causal Prefix-Sinkhorn
+  matrices. It fits `C A = B C` with per-head/global/identity/random and
+  additive-residual arms, rejects unidentified or ill-conditioned maps, and
+  replays train/calibration/strict holdout evidence on restore. The deterministic
+  mechanism fixture reaches held-out residual `1.33e-17` per-head versus
+  `9.57e-4` global. Existing Qwen artifacts fail closed with an exact request
+  for the pre-native-blend routed per-head matrix.
+- Added a joint Qwen `gate_proj/up_proj` collision-limit evaluator using only
+  contextual RMSNormed post-attention evidence and train-only bases/scales.
+  In the mechanism control, `k=1` produces `12/4/8` wrong collisions across
+  train/calibration/holdout and is blocked; `k=2` is exact on calibration
+  `4/4` and holdout `8/8` at `112` bytes. The real Harvester adapter emits a
+  sealed instrumentation request instead of treating 40 projected MLP sketches
+  as exact gate/up evidence.
+
 ### Real FERTIG action learning and controller frontier
 
 - Integration base before the new cut:

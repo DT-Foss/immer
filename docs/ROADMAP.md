@@ -140,12 +140,28 @@ around every domain that supports it.
   Crystal promotions with zero errors.
 - [ ] Connect production OrganBank and anchor executors to the learned action
   alphabet for non-chat workloads.
-- [ ] Learn conditional-independence Markov blankets over quotient state and
-  measure sparse-context parity against the complete authenticated context.
-- [ ] Add receipt-bound operator conjugation across exact ModelPins and bases,
-  with singular/ill-conditioned/rebound-basis rejection.
-- [ ] Build the Qwen-native joint `gate_proj/up_proj` quantized subspace battery
-  and compare it against separate-projection and shuffled-subspace controls.
+- [x] Learn exact conditional-independence blankets with full-power-set
+  closure, chronological group holdout, Full/Random/Marginal controls, and
+  fail-closed higher-order synergy/capacity gates.
+- [x] Integrate the verified Demand lag blanket as
+  Blanket-singleton → PPM → full UCB; recover non-contiguous lags `(1,3)` while
+  retaining residual execution and external verification. Its self-replaying
+  E2E benchmark now covers 30 authenticated outcomes and four execution paths.
+- [x] Seal exact-feature router top-two closures; live FERTIG routing reduces
+  centroid distances `128→32` with exact full/sparse parity.
+- [x] Seal the Qwen boundary residual blanket `2/6`; verify later unseen-layer
+  parity and `5/5` leave-one-question-out stability.
+- [x] Add receipt-bound causal Prefix-Sinkhorn operator transport across exact
+  ModelPins and graph revisions, with rank, identification-gap,
+  singular/ill-conditioned, temporal-leakage, and rebound-evidence rejection.
+- [ ] Capture the pre-native-blend routed per-head matrices in O1 and run the
+  transport diagnostic on the local Qwen checkpoint.
+- [x] Build the exact joint `gate_proj/up_proj` quantized subspace collision
+  evaluator with train-only basis/scale and zero-wrong promotion.
+- [ ] Extend O1's contextual Harvester receipt with exact RMSNormed MLP input,
+  gate/up projections, per-row output identity, and projection verifier; then
+  run the collision sweep on local Qwen against separate-projection and
+  shuffled-subspace controls.
 - [ ] Apply topology-aware Warmth only as a downward charging brake and measure
   redundant-charge suppression without changing authenticated demand.
 - [x] Export the first eight live O1/Atlas controller promotions into an exact

@@ -614,6 +614,44 @@ class OperatorDemandSchedulerTests(unittest.TestCase):
                 expected_state_sha256=initial.sha256,
             )
 
+    def test_authenticated_append_only_ancestry_query(self) -> None:
+        initial = self.scheduler.state()
+        first = self.scheduler.select_ucb1(
+            self.graph_state, input_abi_sha256=self.input_abi
+        )
+        first_head = self.scheduler.state()
+        route = OperatorDemandScheduler.resolve_materialized_candidate(
+            self.graph_state, first.route_sha256
+        )
+        self.scheduler.record_outcome(
+            self._make_outcome(
+                route,
+                selection_event_sha256=first.selection_event_sha256,
+            ),
+            self.graph_state,
+        )
+        current = self.scheduler.state()
+
+        self.assertTrue(self.scheduler.is_state_ancestor(initial.sha256))
+        self.assertTrue(self.scheduler.is_state_ancestor(first_head.sha256))
+        self.assertTrue(self.scheduler.is_state_ancestor(current.sha256))
+        self.assertTrue(
+            self.scheduler.is_state_ancestor(
+                initial.sha256, first_head.sha256
+            )
+        )
+        self.assertFalse(
+            self.scheduler.is_state_ancestor(
+                current.sha256, first_head.sha256
+            )
+        )
+        self.assertFalse(self.scheduler.is_state_ancestor(_digest("foreign-state")))
+
+        restarted = OperatorDemandScheduler(
+            self.bank.store, config=self.scheduler.config
+        )
+        self.assertTrue(restarted.is_state_ancestor(first_head.sha256))
+
     def test_concurrent_scheduler_instances_do_not_lose_pulls(self) -> None:
         errors: list[BaseException] = []
         receipts = []

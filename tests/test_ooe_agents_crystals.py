@@ -211,6 +211,18 @@ class AgentTests(unittest.TestCase):
         self.assertNotEqual(near_digest, far_digest)
         self.assertEqual(near_digest, reverse_digest)
 
+    def test_router_centroid_universe_cache_invalidates_on_observation(self) -> None:
+        router = AttractorRouter(radius=5.0)
+        router.observe("a", np.array([-1.0, 0.0]))
+        router.observe("b", np.array([1.0, 0.0]))
+        first = router.centroid_universe_sha256
+        self.assertEqual(router.centroid_universe_sha256, first)
+        self.assertEqual(router.labels, ("a", "b"))
+
+        router.observe("c", np.array([2.0, 0.0]))
+        self.assertEqual(router.labels, ("a", "b", "c"))
+        self.assertNotEqual(router.centroid_universe_sha256, first)
+
     def test_mobile_token_memory_and_rapidity_change_executable_gate(self) -> None:
         token = MobileMarkovToken.from_state(0, state_size=3, reservoir_size=12)
         confidence = token.update(

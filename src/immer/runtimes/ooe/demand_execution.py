@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -25,6 +26,12 @@ from .demand_scheduler import (
     OperatorDemandScheduler,
     PPMPredictionReceipt,
     UCBSelectionReceipt,
+)
+from .demand_blanket import (
+    DemandBlanketIntegrityError,
+    DemandLagBlanketPredictionReceipt,
+    DemandLagBlanketValidationReceipt,
+    predict_demand_lag_blanket,
 )
 from .identity import canonical_json_bytes, require_sha256
 from .residual_execution import (
@@ -339,6 +346,21 @@ def _parse_ppm(value: object) -> PPMPredictionReceipt:
         raise DemandExecutionIntegrityError("PPM prediction is invalid") from exc
 
 
+def _parse_blanket(
+    value: object,
+    *,
+    validation: DemandLagBlanketValidationReceipt,
+) -> DemandLagBlanketPredictionReceipt:
+    try:
+        return DemandLagBlanketPredictionReceipt.from_bytes(
+            canonical_json_bytes(value), validation=validation
+        )
+    except (DemandBlanketIntegrityError, TypeError, ValueError) as exc:
+        raise DemandExecutionIntegrityError(
+            "Demand lag blanket prediction is invalid"
+        ) from exc
+
+
 @dataclass(frozen=True, slots=True)
 class DemandRoutedExecutionReceipt:
     """One joined proof from demand selection through verified feedback."""
@@ -353,6 +375,7 @@ class DemandRoutedExecutionReceipt:
     outcome: DemandOutcomeReceipt
     outcome_transition: DemandStateTransitionReceipt
     episode_sha256: str | None
+    blanket_prediction: DemandLagBlanketPredictionReceipt | None = None
     reward_policy: str = DEMAND_REWARD_POLICY
 
     def __post_init__(self) -> None:
@@ -383,6 +406,12 @@ class DemandRoutedExecutionReceipt:
             self.ppm_prediction, PPMPredictionReceipt
         ):
             raise TypeError("ppm_prediction must be a PPMPredictionReceipt or None")
+        if self.blanket_prediction is not None and not isinstance(
+            self.blanket_prediction, DemandLagBlanketPredictionReceipt
+        ):
+            raise TypeError(
+                "blanket_prediction must be a DemandLagBlanketPredictionReceipt or None"
+            )
         episode = self.episode_sha256
         if episode is not None:
             episode = require_sha256(episode, field="episode_sha256")
@@ -453,6 +482,25 @@ class DemandRoutedExecutionReceipt:
                 != self.selection.transition.previous_state_sha256
             ):
                 raise ValueError("PPM prediction differs from selection graph or ABI")
+        if self.blanket_prediction is not None:
+            blanket = self.blanket_prediction
+            if (
+                blanket.graph_generation != self.graph_generation
+                or blanket.graph_state_sha256 != graph_sha
+                or blanket.input_abi_sha256 != selection_event.input_abi_sha256
+                or blanket.scheduler_state_sha256
+                != self.selection.transition.previous_state_sha256
+            ):
+                raise ValueError(
+                    "lag blanket prediction differs from selection graph, ABI, or head"
+                )
+            if (
+                blanket.candidate_route_sha256 == selected
+                and self.ppm_prediction is not None
+            ):
+                raise ValueError(
+                    "PPM cannot supersede an applied high-confidence lag blanket"
+                )
         object.__setattr__(self, "graph_state_sha256", graph_sha)
         object.__setattr__(self, "selected_prefix_route_sha256", selected)
         object.__setattr__(self, "episode_sha256", episode)
@@ -460,10 +508,17 @@ class DemandRoutedExecutionReceipt:
 
     def to_dict(self) -> dict[str, object]:
         ppm = self.ppm_prediction
+        blanket = self.blanket_prediction
         body = {
             "graph_generation": self.graph_generation,
             "graph_state_sha256": self.graph_state_sha256,
             "selected_prefix_route_sha256": self.selected_prefix_route_sha256,
+            "blanket_prediction": (
+                None if blanket is None else blanket.to_dict()
+            ),
+            "blanket_prediction_sha256": (
+                None if blanket is None else blanket.sha256
+            ),
             "ppm_prediction": None if ppm is None else ppm.to_dict(),
             "ppm_prediction_sha256": None if ppm is None else ppm.sha256,
             "selection": self.selection.to_dict(),
@@ -496,7 +551,12 @@ class DemandRoutedExecutionReceipt:
         return hashlib.sha256(self.to_bytes()).hexdigest()
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "DemandRoutedExecutionReceipt":
+    def from_bytes(
+        cls,
+        data: bytes,
+        *,
+        lag_blanket_validation: DemandLagBlanketValidationReceipt | None = None,
+    ) -> "DemandRoutedExecutionReceipt":
         value = _strict_json(data, label="demand routed execution")
         body = _sealed_body(
             value,
@@ -507,6 +567,8 @@ class DemandRoutedExecutionReceipt:
             "graph_generation",
             "graph_state_sha256",
             "selected_prefix_route_sha256",
+            "blanket_prediction",
+            "blanket_prediction_sha256",
             "ppm_prediction",
             "ppm_prediction_sha256",
             "selection",
@@ -529,6 +591,23 @@ class DemandRoutedExecutionReceipt:
         try:
             ppm_document = body.get("ppm_prediction")
             ppm = None if ppm_document is None else _parse_ppm(ppm_document)
+            blanket_document = body.get("blanket_prediction")
+            blanket = (
+                None
+                if blanket_document is None
+                else (
+                    _parse_blanket(
+                        blanket_document,
+                        validation=lag_blanket_validation,
+                    )
+                    if lag_blanket_validation is not None
+                    else None
+                )
+            )
+            if blanket_document is not None and lag_blanket_validation is None:
+                raise DemandExecutionIntegrityError(
+                    "lag blanket validation authority is required for replay"
+                )
             selection = UCBSelectionReceipt.from_bytes(
                 canonical_json_bytes(body.get("selection"))
             )
@@ -548,6 +627,7 @@ class DemandRoutedExecutionReceipt:
                 selected_prefix_route_sha256=cast(
                     str, body.get("selected_prefix_route_sha256")
                 ),
+                blanket_prediction=blanket,
                 ppm_prediction=ppm,
                 selection=selection,
                 residual=residual,
@@ -558,6 +638,10 @@ class DemandRoutedExecutionReceipt:
                 reward_policy=cast(str, body.get("reward_policy")),
             )
             nested = (
+                (
+                    "blanket_prediction_sha256",
+                    None if blanket is None else blanket.sha256,
+                ),
                 ("ppm_prediction_sha256", None if ppm is None else ppm.sha256),
                 ("selection_sha256", selection.sha256),
                 ("residual_sha256", residual.sha256),
@@ -606,6 +690,8 @@ class DemandRoutedExecutor:
         verifier: DemandExecutionVerifier
         | Callable[[ResidualRouteExecution], DemandExecutionVerification],
         ppm_min_probability: float = 0.75,
+        lag_blanket_validation: DemandLagBlanketValidationReceipt | None = None,
+        lag_blanket_min_probability: Fraction = Fraction(3, 4),
     ) -> None:
         if not isinstance(graph, ComputeOperatorGraph):
             raise TypeError("graph must be a ComputeOperatorGraph")
@@ -620,6 +706,30 @@ class DemandRoutedExecutor:
         self.scheduler = scheduler
         self.verifier = verifier
         self.ppm_min_probability = probability
+        if lag_blanket_validation is not None and not isinstance(
+            lag_blanket_validation, DemandLagBlanketValidationReceipt
+        ):
+            raise TypeError(
+                "lag_blanket_validation must be a DemandLagBlanketValidationReceipt or None"
+            )
+        if isinstance(lag_blanket_min_probability, bool) or not isinstance(
+            lag_blanket_min_probability, (int, Fraction)
+        ):
+            raise TypeError(
+                "lag_blanket_min_probability must be exact int/Fraction data"
+            )
+        blanket_probability = Fraction(lag_blanket_min_probability)
+        if not 0 <= blanket_probability <= 1:
+            raise ValueError("lag_blanket_min_probability must lie in [0, 1]")
+        self.lag_blanket_validation = lag_blanket_validation
+        self.lag_blanket_min_probability = blanket_probability
+        if lag_blanket_validation is not None:
+            try:
+                lag_blanket_validation.verify_or_raise()
+            except DemandBlanketIntegrityError as exc:
+                raise DemandExecutionIntegrityError(
+                    "lag blanket validation failed exact replay"
+                ) from exc
 
     @staticmethod
     def _matches_prefix(route: MaterializedRoute, plan: ComputeRoutePlan) -> bool:
@@ -739,11 +849,40 @@ class DemandRoutedExecutor:
             for value in history_route_sha256s
         )
         ppm: PPMPredictionReceipt | None = None
+        blanket: DemandLagBlanketPredictionReceipt | None = None
         selection_candidates = tuple(route.sha256 for route in candidates)
-        if history:
-            ppm = self.scheduler.predict_ppm(
+        blanket_applied = False
+        if self.lag_blanket_validation is not None:
+            blanket = predict_demand_lag_blanket(
+                self.lag_blanket_validation,
+                self.scheduler,
                 state,
                 history,
+                input_abi_sha256=input_abi,
+                output_abi_sha256=(
+                    self.lag_blanket_validation.fit.corpus.output_abi_sha256
+                ),
+                minimum_probability=self.lag_blanket_min_probability,
+            )
+            if blanket.candidate_route_sha256 in set(selection_candidates):
+                selection_candidates = (
+                    cast(str, blanket.candidate_route_sha256),
+                )
+                blanket_applied = True
+        materialized_route_sha256s = {
+            route.sha256 for route in state.materialized_routes
+        }
+        ppm_start = len(history)
+        while (
+            ppm_start > 0
+            and history[ppm_start - 1] in materialized_route_sha256s
+        ):
+            ppm_start -= 1
+        ppm_history = history[ppm_start:]
+        if ppm_history and not blanket_applied:
+            ppm = self.scheduler.predict_ppm(
+                state,
+                ppm_history,
                 input_abi_sha256=input_abi,
             )
             if (
@@ -756,8 +895,16 @@ class DemandRoutedExecutor:
             input_abi_sha256=input_abi,
             candidate_route_sha256s=tuple(sorted(selection_candidates)),
         )
-        stage = "ppm-selection-binding"
+        stage = "prediction-selection-binding"
         try:
+            if (
+                blanket is not None
+                and blanket.scheduler_state_sha256
+                != selection.transition.previous_state_sha256
+            ):
+                raise DemandExecutionIntegrityError(
+                    "scheduler changed between lag blanket prediction and persisted selection"
+                )
             if (
                 ppm is not None
                 and ppm.scheduler_state_sha256
@@ -846,6 +993,7 @@ class DemandRoutedExecutor:
             graph_generation=state.generation,
             graph_state_sha256=state.sha256,
             selected_prefix_route_sha256=selected_route.sha256,
+            blanket_prediction=blanket,
             ppm_prediction=ppm,
             selection=selection,
             residual=residual_execution.receipt,

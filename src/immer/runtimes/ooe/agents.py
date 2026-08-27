@@ -74,6 +74,9 @@ class AttractorRouter:
         self._clusters: dict[str, _Cluster] = {}
         self._dimension: int | None = None
         self._calibration_sha256: str | None = None
+        self._centroid_universe_sha256: str | None = None
+        self._labels_cache: tuple[str, ...] | None = None
+        self._distance_evaluations = 0
 
     @property
     def dimension(self) -> int | None:
@@ -85,7 +88,52 @@ class AttractorRouter:
 
     @property
     def labels(self) -> tuple[str, ...]:
-        return tuple(sorted(self._clusters))
+        cached = self._labels_cache
+        if cached is None:
+            cached = tuple(sorted(self._clusters))
+            self._labels_cache = cached
+        return cached
+
+    @property
+    def distance_evaluations(self) -> int:
+        """Number of centroid distances evaluated since construction/reset.
+
+        This counter is diagnostic only: it is deliberately absent from every
+        calibration and persistence identity.  It makes full-versus-sparse
+        router execution directly measurable without changing a decision.
+        """
+
+        return self._distance_evaluations
+
+    def reset_distance_evaluations(self) -> None:
+        self._distance_evaluations = 0
+
+    def centroid_universe_record(self) -> dict[str, object]:
+        """Return the complete, canonical centroid state of this router."""
+
+        return {
+            "clusters": [
+                {
+                    "count": self._clusters[label].count,
+                    "label": label,
+                    "mean": self._clusters[label].mean.tolist(),
+                }
+                for label in self.labels
+            ],
+            "dimension": self._dimension,
+            "format": "immer-ooe-router-centroid-universe/v1",
+            "labels": list(self.labels),
+        }
+
+    @property
+    def centroid_universe_sha256(self) -> str:
+        cached = self._centroid_universe_sha256
+        if cached is None:
+            cached = hashlib.sha256(
+                canonical_json_bytes(self.centroid_universe_record())
+            ).hexdigest()
+            self._centroid_universe_sha256 = cached
+        return cached
 
     def observe(self, label: str, sketch: NDArray[np.floating]) -> None:
         if not isinstance(label, str) or not label:
@@ -104,6 +152,8 @@ class AttractorRouter:
         # New evidence changes the centroids.  Existing numerical thresholds
         # remain usable, but their calibration receipt no longer describes them.
         self._calibration_sha256 = None
+        self._centroid_universe_sha256 = None
+        self._labels_cache = None
 
     def calibrate(
         self,
@@ -185,8 +235,63 @@ class AttractorRouter:
         ).hexdigest()
         return self._calibration_sha256
 
-    def decision(self, sketch: NDArray[np.floating]) -> RouteDecision:
+    def _candidate_labels(
+        self,
+        candidate_labels: Iterable[str] | None,
+    ) -> tuple[str, ...]:
+        if candidate_labels is None:
+            return self.labels
+        if isinstance(candidate_labels, (str, bytes)):
+            raise TypeError("candidate_labels must be a label sequence")
+        try:
+            labels = tuple(candidate_labels)
+        except TypeError as exc:
+            raise TypeError("candidate_labels must be a label sequence") from exc
+        if not labels:
+            raise ValueError("candidate_labels must not be empty")
+        if any(not isinstance(label, str) or not label for label in labels):
+            raise ValueError("candidate_labels must contain non-empty strings")
+        if labels != tuple(sorted(set(labels))):
+            raise ValueError("candidate_labels must be sorted and unique")
+        unknown = tuple(label for label in labels if label not in self._clusters)
+        if unknown:
+            raise KeyError(f"unknown attractor labels: {', '.join(unknown)}")
+        return labels
+
+    def _rank_candidates(
+        self,
+        sketch: NDArray[np.floating],
+        candidate_labels: Iterable[str] | None = None,
+    ) -> tuple[tuple[float, str], ...]:
+        """Rank one strict set of known labels by exact centroid distance."""
+
         if not self._clusters:
+            if candidate_labels is not None:
+                self._candidate_labels(candidate_labels)
+            return ()
+        value = _finite_vector(sketch, name="sketch")
+        if value.size != self._dimension:
+            raise ValueError(f"sketch must have length {self._dimension}")
+        labels = self._candidate_labels(candidate_labels)
+        ordered: list[tuple[float, str]] = []
+        for label in labels:
+            self._distance_evaluations += 1
+            ordered.append(
+                (float(np.linalg.norm(value - self._clusters[label].mean)), label)
+            )
+        return tuple(
+            sorted(
+                ordered,
+                key=lambda item: (item[0], item[1]),
+            )
+        )
+
+    def _decision_from_ranked(
+        self,
+        ordered: Iterable[tuple[float, str]],
+    ) -> RouteDecision:
+        ranked = tuple(ordered)
+        if not ranked:
             return RouteDecision(
                 None,
                 False,
@@ -197,18 +302,15 @@ class AttractorRouter:
                 self.radius,
                 self.min_margin,
             )
-        value = _finite_vector(sketch, name="sketch")
-        if value.size != self._dimension:
-            raise ValueError(f"sketch must have length {self._dimension}")
-        ordered = sorted(
-            (
-                (float(np.linalg.norm(value - cluster.mean)), label)
-                for label, cluster in self._clusters.items()
-            ),
-            key=lambda item: (item[0], item[1]),
-        )
-        nearest, label = ordered[0]
-        second = ordered[1][0] if len(ordered) > 1 else math.inf
+        if ranked != tuple(
+            sorted(
+                ranked,
+                key=lambda item: (item[0], item[1]),
+            )
+        ):
+            raise ValueError("ranked candidates must use canonical distance order")
+        nearest, label = ranked[0]
+        second = ranked[1][0] if len(ranked) > 1 else math.inf
         margin = second - nearest
         if nearest > self.radius:
             return RouteDecision(
@@ -242,6 +344,24 @@ class AttractorRouter:
             self.radius,
             self.min_margin,
         )
+
+    def decision_for_candidates(
+        self,
+        sketch: NDArray[np.floating],
+        candidate_labels: Iterable[str],
+    ) -> RouteDecision:
+        """Decide over a strict known subset.
+
+        This is an internal acceleration seam.  Callers must prove that the
+        subset contains the global nearest and runner-up before relying on it.
+        """
+
+        return self._decision_from_ranked(
+            self._rank_candidates(sketch, candidate_labels)
+        )
+
+    def decision(self, sketch: NDArray[np.floating]) -> RouteDecision:
+        return self._decision_from_ranked(self._rank_candidates(sketch))
 
     def classify(self, sketch: NDArray[np.floating]) -> str | None:
         return self.decision(sketch).label

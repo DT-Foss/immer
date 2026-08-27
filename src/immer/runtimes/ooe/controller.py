@@ -32,6 +32,12 @@ from .crystal import (
 )
 from .identity import OoeSiteIdentity, canonical_json_bytes, require_sha256
 from .math_core import RapidityLedger, array_sha256, normalize_rows
+from .predictive_blanket import (
+    ExactRouterBlanketError,
+    ExactRouterBlanketReceipt,
+    apply_exact_router_blanket,
+    build_exact_router_blanket,
+)
 from .qwen_bridge import (
     OOE_ACTIONS,
     OoeAction,
@@ -1043,6 +1049,19 @@ class OoeController:
             radius_ceiling=self.config.router_radius,
         )
 
+    @_locked
+    def build_router_blanket(
+        self,
+        receipt: QwenOoeFeatureReceipt,
+    ) -> ExactRouterBlanketReceipt:
+        """Full-scan and seal a sparse route for one exact current feature."""
+
+        if not isinstance(receipt, QwenOoeFeatureReceipt):
+            raise TypeError("receipt must be a QwenOoeFeatureReceipt")
+        self._assert_pins(receipt)
+        self._assert_executable_atlas_revision(receipt.atlas_graph_revision)
+        return build_exact_router_blanket(self.router, receipt)
+
     @staticmethod
     def _named_hashes(prefix: str, values: Sequence[str]) -> dict[str, str]:
         return {
@@ -1192,6 +1211,36 @@ class OoeController:
             token.belief[source] = 1.0
         return token
 
+    @staticmethod
+    def _clone_mobile_token(token: MobileMarkovToken) -> MobileMarkovToken:
+        if not isinstance(token, MobileMarkovToken):
+            raise TypeError("token must be a MobileMarkovToken")
+        return MobileMarkovToken(
+            belief=token.belief.copy(),
+            reservoir=token.reservoir.copy(),
+            ledger=RapidityLedger(token.ledger.xi, token.ledger.limit),
+            route=list(token.route),
+            branch_mass=token.branch_mass,
+            fallbacks=token.fallbacks,
+            reservoir_decay=token.reservoir_decay,
+            _reservoir_coherence=token._reservoir_coherence,
+        )
+
+    def _token_checkpoint(self, stream_id: str) -> tuple[str, MobileMarkovToken | None]:
+        key = _canonical_text(stream_id, field="stream_id")
+        token = self._tokens.get(key)
+        return key, None if token is None else self._clone_mobile_token(token)
+
+    def _restore_token_checkpoint(
+        self,
+        checkpoint: tuple[str, MobileMarkovToken | None],
+    ) -> None:
+        key, token = checkpoint
+        if token is None:
+            self._tokens.pop(key, None)
+        else:
+            self._tokens[key] = token
+
     @_locked
     def decide(
         self,
@@ -1199,6 +1248,7 @@ class OoeController:
         source_action: OoeAction | str,
         *,
         stream_id: str = "default",
+        router_blanket: ExactRouterBlanketReceipt | None = None,
     ) -> OoeDecision:
         """Execute a promoted Crystal or return an explicit Qwen abstention."""
 
@@ -1209,6 +1259,7 @@ class OoeController:
             routed_site_override=None,
             crystal_site_override=None,
             placebo_mode=None,
+            router_blanket=router_blanket,
         )
 
     def _decide(
@@ -1220,6 +1271,7 @@ class OoeController:
         routed_site_override: str | None,
         crystal_site_override: str | None,
         placebo_mode: Literal["shuffled-site", "shuffled-crystal"] | None,
+        router_blanket: ExactRouterBlanketReceipt | None,
     ) -> OoeDecision:
         """Shared exact execution path; overrides exist only for placebo calls."""
 
@@ -1228,8 +1280,20 @@ class OoeController:
         self._assert_pins(receipt)
         source = validate_action(source_action)
         input_site = receipt.site_identity.sha256
-        route = self.router.decision(receipt.sketch_array)
         self._assert_executable_atlas_revision(receipt.atlas_graph_revision)
+        if router_blanket is None:
+            route = self.router.decision(receipt.sketch_array)
+        else:
+            try:
+                route = apply_exact_router_blanket(
+                    self.router,
+                    receipt,
+                    router_blanket,
+                )
+            except ExactRouterBlanketError as exc:
+                raise OoeControllerIntegrityError(
+                    "exact router blanket validation failed"
+                ) from exc
         if not route.accepted or route.label != input_site:
             self.metrics.novelty_abstentions += 1
             return OoeDecision(
@@ -1388,6 +1452,7 @@ class OoeController:
             routed_site_override=(override if mode == "shuffled-site" else None),
             crystal_site_override=(override if mode == "shuffled-crystal" else None),
             placebo_mode=mode,
+            router_blanket=None,
         )
 
     @staticmethod
@@ -1525,14 +1590,23 @@ class OoeController:
         *,
         quality_verifier: ExecutionQualityVerifier,
         stream_id: str = "default",
+        router_blanket: ExactRouterBlanketReceipt | None = None,
     ) -> OoeDecision:
         """Try one warm bypass without invoking or learning from the teacher."""
 
         if not callable(quality_verifier):
             raise TypeError("quality_verifier must be callable")
-        self.metrics.requests += 1
         source = validate_action(source_action)
-        candidate = self.decide(receipt, source, stream_id=stream_id)
+        token_checkpoint = self._token_checkpoint(stream_id)
+        candidate = self.decide(
+            receipt,
+            source,
+            stream_id=stream_id,
+            router_blanket=router_blanket,
+        )
+        # Invalid or stale blanket evidence must fail before request accounting
+        # just as it fails before the mobile token is created or updated.
+        self.metrics.requests += 1
         if candidate.origin != "crystal":
             return candidate
         if candidate.action == "qwen_fallback":
@@ -1542,21 +1616,31 @@ class OoeController:
             )
         executor = self._executors.get(candidate.action)
         if executor is None:
+            self._restore_token_checkpoint(token_checkpoint)
             return self._as_warm_abstention(
                 candidate,
                 reason="missing-action-executor",
             )
-        execution = executor(receipt)
-        if not isinstance(execution, ActionExecution):
-            raise OoeControllerIntegrityError(
-                "action executor must return an ActionExecution"
-            )
-        execution.assert_bound(receipt, candidate.action)
+        try:
+            execution = executor(receipt)
+            if not isinstance(execution, ActionExecution):
+                raise OoeControllerIntegrityError(
+                    "action executor must return an ActionExecution"
+                )
+            execution.assert_bound(receipt, candidate.action)
+        except BaseException:
+            self._restore_token_checkpoint(token_checkpoint)
+            raise
         self.metrics.executed_qwen_forwards += execution.qwen_forwards
-        verified = execution.quality_verified and bool(
-            quality_verifier(receipt, execution)
-        )
+        try:
+            verified = execution.quality_verified and bool(
+                quality_verifier(receipt, execution)
+            )
+        except BaseException:
+            self._restore_token_checkpoint(token_checkpoint)
+            raise
         if not verified:
+            self._restore_token_checkpoint(token_checkpoint)
             self.metrics.quality_failures += 1
             return self._as_warm_abstention(
                 candidate,
@@ -1589,6 +1673,7 @@ class OoeController:
         teacher: Teacher,
         quality_verifier: ExecutionQualityVerifier,
         stream_id: str = "default",
+        router_blanket: ExactRouterBlanketReceipt | None = None,
     ) -> OoeDecision:
         """Try warm execution, then invoke the complete Qwen teacher on miss."""
 
@@ -1600,6 +1685,7 @@ class OoeController:
             source,
             quality_verifier=quality_verifier,
             stream_id=stream_id,
+            router_blanket=router_blanket,
         )
         if candidate.origin == "crystal":
             self.commit_warm(candidate)

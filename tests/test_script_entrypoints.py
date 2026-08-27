@@ -25,10 +25,16 @@ SCRIPTS = (
     "qwen38_ooe_cold_warm_cohort.py",
     "qwen38_ooe_chat_cohort.py",
     "ooe_intelligence_benchmark.py",
+    "ooe_boundary_blanket.py",
+    "ooe_demand_blanket_benchmark.py",
+    "ooe_controller_action_frontier.py",
     "ooe_controller_language_bootstrap.py",
     "ooe_dialect_mesh_benchmark.py",
+    "ooe_fertig_action_learning.py",
     "ooe_language_growth_benchmark.py",
     "ooe_markov_language_benchmark.py",
+    "ooe_predictive_quotient.py",
+    "ooe_router_blanket.py",
 )
 FORBIDDEN_RESEARCH_IMPORTS = (
     "vendor/mitglm",
@@ -84,8 +90,11 @@ class ScriptEntrypointTests(unittest.TestCase):
             for manifest in ("s3_ship_v6.json", "crsa_router_v1.json"):
                 shutil.copy2(ROOT / "manifests" / manifest, resources / manifest)
             bin_dir.mkdir()
-            for name in SCRIPTS:
-                copied = shutil.copy2(ROOT / "scripts" / name, bin_dir / name)
+            copied_scripts = {
+                name: shutil.copy2(ROOT / "scripts" / name, bin_dir / name)
+                for name in SCRIPTS
+            }
+            for name, copied in copied_scripts.items():
                 with self.subTest(script=name):
                     self._assert_help(Path(copied), site, root)
 
