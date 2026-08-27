@@ -1,6 +1,9 @@
 # Runtime Verdict
 
-Release: 0.8.0 · 2026-08-26
+Release: 0.8.0 · 2026-08-27
+
+Integration base:
+`45778a4aeac55a8f1a7bcb47df73fee4972e1228`.
 
 ## Verdict
 
@@ -74,6 +77,37 @@ later requests.
   whole-layer and sublayer observations to the live controller. Eight sites
   pass PS-Lifted promotion and export as exact row-Markov ComputeCrystals under
   one source-snapshot/Atlas/model/coverage/calibration/bank receipt.
+- Exact FERTIG execution is now learned as a real controller action. Sixteen of
+  sixteen Atlas-bound warm transactions complete across all eight O1 sites and
+  two certified inputs, produce exact answers `81` and `310`, consume zero Qwen
+  forwards, and append unique measurement, feature, execution, learning, and
+  trace identities before persistent teacher ingestion.
+- The enriched controller re-promotes all eight sites and exports every exact
+  5x5 policy to a source-bound `ComputeCrystal.markov`. All eight restored
+  policies select `execute_fertig` from the `execute_fertig` row. The frontier
+  is `44074166d5b7db8b39b43100b95aeffa48e4c80bd114e13f8079150e77315e41`
+  and the export receipt is
+  `1663d7524460b9677cde7a5bc92218e2c2429d489964c8bd1a444763fbee590d`.
+- The predictive-state quotient contracts a four-history positive process to
+  two states while the non-bisimilar control stays at four. It preserves the
+  exact rational `2/3`–`1/3` law, scores held-out total variation `0`, separates
+  a disturbed law at total variation `1`, and is byte-identical under reversed
+  input order.
+- Exact Store forks preserve every historical object, manifest-chain byte, and
+  state generation behind a source-pinned no-replace intent. Restore accepts a
+  promoted policy only after rebuilding its kernel from authenticated history;
+  foreign targets, manifest extras, arbitrary same-metadata kernels, stale
+  trace endpoints, and crash residues cannot enter an exported frontier.
+- The complete warning-fatal suite closes at `1,814/1,814`, `OK`, `591.551 s`.
+- On the 16 live FERTIG receipts, controller-local successor semantics
+  `(same site, executed action)` contract nine observed `(site, source-action)`
+  states to one exact predictive class: `9x`, one refinement round, terminal
+  `0`, censored `0`. The same receipts under global trace topology remain
+  `9→9`, proving the compression is the correct local-agent Markov quotient.
+  Quotient SHA:
+  `064dd640c673a3e86dca24513663a1c3a7d2793ed279d2b0b9d2667081e15ae1`;
+  file SHA:
+  `44e3853cc9bb1953feb01146f4b634a75247cffdc5e129b80e6d7df7c5eaa3fa`.
 - A fresh agent grounds an opaque eight-action language on those live operators,
   freezes at `100%`, and passes `1,000/1,000` post-persistence greedy
   executions. Fake controller authorities, replaced banks, forged ancestors,

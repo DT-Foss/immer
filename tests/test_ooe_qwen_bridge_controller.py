@@ -8,6 +8,8 @@ import tempfile
 import threading
 import unittest
 
+import numpy as np
+
 from immer.runtimes.deepseek_v4.causal_weights import TensorRangePlan
 from immer.runtimes.ooe.controller import (
     CONTROLLER_STATE_NAME,
@@ -20,8 +22,9 @@ from immer.runtimes.ooe.controller import (
     OoePromotionError,
     VerifiedTeacherTransition,
 )
-from immer.runtimes.ooe.crystal import CrystalStore, CrystalTamperError
+from immer.runtimes.ooe.crystal import CrystalPayload, CrystalStore, CrystalTamperError
 from immer.runtimes.ooe.identity import canonical_json_bytes
+from immer.runtimes.ooe.math_core import array_sha256
 from immer.runtimes.ooe.qwen_bridge import (
     ACTION_SCHEMA_SHA256,
     OOE_ACTIONS,
@@ -386,11 +389,13 @@ class OoeControllerTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             controller = self._controller(Path(tmp))
+            self.assertIsNone(controller.last_teacher_action)
             first, _ = _feature(0, site=0, source=0, signal=2.0)
             controller.ingest_teacher(
                 first,
                 _transition(first, OOE_ACTIONS[0], OOE_ACTIONS[1]),
             )
+            self.assertEqual(controller.last_teacher_action, OOE_ACTIONS[1])
             shared_question = first.probe.question_sha256
 
             second_measurement = _measurement(
@@ -418,6 +423,7 @@ class OoeControllerTests(unittest.TestCase):
                 second,
                 _transition(second, OOE_ACTIONS[0], OOE_ACTIONS[2]),
             )
+            self.assertEqual(controller.last_teacher_action, OOE_ACTIONS[2])
 
             matches = controller.feature_receipts_for_prompt(shared_question)
             self.assertEqual(matches, (first, second))
@@ -619,6 +625,52 @@ class OoeControllerTests(unittest.TestCase):
                     coverage_sha256=strict_coverage.sha256,
                     verifier_sha256s=strict_coverage.verifier_sha256s,
                 )
+
+    def test_restore_rederives_promoted_kernel_from_verified_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = self._controller(Path(tmp))
+            receipt, _ = _feature(0)
+            controller.ingest_teacher(
+                receipt,
+                _transition(receipt, OOE_ACTIONS[0], OOE_ACTIONS[1]),
+            )
+            coverage = controller.coverage_receipt(receipt.site_identity.sha256)
+            controller.promote(
+                receipt.site_identity.sha256,
+                coverage_sha256=coverage.sha256,
+                verifier_sha256s=coverage.verifier_sha256s,
+            )
+            first_state = controller.save_snapshot()
+            original = controller.crystal_store.restore_named(
+                receipt.site_identity.sha256
+            )
+            forged_kernel = np.eye(len(OOE_ACTIONS), dtype=np.float64)
+            consensus = dict(original.consensus_receipt)
+            consensus["fused_kernel_sha256"] = array_sha256(forged_kernel)
+            forged = CrystalPayload.from_kernel(
+                name=original.name,
+                identity=original.identity,
+                kernel=forged_kernel,
+                coverage_sha256=original.coverage_sha256,
+                calibration_sha256=original.calibration_sha256,
+                verifier_hashes=dict(original.verifier_hashes),
+                evidence_hashes=dict(original.evidence_hashes),
+                consensus_receipt=consensus,
+                quantization_levels=original.quantization_levels,
+            )
+            controller.crystal_store.publish(
+                forged,
+                expected_generation=controller.crystal_store.manifest().generation,
+            )
+            controller._sites[
+                receipt.site_identity.sha256
+            ].crystal_sha256 = forged.sha256
+            controller.save_snapshot(expected_sha256=first_state.payload_sha256)
+            with self.assertRaisesRegex(
+                OoeControllerIntegrityError,
+                "cannot be rederived",
+            ):
+                OoeController.restore(crystal_store=controller.crystal_store)
 
     def test_failed_execution_quality_repairs_through_teacher_without_savings(
         self,

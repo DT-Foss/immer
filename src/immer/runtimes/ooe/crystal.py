@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import secrets
 import stat
-from typing import Iterator, Mapping
+from typing import Iterator, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -601,12 +601,14 @@ class CrystalStore:
 
     _MANIFEST = "manifest.json"
     _LOCK = "LOCK"
+    _FORK_MARKER = "IMMER-EXACT-FORK-INTENT"
 
     def __init__(
         self,
         root: str | os.PathLike[str],
         *,
         max_state_bytes: int = 64 * 1024 * 1024,
+        _allow_incomplete_fork: bool = False,
     ) -> None:
         if (
             isinstance(max_state_bytes, bool)
@@ -617,6 +619,28 @@ class CrystalStore:
         self.root = Path(root)
         self.max_state_bytes = max_state_bytes
         self._ensure_managed_directory(self.root)
+        if not isinstance(_allow_incomplete_fork, bool):
+            raise TypeError("_allow_incomplete_fork must be bool")
+        marker = self.root / self._FORK_MARKER
+        marker_temporaries = tuple(
+            path
+            for path in self.root.iterdir()
+            if path.name.startswith(f".{self._FORK_MARKER}.")
+            and path.name.endswith(".tmp")
+        )
+        parent_intents = tuple(
+            path
+            for path in self.root.parent.iterdir()
+            if path.name.startswith(f".{self.root.name}.")
+            and path.name.endswith(".fork.INTENT")
+        )
+        if not _allow_incomplete_fork and (
+            marker.exists()
+            or marker.is_symlink()
+            or marker_temporaries
+            or (parent_intents and not (self.root / self._MANIFEST).is_file())
+        ):
+            raise CrystalStoreError("CrystalStore exact fork is still in progress")
         self._ensure_managed_directory(self.root / "objects")
         self._ensure_managed_directory(self.root / "staging")
         self._ensure_managed_directory(self.root / "state")
@@ -834,6 +858,520 @@ class CrystalStore:
     def manifest(self) -> CrystalManifest:
         with self._directories() as (root_fd, _, _):
             return self._read_manifest_fd(root_fd)
+
+    def fork_exact(
+        self,
+        target_root: str | os.PathLike[str],
+        *,
+        state_names: Sequence[str],
+        expected_manifest_sha256: str | None = None,
+        expected_state_sha256s: Mapping[str, str] | None = None,
+    ) -> "CrystalStore":
+        """Create or resume one exact, plan-marked CrystalStore fork.
+
+        The target directory itself is the no-replace reservation.  Until all
+        declared historical objects, exact manifest bytes, and selected state
+        envelopes pass audit, it carries a sealed fork-plan marker.  A retry
+        repairs only plan-named regular files inside that marked directory; it
+        never recursively deletes a predictable sibling path and never replaces
+        a concurrently created target directory.
+        """
+
+        if isinstance(state_names, (str, bytes, bytearray)):
+            raise TypeError("state_names must be a sequence of state names")
+        try:
+            names = tuple(state_names)
+        except TypeError as exc:
+            raise TypeError("state_names must be a sequence of state names") from exc
+        if not names or len(set(names)) != len(names):
+            raise ValueError("state_names must be a non-empty unique sequence")
+        state_filenames = {name: self._state_filename(name) for name in names}
+        expected_manifest = (
+            None
+            if expected_manifest_sha256 is None
+            else require_sha256(
+                expected_manifest_sha256,
+                field="expected_manifest_sha256",
+            )
+        )
+        if expected_state_sha256s is None:
+            expected_states: dict[str, str] = {}
+        else:
+            if not isinstance(expected_state_sha256s, Mapping) or set(
+                expected_state_sha256s
+            ) != set(names):
+                raise ValueError(
+                    "expected_state_sha256s must cover every selected state"
+                )
+            expected_states = {
+                name: require_sha256(
+                    expected_state_sha256s[name],
+                    field=f"expected_state_sha256s[{name!r}]",
+                )
+                for name in names
+            }
+
+        target = Path(target_root).expanduser().absolute()
+        parent = target.parent
+        try:
+            parent_metadata = parent.lstat()
+        except OSError as exc:
+            raise CrystalStoreError(f"fork parent does not exist: {parent}") from exc
+        if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(
+            parent_metadata.st_mode
+        ):
+            raise CrystalStoreError("fork parent must be a real directory")
+        source_real = self.root.resolve(strict=True)
+        target_real = parent.resolve(strict=True) / target.name
+        if (
+            target_real == source_real
+            or source_real in target_real.parents
+            or target_real in source_real.parents
+        ):
+            raise CrystalStoreError("fork source and target roots overlap")
+
+        token = hashlib.sha256(str(target_real).encode("utf-8")).hexdigest()[:20]
+        parent_lock_name = f".{target.name}.{token}.fork.LOCK"
+        parent_intent_name = f".{target.name}.{token}.fork.INTENT"
+        marker_name = self._FORK_MARKER
+        parent_fd = os.open(parent, self._directory_flags())
+        lock_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        parent_lock_fd = os.open(
+            parent_lock_name,
+            lock_flags,
+            0o600,
+            dir_fd=parent_fd,
+        )
+
+        def install_exact(dir_fd: int, name: str, data: bytes) -> None:
+            try:
+                current = self._stable_read(
+                    dir_fd,
+                    name,
+                    max_bytes=max(len(data), 1),
+                )
+            except FileNotFoundError:
+                current = None
+            if current == data:
+                return
+            if current is not None:
+                metadata = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise CrystalStoreError(
+                        "fork plan file is not a replaceable regular file"
+                    )
+                os.unlink(name, dir_fd=dir_fd)
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(
+                os, "O_NOFOLLOW", 0
+            )
+            descriptor = os.open(name, flags, 0o600, dir_fd=dir_fd)
+            try:
+                self._write_all(descriptor, data)
+                os.fsync(descriptor)
+                os.fchmod(descriptor, 0o444)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+        def publish_immutable(dir_fd: int, name: str, data: bytes) -> None:
+            try:
+                current = self._stable_read(
+                    dir_fd,
+                    name,
+                    max_bytes=max(len(data), 1),
+                )
+            except FileNotFoundError:
+                current = None
+            if current is not None:
+                if current != data:
+                    raise CrystalStoreError(
+                        "immutable fork intent belongs to another plan"
+                    )
+                return
+            temporary = f".{name}.{secrets.token_hex(12)}.tmp"
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(
+                os, "O_NOFOLLOW", 0
+            )
+            descriptor = os.open(temporary, flags, 0o600, dir_fd=dir_fd)
+            try:
+                self._write_all(descriptor, data)
+                os.fsync(descriptor)
+                os.fchmod(descriptor, 0o444)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            try:
+                try:
+                    os.link(
+                        temporary,
+                        name,
+                        src_dir_fd=dir_fd,
+                        dst_dir_fd=dir_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    if self._stable_read(
+                        dir_fd,
+                        name,
+                        max_bytes=max(len(data), 1),
+                    ) != data:
+                        raise CrystalStoreError(
+                            "concurrent fork intent belongs to another plan"
+                        )
+                os.fsync(dir_fd)
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    pass
+
+        try:
+            metadata = os.fstat(parent_lock_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise CrystalStoreError("fork parent lock is not a regular file")
+            fcntl.flock(parent_lock_fd, fcntl.LOCK_EX)
+            with self._directories() as (
+                source_root_fd,
+                source_objects_fd,
+                source_staging_fd,
+            ):
+                source_state_fd = os.open(
+                    "state", self._directory_flags(), dir_fd=source_root_fd
+                )
+                try:
+                    with self._locked(source_root_fd):
+                        manifest = self._read_manifest_fd(source_root_fd)
+                        if (
+                            expected_manifest is not None
+                            and manifest.sha256 != expected_manifest
+                        ):
+                            raise ManifestConflictError(
+                                "source manifest differs from exact fork pin"
+                            )
+                        if os.listdir(source_staging_fd):
+                            raise CrystalStoreError(
+                                "source staging must be clean before exact fork"
+                            )
+                        expected_object_files = {
+                            f"{digest}.crystal" for digest in manifest.objects
+                        }
+                        if set(os.listdir(source_objects_fd)) != expected_object_files:
+                            raise CrystalStoreError(
+                                "source object inventory differs from its manifest"
+                            )
+                        state_envelopes: dict[str, bytes] = {}
+                        state_payloads: dict[str, bytes] = {}
+                        for name, filename in state_filenames.items():
+                            envelope = self._stable_read(
+                                source_state_fd,
+                                filename,
+                                max_bytes=(
+                                    4096
+                                    + 4 * ((self.max_state_bytes + 2) // 3)
+                                ),
+                            )
+                            payload, _, _ = self._decode_state(
+                                envelope,
+                                expected_name=name,
+                            )
+                            if name in expected_states and hashlib.sha256(
+                                payload
+                            ).hexdigest() != expected_states[name]:
+                                raise ManifestConflictError(
+                                    "source state differs from exact fork pin"
+                                )
+                            state_envelopes[name] = envelope
+                            state_payloads[name] = payload
+                        plan_body = {
+                            "format": "immer-ooe-crystal-store-fork-plan/v1",
+                            "manifest_sha256": manifest.sha256,
+                            "state_sha256s": {
+                                name: hashlib.sha256(payload).hexdigest()
+                                for name, payload in sorted(state_payloads.items())
+                            },
+                            "target_realpath_sha256": hashlib.sha256(
+                                str(target_real).encode("utf-8")
+                            ).hexdigest(),
+                        }
+                        plan = canonical_json_bytes(
+                            {
+                                "body": plan_body,
+                                "schema": "immer-ooe-crystal-store-fork-plan/v1",
+                                "sha256": hashlib.sha256(
+                                    canonical_json_bytes(plan_body)
+                                ).hexdigest(),
+                            }
+                        )
+
+                        try:
+                            target_metadata = os.stat(
+                                target.name,
+                                dir_fd=parent_fd,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            target_metadata = None
+                        if target_metadata is not None and not stat.S_ISDIR(
+                            target_metadata.st_mode
+                        ):
+                            raise CrystalStoreError(
+                                "fork target is not a real directory"
+                            )
+                        try:
+                            prior_parent_intent = self._stable_read(
+                                parent_fd,
+                                parent_intent_name,
+                                max_bytes=64 * 1024,
+                            )
+                        except FileNotFoundError:
+                            prior_parent_intent = None
+                        if target_metadata is not None and prior_parent_intent is None:
+                            raise FileExistsError(
+                                f"fork target already exists: {target}"
+                            )
+                        if (
+                            prior_parent_intent is not None
+                            and prior_parent_intent != plan
+                        ):
+                            raise CrystalStoreError(
+                                "fork parent intent belongs to another plan"
+                            )
+                        publish_immutable(parent_fd, parent_intent_name, plan)
+                        if target_metadata is None:
+                            try:
+                                os.mkdir(target.name, 0o700, dir_fd=parent_fd)
+                            except FileExistsError:
+                                if prior_parent_intent is None:
+                                    if self._stable_read(
+                                        parent_fd,
+                                        parent_intent_name,
+                                        max_bytes=64 * 1024,
+                                    ) == plan:
+                                        os.unlink(
+                                            parent_intent_name,
+                                            dir_fd=parent_fd,
+                                        )
+                                        os.fsync(parent_fd)
+                                raise
+                        else:
+                            if not stat.S_ISDIR(target_metadata.st_mode):
+                                raise CrystalStoreError(
+                                    "fork target is not a real directory"
+                                )
+                        target_fd = os.open(
+                            target.name,
+                            self._directory_flags(),
+                            dir_fd=parent_fd,
+                        )
+                        try:
+                            root_entries = set(os.listdir(target_fd))
+                            marker_temporaries = {
+                                name
+                                for name in root_entries
+                                if name.startswith(f".{marker_name}.")
+                                and name.endswith(".tmp")
+                            }
+                            for temporary in marker_temporaries:
+                                temporary_metadata = os.stat(
+                                    temporary,
+                                    dir_fd=target_fd,
+                                    follow_symlinks=False,
+                                )
+                                if not stat.S_ISREG(temporary_metadata.st_mode):
+                                    raise CrystalStoreError(
+                                        "fork marker residue is not a regular file"
+                                    )
+                                os.unlink(temporary, dir_fd=target_fd)
+                            if marker_temporaries:
+                                os.fsync(target_fd)
+                                root_entries -= marker_temporaries
+                            if marker_name in root_entries:
+                                if self._stable_read(
+                                    target_fd,
+                                    marker_name,
+                                    max_bytes=64 * 1024,
+                                ) != plan:
+                                    raise CrystalStoreError(
+                                        "fork target carries another plan marker"
+                                    )
+                            elif root_entries:
+                                raise FileExistsError(
+                                    f"fork target already exists: {target}"
+                                )
+                            else:
+                                publish_immutable(target_fd, marker_name, plan)
+
+                            child_fds: dict[str, int] = {}
+                            try:
+                                for child in ("objects", "staging", "state"):
+                                    try:
+                                        os.mkdir(child, 0o700, dir_fd=target_fd)
+                                    except FileExistsError:
+                                        child_metadata = os.stat(
+                                            child,
+                                            dir_fd=target_fd,
+                                            follow_symlinks=False,
+                                        )
+                                        if not stat.S_ISDIR(child_metadata.st_mode):
+                                            raise CrystalStoreError(
+                                                "fork managed child is not a directory"
+                                            )
+                                    child_fds[child] = os.open(
+                                        child,
+                                        self._directory_flags(),
+                                        dir_fd=target_fd,
+                                    )
+                                allowed_root = {
+                                    marker_name,
+                                    "objects",
+                                    "staging",
+                                    "state",
+                                    self._MANIFEST,
+                                    self._LOCK,
+                                }
+                                if set(os.listdir(target_fd)) - allowed_root:
+                                    raise CrystalStoreError(
+                                        "fork target root contains unexpected files"
+                                    )
+                                if set(os.listdir(child_fds["objects"])) - (
+                                    expected_object_files
+                                ):
+                                    raise CrystalStoreError(
+                                        "fork target contains unexpected objects"
+                                    )
+                                if os.listdir(child_fds["staging"]):
+                                    raise CrystalStoreError(
+                                        "fork target staging is not empty"
+                                    )
+                                if set(os.listdir(child_fds["state"])) - set(
+                                    state_filenames.values()
+                                ):
+                                    raise CrystalStoreError(
+                                        "fork target contains unexpected states"
+                                    )
+                                for digest in manifest.objects:
+                                    data = self._stable_read(
+                                        source_objects_fd,
+                                        f"{digest}.crystal",
+                                        max_bytes=MAX_CRYSTAL_PAYLOAD_BYTES,
+                                    )
+                                    if hashlib.sha256(data).hexdigest() != digest:
+                                        raise CrystalTamperError(
+                                            "source object changed during exact fork"
+                                        )
+                                    payload = CrystalPayload.from_bytes(data)
+                                    if payload.sha256 != digest:
+                                        raise CrystalTamperError(
+                                            "source object semantic identity changed"
+                                        )
+                                    install_exact(
+                                        child_fds["objects"],
+                                        f"{digest}.crystal",
+                                        data,
+                                    )
+                                manifest_bytes = manifest.to_bytes()
+                                install_exact(
+                                    target_fd,
+                                    self._MANIFEST,
+                                    manifest_bytes,
+                                )
+                                for name, envelope in state_envelopes.items():
+                                    install_exact(
+                                        child_fds["state"],
+                                        state_filenames[name],
+                                        envelope,
+                                    )
+                                for descriptor in child_fds.values():
+                                    os.fsync(descriptor)
+                                os.fsync(target_fd)
+                            finally:
+                                for descriptor in child_fds.values():
+                                    os.close(descriptor)
+                        finally:
+                            os.close(target_fd)
+
+                        prepared = CrystalStore(
+                            target,
+                            max_state_bytes=self.max_state_bytes,
+                            _allow_incomplete_fork=True,
+                        )
+                        audit = prepared.audit()
+                        if (
+                            not audit.clean
+                            or prepared.manifest().to_bytes() != manifest_bytes
+                            or any(
+                                prepared.restore_state(name) != payload
+                                for name, payload in state_payloads.items()
+                            )
+                        ):
+                            raise CrystalStoreError(
+                                "prepared exact fork failed its audit"
+                            )
+                        target_fd = os.open(
+                            target.name,
+                            self._directory_flags(),
+                            dir_fd=parent_fd,
+                        )
+                        try:
+                            if self._stable_read(
+                                target_fd,
+                                marker_name,
+                                max_bytes=64 * 1024,
+                            ) != plan:
+                                raise CrystalStoreError(
+                                    "fork plan marker changed before commit"
+                                )
+                            os.unlink(marker_name, dir_fd=target_fd)
+                            os.fsync(target_fd)
+                        finally:
+                            os.close(target_fd)
+                        if self._read_manifest_fd(source_root_fd) != manifest:
+                            raise ManifestConflictError(
+                                "source manifest changed during exact fork"
+                            )
+                        for name, filename in state_filenames.items():
+                            if self._stable_read(
+                                source_state_fd,
+                                filename,
+                                max_bytes=(
+                                    4096
+                                    + 4 * ((self.max_state_bytes + 2) // 3)
+                                ),
+                            ) != state_envelopes[name]:
+                                raise ManifestConflictError(
+                                    "source state changed during exact fork"
+                                )
+                        if self._stable_read(
+                            parent_fd,
+                            parent_intent_name,
+                            max_bytes=64 * 1024,
+                        ) != plan:
+                            raise CrystalStoreError(
+                                "fork parent intent changed before commit"
+                            )
+                        os.unlink(parent_intent_name, dir_fd=parent_fd)
+                        os.fsync(parent_fd)
+                finally:
+                    os.close(source_state_fd)
+            os.fsync(parent_fd)
+            result = CrystalStore(target, max_state_bytes=self.max_state_bytes)
+            result_audit = result.audit()
+            if (
+                not result_audit.clean
+                or result.manifest().to_bytes() != manifest_bytes
+                or any(
+                    result.restore_state(name) != payload
+                    for name, payload in state_payloads.items()
+                )
+            ):
+                raise CrystalStoreError("installed exact fork failed its audit")
+            return result
+        finally:
+            try:
+                fcntl.flock(parent_lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(parent_lock_fd)
+                os.close(parent_fd)
 
     def publish(
         self,

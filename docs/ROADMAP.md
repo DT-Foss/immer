@@ -1,6 +1,9 @@
 # Roadmap
 
-Release line: 0.8.x · 2026-08-26
+Release line: 0.8.x · 2026-08-27
+
+Integration base:
+`45778a4aeac55a8f1a7bcb47df73fee4972e1228`.
 
 The target is a local frontier runtime whose immutable weights are fully
 addressable through a growing causal control plane, with exact verification
@@ -44,6 +47,20 @@ around every domain that supports it.
   same-endpoint operator alternatives.
 - [x] Qwen sublayer boundary cartography for whole-layer, Attention core and
   residual, and MLP core and residual transition families.
+- [x] Real FERTIG action learning from Atlas-authenticated Qwen/O1 features:
+  16/16 replay-verified warm transactions across eight sites and two certified
+  inputs, zero Qwen forwards, append-only learning traces, and persistent
+  controller updates.
+- [x] Re-promote the eight FERTIG-enriched site policies and export them as an
+  exact eight-action `ComputeCrystal.markov` frontier; all eight restored
+  `execute_fertig` rows select `execute_fertig`.
+- [x] Learned predictive-state quotient with exact 4→2 contraction,
+  non-bisimilar 4→4 control, rational 2/3–1/3 preservation, held-out TV 0,
+  disturbed TV 1, and observation-order byte identity.
+- [x] First live predictive quotient over all 16 FERTIG learning receipts:
+  correct agent-local successors contract nine `(site, source-action)` states
+  to one class (`9x`), while the matched global trace-topology control remains
+  `9→9`.
 - [x] Left-acting `CAUSAL_MIX_FLOAT64` execution, fusion, dedicated verification,
   charging, and exact-route discharge.
 - [x] Prompt-preserving multi-timescale residual prediction with chronological
@@ -123,6 +140,14 @@ around every domain that supports it.
   Crystal promotions with zero errors.
 - [ ] Connect production OrganBank and anchor executors to the learned action
   alphabet for non-chat workloads.
+- [ ] Learn conditional-independence Markov blankets over quotient state and
+  measure sparse-context parity against the complete authenticated context.
+- [ ] Add receipt-bound operator conjugation across exact ModelPins and bases,
+  with singular/ill-conditioned/rebound-basis rejection.
+- [ ] Build the Qwen-native joint `gate_proj/up_proj` quantized subspace battery
+  and compare it against separate-projection and shuffled-subspace controls.
+- [ ] Apply topology-aware Warmth only as a downward charging brake and measure
+  redundant-charge suppression without changing authenticated demand.
 - [x] Export the first eight live O1/Atlas controller promotions into an exact
   ComputeCrystal ActionFrontier with source snapshot, Atlas/model/coverage,
   verifier/evidence, quantized-kernel, and append-only bank receipts.

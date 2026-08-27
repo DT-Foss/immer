@@ -1,6 +1,9 @@
 # Formula Leverage
 
-Release: 0.8.0 · 2026-08-26
+Release: 0.8.0 · 2026-08-27
+
+Integration base:
+`45778a4aeac55a8f1a7bcb47df73fee4972e1228`.
 
 IMMER's strongest mechanisms share one pattern:
 
@@ -12,6 +15,73 @@ IMMER's strongest mechanisms share one pattern:
 The runtime applies that pattern across attention, transport, world modeling,
 memory, algebra, stored compute, novelty, causal addressing, and exact
 capability execution.
+
+## 0. Learned predictive-state quotient
+
+Histories belong to the same executable state exactly when their future laws
+agree:
+
+\[
+P(Y_{future}\mid h)=P(Y_{future}\mid q(h)).
+\]
+
+The quotient is learned from exact empirical outcome counts and serialized in
+canonical order. The first mechanism controls are decisive:
+
+- a four-history process with two equal future laws contracts `4→2`;
+- the non-bisimilar control remains `4→4`;
+- a rational `2/3`–`1/3` law survives the merge exactly;
+- held-out total variation is `0`;
+- a disturbed future law has total variation `1`;
+- reversed observation order produces byte-identical quotient state.
+
+The live controller uses an agent-local transition law:
+
+\[
+(s,a)\longrightarrow(s,a_{executed}),
+\]
+
+where the site `s` remains the same. On all 16 live FERTIG learning receipts,
+nine observed `(site, source-action)` states have one identical future law and
+therefore contract `9→1`: `9x` compression after one refinement round, with
+zero terminal and zero censored observations. The quotient SHA is
+`064dd640c673a3e86dca24513663a1c3a7d2793ed279d2b0b9d2667081e15ae1`;
+the persisted file SHA is
+`44e3853cc9bb1953feb01146f4b634a75247cffdc5e129b80e6d7df7c5eaa3fa`.
+Replacing that successor with global trace topology leaves all nine states
+separate (`9→9`). This matched control proves that the compression is the
+site-local Markov quotient, not a generic merge.
+
+This quotient is the compression gate for language contexts, O1 histories,
+route-demand episodes, and battery compatibility domains. It preserves the
+future distribution that matters and deletes historical distinctions that do
+not.
+
+The next formula-derived stack is:
+
+\[
+P(y\mid q,G)\approx P(y\mid q,C_q),
+\]
+
+where `C_q` is a learned conditional-independence Markov blanket, followed by
+exact cross-basis operator transport
+
+\[
+O_B=C\,O_A\,C^{-1}
+\]
+
+under explicit ModelPins and basis receipts. The Qwen-native MLP battery then
+learns a joint quantized subspace for `gate_proj` and `up_proj`; it never
+reduces the gated MLP to a single projection. Topology-aware Warmth is a
+downward charging brake: high local reuse suppresses redundant charging and
+cannot manufacture demand.
+
+The external formula source was audited at SHA
+`5b986886988fe1a1c42256bdebaa6aff9b91588041f2af010ef80408a0b4e0b7`:
+`214` normal tests pass in `148.20 s` with `560` warnings, while warning-fatal
+execution passes `24/42` files and fails `18/42`. IMMER implements the formulas
+in its own runtime. The source archive's fixed-`q,K` Softmax Attention code is
+excluded because IMMER uses causal Prefix-Sinkhorn Attention.
 
 ## 1. Prefix-mass-balanced attention
 

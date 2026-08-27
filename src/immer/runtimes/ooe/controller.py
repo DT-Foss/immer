@@ -772,6 +772,29 @@ class OoeController:
 
     @property
     @_locked
+    def last_teacher_action(self) -> OoeAction | None:
+        """Return the target action of the latest authenticated transition."""
+
+        latest: tuple[int, OoeAction] | None = None
+        for site in self._sites.values():
+            for receipt, transition in site.history:
+                candidate = (receipt.temporal_index, transition.target_action)
+                if latest is None or candidate[0] > latest[0]:
+                    latest = candidate
+        if latest is None:
+            if self._last_temporal_index != -1:
+                raise OoeControllerIntegrityError(
+                    "controller temporal head has no teacher transition"
+                )
+            return None
+        if latest[0] != self._last_temporal_index:
+            raise OoeControllerIntegrityError(
+                "latest teacher action differs from controller temporal head"
+            )
+        return latest[1]
+
+    @property
+    @_locked
     def atlas_graph_revision(self) -> GraphRevision:
         return self._atlas_head
 
@@ -1933,6 +1956,24 @@ class OoeController:
                 if receipt.site_identity.sha256 != site_sha256:
                     raise OoeControllerIntegrityError("history row has wrong site")
                 history.append((receipt.temporal_index, receipt, transition))
+        known_site_sha256s = set(crystal_bindings)
+        if any(
+            entry.name not in known_site_sha256s
+            or entry.identity_sha256 != entry.name
+            for entry in stored_manifest.entries
+        ):
+            raise OoeControllerIntegrityError(
+                "controller manifest contains an unknown site entry"
+            )
+        for payload_sha256 in stored_manifest.objects:
+            historical_payload = crystal_store.restore(payload_sha256)
+            if (
+                historical_payload.name not in known_site_sha256s
+                or historical_payload.identity.sha256 != historical_payload.name
+            ):
+                raise OoeControllerIntegrityError(
+                    "controller manifest contains an unknown historical object"
+                )
         history.sort(key=lambda row: row[0])
         if len({row[0] for row in history}) != len(history):
             raise OoeControllerIntegrityError("history temporal index is duplicated")
@@ -2002,13 +2043,35 @@ class OoeController:
             payload = crystal_store.restore(crystal_digest)
             site = controller._sites[site_sha256]
             coverage = controller.coverage_receipt(site_sha256)
+            calibration_sha256 = controller.router.calibration_sha256
+            if calibration_sha256 is None:
+                raise OoeControllerIntegrityError(
+                    "promoted Crystal has no reproducible router calibration"
+                )
+            expected_payload = controller._build_crystal_payload(
+                site_sha256,
+                coverage,
+                calibration_sha256,
+            )
+            try:
+                manifest_entry = crystal_store.manifest().resolve(site_sha256)
+            except KeyError as exc:
+                raise OoeControllerIntegrityError(
+                    "snapshot Crystal is not active in the manifest"
+                ) from exc
             if (
                 payload.name != site_sha256
                 or payload.identity != site.identity
                 or payload.coverage_sha256 != coverage.sha256
-                or payload.calibration_sha256 != controller.router.calibration_sha256
+                or payload.calibration_sha256 != calibration_sha256
+                or manifest_entry.payload_sha256 != crystal_digest
+                or manifest_entry.identity_sha256 != site.identity.sha256
+                or payload.to_bytes() != expected_payload.to_bytes()
+                or crystal_digest != expected_payload.sha256
             ):
-                raise OoeControllerIntegrityError("snapshot Crystal binding is invalid")
+                raise OoeControllerIntegrityError(
+                    "snapshot Crystal payload cannot be rederived from history"
+                )
             site.crystal_sha256 = crystal_digest
 
         raw_tokens = body["tokens"]

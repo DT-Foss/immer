@@ -61,6 +61,54 @@ def _output_directory(value: str, *, label: str) -> Path:
     return _existing_directory(str(path), label=label)
 
 
+def _assert_disjoint_directories(*paths: Path) -> None:
+    resolved = tuple(path.resolve(strict=True) for path in paths)
+    identities = tuple((path.stat().st_dev, path.stat().st_ino) for path in paths)
+    for index, left in enumerate(resolved):
+        for other in range(index + 1, len(resolved)):
+            right = resolved[other]
+            if (
+                identities[index] == identities[other]
+                or left == right
+                or left in right.parents
+                or right in left.parents
+            ):
+                raise ControllerLanguageBootstrapCliError(
+                    "controller, Atlas, compute, state, and lexicon roots must "
+                    "be physically disjoint"
+                )
+
+
+def _assert_planned_directories(*paths: Path) -> None:
+    resolved = tuple(path.resolve(strict=False) for path in paths)
+    for index, left in enumerate(resolved):
+        for right in resolved[index + 1 :]:
+            if left == right or left in right.parents or right in left.parents:
+                raise ControllerLanguageBootstrapCliError(
+                    "planned runtime roots must be disjoint before creation"
+                )
+
+
+def _assert_planned_output_outside_roots(output: Path, *paths: Path) -> None:
+    resolved_output = output.resolve(strict=False)
+    for path in paths:
+        root = path.resolve(strict=False)
+        if resolved_output == root or root in resolved_output.parents:
+            raise ControllerLanguageBootstrapCliError(
+                "planned output must not be inside a runtime root"
+            )
+
+
+def _assert_output_outside_roots(output: Path, *paths: Path) -> None:
+    resolved_output = output.parent.resolve(strict=True) / output.name
+    for path in paths:
+        root = path.resolve(strict=True)
+        if resolved_output == root or root in resolved_output.parents:
+            raise ControllerLanguageBootstrapCliError(
+                "output report must not be inside a managed runtime root"
+            )
+
+
 def _stable_regular_bytes(path: Path, *, maximum: int) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -312,11 +360,44 @@ def run(args: argparse.Namespace) -> ControllerLanguageBootstrapReport:
         args.controller_store, label="controller store"
     )
     atlas_root = _existing_directory(args.atlas_root, label="Atlas root")
-    compute_root = _output_directory(args.compute_root, label="compute root")
-    state_root = _output_directory(args.state_root, label="state root")
-    lexicon_root = _output_directory(args.lexicon_root, label="lexicon root")
+    compute_root = Path(args.compute_root).expanduser().absolute()
+    state_root = Path(args.state_root).expanduser().absolute()
+    lexicon_root = Path(args.lexicon_root).expanduser().absolute()
     output = Path(args.output).expanduser().absolute()
+    _assert_planned_directories(
+        controller_root,
+        atlas_root,
+        compute_root,
+        state_root,
+        lexicon_root,
+    )
+    _assert_planned_output_outside_roots(
+        output,
+        controller_root,
+        atlas_root,
+        compute_root,
+        state_root,
+        lexicon_root,
+    )
+    compute_root = _output_directory(str(compute_root), label="compute root")
+    state_root = _output_directory(str(state_root), label="state root")
+    lexicon_root = _output_directory(str(lexicon_root), label="lexicon root")
     _output_directory(str(output.parent), label="output parent")
+    _assert_disjoint_directories(
+        controller_root,
+        atlas_root,
+        compute_root,
+        state_root,
+        lexicon_root,
+    )
+    _assert_output_outside_roots(
+        output,
+        controller_root,
+        atlas_root,
+        compute_root,
+        state_root,
+        lexicon_root,
+    )
 
     expected_snapshot = _pin(
         args.expected_controller_snapshot_sha256,

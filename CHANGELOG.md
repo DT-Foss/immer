@@ -4,6 +4,84 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-27
 
+### Real FERTIG action learning and controller frontier
+
+- Integration base before the new cut:
+  `45778a4aeac55a8f1a7bcb47df73fee4972e1228`.
+- Added authority-bound execution learning from real Atlas measurements. Exact
+  FERTIG certificates are independently replayed before an `ActionExecution`
+  can become a verified teacher transition or change persistent controller
+  state.
+- Completed `16/16` full warm execution-learning transactions across eight
+  promoted O1 sites and two certified input identities. The certified answers
+  are `81` and `310`; total Qwen forwards are `0`; all 16 measurements,
+  features, executions, learning receipts, and append-only traces are unique.
+- Kept the completed source controller immutable at snapshot
+  `e59277f837fc5eb8289d24fe431b650d261e24517787cdabc0b96cbc88b81ab1`.
+  The learned controller snapshot is
+  `a8c50b2979049803e298b4ea600ebbdc698eb2a3c80b6b210264ba6fc9cdd7d4`.
+- The private sealed action report has body SHA
+  `b6b9b3870a1ac8c79463906e0d421992b9ca0a3b3cbce11ae79d22b8bbb6e598`
+  and file SHA
+  `d536b54950dfb1027c610953827d0d210f3212d6a40f84897f6e37055f3466e6`.
+- Promoted all eight evidence-enriched site policies and exported their exact
+  5x5 kernels to authenticated `ComputeCrystal.markov` artifacts. The promoted
+  controller snapshot is
+  `1562094921890a764c412326336c950046ddd9bf73eaaa9d1f23ca245d8a0fbe`;
+  export receipt
+  `1663d7524460b9677cde7a5bc92218e2c2429d489964c8bd1a444763fbee590d`;
+  frontier
+  `44074166d5b7db8b39b43100b95aeffa48e4c80bd114e13f8079150e77315e41`;
+  ComputeBank anchor
+  `1fa4d2caf5626b33e16e8d5be5d7fc3d7d2d88e34626567d6daacf8f56ce58d8`.
+- Every restored exported site policy chooses `execute_fertig` from its
+  `execute_fertig` row. The frontier report body SHA is
+  `550d707d5093ab3c464bac4d94c068f978430c92def59364b20aca3eb4903715`
+  and its file SHA is
+  `194f6353067b941a72f6fc36bb1169594856bc5ec69b11950a60d032afdba523`.
+
+### Predictive quotient and formula-derived battery levers
+
+- Added a learned predictive-state quotient using the exact bisimulation
+  condition `P(Y_future | h) = P(Y_future | q(h))`. The positive control
+  merges four histories into two states; the non-bisimilar control remains at
+  four.
+- Preserved an exact rational `2/3`–`1/3` future law, reached held-out total
+  variation `0`, separated a disturbed law at total variation `1`, and produced
+  byte-identical state after reversed observation order.
+- Applied the quotient to all 16 live FERTIG learning receipts with the actual
+  controller-agent successor `(same site, executed action)`. Nine observed
+  `(site, source-action)` states contract to one exact predictive class: `9→1`,
+  `9x` compression, one refinement round, zero terminal observations, and zero
+  censored observations. Quotient SHA:
+  `064dd640c673a3e86dca24513663a1c3a7d2793ed279d2b0b9d2667081e15ae1`;
+  persisted file SHA:
+  `44e3853cc9bb1953feb01146f4b634a75247cffdc5e129b80e6d7df7c5eaa3fa`.
+- The global trace-topology control on the same 16 receipts remains `9→9`.
+  The live compression is therefore specific to correct site-local Markov
+  semantics, not generic collapsing.
+- Audited the external formula archive at SHA
+  `5b986886988fe1a1c42256bdebaa6aff9b91588041f2af010ef80408a0b4e0b7`.
+  Its normal suite passes `214` tests in `148.20 s` with `560` warnings; a
+  warning-fatal file audit passes `24/42` files and fails `18/42`.
+- Retained five formulas for native implementation: predictive bisimulation,
+  conditional-independence Markov blankets, exact operator conjugation across
+  pinned bases, a joint quantized Qwen `gate_proj/up_proj` subspace battery,
+  and topology-aware Warmth as a downward charging brake.
+- Imported no archive runtime code. Its fixed-`q,K` Softmax Attention path is
+  incompatible with IMMER's own causal Prefix-Sinkhorn Attention and stays out
+  of the runtime.
+- Exact controller forks now copy the complete historical object inventory,
+  original manifest bytes, and selected state envelopes under a pinned,
+  crash-resumable no-replace intent. Physical aliases, nested stores, foreign
+  targets, incomplete forks, stale source pins, staging residue, unrelated
+  promotion descendants, extra manifest inventory, forged kernels, and stale
+  learning/controller endpoints fail before publication.
+- Controller restore rederives every active promoted kernel from verified
+  history, consensus, coverage, and router calibration before accepting its
+  payload or exporting it.
+- Complete warning-fatal regression suite: `1,814/1,814`, `OK`, `591.551 s`.
+
 ### First live O1 language frontier
 
 - Completed the official local-Qwen frontier: `40/40` layer probes produced

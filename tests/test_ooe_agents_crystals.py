@@ -339,6 +339,168 @@ class CrystalStoreTests(unittest.TestCase):
                 store.publish(rebound, expected_generation=2)
             self.assertTrue(store.audit().clean)
 
+    def test_exact_fork_preserves_history_order_objects_and_state_generation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = CrystalStore(root / "source")
+            payload_b = _payload(name="b")
+            payload_a = _payload(name="a")
+            promoted_b = _payload(name="b", evidence="c")
+            source.publish(payload_b, expected_generation=0)
+            source.publish(payload_a, expected_generation=1)
+            source.publish(promoted_b, expected_generation=2)
+            first = source.publish_state("controller", b"first")
+            source.publish_state(
+                "controller",
+                b"second",
+                expected_sha256=first.payload_sha256,
+            )
+            source_manifest = source.manifest()
+            self.assertEqual(len(source_manifest.objects), 3)
+
+            target = root / "target"
+            token = hashlib.sha256(
+                str(target.resolve(strict=False)).encode("utf-8")
+            ).hexdigest()[:20]
+            crash_residue = root / f".{target.name}.{token}.fork.tmp"
+            crash_residue.mkdir()
+            (crash_residue / "partial").write_bytes(b"crash")
+            forked = source.fork_exact(
+                target,
+                state_names=("controller",),
+                expected_manifest_sha256=source_manifest.sha256,
+                expected_state_sha256s={
+                    "controller": hashlib.sha256(b"second").hexdigest()
+                },
+            )
+
+            self.assertEqual((crash_residue / "partial").read_bytes(), b"crash")
+            self.assertEqual(forked.manifest().to_bytes(), source_manifest.to_bytes())
+            self.assertEqual(forked.restore_state("controller"), b"second")
+            self.assertTrue(forked.audit().clean)
+            state_filename = hashlib.sha256(b"controller").hexdigest() + ".state"
+            self.assertEqual(
+                (forked.root / "state" / state_filename).read_bytes(),
+                (source.root / "state" / state_filename).read_bytes(),
+            )
+            self.assertEqual(
+                set(forked.manifest().objects),
+                {payload_a.sha256, payload_b.sha256, promoted_b.sha256},
+            )
+            with self.assertRaises(FileExistsError):
+                source.fork_exact(target, state_names=("controller",))
+            with self.assertRaisesRegex(CrystalStoreError, "overlap"):
+                source.fork_exact(
+                    source.root / "nested",
+                    state_names=("controller",),
+                )
+            stale_target = root / "stale-target"
+            with self.assertRaisesRegex(ManifestConflictError, "state differs"):
+                source.fork_exact(
+                    stale_target,
+                    state_names=("controller",),
+                    expected_manifest_sha256=source_manifest.sha256,
+                    expected_state_sha256s={
+                        "controller": hashlib.sha256(b"stale").hexdigest()
+                    },
+                )
+            self.assertFalse(stale_target.exists())
+
+            resume_target = root / "resume-target"
+            original_write = CrystalStore._write_all
+            writes = 0
+
+            def crash_during_object(descriptor: int, data: bytes) -> None:
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    os.write(descriptor, data[: max(1, len(data) // 2)])
+                    raise OSError("injected hard-fork crash")
+                original_write(descriptor, data)
+
+            with mock.patch.object(
+                CrystalStore,
+                "_write_all",
+                staticmethod(crash_during_object),
+            ):
+                with self.assertRaisesRegex(OSError, "hard-fork crash"):
+                    source.fork_exact(
+                        resume_target,
+                        state_names=("controller",),
+                        expected_manifest_sha256=source_manifest.sha256,
+                        expected_state_sha256s={
+                            "controller": hashlib.sha256(b"second").hexdigest()
+                        },
+                    )
+            self.assertTrue(resume_target.is_dir())
+            with self.assertRaisesRegex(CrystalStoreError, "still in progress"):
+                CrystalStore(resume_target)
+            resumed = source.fork_exact(
+                resume_target,
+                state_names=("controller",),
+                expected_manifest_sha256=source_manifest.sha256,
+                expected_state_sha256s={
+                    "controller": hashlib.sha256(b"second").hexdigest()
+                },
+            )
+            self.assertTrue(resumed.audit().clean)
+            self.assertEqual(resumed.manifest(), source_manifest)
+
+            hostile_target = root / "hostile-target"
+            hostile_target.mkdir()
+            (hostile_target / "owned").write_bytes(b"do-not-replace")
+            with self.assertRaises(FileExistsError):
+                source.fork_exact(
+                    hostile_target,
+                    state_names=("controller",),
+                    expected_manifest_sha256=source_manifest.sha256,
+                    expected_state_sha256s={
+                        "controller": hashlib.sha256(b"second").hexdigest()
+                    },
+                )
+            self.assertEqual(
+                (hostile_target / "owned").read_bytes(),
+                b"do-not-replace",
+            )
+
+            raced_target = root / "raced-target"
+            original_link = os.link
+            raced = False
+
+            def create_target_before_intent_link(*args, **kwargs):
+                nonlocal raced
+                if not raced:
+                    raced = True
+                    raced_target.mkdir()
+                return original_link(*args, **kwargs)
+
+            with mock.patch(
+                "immer.runtimes.ooe.crystal.os.link",
+                side_effect=create_target_before_intent_link,
+            ):
+                with self.assertRaises(FileExistsError):
+                    source.fork_exact(
+                        raced_target,
+                        state_names=("controller",),
+                        expected_manifest_sha256=source_manifest.sha256,
+                        expected_state_sha256s={
+                            "controller": hashlib.sha256(b"second").hexdigest()
+                        },
+                    )
+            self.assertEqual(tuple(raced_target.iterdir()), ())
+            with self.assertRaises(FileExistsError):
+                source.fork_exact(
+                    raced_target,
+                    state_names=("controller",),
+                    expected_manifest_sha256=source_manifest.sha256,
+                    expected_state_sha256s={
+                        "controller": hashlib.sha256(b"second").hexdigest()
+                    },
+                )
+            self.assertEqual(tuple(raced_target.iterdir()), ())
+
     def test_named_restore_is_one_locked_manifest_object_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = CrystalStore(Path(temporary) / "bank")
