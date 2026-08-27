@@ -168,9 +168,14 @@ around every domain that supports it.
   attention path, fixed layer allowlists, atomic five-prompt layer groups,
   `25/10` pre-holdout locking, `645` layer executions, `24` weight-local replay
   reads, 40 exact O1/Atlas/Harvester authorities, and a bank-invoked CAS proof.
-- [ ] Execute the 40-group official 27B MLP capture, open the five-group holdout
-  only after the calibration lock, and run the collision sweep against
-  separate-projection and shuffled-subspace controls.
+- [x] Execute the 40-group official 27B MLP capture and open the five-group L54
+  holdout only after the `25/10` calibration lock. Minimal promoted joint key:
+  `k=2/16`, zero wrong, `116/512` held exact hits, `1,743.80x` smaller than the
+  full-16 control.
+- [ ] Replace fixed joint-energy coordinate ranking with O1/Markov selection and
+  test it on genuinely unseen prompts. The deterministic random `k=2/12`
+  control already matches the zero-wrong boundary, so selector advantage is
+  the next target rather than re-proving subspace compression.
 - [ ] Apply topology-aware Warmth only as a downward charging brake and measure
   redundant-charge suppression without changing authenticated demand.
 - [x] Export the first eight live O1/Atlas controller promotions into an exact

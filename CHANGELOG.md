@@ -21,9 +21,17 @@ All notable changes to IMMER are recorded here.
   bank; the bank invokes the concrete replay verifier and publishes its proof
   through CAS. Exact source-dtype array bits live in compact content-addressed
   objects with crash recovery and orphan auditing.
-- The official 27B capture and joint gate/up collision result is the next live
-  run. This cut establishes the executable capture, replay, authority, and
-  persistence path.
+- Completed the official local Qwen3.8-27B run: `40/40` groups, exact
+  `25/10/5` closure, `audit_clean=true`, and `369,098,752` referenced tensor
+  bytes. The minimal promoted candidate uses joint gate/up coordinates
+  `[6844,3028]` at `k=2`, 16-bit quantization: calibration `232/1024` exact
+  verified hits and holdout `116/512`, both with zero wrong collisions.
+- That candidate stores `126,760 B`, versus `221,043,712 B` for the full
+  17,408-coordinate 16-bit control with identical held hit/miss counts: a
+  `1,743.80x` reduction. The layer-54 holdout is a topology holdout over the
+  same five prompts. A deterministic random `k=2` control also reaches zero
+  wrong collisions at 12 bits, so the compressed joint-key mechanism is
+  established while fixed energy ranking is not uniquely superior.
 ### O1 exact measurement sidecars
 
 - Added an opt-in native observer for the exact

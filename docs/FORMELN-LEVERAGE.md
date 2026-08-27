@@ -141,7 +141,20 @@ gives `24` reads and proves the captured values against the immutable weights.
 The bank invokes that verifier, stores the proof under CAS, and binds all 40
 groups to one manifest, ModelPin, verifier, and exact O1/Atlas/Harvester
 authority inventory. The `25/10` fit inventory is sealed before the five
-holdout groups execute. The official 27B capture and collision result remains
+holdout groups execute.
+
+The official local Qwen3.8-27B measurement is complete. The smallest promoted
+joint key selects intermediate coordinates `[6844,3028]` and concatenates
+their gate/up values, producing four quantized scalars per token. At 16 bits it
+records `232/1024` exact calibration hits and `116/512` exact layer-54 holdout
+hits with zero wrong collisions. Its `126,760 B` cache is `1,743.80x` smaller
+than the full 17,408-coordinate 16-bit control (`221,043,712 B`) with the same
+held hit/miss counts. Candidate `k=1/16` was correctly blocked by 8 train and 3
+calibration wrong collisions even though its holdout happened to contain zero
+wrong collisions. A deterministic random `k=2/12` control also remains
+zero-wrong, so the result validates the joint subspace key and compression
+boundary, not the current energy ranking as a unique selector. The holdout is
+across layer topology with the same five prompts; prompt-temporal selection is
 the next measurement.
 
 The first real operator wave isolates one admissible directed pair, `20→8`.

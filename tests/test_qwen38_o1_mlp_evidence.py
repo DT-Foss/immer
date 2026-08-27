@@ -79,24 +79,27 @@ class Qwen38O1MlpEvidenceScriptTests(unittest.TestCase):
                 )
             )
             bank_root = root / "bank"
+            status_path = root / "first-status.json"
             outputs = []
-            for _ in range(2):
+            for index in range(2):
+                arguments = [
+                    "--root",
+                    str(bank_root),
+                    "--manifest",
+                    str(manifest_path),
+                    "--fixture",
+                    str(fixture_path),
+                ]
+                if index == 0:
+                    arguments.extend(("--output", str(status_path)))
                 stream = io.StringIO()
                 with contextlib.redirect_stdout(stream):
                     self.assertEqual(
-                        module.main(
-                            [
-                                "--root",
-                                str(bank_root),
-                                "--manifest",
-                                str(manifest_path),
-                                "--fixture",
-                                str(fixture_path),
-                            ]
-                        ),
+                        module.main(arguments),
                         0,
                     )
                 outputs.append(json.loads(stream.getvalue()))
+            self.assertEqual(json.loads(status_path.read_bytes()), outputs[0])
             self.assertEqual(outputs[0]["new_publications"], 40)
             self.assertEqual(outputs[1]["new_publications"], 0)
             self.assertEqual(outputs[1]["split_counts"], [25, 10, 5])

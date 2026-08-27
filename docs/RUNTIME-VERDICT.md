@@ -124,7 +124,12 @@ later requests.
   the five holdout groups, and reduces the full plan to `645` layer executions
   plus `24` weight-local batched projection reads. One manifest, ModelPin, and
   verifier pin bind compact tensor objects, the bank-invoked replay proof, CAS
-  recovery, and the orphan audit. The official 27B capture is the next run.
+  recovery, and the orphan audit. The official run completes `40/40` with a
+  clean audit. Joint coordinates `[6844,3028]` at `k=2/16` give `116/512`
+  exact verified L54 holdout hits, zero wrong collisions, and `126,760 B`
+  storage versus `221,043,712 B` for full-16 (`1,743.80x`). Random `k=2/12`
+  also stays zero-wrong; the runtime mechanism is established, while learned
+  coordinate selection remains the active intelligence problem.
 - The first real five-prompt L27 wave finds one stable transport, `20→8`.
   Held-out residual falls from Identity `0.2373913654` to `0.0248507190`; pair
   selection uses structural and calibration evidence only, before holdout.

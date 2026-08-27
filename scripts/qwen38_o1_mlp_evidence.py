@@ -568,6 +568,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--analysis-max-working-gb", type=float, default=8.0)
     parser.add_argument("--capture-max-resident-gb", type=float, default=4.0)
     parser.add_argument(
+        "--output",
+        help="optional no-replace path for the canonical JSON status",
+    )
+    parser.add_argument(
         "--authority-only",
         action="store_true",
         help="authenticate the live 40-cell authority without opening an evidence bank",
@@ -877,7 +881,19 @@ def _run_live(args: argparse.Namespace) -> dict[str, object]:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     status = _run_fixture(args) if args.fixture is not None else _run_live(args)
-    print(json.dumps(status, allow_nan=False, sort_keys=True))
+    encoded = (
+        json.dumps(
+            status,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    if args.output is not None:
+        _persist_exact(Path(args.output).expanduser().absolute(), encoded)
+    print(encoded.decode("utf-8"), end="")
     return 0
 
 
