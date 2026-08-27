@@ -108,6 +108,7 @@ class Qwen38O1MlpEvidenceScriptTests(unittest.TestCase):
                 set(outputs[1]),
                 {
                     "audit_clean",
+                    "budget_sha256",
                     "fixture",
                     "manifest_sha256",
                     "new_publications",
@@ -124,29 +125,40 @@ class Qwen38O1MlpEvidenceScriptTests(unittest.TestCase):
                 capture_mode = "live-exact"
 
             fixture = json.loads(fixture_path.read_text())
+            holdout_bank = QwenMlpEvidenceBank(root / "holdout-first-bank")
+            with self.assertRaisesRegex(
+                QwenMlpEvidenceIntegrityError, "25/10/5 state machine"
+            ):
+                run_capture_manifest(
+                    manifest,
+                    holdout_bank,
+                    module.FixtureRunner(manifest, fixture),
+                    allowed_splits=("holdout",),
+                )
+            self.assertEqual(holdout_bank.state().receipt_count, 0)
+            self.assertTrue(holdout_bank.audit().clean)
+            with self.assertRaisesRegex(
+                QwenMlpEvidenceIntegrityError, "25/10/5 state machine"
+            ):
+                run_capture_manifest(
+                    manifest,
+                    bank,
+                    LiveFixtureRunner(manifest, fixture),
+                )
+            self.assertEqual(bank.state().receipt_count, 40)
+            self.assertTrue(bank.audit().clean)
+            live_bank = QwenMlpEvidenceBank(root / "live-bank")
             live_publications = run_capture_manifest(
                 manifest,
-                bank,
+                live_bank,
                 LiveFixtureRunner(manifest, fixture),
             )
             self.assertEqual(len(live_publications), 40)
-            self.assertEqual(bank.state().receipt_count, 80)
-            self.assertEqual(bank.state().split_counts, (50, 20, 10))
-            modes_by_entry: dict[str, set[str]] = {}
-            for receipt, _verification in bank.committed_pairs():
-                modes_by_entry.setdefault(receipt.entry.sha256, set()).add(
-                    receipt.capture_mode
-                )
-            self.assertEqual(len(modes_by_entry), 40)
-            self.assertTrue(
-                all(
-                    modes == {"fixture", "live-exact"}
-                    for modes in modes_by_entry.values()
-                )
-            )
-            self.assertTrue(bank.audit().clean)
+            self.assertEqual(live_bank.state().split_counts, (25, 10, 5))
+            self.assertEqual(len(live_bank.build_subspace_corpus().groups), 40)
             with self.assertRaisesRegex(
-                QwenMlpEvidenceIntegrityError, "fixture evidence"
+                QwenMlpEvidenceIntegrityError,
+                "one live manifest/model/verifier pin",
             ):
                 bank.build_subspace_corpus()
 

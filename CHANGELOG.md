@@ -4,6 +4,26 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-27
 
+### Live exact Qwen MLP capture runtime
+
+- Mounted `LiveExactMlpCaptureRunner` directly on the local causal Qwen runtime
+  and IMMER's native attention path. A fixed layer allowlist captures the four
+  ordered MLP boundaries from one partial forward per prompt and split. The
+  canonical `25/10/5` plan therefore uses five prompt forwards per split and
+  `645` total layer executions instead of one full-model forward per cell.
+- Added split-closed execution: all five prompts for a layer publish as one
+  atomic resume unit, calibration seals the `25/10` model inventory before the
+  five holdout groups can run, and fixture evidence remains outside the live
+  corpus. Eight selected layers use exactly `24` weight-local `linear_many`
+  replay reads across gate, up, and down projections.
+- Bound all 40 prompt/layer cells to exact O1 scheduler, Atlas measurement, and
+  Harvester authorities. One manifest, ModelPin, and verifier pin govern the
+  bank; the bank invokes the concrete replay verifier and publishes its proof
+  through CAS. Exact source-dtype array bits live in compact content-addressed
+  objects with crash recovery and orphan auditing.
+- The official 27B capture and joint gate/up collision result is the next live
+  run. This cut establishes the executable capture, replay, authority, and
+  persistence path.
 ### O1 exact measurement sidecars
 
 - Added an opt-in native observer for the exact

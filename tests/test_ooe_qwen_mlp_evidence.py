@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 import tempfile
@@ -73,6 +74,7 @@ def _capture_pair(
         manifest_sha256=manifest.sha256,
         model_pin_sha256=manifest.model_pin_sha256,
         token_sha256=_hash(f"tokens:{entry.prompt_sha256}"),
+        probe_spec_sha256=_hash(f"probe-spec:{entry.ordinal}"),
         atlas_sequence=entry.ordinal,
         atlas_event_sha256=event,
         atlas_revision_sha256=graph_revision_sha256(entry.ordinal, event),
@@ -103,6 +105,41 @@ def _capture_pair(
         output_exact=True,
     )
     return receipt, verification
+
+
+class _ReceiptVerifier:
+    def __init__(self, verification: MlpProjectionVerificationReceipt) -> None:
+        self.verification = verification
+        self.verifier_sha256 = verification.verifier_sha256
+
+    def verify(
+        self, receipt: MlpEvidenceReceipt, bank: QwenMlpEvidenceBank
+    ) -> MlpProjectionVerificationReceipt:
+        if receipt.sha256 != self.verification.evidence_receipt_sha256:
+            raise AssertionError("test verifier received another receipt")
+        verification = self.verification
+        proof = bank.publish_verifier_evidence(
+            evidence_receipt_sha256=receipt.sha256,
+            verifier_sha256=self.verifier_sha256,
+            evidence={
+                "gate_exact": verification.gate_exact,
+                "input_sketch_exact": verification.input_sketch_exact,
+                "kind": "test-exact-replay",
+                "output_exact": verification.output_exact,
+                "receipt": receipt.sha256,
+                "replay_access_trace_sha256": (verification.replay_access_trace_sha256),
+                "storage_exact": verification.storage_exact,
+                "tensor_object_sha256s": [row.object_sha256 for row in receipt.tensors],
+                "up_exact": verification.up_exact,
+            },
+        )
+        return replace(verification, verifier_evidence_sha256=proof)
+
+
+def _verifier(
+    verification: MlpProjectionVerificationReceipt,
+) -> _ReceiptVerifier:
+    return _ReceiptVerifier(verification)
 
 
 class QwenMlpEvidenceTests(unittest.TestCase):
@@ -161,24 +198,30 @@ class QwenMlpEvidenceTests(unittest.TestCase):
             receipt, verification = _capture_pair(bank, manifest)
             initial = bank.state()
             publication = bank.append_verified(
-                receipt, verification, expected_head_sha256=initial.sha256
+                receipt, _verifier(verification), expected_head_sha256=initial.sha256
             )
             self.assertTrue(publication.changed)
             self.assertEqual(publication.generation, 1)
-            replay = bank.append_verified(receipt, verification)
+            replay = bank.append_verified(receipt, _verifier(verification))
             self.assertFalse(replay.changed)
             with self.assertRaisesRegex(QwenMlpEvidenceConflictError, "CAS"):
                 bank.append_verified(
-                    receipt, verification, expected_head_sha256=_hash("stale-head")
+                    receipt,
+                    _verifier(verification),
+                    expected_head_sha256=_hash("stale-head"),
                 )
+            self.assertTrue(bank.audit().clean)
             conflicting, conflicting_verification = _capture_pair(
                 bank, manifest, access_label="different-access"
             )
             with self.assertRaisesRegex(QwenMlpEvidenceConflictError, "rebound"):
-                bank.append_verified(conflicting, conflicting_verification)
+                bank.append_verified(conflicting, _verifier(conflicting_verification))
             audit = bank.audit()
-            self.assertTrue(audit.clean)
+            self.assertFalse(audit.clean)
             self.assertEqual(audit.receipt_count, 1)
+            self.assertEqual(len(audit.orphan_receipts), 1)
+            self.assertEqual(len(audit.orphan_verifications), 1)
+            self.assertEqual(len(audit.orphan_verifier_evidence), 1)
             corpus = bank.build_subspace_corpus()
             self.assertEqual(len(corpus.groups), 1)
             self.assertEqual(
@@ -206,10 +249,39 @@ class QwenMlpEvidenceTests(unittest.TestCase):
                 output_exact=False,
             )
             with self.assertRaisesRegex(QwenMlpEvidenceIntegrityError, "not exact"):
-                bank.append_verified(receipt, false)
+                bank.append_verified(receipt, _verifier(false))
+            wrong_identity = _verifier(verification)
+            wrong_identity.verifier_sha256 = _hash("another-verifier")
+            with self.assertRaisesRegex(
+                QwenMlpEvidenceIntegrityError, "identity differs"
+            ):
+                bank.append_verified(receipt, wrong_identity)
+
+            class DishonestProofVerifier:
+                verifier_sha256 = verification.verifier_sha256
+
+                def verify(self, value, target_bank):
+                    proof = target_bank.publish_verifier_evidence(
+                        evidence_receipt_sha256=value.sha256,
+                        verifier_sha256=self.verifier_sha256,
+                        evidence={
+                            "gate_exact": False,
+                            "input_sketch_exact": False,
+                            "output_exact": False,
+                            "replay_access_trace_sha256": _hash("wrong-trace"),
+                            "storage_exact": False,
+                            "tensor_object_sha256s": [],
+                            "up_exact": False,
+                        },
+                    )
+                    return replace(verification, verifier_evidence_sha256=proof)
+
+            with self.assertRaisesRegex(QwenMlpEvidenceIntegrityError, "proof differs"):
+                bank.append_verified(receipt, DishonestProofVerifier())
 
     def test_crash_recovery_at_every_append_boundary(self) -> None:
         for fault_stage in (
+            "after-receipt-verification",
             "after-history",
             "after-intent",
             "after-head",
@@ -231,12 +303,12 @@ class QwenMlpEvidenceTests(unittest.TestCase):
                 manifest = _manifest()
                 receipt, verification = _capture_pair(bank, manifest)
                 with self.assertRaisesRegex(RuntimeError, fault_stage):
-                    bank.append_verified(receipt, verification)
+                    bank.append_verified(receipt, _verifier(verification))
                 restarted = QwenMlpEvidenceBank(temporary)
                 state = restarted.state()
-                if fault_stage == "after-history":
+                if fault_stage in {"after-receipt-verification", "after-history"}:
                     self.assertEqual(state.generation, 0)
-                    restarted.append_verified(receipt, verification)
+                    restarted.append_verified(receipt, _verifier(verification))
                 else:
                     self.assertEqual(state.generation, 1)
                 self.assertEqual(restarted.state().generation, 1)
@@ -245,6 +317,53 @@ class QwenMlpEvidenceTests(unittest.TestCase):
     def test_root_state_roundtrip(self) -> None:
         root = MlpEvidenceJournalState.initial()
         self.assertEqual(MlpEvidenceJournalState.from_bytes(root.to_bytes()), root)
+
+    def test_bank_budget_is_pinned_across_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            QwenMlpEvidenceBank(
+                temporary,
+                budget=MlpEvidenceBudget(max_total_referenced_bytes=1024),
+            )
+            with self.assertRaisesRegex(QwenMlpEvidenceConflictError, "budget changed"):
+                QwenMlpEvidenceBank(temporary)
+
+    def test_production_corpus_rejects_mixed_live_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = QwenMlpEvidenceBank(temporary)
+            first_manifest = _manifest()
+            prompts = tuple(_hash(f"other-prompt:{index}") for index in range(5))
+            second_manifest = CaptureManifest(
+                _hash("model-pin"),
+                _hash("other-input-manifest"),
+                prompts,
+                canonical_capture_plan(prompts),
+            )
+            first, first_verification = _capture_pair(bank, first_manifest)
+            second, second_verification = _capture_pair(bank, second_manifest)
+            bank.append_verified(first, _verifier(first_verification))
+            bank.append_verified(second, _verifier(second_verification))
+            with self.assertRaisesRegex(
+                QwenMlpEvidenceIntegrityError,
+                "one live manifest/model/verifier pin",
+            ):
+                bank.build_subspace_corpus()
+
+    def test_production_corpus_rejects_mixed_verifier_pins(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = QwenMlpEvidenceBank(temporary)
+            manifest = _manifest()
+            first, first_verification = _capture_pair(bank, manifest, index=0)
+            second, second_verification = _capture_pair(bank, manifest, index=1)
+            second_verification = replace(
+                second_verification, verifier_sha256=_hash("second-verifier")
+            )
+            bank.append_verified(first, _verifier(first_verification))
+            bank.append_verified(second, _verifier(second_verification))
+            with self.assertRaisesRegex(
+                QwenMlpEvidenceIntegrityError,
+                "one live manifest/model/verifier pin",
+            ):
+                bank.build_subspace_corpus()
 
     def test_audit_clean_is_derived_from_object_and_history_orphans(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -256,6 +375,9 @@ class QwenMlpEvidenceTests(unittest.TestCase):
             self.assertFalse(audit.clean)
             self.assertIn(orphan.object_sha256, audit.orphan_objects)
             self.assertFalse(audit.orphan_histories)
+            self.assertFalse(audit.orphan_receipts)
+            self.assertFalse(audit.orphan_verifications)
+            self.assertFalse(audit.orphan_verifier_evidence)
 
         with tempfile.TemporaryDirectory() as temporary:
             fired = False
@@ -269,11 +391,28 @@ class QwenMlpEvidenceTests(unittest.TestCase):
             bank = QwenMlpEvidenceBank(temporary, fault_injector=fault)
             receipt, verification = _capture_pair(bank, _manifest())
             with self.assertRaisesRegex(RuntimeError, "after-history"):
-                bank.append_verified(receipt, verification)
+                bank.append_verified(receipt, _verifier(verification))
             audit = QwenMlpEvidenceBank(temporary).audit()
             self.assertFalse(audit.clean)
             self.assertEqual(len(audit.orphan_histories), 1)
+            self.assertEqual(len(audit.orphan_receipts), 1)
+            self.assertEqual(len(audit.orphan_verifications), 1)
+            self.assertEqual(len(audit.orphan_verifier_evidence), 1)
             self.assertGreaterEqual(len(audit.orphan_objects), 4)
+
+    def test_interrupted_prejournal_tensor_capture_self_heals_on_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = QwenMlpEvidenceBank(temporary)
+            partial = (
+                torch.arange(12, dtype=torch.float32)
+                .reshape(1, 3, 4)
+                .to(torch.bfloat16)
+            )
+            orphan = bank.publish_tensor("mlp.input", 45, partial)
+            self.assertIn(orphan.object_sha256, bank.audit().orphan_objects)
+            receipt, verification = _capture_pair(bank, _manifest())
+            bank.append_verified(receipt, _verifier(verification))
+            self.assertTrue(bank.audit().clean)
 
 
 if __name__ == "__main__":

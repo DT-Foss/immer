@@ -36,6 +36,7 @@ SUBSPACE_GROUP_SCHEMA = "immer-ooe-qwen-joint-subspace-group/v1"
 SUBSPACE_CORPUS_SCHEMA = "immer-ooe-qwen-joint-subspace-corpus/v1"
 SUBSPACE_FIT_SCHEMA = "immer-ooe-qwen-joint-subspace-fit/v1"
 SUBSPACE_HOLDOUT_SCHEMA = "immer-ooe-qwen-joint-subspace-holdout/v1"
+SUBSPACE_CONTENT_ADDRESS_SCHEMA = "immer-ooe-qwen-joint-subspace-content-address/v1"
 SUBSPACE_INSTRUMENT_REQUEST_SCHEMA = (
     "immer-ooe-qwen-joint-subspace-instrument-request/v1"
 )
@@ -205,6 +206,16 @@ def _array_record(value: FloatArray) -> dict[str, object]:
     }
 
 
+def _array_address_record(value: FloatArray) -> dict[str, object]:
+    array = _canonical_array(value, field="array")
+    raw = array.tobytes(order="C")
+    return {
+        "dtype": "float64-le",
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "shape": [int(row) for row in array.shape],
+    }
+
+
 def graph_revision_sha256(sequence: int, event_sha256: str) -> str:
     """Return the exact SemanticWeightAtlas GraphRevision address."""
 
@@ -233,9 +244,11 @@ def projection_evidence_sha256(
         {
             "attention_kind": SUBSPACE_ATTENTION_KIND,
             "context_kind": SUBSPACE_CONTEXT_KIND,
-            "context_states_sha256": cast(str, _array_record(context_states)["sha256"]),
+            "context_states_sha256": cast(
+                str, _array_address_record(context_states)["sha256"]
+            ),
             "gate_projection_sha256": cast(
-                str, _array_record(gate_projection)["sha256"]
+                str, _array_address_record(gate_projection)["sha256"]
             ),
             "graph_revision_sha256": require_sha256(
                 graph_revision_sha256, field="graph_revision_sha256"
@@ -255,7 +268,9 @@ def projection_evidence_sha256(
                     sorted_unique=True,
                 )
             ),
-            "up_projection_sha256": cast(str, _array_record(up_projection)["sha256"]),
+            "up_projection_sha256": cast(
+                str, _array_address_record(up_projection)["sha256"]
+            ),
         }
     )
 
@@ -441,7 +456,30 @@ class SubspaceObservationGroup:
 
     @property
     def sha256(self) -> str:
-        return _digest(self.to_record())
+        return _digest(
+            {
+                "attention_kind": SUBSPACE_ATTENTION_KIND,
+                "content_address_schema": SUBSPACE_CONTENT_ADDRESS_SCHEMA,
+                "context_kind": SUBSPACE_CONTEXT_KIND,
+                "context_states": _array_address_record(self.context_states),
+                "gate_projection": _array_address_record(self.gate_projection),
+                "graph_event_sha256": self.graph_event_sha256,
+                "graph_revision_sha256": self.graph_revision_sha256,
+                "graph_sequence": self.graph_sequence,
+                "group_sha256": self.group_sha256,
+                "layer": self.layer,
+                "logical_time": self.logical_time,
+                "model_pin_sha256": self.model_pin_sha256,
+                "output_evidence_sha256": self.output_evidence_sha256,
+                "output_payload_sha256s": list(self.output_payload_sha256s),
+                "output_verifier_sha256": self.output_verifier_sha256,
+                "projection_evidence_sha256": self.projection_evidence_sha256,
+                "projection_verifier_sha256": self.projection_verifier_sha256,
+                "prompt_sha256": self.prompt_sha256,
+                "source_receipt_sha256s": list(self.source_receipt_sha256s),
+                "up_projection": _array_address_record(self.up_projection),
+            }
+        )
 
     def to_record(self) -> dict[str, object]:
         return {
@@ -583,7 +621,17 @@ class SubspaceCorpus:
 
     @property
     def sha256(self) -> str:
-        return hashlib.sha256(self.to_bytes()).hexdigest()
+        return _digest(
+            {
+                "content_address_schema": SUBSPACE_CONTENT_ADDRESS_SCHEMA,
+                "graph_revision_sha256s": [
+                    row.graph_revision_sha256 for row in self.groups
+                ],
+                "group_receipt_sha256s": [row.sha256 for row in self.groups],
+                "group_sha256s": [row.group_sha256 for row in self.groups],
+                "model_pin_sha256": self.model_pin_sha256,
+            }
+        )
 
     def to_document(self) -> dict[str, object]:
         return _sealed(
@@ -2170,6 +2218,7 @@ __all__ = [
     "DEFAULT_QUANT_BITS",
     "SUBSPACE_ATTENTION_KIND",
     "SUBSPACE_CONTEXT_KIND",
+    "SUBSPACE_CONTENT_ADDRESS_SCHEMA",
     "SUBSPACE_CORPUS_SCHEMA",
     "SUBSPACE_EXACT_VERIFIER_SHA256",
     "SUBSPACE_FIT_SCHEMA",

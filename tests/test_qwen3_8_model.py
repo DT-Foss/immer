@@ -444,12 +444,42 @@ class Qwen38ModelTests(unittest.TestCase):
                 for stage in ("attention.output", "mlp.output")
             ],
         )
+        layer_filtered: list[tuple[int, str]] = []
+        layer_filtered_model = StreamedQwen38(
+            self.config,
+            self.pager,
+            layer_boundary_observer=(
+                lambda layer, stage, _value: layer_filtered.append((layer, stage))
+            ),
+            layer_boundary_stages=("mlp.input", "mlp.gate", "mlp.up", "mlp.output"),
+            layer_boundary_layers=(3, 1),
+            max_batch_size=3,
+            max_seq_len=32,
+        )
+        layer_filtered_model.forward_prefill(token_ids)
+        self.assertEqual(
+            layer_filtered,
+            [
+                (layer, stage)
+                for layer in (1, 3)
+                for stage in ("mlp.input", "mlp.gate", "mlp.up", "mlp.output")
+            ],
+        )
+        self.assertEqual(layer_filtered_model.layer_boundary_layers, (1, 3))
         with self.assertRaisesRegex(ValueError, "duplicated"):
             StreamedQwen38(
                 self.config,
                 self.pager,
                 layer_boundary_observer=lambda *_args: None,
                 layer_boundary_stages=("mlp.output", "mlp.output"),
+                max_seq_len=32,
+            )
+        with self.assertRaisesRegex(ValueError, "layer_boundary_layers"):
+            StreamedQwen38(
+                self.config,
+                self.pager,
+                layer_boundary_observer=lambda *_args: None,
+                layer_boundary_layers=(1, 1),
                 max_seq_len=32,
             )
 

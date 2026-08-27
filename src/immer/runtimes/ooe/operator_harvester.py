@@ -970,6 +970,42 @@ class HarvesterConfig:
         return _digest(self.as_record())
 
 
+def harvester_identity_sha256(
+    *,
+    model_pin_sha256: str,
+    config: HarvesterConfig,
+    emitter_sha256: str = QWEN_CONTEXT_EMITTER_SHA256,
+) -> str:
+    """Return the persistent harvester identity without opening its provider."""
+
+    if not isinstance(config, HarvesterConfig):
+        raise TypeError("config must be a HarvesterConfig")
+    return _digest(
+        {
+            "atlas_model_pin_sha256": require_sha256(
+                model_pin_sha256, field="model_pin_sha256"
+            ),
+            "config_sha256": config.sha256,
+            "emitter_sha256": require_sha256(emitter_sha256, field="emitter_sha256"),
+            "schema": HARVESTER_STATE_SCHEMA,
+        }
+    )
+
+
+def harvester_state_name(
+    *,
+    model_pin_sha256: str,
+    config: HarvesterConfig,
+    emitter_sha256: str = QWEN_CONTEXT_EMITTER_SHA256,
+) -> str:
+    identity = harvester_identity_sha256(
+        model_pin_sha256=model_pin_sha256,
+        config=config,
+        emitter_sha256=emitter_sha256,
+    )
+    return f"{HARVESTER_STATE_PREFIX}{identity}"
+
+
 def _group_record(receipt: ContextualTransitionReceipt) -> dict[str, object]:
     return {
         "action_schema_sha256": receipt.action_schema_sha256,
@@ -1345,13 +1381,10 @@ class ContinuousOperatorHarvester:
         self.bank: ComputeCrystalBank = graph.bank
         self.config = selected_config
         self.emitter_sha256 = emitter_sha256
-        self.identity_sha256 = _digest(
-            {
-                "atlas_model_pin_sha256": atlas.model_pin.sha256,
-                "config_sha256": selected_config.sha256,
-                "emitter_sha256": emitter_sha256,
-                "schema": HARVESTER_STATE_SCHEMA,
-            }
+        self.identity_sha256 = harvester_identity_sha256(
+            model_pin_sha256=atlas.model_pin.sha256,
+            config=selected_config,
+            emitter_sha256=emitter_sha256,
         )
         default_name = f"{HARVESTER_STATE_PREFIX}{self.identity_sha256}"
         self.state_name = _text(
@@ -2058,4 +2091,6 @@ __all__ = [
     "SingleBatchContextualProvider",
     "contextual_observations_from_probe_result",
     "probe_result_context_cursor",
+    "harvester_identity_sha256",
+    "harvester_state_name",
 ]

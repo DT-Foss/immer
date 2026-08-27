@@ -132,6 +132,18 @@ Both are stored as measurement-bound binary sidecars. Atlas and O1 status carry
 only their receipt hashes; exact tensor bytes never become semantic labels or
 status payloads.
 
+The MLP formula now has its full local-Qwen measurement path. The runner uses
+IMMER's causal attention and captures only layers
+`(45,18,36,63,27)/(0,9)/(54)` for train/calibration/holdout. Five prompt
+forwards per split execute `645` layers in total. One weight-local
+`linear_many` replay per gate, up, and down projection at each selected layer
+gives `24` reads and proves the captured values against the immutable weights.
+The bank invokes that verifier, stores the proof under CAS, and binds all 40
+groups to one manifest, ModelPin, verifier, and exact O1/Atlas/Harvester
+authority inventory. The `25/10` fit inventory is sealed before the five
+holdout groups execute. The official 27B capture and collision result remains
+the next measurement.
+
 The first real operator wave isolates one admissible directed pair, `20→8`.
 Its held-out intertwining residual is `0.0248507190`, compared with
 `0.2373913654` for `C=I` and `0.2729029466` for the deterministic random
@@ -163,7 +175,6 @@ The external formula source was audited at SHA
 execution passes `24/42` files and fails `18/42`. IMMER implements the formulas
 in its own runtime. The source archive's fixed-`q,K` Softmax Attention code is
 excluded because IMMER uses causal Prefix-Sinkhorn Attention.
-
 ## 1. Prefix-mass-balanced attention
 
 For a causal non-negative attention matrix \(A\), the Balanced role uses a

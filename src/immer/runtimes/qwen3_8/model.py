@@ -218,6 +218,7 @@ class StreamedQwen38:
         ) = None,
         layer_boundary_observer: LayerBoundaryObserver | None = None,
         layer_boundary_stages: Sequence[str] | None = None,
+        layer_boundary_layers: Sequence[int] | None = None,
         max_batch_size: int = 8,
         max_seq_len: int = 4096,
     ) -> None:
@@ -259,6 +260,8 @@ class StreamedQwen38:
             raise TypeError("layer_boundary_observer must be callable or None")
         if layer_boundary_observer is None and layer_boundary_stages is not None:
             raise ValueError("layer_boundary_stages require a layer_boundary_observer")
+        if layer_boundary_observer is None and layer_boundary_layers is not None:
+            raise ValueError("layer_boundary_layers require a layer_boundary_observer")
         selected_boundary_stages = (
             ()
             if layer_boundary_observer is None
@@ -272,6 +275,24 @@ class StreamedQwen38:
             stage not in LAYER_BOUNDARY_STAGES for stage in selected_boundary_stages
         ):
             raise ValueError("layer_boundary_stages are invalid or duplicated")
+        selected_boundary_layers: tuple[int, ...] | None = None
+        if layer_boundary_observer is not None and layer_boundary_layers is not None:
+            try:
+                selected_boundary_layers = tuple(layer_boundary_layers)
+            except TypeError as exc:
+                raise TypeError("layer_boundary_layers must be a sequence") from exc
+            if (
+                not selected_boundary_layers
+                or len(set(selected_boundary_layers)) != len(selected_boundary_layers)
+                or any(
+                    isinstance(layer, bool)
+                    or not isinstance(layer, int)
+                    or not 0 <= layer < config.n_layers
+                    for layer in selected_boundary_layers
+                )
+            ):
+                raise ValueError("layer_boundary_layers are invalid or duplicated")
+            selected_boundary_layers = tuple(sorted(selected_boundary_layers))
         if native_head_crsa is not None and not isinstance(
             native_head_crsa, Qwen38NativeHeadCrsa
         ):
@@ -324,6 +345,7 @@ class StreamedQwen38:
         )
         self.layer_boundary_observer = layer_boundary_observer
         self.layer_boundary_stages = tuple(selected_boundary_stages)
+        self.layer_boundary_layers = selected_boundary_layers
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self._layer_states: list[LayerState | None] = [
@@ -1119,7 +1141,14 @@ class StreamedQwen38:
         value: torch.Tensor,
     ) -> None:
         observer = self.layer_boundary_observer
-        if observer is None or stage not in self.layer_boundary_stages:
+        if (
+            observer is None
+            or stage not in self.layer_boundary_stages
+            or (
+                self.layer_boundary_layers is not None
+                and layer not in self.layer_boundary_layers
+            )
+        ):
             return
         if stage not in LAYER_BOUNDARY_STAGES:
             raise Qwen38RuntimeError("layer boundary stage is not registered")
@@ -1743,6 +1772,11 @@ class StreamedQwen38:
                     else id(self.layer_boundary_observer)
                 ),
                 "layer_boundary_stages": list(self.layer_boundary_stages),
+                "layer_boundary_layers": (
+                    None
+                    if self.layer_boundary_layers is None
+                    else list(self.layer_boundary_layers)
+                ),
                 "graft": self._graft_snapshot_identity(),
                 "native_head_crsa": native,
             }

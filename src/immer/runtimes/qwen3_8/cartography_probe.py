@@ -1370,6 +1370,11 @@ def _model_attachment_stamp(model: StreamedQwen38) -> str:
             else id(model.layer_boundary_observer)
         ),
         "layer_boundary_stages": list(model.layer_boundary_stages),
+        "layer_boundary_layers": (
+            None
+            if model.layer_boundary_layers is None
+            else list(model.layer_boundary_layers)
+        ),
         "max_batch_size": model.max_batch_size,
         "max_seq_len": model.max_seq_len,
         "native_head_crsa": native,
@@ -1389,12 +1394,24 @@ def _model_attachment_stamp(model: StreamedQwen38) -> str:
     return _digest(body)
 
 
-def _sketch_record(
+def project_hidden_sketch(
     value: torch.Tensor,
     projection: HiddenSketchProjection,
     *,
     max_elements: int,
 ) -> tuple[dict[str, Any], np.ndarray]:
+    """Project one exact hidden boundary with the cartography sketch kernel."""
+
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.ndim < 1
+        or value.shape[-1] < 1
+        or not value.is_floating_point()
+    ):
+        raise TypeError("hidden sketch input must be a non-empty floating tensor")
+    if not isinstance(projection, HiddenSketchProjection):
+        raise TypeError("projection must be a HiddenSketchProjection")
+    maximum = _positive(max_elements, "max_elements")
     rows = (
         value.detach()
         .contiguous()
@@ -1403,7 +1420,7 @@ def _sketch_record(
     )
     matrix_elements = int(value.shape[-1]) * projection.output_dimensions
     output_elements = int(rows.shape[0]) * projection.output_dimensions
-    if matrix_elements + output_elements > max_elements:
+    if matrix_elements + output_elements > maximum:
         raise Qwen38CartographyBudgetError(
             "hidden sketch exceeds max_sketch_elements before allocation"
         )
@@ -2048,7 +2065,7 @@ def _execute_arm(
             raise Qwen38CartographyIntegrityError(
                 "layer boundary observer repeated a stage"
             )
-        layer_rows[stage] = _sketch_record(
+        layer_rows[stage] = project_hidden_sketch(
             value,
             spec.hidden_sketch,
             max_elements=spec.budget.max_sketch_elements,
@@ -2130,12 +2147,12 @@ def _execute_arm(
                     "state": state_record,
                 }
                 if spec.hidden_sketch is not None:
-                    pre_sketch, pre_array = _sketch_record(
+                    pre_sketch, pre_array = project_hidden_sketch(
                         pre,
                         spec.hidden_sketch,
                         max_elements=spec.budget.max_sketch_elements,
                     )
-                    post_sketch, post_array = _sketch_record(
+                    post_sketch, post_array = project_hidden_sketch(
                         post,
                         spec.hidden_sketch,
                         max_elements=spec.budget.max_sketch_elements,
@@ -2668,5 +2685,6 @@ __all__ = [
     "Qwen38CartographyProbe",
     "Qwen38CartographyProbeError",
     "TensorRangeReceipt",
+    "project_hidden_sketch",
     "prompt_token_sha256",
 ]

@@ -728,6 +728,13 @@ from .qwen_mlp_evidence import (
     canonical_capture_plan,
     run_capture_manifest,
 )
+from .qwen_mlp_live import (
+    LIVE_MLP_VERIFIER_SCHEMA,
+    MLP_CALIBRATION_LOCK_SCHEMA,
+    LiveExactMlpCaptureRunner,
+    LiveMlpAuthority,
+    MlpCalibrationLock,
+)
 from .demand_execution import (
     DEMAND_EXECUTION_ABORT_SCHEMA,
     DEMAND_EXECUTION_ABORT_VERIFIER_SHA256,
@@ -837,6 +844,8 @@ from .operator_harvester import (
     QWEN_CONTEXT_EMITTER_SHA256,
     SingleBatchContextualProvider,
     contextual_observations_from_probe_result,
+    harvester_identity_sha256,
+    harvester_state_name,
     probe_result_context_cursor,
 )
 from .planning import (
@@ -1736,4 +1745,11 @@ __all__ = [
     "QwenMlpEvidenceIntegrityError",
     "canonical_capture_plan",
     "run_capture_manifest",
+    "LIVE_MLP_VERIFIER_SCHEMA",
+    "MLP_CALIBRATION_LOCK_SCHEMA",
+    "LiveExactMlpCaptureRunner",
+    "LiveMlpAuthority",
+    "MlpCalibrationLock",
+    "harvester_identity_sha256",
+    "harvester_state_name",
 ]

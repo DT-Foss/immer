@@ -22,6 +22,7 @@ import re
 import secrets
 import stat
 import struct
+import time
 from typing import Protocol, cast, runtime_checkable
 
 import numpy as np
@@ -41,9 +42,11 @@ from .subspace_battery import (
 TENSOR_SCHEMA = "immer.qwen3.8-mlp-tensor-object/v1"
 EVIDENCE_SCHEMA = "immer.qwen3.8-mlp-evidence/v1"
 VERIFICATION_SCHEMA = "immer.qwen3.8-mlp-evidence-verification/v1"
+VERIFIER_EVIDENCE_SCHEMA = "immer.qwen3.8-mlp-verifier-evidence/v1"
 JOURNAL_STATE_SCHEMA = "immer.qwen3.8-mlp-evidence-journal/v1"
 JOURNAL_INTENT_SCHEMA = "immer.qwen3.8-mlp-evidence-intent/v1"
 CAPTURE_MANIFEST_SCHEMA = "immer.qwen3.8-mlp-capture-manifest/v1"
+EVIDENCE_BUDGET_SCHEMA = "immer.qwen3.8-mlp-evidence-budget/v1"
 CAPTURE_STAGES = ("mlp.input", "mlp.gate", "mlp.up", "mlp.output")
 CAPTURE_SPLITS = ("train", "calibration", "holdout")
 CAPTURE_PLAN_LAYERS = {
@@ -56,6 +59,7 @@ _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _HEAD = "HEAD"
 _INTENT = "PREPARED"
 _LOCK = "LOCK"
+_BUDGET = "BUDGET.json"
 
 
 class QwenMlpEvidenceError(RuntimeError):
@@ -418,6 +422,7 @@ class MlpEvidenceReceipt:
     manifest_sha256: str
     model_pin_sha256: str
     token_sha256: str
+    probe_spec_sha256: str
     atlas_sequence: int
     atlas_event_sha256: str
     atlas_revision_sha256: str
@@ -438,6 +443,7 @@ class MlpEvidenceReceipt:
             "manifest_sha256",
             "model_pin_sha256",
             "token_sha256",
+            "probe_spec_sha256",
             "atlas_event_sha256",
             "atlas_revision_sha256",
             "measurement_sha256",
@@ -469,6 +475,8 @@ class MlpEvidenceReceipt:
                 }
             )
         )
+        if not sources or len(sources) > 64:
+            raise ValueError("source_receipt_sha256s must contain 1..64 hashes")
         tensors = tuple(self.tensors)
         if tuple(v.stage for v in tensors) != CAPTURE_STAGES or any(
             v.layer != self.entry.layer for v in tensors
@@ -494,8 +502,37 @@ class MlpEvidenceReceipt:
                 "capture_mode": self.capture_mode,
                 "manifest_sha256": self.manifest_sha256,
                 "model_pin_sha256": self.model_pin_sha256,
+                "probe_spec_sha256": self.probe_spec_sha256,
             }
         )
+
+    @property
+    def capture_event_sha256(self) -> str:
+        """Deterministic event for the manifest-ordered MLP evidence graph."""
+
+        return _digest(
+            {
+                "access_trace_sha256": self.access_trace_sha256,
+                "atlas_revision_sha256": self.atlas_revision_sha256,
+                "cartography_input_sketch_sha256": (
+                    self.cartography_input_sketch_sha256
+                ),
+                "entry_sha256": self.entry.sha256,
+                "manifest_sha256": self.manifest_sha256,
+                "measurement_sha256": self.measurement_sha256,
+                "model_pin_sha256": self.model_pin_sha256,
+                "probe_spec_sha256": self.probe_spec_sha256,
+                "schema": "immer.qwen3.8-mlp-capture-event/v1",
+                "source_receipt_sha256s": list(self.source_receipt_sha256s),
+                "tensor_raw_sha256s": [row.raw_sha256 for row in self.tensors],
+                "token_sha256": self.token_sha256,
+                "weight_revision_sha256": self.weight_revision_sha256,
+            }
+        )
+
+    @property
+    def capture_revision_sha256(self) -> str:
+        return graph_revision_sha256(self.entry.ordinal, self.capture_event_sha256)
 
     @property
     def sha256(self) -> str:
@@ -512,12 +549,16 @@ class MlpEvidenceReceipt:
                 "attention_kind": SUBSPACE_ATTENTION_KIND,
                 "cartography_input_sketch_sha256": self.cartography_input_sketch_sha256,
                 "capture_mode": self.capture_mode,
+                "capture_event_sha256": self.capture_event_sha256,
+                "capture_revision_sha256": self.capture_revision_sha256,
+                "capture_sequence": self.entry.ordinal,
                 "context_kind": SUBSPACE_CONTEXT_KIND,
                 "entry": self.entry.to_record(),
                 "identity_sha256": self.identity_sha256,
                 "manifest_sha256": self.manifest_sha256,
                 "measurement_sha256": self.measurement_sha256,
                 "model_pin_sha256": self.model_pin_sha256,
+                "probe_spec_sha256": self.probe_spec_sha256,
                 "recomputed_input_sketch_sha256": self.recomputed_input_sketch_sha256,
                 "source_receipt_sha256s": list(self.source_receipt_sha256s),
                 "tensors": [v.to_record() for v in self.tensors],
@@ -545,12 +586,16 @@ class MlpEvidenceReceipt:
             "attention_kind",
             "cartography_input_sketch_sha256",
             "capture_mode",
+            "capture_event_sha256",
+            "capture_revision_sha256",
+            "capture_sequence",
             "context_kind",
             "entry",
             "identity_sha256",
             "manifest_sha256",
             "measurement_sha256",
             "model_pin_sha256",
+            "probe_spec_sha256",
             "recomputed_input_sketch_sha256",
             "source_receipt_sha256s",
             "tensors",
@@ -579,6 +624,7 @@ class MlpEvidenceReceipt:
             manifest_sha256=cast(str, body.get("manifest_sha256")),
             model_pin_sha256=cast(str, body.get("model_pin_sha256")),
             token_sha256=cast(str, body.get("token_sha256")),
+            probe_spec_sha256=cast(str, body.get("probe_spec_sha256")),
             atlas_sequence=cast(int, body.get("atlas_sequence")),
             atlas_event_sha256=cast(str, body.get("atlas_event_sha256")),
             atlas_revision_sha256=cast(str, body.get("atlas_revision_sha256")),
@@ -601,6 +647,9 @@ class MlpEvidenceReceipt:
         )
         if (
             body.get("identity_sha256") != result.identity_sha256
+            or body.get("capture_sequence") != result.entry.ordinal
+            or body.get("capture_event_sha256") != result.capture_event_sha256
+            or body.get("capture_revision_sha256") != result.capture_revision_sha256
             or result.to_bytes() != data
         ):
             raise QwenMlpEvidenceIntegrityError(
@@ -834,6 +883,9 @@ class MlpEvidenceAudit:
     referenced_objects: int
     orphan_objects: tuple[str, ...]
     orphan_histories: tuple[str, ...]
+    orphan_receipts: tuple[str, ...]
+    orphan_verifications: tuple[str, ...]
+    orphan_verifier_evidence: tuple[str, ...]
 
 
 class QwenMlpEvidenceBank:
@@ -856,6 +908,7 @@ class QwenMlpEvidenceBank:
             "objects",
             "receipts",
             "verifications",
+            "verifier-evidence",
             "history",
             "commits",
             "staging",
@@ -891,6 +944,33 @@ class QwenMlpEvidenceBank:
     def _fault(self, stage: str) -> None:
         if self.fault_injector is not None:
             self.fault_injector(stage)
+
+    @staticmethod
+    def _validate_split_transition(
+        split_counts: tuple[int, int, int], split: str
+    ) -> None:
+        train, calibration, holdout = split_counts
+        if split == "train":
+            valid = calibration == 0 and holdout == 0 and train < 25
+        elif split == "calibration":
+            valid = train == 25 and holdout == 0 and calibration < 10
+        elif split == "holdout":
+            valid = train == 25 and calibration == 10 and holdout < 5
+        else:  # protected by CapturePlanEntry, kept fail-closed.
+            valid = False
+        if not valid:
+            raise QwenMlpEvidenceIntegrityError(
+                "MLP evidence split violates the canonical 25/10/5 state machine"
+            )
+
+    def preflight_split_append(self, split: str) -> None:
+        if split not in CAPTURE_SPLITS:
+            raise ValueError("capture split is invalid")
+        with self._locked():
+            self._recover_unlocked()
+            self._validate_split_transition(
+                self._load_head_unlocked().split_counts, split
+            )
 
     @staticmethod
     def _fsync_dir(path: Path) -> None:
@@ -1054,10 +1134,34 @@ class QwenMlpEvidenceBank:
     def _initialize(self) -> None:
         with self._locked():
             head = self.root / _HEAD
-            if head.is_symlink() or (self.root / _INTENT).is_symlink():
+            budget_path = self.root / _BUDGET
+            if (
+                head.is_symlink()
+                or (self.root / _INTENT).is_symlink()
+                or budget_path.is_symlink()
+            ):
                 raise QwenMlpEvidenceIntegrityError(
                     "journal pointers cannot be symlinks"
                 )
+            budget_data = canonical_json_bytes(
+                _sealed(
+                    EVIDENCE_BUDGET_SCHEMA,
+                    {
+                        "budget_sha256": self.budget.sha256,
+                        "limits": {
+                            name: getattr(self.budget, name)
+                            for name in self.budget.__dataclass_fields__
+                        },
+                    },
+                )
+            )
+            if budget_path.exists():
+                if self._stable_read(budget_path, 64 * 1024) != budget_data:
+                    raise QwenMlpEvidenceConflictError(
+                        "evidence bank budget changed across resume"
+                    )
+            else:
+                self._replace_pointer(_BUDGET, budget_data)
             if not head.exists():
                 state = MlpEvidenceJournalState.initial()
                 digest, _ = self._publish_content(
@@ -1438,6 +1542,13 @@ class QwenMlpEvidenceBank:
             self._recover_unlocked()
             return self._load_head_unlocked()
 
+    def state_history(self) -> tuple[MlpEvidenceJournalState, ...]:
+        """Return the complete authenticated MLP journal ancestry."""
+
+        with self._locked():
+            self._recover_unlocked()
+            return self._replay_unlocked(self._load_head_unlocked())
+
     def _receipt_path(self, digest: str) -> Path:
         return self._path("receipts", digest, "json")
 
@@ -1461,6 +1572,54 @@ class QwenMlpEvidenceBank:
         if hashlib.sha256(data).hexdigest() != address:
             raise QwenMlpEvidenceIntegrityError("verification address mismatch")
         return MlpProjectionVerificationReceipt.from_bytes(data)
+
+    def publish_verifier_evidence(
+        self,
+        *,
+        evidence_receipt_sha256: str,
+        verifier_sha256: str,
+        evidence: Mapping[str, object],
+    ) -> str:
+        if not isinstance(evidence, Mapping):
+            raise TypeError("verifier evidence must be a mapping")
+        document = _sealed(
+            VERIFIER_EVIDENCE_SCHEMA,
+            {
+                "evidence": dict(evidence),
+                "evidence_receipt_sha256": require_sha256(
+                    evidence_receipt_sha256, field="evidence_receipt_sha256"
+                ),
+                "verifier_sha256": require_sha256(
+                    verifier_sha256, field="verifier_sha256"
+                ),
+            },
+        )
+        digest, _ = self._publish_content(
+            "verifier-evidence", "json", canonical_json_bytes(document), 64 * 1024
+        )
+        return digest
+
+    def restore_verifier_evidence(self, digest: str) -> Mapping[str, object]:
+        address = require_sha256(digest, field="verifier_evidence_sha256")
+        data = self._stable_read(
+            self._path("verifier-evidence", address, "json"), 64 * 1024
+        )
+        if hashlib.sha256(data).hexdigest() != address:
+            raise QwenMlpEvidenceIntegrityError("verifier evidence address mismatch")
+        envelope = _strict_json(
+            data,
+            schema=VERIFIER_EVIDENCE_SCHEMA,
+            label="verifier evidence",
+            maximum=64 * 1024,
+        )
+        body = cast(Mapping[str, object], envelope["body"])
+        if set(body) != {
+            "evidence",
+            "evidence_receipt_sha256",
+            "verifier_sha256",
+        } or not isinstance(body.get("evidence"), Mapping):
+            raise QwenMlpEvidenceIntegrityError("verifier evidence body is invalid")
+        return body
 
     def _committed_pairs_unlocked(
         self,
@@ -1495,20 +1654,53 @@ class QwenMlpEvidenceBank:
             raise QwenMlpEvidenceIntegrityError(
                 "MLP evidence verification was not exact"
             )
+        proof = self.restore_verifier_evidence(verification.verifier_evidence_sha256)
+        if (
+            proof.get("evidence_receipt_sha256") != receipt.sha256
+            or proof.get("verifier_sha256") != verification.verifier_sha256
+        ):
+            raise QwenMlpEvidenceIntegrityError(
+                "MLP verifier evidence is bound to another receipt/verifier"
+            )
+        evidence = cast(Mapping[str, object], proof.get("evidence"))
+        expected_proof = {
+            "gate_exact": verification.gate_exact,
+            "input_sketch_exact": verification.input_sketch_exact,
+            "output_exact": verification.output_exact,
+            "replay_access_trace_sha256": (verification.replay_access_trace_sha256),
+            "storage_exact": verification.storage_exact,
+            "tensor_object_sha256s": [row.object_sha256 for row in receipt.tensors],
+            "up_exact": verification.up_exact,
+        }
+        if any(evidence.get(field) != value for field, value in expected_proof.items()):
+            raise QwenMlpEvidenceIntegrityError(
+                "MLP verifier proof differs from its verification receipt/tensors"
+            )
         for ref in receipt.tensors:
             self.restore_tensor(ref)
 
     def append_verified(
         self,
         receipt: MlpEvidenceReceipt,
-        verification: MlpProjectionVerificationReceipt,
+        verifier: MlpProjectionVerifier,
         *,
         expected_head_sha256: str | None = None,
     ) -> MlpEvidencePublication:
         if not isinstance(receipt, MlpEvidenceReceipt) or not isinstance(
-            verification, MlpProjectionVerificationReceipt
+            verifier, MlpProjectionVerifier
         ):
-            raise TypeError("receipt/verification types are invalid")
+            raise TypeError("receipt/verifier types are invalid")
+        verification = verifier.verify(receipt, self)
+        if not isinstance(verification, MlpProjectionVerificationReceipt):
+            raise QwenMlpEvidenceIntegrityError(
+                "MLP verifier returned an invalid verification receipt"
+            )
+        if verification.verifier_sha256 != require_sha256(
+            verifier.verifier_sha256, field="verifier.verifier_sha256"
+        ):
+            raise QwenMlpEvidenceIntegrityError(
+                "MLP verifier identity differs from its verification receipt"
+            )
         if len(receipt.to_bytes()) > self.budget.max_receipt_bytes:
             raise QwenMlpEvidenceCapacityError("receipt exceeds budget")
         self._verify_pair(receipt, verification)
@@ -1518,6 +1710,7 @@ class QwenMlpEvidenceBank:
         vsha, _ = self._publish_content(
             "verifications", "json", verification.to_bytes(), 64 * 1024
         )
+        self._fault("after-receipt-verification")
         with self._locked():
             self._recover_unlocked()
             head = self._load_head_unlocked()
@@ -1545,6 +1738,7 @@ class QwenMlpEvidenceBank:
                 )
             if head.receipt_count >= self.budget.max_groups:
                 raise QwenMlpEvidenceCapacityError("journal group bound reached")
+            self._validate_split_transition(head.split_counts, receipt.entry.split)
             added_bytes = sum(ref.raw_nbytes for ref in receipt.tensors)
             total_bytes = head.referenced_tensor_bytes + added_bytes
             if total_bytes > self.budget.max_total_referenced_bytes:
@@ -1604,15 +1798,54 @@ class QwenMlpEvidenceBank:
                 for path in shard.glob("*.json")
             }
             chain = {state.sha256 for state in self._replay_unlocked(head)}
+            committed_receipts = {receipt.sha256 for receipt, _ in pairs}
+            committed_verifications = {verification.sha256 for _, verification in pairs}
+            receipts = {
+                path.stem
+                for shard in (self.root / "receipts").iterdir()
+                if shard.is_dir()
+                for path in shard.glob("*.json")
+            }
+            verifications = {
+                path.stem
+                for shard in (self.root / "verifications").iterdir()
+                if shard.is_dir()
+                for path in shard.glob("*.json")
+            }
+            verifier_evidence = {
+                path.stem
+                for shard in (self.root / "verifier-evidence").iterdir()
+                if shard.is_dir()
+                for path in shard.glob("*.json")
+            }
             orphan_objects = tuple(sorted(objects - referenced))
             orphan_histories = tuple(sorted(histories - chain))
+            orphan_receipts = tuple(sorted(receipts - committed_receipts))
+            orphan_verifications = tuple(
+                sorted(verifications - committed_verifications)
+            )
+            referenced_verifier_evidence = {
+                verification.verifier_evidence_sha256 for _, verification in pairs
+            }
+            orphan_verifier_evidence = tuple(
+                sorted(verifier_evidence - referenced_verifier_evidence)
+            )
+            # The verifier proof is a first-class replay artifact. Orphans
+            # are never silently treated as a clean bank.
             return MlpEvidenceAudit(
-                not orphan_objects and not orphan_histories,
+                not orphan_objects
+                and not orphan_histories
+                and not orphan_receipts
+                and not orphan_verifications
+                and not orphan_verifier_evidence,
                 head.sha256,
                 len(pairs),
                 len(referenced),
                 orphan_objects,
                 orphan_histories,
+                orphan_receipts,
+                orphan_verifications,
+                orphan_verifier_evidence,
             )
 
     def build_subspace_corpus(self) -> SubspaceCorpus:
@@ -1621,12 +1854,18 @@ class QwenMlpEvidenceBank:
             pairs = self._committed_pairs_unlocked()
         if not pairs:
             raise QwenMlpEvidenceIntegrityError("bank contains no verified MLP groups")
+        if (
+            len({receipt.manifest_sha256 for receipt, _ in pairs}) != 1
+            or len({receipt.model_pin_sha256 for receipt, _ in pairs}) != 1
+            or len({verification.verifier_sha256 for _receipt, verification in pairs})
+            != 1
+            or any(receipt.capture_mode != "live-exact" for receipt, _ in pairs)
+        ):
+            raise QwenMlpEvidenceIntegrityError(
+                "production SubspaceCorpus requires one live manifest/model/verifier pin"
+            )
         groups = []
         for receipt, verification in pairs:
-            if receipt.capture_mode != "live-exact":
-                raise QwenMlpEvidenceIntegrityError(
-                    "fixture evidence cannot become a production SubspaceCorpus"
-                )
             refs = {ref.stage: ref for ref in receipt.tensors}
             context = self.restore_tensor(refs["mlp.input"]).reshape(
                 -1, refs["mlp.input"].shape[-1]
@@ -1642,6 +1881,7 @@ class QwenMlpEvidenceBank:
                 sorted(
                     set(receipt.source_receipt_sha256s)
                     | {
+                        receipt.probe_spec_sha256,
                         receipt.measurement_sha256,
                         receipt.access_trace_sha256,
                         verification.sha256,
@@ -1651,7 +1891,7 @@ class QwenMlpEvidenceBank:
             projection_verifier = verification.verifier_sha256
             projection_evidence = projection_evidence_sha256(
                 model_pin_sha256=receipt.model_pin_sha256,
-                graph_revision_sha256=receipt.atlas_revision_sha256,
+                graph_revision_sha256=receipt.capture_revision_sha256,
                 layer=receipt.entry.layer,
                 source_receipt_sha256s=source,
                 projection_verifier_sha256=projection_verifier,
@@ -1662,12 +1902,12 @@ class QwenMlpEvidenceBank:
             output_verifier = verification.verifier_sha256
             groups.append(
                 SubspaceObservationGroup(
-                    logical_time=receipt.atlas_sequence,
+                    logical_time=receipt.entry.ordinal,
                     group_sha256=receipt.identity_sha256,
                     model_pin_sha256=receipt.model_pin_sha256,
-                    graph_revision_sha256=receipt.atlas_revision_sha256,
-                    graph_sequence=receipt.atlas_sequence,
-                    graph_event_sha256=receipt.atlas_event_sha256,
+                    graph_revision_sha256=receipt.capture_revision_sha256,
+                    graph_sequence=receipt.entry.ordinal,
+                    graph_event_sha256=receipt.capture_event_sha256,
                     layer=receipt.entry.layer,
                     prompt_sha256=receipt.entry.prompt_sha256,
                     source_receipt_sha256s=source,
@@ -1738,18 +1978,22 @@ class ExactMlpBoundaryCapture:
 
 
 @runtime_checkable
-class ExactMlpCaptureRunner(Protocol):
+class ExactMlpCaptureRunner(MlpProjectionVerifier, Protocol):
     capture_mode: str
 
     def capture(
         self, entry: CapturePlanEntry, sink: ExactMlpBoundaryCapture
-    ) -> tuple[MlpEvidenceReceipt, MlpProjectionVerificationReceipt]: ...
+    ) -> MlpEvidenceReceipt: ...
 
 
 def run_capture_manifest(
     manifest: CaptureManifest,
     bank: QwenMlpEvidenceBank,
     runner: ExactMlpCaptureRunner,
+    *,
+    allowed_splits: Sequence[str] | None = None,
+    max_new_groups: int | None = None,
+    max_seconds: float | None = None,
 ) -> tuple[MlpEvidencePublication, ...]:
     if (
         not isinstance(manifest, CaptureManifest)
@@ -1759,6 +2003,46 @@ def run_capture_manifest(
         raise TypeError("manifest/bank/runner types are invalid")
     if runner.capture_mode not in {"fixture", "live-exact"}:
         raise ValueError("runner capture_mode is invalid")
+    selected_splits = (
+        CAPTURE_SPLITS if allowed_splits is None else tuple(allowed_splits)
+    )
+    if (
+        not selected_splits
+        or len(set(selected_splits)) != len(selected_splits)
+        or any(split not in CAPTURE_SPLITS for split in selected_splits)
+    ):
+        raise ValueError("allowed_splits are invalid or duplicated")
+    if max_new_groups is not None and (
+        isinstance(max_new_groups, bool)
+        or not isinstance(max_new_groups, int)
+        or max_new_groups < 1
+    ):
+        raise ValueError("max_new_groups must be positive or None")
+    atomic_group_size = getattr(runner, "atomic_capture_group_size", 1)
+    if (
+        isinstance(atomic_group_size, bool)
+        or not isinstance(atomic_group_size, int)
+        or atomic_group_size < 1
+    ):
+        raise QwenMlpEvidenceIntegrityError(
+            "runner atomic_capture_group_size is invalid"
+        )
+    if max_new_groups is not None and max_new_groups % atomic_group_size != 0:
+        raise ValueError("max_new_groups must align to the runner atomic capture group")
+    if max_seconds is not None and atomic_group_size > 1:
+        raise ValueError(
+            "max_seconds cannot hard-bound an atomic multi-forward capture; "
+            "use max_new_groups"
+        )
+    if max_seconds is not None and (
+        isinstance(max_seconds, bool)
+        or not isinstance(max_seconds, (int, float))
+        or not math.isfinite(float(max_seconds))
+        or float(max_seconds) <= 0.0
+    ):
+        raise ValueError("max_seconds must be finite positive or None")
+    started = time.monotonic()
+    active_atomic_group: str | None = None
     publications = []
     committed = {
         (
@@ -1769,7 +2053,32 @@ def run_capture_manifest(
         )
         for receipt, _ in bank.committed_pairs()
     }
+    atomic_group_fn = getattr(runner, "atomic_capture_group", None)
+    pending_by_atomic_group: dict[str, int] = {}
+    if callable(atomic_group_fn):
+        for planned in manifest.entries:
+            if (
+                planned.split not in selected_splits
+                or (
+                    planned.sha256,
+                    manifest.sha256,
+                    manifest.model_pin_sha256,
+                    runner.capture_mode,
+                )
+                in committed
+            ):
+                continue
+            planned_group = atomic_group_fn(planned)
+            if not isinstance(planned_group, str) or not planned_group:
+                raise QwenMlpEvidenceIntegrityError(
+                    "runner returned an invalid atomic capture group"
+                )
+            pending_by_atomic_group[planned_group] = (
+                pending_by_atomic_group.get(planned_group, 0) + 1
+            )
     for entry in manifest.entries:
+        if entry.split not in selected_splits:
+            continue
         if (
             entry.sha256,
             manifest.sha256,
@@ -1777,8 +2086,29 @@ def run_capture_manifest(
             runner.capture_mode,
         ) in committed:
             continue
+        atomic_group = None
+        if callable(atomic_group_fn):
+            atomic_group = atomic_group_fn(entry)
+            if not isinstance(atomic_group, str) or not atomic_group:
+                raise QwenMlpEvidenceIntegrityError(
+                    "runner returned an invalid atomic capture group"
+                )
+        at_boundary = atomic_group is None or atomic_group != active_atomic_group
+        pending_in_group = (
+            1 if atomic_group is None else pending_by_atomic_group[atomic_group]
+        )
+        if at_boundary and (
+            (
+                max_new_groups is not None
+                and len(publications) + pending_in_group > max_new_groups
+            )
+            or (max_seconds is not None and time.monotonic() - started >= max_seconds)
+        ):
+            break
+        active_atomic_group = atomic_group
+        bank.preflight_split_append(entry.split)
         sink = ExactMlpBoundaryCapture(bank)
-        receipt, verification = runner.capture(entry, sink)
+        receipt = runner.capture(entry, sink)
         if (
             receipt.manifest_sha256 != manifest.sha256
             or receipt.model_pin_sha256 != manifest.model_pin_sha256
@@ -1788,7 +2118,7 @@ def run_capture_manifest(
             raise QwenMlpEvidenceIntegrityError(
                 "runner returned evidence for another manifest entry"
             )
-        publications.append(bank.append_verified(receipt, verification))
+        publications.append(bank.append_verified(receipt, runner))
     return tuple(publications)
 
 
@@ -1796,6 +2126,8 @@ __all__ = [
     "CAPTURE_PLAN_LAYERS",
     "CAPTURE_SPLITS",
     "CAPTURE_STAGES",
+    "EVIDENCE_BUDGET_SCHEMA",
+    "VERIFIER_EVIDENCE_SCHEMA",
     "BinaryTensorRef",
     "CaptureManifest",
     "CapturePlanEntry",

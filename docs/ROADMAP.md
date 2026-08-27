@@ -164,9 +164,13 @@ around every domain that supports it.
 - [x] Add the crash-safe exact MLP binary evidence bank, projection-verifier
   protocol, `25/10/5` capture manifest, resume logic, and production-corpus
   gate.
-- [ ] Mount the real `ExactMlpCaptureRunner`, execute the 40 local-Qwen groups,
-  and run the collision sweep against separate-projection and shuffled-subspace
-  controls.
+- [x] Mount `LiveExactMlpCaptureRunner` on local causal Qwen with the native
+  attention path, fixed layer allowlists, atomic five-prompt layer groups,
+  `25/10` pre-holdout locking, `645` layer executions, `24` weight-local replay
+  reads, 40 exact O1/Atlas/Harvester authorities, and a bank-invoked CAS proof.
+- [ ] Execute the 40-group official 27B MLP capture, open the five-group holdout
+  only after the calibration lock, and run the collision sweep against
+  separate-projection and shuffled-subspace controls.
 - [ ] Apply topology-aware Warmth only as a downward charging brake and measure
   redundant-charge suppression without changing authenticated demand.
 - [x] Export the first eight live O1/Atlas controller promotions into an exact

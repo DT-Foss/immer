@@ -118,6 +118,13 @@ later requests.
   and full MLP stages are persisted in bounded binary sidecars tied to Atlas
   measurements. Sidecars control reuse and crash repair; fixture evidence is
   permanently barred from production corpus construction.
+- The exact MLP runner now executes on local causal Qwen through IMMER's own
+  attention. It resolves 40 exact O1/Atlas/Harvester authorities, captures only
+  allowlisted layers, closes each layer over five prompts, locks `25/10` before
+  the five holdout groups, and reduces the full plan to `645` layer executions
+  plus `24` weight-local batched projection reads. One manifest, ModelPin, and
+  verifier pin bind compact tensor objects, the bank-invoked replay proof, CAS
+  recovery, and the orphan audit. The official 27B capture is the next run.
 - The first real five-prompt L27 wave finds one stable transport, `20→8`.
   Held-out residual falls from Identity `0.2373913654` to `0.0248507190`; pair
   selection uses structural and calibration evidence only, before holdout.

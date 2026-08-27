@@ -36,6 +36,7 @@ from .cartography_probe import (
     Qwen38CartographyProbe,
     Qwen38CartographyProbeError,
     TensorRangeReceipt,
+    project_hidden_sketch,
     prompt_token_sha256,
 )
 from .draft_verification import Qwen38DraftVerifier
@@ -352,6 +353,7 @@ __all__ = [
     "bind_causal_tensor_plans",
     "build_probe_document",
     "compare_probe_documents",
+    "project_hidden_sketch",
     "prompt_token_sha256",
     "semantic_label_sha256",
     "tensor_range_plan_from_source",
