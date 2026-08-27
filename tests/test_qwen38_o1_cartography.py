@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import importlib.util
 import json
@@ -24,8 +24,10 @@ from immer.runtimes.ooe.operator_harvester import (
     CandidateEvidenceStream,
     HarvestPromotion,
 )
+from immer.runtimes.ooe.operator_transport import causal_prefix_sinkhorn_operator
 from immer.runtimes.qwen3_8 import (
     AtlasQueryResult,
+    ContextualPrefixSinkhornOperators,
     GraphRevision,
     InterventionIdentity,
     MeasurementReceipt,
@@ -150,7 +152,7 @@ class _FakeAppendReceipt:
 
 
 class _FakeResult:
-    def __init__(self, measurement: object) -> None:
+    def __init__(self, measurement: object, contextual=None) -> None:
         self.measurement = measurement
         self.measurements_in_append_order = (measurement,)
         operation = SimpleNamespace(source_bytes=7)
@@ -161,6 +163,7 @@ class _FakeResult:
         leaf = SimpleNamespace(source_bytes=7)
         self.tensor_range_receipts = (leaf, leaf)
         self.control_tensor_range_receipts = ()
+        self.contextual_prefix_sinkhorn_operators = contextual
 
     def verify(self) -> None:
         if not self.measurement.sha256:
@@ -331,8 +334,8 @@ class _AuthenticProbe:
             probe=spec.probe_identity,
             intervention=InterventionIdentity(
                 mode=str(spec.intervention_mode),
-                configuration_sha256=_digest(
-                    {"alpha": 0.0, "kind": "original-qwen-identity"}
+                configuration_sha256=cartography._intervention_configuration_sha256(
+                    spec
                 ),
             ),
             observation_status="recorded",
@@ -358,7 +361,45 @@ class _AuthenticProbe:
             placebo_effects=(),
             runtime=_RUNTIME_PROVENANCE,
         )
-        return _FakeResult(measurement)
+        contextual = None
+        capture = spec.prefix_sinkhorn_operator_capture
+        if capture is not None:
+            dimension = min(len(spec.prompt_token_ids), capture.max_positions)
+            operators = np.stack(
+                tuple(
+                    causal_prefix_sinkhorn_operator(
+                        np.random.default_rng(900 + head).normal(
+                            size=(dimension, dimension)
+                        )
+                    )
+                    for head in range(4)
+                ),
+                axis=0,
+            )[None]
+            raw_sha = hashlib.sha256(
+                np.asarray(operators, dtype="<f8").tobytes(order="C")
+            ).hexdigest()
+            head_hashes = tuple(
+                hashlib.sha256(
+                    np.asarray(operators[:, index], dtype="<f8").tobytes(
+                        order="C"
+                    )
+                ).hexdigest()
+                for index in range(4)
+            )
+            contextual = ContextualPrefixSinkhornOperators(
+                layer=27,
+                query_positions=tuple(range(dimension)),
+                key_positions=tuple(range(dimension)),
+                selected_query_heads=(2, 8, 14, 20),
+                attention_spec_sha256=(
+                    cartography._capture_attention_spec_sha256(spec)
+                ),
+                raw_sha256=raw_sha,
+                head_sha256s=head_hashes,
+                operators=operators.astype(np.float64),
+            )
+        return _FakeResult(measurement, contextual)
 
 
 def _runtime_factory(body):
@@ -400,6 +441,36 @@ def _jobs() -> list[dict[str, object]]:
     return rows
 
 
+def _capture_jobs() -> list[dict[str, object]]:
+    module = "model.language_model.layers.27.self_attn"
+    return [
+        {
+            "coordinate": {
+                "layer": 27,
+                "module": module,
+                "row_end": 2,
+                "row_start": 0,
+                "tensor": f"{module}.q_proj.weight",
+            },
+            "intervention_mode": "native",
+            "native_head_crsa": {
+                "alpha": 0.01,
+                "balance_alpha": 1.0,
+                "diagonal_debit": 3.0,
+                "head_indices": [2, 8, 14, 20],
+                "layer": 27,
+            },
+            "prefix_sinkhorn_operator_capture": {
+                "max_bytes": 1024**2,
+                "max_positions": 8,
+            },
+            "probe_family": "operator-transport",
+            "start_layer": 27,
+            "stop_layer": 28,
+        }
+    ]
+
+
 class Qwen38O1CartographyTests(unittest.TestCase):
     def setUp(self) -> None:
         _FakeAtlas.stores.clear()
@@ -431,6 +502,18 @@ class Qwen38O1CartographyTests(unittest.TestCase):
             seed=17,
         )
 
+    def _prepare_capture(self, root: Path):
+        return cartography.prepare_manifest(
+            root,
+            bundle_root=self.bundle,
+            model_pin=_pin(),
+            prompt_token_ids=self.tokens,
+            prompt_sha256=self.prompt_sha,
+            jobs=_capture_jobs(),
+            code_revision=CODE_REVISION,
+            seed=17,
+        )
+
     def _run(self, root: Path, **changes):
         options = {
             "max_jobs": 0,
@@ -442,6 +525,36 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         }
         options.update(changes)
         return cartography.run_cartography(root, **options)
+
+    def _seed_capture_atlas(self, root: Path, *, publish_sidecar: bool):
+        manifest = self._prepare_capture(root)
+        spec = cartography._spec_from_record(manifest["body"]["jobs"][0]["spec"])
+        atlas_path = root / cartography.ATLAS_NAME
+        atlas_path.mkdir()
+        atlas = _FakeAtlas(atlas_path, model_pin=_pin(), tensor_plans=(object(),))
+        result = _AuthenticProbe(_FakeModel(_pin())).execute(
+            spec,
+            atlas_head_revision=atlas.revision(),
+        )
+        atlas.append_measurement(result.measurement)
+        receipt = None
+        if publish_sidecar:
+            (root / cartography.OOE_NAME).mkdir()
+            bank = cartography.QwenPrefixSinkhornCaptureBank(
+                root / cartography.OOE_NAME / cartography.OPERATOR_TRANSPORT_NAME
+            )
+            contextual = result.contextual_prefix_sinkhorn_operators
+            if contextual is None:
+                self.fail("capture fixture produced no raw operators")
+            receipt = cartography.QwenPrefixSinkhornCaptureReceipt.create(
+                result.measurement,
+                atlas_revision=atlas.revision(),
+                capture_spec_sha256=cartography._capture_spec_sha256(spec),
+                attention_spec_sha256=contextual.attention_spec_sha256,
+                operators=tuple(contextual.operators[0]),
+            )
+            bank.publish(receipt)
+        return manifest, spec, atlas, result, receipt
 
     def test_prepare_is_deterministic_atomic_and_non_overwriting(self) -> None:
         first_root = self.base / "first"
@@ -1271,6 +1384,219 @@ class Qwen38O1CartographyTests(unittest.TestCase):
         self.assertTrue(report["ooe"]["learning_receipts"][0]["reused_atlas_proof"])
         self.assertEqual(report["ooe"]["saved_qwen_forwards"], 0)
         self.assertEqual(_AuthenticProbe.calls, [])
+
+    def test_prefix_sinkhorn_sidecar_controls_measurement_reuse(self) -> None:
+        missing_root = self.base / "capture-missing"
+        self._seed_capture_atlas(missing_root, publish_sidecar=False)
+        _AuthenticProbe.calls.clear()
+        repaired = self._run(
+            missing_root,
+            max_jobs=1,
+            probe_factory=_AuthenticProbe,
+        )
+        self.assertEqual(len(_AuthenticProbe.calls), 1)
+        self.assertEqual(repaired["ooe"]["reused_atlas_proofs"], 0)
+        self.assertEqual(
+            len(repaired["operator_transport"]["capture_receipt_sha256s"]),
+            1,
+        )
+
+        reuse_root = self.base / "capture-reuse"
+        _manifest, _spec, _atlas, _result, receipt = self._seed_capture_atlas(
+            reuse_root,
+            publish_sidecar=True,
+        )
+        if receipt is None:
+            self.fail("capture fixture lost its receipt")
+        _AuthenticProbe.calls.clear()
+        reused = self._run(
+            reuse_root,
+            max_jobs=1,
+            probe_factory=_AuthenticProbe,
+        )
+        self.assertEqual(_AuthenticProbe.calls, [])
+        self.assertEqual(reused["ooe"]["reused_atlas_proofs"], 1)
+        self.assertEqual(
+            reused["attached_atlas_receipt_sha256s"],
+            [reused["atlas"]["measurement_sha256s"][0]],
+        )
+        self.assertEqual(
+            reused["operator_transport"]["capture_receipt_sha256s"],
+            [receipt.sha256],
+        )
+        status = cartography.status_cartography(
+            reuse_root,
+            runtime_factory=_runtime_factory,
+            atlas_factory=_FakeAtlas,
+            stream_factory=_FakeStream,
+        )
+        self.assertEqual(
+            status["operator_transport"]["capture_receipt_sha256s"],
+            [receipt.sha256],
+        )
+        self.assertTrue(status["operator_transport"]["audit_clean"])
+        self.assertEqual(
+            status["operator_transport"]["orphan_state_filenames"], []
+        )
+        self.assertNotIn("operators", status["operator_transport"])
+        bank = cartography.QwenPrefixSinkhornCaptureBank(
+            reuse_root / cartography.OOE_NAME / cartography.OPERATOR_TRANSPORT_NAME
+        )
+        bank.store.publish_state("foreign-capture-orphan", b"orphan")
+        expected_audit = bank.audit()
+        self.assertTrue(expected_audit.orphan_state_filenames)
+        dirty_status = cartography.status_cartography(
+            reuse_root,
+            runtime_factory=_runtime_factory,
+            atlas_factory=_FakeAtlas,
+            stream_factory=_FakeStream,
+        )
+        self.assertFalse(dirty_status["operator_transport"]["audit_clean"])
+        self.assertEqual(
+            dirty_status["operator_transport"]["orphan_state_filenames"],
+            list(expected_audit.orphan_state_filenames),
+        )
+        dirty_run = self._run(
+            reuse_root,
+            max_jobs=1,
+            probe_factory=_AuthenticProbe,
+        )
+        self.assertFalse(dirty_run["operator_transport"]["audit_clean"])
+        self.assertEqual(
+            dirty_run["operator_transport"]["orphan_state_filenames"],
+            list(expected_audit.orphan_state_filenames),
+        )
+        outcome = cartography._scheduler(
+            reuse_root,
+            cartography._effective_manifest(reuse_root)[1],
+            create=False,
+            stream_factory=_FakeStream,
+        ).outcomes[0]
+        observation = outcome.observation_document()
+        self.assertEqual(
+            observation["operator_capture_receipt_sha256"], receipt.sha256
+        )
+
+    def test_prefix_sinkhorn_capture_crash_repair_and_raw_absence(self) -> None:
+        crash_root = self.base / "capture-crash"
+        self._prepare_capture(crash_root)
+        original_publish = cartography.QwenPrefixSinkhornCaptureBank.publish
+        crashed = False
+
+        def crash_once(bank, receipt):
+            nonlocal crashed
+            if not crashed:
+                crashed = True
+                raise OSError("crash after Atlas append")
+            return original_publish(bank, receipt)
+
+        _AuthenticProbe.calls.clear()
+        with mock.patch.object(
+            cartography.QwenPrefixSinkhornCaptureBank,
+            "publish",
+            autospec=True,
+            side_effect=crash_once,
+        ):
+            first = self._run(
+                crash_root,
+                max_jobs=1,
+                probe_factory=_AuthenticProbe,
+            )
+        self.assertEqual(first["coverage"]["retryable_jobs"], 1)
+        repaired = self._run(
+            crash_root,
+            max_jobs=1,
+            probe_factory=_AuthenticProbe,
+        )
+        self.assertEqual(len(_AuthenticProbe.calls), 2)
+        self.assertEqual(repaired["coverage"]["succeeded_jobs"], 1)
+        self.assertEqual(
+            len(repaired["operator_transport"]["capture_receipt_sha256s"]),
+            1,
+        )
+
+        class _RawAbsentProbe(_AuthenticProbe):
+            def execute(self, spec, *, atlas_head_revision):
+                result = super().execute(
+                    spec,
+                    atlas_head_revision=atlas_head_revision,
+                )
+                result.contextual_prefix_sinkhorn_operators = None
+                return result
+
+        absent_root = self.base / "capture-raw-absent"
+        self._prepare_capture(absent_root)
+        failed = self._run(
+            absent_root,
+            max_jobs=1,
+            probe_factory=_RawAbsentProbe,
+        )
+        self.assertEqual(failed["coverage"]["retryable_jobs"], 1)
+        self.assertEqual(
+            failed["operator_transport"]["capture_receipt_sha256s"], []
+        )
+
+    def test_wrong_prefix_sinkhorn_sidecars_never_authorize_reuse(self) -> None:
+        def wrong_receipt(root: Path, **changes):
+            _manifest, spec, atlas, result, _receipt = self._seed_capture_atlas(
+                root,
+                publish_sidecar=False,
+            )
+            (root / cartography.OOE_NAME).mkdir()
+            bank = cartography.QwenPrefixSinkhornCaptureBank(
+                root / cartography.OOE_NAME / cartography.OPERATOR_TRANSPORT_NAME
+            )
+            contextual = result.contextual_prefix_sinkhorn_operators
+            if contextual is None:
+                self.fail("capture fixture produced no raw operators")
+            receipt = cartography.QwenPrefixSinkhornCaptureReceipt.create(
+                result.measurement,
+                atlas_revision=atlas.revision(),
+                capture_spec_sha256=cartography._capture_spec_sha256(spec),
+                attention_spec_sha256=contextual.attention_spec_sha256,
+                operators=tuple(contextual.operators[0]),
+            )
+            receipt = replace(receipt, **changes)
+            bank.publish(receipt)
+            return spec
+
+        wrong_spec_root = self.base / "capture-wrong-spec"
+        wrong_receipt(
+            wrong_spec_root,
+            capture_spec_sha256=_digest("wrong-capture-spec"),
+        )
+        _AuthenticProbe.calls.clear()
+        recovered = self._run(
+            wrong_spec_root,
+            max_jobs=1,
+            probe_factory=_AuthenticProbe,
+        )
+        self.assertEqual(len(_AuthenticProbe.calls), 1)
+        self.assertEqual(recovered["ooe"]["reused_atlas_proofs"], 0)
+
+        for suffix, changes in (
+            ("model", {"model_pin_sha256": "d" * 64}),
+            (
+                "revision",
+                {
+                    "atlas_revision": GraphRevision(
+                        999,
+                        _digest("foreign-atlas-revision"),
+                    )
+                },
+            ),
+        ):
+            root = self.base / f"capture-wrong-{suffix}"
+            wrong_receipt(root, **changes)
+            _AuthenticProbe.calls.clear()
+            report = self._run(
+                root,
+                max_jobs=1,
+                probe_factory=_AuthenticProbe,
+            )
+            self.assertEqual(_AuthenticProbe.calls, [])
+            self.assertEqual(report["coverage"]["retryable_jobs"], 1)
+            self.assertEqual(report["ooe"]["reused_atlas_proofs"], 0)
 
     def test_ooe_atlas_verifier_rejects_forged_historical_event(self) -> None:
         run_root = self.base / "ooe-historical-revision"

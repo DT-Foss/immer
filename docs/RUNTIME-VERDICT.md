@@ -114,6 +114,10 @@ later requests.
   replayed evaluators. They accept only pre-native-blend Prefix-Sinkhorn head
   matrices and contextual RMSNormed gate/up projections respectively. Existing
   Atlas sketches are named as missing evidence and cannot produce a live fit.
+- O1 now has the missing exact evidence transport: native Prefix-Sinkhorn rows
+  and full MLP stages are persisted in bounded binary sidecars tied to Atlas
+  measurements. Sidecars control reuse and crash repair; fixture evidence is
+  permanently barred from production corpus construction.
 - Exact Store forks preserve every historical object, manifest-chain byte, and
   state generation behind a source-pinned no-replace intent. Restore accepts a
   promoted policy only after rebuilding its kernel from authenticated history;

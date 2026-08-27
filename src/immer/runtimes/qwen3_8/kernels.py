@@ -24,7 +24,11 @@ import math
 import torch
 import torch.nn.functional as F
 
-from .native_crsa import NativeHeadCrsaEvidence, Qwen38NativeHeadCrsa
+from .native_crsa import (
+    NativeHeadCrsaEvidence,
+    NativePrefixSinkhornOperatorObserver,
+    Qwen38NativeHeadCrsa,
+)
 
 
 __all__ = [
@@ -721,6 +725,8 @@ def _route_native_attention(
     prior_log_usage: torch.Tensor | None,
     *,
     tokenwise_usage: bool = False,
+    routed_operator_observer: NativePrefixSinkhornOperatorObserver
+    | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, NativeHeadCrsaEvidence]:
     probabilities = work.base_probabilities
     if intervention.active:
@@ -732,19 +738,25 @@ def _route_native_attention(
         allowed=work.allowed,
         prior_log_usage=prior_log_usage,
         tokenwise_usage=tokenwise_usage,
+        routed_operator_observer=routed_operator_observer,
     )
 
 
 def _validate_native_attention_hook(
     native_head_crsa: Qwen38NativeHeadCrsa | None,
     native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None] | None,
+    native_prefix_sinkhorn_operator_observer: NativePrefixSinkhornOperatorObserver
+    | None,
     *,
     required: bool,
 ) -> Qwen38NativeHeadCrsa | None:
     if native_head_crsa is None:
         if required:
             raise TypeError("native_head_crsa must be a Qwen38NativeHeadCrsa")
-        if native_head_crsa_observer is not None:
+        if (
+            native_head_crsa_observer is not None
+            or native_prefix_sinkhorn_operator_observer is not None
+        ):
             raise ValueError(
                 "native_head_crsa_observer requires an active native_head_crsa hook"
             )
@@ -756,6 +768,13 @@ def _validate_native_attention_hook(
         native_head_crsa_observer
     ):
         raise TypeError("native_head_crsa_observer must be callable or None")
+    if native_prefix_sinkhorn_operator_observer is not None and not isinstance(
+        native_prefix_sinkhorn_operator_observer,
+        NativePrefixSinkhornOperatorObserver,
+    ):
+        raise TypeError(
+            "native_prefix_sinkhorn_operator_observer must be bounded or None"
+        )
     return native_head_crsa
 
 
@@ -774,6 +793,8 @@ def full_attention_core(
     attention_mask: torch.Tensor | None = None,
     native_head_crsa: Qwen38NativeHeadCrsa | None = None,
     native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None] | None = None,
+    native_prefix_sinkhorn_operator_observer: NativePrefixSinkhornOperatorObserver
+    | None = None,
     native_head_crsa_tokenwise_usage: bool = False,
     rope_theta: float = 10_000_000.0,
     rotary_dim: int | None = None,
@@ -794,6 +815,7 @@ def full_attention_core(
     intervention = _validate_native_attention_hook(
         native_head_crsa,
         native_head_crsa_observer,
+        native_prefix_sinkhorn_operator_observer,
         required=False,
     )
     work = _full_attention_work(
@@ -825,6 +847,7 @@ def full_attention_core(
             intervention,
             None if state is None else state.crsa_log_usage,
             tokenwise_usage=native_head_crsa_tokenwise_usage,
+            routed_operator_observer=native_prefix_sinkhorn_operator_observer,
         )
         if native_head_crsa_observer is not None:
             native_head_crsa_observer(evidence)
@@ -853,6 +876,8 @@ def full_attention_fork_core(
     native_state: AttentionState | None = None,
     attention_mask: torch.Tensor | None = None,
     native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None] | None = None,
+    native_prefix_sinkhorn_operator_observer: NativePrefixSinkhornOperatorObserver
+    | None = None,
     rope_theta: float = 10_000_000.0,
     rotary_dim: int | None = None,
     partial_rotary_factor: float = 0.25,
@@ -878,6 +903,7 @@ def full_attention_fork_core(
     intervention = _validate_native_attention_hook(
         native_head_crsa,
         native_head_crsa_observer,
+        native_prefix_sinkhorn_operator_observer,
         required=True,
     )
     assert intervention is not None
@@ -930,6 +956,7 @@ def full_attention_fork_core(
         work,
         intervention,
         None if native_state is None else native_state.crsa_log_usage,
+        routed_operator_observer=native_prefix_sinkhorn_operator_observer,
     )
     off_output = _full_attention_output(work, work.base_probabilities)
     native_output = _full_attention_output(work, native_probabilities)

@@ -16,14 +16,18 @@ The required production seam is the routed probability tensor emitted by
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
 import base64
 import binascii
+import fcntl
 import hashlib
 import json
 import math
+import os
+import stat
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -36,6 +40,7 @@ from immer.runtimes.qwen3_8.semantic_atlas import (
     MeasurementReceipt,
 )
 
+from .crystal import CrystalStore, CrystalStoreError, CrystalTamperError
 from .identity import canonical_json_bytes, require_sha256
 
 
@@ -51,10 +56,15 @@ OPERATOR_TRANSPORT_HOLDOUT_SCHEMA = "immer-ooe-operator-transport-holdout/v1"
 QWEN_OPERATOR_TRANSPORT_AVAILABILITY_SCHEMA = (
     "immer-ooe-qwen-operator-transport-availability/v1"
 )
+QWEN_PREFIX_SINKHORN_CAPTURE_SCHEMA = "immer-ooe-prefix-sinkhorn-capture/v1"
+QWEN_PREFIX_SINKHORN_CAPTURE_INVENTORY_SCHEMA = (
+    "immer-ooe-prefix-sinkhorn-capture-inventory/v1"
+)
 
 MAX_OPERATOR_DIMENSION = 32
 MAX_OPERATOR_OBSERVATIONS = 100_000
 MAX_OPERATOR_TRANSPORT_BYTES = 256 * 1024 * 1024
+MAX_PREFIX_SINKHORN_CAPTURE_BYTES = 1024 * 1024
 _QWEN_OPERATOR_SEAM = (
     "Qwen38NativeHeadCrsa.route:streaming_prefix_log.routed"
     "[batch,selected_head,query,key]-before-native-blend"
@@ -80,6 +90,10 @@ class OperatorTransportFitError(OperatorTransportError):
 
 class OperatorTransportMissingMeasurementError(OperatorTransportError):
     """Qwen artifacts lack the required native per-head operator matrices."""
+
+
+class OperatorTransportCaptureConflictError(OperatorTransportIntegrityError):
+    """One measurement/capture key was already bound to different bytes."""
 
 
 def _digest(value: object) -> str:
@@ -211,17 +225,18 @@ def _matrix(value: object, *, field: str) -> NDArray[np.float64]:
 
 def _operator(value: object, *, field: str) -> NDArray[np.float64]:
     matrix = _matrix(value, field=field)
-    tolerance = 2.0**-40
-    if float(np.max(np.abs(np.triu(matrix, 1)))) > tolerance:
+    # Native Qwen routes are computed in float32 when the checkpoint runs in
+    # BF16. Preserve those exact promoted float32 values in float64 storage;
+    # only the row-sum validation uses a float32-scale tolerance.
+    if float(np.max(np.abs(np.triu(matrix, 1)))) != 0.0:
         raise OperatorTransportError(f"{field} is not causal lower-triangular")
-    if float(np.min(matrix)) < -tolerance:
+    if float(np.min(matrix)) < 0.0:
         raise OperatorTransportError(f"{field} contains negative probability mass")
-    if float(np.max(np.abs(matrix.sum(axis=1) - 1.0))) > tolerance:
+    if float(np.max(np.abs(matrix.sum(axis=1) - 1.0))) > 2.0**-18:
         raise OperatorTransportError(f"{field} rows do not sum to one")
-    normalized = np.array(matrix, dtype=np.float64, order="C", copy=True)
-    normalized[np.abs(normalized) <= tolerance] = 0.0
-    normalized.setflags(write=False)
-    return normalized
+    result = np.array(matrix, dtype=np.float64, order="C", copy=True)
+    result.setflags(write=False)
+    return result
 
 
 def _matrix_record(matrix: NDArray[np.float64]) -> dict[str, object]:
@@ -306,6 +321,68 @@ def causal_prefix_sinkhorn_operator(
     return _operator(result, field="prefix_sinkhorn_operator")
 
 
+def operator_transport_evidence_sha256(
+    *,
+    temporal_index: int,
+    model_pin_sha256: str,
+    graph_revision: GraphRevision,
+    attention_mode: str,
+    prompt_sha256: str,
+    position_group_sha256: str,
+    source_head: int,
+    target_head: int,
+    source_measurement_sha256: str,
+    target_measurement_sha256: str,
+    source_operator: NDArray[np.float64],
+    target_operator: NDArray[np.float64],
+) -> str:
+    """Derive the evidence address from every observation authority and byte."""
+
+    time = _uint(temporal_index, field="temporal_index", positive=True)
+    if not isinstance(graph_revision, GraphRevision):
+        raise TypeError("graph_revision must be GraphRevision")
+    mode = _text(attention_mode, field="attention_mode", maximum=64)
+    if mode != QWEN_PREFIX_SINKHORN_ATTENTION_MODE:
+        raise OperatorTransportError(
+            "operator evidence accepts only native Prefix-Sinkhorn attention"
+        )
+    source = _operator(source_operator, field="source_operator")
+    target = _operator(target_operator, field="target_operator")
+    if source.shape != target.shape:
+        raise OperatorTransportError("operator evidence dimensions differ")
+    return _digest(
+        {
+            "schema": "immer-ooe-operator-transport-evidence/v1",
+            "temporal_index": time,
+            "model_pin_sha256": require_sha256(
+                model_pin_sha256, field="model_pin_sha256"
+            ),
+            "graph_revision": graph_revision.to_document(),
+            "attention_mode": mode,
+            "prompt_sha256": require_sha256(
+                prompt_sha256, field="prompt_sha256"
+            ),
+            "position_group_sha256": require_sha256(
+                position_group_sha256, field="position_group_sha256"
+            ),
+            "source_head": _uint(source_head, field="source_head"),
+            "target_head": _uint(target_head, field="target_head"),
+            "source_measurement_sha256": require_sha256(
+                source_measurement_sha256, field="source_measurement_sha256"
+            ),
+            "target_measurement_sha256": require_sha256(
+                target_measurement_sha256, field="target_measurement_sha256"
+            ),
+            "source_operator_sha256": cast(
+                str, _matrix_record(source)["data_sha256"]
+            ),
+            "target_operator_sha256": cast(
+                str, _matrix_record(target)["data_sha256"]
+            ),
+        }
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class OperatorTransportObservation:
     temporal_index: int
@@ -352,6 +429,24 @@ class OperatorTransportObservation:
         target = _operator(self.target_operator, field="target_operator")
         if source.shape != target.shape:
             raise OperatorTransportError("source and target operator shapes differ")
+        expected_evidence = operator_transport_evidence_sha256(
+            temporal_index=self.temporal_index,
+            model_pin_sha256=self.model_pin_sha256,
+            graph_revision=self.graph_revision,
+            attention_mode=mode,
+            prompt_sha256=self.prompt_sha256,
+            position_group_sha256=self.position_group_sha256,
+            source_head=source_head,
+            target_head=target_head,
+            source_measurement_sha256=self.source_measurement_sha256,
+            target_measurement_sha256=self.target_measurement_sha256,
+            source_operator=source,
+            target_operator=target,
+        )
+        if self.evidence_sha256 != expected_evidence:
+            raise OperatorTransportIntegrityError(
+                "observation evidence differs from its authorities and operators"
+            )
         object.__setattr__(self, "attention_mode", mode)
         object.__setattr__(self, "source_head", source_head)
         object.__setattr__(self, "target_head", target_head)
@@ -1830,6 +1925,522 @@ def evaluate_operator_transport_holdout(
     return OperatorTransportHoldoutReceipt(fit, metrics, best)
 
 
+def _capture_operator_sha256(operator: NDArray[np.float64]) -> str:
+    record = _matrix_record(_operator(operator, field="capture operator"))
+    return cast(str, record["data_sha256"])
+
+
+def _capture_key_sha256(
+    measurement_sha256: str,
+    capture_spec_sha256: str,
+) -> str:
+    return _digest(
+        {
+            "schema": "immer-ooe-prefix-sinkhorn-capture-key/v1",
+            "measurement_sha256": require_sha256(
+                measurement_sha256, field="measurement_sha256"
+            ),
+            "capture_spec_sha256": require_sha256(
+                capture_spec_sha256, field="capture_spec_sha256"
+            ),
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class QwenPrefixSinkhornCaptureReceipt:
+    """One bounded native Prefix-Sinkhorn operator sidecar."""
+
+    measurement_sha256: str
+    model_pin_sha256: str
+    atlas_revision: GraphRevision
+    probe_identity_sha256: str
+    prompt_sha256: str
+    intervention_sha256: str
+    source_evidence_sha256: str
+    capture_spec_sha256: str
+    attention_spec_sha256: str
+    attention_mode: str
+    layer: int
+    head_indices: tuple[int, ...]
+    query_positions: tuple[int, ...]
+    key_positions: tuple[int, ...]
+    operator_sha256s: tuple[str, ...]
+    operators: tuple[NDArray[np.float64], ...]
+
+    def __post_init__(self) -> None:
+        for field in (
+            "measurement_sha256",
+            "model_pin_sha256",
+            "probe_identity_sha256",
+            "prompt_sha256",
+            "intervention_sha256",
+            "source_evidence_sha256",
+            "capture_spec_sha256",
+            "attention_spec_sha256",
+        ):
+            object.__setattr__(
+                self,
+                field,
+                require_sha256(getattr(self, field), field=field),
+            )
+        if not isinstance(self.atlas_revision, GraphRevision):
+            raise TypeError("atlas_revision must be GraphRevision")
+        if self.attention_mode != QWEN_PREFIX_SINKHORN_ATTENTION_MODE:
+            raise OperatorTransportError("capture attention mode is not Prefix-Sinkhorn")
+        if isinstance(self.layer, bool) or self.layer != 27:
+            raise OperatorTransportError("native Prefix-Sinkhorn capture requires layer 27")
+        try:
+            heads = tuple(self.head_indices)
+            queries = tuple(self.query_positions)
+            keys = tuple(self.key_positions)
+            claimed = tuple(self.operator_sha256s)
+            raw_operators = tuple(self.operators)
+        except TypeError as exc:
+            raise TypeError("capture inventories must be sequences") from exc
+        if heads != (2, 8, 14, 20):
+            raise OperatorTransportError(
+                "capture heads must be the native query heads (2, 8, 14, 20)"
+            )
+        dimension = len(queries)
+        if not 3 <= dimension <= MAX_OPERATOR_DIMENSION:
+            raise OperatorTransportError("capture position count lies outside [3, 32]")
+        expected_positions = tuple(range(dimension))
+        if queries != expected_positions or keys != expected_positions:
+            raise OperatorTransportError(
+                "capture query/key positions must be one complete absolute prefix"
+            )
+        if len(raw_operators) != len(heads) or len(claimed) != len(heads):
+            raise OperatorTransportError("capture operator/head inventory differs")
+        operators = tuple(
+            _operator(value, field=f"operators[{index}]")
+            for index, value in enumerate(raw_operators)
+        )
+        if any(operator.shape != (dimension, dimension) for operator in operators):
+            raise OperatorTransportError("capture operator dimensions differ")
+        hashes = tuple(
+            require_sha256(value, field="operator_sha256s") for value in claimed
+        )
+        expected_hashes = tuple(_capture_operator_sha256(value) for value in operators)
+        if hashes != expected_hashes:
+            raise OperatorTransportIntegrityError(
+                "capture operator hashes differ from their exact bytes"
+            )
+        object.__setattr__(self, "head_indices", heads)
+        object.__setattr__(self, "query_positions", queries)
+        object.__setattr__(self, "key_positions", keys)
+        object.__setattr__(self, "operator_sha256s", hashes)
+        object.__setattr__(self, "operators", operators)
+
+    @classmethod
+    def create(
+        cls,
+        measurement: MeasurementReceipt,
+        *,
+        atlas_revision: GraphRevision,
+        capture_spec_sha256: str,
+        attention_spec_sha256: str,
+        operators: Sequence[NDArray[np.float64]],
+        head_indices: Sequence[int] = (2, 8, 14, 20),
+        layer: int = 27,
+    ) -> "QwenPrefixSinkhornCaptureReceipt":
+        if not isinstance(measurement, MeasurementReceipt):
+            raise TypeError("measurement must be MeasurementReceipt")
+        if measurement.intervention.mode != "native":
+            raise OperatorTransportError("operator capture requires a native measurement")
+        matrices = tuple(operators)
+        if not matrices:
+            raise OperatorTransportError("operator capture is empty")
+        first = _operator(matrices[0], field="operators[0]")
+        dimension = int(first.shape[0])
+        positions = tuple(range(dimension))
+        return cls(
+            measurement_sha256=measurement.sha256,
+            model_pin_sha256=measurement.model_pin.sha256,
+            atlas_revision=atlas_revision,
+            probe_identity_sha256=measurement.probe.sha256,
+            prompt_sha256=measurement.probe.prompt_signature,
+            intervention_sha256=measurement.intervention.sha256,
+            source_evidence_sha256=measurement.evidence_sha256,
+            capture_spec_sha256=capture_spec_sha256,
+            attention_spec_sha256=attention_spec_sha256,
+            attention_mode=QWEN_PREFIX_SINKHORN_ATTENTION_MODE,
+            layer=layer,
+            head_indices=tuple(head_indices),
+            query_positions=positions,
+            key_positions=positions,
+            operator_sha256s=tuple(_capture_operator_sha256(row) for row in matrices),
+            operators=matrices,
+        )
+
+    @property
+    def capture_key_sha256(self) -> str:
+        return _capture_key_sha256(
+            self.measurement_sha256,
+            self.capture_spec_sha256,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        body = {
+            "measurement_sha256": self.measurement_sha256,
+            "model_pin_sha256": self.model_pin_sha256,
+            "atlas_revision": self.atlas_revision.to_document(),
+            "probe_identity_sha256": self.probe_identity_sha256,
+            "prompt_sha256": self.prompt_sha256,
+            "intervention_sha256": self.intervention_sha256,
+            "source_evidence_sha256": self.source_evidence_sha256,
+            "capture_spec_sha256": self.capture_spec_sha256,
+            "capture_key_sha256": self.capture_key_sha256,
+            "attention_spec_sha256": self.attention_spec_sha256,
+            "attention_mode": self.attention_mode,
+            "layer": self.layer,
+            "head_indices": list(self.head_indices),
+            "query_positions": list(self.query_positions),
+            "key_positions": list(self.key_positions),
+            "operator_sha256s": list(self.operator_sha256s),
+            "operators": [_matrix_record(row) for row in self.operators],
+        }
+        return _seal(QWEN_PREFIX_SINKHORN_CAPTURE_SCHEMA, body)
+
+    def to_bytes(self) -> bytes:
+        data = canonical_json_bytes(self.to_dict())
+        if len(data) > MAX_PREFIX_SINKHORN_CAPTURE_BYTES:
+            raise OperatorTransportError("Prefix-Sinkhorn capture exceeds byte bound")
+        return data
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.to_bytes()).hexdigest()
+
+    def verify_against_measurement(
+        self,
+        measurement: MeasurementReceipt,
+        *,
+        atlas_revision: GraphRevision,
+    ) -> bool:
+        if not isinstance(measurement, MeasurementReceipt):
+            raise TypeError("measurement must be MeasurementReceipt")
+        if not isinstance(atlas_revision, GraphRevision):
+            raise TypeError("atlas_revision must be GraphRevision")
+        if (
+            measurement.sha256 != self.measurement_sha256
+            or measurement.model_pin.sha256 != self.model_pin_sha256
+            or measurement.probe.sha256 != self.probe_identity_sha256
+            or measurement.probe.prompt_signature != self.prompt_sha256
+            or measurement.intervention.sha256 != self.intervention_sha256
+            or measurement.intervention.mode != "native"
+            or measurement.evidence_sha256 != self.source_evidence_sha256
+            or atlas_revision != self.atlas_revision
+        ):
+            raise OperatorTransportIntegrityError(
+                "capture differs from its Atlas measurement authority"
+            )
+        return True
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "QwenPrefixSinkhornCaptureReceipt":
+        if not isinstance(data, bytes) or len(data) > MAX_PREFIX_SINKHORN_CAPTURE_BYTES:
+            raise OperatorTransportIntegrityError("invalid Prefix-Sinkhorn capture bytes")
+        value = _strict_json(data, label="Prefix-Sinkhorn capture")
+        body = _unseal(
+            value,
+            schema=QWEN_PREFIX_SINKHORN_CAPTURE_SCHEMA,
+            label="Prefix-Sinkhorn capture",
+        )
+        expected = {
+            "measurement_sha256",
+            "model_pin_sha256",
+            "atlas_revision",
+            "probe_identity_sha256",
+            "prompt_sha256",
+            "intervention_sha256",
+            "source_evidence_sha256",
+            "capture_spec_sha256",
+            "capture_key_sha256",
+            "attention_spec_sha256",
+            "attention_mode",
+            "layer",
+            "head_indices",
+            "query_positions",
+            "key_positions",
+            "operator_sha256s",
+            "operators",
+        }
+        if set(body) != expected:
+            raise OperatorTransportIntegrityError("invalid Prefix-Sinkhorn capture body")
+        try:
+            operators_value = body.get("operators")
+            if not isinstance(operators_value, list):
+                raise TypeError("operators must be a list")
+            result = cls(
+                measurement_sha256=cast(str, body.get("measurement_sha256")),
+                model_pin_sha256=cast(str, body.get("model_pin_sha256")),
+                atlas_revision=GraphRevision.from_document(body.get("atlas_revision")),
+                probe_identity_sha256=cast(str, body.get("probe_identity_sha256")),
+                prompt_sha256=cast(str, body.get("prompt_sha256")),
+                intervention_sha256=cast(str, body.get("intervention_sha256")),
+                source_evidence_sha256=cast(str, body.get("source_evidence_sha256")),
+                capture_spec_sha256=cast(str, body.get("capture_spec_sha256")),
+                attention_spec_sha256=cast(str, body.get("attention_spec_sha256")),
+                attention_mode=cast(str, body.get("attention_mode")),
+                layer=cast(int, body.get("layer")),
+                head_indices=tuple(cast(list[int], body.get("head_indices"))),
+                query_positions=tuple(cast(list[int], body.get("query_positions"))),
+                key_positions=tuple(cast(list[int], body.get("key_positions"))),
+                operator_sha256s=tuple(
+                    cast(list[str], body.get("operator_sha256s"))
+                ),
+                operators=tuple(
+                    _matrix_from_record(row, field=f"operators[{index}]")
+                    for index, row in enumerate(operators_value)
+                ),
+            )
+        except OperatorTransportIntegrityError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise OperatorTransportIntegrityError(
+                "Prefix-Sinkhorn capture failed validation"
+            ) from exc
+        if body.get("capture_key_sha256") != result.capture_key_sha256:
+            raise OperatorTransportIntegrityError("capture key changed")
+        if result.to_bytes() != data:
+            raise OperatorTransportIntegrityError("capture reconstruction changed")
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class QwenPrefixSinkhornCaptureAudit:
+    receipt_count: int
+    receipt_sha256s: tuple[str, ...]
+    orphan_state_filenames: tuple[str, ...]
+    inventory_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.receipt_count, bool)
+            or not isinstance(self.receipt_count, int)
+            or self.receipt_count < 0
+        ):
+            raise ValueError("receipt_count must be non-negative")
+        receipts = tuple(
+            require_sha256(value, field="receipt_sha256s")
+            for value in self.receipt_sha256s
+        )
+        if receipts != tuple(sorted(set(receipts))) or len(receipts) != self.receipt_count:
+            raise ValueError("audit receipt inventory is invalid")
+        orphans = tuple(self.orphan_state_filenames)
+        if orphans != tuple(sorted(set(orphans))) or any(
+            not isinstance(value, str) or not value.endswith(".state")
+            for value in orphans
+        ):
+            raise ValueError("audit orphan inventory is invalid")
+        object.__setattr__(self, "receipt_sha256s", receipts)
+        object.__setattr__(self, "orphan_state_filenames", orphans)
+        object.__setattr__(
+            self,
+            "inventory_sha256",
+            require_sha256(self.inventory_sha256, field="inventory_sha256"),
+        )
+
+
+class QwenPrefixSinkhornCaptureBank:
+    """Crash-safe, no-replace measurement/capture sidecar bank."""
+
+    _INVENTORY_STATE = "qwen-prefix-sinkhorn-capture-inventory/v1"
+    _CAPTURE_STATE_PREFIX = "qwen-prefix-sinkhorn-capture/v1:"
+    _LOCK_NAME = ".prefix-sinkhorn-capture.lock"
+
+    def __init__(self, root: str | os.PathLike[str]) -> None:
+        self.store = CrystalStore(
+            root,
+            max_state_bytes=MAX_PREFIX_SINKHORN_CAPTURE_BYTES,
+        )
+        self.root = self.store.root
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.root / self._LOCK_NAME, flags, 0o600)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OperatorTransportIntegrityError("capture bank lock is not regular")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    @staticmethod
+    def _capture_state_name(key_sha256: str) -> str:
+        return QwenPrefixSinkhornCaptureBank._CAPTURE_STATE_PREFIX + require_sha256(
+            key_sha256, field="capture_key_sha256"
+        )
+
+    @staticmethod
+    def _state_filename(name: str) -> str:
+        return hashlib.sha256(name.encode("utf-8")).hexdigest() + ".state"
+
+    def _inventory_bytes(self, entries: Mapping[str, str]) -> bytes:
+        normalized = {
+            require_sha256(key, field="capture inventory key"): require_sha256(
+                value, field="capture inventory receipt"
+            )
+            for key, value in entries.items()
+        }
+        body = {
+            "entries": [
+                {"capture_key_sha256": key, "receipt_sha256": normalized[key]}
+                for key in sorted(normalized)
+            ]
+        }
+        return canonical_json_bytes(
+            _seal(QWEN_PREFIX_SINKHORN_CAPTURE_INVENTORY_SCHEMA, body)
+        )
+
+    def _read_inventory(self) -> tuple[dict[str, str], bytes | None]:
+        try:
+            data = self.store.restore_state(self._INVENTORY_STATE)
+        except KeyError:
+            return {}, None
+        value = _strict_json(data, label="capture inventory")
+        body = _unseal(
+            value,
+            schema=QWEN_PREFIX_SINKHORN_CAPTURE_INVENTORY_SCHEMA,
+            label="capture inventory",
+        )
+        if set(body) != {"entries"} or not isinstance(body.get("entries"), list):
+            raise OperatorTransportIntegrityError("invalid capture inventory")
+        entries: dict[str, str] = {}
+        for row in cast(list[object], body.get("entries")):
+            if not isinstance(row, Mapping) or set(row) != {
+                "capture_key_sha256",
+                "receipt_sha256",
+            }:
+                raise OperatorTransportIntegrityError("invalid capture inventory row")
+            key = require_sha256(
+                row.get("capture_key_sha256"), field="capture_key_sha256"
+            )
+            receipt = require_sha256(row.get("receipt_sha256"), field="receipt_sha256")
+            if key in entries:
+                raise OperatorTransportIntegrityError("duplicate capture inventory key")
+            entries[key] = receipt
+        if data != self._inventory_bytes(entries):
+            raise OperatorTransportIntegrityError("capture inventory is not canonical")
+        return entries, data
+
+    def publish(
+        self,
+        receipt: QwenPrefixSinkhornCaptureReceipt,
+    ) -> QwenPrefixSinkhornCaptureReceipt:
+        if not isinstance(receipt, QwenPrefixSinkhornCaptureReceipt):
+            raise TypeError("receipt must be QwenPrefixSinkhornCaptureReceipt")
+        data = receipt.to_bytes()
+        key = receipt.capture_key_sha256
+        state_name = self._capture_state_name(key)
+        try:
+            with self._locked():
+                entries, inventory_data = self._read_inventory()
+                try:
+                    current = self.store.restore_state(state_name)
+                except KeyError:
+                    current = None
+                if current is not None and current != data:
+                    raise OperatorTransportCaptureConflictError(
+                        "capture key is already bound to different bytes"
+                    )
+                if current is None:
+                    self.store.publish_state(state_name, data)
+                prior = entries.get(key)
+                if prior is not None and prior != receipt.sha256:
+                    raise OperatorTransportCaptureConflictError(
+                        "capture inventory is already bound to a different receipt"
+                    )
+                entries[key] = receipt.sha256
+                next_inventory = self._inventory_bytes(entries)
+                if next_inventory != inventory_data:
+                    self.store.publish_state(
+                        self._INVENTORY_STATE,
+                        next_inventory,
+                        expected_sha256=(
+                            None
+                            if inventory_data is None
+                            else hashlib.sha256(inventory_data).hexdigest()
+                        ),
+                    )
+        except OperatorTransportError:
+            raise
+        except (CrystalStoreError, CrystalTamperError, OSError, ValueError) as exc:
+            raise OperatorTransportIntegrityError("capture publication failed") from exc
+        return receipt
+
+    def restore(
+        self,
+        measurement_sha256: str,
+        capture_spec_sha256: str,
+    ) -> QwenPrefixSinkhornCaptureReceipt:
+        key = _capture_key_sha256(measurement_sha256, capture_spec_sha256)
+        try:
+            with self._locked():
+                entries, _inventory = self._read_inventory()
+                expected = entries.get(key)
+                if expected is None:
+                    raise KeyError(f"unknown Prefix-Sinkhorn capture: {key}")
+                data = self.store.restore_state(self._capture_state_name(key))
+        except KeyError:
+            raise
+        except OperatorTransportError:
+            raise
+        except (CrystalStoreError, CrystalTamperError, OSError, ValueError) as exc:
+            raise OperatorTransportIntegrityError("capture restore failed") from exc
+        receipt = QwenPrefixSinkhornCaptureReceipt.from_bytes(data)
+        if receipt.sha256 != expected or receipt.capture_key_sha256 != key:
+            raise OperatorTransportIntegrityError("capture differs from inventory")
+        return receipt
+
+    def audit(self) -> QwenPrefixSinkhornCaptureAudit:
+        try:
+            with self._locked():
+                entries, inventory_data = self._read_inventory()
+                if inventory_data is None:
+                    inventory_data = self._inventory_bytes({})
+                receipts: list[str] = []
+                expected_files = {
+                    self._state_filename(self._INVENTORY_STATE)
+                } if entries else set()
+                for key, expected in sorted(entries.items()):
+                    state_name = self._capture_state_name(key)
+                    data = self.store.restore_state(state_name)
+                    receipt = QwenPrefixSinkhornCaptureReceipt.from_bytes(data)
+                    if receipt.capture_key_sha256 != key or receipt.sha256 != expected:
+                        raise OperatorTransportIntegrityError(
+                            "capture audit found an inventory mismatch"
+                        )
+                    receipts.append(receipt.sha256)
+                    expected_files.add(self._state_filename(state_name))
+                state_root = self.root / "state"
+                actual_files: set[str] = set()
+                for path in state_root.iterdir():
+                    metadata = path.lstat()
+                    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(
+                        metadata.st_mode
+                    ):
+                        raise OperatorTransportIntegrityError(
+                            "capture state inventory contains a non-regular entry"
+                        )
+                    actual_files.add(path.name)
+        except OperatorTransportError:
+            raise
+        except (CrystalStoreError, CrystalTamperError, OSError, ValueError) as exc:
+            raise OperatorTransportIntegrityError("capture audit failed") from exc
+        return QwenPrefixSinkhornCaptureAudit(
+            receipt_count=len(receipts),
+            receipt_sha256s=tuple(sorted(receipts)),
+            orphan_state_filenames=tuple(sorted(actual_files - expected_files)),
+            inventory_sha256=hashlib.sha256(inventory_data).hexdigest(),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class QwenOperatorTransportAvailability:
     model_pin_sha256: str
@@ -1989,15 +2600,152 @@ def qwen_operator_transport_corpus_from_atlas(
     )
 
 
+def qwen_operator_transport_corpus_from_captures(
+    captures: Sequence[QwenPrefixSinkhornCaptureReceipt],
+    *,
+    graph_revision: GraphRevision,
+    head_pairs: Sequence[tuple[int, int]] = ((2, 8), (14, 20)),
+) -> OperatorTransportCorpus:
+    """Build real head-pair observations from authenticated native sidecars."""
+
+    if isinstance(captures, (str, bytes)):
+        raise TypeError("captures must be a sequence")
+    rows = tuple(captures)
+    if not rows or any(
+        not isinstance(row, QwenPrefixSinkhornCaptureReceipt) for row in rows
+    ):
+        raise TypeError("captures must contain Prefix-Sinkhorn capture receipts")
+    if not isinstance(graph_revision, GraphRevision):
+        raise TypeError("graph_revision must be GraphRevision")
+    try:
+        pairs = tuple((int(source), int(target)) for source, target in head_pairs)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("head_pairs must contain integer pairs") from exc
+    if (
+        not pairs
+        or len(set(pairs)) != len(pairs)
+        or any(source == target for source, target in pairs)
+    ):
+        raise OperatorTransportError("head_pairs must be unique non-identity pairs")
+    ordered = tuple(
+        sorted(
+            rows,
+            key=lambda row: (
+                row.atlas_revision.sequence,
+                row.prompt_sha256,
+                row.capture_key_sha256,
+            ),
+        )
+    )
+    model_pin = ordered[0].model_pin_sha256
+    dimension = len(ordered[0].query_positions)
+    attention_spec = ordered[0].attention_spec_sha256
+    prompts: set[str] = set()
+    captures_seen: set[str] = set()
+    observations: list[OperatorTransportObservation] = []
+    for temporal_index, capture in enumerate(ordered, start=1):
+        if (
+            capture.model_pin_sha256 != model_pin
+            or len(capture.query_positions) != dimension
+            or capture.attention_spec_sha256 != attention_spec
+            or capture.attention_mode != QWEN_PREFIX_SINKHORN_ATTENTION_MODE
+        ):
+            raise OperatorTransportIntegrityError(
+                "capture corpus model, dimension, spec, or attention mode changed"
+            )
+        if capture.capture_key_sha256 in captures_seen:
+            raise OperatorTransportIntegrityError("capture corpus contains a duplicate")
+        if capture.prompt_sha256 in prompts:
+            raise OperatorTransportLeakageError(
+                "capture corpus repeats one prompt across temporal groups"
+            )
+        captures_seen.add(capture.capture_key_sha256)
+        prompts.add(capture.prompt_sha256)
+        by_head = dict(zip(capture.head_indices, capture.operators, strict=True))
+        position_group = _digest(
+            {
+                "schema": "immer-ooe-prefix-sinkhorn-position-group/v1",
+                "attention_spec_sha256": capture.attention_spec_sha256,
+                "capture_receipt_sha256": capture.sha256,
+                "capture_spec_sha256": capture.capture_spec_sha256,
+                "query_positions": list(capture.query_positions),
+                "key_positions": list(capture.key_positions),
+            }
+        )
+        for source_head, target_head in pairs:
+            try:
+                source = by_head[source_head]
+                target = by_head[target_head]
+            except KeyError as exc:
+                raise OperatorTransportIntegrityError(
+                    "head pair is absent from a capture receipt"
+                ) from exc
+            evidence = operator_transport_evidence_sha256(
+                temporal_index=temporal_index,
+                model_pin_sha256=model_pin,
+                graph_revision=graph_revision,
+                attention_mode=QWEN_PREFIX_SINKHORN_ATTENTION_MODE,
+                prompt_sha256=capture.prompt_sha256,
+                position_group_sha256=position_group,
+                source_head=source_head,
+                target_head=target_head,
+                source_measurement_sha256=capture.measurement_sha256,
+                target_measurement_sha256=capture.measurement_sha256,
+                source_operator=source,
+                target_operator=target,
+            )
+            observations.append(
+                OperatorTransportObservation(
+                    temporal_index=temporal_index,
+                    model_pin_sha256=model_pin,
+                    graph_revision=graph_revision,
+                    attention_mode=QWEN_PREFIX_SINKHORN_ATTENTION_MODE,
+                    prompt_sha256=capture.prompt_sha256,
+                    position_group_sha256=position_group,
+                    source_head=source_head,
+                    target_head=target_head,
+                    source_measurement_sha256=capture.measurement_sha256,
+                    target_measurement_sha256=capture.measurement_sha256,
+                    evidence_sha256=evidence,
+                    source_operator=source,
+                    target_operator=target,
+                )
+            )
+    normalized = tuple(
+        sorted(
+            observations,
+            key=lambda row: (
+                row.temporal_index,
+                row.split_group_sha256,
+                row.source_head,
+                row.target_head,
+                row.sha256,
+            ),
+        )
+    )
+    return OperatorTransportCorpus(
+        model_pin_sha256=model_pin,
+        graph_revision=graph_revision,
+        attention_mode=QWEN_PREFIX_SINKHORN_ATTENTION_MODE,
+        observations=normalized,
+        observation_sha256s=tuple(row.sha256 for row in normalized),
+        evidence_sha256s=tuple(row.evidence_sha256 for row in normalized),
+    )
+
+
 __all__ = [
     "MAX_OPERATOR_DIMENSION",
     "MAX_OPERATOR_OBSERVATIONS",
     "MAX_OPERATOR_TRANSPORT_BYTES",
+    "MAX_PREFIX_SINKHORN_CAPTURE_BYTES",
     "OPERATOR_TRANSPORT_CORPUS_SCHEMA",
     "OPERATOR_TRANSPORT_FIT_SCHEMA",
     "OPERATOR_TRANSPORT_HOLDOUT_SCHEMA",
     "OPERATOR_TRANSPORT_OBSERVATION_SCHEMA",
     "OPERATOR_TRANSPORT_SPLIT_SCHEMA",
+    "QWEN_PREFIX_SINKHORN_CAPTURE_INVENTORY_SCHEMA",
+    "QWEN_PREFIX_SINKHORN_CAPTURE_SCHEMA",
+    "OperatorTransportCaptureConflictError",
     "OperatorTransportConfig",
     "OperatorTransportCorpus",
     "OperatorTransportError",
@@ -2013,10 +2761,15 @@ __all__ = [
     "OperatorTransportSplit",
     "QWEN_PREFIX_SINKHORN_ATTENTION_MODE",
     "QwenOperatorTransportAvailability",
+    "QwenPrefixSinkhornCaptureAudit",
+    "QwenPrefixSinkhornCaptureBank",
+    "QwenPrefixSinkhornCaptureReceipt",
     "causal_prefix_sinkhorn_operator",
     "chronological_operator_transport_split",
     "evaluate_operator_transport_holdout",
     "fit_operator_transport",
     "inspect_qwen_operator_transport_availability",
+    "operator_transport_evidence_sha256",
     "qwen_operator_transport_corpus_from_atlas",
+    "qwen_operator_transport_corpus_from_captures",
 ]

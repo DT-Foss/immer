@@ -54,12 +54,18 @@ from immer.runtimes.ooe.operator_harvester import (
     contextual_observations_from_probe_result,
     probe_result_context_cursor,
 )
+from immer.runtimes.ooe.operator_transport import (
+    OperatorTransportError,
+    QwenPrefixSinkhornCaptureBank,
+    QwenPrefixSinkhornCaptureReceipt,
+)
 from immer.runtimes.qwen3_8 import (
     GraphRevision,
     HiddenSketchProjection,
     LogicalModelIdentity,
     MeasurementReceipt,
     ModelPin,
+    PrefixSinkhornOperatorCapture,
     ProbeCoordinateSpec,
     ProbeResourceBudget,
     ProbeSpec,
@@ -85,6 +91,7 @@ O1_STATE_NAME = "o1-state.pt"
 IDLE_STATE_NAME = "idle-state.json"
 OOE_NAME = "ooe"
 OPERATOR_COMPUTE_NAME = "operator-compute"
+OPERATOR_TRANSPORT_NAME = "operator-transport"
 OPERATOR_ALGEBRA_ROUTER_NAME = "qwen-contextual-operators"
 OPERATOR_ALGEBRA_BIN_COUNTS = (4, 16, 2)
 OPERATOR_ALGEBRA_OBJECTIVE_COUNT = 4
@@ -97,6 +104,9 @@ IDLE_STATE_SCHEMA = "immer.qwen3.8-o1-cartography-idle-state/v1"
 OOE_PROMOTION_STATE_NAME = "qwen-o1-cartography-promotion-transaction"
 OOE_PROMOTION_TRANSACTION_SCHEMA = (
     "immer.qwen3.8-o1-cartography-ooe-promotion-transaction/v1"
+)
+PREFIX_SINKHORN_CAPTURE_SPEC_SCHEMA = (
+    "immer.qwen3.8-o1-prefix-sinkhorn-capture-spec/v1"
 )
 _MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -111,6 +121,25 @@ _PROMPT_DEFAULT_FIELDS = frozenset(
         "label_source_sha256",
         "question_sha256",
         "semantic_label",
+    }
+)
+_LEGACY_PROBE_SPEC_FIELDS = frozenset(
+    {
+        "budget",
+        "code_revision",
+        "coordinate",
+        "family_sha256",
+        "hidden_sketch",
+        "intervention_mode",
+        "label_evidence_sha256",
+        "label_source_sha256",
+        "native_head_crsa",
+        "prompt_sha256",
+        "prompt_token_ids",
+        "question_sha256",
+        "semantic_label",
+        "start_layer",
+        "stop_layer",
     }
 )
 
@@ -210,6 +239,7 @@ def _contained(root: Path, name: str) -> Path:
         IDLE_STATE_NAME,
         OOE_NAME,
         OPERATOR_COMPUTE_NAME,
+        OPERATOR_TRANSPORT_NAME,
     }:
         raise O1CartographyCliError("cartography output name is not allowlisted")
     candidate = root / name
@@ -423,25 +453,31 @@ def _native_from_record(value: object) -> Qwen38NativeHeadCrsa | None:
     )
 
 
+def _prefix_sinkhorn_capture_from_record(
+    value: object,
+) -> PrefixSinkhornOperatorCapture | None:
+    if value is None:
+        return None
+    expected = set(PrefixSinkhornOperatorCapture.__dataclass_fields__)
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise O1CartographyCliError(
+            "Prefix-Sinkhorn operator capture record is malformed"
+        )
+    try:
+        return PrefixSinkhornOperatorCapture(**dict(value))
+    except (TypeError, ValueError) as exc:
+        raise O1CartographyCliError(
+            "Prefix-Sinkhorn operator capture record is invalid"
+        ) from exc
+
+
 def _spec_from_record(value: object) -> ProbeSpec:
-    fields = {
-        "budget",
-        "code_revision",
-        "coordinate",
-        "family_sha256",
-        "hidden_sketch",
-        "intervention_mode",
-        "label_evidence_sha256",
-        "label_source_sha256",
-        "native_head_crsa",
-        "prompt_sha256",
-        "prompt_token_ids",
-        "question_sha256",
-        "semantic_label",
-        "start_layer",
-        "stop_layer",
-    }
-    if not isinstance(value, Mapping) or set(value) != fields:
+    actual_fields = set(value) if isinstance(value, Mapping) else set()
+    if not isinstance(value, Mapping) or (
+        actual_fields != set(_LEGACY_PROBE_SPEC_FIELDS)
+        and actual_fields
+        != {*_LEGACY_PROBE_SPEC_FIELDS, "prefix_sinkhorn_operator_capture"}
+    ):
         raise O1CartographyCliError("probe spec record is malformed")
     coordinate = value["coordinate"]
     budget = value["budget"]
@@ -473,6 +509,9 @@ def _spec_from_record(value: object) -> ProbeSpec:
         semantic_label=value["semantic_label"],
         label_evidence_sha256=value["label_evidence_sha256"],
         native_head_crsa=_native_from_record(value["native_head_crsa"]),
+        prefix_sinkhorn_operator_capture=_prefix_sinkhorn_capture_from_record(
+            value.get("prefix_sinkhorn_operator_capture")
+        ),
     )
 
 
@@ -574,23 +613,10 @@ def _prepared_job(
         raw_spec = value.get("spec", value)
         if not isinstance(raw_spec, Mapping):
             raise O1CartographyCliError("job spec must be an object")
-        if set(raw_spec) == {
-            "budget",
-            "code_revision",
-            "coordinate",
-            "family_sha256",
-            "hidden_sketch",
-            "intervention_mode",
-            "label_evidence_sha256",
-            "label_source_sha256",
-            "native_head_crsa",
-            "prompt_sha256",
-            "prompt_token_ids",
-            "question_sha256",
-            "semantic_label",
-            "start_layer",
-            "stop_layer",
-        }:
+        if set(raw_spec) in (
+            set(_LEGACY_PROBE_SPEC_FIELDS),
+            {*_LEGACY_PROBE_SPEC_FIELDS, "prefix_sinkhorn_operator_capture"},
+        ):
             spec = _spec_from_record(raw_spec)
         else:
             coordinate = raw_spec.get("coordinate")
@@ -630,6 +656,12 @@ def _prepared_job(
             if "native_head_crsa" in raw_spec:
                 kwargs["native_head_crsa"] = _native_from_record(
                     raw_spec["native_head_crsa"]
+                )
+            if "prefix_sinkhorn_operator_capture" in raw_spec:
+                kwargs["prefix_sinkhorn_operator_capture"] = (
+                    _prefix_sinkhorn_capture_from_record(
+                        raw_spec["prefix_sinkhorn_operator_capture"]
+                    )
                 )
             spec = ProbeSpec(**kwargs)
         probe_family = str(value.get("probe_family", probe_family))
@@ -1048,6 +1080,10 @@ def _operational_job_template(
         "start_layer": spec["start_layer"],
         "stop_layer": spec["stop_layer"],
     }
+    if "prefix_sinkhorn_operator_capture" in spec:
+        operational_spec["prefix_sinkhorn_operator_capture"] = spec[
+            "prefix_sinkhorn_operator_capture"
+        ]
     for name, expected in scoped_defaults.items():
         if spec[name] != expected:
             operational_spec[name] = spec[name]
@@ -1196,6 +1232,7 @@ def qwen38_frontier_grid(
     native_alpha: float = 0.01,
     native_balance_alpha: float = 1.0,
     native_diagonal_debit: float = 3.0,
+    prefix_sinkhorn_operator_capture: PrefixSinkhornOperatorCapture | None = None,
     layer_types: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Build a deterministic Qwen layer/site/intervention measurement grid."""
@@ -1252,7 +1289,14 @@ def qwen38_frontier_grid(
         raise O1CartographyCliError(
             "native head indices must be non-empty and duplicate-free"
         )
+    if prefix_sinkhorn_operator_capture is not None and not isinstance(
+        prefix_sinkhorn_operator_capture, PrefixSinkhornOperatorCapture
+    ):
+        raise TypeError(
+            "prefix_sinkhorn_operator_capture must be bounded or None"
+        )
     templates: list[dict[str, Any]] = []
+    capture_templates = 0
     for layer in sorted(layer_axis):
         prefix = f"model.language_model.layers.{layer}"
         for site in sorted(site_axis):
@@ -1287,12 +1331,26 @@ def qwen38_frontier_grid(
                         "head_indices": list(heads),
                         "layer": layer,
                     }
+                if (
+                    prefix_sinkhorn_operator_capture is not None
+                    and mode == "native"
+                    and layer == 27
+                    and module.endswith(".layers.27.self_attn")
+                ):
+                    raw_spec["prefix_sinkhorn_operator_capture"] = (
+                        prefix_sinkhorn_operator_capture.as_record()
+                    )
+                    capture_templates += 1
                 templates.append(
                     {
                         "probe_family": f"contextual.{site}",
                         "spec": raw_spec,
                     }
                 )
+    if prefix_sinkhorn_operator_capture is not None and capture_templates == 0:
+        raise O1CartographyCliError(
+            "Prefix-Sinkhorn grid capture requires native layer-27 attention-q"
+        )
     return tuple(templates)
 
 
@@ -1605,16 +1663,256 @@ def _atlas_receipt_sha256(job: ProbeJob, measurement_sha256: str) -> str:
     return _sha(measurement_sha256, "primary measurement SHA-256")
 
 
+def _capture_spec_sha256(spec: ProbeSpec) -> str | None:
+    capture = spec.prefix_sinkhorn_operator_capture
+    if capture is None:
+        return None
+    return _digest(
+        {
+            "capture": capture.as_record(),
+            "schema": PREFIX_SINKHORN_CAPTURE_SPEC_SCHEMA,
+        }
+    )
+
+
+def _capture_attention_spec_sha256(spec: ProbeSpec) -> str:
+    native = spec.native_head_crsa
+    if native is None or spec.intervention_mode != "native":
+        raise O1CartographyCliError(
+            "Prefix-Sinkhorn capture has no native attention specification"
+        )
+    return _digest(
+        {
+            "attention_spec": asdict(native.spec),
+            "schema": "immer.qwen3.8-prefix-sinkhorn-spec/v1",
+            "stage": "streaming_prefix_log.routed-before-native-blend",
+        }
+    )
+
+
+def _capture_bank(
+    ooe_root: Path,
+    *,
+    create: bool,
+) -> QwenPrefixSinkhornCaptureBank | None:
+    if not create:
+        try:
+            root_metadata = ooe_root.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise O1CartographyCliError(
+                "cannot inspect Prefix-Sinkhorn capture root"
+            ) from exc
+        if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(
+            root_metadata.st_mode
+        ):
+            raise O1CartographyCliError(
+                "Prefix-Sinkhorn capture root must be a non-symlink directory"
+            )
+    managed = _plain_root(ooe_root, create=create)
+    path = _contained(managed, OPERATOR_TRANSPORT_NAME)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        if not create:
+            return None
+    except OSError as exc:
+        raise O1CartographyCliError(
+            "cannot inspect Prefix-Sinkhorn capture bank"
+        ) from exc
+    else:
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise O1CartographyCliError(
+                "Prefix-Sinkhorn capture bank must be a non-symlink directory"
+            )
+    try:
+        return QwenPrefixSinkhornCaptureBank(path)
+    except (OperatorTransportError, OSError, ValueError) as exc:
+        raise O1CartographyCliError(
+            "cannot open Prefix-Sinkhorn capture bank"
+        ) from exc
+
+
+def _atlas_contains_revision(atlas: Any, revision: GraphRevision) -> bool:
+    contains = getattr(atlas, "contains_revision", None)
+    if callable(contains):
+        return bool(contains(revision))
+    history = getattr(atlas, "revision_history", None)
+    if callable(history):
+        return revision in tuple(history())
+    return revision == atlas.revision()
+
+
+def _verify_capture_receipt(
+    receipt: QwenPrefixSinkhornCaptureReceipt,
+    *,
+    measurement: MeasurementReceipt,
+    spec: ProbeSpec,
+    model_pin: ModelPin,
+    atlas: Any,
+    expected_receipt_sha256: str | None = None,
+) -> None:
+    capture = spec.prefix_sinkhorn_operator_capture
+    capture_spec_sha256 = _capture_spec_sha256(spec)
+    if capture is None or capture_spec_sha256 is None:
+        raise O1CartographyCliError("unexpected Prefix-Sinkhorn capture receipt")
+    current = atlas.revision()
+    if not isinstance(current, GraphRevision):
+        raise O1CartographyCliError("Atlas returned an invalid capture head")
+    try:
+        receipt.verify_against_measurement(
+            measurement,
+            atlas_revision=receipt.atlas_revision,
+        )
+    except (OperatorTransportError, TypeError, ValueError) as exc:
+        raise O1CartographyCliError(
+            "Prefix-Sinkhorn sidecar differs from its reusable measurement"
+        ) from exc
+    dimension = min(len(spec.prompt_token_ids), capture.max_positions)
+    if (
+        receipt.capture_spec_sha256 != capture_spec_sha256
+        or receipt.attention_spec_sha256 != _capture_attention_spec_sha256(spec)
+        or receipt.model_pin_sha256 != model_pin.sha256
+        or receipt.query_positions != tuple(range(dimension))
+        or receipt.key_positions != tuple(range(dimension))
+        or receipt.atlas_revision.sequence
+        <= measurement.atlas_head_revision.sequence
+        or receipt.atlas_revision.sequence > current.sequence
+        or not _atlas_contains_revision(atlas, measurement.atlas_head_revision)
+        or not _atlas_contains_revision(atlas, receipt.atlas_revision)
+        or (
+            expected_receipt_sha256 is not None
+            and receipt.sha256
+            != _sha(expected_receipt_sha256, "capture receipt SHA-256")
+        )
+    ):
+        raise O1CartographyCliError(
+            "Prefix-Sinkhorn sidecar spec/model/revision authority changed"
+        )
+
+
+def _find_reusable_probe_proof(
+    atlas: Any,
+    spec: ProbeSpec,
+    model_pin: ModelPin,
+    capture_bank: QwenPrefixSinkhornCaptureBank | None,
+) -> tuple[Any | None, QwenPrefixSinkhornCaptureReceipt | None]:
+    capture_spec_sha256 = _capture_spec_sha256(spec)
+    if capture_spec_sha256 is None:
+        return _find_reusable_measurement(atlas, spec, model_pin), None
+    if capture_bank is None:
+        return None, None
+    result = atlas.query_by_prompt_signature(spec.probe_identity.prompt_signature)
+    matches = {
+        measurement.sha256: measurement
+        for measurement in result.measurements
+        if _measurement_matches_spec(measurement, spec, model_pin)
+    }
+    complete: list[tuple[Any, QwenPrefixSinkhornCaptureReceipt]] = []
+    for measurement_sha256 in sorted(matches):
+        measurement = matches[measurement_sha256]
+        try:
+            receipt = capture_bank.restore(
+                measurement_sha256,
+                capture_spec_sha256,
+            )
+        except KeyError:
+            continue
+        except (OperatorTransportError, OSError, ValueError) as exc:
+            raise O1CartographyCliError(
+                "Prefix-Sinkhorn sidecar restore failed closed"
+            ) from exc
+        if not isinstance(measurement, MeasurementReceipt):
+            raise O1CartographyCliError(
+                "Prefix-Sinkhorn reuse requires an exact MeasurementReceipt"
+            )
+        _verify_capture_receipt(
+            receipt,
+            measurement=measurement,
+            spec=spec,
+            model_pin=model_pin,
+            atlas=atlas,
+        )
+        complete.append((measurement, receipt))
+    if len(complete) > 1:
+        raise O1CartographyCliError(
+            "Atlas contains ambiguous complete Prefix-Sinkhorn probe proofs"
+        )
+    return (None, None) if not complete else complete[0]
+
+
+def _operator_transport_status(
+    ooe_root: Path,
+    *,
+    scheduler: O1Cartographer | None,
+    specs: Mapping[str, ProbeSpec],
+) -> dict[str, Any] | None:
+    if not any(
+        spec.prefix_sinkhorn_operator_capture is not None for spec in specs.values()
+    ):
+        return None
+    persisted: set[str] = set()
+    for outcome in (() if scheduler is None else scheduler.outcomes):
+        if outcome.status != "succeeded":
+            continue
+        spec = specs[outcome.job_id]
+        if spec.prefix_sinkhorn_operator_capture is None:
+            continue
+        observation = outcome.observation_document()
+        if not isinstance(observation, Mapping):
+            raise O1CartographyCliError(
+                "captured successful outcome lost its observation"
+            )
+        persisted.add(
+            _sha(
+                observation.get("operator_capture_receipt_sha256"),
+                "persisted operator capture receipt SHA-256",
+            )
+        )
+    bank = _capture_bank(ooe_root, create=False)
+    if bank is None:
+        if persisted:
+            raise O1CartographyCliError(
+                "scheduler names an absent Prefix-Sinkhorn capture bank"
+            )
+        return {
+            "audit_clean": True,
+            "capture_receipt_sha256s": [],
+            "inventory_sha256": None,
+            "orphan_state_filenames": [],
+            "root": str(_contained(ooe_root, OPERATOR_TRANSPORT_NAME)),
+        }
+    try:
+        audit = bank.audit()
+    except (OperatorTransportError, OSError, ValueError) as exc:
+        raise O1CartographyCliError(
+            "Prefix-Sinkhorn capture status failed closed"
+        ) from exc
+    if not persisted <= set(audit.receipt_sha256s):
+        raise O1CartographyCliError(
+            "scheduler capture receipt is absent from the sidecar bank"
+        )
+    return {
+        "audit_clean": not audit.orphan_state_filenames,
+        "capture_receipt_sha256s": list(audit.receipt_sha256s),
+        "inventory_sha256": audit.inventory_sha256,
+        "orphan_state_filenames": list(audit.orphan_state_filenames),
+        "root": str(bank.root),
+    }
+
+
 def _observation(
     job: ProbeJob,
     spec: ProbeSpec,
     measurement: Any,
     *,
     reused: bool,
+    capture_receipt_sha256: str | None = None,
 ) -> dict[str, Any]:
     measurement_sha = _sha(measurement.sha256, "measurement SHA-256")
     coordinate_sha = _sha(measurement.coordinate.sha256, "coordinate SHA-256")
-    return {
+    record = {
         "atlas_receipt_sha256": _atlas_receipt_sha256(job, measurement_sha),
         "coordinate_sha256": coordinate_sha,
         "intervention": spec.intervention_mode,
@@ -1624,6 +1922,16 @@ def _observation(
         "prompt_sha256": spec.prompt_sha256,
         "reused_atlas_proof": reused,
     }
+    if spec.prefix_sinkhorn_operator_capture is not None:
+        if capture_receipt_sha256 is None:
+            raise O1CartographyCliError(
+                "captured observation lost its Prefix-Sinkhorn sidecar"
+            )
+        record["operator_capture_receipt_sha256"] = _sha(
+            capture_receipt_sha256,
+            "operator capture receipt SHA-256",
+        )
+    return record
 
 
 def _find_reusable_measurement(
@@ -1642,6 +1950,71 @@ def _find_reusable_measurement(
     return next(iter(by_sha.values()))
 
 
+def _publish_probe_capture(
+    bank: QwenPrefixSinkhornCaptureBank | None,
+    *,
+    atlas: Any,
+    result: Any,
+    primary: Any,
+    spec: ProbeSpec,
+    model_pin: ModelPin,
+) -> QwenPrefixSinkhornCaptureReceipt | None:
+    capture_spec_sha256 = _capture_spec_sha256(spec)
+    if capture_spec_sha256 is None:
+        return None
+    if bank is None or not isinstance(primary, MeasurementReceipt):
+        raise O1CartographyCliError(
+            "native Prefix-Sinkhorn capture requires its exact sidecar bank/measurement"
+        )
+    contextual = getattr(result, "contextual_prefix_sinkhorn_operators", None)
+    operators = getattr(contextual, "operators", None)
+    if (
+        contextual is None
+        or type(operators) is not np.ndarray
+        or operators.dtype != np.dtype(np.float64)
+        or operators.ndim != 4
+        or operators.shape[0] != 1
+        or tuple(getattr(contextual, "selected_query_heads", ()))
+        != (2, 8, 14, 20)
+        or getattr(contextual, "attention_spec_sha256", None)
+        != _capture_attention_spec_sha256(spec)
+    ):
+        raise O1CartographyCliError(
+            "native probe result has no exact raw Prefix-Sinkhorn operators"
+        )
+    verifier = getattr(contextual, "verify", None)
+    if not callable(verifier):
+        raise O1CartographyCliError("raw Prefix-Sinkhorn operators are unverifiable")
+    verifier()
+    revision = atlas.revision()
+    if not isinstance(revision, GraphRevision):
+        raise O1CartographyCliError("Atlas returned an invalid post-append revision")
+    try:
+        receipt = QwenPrefixSinkhornCaptureReceipt.create(
+            primary,
+            atlas_revision=revision,
+            capture_spec_sha256=capture_spec_sha256,
+            attention_spec_sha256=contextual.attention_spec_sha256,
+            operators=tuple(operators[0]),
+            head_indices=contextual.selected_query_heads,
+            layer=contextual.layer,
+        )
+        _verify_capture_receipt(
+            receipt,
+            measurement=primary,
+            spec=spec,
+            model_pin=model_pin,
+            atlas=atlas,
+        )
+        return bank.publish(receipt)
+    except O1CartographyCliError:
+        raise
+    except (OperatorTransportError, TypeError, ValueError, OSError) as exc:
+        raise O1CartographyCliError(
+            "Prefix-Sinkhorn capture publication failed closed"
+        ) from exc
+
+
 def _append_probe_result(
     atlas: Any,
     result: Any,
@@ -1649,6 +2022,7 @@ def _append_probe_result(
     job: ProbeJob,
     spec: ProbeSpec,
     model_pin: ModelPin,
+    capture_bank: QwenPrefixSinkhornCaptureBank | None = None,
 ) -> tuple[dict[str, Any], int]:
     if hasattr(result, "verify"):
         result.verify()
@@ -1669,6 +2043,14 @@ def _append_probe_result(
     ]
     if len(primary_receipts) != 1:
         raise O1CartographyCliError("atlas did not return the primary append receipt")
+    capture_receipt = _publish_probe_capture(
+        capture_bank,
+        atlas=atlas,
+        result=result,
+        primary=primary,
+        spec=spec,
+        model_pin=model_pin,
+    )
     source_bytes = 0
     for name in ("access_trace", "control_access_trace"):
         trace = getattr(result, name, None)
@@ -1679,7 +2061,18 @@ def _append_probe_result(
                     "probe access trace has an invalid source-byte count"
                 )
             source_bytes += value
-    return _observation(job, spec, primary, reused=False), source_bytes
+    return (
+        _observation(
+            job,
+            spec,
+            primary,
+            reused=False,
+            capture_receipt_sha256=(
+                None if capture_receipt is None else capture_receipt.sha256
+            ),
+        ),
+        source_bytes,
+    )
 
 
 def _admit_harvested_algebras(
@@ -1901,6 +2294,7 @@ def _reconcile_receipts(
     atlas: Any,
     specs: Mapping[str, ProbeSpec],
     model_pin: ModelPin,
+    capture_bank: QwenPrefixSinkhornCaptureBank | None = None,
 ) -> int:
     attached = 0
     for outcome in scheduler.outcomes:
@@ -1914,10 +2308,40 @@ def _reconcile_receipts(
             "persisted atlas receipt SHA-256",
         )
         spec = specs[outcome.job_id]
-        reusable = _find_reusable_measurement(atlas, spec, model_pin)
-        if reusable is None or reusable.sha256 != receipt:
+        query = atlas.query_by_prompt_signature(spec.probe_identity.prompt_signature)
+        matches = tuple(
+            measurement
+            for measurement in query.measurements
+            if measurement.sha256 == receipt
+            and _measurement_matches_spec(measurement, spec, model_pin)
+        )
+        if len(matches) != 1:
             raise O1CartographyCliError(
                 "unpromoted successful outcome has no authentic atlas record"
+            )
+        if spec.prefix_sinkhorn_operator_capture is not None:
+            if capture_bank is None or not isinstance(matches[0], MeasurementReceipt):
+                raise O1CartographyCliError(
+                    "captured outcome has no exact sidecar authority"
+                )
+            try:
+                capture_receipt = capture_bank.restore(
+                    receipt,
+                    _capture_spec_sha256(spec),
+                )
+            except (KeyError, OperatorTransportError, OSError, ValueError) as exc:
+                raise O1CartographyCliError(
+                    "captured outcome sidecar cannot be reconciled"
+                ) from exc
+            _verify_capture_receipt(
+                capture_receipt,
+                measurement=matches[0],
+                spec=spec,
+                model_pin=model_pin,
+                atlas=atlas,
+                expected_receipt_sha256=observation.get(
+                    "operator_capture_receipt_sha256"
+                ),
             )
         scheduler.attach_atlas_receipt(
             job_id=outcome.job_id,
@@ -2306,6 +2730,7 @@ def _active_outcome_measurement(
     atlas: Any,
     spec: ProbeSpec,
     model_pin: ModelPin,
+    capture_bank: QwenPrefixSinkhornCaptureBank | None = None,
 ) -> Any:
     observation = outcome.observation_document()
     if observation is None:
@@ -2316,10 +2741,41 @@ def _active_outcome_measurement(
     )
     if observation.get("atlas_receipt_sha256") != receipt_sha256:
         raise O1CartographyCliError("attached outcome and observation receipts differ")
-    measurement = _find_reusable_measurement(atlas, spec, model_pin)
-    if measurement is None or measurement.sha256 != receipt_sha256:
+    result = atlas.query_by_prompt_signature(spec.probe_identity.prompt_signature)
+    matches = tuple(
+        measurement
+        for measurement in result.measurements
+        if measurement.sha256 == receipt_sha256
+        and _measurement_matches_spec(measurement, spec, model_pin)
+    )
+    if len(matches) != 1:
         raise O1CartographyCliError(
             "attached outcome has no exact active Atlas measurement"
+        )
+    measurement = matches[0]
+    if spec.prefix_sinkhorn_operator_capture is not None:
+        if capture_bank is None or not isinstance(measurement, MeasurementReceipt):
+            raise O1CartographyCliError(
+                "attached captured outcome has no exact sidecar bank"
+            )
+        try:
+            capture_receipt = capture_bank.restore(
+                receipt_sha256,
+                _capture_spec_sha256(spec),
+            )
+        except (KeyError, OperatorTransportError, OSError, ValueError) as exc:
+            raise O1CartographyCliError(
+                "attached captured outcome lost its sidecar"
+            ) from exc
+        _verify_capture_receipt(
+            capture_receipt,
+            measurement=measurement,
+            spec=spec,
+            model_pin=model_pin,
+            atlas=atlas,
+            expected_receipt_sha256=observation.get(
+                "operator_capture_receipt_sha256"
+            ),
         )
     return measurement
 
@@ -2335,6 +2791,7 @@ def _integrate_ooe_outcomes(
     outcomes: Sequence[Any] | None = None,
     session: _OoeCartographyRuntime | None = None,
     source_actions: Mapping[str, tuple[str, str]] | None = None,
+    capture_bank: QwenPrefixSinkhornCaptureBank | None = None,
 ) -> tuple[_OoeCartographyRuntime | None, list[dict[str, Any]]]:
     sources = (
         _source_actions(scheduler, specs) if source_actions is None else source_actions
@@ -2349,6 +2806,7 @@ def _integrate_ooe_outcomes(
             atlas=atlas,
             spec=specs[outcome.job_id],
             model_pin=model_pin,
+            capture_bank=capture_bank,
         )
         # Injected legacy/fake atlases remain supported.  The production path
         # starts only from the actual immutable MeasurementReceipt contract.
@@ -2573,8 +3031,21 @@ def run_cartography(
             assert atlas is not None
             model_pin = ModelPin.from_document(body["model_pin"])
             specs = {job.job_id: spec for job, spec in _manifest_jobs(body)}
+            capture_enabled = any(
+                spec.prefix_sinkhorn_operator_capture is not None
+                for spec in specs.values()
+            )
+            capture_bank = (
+                _capture_bank(ooe_path, create=True) if capture_enabled else None
+            )
             probe = probe_factory(runtime.model)
-            reconciled = _reconcile_receipts(scheduler, atlas, specs, model_pin)
+            reconciled = _reconcile_receipts(
+                scheduler,
+                atlas,
+                specs,
+                model_pin,
+                capture_bank=capture_bank,
+            )
             ooe_session, learning_receipts = _integrate_ooe_outcomes(
                 root=ooe_path,
                 scheduler=scheduler,
@@ -2582,6 +3053,7 @@ def run_cartography(
                 specs=specs,
                 model_pin=model_pin,
                 cartography_manifest_sha256=manifest["sha256"],
+                capture_bank=capture_bank,
             )
             stream_actions = {
                 specs[outcome.job_id].prompt_sha256: "probe_coordinate"
@@ -2603,10 +3075,25 @@ def run_cartography(
                 def execute(job: ProbeJob, _attempt: int):
                     nonlocal qwen_probe_calls, reused_atlas_proofs
                     spec = specs[job.job_id]
-                    reusable = _find_reusable_measurement(atlas, spec, model_pin)
+                    reusable, reusable_capture = _find_reusable_probe_proof(
+                        atlas,
+                        spec,
+                        model_pin,
+                        capture_bank,
+                    )
                     if reusable is not None:
                         reused_atlas_proofs += 1
-                        return _observation(job, spec, reusable, reused=True)
+                        return _observation(
+                            job,
+                            spec,
+                            reusable,
+                            reused=True,
+                            capture_receipt_sha256=(
+                                None
+                                if reusable_capture is None
+                                else reusable_capture.sha256
+                            ),
+                        )
                     qwen_probe_calls += 1
                     before = time.monotonic()
                     result = probe.execute(spec, atlas_head_revision=atlas.revision())
@@ -2616,6 +3103,7 @@ def run_cartography(
                         job=job,
                         spec=spec,
                         model_pin=model_pin,
+                        capture_bank=capture_bank,
                     )
                     harvested = _harvest_probe_context(
                         ooe_path,
@@ -2668,6 +3156,7 @@ def run_cartography(
                         cartography_manifest_sha256=manifest["sha256"],
                         outcomes=(attached,),
                         session=ooe_session,
+                        capture_bank=capture_bank,
                         source_actions={
                             attached.attempt_id: (
                                 source_action,
@@ -2754,6 +3243,17 @@ def run_cartography(
                 "receipts_reconciled": reconciled,
                 "stop_reason": stop_reason,
             }
+            if capture_bank is not None:
+                transport_status = _operator_transport_status(
+                    ooe_path,
+                    scheduler=scheduler,
+                    specs=specs,
+                )
+                if transport_status is None:
+                    raise O1CartographyCliError(
+                        "capture bank exists without an enabled capture spec"
+                    )
+                report["operator_transport"] = transport_status
             return report
         finally:
             runtime.close()
@@ -2780,6 +3280,7 @@ def _empty_coverage(total_jobs: int) -> dict[str, Any]:
 def status_cartography(
     root: str | os.PathLike[str],
     *,
+    ooe_root: str | os.PathLike[str] | None = None,
     runtime_factory: RuntimeFactory | None = None,
     atlas_factory: AtlasFactory = SemanticWeightAtlas,
     stream_factory: Callable[..., Any] | None = None,
@@ -2796,6 +3297,12 @@ def status_cartography(
             _empty_coverage(len(_manifest_jobs(body)))
             if scheduler is None
             else scheduler.coverage().to_document()
+        )
+        specs = {job.job_id: spec for job, spec in _manifest_jobs(body)}
+        transport_status = _operator_transport_status(
+            _ooe_root_path(root_path, ooe_root),
+            scheduler=scheduler,
+            specs=specs,
         )
         atlas_path = _atlas_path(root_path, create=False)
         atlas_document = None
@@ -2815,7 +3322,7 @@ def status_cartography(
                 atlas_revision = atlas.revision().to_document()
             finally:
                 runtime.close()
-        return {
+        report = {
             "atlas": atlas_document,
             "atlas_revision": atlas_revision,
             "atlas_receipt_sha256s": sorted(
@@ -2827,6 +3334,9 @@ def status_cartography(
             "frontier": frontier_status,
             "manifest_sha256": manifest["sha256"],
         }
+        if transport_status is not None:
+            report["operator_transport"] = transport_status
+        return report
 
 
 def frontier_status(
@@ -3428,6 +3938,21 @@ def _parser() -> argparse.ArgumentParser:
     extend.add_argument("--native-alpha", type=float, default=0.01)
     extend.add_argument("--native-balance-alpha", type=float, default=1.0)
     extend.add_argument("--native-diagonal-debit", type=float, default=3.0)
+    extend.add_argument(
+        "--capture-prefix-sinkhorn-operators",
+        action="store_true",
+        help="persist bounded native layer-27 Prefix-Sinkhorn matrices",
+    )
+    extend.add_argument(
+        "--prefix-sinkhorn-max-positions",
+        type=_nonnegative_int_arg,
+        default=32,
+    )
+    extend.add_argument(
+        "--prefix-sinkhorn-max-bytes",
+        type=_nonnegative_int_arg,
+        default=1024**2,
+    )
 
     run = commands.add_parser("run", help="run a bounded resumable probe slice")
     run.add_argument("--root", required=True)
@@ -3457,6 +3982,7 @@ def _parser() -> argparse.ArgumentParser:
 
     status = commands.add_parser("status", help="authenticate and print coverage")
     status.add_argument("--root", required=True)
+    status.add_argument("--ooe-root")
 
     frontier = commands.add_parser(
         "frontier-status",
@@ -3528,6 +4054,14 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 native_alpha=args.native_alpha,
                 native_balance_alpha=args.native_balance_alpha,
                 native_diagonal_debit=args.native_diagonal_debit,
+                prefix_sinkhorn_operator_capture=(
+                    PrefixSinkhornOperatorCapture(
+                        max_positions=args.prefix_sinkhorn_max_positions,
+                        max_bytes=args.prefix_sinkhorn_max_bytes,
+                    )
+                    if args.capture_prefix_sinkhorn_operators
+                    else None
+                ),
                 layer_types=_grid_layer_types(args.root),
             )
         elif args.inherit_jobs:
@@ -3551,7 +4085,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
             ooe_root=args.ooe_root,
         )
     if args.command == "status":
-        return status_cartography(args.root)
+        return status_cartography(args.root, ooe_root=args.ooe_root)
     if args.command == "frontier-status":
         return frontier_status(args.root)
     if args.command == "query":

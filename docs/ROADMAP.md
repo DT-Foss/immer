@@ -154,14 +154,18 @@ around every domain that supports it.
 - [x] Add receipt-bound causal Prefix-Sinkhorn operator transport across exact
   ModelPins and graph revisions, with rank, identification-gap,
   singular/ill-conditioned, temporal-leakage, and rebound-evidence rejection.
-- [ ] Capture the pre-native-blend routed per-head matrices in O1 and run the
-  transport diagnostic on the local Qwen checkpoint.
+- [x] Implement bounded pre-native-blend Prefix-Sinkhorn capture, atomic
+  measurement sidecars, O1 reuse/crash repair, and truthful orphan audits.
+- [ ] Execute the first multi-prompt operator sidecar wave on local Qwen and run
+  the transport diagnostic on its strict held-out groups.
 - [x] Build the exact joint `gate_proj/up_proj` quantized subspace collision
   evaluator with train-only basis/scale and zero-wrong promotion.
-- [ ] Extend O1's contextual Harvester receipt with exact RMSNormed MLP input,
-  gate/up projections, per-row output identity, and projection verifier; then
-  run the collision sweep on local Qwen against separate-projection and
-  shuffled-subspace controls.
+- [x] Add the crash-safe exact MLP binary evidence bank, projection-verifier
+  protocol, `25/10/5` capture manifest, resume logic, and production-corpus
+  gate.
+- [ ] Mount the real `ExactMlpCaptureRunner`, execute the 40 local-Qwen groups,
+  and run the collision sweep against separate-projection and shuffled-subspace
+  controls.
 - [ ] Apply topology-aware Warmth only as a downward charging brake and measure
   redundant-charge suppression without changing authenticated demand.
 - [x] Export the first eight live O1/Atlas controller promotions into an exact

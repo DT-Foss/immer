@@ -32,7 +32,9 @@ from immer.runtimes.ooe.operator_harvester import (
 from immer.runtimes.ooe.compute_crystals import ComputeCrystalBank
 from immer.runtimes.ooe.compute_graph import ComputeOperatorGraph
 from immer.runtimes.qwen3_8.cartography_probe import (
+    ContextualPrefixSinkhornOperators,
     HiddenSketchProjection,
+    PrefixSinkhornOperatorCapture,
     ProbeCoordinateSpec,
     ProbeResourceBudget,
     ProbeSpec,
@@ -201,7 +203,15 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
 
     def test_passive_sweep_is_deterministic_and_never_commits(self) -> None:
         before = _committed_state(self.model)
-        first = self._execute(self._spec())
+        disabled_spec = self._spec()
+        self.assertNotIn(
+            "prefix_sinkhorn_operator_capture", disabled_spec.as_record()
+        )
+        first = self._execute(disabled_spec)
+        self.assertIsNone(first.contextual_prefix_sinkhorn_operators)
+        self.assertNotIn(
+            "prefix_sinkhorn_operators", first.evidence_document["body"]
+        )
         plans = tuple(
             self.mount.resolve_tensor_plan(str(row["name"]))
             for row in self.mount.source.inventory().get("tensors", ())
@@ -460,6 +470,79 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
                 label_evidence_sha256=_LABEL_EVIDENCE_SHA256,
             )
 
+    def test_prefix_sinkhorn_capture_spec_is_native_layer27_only(self) -> None:
+        capture = PrefixSinkhornOperatorCapture(max_positions=8, max_bytes=4096)
+        base = self._spec(hidden_sketch=None)
+        for mode in ("passive", "off", "placebo"):
+            with self.assertRaisesRegex(
+                Qwen38CartographyProbeError, "requires native mode"
+            ):
+                replace(
+                    base,
+                    intervention_mode=mode,
+                    prefix_sinkhorn_operator_capture=capture,
+                )
+        with self.assertRaisesRegex(
+            Qwen38CartographyProbeError, "cover native layer 27"
+        ):
+            replace(
+                base,
+                intervention_mode="native",
+                native_head_crsa=Qwen38NativeHeadCrsa(alpha=0.01),
+                prefix_sinkhorn_operator_capture=capture,
+            )
+        with self.assertRaisesRegex(
+            Qwen38CartographyProbeError, "coordinate must bind layer-27"
+        ):
+            replace(
+                base,
+                start_layer=0,
+                stop_layer=28,
+                intervention_mode="native",
+                native_head_crsa=Qwen38NativeHeadCrsa(alpha=0.01),
+                prefix_sinkhorn_operator_capture=capture,
+            )
+        with self.assertRaisesRegex(Qwen38CartographyProbeError, r"\[3, 32\]"):
+            PrefixSinkhornOperatorCapture(max_positions=33)
+
+        long_tokens = tuple((index % 13) + 1 for index in range(4096))
+        retained_bytes = 1 * 4 * 32 * 32 * 8
+        tokenwise_bytes = 4 * (32 * 33 // 2) * 8
+        long_spec = ProbeSpec(
+            prompt_token_ids=long_tokens,
+            prompt_sha256=prompt_token_sha256(long_tokens),
+            start_layer=27,
+            stop_layer=28,
+            coordinate=ProbeCoordinateSpec(
+                layer=27,
+                module="model.language_model.layers.27.self_attn",
+                tensor="model.language_model.layers.27.self_attn.q_proj.weight",
+            ),
+            intervention_mode="native",
+            code_revision=_CODE_REVISION,
+            native_head_crsa=Qwen38NativeHeadCrsa(alpha=0.01),
+            prefix_sinkhorn_operator_capture=PrefixSinkhornOperatorCapture(
+                max_positions=32,
+                max_bytes=retained_bytes + tokenwise_bytes,
+            ),
+        )
+        preflight = cartography_module._prefix_sinkhorn_operator_preflight(
+            long_spec
+        )
+        self.assertEqual(
+            preflight,
+            {
+                "captured_arms": 1,
+                "layer": 27,
+                "max_bytes": retained_bytes + tokenwise_bytes,
+                "max_positions": 32,
+                "planned_bytes": retained_bytes + tokenwise_bytes,
+                "planned_positions": 32,
+                "retained_array_bytes": retained_bytes,
+                "tokenwise_observer_bytes": tokenwise_bytes,
+            },
+        )
+
     def test_paired_placebo_has_exactly_zero_effect(self) -> None:
         result = self._execute(
             self._spec(intervention_mode="placebo", hidden_sketch=None)
@@ -637,6 +720,10 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
                 semantic_label=_SEMANTIC_LABEL,
                 label_evidence_sha256=_LABEL_EVIDENCE_SHA256,
                 native_head_crsa=Qwen38NativeHeadCrsa(alpha=0.01),
+                prefix_sinkhorn_operator_capture=PrefixSinkhornOperatorCapture(
+                    max_positions=8,
+                    max_bytes=1024**2,
+                ),
             )
             try:
                 result = Qwen38CartographyProbe(model).execute(
@@ -678,6 +765,57 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
                 self.assertFalse(
                     result.evidence_document["body"]["crsa_evidence"][0]["identity"]
                 )
+                operators = result.contextual_prefix_sinkhorn_operators
+                self.assertIsInstance(
+                    operators, ContextualPrefixSinkhornOperators
+                )
+                if operators is None:
+                    self.fail("native capture returned no Prefix-Sinkhorn operators")
+                self.assertEqual(operators.layer, 27)
+                self.assertEqual(operators.query_positions, (0, 1, 2))
+                self.assertEqual(operators.key_positions, (0, 1, 2))
+                self.assertEqual(
+                    operators.selected_query_heads, (2, 8, 14, 20)
+                )
+                self.assertEqual(operators.operators.shape, (1, 4, 3, 3))
+                self.assertEqual(operators.operators.dtype, np.dtype(np.float64))
+                self.assertFalse(operators.operators.flags.writeable)
+                np.testing.assert_allclose(
+                    operators.operators.sum(axis=-1),
+                    np.ones((1, 4, 3), dtype=np.float64),
+                    rtol=0.0,
+                    atol=2.0**-7,
+                )
+                operator_evidence = result.evidence_document["body"][
+                    "prefix_sinkhorn_operators"
+                ]
+                self.assertEqual(operator_evidence, operators.evidence_record())
+                self.assertNotIn("operators", operator_evidence)
+                self.assertNotIn("data_base64", operator_evidence)
+                self.assertNotIn(
+                    "prefix_sinkhorn_operators",
+                    result.control_evidence_document["body"],
+                )
+                resource_capture = result.evidence_document["body"][
+                    "resource_preflight"
+                ]["prefix_sinkhorn_operator_capture"]
+                self.assertEqual(
+                    resource_capture["retained_array_bytes"],
+                    operators.operators.nbytes,
+                )
+                result.verify()
+                with self.assertRaisesRegex(ValueError, "absolute positions"):
+                    replace(operators, query_positions=(0, 1, 3))
+                with self.assertRaisesRegex(ValueError, "wrong native heads"):
+                    replace(
+                        operators,
+                        selected_query_heads=(1, 8, 14, 20),
+                    )
+                with self.assertRaisesRegex(
+                    Qwen38CartographyIntegrityError,
+                    "raw Prefix-Sinkhorn operator hash changed",
+                ):
+                    replace(operators, raw_sha256="0" * 64)
                 atlas = SemanticWeightAtlas(
                     atlas_graph,
                     model_pin=result.measurement.model_pin,
@@ -692,6 +830,48 @@ class Qwen38CartographyProbeTests(unittest.TestCase):
                 self.assertEqual(appended, (True, True))
                 labeled = atlas.query_by_semantic_label(_SEMANTIC_LABEL)
                 self.assertEqual(labeled.measurements, (result.measurement,))
+
+                too_small = replace(
+                    spec,
+                    prefix_sinkhorn_operator_capture=(
+                        PrefixSinkhornOperatorCapture(
+                            max_positions=8,
+                            max_bytes=1,
+                        )
+                    ),
+                )
+                with mock.patch.object(
+                    model,
+                    "checkpoint_preflight",
+                    wraps=model.checkpoint_preflight,
+                ) as checkpoint_preflight:
+                    with self.assertRaisesRegex(
+                        Qwen38CartographyBudgetError,
+                        "max_bytes before weight reads",
+                    ):
+                        Qwen38CartographyProbe(model).execute(
+                            too_small,
+                            atlas_head_revision=atlas.revision(),
+                        )
+                checkpoint_preflight.assert_not_called()
+
+                missing_raw = replace(
+                    result,
+                    contextual_prefix_sinkhorn_operators=None,
+                )
+                with self.assertRaisesRegex(
+                    Qwen38CartographyIntegrityError,
+                    "spec, metadata, and raw operators are not atomic",
+                ):
+                    missing_raw.verify()
+
+                operators.operators.flags.writeable = True
+                operators.operators[0, 0, 0, 0] += 0.125
+                with self.assertRaisesRegex(
+                    Qwen38CartographyIntegrityError,
+                    "raw Prefix-Sinkhorn operator hash changed",
+                ):
+                    result.verify()
             finally:
                 pager.close()
 

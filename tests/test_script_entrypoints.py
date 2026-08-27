@@ -24,6 +24,7 @@ SCRIPTS = (
     "qwen38_fertig_arm_compare.py",
     "qwen38_ooe_cold_warm_cohort.py",
     "qwen38_ooe_chat_cohort.py",
+    "qwen38_o1_mlp_evidence.py",
     "ooe_intelligence_benchmark.py",
     "ooe_boundary_blanket.py",
     "ooe_demand_blanket_benchmark.py",

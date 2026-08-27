@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
+import json
 import math
-from typing import Any, ClassVar
+from typing import Any, Callable, ClassVar
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -26,6 +29,22 @@ NATIVE_HEAD_CRSA_FREE_HEADS = tuple(
 # sum of real 109-token Qwen attention while still rejecting percent-scale
 # receipt drift.
 NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE = 2.0**-7
+MAX_NATIVE_PREFIX_SINKHORN_OPERATOR_POSITIONS = 32
+NATIVE_PREFIX_SINKHORN_OPERATOR_SCHEMA = (
+    "immer.qwen3.8-native-prefix-sinkhorn-operator/v1"
+)
+
+
+def _operator_digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _real(value: object, name: str, *, maximum: float | None = None) -> float:
@@ -61,6 +80,151 @@ def _outside_support_max_abs(value: Tensor, support: Tensor) -> float:
         if outside.numel():
             maximum = max(maximum, float(outside.abs().max()))
     return maximum
+
+
+@dataclass(frozen=True, slots=True)
+class NativePrefixSinkhornOperatorBlock:
+    """One detached, bounded pre-blend Prefix-Sinkhorn query row."""
+
+    schema: str
+    layer: int
+    query_positions: tuple[int, ...]
+    key_positions: tuple[int, ...]
+    selected_query_heads: tuple[int, ...]
+    attention_spec_sha256: str
+    operators: np.ndarray
+
+    def __post_init__(self) -> None:
+        if self.schema != NATIVE_PREFIX_SINKHORN_OPERATOR_SCHEMA:
+            raise ValueError("native Prefix-Sinkhorn operator schema is invalid")
+        if self.layer != NATIVE_HEAD_CRSA_LAYER:
+            raise ValueError("native Prefix-Sinkhorn operators require layer 27")
+        queries = tuple(self.query_positions)
+        keys = tuple(self.key_positions)
+        if (
+            len(queries) != 1
+            or not 0 <= queries[0] < MAX_NATIVE_PREFIX_SINKHORN_OPERATOR_POSITIONS
+            or keys != tuple(range(queries[0] + 1))
+        ):
+            raise ValueError("native Prefix-Sinkhorn positions are not one causal row")
+        if self.selected_query_heads != NATIVE_HEAD_CRSA_QUERY_HEADS:
+            raise ValueError("native Prefix-Sinkhorn selected heads changed")
+        if (
+            not isinstance(self.attention_spec_sha256, str)
+            or len(self.attention_spec_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.attention_spec_sha256
+            )
+        ):
+            raise ValueError("native Prefix-Sinkhorn attention spec hash is invalid")
+        value = self.operators
+        if type(value) is not np.ndarray or value.dtype != np.dtype(np.float64):
+            raise TypeError("native Prefix-Sinkhorn operator array is invalid")
+        if value.ndim != 4:
+            raise ValueError("native Prefix-Sinkhorn operator array is not rank four")
+        expected = (
+            value.shape[0],
+            len(NATIVE_HEAD_CRSA_QUERY_HEADS),
+            1,
+            len(keys),
+        )
+        if (
+            tuple(value.shape) != expected
+            or value.shape[0] < 1
+        ):
+            raise ValueError("native Prefix-Sinkhorn operator shape is invalid")
+        if value.flags.writeable:
+            raise ValueError("native Prefix-Sinkhorn operator block must be readonly")
+        if not np.isfinite(value).all() or float(value.min()) < 0.0:
+            raise ValueError("native Prefix-Sinkhorn operators are invalid probabilities")
+        if (
+            float(np.max(np.abs(value.sum(axis=-1) - 1.0)))
+            > NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE
+        ):
+            raise ValueError("native Prefix-Sinkhorn operator row mass changed")
+        object.__setattr__(self, "query_positions", queries)
+        object.__setattr__(self, "key_positions", keys)
+
+    @property
+    def sha256(self) -> str:
+        little = np.asarray(self.operators, dtype="<f8", order="C")
+        return _operator_digest(
+            {
+                "attention_spec_sha256": self.attention_spec_sha256,
+                "key_positions": list(self.key_positions),
+                "layer": self.layer,
+                "operator_sha256": hashlib.sha256(
+                    little.tobytes(order="C")
+                ).hexdigest(),
+                "operator_shape": list(self.operators.shape),
+                "query_positions": list(self.query_positions),
+                "schema": self.schema,
+                "selected_query_heads": list(self.selected_query_heads),
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class NativePrefixSinkhornOperatorObserver:
+    """Bound a passive callback before any routed tensor is copied."""
+
+    callback: Callable[[NativePrefixSinkhornOperatorBlock], None]
+    max_positions: int = MAX_NATIVE_PREFIX_SINKHORN_OPERATOR_POSITIONS
+
+    def __post_init__(self) -> None:
+        if not callable(self.callback):
+            raise TypeError("native Prefix-Sinkhorn operator callback must be callable")
+        if (
+            isinstance(self.max_positions, bool)
+            or not isinstance(self.max_positions, int)
+            or not 3
+            <= self.max_positions
+            <= MAX_NATIVE_PREFIX_SINKHORN_OPERATOR_POSITIONS
+        ):
+            raise ValueError(
+                "native Prefix-Sinkhorn max_positions must lie in [3, 32]"
+            )
+
+    def emit(
+        self,
+        routed: Tensor,
+        *,
+        layer: int,
+        query_start: int,
+        selected_query_heads: tuple[int, ...],
+        attention_spec_sha256: str,
+    ) -> None:
+        if routed.ndim != 4 or routed.shape[1] != len(selected_query_heads):
+            raise ValueError("routed Prefix-Sinkhorn tensor has the wrong shape")
+        query_length = int(routed.shape[2])
+        if int(routed.shape[3]) != query_start + query_length:
+            raise ValueError("routed Prefix-Sinkhorn key length lost absolute position")
+        stop = min(query_length, self.max_positions - query_start)
+        for offset in range(max(0, stop)):
+            absolute_query = query_start + offset
+            key_length = absolute_query + 1
+            array = np.array(
+                routed[:, :, offset : offset + 1, :key_length]
+                .detach()
+                .to(device="cpu", dtype=torch.float64)
+                .numpy(),
+                dtype=np.float64,
+                order="C",
+                copy=True,
+            )
+            array.setflags(write=False)
+            self.callback(
+                NativePrefixSinkhornOperatorBlock(
+                    schema=NATIVE_PREFIX_SINKHORN_OPERATOR_SCHEMA,
+                    layer=layer,
+                    query_positions=(absolute_query,),
+                    key_positions=tuple(range(key_length)),
+                    selected_query_heads=selected_query_heads,
+                    attention_spec_sha256=attention_spec_sha256,
+                    operators=array,
+                )
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,11 +394,19 @@ class Qwen38NativeHeadCrsa:
         allowed: Tensor,
         prior_log_usage: Tensor | None,
         tokenwise_usage: bool = False,
+        routed_operator_observer: NativePrefixSinkhornOperatorObserver
+        | None = None,
     ) -> tuple[Tensor, Tensor | None, NativeHeadCrsaEvidence]:
         """Return native probabilities, staged usage state, and strict evidence."""
 
         if not isinstance(tokenwise_usage, bool):
             raise TypeError("tokenwise_usage must be a boolean")
+        if routed_operator_observer is not None and not isinstance(
+            routed_operator_observer, NativePrefixSinkhornOperatorObserver
+        ):
+            raise TypeError(
+                "routed_operator_observer must be a bounded native observer or None"
+            )
 
         if not isinstance(logits, Tensor) or not logits.is_floating_point():
             raise TypeError("logits must be a floating-point torch tensor")
@@ -327,6 +499,7 @@ class Qwen38NativeHeadCrsa:
                     allowed=support[:, :, offset : offset + 1, :row_key_length],
                     prior_log_usage=usage,
                     tokenwise_usage=False,
+                    routed_operator_observer=routed_operator_observer,
                 )
                 if row_key_length < key_length:
                     row_probabilities = torch.nn.functional.pad(
@@ -413,6 +586,23 @@ class Qwen38NativeHeadCrsa:
         )
         mixed_selected = selected_base + self.alpha * (routed - selected_base)
         mixed_selected = mixed_selected.to(dtype=base_probabilities.dtype)
+        if (
+            routed_operator_observer is not None
+            and query_start < routed_operator_observer.max_positions
+        ):
+            routed_operator_observer.emit(
+                routed,
+                layer=self.layer,
+                query_start=query_start,
+                selected_query_heads=self.head_indices,
+                attention_spec_sha256=_operator_digest(
+                    {
+                        "schema": "immer.qwen3.8-prefix-sinkhorn-spec/v1",
+                        "attention_spec": asdict(self.spec),
+                        "stage": "streaming_prefix_log.routed-before-native-blend",
+                    }
+                ),
+            )
         probabilities = base_probabilities.clone()
         probabilities[:, self.head_indices] = mixed_selected
 
@@ -458,12 +648,16 @@ class Qwen38NativeHeadCrsa:
 
 
 __all__ = [
+    "MAX_NATIVE_PREFIX_SINKHORN_OPERATOR_POSITIONS",
     "NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA",
     "NATIVE_HEAD_CRSA_FREE_HEADS",
     "NATIVE_HEAD_CRSA_KV_HEADS",
     "NATIVE_HEAD_CRSA_LAYER",
     "NATIVE_HEAD_CRSA_QUERY_HEADS",
     "NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE",
+    "NATIVE_PREFIX_SINKHORN_OPERATOR_SCHEMA",
     "NativeHeadCrsaEvidence",
+    "NativePrefixSinkhornOperatorBlock",
+    "NativePrefixSinkhornOperatorObserver",
     "Qwen38NativeHeadCrsa",
 ]

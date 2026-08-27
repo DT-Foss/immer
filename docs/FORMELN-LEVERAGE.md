@@ -114,6 +114,24 @@ A dimension/quantizer pair can promote only when train, calibration, and
 holdout contain zero wrong-output collisions and at least one exact verified
 hit.
 
+O1 now captures the missing evidence without changing either formula:
+
+\[
+R_{h,q,:}=\operatorname{PrefixSinkhorn}(L)_{h,q,:}
+\quad\text{before native blend},
+\]
+
+and
+
+\[
+(h,\;W^{gate}h,\;W^{up}h,\;W^{down}
+(\operatorname{SiLU}(W^{gate}h)\odot W^{up}h)).
+\]
+
+Both are stored as measurement-bound binary sidecars. Atlas and O1 status carry
+only their receipt hashes; exact tensor bytes never become semantic labels or
+status payloads.
+
 The next formula-derived stack is:
 
 \[

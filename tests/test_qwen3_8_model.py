@@ -5,6 +5,7 @@ from pathlib import Path
 import unittest
 from unittest import mock
 
+import numpy as np
 import torch
 from safetensors.torch import save_file
 
@@ -1572,10 +1573,25 @@ class Qwen38ModelTests(unittest.TestCase):
     def test_greedy_generation_from_anchor_prefills_only_prompt_suffix(self) -> None:
         prefix = [[1, 4]]
         prompt = [[1, 4, 9]]
-        baseline, baseline_evidence = self.model.generate_greedy(
+        one_shot, one_shot_evidence = self.model.generate_greedy(
             prompt,
             max_new_tokens=1,
             head_block_rows=7,
+        )
+        self.model.reset_state(release=True)
+        # Exact state parity requires the same prefix/suffix execution graph;
+        # one-shot GEMM versus segmented GEMV is a separate numerical control.
+        self.model.prefill(prefix)
+        baseline, baseline_evidence = self.model.generate_greedy(
+            prompt,
+            max_new_tokens=1,
+            restored_prefix_length=len(prefix[0]),
+            head_block_rows=7,
+        )
+        self.assertEqual(baseline, one_shot)
+        self.assertEqual(
+            baseline_evidence.generated_token_ids,
+            one_shot_evidence.generated_token_ids,
         )
         baseline_states = _clone_layer_states(self.model._layer_states)
         baseline_snapshot_root = self.root / "suffix-baseline"
@@ -1904,6 +1920,158 @@ class Qwen38ModelTests(unittest.TestCase):
         finally:
             for pager in pagers:
                 pager.close()
+
+
+class Qwen38NativePrefixSinkhornOperatorObserverTests(unittest.TestCase):
+    @staticmethod
+    def _fixture():
+        from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
+        torch.manual_seed(20260827)
+        logits = torch.randn(1, 24, 4, 4, dtype=torch.float32)
+        allowed = torch.ones(4, 4, dtype=torch.bool).tril().reshape(1, 1, 4, 4)
+        base = torch.softmax(logits.masked_fill(~allowed, -torch.inf), -1)
+        base = base.masked_fill(~allowed, 0.0)
+        return Qwen38NativeHeadCrsa(alpha=0.1), logits, base, allowed
+
+    def test_preblend_rows_match_streaming_and_callback_cannot_change_math(
+        self,
+    ) -> None:
+        from immer.attention.crsa.operators import streaming_prefix_log
+        from immer.runtimes.qwen3_8.native_crsa import (
+            NativePrefixSinkhornOperatorObserver,
+        )
+
+        intervention, logits, base, allowed = self._fixture()
+        blocks = []
+        observer = NativePrefixSinkhornOperatorObserver(
+            blocks.append, max_positions=4
+        )
+        actual, actual_usage, actual_evidence = intervention.route(
+            logits,
+            base,
+            query_start=0,
+            allowed=allowed,
+            prior_log_usage=None,
+            tokenwise_usage=True,
+            routed_operator_observer=observer,
+        )
+        self.assertEqual(
+            [row.query_positions for row in blocks],
+            [(0,), (1,), (2,), (3,)],
+        )
+        self.assertEqual(
+            [row.key_positions for row in blocks],
+            [tuple(range(length)) for length in range(1, 5)],
+        )
+
+        usage = None
+        expected_selected_rows = []
+        for position in range(4):
+            routed, usage = streaming_prefix_log(
+                logits[
+                    :, intervention.head_indices, position : position + 1, : position + 1
+                ],
+                intervention.spec,
+                query_start=position,
+                prior_log_usage=usage,
+                allowed=allowed[:, :, position : position + 1, : position + 1],
+            )
+            expected_selected_rows.append(routed)
+            np.testing.assert_array_equal(
+                blocks[position].operators,
+                routed.detach().to(torch.float64).numpy(),
+            )
+            self.assertFalse(blocks[position].operators.flags.writeable)
+        assert usage is not None
+        self.assertTrue(torch.equal(actual_usage, usage))
+        expected_selected = torch.cat(
+            [
+                torch.nn.functional.pad(row, (0, 4 - row.shape[-1]))
+                for row in expected_selected_rows
+            ],
+            dim=2,
+        )
+        expected = base.clone()
+        selected_base = base[:, intervention.head_indices]
+        expected[:, intervention.head_indices] = selected_base + intervention.alpha * (
+            expected_selected - selected_base
+        )
+        self.assertTrue(torch.equal(actual, expected))
+
+        mutated_blocks = []
+
+        def mutate_detached(block):
+            block.operators.setflags(write=True)
+            block.operators.fill(0.0)
+            mutated_blocks.append(block)
+
+        mutated, mutated_usage, mutated_evidence = intervention.route(
+            logits,
+            base,
+            query_start=0,
+            allowed=allowed,
+            prior_log_usage=None,
+            tokenwise_usage=True,
+            routed_operator_observer=NativePrefixSinkhornOperatorObserver(
+                mutate_detached, max_positions=4
+            ),
+        )
+        self.assertEqual(len(mutated_blocks), 4)
+        self.assertTrue(torch.equal(mutated, actual))
+        self.assertTrue(torch.equal(mutated_usage, actual_usage))
+        self.assertEqual(mutated_evidence, actual_evidence)
+
+    def test_bound_disabled_path_and_alpha_zero_emit_nothing(self) -> None:
+        from immer.runtimes.qwen3_8.native_crsa import (
+            NativePrefixSinkhornOperatorObserver,
+            Qwen38NativeHeadCrsa,
+        )
+
+        intervention, logits, base, allowed = self._fixture()
+        baseline, usage, evidence = intervention.route(
+            logits,
+            base,
+            query_start=0,
+            allowed=allowed,
+            prior_log_usage=None,
+            tokenwise_usage=True,
+        )
+        bounded_rows = []
+        observed, observed_usage, observed_evidence = intervention.route(
+            logits,
+            base,
+            query_start=0,
+            allowed=allowed,
+            prior_log_usage=None,
+            tokenwise_usage=True,
+            routed_operator_observer=NativePrefixSinkhornOperatorObserver(
+                bounded_rows.append, max_positions=3
+            ),
+        )
+        self.assertEqual([row.query_positions for row in bounded_rows], [(0,), (1,), (2,)])
+        self.assertTrue(torch.equal(observed, baseline))
+        self.assertTrue(torch.equal(observed_usage, usage))
+        self.assertEqual(observed_evidence, evidence)
+
+        identity_rows = []
+        identity, identity_usage, identity_evidence = Qwen38NativeHeadCrsa(
+            alpha=0.0
+        ).route(
+            logits,
+            base,
+            query_start=0,
+            allowed=allowed,
+            prior_log_usage=None,
+            tokenwise_usage=True,
+            routed_operator_observer=NativePrefixSinkhornOperatorObserver(
+                identity_rows.append, max_positions=4
+            ),
+        )
+        self.assertIs(identity, base)
+        self.assertIsNone(identity_usage)
+        self.assertTrue(identity_evidence.identity)
+        self.assertEqual(identity_rows, [])
 
 
 class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):

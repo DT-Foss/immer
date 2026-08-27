@@ -4,6 +4,34 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-27
 
+### O1 exact measurement sidecars
+
+- Added an opt-in native observer for the exact
+  `streaming_prefix_log.routed` tensor before Head-CRSA blending. It preserves
+  absolute tokenwise query/key positions, copies at most 32 Prefix-Sinkhorn
+  rows into detached readonly CPU `float64`, emits nothing for `alpha=0`, and
+  adds no tensor operation or copy when disabled.
+- Added bounded Prefix-Sinkhorn capture to Qwen cartography and O1. Raw matrices
+  remain outside Atlas/status JSON; an atomic measurement-bound sidecar stores
+  them under `<ooe>/operator-transport`. Reuse requires the exact measurement,
+  capture spec, attention spec, ModelPin, and Atlas ancestry. Missing sidecars
+  rerun the probe, matching sidecars save it, and a crash after Atlas append is
+  repaired on retry. Run/status expose orphan state and derive `audit_clean`
+  from the bank audit.
+- Added the exact Qwen MLP evidence bank. BF16 tensors retain their original
+  bit patterns in content-addressed binary objects; receipts bind the ordered
+  `mlp.input → gate → up → output` stages, verifier evidence, append-only
+  history, CAS head, prepared intent, and commit marker. The canonical O1 plan
+  is `25/10/5` train/calibration/holdout groups. Fixture and `live-exact` modes
+  have distinct resume identities, and fixture data can never enter a
+  production `SubspaceCorpus`.
+- Corrected the suffix-anchor regression control exposed by Linux: exact state
+  parity is now measured against a cold prefix-then-suffix execution with the
+  same numerical boundary. One-shot prompt execution remains a separate token
+  control because GEMM/GEMV shape changes can differ by float32 ULPs. The test
+  still requires bit-exact layer state and snapshot parity on the valid
+  iso-boundary comparison.
+
 ### Exact Markov blankets
 
 - Added a categorical conditional-independence blanket with exhaustive bounded

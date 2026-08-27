@@ -31,7 +31,11 @@ from .kernels import (
     rms_norm,
     swiglu,
 )
-from .native_crsa import NativeHeadCrsaEvidence, Qwen38NativeHeadCrsa
+from .native_crsa import (
+    NativeHeadCrsaEvidence,
+    NativePrefixSinkhornOperatorObserver,
+    Qwen38NativeHeadCrsa,
+)
 from .pager import Qwen38WeightPager
 from .provenance import runtime_dependency_versions, runtime_source_manifest
 from .snapshot import (
@@ -209,6 +213,9 @@ class StreamedQwen38:
         native_head_crsa: Qwen38NativeHeadCrsa | None = None,
         native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None]
         | None = None,
+        native_prefix_sinkhorn_operator_observer: (
+            NativePrefixSinkhornOperatorObserver | None
+        ) = None,
         layer_boundary_observer: LayerBoundaryObserver | None = None,
         layer_boundary_stages: Sequence[str] | None = None,
         max_batch_size: int = 8,
@@ -274,6 +281,18 @@ class StreamedQwen38:
                 raise ValueError("native_head_crsa_observer requires native_head_crsa")
             if not callable(native_head_crsa_observer):
                 raise TypeError("native_head_crsa_observer must be callable or None")
+        if native_prefix_sinkhorn_operator_observer is not None:
+            if native_head_crsa is None:
+                raise ValueError(
+                    "native_prefix_sinkhorn_operator_observer requires native_head_crsa"
+                )
+            if not isinstance(
+                native_prefix_sinkhorn_operator_observer,
+                NativePrefixSinkhornOperatorObserver,
+            ):
+                raise TypeError(
+                    "native_prefix_sinkhorn_operator_observer must be bounded or None"
+                )
         if native_head_crsa is not None:
             layer = native_head_crsa.layer
             if layer >= config.n_layers or not config.is_full_attention(layer):
@@ -300,6 +319,9 @@ class StreamedQwen38:
         self.delta_probe = delta_probe
         self.native_head_crsa = native_head_crsa
         self.native_head_crsa_observer = native_head_crsa_observer
+        self.native_prefix_sinkhorn_operator_observer = (
+            native_prefix_sinkhorn_operator_observer
+        )
         self.layer_boundary_observer = layer_boundary_observer
         self.layer_boundary_stages = tuple(selected_boundary_stages)
         self.max_batch_size = max_batch_size
@@ -1167,6 +1189,11 @@ class StreamedQwen38:
                 native_head_crsa_observer=(
                     native_head_crsa_observer if native_head_crsa is not None else None
                 ),
+                native_prefix_sinkhorn_operator_observer=(
+                    self.native_prefix_sinkhorn_operator_observer
+                    if native_head_crsa is not None
+                    else None
+                ),
                 native_head_crsa_tokenwise_usage=native_head_crsa_tokenwise_usage,
                 rope_theta=self.config.rope_theta,
                 rotary_dim=self.config.rotary_dim,
@@ -1331,6 +1358,11 @@ class StreamedQwen38:
                     native_head_crsa=intervention,
                     native_head_crsa_observer=(
                         native_head_crsa_observer if intervention is not None else None
+                    ),
+                    native_prefix_sinkhorn_operator_observer=(
+                        self.native_prefix_sinkhorn_operator_observer
+                        if intervention is not None
+                        else None
                     ),
                     rope_theta=self.config.rope_theta,
                     rotary_dim=self.config.rotary_dim,

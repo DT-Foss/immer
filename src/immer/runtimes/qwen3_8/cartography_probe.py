@@ -31,6 +31,10 @@ from .kernels import AttentionState, DeltaNetProbe, DeltaNetState
 from .model import LAYER_BOUNDARY_STAGES, LayerState, StreamedQwen38
 from .native_crsa import (
     NATIVE_HEAD_CRSA_LAYER,
+    NATIVE_HEAD_CRSA_QUERY_HEADS,
+    NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE,
+    NativePrefixSinkhornOperatorBlock,
+    NativePrefixSinkhornOperatorObserver,
     Qwen38NativeHeadCrsa,
 )
 from .provenance import runtime_dependency_versions, runtime_source_manifest
@@ -57,6 +61,10 @@ _UNLABELED_FAMILY_SHA256 = hashlib.sha256(b"immer:unlabeled-family/v1").hexdiges
 _NO_LABEL_SOURCE_SHA256 = hashlib.sha256(b"immer:no-label-source/v1").hexdigest()
 _MAX_BUNDLE_MANIFEST_BYTES = 64 * 1024**2
 _MAX_RUNTIME_SOURCE_BYTES = 64 * 1024**2
+_MAX_PREFIX_SINKHORN_POSITIONS = 32
+_PREFIX_SINKHORN_OPERATOR_SCHEMA = (
+    "immer.qwen3.8-contextual-prefix-sinkhorn-operators/v1"
+)
 _CARTOGRAPHY_BOUNDARY_STAGES = frozenset(
     {
         "attention.input",
@@ -289,6 +297,26 @@ class HiddenSketchProjection:
 
 
 @dataclass(frozen=True, slots=True)
+class PrefixSinkhornOperatorCapture:
+    """Opt-in byte and position budget for native layer-27 operator rows."""
+
+    max_positions: int = _MAX_PREFIX_SINKHORN_POSITIONS
+    max_bytes: int = 1024**2
+
+    def __post_init__(self) -> None:
+        positions = _positive(self.max_positions, "max_positions")
+        if not 3 <= positions <= _MAX_PREFIX_SINKHORN_POSITIONS:
+            raise Qwen38CartographyProbeError(
+                "max_positions must lie in the exact Prefix-Sinkhorn range [3, 32]"
+            )
+        object.__setattr__(self, "max_positions", positions)
+        object.__setattr__(self, "max_bytes", _positive(self.max_bytes, "max_bytes"))
+
+    def as_record(self) -> dict[str, int]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
 class ProbeCoordinateSpec:
     """Requested semantic coordinate inside one causally bound tensor plan."""
 
@@ -370,6 +398,7 @@ class ProbeSpec:
     code_revision: str
     budget: ProbeResourceBudget = ProbeResourceBudget()
     hidden_sketch: HiddenSketchProjection | None = None
+    prefix_sinkhorn_operator_capture: PrefixSinkhornOperatorCapture | None = None
     question_sha256: str | None = None
     family_sha256: str = _UNLABELED_FAMILY_SHA256
     label_source_sha256: str = _NO_LABEL_SOURCE_SHA256
@@ -415,6 +444,31 @@ class ProbeSpec:
             self.hidden_sketch, HiddenSketchProjection
         ):
             raise TypeError("hidden_sketch must be a HiddenSketchProjection or None")
+        operator_capture = self.prefix_sinkhorn_operator_capture
+        if operator_capture is not None:
+            if not isinstance(operator_capture, PrefixSinkhornOperatorCapture):
+                raise TypeError(
+                    "prefix_sinkhorn_operator_capture must be a "
+                    "PrefixSinkhornOperatorCapture or None"
+                )
+            if mode != "native":
+                raise Qwen38CartographyProbeError(
+                    "Prefix-Sinkhorn operator capture requires native mode"
+                )
+            if not start <= NATIVE_HEAD_CRSA_LAYER < stop:
+                raise Qwen38CartographyProbeError(
+                    "Prefix-Sinkhorn operator capture must cover native layer 27"
+                )
+            if (
+                self.coordinate.layer != NATIVE_HEAD_CRSA_LAYER
+                or not self.coordinate.module.endswith(
+                    f".layers.{NATIVE_HEAD_CRSA_LAYER}.self_attn"
+                )
+            ):
+                raise Qwen38CartographyProbeError(
+                    "Prefix-Sinkhorn capture coordinate must bind layer-27 "
+                    "self-attention"
+                )
         question = (
             claimed_prompt
             if self.question_sha256 is None
@@ -487,7 +541,7 @@ class ProbeSpec:
         )
 
     def as_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "budget": self.budget.as_record(),
             "code_revision": self.code_revision,
             "coordinate": self.coordinate.as_record(),
@@ -508,6 +562,12 @@ class ProbeSpec:
             "start_layer": self.start_layer,
             "stop_layer": self.stop_layer,
         }
+        # Absence remains byte-identical to the pre-capture probe contract.
+        if self.prefix_sinkhorn_operator_capture is not None:
+            record["prefix_sinkhorn_operator_capture"] = (
+                self.prefix_sinkhorn_operator_capture.as_record()
+            )
+        return record
 
     @property
     def sha256(self) -> str:
@@ -632,6 +692,146 @@ class ContextualBoundarySketch:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextualPrefixSinkhornOperators:
+    """Raw native Prefix-Sinkhorn matrices retained outside sealed JSON."""
+
+    layer: int
+    query_positions: tuple[int, ...]
+    key_positions: tuple[int, ...]
+    selected_query_heads: tuple[int, ...]
+    attention_spec_sha256: str
+    raw_sha256: str
+    head_sha256s: tuple[str, ...]
+    operators: np.ndarray
+
+    def __post_init__(self) -> None:
+        if self.layer != NATIVE_HEAD_CRSA_LAYER:
+            raise ValueError("Prefix-Sinkhorn operators are valid only at layer 27")
+        query_positions = tuple(
+            _nonnegative(value, "query position") for value in self.query_positions
+        )
+        key_positions = tuple(
+            _nonnegative(value, "key position") for value in self.key_positions
+        )
+        if (
+            not query_positions
+            or len(query_positions) > _MAX_PREFIX_SINKHORN_POSITIONS
+            or query_positions != tuple(range(len(query_positions)))
+            or key_positions != query_positions
+        ):
+            raise ValueError(
+                "Prefix-Sinkhorn capture requires absolute positions 0..N-1, N<=32"
+            )
+        heads = tuple(
+            _nonnegative(value, "selected query head")
+            for value in self.selected_query_heads
+        )
+        if heads != NATIVE_HEAD_CRSA_QUERY_HEADS:
+            raise ValueError("Prefix-Sinkhorn capture names the wrong native heads")
+        spec_sha = _sha(self.attention_spec_sha256, "attention_spec_sha256")
+        raw_sha = _sha(self.raw_sha256, "raw_sha256")
+        head_hashes = tuple(
+            _sha(value, "head_sha256s") for value in self.head_sha256s
+        )
+        if len(head_hashes) != len(heads):
+            raise ValueError("Prefix-Sinkhorn head hash inventory is incomplete")
+        value = self.operators
+        if type(value) is not np.ndarray or value.dtype != np.dtype(np.float64):
+            raise TypeError("operators must be an exact float64 numpy array")
+        size = len(query_positions)
+        if value.shape != (1, len(heads), size, size):
+            raise ValueError(
+                "operators must have [1, selected_head, position, position] shape"
+            )
+        if not np.isfinite(value).all() or bool((value < 0.0).any()):
+            raise ValueError("Prefix-Sinkhorn operators must be finite and non-negative")
+        array = np.array(value, dtype="<f8", order="C", copy=True)
+        array[array == 0.0] = 0.0
+        object.__setattr__(self, "query_positions", query_positions)
+        object.__setattr__(self, "key_positions", key_positions)
+        object.__setattr__(self, "selected_query_heads", heads)
+        object.__setattr__(self, "attention_spec_sha256", spec_sha)
+        object.__setattr__(self, "raw_sha256", raw_sha)
+        object.__setattr__(self, "head_sha256s", head_hashes)
+        object.__setattr__(self, "operators", array)
+        array.flags.writeable = False
+        self.verify()
+
+    def verify(self) -> None:
+        """Recompute raw, per-head, position, support, and probability hashes."""
+
+        array = self.operators
+        size = len(self.query_positions)
+        if (
+            type(array) is not np.ndarray
+            or array.dtype != np.dtype(np.float64)
+            or array.shape != (1, len(self.selected_query_heads), size, size)
+            or not np.isfinite(array).all()
+            or bool((array < 0.0).any())
+        ):
+            raise Qwen38CartographyIntegrityError(
+                "raw Prefix-Sinkhorn operator array changed"
+            )
+        little = np.asarray(array, dtype="<f8", order="C")
+        if hashlib.sha256(little.tobytes(order="C")).hexdigest() != self.raw_sha256:
+            raise Qwen38CartographyIntegrityError(
+                "raw Prefix-Sinkhorn operator hash changed"
+            )
+        actual_heads = tuple(
+            hashlib.sha256(
+                np.asarray(little[:, index], dtype="<f8", order="C").tobytes(
+                    order="C"
+                )
+            ).hexdigest()
+            for index in range(len(self.selected_query_heads))
+        )
+        if actual_heads != self.head_sha256s:
+            raise Qwen38CartographyIntegrityError(
+                "Prefix-Sinkhorn head operator hash changed"
+            )
+        if array.flags.writeable:
+            raise Qwen38CartographyIntegrityError(
+                "Prefix-Sinkhorn operator array is no longer readonly"
+            )
+        if (
+            float(np.max(np.abs(array.sum(axis=-1) - 1.0)))
+            > NATIVE_HEAD_CRSA_ROW_SUM_TOLERANCE
+        ):
+            raise Qwen38CartographyIntegrityError(
+                "Prefix-Sinkhorn operator row mass changed"
+            )
+        for query_index, query_position in enumerate(self.query_positions):
+            for key_index, key_position in enumerate(self.key_positions):
+                if key_position > query_position and bool(
+                    (array[:, :, query_index, key_index] != 0.0).any()
+                ):
+                    raise Qwen38CartographyIntegrityError(
+                        "Prefix-Sinkhorn operator contains future probability mass"
+                    )
+
+    def evidence_record(self) -> dict[str, Any]:
+        return {
+            "attention_spec_sha256": self.attention_spec_sha256,
+            "batch_size": int(self.operators.shape[0]),
+            "byte_length": int(self.operators.nbytes),
+            "dtype": "float64-le",
+            "head_sha256s": [
+                {"head_index": head, "sha256": digest}
+                for head, digest in zip(
+                    self.selected_query_heads, self.head_sha256s, strict=True
+                )
+            ],
+            "key_positions": list(self.key_positions),
+            "layer": self.layer,
+            "query_positions": list(self.query_positions),
+            "raw_sha256": self.raw_sha256,
+            "schema": _PREFIX_SINKHORN_OPERATOR_SCHEMA,
+            "selected_query_heads": list(self.selected_query_heads),
+            "shape": list(self.operators.shape),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CartographyProbeResult:
     """Primary measurement plus optional paired control and raw proof objects."""
 
@@ -645,6 +845,9 @@ class CartographyProbeResult:
     control_evidence_document: dict[str, Any] | None = None
     control_access_trace: AccessTrace | None = None
     control_tensor_range_receipts: tuple[TensorRangeReceipt, ...] = ()
+    contextual_prefix_sinkhorn_operators: (
+        ContextualPrefixSinkhornOperators | None
+    ) = None
 
     @property
     def measurements_in_append_order(self) -> tuple[MeasurementReceipt, ...]:
@@ -761,6 +964,95 @@ class CartographyProbeResult:
             raise Qwen38CartographyIntegrityError(
                 "contextual boundary sketch inventory is incomplete"
             )
+        operators = self.contextual_prefix_sinkhorn_operators
+        sealed_operators = primary_body.get("prefix_sinkhorn_operators")
+        primary_probe_spec = primary_body.get("probe_spec")
+        capture_requested = isinstance(primary_probe_spec, Mapping) and (
+            "prefix_sinkhorn_operator_capture" in primary_probe_spec
+        )
+        if operators is None:
+            if "prefix_sinkhorn_operators" in primary_body or capture_requested:
+                raise Qwen38CartographyIntegrityError(
+                    "Prefix-Sinkhorn spec, metadata, and raw operators are not atomic"
+                )
+        else:
+            if not isinstance(operators, ContextualPrefixSinkhornOperators):
+                raise Qwen38CartographyIntegrityError(
+                    "contextual Prefix-Sinkhorn operators have the wrong type"
+                )
+            operators.verify()
+            if sealed_operators != operators.evidence_record():
+                raise Qwen38CartographyIntegrityError(
+                    "raw Prefix-Sinkhorn operators differ from sealed evidence"
+                )
+            probe_spec = primary_body.get("probe_spec")
+            resource = primary_body.get("resource_preflight")
+            capture_spec = (
+                None
+                if not isinstance(probe_spec, Mapping)
+                else probe_spec.get("prefix_sinkhorn_operator_capture")
+            )
+            capture_resource = (
+                None
+                if not isinstance(resource, Mapping)
+                else resource.get("prefix_sinkhorn_operator_capture")
+            )
+            prompt_tokens = (
+                None
+                if not isinstance(probe_spec, Mapping)
+                else probe_spec.get("prompt_token_ids")
+            )
+            if (
+                primary_body.get("arm") != "native"
+                or primary_body.get("intervention_mode") != "native"
+                or not isinstance(capture_spec, Mapping)
+                or set(capture_spec) != {"max_bytes", "max_positions"}
+                or any(
+                    isinstance(capture_spec.get(field), bool)
+                    or not isinstance(capture_spec.get(field), int)
+                    for field in ("max_bytes", "max_positions")
+                )
+                or not isinstance(capture_resource, Mapping)
+                or not isinstance(prompt_tokens, list)
+            ):
+                raise Qwen38CartographyIntegrityError(
+                    "Prefix-Sinkhorn capture lacks its native spec/preflight binding"
+                )
+            max_positions = cast(int, capture_spec.get("max_positions"))
+            max_bytes = cast(int, capture_spec.get("max_bytes"))
+            captured_positions = min(len(prompt_tokens), max_positions)
+            retained_bytes = (
+                captured_positions
+                * captured_positions
+                * len(NATIVE_HEAD_CRSA_QUERY_HEADS)
+                * np.dtype("<f8").itemsize
+            )
+            tokenwise_bytes = (
+                captured_positions
+                * (captured_positions + 1)
+                // 2
+                * len(NATIVE_HEAD_CRSA_QUERY_HEADS)
+                * np.dtype("<f8").itemsize
+            )
+            expected_resource = {
+                "captured_arms": 1,
+                "layer": NATIVE_HEAD_CRSA_LAYER,
+                "max_bytes": max_bytes,
+                "max_positions": max_positions,
+                "planned_bytes": retained_bytes + tokenwise_bytes,
+                "planned_positions": captured_positions,
+                "retained_array_bytes": retained_bytes,
+                "tokenwise_observer_bytes": tokenwise_bytes,
+            }
+            if (
+                operators.query_positions != tuple(range(captured_positions))
+                or operators.operators.nbytes != retained_bytes
+                or dict(capture_resource) != expected_resource
+                or retained_bytes + tokenwise_bytes > max_bytes
+            ):
+                raise Qwen38CartographyIntegrityError(
+                    "Prefix-Sinkhorn capture preflight does not recompute exactly"
+                )
         if self.control_measurement is None:
             if (
                 any(
@@ -785,6 +1077,10 @@ class CartographyProbeResult:
         )
         self.control_access_trace.verify()
         control_body = _verify_evidence_document(self.control_evidence_document)
+        if "prefix_sinkhorn_operators" in control_body:
+            raise Qwen38CartographyIntegrityError(
+                "control arm synthesized a Prefix-Sinkhorn operator"
+            )
         _verify_external_label_binding(
             control,
             self.control_evidence_document,
@@ -813,6 +1109,7 @@ class _ArmCapture:
     hidden_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]]
     contextual_hidden_transitions: list[ContextualHiddenTransition]
     contextual_boundary_sketches: list[ContextualBoundarySketch]
+    contextual_prefix_sinkhorn_operators: ContextualPrefixSinkhornOperators | None
     delta_probes: list[dict[str, Any]]
     crsa_evidence: list[dict[str, Any]]
     final_hidden_sha256: str
@@ -1080,6 +1377,11 @@ def _model_attachment_stamp(model: StreamedQwen38) -> str:
             None
             if model.native_head_crsa_observer is None
             else id(model.native_head_crsa_observer)
+        ),
+        "native_prefix_sinkhorn_operator_observer_id": (
+            None
+            if model.native_prefix_sinkhorn_operator_observer is None
+            else id(model.native_prefix_sinkhorn_operator_observer)
         ),
         "pager_id": id(model.pager),
         "source_id": id(model.pager.source),
@@ -1442,6 +1744,34 @@ def _validate_intervention(model: StreamedQwen38, spec: ProbeSpec) -> None:
         )
 
 
+def _prefix_sinkhorn_operator_preflight(
+    spec: ProbeSpec,
+) -> dict[str, Any] | None:
+    capture = spec.prefix_sinkhorn_operator_capture
+    if capture is None:
+        return None
+    positions = min(len(spec.prompt_token_ids), capture.max_positions)
+    heads = len(NATIVE_HEAD_CRSA_QUERY_HEADS)
+    element_bytes = np.dtype("<f8").itemsize
+    retained_bytes = positions * positions * heads * element_bytes
+    tokenwise_bytes = positions * (positions + 1) // 2 * heads * element_bytes
+    planned_bytes = retained_bytes + tokenwise_bytes
+    if planned_bytes > capture.max_bytes:
+        raise Qwen38CartographyBudgetError(
+            "Prefix-Sinkhorn operator capture exceeds max_bytes before weight reads"
+        )
+    return {
+        "captured_arms": 1,
+        "layer": NATIVE_HEAD_CRSA_LAYER,
+        "max_bytes": capture.max_bytes,
+        "max_positions": capture.max_positions,
+        "planned_bytes": planned_bytes,
+        "planned_positions": positions,
+        "retained_array_bytes": retained_bytes,
+        "tokenwise_observer_bytes": tokenwise_bytes,
+    }
+
+
 def _preflight_plans(
     model: StreamedQwen38,
     spec: ProbeSpec,
@@ -1582,6 +1912,92 @@ class _DeltaRecorder:
         self.rows.append({"layer": layer, **asdict(probe)})
 
 
+class _PrefixSinkhornOperatorCollector:
+    def __init__(self, capture: PrefixSinkhornOperatorCapture) -> None:
+        self.capture = capture
+        self._blocks: dict[int, NativePrefixSinkhornOperatorBlock] = {}
+        self._heads: tuple[int, ...] | None = None
+        self._attention_spec_sha256: str | None = None
+
+    def __call__(self, block: NativePrefixSinkhornOperatorBlock) -> None:
+        if not isinstance(block, NativePrefixSinkhornOperatorBlock):
+            raise TypeError("Prefix-Sinkhorn observer emitted an invalid block")
+        query_positions = tuple(block.query_positions)
+        key_positions = tuple(block.key_positions)
+        heads = tuple(block.selected_query_heads)
+        if (
+            block.layer != NATIVE_HEAD_CRSA_LAYER
+            or len(query_positions) != 1
+            or query_positions[0] >= self.capture.max_positions
+            or key_positions != tuple(range(query_positions[0] + 1))
+            or heads != NATIVE_HEAD_CRSA_QUERY_HEADS
+        ):
+            raise Qwen38CartographyIntegrityError(
+                "Prefix-Sinkhorn observer emitted the wrong layer/head/position row"
+            )
+        operators = block.operators
+        if (
+            type(operators) is not np.ndarray
+            or operators.dtype != np.dtype(np.float64)
+            or operators.shape != (1, len(heads), 1, len(key_positions))
+            or not np.isfinite(operators).all()
+            or bool((operators < 0.0).any())
+        ):
+            raise Qwen38CartographyIntegrityError(
+                "Prefix-Sinkhorn observer emitted invalid raw operators"
+            )
+        position = query_positions[0]
+        if position in self._blocks:
+            raise Qwen38CartographyIntegrityError(
+                "Prefix-Sinkhorn observer repeated an absolute query position"
+            )
+        spec_sha = _sha(block.attention_spec_sha256, "attention_spec_sha256")
+        if self._heads is None:
+            self._heads = heads
+            self._attention_spec_sha256 = spec_sha
+        elif self._heads != heads or self._attention_spec_sha256 != spec_sha:
+            raise Qwen38CartographyIntegrityError(
+                "Prefix-Sinkhorn observer changed head/spec identity"
+            )
+        self._blocks[position] = block
+
+    def finalize(self, *, expected_positions: int) -> ContextualPrefixSinkhornOperators:
+        count = _positive(expected_positions, "expected_positions")
+        if count > self.capture.max_positions or tuple(sorted(self._blocks)) != tuple(
+            range(count)
+        ):
+            raise Qwen38CartographyIntegrityError(
+                "Prefix-Sinkhorn observer omitted tokenwise absolute positions"
+            )
+        if self._heads is None or self._attention_spec_sha256 is None:
+            raise Qwen38CartographyIntegrityError(
+                "native capture emitted no Prefix-Sinkhorn operators"
+            )
+        array = np.zeros((1, len(self._heads), count, count), dtype="<f8")
+        for position in range(count):
+            row = np.asarray(self._blocks[position].operators, dtype="<f8", order="C")
+            array[:, :, position : position + 1, : position + 1] = row
+        raw_sha = hashlib.sha256(array.tobytes(order="C")).hexdigest()
+        head_hashes = tuple(
+            hashlib.sha256(
+                np.asarray(array[:, index], dtype="<f8", order="C").tobytes(
+                    order="C"
+                )
+            ).hexdigest()
+            for index in range(len(self._heads))
+        )
+        return ContextualPrefixSinkhornOperators(
+            layer=NATIVE_HEAD_CRSA_LAYER,
+            query_positions=tuple(range(count)),
+            key_positions=tuple(range(count)),
+            selected_query_heads=self._heads,
+            attention_spec_sha256=self._attention_spec_sha256,
+            raw_sha256=raw_sha,
+            head_sha256s=head_hashes,
+            operators=array,
+        )
+
+
 def _arm_intervention(
     spec: ProbeSpec, arm: str
 ) -> tuple[Qwen38NativeHeadCrsa | None, str, dict[str, Any]]:
@@ -1604,6 +2020,19 @@ def _execute_arm(
 ) -> _ArmCapture:
     native, intervention_mode, intervention_configuration = _arm_intervention(spec, arm)
     delta = _DeltaRecorder()
+    operator_collector = (
+        _PrefixSinkhornOperatorCollector(spec.prefix_sinkhorn_operator_capture)
+        if arm == "native" and spec.prefix_sinkhorn_operator_capture is not None
+        else None
+    )
+    operator_observer = (
+        None
+        if operator_collector is None
+        else NativePrefixSinkhornOperatorObserver(
+            operator_collector,
+            max_positions=spec.prefix_sinkhorn_operator_capture.max_positions,
+        )
+    )
     boundary_rows: dict[int, dict[str, tuple[dict[str, Any], np.ndarray]]] = {}
 
     def boundary_observer(layer: int, stage: str, value: torch.Tensor) -> None:
@@ -1630,6 +2059,7 @@ def _execute_arm(
         model.pager,
         delta_probe=delta,
         native_head_crsa=native,
+        native_prefix_sinkhorn_operator_observer=operator_observer,
         layer_boundary_observer=(
             None if spec.hidden_sketch is None else boundary_observer
         ),
@@ -1822,6 +2252,16 @@ def _execute_arm(
         }
         for row in layer_records
     ]
+    contextual_prefix_sinkhorn_operators = (
+        None
+        if operator_collector is None
+        else operator_collector.finalize(
+            expected_positions=min(
+                len(spec.prompt_token_ids),
+                spec.prefix_sinkhorn_operator_capture.max_positions,
+            )
+        )
+    )
     return _ArmCapture(
         arm=arm,
         intervention_mode=intervention_mode,
@@ -1830,6 +2270,9 @@ def _execute_arm(
         hidden_by_layer=hidden_by_layer,
         contextual_hidden_transitions=contextual_hidden_transitions,
         contextual_boundary_sketches=contextual_boundary_sketches,
+        contextual_prefix_sinkhorn_operators=(
+            contextual_prefix_sinkhorn_operators
+        ),
         delta_probes=delta.rows,
         crsa_evidence=crsa_rows,
         final_hidden_sha256=_tensor_record(final_hidden)["sha256"],
@@ -1882,7 +2325,7 @@ def _evidence_body(
     atlas_head_revision: GraphRevision,
     external_label_applies: bool,
 ) -> dict[str, Any]:
-    return {
+    body = {
         "access_trace": capture.access_trace.to_document(),
         "arm": capture.arm,
         "atlas_head_revision": atlas_head_revision.to_document(),
@@ -1915,6 +2358,11 @@ def _evidence_body(
         "tensor_range_receipts": [row.as_record() for row in capture.tensor_receipts],
         "weight_rail_revision": weight_rail_revision.to_document(),
     }
+    if capture.contextual_prefix_sinkhorn_operators is not None:
+        body["prefix_sinkhorn_operators"] = (
+            capture.contextual_prefix_sinkhorn_operators.evidence_record()
+        )
+    return body
 
 
 def _measurement(
@@ -1980,6 +2428,7 @@ class Qwen38CartographyProbe:
             raise TypeError("spec must be a ProbeSpec")
         if not isinstance(atlas_head_revision, GraphRevision):
             raise TypeError("atlas_head_revision must be a GraphRevision")
+        operator_preflight = _prefix_sinkhorn_operator_preflight(spec)
         model = self.model
         state_before = _model_state_stamp(model)
         attachments_before = _model_attachment_stamp(model)
@@ -1991,8 +2440,21 @@ class Qwen38CartographyProbe:
         coordinate = _coordinate(model, spec)
         paired = spec.intervention_mode in ("native", "placebo")
         arm_count = 2 if paired else 1
-        preflight, planned_source_bytes, planned_operations, planned_tensors = (
+        (
+            checkpoint_preflight,
+            planned_source_bytes,
+            planned_operations,
+            planned_tensors,
+        ) = (
             _preflight_plans(model, spec, arm_count=arm_count)
+        )
+        preflight = (
+            checkpoint_preflight
+            if operator_preflight is None
+            else {
+                **checkpoint_preflight,
+                "prefix_sinkhorn_operator_capture": operator_preflight,
+            }
         )
         model_pin = _model_pin(
             model,
@@ -2035,6 +2497,10 @@ class Qwen38CartographyProbe:
                         "planned_source_bytes": planned_source_bytes,
                         "planned_tensors_per_arm": planned_tensors,
                     }
+                    if operator_preflight is not None:
+                        control_body["resource_preflight"][
+                            "prefix_sinkhorn_operator_capture"
+                        ] = operator_preflight
                     control_evidence = _seal_evidence(control_body)
                     if (
                         len(_canonical(control_evidence))
@@ -2104,6 +2570,10 @@ class Qwen38CartographyProbe:
                     "planned_source_bytes": planned_source_bytes,
                     "planned_tensors_per_arm": planned_tensors,
                 }
+                if operator_preflight is not None:
+                    primary_body["resource_preflight"][
+                        "prefix_sinkhorn_operator_capture"
+                    ] = operator_preflight
                 primary_evidence = _seal_evidence(primary_body)
                 if len(_canonical(primary_evidence)) > spec.budget.max_evidence_bytes:
                     raise Qwen38CartographyBudgetError(
@@ -2149,7 +2619,7 @@ class Qwen38CartographyProbe:
             raise Qwen38CartographyIntegrityError(
                 "model observer/intervention attachments changed during probe"
             )
-        if model.checkpoint_preflight() != preflight:
+        if model.checkpoint_preflight() != checkpoint_preflight:
             raise Qwen38CartographyIntegrityError(
                 "checkpoint tensor contract changed during probe execution"
             )
@@ -2163,6 +2633,9 @@ class Qwen38CartographyProbe:
             ),
             contextual_boundary_sketches=tuple(
                 primary_capture.contextual_boundary_sketches
+            ),
+            contextual_prefix_sinkhorn_operators=(
+                primary_capture.contextual_prefix_sinkhorn_operators
             ),
             control_measurement=control_measurement,
             control_evidence_document=control_evidence,
@@ -2184,7 +2657,9 @@ __all__ = [
     "CartographyProbeResult",
     "ContextualBoundarySketch",
     "ContextualHiddenTransition",
+    "ContextualPrefixSinkhornOperators",
     "HiddenSketchProjection",
+    "PrefixSinkhornOperatorCapture",
     "ProbeCoordinateSpec",
     "ProbeResourceBudget",
     "ProbeSpec",
