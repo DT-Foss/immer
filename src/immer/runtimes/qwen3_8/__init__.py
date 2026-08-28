@@ -48,6 +48,15 @@ from .encoding import (
     Qwen38Tokenizer,
 )
 from .graft import Qwen38StableCrsaGraft
+from .fast_mlp import (
+    FAST_MLP_MOUNT_SCHEMA,
+    PILOT_WEIGHT_MANIFEST_SCHEMA,
+    Qwen38FastMlpError,
+    Qwen38FastMlpMount,
+    Qwen38FastMlpPaths,
+    Qwen38FastMlpReceipt,
+    open_qwen38_fast_mlp,
+)
 from .kernels import AttentionState, DeltaNetProbe, DeltaNetState
 from .local_draft import (
     QWEN35_K2_DRAFT_PROVIDER_SCHEMA,
@@ -225,6 +234,7 @@ __all__ = [
     "END_OF_TEXT_TOKEN_ID",
     "EVIDENCE_POLICY_SCHEMA",
     "EvidencePolicy",
+    "FAST_MLP_MOUNT_SCHEMA",
     "DraftProvider",
     "K4DraftProvider",
     "K4ReconciledDraftProvider",
@@ -300,6 +310,10 @@ __all__ = [
     "Qwen38DraftVerifier",
     "Qwen38DeltaNetProbeError",
     "Qwen38EncodingError",
+    "Qwen38FastMlpError",
+    "Qwen38FastMlpMount",
+    "Qwen38FastMlpPaths",
+    "Qwen38FastMlpReceipt",
     "Qwen38NativeHeadCrsa",
     "Qwen38NativeFork",
     "Qwen38ForkArmState",
@@ -327,6 +341,7 @@ __all__ = [
     "QWEN38_K2_SPECULATIVE_SCHEMA",
     "QWEN38_K4_SPECULATIVE_ROUND_SCHEMA",
     "QWEN38_K4_SPECULATIVE_SCHEMA",
+    "PILOT_WEIGHT_MANIFEST_SCHEMA",
     "StatefulEvidence",
     "StatefulBlockEvidence",
     "StatefulBlockStage",
@@ -358,6 +373,7 @@ __all__ = [
     "semantic_label_sha256",
     "tensor_range_plan_from_source",
     "token_prefix_sha256",
+    "open_qwen38_fast_mlp",
     "verify_probe_document",
     "verify_qwen38_causal_mount",
 ]

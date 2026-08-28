@@ -27,6 +27,24 @@ COMPONENTS = (
     ("o1-state", "persistent life stream outside frozen execution", "integrated runtime"),
 )
 
+
+def _sorted_layer_list(value: str) -> tuple[int, ...]:
+    try:
+        layers = tuple(int(item) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "layers must be comma-separated integers"
+        ) from exc
+    if (
+        not layers
+        or layers != tuple(sorted(set(layers)))
+        or any(layer < 0 for layer in layers)
+    ):
+        raise argparse.ArgumentTypeError(
+            "layers must be sorted unique non-negative integers"
+        )
+    return layers
+
 def _s3_manifest(configured: str | Path | None = None) -> Path:
     """Resolve the one deployment manifest used by solve, serve and organs."""
 
@@ -106,6 +124,14 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 if args.draft_max_resident_mb is None
                 else int(args.draft_max_resident_mb * 1024**2)
             ),
+            fast_mlp_root=args.fast_mlp,
+            fast_mlp_source_budget_mb=args.fast_mlp_source_budget_mb,
+            fast_mlp_max_resident_bytes=(
+                None
+                if args.fast_mlp_max_resident_mb is None
+                else int(args.fast_mlp_max_resident_mb * 1024**2)
+            ),
+            fast_mlp_active_layers=args.fast_mlp_layers,
         )
         result = component.handle(Request("chat", args.message))
     except (OSError, TypeError, ValueError) as exc:
@@ -706,6 +732,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional local causal Qwen3.5-0.8B bundle for exact K=4 drafting",
     )
     chat.add_argument(
+        "--fast-mlp",
+        metavar="ARTIFACT_ROOT",
+        help="mount the existing row-routed sparse MLP banks for fast chat",
+    )
+    chat.add_argument(
+        "--fast-mlp-layers",
+        type=_sorted_layer_list,
+        help="sorted fitted layer subset, for example 0,9,18,27,36,45,54,63",
+    )
+    chat.add_argument(
         "--qwen38-anchor-cache",
         default=os.environ.get("IMMER_QWEN38_ANCHOR_CACHE"),
         help="local authenticated semantic anchor cache",
@@ -717,10 +753,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "float16", "bfloat16", "float32"),
         default="auto",
     )
-    chat.add_argument("--source-budget-mb", type=float, default=65536)
-    chat.add_argument("--draft-source-budget-mb", type=float, default=262144)
-    chat.add_argument("--max-resident-mb", type=int, default=384)
-    chat.add_argument("--draft-max-resident-mb", type=int)
+    chat.add_argument("--source-budget-mb", type=float, default=4194304)
+    chat.add_argument("--draft-source-budget-mb", type=float, default=1048576)
+    chat.add_argument("--fast-mlp-source-budget-mb", type=float)
+    chat.add_argument("--max-resident-mb", type=int, default=192)
+    chat.add_argument("--draft-max-resident-mb", type=int, default=64)
+    chat.add_argument("--fast-mlp-max-resident-mb", type=int)
     chat.add_argument("--max-prompt-tokens", type=int, default=1024)
     chat.add_argument("--max-new-tokens", type=int, default=64)
     chat.add_argument("--max-context-tokens", type=int, default=2048)

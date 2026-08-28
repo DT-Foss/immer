@@ -28,6 +28,11 @@ from .config import (
     Qwen38Config,
 )
 from .encoding import END_OF_TEXT_TOKEN_ID, IM_END_TOKEN_ID, Qwen38Tokenizer
+from .fast_mlp import (
+    Qwen38FastMlpMount,
+    Qwen38FastMlpPaths,
+    open_qwen38_fast_mlp,
+)
 from .model import StreamedQwen38
 from .local_draft import Qwen35K4DraftProvider
 from .pager import Qwen38WeightPager
@@ -432,6 +437,7 @@ class _OwnedRuntime:
         tokenizer_sha256: str,
         bundle_receipt: Mapping[str, Any],
         preflight_receipt: Mapping[str, Any],
+        fast_mlp_mount: Qwen38FastMlpMount | None = None,
     ) -> None:
         self.mount = mount
         self.pager = pager
@@ -440,6 +446,10 @@ class _OwnedRuntime:
         self.tokenizer_sha256 = tokenizer_sha256
         self.bundle_receipt = dict(bundle_receipt)
         self.preflight_receipt = dict(preflight_receipt)
+        self.fast_mlp_mount = fast_mlp_mount
+        self.fast_mlp_receipt = (
+            None if fast_mlp_mount is None else fast_mlp_mount.receipt.to_record()
+        )
         self._closed = False
 
     def close(self) -> None:
@@ -450,6 +460,12 @@ class _OwnedRuntime:
             self.model.reset_state(release=True)
         except Exception as exc:  # release the remaining owners regardless
             failures.append(exc)
+        self.model.mlp_sparse_executor = None
+        if self.fast_mlp_mount is not None:
+            try:
+                self.fast_mlp_mount.close()
+            except Exception as exc:
+                failures.append(exc)
         try:
             self.pager.close()
         except Exception as exc:
@@ -477,6 +493,10 @@ def _open_local_runtime(
     source_budget_mb: float,
     max_resident_bytes: int,
     max_context_tokens: int,
+    fast_mlp_paths: Qwen38FastMlpPaths | None = None,
+    fast_mlp_source_budget_mb: float | None = None,
+    fast_mlp_max_resident_bytes: int | None = None,
+    fast_mlp_active_layers: Sequence[int] | None = None,
 ) -> _OwnedRuntime:
     """Open one pinned local causal model; no remote source exists here."""
 
@@ -487,6 +507,7 @@ def _open_local_runtime(
     mount: CausalWeightMount | None = None
     pager: Qwen38WeightPager | None = None
     model: StreamedQwen38 | None = None
+    fast_mlp_mount: Qwen38FastMlpMount | None = None
     try:
         mount = CausalWeightMount(
             bundle_path,
@@ -510,11 +531,32 @@ def _open_local_runtime(
             require_source_identity=True,
             causal_tensor_reader=mount.tensor_reader,
         )
+        if fast_mlp_paths is not None:
+            fast_mlp_mount = open_qwen38_fast_mlp(
+                paths=fast_mlp_paths,
+                target_mount=mount,
+                target_pager=pager,
+                config=config,
+                source_budget_mb=(
+                    source_budget_mb
+                    if fast_mlp_source_budget_mb is None
+                    else fast_mlp_source_budget_mb
+                ),
+                max_resident_bytes=(
+                    max_resident_bytes
+                    if fast_mlp_max_resident_bytes is None
+                    else fast_mlp_max_resident_bytes
+                ),
+                active_layers=fast_mlp_active_layers,
+            )
         model = StreamedQwen38(
             config,
             pager,
             max_batch_size=1,
             max_seq_len=max_context_tokens,
+            mlp_sparse_executor=(
+                None if fast_mlp_mount is None else fast_mlp_mount.executor
+            ),
         )
         preflight_receipt = model.checkpoint_preflight()
         tokenizer = Qwen38Tokenizer(tokenizer_path, require_official=True)
@@ -528,6 +570,7 @@ def _open_local_runtime(
             tokenizer_sha256=tokenizer_sha256,
             bundle_receipt=bundle_receipt,
             preflight_receipt=preflight_receipt,
+            fast_mlp_mount=fast_mlp_mount,
         )
     except Exception:
         if model is not None:
@@ -536,6 +579,11 @@ def _open_local_runtime(
             except Exception:
                 pass
         if pager is not None:
+            if fast_mlp_mount is not None:
+                try:
+                    fast_mlp_mount.close()
+                except Exception:
+                    pass
             try:
                 pager.close()
             except Exception:
@@ -554,6 +602,10 @@ def _open_official_runtime(
     source_budget_mb: float,
     max_resident_bytes: int,
     max_context_tokens: int,
+    fast_mlp_paths: Qwen38FastMlpPaths | None = None,
+    fast_mlp_source_budget_mb: float | None = None,
+    fast_mlp_max_resident_bytes: int | None = None,
+    fast_mlp_active_layers: Sequence[int] | None = None,
 ) -> _OwnedRuntime:
     return _open_local_runtime(
         bundle_path=bundle_path,
@@ -565,6 +617,10 @@ def _open_official_runtime(
         source_budget_mb=source_budget_mb,
         max_resident_bytes=max_resident_bytes,
         max_context_tokens=max_context_tokens,
+        fast_mlp_paths=fast_mlp_paths,
+        fast_mlp_source_budget_mb=fast_mlp_source_budget_mb,
+        fast_mlp_max_resident_bytes=fast_mlp_max_resident_bytes,
+        fast_mlp_active_layers=fast_mlp_active_layers,
     )
 
 
@@ -582,8 +638,8 @@ class Qwen38CausalChat:
         system_prompt: str = "",
         device: str = "auto",
         compute_dtype: str = "auto",
-        source_budget_mb: float = 65536,
-        max_resident_bytes: int = Qwen38WeightPager.DEFAULT_MAX_RESIDENT_BYTES,
+        source_budget_mb: float = 4_194_304,
+        max_resident_bytes: int = 192 * 1024**2,
         max_prompt_tokens: int = 1024,
         max_new_tokens: int = 64,
         max_context_tokens: int = 2048,
@@ -591,8 +647,12 @@ class Qwen38CausalChat:
         anchor_cache: SemanticStateAnchorCache | None = None,
         result_cell_code_revision: str | None = None,
         draft_bundle_path: str | Path | None = None,
-        draft_source_budget_mb: float = 262_144,
+        draft_source_budget_mb: float = 1_048_576,
         draft_max_resident_bytes: int | None = None,
+        fast_mlp_root: str | Path | None = None,
+        fast_mlp_source_budget_mb: float | None = None,
+        fast_mlp_max_resident_bytes: int | None = None,
+        fast_mlp_active_layers: Sequence[int] | None = None,
     ) -> None:
         if not isinstance(bundle_path, (str, Path)):
             raise TypeError("bundle_path must be a local filesystem path")
@@ -612,10 +672,18 @@ class Qwen38CausalChat:
         )
         max_resident_bytes = _positive_int(max_resident_bytes, "max_resident_bytes")
         if draft_max_resident_bytes is None:
-            draft_max_resident_bytes = max_resident_bytes
+            draft_max_resident_bytes = 64 * 1024**2
         draft_max_resident_bytes = _positive_int(
             draft_max_resident_bytes, "draft_max_resident_bytes"
         )
+        if fast_mlp_source_budget_mb is not None:
+            fast_mlp_source_budget_mb = _positive_number(
+                fast_mlp_source_budget_mb, "fast_mlp_source_budget_mb"
+            )
+        if fast_mlp_max_resident_bytes is not None:
+            fast_mlp_max_resident_bytes = _positive_int(
+                fast_mlp_max_resident_bytes, "fast_mlp_max_resident_bytes"
+            )
         max_prompt_tokens = _positive_int(max_prompt_tokens, "max_prompt_tokens")
         max_new_tokens = _positive_int(max_new_tokens, "max_new_tokens")
         max_context_tokens = _positive_int(max_context_tokens, "max_context_tokens")
@@ -631,6 +699,40 @@ class Qwen38CausalChat:
             raise TypeError("draft_bundle_path must be a local path or None")
         if draft_bundle_path is not None and anchor_cache is not None:
             raise ValueError("K=4 drafting and anchor restore cannot share one request")
+        if fast_mlp_root is not None and not isinstance(fast_mlp_root, (str, Path)):
+            raise TypeError("fast_mlp_root must be a local path or None")
+        if fast_mlp_active_layers is not None:
+            try:
+                fast_mlp_active_layers = tuple(fast_mlp_active_layers)
+            except TypeError as exc:
+                raise TypeError(
+                    "fast_mlp_active_layers must be an integer sequence"
+                ) from exc
+            if (
+                not fast_mlp_active_layers
+                or fast_mlp_active_layers
+                != tuple(sorted(set(fast_mlp_active_layers)))
+                or any(
+                    isinstance(layer, bool)
+                    or not isinstance(layer, int)
+                    or layer < 0
+                    for layer in fast_mlp_active_layers
+                )
+            ):
+                raise ValueError(
+                    "fast_mlp_active_layers must be sorted unique non-negative integers"
+                )
+        if fast_mlp_root is None and any(
+            value is not None
+            for value in (
+                fast_mlp_source_budget_mb,
+                fast_mlp_max_resident_bytes,
+                fast_mlp_active_layers,
+            )
+        ):
+            raise ValueError("fast-MLP options require fast_mlp_root")
+        if fast_mlp_root is not None and fast_mlp_max_resident_bytes is None:
+            fast_mlp_max_resident_bytes = 64 * 1024**2
         if result_cell_code_revision is not None and (
             not isinstance(result_cell_code_revision, str)
             or len(result_cell_code_revision)
@@ -663,10 +765,19 @@ class Qwen38CausalChat:
         )
         self._draft_source_budget_mb = draft_source_budget_mb
         self._draft_max_resident_bytes = draft_max_resident_bytes
+        self._fast_mlp_paths = (
+            None
+            if fast_mlp_root is None
+            else Qwen38FastMlpPaths.from_root(fast_mlp_root)
+        )
+        self._fast_mlp_source_budget_mb = fast_mlp_source_budget_mb
+        self._fast_mlp_max_resident_bytes = fast_mlp_max_resident_bytes
+        self._fast_mlp_active_layers = fast_mlp_active_layers
         self._result_cell_code_revision = result_cell_code_revision
         self._runtime: Any | None = None
         self._draft_runtime: Any | None = None
         self._last_draft_evidence: dict[str, Any] | None = None
+        self._last_fast_mlp_evidence: dict[str, Any] | None = None
         self._bundle_receipt: dict[str, Any] | None = None
         self._tokenizer_sha256: str | None = None
         self._load_error: str | None = None
@@ -698,6 +809,33 @@ class Qwen38CausalChat:
                 "repo_id": QWEN35_DRAFTER_REPO_ID,
                 "revision": QWEN35_DRAFTER_REVISION,
             }
+        if self._fast_mlp_paths is not None:
+            policy["fast_mlp"] = {
+                "active_layers": (
+                    "all-fitted"
+                    if self._fast_mlp_active_layers is None
+                    else list(self._fast_mlp_active_layers)
+                ),
+                "enabled": True,
+            }
+            runtime = self._runtime
+            receipt = (
+                None
+                if runtime is None
+                else getattr(runtime, "fast_mlp_receipt", None)
+            )
+            if receipt is not None:
+                policy["fast_mlp"]["artifacts"] = {
+                    key: receipt[key]
+                    for key in (
+                        "affine_fit_sha256",
+                        "model_pin_sha256",
+                        "pilot_manifest_body_sha256",
+                        "router_fit_sha256",
+                        "transpose_manifest_sha256",
+                        "weights_index_sha256",
+                    )
+                }
         return _digest(policy)
 
     def _result_cell_binding_receipt(
@@ -776,6 +914,10 @@ class Qwen38CausalChat:
             source_budget_mb=self._source_budget_mb,
             max_resident_bytes=self._max_resident_bytes,
             max_context_tokens=self._max_context_tokens,
+            fast_mlp_paths=self._fast_mlp_paths,
+            fast_mlp_source_budget_mb=self._fast_mlp_source_budget_mb,
+            fast_mlp_max_resident_bytes=self._fast_mlp_max_resident_bytes,
+            fast_mlp_active_layers=self._fast_mlp_active_layers,
         )
 
     def _open_draft_runtime(self) -> _OwnedRuntime:
@@ -814,12 +956,23 @@ class Qwen38CausalChat:
         generation_options: Mapping[str, Any],
     ) -> tuple[tuple[int, ...], Mapping[str, Any]]:
         self._last_draft_evidence = None
+        self._last_fast_mlp_evidence = None
+        fast_mount = getattr(runtime, "fast_mlp_mount", None)
+        fast_before = None if fast_mount is None else fast_mount.metrics()
         if self._draft_bundle_path is None or self._max_new_tokens < 4:
-            return runtime.model.generate_greedy(
+            generated, evidence = runtime.model.generate_greedy(
                 [list(prompt_ids)],
                 retain_final_state=False,
                 **generation_options,
             )
+            mapped = _mapping(evidence, "generation evidence")
+            self._record_fast_mlp_request(
+                runtime,
+                fast_before,
+                target_source_body_bytes=int(mapped["source_body_bytes"]),
+                draft_source_body_bytes=0,
+            )
+            return generated, evidence
         draft = self._load_draft_locked(runtime)
         eos = tuple(generation_options["eos_token_ids"])
         provider = Qwen35K4DraftProvider(
@@ -840,6 +993,17 @@ class Qwen38CausalChat:
             )
             provider_metrics = provider.metrics()
             evidence = generated.evidence
+            fast_request = self._record_fast_mlp_request(
+                runtime,
+                fast_before,
+                target_source_body_bytes=evidence.source_body_bytes,
+                draft_source_body_bytes=provider_metrics.source_body_bytes,
+            )
+            aux_source_body_bytes = (
+                0
+                if fast_request is None
+                else int(fast_request["aux_source_body_bytes"])
+            )
             self._last_draft_evidence = {
                 "accepted_draft_tokens": evidence.accepted_draft_tokens,
                 "draft_source_body_bytes": provider_metrics.source_body_bytes,
@@ -847,7 +1011,9 @@ class Qwen38CausalChat:
                 "target_source_body_bytes": evidence.source_body_bytes,
                 "target_linear_calls": evidence.linear_calls,
                 "total_source_body_bytes": (
-                    evidence.source_body_bytes + provider_metrics.source_body_bytes
+                    evidence.source_body_bytes
+                    + provider_metrics.source_body_bytes
+                    + aux_source_body_bytes
                 ),
                 "total_linear_calls": (
                     evidence.linear_calls + provider_metrics.linear_calls
@@ -874,6 +1040,42 @@ class Qwen38CausalChat:
         finally:
             provider.close()
 
+    def _record_fast_mlp_request(
+        self,
+        runtime: _OwnedRuntime,
+        before: Mapping[str, int] | None,
+        *,
+        target_source_body_bytes: int,
+        draft_source_body_bytes: int,
+    ) -> dict[str, Any] | None:
+        mount = getattr(runtime, "fast_mlp_mount", None)
+        if mount is None or before is None:
+            return None
+        after = mount.metrics()
+        delta = {
+            key: int(after.get(key, 0)) - int(before.get(key, 0))
+            for key in after
+        }
+        if any(value < 0 for value in delta.values()):
+            raise Qwen38ChatError("fast-MLP request counters moved backwards")
+        aux = delta["source_body_bytes"]
+        request = {
+            "aux_logical_weight_bytes": delta["logical_weight_bytes"],
+            "aux_source_body_bytes": aux,
+            "draft_source_body_bytes": draft_source_body_bytes,
+            "pilot_source_body_bytes": delta["pilot_source_body_bytes"],
+            "schema": "immer.qwen3.8-fast-mlp-request/v1",
+            "target_source_body_bytes": target_source_body_bytes,
+            "total_source_body_bytes": (
+                target_source_body_bytes + draft_source_body_bytes + aux
+            ),
+            "transpose_source_body_bytes": delta[
+                "transpose_source_body_bytes"
+            ],
+        }
+        self._last_fast_mlp_evidence = request
+        return request
+
     def _base_evidence(self) -> dict[str, Any]:
         evidence: dict[str, Any] = {
             "execution": "local-authenticated-causal-bundle/v1",
@@ -887,6 +1089,13 @@ class Qwen38CausalChat:
             evidence["tokenizer_sha256"] = self._tokenizer_sha256
         if self._draft_runtime is not None:
             evidence["draft_bundle"] = dict(self._draft_runtime.bundle_receipt)
+        fast_mlp_receipt = (
+            None
+            if self._runtime is None
+            else getattr(self._runtime, "fast_mlp_receipt", None)
+        )
+        if fast_mlp_receipt is not None:
+            evidence["fast_mlp"] = dict(fast_mlp_receipt)
         return evidence
 
     def _load_locked(self) -> Any:
@@ -1078,6 +1287,11 @@ class Qwen38CausalChat:
         }
         if self._last_draft_evidence is not None:
             evidence["draft"] = dict(self._last_draft_evidence)
+        if self._last_fast_mlp_evidence is not None:
+            evidence["fast_mlp"] = {
+                **dict(evidence["fast_mlp"]),
+                "request": dict(self._last_fast_mlp_evidence),
+            }
         result_cell_binding = self._result_cell_binding_receipt(
             question=text,
             rendered_prompt=prompt,

@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -24,6 +25,7 @@ from immer.runtimes.qwen3_8 import (
     Qwen38WeightPager,
     StreamedQwen38,
 )
+from immer.runtimes.qwen3_8 import bundle as runtime_bundle
 
 from test_qwen3_8_model import (
     _tiny_config,
@@ -143,6 +145,61 @@ def _fixture(root: Path) -> tuple[Path, Path, str]:
 
 
 class QwenCausalBundleTests(unittest.TestCase):
+    def test_runtime_verification_reuses_unchanged_local_shard_digest(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".qwen-runtime-verify-cache-", dir=Path.cwd()
+        ) as temporary:
+            root = Path(temporary)
+            source, inventory, fingerprint = _fixture(root)
+            output = root / "model.causal"
+            bundle_script.build_bundle(
+                source,
+                inventory,
+                output,
+                repo_id=REPO_ID,
+                revision=REVISION,
+                expected_fingerprint=fingerprint,
+                require_official=False,
+                require_remote_hashes=True,
+            )
+            identity = LogicalModelIdentity(REPO_ID, REVISION)
+            with CausalWeightMount(output, identity, budget_mb=20) as mount:
+                with mock.patch.object(
+                    runtime_bundle,
+                    "_sha256_file",
+                    wraps=runtime_bundle._sha256_file,
+                ) as shard_hash:
+                    runtime_bundle.verify_qwen38_causal_mount(
+                        mount,
+                        require_official_config=False,
+                    )
+                    self.assertEqual(shard_hash.call_count, 1)
+                    self.assertTrue(
+                        mount.causal_root.joinpath(
+                            runtime_bundle.QWEN38_BUNDLE_VERIFY_CACHE_NAME
+                        ).is_file()
+                    )
+
+                    shard_hash.reset_mock()
+                    runtime_bundle.verify_qwen38_causal_mount(
+                        mount,
+                        require_official_config=False,
+                    )
+                    self.assertEqual(shard_hash.call_count, 0)
+
+                    shard = mount.weights_root / "model.safetensors"
+                    before = shard.stat()
+                    os.utime(
+                        shard,
+                        ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000),
+                    )
+                    shard_hash.reset_mock()
+                    runtime_bundle.verify_qwen38_causal_mount(
+                        mount,
+                        require_official_config=False,
+                    )
+                    self.assertEqual(shard_hash.call_count, 1)
+
     def test_pin_local_inventory_is_stable_and_adopts_without_copying(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix=".qwen-local-pin-test-", dir=Path.cwd()

@@ -229,6 +229,47 @@ class _Runtime:
         self.close_calls += 1
 
 
+class _FastMount:
+    def __init__(
+        self,
+        *,
+        aux_bytes: int = 20,
+        cumulative: tuple[int, ...] | None = None,
+    ) -> None:
+        self.cumulative = (0, aux_bytes) if cumulative is None else cumulative
+        self.calls = 0
+
+    def metrics(self):
+        total = self.cumulative[min(self.calls, len(self.cumulative) - 1)]
+        self.calls += 1
+        return {
+            "pilot_source_body_bytes": 3 * total // 5,
+            "transpose_source_body_bytes": total - 3 * total // 5,
+            "source_body_bytes": total,
+            "pilot_logical_weight_bytes": 3 * total // 5,
+            "transpose_logical_weight_bytes": total - 3 * total // 5,
+            "logical_weight_bytes": total,
+            "pilot_row_reads": self.calls - 1,
+            "transpose_row_reads": self.calls - 1,
+        }
+
+
+_FAST_RECEIPT = {
+    "active_layers": [0, 9],
+    "affine_fit_sha256": "1" * 64,
+    "execution": "row-routed-sparse-mlp",
+    "fitted_layers": [0, 9],
+    "model_pin_sha256": "2" * 64,
+    "pilot_manifest_body_sha256": "3" * 64,
+    "router_fit_sha256": "4" * 64,
+    "schema": "immer.qwen3.8-fast-mlp-mount/v1",
+    "selected_neuron_fraction_by_layer": {"0": 0.2, "9": 0.2},
+    "transport_row_fraction_by_layer": {"0": 0.2, "9": 0.2},
+    "transpose_manifest_sha256": "5" * 64,
+    "weights_index_sha256": "6" * 64,
+}
+
+
 class _InjectedChat(Qwen38CausalChat):
     def __init__(self, factory, *args, **kwargs) -> None:
         self._injected_factory = factory
@@ -314,7 +355,15 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
     def test_optional_k4_drafter_is_used_by_general_chat(self) -> None:
         target = _Runtime()
-        chat = _chat(target, draft_bundle_path="draft.causal", max_new_tokens=4)
+        target.fast_mlp_mount = _FastMount()
+        target.fast_mlp_receipt = dict(_FAST_RECEIPT)
+        chat = _chat(
+            target,
+            draft_bundle_path="draft.causal",
+            max_new_tokens=4,
+            fast_mlp_root="/artifacts/fast-mlp",
+            fast_mlp_active_layers=(0, 9),
+        )
         chat._draft_runtime = SimpleNamespace(
             tokenizer_sha256=_DIGEST,
             model=SimpleNamespace(config=SimpleNamespace(vocab_size=300_000)),
@@ -350,7 +399,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         ), patch(
             "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
             return_value=decoder,
-        ):
+        ) as decoder_constructor:
             result = chat.handle(Request("chat", "hello"))
 
         self.assertTrue(result.ok, result.reason)
@@ -359,10 +408,94 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(result.evidence["draft"]["accepted_draft_tokens"], 4)
         self.assertEqual(result.evidence["draft"]["draft_linear_calls"], 3)
         self.assertEqual(result.evidence["draft"]["target_source_body_bytes"], 100)
-        self.assertEqual(result.evidence["draft"]["total_source_body_bytes"], 112)
+        self.assertEqual(result.evidence["draft"]["total_source_body_bytes"], 132)
         self.assertEqual(result.evidence["draft"]["target_linear_calls"], 10)
         self.assertEqual(result.evidence["draft"]["total_linear_calls"], 13)
         self.assertEqual(result.evidence["generation"]["linear_calls"], 10)
+        self.assertEqual(result.evidence["fast_mlp"]["request"]["aux_source_body_bytes"], 20)
+        decoder_constructor.assert_called_once_with(target.model, provider)
+        chat.close()
+
+    def test_fast_mlp_identity_and_request_traffic_reach_general_chat(self) -> None:
+        runtime = _Runtime()
+        runtime.fast_mlp_mount = _FastMount()
+        runtime.fast_mlp_receipt = dict(_FAST_RECEIPT)
+        chat = _chat(
+            runtime,
+            fast_mlp_root="/artifacts/fast-mlp",
+            fast_mlp_active_layers=(0, 9),
+        )
+
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        fast = result.evidence["fast_mlp"]
+        self.assertEqual(fast["router_fit_sha256"], "4" * 64)
+        self.assertEqual(fast["request"]["target_source_body_bytes"], 1234)
+        self.assertEqual(fast["request"]["aux_source_body_bytes"], 20)
+        self.assertEqual(fast["request"]["total_source_body_bytes"], 1254)
+        policy = chat._result_cell_generation_policy_sha256()
+        self.assertEqual(len(policy), 64)
+        chat.close()
+
+    def test_failed_k4_fast_request_cannot_leak_counters_into_next_call(self) -> None:
+        target = _Runtime()
+        target.fast_mlp_mount = _FastMount(cumulative=(0, 7, 27))
+        target.fast_mlp_receipt = dict(_FAST_RECEIPT)
+        chat = _chat(
+            target,
+            draft_bundle_path="draft.causal",
+            max_new_tokens=4,
+            fast_mlp_root="/artifacts/fast-mlp",
+            fast_mlp_active_layers=(0, 9),
+        )
+        chat._draft_runtime = SimpleNamespace(
+            tokenizer_sha256=_DIGEST,
+            model=SimpleNamespace(config=SimpleNamespace(vocab_size=300_000)),
+            bundle_receipt=_BUNDLE_RECEIPT,
+            close=lambda: None,
+        )
+        provider = SimpleNamespace(
+            metrics=lambda: SimpleNamespace(source_body_bytes=12, linear_calls=3),
+            close=lambda: None,
+        )
+        evidence = SimpleNamespace(
+            accepted_draft_tokens=4,
+            source_body_bytes=100,
+            linear_calls=10,
+            seconds=1.25,
+            state_bytes=456,
+            stopped_on_eos=False,
+            prompt_token_ids=(11, 12),
+            generated_token_ids=(7, 8, 9, 10),
+            forward_passes=2,
+            rounds=(object(),),
+            schema="immer.qwen3.8-k4-speculative-generation/v1",
+            final_state_committed=False,
+        )
+        generated = SimpleNamespace(token_ids=(7, 8, 9, 10), evidence=evidence)
+        decoder = SimpleNamespace(
+            generate=Mock(side_effect=[RuntimeError("first failed"), generated])
+        )
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen35K4DraftProvider",
+            return_value=provider,
+        ), patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+            return_value=decoder,
+        ):
+            failed = chat.handle(Request("chat", "hello"))
+            succeeded = chat.handle(Request("chat", "hello"))
+
+        self.assertIs(failed.status, ExecutionStatus.ERROR)
+        self.assertNotIn("request", failed.evidence["fast_mlp"])
+        self.assertTrue(succeeded.ok, succeeded.reason)
+        self.assertEqual(
+            succeeded.evidence["fast_mlp"]["request"][
+                "aux_source_body_bytes"
+            ],
+            20,
+        )
         chat.close()
 
     def test_opt_in_result_cell_binding_is_runtime_derived_and_chargeable(
@@ -761,10 +894,46 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         options = constructor.call_args.kwargs
         self.assertEqual(options["max_new_tokens"], 4)
-        self.assertEqual(options["source_budget_mb"], 65536)
+        self.assertEqual(options["source_budget_mb"], 4194304)
+        self.assertEqual(options["draft_source_budget_mb"], 1048576)
+        self.assertEqual(options["max_resident_bytes"], 192 * 1024**2)
+        self.assertEqual(options["draft_max_resident_bytes"], 64 * 1024**2)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["component"], "qwen3.8.causal-chat")
         self.assertEqual(payload["output"], "local answer")
+
+    def test_cli_wires_fast_mlp_root_and_layer_subset(self) -> None:
+        qwen = _chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor:
+            with redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--fast-mlp",
+                        "/artifacts/qwen-fast",
+                        "--fast-mlp-layers",
+                        "0,9,18,63",
+                        "--fast-mlp-source-budget-mb",
+                        "8192",
+                        "--fast-mlp-max-resident-mb",
+                        "96",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["fast_mlp_root"], "/artifacts/qwen-fast")
+        self.assertEqual(options["fast_mlp_active_layers"], (0, 9, 18, 63))
+        self.assertEqual(options["fast_mlp_source_budget_mb"], 8192.0)
+        self.assertEqual(options["fast_mlp_max_resident_bytes"], 96 * 1024**2)
 
 
 if __name__ == "__main__":

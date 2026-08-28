@@ -8,8 +8,9 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import stat
-from typing import Any
+from typing import Any, cast
 
 from immer.knowledge import Streamer
 
@@ -21,6 +22,8 @@ from .config import Qwen38Config
 
 
 QWEN38_BUNDLE_SCHEMA = "immer.qwen3.8-complete-causal-bundle/v1"
+QWEN38_BUNDLE_VERIFY_CACHE_SCHEMA = "immer.qwen3.8-bundle-verify-cache/v1"
+QWEN38_BUNDLE_VERIFY_CACHE_NAME = ".bundle-verify-cache-v1.json"
 NESTED_WEIGHTS_LAYOUT = "nested/v1"
 FLAT_WEIGHTS_LAYOUT = "flat/v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -158,6 +161,128 @@ def _payload_sha256(shard: Mapping[str, Any]) -> str:
     return next(iter(values))
 
 
+def _cache_identity(
+    *,
+    manifest: Mapping[str, Any],
+    pinned: Mapping[str, Any],
+    fingerprint: str,
+    weights_layout: str,
+) -> dict[str, Any]:
+    body = cast(Mapping[str, Any], manifest["body"])
+    return {
+        "config_sha256": body.get("config_sha256"),
+        "index_sha256": body.get("index_sha256"),
+        "inventory_sha256": pinned.get("inventory_sha256"),
+        "layout_fingerprint": fingerprint,
+        "manifest_sha256": manifest.get("sha256"),
+        "weights_layout": weights_layout,
+    }
+
+
+def _load_verify_cache(
+    path: Path,
+    *,
+    identity: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]]:
+    if not path.exists() and not path.is_symlink():
+        return {}
+    try:
+        document = _strict_json(path, "bundle verification cache")
+    except Qwen38BundleError:
+        return {}
+    if (
+        set(document) != {"body", "schema", "sha256"}
+        or document.get("schema") != QWEN38_BUNDLE_VERIFY_CACHE_SCHEMA
+        or not isinstance(document.get("body"), Mapping)
+        or document.get("sha256") != _sha256(document["body"])
+    ):
+        return {}
+    body = document["body"]
+    if (
+        not isinstance(body, Mapping)
+        or body.get("identity") != dict(identity)
+        or not isinstance(body.get("shards"), list)
+    ):
+        return {}
+    rows: dict[str, Mapping[str, Any]] = {}
+    for raw in body["shards"]:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "ctime_ns",
+            "device",
+            "file",
+            "inode",
+            "mtime_ns",
+            "sha256",
+            "size",
+        }:
+            return {}
+        name = raw.get("file")
+        if (
+            not isinstance(name, str)
+            or PurePosixPath(name).name != name
+            or name in rows
+            or not isinstance(raw.get("sha256"), str)
+            or _SHA256.fullmatch(cast(str, raw["sha256"])) is None
+            or any(
+                isinstance(raw.get(field), bool)
+                or not isinstance(raw.get(field), int)
+                or cast(int, raw[field]) < 0
+                for field in ("ctime_ns", "device", "inode", "mtime_ns", "size")
+            )
+        ):
+            return {}
+        rows[name] = raw
+    return rows
+
+
+def _write_verify_cache(
+    path: Path,
+    *,
+    identity: Mapping[str, Any],
+    shards: list[dict[str, Any]],
+) -> None:
+    body = {"identity": dict(identity), "shards": shards}
+    document = {
+        "body": body,
+        "schema": QWEN38_BUNDLE_VERIFY_CACHE_SCHEMA,
+        "sha256": _sha256(body),
+    }
+    data = _canonical(document)
+    temporary = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_CREAT
+            | os.O_EXCL
+            | os.O_WRONLY
+            | int(getattr(os, "O_CLOEXEC", 0))
+            | int(getattr(os, "O_NOFOLLOW", 0)),
+            0o600,
+        )
+        view = memoryview(data)
+        offset = 0
+        while offset < len(view):
+            written = os.write(descriptor, view[offset:])
+            if written <= 0:
+                raise OSError("short verification-cache write")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, path)
+    except OSError:
+        # Read-only bundles still work through the original full verification.
+        pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _pinned_inventory(
     path: Path,
     *,
@@ -199,11 +324,14 @@ def verify_qwen38_causal_mount(
     mount: CausalWeightMount,
     *,
     require_official_config: bool = True,
+    use_verification_cache: bool = True,
 ) -> dict[str, Any]:
-    """Fully re-hash one mounted payload and replay every tensor binding."""
+    """Verify one mount, reusing unchanged local shard digests when available."""
 
     if not isinstance(mount, CausalWeightMount):
         raise TypeError("mount must be a CausalWeightMount")
+    if not isinstance(use_verification_cache, bool):
+        raise TypeError("use_verification_cache must be boolean")
     manifest = _strict_json(mount.root / "bundle.json", "bundle manifest")
     if (
         set(manifest) != {"body", "schema", "sha256"}
@@ -277,6 +405,19 @@ def verify_qwen38_causal_mount(
     receipts = {
         str(row.get("file")): row for row in raw_receipts if isinstance(row, Mapping)
     }
+    cache_path = mount.causal_root / QWEN38_BUNDLE_VERIFY_CACHE_NAME
+    cache_identity = _cache_identity(
+        manifest=manifest,
+        pinned=pinned,
+        fingerprint=fingerprint,
+        weights_layout=weights_layout,
+    )
+    cached_shards = (
+        _load_verify_cache(cache_path, identity=cache_identity)
+        if use_verification_cache
+        else {}
+    )
+    next_cache_rows: list[dict[str, Any]] = []
     payload_receipts: list[dict[str, Any]] = []
     checkpoint_bytes = 0
     for shard in inventory.get("shards", ()):
@@ -291,11 +432,24 @@ def verify_qwen38_causal_mount(
         ):
             raise Qwen38BundleError("pinned shard filename is unsafe")
         path = mount.weights_root / name
-        metadata = _regular_file(path, "bundle shard")
+        identity_descriptor, metadata = _open_regular(path, "bundle shard")
+        os.close(identity_descriptor)
         expected_size = int(shard.get("size", -1))
         expected_sha256 = _payload_sha256(shard)
-        actual_sha256 = _sha256_file(path)
         receipt = receipts.get(name)
+        cached = cached_shards.get(name)
+        cache_matches = cached is not None and all(
+            cached.get(field) == value
+            for field, value in (
+                ("ctime_ns", metadata.st_ctime_ns),
+                ("device", metadata.st_dev),
+                ("inode", metadata.st_ino),
+                ("mtime_ns", metadata.st_mtime_ns),
+                ("sha256", expected_sha256),
+                ("size", metadata.st_size),
+            )
+        )
+        actual_sha256 = expected_sha256 if cache_matches else _sha256_file(path)
         if (
             receipt is None
             or metadata.st_size != expected_size
@@ -306,6 +460,17 @@ def verify_qwen38_causal_mount(
             raise Qwen38BundleError(f"bundle shard verification failed: {name}")
         payload_receipts.append(
             {"file": name, "sha256": actual_sha256, "size": expected_size}
+        )
+        next_cache_rows.append(
+            {
+                "ctime_ns": metadata.st_ctime_ns,
+                "device": metadata.st_dev,
+                "file": name,
+                "inode": metadata.st_ino,
+                "mtime_ns": metadata.st_mtime_ns,
+                "sha256": actual_sha256,
+                "size": metadata.st_size,
+            }
         )
         checkpoint_bytes += expected_size
     if checkpoint_bytes != body.get("checkpoint_bytes"):
@@ -324,6 +489,13 @@ def verify_qwen38_causal_mount(
     if body.get("graph_revision") != [graph_revision[0], graph_revision[1]]:
         raise Qwen38BundleError("bundle graph revision differs")
 
+    if use_verification_cache:
+        _write_verify_cache(
+            cache_path,
+            identity=cache_identity,
+            shards=next_cache_rows,
+        )
+
     return {
         "checkpoint_bytes": checkpoint_bytes,
         "graph_revision": [graph_revision[0], graph_revision[1]],
@@ -341,6 +513,8 @@ __all__ = [
     "FLAT_WEIGHTS_LAYOUT",
     "NESTED_WEIGHTS_LAYOUT",
     "QWEN38_BUNDLE_SCHEMA",
+    "QWEN38_BUNDLE_VERIFY_CACHE_NAME",
+    "QWEN38_BUNDLE_VERIFY_CACHE_SCHEMA",
     "Qwen38BundleError",
     "verify_qwen38_causal_mount",
 ]

@@ -22,6 +22,23 @@ All notable changes to IMMER are recorded here.
 - CPU BF16 linear execution now aliases authenticated range buffers directly
   instead of cloning every streamed matrix. Public tensor reads retain their
   copy-owning contract.
+- Added the production fast-MLP mount for arbitrary chat. One artifact root
+  loads the existing router, affine correction, packed pilots, and row-addressed
+  down-projection transposes; the target pager stays shared, auxiliary traffic
+  is accounted separately, and K=4 automatically executes through
+  `execute_many()` on every selected layer. The real cached Beast bundle plus
+  the existing layer `0,63` fast banks mount in `2.274 s` with no model
+  forward.
+- Local chat defaults now cover a complete 64-token request instead of
+  exhausting the cumulative range-read budget after the first target sweeps.
+  Target residency defaults to `192 MiB`; the drafter and fast-MLP auxiliaries
+  each default to `64 MiB` without allocating those limits up front.
+- Complete local bundle verification now memoizes each fully hashed shard by
+  manifest identity plus device, inode, size, mtime, and ctime. Unchanged
+  55.6 GB checkpoints reuse their authenticated digests on later chat starts;
+  any shard identity change forces the original full-content hash again. On
+  the official Beast bundle, cold verification takes `77.772 s`; the unchanged
+  next-process reopen takes `1.198 s`, a `64.898x` startup speedup.
 
 ### Receipt-native Seed v3 and O1 information geometry
 
