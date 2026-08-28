@@ -318,6 +318,7 @@ class MlpPilotSparseExecutor:
         down_transpose_pager: SelectedRowPager,
         *,
         pilot_pager: SelectedRowPager | None = None,
+        active_layers: Sequence[int] | None = None,
         output_dtype: torch.dtype = torch.float32,
     ) -> None:
         if not isinstance(router_fit, MlpPilotRouterFit):
@@ -348,6 +349,27 @@ class MlpPilotSparseExecutor:
         affine_models = {model.layer: model for model in affine_fit.models}
         if set(router_models) != set(affine_models):
             raise ValueError("router and affine fits cover different layers")
+        fitted_layers = set(router_models)
+        if active_layers is None:
+            selected_layers = tuple(sorted(fitted_layers))
+        else:
+            try:
+                selected_layers = tuple(active_layers)
+            except TypeError as exc:
+                raise TypeError("active_layers must be an integer sequence") from exc
+            if (
+                not selected_layers
+                or selected_layers != tuple(sorted(set(selected_layers)))
+                or any(
+                    isinstance(layer, bool)
+                    or not isinstance(layer, int)
+                    or layer not in fitted_layers
+                    for layer in selected_layers
+                )
+            ):
+                raise ValueError(
+                    "active_layers must be a sorted non-empty fitted subset"
+                )
         self.router_fit = router_fit
         self.affine_fit = affine_fit
         self.weight_pager = weight_pager
@@ -356,6 +378,7 @@ class MlpPilotSparseExecutor:
         self.output_dtype = output_dtype
         self._router_models = router_models
         self._affine_models = affine_models
+        self._active_layers = frozenset(selected_layers)
         transport_sources = []
         for label, selected_pager in (
             ("weight", self.weight_pager),
@@ -403,14 +426,19 @@ class MlpPilotSparseExecutor:
         return f"{cls._base(layer)}.pilot.{projection}.weight"
 
     def supports_layer(self, layer: int) -> bool:
-        return layer in self._router_models
+        return layer in self._active_layers
+
+    @property
+    def active_layers(self) -> tuple[int, ...]:
+        return tuple(sorted(self._active_layers))
 
     def snapshot_identity(
         self, *, transport_neutral: bool = False
     ) -> dict[str, object]:
         identity: dict[str, object] = {
             "affine_fit_sha256": self.affine_fit.sha256,
-            "layers": sorted(self._router_models),
+            "fitted_layers": sorted(self._router_models),
+            "layers": sorted(self._active_layers),
             "output_dtype": str(self.output_dtype).removeprefix("torch."),
             "range_mode": (
                 "scattered-union"

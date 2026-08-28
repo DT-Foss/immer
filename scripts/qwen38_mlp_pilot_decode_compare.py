@@ -16,6 +16,7 @@ from immer.runtimes.deepseek_v4.causal_weights import (
     LogicalModelIdentity,
 )
 from immer.runtimes.ooe.identity import canonical_json_bytes
+from immer.runtimes.ooe.mlp_pilot_budget import MlpPilotLayerBudgetPolicy
 from immer.runtimes.ooe.mlp_pilot_residual import MlpPilotAffineFit
 from immer.runtimes.ooe.mlp_pilot_router import MlpPilotRouterFit
 from immer.runtimes.ooe.mlp_pilot_runtime import (
@@ -34,8 +35,8 @@ import torch
 from qwen38_mlp_pilot_router import _digest, _persist_exact, _stable_read
 
 
-REPORT_NAME = "sparse-decode-compare-v1.json"
-REPORT_SCHEMA = "immer.qwen3.8-mlp-pilot-sparse-decode-compare/v1"
+REPORT_NAME = "sparse-decode-compare-v3.json"
+REPORT_SCHEMA = "immer.qwen3.8-mlp-pilot-sparse-decode-compare/v3"
 
 
 class CliError(RuntimeError):
@@ -44,6 +45,24 @@ class CliError(RuntimeError):
 
 def _delta(after: dict, before: dict, key: str) -> int:
     return int(after.get(key, 0)) - int(before.get(key, 0))
+
+
+def _layer_subset(value: str) -> tuple[int, ...]:
+    try:
+        layers = tuple(int(row) for row in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "sparse layers must be comma-separated integers"
+        ) from exc
+    if (
+        not layers
+        or layers != tuple(sorted(set(layers)))
+        or any(layer < 0 for layer in layers)
+    ):
+        raise argparse.ArgumentTypeError(
+            "sparse layers must be sorted unique non-negative integers"
+        )
+    return layers
 
 
 def _prompt(
@@ -124,8 +143,28 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     prompt_sha256, prompt_tokens = _prompt(
         Path(args.prompt_registry).expanduser().absolute(), args.prompt_sha256
     )
-    if len(prompt_tokens) + 1 > args.max_context_tokens:
+    if len(prompt_tokens) + args.steps > args.max_context_tokens:
         raise CliError("selected prompt exceeds --max-context-tokens")
+    layer_budget_policy = None
+    active_layers = args.sparse_layers
+    if args.layer_budget_policy is not None:
+        layer_budget_policy = MlpPilotLayerBudgetPolicy.from_bytes(
+            _stable_read(Path(args.layer_budget_policy).expanduser().absolute())
+        )
+        if (
+            layer_budget_policy.model_pin_sha256 != router_fit.model_pin_sha256
+            or layer_budget_policy.router_fit_sha256 != router_fit.sha256
+            or layer_budget_policy.affine_fit_sha256 != affine_fit.sha256
+        ):
+            raise CliError("layer budget policy crosses sparse runtime identities")
+        measured_path = layer_budget_policy.measured_input_token_ids(prompt_sha256)
+        if len(measured_path) < args.steps:
+            raise CliError("layer budget policy requires full-Qwen fallback")
+        active_layers = layer_budget_policy.authorize_teacher_forced(
+            prompt_sha256, measured_path[: args.steps]
+        )
+        if not active_layers:
+            raise CliError("layer budget policy requires full-Qwen fallback")
 
     with tempfile.TemporaryDirectory(prefix="immer-sparse-decode-") as temporary:
         scratch = Path(temporary)
@@ -176,6 +215,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 pager,
                 transpose_pager,
                 pilot_pager=pilot_pager,
+                active_layers=active_layers,
                 output_dtype=torch.bfloat16,
             )
             model = StreamedQwen38(
@@ -191,93 +231,197 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             prefix_values, prefix_ids = pager.topk_logits(
                 prefix_hidden[:, -1, :], k=1, block_rows=args.head_block_rows
             )
-            decode_token = int(prefix_ids[0, 0])
+            first_decode_token = int(prefix_ids[0, 0])
             snapshot = scratch / "prefix.snapshot"
             model.save_state(snapshot)
 
             model.mlp_sparse_executor = None
-            before_full_pager = pager.metrics()
             before_full_transpose = transpose_pager.metrics()
             before_full_pilot = pilot_pager.metrics()
-            full_hidden, full_evidence = model.decode([[decode_token]])
-            after_full_decode_pager = pager.metrics()
-            full_values, full_ids = pager.topk_logits(
-                full_hidden[:, -1, :], k=10, block_rows=args.head_block_rows
-            )
+            full_steps = []
+            decode_token = first_decode_token
+            for step in range(args.steps):
+                before_decode = pager.metrics()
+                full_hidden, full_evidence = model.decode([[decode_token]])
+                after_decode = pager.metrics()
+                full_values, full_ids = pager.topk_logits(
+                    full_hidden[:, -1, :], k=10, block_rows=args.head_block_rows
+                )
+                full_steps.append(
+                    {
+                        "hidden": full_hidden.detach().clone(),
+                        "input_token_id": decode_token,
+                        "primary_weight_bytes": _delta(
+                            after_decode,
+                            before_decode,
+                            "logical_weight_bytes",
+                        ),
+                        "seconds": full_evidence.seconds,
+                        "step": step,
+                        "top10_ids": tuple(int(row) for row in full_ids[0].tolist()),
+                        "top10_values": tuple(
+                            float(row) for row in full_values[0].tolist()
+                        ),
+                    }
+                )
+                decode_token = int(full_ids[0, 0])
             after_full_transpose = transpose_pager.metrics()
             after_full_pilot = pilot_pager.metrics()
+            if layer_budget_policy is not None and tuple(
+                int(row["input_token_id"]) for row in full_steps
+            ) != layer_budget_policy.measured_input_token_ids(prompt_sha256)[: args.steps]:
+                raise CliError("full-Qwen continuation left the policy token path")
 
             model.mlp_sparse_executor = executor
             model.load_state(snapshot)
-            before_sparse_pager = pager.metrics()
-            before_sparse_transpose = transpose_pager.metrics()
-            before_sparse_pilot = pilot_pager.metrics()
-            sparse_hidden, sparse_evidence = model.decode([[decode_token]])
-            after_sparse_decode_pager = pager.metrics()
-            sparse_values, sparse_ids = pager.topk_logits(
-                sparse_hidden[:, -1, :], k=10, block_rows=args.head_block_rows
-            )
-            after_sparse_transpose = transpose_pager.metrics()
-            after_sparse_pilot = pilot_pager.metrics()
-
-            candidates = tuple(
-                sorted(
-                    set(int(row) for row in full_ids.reshape(-1).tolist())
-                    | set(int(row) for row in sparse_ids.reshape(-1).tolist())
+            sparse_steps = []
+            for full_step in full_steps:
+                before_sparse_pager = pager.metrics()
+                before_sparse_transpose = transpose_pager.metrics()
+                before_sparse_pilot = pilot_pager.metrics()
+                sparse_hidden, sparse_evidence = model.decode(
+                    [[full_step["input_token_id"]]]
                 )
-            )
-            full_candidate_logits = pager.candidate_logits(
-                full_hidden[:, -1, :], candidates
-            ).float()
-            sparse_candidate_logits = pager.candidate_logits(
-                sparse_hidden[:, -1, :], candidates
-            ).float()
+                after_sparse_decode_pager = pager.metrics()
+                after_sparse_transpose = transpose_pager.metrics()
+                after_sparse_pilot = pilot_pager.metrics()
+                sparse_values, sparse_ids = pager.topk_logits(
+                    sparse_hidden[:, -1, :],
+                    k=10,
+                    block_rows=args.head_block_rows,
+                )
+                sparse_top = tuple(int(row) for row in sparse_ids[0].tolist())
+                candidates = tuple(
+                    sorted(set(full_step["top10_ids"]) | set(sparse_top))
+                )
+                full_candidate_logits = pager.candidate_logits(
+                    full_step["hidden"][:, -1, :], candidates
+                ).float()
+                sparse_candidate_logits = pager.candidate_logits(
+                    sparse_hidden[:, -1, :], candidates
+                ).float()
+                sparse_steps.append(
+                    {
+                        "candidate_logit_max_abs_error": float(
+                            (sparse_candidate_logits - full_candidate_logits)
+                            .abs()
+                            .max()
+                        ),
+                        "candidate_token_ids": candidates,
+                        "hidden_metrics": _hidden_metrics(
+                            sparse_hidden, full_step["hidden"]
+                        ),
+                        "input_token_id": full_step["input_token_id"],
+                        "pilot_weight_bytes": _delta(
+                            after_sparse_pilot,
+                            before_sparse_pilot,
+                            "logical_weight_bytes",
+                        ),
+                        "primary_weight_bytes": _delta(
+                            after_sparse_decode_pager,
+                            before_sparse_pager,
+                            "logical_weight_bytes",
+                        ),
+                        "seconds": sparse_evidence.seconds,
+                        "step": full_step["step"],
+                        "top10_ids": sparse_top,
+                        "top10_overlap": len(
+                            set(full_step["top10_ids"]) & set(sparse_top)
+                        ),
+                        "top10_values": tuple(
+                            float(row) for row in sparse_values[0].tolist()
+                        ),
+                        "top1_equal": full_step["top10_ids"][0] == sparse_top[0],
+                        "transpose_weight_bytes": _delta(
+                            after_sparse_transpose,
+                            before_sparse_transpose,
+                            "logical_weight_bytes",
+                        ),
+                    }
+                )
         finally:
             pager.close()
             transpose_pager.close()
             pilot_pager.close()
             mount.close()
-    full_top = tuple(int(row) for row in full_ids[0].tolist())
-    sparse_top = tuple(int(row) for row in sparse_ids[0].tolist())
+    step_rows = []
+    for full_step, sparse_step in zip(full_steps, sparse_steps, strict=True):
+        step_rows.append(
+            {
+                "candidate_logit_max_abs_error": sparse_step[
+                    "candidate_logit_max_abs_error"
+                ],
+                "candidate_token_ids": list(sparse_step["candidate_token_ids"]),
+                "full_primary_weight_bytes": full_step["primary_weight_bytes"],
+                "full_seconds": full_step["seconds"],
+                "full_top10": list(full_step["top10_ids"]),
+                "full_top10_values": list(full_step["top10_values"]),
+                "hidden_metrics": sparse_step["hidden_metrics"],
+                "input_token_id": full_step["input_token_id"],
+                "sparse_pilot_weight_bytes": sparse_step["pilot_weight_bytes"],
+                "sparse_primary_weight_bytes": sparse_step["primary_weight_bytes"],
+                "sparse_seconds": sparse_step["seconds"],
+                "sparse_top10": list(sparse_step["top10_ids"]),
+                "sparse_top10_overlap": sparse_step["top10_overlap"],
+                "sparse_top10_values": list(sparse_step["top10_values"]),
+                "sparse_transpose_weight_bytes": sparse_step["transpose_weight_bytes"],
+                "step": full_step["step"],
+                "top1_equal": sparse_step["top1_equal"],
+            }
+        )
+    full_seconds = sum(float(row["seconds"]) for row in full_steps)
+    sparse_seconds = sum(float(row["seconds"]) for row in sparse_steps)
+    hidden_rows = [row["hidden_metrics"] for row in sparse_steps]
     body = {
         "affine_fit_sha256": affine_fit.sha256,
-        "candidate_logit_max_abs_error": float(
-            (sparse_candidate_logits - full_candidate_logits).abs().max()
+        "candidate_logit_max_abs_error": max(
+            float(row["candidate_logit_max_abs_error"]) for row in sparse_steps
         ),
-        "candidate_token_ids": list(candidates),
-        "decode_token_id": decode_token,
-        "full_decode_seconds": full_evidence.seconds,
-        "full_primary_weight_bytes": _delta(
-            after_full_decode_pager, before_full_pager, "logical_weight_bytes"
+        "full_decode_seconds": full_seconds,
+        "full_primary_weight_bytes": sum(
+            int(row["primary_weight_bytes"]) for row in full_steps
         ),
-        "full_top10": list(full_top),
-        "full_top10_values": [float(row) for row in full_values[0].tolist()],
-        "hidden_metrics": _hidden_metrics(sparse_hidden, full_hidden),
+        "hidden_cosine_mean": sum(float(row["cosine"]) for row in hidden_rows)
+        / len(hidden_rows),
+        "hidden_cosine_min": min(float(row["cosine"]) for row in hidden_rows),
+        "hidden_relative_l2_max": max(
+            float(row["relative_l2_error"]) for row in hidden_rows
+        ),
+        "hidden_relative_l2_mean": sum(
+            float(row["relative_l2_error"]) for row in hidden_rows
+        )
+        / len(hidden_rows),
+        "layer_budget_policy_sha256": (
+            None if layer_budget_policy is None else layer_budget_policy.sha256
+        ),
         "model_pin_sha256": router_fit.model_pin_sha256,
         "prefix_seconds": prefix_evidence.seconds,
         "prefix_sha256": prompt_sha256,
         "prefix_top1_value": float(prefix_values[0, 0]),
         "prefix_tokens": len(prompt_tokens),
         "router_fit_sha256": router_fit.sha256,
-        "sparse_decode_seconds": sparse_evidence.seconds,
-        "sparse_pilot_weight_bytes": _delta(
-            after_sparse_pilot, before_sparse_pilot, "logical_weight_bytes"
+        "sparse_layers": list(executor.active_layers),
+        "sparse_decode_seconds": sparse_seconds,
+        "sparse_pilot_weight_bytes": sum(
+            int(row["pilot_weight_bytes"]) for row in sparse_steps
         ),
-        "sparse_primary_weight_bytes": _delta(
-            after_sparse_decode_pager,
-            before_sparse_pager,
-            "logical_weight_bytes",
+        "sparse_primary_weight_bytes": sum(
+            int(row["primary_weight_bytes"]) for row in sparse_steps
         ),
-        "sparse_top10": list(sparse_top),
-        "sparse_top10_overlap": len(set(full_top) & set(sparse_top)),
-        "sparse_top10_values": [float(row) for row in sparse_values[0].tolist()],
-        "sparse_transpose_weight_bytes": _delta(
-            after_sparse_transpose,
-            before_sparse_transpose,
-            "logical_weight_bytes",
+        "sparse_top10_overlap_mean": sum(
+            int(row["top10_overlap"]) for row in sparse_steps
+        )
+        / len(sparse_steps),
+        "sparse_transpose_weight_bytes": sum(
+            int(row["transpose_weight_bytes"]) for row in sparse_steps
         ),
-        "speedup_full_over_sparse": full_evidence.seconds / sparse_evidence.seconds,
-        "top1_equal": full_top[0] == sparse_top[0],
+        "speedup_full_over_sparse": full_seconds / sparse_seconds,
+        "step_receipts": step_rows,
+        "steps": args.steps,
+        "teacher_forced_input_token_ids": [
+            int(row["input_token_id"]) for row in full_steps
+        ],
+        "top1_equal_steps": sum(bool(row["top1_equal"]) for row in sparse_steps),
         "unused_full_auxiliary_bytes": _delta(
             after_full_transpose, before_full_transpose, "logical_weight_bytes"
         )
@@ -306,7 +450,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-registry", required=True)
     parser.add_argument("--prompt-sha256")
     parser.add_argument("--output")
-    parser.add_argument("--source-budget-mb", type=float, default=524_288.0)
+    parser.add_argument("--steps", type=int, default=1)
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--sparse-layers", type=_layer_subset)
+    action.add_argument("--layer-budget-policy")
+    parser.add_argument("--source-budget-mb", type=float, default=1_048_576.0)
     parser.add_argument("--max-context-tokens", type=int, default=256)
     parser.add_argument("--head-block-rows", type=int, default=2048)
     return parser
@@ -319,6 +467,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         or args.source_budget_mb <= 0.0
         or args.max_context_tokens < 2
         or args.head_block_rows < 1
+        or args.steps < 1
     ):
         raise CliError("decode budgets are invalid")
     report = run(args)

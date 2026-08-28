@@ -24,7 +24,10 @@ SCRIPTS = (
     "qwen38_fertig_arm_compare.py",
     "qwen38_ooe_cold_warm_cohort.py",
     "qwen38_ooe_chat_cohort.py",
+    "qwen38_mlp_pilot_router.py",
+    "qwen38_mlp_pilot_decode_compare.py",
     "qwen38_o1_mlp_evidence.py",
+    "qwen38_mlp_pilot_layer_budget.py",
     "ooe_intelligence_benchmark.py",
     "ooe_boundary_blanket.py",
     "ooe_demand_blanket_benchmark.py",
@@ -133,6 +136,41 @@ class ScriptEntrypointTests(unittest.TestCase):
         source = (ROOT / "scripts" / "router_v2_stage2.py").read_text(encoding="utf-8")
         self.assertIn('METHOD_VERDICT = "NEGATIVE_METHOD_FALSIFIED"', source)
         self.assertIn('"eligible_as_runtime_router": False', source)
+
+    def test_mlp_decode_layer_action_sources_are_mutually_exclusive(self) -> None:
+        required = [
+            "--analysis-root",
+            "analysis",
+            "--transpose-root",
+            "transpose",
+            "--pilot-root",
+            "pilot",
+            "--weights-root",
+            "weights",
+            "--prompt-registry",
+            "prompts.json",
+        ]
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(ROOT / "src")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "qwen38_mlp_pilot_decode_compare.py"),
+                *required,
+                "--sparse-layers",
+                "0,63",
+                "--layer-budget-policy",
+                "policy.json",
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not allowed with argument", result.stderr)
 
 
 if __name__ == "__main__":

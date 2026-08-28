@@ -222,6 +222,24 @@ class MlpPilotRuntimeTests(unittest.TestCase):
             (model.block_count * model.pilot_count + model.block_size)
             / model.intermediate_dimension,
         )
+        subset = MlpPilotSparseExecutor(
+            router,
+            affine,
+            consolidated_weight_pager,
+            consolidated_transpose_pager,
+            pilot_pager=packed_pager,
+            active_layers=(model.layer,),
+        )
+        self.assertTrue(subset.supports_layer(model.layer))
+        self.assertFalse(subset.supports_layer(router.models[1].layer))
+        with self.assertRaisesRegex(ValueError, "sorted non-empty fitted subset"):
+            MlpPilotSparseExecutor(
+                router,
+                affine,
+                consolidated_weight_pager,
+                consolidated_transpose_pager,
+                active_layers=(router.models[1].layer, model.layer),
+            )
 
 
 if __name__ == "__main__":
