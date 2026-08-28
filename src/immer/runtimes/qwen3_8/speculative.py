@@ -1660,6 +1660,12 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             )
             guard_bytes += reconcile_bytes
             guard_seconds += reconcile_seconds
+            if terminal:
+                final_bytes, final_seconds = self._observe_rolling_final_provider(
+                    (*prompt, *generated, *emitted)
+                )
+                guard_bytes += final_bytes
+                guard_seconds += final_seconds
             correction = None if terminal else targets[accepted]
             rounds.append(
                 RollingK4SpeculativeRoundEvidence(

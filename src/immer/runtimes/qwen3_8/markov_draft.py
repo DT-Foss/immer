@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 import os
@@ -19,15 +19,76 @@ import stat
 from typing import Sequence
 import zlib
 
-MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v1"
-_STATE_PREFIX = b"IMMD\x01"
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - production targets are POSIX.
+    fcntl = None  # type: ignore[assignment]
+
+MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
+LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v2"
+_STATE_PREFIX = b"IMMD\x02"
+_LEGACY_STATE_PREFIX = b"IMMD\x01"
 _MAX_STATE_BYTES = 16 * 1024 * 1024
 _UNKNOWN_TOKEN = "<unknown>"
+_EPISODE_TOKEN = "<episode>"
 
 
 class MarkovDraftError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class MarkovExpertSpec:
+    name: str
+    max_order: int
+    window: int
+    local_only: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("Markov expert name must not be empty")
+        if (
+            isinstance(self.max_order, bool)
+            or not isinstance(self.max_order, int)
+            or self.max_order < 0
+        ):
+            raise ValueError("Markov expert order must be non-negative")
+        if (
+            isinstance(self.window, bool)
+            or not isinstance(self.window, int)
+            or self.window < max(8, self.max_order + 1)
+        ):
+            raise ValueError("Markov expert window is too small")
+        if not isinstance(self.local_only, bool):
+            raise TypeError("local_only must be boolean")
+
+
+def _expert_specs(max_order: int, max_history_tokens: int) -> tuple[MarkovExpertSpec, ...]:
+    rows = (
+        ("local-o0-w128", 0, min(128, max_history_tokens), True),
+        ("global-o0-w4096", 0, max_history_tokens, False),
+        ("local-o1-w128", min(1, max_order), min(128, max_history_tokens), True),
+        ("global-o1-w4096", min(1, max_order), max_history_tokens, False),
+        (
+            "recent-o2-w256",
+            min(2, max_order),
+            min(256, max_history_tokens),
+            False,
+        ),
+        (
+            "medium-o4-w1024",
+            min(4, max_order),
+            min(1024, max_history_tokens),
+            False,
+        ),
+        ("deep-o8-w4096", min(8, max_order), max_history_tokens, False),
+        (f"max-o{max_order}-w4096", max_order, max_history_tokens, False),
+    )
+    return tuple(
+        MarkovExpertSpec(name, order, max(8, window), local)
+        for name, order, window, local in rows
+    )
 
 
 class _TransitionFingerprint:
@@ -114,12 +175,69 @@ def _canonical(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _read_state_bytes(path: Path) -> bytes:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | int(getattr(os, "O_CLOEXEC", 0))
+            | int(getattr(os, "O_NOFOLLOW", 0)),
+        )
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= _MAX_STATE_BYTES:
+            raise MarkovDraftError("Markov draft state size is invalid")
+        chunks = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise MarkovDraftError("Markov draft state returned a short read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        linked = path.lstat()
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or (after.st_dev, after.st_ino) != (linked.st_dev, linked.st_ino):
+            raise MarkovDraftError("Markov draft state changed while read")
+        return b"".join(chunks)
+    except MarkovDraftError:
+        raise
+    except OSError as exc:
+        raise MarkovDraftError("cannot read Markov draft state") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 @dataclass(frozen=True, slots=True)
 class MarkovDraftState:
     vocab_size: int
     max_history_tokens: int
     token_ids: tuple[int, ...]
     updates: int = 0
+    expert_names: tuple[str, ...] = ()
+    expert_log_weights: tuple[float, ...] = ()
+    expert_observations: tuple[int, ...] = ()
+    expert_hits: tuple[int, ...] = ()
+    leader_changes: int = 0
+    episode_lengths: tuple[int, ...] = ()
+    feedback_count: int = 0
+    surprise_mean: float = 0.0
+    surprise_deviation: float = 1.0
+    surprise_cusum: float = 0.0
+    regime_generation: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -141,14 +259,86 @@ class MarkovDraftState:
             for token in self.token_ids
         ):
             raise ValueError("Markov draft token history is invalid")
+        episode_lengths = tuple(self.episode_lengths)
+        if self.token_ids and not episode_lengths:
+            episode_lengths = (len(self.token_ids),)
+        if (
+            any(
+                isinstance(length, bool)
+                or not isinstance(length, int)
+                or length <= 0
+                for length in episode_lengths
+            )
+            or sum(episode_lengths) != len(self.token_ids)
+        ):
+            raise ValueError("Markov episode boundaries are invalid")
         if isinstance(self.updates, bool) or not isinstance(self.updates, int) or self.updates < 0:
             raise ValueError("updates must be a non-negative integer")
+        names = tuple(self.expert_names)
+        log_weights = tuple(float(value) for value in self.expert_log_weights)
+        observations = tuple(self.expert_observations)
+        hits = tuple(self.expert_hits)
+        lengths = {len(names), len(log_weights), len(observations), len(hits)}
+        if lengths not in ({0}, {len(names)}) or (
+            names
+            and (
+                len(set(names)) != len(names)
+                or any(not isinstance(name, str) or not name for name in names)
+                or any(not math.isfinite(value) for value in log_weights)
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    for value in (*observations, *hits)
+                )
+                or any(hit > seen for hit, seen in zip(hits, observations, strict=True))
+            )
+        ):
+            raise ValueError("Markov expert state is invalid")
+        if (
+            isinstance(self.leader_changes, bool)
+            or not isinstance(self.leader_changes, int)
+            or self.leader_changes < 0
+        ):
+            raise ValueError("leader_changes must be non-negative")
+        if (
+            isinstance(self.feedback_count, bool)
+            or not isinstance(self.feedback_count, int)
+            or self.feedback_count < 0
+            or isinstance(self.regime_generation, bool)
+            or not isinstance(self.regime_generation, int)
+            or self.regime_generation < 0
+        ):
+            raise ValueError("Markov regime counters are invalid")
+        for value, label in (
+            (self.surprise_mean, "surprise_mean"),
+            (self.surprise_deviation, "surprise_deviation"),
+            (self.surprise_cusum, "surprise_cusum"),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{label} must be finite and non-negative")
+        object.__setattr__(self, "expert_names", names)
+        object.__setattr__(self, "expert_log_weights", log_weights)
+        object.__setattr__(self, "expert_observations", observations)
+        object.__setattr__(self, "expert_hits", hits)
+        object.__setattr__(self, "episode_lengths", episode_lengths)
 
     def to_bytes(self) -> bytes:
         raw = _canonical(
             {
                 "max_history_tokens": self.max_history_tokens,
+                "expert_hits": list(self.expert_hits),
+                "expert_log_weights": [value.hex() for value in self.expert_log_weights],
+                "expert_names": list(self.expert_names),
+                "expert_observations": list(self.expert_observations),
+                "leader_changes": self.leader_changes,
+                "episode_lengths": list(self.episode_lengths),
+                "feedback_count": self.feedback_count,
+                "regime_generation": self.regime_generation,
                 "schema": MARKOV_DRAFT_STATE_SCHEMA,
+                "surprise_cusum": self.surprise_cusum.hex(),
+                "surprise_deviation": self.surprise_deviation.hex(),
+                "surprise_mean": self.surprise_mean.hex(),
                 "token_ids": list(self.token_ids),
                 "updates": self.updates,
                 "vocab_size": self.vocab_size,
@@ -164,14 +354,15 @@ class MarkovDraftState:
         if (
             not isinstance(data, bytes)
             or len(data) > _MAX_STATE_BYTES
-            or not data.startswith(_STATE_PREFIX)
+            or not data.startswith((_STATE_PREFIX, _LEGACY_STATE_PREFIX))
         ):
             raise MarkovDraftError("Markov draft state envelope is invalid")
         try:
             decoder = zlib.decompressobj()
-            raw = decoder.decompress(
-                data[len(_STATE_PREFIX) :], _MAX_STATE_BYTES + 1
+            prefix = (
+                _STATE_PREFIX if data.startswith(_STATE_PREFIX) else _LEGACY_STATE_PREFIX
             )
+            raw = decoder.decompress(data[len(prefix) :], _MAX_STATE_BYTES + 1)
             if (
                 len(raw) > _MAX_STATE_BYTES
                 or decoder.unconsumed_tail
@@ -181,17 +372,43 @@ class MarkovDraftState:
             value = json.loads(raw)
         except (zlib.error, UnicodeError, json.JSONDecodeError) as exc:
             raise MarkovDraftError("Markov draft state is corrupt") from exc
-        if (
-            not isinstance(value, dict)
-            or set(value)
-            != {
+        legacy = (
+            isinstance(value, dict)
+            and value.get("schema") == LEGACY_MARKOV_DRAFT_STATE_SCHEMA
+        )
+        expected = (
+            {
                 "max_history_tokens",
                 "schema",
                 "token_ids",
                 "updates",
                 "vocab_size",
             }
-            or value.get("schema") != MARKOV_DRAFT_STATE_SCHEMA
+            if legacy
+            else {
+                "expert_hits",
+                "expert_log_weights",
+                "expert_names",
+                "expert_observations",
+                "leader_changes",
+                "episode_lengths",
+                "feedback_count",
+                "max_history_tokens",
+                "regime_generation",
+                "schema",
+                "surprise_cusum",
+                "surprise_deviation",
+                "surprise_mean",
+                "token_ids",
+                "updates",
+                "vocab_size",
+            }
+        )
+        if (
+            not isinstance(value, dict)
+            or set(value) != expected
+            or value.get("schema")
+            not in {MARKOV_DRAFT_STATE_SCHEMA, LEGACY_MARKOV_DRAFT_STATE_SCHEMA}
             or not isinstance(value.get("token_ids"), list)
             or _canonical(value) != raw
         ):
@@ -202,6 +419,24 @@ class MarkovDraftState:
                 max_history_tokens=value["max_history_tokens"],
                 token_ids=tuple(value["token_ids"]),
                 updates=value["updates"],
+                expert_names=tuple(value.get("expert_names", ())),
+                expert_log_weights=tuple(
+                    float.fromhex(item)
+                    for item in value.get("expert_log_weights", ())
+                ),
+                expert_observations=tuple(value.get("expert_observations", ())),
+                expert_hits=tuple(value.get("expert_hits", ())),
+                leader_changes=value.get("leader_changes", 0),
+                episode_lengths=tuple(value.get("episode_lengths", ())),
+                feedback_count=value.get("feedback_count", 0),
+                surprise_mean=float.fromhex(value.get("surprise_mean", "0x0.0p+0")),
+                surprise_deviation=float.fromhex(
+                    value.get("surprise_deviation", "0x1.0p+0")
+                ),
+                surprise_cusum=float.fromhex(
+                    value.get("surprise_cusum", "0x0.0p+0")
+                ),
+                regime_generation=value.get("regime_generation", 0),
             )
         except (TypeError, ValueError) as exc:
             raise MarkovDraftError("Markov draft state values are invalid") from exc
@@ -216,22 +451,47 @@ class MarkovDraftMetrics:
     learned_tokens: int
     updates: int
     state_bytes: int
+    council_predictions: int
+    council_feedback: int
+    leader_changes: int
+    expert_weights: tuple[tuple[str, float], ...]
+    expert_accuracy: tuple[tuple[str, float], ...]
+    effective_experts: float
+    last_confidence: float
+    last_disagreement: float
+    regime_generation: int
+    surprise_mean: float
+    surprise_cusum: float
     source_body_bytes: int = 0
     linear_calls: int = 0
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        value = asdict(self)
+        value["expert_weights"] = dict(self.expert_weights)
+        value["expert_accuracy"] = dict(self.expert_accuracy)
+        return value
 
 
 class FingerprintRollingK4DraftProvider:
     """Draft with sparse PPM counts and learn only target-confirmed tokens."""
+
+    EXPERT_LEARNING_RATE = 0.5
+    RAPIDITY_DECAY = 0.95
+    EXPERT_TEMPERATURE = 0.5
+    FIXED_SHARE = 0.05
+    SURPRISE_RATE = 0.05
+    CUSUM_DECAY = 0.90
+    CUSUM_DRIFT = 0.50
+    CUSUM_THRESHOLD = 8.0
+    REGIME_WARMUP = 16
+    REGIME_RAPIDITY_SHRINK = 0.25
 
     def __init__(
         self,
         *,
         vocab_size: int,
         state_path: str | Path | None = None,
-        max_order: int = 8,
+        max_order: int = 16,
         alpha: float = 0.5,
         backoff_strength: float = 3.0,
         min_count: int = 1,
@@ -265,14 +525,78 @@ class FingerprintRollingK4DraftProvider:
         self.backoff_strength = float(backoff_strength)
         self.min_count = min_count
         self.max_history_tokens = max_history_tokens
-        self._state = self._load_state()
+        self._experts = _expert_specs(max_order, max_history_tokens)
+        self._state_lock_descriptor: int | None = None
+        self._acquire_state_lock()
+        try:
+            self._state = self._load_state()
+        except Exception:
+            self._release_state_lock()
+            raise
+        names = tuple(row.name for row in self._experts)
+        if not self._state.expert_names:
+            uniform = -math.log(len(names))
+            self._state = replace(
+                self._state,
+                expert_names=names,
+                expert_log_weights=(uniform,) * len(names),
+                expert_observations=(0,) * len(names),
+                expert_hits=(0,) * len(names),
+            )
+        elif self._state.expert_names != names:
+            self._release_state_lock()
+            raise MarkovDraftError("Markov council topology changed")
         self._pending_base: tuple[int, ...] | None = None
         self._pending_proposal: tuple[int, ...] | None = None
+        self._pending_feedback: tuple[
+            tuple[tuple[dict[str, float], int], ...], ...
+        ] = ()
+        self._carry_feedback: tuple[tuple[dict[str, float], int], ...] | None = None
+        self._episode_feedback: list[
+            tuple[tuple[tuple[dict[str, float], int], ...], int]
+        ] = []
         self._last_confirmed_length: int | None = None
         self._draft_calls = 0
         self._reconcile_calls = 0
         self._predictions = 0
+        self._council_predictions = 0
+        self._council_feedback = 0
+        self._last_confidence = 0.0
+        self._last_disagreement = 0.0
         self._closed = False
+
+    def _acquire_state_lock(self) -> None:
+        path = self.state_path
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = path.parent / f".{path.name}.lock"
+        descriptor = os.open(
+            lock,
+            os.O_CREAT
+            | os.O_RDWR
+            | int(getattr(os, "O_CLOEXEC", 0))
+            | int(getattr(os, "O_NOFOLLOW", 0)),
+            0o600,
+        )
+        try:
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except Exception:
+            os.close(descriptor)
+            raise
+        self._state_lock_descriptor = descriptor
+
+    def _release_state_lock(self) -> None:
+        descriptor = self._state_lock_descriptor
+        self._state_lock_descriptor = None
+        if descriptor is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
     def _load_state(self) -> MarkovDraftState:
         empty = MarkovDraftState(
@@ -284,13 +608,8 @@ class FingerprintRollingK4DraftProvider:
         if path is None or (not path.exists() and not path.is_symlink()):
             return empty
         try:
-            metadata = path.lstat()
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-                raise MarkovDraftError("Markov draft state must be a regular file")
-            if not 0 < metadata.st_size <= _MAX_STATE_BYTES:
-                raise MarkovDraftError("Markov draft state size is invalid")
-            state = MarkovDraftState.from_bytes(path.read_bytes())
-        except OSError as exc:
+            state = MarkovDraftState.from_bytes(_read_state_bytes(path))
+        except OSError as exc:  # pragma: no cover - normalized by helper.
             raise MarkovDraftError("cannot read Markov draft state") from exc
         if (
             state.vocab_size != self.vocab_size
@@ -315,39 +634,247 @@ class FingerprintRollingK4DraftProvider:
     def _symbol(self, token: int) -> str:
         return f"{token:0{self.width}d}"
 
-    def _predict(self, history: tuple[int, ...], count: int) -> tuple[int, ...]:
-        learned = self._state.token_ids
-        combined = (*learned, *history)[-self.max_history_tokens :]
-        symbols = tuple(self._symbol(token) for token in combined)
-        fingerprint = _TransitionFingerprint.fit(
-            symbols,
-            max_order=min(self.max_order, len(symbols) - 1),
-            alpha=self.alpha,
-            backoff_strength=self.backoff_strength,
-            min_count=self.min_count,
+    def _weights(self) -> tuple[float, ...]:
+        scaled = tuple(
+            value / self.EXPERT_TEMPERATURE
+            for value in self._state.expert_log_weights
         )
-        context = list(symbols)
+        maximum = max(scaled)
+        raw = tuple(math.exp(value - maximum) for value in scaled)
+        total = sum(raw)
+        count = len(raw)
+        return tuple(
+            (1.0 - self.FIXED_SHARE) * value / total
+            + self.FIXED_SHARE / count
+            for value in raw
+        )
+
+    def _persistent_symbols(self) -> tuple[str, ...]:
+        rows: list[str] = []
+        offset = 0
+        for index, length in enumerate(self._state.episode_lengths):
+            if index:
+                rows.append(_EPISODE_TOKEN)
+            rows.extend(
+                self._symbol(token)
+                for token in self._state.token_ids[offset : offset + length]
+            )
+            offset += length
+        return tuple(rows)
+
+    def _expert_models(
+        self, history: tuple[int, ...]
+    ) -> tuple[tuple[_TransitionFingerprint, list[str]], ...]:
+        rows = []
+        persistent = self._persistent_symbols()
+        current = tuple(self._symbol(token) for token in history)
+        for spec in self._experts:
+            source = (
+                current
+                if spec.local_only or not persistent
+                else (*persistent, _EPISODE_TOKEN, *current)
+            )
+            selected = source[-spec.window :]
+            model = _TransitionFingerprint.fit(
+                selected,
+                max_order=min(spec.max_order, len(selected) - 1),
+                alpha=self.alpha,
+                backoff_strength=self.backoff_strength,
+                min_count=self.min_count,
+            )
+            rows.append((model, list(selected)))
+        return tuple(rows)
+
+    def _predict_council(
+        self, history: tuple[int, ...], count: int
+    ) -> tuple[
+        tuple[int, ...],
+        tuple[tuple[tuple[dict[str, float], int], ...], ...],
+    ]:
+        experts = self._expert_models(history)
+        weights = self._weights()
         proposal: list[int] = []
+        feedback_rows = []
         for _ in range(count):
-            distribution = fingerprint.distribution(context)
-            candidates = [
+            distributions = tuple(
+                model.distribution(context) for model, context in experts
+            )
+            numeric_symbols = sorted(
+                {
+                    symbol
+                    for distribution in distributions
+                    for symbol in distribution
+                    if symbol != _UNKNOWN_TOKEN
+                    and symbol.isdecimal()
+                    and 0 <= int(symbol) < self.vocab_size
+                }
+            )
+            if not numeric_symbols:
+                raise MarkovDraftError("Markov council has no Qwen token")
+            mixture = {
+                symbol: sum(
+                    weight * distribution.get(symbol, 0.0)
+                    for weight, distribution in zip(
+                        weights, distributions, strict=True
+                    )
+                )
+                for symbol in numeric_symbols
+            }
+            token = max(
                 (probability, -int(symbol), int(symbol))
-                for symbol, probability in distribution.items()
-                if symbol != _UNKNOWN_TOKEN
-                and symbol.isdecimal()
-                and 0 <= int(symbol) < self.vocab_size
-            ]
-            if not candidates:
-                raise MarkovDraftError("Markov fingerprint has no Qwen token")
-            token = max(candidates)[2]
+                for symbol, probability in mixture.items()
+            )[2]
             proposal.append(token)
-            context.append(self._symbol(token))
+            universe = set().union(*(distribution.keys() for distribution in distributions))
+            pooled = {
+                symbol: sum(
+                    weight * distribution.get(symbol, 0.0)
+                    for weight, distribution in zip(
+                        weights, distributions, strict=True
+                    )
+                )
+                for symbol in universe
+            }
+
+            def entropy(probabilities: Mapping[str, float]) -> float:
+                return -sum(
+                    value * math.log(max(value, 1e-12))
+                    for value in probabilities.values()
+                    if value > 0.0
+                )
+
+            self._last_confidence = mixture[self._symbol(token)]
+            self._last_disagreement = max(
+                0.0,
+                entropy(pooled)
+                - sum(
+                    weight * entropy(distribution)
+                    for weight, distribution in zip(
+                        weights, distributions, strict=True
+                    )
+                ),
+            )
+            expert_row = []
+            for distribution in distributions:
+                predicted = max(
+                    (
+                        probability,
+                        -int(symbol),
+                        int(symbol),
+                    )
+                    for symbol, probability in distribution.items()
+                    if symbol != _UNKNOWN_TOKEN
+                    and symbol.isdecimal()
+                    and 0 <= int(symbol) < self.vocab_size
+                )[2]
+                expert_row.append((distribution, predicted))
+            feedback_rows.append(tuple(expert_row))
+            symbol = self._symbol(token)
+            for _model, context in experts:
+                context.append(symbol)
         self._predictions += count
-        return tuple(proposal)
+        self._council_predictions += count
+        return tuple(proposal), tuple(feedback_rows)
+
+    def _apply_council_feedback(
+        self,
+        feedback: tuple[tuple[dict[str, float], int], ...],
+        token: int,
+    ) -> None:
+        if len(feedback) != len(self._experts):
+            raise MarkovDraftError("Markov council feedback width changed")
+        symbol = self._symbol(token)
+        before_leader = max(
+            range(len(self._experts)),
+            key=lambda index: self._state.expert_log_weights[index],
+        )
+        logs = list(self._state.expert_log_weights)
+        observations = list(self._state.expert_observations)
+        hits = list(self._state.expert_hits)
+        weights = self._weights()
+        probabilities = []
+        for distribution, _prediction in feedback:
+            if symbol in distribution:
+                probabilities.append(distribution[symbol])
+                continue
+            seen = sum(
+                candidate.isdecimal()
+                and 0 <= int(candidate) < self.vocab_size
+                for candidate in distribution
+            )
+            probabilities.append(
+                distribution.get(_UNKNOWN_TOKEN, 1e-12)
+                / max(1, self.vocab_size - seen)
+            )
+        mixture_probability = sum(
+            weight * probability
+            for weight, probability in zip(weights, probabilities, strict=True)
+        )
+        surprise = -math.log(max(mixture_probability, 1e-12))
+        previous_mean = self._state.surprise_mean
+        previous_deviation = self._state.surprise_deviation
+        if self._state.feedback_count == 0:
+            z_score = 0.0
+        else:
+            z_score = (surprise - previous_mean) / max(
+                previous_deviation, 1e-6
+            )
+        next_mean = (
+            (1.0 - self.SURPRISE_RATE) * previous_mean
+            + self.SURPRISE_RATE * surprise
+        )
+        next_deviation = (
+            (1.0 - self.SURPRISE_RATE) * previous_deviation
+            + self.SURPRISE_RATE * abs(surprise - previous_mean)
+        )
+        next_cusum = max(
+            0.0,
+            self.CUSUM_DECAY * self._state.surprise_cusum
+            + z_score
+            - self.CUSUM_DRIFT,
+        )
+        for index, (distribution, prediction) in enumerate(feedback):
+            probability = probabilities[index]
+            advantage = math.log(max(probability, 1e-12)) - math.log(
+                max(mixture_probability, 1e-12)
+            )
+            logs[index] = (
+                self.RAPIDITY_DECAY * logs[index]
+                + self.EXPERT_LEARNING_RATE * advantage
+            )
+            observations[index] += 1
+            hits[index] += int(prediction == token)
+        center = sum(logs) / len(logs)
+        logs = [value - center for value in logs]
+        regime_change = (
+            self._state.feedback_count + 1 >= self.REGIME_WARMUP
+            and next_cusum > self.CUSUM_THRESHOLD
+        )
+        if regime_change:
+            logs = [self.REGIME_RAPIDITY_SHRINK * value for value in logs]
+            next_cusum = 0.0
+        after_leader = max(range(len(logs)), key=logs.__getitem__)
+        self._state = replace(
+            self._state,
+            expert_log_weights=tuple(logs),
+            expert_observations=tuple(observations),
+            expert_hits=tuple(hits),
+            leader_changes=(
+                self._state.leader_changes + int(before_leader != after_leader)
+            ),
+            feedback_count=self._state.feedback_count + 1,
+            surprise_mean=next_mean,
+            surprise_deviation=next_deviation,
+            surprise_cusum=next_cusum,
+            regime_generation=(
+                self._state.regime_generation + int(regime_change)
+            ),
+        )
+        self._council_feedback += 1
 
     def __call__(self, history: tuple[int, ...], /) -> tuple[int, int, int, int]:
         committed = self._token_tuple(history, label="Markov draft history")
-        proposal = self._predict(committed, 4)
+        proposal, _feedback = self._predict_council(committed, 4)
         return proposal[0], proposal[1], proposal[2], proposal[3]
 
     def propose_after(
@@ -367,21 +894,38 @@ class FingerprintRollingK4DraftProvider:
             self._last_confirmed_length = len(committed)
         elif len(committed) != self._last_confirmed_length:
             raise MarkovDraftError("rolling Markov history length is discontinuous")
+        if self._carry_feedback is not None:
+            self._episode_feedback.append((self._carry_feedback, known_token))
+            self._carry_feedback = None
         base = (*committed, known_token)
-        proposal = self._predict(base, 3)
+        complete, feedback = self._predict_council(base, 4)
+        proposal = complete[:3]
         self._pending_base = base
         self._pending_proposal = proposal
+        self._pending_feedback = feedback
         self._draft_calls += 1
         return proposal[0], proposal[1], proposal[2]
 
-    def _learn(self, tokens: Sequence[int]) -> None:
-        if not tokens:
+    def _learn_episode(self, tokens: Sequence[int]) -> None:
+        episode = tuple(tokens)
+        if not episode:
             return
-        combined = (*self._state.token_ids, *tokens)[-self.max_history_tokens :]
-        self._state = MarkovDraftState(
-            vocab_size=self.vocab_size,
-            max_history_tokens=self.max_history_tokens,
+        episodes = []
+        offset = 0
+        for length in self._state.episode_lengths:
+            episodes.append(self._state.token_ids[offset : offset + length])
+            offset += length
+        episodes.append(episode)
+        total = sum(len(row) for row in episodes)
+        while len(episodes) > 1 and total > self.max_history_tokens:
+            total -= len(episodes.pop(0))
+        if total > self.max_history_tokens:
+            episodes[0] = episodes[0][-self.max_history_tokens :]
+        combined = tuple(token for row in episodes for token in row)
+        self._state = replace(
+            self._state,
             token_ids=combined,
+            episode_lengths=tuple(len(row) for row in episodes),
             updates=self._state.updates + 1,
         )
 
@@ -391,31 +935,49 @@ class FingerprintRollingK4DraftProvider:
         proposal = self._pending_proposal
         if base is None or proposal is None:
             raise MarkovDraftError("reconcile_prefix requires a pending proposal")
+        if len(self._pending_feedback) != 4:
+            raise MarkovDraftError("Markov council proposal feedback is missing")
         if committed[: len(base)] != base:
             raise MarkovDraftError("Markov reconciliation changed its known base")
         delta = committed[len(base) :]
         if len(delta) > 3 or delta != proposal[: len(delta)]:
             raise MarkovDraftError("Markov reconciliation is not a proposal prefix")
         assert self._last_confirmed_length is not None
-        self._learn(committed[self._last_confirmed_length :])
+        for index, token in enumerate(delta):
+            self._episode_feedback.append((self._pending_feedback[index], token))
+        self._carry_feedback = self._pending_feedback[len(delta)]
         self._last_confirmed_length = len(committed)
         self._pending_base = None
         self._pending_proposal = None
+        self._pending_feedback = ()
         self._reconcile_calls += 1
-        self._persist()
 
     def observe_final(self, history: tuple[int, ...], /) -> None:
         committed = self._token_tuple(history, label="final Markov history")
         if self._pending_base is not None:
             raise MarkovDraftError("cannot finalize an unreconciled proposal")
         if self._last_confirmed_length is None:
-            self._learn(committed)
+            for feedback, token in self._episode_feedback:
+                self._apply_council_feedback(feedback, token)
+            self._episode_feedback.clear()
+            self._learn_episode(committed)
             self._last_confirmed_length = len(committed)
             self._persist()
             return
         if len(committed) < self._last_confirmed_length:
             raise MarkovDraftError("final Markov history moved backwards")
-        self._learn(committed[self._last_confirmed_length :])
+        if self._carry_feedback is not None and len(committed) > self._last_confirmed_length:
+            self._episode_feedback.append(
+                (
+                    self._carry_feedback,
+                    committed[self._last_confirmed_length],
+                )
+            )
+        self._carry_feedback = None
+        for feedback, token in self._episode_feedback:
+            self._apply_council_feedback(feedback, token)
+        self._episode_feedback.clear()
+        self._learn_episode(committed)
         self._last_confirmed_length = len(committed)
         self._persist()
 
@@ -446,6 +1008,14 @@ class FingerprintRollingK4DraftProvider:
             os.close(descriptor)
             descriptor = None
             os.replace(temporary, path)
+            directory = os.open(
+                path.parent,
+                os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)),
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         except OSError as exc:
             raise MarkovDraftError("cannot persist Markov draft state") from exc
         finally:
@@ -454,6 +1024,15 @@ class FingerprintRollingK4DraftProvider:
             temporary.unlink(missing_ok=True)
 
     def metrics(self) -> MarkovDraftMetrics:
+        weights = self._weights()
+        accuracy = tuple(
+            0.0 if seen == 0 else hit / seen
+            for hit, seen in zip(
+                self._state.expert_hits,
+                self._state.expert_observations,
+                strict=True,
+            )
+        )
         return MarkovDraftMetrics(
             schema=MARKOV_DRAFT_METRICS_SCHEMA,
             draft_calls=self._draft_calls,
@@ -462,6 +1041,21 @@ class FingerprintRollingK4DraftProvider:
             learned_tokens=len(self._state.token_ids),
             updates=self._state.updates,
             state_bytes=len(self._state.to_bytes()),
+            council_predictions=self._council_predictions,
+            council_feedback=self._council_feedback,
+            leader_changes=self._state.leader_changes,
+            expert_weights=tuple(
+                zip(self._state.expert_names, weights, strict=True)
+            ),
+            expert_accuracy=tuple(
+                zip(self._state.expert_names, accuracy, strict=True)
+            ),
+            effective_experts=1.0 / sum(value * value for value in weights),
+            last_confidence=self._last_confidence,
+            last_disagreement=self._last_disagreement,
+            regime_generation=self._state.regime_generation,
+            surprise_mean=self._state.surprise_mean,
+            surprise_cusum=self._state.surprise_cusum,
         )
 
     def close(self) -> None:
@@ -469,15 +1063,23 @@ class FingerprintRollingK4DraftProvider:
             return
         self._pending_base = None
         self._pending_proposal = None
-        self._persist()
-        self._closed = True
+        self._pending_feedback = ()
+        self._carry_feedback = None
+        self._episode_feedback.clear()
+        try:
+            self._persist()
+        finally:
+            self._closed = True
+            self._release_state_lock()
 
 
 __all__ = [
+    "LEGACY_MARKOV_DRAFT_STATE_SCHEMA",
     "MARKOV_DRAFT_METRICS_SCHEMA",
     "MARKOV_DRAFT_STATE_SCHEMA",
     "FingerprintRollingK4DraftProvider",
     "MarkovDraftError",
     "MarkovDraftMetrics",
     "MarkovDraftState",
+    "MarkovExpertSpec",
 ]

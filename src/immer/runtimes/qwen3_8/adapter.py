@@ -841,7 +841,9 @@ class Qwen38CausalChat:
             else:
                 policy["markov_draft"] = {
                     "max_history_tokens": 4096,
-                    "max_order": 8,
+                    "max_order": 16,
+                    "experts": 8,
+                    "fixed_share": 0.05,
                     "persistent": self._markov_draft_state_path is not None,
                 }
         elif self._draft_mode is not None:

@@ -49,6 +49,19 @@ All notable changes to IMMER are recorded here.
   directly over token IDs, require no sibling model and no draft weight bytes,
   learn only target-confirmed prefixes, persist bounded cross-request memory,
   and remain subordinate to rolling target verification.
+- Expanded Markov drafting into an eight-agent council spanning orders
+  `0/0/1/1/2/4/8/16` and windows `128..4096`. Linear probability pooling is
+  updated by target-only log-likelihood advantage, Rapidity EWMA, Fixed Share,
+  and surprise CUSUM. A deterministic regime test moves structured experts to
+  `24.37%` each, then shifts the two unigram agents to `48.125%` each while
+  preserving a `0.625%` floor for every dormant expert.
+- Persistent Markov memory now stores complete request episodes exactly once,
+  injects non-proposable episode boundaries during fitting, migrates v1 state,
+  records expert accuracy/disagreement/effective count/regime generation, and
+  holds a POSIX state lock through each request so concurrent writers cannot
+  lose confirmed learning. Expert feedback and episode bytes are deferred to
+  one terminal transaction; an aborted half-request persists neither. State
+  reads use a stable `O_NOFOLLOW` descriptor and reject inode/time replacement.
 - The explicit Fast-MLP mode now packs the independent K-token projection rows
   into one physical GEMM per matrix. Exact mode retains the original separate
   kernels; packed execution is bound into the Fast runtime identity and

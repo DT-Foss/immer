@@ -69,12 +69,14 @@ from .local_draft import (
     Qwen35K4DraftProviderMetrics,
 )
 from .markov_draft import (
+    LEGACY_MARKOV_DRAFT_STATE_SCHEMA,
     MARKOV_DRAFT_METRICS_SCHEMA,
     MARKOV_DRAFT_STATE_SCHEMA,
     FingerprintRollingK4DraftProvider,
     MarkovDraftError,
     MarkovDraftMetrics,
     MarkovDraftState,
+    MarkovExpertSpec,
 )
 from .model import (
     GenerationEvidence,
@@ -253,6 +255,7 @@ __all__ = [
     "K4ReconciledDraftProvider",
     "GenerationEvidence",
     "LAYER_BOUNDARY_STAGES",
+    "LEGACY_MARKOV_DRAFT_STATE_SCHEMA",
     "LayerBoundaryObserver",
     "GRAPH_REVISION_SCHEMA",
     "GraphRevision",
@@ -283,6 +286,7 @@ __all__ = [
     "MarkovDraftError",
     "MarkovDraftMetrics",
     "MarkovDraftState",
+    "MarkovExpertSpec",
     "ModelPin",
     "NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA",
     "NATIVE_HEAD_CRSA_FREE_HEADS",

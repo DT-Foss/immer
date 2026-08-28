@@ -112,7 +112,7 @@ release surface.
 |---|---:|---|
 | Local causal bundle reopen | 77.77 → 1.20 s; 64.90x | complete 55.6 GB Qwen3.8 bundle; first full-content verification followed by unchanged next-process stat+digest reuse; no model forward |
 | Rolling K=4 continuation | accepted prefixes commit with zero weight reads | target-known token + three drafts; widths 1–4, next-token continuation, Graft and native Prefix-Sinkhorn state remain bit-exact |
-| Native-token Markov drafter | zero draft-model bytes | sparse variable-order prediction directly over Qwen token IDs; target-confirmed online learning and bounded persistent memory |
+| Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, episode memory, and persistent online learning |
 | Arbitrary local Qwen chat | one terminal 64-layer sweep removed per request | authenticated causal Qwen3.8 path; rolling local-Qwen or zero-model-byte Markov drafting plus row-routed fast MLP; target, auxiliary, draft, and combined transport reported separately |
 | Seed v3 native migration | exact parity on 8/8 inherited tensor outputs for Micro and 5M | SHA-first migration of shared trained GRU/CRSA/SwiGLU weights; new receipt, quotient, route-value, and expected-work heads added under a strict inference-only manifest |
 | Full Qwen MLP layer map | 640/640 cells; content promotion 0 | every layer repeats the same 146/549 template hits; 1,370/1,389 candidate admissions equal their matched random controls, closing the exhaustive exact-key line |

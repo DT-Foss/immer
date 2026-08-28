@@ -65,13 +65,28 @@ address graph.
 - authenticated causal-bundle mounting and exact range paging;
 - stateful full-attention and Gated DeltaNet execution;
 - native Causal Prefix Sinkhorn Attention;
-- exact K=1–4 continuation and Qwen3.5 drafting;
+- correction-first rolling K=4 continuation with zero-read prefix commits;
+- local Qwen3.5 and zero-model-byte native-token Markov drafting;
+- packed K-token projection GEMMs in the explicit Fast-MLP mode;
 - semantic state snapshots and prefix batteries;
 - contextual cartography receipts tied to exact weight coordinates.
 
 The anchor cache can restore the deepest exact prompt prefix before generation.
 An exact hit uses the authenticated final-hidden seed; a shorter hit evaluates
 only the suffix. The output token loop remains the ordinary Qwen loop.
+
+Rolling K=4 stages one target-known token followed by three untrusted drafts.
+The target executes the four rows once and commits only the accepted prefix.
+DeltaNet update operands reconstruct recurrent state without another weight
+read; native Prefix-Sinkhorn usage and Graft history remain aligned to the
+same prefix.
+
+The Markov draft council contains eight sparse PPM experts across orders
+`0..16` and windows `128..4096`. Their Qwen-ID distributions are pooled by
+target-trained Rapidity weights with Fixed Share. Confirmed surprise drives a
+CUSUM regime detector; request boundaries remain explicit non-proposable
+symbols. Feedback, expert state, and the completed episode persist as one
+transaction. Draft consensus never overrides the target.
 
 ## 4. Organism of Experts
 
