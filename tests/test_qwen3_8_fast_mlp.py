@@ -335,6 +335,13 @@ class Qwen38FastMlpMountTests(unittest.TestCase):
         self.assertTrue(all(0.0 < value <= 1.0 for value in selected.values()))
         metrics = mount.metrics()
         self.assertGreater(metrics["source_body_bytes"], 0)
+        self.assertGreater(
+            self.fixture.target_pager.metrics()["direct_tensor_fills"], 0
+        )
+        self.assertGreater(mount.pilot_pager.metrics()["direct_tensor_fills"], 0)
+        self.assertGreater(
+            mount.transpose_pager.metrics()["direct_tensor_fills"], 0
+        )
         mount.close()
         mount.close()
         rows = self.fixture.target_pager.tensor_rows(

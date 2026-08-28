@@ -92,6 +92,19 @@ class Qwen38CausalTensorTests(unittest.TestCase):
                 read = mount.read_tensor_range(names[0], relative_offset=2, length=7)
             self.assertEqual(bytes(read.part), bytes(expected))
             self.assertEqual(read.plan, plans[0])
+            target = bytearray(7)
+            into = mount.tensor_reader.read_tensor_into(
+                names[0], target, relative_offset=2
+            )
+            self.assertEqual(bytes(target), bytes(expected))
+            self.assertEqual(into.length, 7)
+            self.assertEqual(into.plan, plans[0])
+            with self.assertRaisesRegex(
+                ValueError, "writable contiguous storage"
+            ):
+                mount.tensor_reader.read_tensor_into(
+                    names[0], bytes(7), relative_offset=2
+                )
             self.assertEqual(
                 len(mount.graph.query_base(semantic_tensor_key(_MODEL, name=names[0]))),
                 1,
@@ -151,11 +164,20 @@ class Qwen38CausalTensorTests(unittest.TestCase):
                     config, causal_pager, max_batch_size=1, max_seq_len=16
                 )
                 try:
-                    with mock.patch.object(
-                        mount.source,
-                        "find",
-                        side_effect=AssertionError(
-                            "Qwen causal pager used tensor inventory discovery"
+                    with (
+                        mock.patch.object(
+                            mount.source,
+                            "find",
+                            side_effect=AssertionError(
+                                "Qwen causal pager used tensor inventory discovery"
+                            ),
+                        ),
+                        mock.patch.object(
+                            mount.source,
+                            "raw_bytes",
+                            side_effect=AssertionError(
+                                "Qwen causal pager allocated an intermediate body"
+                            ),
                         ),
                     ):
                         actual, _ = causal.forward_prefill([[1, 4, 9]])
@@ -170,6 +192,10 @@ class Qwen38CausalTensorTests(unittest.TestCase):
                         metrics["causal_tensor_plan_cache_entries"], len(names)
                     )
                     self.assertGreater(metrics["causal_tensor_read_calls"], len(names))
+                    self.assertGreater(metrics["direct_tensor_fills"], len(names))
+                    self.assertGreater(
+                        metrics["causal_tensor_direct_into_read_calls"], len(names)
+                    )
                 finally:
                     causal_pager.close()
         finally:

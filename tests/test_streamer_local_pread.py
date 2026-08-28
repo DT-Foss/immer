@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import tempfile
 import threading
@@ -9,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
+from immer.knowledge import RawBytesIntoResult
 from immer.knowledge.streamer import (
     ByteBudgetExceeded,
     HardByteBudget,
@@ -19,6 +21,17 @@ from immer.knowledge.streamer import (
 
 
 class LocalPreadRangeReaderTests(unittest.TestCase):
+    def test_raw_bytes_into_capability_is_local_only(self) -> None:
+        remote = Streamer(
+            "fixture",
+            revision="pinned",
+            reader=object(),
+            use_cache=False,
+        )
+        self.assertFalse(remote.raw_bytes_into_available)
+        with self.assertRaises(NotImplementedError):
+            remote.raw_bytes_into("weights.bin", 0, bytearray(1))
+
     def test_configured_root_symlink_is_rejected_before_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -114,6 +127,289 @@ class LocalPreadRangeReaderTests(unittest.TestCase):
                 self.assertEqual(metrics["budget"]["http_requests"], 1)
                 self.assertEqual(metrics["budget"]["rejected_charges"], 0)
                 self.assertEqual(source.budget._reserved_bytes, 0)
+            finally:
+                source.close()
+
+    @unittest.skipUnless(hasattr(os, "preadv"), "os.preadv is unavailable")
+    def test_raw_bytes_into_fills_exact_storage_without_pread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = bytes(range(64))
+            root.joinpath("weights.bin").write_bytes(payload)
+            source = Streamer.from_local(root, use_cache=False, budget_mb=1.0)
+            target = bytearray(b"x" * 17)
+            try:
+                self.assertTrue(source.raw_bytes_into_available)
+                with (
+                    mock.patch("os.pread", side_effect=AssertionError("copy path")),
+                    mock.patch("os.preadv", wraps=os.preadv) as preadv,
+                ):
+                    result = source.raw_bytes_into("weights.bin", 11, target)
+                self.assertEqual(target, payload[11:28])
+                self.assertEqual(result.length, 17)
+                self.assertEqual(result.source_requests, 1)
+                self.assertEqual(result.source_bytes, 17)
+                self.assertIsInstance(result, RawBytesIntoResult)
+                preadv.assert_called_once()
+                with self.assertRaises(AttributeError):
+                    result.length = 1  # type: ignore[misc]
+            finally:
+                source.close()
+
+    @unittest.skipUnless(hasattr(os, "preadv"), "os.preadv is unavailable")
+    def test_raw_bytes_into_budget_fails_before_open_or_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.joinpath("weights.bin").write_bytes(b"0123456789abcdef")
+            source = Streamer.from_local(root, use_cache=False, budget_mb=0.0)
+            target = bytearray(b"unchanged")
+            try:
+                with (
+                    mock.patch("os.pread", wraps=os.pread) as pread,
+                    mock.patch("os.preadv", wraps=os.preadv) as preadv,
+                ):
+                    with self.assertRaises(ByteBudgetExceeded):
+                        source.raw_bytes_into("weights.bin", 0, target)
+                pread.assert_not_called()
+                preadv.assert_not_called()
+                self.assertEqual(target, b"unchanged")
+                metrics = source.metrics()
+                self.assertEqual(metrics["transport_fd_opens"], 0)
+                self.assertEqual(metrics["budget"]["bytes_body"], 0)
+                self.assertEqual(metrics["budget"]["http_requests"], 0)
+                self.assertEqual(metrics["budget"]["rejected_charges"], 1)
+            finally:
+                source.close()
+
+    @unittest.skipUnless(hasattr(os, "preadv"), "os.preadv is unavailable")
+    def test_raw_bytes_into_retries_after_post_read_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "weights.bin"
+            path.write_bytes(b"old-value")
+            replacement = root / "replacement.tmp"
+            original_preadv = os.preadv
+            calls = 0
+
+            def replace_after_read(
+                descriptor: int,
+                buffers: list[memoryview],
+                offset: int,
+            ) -> int:
+                nonlocal calls
+                count = original_preadv(descriptor, buffers, offset)
+                calls += 1
+                if calls == 1:
+                    replacement.write_bytes(b"new-value")
+                    os.replace(replacement, path)
+                return count
+
+            source = Streamer.from_local(root, use_cache=False, budget_mb=1.0)
+            target = bytearray(9)
+            try:
+                with (
+                    mock.patch("os.pread", side_effect=AssertionError("copy path")),
+                    mock.patch("os.preadv", side_effect=replace_after_read),
+                ):
+                    result = source.raw_bytes_into("weights.bin", 0, target)
+                self.assertEqual(target, b"new-value")
+                self.assertEqual(calls, 2)
+                self.assertEqual(result.source_requests, 1)
+                self.assertEqual(result.source_bytes, 9)
+                metrics = source.metrics()
+                self.assertEqual(metrics["transport_fd_opens"], 2)
+                self.assertEqual(metrics["transport_fd_reopens"], 1)
+                self.assertEqual(metrics["budget"]["bytes_body"], 9)
+                self.assertEqual(metrics["budget"]["http_requests"], 1)
+            finally:
+                source.close()
+
+    @unittest.skipUnless(hasattr(os, "preadv"), "os.preadv is unavailable")
+    def test_raw_bytes_into_rejects_invalid_buffers_before_io(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.joinpath("weights.bin").write_bytes(b"0123456789abcdef")
+            source = Streamer.from_local(root, use_cache=False, budget_mb=1.0)
+            invalid = (
+                b"readonly",
+                memoryview(bytearray(8))[::2],
+                object(),
+            )
+            try:
+                with (
+                    mock.patch("os.pread", wraps=os.pread) as pread,
+                    mock.patch("os.preadv", wraps=os.preadv) as preadv,
+                ):
+                    for target in invalid:
+                        with self.subTest(target=type(target).__name__):
+                            with self.assertRaises(RangeValidationError):
+                                source.raw_bytes_into("weights.bin", 0, target)
+                pread.assert_not_called()
+                preadv.assert_not_called()
+                self.assertEqual(source.budget.body, 0)
+                self.assertEqual(source.budget.requests, 0)
+            finally:
+                source.close()
+
+    @unittest.skipUnless(hasattr(os, "preadv"), "os.preadv is unavailable")
+    def test_raw_bytes_into_cache_metrics_and_access_receipts_are_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            cache = Path(tmp) / "cache"
+            root.mkdir()
+            payload = bytes(range(32))
+            root.joinpath("weights.bin").write_bytes(payload)
+            source = Streamer.from_local(
+                root,
+                cache_dir=cache,
+                budget_mb=1.0,
+            )
+            events = []
+            source._inventory_fingerprint = "a" * 64
+            source.set_access_observer(events.append, prepare_identity=False)
+            cold = bytearray(8)
+            warm = bytearray(8)
+            try:
+                self.assertFalse(source.raw_bytes_into_available)
+                original_write = source.reader._write_cache
+
+                def mutate_target_before_cache_write(*args, **kwargs):
+                    cold[:] = b"Z" * len(cold)
+                    return original_write(*args, **kwargs)
+
+                with mock.patch.object(
+                    source.reader,
+                    "_write_cache",
+                    side_effect=mutate_target_before_cache_write,
+                ):
+                    first = source.raw_bytes_into("weights.bin", 4, cold)
+                with mock.patch("os.preadv", wraps=os.preadv) as preadv:
+                    second = source.raw_bytes_into("weights.bin", 4, warm)
+                preadv.assert_not_called()
+
+                self.assertEqual(cold, payload[4:12])
+                self.assertEqual(warm, payload[4:12])
+                self.assertEqual((first.source_requests, first.source_bytes), (1, 8))
+                self.assertEqual((second.source_requests, second.source_bytes), (0, 0))
+                metrics = source.metrics()
+                self.assertEqual(metrics["range_logical_leaves"], 2)
+                self.assertEqual(metrics["range_logical_leaf_bytes"], 16)
+                self.assertEqual(metrics["range_requests"], 1)
+                self.assertEqual(metrics["range_source_requests"], 1)
+                self.assertEqual(metrics["range_source_bytes"], 8)
+                self.assertEqual(metrics["cache_misses"], 1)
+                self.assertEqual(metrics["cache_hits"], 1)
+                self.assertEqual(metrics["budget"]["bytes_body"], 8)
+                self.assertEqual(metrics["budget"]["http_requests"], 1)
+                self.assertEqual(metrics["transport_direct_fill_calls"], 0)
+                self.assertEqual(metrics["transport_direct_fill_bytes"], 0)
+                self.assertEqual(metrics["transport_preadv_calls"], 0)
+                self.assertEqual(metrics["transport_pread_fallback_calls"], 0)
+                self.assertEqual(len(events), 2)
+                self.assertEqual(events[0].operation, "raw_bytes")
+                self.assertEqual(
+                    (events[0].source_requests, events[0].source_bytes), (1, 8)
+                )
+                self.assertEqual(
+                    (events[1].source_requests, events[1].source_bytes), (0, 0)
+                )
+                self.assertEqual(
+                    (events[0].leaves[0].offset, events[0].leaves[0].length), (4, 8)
+                )
+            finally:
+                source.close()
+
+    def test_raw_bytes_into_falls_back_to_pread_only_without_preadv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = b"0123456789abcdef"
+            root.joinpath("weights.bin").write_bytes(payload)
+            source = Streamer.from_local(root, use_cache=False, budget_mb=1.0)
+            target = bytearray(7)
+            try:
+                with (
+                    mock.patch.object(os, "preadv", None, create=True),
+                    mock.patch("os.pread", wraps=os.pread) as pread,
+                ):
+                    result = source.raw_bytes_into("weights.bin", 5, target)
+                self.assertEqual(target, payload[5:12])
+                self.assertEqual(result.length, 7)
+                self.assertEqual(result.source_requests, 1)
+                self.assertEqual(result.source_bytes, 7)
+                pread.assert_called_once()
+                metrics = source.metrics()
+                self.assertEqual(metrics["transport_direct_fill_calls"], 1)
+                self.assertEqual(metrics["transport_direct_fill_bytes"], 7)
+                self.assertEqual(metrics["transport_preadv_calls"], 0)
+                self.assertEqual(metrics["transport_pread_fallback_calls"], 1)
+            finally:
+                source.close()
+
+    def test_raw_bytes_into_falls_back_when_preadv_is_runtime_unsupported(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = b"0123456789abcdef"
+            root.joinpath("weights.bin").write_bytes(payload)
+            failures = (
+                NotImplementedError("preadv unavailable"),
+                OSError(errno.ENOSYS, "preadv unavailable"),
+            )
+            for index, failure in enumerate(failures):
+                with self.subTest(failure=type(failure).__name__):
+                    source = Streamer.from_local(
+                        root,
+                        use_cache=False,
+                        budget_mb=1.0,
+                    )
+                    target = bytearray(7)
+                    try:
+                        with (
+                            mock.patch("os.preadv", side_effect=failure),
+                            mock.patch("os.pread", wraps=os.pread) as pread,
+                        ):
+                            result = source.raw_bytes_into(
+                                "weights.bin", index + 2, target
+                            )
+                        self.assertEqual(
+                            target,
+                            payload[index + 2 : index + 9],
+                        )
+                        self.assertEqual(result.source_bytes, 7)
+                        pread.assert_called_once()
+                        metrics = source.metrics()
+                        self.assertEqual(metrics["transport_preadv_calls"], 1)
+                        self.assertEqual(
+                            metrics["transport_pread_fallback_calls"], 1
+                        )
+                    finally:
+                        source.close()
+
+    @unittest.skipUnless(hasattr(os, "preadv"), "os.preadv is unavailable")
+    def test_raw_bytes_into_completes_progressing_short_preadv_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = b"0123456789abcdef"
+            root.joinpath("weights.bin").write_bytes(payload)
+            original_preadv = os.preadv
+
+            def short_preadv(
+                descriptor: int,
+                buffers: list[memoryview],
+                offset: int,
+            ) -> int:
+                limited = buffers[0][: min(2, buffers[0].nbytes)]
+                return original_preadv(descriptor, [limited], offset)
+
+            source = Streamer.from_local(root, use_cache=False, budget_mb=1.0)
+            target = bytearray(7)
+            try:
+                with mock.patch("os.preadv", side_effect=short_preadv) as preadv:
+                    result = source.raw_bytes_into("weights.bin", 3, target)
+                self.assertEqual(target, payload[3:10])
+                self.assertEqual(result.source_bytes, 7)
+                self.assertEqual(preadv.call_count, 4)
             finally:
                 source.close()
 

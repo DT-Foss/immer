@@ -63,6 +63,7 @@ address graph.
 `src/immer/runtimes/qwen3_8/` implements the primary local neural path:
 
 - authenticated causal-bundle mounting and exact range paging;
+- stable direct-to-Torch local `preadv` transport;
 - stateful full-attention and Gated DeltaNet execution;
 - native Causal Prefix Sinkhorn Attention;
 - correction-first rolling K=4 continuation with zero-read prefix commits;
@@ -95,6 +96,15 @@ the selected Gate/Up neurons across the K-token wave. The union is streamed in
 chunks no larger than one route, projected rowwise, and restored to each
 route's original order before SwiGLU. Down-transpose execution stays rowwise,
 preserving its reduction order and auxiliary residency bound.
+
+The local transport has a caller-owned direct-fill plane. LiveCausal resolves
+the tensor plan first; the pager allocates the final CPU weight tensor; then
+`preadv` fills its writable byte view from one leased inode. A post-read path
+identity check retries atomic replacements before the tensor becomes visible.
+Sorted unique row routes are filled directly into their final tensor slices;
+only requests whose order or repetition requires restoration allocate a
+second gathered output. Remote sources and dtype/device conversions retain the
+portable owned-byte path.
 
 The Markov draft council contains eight sparse PPM experts across orders
 `0..16` and windows `128..4096`. Their Qwen-ID distributions are pooled by

@@ -19,6 +19,7 @@ that a mutable ``main`` revision has not moved.
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 import re
@@ -81,6 +82,28 @@ class RawBytesManyResult:
     resident_bytes: int
     source_requests: int
     source_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class RawBytesIntoResult:
+    """Immutable receipt for one caller-owned direct-fill range."""
+
+    length: int
+    source_requests: int
+    source_bytes: int
+
+    def __post_init__(self) -> None:
+        if (
+            any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in (self.length, self.source_requests, self.source_bytes)
+            )
+            or self.length < 0
+            or not 0 <= self.source_requests <= 1
+            or not 0 <= self.source_bytes <= self.length
+            or (self.source_requests == 0) != (self.source_bytes == 0)
+        ):
+            raise ValueError("direct-fill receipt accounting is invalid")
 
 
 @runtime_checkable
@@ -284,6 +307,16 @@ class _LocalFileIdentity:
             f"{self.mtime_ns:x}-{self.ctime_ns:x}"
         )
 
+    @property
+    def source_identity(self) -> dict[str, str]:
+        return {"size": str(self.size), "etag": self.etag}
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalRangeIntoResult:
+    length: int
+    identity: _LocalFileIdentity
+
 
 @dataclass(slots=True)
 class _LocalFDEntry:
@@ -311,7 +344,7 @@ class LocalRangeReader:
     DEFAULT_MAX_OPEN_FILES = 64
     _MAX_REPLACEMENT_RETRIES = 4
     range_overhead_reserve = 0
-    transport_policy = "local-range/v1"
+    transport_policy = "local-range-direct-fill/v2"
     transport_connection_limit = 0
 
     def __init__(
@@ -389,6 +422,10 @@ class LocalRangeReader:
         self._fd_reopens = 0
         self._fd_evictions = 0
         self._fd_waits = 0
+        self._direct_fill_calls = 0
+        self._direct_fill_bytes = 0
+        self._preadv_calls = 0
+        self._pread_fallback_calls = 0
         self._closed = False
 
     @staticmethod
@@ -635,6 +672,112 @@ class LocalRangeReader:
             f"Lokale Quelldatei aenderte sich wiederholt beim Lesen: {key!r}"
         ) from last_error
 
+    def _pread_into_once(
+        self,
+        descriptor: int,
+        target: memoryview,
+        offset: int,
+    ) -> int:
+        """Fill as much of ``target`` as possible without moving the FD cursor."""
+
+        total = 0
+        preadv = getattr(os, "preadv", None)
+        while total < target.nbytes:
+            remaining = target[total:]
+            if callable(preadv):
+                with self._condition:
+                    self._preadv_calls += 1
+                try:
+                    count = preadv(descriptor, [remaining], offset + total)
+                except NotImplementedError:
+                    preadv = None
+                    continue
+                except OSError as exc:
+                    unsupported = {
+                        errno.ENOSYS,
+                        getattr(errno, "ENOTSUP", errno.ENOSYS),
+                        getattr(errno, "EOPNOTSUPP", errno.ENOSYS),
+                    }
+                    if exc.errno not in unsupported:
+                        raise
+                    preadv = None
+                    continue
+                if isinstance(count, bool) or not isinstance(count, int):
+                    raise RangeValidationError("os.preadv lieferte keine Bytezahl")
+                if count < 0 or count > remaining.nbytes:
+                    raise RangeValidationError(
+                        f"os.preadv lieferte eine ungueltige Bytezahl: {count}"
+                    )
+            else:
+                with self._condition:
+                    self._pread_fallback_calls += 1
+                body = os.pread(descriptor, remaining.nbytes, offset + total)
+                count = len(body)
+                remaining[:count] = body
+            if count == 0:
+                break
+            total += count
+        return total
+
+    def _read_stable_into(
+        self,
+        key: str,
+        parts: tuple[str, ...],
+        start: int,
+        target: memoryview,
+    ) -> _LocalFileIdentity:
+        """Fill from one inode and retry if the source path changes afterward."""
+
+        length = target.nbytes
+        last_error: Exception | None = None
+        for _attempt in range(self._MAX_REPLACEMENT_RETRIES):
+            try:
+                entry = self._lease_entry(key, parts)
+            except RangeValidationError as exc:
+                last_error = exc
+                continue
+            try:
+                if start + length > entry.identity.size:
+                    raise RangeValidationError(
+                        f"Range ausserhalb {key}: [{start}, {start + length - 1}] "
+                        f"bei {entry.identity.size} Bytes"
+                    )
+
+                read_error: Exception | None = None
+                read_length = 0
+                try:
+                    read_length = self._pread_into_once(entry.fd, target, start)
+                except Exception as exc:
+                    read_error = exc
+
+                with self._condition:
+                    try:
+                        current = self._stat_locked(key, parts)
+                    except (FileNotFoundError, RangeValidationError) as exc:
+                        current = None
+                        last_error = exc
+                    stable = current == entry.identity
+                    if not stable:
+                        self._fd_reopens += 1
+                        self._retire_entry_locked(entry)
+                if not stable:
+                    last_error = last_error or RangeValidationError(
+                        f"Lokale Quelldatei wurde beim Lesen ersetzt: {key!r}"
+                    )
+                    continue
+                if read_error is not None:
+                    raise read_error
+                if read_length != length:
+                    raise RangeValidationError(
+                        f"Kurzer lokaler Read {key}: {read_length}/{length} Bytes"
+                    )
+                return entry.identity
+            finally:
+                self._release_entry(entry)
+        raise RangeValidationError(
+            f"Lokale Quelldatei aenderte sich wiederholt beim Lesen: {key!r}"
+        ) from last_error
+
     def _remember(self, key: str, identity: _LocalFileIdentity) -> None:
         with self._condition:
             self.file_info.setdefault(key, {}).update(
@@ -668,6 +811,29 @@ class LocalRangeReader:
             self.budget.charge(length, 0, tag)
         self._remember(key, identity)
         return body
+
+    def get_range_into(
+        self,
+        filename: str,
+        start: int,
+        writable_buffer: Any,
+    ) -> _LocalRangeIntoResult:
+        """Fill one exact local range into writable contiguous caller storage."""
+
+        start = _validate_nonnegative_int(start, "Range-Start")
+        target = _writable_bytes_view(writable_buffer)
+        if target.nbytes == 0:
+            raise RangeValidationError("Direkter lokaler Read darf nicht leer sein")
+        key, parts = self._normalise_filename(filename)
+        tag = f"local-range-into:{key}:{start}"
+        with self.budget.exact_reservation_or_reuse(target.nbytes, tag):
+            identity = self._read_stable_into(key, parts, start, target)
+            self.budget.charge(target.nbytes, 0, tag)
+        with self._condition:
+            self._direct_fill_calls += 1
+            self._direct_fill_bytes += target.nbytes
+        self._remember(key, identity)
+        return _LocalRangeIntoResult(length=target.nbytes, identity=identity)
 
     def fetch_file(self, filename: str) -> bytes:
         key, parts = self._normalise_filename(filename)
@@ -717,6 +883,10 @@ class LocalRangeReader:
                 "transport_fd_reopens": self._fd_reopens,
                 "transport_fd_evictions": self._fd_evictions,
                 "transport_fd_waits": self._fd_waits,
+                "transport_direct_fill_calls": self._direct_fill_calls,
+                "transport_direct_fill_bytes": self._direct_fill_bytes,
+                "transport_preadv_calls": self._preadv_calls,
+                "transport_pread_fallback_calls": self._pread_fallback_calls,
                 "transport_closed": self._closed,
             }
 
@@ -758,6 +928,27 @@ def _validate_inclusive_range(start: Any, end: Any) -> tuple[int, int]:
     if end < start:
         raise RangeValidationError(f"Leere/verkehrte Range: [{start}, {end}]")
     return start, end
+
+
+def _writable_bytes_view(writable_buffer: Any) -> memoryview:
+    """Return one writable C-contiguous byte view without copying storage."""
+
+    try:
+        view = memoryview(writable_buffer)
+    except TypeError as exc:
+        raise RangeValidationError(
+            "writable_buffer muss das schreibbare Buffer-Protokoll unterstuetzen"
+        ) from exc
+    if view.readonly or not view.c_contiguous:
+        raise RangeValidationError(
+            "writable_buffer muss schreibbar und C-zusammenhaengend sein"
+        )
+    try:
+        return view.cast("B")
+    except (TypeError, ValueError) as exc:
+        raise RangeValidationError(
+            "writable_buffer muss als zusammenhaengende Bytes darstellbar sein"
+        ) from exc
 
 
 def _canonical_json(document: Any) -> bytes:
@@ -1293,6 +1484,8 @@ class _ContractReader:
         key: str,
         contract: Mapping[str, Any],
         body: bytes | memoryview,
+        *,
+        source_identity: Mapping[str, Any] | None = None,
     ) -> None:
         paths = self._cache_paths(kind, key)
         if paths is None:
@@ -1302,7 +1495,14 @@ class _ContractReader:
         meta = {
             "schema": self._CACHE_SCHEMA,
             "contract": dict(contract),
-            "source_identity": self._identity(str(contract["filename"])),
+            "source_identity": (
+                self._identity(str(contract["filename"]))
+                if source_identity is None
+                else {
+                    str(identity_key): str(identity_value)
+                    for identity_key, identity_value in source_identity.items()
+                }
+            ),
             "size": len(body),
             "sha256": _sha256(body),
         }
@@ -1445,6 +1645,87 @@ class _ContractReader:
                     raise
             self._write_cache("range", key, contract, body)
             return body
+
+    def get_range_into(
+        self,
+        filename: str,
+        start: int,
+        writable_buffer: Any,
+    ) -> RawBytesIntoResult:
+        """Fill one exact local range while preserving cache and budget semantics."""
+
+        start = _validate_nonnegative_int(start, "Range-Start")
+        target = _writable_bytes_view(writable_buffer)
+        expected = target.nbytes
+        if expected == 0:
+            return RawBytesIntoResult(0, 0, 0)
+        if self.cache_dir is not None:
+            before = self.budget.thread_charge_snapshot()
+            body = self.get_range(filename, start, start + expected - 1)
+            after = self.budget.thread_charge_snapshot()
+            target[:] = body
+            return RawBytesIntoResult(
+                expected,
+                after[2] - before[2],
+                after[0] - before[0],
+            )
+        direct_read = getattr(self.upstream, "get_range_into", None)
+        if not isinstance(self.upstream, LocalRangeReader) or not callable(direct_read):
+            raise NotImplementedError(
+                "raw_bytes_into ist nur fuer lokale Range-Quellen verfuegbar"
+            )
+
+        self._bump("range_logical_leaves")
+        self._bump("range_logical_leaf_bytes", expected)
+        end = start + expected - 1
+        key, contract = self._cache_key("range", filename, start, end)
+        with self._locked_cache_key(key):
+            cached = self._load_cache("range", key, contract, expected)
+            if cached is not None:
+                target[:] = cached
+                return RawBytesIntoResult(expected, 0, 0)
+            self._bump("cache_misses")
+            with self.budget.reservation(
+                expected, f"range-into:{filename}:{start}-{end}"
+            ) as receipt:
+                self._bump("range_requests")
+                self._bump("range_bytes_requested", expected)
+                self._bump("range_source_requests")
+                try:
+                    local_result = direct_read(filename, start, target)
+                    if (
+                        not isinstance(local_result, _LocalRangeIntoResult)
+                        or local_result.length != expected
+                    ):
+                        raise RangeValidationError(
+                            f"Direkter Range-Read {filename}[{start}:{end}] "
+                            "lieferte keine exakte Quittung"
+                        )
+                    charged_body = int(receipt["body"])
+                    if charged_body == 0:
+                        self.budget.charge(
+                            expected,
+                            0,
+                            f"range-into:{filename}:{start}",
+                        )
+                    elif charged_body != expected:
+                        raise RangeValidationError(
+                            f"Reader verbuchte fuer {filename} {charged_body} "
+                            f"statt {expected} Bytes"
+                        )
+                    source_bytes = int(receipt["body"])
+                    self._bump("range_source_bytes", source_bytes)
+                except Exception:
+                    self._bump("failed_requests")
+                    raise
+            self._write_cache(
+                "range",
+                key,
+                contract,
+                target,
+                source_identity=local_result.identity.source_identity,
+            )
+            return RawBytesIntoResult(expected, 1, source_bytes)
 
     def get_ranges(
         self,
@@ -2524,6 +2805,16 @@ class Streamer:
             self._access_observer = observer
         return previous
 
+    @property
+    def raw_bytes_into_available(self) -> bool:
+        """Whether this source supports direct caller-owned range fills."""
+
+        with self._state_lock:
+            upstream = (
+                self._reader.upstream if self._reader is not None else self._upstream
+            )
+        return self._cache_dir is None and isinstance(upstream, LocalRangeReader)
+
     def _emit_access_operation(
         self,
         operation: str,
@@ -2598,6 +2889,48 @@ class Streamer:
                 cache_hits=1 if source_requests == 0 else 0,
             )
         return body
+
+    def raw_bytes_into(
+        self,
+        shard: str,
+        offset: int,
+        writable_buffer: Any,
+    ) -> RawBytesIntoResult:
+        """Fill caller-owned writable bytes from an inode-stable local range.
+
+        This is an optional local-source extension and intentionally remains
+        outside :class:`TensorSource`. Remote readers must continue to use the
+        portable ``raw_bytes`` contract.
+        """
+
+        offset = _validate_nonnegative_int(offset, "offset")
+        if not isinstance(shard, str) or not shard:
+            raise RangeValidationError("shard muss ein nichtleerer String sein")
+        with self._state_lock:
+            upstream = (
+                self._reader.upstream
+                if self._reader is not None
+                else self._upstream
+            )
+        if not isinstance(upstream, LocalRangeReader):
+            raise NotImplementedError(
+                "raw_bytes_into ist nur fuer lokale Range-Quellen verfuegbar"
+            )
+        target = _writable_bytes_view(writable_buffer)
+        if target.nbytes == 0:
+            return RawBytesIntoResult(0, 0, 0)
+        result = self.reader.get_range_into(shard, offset, target)
+        if self._access_observer is not None:
+            # Access-trace v1 classifies direct-fill as the same exact logical
+            # raw range; storage ownership is deliberately not trace identity.
+            self._emit_access_operation(
+                "raw_bytes",
+                (AccessLeaf(shard, offset, target.nbytes),),
+                source_requests=result.source_requests,
+                source_bytes=result.source_bytes,
+                cache_hits=1 if result.source_requests == 0 else 0,
+            )
+        return result
 
     def raw_bytes_many(
         self,

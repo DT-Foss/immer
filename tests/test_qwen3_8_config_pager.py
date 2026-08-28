@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -186,6 +187,36 @@ class _RawBF16Source:
         self.closed = True
 
 
+class _RawBF16IntoSource(_RawBF16Source):
+    raw_bytes_into_available = True
+
+    def __init__(self, tensors: dict[str, np.ndarray]) -> None:
+        super().__init__(tensors)
+        self.into_calls: list[tuple[str, int, int]] = []
+
+    def raw_bytes_into(self, shard: str, offset: int, target: object):
+        if self.closed:
+            raise RuntimeError("source closed")
+        if shard != self.shard:
+            raise KeyError(shard)
+        view = memoryview(target).cast("B")
+        relative = offset - self.data_start
+        view[:] = self.payload[relative : relative + view.nbytes]
+        self.into_calls.append((shard, offset, view.nbytes))
+        return SimpleNamespace(
+            length=view.nbytes,
+            source_requests=1,
+            source_bytes=view.nbytes,
+        )
+
+    def metrics(self) -> dict:
+        return {
+            "network_or_source_body_bytes": sum(
+                length for _, _, length in (*self.raw_calls, *self.into_calls)
+            )
+        }
+
+
 class Qwen38ConfigTests(unittest.TestCase):
     def test_official_nested_config_is_strict_and_maps_runtime_fields(self) -> None:
         from immer.runtimes.qwen3_8.config import Qwen38Config
@@ -348,8 +379,118 @@ class Qwen38PagerTests(unittest.TestCase):
         self.assertEqual(metrics["zero_copy_bytes_avoided"], 8)
         self.assertEqual(metrics["materialized_weight_releases"], 1)
         self.assertEqual(
-            metrics["weight_cache_policy"], "one-shot-qwen35-exact-range/v3"
+            metrics["weight_cache_policy"], "one-shot-qwen35-direct-fill/v4"
         )
+
+    def test_direct_fill_linear_reads_into_torch_storage_without_body_copy(
+        self,
+    ) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        source = _RawBF16IntoSource(
+            {
+                "dense.weight": np.asarray(
+                    [[1.0, 2.0], [3.0, 4.0]], dtype=np.float32
+                )
+            }
+        )
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=8,
+        )
+
+        with mock.patch.object(
+            source,
+            "raw_bytes",
+            side_effect=AssertionError("intermediate body read"),
+        ):
+            result = pager.linear(torch.tensor([[1.0, 1.0]]), "dense")
+
+        torch.testing.assert_close(
+            result.float(), torch.tensor([[3.0, 7.0]]), rtol=0, atol=0
+        )
+        self.assertEqual(source.into_calls, [(source.shard, source.data_start, 8)])
+        metrics = pager.metrics()
+        self.assertEqual(metrics["direct_tensor_fills"], 1)
+        self.assertEqual(metrics["direct_tensor_fill_bytes"], 8)
+        self.assertEqual(metrics["zero_copy_tensor_reads"], 0)
+        self.assertEqual(metrics["peak_planned_resident_bytes"], 8)
+        self.assertEqual(metrics["materialized_tensor_bytes"], 8)
+
+    def test_direct_fill_sorted_rows_use_one_final_resident_tensor(self) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        values = np.arange(20, dtype=np.float32).reshape(10, 2)
+        source = _RawBF16IntoSource(
+            {"model.language_model.embed_tokens.weight": values}
+        )
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=12,
+        )
+
+        rows = pager.tensor_rows(
+            "model.language_model.embed_tokens.weight",
+            (1, 2, 3),
+        )
+
+        self.assertTrue(
+            torch.equal(rows, torch.from_numpy(values[1:4]).to(torch.bfloat16))
+        )
+        self.assertEqual(len(source.into_calls), 1)
+        metrics = pager.metrics()
+        self.assertEqual(metrics["direct_tensor_fills"], 1)
+        self.assertEqual(metrics["direct_tensor_fill_bytes"], 12)
+        self.assertEqual(metrics["peak_planned_resident_bytes"], 12)
+        self.assertEqual(metrics["row_reads"], 1)
+        self.assertEqual(metrics["logical_weight_bytes"], 12)
+        self.assertEqual(metrics["materialized_tensor_bytes"], 12)
+
+    def test_direct_fill_restore_index_is_inside_resident_preflight(self) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import (
+            Qwen38PagerError,
+            Qwen38WeightPager,
+        )
+
+        name = "model.language_model.embed_tokens.weight"
+        values = np.arange(20, dtype=np.float32).reshape(10, 2)
+        rejected_source = _RawBF16IntoSource({name: values})
+        rejected = Qwen38WeightPager(
+            rejected_source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=43,
+        )
+        with self.assertRaisesRegex(Qwen38PagerError, "need 44 resident bytes"):
+            rejected.tensor_rows(name, (3, 1, 3))
+        self.assertEqual(rejected_source.into_calls, [])
+
+        source = _RawBF16IntoSource({name: values})
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=44,
+        )
+        rows = pager.tensor_rows(name, (3, 1, 3))
+
+        self.assertTrue(
+            torch.equal(
+                rows,
+                torch.from_numpy(values[[3, 1, 3]]).to(torch.bfloat16),
+            )
+        )
+        self.assertEqual(pager.metrics()["peak_planned_resident_bytes"], 44)
 
     def test_real_qwen35_f32_control_tensor_is_range_decoded_exactly(self) -> None:
         import torch

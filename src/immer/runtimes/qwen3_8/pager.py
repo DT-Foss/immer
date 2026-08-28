@@ -124,6 +124,8 @@ class PagerMetrics:
     materialized_tensor_bytes: int = 0
     zero_copy_tensor_reads: int = 0
     zero_copy_bytes_avoided: int = 0
+    direct_tensor_fills: int = 0
+    direct_tensor_fill_bytes: int = 0
     peak_planned_resident_bytes: int = 0
     materialized_weight_releases: int = 0
     release_boundaries: int = 0
@@ -172,7 +174,7 @@ class Qwen38WeightPager:
     DEFAULT_HEAD_BLOCK_ROWS = 2048
     DEFAULT_GC_INTERVAL_BOUNDARIES = 256
     DEFAULT_GC_RSS_HEADROOM_BYTES = 1024**3
-    WEIGHT_CACHE_POLICY = "one-shot-qwen35-exact-range/v3"
+    WEIGHT_CACHE_POLICY = "one-shot-qwen35-direct-fill/v4"
 
     def __init__(
         self,
@@ -464,6 +466,99 @@ class Qwen38WeightPager:
         result.requires_grad_(False)
         return result
 
+    def _direct_fill_supported(
+        self,
+        *,
+        source_dtype: Any,
+        dtype: Any,
+        device: Any,
+    ) -> bool:
+        return (
+            self.torch.device(device).type == "cpu"
+            and dtype == source_dtype
+            and getattr(self.source, "raw_bytes_into_available", False) is True
+            and callable(getattr(self.source, "raw_bytes_into", None))
+        )
+
+    def _direct_fill_existing(
+        self,
+        layout: _TensorLayout,
+        *,
+        relative_offset: int,
+        result: Any,
+    ) -> bool:
+        source_dtype = (
+            self.torch.bfloat16 if layout.dtype == "BF16" else self.torch.float32
+        )
+        if not self._direct_fill_supported(
+            source_dtype=source_dtype,
+            dtype=result.dtype,
+            device=result.device,
+        ):
+            return False
+        if not result.is_contiguous():
+            raise Qwen38PagerError("direct tensor target must be contiguous")
+        byte_view = memoryview(result.view(self.torch.uint8).numpy()).cast("B")
+        if self.causal_tensor_reader is None:
+            receipt = self.source.raw_bytes_into(
+                layout.shard,
+                layout.absolute + relative_offset,
+                byte_view,
+            )
+            try:
+                length = receipt.length
+            except AttributeError as exc:
+                raise Qwen38PagerError(
+                    "direct tensor source returned an invalid receipt"
+                ) from exc
+        else:
+            receipt = self.causal_tensor_reader.read_tensor_into(
+                layout.name,
+                byte_view,
+                relative_offset=relative_offset,
+            )
+            if (
+                receipt.plan.shard != layout.shard
+                or receipt.plan.absolute_offset != layout.absolute
+                or receipt.relative_offset != relative_offset
+            ):
+                raise Qwen38PagerError(
+                    "causal direct-fill receipt disagrees with layout"
+                )
+            length = receipt.length
+        if length != byte_view.nbytes:
+            raise Qwen38PagerError("direct tensor source returned a short receipt")
+        self._stats.direct_tensor_fills += 1
+        self._stats.direct_tensor_fill_bytes += byte_view.nbytes
+        return True
+
+    def _direct_fill_tensor(
+        self,
+        layout: _TensorLayout,
+        *,
+        relative_offset: int,
+        shape: tuple[int, ...],
+        dtype: Any,
+        device: Any,
+    ) -> Any | None:
+        source_dtype = (
+            self.torch.bfloat16 if layout.dtype == "BF16" else self.torch.float32
+        )
+        if not self._direct_fill_supported(
+            source_dtype=source_dtype,
+            dtype=dtype,
+            device=device,
+        ):
+            return None
+        result = self.torch.empty(shape, device=device, dtype=dtype)
+        if not self._direct_fill_existing(
+            layout,
+            relative_offset=relative_offset,
+            result=result,
+        ):  # pragma: no cover - identical support check above.
+            return None
+        return result
+
     def _read_tensor(
         self,
         name: str,
@@ -488,31 +583,41 @@ class Qwen38WeightPager:
             label=name,
             target_materialized=not zero_copy,
         )
-        if self.causal_tensor_reader is None:
-            raw = self.source.raw_bytes(
-                layout.shard, layout.absolute, layout.payload_bytes
-            )
-        else:
-            receipt = self.causal_tensor_reader.read_tensor_range(
-                name,
-                length=layout.payload_bytes,
-            )
-            if (
-                receipt.plan.shard != layout.shard
-                or receipt.plan.absolute_offset != layout.absolute
-                or receipt.length != layout.payload_bytes
-            ):
-                raise Qwen38PagerError("causal tensor receipt disagrees with layout")
-            raw = receipt.part
-        result = self._decode_tensor(
-            raw,
+        result = self._direct_fill_tensor(
+            layout,
+            relative_offset=0,
             shape=layout.shape,
-            source_dtype=layout.dtype,
             dtype=dtype,
             device=device,
-            name=name,
-            zero_copy_cpu=zero_copy,
         )
+        if result is None:
+            if self.causal_tensor_reader is None:
+                raw = self.source.raw_bytes(
+                    layout.shard, layout.absolute, layout.payload_bytes
+                )
+            else:
+                receipt = self.causal_tensor_reader.read_tensor_range(
+                    name,
+                    length=layout.payload_bytes,
+                )
+                if (
+                    receipt.plan.shard != layout.shard
+                    or receipt.plan.absolute_offset != layout.absolute
+                    or receipt.length != layout.payload_bytes
+                ):
+                    raise Qwen38PagerError(
+                        "causal tensor receipt disagrees with layout"
+                    )
+                raw = receipt.part
+            result = self._decode_tensor(
+                raw,
+                shape=layout.shape,
+                source_dtype=layout.dtype,
+                dtype=dtype,
+                device=device,
+                name=name,
+                zero_copy_cpu=zero_copy,
+            )
         self._stats.tensor_reads += 1
         self._stats.logical_weight_bytes += layout.payload_bytes
         self._stats.materialized_tensor_bytes += result.numel() * result.element_size()
@@ -546,43 +651,60 @@ class Qwen38WeightPager:
         row_bytes = columns * layout.item_bytes
         payload_bytes = n_rows * row_bytes
         numel = n_rows * columns
+        source_dtype = (
+            self.torch.bfloat16 if layout.dtype == "BF16" else self.torch.float32
+        )
+        direct_fill = self._direct_fill_supported(
+            source_dtype=source_dtype,
+            dtype=dtype,
+            device=device,
+        )
         self._preflight_resident(
             payload_bytes=payload_bytes,
             numel=numel,
             target_dtype=dtype,
             label=f"{name}[{start_row}:{start_row + n_rows}]",
+            target_materialized=not direct_fill,
         )
         relative_offset = start_row * row_bytes
-        if self.causal_tensor_reader is None:
-            raw = self.source.raw_bytes(
-                layout.shard,
-                layout.absolute + relative_offset,
-                payload_bytes,
-            )
-        else:
-            receipt = self.causal_tensor_reader.read_tensor_range(
-                name,
-                relative_offset=relative_offset,
-                length=payload_bytes,
-            )
-            if (
-                receipt.plan.shard != layout.shard
-                or receipt.plan.absolute_offset != layout.absolute
-                or receipt.relative_offset != relative_offset
-                or receipt.length != payload_bytes
-            ):
-                raise Qwen38PagerError(
-                    "causal tensor row receipt disagrees with layout"
-                )
-            raw = receipt.part
-        result = self._decode_tensor(
-            raw,
+        result = self._direct_fill_tensor(
+            layout,
+            relative_offset=relative_offset,
             shape=(n_rows, columns),
-            source_dtype=layout.dtype,
             dtype=dtype,
             device=device,
-            name=name,
         )
+        if result is None:
+            if self.causal_tensor_reader is None:
+                raw = self.source.raw_bytes(
+                    layout.shard,
+                    layout.absolute + relative_offset,
+                    payload_bytes,
+                )
+            else:
+                receipt = self.causal_tensor_reader.read_tensor_range(
+                    name,
+                    relative_offset=relative_offset,
+                    length=payload_bytes,
+                )
+                if (
+                    receipt.plan.shard != layout.shard
+                    or receipt.plan.absolute_offset != layout.absolute
+                    or receipt.relative_offset != relative_offset
+                    or receipt.length != payload_bytes
+                ):
+                    raise Qwen38PagerError(
+                        "causal tensor row receipt disagrees with layout"
+                    )
+                raw = receipt.part
+            result = self._decode_tensor(
+                raw,
+                shape=(n_rows, columns),
+                source_dtype=layout.dtype,
+                dtype=dtype,
+                device=device,
+                name=name,
+            )
         self._stats.row_reads += 1
         self._stats.logical_weight_bytes += payload_bytes
         self._stats.materialized_tensor_bytes += result.numel() * result.element_size()
@@ -789,14 +911,34 @@ class Qwen38WeightPager:
         layout = self._layout(name)
         columns = layout.shape[1]
         runs = self._consecutive_runs(token_ids)
+        unique_ids = tuple(value for start, stop in runs for value in range(start, stop))
+        source_dtype = (
+            self.torch.bfloat16 if layout.dtype == "BF16" else self.torch.float32
+        )
+        direct_fill = self._direct_fill_supported(
+            source_dtype=source_dtype,
+            dtype=self.compute_dtype,
+            device=self.device,
+        )
         unique_target_bytes = (
-            len(set(token_ids)) * columns * self._dtype_bytes(self.compute_dtype)
+            len(unique_ids) * columns * self._dtype_bytes(self.compute_dtype)
         )
         largest_payload = (
             max(stop - start for start, stop in runs) * columns * layout.item_bytes
         )
         output_bytes = len(token_ids) * columns * self._dtype_bytes(self.compute_dtype)
-        planned = unique_target_bytes + max(largest_payload, output_bytes)
+        ordered_unique = token_ids == unique_ids
+        if direct_fill:
+            restore_bytes = (
+                0
+                if ordered_unique
+                else len(token_ids) * self._dtype_bytes(self.torch.long)
+            )
+            planned = unique_target_bytes + (
+                0 if ordered_unique else output_bytes + restore_bytes
+            )
+        else:
+            planned = unique_target_bytes + max(largest_payload, output_bytes)
         if planned > self.max_resident_bytes:
             raise Qwen38PagerError(
                 f"selected rows from {name!r} need {planned} resident bytes, "
@@ -805,6 +947,37 @@ class Qwen38WeightPager:
         self._stats.peak_planned_resident_bytes = max(
             self._stats.peak_planned_resident_bytes, planned
         )
+        if direct_fill:
+            unique_rows = self.torch.empty(
+                (len(unique_ids), columns),
+                device=self.device,
+                dtype=self.compute_dtype,
+            )
+            unique_offset = 0
+            row_bytes = columns * layout.item_bytes
+            for start, stop in runs:
+                count = stop - start
+                target = unique_rows[unique_offset : unique_offset + count]
+                if not self._direct_fill_existing(
+                    layout,
+                    relative_offset=start * row_bytes,
+                    result=target,
+                ):  # pragma: no cover - direct_fill was checked above.
+                    raise Qwen38PagerError("direct selected-row fill disappeared")
+                payload_bytes = count * row_bytes
+                self._stats.row_reads += 1
+                self._stats.logical_weight_bytes += payload_bytes
+                self._stats.materialized_tensor_bytes += payload_bytes
+                unique_offset += count
+            if ordered_unique:
+                return unique_rows
+            by_id = {value: index for index, value in enumerate(unique_ids)}
+            restore = self.torch.tensor(
+                [by_id[value] for value in token_ids],
+                device=self.device,
+                dtype=self.torch.long,
+            )
+            return unique_rows.index_select(0, restore)
         by_id: dict[int, Any] = {}
         for start, stop in runs:
             rows = self._read_rows(

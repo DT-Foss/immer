@@ -435,6 +435,17 @@ class CausalTensorReadReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class CausalTensorIntoReceipt:
+    """One graph-resolved tensor subrange filled into caller-owned storage."""
+
+    plan: TensorRangePlan
+    relative_offset: int
+    length: int
+    source_requests: int
+    source_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class CausalTensorRangesReadReceipt:
     """Authenticated bounded multi-range read inside one tensor plan."""
 
@@ -1566,6 +1577,7 @@ class CausalTensorReader:
         self._plan_cache_invalidations = 0
         self._metrics_lock = threading.Lock()
         self._read_calls = 0
+        self._direct_into_read_calls = 0
         self._multi_range_read_calls = 0
         self._requested_bytes = 0
         self._resident_bytes = 0
@@ -1857,6 +1869,78 @@ class CausalTensorReader:
             part=batch.parts[0],
         )
 
+    def read_tensor_into(
+        self,
+        name: str,
+        target: object,
+        *,
+        relative_offset: int = 0,
+    ) -> CausalTensorIntoReceipt:
+        """Fill caller-owned writable storage through one causal tensor plan."""
+
+        self._validate_source_identity()
+        assert self.source is not None
+        try:
+            view = memoryview(target)
+            if view.readonly or not view.c_contiguous:
+                raise TypeError
+            byte_view = view.cast("B")
+        except (TypeError, ValueError) as exc:
+            raise CausalWeightError(
+                "tensor direct-fill target must be writable contiguous storage"
+            ) from exc
+        length = byte_view.nbytes
+        if length <= 0:
+            raise CausalWeightError("tensor direct-fill target must not be empty")
+        plan = self.resolve_tensor_plan(name)
+        offset = _uint64(relative_offset, "relative_offset")
+        if offset > plan.length or length > plan.length - offset:
+            raise CausalWeightError("tensor direct-fill range exceeds its bound plan")
+        raw_bytes_into = getattr(self.source, "raw_bytes_into", None)
+        if not callable(raw_bytes_into):
+            raise CausalWeightError(
+                "attached tensor source does not implement raw_bytes_into"
+            )
+        result = raw_bytes_into(
+            plan.shard,
+            plan.absolute_offset + offset,
+            byte_view,
+        )
+        try:
+            counters = (
+                result.length,
+                result.source_requests,
+                result.source_bytes,
+            )
+        except (AttributeError, TypeError) as exc:
+            raise CausalWeightIntegrityError(
+                "raw_bytes_into returned an invalid tensor receipt"
+            ) from exc
+        if (
+            any(isinstance(value, bool) or not isinstance(value, int) for value in counters)
+            or result.length != length
+            or not 0 <= result.source_requests <= 1
+            or not 0 <= result.source_bytes <= length
+        ):
+            raise CausalWeightIntegrityError(
+                "raw_bytes_into returned impossible tensor accounting"
+            )
+        receipt = CausalTensorIntoReceipt(
+            plan=plan,
+            relative_offset=offset,
+            length=length,
+            source_requests=result.source_requests,
+            source_bytes=result.source_bytes,
+        )
+        with self._metrics_lock:
+            self._read_calls += 1
+            self._direct_into_read_calls += 1
+            self._requested_bytes += length
+            self._resident_bytes += length
+            self._source_requests += result.source_requests
+            self._source_bytes += result.source_bytes
+        return receipt
+
     def metrics(self) -> dict[str, int | str]:
         with self._plan_cache_lock:
             revision = self._plan_cache_revision
@@ -1872,6 +1956,7 @@ class CausalTensorReader:
             return {
                 "layout_fingerprint": self.layout.layout_fingerprint,
                 "read_calls": self._read_calls,
+                "direct_into_read_calls": self._direct_into_read_calls,
                 "multi_range_read_calls": self._multi_range_read_calls,
                 "requested_bytes": self._requested_bytes,
                 "resident_bytes": self._resident_bytes,
@@ -2089,6 +2174,20 @@ class CausalWeightMount:
             length=length,
         )
 
+    def read_tensor_into(
+        self,
+        name: str,
+        target: object,
+        *,
+        relative_offset: int = 0,
+    ) -> CausalTensorIntoReceipt:
+        self._require_open()
+        return self.tensor_reader.read_tensor_into(
+            name,
+            target,
+            relative_offset=relative_offset,
+        )
+
     def read_tensor_ranges(
         self,
         name: str,
@@ -2125,6 +2224,7 @@ __all__ = [
     "CAUSAL_TENSOR_BINDING_SCHEMA",
     "CAUSAL_WEIGHT_BINDING_SCHEMA",
     "CausalTensorBindingReceipt",
+    "CausalTensorIntoReceipt",
     "CausalTensorReadReceipt",
     "CausalTensorRangesReadReceipt",
     "CausalTensorReader",

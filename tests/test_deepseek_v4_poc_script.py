@@ -448,7 +448,9 @@ class DeepSeekV4PocScriptTests(unittest.TestCase):
                 execution["expert_prefetch_resident_limit_bytes"],
                 48 * 1024**2,
             )
-            self.assertEqual(execution["source_transport_policy"], "local-range/v1")
+            self.assertEqual(
+                execution["source_transport_policy"], "local-range-direct-fill/v2"
+            )
             self.assertEqual(execution["source_transport_connection_limit"], 0)
             self.assertRegex(
                 report["provenance"]["runtime_source_sha256"],

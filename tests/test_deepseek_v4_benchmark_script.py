@@ -431,7 +431,9 @@ class DeepSeekV4BenchmarkScriptTests(unittest.TestCase):
                 document["expert_prefetch_resident_limit_bytes"],
                 48 * 1024**2,
             )
-            self.assertEqual(document["source_transport_policy"], "local-range/v1")
+            self.assertEqual(
+                document["source_transport_policy"], "local-range-direct-fill/v2"
+            )
             self.assertEqual(document["source_transport_connection_limit"], 0)
             self.assertEqual(
                 document["remote_pinned_inventory"],

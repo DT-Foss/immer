@@ -95,6 +95,18 @@ All notable changes to IMMER are recorded here.
   per-row down-projection arithmetic. Identical K4 routes remove `75%` of
   dynamic Gate/Up target transport; disjoint routes read exactly the former
   byte count. Runtime trace v2 records requested rows, unique rows, and reuse.
+- Added stable direct-fill local transport. `LocalRangeReader` uses `preadv` to
+  write an exact inode-validated range into caller-owned writable storage,
+  retries after replacement, handles progressing short reads, preserves cache,
+  budget, and access-trace accounting, and falls back to `pread` only when the
+  platform lacks `preadv`.
+- CPU Qwen pagers now allocate the final BF16/F32 Torch weight tensor first and
+  fill it directly through the CausalTensorReader plan. Sorted unique selected
+  rows are written into their final row tensor run by run, eliminating both
+  the intermediate Python body and the later stack duplicate. Unordered or
+  repeated IDs retain one bounded restore gather. Transport policy is
+  `local-range-direct-fill/v2`; pager policy is
+  `one-shot-qwen35-direct-fill/v4`.
 - The explicit Fast-MLP mode now packs the independent K-token projection rows
   into one physical GEMM per matrix. Exact mode retains the original separate
   kernels; packed execution is bound into the Fast runtime identity and
