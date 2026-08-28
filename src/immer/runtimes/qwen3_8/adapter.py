@@ -847,6 +847,9 @@ class Qwen38CausalChat:
                     "dialect_profiles": 64,
                     "dialect_sketch_size": 32,
                     "dialect_similarity_threshold": 0.20,
+                    "dialect_phrase_min_support": 2,
+                    "global_phrase_min_support": 3,
+                    "phrase_width": 3,
                     "persistent": self._markov_draft_state_path is not None,
                 }
         elif self._draft_mode is not None:

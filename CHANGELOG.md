@@ -72,6 +72,18 @@ All notable changes to IMMER are recorded here.
 - Markov state now migrates both v1 and Council-v2 into dialect-v3. Dialect
   profile, global Council update, regime state, episode boundary, and confirmed
   tokens share the same terminal atomic write and process lock.
+- Added target-confirmed phrase-option agents above the native-token Council.
+  Completed episodes produce three-token continuations only after repeated
+  support: two matching episodes inside the active dialect or three globally.
+  Options never cross episode boundaries and never bypass Qwen verification.
+- Markov state v4 binds every completed episode to its active dialect and
+  migrates v1, v2, and v3 state in place. Dialect and global phrase candidates
+  compete by confidence, support, matched context depth, and dialect
+  similarity; a weak local phrase cannot override stronger global evidence.
+- Phrase tokens are teacher-forced through the ordinary Council prediction
+  rows, so accepted and rejected prefixes update the same target-only expert
+  feedback as ordinary Markov drafts. Runtime evidence reports proposed and
+  accepted phrase tokens, source, support, and confidence.
 - The explicit Fast-MLP mode now packs the independent K-token projection rows
   into one physical GEMM per matrix. Exact mode retains the original separate
   kernels; packed execution is bound into the Fast runtime identity and

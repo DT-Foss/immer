@@ -71,6 +71,7 @@ from .local_draft import (
 from .markov_draft import (
     LEGACY_MARKOV_DRAFT_STATE_SCHEMA,
     V2_MARKOV_DRAFT_STATE_SCHEMA,
+    V3_MARKOV_DRAFT_STATE_SCHEMA,
     MARKOV_DRAFT_METRICS_SCHEMA,
     MARKOV_DRAFT_STATE_SCHEMA,
     FingerprintRollingK4DraftProvider,
@@ -79,6 +80,7 @@ from .markov_draft import (
     MarkovDraftMetrics,
     MarkovDraftState,
     MarkovExpertSpec,
+    MarkovPhraseOption,
 )
 from .model import (
     GenerationEvidence,
@@ -259,6 +261,7 @@ __all__ = [
     "LAYER_BOUNDARY_STAGES",
     "LEGACY_MARKOV_DRAFT_STATE_SCHEMA",
     "V2_MARKOV_DRAFT_STATE_SCHEMA",
+    "V3_MARKOV_DRAFT_STATE_SCHEMA",
     "LayerBoundaryObserver",
     "GRAPH_REVISION_SCHEMA",
     "GraphRevision",
@@ -291,6 +294,7 @@ __all__ = [
     "MarkovDraftMetrics",
     "MarkovDraftState",
     "MarkovExpertSpec",
+    "MarkovPhraseOption",
     "ModelPin",
     "NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA",
     "NATIVE_HEAD_CRSA_FREE_HEADS",

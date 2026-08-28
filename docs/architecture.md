@@ -66,7 +66,8 @@ address graph.
 - stateful full-attention and Gated DeltaNet execution;
 - native Causal Prefix Sinkhorn Attention;
 - correction-first rolling K=4 continuation with zero-read prefix commits;
-- local Qwen3.5 and zero-model-byte native-token Markov drafting;
+- local Qwen3.5 and zero-model-byte native-token Markov drafting with
+  target-confirmed phrase options;
 - packed K-token projection GEMMs in the explicit Fast-MLP mode;
 - semantic state snapshots and prefix batteries;
 - contextual cartography receipts tied to exact weight coordinates.
@@ -87,6 +88,14 @@ target-trained Rapidity weights with Fixed Share. Confirmed surprise drives a
 CUSUM regime detector; request boundaries remain explicit non-proposable
 symbols. Feedback, expert state, and the completed episode persist as one
 transaction. Draft consensus never overrides the target.
+
+State v4 binds each completed episode to its selected contextual dialect.
+Global and dialect-local agents mine only within those episode boundaries and
+offer a three-token phrase after repeated target confirmation. Competing
+options are ranked by confidence, support, matched context depth, and dialect
+similarity. The selected phrase is teacher-forced through the same Council
+rows, verified by the same rolling K=4 target wave, and learned only when the
+request reaches its terminal atomic commit.
 
 Context dialects sit above the global Council weights. A bounded bottom-k
 sketch of token unigrams, bigrams, and trigrams selects one of at most 64

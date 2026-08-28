@@ -105,7 +105,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(provider.metrics().expert_weights), 8)
         provider.close()
 
-    def test_v2_council_state_migrates_to_v3_dialect_memory(self) -> None:
+    def test_v2_council_state_migrates_to_v4_phrase_memory(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         state = seed._state
         seed.close()
@@ -145,9 +145,40 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((1, 2, 3, 4))
         provider.close()
 
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x03"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x04"))
         migrated = MarkovDraftState.from_bytes(path.read_bytes())
         self.assertEqual(len(migrated.dialects), 1)
+
+    def test_v3_dialect_state_migrates_episode_bindings_to_v4(self) -> None:
+        encoded = MarkovDraftState(
+            vocab_size=32,
+            max_history_tokens=64,
+            token_ids=(1, 2, 3),
+            episode_lengths=(3,),
+        ).to_bytes()
+        document = json.loads(zlib.decompress(encoded[5:]))
+        document.pop("episode_dialects")
+        document["schema"] = "immer.qwen3.8-markov-draft-state/v3"
+        raw = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        path = self.root / "v3-state.bin"
+        path.write_bytes(b"IMMD\x03" + zlib.compress(raw, level=9))
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=path,
+            max_history_tokens=64,
+        )
+
+        self.assertEqual(provider._state.episode_dialects, (None,))
+        provider.observe_final((1, 2, 3, 4))
+        provider.close()
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x04"))
 
     def test_variable_order_provider_predicts_and_learns_confirmed_prefix(self) -> None:
         state_path = self.root / "markov-state.bin"
@@ -219,6 +250,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertLessEqual(metrics.effective_experts, 8.0)
         self.assertGreater(metrics.last_confidence, 0.0)
         self.assertGreaterEqual(metrics.last_disagreement, 0.0)
+        self.assertGreater(metrics.phrase_option_calls, 0)
+        self.assertGreater(metrics.phrase_accepted_tokens, 0)
+        self.assertEqual(metrics.last_phrase_source, "global")
         provider.close()
         restored = MarkovDraftState.from_bytes(state_path.read_bytes())
         self.assertEqual(restored.updates, 33)
@@ -538,6 +572,103 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertGreater(sum(exact[4:]), sum(low[4:]))
         self.assertLess(sum(exact[:4]), sum(low[:4]))
+
+    def test_global_phrase_agent_emits_only_repeated_three_token_option(self) -> None:
+        episode = (1, 2, 3, 4, 5, 6)
+        state_path = self.root / "global-phrases.bin"
+        state_path.write_bytes(
+            MarkovDraftState(
+                vocab_size=32,
+                max_history_tokens=128,
+                token_ids=episode * 3,
+                episode_lengths=(len(episode),) * 3,
+            ).to_bytes()
+        )
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=128,
+        )
+        provider.begin_request((9, 1))
+
+        proposal = provider.propose_after((9, 1), 2)
+
+        self.assertEqual(proposal, (3, 4, 5))
+        metrics = provider.metrics()
+        self.assertEqual(metrics.last_phrase_source, "global")
+        self.assertEqual(metrics.last_phrase_support, 3)
+        self.assertEqual(metrics.last_phrase_confidence, 1.0)
+        provider.reconcile_prefix((9, 1, 2, 3, 4))
+        provider.observe_final((9, 1, 2, 3, 4, 7))
+        self.assertEqual(provider.metrics().phrase_accepted_tokens, 2)
+        provider.close()
+
+    def test_dialect_phrase_agent_activates_before_global_support_threshold(self) -> None:
+        state_path = self.root / "dialect-phrases.bin"
+        prompt = tuple((1, 2) * 20)
+        episode = (*prompt, 3, 4, 5, 6)
+        for _ in range(2):
+            writer = FingerprintRollingK4DraftProvider(
+                vocab_size=32,
+                state_path=state_path,
+                max_history_tokens=256,
+            )
+            writer.observe_final(episode)
+            writer.close()
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=256,
+        )
+        provider.begin_request(prompt)
+
+        proposal = provider.propose_after(prompt, 3)
+
+        self.assertEqual(proposal, (4, 5, 6))
+        self.assertEqual(provider.metrics().last_phrase_source, "dialect")
+        self.assertEqual(provider.metrics().last_phrase_support, 2)
+        provider.reconcile_prefix((*prompt, 3, 4, 5, 6))
+        provider.observe_final((*prompt, 3, 4, 5, 6))
+        provider.close()
+
+    def test_stronger_global_phrase_beats_weak_dialect_phrase(self) -> None:
+        prompt = (9, 1, 2)
+        local_episode = (1, 2, 3, 4, 5)
+        global_episode = (1, 2, 7, 8, 9)
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=64,
+        )
+        dialect_id = "a" * 64
+        expert_count = len(provider._state.expert_names)
+        dialect = MarkovDialectState(
+            dialect_id=dialect_id,
+            signature=provider._context_signature(prompt),
+            visits=2,
+            last_seen=1,
+            rapidities=(0.0,) * expert_count,
+            observations=(0,) * expert_count,
+            hits=(0,) * expert_count,
+        )
+        episodes = (local_episode,) * 2 + (global_episode,) * 6
+        provider._state = replace(
+            provider._state,
+            token_ids=tuple(token for episode in episodes for token in episode),
+            episode_lengths=(5,) * len(episodes),
+            episode_dialects=(dialect_id, dialect_id) + (None,) * 6,
+            clock=1,
+            dialects=(dialect,),
+        )
+        provider.begin_request(prompt)
+
+        proposal = provider.propose_after((9, 1), 2)
+
+        self.assertEqual(proposal, (7, 8, 9))
+        self.assertEqual(provider.metrics().last_phrase_source, "global")
+        self.assertEqual(provider.metrics().last_phrase_support, 6)
+        provider.reconcile_prefix((9, 1, 2, 7, 8, 9))
+        provider.observe_final((9, 1, 2, 7, 8, 9))
+        provider.close()
 
 
 if __name__ == "__main__":
