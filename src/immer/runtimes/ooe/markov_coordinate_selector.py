@@ -40,6 +40,7 @@ MARKOV_HOLDOUT_SCHEMA = "immer.qwen-markov-coordinate-holdout/v1"
 MARKOV_SELECTOR_VERIFIER_SHA256 = hashlib.sha256(
     b"immer:qwen-markov-coordinate-selector/train-only-beam+calibration-lock/v1"
 ).hexdigest()
+EXACT_REUSE_CEILING_SCHEMA = "immer.qwen-exact-output-reuse-ceiling/v1"
 _MAX_RECEIPT_BYTES = 64 * 1024 * 1024
 
 
@@ -53,6 +54,92 @@ class MarkovCoordinateSelectorIntegrityError(MarkovCoordinateSelectorError):
 
 class MarkovCoordinateSelectorCapacityError(MarkovCoordinateSelectorError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class ExactReuseCeiling:
+    train_rows: int
+    query_rows: int
+    frozen_exact_hits: int
+    adaptive_exact_hits: int
+    frozen_misses: int
+    adaptive_misses: int
+
+    def __post_init__(self) -> None:
+        for field in (
+            "train_rows",
+            "query_rows",
+            "frozen_exact_hits",
+            "adaptive_exact_hits",
+            "frozen_misses",
+            "adaptive_misses",
+        ):
+            value = getattr(self, field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field} must be non-negative")
+        if (
+            self.train_rows < 1
+            or self.query_rows < 1
+            or self.frozen_exact_hits + self.frozen_misses != self.query_rows
+            or self.adaptive_exact_hits + self.adaptive_misses != self.query_rows
+            or self.adaptive_exact_hits < self.frozen_exact_hits
+        ):
+            raise ValueError("exact reuse ceiling partition is invalid")
+
+    @property
+    def sha256(self) -> str:
+        return _digest(self.to_record())
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "adaptive_exact_hits": self.adaptive_exact_hits,
+            "adaptive_misses": self.adaptive_misses,
+            "frozen_exact_hits": self.frozen_exact_hits,
+            "frozen_misses": self.frozen_misses,
+            "query_rows": self.query_rows,
+            "schema": EXACT_REUSE_CEILING_SCHEMA,
+            "train_rows": self.train_rows,
+        }
+
+
+def exact_output_reuse_ceiling(
+    train: Sequence[SubspaceObservationGroup],
+    query: Sequence[SubspaceObservationGroup],
+) -> ExactReuseCeiling:
+    """Return the coordinate-independent exact-output cache opportunity."""
+
+    train_groups = tuple(train)
+    query_groups = tuple(query)
+    if not train_groups or not query_groups:
+        raise ValueError("reuse ceiling requires train and query groups")
+    if any(
+        not isinstance(group, SubspaceObservationGroup)
+        for group in (*train_groups, *query_groups)
+    ):
+        raise TypeError("reuse ceiling groups must be SubspaceObservationGroup values")
+    train_outputs = [
+        output for group in train_groups for output in group.output_payload_sha256s
+    ]
+    query_outputs = [
+        output for group in query_groups for output in group.output_payload_sha256s
+    ]
+    initial = set(train_outputs)
+    frozen_hits = sum(output in initial for output in query_outputs)
+    adaptive = set(initial)
+    adaptive_hits = 0
+    for output in query_outputs:
+        if output in adaptive:
+            adaptive_hits += 1
+        else:
+            adaptive.add(output)
+    return ExactReuseCeiling(
+        train_rows=len(train_outputs),
+        query_rows=len(query_outputs),
+        frozen_exact_hits=frozen_hits,
+        adaptive_exact_hits=adaptive_hits,
+        frozen_misses=len(query_outputs) - frozen_hits,
+        adaptive_misses=len(query_outputs) - adaptive_hits,
+    )
 
 
 def _digest(value: object) -> str:
@@ -1260,6 +1347,7 @@ def evaluate_markov_coordinate_selector(
 
 
 __all__ = [
+    "EXACT_REUSE_CEILING_SCHEMA",
     "MARKOV_FIT_SCHEMA",
     "MARKOV_HOLDOUT_SCHEMA",
     "MARKOV_NOMINATION_SCHEMA",
@@ -1267,6 +1355,7 @@ __all__ = [
     "MARKOV_SELECTOR_VERIFIER_SHA256",
     "MARKOV_STATE_SCHEMA",
     "CoordinateNominationReceipt",
+    "ExactReuseCeiling",
     "MarkovCoordinateSelectorCapacityError",
     "MarkovCoordinateSelectorConfig",
     "MarkovCoordinateSelectorError",
@@ -1276,5 +1365,6 @@ __all__ = [
     "MarkovCoordinateState",
     "MarkovHoldoutResult",
     "evaluate_markov_coordinate_selector",
+    "exact_output_reuse_ceiling",
     "fit_markov_coordinate_selector",
 ]

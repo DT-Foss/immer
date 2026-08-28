@@ -170,14 +170,19 @@ around every domain that supports it.
   reads, 40 exact O1/Atlas/Harvester authorities, and a bank-invoked CAS proof.
 - [x] Execute the 40-group official 27B MLP capture and open the five-group L54
   holdout only after the `25/10` calibration lock. Minimal promoted joint key:
-  `k=2/16`, zero wrong, `116/512` held exact hits, `1,743.80x` smaller than the
-  full-16 control.
+  `k=2/16`, zero wrong, `116/512` all-row held exact hits, `1,743.80x` smaller
+  than the full-16 control.
 - [x] Mount a sealed Markov coordinate agent with train-only multi-nominator
   beam search, exact collision rewards, a 64-bit capacity gate, frozen/adaptive
   holdout metrics, and equal-`k` plus Full/Marginal controls.
+- [x] Split shared chat-template rows from question content and measure the
+  coordinate-independent reuse ceiling. Content-only calibration has zero
+  adaptive exact-output repeats; the `116/512` all-row hits are template reuse,
+  so the exact-output selector abstains before fit and holdout.
 - [ ] Complete O1 cartography and exact MLP capture for the new deterministic
-  five-prompt label-free cohort, then test selector advantage on genuinely
-  unseen prompts. Compression itself no longer needs re-proving.
+  five-prompt label-free cohort, then evaluate layer-local Gate×Up action
+  kernels on genuinely unseen prompts. Exact output caching is closed for this
+  cohort; sparse range selection is the active compute path.
 - [ ] Apply topology-aware Warmth only as a downward charging brake and measure
   redundant-charge suppression without changing authenticated demand.
 - [x] Export the first eight live O1/Atlas controller promotions into an exact

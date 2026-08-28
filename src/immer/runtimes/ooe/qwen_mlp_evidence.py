@@ -1881,7 +1881,10 @@ class QwenMlpEvidenceBank:
             )
 
     def build_subspace_corpus(
-        self, *, allowed_splits: Sequence[str] | None = None
+        self,
+        *,
+        allowed_splits: Sequence[str] | None = None,
+        row_indices_by_prompt: Mapping[str, Sequence[int]] | None = None,
     ) -> SubspaceCorpus:
         selected_splits = (
             CAPTURE_SPLITS if allowed_splits is None else tuple(allowed_splits)
@@ -1912,6 +1915,34 @@ class QwenMlpEvidenceBank:
             raise QwenMlpEvidenceIntegrityError(
                 "production SubspaceCorpus requires one live manifest/model/verifier pin"
             )
+        row_selection: dict[str, tuple[int, ...]] | None = None
+        if row_indices_by_prompt is not None:
+            if not isinstance(row_indices_by_prompt, Mapping):
+                raise TypeError("row_indices_by_prompt must be a mapping")
+            expected_prompts = {
+                receipt.entry.prompt_sha256 for receipt, _verification in pairs
+            }
+            if set(row_indices_by_prompt) != expected_prompts:
+                raise ValueError(
+                    "row selection differs from the corpus prompt inventory"
+                )
+            row_selection = {}
+            for prompt, raw_indices in row_indices_by_prompt.items():
+                if isinstance(raw_indices, (str, bytes, bytearray)):
+                    raise TypeError("row selection indices must be an integer sequence")
+                indices = tuple(raw_indices)
+                if (
+                    not indices
+                    or indices != tuple(sorted(set(indices)))
+                    or any(
+                        isinstance(index, bool)
+                        or not isinstance(index, int)
+                        or index < 0
+                        for index in indices
+                    )
+                ):
+                    raise ValueError("row selection indices are invalid or duplicated")
+                row_selection[prompt] = indices
         groups = []
         for receipt, verification in pairs:
             refs = {ref.stage: ref for ref in receipt.tensors}
@@ -1925,6 +1956,23 @@ class QwenMlpEvidenceBank:
                 -1, refs["mlp.up"].shape[-1]
             )
             outputs = refs["mlp.output"].row_sha256s
+            selection_sha256: str | None = None
+            if row_selection is not None:
+                indices = row_selection[receipt.entry.prompt_sha256]
+                if indices[-1] >= len(outputs):
+                    raise ValueError("row selection exceeds captured prompt rows")
+                take = np.asarray(indices, dtype=np.int64)
+                context = context[take]
+                gate = gate[take]
+                up = up[take]
+                outputs = tuple(outputs[index] for index in indices)
+                selection_sha256 = _digest(
+                    {
+                        "indices": list(indices),
+                        "prompt_sha256": receipt.entry.prompt_sha256,
+                        "schema": "immer.qwen3.8-subspace-row-selection/v1",
+                    }
+                )
             source = tuple(
                 sorted(
                     set(receipt.source_receipt_sha256s)
@@ -1934,6 +1982,7 @@ class QwenMlpEvidenceBank:
                         receipt.access_trace_sha256,
                         verification.sha256,
                     }
+                    | (set() if selection_sha256 is None else {selection_sha256})
                 )
             )
             projection_verifier = verification.verifier_sha256

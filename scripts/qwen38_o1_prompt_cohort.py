@@ -28,6 +28,18 @@ class CohortError(RuntimeError):
     pass
 
 
+def _require_sha256(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or len(value) != 64:
+        raise ValueError(f"{field} must be a SHA-256")
+    try:
+        bytes.fromhex(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a SHA-256") from exc
+    if value != value.lower():
+        raise ValueError(f"{field} must be a lowercase SHA-256")
+    return value
+
+
 def _digest(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
@@ -136,9 +148,10 @@ def _existing_prompt_hashes(paths: Sequence[Path]) -> tuple[str, ...]:
             if not isinstance(row, Mapping):
                 raise CohortError(f"existing prompt row is invalid: {path}")
             digest = row.get("sha256")
-            if not isinstance(digest, str) or len(digest) != 64:
-                raise CohortError(f"existing prompt SHA is invalid: {path}")
-            hashes.add(digest)
+            try:
+                hashes.add(_require_sha256(digest, field="existing prompt SHA"))
+            except ValueError as exc:
+                raise CohortError(f"existing prompt SHA is invalid: {path}") from exc
     return tuple(sorted(hashes))
 
 
@@ -161,8 +174,7 @@ def build_cohort(
         or max_prompt_tokens < 1
     ):
         raise ValueError("max_prompt_tokens must be positive")
-    if not isinstance(seed_sha256, str) or len(seed_sha256) != 64:
-        raise ValueError("seed_sha256 must be a SHA-256")
+    seed_sha256 = _require_sha256(seed_sha256, field="seed_sha256")
     benchmark, benchmark_raw = _json(benchmark_path)
     if not isinstance(benchmark, Mapping) or not isinstance(
         benchmark.get("items"), list
@@ -174,9 +186,7 @@ def build_cohort(
     )
     existing = set(_existing_prompt_hashes(existing_manifest_paths))
     for digest in existing_prompt_sha256s:
-        if not isinstance(digest, str) or len(digest) != 64:
-            raise ValueError("existing_prompt_sha256s contains an invalid SHA-256")
-        existing.add(digest)
+        existing.add(_require_sha256(digest, field="existing_prompt_sha256s"))
     if not existing:
         raise ValueError("at least one existing prompt identity is required")
     items = cast(list[object], benchmark["items"])

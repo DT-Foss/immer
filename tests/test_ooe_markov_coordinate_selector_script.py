@@ -13,7 +13,9 @@ from immer.runtimes.ooe.qwen_mlp_evidence import (
     CaptureManifest,
     QwenMlpEvidenceBank,
     canonical_capture_plan,
+    run_capture_manifest,
 )
+from immer.runtimes.qwen3_8 import prompt_token_sha256
 
 from test_ooe_qwen_mlp_evidence import _capture_pair, _verifier
 from test_qwen38_o1_mlp_evidence import _hash
@@ -21,6 +23,7 @@ from test_qwen38_o1_mlp_evidence import _hash
 
 ROOT = Path(__file__).resolve().parents[1]
 SELECTOR_SCRIPT = ROOT / "scripts" / "ooe_markov_coordinate_selector.py"
+MLP_SCRIPT = ROOT / "scripts" / "qwen38_o1_mlp_evidence.py"
 
 
 def _load(path: Path, name: str):
@@ -122,6 +125,83 @@ class MarkovCoordinateSelectorScriptTests(unittest.TestCase):
                 external_report["body"]["fit_bank_state_sha256"],
                 external_report["body"]["holdout_bank_state_sha256"],
             )
+
+    def test_content_rows_abstain_when_exact_reuse_ceiling_is_zero(self) -> None:
+        selector = _load(SELECTOR_SCRIPT, "ooe_markov_coordinate_selector_content_test")
+        mlp = _load(MLP_SCRIPT, "qwen38_o1_mlp_content_fixture")
+        token_rows = tuple((1, 2, 10 + index, 8, 9) for index in range(5))
+        prompts = tuple(prompt_token_sha256(tokens) for tokens in token_rows)
+        manifest = CaptureManifest(
+            model_pin_sha256=_hash("content-model"),
+            input_manifest_sha256=_hash("content-inputs"),
+            prompt_sha256s=prompts,
+            entries=canonical_capture_plan(prompts),
+        )
+
+        class LiveFixtureRunner(mlp.FixtureRunner):
+            capture_mode = "live-exact"
+
+        fixture = {
+            "hidden_dimension": 4,
+            "intermediate_dimension": 6,
+            "rows": 5,
+            "schema": mlp.FIXTURE_SCHEMA,
+            "seed_sha256": _hash("content-fixture"),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bank_root = root / "bank"
+            bank = QwenMlpEvidenceBank(bank_root)
+            run_capture_manifest(manifest, bank, LiveFixtureRunner(manifest, fixture))
+            registry = root / "prompts.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "prompts": [
+                            {"sha256": prompt, "token_ids": list(tokens)}
+                            for prompt, tokens in zip(prompts, token_rows, strict=True)
+                        ]
+                    }
+                )
+            )
+            output = root / "selector"
+            stream = io.StringIO()
+            with contextlib.redirect_stdout(stream):
+                self.assertEqual(
+                    selector.main(
+                        [
+                            "--bank-root",
+                            str(bank_root),
+                            "--output-root",
+                            str(output),
+                            "--row-mode",
+                            "content",
+                            "--fit-prompt-registry",
+                            str(registry),
+                            "--max-depth",
+                            "2",
+                            "--beam-width",
+                            "2",
+                            "--max-candidate-pool",
+                            "6",
+                            "--max-evaluated-states",
+                            "32",
+                            "--max-working-gb",
+                            "0.1",
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(stream.getvalue())
+            self.assertEqual(report["body"]["status"], "no_exact_output_reuse_signal")
+            self.assertEqual(
+                report["body"]["calibration_reuse_ceiling"]["adaptive_exact_hits"],
+                0,
+            )
+            self.assertFalse((output / "fit.json").exists())
+            self.assertFalse((output / "holdout.json").exists())
+            self.assertTrue((output / "fit-row-roles.json").is_file())
+            self.assertTrue((output / "reuse-ceiling.json").is_file())
 
 
 if __name__ == "__main__":

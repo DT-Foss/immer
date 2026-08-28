@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import unittest
 
@@ -8,18 +9,42 @@ from immer.runtimes.ooe.markov_coordinate_selector import (
     MarkovCoordinateSelectorEvaluation,
     MarkovCoordinateSelectorFit,
     MarkovCoordinateSelectorIntegrityError,
+    exact_output_reuse_ceiling,
     evaluate_markov_coordinate_selector,
     fit_markov_coordinate_selector,
 )
 from immer.runtimes.ooe.subspace_battery import (
     SubspaceBatteryIntegrityError,
     SubspaceCorpus,
+    output_evidence_sha256,
 )
 
 from test_ooe_subspace_battery import _corpus, _hash
 
 
 class MarkovCoordinateSelectorTests(unittest.TestCase):
+    def test_exact_output_reuse_ceiling_separates_frozen_and_adaptive(self) -> None:
+        train = _corpus().groups[0]
+        query = _corpus().groups[1]
+        outputs = (_hash("C"), _hash("C"), _hash("D"), _hash("D"))
+        query = replace(
+            query,
+            group_sha256=_hash("adaptive-query"),
+            output_evidence_sha256=output_evidence_sha256(
+                output_payload_sha256s=outputs,
+                output_verifier_sha256=query.output_verifier_sha256,
+                source_receipt_sha256s=query.source_receipt_sha256s,
+            ),
+            output_payload_sha256s=outputs,
+        )
+        ceiling = exact_output_reuse_ceiling((train,), (query,))
+        self.assertEqual(ceiling.train_rows, 4)
+        self.assertEqual(ceiling.query_rows, 4)
+        self.assertEqual(ceiling.frozen_exact_hits, 0)
+        self.assertEqual(ceiling.adaptive_exact_hits, 2)
+        self.assertEqual(ceiling.frozen_misses, 4)
+        self.assertEqual(ceiling.adaptive_misses, 2)
+
     def test_train_only_beam_entropy_gate_and_dual_holdout_are_recomputable(
         self,
     ) -> None:

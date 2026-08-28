@@ -2,7 +2,7 @@
 
 All notable changes to IMMER are recorded here.
 
-## [Unreleased] — 2026-08-27
+## [Unreleased] — 2026-08-28
 
 ### Markov coordinate intelligence
 
@@ -23,6 +23,15 @@ All notable changes to IMMER are recorded here.
   derived only from item identity, question hashes, a pinned seed, tokenizer,
   and prior prompt identities; gold answers, model outcomes, and benchmark
   status cannot affect the selected registry.
+- Added sealed prompt-row roles derived from the exact token registry. The
+  longest shared chat-template prefix and suffix are removed before selector
+  fitting, and each content-row selection is bound back into the projection
+  evidence.
+- Added the coordinate-independent exact-output reuse ceiling. On the first
+  official bank the content-only ceiling is zero: the earlier adaptive
+  `116/512` L54 hits are shared chat-template rows, not question-content reuse.
+  Content mode now persists that result and exits before fitting or opening
+  holdout tensors when no exact-output reuse signal exists.
 
 ### Live exact Qwen MLP capture runtime
 
@@ -45,13 +54,14 @@ All notable changes to IMMER are recorded here.
   `25/10/5` closure, `audit_clean=true`, and `369,098,752` referenced tensor
   bytes. The minimal promoted candidate uses joint gate/up coordinates
   `[6844,3028]` at `k=2`, 16-bit quantization: calibration `232/1024` exact
-  verified hits and holdout `116/512`, both with zero wrong collisions.
+  verified all-row hits and holdout `116/512`, both with zero wrong collisions.
 - That candidate stores `126,760 B`, versus `221,043,712 B` for the full
   17,408-coordinate 16-bit control with identical held hit/miss counts: a
   `1,743.80x` reduction. The layer-54 holdout is a topology holdout over the
   same five prompts. A deterministic random `k=2` control also reaches zero
-  wrong collisions at 12 bits, so the compressed joint-key mechanism is
-  established while fixed energy ranking is not uniquely superior.
+  wrong collisions at 12 bits. Content-row decomposition subsequently proves
+  zero exact output reuse, so this result is a compact collision-safe key for
+  template repetition, not a content-compute saving mechanism.
 ### O1 exact measurement sidecars
 
 - Added an opt-in native observer for the exact

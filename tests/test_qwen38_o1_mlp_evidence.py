@@ -173,6 +173,16 @@ class Qwen38O1MlpEvidenceScriptTests(unittest.TestCase):
                 ),
                 5,
             )
+            selected_rows = live_bank.build_subspace_corpus(
+                allowed_splits=("holdout",),
+                row_indices_by_prompt={prompt: (1,) for prompt in prompts},
+            )
+            self.assertEqual(sum(group.row_count for group in selected_rows.groups), 5)
+            with self.assertRaisesRegex(ValueError, "prompt inventory"):
+                live_bank.build_subspace_corpus(
+                    allowed_splits=("holdout",),
+                    row_indices_by_prompt={prompts[0]: (0,)},
+                )
             holdout_receipt = next(
                 receipt
                 for receipt, _verification in live_bank.committed_pairs()

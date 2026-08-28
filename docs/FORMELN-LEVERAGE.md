@@ -146,16 +146,15 @@ holdout groups execute.
 The official local Qwen3.8-27B measurement is complete. The smallest promoted
 joint key selects intermediate coordinates `[6844,3028]` and concatenates
 their gate/up values, producing four quantized scalars per token. At 16 bits it
-records `232/1024` exact calibration hits and `116/512` exact layer-54 holdout
-hits with zero wrong collisions. Its `126,760 B` cache is `1,743.80x` smaller
-than the full 17,408-coordinate 16-bit control (`221,043,712 B`) with the same
-held hit/miss counts. Candidate `k=1/16` was correctly blocked by 8 train and 3
-calibration wrong collisions even though its holdout happened to contain zero
-wrong collisions. A deterministic random `k=2/12` control also remains
-zero-wrong, so the result validates the joint subspace key and compression
-boundary, not the current energy ranking as a unique selector. The holdout is
-across layer topology with the same five prompts; prompt-temporal selection is
-the next measurement.
+records `232/1024` all-row calibration hits and `116/512` all-row layer-54
+holdout hits with zero wrong collisions. Its `126,760 B` cache is `1,743.80x`
+smaller than the full 17,408-coordinate 16-bit control (`221,043,712 B`) with
+the same held hit/miss counts. Exact prompt-row roles then remove the 29-token
+shared prefix and 9-token suffix: content-only calibration and L54 contain no
+repeated output payload at all (`0/644` and `0/322` adaptive hits). Candidate
+`k=1/16` remains correctly blocked by prior wrong collisions, but the surviving
+`k=2` hits are template reuse rather than content-compute savings. The next
+mechanism predicts layer-local Gate×Up ranges instead of exact output payloads.
 
 The next selector uses a finite Markov walk rather than one static ranking:
 

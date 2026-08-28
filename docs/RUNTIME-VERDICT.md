@@ -126,10 +126,12 @@ later requests.
   verifier pin bind compact tensor objects, the bank-invoked replay proof, CAS
   recovery, and the orphan audit. The official run completes `40/40` with a
   clean audit. Joint coordinates `[6844,3028]` at `k=2/16` give `116/512`
-  exact verified L54 holdout hits, zero wrong collisions, and `126,760 B`
-  storage versus `221,043,712 B` for full-16 (`1,743.80x`). Random `k=2/12`
-  also stays zero-wrong; the runtime mechanism is established, while learned
-  coordinate selection remains the active intelligence problem.
+  all-row L54 holdout hits, zero wrong collisions, and `126,760 B` storage
+  versus `221,043,712 B` for full-16 (`1,743.80x`). Exact token-row
+  decomposition shows every content output is unique and the content-only
+  adaptive reuse ceiling is `0/322`; the hits are shared chat-template rows.
+  The runtime therefore closes this cache branch and moves to layer-local
+  Gate×Up range actions.
 - The first real five-prompt L27 wave finds one stable transport, `20→8`.
   Held-out residual falls from Identity `0.2373913654` to `0.0248507190`; pair
   selection uses structural and calibration evidence only, before holdout.
