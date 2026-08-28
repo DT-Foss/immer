@@ -20,7 +20,8 @@ request -> CompositionRoot -> FERTIG exact first refusal
 
 continuous learning plane:
 
-living frontier -> Qwen probe -> exact WeightCoordinate + projected pre/post hidden states
+living frontier -> D-optimal O1 acquisition -> Qwen probe
+     -> exact WeightCoordinate + projected pre/post hidden states
      -> SemanticWeightAtlas -> O1 signal -> contextual operator harvester
      -> whole / Attention core+residual / MLP core+residual families
      -> affine / permutation / Markov Crystals -> Birkhoff atom bases
@@ -29,6 +30,7 @@ living frontier -> Qwen probe -> exact WeightCoordinate + projected pre/post hid
      -> replicated Markov agents -> world model / options / operator graph
      -> demand scheduler -> charged prefix + live residual suffix
      -> verifier outcome -> algebra and demand feedback
+     -> receipt-native Seed shadow proposer -> novelty / route / work proposal
      -> opaque consequence word -> context-aware executable language
      -> self-hosted definition DAG -> compiled Crystal / bounded program
 ```
@@ -337,6 +339,13 @@ Attention coordinates follow the authenticated hybrid layer topology:
 DeltaNet layers use `linear_attn.in_proj_qkv`, while full-attention layers use
 `self_attn.q_proj`.
 
+Before a bounded frontier opens, D-optimal acquisition can derive a structural
+design directly from immutable `ProbeJob` fields. Greedy log-determinant gain
+spreads the selected cells over prompt identities, layers, interventions,
+modules, and target units. The ordered choice, every gain, numeric ABI,
+feature schema, model/code pins, and candidate inventory form one replayable
+receipt. Outcome and holdout values are not accepted by this interface.
+
 Atlas revisions expose exact hash-chain membership. Rollback, fork, forged
 historical events, and a head change during proof construction fail closed.
 Scheduler observation order can traverse authenticated historical revisions in
@@ -363,6 +372,27 @@ placebo effects remain scalars; the runtime never reconstructs a hidden tensor
 from summary statistics. Weight-site measurements sharing one prompt remain
 separate Atlas records but count once inside an operator family, so fit and
 holdout evidence is prompt-diverse rather than coordinate-duplicated.
+
+The trainable Seed v3 sits beside this exact path as a shadow proposer. Its
+GRU recurrence feeds role-complete trainable Causal Prefix Sinkhorn Attention
+and a Keyed SwiGLU seam. Contextual operator, novelty, predictive quotient,
+joint microkey, route-value, and expected-work heads learn from aligned
+receipt sequences. The input can be token IDs or the same authenticated
+64-dimensional Qwen/O1 feature sketch used by OoE.
+
+The receipt projection retains every model, code, site, graph, authority,
+verifier, prompt-generation, group, and split binding. Numeric meanings enter
+only through a pinned projection function. Train, calibration, and holdout
+groups remain disjoint, and finite-sample promotion risk counts independent
+admitted groups rather than multiplying correlated layer rows. Seed output
+enters the existing verifier path; it creates proposals, not a parallel
+execution authority.
+
+Exact finite-world transitions can also identify a modular affine action
+directly. Deterministic Gauss-Jordan elimination over an explicit prime field
+fits `y = Ax + b`; all train and later calibration transitions replay before
+the operator is emitted as the existing `AffineActionAtom` type. No second
+snapshot or Crystal runtime is introduced.
 
 The probe also captures five internal boundaries during the same layer
 execution: normalized Attention input, Attention output, Attention residual,

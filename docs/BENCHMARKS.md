@@ -1,12 +1,12 @@
 # Benchmarks
 
-Release: Unreleased · 2026-08-27
+Release: Unreleased · 2026-08-28
 
 Integration base for the new FERTIG-action and predictive-quotient rows:
 `45778a4aeac55a8f1a7bcb47df73fee4972e1228`.
 
-Final warning-fatal regression boundary for this cut: `1,814/1,814`, `OK`,
-`591.551 s`.
+Final warning-fatal regression boundary for this cut: `1,951/1,951`, `OK`,
+`785.153 s`.
 
 Each row states its exact measurement scope and evidence boundary. Committed
 machine-readable receipts are linked directly. Model-weight execution receipts
@@ -35,6 +35,9 @@ those exact item sets.
 
 | Benchmark | Result | Exact scope | Evidence boundary |
 |---|---:|---|---|
+| Native Seed v3 migration | Micro and 5M exact on hidden, LM, operator, state, final, novelty, predictive, and joint MLP-key tensors | fresh two-program contextual batches; SHA-first source load; trained GRU/CRSA/SwiGLU and existing heads preserved; quotient initialized from predictive; receipt/route/work heads deterministically added; no optimizer/RNG state enters inference artifacts | [`seed_v3`](../src/immer/runtimes/seed_v3); manifests `9fa2e6d3… / 8e88c0d0…`; weights `630a2676… / 5f339960…`; [`test_seed_v3_core.py`](../tests/test_seed_v3_core.py) |
+| D-optimal O1 acquisition | deterministic byte-identical plan and replay; target/holdout inputs rejected | ordinary finite `ProbeJob` frontier; structural design binds prompt identity, layer, intervention, module, unit kind/index, numeric ABI, ridge, budget, gains, model/code pins, and exact candidate set | [`acquisition.py`](../src/immer/runtimes/o1_state/acquisition.py); [`test_o1_acquisition.py`](../tests/test_o1_acquisition.py) |
+| Exact modular-affine discovery | exact unseen-state execution for dimensions 2 and 4; singular, composite-modulus, identity, calibration, and tamper controls rejected | deterministic prime-field fit of `y=Ax+b`; source-receipt-addressed train rows; separate calibration rows; output is the existing `AffineActionAtom` type | [`modular_affine_fit.py`](../src/immer/runtimes/ooe/modular_affine_fit.py); [`test_ooe_modular_affine_fit.py`](../tests/test_ooe_modular_affine_fit.py) |
 | Standalone Markov-OoE | local `17.28%`; reversible `49.84%`; PS-Lifted `96.10%`; warm `100%`; shuffled Crystal `13.50%` | six finite operator families; local noisy one-step teacher transitions; 250 unseen plans and 5,000 longer unseen compositions | imported package manifest `28/28`; production port and regression tests in [`runtimes/ooe`](../src/immer/runtimes/ooe) |
 | Consequence-grounded executable language | primitive `100%`; unseen programs `100%`; context-dependent word `100%`; held-out grammar `100%`; option words `100%`; cultural child `100%`; self-hosted macro `100%` | five independent seeds × 1,000 held-out programs; receiver sees word + context + chosen-action consequence only; shuffled semantics `2.02%`, fixed no-message policy `0.98%`, no-action abstain `2.90%`, shuffled grammar `5.00%`, holistic held-out `0%`; every unassigned in-vocabulary word abstains | [`markov_language.py`](../src/immer/runtimes/ooe/markov_language.py); [`ooe_markov_language_benchmark.py`](../scripts/ooe_markov_language_benchmark.py); [`test_ooe_markov_language.py`](../tests/test_ooe_markov_language.py); [`test_ooe_markov_language_benchmark.py`](../tests/test_ooe_markov_language_benchmark.py) |
 | Recursive executable word DAG | `8,191` actions → `36` references → one charged Crystal; exact parity; `8.380x` authenticated-VM speedup | depth 12, five seeds, 25 future states per seed; flat VM `0.327760 s`, compiled VM `0.039530 s`, one-time compile `0.784953 s`; `99.5605%` knowledge-reference and `99.9878%` deployment-symbol reduction; `1,638,000` historical vs. `200` live work units | [`executable_lexicon.py`](../src/immer/runtimes/ooe/executable_lexicon.py); [`compute_crystals.py`](../src/immer/runtimes/ooe/compute_crystals.py); [`test_ooe_executable_lexicon.py`](../tests/test_ooe_executable_lexicon.py) |

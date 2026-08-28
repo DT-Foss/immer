@@ -1,7 +1,7 @@
 {
   "schema": "immer.components.v2",
   "package_version": "0.8.0",
-  "released": "2026-08-26",
+  "released": "2026-08-28",
   "author": {
     "name": "David Tom Foss",
     "orcid": "https://orcid.org/0009-0004-0289-7154",
@@ -36,6 +36,8 @@
         "src/immer/cognition/qwen_fertig_chat.py",
         "src/immer/runtimes/ooe/demand_execution.py",
         "src/immer/runtimes/ooe/affine_monoid.py",
+        "src/immer/runtimes/ooe/modular_affine_fit.py",
+        "src/immer/runtimes/ooe/seed_projection.py",
         "src/immer/runtimes/ooe/algebra_agents.py",
         "src/immer/runtimes/ooe/harvest_algebra_bridge.py",
                 "src/immer/runtimes/ooe/harvest_algebra_intelligence.py",
@@ -53,6 +55,18 @@
                 "scripts/ooe_controller_language_bootstrap.py",
                 "scripts/ooe_dialect_mesh_benchmark.py"
             ]
+    },
+    {
+      "name": "IMMER Seed v3",
+      "role": "receipt-native GRU/CRSA/Keyed-SwiGLU shadow proposer for contextual action, novelty, predictive quotient, route value, and expected work",
+      "repository": "https://github.com/DT-Foss/immer",
+      "revision": "package:0.8.0",
+      "status": "integrated shadow training path",
+      "integration": "src/immer/runtimes/seed_v3/",
+      "additional_integrations": [
+        "src/immer/runtimes/ooe/seed_projection.py",
+        "src/immer/runtimes/o1_state/acquisition.py"
+      ]
     },
     {
       "name": "Qwen compute battery",
@@ -175,7 +189,7 @@
     },
     {
       "name": "o1-state",
-      "role": "persistent life stream, additive model cartography, and idle experiment scheduling",
+      "role": "persistent life stream, additive model cartography, D-optimal acquisition, and idle experiment scheduling",
       "repository": "https://github.com/DT-Foss/o1-state",
       "revision": "bb5e443f1b101dac0faedc25d3450343b59c93cd",
       "status": "ported into runtime core",

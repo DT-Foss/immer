@@ -884,6 +884,69 @@ y=\operatorname{dischargeExact}(r,x).
 Canonical cost planning remains available; exact discharge preserves an
 algebra agent's explicit alternative.
 
+### Receipt-native Seed accumulation
+
+The trainable Seed moves competence across three time scales:
+
+\[
+\theta_{k+1}=\theta_k-\eta\nabla_\theta\mathcal L,
+\qquad
+M_{t+1}=U(M_t,z_t,a_t,r_t,z_{t+1}),
+\qquad
+C_{t+1}=C_t\cup\operatorname{Crystallize}(M_{0:t}).
+\]
+
+Slow GRU/CRSA parameters learn contextual acquisition and routing. Fast
+Markov state learns from verified consequences. Repeated stable programs enter
+the persistent Crystal bank. The Seed receives authenticated receipt sequences
+and emits proposals for operator, novelty, predictive quotient, route value,
+and expected work.
+
+Every Keyed-SwiGLU block exposes a joint address
+
+\[
+k(h)=Q_b\!\left([g_{I_k}(h)\Vert u_{I_k}(h)]\right).
+\]
+
+Its decoded action must agree with the independent contextual head before the
+existing verifier path can use it. Training heads never create a second
+execution authority.
+
+O1 chooses a bounded measurement set by sequential D-optimal gain. For the
+current selected design (X_S) and candidate row (x),
+
+\[
+\Delta(x)=\log\!\left(1+x^\top
+(X_S^\top X_S+\lambda I)^{-1}x\right).
+\]
+
+The implementation updates the inverse through Sherman-Morrison and seals the
+ordered gains, candidate identities, structural feature schema, ridge, budget,
+and model/code pins. Outcomes and holdout values are outside the function
+signature used for selection.
+
+Promotion uncertainty counts independent admitted groups. With zero failed
+groups among (n), confidence (c), and error probability (p), the exact
+one-sided bound is
+
+\[
+p_{upper}=1-(1-c)^{1/n}.
+\]
+
+Correlated layer rows inside one prompt group therefore increase evidence
+resolution without pretending to increase the independent trial count.
+
+When a finite-world transition is affine over a prime field, the Seed/OoE path
+identifies
+
+\[
+y=Ax+b\pmod p
+\]
+
+by deterministic exact elimination, verifies every later calibration row, and
+emits the existing `AffineActionAtom`. The fitted operator immediately joins
+ordinary composition, guards, execution receipts, and Crystal storage.
+
 ## 8. Novelty and structured kernels
 
 For site patterns \(X\), query \(q\), and inverse temperature \(\beta\), the

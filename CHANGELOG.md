@@ -4,14 +4,45 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-28
 
+### Receipt-native Seed v3 and O1 information geometry
+
+- Integrated the shared Seed v0.3 architecture as a native IMMER shadow
+  proposer: GRU recurrence, trainable Causal Prefix Sinkhorn Attention,
+  joint Gate×Up microkeys, contextual operator and novelty heads, predictive
+  and quotient heads, plus route-value and expected-work heads. The same core
+  now accepts either tokens or the existing 64-dimensional authenticated
+  Qwen/O1 receipt sketch.
+- Added the sealed receipt-to-training ABI. Measurement, execution-learning,
+  and demand-execution receipts retain their model, code, site, graph,
+  authority, verifier, group, generation, and split identities while exposing
+  aligned `[group, sequence, feature]` tensors. Train, calibration, and
+  holdout groups cannot overlap. Promotion risk counts admitted groups instead
+  of correlated layer rows.
+- Added deterministic D-optimal O1 acquisition. A structural design derived
+  from immutable `ProbeJob` fields selects a bounded information-maximizing
+  frontier subset through exact replayable log-determinant gains; prompt
+  identity, layer topology, intervention, module, and unit structure are
+  included, while outcomes and holdout values are rejected as inputs.
+- Added exact modular-affine discovery over explicit prime fields. A bounded
+  deterministic Gauss-Jordan fit identifies `y = Ax + b`, verifies every
+  training and chronologically separate calibration transition, and emits the
+  existing `AffineActionAtom` runtime type with a sealed replay receipt.
+- Added SHA-first Seed inference checkpoints and a strict v0.3 migration path.
+  The trained Micro and 5M checkpoints now load without optimizer/RNG payloads;
+  their hidden states, LM logits, operator/state/final/novelty/predictive heads,
+  and MLP microkeys remain tensor-identical to the source models on fresh
+  contextual programs. Migrated manifests are `9fa2e6d3…` and `8e88c0d0…`.
+- Closed the complete spawn-safe warning-fatal repository gate at
+  `1,951/1,951`, `OK`, `785.153 s`, exit `0`; the post-review Seed regression
+  gate closes `9/9` and the final affected matrix closes `114/114`. The built
+  `immer-0.8.0` wheel contains every new runtime module and hashes to
+  `9440a8c0…`.
+
 ### Receipt-bound Qwen MLP layer governor
 
-- Audited the supplied compute-battery prototype in an isolated tree. Its
-  `214` passing tests coexist with invalidation, control, cache-identity, and
-  conjugation-verification defects, so no source code entered IMMER. The valid
-  formulas were rebuilt against IMMER's own receipts as a brake-only layer
-  policy: it may remove already measured sparse layers, never add or promote
-  one.
+- Rebuilt the compute-battery formulas directly against IMMER's own receipts
+  as a brake-only layer policy: it may remove already measured sparse layers,
+  never add or promote one.
 - Extended the mounted Qwen comparison from assistant onset to a four-token,
   teacher-forced trajectory from one exact native prefix. Running all eight
   measured sparse layers preserves Top-1 on `3/4` steps, with mean Top-10

@@ -1,5 +1,25 @@
 """Persistent O1 state and resumable model-cartography scheduling."""
 
+from .acquisition import (
+    D_OPTIMAL_ACQUISITION_SCHEMA,
+    D_OPTIMAL_ALGORITHM,
+    D_OPTIMAL_DESIGN_ENCODING,
+    D_OPTIMAL_NUMERIC_ABI,
+    D_OPTIMAL_TIE_BREAK,
+    PROBE_JOB_FEATURE_SCHEMA,
+    PROBE_JOB_STRUCTURAL_DESIGN_ABI,
+    AcquisitionError,
+    AcquisitionIntegrityError,
+    AcquisitionLeakageError,
+    AcquisitionLimits,
+    DOptimalAcquisitionReceipt,
+    encode_probe_job_structural_design,
+    plan_d_optimal_acquisition,
+    plan_probe_job_acquisition,
+    replay_d_optimal_acquisition,
+    replay_probe_job_acquisition,
+    selected_probe_jobs,
+)
 from .cartographer import (
     CartographyBudget,
     CartographyError,
@@ -16,11 +36,23 @@ from .cartographer import (
 )
 
 __all__ = [
+    "D_OPTIMAL_ACQUISITION_SCHEMA",
+    "D_OPTIMAL_ALGORITHM",
+    "D_OPTIMAL_DESIGN_ENCODING",
+    "D_OPTIMAL_NUMERIC_ABI",
+    "D_OPTIMAL_TIE_BREAK",
+    "PROBE_JOB_FEATURE_SCHEMA",
+    "PROBE_JOB_STRUCTURAL_DESIGN_ABI",
+    "AcquisitionError",
+    "AcquisitionIntegrityError",
+    "AcquisitionLeakageError",
+    "AcquisitionLimits",
     "CartographyBudget",
     "CartographyError",
     "CartographyIdentityError",
     "CartographyIntegrityError",
     "Coverage",
+    "DOptimalAcquisitionReceipt",
     "O1Cartographer",
     "ProbeJob",
     "ProbeOutcome",
@@ -28,4 +60,10 @@ __all__ = [
     "RetryPolicy",
     "RunResult",
     "build_probe_frontier",
+    "encode_probe_job_structural_design",
+    "plan_d_optimal_acquisition",
+    "plan_probe_job_acquisition",
+    "replay_d_optimal_acquisition",
+    "replay_probe_job_acquisition",
+    "selected_probe_jobs",
 ]
