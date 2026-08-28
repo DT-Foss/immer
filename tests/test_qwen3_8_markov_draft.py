@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 import json
 import os
 import tempfile
@@ -13,6 +14,7 @@ from safetensors.torch import save_file
 from immer.knowledge import Streamer
 from immer.runtimes.qwen3_8.markov_draft import (
     FingerprintRollingK4DraftProvider,
+    MarkovDialectState,
     MarkovDraftError,
     MarkovDraftState,
 )
@@ -102,6 +104,50 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.episode_lengths, (3,))
         self.assertEqual(len(provider.metrics().expert_weights), 8)
         provider.close()
+
+    def test_v2_council_state_migrates_to_v3_dialect_memory(self) -> None:
+        seed = FingerprintRollingK4DraftProvider(vocab_size=32)
+        state = seed._state
+        seed.close()
+        v2 = {
+            "episode_lengths": [3],
+            "expert_hits": list(state.expert_hits),
+            "expert_log_weights": [value.hex() for value in state.expert_log_weights],
+            "expert_names": list(state.expert_names),
+            "expert_observations": list(state.expert_observations),
+            "feedback_count": 0,
+            "leader_changes": 0,
+            "max_history_tokens": 4096,
+            "regime_generation": 0,
+            "schema": "immer.qwen3.8-markov-draft-state/v2",
+            "surprise_cusum": float(0.0).hex(),
+            "surprise_deviation": float(1.0).hex(),
+            "surprise_mean": float(0.0).hex(),
+            "token_ids": [1, 2, 3],
+            "updates": 1,
+            "vocab_size": 32,
+        }
+        raw = json.dumps(
+            v2,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        path = self.root / "v2-state.bin"
+        path.write_bytes(b"IMMD\x02" + zlib.compress(raw, level=9))
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=path,
+        )
+        self.assertEqual(provider.metrics().dialect_count, 0)
+        provider.observe_final((1, 2, 3, 4))
+        provider.close()
+
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x03"))
+        migrated = MarkovDraftState.from_bytes(path.read_bytes())
+        self.assertEqual(len(migrated.dialects), 1)
 
     def test_variable_order_provider_predicts_and_learns_confirmed_prefix(self) -> None:
         state_path = self.root / "markov-state.bin"
@@ -283,6 +329,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(aborted.feedback_count, 0)
         self.assertEqual(aborted.updates, 0)
         self.assertEqual(aborted.token_ids, ())
+        self.assertEqual(aborted.dialects, ())
 
         replay = FingerprintRollingK4DraftProvider(
             vocab_size=32,
@@ -338,6 +385,159 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                     state_path=state_path,
                     max_history_tokens=64,
                 )
+
+    def test_similar_context_reuses_dialect_and_distinct_context_creates_one(self) -> None:
+        state_path = self.root / "dialects.bin"
+        first_context = tuple((1, 2, 3, 4) * 20)
+        similar_context = (*first_context[:-1], 5)
+        second_context = tuple((40, 41, 42, 43) * 20)
+        for context, expected_count, minimum_similarity in (
+            (first_context, 1, 0.0),
+            (similar_context, 1, 0.80),
+            (second_context, 2, 0.0),
+        ):
+            provider = FingerprintRollingK4DraftProvider(
+                vocab_size=64,
+                state_path=state_path,
+                max_history_tokens=256,
+            )
+            provider.observe_final(context)
+            metrics = provider.metrics()
+            self.assertEqual(metrics.dialect_count, expected_count)
+            self.assertGreaterEqual(
+                metrics.active_dialect_similarity,
+                minimum_similarity,
+            )
+            provider.close()
+
+        state = MarkovDraftState.from_bytes(state_path.read_bytes())
+        visits = sorted(row.visits for row in state.dialects)
+        self.assertEqual(visits, [1, 2])
+
+    def test_ricci_retention_evicts_oldest_low_visit_dialect(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=128)
+        width = len(provider._experts)
+        dialects = tuple(
+            MarkovDialectState(
+                dialect_id=f"{index:064x}",
+                signature=(index,),
+                visits=1,
+                last_seen=index,
+                rapidities=(0.0,) * width,
+                observations=(0,) * width,
+                hits=(0,) * width,
+            )
+            for index in range(64)
+        )
+        provider._state = replace(provider._state, clock=100, dialects=dialects)
+        provider._active_dialect = MarkovDialectState(
+            dialect_id="f" * 64,
+            signature=(999,),
+            visits=1,
+            last_seen=101,
+            rapidities=(0.0,) * width,
+            observations=(0,) * width,
+            hits=(0,) * width,
+        )
+        provider._active_dialect_is_new = True
+        provider._request_signature = (999,)
+
+        provider._commit_active_dialect()
+
+        self.assertEqual(len(provider._state.dialects), 64)
+        self.assertNotIn("0" * 64, {row.dialect_id for row in provider._state.dialects})
+        self.assertIn("f" * 64, {row.dialect_id for row in provider._state.dialects})
+        self.assertEqual(provider.metrics().dialect_evictions, 1)
+
+    def test_dialect_profiles_recall_opposite_expert_regimes(self) -> None:
+        state_path = self.root / "opposite-dialects.bin"
+        structured_context = tuple((1, 2, 3, 4) * 20)
+        frequency_context = tuple((40, 41, 42, 43) * 20)
+
+        def feedback(target: int, *, structured: bool):
+            rows = []
+            other = 1 if target != 1 else 3
+            for index in range(8):
+                correct = (index >= 4) == structured
+                probability = 0.9 if correct else 0.1
+                rows.append(
+                    (
+                        {
+                            f"{target:03d}": probability,
+                            f"{other:03d}": 1.0 - probability,
+                            "<unknown>": 0.0,
+                        },
+                        target if correct else other,
+                    )
+                )
+            return tuple(rows)
+
+        first = FingerprintRollingK4DraftProvider(
+            vocab_size=128,
+            state_path=state_path,
+            max_history_tokens=256,
+        )
+        first._activate_dialect(structured_context)
+        for _ in range(30):
+            first._apply_council_feedback(feedback(3, structured=True), 3)
+        first.observe_final(structured_context)
+        first.close()
+
+        second = FingerprintRollingK4DraftProvider(
+            vocab_size=128,
+            state_path=state_path,
+            max_history_tokens=256,
+        )
+        second._activate_dialect(frequency_context)
+        for _ in range(80):
+            second._apply_council_feedback(feedback(1, structured=False), 1)
+        second.observe_final(frequency_context)
+        second.close()
+
+        recalled = []
+        for context in (structured_context, frequency_context):
+            provider = FingerprintRollingK4DraftProvider(
+                vocab_size=128,
+                state_path=state_path,
+                max_history_tokens=256,
+            )
+            provider._activate_dialect(context)
+            recalled.append(dict(provider.metrics().expert_weights))
+            self.assertEqual(provider.metrics().active_dialect_similarity, 1.0)
+            provider.close()
+
+        self.assertGreater(recalled[0]["recent-o2-w256"], 0.20)
+        self.assertLess(recalled[0]["global-o0-w4096"], 0.01)
+        self.assertGreater(recalled[1]["global-o0-w4096"], 0.20)
+        self.assertLess(recalled[1]["recent-o2-w256"], 0.01)
+
+    def test_one_provider_cannot_leak_dialect_into_a_second_request(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=64)
+        provider.begin_request((1, 2, 3, 4))
+        provider.observe_final((1, 2, 3, 4, 5))
+
+        with self.assertRaisesRegex(MarkovDraftError, "exactly one request"):
+            provider.begin_request((40, 41, 42, 43))
+
+    def test_dialect_influence_scales_with_context_similarity(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=64)
+        width = len(provider._experts)
+        provider._active_dialect = MarkovDialectState(
+            dialect_id="a" * 64,
+            signature=(1, 2, 3),
+            visits=4,
+            last_seen=0,
+            rapidities=(-2.0, -2.0, -2.0, -2.0, 2.0, 2.0, 2.0, 2.0),
+            observations=(10,) * width,
+            hits=(5,) * width,
+        )
+        provider._active_dialect_similarity = 0.20
+        low = provider._weights()
+        provider._active_dialect_similarity = 1.0
+        exact = provider._weights()
+
+        self.assertGreater(sum(exact[4:]), sum(low[4:]))
+        self.assertLess(sum(exact[:4]), sum(low[:4]))
 
 
 if __name__ == "__main__":

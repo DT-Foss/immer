@@ -88,6 +88,13 @@ CUSUM regime detector; request boundaries remain explicit non-proposable
 symbols. Feedback, expert state, and the completed episode persist as one
 transaction. Draft consensus never overrides the target.
 
+Context dialects sit above the global Council weights. A bounded bottom-k
+sketch of token unigrams, bigrams, and trigrams selects one of at most 64
+profiles. Similarity continuously scales local influence; an exact match gets
+full dialect rapidity while a threshold match remains mostly global. Profiles
+store sketches and expert state, never raw text. Ricci value
+`visits * exp(-0.001 * age)` selects eviction at capacity.
+
 ## 4. Organism of Experts
 
 OoE learns runtime actions around Qwen without modifying Qwen's weights or

@@ -1402,6 +1402,47 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         assert proposal is not None
         return (proposal[0], proposal[1], proposal[2]), integrity_bytes, integrity_seconds
 
+    def _begin_rolling_provider(
+        self,
+        history: tuple[int, ...],
+    ) -> tuple[int, float]:
+        missing = object()
+        if (
+            inspect.getattr_static(self.draft_provider, "begin_request", missing)
+            is missing
+        ):
+            return 0, 0.0
+        stamp_started = time.perf_counter()
+        before = _model_state_stamp(self.model)
+        integrity_seconds = time.perf_counter() - stamp_started
+        integrity_bytes = self.model.state_bytes
+        failure: Exception | None = None
+        try:
+            callback = getattr(self.draft_provider, "begin_request")
+            if not callable(callback):
+                raise TypeError("draft provider begin_request is not callable")
+            callback(history)
+        except Exception as exc:
+            failure = exc
+        stamp_started = time.perf_counter()
+        try:
+            changed = _model_state_stamp(self.model) != before
+        except Exception:
+            changed = True
+        integrity_seconds += time.perf_counter() - stamp_started
+        integrity_bytes += self.model.state_bytes
+        if changed:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError(
+                "rolling request initializer changed target model state"
+            )
+        if failure is not None:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError(
+                f"rolling request initializer failed: {type(failure).__name__}: {failure}"
+            ) from failure
+        return integrity_bytes, integrity_seconds
+
     def _reconcile_rolling_provider(
         self,
         history: tuple[int, ...],
@@ -1542,6 +1583,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         hidden, prefill_evidence = self.model.prefill(
             [prompt], reset=True, tokenwise=False
         )
+        begin_guard_bytes, begin_guard_seconds = self._begin_rolling_provider(prompt)
         seed = self._scan(hidden[:, -1:], block_rows=head_block_rows)
         if len(seed) != 1:
             raise Qwen38SpeculativeError("rolling seed scan returned wrong width")
@@ -1591,8 +1633,14 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                             _owner_metric(self.model.pager, "linear_calls")
                             - round_linears
                         ),
-                        provider_guard_bytes=final_guard_bytes,
-                        provider_guard_seconds=final_guard_seconds,
+                        provider_guard_bytes=(
+                            final_guard_bytes
+                            + (begin_guard_bytes if round_index == 0 else 0)
+                        ),
+                        provider_guard_seconds=(
+                            final_guard_seconds
+                            + (begin_guard_seconds if round_index == 0 else 0.0)
+                        ),
                         seconds=time.perf_counter() - round_started,
                         state_bytes=self.model.state_bytes,
                         state_committed=commit,
@@ -1609,6 +1657,9 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                 (*prompt, *generated),
                 pending_token,
             )
+            if round_index == 0:
+                guard_bytes += begin_guard_bytes
+                guard_seconds += begin_guard_seconds
             stage = self.model.stage_continuation_block(
                 [[pending_token, *proposal]]
             )

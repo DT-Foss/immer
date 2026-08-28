@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
+import hashlib
 import json
 import math
 import os
@@ -24,14 +25,17 @@ try:
 except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
-MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
+MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
+V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
 MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v2"
-_STATE_PREFIX = b"IMMD\x02"
+_STATE_PREFIX = b"IMMD\x03"
+_V2_STATE_PREFIX = b"IMMD\x02"
 _LEGACY_STATE_PREFIX = b"IMMD\x01"
 _MAX_STATE_BYTES = 16 * 1024 * 1024
 _UNKNOWN_TOKEN = "<unknown>"
 _EPISODE_TOKEN = "<episode>"
+_HEX = frozenset("0123456789abcdef")
 
 
 class MarkovDraftError(RuntimeError):
@@ -222,6 +226,104 @@ def _read_state_bytes(path: Path) -> bytes:
 
 
 @dataclass(frozen=True, slots=True)
+class MarkovDialectState:
+    dialect_id: str
+    signature: tuple[int, ...]
+    visits: int
+    last_seen: int
+    rapidities: tuple[float, ...]
+    observations: tuple[int, ...]
+    hits: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.dialect_id, str)
+            or len(self.dialect_id) != 64
+            or set(self.dialect_id) - _HEX
+        ):
+            raise ValueError("dialect_id must be a SHA-256 digest")
+        signature = tuple(self.signature)
+        if (
+            not 1 <= len(signature) <= 32
+            or signature != tuple(sorted(set(signature)))
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value < 1 << 64
+                for value in signature
+            )
+        ):
+            raise ValueError("dialect signature is invalid")
+        if (
+            isinstance(self.visits, bool)
+            or not isinstance(self.visits, int)
+            or self.visits <= 0
+            or isinstance(self.last_seen, bool)
+            or not isinstance(self.last_seen, int)
+            or self.last_seen < 0
+        ):
+            raise ValueError("dialect visit state is invalid")
+        rapidities = tuple(float(value) for value in self.rapidities)
+        observations = tuple(self.observations)
+        hits = tuple(self.hits)
+        if (
+            not rapidities
+            or len({len(rapidities), len(observations), len(hits)}) != 1
+            or any(not math.isfinite(value) for value in rapidities)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in (*observations, *hits)
+            )
+            or any(hit > seen for hit, seen in zip(hits, observations, strict=True))
+        ):
+            raise ValueError("dialect expert state is invalid")
+        object.__setattr__(self, "signature", signature)
+        object.__setattr__(self, "rapidities", rapidities)
+        object.__setattr__(self, "observations", observations)
+        object.__setattr__(self, "hits", hits)
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "dialect_id": self.dialect_id,
+            "hits": list(self.hits),
+            "last_seen": self.last_seen,
+            "observations": list(self.observations),
+            "rapidities": [value.hex() for value in self.rapidities],
+            "signature": [f"{value:016x}" for value in self.signature],
+            "visits": self.visits,
+        }
+
+    @classmethod
+    def from_record(cls, value: object) -> "MarkovDialectState":
+        if not isinstance(value, Mapping) or set(value) != {
+            "dialect_id",
+            "hits",
+            "last_seen",
+            "observations",
+            "rapidities",
+            "signature",
+            "visits",
+        }:
+            raise ValueError("dialect record is invalid")
+        try:
+            return cls(
+                dialect_id=value["dialect_id"],
+                signature=tuple(int(item, 16) for item in value["signature"]),
+                visits=value["visits"],
+                last_seen=value["last_seen"],
+                rapidities=tuple(
+                    float.fromhex(item) for item in value["rapidities"]
+                ),
+                observations=tuple(value["observations"]),
+                hits=tuple(value["hits"]),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("dialect record values are invalid") from exc
+
+
+@dataclass(frozen=True, slots=True)
 class MarkovDraftState:
     vocab_size: int
     max_history_tokens: int
@@ -238,6 +340,8 @@ class MarkovDraftState:
     surprise_deviation: float = 1.0
     surprise_cusum: float = 0.0
     regime_generation: int = 0
+    clock: int = 0
+    dialects: tuple[MarkovDialectState, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -317,11 +421,26 @@ class MarkovDraftState:
         ):
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{label} must be finite and non-negative")
+        if isinstance(self.clock, bool) or not isinstance(self.clock, int) or self.clock < 0:
+            raise ValueError("clock must be a non-negative integer")
+        dialects = tuple(self.dialects)
+        if (
+            len(dialects) > 64
+            or any(not isinstance(row, MarkovDialectState) for row in dialects)
+            or tuple(sorted(dialects, key=lambda row: row.dialect_id)) != dialects
+            or len({row.dialect_id for row in dialects}) != len(dialects)
+            or any(
+                len(row.rapidities) != len(names) or row.last_seen > self.clock
+                for row in dialects
+            )
+        ):
+            raise ValueError("Markov dialect inventory is invalid")
         object.__setattr__(self, "expert_names", names)
         object.__setattr__(self, "expert_log_weights", log_weights)
         object.__setattr__(self, "expert_observations", observations)
         object.__setattr__(self, "expert_hits", hits)
         object.__setattr__(self, "episode_lengths", episode_lengths)
+        object.__setattr__(self, "dialects", dialects)
 
     def to_bytes(self) -> bytes:
         raw = _canonical(
@@ -333,6 +452,8 @@ class MarkovDraftState:
                 "expert_observations": list(self.expert_observations),
                 "leader_changes": self.leader_changes,
                 "episode_lengths": list(self.episode_lengths),
+                "clock": self.clock,
+                "dialects": [row.to_record() for row in self.dialects],
                 "feedback_count": self.feedback_count,
                 "regime_generation": self.regime_generation,
                 "schema": MARKOV_DRAFT_STATE_SCHEMA,
@@ -354,13 +475,21 @@ class MarkovDraftState:
         if (
             not isinstance(data, bytes)
             or len(data) > _MAX_STATE_BYTES
-            or not data.startswith((_STATE_PREFIX, _LEGACY_STATE_PREFIX))
+            or not data.startswith(
+                (_STATE_PREFIX, _V2_STATE_PREFIX, _LEGACY_STATE_PREFIX)
+            )
         ):
             raise MarkovDraftError("Markov draft state envelope is invalid")
         try:
             decoder = zlib.decompressobj()
             prefix = (
-                _STATE_PREFIX if data.startswith(_STATE_PREFIX) else _LEGACY_STATE_PREFIX
+                _STATE_PREFIX
+                if data.startswith(_STATE_PREFIX)
+                else (
+                    _V2_STATE_PREFIX
+                    if data.startswith(_V2_STATE_PREFIX)
+                    else _LEGACY_STATE_PREFIX
+                )
             )
             raw = decoder.decompress(data[len(prefix) :], _MAX_STATE_BYTES + 1)
             if (
@@ -376,6 +505,28 @@ class MarkovDraftState:
             isinstance(value, dict)
             and value.get("schema") == LEGACY_MARKOV_DRAFT_STATE_SCHEMA
         )
+        v2 = (
+            isinstance(value, dict)
+            and value.get("schema") == V2_MARKOV_DRAFT_STATE_SCHEMA
+        )
+        v2_fields = {
+            "expert_hits",
+            "expert_log_weights",
+            "expert_names",
+            "expert_observations",
+            "leader_changes",
+            "episode_lengths",
+            "feedback_count",
+            "max_history_tokens",
+            "regime_generation",
+            "schema",
+            "surprise_cusum",
+            "surprise_deviation",
+            "surprise_mean",
+            "token_ids",
+            "updates",
+            "vocab_size",
+        }
         expected = (
             {
                 "max_history_tokens",
@@ -385,6 +536,8 @@ class MarkovDraftState:
                 "vocab_size",
             }
             if legacy
+            else v2_fields
+            if v2
             else {
                 "expert_hits",
                 "expert_log_weights",
@@ -392,6 +545,8 @@ class MarkovDraftState:
                 "expert_observations",
                 "leader_changes",
                 "episode_lengths",
+                "clock",
+                "dialects",
                 "feedback_count",
                 "max_history_tokens",
                 "regime_generation",
@@ -408,7 +563,11 @@ class MarkovDraftState:
             not isinstance(value, dict)
             or set(value) != expected
             or value.get("schema")
-            not in {MARKOV_DRAFT_STATE_SCHEMA, LEGACY_MARKOV_DRAFT_STATE_SCHEMA}
+            not in {
+                MARKOV_DRAFT_STATE_SCHEMA,
+                V2_MARKOV_DRAFT_STATE_SCHEMA,
+                LEGACY_MARKOV_DRAFT_STATE_SCHEMA,
+            }
             or not isinstance(value.get("token_ids"), list)
             or _canonical(value) != raw
         ):
@@ -437,6 +596,11 @@ class MarkovDraftState:
                     value.get("surprise_cusum", "0x0.0p+0")
                 ),
                 regime_generation=value.get("regime_generation", 0),
+                clock=value.get("clock", 0),
+                dialects=tuple(
+                    MarkovDialectState.from_record(row)
+                    for row in value.get("dialects", ())
+                ),
             )
         except (TypeError, ValueError) as exc:
             raise MarkovDraftError("Markov draft state values are invalid") from exc
@@ -462,6 +626,10 @@ class MarkovDraftMetrics:
     regime_generation: int
     surprise_mean: float
     surprise_cusum: float
+    dialect_count: int
+    active_dialect_id: str | None
+    active_dialect_similarity: float
+    dialect_evictions: int
     source_body_bytes: int = 0
     linear_calls: int = 0
 
@@ -485,6 +653,11 @@ class FingerprintRollingK4DraftProvider:
     CUSUM_THRESHOLD = 8.0
     REGIME_WARMUP = 16
     REGIME_RAPIDITY_SHRINK = 0.25
+    MAX_DIALECTS = 64
+    DIALECT_SKETCH_SIZE = 32
+    DIALECT_SIMILARITY_THRESHOLD = 0.20
+    DIALECT_STRENGTH = 2.0
+    RICCI_AGE_ALPHA = 0.001
 
     def __init__(
         self,
@@ -555,6 +728,13 @@ class FingerprintRollingK4DraftProvider:
         self._episode_feedback: list[
             tuple[tuple[tuple[dict[str, float], int], ...], int]
         ] = []
+        self._active_dialect: MarkovDialectState | None = None
+        self._active_dialect_is_new = False
+        self._request_signature: tuple[int, ...] = ()
+        self._active_dialect_similarity = 0.0
+        self._dialect_evictions = 0
+        self._request_started = False
+        self._request_completed = False
         self._last_confirmed_length: int | None = None
         self._draft_calls = 0
         self._reconcile_calls = 0
@@ -634,10 +814,94 @@ class FingerprintRollingK4DraftProvider:
     def _symbol(self, token: int) -> str:
         return f"{token:0{self.width}d}"
 
+    def _context_signature(self, history: Sequence[int]) -> tuple[int, ...]:
+        tokens = tuple(history)
+        features: set[int] = set()
+        for order in (1, 2, 3):
+            for start in range(max(0, len(tokens) - 512), len(tokens) - order + 1):
+                material = bytearray((order,))
+                for token in tokens[start : start + order]:
+                    material.extend(int(token).to_bytes(4, "little", signed=False))
+                digest = hashlib.blake2b(
+                    material,
+                    digest_size=8,
+                    person=b"IMMRDIA",
+                ).digest()
+                features.add(int.from_bytes(digest, "big"))
+        length_bucket = min(255, len(tokens).bit_length())
+        features.add(
+            int.from_bytes(
+                hashlib.blake2b(
+                    bytes((255, length_bucket)),
+                    digest_size=8,
+                    person=b"IMMRDIA",
+                ).digest(),
+                "big",
+            )
+        )
+        return tuple(sorted(features)[: self.DIALECT_SKETCH_SIZE])
+
+    @staticmethod
+    def _dialect_similarity(
+        left: Sequence[int], right: Sequence[int]
+    ) -> float:
+        first = set(left)
+        second = set(right)
+        union = first | second
+        return 0.0 if not union else len(first & second) / len(union)
+
+    def _activate_dialect(self, history: tuple[int, ...]) -> None:
+        if self._active_dialect is not None:
+            return
+        signature = self._context_signature(history)
+        self._request_signature = signature
+        candidates = [
+            (
+                self._dialect_similarity(signature, row.signature),
+                row.visits,
+                row.dialect_id,
+                row,
+            )
+            for row in self._state.dialects
+        ]
+        selected = max(candidates, default=None)
+        if selected is not None and selected[0] >= self.DIALECT_SIMILARITY_THRESHOLD:
+            self._active_dialect_similarity = selected[0]
+            self._active_dialect = selected[3]
+            self._active_dialect_is_new = False
+            return
+        dialect_id = hashlib.sha256(
+            _canonical([f"{value:016x}" for value in signature])
+        ).hexdigest()
+        self._active_dialect = MarkovDialectState(
+            dialect_id=dialect_id,
+            signature=signature,
+            visits=1,
+            last_seen=self._state.clock + 1,
+            rapidities=(0.0,) * len(self._experts),
+            observations=(0,) * len(self._experts),
+            hits=(0,) * len(self._experts),
+        )
+        self._active_dialect_similarity = 0.0
+        self._active_dialect_is_new = True
+
     def _weights(self) -> tuple[float, ...]:
+        rapidities = self._state.expert_log_weights
+        if self._active_dialect is not None:
+            rapidities = tuple(
+                global_value
+                + self.DIALECT_STRENGTH
+                * self._active_dialect_similarity
+                * local_value
+                for global_value, local_value in zip(
+                    rapidities,
+                    self._active_dialect.rapidities,
+                    strict=True,
+                )
+            )
         scaled = tuple(
             value / self.EXPERT_TEMPERATURE
-            for value in self._state.expert_log_weights
+            for value in rapidities
         )
         maximum = max(scaled)
         raw = tuple(math.exp(value - maximum) for value in scaled)
@@ -648,6 +912,15 @@ class FingerprintRollingK4DraftProvider:
             + self.FIXED_SHARE / count
             for value in raw
         )
+
+    def begin_request(self, history: tuple[int, ...], /) -> None:
+        if self._closed:
+            raise MarkovDraftError("Markov draft provider is closed")
+        if self._request_started or self._request_completed:
+            raise MarkovDraftError("Markov provider accepts exactly one request")
+        committed = self._token_tuple(history, label="Markov request history")
+        self._activate_dialect(committed)
+        self._request_started = True
 
     def _persistent_symbols(self) -> tuple[str, ...]:
         rows: list[str] = []
@@ -853,6 +1126,33 @@ class FingerprintRollingK4DraftProvider:
         if regime_change:
             logs = [self.REGIME_RAPIDITY_SHRINK * value for value in logs]
             next_cusum = 0.0
+        dialect = self._active_dialect
+        if dialect is not None:
+            local_logs = list(dialect.rapidities)
+            local_observations = list(dialect.observations)
+            local_hits = list(dialect.hits)
+            for index, (_distribution, prediction) in enumerate(feedback):
+                advantage = math.log(max(probabilities[index], 1e-12)) - math.log(
+                    max(mixture_probability, 1e-12)
+                )
+                local_logs[index] = (
+                    self.RAPIDITY_DECAY * local_logs[index]
+                    + self.EXPERT_LEARNING_RATE * advantage
+                )
+                local_observations[index] += 1
+                local_hits[index] += int(prediction == token)
+            local_center = sum(local_logs) / len(local_logs)
+            local_logs = [value - local_center for value in local_logs]
+            if regime_change:
+                local_logs = [
+                    self.REGIME_RAPIDITY_SHRINK * value for value in local_logs
+                ]
+            self._active_dialect = replace(
+                dialect,
+                rapidities=tuple(local_logs),
+                observations=tuple(local_observations),
+                hits=tuple(local_hits),
+            )
         after_leader = max(range(len(logs)), key=logs.__getitem__)
         self._state = replace(
             self._state,
@@ -885,12 +1185,17 @@ class FingerprintRollingK4DraftProvider:
     ) -> tuple[int, int, int]:
         if self._closed:
             raise MarkovDraftError("Markov draft provider is closed")
+        if self._request_completed:
+            raise MarkovDraftError("Markov provider request is complete")
         committed = self._token_tuple(history, label="rolling Markov history")
         if isinstance(known_token, bool) or not isinstance(known_token, int) or not 0 <= known_token < self.vocab_size:
             raise ValueError("known token is outside the Qwen vocabulary")
         if self._pending_base is not None:
             raise MarkovDraftError("previous Markov proposal was not reconciled")
         if self._last_confirmed_length is None:
+            if not self._request_started:
+                self._activate_dialect(committed)
+                self._request_started = True
             self._last_confirmed_length = len(committed)
         elif len(committed) != self._last_confirmed_length:
             raise MarkovDraftError("rolling Markov history length is discontinuous")
@@ -929,6 +1234,49 @@ class FingerprintRollingK4DraftProvider:
             updates=self._state.updates + 1,
         )
 
+    def _commit_active_dialect(self) -> None:
+        dialect = self._active_dialect
+        if dialect is None:
+            raise MarkovDraftError("completed request has no active dialect")
+        clock = self._state.clock + 1
+        signature = tuple(
+            sorted(set(dialect.signature) | set(self._request_signature))[
+                : self.DIALECT_SKETCH_SIZE
+            ]
+        )
+        committed = replace(
+            dialect,
+            signature=signature,
+            visits=dialect.visits if self._active_dialect_is_new else dialect.visits + 1,
+            last_seen=clock,
+        )
+        profiles = {row.dialect_id: row for row in self._state.dialects}
+        profiles[committed.dialect_id] = committed
+        if len(profiles) > self.MAX_DIALECTS:
+            candidates = [
+                row
+                for row in profiles.values()
+                if row.dialect_id != committed.dialect_id
+            ]
+            evicted = min(
+                candidates,
+                key=lambda row: (
+                    row.visits
+                    * math.exp(
+                        -self.RICCI_AGE_ALPHA * (clock - row.last_seen)
+                    ),
+                    row.last_seen,
+                    row.dialect_id,
+                ),
+            )
+            del profiles[evicted.dialect_id]
+            self._dialect_evictions += 1
+        self._state = replace(
+            self._state,
+            clock=clock,
+            dialects=tuple(sorted(profiles.values(), key=lambda row: row.dialect_id)),
+        )
+
     def reconcile_prefix(self, history: tuple[int, ...], /) -> None:
         committed = self._token_tuple(history, label="reconciled Markov history")
         base = self._pending_base
@@ -954,32 +1302,52 @@ class FingerprintRollingK4DraftProvider:
 
     def observe_final(self, history: tuple[int, ...], /) -> None:
         committed = self._token_tuple(history, label="final Markov history")
+        if self._request_completed:
+            raise MarkovDraftError("Markov provider request is already complete")
+        if self._active_dialect is None:
+            self._activate_dialect(committed)
+            self._request_started = True
         if self._pending_base is not None:
             raise MarkovDraftError("cannot finalize an unreconciled proposal")
-        if self._last_confirmed_length is None:
+        original_state = self._state
+        original_dialect = self._active_dialect
+        original_carry = self._carry_feedback
+        original_feedback = list(self._episode_feedback)
+        original_confirmed_length = self._last_confirmed_length
+        original_evictions = self._dialect_evictions
+        try:
+            if self._last_confirmed_length is not None and len(
+                committed
+            ) < self._last_confirmed_length:
+                raise MarkovDraftError("final Markov history moved backwards")
+            if (
+                self._carry_feedback is not None
+                and self._last_confirmed_length is not None
+                and len(committed) > self._last_confirmed_length
+            ):
+                self._episode_feedback.append(
+                    (
+                        self._carry_feedback,
+                        committed[self._last_confirmed_length],
+                    )
+                )
+            self._carry_feedback = None
             for feedback, token in self._episode_feedback:
                 self._apply_council_feedback(feedback, token)
             self._episode_feedback.clear()
             self._learn_episode(committed)
+            self._commit_active_dialect()
             self._last_confirmed_length = len(committed)
             self._persist()
-            return
-        if len(committed) < self._last_confirmed_length:
-            raise MarkovDraftError("final Markov history moved backwards")
-        if self._carry_feedback is not None and len(committed) > self._last_confirmed_length:
-            self._episode_feedback.append(
-                (
-                    self._carry_feedback,
-                    committed[self._last_confirmed_length],
-                )
-            )
-        self._carry_feedback = None
-        for feedback, token in self._episode_feedback:
-            self._apply_council_feedback(feedback, token)
-        self._episode_feedback.clear()
-        self._learn_episode(committed)
-        self._last_confirmed_length = len(committed)
-        self._persist()
+            self._request_completed = True
+        except Exception:
+            self._state = original_state
+            self._active_dialect = original_dialect
+            self._carry_feedback = original_carry
+            self._episode_feedback = original_feedback
+            self._last_confirmed_length = original_confirmed_length
+            self._dialect_evictions = original_evictions
+            raise
 
     def _persist(self) -> None:
         path = self.state_path
@@ -1056,6 +1424,14 @@ class FingerprintRollingK4DraftProvider:
             regime_generation=self._state.regime_generation,
             surprise_mean=self._state.surprise_mean,
             surprise_cusum=self._state.surprise_cusum,
+            dialect_count=len(self._state.dialects),
+            active_dialect_id=(
+                None
+                if self._active_dialect is None
+                else self._active_dialect.dialect_id
+            ),
+            active_dialect_similarity=self._active_dialect_similarity,
+            dialect_evictions=self._dialect_evictions,
         )
 
     def close(self) -> None:
@@ -1075,10 +1451,12 @@ class FingerprintRollingK4DraftProvider:
 
 __all__ = [
     "LEGACY_MARKOV_DRAFT_STATE_SCHEMA",
+    "V2_MARKOV_DRAFT_STATE_SCHEMA",
     "MARKOV_DRAFT_METRICS_SCHEMA",
     "MARKOV_DRAFT_STATE_SCHEMA",
     "FingerprintRollingK4DraftProvider",
     "MarkovDraftError",
+    "MarkovDialectState",
     "MarkovDraftMetrics",
     "MarkovDraftState",
     "MarkovExpertSpec",

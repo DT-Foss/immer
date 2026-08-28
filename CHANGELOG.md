@@ -62,6 +62,16 @@ All notable changes to IMMER are recorded here.
   lose confirmed learning. Expert feedback and episode bytes are deferred to
   one terminal transaction; an aborted half-request persists neither. State
   reads use a stable `O_NOFOLLOW` descriptor and reject inode/time replacement.
+- Added Council dialect memory v3. Bottom-k token N-gram sketches select up to
+  64 context profiles without storing raw context in the profile. Similar
+  prompts reuse a profile (`0.8125` under a one-token perturbation), unrelated
+  prompts split, and opposite profiles recall opposite expert regimes even
+  after global weights adapt elsewhere. Dialect force scales with similarity;
+  one provider is explicitly one request. At capacity, Ricci retention
+  `visits * exp(-0.001 * age)` evicts the least useful stale profile.
+- Markov state now migrates both v1 and Council-v2 into dialect-v3. Dialect
+  profile, global Council update, regime state, episode boundary, and confirmed
+  tokens share the same terminal atomic write and process lock.
 - The explicit Fast-MLP mode now packs the independent K-token projection rows
   into one physical GEMM per matrix. Exact mode retains the original separate
   kernels; packed execution is bound into the Fast runtime identity and

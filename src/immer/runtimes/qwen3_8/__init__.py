@@ -70,10 +70,12 @@ from .local_draft import (
 )
 from .markov_draft import (
     LEGACY_MARKOV_DRAFT_STATE_SCHEMA,
+    V2_MARKOV_DRAFT_STATE_SCHEMA,
     MARKOV_DRAFT_METRICS_SCHEMA,
     MARKOV_DRAFT_STATE_SCHEMA,
     FingerprintRollingK4DraftProvider,
     MarkovDraftError,
+    MarkovDialectState,
     MarkovDraftMetrics,
     MarkovDraftState,
     MarkovExpertSpec,
@@ -256,6 +258,7 @@ __all__ = [
     "GenerationEvidence",
     "LAYER_BOUNDARY_STAGES",
     "LEGACY_MARKOV_DRAFT_STATE_SCHEMA",
+    "V2_MARKOV_DRAFT_STATE_SCHEMA",
     "LayerBoundaryObserver",
     "GRAPH_REVISION_SCHEMA",
     "GraphRevision",
@@ -284,6 +287,7 @@ __all__ = [
     "MeasurementReceipt",
     "FingerprintRollingK4DraftProvider",
     "MarkovDraftError",
+    "MarkovDialectState",
     "MarkovDraftMetrics",
     "MarkovDraftState",
     "MarkovExpertSpec",

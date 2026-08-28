@@ -844,6 +844,9 @@ class Qwen38CausalChat:
                     "max_order": 16,
                     "experts": 8,
                     "fixed_share": 0.05,
+                    "dialect_profiles": 64,
+                    "dialect_sketch_size": 32,
+                    "dialect_similarity_threshold": 0.20,
                     "persistent": self._markov_draft_state_path is not None,
                 }
         elif self._draft_mode is not None:
