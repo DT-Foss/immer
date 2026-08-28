@@ -88,6 +88,41 @@ class MarkovCoordinateSelectorScriptTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(selector.main(arguments), 0)
 
+            external_prompts = tuple(
+                _hash(f"external-selector-prompt:{index}") for index in range(5)
+            )
+            external_manifest = CaptureManifest(
+                model_pin_sha256=manifest.model_pin_sha256,
+                input_manifest_sha256=_hash("external-selector-inputs"),
+                prompt_sha256s=external_prompts,
+                entries=canonical_capture_plan(external_prompts),
+            )
+            external_bank_root = root / "external-bank"
+            external_bank = QwenMlpEvidenceBank(external_bank_root)
+            for index in range(40):
+                receipt, verification = _capture_pair(
+                    external_bank, external_manifest, index=index
+                )
+                external_bank.append_verified(receipt, _verifier(verification))
+            external_output = root / "external-selector"
+            external_arguments = [
+                *arguments,
+                "--external-holdout-bank-root",
+                str(external_bank_root),
+            ]
+            external_arguments[external_arguments.index(str(output))] = str(
+                external_output
+            )
+            stream = io.StringIO()
+            with contextlib.redirect_stdout(stream):
+                self.assertEqual(selector.main(external_arguments), 0)
+            external_report = json.loads(stream.getvalue())
+            self.assertTrue(external_report["body"]["external_holdout"])
+            self.assertNotEqual(
+                external_report["body"]["fit_bank_state_sha256"],
+                external_report["body"]["holdout_bank_state_sha256"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

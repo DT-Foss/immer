@@ -1197,6 +1197,13 @@ def evaluate_markov_coordinate_selector(
     ):
         raise TypeError("fit_corpus and holdout_corpus must be SubspaceCorpus values")
     fit.verify_against(fit_corpus)
+    if (
+        fit_corpus.model_pin_sha256 != fit.model_pin_sha256
+        or holdout_corpus.model_pin_sha256 != fit.model_pin_sha256
+    ):
+        raise MarkovCoordinateSelectorIntegrityError(
+            "selector fit/holdout crosses Qwen model pins"
+        )
     authority = require_sha256(
         holdout_authority_sha256, field="holdout_authority_sha256"
     )
