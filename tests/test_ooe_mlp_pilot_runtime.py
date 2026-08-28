@@ -42,6 +42,29 @@ class _Pager:
 
 
 class MlpPilotRuntimeTests(unittest.TestCase):
+    def test_down_route_order_minimizes_one_route_cache_reloads(self) -> None:
+        order = MlpPilotSparseExecutor._route_processing_order(
+            ((0, 1), (4, 5), (0, 1), (4, 5))
+        )
+
+        self.assertEqual(order, (0, 2, 1, 3))
+        self.assertEqual(
+            MlpPilotSparseExecutor._route_processing_order(
+                ((0, 1), (4, 5), (0, 1), (4, 5), (0, 1), (4, 5))
+            ),
+            (0, 2, 4, 1, 3, 5),
+        )
+        self.assertEqual(
+            MlpPilotSparseExecutor._route_processing_order(
+                ((0,), (0,), (0,), (1,), (0, 1))
+            ),
+            (0, 1, 2, 4, 3),
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "down route inventory is invalid"
+        ):
+            MlpPilotSparseExecutor._route_processing_order(((0, 0),))
+
     def test_transpose_manifest_roundtrips_and_resealed_total_tamper_fails(
         self,
     ) -> None:
@@ -216,7 +239,7 @@ class MlpPilotRuntimeTests(unittest.TestCase):
         torch.testing.assert_close(consolidated_output, expected, rtol=0, atol=0)
         self.assertEqual(
             consolidated_trace.range_mode,
-            "consolidated-pilot+union-target-blocks",
+            "consolidated-pilot+union-target+route-cache-down",
         )
         self.assertEqual(
             consolidated_trace.weight_row_fraction,
@@ -282,7 +305,6 @@ class MlpPilotRuntimeTests(unittest.TestCase):
                     for ids in calls
                 )
             )
-        self.assertEqual(len(consolidated_transpose_pager.calls), len(many_hidden))
         self.assertEqual(len(packed_pager.calls), 3)
         self.assertEqual(
             many_trace.dynamic_requested_rows,
@@ -291,13 +313,61 @@ class MlpPilotRuntimeTests(unittest.TestCase):
         self.assertEqual(many_trace.dynamic_unique_rows, len(union_rows))
         self.assertGreaterEqual(many_trace.dynamic_row_reuse, 1.0)
         self.assertEqual(
+            many_trace.down_requested_rows,
+            many_trace.dynamic_requested_rows,
+        )
+        self.assertGreaterEqual(many_trace.down_row_reuse, 1.0)
+        self.assertEqual(
             sum(len(ids) for _name, ids in consolidated_weight_pager.calls),
             2 * len(union_rows),
         )
         self.assertEqual(
             sum(len(ids) for _name, ids in consolidated_transpose_pager.calls),
-            many_trace.dynamic_requested_rows,
+            many_trace.down_loaded_rows,
         )
+        self.assertTrue(
+            all(
+                len(ids) == model.block_size
+                for _name, ids in consolidated_transpose_pager.calls
+            )
+        )
+
+        route_bytes = (
+            model.selected_block_count
+            * model.block_size
+            * affine_layer.output_dimension
+            * torch.empty((), dtype=torch.bfloat16).element_size()
+        )
+        consolidated_transpose_pager.max_resident_bytes = route_bytes
+        tight_output, tight_trace = consolidated.execute_many(
+            (hidden, hidden),
+            layer=model.layer,
+        )
+        torch.testing.assert_close(tight_output[0], expected, rtol=0, atol=0)
+        torch.testing.assert_close(tight_output[1], expected, rtol=0, atol=0)
+        self.assertEqual(tight_trace.down_row_reuse, 2.0)
+
+        weight_pager.calls.clear()
+        transpose_pager.calls.clear()
+        scattered_output, scattered_trace = executor.execute_many(
+            many_hidden,
+            layer=model.layer,
+        )
+        torch.testing.assert_close(
+            torch.cat(scattered_output, dim=0),
+            many_expected,
+            rtol=0,
+            atol=0,
+        )
+        self.assertEqual(
+            scattered_trace.range_mode,
+            "scattered-pilot+union-target+route-cache-down",
+        )
+        self.assertEqual(
+            sum(len(ids) for _name, ids in transpose_pager.calls),
+            len(model.pilot_neuron_indices()) + scattered_trace.down_loaded_rows,
+        )
+        self.assertGreaterEqual(scattered_trace.down_row_reuse, 1.0)
         subset = MlpPilotSparseExecutor(
             router,
             affine,

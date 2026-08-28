@@ -94,8 +94,11 @@ non-consuming because partial-prefix reconstruction still needs the base.
 Fast-MLP routing evaluates every row's pilots first, then forms the union of
 the selected Gate/Up neurons across the K-token wave. The union is streamed in
 chunks no larger than one route, projected rowwise, and restored to each
-route's original order before SwiGLU. Down-transpose execution stays rowwise,
-preserving its reduction order and auxiliary residency bound.
+route's original order before SwiGLU. Down-transpose blocks live in a cache no
+larger than one route. K<=4 rows use exhaustive minimum-reload ordering, then
+assemble each original route in its original block order before the unchanged
+rowwise reduction. The cache plus assembled route remains inside the auxiliary
+resident bound.
 
 The local transport has a caller-owned direct-fill plane. LiveCausal resolves
 the tensor plan first; the pager allocates the final CPU weight tensor; then

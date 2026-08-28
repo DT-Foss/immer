@@ -18,7 +18,7 @@ from .mlp_pilot_residual import MlpPilotAffineFit, MlpPilotAffineLayer
 from .mlp_pilot_router import MlpPilotLayerModel, MlpPilotRouterFit
 
 
-PILOT_SPARSE_RUNTIME_SCHEMA = "immer.qwen-mlp-pilot-sparse-runtime/v2"
+PILOT_SPARSE_RUNTIME_SCHEMA = "immer.qwen-mlp-pilot-sparse-runtime/v3"
 PILOT_TRANSPOSE_ENTRY_SCHEMA = "immer.qwen-mlp-pilot-transpose-entry/v1"
 PILOT_TRANSPOSE_MANIFEST_SCHEMA = "immer.qwen-mlp-pilot-transpose-manifest/v1"
 
@@ -259,8 +259,10 @@ class MlpPilotSparseTrace:
     full_weight_rows: int
     dynamic_requested_rows: int
     dynamic_unique_rows: int
+    down_requested_rows: int
+    down_loaded_rows: int
     output_dtype: str
-    range_mode: str = "scattered-pilot+union-target-blocks"
+    range_mode: str = "scattered-pilot+union-target+route-cache-down"
 
     def __post_init__(self) -> None:
         for field in (
@@ -272,6 +274,8 @@ class MlpPilotSparseTrace:
             "full_weight_rows",
             "dynamic_requested_rows",
             "dynamic_unique_rows",
+            "down_requested_rows",
+            "down_loaded_rows",
         ):
             value = getattr(self, field)
             minimum = 0 if field == "layer" else 1
@@ -284,12 +288,13 @@ class MlpPilotSparseTrace:
             or self.selected_neuron_count >= self.intermediate_dimension
             or self.full_weight_rows != 3 * self.intermediate_dimension
             or self.dynamic_unique_rows > self.dynamic_requested_rows
+            or self.down_loaded_rows > self.down_requested_rows
             or not isinstance(self.output_dtype, str)
             or not self.output_dtype
             or self.range_mode
             not in {
-                "scattered-pilot+union-target-blocks",
-                "consolidated-pilot+union-target-blocks",
+                "scattered-pilot+union-target+route-cache-down",
+                "consolidated-pilot+union-target+route-cache-down",
             }
         ):
             raise ValueError("sparse runtime trace is inconsistent")
@@ -303,6 +308,10 @@ class MlpPilotSparseTrace:
     def dynamic_row_reuse(self) -> float:
         return self.dynamic_requested_rows / self.dynamic_unique_rows
 
+    @property
+    def down_row_reuse(self) -> float:
+        return self.down_requested_rows / self.down_loaded_rows
+
     def to_record(self) -> dict[str, object]:
         return {
             "full_weight_rows": self.full_weight_rows,
@@ -311,6 +320,9 @@ class MlpPilotSparseTrace:
             "dynamic_requested_rows": self.dynamic_requested_rows,
             "dynamic_row_reuse": self.dynamic_row_reuse,
             "dynamic_unique_rows": self.dynamic_unique_rows,
+            "down_loaded_rows": self.down_loaded_rows,
+            "down_requested_rows": self.down_requested_rows,
+            "down_row_reuse": self.down_row_reuse,
             "output_dtype": self.output_dtype,
             "row_count": self.row_count,
             "range_mode": self.range_mode,
@@ -456,9 +468,9 @@ class MlpPilotSparseExecutor:
             "layers": sorted(self._active_layers),
             "output_dtype": str(self.output_dtype).removeprefix("torch."),
             "range_mode": (
-                "scattered-pilot+union-target-blocks"
+                "scattered-pilot+union-target+route-cache-down"
                 if self.pilot_pager is None
-                else "consolidated-pilot+union-target-blocks"
+                else "consolidated-pilot+union-target+route-cache-down"
             ),
             "router_fit_sha256": self.router_fit.sha256,
             "schema": PILOT_SPARSE_RUNTIME_SCHEMA,
@@ -556,6 +568,87 @@ class MlpPilotSparseExecutor:
             )
             result.append(projected.index_select(-1, restore))
         return tuple(result)
+
+    @staticmethod
+    def _route_processing_order(
+        block_orders: Sequence[Sequence[int]],
+    ) -> tuple[int, ...]:
+        """Order rows by exact unique-route DP, then bounded greedy fallback."""
+
+        routes = tuple(frozenset(int(block) for block in row) for row in block_orders)
+        if (
+            not routes
+            or any(
+                not route or len(route) != len(tuple(row))
+                for route, row in zip(routes, block_orders, strict=True)
+            )
+        ):
+            raise MlpPilotSparseRuntimeError("down route inventory is invalid")
+
+        unique_routes: list[frozenset[int]] = []
+        rows_by_route: list[list[int]] = []
+        route_index: dict[frozenset[int], int] = {}
+        for row, route in enumerate(routes):
+            index = route_index.get(route)
+            if index is None:
+                index = len(unique_routes)
+                route_index[route] = index
+                unique_routes.append(route)
+                rows_by_route.append([])
+            rows_by_route[index].append(row)
+
+        unique_order: tuple[int, ...]
+        count = len(unique_routes)
+        if count <= 12:
+            states: dict[tuple[int, int], tuple[int, tuple[int, ...]]] = {
+                (1 << index, index): (len(route), (index,))
+                for index, route in enumerate(unique_routes)
+            }
+            for mask in range(1, 1 << count):
+                for last in range(count):
+                    current = states.get((mask, last))
+                    if current is None:
+                        continue
+                    cost, path = current
+                    for following in range(count):
+                        bit = 1 << following
+                        if mask & bit:
+                            continue
+                        candidate = (
+                            cost
+                            + len(unique_routes[following] - unique_routes[last]),
+                            (*path, following),
+                        )
+                        key = (mask | bit, following)
+                        previous = states.get(key)
+                        if previous is None or candidate < previous:
+                            states[key] = candidate
+            complete = (1 << count) - 1
+            unique_order = min(
+                states[(complete, last)] for last in range(count)
+            )[1]
+        else:
+            order: list[int] = []
+            remaining = set(range(count))
+            active: frozenset[int] = frozenset()
+            while remaining:
+                index = min(
+                    remaining,
+                    key=lambda candidate: (
+                        len(unique_routes[candidate] - active),
+                        candidate,
+                    ),
+                )
+                order.append(index)
+                remaining.remove(index)
+                active = unique_routes[index]
+            unique_order = tuple(order)
+
+        return tuple(
+            row
+            for index in unique_order
+            for row in rows_by_route[index]
+        )
 
     def _execute_flat(
         self, hidden: torch.Tensor, *, layer: int
@@ -696,24 +789,136 @@ class MlpPilotSparseExecutor:
             columns=affine.output_dimension,
         )
 
-        outputs = []
-        for row, (blocks, extra) in enumerate(zip(selected, extra_by_row, strict=True)):
-            down_extra_weight = self._rows(
-                self.down_transpose_pager,
-                self.transpose_name(layer),
-                extra,
-                columns=affine.output_dimension,
+        selected_blocks = tuple(
+            tuple(int(block) for block in blocks) for blocks in selected
+        )
+        down_block_orders = tuple(
+            tuple(sorted(blocks)) if self.pilot_pager is None else blocks
+            for blocks in selected_blocks
+        )
+        down_ids_by_block = {
+            block: np.asarray(
+                [
+                    neuron
+                    for neuron in range(
+                        block * model.block_size,
+                        (block + 1) * model.block_size,
+                    )
+                    if self.pilot_pager is not None or neuron not in pilot_set
+                ],
+                dtype=np.int64,
             )
+            for blocks in down_block_orders
+            for block in blocks
+        }
+        for blocks, extra in zip(down_block_orders, extra_by_row, strict=True):
+            reconstructed = tuple(
+                int(neuron)
+                for block in blocks
+                for neuron in down_ids_by_block[block]
+            )
+            if reconstructed != tuple(int(neuron) for neuron in extra):
+                raise MlpPilotSparseRuntimeError(
+                    "down route order differs from its activation order"
+                )
+
+        routes = tuple(frozenset(blocks) for blocks in down_block_orders)
+        processing_order = self._route_processing_order(down_block_orders)
+        dtype_bytes = int(
+            torch.empty((), dtype=self.down_transpose_pager.compute_dtype).element_size()
+        )
+        route_bytes = per_row_dynamic * affine.output_dimension * dtype_bytes
+        same_pager_pilot_bytes = (
+            len(pilots) * affine.output_dimension * dtype_bytes
+            if self.pilot_pager is None
+            else 0
+        )
+        assembled_route_bytes = (
+            0 if model.selected_block_count == 1 else route_bytes
+        )
+        resident_required = (
+            route_bytes + assembled_route_bytes + same_pager_pilot_bytes
+        )
+        resident_limit = getattr(
+            self.down_transpose_pager,
+            "max_resident_bytes",
+            None,
+        )
+        active: frozenset[int] = frozenset()
+        planned_loaded_blocks = 0
+        for row in processing_order:
+            planned_loaded_blocks += len(routes[row] - active)
+            active = routes[row]
+        requested_blocks = len(hidden) * model.selected_block_count
+        cache_reuses_blocks = planned_loaded_blocks < requested_blocks
+        cache_fits = not (
+            isinstance(resident_limit, int)
+            and not isinstance(resident_limit, bool)
+            and resident_required > resident_limit
+        )
+        use_down_cache = cache_reuses_blocks and cache_fits
+
+        outputs: list[torch.Tensor | None] = [None] * len(hidden)
+        down_loaded_rows = 0
+
+        def execute_down_row(row: int, weight: torch.Tensor) -> torch.Tensor:
             extra_activation = swiglu(gate_extra[row], up_extra[row])
             if self.pilot_pager is not None:
                 extra_activation = extra_activation.clone()
-                for block_index, block in enumerate(blocks):
-                    for offset in model.pilot_offsets[int(block)]:
-                        extra_activation[:, block_index * model.block_size + offset] = 0
+                for block_index, block in enumerate(selected_blocks[row]):
+                    for offset in model.pilot_offsets[block]:
+                        extra_activation[
+                            :, block_index * model.block_size + offset
+                        ] = 0
             pilot_output = pilot_activation[row : row + 1] @ down_pilot_weight
-            extra_output = extra_activation @ down_extra_weight
-            outputs.append(pilot_output + extra_output)
-        sparse = torch.cat(outputs, dim=0)
+            return pilot_output + extra_activation @ weight
+
+        if not use_down_cache:
+            for row, extra in enumerate(extra_by_row):
+                down_extra_weight = self._rows(
+                    self.down_transpose_pager,
+                    self.transpose_name(layer),
+                    extra,
+                    columns=affine.output_dimension,
+                )
+                down_loaded_rows += len(extra)
+                outputs[row] = execute_down_row(row, down_extra_weight)
+                del down_extra_weight
+        else:
+            down_cache: dict[int, torch.Tensor] = {}
+            for row in processing_order:
+                blocks = down_block_orders[row]
+                active = routes[row]
+                for cached in tuple(down_cache):
+                    if cached not in active:
+                        del down_cache[cached]
+                for block in blocks:
+                    if block in down_cache:
+                        continue
+                    ids = down_ids_by_block[block]
+                    down_cache[block] = self._rows(
+                        self.down_transpose_pager,
+                        self.transpose_name(layer),
+                        ids,
+                        columns=affine.output_dimension,
+                    )
+                    down_loaded_rows += len(ids)
+                down_extra_weight = (
+                    down_cache[blocks[0]]
+                    if len(blocks) == 1
+                    else torch.cat(
+                        tuple(down_cache[block] for block in blocks),
+                        dim=0,
+                    )
+                )
+                outputs[row] = execute_down_row(row, down_extra_weight)
+                del down_extra_weight
+        if any(output is None for output in outputs):  # pragma: no cover - permutation.
+            raise MlpPilotSparseRuntimeError("down route cache lost an output row")
+        sparse = torch.cat(
+            [output for output in outputs if output is not None],
+            dim=0,
+        )
         corrected = affine.apply(sparse).to(dtype=self.output_dtype)
         trace = MlpPilotSparseTrace(
             layer=layer,
@@ -726,16 +931,18 @@ class MlpPilotSparseExecutor:
             source_weight_rows=(
                 3 * len(pilots)
                 + 2 * len(union_extra)
-                + len(hidden) * per_row_dynamic
+                + down_loaded_rows
             ),
             full_weight_rows=3 * model.intermediate_dimension,
             dynamic_requested_rows=len(hidden) * per_row_dynamic,
             dynamic_unique_rows=len(union_extra),
+            down_requested_rows=len(hidden) * per_row_dynamic,
+            down_loaded_rows=down_loaded_rows,
             output_dtype=str(corrected.dtype).removeprefix("torch."),
             range_mode=(
-                "scattered-pilot+union-target-blocks"
+                "scattered-pilot+union-target+route-cache-down"
                 if self.pilot_pager is None
-                else "consolidated-pilot+union-target-blocks"
+                else "consolidated-pilot+union-target+route-cache-down"
             ),
         )
         return corrected, trace

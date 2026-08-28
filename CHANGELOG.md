@@ -95,6 +95,12 @@ All notable changes to IMMER are recorded here.
   per-row down-projection arithmetic. Identical K4 routes remove `75%` of
   dynamic Gate/Up target transport; disjoint routes read exactly the former
   byte count. Runtime trace v2 records requested rows, unique rows, and reuse.
+- Fast-MLP runtime trace v3 adds a one-route down-transpose block cache.
+  Up to 12 unique routes are ordered by exact bitmask-DP block-reload cost;
+  larger generic batches use deterministic maximum-overlap greedy ordering.
+  Every row's original block, activation, and reduction order is restored
+  before multiplication. Identical K4 routes remove a further `60 MiB` per
+  active p4/k32 layer; disjoint routes read the former byte count.
 - Added stable direct-fill local transport. `LocalRangeReader` uses `preadv` to
   write an exact inode-validated range into caller-owned writable storage,
   retries after replacement, handles progressing short reads, preserves cache,
