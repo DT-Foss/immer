@@ -120,6 +120,8 @@ class PagerMetrics:
     head_rows: int = 0
     logical_weight_bytes: int = 0
     materialized_tensor_bytes: int = 0
+    zero_copy_tensor_reads: int = 0
+    zero_copy_bytes_avoided: int = 0
     peak_planned_resident_bytes: int = 0
     materialized_weight_releases: int = 0
     release_boundaries: int = 0
@@ -306,8 +308,12 @@ class Qwen38WeightPager:
         numel: int,
         target_dtype: Any,
         label: str,
+        target_materialized: bool = True,
     ) -> int:
-        planned = payload_bytes + numel * self._dtype_bytes(target_dtype)
+        target_bytes = (
+            numel * self._dtype_bytes(target_dtype) if target_materialized else 0
+        )
+        planned = payload_bytes + target_bytes
         if planned > self.max_resident_bytes:
             raise Qwen38PagerError(
                 f"{label} needs {planned} resident bytes (source payload plus "
@@ -406,6 +412,7 @@ class Qwen38WeightPager:
         dtype: Any,
         device: Any,
         name: str,
+        zero_copy_cpu: bool = False,
     ) -> Any:
         numel = 1
         for dimension in shape:
@@ -440,7 +447,15 @@ class Qwen38WeightPager:
             )
         storage = storage.reshape(shape)
         target_device = self.torch.device(device)
-        if target_device.type == "cpu" and dtype == storage.dtype:
+        if (
+            zero_copy_cpu
+            and target_device.type == "cpu"
+            and dtype == storage.dtype
+        ):
+            result = storage
+            self._stats.zero_copy_tensor_reads += 1
+            self._stats.zero_copy_bytes_avoided += expected_bytes
+        elif target_device.type == "cpu" and dtype == storage.dtype:
             result = storage.clone()
         else:
             result = storage.to(device=target_device, dtype=dtype)
@@ -453,13 +468,23 @@ class Qwen38WeightPager:
         *,
         dtype: Any,
         device: Any,
+        zero_copy_cpu: bool = False,
     ) -> Any:
         layout = self._layout(name)
+        source_dtype = (
+            self.torch.bfloat16 if layout.dtype == "BF16" else self.torch.float32
+        )
+        zero_copy = (
+            zero_copy_cpu
+            and self.torch.device(device).type == "cpu"
+            and dtype == source_dtype
+        )
         self._preflight_resident(
             payload_bytes=layout.payload_bytes,
             numel=layout.numel,
             target_dtype=dtype,
             label=name,
+            target_materialized=not zero_copy,
         )
         if self.causal_tensor_reader is None:
             raw = self.source.raw_bytes(
@@ -484,6 +509,7 @@ class Qwen38WeightPager:
             dtype=dtype,
             device=device,
             name=name,
+            zero_copy_cpu=zero_copy,
         )
         self._stats.tensor_reads += 1
         self._stats.logical_weight_bytes += layout.payload_bytes
@@ -610,7 +636,10 @@ class Qwen38WeightPager:
             weight_name = self._weight_name(name)
             compute_x = x.to(device=self.device, dtype=self.compute_dtype)
             weight = self._read_tensor(
-                weight_name, dtype=self.compute_dtype, device=self.device
+                weight_name,
+                dtype=self.compute_dtype,
+                device=self.device,
+                zero_copy_cpu=True,
             )
             if weight.ndim != 2:
                 del weight
@@ -694,6 +723,7 @@ class Qwen38WeightPager:
                 weight_name,
                 dtype=self.compute_dtype,
                 device=self.device,
+                zero_copy_cpu=True,
             )
             try:
                 results: list[Any] = []

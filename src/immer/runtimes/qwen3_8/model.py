@@ -131,6 +131,7 @@ class GenerationEvidence:
     seconds: float
     state_bytes: int
     stopped_on_eos: bool
+    final_state_committed: bool
 
 
 LayerState = AttentionState | DeltaNetState
@@ -2919,6 +2920,7 @@ class StreamedQwen38:
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
         progress: Callable[[dict[str, Any]], None] | None = None,
         head_progress: Callable[[dict[str, int]], None] | None = None,
+        retain_final_state: bool = True,
     ) -> tuple[tuple[int, ...], GenerationEvidence]:
         """Run exact greedy generation, optionally from an authenticated prefix.
 
@@ -2938,6 +2940,8 @@ class StreamedQwen38:
             raise ValueError("max_new_tokens must be a positive integer")
         if not isinstance(prefill_tokenwise, bool):
             raise TypeError("prefill_tokenwise must be a boolean")
+        if not isinstance(retain_final_state, bool):
+            raise TypeError("retain_final_state must be a boolean")
         prompt = self._token_tensor(prompt_token_ids)
         if prompt.shape[0] != 1:
             raise ValueError("greedy generation requires batch size one")
@@ -3047,12 +3051,16 @@ class StreamedQwen38:
                         "logit": float(values[0, 0].item()),
                     }
                 )
-            # Commit every emitted token before returning.  This keeps the
-            # persistent state exactly aligned with the returned sequence, so
-            # callers can continue decoding without replaying the final token.
-            hidden, _evidence = self.decode([[token_id]], progress=progress)
-            forward_count += 1
-            if token_id in eos:
+            stopped = token_id in eos
+            final_output = stopped or step + 1 == max_new_tokens
+            # Stateful callers retain the historical contract.  One-shot chat
+            # callers release the model immediately and therefore must not
+            # stream the complete checkpoint once more for a state they throw
+            # away without reading its logits.
+            if retain_final_state or not final_output:
+                hidden, _evidence = self.decode([[token_id]], progress=progress)
+                forward_count += 1
+            if stopped:
                 stopped_on_eos = True
                 break
 
@@ -3074,6 +3082,7 @@ class StreamedQwen38:
             seconds=time.perf_counter() - started,
             state_bytes=self.state_bytes,
             stopped_on_eos=stopped_on_eos,
+            final_state_committed=retain_final_state,
         )
         return tuple(generated), evidence
 

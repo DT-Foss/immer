@@ -1604,6 +1604,37 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(stopped_evidence.forward_passes, 2)
         self.assertEqual(self.model.next_position, 3)
 
+    def test_one_shot_greedy_skips_the_unused_final_decode(self) -> None:
+        committed, committed_evidence = self.model.generate_greedy(
+            [[1, 4]],
+            max_new_tokens=3,
+            head_block_rows=7,
+        )
+        self.model.reset_state(release=True)
+
+        one_shot, one_shot_evidence = self.model.generate_greedy(
+            [[1, 4]],
+            max_new_tokens=3,
+            head_block_rows=7,
+            retain_final_state=False,
+        )
+
+        self.assertEqual(one_shot, committed)
+        self.assertEqual(
+            one_shot_evidence.forward_passes,
+            committed_evidence.forward_passes - 1,
+        )
+        self.assertFalse(one_shot_evidence.final_state_committed)
+        self.assertEqual(self.model.next_position, 4)
+        self.assertIsNone(self.model._pending_block_stage)
+
+        with self.assertRaisesRegex(TypeError, "retain_final_state"):
+            self.model.generate_greedy(
+                [[1, 4]],
+                max_new_tokens=1,
+                retain_final_state=1,  # type: ignore[arg-type]
+            )
+
     def test_greedy_generation_from_exact_anchor_skips_prompt_prefill(self) -> None:
         prompt = [[1, 4]]
         baseline, baseline_evidence = self.model.generate_greedy(

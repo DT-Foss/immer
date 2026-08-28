@@ -624,6 +624,51 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         self.assertEqual(result.evidence.rounds[0].accepted_prefix_length, 3)
         self.assertEqual(baseline.next_position, eos_baseline.next_position)
 
+    def test_k4_one_shot_discards_terminal_eos_without_replay(self) -> None:
+        _baseline, tokens, _evidence = self._baseline(count=4)
+        candidate = self._model()
+        result = Qwen38K4SpeculativeDecoder(
+            candidate,
+            _Quads(tokens),  # type: ignore[arg-type]
+        ).generate(
+            [[1, 4]],
+            max_new_tokens=4,
+            eos_token_ids=(tokens[2],),
+            head_block_rows=7,
+            retain_final_state=False,
+        )
+
+        self.assertEqual(result.token_ids, tokens[:3])
+        self.assertEqual(result.evidence.forward_passes, 2)
+        self.assertEqual(result.evidence.rounds[0].replay_kind, "eos-uncommitted")
+        self.assertFalse(result.evidence.final_state_committed)
+        self.assertEqual(candidate.next_position, 2)
+        self.assertIsNone(candidate._pending_block_stage)
+
+    def test_k4_one_shot_mismatch3_returns_correction_without_replay(self) -> None:
+        _baseline, tokens, _evidence = self._baseline(count=4)
+        proposal = (*tokens[:3], (tokens[3] + 1) % self.config.vocab_size)
+        candidate = self._model()
+        result = Qwen38K4SpeculativeDecoder(
+            candidate,
+            _Quads(proposal),
+        ).generate(
+            [[1, 4]],
+            max_new_tokens=4,
+            head_block_rows=7,
+            retain_final_state=False,
+        )
+
+        self.assertEqual(result.token_ids, tokens)
+        self.assertEqual(result.evidence.forward_passes, 2)
+        self.assertEqual(
+            result.evidence.rounds[0].replay_kind,
+            "mismatch3-uncommitted",
+        )
+        self.assertFalse(result.evidence.final_state_committed)
+        self.assertEqual(candidate.next_position, 2)
+        self.assertIsNone(candidate._pending_block_stage)
+
     def test_k4_terminal_tails_one_through_three_never_call_provider(self) -> None:
         for tail in range(1, 4):
             with self.subTest(tail=tail):
@@ -646,6 +691,29 @@ class Qwen38SpeculativeTests(unittest.TestCase):
                 self.assertEqual(result.evidence.forward_passes, 1 + tail)
                 self.assertEqual(result.evidence.head_scans, tail)
                 self.assertEqual(result.evidence.provider_guard_bytes, 0)
+
+    def test_k4_one_shot_tail_skips_only_the_unused_final_decode(self) -> None:
+        _baseline, tokens, _evidence = self._baseline(count=3)
+        candidate = self._model()
+
+        def forbidden(_history):
+            raise AssertionError("terminal tail invoked the provider")
+
+        result = Qwen38K4SpeculativeDecoder(candidate, forbidden).generate(
+            [[1, 4]],
+            max_new_tokens=3,
+            head_block_rows=7,
+            retain_final_state=False,
+        )
+
+        self.assertEqual(result.token_ids, tokens)
+        self.assertEqual(result.evidence.forward_passes, 3)
+        self.assertEqual(
+            [row.replay_kind for row in result.evidence.rounds],
+            ["terminal-single", "terminal-single", "terminal-single-uncommitted"],
+        )
+        self.assertFalse(result.evidence.final_state_committed)
+        self.assertEqual(candidate.next_position, 4)
 
     def test_k4_receipt_digests_reject_tampering(self) -> None:
         _baseline, tokens, _evidence = self._baseline(count=4)

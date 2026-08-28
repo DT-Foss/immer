@@ -332,7 +332,7 @@ class Qwen38PagerTests(unittest.TestCase):
             source,
             device="cpu",
             compute_dtype="bfloat16",
-            max_resident_bytes=16,
+            max_resident_bytes=8,
         )
         result = pager.linear(torch.tensor([[1.0, 1.0]]), "dense")
 
@@ -341,9 +341,11 @@ class Qwen38PagerTests(unittest.TestCase):
         )
         self.assertEqual(source.raw_calls[-1][2], 8)
         metrics = pager.metrics()
-        self.assertEqual(metrics["peak_planned_resident_bytes"], 16)
+        self.assertEqual(metrics["peak_planned_resident_bytes"], 8)
         self.assertEqual(metrics["logical_weight_bytes"], 8)
         self.assertEqual(metrics["materialized_tensor_bytes"], 8)
+        self.assertEqual(metrics["zero_copy_tensor_reads"], 1)
+        self.assertEqual(metrics["zero_copy_bytes_avoided"], 8)
         self.assertEqual(metrics["materialized_weight_releases"], 1)
         self.assertEqual(
             metrics["weight_cache_policy"], "one-shot-qwen35-exact-range/v3"

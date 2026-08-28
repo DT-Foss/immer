@@ -116,6 +116,7 @@ class _Model:
     ) -> None:
         self.config = SimpleNamespace(vocab_size=300_000)
         self.generated = tuple(generated)
+        self.state_bytes = 0
         self.generation_error = generation_error
         self.cleanup_error = cleanup_error
         self.calls: list[tuple[object, dict[str, object]]] = []
@@ -171,7 +172,7 @@ class _AnchorModel(_Model):
             "stateful_cache": True,
             "general_generation": True,
             "prefill_mode": "batched",
-            "forward_passes": 2,
+            "forward_passes": 1,
             "source_body_bytes": 600,
             "linear_calls": 66,
             "seconds": 0.75,
@@ -190,7 +191,7 @@ class _AnchorModel(_Model):
 class _UnderreportedAnchorModel(_AnchorModel):
     def generate_greedy(self, prompt, **kwargs):
         generated, evidence = super().generate_greedy(prompt, **kwargs)
-        return generated, {**evidence, "forward_passes": 1}
+        return generated, {**evidence, "forward_passes": 0}
 
 
 def _anchor_cache(
@@ -296,6 +297,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "prefill_tokenwise": False,
                 "eos_token_ids": (248046, 248044),
                 "head_block_rows": 17,
+                "retain_final_state": False,
             },
         )
         self.assertEqual(runtime.model.reset_calls, [True])
@@ -309,6 +311,59 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotIn("prompt_token_ids", generation)
         self.assertNotIn("generated_token_ids", generation)
         self.assertNotIn("result_cell_binding_receipt", result.evidence)
+
+    def test_optional_k4_drafter_is_used_by_general_chat(self) -> None:
+        target = _Runtime()
+        chat = _chat(target, draft_bundle_path="draft.causal", max_new_tokens=4)
+        chat._draft_runtime = SimpleNamespace(
+            tokenizer_sha256=_DIGEST,
+            model=SimpleNamespace(config=SimpleNamespace(vocab_size=300_000)),
+            bundle_receipt=_BUNDLE_RECEIPT,
+            close=lambda: None,
+        )
+        provider = SimpleNamespace(
+            metrics=lambda: SimpleNamespace(
+                source_body_bytes=12,
+                linear_calls=3,
+            ),
+            close=lambda: None,
+        )
+        evidence = SimpleNamespace(
+            accepted_draft_tokens=4,
+            source_body_bytes=100,
+            linear_calls=10,
+            seconds=1.25,
+            state_bytes=456,
+            stopped_on_eos=False,
+            prompt_token_ids=(11, 12),
+            generated_token_ids=(7, 8, 9, 10),
+            forward_passes=2,
+            rounds=(object(),),
+            schema="immer.qwen3.8-k4-speculative-generation/v1",
+            final_state_committed=False,
+        )
+        generated = SimpleNamespace(token_ids=(7, 8, 9, 10), evidence=evidence)
+        decoder = SimpleNamespace(generate=lambda *args, **kwargs: generated)
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen35K4DraftProvider",
+            return_value=provider,
+        ), patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+            return_value=decoder,
+        ):
+            result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(result.evidence["generation"]["forward_passes"], 2)
+        self.assertEqual(result.evidence["generation"]["source_body_bytes"], 100)
+        self.assertEqual(result.evidence["draft"]["accepted_draft_tokens"], 4)
+        self.assertEqual(result.evidence["draft"]["draft_linear_calls"], 3)
+        self.assertEqual(result.evidence["draft"]["target_source_body_bytes"], 100)
+        self.assertEqual(result.evidence["draft"]["total_source_body_bytes"], 112)
+        self.assertEqual(result.evidence["draft"]["target_linear_calls"], 10)
+        self.assertEqual(result.evidence["draft"]["total_linear_calls"], 13)
+        self.assertEqual(result.evidence["generation"]["linear_calls"], 10)
+        chat.close()
 
     def test_opt_in_result_cell_binding_is_runtime_derived_and_chargeable(
         self,
@@ -398,8 +453,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(anchor["prefix_tokens"], 2)
         self.assertEqual(anchor["suffix_tokens"], 0)
         self.assertEqual(anchor["snapshot_bytes_read"], 70)
-        self.assertEqual(anchor["forward_passes_baseline"], 3)
-        self.assertEqual(anchor["forward_passes_executed"], 2)
+        self.assertEqual(anchor["forward_passes_baseline"], 2)
+        self.assertEqual(anchor["forward_passes_executed"], 1)
         self.assertEqual(anchor["forward_passes_saved"], 1)
         self.assertEqual(anchor["prefill_weight_sweeps_saved"], 1)
         self.assertEqual(anchor["checkpoint_read_sweeps_saved"], 1)
@@ -470,6 +525,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     "prefill_tokenwise": False,
                     "eos_token_ids": (248046, 248044),
                     "head_block_rows": 17,
+                    "retain_final_state": False,
                 },
             ),
         )
@@ -678,18 +734,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
     def test_cli_wires_explicit_local_paths_and_closes_component(self) -> None:
         qwen = _chat(_Runtime())
-        component = QwenFertigChat(qwen, FertigSolver())
-
-        class _Root:
-            general_chat = component
-
-            def dispatch(self, capability, payload):
-                self.call = (capability, payload)
-                return self.general_chat.handle(Request(capability, payload))
-
-        root = _Root()
         output = io.StringIO()
-        with patch.object(CompositionRoot, "build", return_value=root) as build:
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor:
             with redirect_stdout(output):
                 code = main(
                     [
@@ -705,21 +754,17 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 )
 
         self.assertEqual(code, 0)
-        self.assertEqual(root.call, ("chat", "hello"))
-        self.assertTrue(component.closed)
         self.assertTrue(qwen.closed)
-        options = build.call_args.kwargs
-        self.assertEqual(options["qwen38_causal_bundle"], "/models/qwen.causal")
-        self.assertEqual(options["qwen38_tokenizer"], "/models/tokenizer.json")
-        self.assertEqual(options["qwen38_options"]["max_new_tokens"], 4)
-        self.assertEqual(options["qwen38_options"]["source_budget_mb"], 65536)
-        payload = json.loads(output.getvalue())
-        self.assertEqual(payload["component"], "qwen3.8.fertig-chat")
-        self.assertEqual(payload["output"], "local answer")
         self.assertEqual(
-            payload["evidence"]["receipt"]["route"],
-            "qwen_verification_abstained",
+            constructor.call_args.args,
+            ("/models/qwen.causal", "/models/tokenizer.json"),
         )
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["max_new_tokens"], 4)
+        self.assertEqual(options["source_budget_mb"], 65536)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["component"], "qwen3.8.causal-chat")
+        self.assertEqual(payload["output"], "local answer")
 
 
 if __name__ == "__main__":

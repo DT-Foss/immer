@@ -76,28 +76,38 @@ def _solve(
 def _chat_qwen38(args: argparse.Namespace) -> int:
     """Run one turn through the verified local causal Qwen3.8 facade."""
 
-    from .composition import CompositionRoot
+    from .runtimes.qwen3_8.adapter import Qwen38CausalChat
+    from .runtimes.qwen3_8.semantic_state_cache import SemanticStateAnchorCache
 
     component = None
     try:
-        composition = CompositionRoot.build(
-            qwen38_causal_bundle=args.qwen38_causal_bundle,
-            qwen38_tokenizer=args.qwen38_tokenizer,
-            qwen38_anchor_cache=args.qwen38_anchor_cache,
-            qwen38_options={
-                "system_prompt": args.system_prompt,
-                "device": args.device,
-                "compute_dtype": args.compute_dtype,
-                "source_budget_mb": args.source_budget_mb,
-                "max_resident_bytes": int(args.max_resident_mb * 1024**2),
-                "max_prompt_tokens": args.max_prompt_tokens,
-                "max_new_tokens": args.max_new_tokens,
-                "max_context_tokens": args.max_context_tokens,
-                "head_block_rows": args.head_block_rows,
-            },
+        anchor_cache = (
+            None
+            if args.qwen38_anchor_cache is None
+            else SemanticStateAnchorCache(args.qwen38_anchor_cache)
         )
-        component = composition.general_chat
-        result = composition.dispatch("chat", args.message)
+        component = Qwen38CausalChat(
+            args.qwen38_causal_bundle,
+            args.qwen38_tokenizer,
+            system_prompt=args.system_prompt,
+            device=args.device,
+            compute_dtype=args.compute_dtype,
+            source_budget_mb=args.source_budget_mb,
+            max_resident_bytes=int(args.max_resident_mb * 1024**2),
+            max_prompt_tokens=args.max_prompt_tokens,
+            max_new_tokens=args.max_new_tokens,
+            max_context_tokens=args.max_context_tokens,
+            head_block_rows=args.head_block_rows,
+            anchor_cache=anchor_cache,
+            draft_bundle_path=args.draft_bundle,
+            draft_source_budget_mb=args.draft_source_budget_mb,
+            draft_max_resident_bytes=(
+                None
+                if args.draft_max_resident_mb is None
+                else int(args.draft_max_resident_mb * 1024**2)
+            ),
+        )
+        result = component.handle(Request("chat", args.message))
     except (OSError, TypeError, ValueError) as exc:
         print(json.dumps({
             "status": "error",
@@ -692,6 +702,10 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--qwen38-causal-bundle", required=True)
     chat.add_argument("--qwen38-tokenizer", required=True)
     chat.add_argument(
+        "--draft-bundle",
+        help="optional local causal Qwen3.5-0.8B bundle for exact K=4 drafting",
+    )
+    chat.add_argument(
         "--qwen38-anchor-cache",
         default=os.environ.get("IMMER_QWEN38_ANCHOR_CACHE"),
         help="local authenticated semantic anchor cache",
@@ -704,7 +718,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     chat.add_argument("--source-budget-mb", type=float, default=65536)
+    chat.add_argument("--draft-source-budget-mb", type=float, default=262144)
     chat.add_argument("--max-resident-mb", type=int, default=384)
+    chat.add_argument("--draft-max-resident-mb", type=int)
     chat.add_argument("--max-prompt-tokens", type=int, default=1024)
     chat.add_argument("--max-new-tokens", type=int, default=64)
     chat.add_argument("--max-context-tokens", type=int, default=2048)

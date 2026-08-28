@@ -4,6 +4,25 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-28
 
+### Arbitrary local Qwen runtime
+
+- `immer chat` now opens the authenticated local Qwen3.8 causal bundle
+  directly. General chat no longer depends on an unrelated S3 or FERTIG
+  composition manifest.
+- Mounted the local Qwen3.5-0.8B model as a K=4 draft provider for arbitrary
+  chat input. The target executes four proposed token rows layer-major while
+  reading each checkpoint matrix once and commits only target-confirmed text.
+- One-shot generation no longer streams the complete 64-layer target stack to
+  materialize a final continuation state that the chat adapter immediately
+  destroys. Terminal K=4 EOS and fourth-token correction paths likewise
+  return their already verified text without replaying the confirmed block.
+- Target, drafter, and combined source bytes now remain separate in runtime
+  evidence. Target forward counts and target byte counts describe the same
+  execution boundary.
+- CPU BF16 linear execution now aliases authenticated range buffers directly
+  instead of cloning every streamed matrix. Public tensor reads retain their
+  copy-owning contract.
+
 ### Receipt-native Seed v3 and O1 information geometry
 
 - Integrated the shared Seed v0.3 architecture as a native IMMER shadow
@@ -79,6 +98,13 @@ All notable changes to IMMER are recorded here.
   its own `3/2` prefix corpus and fit before the later-generation holdout can
   enter the bank; restart and analysis preserve the manifest plan and can
   restore only the requested split and layer payloads.
+- Completed the full bank at `640/640`, exact `192/128/320`, audit-clean,
+  with `6,118,965,248` referenced tensor bytes and complete state
+  `5d91c53e…`. All 64 layer holdouts return the same `146/549` exact hits.
+  Of `1,389` mechanism-local candidate admissions, `1,370` are metrically
+  identical to their matched random-coordinate control; the other `19` only
+  avoid random collisions on the same uniform template hits. No content
+  runtime path is promoted from this all-layer exact-key line.
 
 ### Markov coordinate intelligence
 

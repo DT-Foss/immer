@@ -20,10 +20,18 @@ import torch
 from ...contracts import ExecutionStatus, Request, Result
 from ..deepseek_v4.causal_weights import CausalWeightMount, LogicalModelIdentity
 from .bundle import verify_qwen38_causal_mount
-from .config import OFFICIAL_REPO_ID, OFFICIAL_REVISION, Qwen38Config
+from .config import (
+    OFFICIAL_REPO_ID,
+    OFFICIAL_REVISION,
+    QWEN35_DRAFTER_REPO_ID,
+    QWEN35_DRAFTER_REVISION,
+    Qwen38Config,
+)
 from .encoding import END_OF_TEXT_TOKEN_ID, IM_END_TOKEN_ID, Qwen38Tokenizer
 from .model import StreamedQwen38
+from .local_draft import Qwen35K4DraftProvider
 from .pager import Qwen38WeightPager
+from .speculative import Qwen38K4SpeculativeDecoder
 from .semantic_state_cache import (
     AnchorReceipt,
     RestoredAnchor,
@@ -341,6 +349,7 @@ def _anchor_hit_evidence(
     generation: Mapping[str, Any],
     restore_seconds: float,
     n_layers: int,
+    final_state_committed: bool = True,
 ) -> dict[str, Any]:
     if type(restored) is not RestoredAnchor:
         raise Qwen38ChatError("anchor cache returned an unsealed restore result")
@@ -361,11 +370,18 @@ def _anchor_hit_evidence(
     ):
         raise Qwen38ChatError("restored anchor differs from the prompt contract")
     _positive_int(n_layers, "runtime model decoder depth")
-    forward_baseline = 1 + generation["generated_tokens"]
+    if not isinstance(final_state_committed, bool):
+        raise TypeError("final_state_committed must be a boolean")
+    final_commit = int(final_state_committed)
+    forward_baseline = generation["generated_tokens"] + final_commit
     forward_executed = generation["forward_passes"]
     suffix_tokens = prompt_tokens - prefix_tokens
     prefill_sweeps_executed = int(suffix_tokens > 0)
-    expected_forwards = generation["generated_tokens"] + prefill_sweeps_executed
+    expected_forwards = (
+        generation["generated_tokens"]
+        + prefill_sweeps_executed
+        - (1 - final_commit)
+    )
     if forward_executed != expected_forwards:
         raise Qwen38ChatError("anchor generation forward count is inconsistent")
     snapshot_artifact_bytes = (
@@ -450,17 +466,19 @@ class _OwnedRuntime:
             ) from failures[0]
 
 
-def _open_official_runtime(
+def _open_local_runtime(
     *,
     bundle_path: Path,
     tokenizer_path: Path,
+    identity: LogicalModelIdentity,
+    require_official_config: bool,
     device: str,
     compute_dtype: str,
     source_budget_mb: float,
     max_resident_bytes: int,
     max_context_tokens: int,
 ) -> _OwnedRuntime:
-    """Open only the fixed official local model; no remote source exists here."""
+    """Open one pinned local causal model; no remote source exists here."""
 
     if not bundle_path.is_dir():
         raise FileNotFoundError(f"causal bundle directory is missing: {bundle_path}")
@@ -472,16 +490,16 @@ def _open_official_runtime(
     try:
         mount = CausalWeightMount(
             bundle_path,
-            LogicalModelIdentity(OFFICIAL_REPO_ID, OFFICIAL_REVISION),
+            identity,
             budget_mb=source_budget_mb,
         )
         bundle_receipt = verify_qwen38_causal_mount(
             mount,
-            require_official_config=True,
+            require_official_config=require_official_config,
         )
         config = Qwen38Config.from_file(
             mount.weights_root / "config.json",
-            require_official=True,
+            require_official=require_official_config,
         )
         pager = Qwen38WeightPager(
             mount.source,
@@ -527,6 +545,29 @@ def _open_official_runtime(
         raise
 
 
+def _open_official_runtime(
+    *,
+    bundle_path: Path,
+    tokenizer_path: Path,
+    device: str,
+    compute_dtype: str,
+    source_budget_mb: float,
+    max_resident_bytes: int,
+    max_context_tokens: int,
+) -> _OwnedRuntime:
+    return _open_local_runtime(
+        bundle_path=bundle_path,
+        tokenizer_path=tokenizer_path,
+        identity=LogicalModelIdentity(OFFICIAL_REPO_ID, OFFICIAL_REVISION),
+        require_official_config=True,
+        device=device,
+        compute_dtype=compute_dtype,
+        source_budget_mb=source_budget_mb,
+        max_resident_bytes=max_resident_bytes,
+        max_context_tokens=max_context_tokens,
+    )
+
+
 class Qwen38CausalChat:
     """Lazy ``chat`` component backed only by an authenticated local bundle."""
 
@@ -549,6 +590,9 @@ class Qwen38CausalChat:
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
         anchor_cache: SemanticStateAnchorCache | None = None,
         result_cell_code_revision: str | None = None,
+        draft_bundle_path: str | Path | None = None,
+        draft_source_budget_mb: float = 262_144,
+        draft_max_resident_bytes: int | None = None,
     ) -> None:
         if not isinstance(bundle_path, (str, Path)):
             raise TypeError("bundle_path must be a local filesystem path")
@@ -563,7 +607,15 @@ class Qwen38CausalChat:
                 "compute_dtype must be auto, float16, bfloat16, or float32"
             )
         source_budget_mb = _positive_number(source_budget_mb, "source_budget_mb")
+        draft_source_budget_mb = _positive_number(
+            draft_source_budget_mb, "draft_source_budget_mb"
+        )
         max_resident_bytes = _positive_int(max_resident_bytes, "max_resident_bytes")
+        if draft_max_resident_bytes is None:
+            draft_max_resident_bytes = max_resident_bytes
+        draft_max_resident_bytes = _positive_int(
+            draft_max_resident_bytes, "draft_max_resident_bytes"
+        )
         max_prompt_tokens = _positive_int(max_prompt_tokens, "max_prompt_tokens")
         max_new_tokens = _positive_int(max_new_tokens, "max_new_tokens")
         max_context_tokens = _positive_int(max_context_tokens, "max_context_tokens")
@@ -573,6 +625,12 @@ class Qwen38CausalChat:
             and type(anchor_cache) is not SemanticStateAnchorCache
         ):
             raise TypeError("anchor_cache must be a SemanticStateAnchorCache or None")
+        if draft_bundle_path is not None and not isinstance(
+            draft_bundle_path, (str, Path)
+        ):
+            raise TypeError("draft_bundle_path must be a local path or None")
+        if draft_bundle_path is not None and anchor_cache is not None:
+            raise ValueError("K=4 drafting and anchor restore cannot share one request")
         if result_cell_code_revision is not None and (
             not isinstance(result_cell_code_revision, str)
             or len(result_cell_code_revision)
@@ -598,8 +656,17 @@ class Qwen38CausalChat:
         self._max_context_tokens = max_context_tokens
         self._head_block_rows = head_block_rows
         self._anchor_cache = anchor_cache
+        self._draft_bundle_path = (
+            None
+            if draft_bundle_path is None
+            else Path(draft_bundle_path).expanduser().absolute()
+        )
+        self._draft_source_budget_mb = draft_source_budget_mb
+        self._draft_max_resident_bytes = draft_max_resident_bytes
         self._result_cell_code_revision = result_cell_code_revision
         self._runtime: Any | None = None
+        self._draft_runtime: Any | None = None
+        self._last_draft_evidence: dict[str, Any] | None = None
         self._bundle_receipt: dict[str, Any] | None = None
         self._tokenizer_sha256: str | None = None
         self._load_error: str | None = None
@@ -608,24 +675,30 @@ class Qwen38CausalChat:
         self._lock = threading.RLock()
 
     def _result_cell_generation_policy_sha256(self) -> str:
-        return _digest(
-            {
-                "anchor_cache_enabled": self._anchor_cache is not None,
-                "compute_dtype": self._compute_dtype,
-                "decoding": "greedy",
-                "device": self._device,
-                "eos_token_ids": [IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID],
-                "head_block_rows": self._head_block_rows,
-                "max_context_tokens": self._max_context_tokens,
-                "max_new_tokens": self._max_new_tokens,
-                "max_prompt_tokens": self._max_prompt_tokens,
-                "max_resident_bytes": self._max_resident_bytes,
-                "prefill_tokenwise": False,
-                "schema": RESULT_CELL_GENERATION_POLICY_SCHEMA,
-                "source_budget_mb": self._source_budget_mb,
-                "thinking": False,
+        policy: dict[str, Any] = {
+            "anchor_cache_enabled": self._anchor_cache is not None,
+            "compute_dtype": self._compute_dtype,
+            "decoding": "greedy",
+            "device": self._device,
+            "eos_token_ids": [IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID],
+            "head_block_rows": self._head_block_rows,
+            "max_context_tokens": self._max_context_tokens,
+            "max_new_tokens": self._max_new_tokens,
+            "max_prompt_tokens": self._max_prompt_tokens,
+            "max_resident_bytes": self._max_resident_bytes,
+            "prefill_tokenwise": False,
+            "retain_final_state": False,
+            "schema": RESULT_CELL_GENERATION_POLICY_SCHEMA,
+            "source_budget_mb": self._source_budget_mb,
+            "thinking": False,
+        }
+        if self._draft_bundle_path is not None:
+            policy["decoding"] = "greedy-k4-draft-verify"
+            policy["draft_model"] = {
+                "repo_id": QWEN35_DRAFTER_REPO_ID,
+                "revision": QWEN35_DRAFTER_REVISION,
             }
-        )
+        return _digest(policy)
 
     def _result_cell_binding_receipt(
         self,
@@ -705,6 +778,102 @@ class Qwen38CausalChat:
             max_context_tokens=self._max_context_tokens,
         )
 
+    def _open_draft_runtime(self) -> _OwnedRuntime:
+        if self._draft_bundle_path is None:
+            raise Qwen38ChatError("K=4 draft bundle is not configured")
+        return _open_local_runtime(
+            bundle_path=self._draft_bundle_path,
+            tokenizer_path=self._tokenizer_path,
+            identity=LogicalModelIdentity(
+                QWEN35_DRAFTER_REPO_ID,
+                QWEN35_DRAFTER_REVISION,
+            ),
+            require_official_config=False,
+            device=self._device,
+            compute_dtype=self._compute_dtype,
+            source_budget_mb=self._draft_source_budget_mb,
+            max_resident_bytes=self._draft_max_resident_bytes,
+            max_context_tokens=self._max_context_tokens,
+        )
+
+    def _load_draft_locked(self, target: _OwnedRuntime) -> _OwnedRuntime:
+        if self._draft_runtime is None:
+            self._draft_runtime = self._open_draft_runtime()
+        draft = self._draft_runtime
+        if (
+            draft.tokenizer_sha256 != target.tokenizer_sha256
+            or draft.model.config.vocab_size != target.model.config.vocab_size
+        ):
+            raise Qwen38ChatError("target and K=4 drafter vocabularies differ")
+        return draft
+
+    def _generate_locked(
+        self,
+        runtime: _OwnedRuntime,
+        prompt_ids: tuple[int, ...],
+        generation_options: Mapping[str, Any],
+    ) -> tuple[tuple[int, ...], Mapping[str, Any]]:
+        self._last_draft_evidence = None
+        if self._draft_bundle_path is None or self._max_new_tokens < 4:
+            return runtime.model.generate_greedy(
+                [list(prompt_ids)],
+                retain_final_state=False,
+                **generation_options,
+            )
+        draft = self._load_draft_locked(runtime)
+        eos = tuple(generation_options["eos_token_ids"])
+        provider = Qwen35K4DraftProvider(
+            draft.model,
+            eos_token_ids=eos,
+            head_block_rows=self._head_block_rows,
+        )
+        try:
+            generated = Qwen38K4SpeculativeDecoder(
+                runtime.model,
+                provider,
+            ).generate(
+                [prompt_ids],
+                max_new_tokens=self._max_new_tokens,
+                eos_token_ids=eos,
+                head_block_rows=self._head_block_rows,
+                retain_final_state=False,
+            )
+            provider_metrics = provider.metrics()
+            evidence = generated.evidence
+            self._last_draft_evidence = {
+                "accepted_draft_tokens": evidence.accepted_draft_tokens,
+                "draft_source_body_bytes": provider_metrics.source_body_bytes,
+                "draft_linear_calls": provider_metrics.linear_calls,
+                "target_source_body_bytes": evidence.source_body_bytes,
+                "target_linear_calls": evidence.linear_calls,
+                "total_source_body_bytes": (
+                    evidence.source_body_bytes + provider_metrics.source_body_bytes
+                ),
+                "total_linear_calls": (
+                    evidence.linear_calls + provider_metrics.linear_calls
+                ),
+                "final_state_committed": evidence.final_state_committed,
+                "rounds": len(evidence.rounds),
+                "schema": evidence.schema,
+            }
+            return generated.token_ids, {
+                "prompt_token_ids": evidence.prompt_token_ids,
+                "generated_token_ids": evidence.generated_token_ids,
+                "context_mode": "stateful_autoregressive",
+                "stateful_cache": True,
+                "general_generation": True,
+                "prefill_mode": "batched",
+                "forward_passes": evidence.forward_passes,
+                "source_body_bytes": evidence.source_body_bytes,
+                "linear_calls": evidence.linear_calls,
+                "seconds": evidence.seconds,
+                "state_bytes": runtime.model.state_bytes,
+                "stopped_on_eos": evidence.stopped_on_eos,
+                "final_state_committed": evidence.final_state_committed,
+            }
+        finally:
+            provider.close()
+
     def _base_evidence(self) -> dict[str, Any]:
         evidence: dict[str, Any] = {
             "execution": "local-authenticated-causal-bundle/v1",
@@ -716,6 +885,8 @@ class Qwen38CausalChat:
             evidence["bundle"] = dict(self._bundle_receipt)
         if self._tokenizer_sha256 is not None:
             evidence["tokenizer_sha256"] = self._tokenizer_sha256
+        if self._draft_runtime is not None:
+            evidence["draft_bundle"] = dict(self._draft_runtime.bundle_receipt)
         return evidence
 
     def _load_locked(self) -> Any:
@@ -870,9 +1041,10 @@ class Qwen38CausalChat:
                     }
                 )
 
-        raw_generated, raw_evidence = runtime.model.generate_greedy(
-            [list(prompt_ids)],
-            **generation_options,
+        raw_generated, raw_evidence = self._generate_locked(
+            runtime,
+            prompt_ids,
+            generation_options,
         )
         generated_ids = _token_ids(raw_generated, "generated output")
         if len(generated_ids) > self._max_new_tokens:
@@ -904,6 +1076,8 @@ class Qwen38CausalChat:
             "generation": receipt,
             "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
         }
+        if self._last_draft_evidence is not None:
+            evidence["draft"] = dict(self._last_draft_evidence)
         result_cell_binding = self._result_cell_binding_receipt(
             question=text,
             rendered_prompt=prompt,
@@ -921,6 +1095,7 @@ class Qwen38CausalChat:
                     getattr(config, "n_layers", None),
                     "runtime model decoder depth",
                 ),
+                final_state_committed=False,
             )
         elif anchor_miss is not None:
             evidence["anchor_cache"] = anchor_miss
@@ -941,13 +1116,20 @@ class Qwen38CausalChat:
     def _retire_runtime_locked(self, error: Exception) -> str:
         detail = f"{type(error).__name__}: {error}"
         runtime = self._runtime
+        draft_runtime = self._draft_runtime
         self._runtime = None
+        self._draft_runtime = None
         self._load_error = f"runtime retired after cleanup failure: {detail}"
         if runtime is not None:
             try:
                 runtime.close()
             except Exception as close_exc:
                 detail += f"; close: {type(close_exc).__name__}: {close_exc}"
+        if draft_runtime is not None:
+            try:
+                draft_runtime.close()
+            except Exception as close_exc:
+                detail += f"; draft close: {type(close_exc).__name__}: {close_exc}"
         return detail
 
     def handle(self, request: Request) -> Result:
@@ -1018,11 +1200,18 @@ class Qwen38CausalChat:
             if self._closed:
                 return
             runtime = self._runtime
+            draft_runtime = self._draft_runtime
             self._runtime = None
+            self._draft_runtime = None
             self._closed = True
             if runtime is not None:
                 try:
                     runtime.close()
+                except Exception as exc:
+                    self._close_error = f"{type(exc).__name__}: {exc}"
+            if draft_runtime is not None:
+                try:
+                    draft_runtime.close()
                 except Exception as exc:
                     self._close_error = f"{type(exc).__name__}: {exc}"
 

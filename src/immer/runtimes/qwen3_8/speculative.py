@@ -46,7 +46,10 @@ K4ReplayKind = Literal[
     "mismatch1-restage",
     "mismatch2-restage",
     "mismatch3-restage",
+    "eos-uncommitted",
+    "mismatch3-uncommitted",
     "terminal-single",
+    "terminal-single-uncommitted",
 ]
 
 
@@ -404,6 +407,14 @@ class K4SpeculativeRoundEvidence:
     stopped_on_eos: bool
     evidence_sha256: str
 
+    @property
+    def state_committed(self) -> bool:
+        return self.replay_kind not in {
+            "eos-uncommitted",
+            "mismatch3-uncommitted",
+            "terminal-single-uncommitted",
+        }
+
     def _unsigned_dict(self) -> dict[str, Any]:
         return {
             "schema": self.schema,
@@ -473,14 +484,18 @@ class K4SpeculativeRoundEvidence:
             ):
                 raise TypeError(f"{name} must contain non-negative integers")
 
-        if self.replay_kind == "terminal-single":
+        if self.replay_kind in {
+            "terminal-single",
+            "terminal-single-uncommitted",
+        }:
             if self.proposed_token_ids:
                 raise ValueError("terminal tail rounds cannot contain a proposal")
             if len(self.target_token_ids) != 1:
                 raise ValueError("terminal tail rounds require one target token")
             expected_emitted = self.target_token_ids
             expected_accepted = 0
-            expected_passes = 1
+            expected_passes = int(self.replay_kind == "terminal-single")
+            expected_committed = self.replay_kind == "terminal-single"
             expected_stopped = self.target_token_ids[0] in self.eos_token_ids
         else:
             if len(self.proposed_token_ids) != 4:
@@ -505,12 +520,18 @@ class K4SpeculativeRoundEvidence:
             if eos_index is not None:
                 expected_emitted = self.target_token_ids[: eos_index + 1]
                 expected_accepted = min(common, eos_index + 1)
-                if eos_index == 0:
+                if self.replay_kind == "eos-uncommitted":
+                    expected_kind = "eos-uncommitted"
+                    expected_passes = 1
+                    expected_committed = False
+                elif eos_index == 0:
                     expected_kind: K4ReplayKind = "eos0-decode"
                     expected_passes = 2
+                    expected_committed = True
                 elif eos_index == 3 and common == 4:
                     expected_kind = "eos3-commit-k4"
                     expected_passes = 1
+                    expected_committed = True
                 else:
                     eos_replays: dict[int, K4ReplayKind] = {
                         1: "eos1-restage",
@@ -519,24 +540,32 @@ class K4SpeculativeRoundEvidence:
                     }
                     expected_kind = eos_replays[eos_index]
                     expected_passes = 2
+                    expected_committed = True
                 expected_stopped = True
             elif common == 4:
                 expected_emitted = self.proposed_token_ids
                 expected_accepted = 4
                 expected_kind = "commit-k4"
                 expected_passes = 1
+                expected_committed = True
                 expected_stopped = False
             else:
                 expected_emitted = self.target_token_ids[: common + 1]
                 expected_accepted = common
-                mismatch_replays: dict[int, K4ReplayKind] = {
-                    0: "mismatch0-decode",
-                    1: "mismatch1-restage",
-                    2: "mismatch2-restage",
-                    3: "mismatch3-restage",
-                }
-                expected_kind = mismatch_replays[common]
-                expected_passes = 2
+                if common == 3 and self.replay_kind == "mismatch3-uncommitted":
+                    expected_kind = "mismatch3-uncommitted"
+                    expected_passes = 1
+                    expected_committed = False
+                else:
+                    mismatch_replays: dict[int, K4ReplayKind] = {
+                        0: "mismatch0-decode",
+                        1: "mismatch1-restage",
+                        2: "mismatch2-restage",
+                        3: "mismatch3-restage",
+                    }
+                    expected_kind = mismatch_replays[common]
+                    expected_passes = 2
+                    expected_committed = True
                 expected_stopped = False
             if self.replay_kind != expected_kind:
                 raise ValueError("K=4 replay kind disagrees with target transition")
@@ -547,6 +576,8 @@ class K4SpeculativeRoundEvidence:
             raise ValueError("accepted prefix disagrees with the target transition")
         if self.forward_passes != expected_passes:
             raise ValueError("forward-pass count disagrees with the replay kind")
+        if self.state_committed != expected_committed:
+            raise ValueError("state commit disagrees with the replay kind")
         if self.stopped_on_eos != expected_stopped:
             raise ValueError("EOS state disagrees with the target transition")
         _require_sha256(self.evidence_sha256, "evidence_sha256")
@@ -589,6 +620,10 @@ class K4SpeculativeGenerationEvidence:
     state_bytes: int
     stopped_on_eos: bool
     evidence_sha256: str
+
+    @property
+    def final_state_committed(self) -> bool:
+        return self.rounds[-1].state_committed
 
     def _unsigned_dict(self) -> dict[str, Any]:
         return {
@@ -669,6 +704,8 @@ class K4SpeculativeGenerationEvidence:
                 stopped_rows += 1
                 if index != len(self.rounds) - 1:
                     raise ValueError("no round may follow a terminal EOS round")
+            if not row.state_committed and index != len(self.rounds) - 1:
+                raise ValueError("only the final K=4 round may discard its state")
         if tuple(emitted) != self.generated_token_ids:
             raise ValueError("round tokens differ from generated_token_ids")
         if self.forward_passes != self.prefill_forward_passes + sum(
@@ -1166,6 +1203,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         eos: frozenset[int],
         eos_ids: tuple[int, ...],
         block_rows: int,
+        continuation_required: bool,
+        retain_final_state: bool,
     ) -> tuple[torch.Tensor, K4SpeculativeRoundEvidence]:
         start_pos = self.model.next_position
         source_start = _owner_metric(
@@ -1185,21 +1224,31 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             )
         target = int(selected[0, 0].item())
         del values, selected
-        next_hidden, _state_evidence = self.model.decode([[target]])
         stopped = target in eos
+        commit_state = retain_final_state or (continuation_required and not stopped)
+        if commit_state:
+            next_hidden, _state_evidence = self.model.decode([[target]])
+            replay_kind: K4ReplayKind = "terminal-single"
+            passes = 1
+            end_pos = self.model.next_position
+        else:
+            next_hidden = hidden
+            replay_kind = "terminal-single-uncommitted"
+            passes = 0
+            end_pos = start_pos + 1
         seconds = time.perf_counter() - started
         evidence = _sealed_k4_round(
             schema=QWEN38_K4_SPECULATIVE_ROUND_SCHEMA,
             round_index=round_index,
             start_pos=start_pos,
-            end_pos=self.model.next_position,
+            end_pos=end_pos,
             eos_token_ids=eos_ids,
             proposed_token_ids=(),
             target_token_ids=(target,),
             emitted_token_ids=(target,),
             accepted_prefix_length=0,
-            replay_kind="terminal-single",
-            forward_passes=1,
+            replay_kind=replay_kind,
+            forward_passes=passes,
             head_scans=1,
             source_body_bytes=(
                 _owner_metric(self.model.pager.source, "network_or_source_body_bytes")
@@ -1222,6 +1271,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         max_new_tokens: int = 1,
         eos_token_ids: Iterable[int] = (),
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
+        retain_final_state: bool = True,
     ) -> K4SpeculativeGenerationResult:
         """Generate exact greedy K=4 continuation and commit every output token."""
 
@@ -1237,6 +1287,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             or head_block_rows <= 0
         ):
             raise ValueError("head_block_rows must be a positive integer")
+        if not isinstance(retain_final_state, bool):
+            raise TypeError("retain_final_state must be a boolean")
         prompt_tensor = self.model._token_tensor(prompt_token_ids)
         if prompt_tensor.shape[0] != 1:
             raise ValueError("speculative generation requires batch size one")
@@ -1286,6 +1338,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                     eos=eos,
                     eos_ids=eos_ids,
                     block_rows=head_block_rows,
+                    continuation_required=remaining > 1,
+                    retain_final_state=retain_final_state,
                 )
                 generated.extend(row.emitted_token_ids)
                 rounds.append(row)
@@ -1333,7 +1387,17 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                 None,
             )
 
-            if eos_index is not None:
+            state_committed = True
+            reconcile = True
+            if eos_index is not None and not retain_final_state:
+                emitted = targets[: eos_index + 1]
+                accepted = min(common, eos_index + 1)
+                self.model.discard_continuation_block(stage)
+                replay_kind = "eos-uncommitted"
+                passes = 1
+                state_committed = False
+                reconcile = False
+            elif eos_index is not None:
                 emitted = targets[: eos_index + 1]
                 accepted = min(common, eos_index + 1)
                 if eos_index == 3 and common == 4:
@@ -1365,6 +1429,14 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                 accepted = 4
                 replay_kind = "commit-k4"
                 passes = 1
+            elif common == 3 and remaining == 4 and not retain_final_state:
+                emitted = targets
+                accepted = common
+                self.model.discard_continuation_block(stage)
+                replay_kind = "mismatch3-uncommitted"
+                passes = 1
+                state_committed = False
+                reconcile = False
             else:
                 emitted = targets[: common + 1]
                 accepted = common
@@ -1386,17 +1458,22 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                 passes = 2
 
             stopped = eos_index is not None
-            reconcile_bytes, reconcile_seconds = self._reconcile_provider(
-                (*prompt, *generated, *emitted)
-            )
-            integrity_bytes += reconcile_bytes
-            integrity_seconds += reconcile_seconds
+            if reconcile:
+                reconcile_bytes, reconcile_seconds = self._reconcile_provider(
+                    (*prompt, *generated, *emitted)
+                )
+                integrity_bytes += reconcile_bytes
+                integrity_seconds += reconcile_seconds
             seconds = time.perf_counter() - round_started
             row = _sealed_k4_round(
                 schema=QWEN38_K4_SPECULATIVE_ROUND_SCHEMA,
                 round_index=round_index,
                 start_pos=stage.evidence.start_pos,
-                end_pos=self.model.next_position,
+                end_pos=(
+                    self.model.next_position
+                    if state_committed
+                    else stage.evidence.start_pos + len(emitted)
+                ),
                 eos_token_ids=eos_ids,
                 proposed_token_ids=proposal,
                 target_token_ids=targets,
