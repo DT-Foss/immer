@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,9 +11,13 @@ import numpy as np
 import torch
 
 from immer.runtimes.ooe.qwen_mlp_evidence import (
+    ALL_LAYER_CAPTURE_LAYERS,
+    ALL_LAYER_SPLIT_TARGETS,
     CAPTURE_STAGES,
     CaptureManifest,
+    CaptureManifestV2,
     ExactMlpBoundaryCapture,
+    MlpEvidenceBankPlan,
     MlpEvidenceBudget,
     MlpEvidenceJournalState,
     MlpEvidenceReceipt,
@@ -21,8 +26,10 @@ from immer.runtimes.ooe.qwen_mlp_evidence import (
     QwenMlpEvidenceCapacityError,
     QwenMlpEvidenceConflictError,
     QwenMlpEvidenceIntegrityError,
+    canonical_all_layer_capture_plan,
     canonical_capture_plan,
 )
+from immer.runtimes.ooe.identity import canonical_json_bytes
 from immer.runtimes.ooe.subspace_battery import graph_revision_sha256
 
 
@@ -40,9 +47,28 @@ def _manifest(prompts: int = 5) -> CaptureManifest:
     )
 
 
+def _manifest_v2(seed: str = "v2") -> CaptureManifestV2:
+    train = tuple(_hash(f"{seed}:base-train:{index}") for index in range(3))
+    calibration = tuple(
+        _hash(f"{seed}:base-calibration:{index}") for index in range(2)
+    )
+    holdout = tuple(_hash(f"{seed}:later-holdout:{index}") for index in range(5))
+    return CaptureManifestV2(
+        model_pin_sha256=_hash("model-pin"),
+        base_input_manifest_sha256=_hash(f"{seed}:base-input-manifest"),
+        later_generation_input_manifest_sha256=_hash(
+            f"{seed}:later-input-manifest"
+        ),
+        train_prompt_sha256s=train,
+        calibration_prompt_sha256s=calibration,
+        holdout_prompt_sha256s=holdout,
+        entries=canonical_all_layer_capture_plan(train, calibration, holdout),
+    )
+
+
 def _capture_pair(
     bank: QwenMlpEvidenceBank,
-    manifest: CaptureManifest,
+    manifest: CaptureManifest | CaptureManifestV2,
     index: int = 0,
     *,
     access_label: str = "access",
@@ -143,6 +169,185 @@ def _verifier(
 
 
 class QwenMlpEvidenceTests(unittest.TestCase):
+    def test_v1_manifest_bytes_and_default_bank_budget_remain_stable(self) -> None:
+        manifest = _manifest()
+        self.assertEqual(
+            hashlib.sha256(manifest.to_bytes()).hexdigest(),
+            "7a74a793c2b5aca3d5cb768a2cc8008545e715ea5393e2e2929db64241cda34d",
+        )
+        self.assertEqual(manifest.split_targets, (25, 10, 5))
+        self.assertFalse(manifest.is_all_layer_v2)
+        with tempfile.TemporaryDirectory() as legacy_root:
+            QwenMlpEvidenceBank(legacy_root)
+            legacy_budget = (Path(legacy_root) / "BUDGET.json").read_bytes()
+            self.assertFalse((Path(legacy_root) / "PLAN.json").exists())
+        with tempfile.TemporaryDirectory() as v2_root:
+            QwenMlpEvidenceBank(v2_root, capture_manifest=_manifest_v2())
+            self.assertEqual(
+                (Path(v2_root) / "BUDGET.json").read_bytes(), legacy_budget
+            )
+
+    def test_v2_manifest_prompt_major_roundtrip_and_tamper_rejection(self) -> None:
+        manifest = _manifest_v2()
+        self.assertTrue(manifest.is_all_layer_v2)
+        self.assertEqual(manifest.split_targets, ALL_LAYER_SPLIT_TARGETS)
+        self.assertEqual(len(manifest.prompt_sha256s), 10)
+        self.assertEqual(len(manifest.entries), 640)
+        self.assertEqual(
+            manifest.layers_for_split("train"), ALL_LAYER_CAPTURE_LAYERS
+        )
+        self.assertEqual(
+            manifest.prompts_for_split("calibration"),
+            manifest.calibration_prompt_sha256s,
+        )
+        self.assertEqual(
+            manifest.input_manifest_sha256_for_split("train"),
+            manifest.input_manifest_sha256_for_split("calibration"),
+        )
+        self.assertNotEqual(
+            manifest.input_manifest_sha256_for_split("train"),
+            manifest.input_manifest_sha256_for_split("holdout"),
+        )
+        first_prompt = manifest.train_prompt_sha256s[0]
+        self.assertEqual(
+            tuple(
+                (entry.split, entry.prompt_sha256, entry.layer)
+                for entry in manifest.entries[:64]
+            ),
+            tuple(("train", first_prompt, layer) for layer in range(64)),
+        )
+        self.assertEqual(
+            tuple(
+                sum(entry.split == split for entry in manifest.entries)
+                for split in ("train", "calibration", "holdout")
+            ),
+            ALL_LAYER_SPLIT_TARGETS,
+        )
+        self.assertEqual(CaptureManifestV2.from_bytes(manifest.to_bytes()), manifest)
+
+        document = json.loads(manifest.to_bytes())
+        document["body"]["entries"][0]["layer"] = 1
+        document["body_sha256"] = hashlib.sha256(
+            canonical_json_bytes(document["body"])
+        ).hexdigest()
+        with self.assertRaises(QwenMlpEvidenceIntegrityError):
+            CaptureManifestV2.from_bytes(canonical_json_bytes(document))
+
+        plan = MlpEvidenceBankPlan.for_manifest(manifest)
+        self.assertEqual(MlpEvidenceBankPlan.from_bytes(plan.to_bytes()), plan)
+        plan_document = json.loads(plan.to_bytes())
+        plan_document["body"]["split_targets"]["train"] = 191
+        plan_document["body_sha256"] = hashlib.sha256(
+            canonical_json_bytes(plan_document["body"])
+        ).hexdigest()
+        with self.assertRaises(QwenMlpEvidenceIntegrityError):
+            MlpEvidenceBankPlan.from_bytes(canonical_json_bytes(plan_document))
+
+    def test_v2_plan_dynamic_state_machine_identity_and_exact_resume(self) -> None:
+        manifest = _manifest_v2()
+        plan = MlpEvidenceBankPlan.for_manifest(manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = QwenMlpEvidenceBank(temporary, capture_manifest=manifest)
+            self.assertEqual(bank.plan, plan)
+            self.assertEqual(bank.split_targets, ALL_LAYER_SPLIT_TARGETS)
+            self.assertEqual(
+                (Path(temporary) / "PLAN.json").read_bytes(), plan.to_bytes()
+            )
+            bank._validate_split_transition((0, 0, 0), "train")
+            bank._validate_split_transition((191, 0, 0), "train")
+            bank._validate_split_transition((192, 0, 0), "calibration")
+            bank._validate_split_transition((192, 127, 0), "calibration")
+            bank._validate_split_transition((192, 128, 0), "holdout")
+            bank._validate_split_transition((192, 128, 319), "holdout")
+            for counts, split in (
+                ((0, 0, 0), "calibration"),
+                ((192, 0, 0), "train"),
+                ((192, 127, 0), "holdout"),
+                ((192, 128, 320), "holdout"),
+            ):
+                with self.assertRaises(QwenMlpEvidenceIntegrityError):
+                    bank._validate_split_transition(counts, split)
+
+            receipt, verification = _capture_pair(bank, manifest)
+            first = bank.append_verified(receipt, _verifier(verification))
+            self.assertTrue(first.changed)
+            resumed = QwenMlpEvidenceBank(temporary)
+            self.assertEqual(resumed.plan, plan)
+            self.assertEqual(resumed.state().split_counts, (1, 0, 0))
+            replay = resumed.append_verified(receipt, _verifier(verification))
+            self.assertFalse(replay.changed)
+            wrong_receipt = replace(
+                receipt, manifest_sha256=_hash("wrong-v2-manifest")
+            )
+            with self.assertRaisesRegex(
+                QwenMlpEvidenceIntegrityError, "another planned manifest"
+            ):
+                resumed.append_verified(wrong_receipt, _verifier(verification))
+            with self.assertRaisesRegex(
+                QwenMlpEvidenceConflictError, "plan changed"
+            ):
+                QwenMlpEvidenceBank(
+                    temporary, capture_manifest=_manifest_v2("another-v2")
+                )
+            self.assertEqual(
+                (Path(temporary) / "PLAN.json").read_bytes(), plan.to_bytes()
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            legacy = QwenMlpEvidenceBank(temporary)
+            legacy.preflight_split_append("train")
+            with self.assertRaisesRegex(
+                QwenMlpEvidenceIntegrityError, "canonical 25/10/5"
+            ):
+                legacy.preflight_split_append("calibration")
+            with self.assertRaisesRegex(
+                QwenMlpEvidenceConflictError, "legacy evidence bank"
+            ):
+                QwenMlpEvidenceBank(temporary, capture_manifest=manifest)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            planned = QwenMlpEvidenceBank(temporary, plan=plan)
+            self.assertEqual(planned.plan, plan)
+            self.assertEqual(
+                QwenMlpEvidenceBank(
+                    temporary, capture_manifest=manifest
+                ).plan,
+                plan,
+            )
+
+    def test_layer_filtered_corpus_skips_unselected_tensor_restore(self) -> None:
+        manifest = _manifest_v2()
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = QwenMlpEvidenceBank(temporary, capture_manifest=manifest)
+            first, first_verification = _capture_pair(bank, manifest, index=0)
+            second, second_verification = _capture_pair(bank, manifest, index=1)
+            bank.append_verified(first, _verifier(first_verification))
+            bank.append_verified(second, _verifier(second_verification))
+
+            corrupted = first.tensors[0]
+            path = (
+                Path(temporary)
+                / "objects"
+                / corrupted.object_sha256[:2]
+                / f"{corrupted.object_sha256}.tensor"
+            )
+            data = path.read_bytes()
+            path.chmod(0o600)
+            path.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
+
+            corpus = bank.build_subspace_corpus(allowed_layers=(1,))
+            self.assertEqual(len(corpus.groups), 1)
+            self.assertEqual(corpus.groups[0].layer, 1)
+            with self.assertRaises(QwenMlpEvidenceIntegrityError):
+                bank.build_subspace_corpus(allowed_layers=(0,))
+            with self.assertRaisesRegex(
+                QwenMlpEvidenceIntegrityError, "no verified MLP groups"
+            ):
+                bank.build_subspace_corpus(allowed_layers=(63,))
+            for layers in ((), (1, 1), (True,), (-1,), ("1",)):
+                with self.assertRaises((TypeError, ValueError)):
+                    bank.build_subspace_corpus(allowed_layers=layers)  # type: ignore[arg-type]
+
     def test_bfloat16_binary_roundtrip_row_hashes_and_no_replace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             bank = QwenMlpEvidenceBank(temporary)

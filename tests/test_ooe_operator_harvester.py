@@ -29,6 +29,7 @@ from immer.runtimes.ooe.operator_harvester import (
     ContinuousOperatorHarvester,
     HarvesterConfig,
     HarvesterState,
+    MAX_STATE_BYTES,
     OperatorHarvesterIntegrityError,
 )
 from immer.runtimes.qwen3_8.semantic_atlas import (
@@ -145,6 +146,9 @@ class _ReplayAgainProvider:
 
 
 class ContinuousOperatorHarvesterTests(unittest.TestCase):
+    def test_persistent_bound_covers_complete_full_span_qwen_authority(self) -> None:
+        self.assertEqual(MAX_STATE_BYTES, 256 * 1024 * 1024)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

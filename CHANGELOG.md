@@ -4,6 +4,51 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-28
 
+### Receipt-bound Qwen MLP layer governor
+
+- Audited the supplied compute-battery prototype in an isolated tree. Its
+  `214` passing tests coexist with invalidation, control, cache-identity, and
+  conjugation-verification defects, so no source code entered IMMER. The valid
+  formulas were rebuilt against IMMER's own receipts as a brake-only layer
+  policy: it may remove already measured sparse layers, never add or promote
+  one.
+- Extended the mounted Qwen comparison from assistant onset to a four-token,
+  teacher-forced trajectory from one exact native prefix. Running all eight
+  measured sparse layers preserves Top-1 on `3/4` steps, with mean Top-10
+  overlap `8.75/10`, minimum hidden cosine `0.922312`, and maximum relative L2
+  `0.396926`. The single Top-1 break is now a first-class rejection signal,
+  not an averaged-away metric.
+- Added a receipt-bound layer-budget selector over complete decode reports.
+  The selected brake leaves only layers `0` and `63` sparse and reaches Top-1
+  parity `4/4`, mean Top-10 overlap `9.25/10`, minimum hidden cosine
+  `0.983171`, and maximum relative L2 `0.182834` while saving `1.8003%` of
+  model-weight transport. Policy file SHA
+  `ab6ae5ebf1f7f60c528025cd1fe43efe714b7f8c9c218682dc8c407be6f93e09`
+  is bound to the exact prefix, token path, model, router, affine correction,
+  verifier, and four-step horizon.
+
+### Full-span O1 authority and all-layer MLP evidence v2
+
+- Added a dedicated passive `full-span-v2` O1 probe family. Full-span jobs
+  always execute their own Qwen measurement; a matching layer-63 coordinate
+  can no longer reuse an older one-layer result and impersonate a 64-layer
+  execution.
+- Closed frontier generation `5`: ten full-span measurements over two
+  chronological prompt generations produce exactly `640` layer-local
+  input-to-output context receipts, while the scheduler closes `110/110`
+  jobs. The Harvester and CrystalStore now have a preflighted `256 MiB` state
+  envelope for this prompt-by-layer authority map.
+- Added `CaptureManifestV2` and a durable `PLAN.json`. Its prompt-major plan is
+  train `3`, calibration `2`, holdout `5` across every Qwen MLP layer, for
+  exact split targets `192/128/320`. Bank recovery replays receipts before
+  opening selected tensor payloads, enforces the train-to-calibration-to-
+  holdout transition, and binds every authority to its exact job and probe
+  family.
+- Added a 64-layer calibration lock and layerwise analysis. Every layer seals
+  its own `3/2` prefix corpus and fit before the later-generation holdout can
+  enter the bank; restart and analysis preserve the manifest plan and can
+  restore only the requested split and layer payloads.
+
 ### Markov coordinate intelligence
 
 - Added a sealed Markov coordinate-selector tier over exact Qwen joint

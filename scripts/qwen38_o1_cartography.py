@@ -50,8 +50,11 @@ from immer.runtimes.ooe.harvest_algebra_bridge import (
 from immer.runtimes.ooe.operator_harvester import (
     ContinuousOperatorHarvester,
     HarvesterConfig,
+    MAX_STATE_BYTES,
+    QWEN_CONTEXT_EMITTER_SHA256,
     SingleBatchContextualProvider,
     contextual_observations_from_probe_result,
+    harvester_state_name,
     probe_result_context_cursor,
 )
 from immer.runtimes.ooe.operator_transport import (
@@ -105,9 +108,7 @@ OOE_PROMOTION_STATE_NAME = "qwen-o1-cartography-promotion-transaction"
 OOE_PROMOTION_TRANSACTION_SCHEMA = (
     "immer.qwen3.8-o1-cartography-ooe-promotion-transaction/v1"
 )
-PREFIX_SINKHORN_CAPTURE_SPEC_SCHEMA = (
-    "immer.qwen3.8-o1-prefix-sinkhorn-capture-spec/v1"
-)
+PREFIX_SINKHORN_CAPTURE_SPEC_SCHEMA = "immer.qwen3.8-o1-prefix-sinkhorn-capture-spec/v1"
 _MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _CODE_REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -1219,6 +1220,12 @@ _GRID_SITES: dict[str, tuple[str, str]] = {
     "mlp-gate": ("mlp.gate_proj", "mlp.gate_proj.weight"),
     "mlp-down": ("mlp.down_proj", "mlp.down_proj.weight"),
 }
+MLP_ALL_LAYER_AUTHORITY_SITE = "mlp-all-layer-authority"
+MLP_ALL_LAYER_AUTHORITY_FAMILY_V1 = f"contextual.{MLP_ALL_LAYER_AUTHORITY_SITE}"
+MLP_ALL_LAYER_AUTHORITY_FAMILY = (
+    f"contextual.{MLP_ALL_LAYER_AUTHORITY_SITE}.full-span-v2"
+)
+MLP_ALL_LAYER_COUNT = 64
 
 
 def qwen38_frontier_grid(
@@ -1249,7 +1256,7 @@ def qwen38_frontier_grid(
         or len(set(intervention_axis)) != len(intervention_axis)
     ):
         raise O1CartographyCliError("grid axes must be non-empty and duplicate-free")
-    unknown_sites = set(site_axis) - set(_GRID_SITES)
+    unknown_sites = set(site_axis) - (set(_GRID_SITES) | {MLP_ALL_LAYER_AUTHORITY_SITE})
     if unknown_sites:
         raise O1CartographyCliError(
             f"unknown Qwen grid site: {sorted(unknown_sites)[0]}"
@@ -1292,15 +1299,22 @@ def qwen38_frontier_grid(
     if prefix_sinkhorn_operator_capture is not None and not isinstance(
         prefix_sinkhorn_operator_capture, PrefixSinkhornOperatorCapture
     ):
-        raise TypeError(
-            "prefix_sinkhorn_operator_capture must be bounded or None"
-        )
+        raise TypeError("prefix_sinkhorn_operator_capture must be bounded or None")
     templates: list[dict[str, Any]] = []
     capture_templates = 0
     for layer in sorted(layer_axis):
         prefix = f"model.language_model.layers.{layer}"
         for site in sorted(site_axis):
-            if (
+            if site == MLP_ALL_LAYER_AUTHORITY_SITE:
+                if topology is None or layer != len(topology) - 1:
+                    raise O1CartographyCliError(
+                        "all-layer MLP authority requires the final topology layer"
+                    )
+                module_suffix, tensor_suffix = (
+                    "input_layernorm",
+                    "input_layernorm.weight",
+                )
+            elif (
                 site == "attention-q"
                 and topology is not None
                 and topology[layer] == "linear_attention"
@@ -1312,6 +1326,10 @@ def qwen38_frontier_grid(
             module = f"{prefix}.{module_suffix}"
             tensor = f"{prefix}.{tensor_suffix}"
             for mode in sorted(intervention_axis):
+                if site == MLP_ALL_LAYER_AUTHORITY_SITE and mode != "passive":
+                    raise O1CartographyCliError(
+                        "all-layer MLP authority is passive-only"
+                    )
                 raw_spec: dict[str, Any] = {
                     "coordinate": {
                         "layer": layer,
@@ -1320,7 +1338,9 @@ def qwen38_frontier_grid(
                     },
                     "hidden_sketch": sketch.as_record(),
                     "intervention_mode": mode,
-                    "start_layer": layer,
+                    "start_layer": (
+                        0 if site == MLP_ALL_LAYER_AUTHORITY_SITE else layer
+                    ),
                     "stop_layer": layer + 1,
                 }
                 if mode in {"native", "placebo"}:
@@ -1343,7 +1363,11 @@ def qwen38_frontier_grid(
                     capture_templates += 1
                 templates.append(
                     {
-                        "probe_family": f"contextual.{site}",
+                        "probe_family": (
+                            MLP_ALL_LAYER_AUTHORITY_FAMILY
+                            if site == MLP_ALL_LAYER_AUTHORITY_SITE
+                            else f"contextual.{site}"
+                        ),
                         "spec": raw_spec,
                     }
                 )
@@ -1729,9 +1753,7 @@ def _capture_bank(
     try:
         return QwenPrefixSinkhornCaptureBank(path)
     except (OperatorTransportError, OSError, ValueError) as exc:
-        raise O1CartographyCliError(
-            "cannot open Prefix-Sinkhorn capture bank"
-        ) from exc
+        raise O1CartographyCliError("cannot open Prefix-Sinkhorn capture bank") from exc
 
 
 def _atlas_contains_revision(atlas: Any, revision: GraphRevision) -> bool:
@@ -1776,8 +1798,7 @@ def _verify_capture_receipt(
         or receipt.model_pin_sha256 != model_pin.sha256
         or receipt.query_positions != tuple(range(dimension))
         or receipt.key_positions != tuple(range(dimension))
-        or receipt.atlas_revision.sequence
-        <= measurement.atlas_head_revision.sequence
+        or receipt.atlas_revision.sequence <= measurement.atlas_head_revision.sequence
         or receipt.atlas_revision.sequence > current.sequence
         or not _atlas_contains_revision(atlas, measurement.atlas_head_revision)
         or not _atlas_contains_revision(atlas, receipt.atlas_revision)
@@ -1797,7 +1818,16 @@ def _find_reusable_probe_proof(
     spec: ProbeSpec,
     model_pin: ModelPin,
     capture_bank: QwenPrefixSinkhornCaptureBank | None,
+    *,
+    probe_family: str | None = None,
 ) -> tuple[Any | None, QwenPrefixSinkhornCaptureReceipt | None]:
+    # Atlas measurements bind the primary coordinate but not the execution
+    # span. Full-span authority must therefore execute its own Qwen probe.
+    if probe_family in {
+        MLP_ALL_LAYER_AUTHORITY_FAMILY_V1,
+        MLP_ALL_LAYER_AUTHORITY_FAMILY,
+    }:
+        return None, None
     capture_spec_sha256 = _capture_spec_sha256(spec)
     if capture_spec_sha256 is None:
         return _find_reusable_measurement(atlas, spec, model_pin), None
@@ -1853,7 +1883,7 @@ def _operator_transport_status(
     ):
         return None
     persisted: set[str] = set()
-    for outcome in (() if scheduler is None else scheduler.outcomes):
+    for outcome in () if scheduler is None else scheduler.outcomes:
         if outcome.status != "succeeded":
             continue
         spec = specs[outcome.job_id]
@@ -1974,8 +2004,7 @@ def _publish_probe_capture(
         or operators.dtype != np.dtype(np.float64)
         or operators.ndim != 4
         or operators.shape[0] != 1
-        or tuple(getattr(contextual, "selected_query_heads", ()))
-        != (2, 8, 14, 20)
+        or tuple(getattr(contextual, "selected_query_heads", ())) != (2, 8, 14, 20)
         or getattr(contextual, "attention_spec_sha256", None)
         != _capture_attention_spec_sha256(spec)
     ):
@@ -2184,11 +2213,113 @@ def _admit_harvested_algebras(
     }
 
 
+def _all_layer_mlp_authority_observations(
+    result: Any,
+    observations: Sequence[Any],
+) -> tuple[Any, ...]:
+    selected = tuple(
+        row
+        for row in observations
+        if row.receipt.source_state.endswith(".mlp.input-sketch")
+        and row.receipt.target_state.endswith(".mlp.output-sketch")
+    )
+    expected_layers = {row.layer for row in result.contextual_hidden_transitions}
+    observed_layers = {int(row.receipt.source_state.split(".")[2]) for row in selected}
+    if observed_layers != expected_layers or len(selected) != len(expected_layers):
+        raise O1CartographyCliError(
+            "all-layer MLP authority did not yield one observation per layer"
+        )
+    return selected
+
+
+def _operator_compute_bank(root: Path) -> ComputeCrystalBank:
+    return ComputeCrystalBank(CrystalStore(root, max_state_bytes=MAX_STATE_BYTES))
+
+
+def _operator_harvester_config() -> HarvesterConfig:
+    return HarvesterConfig(
+        minimum_observations=3,
+        minimum_fit_rows=4,
+        max_observations_per_step=128,
+        max_samples_per_group=1024,
+        max_groups=4096,
+        max_recent_receipts=65_536,
+        graph_cas_retries=16,
+    )
+
+
+def _all_layer_harvester_planned_bytes(
+    jobs: Sequence[Any],
+    specs: Mapping[str, ProbeSpec],
+    *,
+    completed_job_ids: frozenset[str] = frozenset(),
+) -> int:
+    total = 0
+    prompts: set[str] = set()
+    for job in jobs:
+        if getattr(job, "probe_family", None) != MLP_ALL_LAYER_AUTHORITY_FAMILY:
+            continue
+        if getattr(job, "job_id", None) in completed_job_ids:
+            continue
+        spec = specs.get(getattr(job, "job_id", None))
+        projection = None if spec is None else spec.hidden_sketch
+        if spec is None or projection is None:
+            raise O1CartographyCliError("all-layer job lost its hidden projection")
+        if spec.prompt_sha256 in prompts:
+            raise O1CartographyCliError("all-layer frontier repeats a prompt authority")
+        prompts.add(spec.prompt_sha256)
+        # Each layer contributes input and output float64 sketches. Canonical
+        # JSON uses at most 32 bytes per finite float under our numeric ABI;
+        # 4 KiB per receipt covers hashes, shapes, and envelope structure.
+        total += (
+            len(spec.prompt_token_ids)
+            * MLP_ALL_LAYER_COUNT
+            * 2
+            * projection.output_dimensions
+            * 32
+            + MLP_ALL_LAYER_COUNT * 4096
+        )
+    return total
+
+
+def _preflight_all_layer_harvester_capacity(
+    root: Path,
+    *,
+    jobs: Sequence[Any],
+    specs: Mapping[str, ProbeSpec],
+    model_pin_sha256: str,
+    completed_job_ids: frozenset[str],
+) -> None:
+    planned = _all_layer_harvester_planned_bytes(
+        jobs, specs, completed_job_ids=completed_job_ids
+    )
+    if not planned:
+        return
+    compute_root = _contained(root, OPERATOR_COMPUTE_NAME)
+    bank = _operator_compute_bank(compute_root)
+    config = _operator_harvester_config()
+    state_name = harvester_state_name(
+        model_pin_sha256=model_pin_sha256,
+        config=config,
+        emitter_sha256=QWEN_CONTEXT_EMITTER_SHA256,
+    )
+    try:
+        existing = len(bank.store.restore_state(state_name))
+    except KeyError:
+        existing = 0
+    reserve = 16 * 1024 * 1024
+    if existing + planned + reserve > MAX_STATE_BYTES:
+        raise O1CartographyCliError(
+            "all-layer authority exceeds the preflighted Harvester state bound"
+        )
+
+
 def _harvest_probe_context(
     root: Path,
     *,
     atlas: Any,
     result: Any,
+    probe_family: str | None = None,
 ) -> dict[str, Any] | None:
     """Feed real projected Qwen states into the persistent operator graph."""
 
@@ -2202,6 +2333,11 @@ def _harvest_probe_context(
         result,
         atlas_revision=atlas_revision,
     )
+    if probe_family in {
+        MLP_ALL_LAYER_AUTHORITY_FAMILY_V1,
+        MLP_ALL_LAYER_AUTHORITY_FAMILY,
+    }:
+        observations = _all_layer_mlp_authority_observations(result, observations)
     if not observations:
         return None
     measurement = getattr(result, "measurement", None)
@@ -2212,21 +2348,13 @@ def _harvest_probe_context(
         observations=observations,
     )
     compute_root = _contained(root, OPERATOR_COMPUTE_NAME)
-    bank = ComputeCrystalBank(compute_root)
+    bank = _operator_compute_bank(compute_root)
     graph = ComputeOperatorGraph(bank)
     harvester = ContinuousOperatorHarvester(
         atlas=atlas,
         provider=provider,
         graph=graph,
-        config=HarvesterConfig(
-            minimum_observations=3,
-            minimum_fit_rows=4,
-            max_observations_per_step=128,
-            max_samples_per_group=1024,
-            max_groups=4096,
-            max_recent_receipts=65_536,
-            graph_cas_retries=16,
-        ),
+        config=_operator_harvester_config(),
     )
     harvested = harvester.step(limit=128)
     bvn_receipt_sha256s = []
@@ -2773,9 +2901,7 @@ def _active_outcome_measurement(
             spec=spec,
             model_pin=model_pin,
             atlas=atlas,
-            expected_receipt_sha256=observation.get(
-                "operator_capture_receipt_sha256"
-            ),
+            expected_receipt_sha256=observation.get("operator_capture_receipt_sha256"),
         )
     return measurement
 
@@ -3038,6 +3164,17 @@ def run_cartography(
             capture_bank = (
                 _capture_bank(ooe_path, create=True) if capture_enabled else None
             )
+            _preflight_all_layer_harvester_capacity(
+                ooe_path,
+                jobs=scheduler.jobs,
+                specs=specs,
+                model_pin_sha256=model_pin.sha256,
+                completed_job_ids=frozenset(
+                    outcome.job_id
+                    for outcome in scheduler.outcomes
+                    if outcome.status == "succeeded"
+                ),
+            )
             probe = probe_factory(runtime.model)
             reconciled = _reconcile_receipts(
                 scheduler,
@@ -3080,6 +3217,7 @@ def run_cartography(
                         spec,
                         model_pin,
                         capture_bank,
+                        probe_family=job.probe_family,
                     )
                     if reusable is not None:
                         reused_atlas_proofs += 1
@@ -3109,6 +3247,7 @@ def run_cartography(
                         ooe_path,
                         atlas=atlas,
                         result=result,
+                        probe_family=job.probe_family,
                     )
                     if harvested is not None:
                         operator_harvest_receipts.append(harvested)

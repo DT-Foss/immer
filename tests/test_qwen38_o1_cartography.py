@@ -381,9 +381,7 @@ class _AuthenticProbe:
             ).hexdigest()
             head_hashes = tuple(
                 hashlib.sha256(
-                    np.asarray(operators[:, index], dtype="<f8").tobytes(
-                        order="C"
-                    )
+                    np.asarray(operators[:, index], dtype="<f8").tobytes(order="C")
                 ).hexdigest()
                 for index in range(4)
             )
@@ -1001,6 +999,129 @@ class Qwen38O1CartographyTests(unittest.TestCase):
                 layer_types=("full_attention",) * 4,
             )
 
+    def test_all_layer_mlp_authority_is_one_passive_full_span_job(self) -> None:
+        topology = tuple(
+            "full_attention" if (layer + 1) % 4 == 0 else "linear_attention"
+            for layer in range(64)
+        )
+        grid = cartography.qwen38_frontier_grid(
+            layers=(63,),
+            sites=(cartography.MLP_ALL_LAYER_AUTHORITY_SITE,),
+            interventions=("passive",),
+            hidden_dimensions=16,
+            layer_types=topology,
+        )
+        self.assertEqual(len(grid), 1)
+        row = grid[0]
+        self.assertEqual(
+            row["probe_family"], cartography.MLP_ALL_LAYER_AUTHORITY_FAMILY
+        )
+        self.assertEqual(row["spec"]["start_layer"], 0)
+        self.assertEqual(row["spec"]["stop_layer"], 64)
+        self.assertEqual(row["spec"]["coordinate"]["layer"], 63)
+        self.assertEqual(
+            row["spec"]["coordinate"]["tensor"],
+            "model.language_model.layers.63.input_layernorm.weight",
+        )
+        class _NoAtlasQuery:
+            def query_by_prompt_signature(self, _signature):
+                raise AssertionError("full-span jobs cannot reuse coordinate-only proofs")
+
+        self.assertEqual(
+            cartography._find_reusable_probe_proof(
+                _NoAtlasQuery(),
+                object(),
+                object(),
+                None,
+                probe_family=row["probe_family"],
+            ),
+            (None, None),
+        )
+        compute_bank = cartography._operator_compute_bank(
+            self.base / "full-span-harvester-bound"
+        )
+        self.assertEqual(
+            compute_bank.store.max_state_bytes, cartography.MAX_STATE_BYTES
+        )
+        oversized_job = SimpleNamespace(
+            job_id="oversized-full-span",
+            probe_family=cartography.MLP_ALL_LAYER_AUTHORITY_FAMILY,
+        )
+        oversized_spec = SimpleNamespace(
+            hidden_sketch=SimpleNamespace(output_dimensions=4096),
+            prompt_sha256="oversized-prompt",
+            prompt_token_ids=tuple(range(1024)),
+        )
+        with self.assertRaisesRegex(
+            cartography.O1CartographyCliError, "preflighted Harvester"
+        ):
+            cartography._preflight_all_layer_harvester_capacity(
+                self.base / "oversized-harvester",
+                jobs=(oversized_job,),
+                specs={oversized_job.job_id: oversized_spec},
+                model_pin_sha256="a" * 64,
+                completed_job_ids=frozenset(),
+            )
+        self.assertEqual(
+            cartography._all_layer_harvester_planned_bytes(
+                (oversized_job,),
+                {oversized_job.job_id: oversized_spec},
+                completed_job_ids=frozenset({oversized_job.job_id}),
+            ),
+            0,
+        )
+        with self.assertRaisesRegex(
+            cartography.O1CartographyCliError, "final topology layer"
+        ):
+            cartography.qwen38_frontier_grid(
+                layers=(62,),
+                sites=(cartography.MLP_ALL_LAYER_AUTHORITY_SITE,),
+                interventions=("passive",),
+                layer_types=topology,
+            )
+        with self.assertRaisesRegex(cartography.O1CartographyCliError, "passive-only"):
+            cartography.qwen38_frontier_grid(
+                layers=(63,),
+                sites=(cartography.MLP_ALL_LAYER_AUTHORITY_SITE,),
+                interventions=("native",),
+                layer_types=topology,
+            )
+
+        result = SimpleNamespace(
+            contextual_hidden_transitions=(
+                SimpleNamespace(layer=0),
+                SimpleNamespace(layer=1),
+            )
+        )
+        observations = (
+            SimpleNamespace(
+                receipt=SimpleNamespace(
+                    source_state="qwen.layer.0.mlp.input-sketch",
+                    target_state="qwen.layer.0.mlp.output-sketch",
+                )
+            ),
+            SimpleNamespace(
+                receipt=SimpleNamespace(
+                    source_state="qwen.layer.0.pre-hidden-sketch",
+                    target_state="qwen.layer.0.post-hidden-sketch",
+                )
+            ),
+            SimpleNamespace(
+                receipt=SimpleNamespace(
+                    source_state="qwen.layer.1.mlp.input-sketch",
+                    target_state="qwen.layer.1.mlp.output-sketch",
+                )
+            ),
+        )
+        selected = cartography._all_layer_mlp_authority_observations(
+            result, observations
+        )
+        self.assertEqual(selected, (observations[0], observations[2]))
+        with self.assertRaisesRegex(
+            cartography.O1CartographyCliError, "one observation per layer"
+        ):
+            cartography._all_layer_mlp_authority_observations(result, observations[:2])
+
     def test_idle_runner_resumes_cycles_waits_and_consumes_later_extension(
         self,
     ) -> None:
@@ -1435,9 +1556,7 @@ class Qwen38O1CartographyTests(unittest.TestCase):
             [receipt.sha256],
         )
         self.assertTrue(status["operator_transport"]["audit_clean"])
-        self.assertEqual(
-            status["operator_transport"]["orphan_state_filenames"], []
-        )
+        self.assertEqual(status["operator_transport"]["orphan_state_filenames"], [])
         self.assertNotIn("operators", status["operator_transport"])
         bank = cartography.QwenPrefixSinkhornCaptureBank(
             reuse_root / cartography.OOE_NAME / cartography.OPERATOR_TRANSPORT_NAME
@@ -1473,9 +1592,7 @@ class Qwen38O1CartographyTests(unittest.TestCase):
             stream_factory=_FakeStream,
         ).outcomes[0]
         observation = outcome.observation_document()
-        self.assertEqual(
-            observation["operator_capture_receipt_sha256"], receipt.sha256
-        )
+        self.assertEqual(observation["operator_capture_receipt_sha256"], receipt.sha256)
 
     def test_prefix_sinkhorn_capture_crash_repair_and_raw_absence(self) -> None:
         crash_root = self.base / "capture-crash"
@@ -1532,9 +1649,7 @@ class Qwen38O1CartographyTests(unittest.TestCase):
             probe_factory=_RawAbsentProbe,
         )
         self.assertEqual(failed["coverage"]["retryable_jobs"], 1)
-        self.assertEqual(
-            failed["operator_transport"]["capture_receipt_sha256s"], []
-        )
+        self.assertEqual(failed["operator_transport"]["capture_receipt_sha256s"], [])
 
     def test_wrong_prefix_sinkhorn_sidecars_never_authorize_reuse(self) -> None:
         def wrong_receipt(root: Path, **changes):

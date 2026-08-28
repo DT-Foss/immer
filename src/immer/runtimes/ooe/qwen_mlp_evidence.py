@@ -46,6 +46,8 @@ VERIFIER_EVIDENCE_SCHEMA = "immer.qwen3.8-mlp-verifier-evidence/v1"
 JOURNAL_STATE_SCHEMA = "immer.qwen3.8-mlp-evidence-journal/v1"
 JOURNAL_INTENT_SCHEMA = "immer.qwen3.8-mlp-evidence-intent/v1"
 CAPTURE_MANIFEST_SCHEMA = "immer.qwen3.8-mlp-capture-manifest/v1"
+CAPTURE_MANIFEST_V2_SCHEMA = "immer.qwen3.8-mlp-capture-manifest/v2"
+EVIDENCE_BANK_PLAN_SCHEMA = "immer.qwen3.8-mlp-evidence-bank-plan/v1"
 EVIDENCE_BUDGET_SCHEMA = "immer.qwen3.8-mlp-evidence-budget/v1"
 CAPTURE_STAGES = ("mlp.input", "mlp.gate", "mlp.up", "mlp.output")
 CAPTURE_SPLITS = ("train", "calibration", "holdout")
@@ -54,12 +56,15 @@ CAPTURE_PLAN_LAYERS = {
     "calibration": (0, 9),
     "holdout": (54,),
 }
+ALL_LAYER_CAPTURE_LAYERS = tuple(range(64))
+ALL_LAYER_SPLIT_TARGETS = (192, 128, 320)
 _MAGIC = b"IMMLP01\0"
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _HEAD = "HEAD"
 _INTENT = "PREPARED"
 _LOCK = "LOCK"
 _BUDGET = "BUDGET.json"
+_PLAN = "PLAN.json"
 
 
 class QwenMlpEvidenceError(RuntimeError):
@@ -325,6 +330,61 @@ def canonical_capture_plan(
     return tuple(rows)
 
 
+def _v2_prompt_group(
+    prompt_sha256s: Sequence[str], *, split: str, expected: int
+) -> tuple[str, ...]:
+    prompts = tuple(
+        require_sha256(value, field=f"{split}_prompt_sha256s")
+        for value in prompt_sha256s
+    )
+    if len(prompts) != expected or len(set(prompts)) != expected:
+        raise ValueError(
+            f"all-layer {split} prompt binding requires {expected} unique prompts"
+        )
+    return tuple(sorted(prompts))
+
+
+def canonical_all_layer_capture_plan(
+    train_prompt_sha256s: Sequence[str],
+    calibration_prompt_sha256s: Sequence[str],
+    holdout_prompt_sha256s: Sequence[str],
+) -> tuple[CapturePlanEntry, ...]:
+    """Return the prompt-major, 64-layer v2 capture plan.
+
+    Prompt-major ordering is intentional: all 64 layer boundaries for one
+    prompt are contiguous and can therefore be supplied by one exact forward.
+    """
+
+    prompts_by_split = {
+        "train": _v2_prompt_group(
+            train_prompt_sha256s, split="train", expected=3
+        ),
+        "calibration": _v2_prompt_group(
+            calibration_prompt_sha256s, split="calibration", expected=2
+        ),
+        "holdout": _v2_prompt_group(
+            holdout_prompt_sha256s, split="holdout", expected=5
+        ),
+    }
+    all_prompts = tuple(
+        prompt
+        for split in CAPTURE_SPLITS
+        for prompt in prompts_by_split[split]
+    )
+    if len(set(all_prompts)) != len(all_prompts):
+        raise ValueError("all-layer prompt bindings must be disjoint across splits")
+    rows: list[CapturePlanEntry] = []
+    for split in CAPTURE_SPLITS:
+        for prompt in prompts_by_split[split]:
+            for layer in ALL_LAYER_CAPTURE_LAYERS:
+                rows.append(CapturePlanEntry(len(rows) + 1, split, layer, prompt))
+    if tuple(
+        sum(entry.split == split for entry in rows) for split in CAPTURE_SPLITS
+    ) != ALL_LAYER_SPLIT_TARGETS:
+        raise AssertionError("all-layer split targets changed")
+    return tuple(rows)
+
+
 @dataclass(frozen=True, slots=True)
 class CaptureManifest:
     model_pin_sha256: str
@@ -359,6 +419,28 @@ class CaptureManifest:
     @property
     def sha256(self) -> str:
         return _digest(self.to_document())
+
+    @property
+    def manifest_schema(self) -> str:
+        return CAPTURE_MANIFEST_SCHEMA
+
+    @property
+    def split_targets(self) -> tuple[int, int, int]:
+        return (25, 10, 5)
+
+    @property
+    def is_all_layer_v2(self) -> bool:
+        return False
+
+    def layers_for_split(self, split: str) -> tuple[int, ...]:
+        if split not in CAPTURE_SPLITS:
+            raise ValueError("capture split is invalid")
+        return CAPTURE_PLAN_LAYERS[split]
+
+    def prompts_for_split(self, split: str) -> tuple[str, ...]:
+        if split not in CAPTURE_SPLITS:
+            raise ValueError("capture split is invalid")
+        return self.prompt_sha256s
 
     def to_document(self) -> dict[str, object]:
         return _sealed(
@@ -412,6 +494,292 @@ class CaptureManifest:
         )
         if result.to_bytes() != data:
             raise QwenMlpEvidenceIntegrityError("capture manifest changed")
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureManifestV2:
+    """Generation-bound, prompt-major evidence plan for every Qwen MLP layer."""
+
+    model_pin_sha256: str
+    base_input_manifest_sha256: str
+    later_generation_input_manifest_sha256: str
+    train_prompt_sha256s: tuple[str, ...]
+    calibration_prompt_sha256s: tuple[str, ...]
+    holdout_prompt_sha256s: tuple[str, ...]
+    entries: tuple[CapturePlanEntry, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "model_pin_sha256",
+            require_sha256(self.model_pin_sha256, field="model_pin_sha256"),
+        )
+        object.__setattr__(
+            self,
+            "base_input_manifest_sha256",
+            require_sha256(
+                self.base_input_manifest_sha256,
+                field="base_input_manifest_sha256",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "later_generation_input_manifest_sha256",
+            require_sha256(
+                self.later_generation_input_manifest_sha256,
+                field="later_generation_input_manifest_sha256",
+            ),
+        )
+        if (
+            self.base_input_manifest_sha256
+            == self.later_generation_input_manifest_sha256
+        ):
+            raise ValueError(
+                "holdout must be bound to a later input-manifest generation"
+            )
+        train = _v2_prompt_group(
+            self.train_prompt_sha256s, split="train", expected=3
+        )
+        calibration = _v2_prompt_group(
+            self.calibration_prompt_sha256s, split="calibration", expected=2
+        )
+        holdout = _v2_prompt_group(
+            self.holdout_prompt_sha256s, split="holdout", expected=5
+        )
+        if len(set(train + calibration + holdout)) != 10:
+            raise ValueError(
+                "all-layer prompt bindings must be disjoint across splits"
+            )
+        entries = tuple(self.entries)
+        if entries != canonical_all_layer_capture_plan(train, calibration, holdout):
+            raise ValueError(
+                "manifest entries differ from canonical 192/128/320 all-layer plan"
+            )
+        object.__setattr__(self, "train_prompt_sha256s", train)
+        object.__setattr__(self, "calibration_prompt_sha256s", calibration)
+        object.__setattr__(self, "holdout_prompt_sha256s", holdout)
+        object.__setattr__(self, "entries", entries)
+
+    @property
+    def prompt_sha256s(self) -> tuple[str, ...]:
+        return (
+            self.train_prompt_sha256s
+            + self.calibration_prompt_sha256s
+            + self.holdout_prompt_sha256s
+        )
+
+    @property
+    def manifest_schema(self) -> str:
+        return CAPTURE_MANIFEST_V2_SCHEMA
+
+    @property
+    def split_targets(self) -> tuple[int, int, int]:
+        return ALL_LAYER_SPLIT_TARGETS
+
+    @property
+    def is_all_layer_v2(self) -> bool:
+        return True
+
+    def layers_for_split(self, split: str) -> tuple[int, ...]:
+        if split not in CAPTURE_SPLITS:
+            raise ValueError("capture split is invalid")
+        return ALL_LAYER_CAPTURE_LAYERS
+
+    def prompts_for_split(self, split: str) -> tuple[str, ...]:
+        if split == "train":
+            return self.train_prompt_sha256s
+        if split == "calibration":
+            return self.calibration_prompt_sha256s
+        if split == "holdout":
+            return self.holdout_prompt_sha256s
+        raise ValueError("capture split is invalid")
+
+    def input_manifest_sha256_for_split(self, split: str) -> str:
+        if split in {"train", "calibration"}:
+            return self.base_input_manifest_sha256
+        if split == "holdout":
+            return self.later_generation_input_manifest_sha256
+        raise ValueError("capture split is invalid")
+
+    @property
+    def sha256(self) -> str:
+        return _digest(self.to_document())
+
+    def to_document(self) -> dict[str, object]:
+        bindings = {
+            split: {
+                "input_manifest_sha256": self.input_manifest_sha256_for_split(split),
+                "prompt_sha256s": list(self.prompts_for_split(split)),
+            }
+            for split in CAPTURE_SPLITS
+        }
+        return _sealed(
+            CAPTURE_MANIFEST_V2_SCHEMA,
+            {
+                "attention_kind": SUBSPACE_ATTENTION_KIND,
+                "context_kind": SUBSPACE_CONTEXT_KIND,
+                "entries": [entry.to_record() for entry in self.entries],
+                "model_pin_sha256": self.model_pin_sha256,
+                "prompt_bindings": bindings,
+            },
+        )
+
+    def to_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_document())
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "CaptureManifestV2":
+        env = _strict_json(
+            data,
+            schema=CAPTURE_MANIFEST_V2_SCHEMA,
+            label="all-layer capture manifest",
+            maximum=2 * 1024 * 1024,
+        )
+        body = cast(Mapping[str, object], env["body"])
+        if (
+            set(body)
+            != {
+                "attention_kind",
+                "context_kind",
+                "entries",
+                "model_pin_sha256",
+                "prompt_bindings",
+            }
+            or body.get("attention_kind") != SUBSPACE_ATTENTION_KIND
+            or body.get("context_kind") != SUBSPACE_CONTEXT_KIND
+            or not isinstance(body.get("entries"), list)
+            or not isinstance(body.get("prompt_bindings"), Mapping)
+        ):
+            raise QwenMlpEvidenceIntegrityError(
+                "all-layer capture manifest body is invalid"
+            )
+        bindings = cast(Mapping[str, object], body["prompt_bindings"])
+        if set(bindings) != set(CAPTURE_SPLITS):
+            raise QwenMlpEvidenceIntegrityError(
+                "all-layer prompt bindings are invalid"
+            )
+        parsed: dict[str, tuple[str, tuple[str, ...]]] = {}
+        for split in CAPTURE_SPLITS:
+            binding = bindings.get(split)
+            if (
+                not isinstance(binding, Mapping)
+                or set(binding) != {"input_manifest_sha256", "prompt_sha256s"}
+                or not isinstance(binding.get("prompt_sha256s"), list)
+            ):
+                raise QwenMlpEvidenceIntegrityError(
+                    "all-layer prompt binding is invalid"
+                )
+            parsed[split] = (
+                cast(str, binding.get("input_manifest_sha256")),
+                tuple(cast(list[str], binding.get("prompt_sha256s"))),
+            )
+        if parsed["train"][0] != parsed["calibration"][0]:
+            raise QwenMlpEvidenceIntegrityError(
+                "train/calibration must share the base input manifest"
+            )
+        try:
+            result = cls(
+                model_pin_sha256=cast(str, body.get("model_pin_sha256")),
+                base_input_manifest_sha256=parsed["train"][0],
+                later_generation_input_manifest_sha256=parsed["holdout"][0],
+                train_prompt_sha256s=parsed["train"][1],
+                calibration_prompt_sha256s=parsed["calibration"][1],
+                holdout_prompt_sha256s=parsed["holdout"][1],
+                entries=tuple(
+                    CapturePlanEntry.from_record(row)
+                    for row in cast(list[object], body.get("entries"))
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise QwenMlpEvidenceIntegrityError(
+                "all-layer capture manifest validation failed"
+            ) from exc
+        if result.to_bytes() != data:
+            raise QwenMlpEvidenceIntegrityError(
+                "all-layer capture manifest changed"
+            )
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class MlpEvidenceBankPlan:
+    manifest_sha256: str
+    manifest_schema: str
+    split_targets: tuple[int, int, int]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "manifest_sha256",
+            require_sha256(self.manifest_sha256, field="manifest_sha256"),
+        )
+        if self.manifest_schema != CAPTURE_MANIFEST_V2_SCHEMA:
+            raise ValueError("evidence bank plan requires the v2 manifest schema")
+        targets = tuple(self.split_targets)
+        if (
+            len(targets) != len(CAPTURE_SPLITS)
+            or any(
+                isinstance(target, bool) or not isinstance(target, int)
+                for target in targets
+            )
+            or targets != ALL_LAYER_SPLIT_TARGETS
+        ):
+            raise ValueError("evidence bank plan split targets are invalid")
+        object.__setattr__(self, "split_targets", targets)
+
+    @classmethod
+    def for_manifest(cls, manifest: CaptureManifestV2) -> "MlpEvidenceBankPlan":
+        if not isinstance(manifest, CaptureManifestV2):
+            raise TypeError("manifest must be CaptureManifestV2")
+        return cls(manifest.sha256, manifest.manifest_schema, manifest.split_targets)
+
+    def to_document(self) -> dict[str, object]:
+        return _sealed(
+            EVIDENCE_BANK_PLAN_SCHEMA,
+            {
+                "manifest_schema": self.manifest_schema,
+                "manifest_sha256": self.manifest_sha256,
+                "split_targets": {
+                    split: self.split_targets[index]
+                    for index, split in enumerate(CAPTURE_SPLITS)
+                },
+            },
+        )
+
+    def to_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_document())
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "MlpEvidenceBankPlan":
+        env = _strict_json(
+            data,
+            schema=EVIDENCE_BANK_PLAN_SCHEMA,
+            label="evidence bank plan",
+            maximum=64 * 1024,
+        )
+        body = cast(Mapping[str, object], env["body"])
+        targets = body.get("split_targets")
+        if (
+            set(body) != {"manifest_schema", "manifest_sha256", "split_targets"}
+            or not isinstance(targets, Mapping)
+            or set(targets) != set(CAPTURE_SPLITS)
+        ):
+            raise QwenMlpEvidenceIntegrityError("evidence bank plan body is invalid")
+        try:
+            result = cls(
+                manifest_sha256=cast(str, body.get("manifest_sha256")),
+                manifest_schema=cast(str, body.get("manifest_schema")),
+                split_targets=tuple(
+                    cast(int, targets.get(split)) for split in CAPTURE_SPLITS
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise QwenMlpEvidenceIntegrityError(
+                "evidence bank plan validation failed"
+            ) from exc
+        if result.to_bytes() != data:
+            raise QwenMlpEvidenceIntegrityError("evidence bank plan changed")
         return result
 
 
@@ -896,6 +1264,8 @@ class QwenMlpEvidenceBank:
         budget: MlpEvidenceBudget | None = None,
         fault_injector: Callable[[str], None] | None = None,
         deferred_tensor_splits: Sequence[str] = (),
+        capture_manifest: CaptureManifestV2 | None = None,
+        plan: MlpEvidenceBankPlan | None = None,
     ) -> None:
         self.root = Path(root)
         self.budget = MlpEvidenceBudget() if budget is None else budget
@@ -903,6 +1273,24 @@ class QwenMlpEvidenceBank:
             raise TypeError("budget must be MlpEvidenceBudget")
         if fault_injector is not None and not callable(fault_injector):
             raise TypeError("fault_injector must be callable")
+        if capture_manifest is not None and not isinstance(
+            capture_manifest, CaptureManifestV2
+        ):
+            raise TypeError("capture_manifest must be CaptureManifestV2 or None")
+        if plan is not None and not isinstance(plan, MlpEvidenceBankPlan):
+            raise TypeError("plan must be MlpEvidenceBankPlan or None")
+        manifest_plan = (
+            None
+            if capture_manifest is None
+            else MlpEvidenceBankPlan.for_manifest(capture_manifest)
+        )
+        if plan is not None and manifest_plan is not None and plan != manifest_plan:
+            raise QwenMlpEvidenceConflictError(
+                "capture manifest and evidence bank plan differ"
+            )
+        self._requested_plan = plan if plan is not None else manifest_plan
+        self.plan: MlpEvidenceBankPlan | None = None
+        self._split_targets = (25, 10, 5)
         deferred = tuple(deferred_tensor_splits)
         if len(set(deferred)) != len(deferred) or any(
             split not in CAPTURE_SPLITS for split in deferred
@@ -922,6 +1310,10 @@ class QwenMlpEvidenceBank:
         ):
             self._ensure_dir(self.root / name)
         self._initialize()
+
+    @property
+    def split_targets(self) -> tuple[int, int, int]:
+        return self._split_targets
 
     @staticmethod
     def _ensure_dir(path: Path) -> None:
@@ -952,22 +1344,48 @@ class QwenMlpEvidenceBank:
         if self.fault_injector is not None:
             self.fault_injector(stage)
 
-    @staticmethod
     def _validate_split_transition(
-        split_counts: tuple[int, int, int], split: str
+        self, split_counts: tuple[int, int, int], split: str
     ) -> None:
         train, calibration, holdout = split_counts
+        train_target, calibration_target, holdout_target = self._split_targets
         if split == "train":
-            valid = calibration == 0 and holdout == 0 and train < 25
+            valid = (
+                calibration == 0 and holdout == 0 and train < train_target
+            )
         elif split == "calibration":
-            valid = train == 25 and holdout == 0 and calibration < 10
+            valid = (
+                train == train_target
+                and holdout == 0
+                and calibration < calibration_target
+            )
         elif split == "holdout":
-            valid = train == 25 and calibration == 10 and holdout < 5
+            valid = (
+                train == train_target
+                and calibration == calibration_target
+                and holdout < holdout_target
+            )
         else:  # protected by CapturePlanEntry, kept fail-closed.
             valid = False
         if not valid:
+            if self.plan is None:
+                message = (
+                    "MLP evidence split violates the canonical 25/10/5 state machine"
+                )
+            else:
+                message = (
+                    "MLP evidence split violates the configured "
+                    f"{train_target}/{calibration_target}/{holdout_target} "
+                    "state machine"
+                )
+            raise QwenMlpEvidenceIntegrityError(message)
+
+    def _validate_receipt_plan(self, receipt: MlpEvidenceReceipt) -> None:
+        if self.plan is not None and (
+            receipt.manifest_sha256 != self.plan.manifest_sha256
+        ):
             raise QwenMlpEvidenceIntegrityError(
-                "MLP evidence split violates the canonical 25/10/5 state machine"
+                "MLP evidence receipt belongs to another planned manifest"
             )
 
     def preflight_split_append(self, split: str) -> None:
@@ -1103,6 +1521,40 @@ class QwenMlpEvidenceBank:
         finally:
             os.close(directory)
 
+    def _publish_root_no_replace(self, name: str, data: bytes, maximum: int) -> None:
+        if not isinstance(data, bytes) or not data or len(data) > maximum:
+            raise QwenMlpEvidenceCapacityError("root metadata exceeds its byte bound")
+        final = self.root / name
+        if final.exists() or final.is_symlink():
+            if final.is_symlink() or self._stable_read(final, maximum) != data:
+                raise QwenMlpEvidenceConflictError(
+                    f"{name} contains another immutable binding"
+                )
+            return
+        temporary = self.root / "staging" / f".{name}.{secrets.token_hex(12)}.tmp"
+        fd = os.open(
+            temporary,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+            0o444,
+        )
+        try:
+            self._write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            try:
+                os.link(temporary, final, follow_symlinks=False)
+                self._fsync_dir(self.root)
+            except FileExistsError:
+                if self._stable_read(final, maximum) != data:
+                    raise QwenMlpEvidenceConflictError(
+                        f"concurrent {name} binding differs"
+                    )
+        finally:
+            temporary.unlink(missing_ok=True)
+            self._fsync_dir(self.root / "staging")
+
     def _commit_path(self, digest: str) -> Path:
         return self._shard("commits", digest) / f"{digest}.commit"
 
@@ -1142,14 +1594,39 @@ class QwenMlpEvidenceBank:
         with self._locked():
             head = self.root / _HEAD
             budget_path = self.root / _BUDGET
+            plan_path = self.root / _PLAN
             if (
                 head.is_symlink()
                 or (self.root / _INTENT).is_symlink()
                 or budget_path.is_symlink()
+                or plan_path.is_symlink()
             ):
                 raise QwenMlpEvidenceIntegrityError(
                     "journal pointers cannot be symlinks"
                 )
+            if plan_path.exists():
+                loaded_plan = MlpEvidenceBankPlan.from_bytes(
+                    self._stable_read(plan_path, 64 * 1024)
+                )
+                if (
+                    self._requested_plan is not None
+                    and loaded_plan != self._requested_plan
+                ):
+                    raise QwenMlpEvidenceConflictError(
+                        "evidence bank plan changed across resume"
+                    )
+                self.plan = loaded_plan
+                self._split_targets = loaded_plan.split_targets
+            elif self._requested_plan is not None:
+                if budget_path.exists():
+                    raise QwenMlpEvidenceConflictError(
+                        "legacy evidence bank cannot be rebound to a v2 plan"
+                    )
+                self._publish_root_no_replace(
+                    _PLAN, self._requested_plan.to_bytes(), 64 * 1024
+                )
+                self.plan = self._requested_plan
+                self._split_targets = self._requested_plan.split_targets
             budget_data = canonical_json_bytes(
                 _sealed(
                     EVIDENCE_BUDGET_SCHEMA,
@@ -1534,6 +2011,7 @@ class QwenMlpEvidenceBank:
                 verification,
                 restore_tensors=receipt.entry.split in selected_splits,
             )
+            self._validate_split_transition(parent.split_counts, receipt.entry.split)
             expected_counts = list(parent.split_counts)
             expected_counts[CAPTURE_SPLITS.index(receipt.entry.split)] += 1
             if (
@@ -1674,6 +2152,7 @@ class QwenMlpEvidenceBank:
         *,
         restore_tensors: bool = True,
     ) -> None:
+        self._validate_receipt_plan(receipt)
         if (
             verification.evidence_receipt_sha256 != receipt.sha256
             or not verification.accepted
@@ -1718,6 +2197,7 @@ class QwenMlpEvidenceBank:
             verifier, MlpProjectionVerifier
         ):
             raise TypeError("receipt/verifier types are invalid")
+        self._validate_receipt_plan(receipt)
         verification = verifier.verify(receipt, self)
         if not isinstance(verification, MlpProjectionVerificationReceipt):
             raise QwenMlpEvidenceIntegrityError(
@@ -1884,6 +2364,7 @@ class QwenMlpEvidenceBank:
         self,
         *,
         allowed_splits: Sequence[str] | None = None,
+        allowed_layers: Sequence[int] | None = None,
         row_indices_by_prompt: Mapping[str, Sequence[int]] | None = None,
     ) -> SubspaceCorpus:
         selected_splits = (
@@ -1895,13 +2376,38 @@ class QwenMlpEvidenceBank:
             or any(split not in CAPTURE_SPLITS for split in selected_splits)
         ):
             raise ValueError("allowed_splits are invalid or duplicated")
-        tensor_splits = frozenset(selected_splits)
+        selected_layers: frozenset[int] | None = None
+        if allowed_layers is not None:
+            if isinstance(allowed_layers, (str, bytes, bytearray)):
+                raise TypeError("allowed_layers must be an integer sequence")
+            layers = tuple(allowed_layers)
+            if (
+                not layers
+                or len(set(layers)) != len(layers)
+                or any(
+                    isinstance(layer, bool)
+                    or not isinstance(layer, int)
+                    or layer < 0
+                    for layer in layers
+                )
+            ):
+                raise ValueError("allowed_layers are invalid or duplicated")
+            selected_layers = frozenset(layers)
+        # Replay receipt/proof metadata first. Tensor objects are restored only
+        # after both split and layer filters have selected their groups.
+        no_tensor_splits: frozenset[str] = frozenset()
         with self._locked():
-            self._recover_unlocked(tensor_splits=tensor_splits)
+            self._recover_unlocked(tensor_splits=no_tensor_splits)
             pairs = tuple(
                 pair
-                for pair in self._committed_pairs_unlocked(tensor_splits=tensor_splits)
+                for pair in self._committed_pairs_unlocked(
+                    tensor_splits=no_tensor_splits
+                )
                 if pair[0].entry.split in selected_splits
+                and (
+                    selected_layers is None
+                    or pair[0].entry.layer in selected_layers
+                )
             )
         if not pairs:
             raise QwenMlpEvidenceIntegrityError("bank contains no verified MLP groups")
@@ -1955,6 +2461,7 @@ class QwenMlpEvidenceBank:
             up = self.restore_tensor(refs["mlp.up"]).reshape(
                 -1, refs["mlp.up"].shape[-1]
             )
+            self.restore_tensor(refs["mlp.output"])
             outputs = refs["mlp.output"].row_sha256s
             selection_sha256: str | None = None
             if row_selection is not None:
@@ -2084,7 +2591,7 @@ class ExactMlpCaptureRunner(MlpProjectionVerifier, Protocol):
 
 
 def run_capture_manifest(
-    manifest: CaptureManifest,
+    manifest: CaptureManifest | CaptureManifestV2,
     bank: QwenMlpEvidenceBank,
     runner: ExactMlpCaptureRunner,
     *,
@@ -2093,11 +2600,21 @@ def run_capture_manifest(
     max_seconds: float | None = None,
 ) -> tuple[MlpEvidencePublication, ...]:
     if (
-        not isinstance(manifest, CaptureManifest)
+        not isinstance(manifest, (CaptureManifest, CaptureManifestV2))
         or not isinstance(bank, QwenMlpEvidenceBank)
         or not isinstance(runner, ExactMlpCaptureRunner)
     ):
         raise TypeError("manifest/bank/runner types are invalid")
+    if isinstance(manifest, CaptureManifestV2):
+        expected_plan = MlpEvidenceBankPlan.for_manifest(manifest)
+        if bank.plan != expected_plan:
+            raise QwenMlpEvidenceIntegrityError(
+                "all-layer capture manifest differs from the evidence bank plan"
+            )
+    elif bank.plan is not None:
+        raise QwenMlpEvidenceIntegrityError(
+            "legacy capture manifest cannot run against a v2 evidence bank plan"
+        )
     if runner.capture_mode not in {"fixture", "live-exact"}:
         raise ValueError("runner capture_mode is invalid")
     selected_splits = (
@@ -2220,19 +2737,25 @@ def run_capture_manifest(
 
 
 __all__ = [
+    "ALL_LAYER_CAPTURE_LAYERS",
+    "ALL_LAYER_SPLIT_TARGETS",
+    "CAPTURE_MANIFEST_V2_SCHEMA",
     "CAPTURE_PLAN_LAYERS",
     "CAPTURE_SPLITS",
     "CAPTURE_STAGES",
     "EVIDENCE_BUDGET_SCHEMA",
+    "EVIDENCE_BANK_PLAN_SCHEMA",
     "VERIFIER_EVIDENCE_SCHEMA",
     "BinaryTensorRef",
     "CaptureManifest",
+    "CaptureManifestV2",
     "CapturePlanEntry",
     "ExactMlpBoundaryCapture",
     "ExactMlpCaptureRunner",
     "MlpEvidenceAudit",
     "MlpEvidenceBudget",
     "MlpEvidenceJournalState",
+    "MlpEvidenceBankPlan",
     "MlpEvidencePublication",
     "MlpEvidenceReceipt",
     "MlpProjectionVerificationReceipt",
@@ -2243,5 +2766,6 @@ __all__ = [
     "QwenMlpEvidenceError",
     "QwenMlpEvidenceIntegrityError",
     "canonical_capture_plan",
+    "canonical_all_layer_capture_plan",
     "run_capture_manifest",
 ]

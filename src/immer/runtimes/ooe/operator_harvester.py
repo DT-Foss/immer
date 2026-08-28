@@ -65,7 +65,9 @@ QWEN_CONTEXT_EMITTER_SCHEMA = "immer-ooe-qwen-context-emitter/v1"
 
 MAX_CURSOR_BYTES = 4096
 MAX_STATE_NAME_BYTES = 1024
-MAX_STATE_BYTES = 48 * 1024 * 1024
+# Ten full-span Qwen prompts contribute 640 authenticated layer observations.
+# Keep the state bounded while leaving headroom for that complete authority set.
+MAX_STATE_BYTES = 256 * 1024 * 1024
 MAX_CONTEXT_ARRAY_BYTES = 8 * 1024 * 1024
 MAX_DIMENSION = 4096
 MAX_OBSERVATIONS_PER_BATCH = 4096
