@@ -420,6 +420,39 @@ class Qwen38ModelTests(unittest.TestCase):
                 max_seq_len=32,
             )
 
+    def test_explicit_fast_mode_packs_continuation_projection_rows(self) -> None:
+        pager = Qwen38WeightPager(
+            self.source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=2 * 1024**2,
+        )
+        model = StreamedQwen38(
+            self.config,
+            pager,
+            packed_continuation_gemm=True,
+            max_batch_size=1,
+            max_seq_len=16,
+        )
+        try:
+            model.prefill([[1, 4]])
+            before = pager.metrics()
+            stage = model.stage_continuation_block([[9, 7, 6, 5]])
+            after = pager.metrics()
+
+            self.assertEqual(tuple(stage.hidden.shape), (1, 4, self.config.dim))
+            self.assertGreater(
+                after["packed_linear_calls"],
+                before["packed_linear_calls"],
+            )
+            self.assertGreater(
+                after["packed_linear_rows"],
+                before["packed_linear_rows"],
+            )
+            model.discard_continuation_block(stage)
+        finally:
+            pager.close()
+
     def test_deltanet_probe_is_passive_and_covers_every_linear_layer(self) -> None:
         token_ids = torch.tensor([[1, 4, 9]])
         baseline, _ = self.model.forward_prefill(token_ids)
@@ -734,6 +767,151 @@ class Qwen38ModelTests(unittest.TestCase):
         finally:
             for pager in pagers:
                 pager.close()
+
+    def test_continuation_prefix_commit_is_bit_exact_and_reads_no_weights(
+        self,
+    ) -> None:
+        tokens = (9, 7, 6, 5)
+        for stage_width in range(2, 5):
+            for commit_width in range(1, stage_width):
+                with self.subTest(
+                    stage_width=stage_width,
+                    commit_width=commit_width,
+                ):
+                    pagers = [
+                        Qwen38WeightPager(
+                            self.source,
+                            device="cpu",
+                            compute_dtype="bfloat16",
+                            max_resident_bytes=2 * 1024**2,
+                        )
+                        for _ in range(2)
+                    ]
+                    block_model, token_model = (
+                        StreamedQwen38(
+                            self.config,
+                            pager,
+                            max_batch_size=1,
+                            max_seq_len=16,
+                        )
+                        for pager in pagers
+                    )
+                    try:
+                        block_model.prefill([[1, 4]])
+                        token_model.prefill([[1, 4]])
+                        stage = block_model.stage_continuation_block(
+                            [tokens[:stage_width]]
+                        )
+                        trace = block_model._pending_block_stage.prefix_trace
+                        self.assertEqual(trace.width, stage_width)
+                        self.assertLess(trace.nbytes, stage.evidence.staged_state_bytes)
+                        expected_rows = []
+                        for token in tokens[:commit_width]:
+                            hidden, _evidence = token_model.decode([[token]])
+                            expected_rows.append(hidden)
+                        expected = torch.cat(expected_rows, dim=1)
+
+                        before = block_model.pager.metrics()
+                        actual, evidence = block_model.commit_continuation_prefix(
+                            stage,
+                            commit_width,
+                        )
+                        after = block_model.pager.metrics()
+
+                        self.assertTrue(torch.equal(actual, expected))
+                        _assert_layer_states_equal(
+                            self,
+                            block_model._layer_states,
+                            token_model._layer_states,
+                        )
+                        self.assertEqual(block_model.next_position, 2 + commit_width)
+                        self.assertEqual(evidence.input_token_ids, (tokens[:commit_width],))
+                        self.assertEqual(evidence.end_pos, 2 + commit_width)
+                        for key in (
+                            "tensor_reads",
+                            "linear_calls",
+                            "network_or_source_body_bytes",
+                        ):
+                            self.assertEqual(after[key], before[key])
+                        with self.assertRaisesRegex(
+                            Qwen38RuntimeError, "stale or foreign"
+                        ):
+                            block_model.commit_continuation_prefix(stage, 1)
+
+                        continued, _ = block_model.decode([[8]])
+                        expected_continued, _ = token_model.decode([[8]])
+                        self.assertTrue(torch.equal(continued, expected_continued))
+                        _assert_layer_states_equal(
+                            self,
+                            block_model._layer_states,
+                            token_model._layer_states,
+                        )
+                    finally:
+                        for pager in pagers:
+                            pager.close()
+
+    def test_extended_continuation_prefix_matches_direct_stage(self) -> None:
+        pagers = [
+            Qwen38WeightPager(
+                self.source,
+                device="cpu",
+                compute_dtype="bfloat16",
+                max_resident_bytes=2 * 1024**2,
+            )
+            for _ in range(2)
+        ]
+        direct, extended = (
+            StreamedQwen38(
+                self.config,
+                pager,
+                max_batch_size=1,
+                max_seq_len=16,
+            )
+            for pager in pagers
+        )
+        try:
+            direct.prefill([[1, 4]])
+            extended.prefill([[1, 4]])
+            direct_stage = direct.stage_continuation_block([[9, 7, 6, 5]])
+            extended_stage = extended.stage_continuation_block([[9]])
+            for token in (7, 6, 5):
+                extended_stage = extended.extend_continuation_block(
+                    extended_stage, [[token]]
+                )
+
+            direct_hidden, _ = direct.commit_continuation_prefix(direct_stage, 2)
+            extended_hidden, _ = extended.commit_continuation_prefix(
+                extended_stage, 2
+            )
+
+            self.assertTrue(torch.equal(direct_hidden, extended_hidden))
+            _assert_layer_states_equal(
+                self,
+                direct._layer_states,
+                extended._layer_states,
+            )
+        finally:
+            for pager in pagers:
+                pager.close()
+
+    def test_failed_prefix_reconstruction_consumes_stage_and_preserves_base(self) -> None:
+        self.model.prefill([[1, 4]])
+        base = _clone_layer_states(self.model._layer_states)
+        stage = self.model.stage_continuation_block([[9, 7, 6, 5]])
+
+        with mock.patch.object(
+            qwen_model_module,
+            "recurrent_gated_delta_rule",
+            side_effect=RuntimeError("prefix recurrence failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "prefix recurrence failed"):
+                self.model.commit_continuation_prefix(stage, 2)
+
+        self.assertIsNone(self.model._pending_block_stage)
+        self.assertEqual(self.model.next_position, 2)
+        _assert_layer_states_equal(self, self.model._layer_states, base)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+            self.model.commit_continuation_prefix(stage, 1)
 
     def test_continuation_block_stale_and_failure_paths_preserve_base_state(
         self,
@@ -1238,6 +1416,104 @@ class Qwen38ModelTests(unittest.TestCase):
                         finally:
                             for pager in pagers:
                                 pager.close()
+        finally:
+            source.close()
+
+    def test_prefix_commit_preserves_graft_and_native_sinkhorn_state(self) -> None:
+        from immer.runtimes.qwen3_8.native_crsa import (
+            NativePrefixSinkhornOperatorObserver,
+            Qwen38NativeHeadCrsa,
+        )
+
+        config = _official_topology_tiny_config()
+        root = self.root / "prefix-runtime-modes"
+        root.mkdir()
+        save_file(_tiny_weights(config), root / "model.safetensors")
+        source = Streamer.from_local(root, budget_mb=64, use_cache=False)
+        try:
+            for mode in ("stable", "native-prefix-sinkhorn"):
+                with self.subTest(mode=mode):
+                    pagers = [
+                        Qwen38WeightPager(
+                            source,
+                            device="cpu",
+                            compute_dtype="bfloat16",
+                            max_resident_bytes=2 * 1024**2,
+                        )
+                        for _ in range(2)
+                    ]
+                    head_rows = [[], []]
+                    operator_rows = [[], []]
+
+                    def build(index: int, pager: Qwen38WeightPager):
+                        kwargs = {}
+                        if mode == "stable":
+                            kwargs = {
+                                "graft": Qwen38StableCrsaGraft(
+                                    mode="crsa", alpha=0.1
+                                ),
+                                "graft_layer": 27,
+                            }
+                        else:
+                            kwargs = {
+                                "native_head_crsa": Qwen38NativeHeadCrsa(alpha=0.1),
+                                "native_head_crsa_observer": head_rows[index].append,
+                                "native_prefix_sinkhorn_operator_observer": (
+                                    NativePrefixSinkhornOperatorObserver(
+                                        operator_rows[index].append,
+                                        max_positions=4,
+                                    )
+                                ),
+                            }
+                        return StreamedQwen38(
+                            config,
+                            pager,
+                            max_batch_size=1,
+                            max_seq_len=16,
+                            **kwargs,
+                        )
+
+                    block, tokenwise = [
+                        build(index, pager) for index, pager in enumerate(pagers)
+                    ]
+                    try:
+                        block.prefill([[1, 4]])
+                        tokenwise.prefill([[1, 4]])
+                        head_rows[0].clear()
+                        head_rows[1].clear()
+                        operator_rows[0].clear()
+                        operator_rows[1].clear()
+                        stage = block.stage_continuation_block([[9, 7, 6, 5]])
+                        self.assertEqual(head_rows[0], [])
+                        self.assertEqual(operator_rows[0], [])
+                        expected_rows = [tokenwise.decode([[token]])[0] for token in (9, 7)]
+
+                        actual, _ = block.commit_continuation_prefix(stage, 2)
+
+                        self.assertTrue(
+                            torch.equal(actual, torch.cat(expected_rows, dim=1))
+                        )
+                        _assert_layer_states_equal(
+                            self,
+                            block._layer_states,
+                            tokenwise._layer_states,
+                        )
+                        if mode == "stable":
+                            self.assertTrue(
+                                torch.equal(
+                                    block._graft_history,
+                                    tokenwise._graft_history,
+                                )
+                            )
+                        else:
+                            self.assertEqual(head_rows[0], head_rows[1])
+                            self.assertEqual(
+                                [row.sha256 for row in operator_rows[0]],
+                                [row.sha256 for row in operator_rows[1]],
+                            )
+                    finally:
+                        for pager in pagers:
+                            pager.close()
         finally:
             source.close()
 

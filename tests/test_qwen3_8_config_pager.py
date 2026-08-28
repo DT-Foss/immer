@@ -466,6 +466,56 @@ class Qwen38PagerTests(unittest.TestCase):
         self.assertEqual(metrics["materialized_tensor_bytes"], 0)
         self.assertEqual(metrics["materialized_weight_releases"], 0)
 
+    def test_linear_many_packed_uses_one_gemm_and_restores_row_shapes(self) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        first = torch.tensor([[1.0, 1.0]], dtype=torch.float32)
+        second = torch.tensor([[2.0, -1.0], [0.5, 3.0]], dtype=torch.float32)
+        source = self._source()
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=16,
+        )
+        original_linear = torch.nn.functional.linear
+        kernel_shapes = []
+
+        def observed_linear(x, weight):
+            kernel_shapes.append(tuple(x.shape))
+            return original_linear(x, weight)
+
+        with mock.patch.object(
+            torch.nn.functional,
+            "linear",
+            side_effect=observed_linear,
+        ):
+            actual = pager.linear_many(
+                (first, second),
+                "dense",
+                packed=True,
+            )
+
+        self.assertEqual(kernel_shapes, [(3, 2)])
+        self.assertEqual(tuple(actual[0].shape), (1, 2))
+        self.assertEqual(tuple(actual[1].shape), (2, 2))
+        expected = original_linear(
+            torch.cat((first, second), dim=0).to(torch.bfloat16),
+            torch.tensor(
+                [[1.0, 2.0], [3.0, 4.0]],
+                dtype=torch.bfloat16,
+            ),
+        )
+        self.assertTrue(torch.equal(actual[0], expected[:1]))
+        self.assertTrue(torch.equal(actual[1], expected[1:]))
+        metrics = pager.metrics()
+        self.assertEqual(metrics["linear_calls"], 1)
+        self.assertEqual(metrics["packed_linear_calls"], 1)
+        self.assertEqual(metrics["packed_linear_rows"], 3)
+        self.assertEqual(len(source.raw_calls), 1)
+
     def test_linear_many_releases_materialized_weight_after_kernel_failure(
         self,
     ) -> None:

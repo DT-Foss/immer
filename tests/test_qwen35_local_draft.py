@@ -374,6 +374,37 @@ class Qwen35LocalDraftTests(unittest.TestCase):
         self.assertFalse(metrics.pending)
         self.assertFalse(metrics.poisoned)
 
+    def test_k4_rolling_identical_model_emits_eight_tokens_in_two_waves(self) -> None:
+        baseline = self._model()
+        expected, baseline_evidence = baseline.generate_greedy(
+            [[1, 4]], max_new_tokens=8, head_block_rows=7
+        )
+        target = self._model()
+        draft = self._model()
+        provider = Qwen35K4DraftProvider(draft, head_block_rows=7)
+
+        result = Qwen38K4SpeculativeDecoder(target, provider).generate_rolling(
+            [[1, 4]],
+            max_new_tokens=8,
+            head_block_rows=7,
+        )
+
+        self.assertEqual(result.token_ids, expected)
+        self.assertEqual(len(result.evidence.rounds), 2)
+        self.assertEqual(result.evidence.forward_passes, 3)
+        self.assertLess(
+            result.evidence.forward_passes,
+            baseline_evidence.forward_passes,
+        )
+        self.assertEqual(provider.committed_history, (1, 4, *expected))
+        self._assert_model_state_equal(target, baseline)
+        self._assert_model_state_equal(draft, baseline)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.accepted_prefix_3, 2)
+        self.assertEqual(metrics.reconcile_calls, 2)
+        self.assertEqual(metrics.restaged_blocks, 0)
+        self.assertEqual(metrics.committed_tokens, 8)
+
     def test_k4_proposal_is_opaque_and_does_not_move_committed_cursor(self) -> None:
         draft = self._model()
         provider = Qwen35K4DraftProvider(draft, head_block_rows=7)
@@ -430,6 +461,65 @@ class Qwen35LocalDraftTests(unittest.TestCase):
                     metrics.restaged_blocks,
                     int(1 < len(delta) < 4 or (len(delta) == 4 and accepted < 4)),
                 )
+
+    def test_k4_rolling_proposal_commits_zero_to_three_without_weight_replay(
+        self,
+    ) -> None:
+        base = (1, 4)
+        reference_tokens_model = self._model()
+        expected, _ = reference_tokens_model.generate_greedy(
+            [base], max_new_tokens=4, head_block_rows=7
+        )
+        for accepted in range(4):
+            with self.subTest(accepted=accepted):
+                draft = self._model()
+                provider = Qwen35K4DraftProvider(draft, head_block_rows=7)
+                proposal = provider.propose_after(base, expected[0])
+                self.assertEqual(proposal, expected[1:4])
+                self.assertEqual(draft.next_position, len(base) + 1)
+                self.assertEqual(provider.pending_proposal, proposal)
+                committed = (*base, expected[0], *proposal[:accepted])
+
+                before = draft.pager.metrics()
+                provider.reconcile_prefix(committed)
+                after = draft.pager.metrics()
+
+                reference = self._model()
+                reference.prefill([base])
+                for token in committed[len(base) :]:
+                    reference.decode([[token]])
+                self._assert_model_state_equal(draft, reference)
+                self.assertEqual(provider.committed_history, committed)
+                self.assertIsNone(provider.pending_proposal)
+                for key in (
+                    "tensor_reads",
+                    "linear_calls",
+                    "network_or_source_body_bytes",
+                ):
+                    self.assertEqual(after[key], before[key])
+                self.assertEqual(
+                    getattr(provider.metrics(), f"accepted_prefix_{accepted}"),
+                    1,
+                )
+
+    def test_k4_rolling_next_wave_starts_after_target_known_correction(self) -> None:
+        base = (1, 4)
+        baseline = self._model()
+        expected, _ = baseline.generate_greedy(
+            [base], max_new_tokens=6, head_block_rows=7
+        )
+        provider = Qwen35K4DraftProvider(self._model(), head_block_rows=7)
+        first = provider.propose_after(base, expected[0])
+        provider.reconcile_prefix((*base, expected[0], first[0]))
+        history = (*base, expected[0], first[0])
+
+        second = provider.propose_after(history, expected[2])
+
+        self.assertEqual(second, expected[3:6])
+        self.assertEqual(provider.committed_history, (*history, expected[2]))
+        self.assertEqual(provider.model.next_position, len(history) + 1)
+        provider.reconcile_prefix((*history, expected[2]))
+        self.assertIsNone(provider.pending_proposal)
 
     def test_k4_rejected_suffix_never_reaches_the_next_proposal(self) -> None:
         base = (1, 4)

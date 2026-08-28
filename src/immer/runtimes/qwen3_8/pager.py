@@ -116,6 +116,8 @@ class PagerMetrics:
     tensor_reads: int = 0
     row_reads: int = 0
     linear_calls: int = 0
+    packed_linear_calls: int = 0
+    packed_linear_rows: int = 0
     embedding_rows: int = 0
     head_rows: int = 0
     logical_weight_bytes: int = 0
@@ -667,13 +669,15 @@ class Qwen38WeightPager:
         name: str,
         *,
         output_dtype: Any | None = None,
+        packed: bool = False,
     ) -> tuple[Any, ...]:
-        """Apply one matrix sequentially to multiple independent inputs.
+        """Apply one matrix to multiple inputs with sequential or packed GEMMs.
 
         Every input is converted and shape-checked before the checkpoint range
         is read.  The matrix is then materialized exactly once and passed to a
-        separate ``F.linear`` invocation for each input, preserving the kernel
-        shape and numerical result of independent :meth:`linear` calls.
+        separate ``F.linear`` invocation for each input by default. ``packed``
+        concatenates their rows into one physical GEMM for the explicit fast
+        runtime; output shapes and ordering remain unchanged.
         """
 
         with self._lock:
@@ -684,6 +688,8 @@ class Qwen38WeightPager:
                 raise TypeError("inputs must be an iterable") from exc
             if len(values) < 2:
                 raise ValueError("linear_many requires at least two inputs")
+            if not isinstance(packed, bool):
+                raise TypeError("packed must be boolean")
 
             weight_name = self._weight_name(name)
             layout = self._layout(weight_name)
@@ -726,6 +732,29 @@ class Qwen38WeightPager:
                 zero_copy_cpu=True,
             )
             try:
+                if packed:
+                    shapes = [tuple(value.shape) for value in compute_inputs]
+                    counts = [value.numel() // value.shape[-1] for value in compute_inputs]
+                    combined = self.torch.cat(
+                        [value.reshape(-1, input_width) for value in compute_inputs],
+                        dim=0,
+                    )
+                    packed_result = self.torch.nn.functional.linear(combined, weight)
+                    if output_dtype is not None:
+                        packed_result = packed_result.to(dtype=output_dtype)
+                    results = []
+                    offset = 0
+                    for shape, count in zip(shapes, counts, strict=True):
+                        results.append(
+                            packed_result[offset : offset + count].reshape(
+                                (*shape[:-1], layout.shape[0])
+                            )
+                        )
+                        offset += count
+                    self._stats.linear_calls += 1
+                    self._stats.packed_linear_calls += 1
+                    self._stats.packed_linear_rows += sum(counts)
+                    return tuple(results)
                 results: list[Any] = []
                 for compute_x in compute_inputs:
                     result = self.torch.nn.functional.linear(compute_x, weight)

@@ -26,6 +26,9 @@ from .pager import Qwen38WeightPager
 QWEN38_K2_SPECULATIVE_SCHEMA = "immer.qwen3.8-k2-speculative-generation/v1"
 QWEN38_K4_SPECULATIVE_SCHEMA = "immer.qwen3.8-k4-speculative-generation/v1"
 QWEN38_K4_SPECULATIVE_ROUND_SCHEMA = "immer.qwen3.8-k4-speculative-round/v1"
+QWEN38_ROLLING_K4_SPECULATIVE_SCHEMA = (
+    "immer.qwen3.8-rolling-k4-speculative-generation/v1"
+)
 
 ReplayKind = Literal[
     "commit-k2",
@@ -84,6 +87,16 @@ class K4ReconciledDraftProvider(K4DraftProvider, Protocol):
     """Stateful K=4 provider notified only after target-confirmed commits."""
 
     def reconcile(self, history: tuple[int, ...], /) -> None: ...
+
+
+class RollingK4DraftProvider(Protocol):
+    """Propose three tokens after one target-known rolling token."""
+
+    def propose_after(
+        self, history: tuple[int, ...], known_token: int, /
+    ) -> Sequence[int]: ...
+
+    def reconcile_prefix(self, history: tuple[int, ...], /) -> None: ...
 
 
 def _plain_nonnegative(value: object, name: str) -> int:
@@ -767,6 +780,144 @@ class K4SpeculativeGenerationResult:
             raise ValueError("result tokens differ from K=4 generation evidence")
 
 
+@dataclass(frozen=True, slots=True)
+class RollingK4SpeculativeRoundEvidence:
+    round_index: int
+    start_pos: int
+    end_pos: int
+    known_token_id: int
+    proposed_token_ids: tuple[int, ...]
+    target_token_ids: tuple[int, ...]
+    emitted_token_ids: tuple[int, ...]
+    accepted_prefix_length: int
+    correction_token_id: int | None
+    forward_passes: int
+    head_scans: int
+    source_body_bytes: int
+    linear_calls: int
+    provider_guard_bytes: int
+    provider_guard_seconds: float
+    seconds: float
+    state_bytes: int
+    state_committed: bool
+    stopped_on_eos: bool
+
+    def __post_init__(self) -> None:
+        for name in (
+            "round_index",
+            "start_pos",
+            "end_pos",
+            "known_token_id",
+            "accepted_prefix_length",
+            "forward_passes",
+            "head_scans",
+            "source_body_bytes",
+            "linear_calls",
+            "provider_guard_bytes",
+            "state_bytes",
+        ):
+            _plain_nonnegative(getattr(self, name), name)
+        _finite_nonnegative(self.provider_guard_seconds, "provider_guard_seconds")
+        _finite_nonnegative(self.seconds, "seconds")
+        tail = not self.proposed_token_ids and not self.target_token_ids
+        if not tail and (
+            len(self.proposed_token_ids) != 3 or len(self.target_token_ids) != 4
+        ):
+            raise ValueError("rolling K=4 round has the wrong proposal width")
+        if not 0 <= self.accepted_prefix_length <= 3:
+            raise ValueError("rolling accepted prefix is outside K=3")
+        if self.end_pos - self.start_pos != len(self.emitted_token_ids):
+            raise ValueError("rolling cursor delta differs from emitted tokens")
+        if tail:
+            if (
+                self.emitted_token_ids != (self.known_token_id,)
+                or self.accepted_prefix_length != 0
+                or self.correction_token_id is not None
+                or self.head_scans != 0
+                or self.forward_passes not in (0, 1)
+            ):
+                raise ValueError("rolling terminal carry is inconsistent")
+        elif self.forward_passes != 1 or self.head_scans != 1:
+            raise ValueError("rolling wave must use one target pass and head scan")
+        if not isinstance(self.state_committed, bool) or not isinstance(
+            self.stopped_on_eos, bool
+        ):
+            raise TypeError("rolling round state flags must be boolean")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class RollingK4SpeculativeGenerationEvidence:
+    schema: str
+    prompt_token_ids: tuple[int, ...]
+    generated_token_ids: tuple[int, ...]
+    rounds: tuple[RollingK4SpeculativeRoundEvidence, ...]
+    prefill_forward_passes: int
+    forward_passes: int
+    head_scans: int
+    accepted_draft_tokens: int
+    source_body_bytes: int
+    linear_calls: int
+    provider_guard_bytes: int
+    provider_guard_seconds: float
+    seconds: float
+    state_bytes: int
+    stopped_on_eos: bool
+
+    @property
+    def final_state_committed(self) -> bool:
+        return self.rounds[-1].state_committed
+
+    def __post_init__(self) -> None:
+        if self.schema != QWEN38_ROLLING_K4_SPECULATIVE_SCHEMA:
+            raise ValueError("rolling K=4 generation schema is invalid")
+        if not self.prompt_token_ids or not self.rounds:
+            raise ValueError("rolling K=4 generation requires prompt and rounds")
+        emitted = tuple(
+            token for row in self.rounds for token in row.emitted_token_ids
+        )
+        if emitted != self.generated_token_ids:
+            raise ValueError("rolling round tokens differ from generated tokens")
+        if self.forward_passes != self.prefill_forward_passes + sum(
+            row.forward_passes for row in self.rounds
+        ):
+            raise ValueError("rolling target forward accounting is inconsistent")
+        if self.head_scans != 1 + sum(row.head_scans for row in self.rounds):
+            raise ValueError("rolling head-scan accounting is inconsistent")
+        if self.accepted_draft_tokens != sum(
+            row.accepted_prefix_length for row in self.rounds
+        ):
+            raise ValueError("rolling accepted-token accounting is inconsistent")
+        if self.provider_guard_bytes != sum(
+            row.provider_guard_bytes for row in self.rounds
+        ):
+            raise ValueError("rolling provider-byte accounting is inconsistent")
+        if self.stopped_on_eos != self.rounds[-1].stopped_on_eos:
+            raise ValueError("rolling EOS accounting is inconsistent")
+        cursor = len(self.prompt_token_ids)
+        for index, row in enumerate(self.rounds):
+            if row.round_index != index or row.start_pos != cursor:
+                raise ValueError("rolling round cursor chain is inconsistent")
+            cursor = row.end_pos
+            if not row.state_committed and index != len(self.rounds) - 1:
+                raise ValueError("only the final rolling round may discard state")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class RollingK4SpeculativeGenerationResult:
+    token_ids: tuple[int, ...]
+    evidence: RollingK4SpeculativeGenerationEvidence
+
+    def __post_init__(self) -> None:
+        if self.token_ids != self.evidence.generated_token_ids:
+            raise ValueError("rolling result differs from generation evidence")
+
+
 class Qwen38K2SpeculativeDecoder:
     """Generate exact greedy tokens with untrusted K=2 draft proposals."""
 
@@ -1195,6 +1346,382 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             integrity_seconds,
         )
 
+    def _rolling_proposal(
+        self,
+        history: tuple[int, ...],
+        known_token: int,
+    ) -> tuple[tuple[int, int, int], int, float]:
+        missing = object()
+        if (
+            inspect.getattr_static(self.draft_provider, "propose_after", missing)
+            is missing
+        ):
+            raise Qwen38SpeculativeError(
+                "rolling K=4 requires draft_provider.propose_after"
+            )
+        stamp_started = time.perf_counter()
+        before = _model_state_stamp(self.model)
+        integrity_seconds = time.perf_counter() - stamp_started
+        integrity_bytes = self.model.state_bytes
+        failure: Exception | None = None
+        proposal: tuple[int, ...] | None = None
+        try:
+            callback = getattr(self.draft_provider, "propose_after")
+            if not callable(callback):
+                raise TypeError("draft provider propose_after is not callable")
+            raw = callback(history, known_token)
+            proposal = _token_tuple(
+                raw,
+                "rolling K=4 draft proposal",
+                lengths=frozenset({3}),
+            )
+            if any(
+                token < 0 or token >= self.model.config.vocab_size
+                for token in proposal
+            ):
+                raise ValueError("rolling draft token outside checkpoint vocabulary")
+        except Exception as exc:
+            failure = exc
+        stamp_started = time.perf_counter()
+        try:
+            changed = _model_state_stamp(self.model) != before
+        except Exception:
+            changed = True
+        integrity_seconds += time.perf_counter() - stamp_started
+        integrity_bytes += self.model.state_bytes
+        if changed:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError(
+                "rolling draft provider changed target model state"
+            )
+        if failure is not None:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError(
+                f"rolling draft provider failed: {type(failure).__name__}: {failure}"
+            ) from failure
+        assert proposal is not None
+        return (proposal[0], proposal[1], proposal[2]), integrity_bytes, integrity_seconds
+
+    def _reconcile_rolling_provider(
+        self,
+        history: tuple[int, ...],
+    ) -> tuple[int, float]:
+        missing = object()
+        if (
+            inspect.getattr_static(self.draft_provider, "reconcile_prefix", missing)
+            is missing
+        ):
+            raise Qwen38SpeculativeError(
+                "rolling K=4 requires draft_provider.reconcile_prefix"
+            )
+        stamp_started = time.perf_counter()
+        before = _model_state_stamp(self.model)
+        integrity_seconds = time.perf_counter() - stamp_started
+        integrity_bytes = self.model.state_bytes
+        failure: Exception | None = None
+        try:
+            callback = getattr(self.draft_provider, "reconcile_prefix")
+            if not callable(callback):
+                raise TypeError("draft provider reconcile_prefix is not callable")
+            callback(history)
+        except Exception as exc:
+            failure = exc
+        stamp_started = time.perf_counter()
+        try:
+            changed = _model_state_stamp(self.model) != before
+        except Exception:
+            changed = True
+        integrity_seconds += time.perf_counter() - stamp_started
+        integrity_bytes += self.model.state_bytes
+        if changed:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError(
+                "rolling reconciliation changed target model state"
+            )
+        if failure is not None:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError(
+                f"rolling reconciliation failed: {type(failure).__name__}: {failure}"
+            ) from failure
+        return integrity_bytes, integrity_seconds
+
+    def _observe_rolling_final_provider(
+        self,
+        history: tuple[int, ...],
+    ) -> tuple[int, float]:
+        missing = object()
+        if (
+            inspect.getattr_static(self.draft_provider, "observe_final", missing)
+            is missing
+        ):
+            return 0, 0.0
+        stamp_started = time.perf_counter()
+        before = _model_state_stamp(self.model)
+        integrity_seconds = time.perf_counter() - stamp_started
+        integrity_bytes = self.model.state_bytes
+        failure: Exception | None = None
+        try:
+            callback = getattr(self.draft_provider, "observe_final")
+            if not callable(callback):
+                raise TypeError("draft provider observe_final is not callable")
+            callback(history)
+        except Exception as exc:
+            failure = exc
+        stamp_started = time.perf_counter()
+        try:
+            changed = _model_state_stamp(self.model) != before
+        except Exception:
+            changed = True
+        integrity_seconds += time.perf_counter() - stamp_started
+        integrity_bytes += self.model.state_bytes
+        if changed:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError(
+                "rolling final observer changed target model state"
+            )
+        if failure is not None:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError(
+                f"rolling final observer failed: {type(failure).__name__}: {failure}"
+            ) from failure
+        return integrity_bytes, integrity_seconds
+
+    def generate_rolling(
+        self,
+        prompt_token_ids: object,
+        *,
+        max_new_tokens: int = 1,
+        eos_token_ids: Iterable[int] = (),
+        head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
+        retain_final_state: bool = True,
+    ) -> RollingK4SpeculativeGenerationResult:
+        """Generate with one target-known token plus three speculative drafts."""
+
+        if (
+            isinstance(max_new_tokens, bool)
+            or not isinstance(max_new_tokens, int)
+            or max_new_tokens <= 0
+        ):
+            raise ValueError("max_new_tokens must be a positive integer")
+        if (
+            isinstance(head_block_rows, bool)
+            or not isinstance(head_block_rows, int)
+            or head_block_rows <= 0
+        ):
+            raise ValueError("head_block_rows must be a positive integer")
+        if not isinstance(retain_final_state, bool):
+            raise TypeError("retain_final_state must be a boolean")
+        prompt_tensor = self.model._token_tensor(prompt_token_ids)
+        if tuple(prompt_tensor.shape[:1]) != (1,):
+            raise ValueError("rolling K=4 generation requires batch size one")
+        prompt = tuple(
+            int(value)
+            for value in prompt_tensor[0].detach().to(device="cpu").tolist()
+        )
+        if len(prompt) + max_new_tokens > self.model.max_seq_len:
+            raise ValueError("generation would exceed max_seq_len")
+        if isinstance(eos_token_ids, (str, bytes)):
+            raise TypeError("eos_token_ids must be an iterable of integers")
+        eos: set[int] = set()
+        try:
+            for raw in eos_token_ids:
+                if isinstance(raw, bool) or not isinstance(raw, numbers.Integral):
+                    raise TypeError("eos_token_ids must contain integers")
+                eos.add(int(raw))
+        except TypeError as exc:
+            if str(exc) == "eos_token_ids must contain integers":
+                raise
+            raise TypeError("eos_token_ids must be iterable") from exc
+        if any(token < 0 or token >= self.model.config.vocab_size for token in eos):
+            raise ValueError("EOS token outside checkpoint vocabulary")
+
+        source = self.model.pager.source
+        source_start = _owner_metric(source, "network_or_source_body_bytes")
+        linears_start = _owner_metric(self.model.pager, "linear_calls")
+        started = time.perf_counter()
+        hidden, prefill_evidence = self.model.prefill(
+            [prompt], reset=True, tokenwise=False
+        )
+        seed = self._scan(hidden[:, -1:], block_rows=head_block_rows)
+        if len(seed) != 1:
+            raise Qwen38SpeculativeError("rolling seed scan returned wrong width")
+        pending_token = seed[0]
+        generated: list[int] = []
+        rounds: list[RollingK4SpeculativeRoundEvidence] = []
+        stopped = False
+
+        while len(generated) < max_new_tokens and not stopped:
+            remaining = max_new_tokens - len(generated)
+            round_index = len(rounds)
+            start_pos = self.model.next_position
+            if pending_token in eos or remaining == 1:
+                round_source = _owner_metric(
+                    source, "network_or_source_body_bytes"
+                )
+                round_linears = _owner_metric(self.model.pager, "linear_calls")
+                round_started = time.perf_counter()
+                commit = retain_final_state
+                if commit:
+                    hidden, _tail_evidence = self.model.decode([[pending_token]])
+                stopped = pending_token in eos
+                emitted = (pending_token,)
+                final_guard_bytes, final_guard_seconds = (
+                    self._observe_rolling_final_provider(
+                        (*prompt, *generated, *emitted)
+                    )
+                )
+                rounds.append(
+                    RollingK4SpeculativeRoundEvidence(
+                        round_index=round_index,
+                        start_pos=start_pos,
+                        end_pos=start_pos + 1,
+                        known_token_id=pending_token,
+                        proposed_token_ids=(),
+                        target_token_ids=(),
+                        emitted_token_ids=emitted,
+                        accepted_prefix_length=0,
+                        correction_token_id=None,
+                        forward_passes=int(commit),
+                        head_scans=0,
+                        source_body_bytes=(
+                            _owner_metric(source, "network_or_source_body_bytes")
+                            - round_source
+                        ),
+                        linear_calls=(
+                            _owner_metric(self.model.pager, "linear_calls")
+                            - round_linears
+                        ),
+                        provider_guard_bytes=final_guard_bytes,
+                        provider_guard_seconds=final_guard_seconds,
+                        seconds=time.perf_counter() - round_started,
+                        state_bytes=self.model.state_bytes,
+                        state_committed=commit,
+                        stopped_on_eos=stopped,
+                    )
+                )
+                generated.extend(emitted)
+                continue
+
+            round_source = _owner_metric(source, "network_or_source_body_bytes")
+            round_linears = _owner_metric(self.model.pager, "linear_calls")
+            round_started = time.perf_counter()
+            proposal, guard_bytes, guard_seconds = self._rolling_proposal(
+                (*prompt, *generated),
+                pending_token,
+            )
+            stage = self.model.stage_continuation_block(
+                [[pending_token, *proposal]]
+            )
+            try:
+                targets = self._scan(stage.hidden, block_rows=head_block_rows)
+                if len(targets) != 4:
+                    raise Qwen38SpeculativeError(
+                        "rolling target scan returned wrong width"
+                    )
+            except Exception:
+                try:
+                    self.model.discard_continuation_block(stage)
+                except Exception:
+                    pass
+                raise
+            accepted = 0
+            while accepted < 3 and proposal[accepted] == targets[accepted]:
+                accepted += 1
+            accepted = min(accepted, remaining - 1)
+            eos_offset = next(
+                (
+                    index
+                    for index, token in enumerate(proposal[:accepted])
+                    if token in eos
+                ),
+                None,
+            )
+            if eos_offset is not None:
+                accepted = eos_offset + 1
+            emitted = (pending_token, *proposal[:accepted])
+            stopped = eos_offset is not None
+            terminal = stopped or len(emitted) == remaining
+            state_committed = retain_final_state or not terminal
+            if state_committed:
+                width = len(emitted)
+                if width == 4:
+                    hidden, _state_evidence = self.model.commit_continuation_block(
+                        stage
+                    )
+                else:
+                    hidden, _state_evidence = self.model.commit_continuation_prefix(
+                        stage,
+                        width,
+                    )
+            else:
+                self.model.discard_continuation_block(stage)
+            reconcile_bytes, reconcile_seconds = self._reconcile_rolling_provider(
+                (*prompt, *generated, *emitted)
+            )
+            guard_bytes += reconcile_bytes
+            guard_seconds += reconcile_seconds
+            correction = None if terminal else targets[accepted]
+            rounds.append(
+                RollingK4SpeculativeRoundEvidence(
+                    round_index=round_index,
+                    start_pos=start_pos,
+                    end_pos=start_pos + len(emitted),
+                    known_token_id=pending_token,
+                    proposed_token_ids=proposal,
+                    target_token_ids=(targets[0], targets[1], targets[2], targets[3]),
+                    emitted_token_ids=emitted,
+                    accepted_prefix_length=accepted,
+                    correction_token_id=correction,
+                    forward_passes=1,
+                    head_scans=1,
+                    source_body_bytes=(
+                        _owner_metric(source, "network_or_source_body_bytes")
+                        - round_source
+                    ),
+                    linear_calls=(
+                        _owner_metric(self.model.pager, "linear_calls")
+                        - round_linears
+                    ),
+                    provider_guard_bytes=guard_bytes,
+                    provider_guard_seconds=guard_seconds,
+                    seconds=time.perf_counter() - round_started,
+                    state_bytes=self.model.state_bytes,
+                    state_committed=state_committed,
+                    stopped_on_eos=stopped,
+                )
+            )
+            generated.extend(emitted)
+            if correction is not None:
+                pending_token = correction
+
+        evidence = RollingK4SpeculativeGenerationEvidence(
+            schema=QWEN38_ROLLING_K4_SPECULATIVE_SCHEMA,
+            prompt_token_ids=prompt,
+            generated_token_ids=tuple(generated),
+            rounds=tuple(rounds),
+            prefill_forward_passes=len(prefill_evidence),
+            forward_passes=len(prefill_evidence)
+            + sum(row.forward_passes for row in rounds),
+            head_scans=1 + sum(row.head_scans for row in rounds),
+            accepted_draft_tokens=sum(
+                row.accepted_prefix_length for row in rounds
+            ),
+            source_body_bytes=(
+                _owner_metric(source, "network_or_source_body_bytes") - source_start
+            ),
+            linear_calls=(
+                _owner_metric(self.model.pager, "linear_calls") - linears_start
+            ),
+            provider_guard_bytes=sum(row.provider_guard_bytes for row in rounds),
+            provider_guard_seconds=sum(
+                row.provider_guard_seconds for row in rounds
+            ),
+            seconds=time.perf_counter() - started,
+            state_bytes=self.model.state_bytes,
+            stopped_on_eos=stopped,
+        )
+        return RollingK4SpeculativeGenerationResult(tuple(generated), evidence)
+
     def _single_round_k4(
         self,
         hidden: torch.Tensor,
@@ -1530,6 +2057,7 @@ __all__ = [
     "DraftProvider",
     "K4DraftProvider",
     "K4ReconciledDraftProvider",
+    "RollingK4DraftProvider",
     "K2SpeculativeGenerationEvidence",
     "K2SpeculativeGenerationResult",
     "K2SpeculativeRoundEvidence",
@@ -1537,9 +2065,13 @@ __all__ = [
     "K4SpeculativeGenerationEvidence",
     "K4SpeculativeGenerationResult",
     "K4SpeculativeRoundEvidence",
+    "RollingK4SpeculativeGenerationEvidence",
+    "RollingK4SpeculativeGenerationResult",
+    "RollingK4SpeculativeRoundEvidence",
     "QWEN38_K2_SPECULATIVE_SCHEMA",
     "QWEN38_K4_SPECULATIVE_ROUND_SCHEMA",
     "QWEN38_K4_SPECULATIVE_SCHEMA",
+    "QWEN38_ROLLING_K4_SPECULATIVE_SCHEMA",
     "Qwen38K2SpeculativeDecoder",
     "Qwen38K4SpeculativeDecoder",
     "Qwen38SpeculativeError",

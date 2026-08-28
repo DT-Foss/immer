@@ -28,11 +28,13 @@ from .kernels import (
     DeltaNetState,
     full_attention_core,
     gated_delta_net_core,
+    recurrent_gated_delta_rule,
     rms_norm,
     swiglu,
 )
 from .native_crsa import (
     NativeHeadCrsaEvidence,
+    NativePrefixSinkhornOperatorBlock,
     NativePrefixSinkhornOperatorObserver,
     Qwen38NativeHeadCrsa,
 )
@@ -138,6 +140,57 @@ LayerState = AttentionState | DeltaNetState
 
 
 @dataclass(frozen=True, slots=True)
+class _DeltaNetPrefixUpdate:
+    key: torch.Tensor
+    value: torch.Tensor
+    beta: torch.Tensor
+    log_decay: torch.Tensor
+
+    @property
+    def nbytes(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (self.key, self.value, self.beta, self.log_decay)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _LayerPrefixTrace:
+    attention_log_usage: tuple[torch.Tensor | None, ...] = ()
+    delta_updates: tuple[_DeltaNetPrefixUpdate, ...] = ()
+
+    @property
+    def width(self) -> int:
+        return max(len(self.attention_log_usage), len(self.delta_updates))
+
+    @property
+    def nbytes(self) -> int:
+        usage = sum(
+            0 if row is None else row.numel() * row.element_size()
+            for row in self.attention_log_usage
+        )
+        return usage + sum(row.nbytes for row in self.delta_updates)
+
+
+@dataclass(frozen=True, slots=True)
+class _ContinuationPrefixTrace:
+    width: int
+    layers: tuple[_LayerPrefixTrace, ...]
+    graft_histories: tuple[torch.Tensor | None, ...]
+    native_operator_blocks: tuple[NativePrefixSinkhornOperatorBlock, ...]
+
+    @property
+    def nbytes(self) -> int:
+        layer_bytes = sum(row.nbytes for row in self.layers)
+        graft_bytes = sum(
+            0 if row is None else row.numel() * row.element_size()
+            for row in self.graft_histories
+        )
+        operator_bytes = sum(row.operators.nbytes for row in self.native_operator_blocks)
+        return layer_bytes + graft_bytes + operator_bytes
+
+
+@dataclass(frozen=True, slots=True)
 class StatefulLayerRangeResult:
     """Hidden state, continuation state, and receipts staged by a layer range."""
 
@@ -146,6 +199,7 @@ class StatefulLayerRangeResult:
     graft_history: torch.Tensor | None
     native_head_crsa_evidence: tuple[NativeHeadCrsaEvidence, ...]
     evidence: StatefulLayerRangeEvidence
+    prefix_trace: _ContinuationPrefixTrace | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +240,7 @@ class _PendingStatefulBlock:
     layer_states: tuple[LayerState | None, ...]
     graft_history: torch.Tensor | None
     native_head_crsa_evidence: tuple[NativeHeadCrsaEvidence, ...]
+    prefix_trace: _ContinuationPrefixTrace
     runtime_identity: str
 
 
@@ -221,6 +276,7 @@ class StreamedQwen38:
         layer_boundary_stages: Sequence[str] | None = None,
         layer_boundary_layers: Sequence[int] | None = None,
         mlp_sparse_executor: Any | None = None,
+        packed_continuation_gemm: bool = False,
         max_batch_size: int = 8,
         max_seq_len: int = 4096,
     ) -> None:
@@ -242,6 +298,8 @@ class StreamedQwen38:
             raise ValueError("max_seq_len must be a positive integer")
         if max_seq_len > config.max_position_embeddings:
             raise ValueError("max_seq_len exceeds the checkpoint context bound")
+        if not isinstance(packed_continuation_gemm, bool):
+            raise TypeError("packed_continuation_gemm must be boolean")
         if graft is not None and native_head_crsa is not None:
             raise ValueError(
                 "hidden graft and native Head-CRSA intervention are mutually exclusive"
@@ -373,6 +431,7 @@ class StreamedQwen38:
         self.layer_boundary_stages = tuple(selected_boundary_stages)
         self.layer_boundary_layers = selected_boundary_layers
         self.mlp_sparse_executor = mlp_sparse_executor
+        self.packed_continuation_gemm = packed_continuation_gemm
         self.mlp_sparse_last_trace: Any | None = None
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
@@ -570,6 +629,7 @@ class StreamedQwen38:
             "max_seq_len": self.max_seq_len,
             "max_position_embeddings": self.config.max_position_embeddings,
             "state_policy": "native-kv+deltanet-transactional/v1",
+            "packed_continuation_gemm": self.packed_continuation_gemm,
         }
         transport_execution = {
             "source_kind": source_kind,
@@ -1391,7 +1451,11 @@ class StreamedQwen38:
 
         if len(hidden) == 1:
             return (self.pager.linear(hidden[0], name),)
-        return self.pager.linear_many(hidden, name)
+        return self.pager.linear_many(
+            hidden,
+            name,
+            packed=self.packed_continuation_gemm,
+        )
 
     def _norm_token_rows(
         self,
@@ -1428,7 +1492,14 @@ class StreamedQwen38:
         state: AttentionState | None,
         start_pos: int,
         native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None],
-    ) -> tuple[tuple[torch.Tensor, ...], AttentionState]:
+        native_prefix_sinkhorn_operator_observer: (
+            NativePrefixSinkhornOperatorObserver | None
+        ) = None,
+    ) -> tuple[
+        tuple[torch.Tensor, ...],
+        AttentionState,
+        _LayerPrefixTrace,
+    ]:
         """Run exact one-token attention recurrence with weight-once projections."""
 
         base = f"model.language_model.layers.{layer}.self_attn"
@@ -1444,6 +1515,7 @@ class StreamedQwen38:
             else None
         )
         mixed_rows: list[torch.Tensor] = []
+        prefix_usage: list[torch.Tensor | None] = []
         next_state = state
         try:
             for offset, row in enumerate(hidden):
@@ -1474,7 +1546,7 @@ class StreamedQwen38:
                         native_head_crsa_observer if intervention is not None else None
                     ),
                     native_prefix_sinkhorn_operator_observer=(
-                        self.native_prefix_sinkhorn_operator_observer
+                        native_prefix_sinkhorn_operator_observer
                         if intervention is not None
                         else None
                     ),
@@ -1485,13 +1557,16 @@ class StreamedQwen38:
                     rms_norm_eps=self.config.rms_norm_eps,
                 )
                 mixed_rows.append(mixed)
+                prefix_usage.append(next_state.crsa_log_usage)
         finally:
             del projected_query_gate, projected_key, projected_value
             del q_norm_weight, k_norm_weight
         if not isinstance(next_state, AttentionState):  # pragma: no cover - kernel.
             raise Qwen38RuntimeError("continuation full attention returned no state")
         projected = self._linear_token_rows(tuple(mixed_rows), f"{base}.o_proj")
-        return projected, next_state
+        return projected, next_state, _LayerPrefixTrace(
+            attention_log_usage=tuple(prefix_usage)
+        )
 
     def _full_attention_k2_pair(
         self,
@@ -1501,17 +1576,27 @@ class StreamedQwen38:
         state: AttentionState | None,
         start_pos: int,
         native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None],
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor], AttentionState]:
+        native_prefix_sinkhorn_operator_observer: (
+            NativePrefixSinkhornOperatorObserver | None
+        ) = None,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        AttentionState,
+        _LayerPrefixTrace,
+    ]:
         """Preserve the K=2 implementation seam over the generic exact path."""
 
-        rows, next_state = self._full_attention_token_rows(
+        rows, next_state, trace = self._full_attention_token_rows(
             hidden,
             layer=layer,
             state=state,
             start_pos=start_pos,
             native_head_crsa_observer=native_head_crsa_observer,
+            native_prefix_sinkhorn_operator_observer=(
+                native_prefix_sinkhorn_operator_observer
+            ),
         )
-        return (rows[0], rows[1]), next_state
+        return (rows[0], rows[1]), next_state, trace
 
     def _linear_attention_token_rows(
         self,
@@ -1519,7 +1604,11 @@ class StreamedQwen38:
         *,
         layer: int,
         state: DeltaNetState | None,
-    ) -> tuple[tuple[torch.Tensor, ...], DeltaNetState]:
+    ) -> tuple[
+        tuple[torch.Tensor, ...],
+        DeltaNetState,
+        _LayerPrefixTrace,
+    ]:
         """Run exact one-token DeltaNet recurrence from one weight pass."""
 
         base = f"model.language_model.layers.{layer}.linear_attn"
@@ -1538,6 +1627,7 @@ class StreamedQwen38:
         dt_bias = self._control(f"{base}.dt_bias")
         norm_weight = self._control(f"{base}.norm.weight", dtype=hidden[0].dtype)
         mixed_rows: list[torch.Tensor] = []
+        updates: list[_DeltaNetPrefixUpdate] = []
         next_state = state
         try:
             for offset in range(len(hidden)):
@@ -1557,6 +1647,16 @@ class StreamedQwen38:
                     state=next_state,
                     rms_norm_eps=self.config.rms_norm_eps,
                     probe=None,
+                    state_update_observer=lambda key, value, beta, log_decay: (
+                        updates.append(
+                            _DeltaNetPrefixUpdate(
+                                key=key,
+                                value=value,
+                                beta=beta,
+                                log_decay=log_decay,
+                            )
+                        )
+                    ),
                 )
                 mixed_rows.append(mixed)
         finally:
@@ -1565,7 +1665,9 @@ class StreamedQwen38:
         if not isinstance(next_state, DeltaNetState):  # pragma: no cover - kernel.
             raise Qwen38RuntimeError("continuation DeltaNet returned no state")
         projected = self._linear_token_rows(tuple(mixed_rows), f"{base}.out_proj")
-        return projected, next_state
+        return projected, next_state, _LayerPrefixTrace(
+            delta_updates=tuple(updates)
+        )
 
     def _linear_attention_k2_pair(
         self,
@@ -1573,15 +1675,19 @@ class StreamedQwen38:
         *,
         layer: int,
         state: DeltaNetState | None,
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor], DeltaNetState]:
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        DeltaNetState,
+        _LayerPrefixTrace,
+    ]:
         """Preserve the K=2 implementation seam over the generic exact path."""
 
-        rows, next_state = self._linear_attention_token_rows(
+        rows, next_state, trace = self._linear_attention_token_rows(
             hidden,
             layer=layer,
             state=state,
         )
-        return (rows[0], rows[1]), next_state
+        return (rows[0], rows[1]), next_state, trace
 
     def _mlp_token_rows(
         self,
@@ -1626,7 +1732,14 @@ class StreamedQwen38:
         state: LayerState | None,
         start_pos: int,
         native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None],
-    ) -> tuple[tuple[torch.Tensor, ...], LayerState]:
+        native_prefix_sinkhorn_operator_observer: (
+            NativePrefixSinkhornOperatorObserver | None
+        ) = None,
+    ) -> tuple[
+        tuple[torch.Tensor, ...],
+        LayerState,
+        _LayerPrefixTrace,
+    ]:
         """Apply one layer tokenwise while reading every checkpoint tensor once."""
 
         prefix = f"model.language_model.layers.{layer}"
@@ -1638,17 +1751,20 @@ class StreamedQwen38:
         if self.config.is_full_attention(layer):
             if state is not None and not isinstance(state, AttentionState):
                 raise Qwen38RuntimeError("full-attention layer received DeltaNet state")
-            mixed, next_state = self._full_attention_token_rows(
+            mixed, next_state, prefix_trace = self._full_attention_token_rows(
                 mixed_input,
                 layer=layer,
                 state=state,
                 start_pos=start_pos,
                 native_head_crsa_observer=native_head_crsa_observer,
+                native_prefix_sinkhorn_operator_observer=(
+                    native_prefix_sinkhorn_operator_observer
+                ),
             )
         else:
             if state is not None and not isinstance(state, DeltaNetState):
                 raise Qwen38RuntimeError("linear-attention layer received KV state")
-            mixed, next_state = self._linear_attention_token_rows(
+            mixed, next_state, prefix_trace = self._linear_attention_token_rows(
                 mixed_input,
                 layer=layer,
                 state=state,
@@ -1661,9 +1777,14 @@ class StreamedQwen38:
             f"{prefix}.post_attention_layernorm.weight",
         )
         mlp = self._mlp_token_rows(mlp_input, layer=layer)
-        return tuple(
-            after_attention[index] + mlp[index] for index in range(len(hidden))
-        ), next_state
+        return (
+            tuple(
+                after_attention[index] + mlp[index]
+                for index in range(len(hidden))
+            ),
+            next_state,
+            prefix_trace,
+        )
 
     def _forward_layer_k2_pair(
         self,
@@ -1673,7 +1794,14 @@ class StreamedQwen38:
         state: LayerState | None,
         start_pos: int,
         native_head_crsa_observer: Callable[[NativeHeadCrsaEvidence], None],
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor], LayerState]:
+        native_prefix_sinkhorn_operator_observer: (
+            NativePrefixSinkhornOperatorObserver | None
+        ) = None,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        LayerState,
+        _LayerPrefixTrace,
+    ]:
         """Preserve the original K=2 seam over generic weight-once helpers."""
 
         prefix = f"model.language_model.layers.{layer}"
@@ -1685,17 +1813,20 @@ class StreamedQwen38:
         if self.config.is_full_attention(layer):
             if state is not None and not isinstance(state, AttentionState):
                 raise Qwen38RuntimeError("full-attention layer received DeltaNet state")
-            mixed, next_state = self._full_attention_k2_pair(
+            mixed, next_state, prefix_trace = self._full_attention_k2_pair(
                 mixed_input,
                 layer=layer,
                 state=state,
                 start_pos=start_pos,
                 native_head_crsa_observer=native_head_crsa_observer,
+                native_prefix_sinkhorn_operator_observer=(
+                    native_prefix_sinkhorn_operator_observer
+                ),
             )
         else:
             if state is not None and not isinstance(state, DeltaNetState):
                 raise Qwen38RuntimeError("linear-attention layer received KV state")
-            mixed, next_state = self._linear_attention_k2_pair(
+            mixed, next_state, prefix_trace = self._linear_attention_k2_pair(
                 mixed_input,
                 layer=layer,
                 state=state,
@@ -1710,9 +1841,13 @@ class StreamedQwen38:
         )
         mlp = self._mlp_k2_pair(mlp_input, layer=layer)
         return (
-            after_attention[0] + mlp[0],
-            after_attention[1] + mlp[1],
-        ), next_state
+            (
+                after_attention[0] + mlp[0],
+                after_attention[1] + mlp[1],
+            ),
+            next_state,
+            prefix_trace,
+        )
 
     def _forward_layer(
         self,
@@ -1857,6 +1992,7 @@ class StreamedQwen38:
                 "source_revision": source_metrics.get("revision"),
                 "device": str(self.pager.device),
                 "compute_dtype": str(self.pager.compute_dtype),
+                "packed_continuation_gemm": self.packed_continuation_gemm,
                 "delta_probe": None
                 if self.delta_probe is None
                 else id(self.delta_probe),
@@ -1898,6 +2034,27 @@ class StreamedQwen38:
                     # Warning filters may promote warnings to exceptions; a
                     # passive evidence sink must still never roll back or mask
                     # an already committed model forward.
+                    pass
+
+    def _emit_native_prefix_sinkhorn_operator_blocks(
+        self,
+        rows: Iterable[NativePrefixSinkhornOperatorBlock],
+    ) -> None:
+        observer = self.native_prefix_sinkhorn_operator_observer
+        if observer is None:
+            return
+        for row in tuple(rows):
+            try:
+                observer.callback(row)
+            except Exception as exc:
+                try:
+                    warnings.warn(
+                        "native Prefix-Sinkhorn operator observer failed after "
+                        f"commit: {type(exc).__name__}: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                except Exception:
                     pass
 
     def _apply_graft_stateful(
@@ -2269,6 +2426,20 @@ class StreamedQwen38:
         staged = list(states)
         staged_history = graft_history
         staged_native_evidence: list[NativeHeadCrsaEvidence] = []
+        staged_layer_traces = [
+            _LayerPrefixTrace() for _ in range(self.config.n_layers)
+        ]
+        graft_prefix_histories: list[torch.Tensor | None] = [None] * len(rows)
+        staged_operator_blocks: list[NativePrefixSinkhornOperatorBlock] = []
+        public_operator_observer = self.native_prefix_sinkhorn_operator_observer
+        private_operator_observer = (
+            None
+            if public_operator_observer is None
+            else NativePrefixSinkhornOperatorObserver(
+                staged_operator_blocks.append,
+                max_positions=public_operator_observer.max_positions,
+            )
+        )
         source = self.pager.source
         start_bytes = self._metric(source, "network_or_source_body_bytes")
         start_linears = self._metric(self.pager, "linear_calls")
@@ -2279,23 +2450,34 @@ class StreamedQwen38:
                     layer_started = time.perf_counter()
                     layer_bytes = self._metric(source, "network_or_source_body_bytes")
                 if len(rows) == 2:
-                    pair, next_state = self._forward_layer_k2_pair(
+                    pair, next_state, prefix_trace = self._forward_layer_k2_pair(
                         (rows[0], rows[1]),
                         layer=layer,
                         state=states[layer],
                         start_pos=start_pos,
                         native_head_crsa_observer=staged_native_evidence.append,
+                        native_prefix_sinkhorn_operator_observer=(
+                            private_operator_observer
+                        ),
                     )
                     rows = pair
                 else:
-                    rows, next_state = self._forward_layer_token_rows(
+                    rows, next_state, prefix_trace = self._forward_layer_token_rows(
                         rows,
                         layer=layer,
                         state=states[layer],
                         start_pos=start_pos,
                         native_head_crsa_observer=staged_native_evidence.append,
+                        native_prefix_sinkhorn_operator_observer=(
+                            private_operator_observer
+                        ),
                     )
                 staged[layer] = next_state
+                if prefix_trace.width != len(rows):
+                    raise Qwen38RuntimeError(
+                        "continuation prefix trace lost a token row"
+                    )
+                staged_layer_traces[layer] = prefix_trace
                 if self.graft is not None and layer == self.graft_layer:
                     grafted: list[torch.Tensor] = []
                     for offset, row in enumerate(rows):
@@ -2304,6 +2486,7 @@ class StreamedQwen38:
                             staged_history,
                             start_pos=start_pos + offset,
                         )
+                        graft_prefix_histories[offset] = staged_history
                         grafted.append(row)
                     rows = tuple(grafted)
                 self.pager.release()
@@ -2331,6 +2514,12 @@ class StreamedQwen38:
             self.pager.release()
 
         staged_states = tuple(staged)
+        prefix_trace = _ContinuationPrefixTrace(
+            width=len(rows),
+            layers=tuple(staged_layer_traces),
+            graft_histories=tuple(graft_prefix_histories),
+            native_operator_blocks=tuple(staged_operator_blocks),
+        )
         combined = torch.cat(rows, dim=1)
         evidence = StatefulLayerRangeEvidence(
             start_pos=start_pos,
@@ -2351,6 +2540,7 @@ class StreamedQwen38:
             graft_history=staged_history,
             native_head_crsa_evidence=tuple(staged_native_evidence),
             evidence=evidence,
+            prefix_trace=prefix_trace,
         )
 
     def _stage_continuation_k2_pair(
@@ -2372,6 +2562,33 @@ class StreamedQwen38:
             start_pos=start_pos,
             graft_history=graft_history,
             progress=progress,
+        )
+
+    @staticmethod
+    def _merge_prefix_traces(
+        left: _ContinuationPrefixTrace,
+        right: _ContinuationPrefixTrace,
+    ) -> _ContinuationPrefixTrace:
+        if right.width != 1 or len(left.layers) != len(right.layers):
+            raise Qwen38RuntimeError("continuation prefix traces cannot be merged")
+        layers = tuple(
+            _LayerPrefixTrace(
+                attention_log_usage=(
+                    before.attention_log_usage + after.attention_log_usage
+                ),
+                delta_updates=before.delta_updates + after.delta_updates,
+            )
+            for before, after in zip(left.layers, right.layers, strict=True)
+        )
+        if any(row.width != left.width + 1 for row in layers):
+            raise Qwen38RuntimeError("merged continuation trace lost a token row")
+        return _ContinuationPrefixTrace(
+            width=left.width + 1,
+            layers=layers,
+            graft_histories=left.graft_histories + right.graft_histories,
+            native_operator_blocks=(
+                left.native_operator_blocks + right.native_operator_blocks
+            ),
         )
 
     def stage_continuation_block(
@@ -2497,6 +2714,8 @@ class StreamedQwen38:
             evidence=replace(evidence),
             _nonce=object(),
         )
+        if staged.prefix_trace is None:
+            raise Qwen38RuntimeError("continuation stage lacks its prefix trace")
         self._pending_block_stage = _PendingStatefulBlock(
             handle=stage,
             evidence=evidence,
@@ -2504,6 +2723,7 @@ class StreamedQwen38:
             layer_states=staged.layer_states,
             graft_history=staged.graft_history,
             native_head_crsa_evidence=staged.native_head_crsa_evidence,
+            prefix_trace=staged.prefix_trace,
             runtime_identity=runtime_identity,
         )
         return stage
@@ -2595,6 +2815,12 @@ class StreamedQwen38:
                 graft_history=pending.graft_history,
                 progress=progress,
             )
+            if staged.prefix_trace is None:
+                raise Qwen38RuntimeError("continuation extension lacks its prefix trace")
+            prefix_trace = self._merge_prefix_traces(
+                pending.prefix_trace,
+                staged.prefix_trace,
+            )
             final_row = self._norm_token_rows(
                 (staged.hidden,),
                 self.FINAL_NORM_NAME,
@@ -2643,6 +2869,7 @@ class StreamedQwen38:
                 native_head_crsa_evidence=(
                     pending.native_head_crsa_evidence + staged.native_head_crsa_evidence
                 ),
+                prefix_trace=prefix_trace,
                 runtime_identity=runtime_identity,
             )
             return next_stage
@@ -2662,6 +2889,182 @@ class StreamedQwen38:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
         self._pending_block_stage = None
         self.pager.release()
+
+    def _reconstruct_continuation_prefix_states(
+        self,
+        row: StatefulBlockEvidence,
+        final_states: list[LayerState | None],
+        trace: _ContinuationPrefixTrace,
+        *,
+        width: int,
+    ) -> tuple[tuple[LayerState, ...], torch.Tensor | None]:
+        stage_width = row.end_pos - row.start_pos
+        if (
+            trace.width != stage_width
+            or len(trace.layers) != self.config.n_layers
+            or len(trace.graft_histories) != stage_width
+            or not 1 <= width < stage_width
+        ):
+            raise Qwen38RuntimeError("continuation prefix trace is invalid")
+        end_pos = row.start_pos + width
+        candidate = final_states
+        for layer, (base, layer_trace) in enumerate(
+            zip(self._layer_states, trace.layers, strict=True)
+        ):
+            final = candidate[layer]
+            if self.config.is_full_attention(layer):
+                if (
+                    not isinstance(base, AttentionState)
+                    or not isinstance(final, AttentionState)
+                    or len(layer_trace.attention_log_usage) != stage_width
+                    or layer_trace.delta_updates
+                ):
+                    raise Qwen38RuntimeError(
+                        f"attention prefix trace is invalid at layer {layer}"
+                    )
+                usage = layer_trace.attention_log_usage[width - 1]
+                candidate[layer] = AttentionState(
+                    key=final.key[:, :, :end_pos],
+                    value=final.value[:, :, :end_pos],
+                    crsa_log_usage=usage,
+                )
+                continue
+            if (
+                not isinstance(base, DeltaNetState)
+                or not isinstance(final, DeltaNetState)
+                or len(layer_trace.delta_updates) != stage_width
+                or layer_trace.attention_log_usage
+            ):
+                raise Qwen38RuntimeError(
+                    f"DeltaNet prefix trace is invalid at layer {layer}"
+                )
+            recurrent = base.recurrent
+            for update in layer_trace.delta_updates[:width]:
+                _unused, recurrent = recurrent_gated_delta_rule(
+                    update.key,
+                    update.key,
+                    update.value,
+                    update.log_decay,
+                    update.beta,
+                    initial_state=recurrent,
+                )
+            kernel_size = int(final.conv.shape[-1])
+            if stage_width > kernel_size:
+                raise Qwen38RuntimeError("continuation block exceeds Conv state")
+            appended = final.conv[..., -stage_width:]
+            conv = torch.cat((base.conv, appended[..., :width]), dim=-1)[
+                ..., -kernel_size:
+            ].contiguous()
+            candidate[layer] = DeltaNetState(conv=conv, recurrent=recurrent)
+        graft_history = trace.graft_histories[width - 1]
+        if any(not isinstance(state, (AttentionState, DeltaNetState)) for state in candidate):
+            raise Qwen38RuntimeError("continuation prefix reconstruction is incomplete")
+        return tuple(candidate), graft_history  # type: ignore[arg-type]
+
+    def commit_continuation_prefix(
+        self,
+        stage: StatefulBlockStage,
+        width: int,
+    ) -> tuple[torch.Tensor, StatefulEvidence]:
+        """Commit a verified staged prefix without reading model weights again."""
+
+        if not isinstance(stage, StatefulBlockStage):
+            raise TypeError("stage must be a StatefulBlockStage")
+        pending = self._pending_block_stage
+        if pending is None or stage is not pending.handle:
+            raise Qwen38RuntimeError("continuation block stage is stale or foreign")
+        row = pending.evidence
+        stage_width = row.end_pos - row.start_pos
+        if isinstance(width, bool) or not isinstance(width, int):
+            raise TypeError("prefix width must be an integer")
+        if not 1 <= width <= stage_width:
+            raise ValueError("prefix width must lie inside the staged block")
+        if width == stage_width:
+            return self.commit_continuation_block(stage)
+        if self._state_poisoned:
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError("decoder state is poisoned; call reset_state()")
+        if self._next_position != row.start_pos:
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError("continuation block base state changed")
+        if self._state_batch_size != len(row.input_token_ids):
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError("continuation block batch state changed")
+        if len(row.input_token_ids) != 1 or row.end_pos > self.max_seq_len:
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError("continuation block exceeds runtime bounds")
+        if self._continuation_block_runtime_identity() != pending.runtime_identity:
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError("continuation block runtime configuration changed")
+        if tuple(pending.hidden.shape) != (1, stage_width, self.config.dim):
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError("continuation block hidden shape is invalid")
+        if (
+            not pending.hidden.is_floating_point()
+            or not self._on_pager_device(pending.hidden)
+            or pending.hidden.dtype != self.pager.compute_dtype
+        ):
+            self._pending_block_stage = None
+            raise Qwen38RuntimeError(
+                "continuation block hidden device/dtype is invalid"
+            )
+        self._validate_stateful_range_states(
+            pending.layer_states,
+            batch_size=1,
+            sequence_length=0,
+            start_pos=row.end_pos,
+            start_layer=0,
+            graft_history=pending.graft_history,
+        )
+
+        self._pending_block_stage = None
+        started = time.perf_counter()
+        pending_hidden = pending.hidden
+        pending_states = list(pending.layer_states)
+        pending_native_evidence = pending.native_head_crsa_evidence
+        prefix_trace = pending.prefix_trace
+        del pending
+        states, graft_history = self._reconstruct_continuation_prefix_states(
+            row,
+            pending_states,
+            prefix_trace,
+            width=width,
+        )
+        end_pos = row.start_pos + width
+        hidden = pending_hidden[:, :width]
+        self._layer_states = list(states)
+        self._next_position = end_pos
+        self._state_batch_size = 1
+        self._graft_history = graft_history
+        evidence = StatefulEvidence(
+            start_pos=row.start_pos,
+            end_pos=end_pos,
+            input_token_ids=(row.input_token_ids[0][:width],),
+            layers_executed=row.layers_executed,
+            checkpoint_layers=row.checkpoint_layers,
+            complete_layer_stack=row.complete_layer_stack,
+            context_mode="decode",
+            stateful_cache=row.stateful_cache,
+            source_body_bytes=row.source_body_bytes,
+            linear_calls=row.linear_calls,
+            seconds=row.seconds + time.perf_counter() - started,
+            state_bytes=self.state_bytes,
+            graft_mode=row.graft_mode,
+            graft_history_tokens=(
+                0 if graft_history is None else int(graft_history.shape[1])
+            ),
+        )
+        self._emit_native_head_crsa_evidence(
+            row
+            for row in pending_native_evidence
+            if row.query_start + row.query_length <= end_pos
+        )
+        self._emit_native_prefix_sinkhorn_operator_blocks(
+            row
+            for row in prefix_trace.native_operator_blocks
+            if row.query_positions[-1] < end_pos
+        )
+        return hidden, evidence
 
     def commit_continuation_block(
         self, stage: StatefulBlockStage
@@ -2746,6 +3149,9 @@ class StreamedQwen38:
             graft_history_tokens=row.graft_history_tokens,
         )
         self._emit_native_head_crsa_evidence(pending.native_head_crsa_evidence)
+        self._emit_native_prefix_sinkhorn_operator_blocks(
+            pending.prefix_trace.native_operator_blocks
+        )
         return pending.hidden, evidence
 
     def hidden_stateful(

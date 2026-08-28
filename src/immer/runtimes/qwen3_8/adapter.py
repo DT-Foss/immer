@@ -35,6 +35,7 @@ from .fast_mlp import (
 )
 from .model import StreamedQwen38
 from .local_draft import Qwen35K4DraftProvider
+from .markov_draft import FingerprintRollingK4DraftProvider
 from .pager import Qwen38WeightPager
 from .speculative import Qwen38K4SpeculativeDecoder
 from .semantic_state_cache import (
@@ -557,6 +558,7 @@ def _open_local_runtime(
             mlp_sparse_executor=(
                 None if fast_mlp_mount is None else fast_mlp_mount.executor
             ),
+            packed_continuation_gemm=fast_mlp_mount is not None,
         )
         preflight_receipt = model.checkpoint_preflight()
         tokenizer = Qwen38Tokenizer(tokenizer_path, require_official=True)
@@ -647,8 +649,10 @@ class Qwen38CausalChat:
         anchor_cache: SemanticStateAnchorCache | None = None,
         result_cell_code_revision: str | None = None,
         draft_bundle_path: str | Path | None = None,
+        draft_mode: str | None = None,
         draft_source_budget_mb: float = 1_048_576,
         draft_max_resident_bytes: int | None = None,
+        markov_draft_state_path: str | Path | None = None,
         fast_mlp_root: str | Path | None = None,
         fast_mlp_source_budget_mb: float | None = None,
         fast_mlp_max_resident_bytes: int | None = None,
@@ -697,8 +701,25 @@ class Qwen38CausalChat:
             draft_bundle_path, (str, Path)
         ):
             raise TypeError("draft_bundle_path must be a local path or None")
-        if draft_bundle_path is not None and anchor_cache is not None:
-            raise ValueError("K=4 drafting and anchor restore cannot share one request")
+        if draft_mode is not None and draft_mode not in {"qwen35", "markov"}:
+            raise ValueError("draft_mode must be qwen35, markov, or None")
+        if markov_draft_state_path is not None and not isinstance(
+            markov_draft_state_path, (str, Path)
+        ):
+            raise TypeError("markov_draft_state_path must be a local path or None")
+        if draft_mode is None:
+            if draft_bundle_path is not None:
+                draft_mode = "qwen35"
+            elif markov_draft_state_path is not None:
+                draft_mode = "markov"
+        if draft_mode == "qwen35" and draft_bundle_path is None:
+            raise ValueError("qwen35 draft mode requires draft_bundle_path")
+        if draft_mode == "markov" and draft_bundle_path is not None:
+            raise ValueError("markov draft mode does not use a draft bundle")
+        if draft_mode != "markov" and markov_draft_state_path is not None:
+            raise ValueError("markov_draft_state_path requires markov draft mode")
+        if draft_mode is not None and anchor_cache is not None:
+            raise ValueError("rolling drafting and anchor restore cannot share a request")
         if fast_mlp_root is not None and not isinstance(fast_mlp_root, (str, Path)):
             raise TypeError("fast_mlp_root must be a local path or None")
         if fast_mlp_active_layers is not None:
@@ -763,8 +784,14 @@ class Qwen38CausalChat:
             if draft_bundle_path is None
             else Path(draft_bundle_path).expanduser().absolute()
         )
+        self._draft_mode = draft_mode
         self._draft_source_budget_mb = draft_source_budget_mb
         self._draft_max_resident_bytes = draft_max_resident_bytes
+        self._markov_draft_state_path = (
+            None
+            if markov_draft_state_path is None
+            else Path(markov_draft_state_path).expanduser().absolute()
+        )
         self._fast_mlp_paths = (
             None
             if fast_mlp_root is None
@@ -803,11 +830,24 @@ class Qwen38CausalChat:
             "source_budget_mb": self._source_budget_mb,
             "thinking": False,
         }
-        if self._draft_bundle_path is not None:
-            policy["decoding"] = "greedy-k4-draft-verify"
-            policy["draft_model"] = {
-                "repo_id": QWEN35_DRAFTER_REPO_ID,
-                "revision": QWEN35_DRAFTER_REVISION,
+        if self._draft_mode is not None and self._max_new_tokens >= 4:
+            policy["decoding"] = "greedy-rolling-k4-draft-verify"
+            policy["draft_mode"] = self._draft_mode
+            if self._draft_mode == "qwen35":
+                policy["draft_model"] = {
+                    "repo_id": QWEN35_DRAFTER_REPO_ID,
+                    "revision": QWEN35_DRAFTER_REVISION,
+                }
+            else:
+                policy["markov_draft"] = {
+                    "max_history_tokens": 4096,
+                    "max_order": 8,
+                    "persistent": self._markov_draft_state_path is not None,
+                }
+        elif self._draft_mode is not None:
+            policy["draft_fallback"] = {
+                "configured_mode": self._draft_mode,
+                "reason": "max-new-tokens-below-4",
             }
         if self._fast_mlp_paths is not None:
             policy["fast_mlp"] = {
@@ -959,7 +999,7 @@ class Qwen38CausalChat:
         self._last_fast_mlp_evidence = None
         fast_mount = getattr(runtime, "fast_mlp_mount", None)
         fast_before = None if fast_mount is None else fast_mount.metrics()
-        if self._draft_bundle_path is None or self._max_new_tokens < 4:
+        if self._draft_mode is None or self._max_new_tokens < 4:
             generated, evidence = runtime.model.generate_greedy(
                 [list(prompt_ids)],
                 retain_final_state=False,
@@ -973,18 +1013,24 @@ class Qwen38CausalChat:
                 draft_source_body_bytes=0,
             )
             return generated, evidence
-        draft = self._load_draft_locked(runtime)
         eos = tuple(generation_options["eos_token_ids"])
-        provider = Qwen35K4DraftProvider(
-            draft.model,
-            eos_token_ids=eos,
-            head_block_rows=self._head_block_rows,
-        )
+        if self._draft_mode == "qwen35":
+            draft = self._load_draft_locked(runtime)
+            provider: Any = Qwen35K4DraftProvider(
+                draft.model,
+                eos_token_ids=eos,
+                head_block_rows=self._head_block_rows,
+            )
+        else:
+            provider = FingerprintRollingK4DraftProvider(
+                vocab_size=runtime.model.config.vocab_size,
+                state_path=self._markov_draft_state_path,
+            )
         try:
             generated = Qwen38K4SpeculativeDecoder(
                 runtime.model,
                 provider,
-            ).generate(
+            ).generate_rolling(
                 [prompt_ids],
                 max_new_tokens=self._max_new_tokens,
                 eos_token_ids=eos,
@@ -1006,6 +1052,7 @@ class Qwen38CausalChat:
             )
             self._last_draft_evidence = {
                 "accepted_draft_tokens": evidence.accepted_draft_tokens,
+                "mode": self._draft_mode,
                 "draft_source_body_bytes": provider_metrics.source_body_bytes,
                 "draft_linear_calls": provider_metrics.linear_calls,
                 "target_source_body_bytes": evidence.source_body_bytes,
@@ -1022,6 +1069,9 @@ class Qwen38CausalChat:
                 "rounds": len(evidence.rounds),
                 "schema": evidence.schema,
             }
+            provider_record = getattr(provider_metrics, "to_dict", None)
+            if callable(provider_record):
+                self._last_draft_evidence["provider"] = provider_record()
             return generated.token_ids, {
                 "prompt_token_ids": evidence.prompt_token_ids,
                 "generated_token_ids": evidence.generated_token_ids,

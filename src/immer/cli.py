@@ -118,12 +118,14 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             head_block_rows=args.head_block_rows,
             anchor_cache=anchor_cache,
             draft_bundle_path=args.draft_bundle,
+            draft_mode=args.draft_mode,
             draft_source_budget_mb=args.draft_source_budget_mb,
             draft_max_resident_bytes=(
                 None
                 if args.draft_max_resident_mb is None
                 else int(args.draft_max_resident_mb * 1024**2)
             ),
+            markov_draft_state_path=args.markov_draft_state,
             fast_mlp_root=args.fast_mlp,
             fast_mlp_source_budget_mb=args.fast_mlp_source_budget_mb,
             fast_mlp_max_resident_bytes=(
@@ -730,6 +732,15 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--draft-bundle",
         help="optional local causal Qwen3.5-0.8B bundle for exact K=4 drafting",
+    )
+    chat.add_argument(
+        "--draft-mode",
+        choices=("qwen35", "markov"),
+        help="rolling K=4 provider; inferred as qwen35 when --draft-bundle is set",
+    )
+    chat.add_argument(
+        "--markov-draft-state",
+        help="persistent sparse Qwen-token Markov memory",
     )
     chat.add_argument(
         "--fast-mlp",

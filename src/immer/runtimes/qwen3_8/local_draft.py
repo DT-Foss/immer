@@ -521,8 +521,9 @@ class Qwen35K4DraftProvider:
         self._committed_history: tuple[int, ...] | None = None
         self._last_hidden: torch.Tensor | None = None
         self._pending_base: tuple[int, ...] | None = None
-        self._pending_proposal: tuple[int, int, int, int] | None = None
+        self._pending_proposal: tuple[int, ...] | None = None
         self._pending_stage: StatefulBlockStage | None = None
+        self._pending_rolling = False
         self._poisoned = False
         self._closed = False
         self._prefill_calls = 0
@@ -541,7 +542,7 @@ class Qwen35K4DraftProvider:
         return self._committed_history
 
     @property
-    def pending_proposal(self) -> tuple[int, int, int, int] | None:
+    def pending_proposal(self) -> tuple[int, ...] | None:
         return self._pending_proposal
 
     @property
@@ -607,6 +608,7 @@ class Qwen35K4DraftProvider:
             self._pending_base,
             self._pending_proposal,
             id(self._pending_stage),
+            self._pending_rolling,
         )
 
     def _abort(self, message: str, cause: Exception | None = None) -> None:
@@ -618,6 +620,7 @@ class Qwen35K4DraftProvider:
             self._pending_base = None
             self._pending_proposal = None
             self._pending_stage = None
+            self._pending_rolling = False
             self._poisoned = True
             self._seal = self._runtime_stamp()
         error = Qwen35K4DraftProviderError(message)
@@ -713,6 +716,7 @@ class Qwen35K4DraftProvider:
             self._pending_base = committed
             self._pending_proposal = block
             self._pending_stage = stage
+            self._pending_rolling = False
             self._draft_calls += 1
             self._seal = self._runtime_stamp()
             return block
@@ -722,6 +726,143 @@ class Qwen35K4DraftProvider:
             raise
         except Exception as exc:
             self._abort(f"local K=4 draft failed: {type(exc).__name__}: {exc}", exc)
+
+    def propose_after(
+        self,
+        history: tuple[int, ...],
+        known_token: int,
+        /,
+    ) -> tuple[int, int, int]:
+        """Commit one target-known token, then stage three following drafts."""
+
+        self._assert_ready()
+        try:
+            committed = self._history(history, name="rolling draft history")
+            if isinstance(known_token, bool) or not isinstance(
+                known_token, numbers.Integral
+            ):
+                raise TypeError("known rolling token must be an integer")
+            known = int(known_token)
+            if not 0 <= known < self.model.config.vocab_size:
+                raise ValueError("known rolling token is outside the vocabulary")
+            if known in self.eos_token_ids:
+                raise ValueError("cannot draft after a target-known EOS token")
+            if self._pending_stage is not None:
+                self._abort("previous rolling draft was not reconciled")
+            combined = (*committed, known)
+            if len(combined) + 3 > self.model.max_seq_len:
+                raise ValueError("rolling draft block would exceed max_seq_len")
+            if self._committed_history is None:
+                hidden, _evidence = self.model.prefill([combined], reset=True)
+                self._last_hidden = hidden[:, -1:].detach().clone()
+                self._committed_history = combined
+                self._prefill_calls += 1
+                self._committed_tokens += 1
+            else:
+                if committed != self._committed_history:
+                    self._abort("rolling history differs from committed local history")
+                hidden, _evidence = self.model.decode([[known]])
+                self._last_hidden = hidden[:, -1:].detach().clone()
+                self._committed_history = combined
+                self._committed_tokens += 1
+            if self.model.next_position != len(combined):
+                self._abort("rolling draft cursor disagrees with known history")
+            if self._last_hidden is None:
+                self._abort("rolling draft has no target-known hidden state")
+
+            proposal = [self._scan(self._last_hidden[:, -1])]
+            stage = self.model.stage_continuation_block([[proposal[0]]])
+            while len(proposal) < 3:
+                token = (
+                    proposal[-1]
+                    if proposal[-1] in self.eos_token_ids
+                    else self._scan(stage.hidden[:, -1])
+                )
+                proposal.append(token)
+                stage = self.model.extend_continuation_block(stage, [[token]])
+                self._extension_calls += 1
+            block = (proposal[0], proposal[1], proposal[2])
+            self._pending_base = combined
+            self._pending_proposal = block
+            self._pending_stage = stage
+            self._pending_rolling = True
+            self._draft_calls += 1
+            self._seal = self._runtime_stamp()
+            return block
+        except Qwen35K4DraftProviderError as exc:
+            if not self._poisoned:
+                self._abort(str(exc), exc)
+            raise
+        except Exception as exc:
+            self._abort(
+                f"rolling local draft failed: {type(exc).__name__}: {exc}",
+                exc,
+            )
+
+    def reconcile_prefix(self, history: tuple[int, ...], /) -> None:
+        """Commit zero through three target-accepted rolling draft tokens."""
+
+        self._assert_ready()
+        try:
+            committed = self._history(history, name="rolling reconciled history")
+            base = self._pending_base
+            proposal = self._pending_proposal
+            stage = self._pending_stage
+            if (
+                base is None
+                or proposal is None
+                or stage is None
+                or not self._pending_rolling
+                or len(proposal) != 3
+            ):
+                self._abort("reconcile_prefix requires one rolling proposal")
+            if committed[: len(base)] != base:
+                self._abort("rolling reconciliation changed its committed base")
+            delta = committed[len(base) :]
+            if len(delta) > 3 or tuple(delta) != proposal[: len(delta)]:
+                self._abort("rolling reconciliation is not an accepted draft prefix")
+            if any(token in self.eos_token_ids for token in delta[:-1]):
+                self._abort("rolling reconciliation contains tokens after EOS")
+            if self.model.next_position != len(base):
+                self._abort("rolling draft model cursor changed under proposal")
+
+            if not delta:
+                self.model.discard_continuation_block(stage)
+                hidden = self._last_hidden
+                if hidden is None:
+                    self._abort("rolling draft lost its known-token hidden state")
+            elif len(delta) == len(proposal):
+                hidden, _evidence = self.model.commit_continuation_block(stage)
+            else:
+                hidden, _evidence = self.model.commit_continuation_prefix(
+                    stage,
+                    len(delta),
+                )
+            self._pending_base = None
+            self._pending_proposal = None
+            self._pending_stage = None
+            self._pending_rolling = False
+            self._committed_history = committed
+            self._last_hidden = hidden[:, -1:].detach().clone()
+            if (
+                self.model.next_position != len(committed)
+                or self.model._pending_block_stage is not None
+            ):
+                self._abort("rolling draft state has the wrong committed cursor")
+            accepted = len(delta)
+            self._reconcile_calls += 1
+            self._accepted[accepted] += 1
+            self._committed_tokens += accepted
+            self._seal = self._runtime_stamp()
+        except Qwen35K4DraftProviderError as exc:
+            if not self._poisoned:
+                self._abort(str(exc), exc)
+            raise
+        except Exception as exc:
+            self._abort(
+                f"rolling reconciliation failed: {type(exc).__name__}: {exc}",
+                exc,
+            )
 
     def reconcile(self, history: tuple[int, ...], /) -> None:
         """Commit only the target-confirmed delta and destroy rejected suffixes."""
@@ -734,6 +875,8 @@ class Qwen35K4DraftProvider:
             stage = self._pending_stage
             if base is None or proposal is None or stage is None:
                 self._abort("reconcile requires one pending K=4 proposal")
+            if self._pending_rolling:
+                self._abort("rolling draft requires reconcile_prefix")
             if committed[: len(base)] != base:
                 self._abort("reconciled history changed the committed draft prefix")
             delta = committed[len(base) :]
@@ -769,6 +912,7 @@ class Qwen35K4DraftProvider:
             self._pending_base = None
             self._pending_proposal = None
             self._pending_stage = None
+            self._pending_rolling = False
             self._committed_history = committed
             self._last_hidden = hidden[:, -1:].detach().clone()
             if (
@@ -801,6 +945,7 @@ class Qwen35K4DraftProvider:
         self._pending_base = None
         self._pending_proposal = None
         self._pending_stage = None
+        self._pending_rolling = False
         self._poisoned = False
         self._seal = self._runtime_stamp()
 
@@ -815,6 +960,7 @@ class Qwen35K4DraftProvider:
         self._pending_base = None
         self._pending_proposal = None
         self._pending_stage = None
+        self._pending_rolling = False
         self._poisoned = False
         self._closed = True
         self._seal = self._runtime_stamp()

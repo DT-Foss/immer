@@ -1149,6 +1149,10 @@ def gated_delta_net_core(
     conv1d_bias: torch.Tensor | None = None,
     rms_norm_eps: float = 1e-6,
     probe: Callable[[DeltaNetProbe], None] | None = None,
+    state_update_observer: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None
+    ]
+    | None = None,
 ) -> tuple[torch.Tensor, DeltaNetState]:
     """Run Qwen3.5 Gated DeltaNet from individually streamed projections.
 
@@ -1167,6 +1171,8 @@ def gated_delta_net_core(
     value_width = _positive_int(value_head_dim, "value_head_dim")
     if value_heads % key_heads:
         raise ValueError("num_value_heads must be divisible by num_key_heads")
+    if state_update_observer is not None and not callable(state_update_observer):
+        raise TypeError("state_update_observer must be callable or None")
     if (
         qkv.shape[:2] != z.shape[:2]
         or qkv.shape[:2] != b.shape[:2]
@@ -1226,6 +1232,13 @@ def gated_delta_net_core(
     if repetitions > 1:
         query = query.repeat_interleave(repetitions, dim=2)
         key = key.repeat_interleave(repetitions, dim=2)
+    if state_update_observer is not None:
+        state_update_observer(
+            key.detach(),
+            value.detach(),
+            beta.detach(),
+            log_decay.detach(),
+        )
     probe_delta_norms: list[float] | None = [] if probe is not None else None
     core_output, next_recurrent = recurrent_gated_delta_rule(
         query,

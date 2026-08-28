@@ -39,6 +39,20 @@ All notable changes to IMMER are recorded here.
   any shard identity change forces the original full-content hash again. On
   the official Beast bundle, cold verification takes `77.772 s`; the unchanged
   next-process reopen takes `1.198 s`, a `64.898x` startup speedup.
+- Replaced replay-based K=4 chat with a correction-first rolling wave: one
+  target-known token leads three drafts, the target executes all four rows
+  once, and any accepted prefix commits from a compact DeltaNet update trace.
+  Prefix widths `1..4`, a following decode, Graft history, and native
+  Prefix-Sinkhorn usage are bit-exact while partial commit performs zero
+  checkpoint reads and zero linear projections.
+- Added native Qwen-token Markov drafting. Sparse variable-order counts operate
+  directly over token IDs, require no sibling model and no draft weight bytes,
+  learn only target-confirmed prefixes, persist bounded cross-request memory,
+  and remain subordinate to rolling target verification.
+- The explicit Fast-MLP mode now packs the independent K-token projection rows
+  into one physical GEMM per matrix. Exact mode retains the original separate
+  kernels; packed execution is bound into the Fast runtime identity and
+  reports physical packed-call and row counts.
 
 ### Receipt-native Seed v3 and O1 information geometry
 

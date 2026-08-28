@@ -388,11 +388,13 @@ class Qwen38CausalChatTests(unittest.TestCase):
             generated_token_ids=(7, 8, 9, 10),
             forward_passes=2,
             rounds=(object(),),
-            schema="immer.qwen3.8-k4-speculative-generation/v1",
+            schema="immer.qwen3.8-rolling-k4-speculative-generation/v1",
             final_state_committed=False,
         )
         generated = SimpleNamespace(token_ids=(7, 8, 9, 10), evidence=evidence)
-        decoder = SimpleNamespace(generate=lambda *args, **kwargs: generated)
+        decoder = SimpleNamespace(
+            generate_rolling=lambda *args, **kwargs: generated
+        )
         with patch(
             "immer.runtimes.qwen3_8.adapter.Qwen35K4DraftProvider",
             return_value=provider,
@@ -438,6 +440,63 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(len(policy), 64)
         chat.close()
 
+    def test_markov_draft_mode_needs_no_sibling_model_runtime(self) -> None:
+        target = _Runtime()
+        chat = _chat(target, draft_mode="markov", max_new_tokens=4)
+        evidence = SimpleNamespace(
+            accepted_draft_tokens=2,
+            source_body_bytes=100,
+            linear_calls=10,
+            seconds=1.0,
+            state_bytes=456,
+            stopped_on_eos=False,
+            prompt_token_ids=(11, 12),
+            generated_token_ids=(7, 8, 9, 10),
+            forward_passes=3,
+            rounds=(object(),),
+            schema="immer.qwen3.8-rolling-k4-speculative-generation/v1",
+            final_state_committed=False,
+        )
+        generated = SimpleNamespace(token_ids=(7, 8, 9, 10), evidence=evidence)
+        decoder = SimpleNamespace(
+            generate_rolling=lambda *args, **kwargs: generated
+        )
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+            return_value=decoder,
+        ) as decoder_constructor:
+            result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(result.evidence["draft"]["mode"], "markov")
+        self.assertEqual(result.evidence["draft"]["draft_source_body_bytes"], 0)
+        self.assertEqual(result.evidence["draft"]["draft_linear_calls"], 0)
+        self.assertNotIn("draft_bundle", result.evidence)
+        provider = decoder_constructor.call_args.args[1]
+        self.assertEqual(provider.metrics().source_body_bytes, 0)
+        chat.close()
+
+    def test_short_generation_policy_records_plain_greedy_draft_fallback(self) -> None:
+        chat = _chat(_Runtime(), draft_mode="markov", max_new_tokens=3)
+        with patch(
+            "immer.runtimes.qwen3_8.adapter._digest",
+            side_effect=lambda value: value,
+        ):
+            policy = chat._result_cell_generation_policy_sha256()
+
+        self.assertEqual(policy["decoding"], "greedy")
+        self.assertEqual(
+            policy["draft_fallback"],
+            {
+                "configured_mode": "markov",
+                "reason": "max-new-tokens-below-4",
+            },
+        )
+        result = chat.handle(Request("chat", "hello"))
+        self.assertTrue(result.ok, result.reason)
+        self.assertNotIn("draft", result.evidence)
+        chat.close()
+
     def test_failed_k4_fast_request_cannot_leak_counters_into_next_call(self) -> None:
         target = _Runtime()
         target.fast_mlp_mount = _FastMount(cumulative=(0, 7, 27))
@@ -470,12 +529,14 @@ class Qwen38CausalChatTests(unittest.TestCase):
             generated_token_ids=(7, 8, 9, 10),
             forward_passes=2,
             rounds=(object(),),
-            schema="immer.qwen3.8-k4-speculative-generation/v1",
+            schema="immer.qwen3.8-rolling-k4-speculative-generation/v1",
             final_state_committed=False,
         )
         generated = SimpleNamespace(token_ids=(7, 8, 9, 10), evidence=evidence)
         decoder = SimpleNamespace(
-            generate=Mock(side_effect=[RuntimeError("first failed"), generated])
+            generate_rolling=Mock(
+                side_effect=[RuntimeError("first failed"), generated]
+            )
         )
         with patch(
             "immer.runtimes.qwen3_8.adapter.Qwen35K4DraftProvider",
@@ -934,6 +995,37 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(options["fast_mlp_active_layers"], (0, 9, 18, 63))
         self.assertEqual(options["fast_mlp_source_budget_mb"], 8192.0)
         self.assertEqual(options["fast_mlp_max_resident_bytes"], 96 * 1024**2)
+
+    def test_cli_wires_persistent_markov_drafting_without_bundle(self) -> None:
+        qwen = _chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor:
+            with redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--draft-mode",
+                        "markov",
+                        "--markov-draft-state",
+                        "/state/qwen-markov.bin",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["draft_mode"], "markov")
+        self.assertEqual(
+            options["markov_draft_state_path"],
+            "/state/qwen-markov.bin",
+        )
+        self.assertIsNone(options["draft_bundle_path"])
 
 
 if __name__ == "__main__":
