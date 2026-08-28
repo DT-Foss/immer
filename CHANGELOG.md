@@ -33,6 +33,59 @@ All notable changes to IMMER are recorded here.
   Content mode now persists that result and exits before fitting or opening
   holdout tensors when no exact-output reuse signal exists.
 
+### Layer-local Qwen MLP pilot agent
+
+- Added a sealed layer-local Gate×Up range router. Each 64-neuron block is an
+  action; residual OMP chooses four train-only pilot neurons per block, and a
+  tiny ridge kernel maps their current SwiGLU energy to the next sparse weight
+  ranges. A deterministic random-pilot policy, equal-compute static marginal,
+  and per-row oracle are evaluated under the same neuron budget.
+- Completed O1 frontier generation 3 at `90/90`, then captured a second clean
+  `40/40` exact Qwen3.8-27B MLP bank from five label-free prompts absent from
+  generation 1. The frozen p4/k32 agent touches `3,008/17,408` neurons
+  (`17.279%`). Calibration captures `41.425%` activation energy versus
+  `27.755%` static; the external generation captures `39.466%` versus
+  `27.754%` static and `25.890%` random over `2,832` content rows.
+- Added the executable BF16 two-pass kernel: resident pilot rows execute first,
+  then non-pilot rows from the 32 selected blocks are added. Across all
+  `14,499,840` external down-projection values, every full reference output
+  reconstructs bit-exactly. The sparse agent reaches cosine `0.8790` and
+  relative L2 error `0.4995`, versus static `0.7590` and `0.6947`; output error
+  falls `28.10%`. The receipt remains `promoted=false` until its residual
+  correction closes the remaining output gap.
+- Added the train-only diagonal affine residual Crystal. Generation 1 fits one
+  scale and bias per output coordinate (`10,240` scalars per layer), persists
+  the complete `860 KB` fit, and only then opens generation 2. External cosine
+  rises `0.8790→0.94524`, relative L2 falls `0.4995→0.32638`, and reconstructed
+  output energy rises `53.29%→89.49%`. Against equal-compute static, total L2
+  error falls `0.69474→0.32638` (`53.02%`). Runtime correction costs one
+  elementwise multiply and add; promotion still requires later-generation
+  logit and answer parity.
+- Added true selected-row execution to the Qwen pager and mounted the sparse
+  executor directly in `StreamedQwen38` continuation layers. A local
+  `1.426 GB` down-projection transpose bank makes columns row-addressable; a
+  `267 MB` packed pilot bank collapses fixed pilots to three reads. Prefill,
+  unmeasured layers, and Gate/Up/Activated observation automatically retain the
+  exact full MLP. Sparse fit identity is bound into snapshots and staged
+  continuations.
+- Verified physical execution on all eight measured 27B layers. The mounted
+  path reads `18.015%` of MLP weight bytes and every layer is faster:
+  `1.31×–1.94×`; aggregate time falls `3.419→2.289 s` (`1.494×`) and transport
+  falls `4.278 GB→770.7 MB`. Consolidation reduces original Causal range reads
+  from `2,366` on the first sparse layout to `48–58` per layer, plus three
+  packed-pilot and 24–29 transpose reads.
+- Ran the mounted path end-to-end from the same exact native prefix state on
+  all five unseen prompts. Assistant-onset Top-1 is identical `5/5`, mean
+  Top-10 overlap is `8.4/10`, final-hidden cosine averages `0.9466`, and mean
+  relative L2 is `0.3276`. Decode transport falls `243.53 GB→225.99 GB`
+  (`92.80%`); wall time is effectively neutral at current `8/64` coverage
+  (`320.06→318.58 s`, `1.0047×`). Status remains unpromoted until multi-token
+  and verified-answer parity replace the assistant-onset gate.
+- Added a spawn-safe warning-fatal unittest runner that removes Python 3.13's
+  SentencePiece SWIG capsule before interpreter teardown. The complete suite
+  closes `1,899/1,899`, `OK`, `740.286 s`, exit `0`; post-mount affected-file
+  coverage and the final process/runtime gate also close cleanly.
+
 ### Live exact Qwen MLP capture runtime
 
 - Mounted `LiveExactMlpCaptureRunner` directly on the local causal Qwen runtime

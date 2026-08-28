@@ -246,9 +246,7 @@ class Qwen38WeightPager:
                 2 * max_resident_bytes,
             )
             gc_rss_limit_bytes = (
-                rss_headroom
-                if initial_rss is None
-                else initial_rss + rss_headroom
+                rss_headroom if initial_rss is None else initial_rss + rss_headroom
             )
         self.gc_rss_limit_bytes = gc_rss_limit_bytes
         self.close_source = close_source
@@ -582,6 +580,19 @@ class Qwen38WeightPager:
                 raise ValueError("dtype must be float16, bfloat16, or float32")
             target_device = self.device if device is None else self.torch.device(device)
             return self._read_tensor(name, dtype=target_dtype, device=target_device)
+
+    def tensor_rows(self, name: str, row_ids: Iterable[int]) -> Any:
+        """Read arbitrary 2D rows through the active authenticated range plane.
+
+        Row order and repeats are preserved. Consecutive addresses are
+        coalesced, and the resident preflight covers the complete selected-row
+        result rather than each source range independently.
+        """
+
+        with self._lock:
+            self._ensure_open()
+            ids = self._validate_ids(name, row_ids)
+            return self._selected_rows(name, ids)
 
     def linear(
         self,
@@ -931,9 +942,7 @@ class Qwen38WeightPager:
                 if rss >= self.gc_rss_limit_bytes:
                     self._collect_locked("pressure")
                 elif (
-                    self._stats.gc_policy_boundaries
-                    % self.gc_interval_boundaries
-                    == 0
+                    self._stats.gc_policy_boundaries % self.gc_interval_boundaries == 0
                 ):
                     self._collect_locked("interval")
                 else:

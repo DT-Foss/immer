@@ -156,6 +156,69 @@ repeated output payload at all (`0/644` and `0/322` adaptive hits). Candidate
 `k=2` hits are template reuse rather than content-compute savings. The next
 mechanism predicts layer-local Gate×Up ranges instead of exact output payloads.
 
+That range mechanism is now measured. For layer \(\ell\), token \(t\), and
+64-neuron block \(b\), the teacher energy is
+
+\[
+e_{\ell tb}=\sum_{j\in b}
+\left(\operatorname{SiLU}(g_{\ell tj})u_{\ell tj}\right)^2.
+\]
+
+Residual OMP builds a block-local Markov blanket of four pilot neurons. At
+step \(r\), it selects the neuron maximally correlated with the current
+train-only residual, refits the ridge kernel, and repeats. Runtime computes all
+pilots once, chooses the top 32 predicted blocks, and executes the union
+
+\[
+S_{\ell t}=P_\ell\cup\bigcup_{b\in\operatorname{Top32}(\hat e_{\ell t})}b.
+\]
+
+The union has `3,008/17,408` neurons (`17.279%`). On the completely later
+five-prompt generation it captures `39.466%` activation energy versus
+`27.754%` for an equal-compute static layer table and `25.890%` for random
+pilots. The native BF16 kernel executes the pilot contribution and selected
+block residual as two exact passes. Across `14,499,840` external output values,
+cosine is `0.8790` and relative L2 error `0.4995`; the static arm gives
+`0.7590` and `0.6947`. The next formula fits the omitted-output residual using
+generation-1 evidence only.
+
+That correction is the diagonal affine Organ
+
+\[
+\tilde y_{\ell t}=s_\ell\odot \hat y_{\ell t}+b_\ell,
+\]
+
+where each coordinate of \((s_\ell,b_\ell)\) is the closed-form OLS solution
+from generation 1. The fit contains only `2×5,120` scalars per layer (`860 KB`
+for all eight measured layers). Unchanged on generation 2, it raises cosine to
+`0.94524`, lowers relative L2 to `0.32638`, and restores `89.49%` output
+energy. Runtime cost is 5,120 multiplies plus 5,120 additions per layer.
+
+The physical layout closes the compute loop. Gate/Up block rows already lie
+contiguously in the checkpoint. `down_proj` is stored row-major in the opposite
+orientation, so the local causal rail materializes the immutable view
+\(W_{down}^{\mathsf T}\) once. Fixed pilot rows are packed once; dynamic actions
+then read full 64-row blocks and zero the four duplicate pilot positions. The
+executed byte fraction is
+
+\[
+\frac{272\cdot4+32\cdot64}{17,408}=0.180147.
+\]
+
+Across layers `0,9,18,27,36,45,54,63`, measured MLP time drops from
+`3.419 s` to `2.289 s` (`1.494×`) and weight reads from `4.278 GB` to
+`770.7 MB`. The first scattered layout required 2,366 original causal reads;
+packing reduces this to 48–58 per layer without changing the selected action.
+
+Mounted continuation confirms that local layer gains survive the surrounding
+model. Starting from the same exact native prefix state on five unseen prompts,
+the sparse and full decoders choose the same first token `5/5`; mean Top-10
+overlap is `8.4/10` and final-hidden cosine is `0.9466`. With only eight of 64
+layers currently measured, whole-decode time is `320.06 s` full versus
+`318.58 s` sparse, while physical weight transport falls from `243.53 GB` to
+`225.99 GB`. O1 coverage expansion, not another router formula, is now the
+speed bottleneck.
+
 The next selector uses a finite Markov walk rather than one static ranking:
 
 \[

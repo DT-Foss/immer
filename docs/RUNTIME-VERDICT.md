@@ -132,6 +132,35 @@ later requests.
   adaptive reuse ceiling is `0/322`; the hits are shared chat-template rows.
   The runtime therefore closes this cache branch and moves to layer-local
   Gate×Up range actions.
+- The replacement range agent is positive on a genuinely later prompt
+  generation. Four residual-OMP pilots per 64-neuron block plus 32 selected
+  blocks execute `3,008/17,408` neurons. Generation-1 calibration captures
+  `41.425%` activation energy; generation 2 retains `39.466%` over `2,832`
+  content rows, against `27.754%` equal-compute static and `25.890%` random.
+- Its actual BF16 two-pass down projection is verified over `14,499,840`
+  external values. All eight full controls reconstruct bit-exactly. Sparse
+  output cosine is `0.8790` versus static `0.7590`; relative L2 error is
+  `0.4995` versus `0.6947`, a `28.10%` reduction. This is the live sparse draft
+  path. Promotion remains closed until a train-only residual restores the
+  remaining output and end-to-end quality.
+- The residual is now executable: a generation-1 diagonal affine Crystal stores
+  one scale and bias per output coordinate and costs only one Mul+Add pass.
+  Generation-2 cosine reaches `0.94524`, L2 falls to `0.32638`, and output
+  energy reaches `89.49%`. Relative to the equal-compute static router, L2
+  error falls `53.02%`. The remaining gate is later-generation end-to-end
+  logits and verified answers, not another hidden-state proxy.
+- The range path is physically live. Qwen reads fixed pilots from a packed
+  `267 MB` bank, selected Gate/Up blocks through the original `.causal` graph,
+  and selected Down rows through a `1.426 GB` local transpose rail. The eight
+  measured layers read `770.7 MB` instead of `4.278 GB` and execute in
+  `2.289 s` instead of `3.419 s` (`1.494×`). Every individual layer is faster;
+  unmeasured and measurement-active paths remain exact full Qwen.
+- From the same exact committed prefix states, the mounted model preserves
+  assistant-onset Top-1 on all `5/5` unseen prompts and averages `8.4/10`
+  Top-10 overlap. Final-hidden cosine averages `0.9466`. Whole-decode time is
+  currently neutral (`1.0047×`) because only 8/64 layers route sparsely, while
+  decode weight transport already falls `7.20%`. Multi-token answer parity is
+  the promotion gate.
 - The first real five-prompt L27 wave finds one stable transport, `20→8`.
   Held-out residual falls from Identity `0.2373913654` to `0.0248507190`; pair
   selection uses structural and calibration evidence only, before holdout.

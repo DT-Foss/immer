@@ -67,6 +67,28 @@
       ]
     },
     {
+      "name": "Qwen MLP pilot range agent",
+      "role": "layer-local residual-OMP pilot routing and BF16 sparse down-projection",
+      "repository": "https://github.com/DT-Foss/immer",
+      "revision": "package:0.8.0",
+      "status": "integrated verified sparse draft",
+      "integration": "src/immer/runtimes/ooe/mlp_pilot_router.py",
+      "additional_integrations": [
+        "src/immer/runtimes/ooe/mlp_pilot_output.py",
+        "src/immer/runtimes/ooe/mlp_pilot_residual.py",
+        "src/immer/runtimes/ooe/mlp_pilot_runtime.py",
+        "src/immer/runtimes/qwen3_8/pager.py",
+        "src/immer/runtimes/qwen3_8/model.py",
+        "scripts/qwen38_mlp_pilot_router.py",
+        "scripts/qwen38_mlp_pilot_output.py",
+        "scripts/qwen38_mlp_pilot_residual.py",
+        "scripts/qwen38_mlp_pilot_transpose_bank.py",
+        "scripts/qwen38_mlp_pilot_weight_bank.py",
+        "scripts/qwen38_mlp_pilot_runtime_smoke.py",
+        "scripts/qwen38_mlp_pilot_decode_compare.py"
+      ]
+    },
+    {
       "name": "DeepSeek-V4-Flash runtime",
       "role": "retained transport and control laboratory",
       "repository": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731",

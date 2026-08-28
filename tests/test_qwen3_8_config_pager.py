@@ -553,6 +553,13 @@ class Qwen38PagerTests(unittest.TestCase):
             embeddings,
             torch.tensor([[6.0, 7.0], [2.0, 3.0], [6.0, 7.0]]),
         )
+        arbitrary = pager.tensor_rows(
+            "model.language_model.embed_tokens.weight", [2, 0, 2]
+        )
+        torch.testing.assert_close(
+            arbitrary,
+            torch.tensor([[4.0, 5.0], [0.0, 1.0], [4.0, 5.0]]),
+        )
         hidden = torch.tensor([[2.0, 1.0]])
         candidates = pager.candidate_logits(hidden, [3, 2, 0])
         torch.testing.assert_close(candidates, torch.tensor([[-2.0, 3.0, 2.0]]))
@@ -584,7 +591,9 @@ class Qwen38PagerTests(unittest.TestCase):
 
         source = self._source()
         pager = Qwen38WeightPager(source, device="cpu", close_source=True)
-        with mock.patch("immer.runtimes.qwen3_8.pager.gc.collect", return_value=7) as collect:
+        with mock.patch(
+            "immer.runtimes.qwen3_8.pager.gc.collect", return_value=7
+        ) as collect:
             pager.close()
             pager.close()
 

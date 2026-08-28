@@ -32,6 +32,7 @@ are outside the repository record.
 | charged-prefix residual execution | `src/immer/runtimes/ooe/residual_execution.py` |
 | real contextual operator harvesting and demand | `src/immer/runtimes/ooe/operator_harvester.py`, `src/immer/runtimes/ooe/demand_scheduler.py` |
 | living O1/Qwen frontier and idle runner | `src/immer/runtimes/o1_state/cartographer.py`, `scripts/qwen38_o1_cartography.py` |
+| mounted Qwen MLP pilot range agent, physical selected-row rail, and affine residual Crystal | `src/immer/runtimes/ooe/mlp_pilot_router.py`, `src/immer/runtimes/ooe/mlp_pilot_runtime.py`, `src/immer/runtimes/qwen3_8/pager.py`, `scripts/qwen38_mlp_pilot_runtime_smoke.py` |
 | harvested-program algebra admission and execution | `src/immer/runtimes/ooe/harvest_algebra_bridge.py`, `src/immer/runtimes/ooe/harvest_algebra_intelligence.py`, `scripts/ooe_harvest_algebra_benchmark.py` |
 | causal sequence Crystals and prompt-preserving prediction | `src/immer/runtimes/ooe/compute_crystals.py`, `src/immer/runtimes/ooe/contextual_sequence.py`, `scripts/ooe_qwen_sequence_report.py` |
 | consequence-grounded executable language | `src/immer/runtimes/ooe/markov_language.py`, `scripts/ooe_markov_language_benchmark.py` |

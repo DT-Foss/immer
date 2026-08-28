@@ -342,6 +342,84 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(evidence.linear_calls, 31)
         self.assertGreater(evidence.source_body_bytes, 0)
 
+    def test_optional_sparse_mlp_mount_is_decode_only_and_observer_safe(self) -> None:
+        class SparseStub:
+            def __init__(self) -> None:
+                self.calls = []
+                self.trace = {"kind": "sparse-trace"}
+
+            def supports_layer(self, layer: int) -> bool:
+                return layer == 1
+
+            def snapshot_identity(self, *, transport_neutral: bool = False):
+                return {
+                    "layers": [1],
+                    "schema": "test-sparse-executor/v1",
+                    "transport_neutral": transport_neutral,
+                }
+
+            def execute(self, hidden: torch.Tensor, *, layer: int):
+                self.calls.append(("one", layer, tuple(hidden.shape)))
+                return torch.full_like(hidden, 0.125), self.trace
+
+            def execute_many(self, hidden, *, layer: int):
+                rows = tuple(hidden)
+                self.calls.append(("many", layer, len(rows)))
+                return tuple(torch.full_like(row, 0.25) for row in rows), self.trace
+
+        sparse = SparseStub()
+        model = StreamedQwen38(
+            self.config,
+            self.pager,
+            mlp_sparse_executor=sparse,
+            max_batch_size=3,
+            max_seq_len=32,
+        )
+        hidden = torch.ones(1, 1, self.config.dim)
+        before = self.pager.metrics()["linear_calls"]
+        output = model._mlp(hidden, layer=1)
+        self.assertTrue(torch.equal(output, torch.full_like(hidden, 0.125)))
+        self.assertEqual(self.pager.metrics()["linear_calls"], before)
+        self.assertIs(model.mlp_sparse_last_trace, sparse.trace)
+
+        prefill = torch.ones(1, 3, self.config.dim)
+        model._mlp(prefill, layer=1)
+        self.assertEqual(self.pager.metrics()["linear_calls"] - before, 3)
+        self.assertIsNone(model.mlp_sparse_last_trace)
+
+        token_rows = (hidden.clone(), hidden.clone())
+        rows = model._mlp_token_rows(token_rows, layer=1)
+        self.assertTrue(
+            all(torch.equal(row, torch.full_like(row, 0.25)) for row in rows)
+        )
+        self.assertEqual(sparse.calls[-1], ("many", 1, 2))
+
+        observed = []
+        guarded = StreamedQwen38(
+            self.config,
+            self.pager,
+            mlp_sparse_executor=sparse,
+            layer_boundary_observer=lambda _layer, stage, _value: observed.append(
+                stage
+            ),
+            layer_boundary_stages=("mlp.gate", "mlp.output"),
+            layer_boundary_layers=(1,),
+            max_batch_size=3,
+            max_seq_len=32,
+        )
+        calls = len(sparse.calls)
+        guarded._mlp(hidden, layer=1)
+        self.assertEqual(len(sparse.calls), calls)
+        self.assertEqual(observed, ["mlp.gate", "mlp.output"])
+
+        with self.assertRaisesRegex(TypeError, "mlp_sparse_executor"):
+            StreamedQwen38(
+                self.config,
+                self.pager,
+                mlp_sparse_executor=object(),
+                max_seq_len=32,
+            )
+
     def test_deltanet_probe_is_passive_and_covers_every_linear_layer(self) -> None:
         token_ids = torch.tensor([[1, 4, 9]])
         baseline, _ = self.model.forward_prefill(token_ids)
@@ -1974,9 +2052,7 @@ class Qwen38NativePrefixSinkhornOperatorObserverTests(unittest.TestCase):
 
         intervention, logits, base, allowed = self._fixture()
         blocks = []
-        observer = NativePrefixSinkhornOperatorObserver(
-            blocks.append, max_positions=4
-        )
+        observer = NativePrefixSinkhornOperatorObserver(blocks.append, max_positions=4)
         actual, actual_usage, actual_evidence = intervention.route(
             logits,
             base,
@@ -2000,7 +2076,10 @@ class Qwen38NativePrefixSinkhornOperatorObserverTests(unittest.TestCase):
         for position in range(4):
             routed, usage = streaming_prefix_log(
                 logits[
-                    :, intervention.head_indices, position : position + 1, : position + 1
+                    :,
+                    intervention.head_indices,
+                    position : position + 1,
+                    : position + 1,
                 ],
                 intervention.spec,
                 query_start=position,
@@ -2079,7 +2158,9 @@ class Qwen38NativePrefixSinkhornOperatorObserverTests(unittest.TestCase):
                 bounded_rows.append, max_positions=3
             ),
         )
-        self.assertEqual([row.query_positions for row in bounded_rows], [(0,), (1,), (2,)])
+        self.assertEqual(
+            [row.query_positions for row in bounded_rows], [(0,), (1,), (2,)]
+        )
         self.assertTrue(torch.equal(observed, baseline))
         self.assertTrue(torch.equal(observed_usage, usage))
         self.assertEqual(observed_evidence, evidence)

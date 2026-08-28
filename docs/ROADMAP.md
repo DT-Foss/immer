@@ -179,10 +179,30 @@ around every domain that supports it.
   coordinate-independent reuse ceiling. Content-only calibration has zero
   adaptive exact-output repeats; the `116/512` all-row hits are template reuse,
   so the exact-output selector abstains before fit and holdout.
-- [ ] Complete O1 cartography and exact MLP capture for the new deterministic
-  five-prompt label-free cohort, then evaluate layer-local Gate×Up action
-  kernels on genuinely unseen prompts. Exact output caching is closed for this
-  cohort; sparse range selection is the active compute path.
+- [x] Complete O1 cartography `90/90` and a second clean `40/40` exact MLP bank
+  for five label-free unseen prompts. Freeze a layer-local residual-OMP
+  p4/k32 router on generation 1 before opening generation 2: `17.279%` of
+  neurons capture `39.466%` external activation energy versus `27.754%`
+  equal-compute static and `25.890%` random.
+- [x] Execute the frozen sparse route through the real BF16 down projections
+  over all `14,499,840` external values. Cosine rises `0.7590→0.8790`, relative
+  L2 error falls `0.6947→0.4995`, and all eight full-output controls reconstruct
+  bit-exactly.
+- [x] Learn and seal the train-only diagonal affine residual Crystal. On
+  generation 2 it raises cosine `0.8790→0.94524`, lowers L2
+  `0.4995→0.32638`, and restores `89.49%` output energy with only 10,240
+  elementwise operations per layer.
+- [x] Mount the router in `StreamedQwen38` with real selected-row Gate/Up reads,
+  a row-addressable local `down_projᵀ` bank, packed pilot kernels, exact
+  fallback for prefill/unmeasured/observed paths, and snapshot identity.
+  Across all eight measured layers the physical path reads `18.015%` of MLP
+  bytes and accelerates every layer; aggregate speedup is `1.494×`.
+- [x] Compare full and sparse decode from the same exact native prefix state on
+  all five unseen prompts. Assistant-onset Top-1 is `5/5`, mean Top-10 overlap
+  `8.4/10`, and final-hidden cosine `0.9466`; full-decode wall time is neutral
+  at the current eight-layer coverage while bytes fall `7.20%`.
+- [ ] Freeze the router plus residual before a later prompt generation and
+  measure multi-token and verified-answer parity before runtime promotion.
 - [ ] Apply topology-aware Warmth only as a downward charging brake and measure
   redundant-charge suppression without changing authenticated demand.
 - [x] Export the first eight live O1/Atlas controller promotions into an exact

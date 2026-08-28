@@ -219,6 +219,7 @@ class StreamedQwen38:
         layer_boundary_observer: LayerBoundaryObserver | None = None,
         layer_boundary_stages: Sequence[str] | None = None,
         layer_boundary_layers: Sequence[int] | None = None,
+        mlp_sparse_executor: Any | None = None,
         max_batch_size: int = 8,
         max_seq_len: int = 4096,
     ) -> None:
@@ -262,6 +263,30 @@ class StreamedQwen38:
             raise ValueError("layer_boundary_stages require a layer_boundary_observer")
         if layer_boundary_observer is None and layer_boundary_layers is not None:
             raise ValueError("layer_boundary_layers require a layer_boundary_observer")
+        if mlp_sparse_executor is not None:
+            required = (
+                "execute",
+                "execute_many",
+                "snapshot_identity",
+                "supports_layer",
+            )
+            if any(
+                not callable(getattr(mlp_sparse_executor, name, None))
+                for name in required
+            ):
+                raise TypeError("mlp_sparse_executor lacks the runtime contract")
+            identity = mlp_sparse_executor.snapshot_identity(transport_neutral=True)
+            if (
+                not isinstance(identity, dict)
+                or not isinstance(identity.get("layers"), list)
+                or any(
+                    isinstance(layer, bool)
+                    or not isinstance(layer, int)
+                    or not 0 <= layer < config.n_layers
+                    for layer in identity["layers"]
+                )
+            ):
+                raise ValueError("mlp_sparse_executor identity is invalid")
         selected_boundary_stages = (
             ()
             if layer_boundary_observer is None
@@ -346,6 +371,8 @@ class StreamedQwen38:
         self.layer_boundary_observer = layer_boundary_observer
         self.layer_boundary_stages = tuple(selected_boundary_stages)
         self.layer_boundary_layers = selected_boundary_layers
+        self.mlp_sparse_executor = mlp_sparse_executor
+        self.mlp_sparse_last_trace: Any | None = None
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self._layer_states: list[LayerState | None] = [
@@ -489,6 +516,31 @@ class StreamedQwen38:
             "policy": str(getattr(graft, "policy", "unreported")),
         }
 
+    def _mlp_sparse_snapshot_identity(
+        self, *, transport_neutral: bool = False
+    ) -> dict[str, Any]:
+        executor = self.mlp_sparse_executor
+        if executor is None:
+            return {"kind": "none"}
+        identity = executor.snapshot_identity(transport_neutral=transport_neutral)
+        if not isinstance(identity, dict):
+            raise Qwen38SnapshotError("sparse MLP identity is not a mapping")
+        try:
+            canonical = json.loads(
+                json.dumps(
+                    identity,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise Qwen38SnapshotError(
+                "sparse MLP identity is not canonical JSON"
+            ) from exc
+        return {"kind": "pilot-sparse", "identity": canonical}
+
     def _snapshot_identity(self, *, transport_neutral: bool = False) -> dict[str, Any]:
         source = self.pager.source
         source.inventory()
@@ -551,6 +603,9 @@ class StreamedQwen38:
             },
             "execution": execution,
             "graft": self._graft_snapshot_identity(),
+            "mlp_sparse_executor": self._mlp_sparse_snapshot_identity(
+                transport_neutral=transport_neutral
+            ),
             "native_head_crsa": self._native_head_crsa_snapshot_identity(),
         }
 
@@ -1282,7 +1337,36 @@ class StreamedQwen38:
             del conv_weight, a_log, dt_bias, norm_weight
         return self.pager.linear(mixed, f"{base}.out_proj"), next_state
 
+    def _sparse_mlp_allowed(self, layer: int, row_count: int) -> bool:
+        executor = self.mlp_sparse_executor
+        if (
+            executor is None
+            or row_count < 1
+            or row_count > self.MAX_CONTINUATION_BLOCK_WIDTH
+            or not executor.supports_layer(layer)
+        ):
+            return False
+        if self.layer_boundary_observer is None:
+            return True
+        if (
+            self.layer_boundary_layers is not None
+            and layer not in self.layer_boundary_layers
+        ):
+            return True
+        return not any(
+            stage in self.layer_boundary_stages
+            for stage in ("mlp.gate", "mlp.up", "mlp.activated")
+        )
+
     def _mlp(self, hidden: torch.Tensor, *, layer: int) -> torch.Tensor:
+        row_count = hidden.numel() // hidden.shape[-1]
+        if row_count == 1 and self._sparse_mlp_allowed(layer, row_count):
+            output, trace = self.mlp_sparse_executor.execute(hidden, layer=layer)
+            self.mlp_sparse_last_trace = trace
+            output = output.to(device=hidden.device, dtype=hidden.dtype)
+            self._observe_layer_boundary(layer, "mlp.output", output)
+            return output
+        self.mlp_sparse_last_trace = None
         base = f"model.language_model.layers.{layer}.mlp"
         gate = self.pager.linear(hidden, f"{base}.gate_proj")
         self._observe_layer_boundary(layer, "mlp.gate", gate)
@@ -1504,6 +1588,15 @@ class StreamedQwen38:
         *,
         layer: int,
     ) -> tuple[torch.Tensor, ...]:
+        row_count = sum(row.numel() // row.shape[-1] for row in hidden)
+        if self._sparse_mlp_allowed(layer, row_count):
+            outputs, trace = self.mlp_sparse_executor.execute_many(hidden, layer=layer)
+            self.mlp_sparse_last_trace = trace
+            return tuple(
+                output.to(device=row.device, dtype=row.dtype)
+                for output, row in zip(outputs, hidden, strict=True)
+            )
+        self.mlp_sparse_last_trace = None
         base = f"model.language_model.layers.{layer}.mlp"
         gate = self._linear_token_rows(hidden, f"{base}.gate_proj")
         up = self._linear_token_rows(hidden, f"{base}.up_proj")
@@ -1778,6 +1871,7 @@ class StreamedQwen38:
                     else list(self.layer_boundary_layers)
                 ),
                 "graft": self._graft_snapshot_identity(),
+                "mlp_sparse_executor": self._mlp_sparse_snapshot_identity(),
                 "native_head_crsa": native,
             }
         )

@@ -371,6 +371,29 @@ core/residual and MLP core/residual transition families beside the whole-layer
 pair. Stage filtering occurs before cloning; unused gate/up/activation tensors
 never enter the cartography payload.
 
+Exact MLP evidence also feeds a separate layer-local range plane. Shared chat
+template rows are removed by a token-derived sealed row manifest. Residual OMP
+then chooses a small pilot blanket independently inside every 64-neuron
+Gate×Up block. The runtime state is the current pilot activation vector; the
+action is a set of 32 block ranges. Pilots execute once, then the non-pilot
+rows of selected blocks are added through a BF16 residual pass. ModelPin,
+generation-specific corpus, pilot inventory, ridge coefficients, row roles,
+random/static controls, and output verifier are all content-addressed. A later
+prompt generation can be opened only after the fit bytes are durable.
+The sparse output then crosses a diagonal affine residual Crystal trained on
+the earlier generation. Its scale and bias vectors are layer-local, immutable,
+and applied in float32 before the model residual join. The affine fit is
+persisted before a later generation is opened; output receipts report raw and
+corrected metrics independently.
+
+The execution rail uses three physical address planes. Original Gate/Up rows
+come from the implanted `.causal` graph. A local immutable transpose bank turns
+Down columns into directly readable rows. A compact packed bank stores fixed
+pilot rows contiguously. Continuation calls route through these planes only for
+fitted layers; ordinary prefill, unknown layers, and internal MLP measurement
+requests execute the untouched full checkpoint path. Sparse runtime identity
+is part of snapshots and staged-block CAS, so a route cannot change mid-step.
+
 Signed projected sequences retain their prompt boundaries in a separate
 predictive plane. A fixed seeded multi-timescale recurrence constructs
 features per prompt, a ridge readout predicts the layer residual, one later
