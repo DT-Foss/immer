@@ -13,7 +13,7 @@ import secrets
 import stat
 import sys
 import time
-from typing import Sequence
+from typing import Sequence, cast
 
 import numpy as np
 
@@ -289,16 +289,24 @@ def _load_live_context(
     cartography_root: Path,
     *,
     ooe_root: Path | None,
+    prompt_sha256s: Sequence[str] | None = None,
 ):
     cartography = _cartography_module()
     base_manifest, body, frontier_status = cartography._effective_manifest(
         cartography_root
     )
     prompt_rows = cartography._manifest_prompts(body)
-    if len(prompt_rows) != 5:
-        raise CliError("live MLP capture requires exactly five O1 prompts")
-    prompt_sha256s = tuple(sorted(row["sha256"] for row in prompt_rows))
-    capture_entries = canonical_capture_plan(prompt_sha256s)
+    available_prompts = {row["sha256"]: row for row in prompt_rows}
+    selected_prompts = (
+        tuple(sorted(available_prompts))
+        if prompt_sha256s is None
+        else tuple(sorted(set(prompt_sha256s)))
+    )
+    if len(selected_prompts) != 5 or any(
+        prompt not in available_prompts for prompt in selected_prompts
+    ):
+        raise CliError("live MLP capture requires exactly five active O1 prompts")
+    capture_entries = canonical_capture_plan(selected_prompts)
     expected_keys = {(entry.prompt_sha256, entry.layer) for entry in capture_entries}
     prepared = cartography._manifest_jobs(body)
     expected_jobs = {job.job_id: job for job, _spec in prepared}
@@ -518,7 +526,7 @@ def _load_live_context(
         capture_manifest = CaptureManifest(
             model_pin_sha256=model_pin.sha256,
             input_manifest_sha256=input_authority_sha256,
-            prompt_sha256s=prompt_sha256s,
+            prompt_sha256s=selected_prompts,
             entries=capture_entries,
         )
         return {
@@ -552,6 +560,12 @@ def _parser() -> argparse.ArgumentParser:
         help="authenticated local O1/Qwen cartography root for live exact capture",
     )
     parser.add_argument("--ooe-root")
+    prompts = parser.add_mutually_exclusive_group()
+    prompts.add_argument("--prompt-sha256", action="append")
+    prompts.add_argument(
+        "--prompt-cohort",
+        help="JSON prompt registry whose exact five hashes define this bank",
+    )
     parser.add_argument("--max-total-mb", type=float, default=4096.0)
     parser.add_argument(
         "--max-new-groups",
@@ -657,6 +671,41 @@ def _prefix_corpus(corpus: SubspaceCorpus) -> SubspaceCorpus:
     return SubspaceCorpus(corpus.model_pin_sha256, corpus.groups[:35])
 
 
+def _requested_prompts(
+    args: argparse.Namespace, bank_root: Path
+) -> tuple[str, ...] | None:
+    values: Sequence[object] | None = args.prompt_sha256
+    if args.prompt_cohort is not None:
+        try:
+            document = json.loads(
+                _stable_bytes(Path(args.prompt_cohort).expanduser().absolute())
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CliError("--prompt-cohort is not JSON") from exc
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"prompts"}
+            or not isinstance(document.get("prompts"), list)
+        ):
+            raise CliError("--prompt-cohort must be an exact prompt registry")
+        values = [
+            row.get("sha256") if isinstance(row, dict) else None
+            for row in document["prompts"]
+        ]
+    capture_path = bank_root / CAPTURE_MANIFEST_NAME
+    if values is None and capture_path.exists():
+        return CaptureManifest.from_bytes(_stable_bytes(capture_path)).prompt_sha256s
+    if values is None:
+        return None
+    raw_values = tuple(values)
+    if any(not isinstance(value, str) or len(value) != 64 for value in raw_values):
+        raise CliError("prompt selection must contain exactly five SHA-256 values")
+    result = tuple(sorted(set(cast(tuple[str, ...], raw_values))))
+    if len(result) != 5:
+        raise CliError("prompt selection must contain exactly five SHA-256 values")
+    return cast(tuple[str, ...], result)
+
+
 def _run_live(args: argparse.Namespace) -> dict[str, object]:
     bank_root = Path(args.root).expanduser().absolute()
     cartography_root = Path(args.cartography_root).expanduser().absolute()
@@ -684,10 +733,12 @@ def _run_live(args: argparse.Namespace) -> dict[str, object]:
     cartography = _cartography_module()
     started = time.monotonic()
     new_publications = 0
+    requested_prompts = _requested_prompts(args, bank_root)
     with cartography._root_lock(cartography_root):
         context = _load_live_context(
             cartography_root,
             ooe_root=selected_ooe_root,
+            prompt_sha256s=requested_prompts,
         )
         runtime = context["runtime"]
         try:

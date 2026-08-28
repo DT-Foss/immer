@@ -895,6 +895,7 @@ class QwenMlpEvidenceBank:
         *,
         budget: MlpEvidenceBudget | None = None,
         fault_injector: Callable[[str], None] | None = None,
+        deferred_tensor_splits: Sequence[str] = (),
     ) -> None:
         self.root = Path(root)
         self.budget = MlpEvidenceBudget() if budget is None else budget
@@ -902,7 +903,13 @@ class QwenMlpEvidenceBank:
             raise TypeError("budget must be MlpEvidenceBudget")
         if fault_injector is not None and not callable(fault_injector):
             raise TypeError("fault_injector must be callable")
+        deferred = tuple(deferred_tensor_splits)
+        if len(set(deferred)) != len(deferred) or any(
+            split not in CAPTURE_SPLITS for split in deferred
+        ):
+            raise ValueError("deferred_tensor_splits are invalid or duplicated")
         self.fault_injector = fault_injector
+        self._eager_tensor_splits = frozenset(CAPTURE_SPLITS) - frozenset(deferred)
         self._ensure_dir(self.root)
         for name in (
             "objects",
@@ -1438,10 +1445,15 @@ class QwenMlpEvidenceBank:
             )
         )
 
-    def _recover_unlocked(self) -> None:
+    def _recover_unlocked(self, *, tensor_splits: frozenset[str] | None = None) -> None:
+        selected_splits = (
+            self._eager_tensor_splits if tensor_splits is None else tensor_splits
+        )
         intent_path = self.root / _INTENT
         if not intent_path.exists():
-            self._replay_unlocked(self._load_head_unlocked())
+            self._replay_unlocked(
+                self._load_head_unlocked(), tensor_splits=selected_splits
+            )
             return
         env = _strict_json(
             self._stable_read(intent_path, 64 * 1024),
@@ -1466,7 +1478,7 @@ class QwenMlpEvidenceBank:
             raise QwenMlpEvidenceIntegrityError("prepared intent matches neither head")
         self._publish_commit(new)
         intent_path.unlink()
-        self._replay_unlocked(candidate)
+        self._replay_unlocked(candidate, tensor_splits=selected_splits)
 
     def _commit_addresses(self) -> set[str]:
         result: set[str] = set()
@@ -1494,8 +1506,14 @@ class QwenMlpEvidenceBank:
         return result
 
     def _replay_unlocked(
-        self, head: MlpEvidenceJournalState
+        self,
+        head: MlpEvidenceJournalState,
+        *,
+        tensor_splits: frozenset[str] | None = None,
     ) -> tuple[MlpEvidenceJournalState, ...]:
+        selected_splits = (
+            self._eager_tensor_splits if tensor_splits is None else tensor_splits
+        )
         chain = [head]
         while chain[-1].generation:
             previous = cast(str, chain[-1].previous_state_sha256)
@@ -1511,7 +1529,11 @@ class QwenMlpEvidenceBank:
             verification = self.restore_verification(
                 cast(str, chain[-1].appended_verification_sha256)
             )
-            self._verify_pair(receipt, verification)
+            self._verify_pair(
+                receipt,
+                verification,
+                restore_tensors=receipt.entry.split in selected_splits,
+            )
             expected_counts = list(parent.split_counts)
             expected_counts[CAPTURE_SPLITS.index(receipt.entry.split)] += 1
             if (
@@ -1623,15 +1645,18 @@ class QwenMlpEvidenceBank:
 
     def _committed_pairs_unlocked(
         self,
+        *,
+        tensor_splits: frozenset[str] | None = None,
     ) -> tuple[tuple[MlpEvidenceReceipt, MlpProjectionVerificationReceipt], ...]:
-        chain = self._replay_unlocked(self._load_head_unlocked())
+        chain = self._replay_unlocked(
+            self._load_head_unlocked(), tensor_splits=tensor_splits
+        )
         rows = []
         for state in chain[1:]:
             receipt = self.restore_receipt(cast(str, state.appended_receipt_sha256))
             verification = self.restore_verification(
                 cast(str, state.appended_verification_sha256)
             )
-            self._verify_pair(receipt, verification)
             rows.append((receipt, verification))
         return tuple(rows)
 
@@ -1646,6 +1671,8 @@ class QwenMlpEvidenceBank:
         self,
         receipt: MlpEvidenceReceipt,
         verification: MlpProjectionVerificationReceipt,
+        *,
+        restore_tensors: bool = True,
     ) -> None:
         if (
             verification.evidence_receipt_sha256 != receipt.sha256
@@ -1676,8 +1703,9 @@ class QwenMlpEvidenceBank:
             raise QwenMlpEvidenceIntegrityError(
                 "MLP verifier proof differs from its verification receipt/tensors"
             )
-        for ref in receipt.tensors:
-            self.restore_tensor(ref)
+        if restore_tensors:
+            for ref in receipt.tensors:
+                self.restore_tensor(ref)
 
     def append_verified(
         self,
@@ -1778,9 +1806,10 @@ class QwenMlpEvidenceBank:
             )
 
     def audit(self) -> MlpEvidenceAudit:
+        all_splits = frozenset(CAPTURE_SPLITS)
         with self._locked():
-            self._recover_unlocked()
-            pairs = self._committed_pairs_unlocked()
+            self._recover_unlocked(tensor_splits=all_splits)
+            pairs = self._committed_pairs_unlocked(tensor_splits=all_splits)
             head = self._load_head_unlocked()
             referenced = {
                 ref.object_sha256 for receipt, _ in pairs for ref in receipt.tensors
@@ -1797,7 +1826,10 @@ class QwenMlpEvidenceBank:
                 if shard.is_dir()
                 for path in shard.glob("*.json")
             }
-            chain = {state.sha256 for state in self._replay_unlocked(head)}
+            chain = {
+                state.sha256
+                for state in self._replay_unlocked(head, tensor_splits=all_splits)
+            }
             committed_receipts = {receipt.sha256 for receipt, _ in pairs}
             committed_verifications = {verification.sha256 for _, verification in pairs}
             receipts = {
@@ -1848,10 +1880,26 @@ class QwenMlpEvidenceBank:
                 orphan_verifier_evidence,
             )
 
-    def build_subspace_corpus(self) -> SubspaceCorpus:
+    def build_subspace_corpus(
+        self, *, allowed_splits: Sequence[str] | None = None
+    ) -> SubspaceCorpus:
+        selected_splits = (
+            CAPTURE_SPLITS if allowed_splits is None else tuple(allowed_splits)
+        )
+        if (
+            not selected_splits
+            or len(set(selected_splits)) != len(selected_splits)
+            or any(split not in CAPTURE_SPLITS for split in selected_splits)
+        ):
+            raise ValueError("allowed_splits are invalid or duplicated")
+        tensor_splits = frozenset(selected_splits)
         with self._locked():
-            self._recover_unlocked()
-            pairs = self._committed_pairs_unlocked()
+            self._recover_unlocked(tensor_splits=tensor_splits)
+            pairs = tuple(
+                pair
+                for pair in self._committed_pairs_unlocked(tensor_splits=tensor_splits)
+                if pair[0].entry.split in selected_splits
+            )
         if not pairs:
             raise QwenMlpEvidenceIntegrityError("bank contains no verified MLP groups")
         if (

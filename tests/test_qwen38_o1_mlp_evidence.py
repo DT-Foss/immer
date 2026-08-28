@@ -159,6 +159,50 @@ class Qwen38O1MlpEvidenceScriptTests(unittest.TestCase):
             self.assertEqual(len(live_publications), 40)
             self.assertEqual(live_bank.state().split_counts, (25, 10, 5))
             self.assertEqual(len(live_bank.build_subspace_corpus().groups), 40)
+            self.assertEqual(
+                len(
+                    live_bank.build_subspace_corpus(
+                        allowed_splits=("train", "calibration")
+                    ).groups
+                ),
+                35,
+            )
+            self.assertEqual(
+                len(
+                    live_bank.build_subspace_corpus(allowed_splits=("holdout",)).groups
+                ),
+                5,
+            )
+            holdout_receipt = next(
+                receipt
+                for receipt, _verification in live_bank.committed_pairs()
+                if receipt.entry.split == "holdout"
+            )
+            holdout_ref = holdout_receipt.tensors[0]
+            holdout_path = (
+                root
+                / "live-bank"
+                / "objects"
+                / holdout_ref.object_sha256[:2]
+                / f"{holdout_ref.object_sha256}.tensor"
+            )
+            tampered = bytearray(holdout_path.read_bytes())
+            tampered[-1] ^= 1
+            holdout_path.chmod(0o600)
+            holdout_path.write_bytes(tampered)
+            deferred = QwenMlpEvidenceBank(
+                root / "live-bank", deferred_tensor_splits=("holdout",)
+            )
+            self.assertEqual(
+                len(
+                    deferred.build_subspace_corpus(
+                        allowed_splits=("train", "calibration")
+                    ).groups
+                ),
+                35,
+            )
+            with self.assertRaises(QwenMlpEvidenceIntegrityError):
+                deferred.audit()
             with self.assertRaisesRegex(
                 QwenMlpEvidenceIntegrityError,
                 "one live manifest/model/verifier pin",
@@ -202,6 +246,41 @@ class Qwen38O1MlpEvidenceScriptTests(unittest.TestCase):
         document["body_sha256"] = _hash_from_body(document["body"])
         with self.assertRaises((ValueError, QwenMlpEvidenceIntegrityError)):
             CaptureManifest.from_bytes(_canonical(document))
+
+    def test_exact_prompt_cohort_selects_five_hashes(self) -> None:
+        module = _load_script()
+        prompts = tuple(_hash(f"cohort-prompt:{index}") for index in range(5))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cohort = root / "prompts.json"
+            cohort.write_text(
+                json.dumps(
+                    {
+                        "prompts": [
+                            {
+                                "sha256": prompt,
+                                "spec_defaults": {},
+                                "token_ids": [index + 1],
+                            }
+                            for index, prompt in enumerate(reversed(prompts))
+                        ]
+                    }
+                )
+            )
+            args = module._parser().parse_args(
+                [
+                    "--root",
+                    str(root / "bank"),
+                    "--cartography-root",
+                    str(root / "cartography"),
+                    "--prompt-cohort",
+                    str(cohort),
+                    "--authority-only",
+                ]
+            )
+            self.assertEqual(
+                module._requested_prompts(args, root / "bank"), tuple(sorted(prompts))
+            )
 
 
 def _canonical(value: object) -> bytes:

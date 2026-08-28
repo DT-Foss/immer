@@ -4,6 +4,26 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-27
 
+### Markov coordinate intelligence
+
+- Added a sealed Markov coordinate-selector tier over exact Qwen joint
+  gate/up evidence. A basis is the state, adding one coordinate is the action,
+  and exact chronological collision reuse is the reward. Train-only Energy,
+  Fisher, variance, and deterministic-random nominators feed a bounded beam;
+  calibration locks one model before holdout.
+- Added the nominal collision-entropy gate `2 * k * quant_bits >= 64`. It
+  blocks compact `k=1` states that fit train/calibration but remain exposed to
+  birthday collisions, while retaining exact collision verification as the
+  promotion authority.
+- Split holdout reporting into frozen-cache and online-adaptive metrics and
+  added equal-`k` Energy/Random plus Full/Marginal controls. The selector opens
+  an MLP bank with holdout tensor payloads deferred, persists its fit, then
+  performs a full payload audit before reading holdout tensors.
+- Added a deterministic label-free unseen-prompt cohort builder. Selection is
+  derived only from item identity, question hashes, a pinned seed, tokenizer,
+  and prior prompt identities; gold answers, model outcomes, and benchmark
+  status cannot affect the selected registry.
+
 ### Live exact Qwen MLP capture runtime
 
 - Mounted `LiveExactMlpCaptureRunner` directly on the local causal Qwen runtime

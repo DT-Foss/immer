@@ -157,6 +157,21 @@ boundary, not the current energy ranking as a unique selector. The holdout is
 across layer topology with the same five prompts; prompt-temporal selection is
 the next measurement.
 
+The next selector uses a finite Markov walk rather than one static ranking:
+
+\[
+B_{t+1}=B_t\cup\{j_t\},\qquad
+j_t=\arg\min_j\bigl(C_{wrong},-C_{exact},C_{miss},\text{bytes}\bigr),
+\]
+
+where every action is replayed by the exact collision cache on train-only
+groups. Energy, Fisher discrimination, variance, and deterministic exploration
+only nominate actions; they never authorize a basis. Calibration chooses among
+the frozen beam, and the collision-capacity guard
+`2 * |B| * quant_bits >= 64` prevents a superficially perfect 32-bit `k=1`
+state from promotion. Holdout now reports both a frozen cache and the intended
+online-adaptive cache explicitly.
+
 The first real operator wave isolates one admissible directed pair, `20→8`.
 Its held-out intertwining residual is `0.0248507190`, compared with
 `0.2373913654` for `C=I` and `0.2729029466` for the deterministic random

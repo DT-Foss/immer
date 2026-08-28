@@ -172,10 +172,12 @@ around every domain that supports it.
   holdout only after the `25/10` calibration lock. Minimal promoted joint key:
   `k=2/16`, zero wrong, `116/512` held exact hits, `1,743.80x` smaller than the
   full-16 control.
-- [ ] Replace fixed joint-energy coordinate ranking with O1/Markov selection and
-  test it on genuinely unseen prompts. The deterministic random `k=2/12`
-  control already matches the zero-wrong boundary, so selector advantage is
-  the next target rather than re-proving subspace compression.
+- [x] Mount a sealed Markov coordinate agent with train-only multi-nominator
+  beam search, exact collision rewards, a 64-bit capacity gate, frozen/adaptive
+  holdout metrics, and equal-`k` plus Full/Marginal controls.
+- [ ] Complete O1 cartography and exact MLP capture for the new deterministic
+  five-prompt label-free cohort, then test selector advantage on genuinely
+  unseen prompts. Compression itself no longer needs re-proving.
 - [ ] Apply topology-aware Warmth only as a downward charging brake and measure
   redundant-charge suppression without changing authenticated demand.
 - [x] Export the first eight live O1/Atlas controller promotions into an exact

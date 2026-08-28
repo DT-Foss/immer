@@ -881,7 +881,7 @@ class CollisionMetrics:
             ) from exc
 
 
-_MODEL_FAMILIES = ("candidate", "full", "marginal", "random")
+_MODEL_FAMILIES = ("candidate", "full", "marginal", "markov", "random")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1312,6 +1312,118 @@ def _model_spec(
         train_wrong_collision_rows=train_wrong,
         calibration_metrics=metrics,
         calibration_safe=not (train_wrong or metrics.wrong_collisions),
+    )
+
+
+def fit_subspace_key_model(
+    train: Sequence[SubspaceObservationGroup],
+    calibration: Sequence[SubspaceObservationGroup],
+    *,
+    basis_indices: Sequence[int],
+    quant_bits: int,
+    family: str = "markov",
+    scale_floor: float = DEFAULT_SCALE_FLOOR,
+) -> SubspaceKeyModel:
+    """Fit one externally selected joint gate/up basis without touching holdout."""
+
+    train_groups = tuple(train)
+    calibration_groups = tuple(calibration)
+    if not train_groups or not calibration_groups:
+        raise ValueError("key-model fit requires train and calibration groups")
+    if any(
+        not isinstance(group, SubspaceObservationGroup)
+        for group in (*train_groups, *calibration_groups)
+    ):
+        raise TypeError("key-model groups must be SubspaceObservationGroup values")
+    basis = tuple(basis_indices)
+    if (
+        not basis
+        or len(set(basis)) != len(basis)
+        or any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < train_groups[0].intermediate_dimension
+            for index in basis
+        )
+    ):
+        raise ValueError("basis_indices are invalid or duplicated")
+    if family not in {"candidate", "full", "markov", "random"}:
+        raise ValueError("external key-model family is invalid")
+    if family == "full" and basis != tuple(
+        range(train_groups[0].intermediate_dimension)
+    ):
+        raise ValueError("full key-model family requires the complete basis")
+    if any(
+        group.intermediate_dimension != train_groups[0].intermediate_dimension
+        for group in (*train_groups, *calibration_groups)
+    ):
+        raise SubspaceBatteryIntegrityError("key-model groups cross projection ABIs")
+    floor = _finite(scale_floor, field="scale_floor", positive=True)
+    scale = _train_scale(train_groups, basis, floor=floor)
+    return _model_spec(
+        family,
+        len(basis),
+        quant_bits,
+        basis,
+        scale,
+        train_groups,
+        calibration_groups,
+    )
+
+
+def fit_marginal_subspace_model(
+    train: Sequence[SubspaceObservationGroup],
+    calibration: Sequence[SubspaceObservationGroup],
+) -> SubspaceKeyModel:
+    """Fit the exact output-marginal control for an external selector."""
+
+    train_groups = tuple(train)
+    calibration_groups = tuple(calibration)
+    if not train_groups or not calibration_groups:
+        raise ValueError("marginal fit requires train and calibration groups")
+    if any(
+        not isinstance(group, SubspaceObservationGroup)
+        for group in (*train_groups, *calibration_groups)
+    ):
+        raise TypeError("marginal groups must be SubspaceObservationGroup values")
+    return _model_spec("marginal", 0, 0, (), None, train_groups, calibration_groups)
+
+
+def evaluate_subspace_key_model(
+    model: SubspaceKeyModel,
+    train: Sequence[SubspaceObservationGroup],
+    calibration: Sequence[SubspaceObservationGroup],
+    holdout: Sequence[SubspaceObservationGroup],
+    *,
+    adaptive: bool,
+) -> CollisionMetrics:
+    """Evaluate one locked key; adaptive mode stores exact misses chronologically."""
+
+    if not isinstance(model, SubspaceKeyModel):
+        raise TypeError("model must be a SubspaceKeyModel")
+    if not isinstance(adaptive, bool):
+        raise TypeError("adaptive must be boolean")
+    train_groups = tuple(train)
+    calibration_groups = tuple(calibration)
+    holdout_groups = tuple(holdout)
+    if not train_groups or not calibration_groups or not holdout_groups:
+        raise ValueError("key-model evaluation requires all three splits")
+    if any(
+        not isinstance(group, SubspaceObservationGroup)
+        for group in (*train_groups, *calibration_groups, *holdout_groups)
+    ):
+        raise TypeError("key-model groups must be SubspaceObservationGroup values")
+    cache = _replay_to_holdout_cache(model, train_groups, calibration_groups)
+    return _simulate_queries(
+        cache,
+        model.family,
+        model.basis_indices,
+        model.quant_bits,
+        model.scale,
+        holdout_groups,
+        update=adaptive,
+        basis_bytes=4 * len(model.basis_indices),
+        scale_bytes=0 if model.scale is None else int(model.scale.nbytes),
     )
 
 
@@ -2239,7 +2351,10 @@ __all__ = [
     "SubspaceObservationGroup",
     "SubspaceSweepConfig",
     "evaluate_subspace_battery",
+    "evaluate_subspace_key_model",
     "fit_subspace_battery",
+    "fit_subspace_key_model",
+    "fit_marginal_subspace_model",
     "graph_revision_sha256",
     "inspect_harvester_subspace_evidence",
     "output_evidence_sha256",
