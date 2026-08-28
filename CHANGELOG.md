@@ -2,7 +2,7 @@
 
 All notable changes to IMMER are recorded here.
 
-## [Unreleased] — 2026-08-28
+## [Unreleased] — 2026-08-29
 
 ### Arbitrary local Qwen runtime
 
@@ -84,6 +84,17 @@ All notable changes to IMMER are recorded here.
   rows, so accepted and rejected prefixes update the same target-only expert
   feedback as ordinary Markov drafts. Runtime evidence reports proposed and
   accepted phrase tokens, source, support, and confidence.
+- Ordinary committed decode now transfers continuation-cache ownership one
+  layer at a time. Each old KV or DeltaNet state is released immediately after
+  its replacement is produced instead of retaining complete old and new
+  64-layer stacks until final norm. For the official topology, the removed
+  duplicate cache is `154,927,104 + 65,552 × prefix_tokens` bytes.
+- Fast-MLP K-token execution now unions overlapping dynamic Gate and Up rows
+  across the complete wave, reads each target neuron once in one-route-bounded
+  chunks, restores every row's original neuron order, and retains the existing
+  per-row down-projection arithmetic. Identical K4 routes remove `75%` of
+  dynamic Gate/Up target transport; disjoint routes read exactly the former
+  byte count. Runtime trace v2 records requested rows, unique rows, and reuse.
 - The explicit Fast-MLP mode now packs the independent K-token projection rows
   into one physical GEMM per matrix. Exact mode retains the original separate
   kernels; packed execution is bound into the Fast runtime identity and

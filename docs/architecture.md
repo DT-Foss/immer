@@ -69,6 +69,7 @@ address graph.
 - local Qwen3.5 and zero-model-byte native-token Markov drafting with
   target-confirmed phrase options;
 - packed K-token projection GEMMs in the explicit Fast-MLP mode;
+- wave-unioned Fast-MLP Gate/Up row transport;
 - semantic state snapshots and prefix batteries;
 - contextual cartography receipts tied to exact weight coordinates.
 
@@ -81,6 +82,19 @@ The target executes the four rows once and commits only the accepted prefix.
 DeltaNet update operands reconstruct recurrent state without another weight
 read; native Prefix-Sinkhorn usage and Graft history remain aligned to the
 same prefix.
+
+Ordinary non-speculative decode consumes its committed continuation cache.
+After layer `l` returns, the old state for `l` loses its final owner and the
+replacement takes its slot. The public cursor and evidence commit only after
+the final norm; a failure clears the partially replaced cache and poisons the
+decoder under the existing recovery contract. Speculative stages remain
+non-consuming because partial-prefix reconstruction still needs the base.
+
+Fast-MLP routing evaluates every row's pilots first, then forms the union of
+the selected Gate/Up neurons across the K-token wave. The union is streamed in
+chunks no larger than one route, projected rowwise, and restored to each
+route's original order before SwiGLU. Down-transpose execution stays rowwise,
+preserving its reduction order and auxiliary residency bound.
 
 The Markov draft council contains eight sparse PPM experts across orders
 `0..16` and windows `128..4096`. Their Qwen-ID distributions are pooled by

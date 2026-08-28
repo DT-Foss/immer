@@ -215,12 +215,88 @@ class MlpPilotRuntimeTests(unittest.TestCase):
         )
         torch.testing.assert_close(consolidated_output, expected, rtol=0, atol=0)
         self.assertEqual(
-            consolidated_trace.range_mode, "consolidated-pilot+full-blocks"
+            consolidated_trace.range_mode,
+            "consolidated-pilot+union-target-blocks",
         )
         self.assertEqual(
             consolidated_trace.weight_row_fraction,
             (model.block_count * model.pilot_count + model.block_size)
             / model.intermediate_dimension,
+        )
+
+        many_hidden = (
+            hidden,
+            hidden,
+            hidden * torch.tensor([[1.0, -1.0, 1.0]]),
+            hidden * torch.tensor([[-1.0, 1.0, 1.0]]),
+        )
+        consolidated_weight_pager.calls.clear()
+        consolidated_transpose_pager.calls.clear()
+        packed_pager.calls.clear()
+        many_output, many_trace = consolidated.execute_many(
+            many_hidden,
+            layer=model.layer,
+        )
+        many_compute = torch.cat(many_hidden, dim=0).to(torch.bfloat16)
+        many_gate = F.linear(many_compute, gate_weight)
+        many_up = F.linear(many_compute, up_weight)
+        many_activated = swiglu(many_gate, many_up)
+        many_selected = np.asarray(many_trace.selected_blocks, dtype=np.int64)
+        many_sparse = pilot_sparse_down_projection(
+            model,
+            many_activated,
+            down_weight,
+            many_selected,
+        )
+        many_expected = affine_layer.apply(many_sparse)
+        torch.testing.assert_close(
+            torch.cat(many_output, dim=0),
+            many_expected,
+            rtol=0,
+            atol=0,
+        )
+        union_rows = tuple(
+            sorted(
+                {
+                    neuron
+                    for blocks in many_trace.selected_blocks
+                    for block in blocks
+                    for neuron in range(
+                        block * model.block_size,
+                        (block + 1) * model.block_size,
+                    )
+                }
+            )
+        )
+        for projection in ("gate", "up"):
+            calls = [
+                ids
+                for name, ids in consolidated_weight_pager.calls
+                if name == f"{base}.{projection}_proj.weight"
+            ]
+            self.assertEqual(tuple(row for ids in calls for row in ids), union_rows)
+            self.assertTrue(
+                all(
+                    len(ids)
+                    <= model.selected_block_count * model.block_size
+                    for ids in calls
+                )
+            )
+        self.assertEqual(len(consolidated_transpose_pager.calls), len(many_hidden))
+        self.assertEqual(len(packed_pager.calls), 3)
+        self.assertEqual(
+            many_trace.dynamic_requested_rows,
+            len(many_hidden) * model.selected_block_count * model.block_size,
+        )
+        self.assertEqual(many_trace.dynamic_unique_rows, len(union_rows))
+        self.assertGreaterEqual(many_trace.dynamic_row_reuse, 1.0)
+        self.assertEqual(
+            sum(len(ids) for _name, ids in consolidated_weight_pager.calls),
+            2 * len(union_rows),
+        )
+        self.assertEqual(
+            sum(len(ids) for _name, ids in consolidated_transpose_pager.calls),
+            many_trace.dynamic_requested_rows,
         )
         subset = MlpPilotSparseExecutor(
             router,

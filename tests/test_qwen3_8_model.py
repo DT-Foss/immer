@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 import unittest
 from unittest import mock
+import weakref
 
 import numpy as np
 import torch
@@ -263,6 +264,23 @@ def _clone_layer_states(
         else:
             cloned.append(None)
     return tuple(cloned)
+
+
+def _weak_layer_state_tensor_refs(
+    states: list[AttentionState | DeltaNetState | None],
+) -> tuple[tuple[weakref.ReferenceType[torch.Tensor], ...], ...]:
+    refs: list[tuple[weakref.ReferenceType[torch.Tensor], ...]] = []
+    for state in states:
+        if isinstance(state, AttentionState):
+            tensors = (state.key, state.value)
+            if state.crsa_log_usage is not None:
+                tensors = (*tensors, state.crsa_log_usage)
+        elif isinstance(state, DeltaNetState):
+            tensors = (state.conv, state.recurrent)
+        else:
+            tensors = ()
+        refs.append(tuple(weakref.ref(tensor) for tensor in tensors))
+    return tuple(refs)
 
 
 class Qwen38ModelTests(unittest.TestCase):
@@ -1661,6 +1679,118 @@ class Qwen38ModelTests(unittest.TestCase):
         decoded, _ = self.model.decode([[7]])
         self.assertTrue(torch.equal(decoded, self.model.finalize_hidden(full.hidden)))
         _assert_layer_states_equal(self, self.model._layer_states, full.layer_states)
+
+    def test_hidden_stateful_decode_consumes_prior_cache_layer_by_layer(self) -> None:
+        self.model.prefill([[1, 4, 9]])
+        embedded = self.model.embed_batch([[7]])
+        staged = self.model.hidden_stateful_range(
+            embedded,
+            self.model._layer_states,
+            start_pos=3,
+            start_layer=0,
+            stop_layer=self.config.n_layers,
+            graft_history=self.model._graft_history,
+        )
+        expected_hidden = self.model.finalize_hidden(staged.hidden)
+        self.pager.release()
+
+        prior_refs = _weak_layer_state_tensor_refs(self.model._layer_states)
+        self.assertTrue(all(ref() is not None for row in prior_refs for ref in row))
+        release_snapshots: list[tuple[bool, ...]] = []
+        original_forward_layer = self.model._forward_layer
+
+        def observe_prior_lifetimes(*args, **kwargs):
+            release_snapshots.append(
+                tuple(all(ref() is None for ref in row) for row in prior_refs)
+            )
+            return original_forward_layer(*args, **kwargs)
+
+        with mock.patch.object(
+            self.model,
+            "_forward_layer",
+            new=observe_prior_lifetimes,
+        ):
+            decoded, evidence = self.model.decode([[7]])
+
+        self.assertEqual(
+            release_snapshots,
+            [
+                tuple(index < layer for index in range(self.config.n_layers))
+                for layer in range(self.config.n_layers)
+            ],
+        )
+        self.assertTrue(all(ref() is None for row in prior_refs for ref in row))
+        self.assertTrue(torch.equal(decoded, expected_hidden))
+        _assert_layer_states_equal(self, self.model._layer_states, staged.layer_states)
+        self.assertEqual((evidence.start_pos, evidence.end_pos), (3, 4))
+        self.assertEqual(evidence.linear_calls, staged.evidence.linear_calls)
+
+    def test_hidden_stateful_decode_releases_pending_stage_before_layer_zero(
+        self,
+    ) -> None:
+        self.model.prefill([[1, 4, 9]])
+        stage = self.model.stage_continuation_block([[7, 6]])
+        pending = self.model._pending_block_stage
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        pending_refs = _weak_layer_state_tensor_refs(list(pending.layer_states))
+        del pending
+        self.assertTrue(all(ref() is not None for row in pending_refs for ref in row))
+
+        layer_zero_pending_released: list[bool] = []
+        original_forward_layer = self.model._forward_layer
+
+        def observe_pending_lifetime(*args, **kwargs):
+            if kwargs["layer"] == 0:
+                layer_zero_pending_released.append(
+                    all(ref() is None for row in pending_refs for ref in row)
+                )
+            return original_forward_layer(*args, **kwargs)
+
+        with mock.patch.object(
+            self.model,
+            "_forward_layer",
+            new=observe_pending_lifetime,
+        ):
+            decoded, evidence = self.model.decode([[5]])
+
+        self.assertEqual(layer_zero_pending_released, [True])
+        self.assertTrue(all(ref() is None for row in pending_refs for ref in row))
+        self.assertEqual(tuple(decoded.shape), (1, 1, self.config.dim))
+        self.assertEqual((evidence.start_pos, evidence.end_pos), (3, 4))
+        with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
+            self.model.commit_continuation_block(stage)
+
+    def test_consuming_decode_failure_poisons_then_reset_recovers(self) -> None:
+        self.model.prefill([[1, 4, 9]])
+        prior_refs = _weak_layer_state_tensor_refs(self.model._layer_states)
+        original_mlp = self.model._mlp
+
+        def fail_on_layer_two(hidden, *, layer):
+            if layer == 2:
+                raise RuntimeError("consuming decode failure")
+            return original_mlp(hidden, layer=layer)
+
+        with mock.patch.object(self.model, "_mlp", new=fail_on_layer_two):
+            with self.assertRaisesRegex(RuntimeError, "consuming decode failure"):
+                self.model.decode([[7]])
+
+        self.assertTrue(self.model.state_poisoned)
+        self.assertEqual(self.model.next_position, 0)
+        self.assertIsNone(self.model.state_batch_size)
+        self.assertEqual(self.model.state_bytes, 0)
+        self.assertTrue(all(state is None for state in self.model._layer_states))
+        self.assertTrue(all(ref() is None for row in prior_refs for ref in row))
+        with self.assertRaisesRegex(Qwen38RuntimeError, "poisoned"):
+            self.model.prefill([[1]], reset=False)
+
+        self.model.reset_state(release=True)
+        self.model.prefill([[1, 4, 9]], reset=False)
+        recovered, evidence = self.model.decode([[7]])
+        self.assertEqual(tuple(recovered.shape), (1, 1, self.config.dim))
+        self.assertTrue(torch.isfinite(recovered).all())
+        self.assertEqual((evidence.start_pos, evidence.end_pos), (3, 4))
+        self.assertFalse(self.model.state_poisoned)
 
     def test_stateful_layer_range_failure_rolls_back_without_poisoning(self) -> None:
         self.model.prefill([[1, 4, 9]])

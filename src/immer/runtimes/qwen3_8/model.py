@@ -3163,9 +3163,12 @@ class StreamedQwen38:
     ) -> tuple[torch.Tensor, StatefulEvidence]:
         """Execute one complete prefill or contiguous decode block.
 
-        State commits only after all 64 layers and the final norm succeed. A
-        failed call clears partial state and latches the runtime until the
-        caller acknowledges the failure with :meth:`reset_state`.
+        Logical state commits only after all 64 layers and the final norm
+        succeed.  A continuation consumes and replaces the private committed
+        layer cache as each layer completes, avoiding simultaneous residency
+        of the complete old and new cache stacks.  A failed call clears partial
+        state and latches the runtime until the caller acknowledges the failure
+        with :meth:`reset_state`.
         """
 
         ids = self._token_tensor(token_ids)
@@ -3212,17 +3215,98 @@ class StreamedQwen38:
         start_linears = self._metric(self.pager, "linear_calls")
         started = time.perf_counter()
         hidden = self.embed_batch(ids)
+        if start_pos > 0:
+            # A successful embedding has crossed the last non-poisoning setup
+            # boundary.  Any pending speculative stage is now stale regardless
+            # of whether continuation compute commits or poisons, so release its
+            # complete private cache before building replacement layer states.
+            self._pending_block_stage = None
+        staged: StatefulLayerRangeResult | None = None
+        staged_native_evidence: tuple[NativeHeadCrsaEvidence, ...] = ()
         try:
-            staged = self.hidden_stateful_range(
-                hidden,
-                committed_states,
-                start_pos=start_pos,
-                start_layer=0,
-                stop_layer=self.config.n_layers,
-                graft_history=self._graft_history,
-                progress=progress,
-            )
-            hidden = self.finalize_hidden(staged.hidden)
+            if start_pos == 0:
+                staged = self.hidden_stateful_range(
+                    hidden,
+                    committed_states,
+                    start_pos=start_pos,
+                    start_layer=0,
+                    stop_layer=self.config.n_layers,
+                    graft_history=self._graft_history,
+                    progress=progress,
+                )
+                hidden = staged.hidden
+            else:
+                # Validation returns a tuple so public range calls can retain a
+                # stable, non-committing boundary.  Ordinary continuation is a
+                # destructive transaction: drop that duplicate ownership, then
+                # transfer each old layer state into its forward and publish the
+                # replacement immediately.  Failure is still atomic to callers
+                # because the established contract poisons and clears the whole
+                # continuation state.
+                del committed_states
+                mask = torch.ones(
+                    (ids.shape[0], ids.shape[1]),
+                    dtype=torch.bool,
+                    device=self.pager.device,
+                )
+                native_evidence: list[NativeHeadCrsaEvidence] = []
+                for layer in range(self.config.n_layers):
+                    if progress is not None:
+                        layer_started = time.perf_counter()
+                        layer_bytes = self._metric(
+                            source, "network_or_source_body_bytes"
+                        )
+                    prior_state = self._layer_states[layer]
+                    self._layer_states[layer] = None
+                    try:
+                        hidden, next_state = self._forward_layer(
+                            hidden,
+                            layer=layer,
+                            token_mask=mask,
+                            state=prior_state,
+                            start_pos=start_pos,
+                            stateful=True,
+                            native_head_crsa_observer=native_evidence.append,
+                        )
+                    finally:
+                        del prior_state
+                    if next_state is None:  # pragma: no cover - stateful contract.
+                        raise Qwen38RuntimeError(
+                            "stateful layer returned no continuation"
+                        )
+                    self._layer_states[layer] = next_state
+                    del next_state
+                    if self.graft is not None and layer == self.graft_layer:
+                        hidden, self._graft_history = self._apply_graft_stateful(
+                            hidden,
+                            self._graft_history,
+                            start_pos=start_pos,
+                        )
+                    self.pager.release()
+                    if progress is not None:
+                        progress(
+                            {
+                                "event": "qwen_stateful_layer_complete",
+                                "layer": layer,
+                                "layers": self.config.n_layers,
+                                "start_pos": start_pos,
+                                "tokens": ids.shape[1],
+                                "source_body_bytes": self._metric(
+                                    source, "network_or_source_body_bytes"
+                                )
+                                - layer_bytes,
+                                "seconds": time.perf_counter() - layer_started,
+                                "state_kind": (
+                                    "kv"
+                                    if isinstance(
+                                        self._layer_states[layer], AttentionState
+                                    )
+                                    else "deltanet"
+                                ),
+                            }
+                        )
+                staged_native_evidence = tuple(native_evidence)
+            hidden = self.finalize_hidden(hidden)
         except Exception:
             self._poison_state()
             self.pager.release()
@@ -3231,10 +3315,12 @@ class StreamedQwen38:
             self.pager.release()
 
         self._pending_block_stage = None
-        self._layer_states = list(staged.layer_states)
+        if staged is not None:
+            self._layer_states = list(staged.layer_states)
+            self._graft_history = staged.graft_history
+            staged_native_evidence = staged.native_head_crsa_evidence
         self._next_position = end_pos
         self._state_batch_size = ids.shape[0]
-        self._graft_history = staged.graft_history
         evidence = StatefulEvidence(
             start_pos=start_pos,
             end_pos=end_pos,
@@ -3258,7 +3344,7 @@ class StreamedQwen38:
                 0 if self._graft_history is None else int(self._graft_history.shape[1])
             ),
         )
-        self._emit_native_head_crsa_evidence(staged.native_head_crsa_evidence)
+        self._emit_native_head_crsa_evidence(staged_native_evidence)
         return hidden, evidence
 
     def prefill(

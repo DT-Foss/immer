@@ -306,13 +306,23 @@ class Qwen38FastMlpMountTests(unittest.TestCase):
         mount = self.fixture.open(layers=(0,))
         hidden = torch.randn(1, self.fixture.config.dim, dtype=torch.bfloat16)
 
+        source_before = self.fixture.target_source.bytes_moved()
         output, trace = mount.executor.execute(hidden, layer=0)
+        single_target_bytes = (
+            self.fixture.target_source.bytes_moved() - source_before
+        )
+        source_before = self.fixture.target_source.bytes_moved()
         many, many_trace = mount.executor.execute_many((hidden, hidden), layer=0)
+        repeated_k2_target_bytes = (
+            self.fixture.target_source.bytes_moved() - source_before
+        )
 
         self.assertEqual(tuple(output.shape), tuple(hidden.shape))
         self.assertEqual(trace.layer, 0)
         self.assertEqual(len(many), 2)
         self.assertEqual(many_trace.row_count, 2)
+        self.assertEqual(repeated_k2_target_bytes, single_target_bytes)
+        self.assertEqual(many_trace.dynamic_row_reuse, 2.0)
         self.assertEqual(mount.receipt.active_layers, (0,))
         model = self.fixture.router.models[0]
         selected = dict(mount.receipt.selected_neuron_fraction_by_layer)

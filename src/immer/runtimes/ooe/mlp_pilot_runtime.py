@@ -18,7 +18,7 @@ from .mlp_pilot_residual import MlpPilotAffineFit, MlpPilotAffineLayer
 from .mlp_pilot_router import MlpPilotLayerModel, MlpPilotRouterFit
 
 
-PILOT_SPARSE_RUNTIME_SCHEMA = "immer.qwen-mlp-pilot-sparse-runtime/v1"
+PILOT_SPARSE_RUNTIME_SCHEMA = "immer.qwen-mlp-pilot-sparse-runtime/v2"
 PILOT_TRANSPOSE_ENTRY_SCHEMA = "immer.qwen-mlp-pilot-transpose-entry/v1"
 PILOT_TRANSPOSE_MANIFEST_SCHEMA = "immer.qwen-mlp-pilot-transpose-manifest/v1"
 
@@ -257,8 +257,10 @@ class MlpPilotSparseTrace:
     intermediate_dimension: int
     source_weight_rows: int
     full_weight_rows: int
+    dynamic_requested_rows: int
+    dynamic_unique_rows: int
     output_dtype: str
-    range_mode: str = "scattered-union"
+    range_mode: str = "scattered-pilot+union-target-blocks"
 
     def __post_init__(self) -> None:
         for field in (
@@ -268,6 +270,8 @@ class MlpPilotSparseTrace:
             "intermediate_dimension",
             "source_weight_rows",
             "full_weight_rows",
+            "dynamic_requested_rows",
+            "dynamic_unique_rows",
         ):
             value = getattr(self, field)
             minimum = 0 if field == "layer" else 1
@@ -279,10 +283,14 @@ class MlpPilotSparseTrace:
             or any(not row or len(set(row)) != len(row) for row in blocks)
             or self.selected_neuron_count >= self.intermediate_dimension
             or self.full_weight_rows != 3 * self.intermediate_dimension
+            or self.dynamic_unique_rows > self.dynamic_requested_rows
             or not isinstance(self.output_dtype, str)
             or not self.output_dtype
             or self.range_mode
-            not in {"scattered-union", "consolidated-pilot+full-blocks"}
+            not in {
+                "scattered-pilot+union-target-blocks",
+                "consolidated-pilot+union-target-blocks",
+            }
         ):
             raise ValueError("sparse runtime trace is inconsistent")
         object.__setattr__(self, "selected_blocks", blocks)
@@ -291,11 +299,18 @@ class MlpPilotSparseTrace:
     def weight_row_fraction(self) -> float:
         return self.source_weight_rows / self.full_weight_rows
 
+    @property
+    def dynamic_row_reuse(self) -> float:
+        return self.dynamic_requested_rows / self.dynamic_unique_rows
+
     def to_record(self) -> dict[str, object]:
         return {
             "full_weight_rows": self.full_weight_rows,
             "intermediate_dimension": self.intermediate_dimension,
             "layer": self.layer,
+            "dynamic_requested_rows": self.dynamic_requested_rows,
+            "dynamic_row_reuse": self.dynamic_row_reuse,
+            "dynamic_unique_rows": self.dynamic_unique_rows,
             "output_dtype": self.output_dtype,
             "row_count": self.row_count,
             "range_mode": self.range_mode,
@@ -441,9 +456,9 @@ class MlpPilotSparseExecutor:
             "layers": sorted(self._active_layers),
             "output_dtype": str(self.output_dtype).removeprefix("torch."),
             "range_mode": (
-                "scattered-union"
+                "scattered-pilot+union-target-blocks"
                 if self.pilot_pager is None
-                else "consolidated-pilot+full-blocks"
+                else "consolidated-pilot+union-target-blocks"
             ),
             "router_fit_sha256": self.router_fit.sha256,
             "schema": PILOT_SPARSE_RUNTIME_SCHEMA,
@@ -473,6 +488,74 @@ class MlpPilotSparseExecutor:
                 f"selected rows for {name!r} differ from the sparse ABI"
             )
         return rows
+
+    def _project_union_rows(
+        self,
+        hidden: torch.Tensor,
+        *,
+        name: str,
+        extra_by_row: Sequence[np.ndarray],
+        union_ids: np.ndarray,
+        chunk_rows: int,
+        columns: int,
+    ) -> tuple[torch.Tensor, ...]:
+        """Read each routed target row once with one-route-bounded residency."""
+
+        pieces: list[list[torch.Tensor]] = [[] for _ in extra_by_row]
+        output_positions: list[list[int]] = [[] for _ in extra_by_row]
+        union = tuple(int(neuron) for neuron in union_ids)
+        for start in range(0, len(union), chunk_rows):
+            chunk = union[start : start + chunk_rows]
+            chunk_offsets = {neuron: index for index, neuron in enumerate(chunk)}
+            weight = self._rows(
+                self.weight_pager,
+                name,
+                np.asarray(chunk, dtype=np.int64),
+                columns=columns,
+            )
+            try:
+                for row, extra in enumerate(extra_by_row):
+                    selected = [
+                        (index, chunk_offsets[int(neuron)])
+                        for index, neuron in enumerate(extra)
+                        if int(neuron) in chunk_offsets
+                    ]
+                    if not selected:
+                        continue
+                    weight_positions = torch.tensor(
+                        [position for _output, position in selected],
+                        device=self.weight_pager.device,
+                        dtype=torch.long,
+                    )
+                    pieces[row].append(
+                        F.linear(
+                            hidden[row : row + 1],
+                            weight.index_select(0, weight_positions),
+                        )
+                    )
+                    output_positions[row].extend(
+                        output for output, _position in selected
+                    )
+            finally:
+                del weight
+
+        result = []
+        for row, extra in enumerate(extra_by_row):
+            if not pieces[row] or len(output_positions[row]) != len(extra):
+                raise MlpPilotSparseRuntimeError(
+                    "union target projection lost routed neurons"
+                )
+            projected = torch.cat(pieces[row], dim=-1)
+            by_output = {
+                output: index for index, output in enumerate(output_positions[row])
+            }
+            restore = torch.tensor(
+                [by_output[index] for index in range(len(extra))],
+                device=self.weight_pager.device,
+                dtype=torch.long,
+            )
+            result.append(projected.index_select(-1, restore))
+        return tuple(result)
 
     def _execute_flat(
         self, hidden: torch.Tensor, *, layer: int
@@ -534,8 +617,11 @@ class MlpPilotSparseExecutor:
                 packed,
                 columns=affine.output_dimension,
             )
-        gate_pilot = F.linear(compute_hidden, gate_pilot_weight)
-        up_pilot = F.linear(compute_hidden, up_pilot_weight)
+        try:
+            gate_pilot = F.linear(compute_hidden, gate_pilot_weight)
+            up_pilot = F.linear(compute_hidden, up_pilot_weight)
+        finally:
+            del gate_pilot_weight, up_pilot_weight
         pilot_activation = swiglu(gate_pilot, up_pilot)
         scores = model.score_pilot_arrays(
             gate_pilot.detach().to(device="cpu", dtype=torch.float64).numpy(),
@@ -545,7 +631,7 @@ class MlpPilotSparseExecutor:
             :, : model.selected_block_count
         ].astype(np.int64, copy=False)
         pilot_set = set(int(row) for row in pilots)
-        outputs = []
+        extra_by_row: list[np.ndarray] = []
         for row, blocks in enumerate(selected):
             if self.pilot_pager is None:
                 extra = np.asarray(
@@ -576,27 +662,49 @@ class MlpPilotSparseExecutor:
                 expected = model.selected_block_count * model.block_size
             if len(extra) != expected or len(set(extra.tolist())) != len(extra):
                 raise MlpPilotSparseRuntimeError("router emitted invalid block ranges")
-            gate_extra_weight = self._rows(
-                self.weight_pager,
-                f"{base}.gate_proj.weight",
-                extra,
-                columns=affine.output_dimension,
-            )
-            up_extra_weight = self._rows(
-                self.weight_pager,
-                f"{base}.up_proj.weight",
-                extra,
-                columns=affine.output_dimension,
-            )
+            extra_by_row.append(extra)
+
+        union_extra = np.asarray(
+            sorted(
+                {
+                    int(neuron)
+                    for extra in extra_by_row
+                    for neuron in extra
+                }
+            ),
+            dtype=np.int64,
+        )
+        per_row_dynamic = model.selected_block_count * (
+            model.block_size - model.pilot_count
+            if self.pilot_pager is None
+            else model.block_size
+        )
+        gate_extra = self._project_union_rows(
+            compute_hidden,
+            name=f"{base}.gate_proj.weight",
+            extra_by_row=extra_by_row,
+            union_ids=union_extra,
+            chunk_rows=per_row_dynamic,
+            columns=affine.output_dimension,
+        )
+        up_extra = self._project_union_rows(
+            compute_hidden,
+            name=f"{base}.up_proj.weight",
+            extra_by_row=extra_by_row,
+            union_ids=union_extra,
+            chunk_rows=per_row_dynamic,
+            columns=affine.output_dimension,
+        )
+
+        outputs = []
+        for row, (blocks, extra) in enumerate(zip(selected, extra_by_row, strict=True)):
             down_extra_weight = self._rows(
                 self.down_transpose_pager,
                 self.transpose_name(layer),
                 extra,
                 columns=affine.output_dimension,
             )
-            gate_extra = F.linear(compute_hidden[row : row + 1], gate_extra_weight)
-            up_extra = F.linear(compute_hidden[row : row + 1], up_extra_weight)
-            extra_activation = swiglu(gate_extra, up_extra)
+            extra_activation = swiglu(gate_extra[row], up_extra[row])
             if self.pilot_pager is not None:
                 extra_activation = extra_activation.clone()
                 for block_index, block in enumerate(blocks):
@@ -607,11 +715,6 @@ class MlpPilotSparseExecutor:
             outputs.append(pilot_output + extra_output)
         sparse = torch.cat(outputs, dim=0)
         corrected = affine.apply(sparse).to(dtype=self.output_dtype)
-        per_row_dynamic = model.selected_block_count * (
-            model.block_size - model.pilot_count
-            if self.pilot_pager is None
-            else model.block_size
-        )
         trace = MlpPilotSparseTrace(
             layer=layer,
             row_count=len(hidden),
@@ -620,13 +723,19 @@ class MlpPilotSparseExecutor:
             ),
             selected_neuron_count=model.selected_neuron_count,
             intermediate_dimension=model.intermediate_dimension,
-            source_weight_rows=3 * (len(pilots) + len(hidden) * per_row_dynamic),
+            source_weight_rows=(
+                3 * len(pilots)
+                + 2 * len(union_extra)
+                + len(hidden) * per_row_dynamic
+            ),
             full_weight_rows=3 * model.intermediate_dimension,
+            dynamic_requested_rows=len(hidden) * per_row_dynamic,
+            dynamic_unique_rows=len(union_extra),
             output_dtype=str(corrected.dtype).removeprefix("torch."),
             range_mode=(
-                "scattered-union"
+                "scattered-pilot+union-target-blocks"
                 if self.pilot_pager is None
-                else "consolidated-pilot+full-blocks"
+                else "consolidated-pilot+union-target-blocks"
             ),
         )
         return corrected, trace

@@ -17,7 +17,8 @@ release surface.
 - **Causalized local weights.** Immutable tensor payloads are paired with an
   appendable causal address graph inside one local model bundle.
 - **Local target execution.** Qwen3.8-27B runs directly from causalized local
-  weights with stateful full-attention and DeltaNet continuation.
+  weights with stateful full-attention and DeltaNet continuation. Ordinary
+  decode replaces continuation state layer by layer.
 - **Native local drafting.** A causalized Qwen3.5-0.8B or a zero-weight Markov
   council proposes transactional K=4 continuations that Qwen3.8 alone verifies
   and commits. Target-confirmed episodes become reusable three-token options;
@@ -116,6 +117,8 @@ release surface.
 | Local causal bundle reopen | 77.77 → 1.20 s; 64.90x | complete 55.6 GB Qwen3.8 bundle; first full-content verification followed by unchanged next-process stat+digest reuse; no model forward |
 | Rolling K=4 continuation | accepted prefixes commit with zero weight reads | target-known token + three drafts; widths 1–4, next-token continuation, Graft and native Prefix-Sinkhorn state remain bit-exact |
 | Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed three-token phrase options |
+| Consuming ordinary decode | one continuation cache plus one replacement layer | removes simultaneous ownership of complete old and new cache stacks; official static cache cut is `154,927,104 + 65,552 × prefix_tokens` bytes |
+| K4 Fast-MLP route union | repeated K2/K4 Gate+Up target bytes equal one route | every dynamic target neuron row is read once per wave in one-route-sized chunks; identical K4 routes remove 75% of dynamic Gate+Up target transport per active layer |
 | Arbitrary local Qwen chat | one terminal 64-layer sweep removed per request | authenticated causal Qwen3.8 path; rolling local-Qwen or zero-model-byte Markov drafting plus row-routed fast MLP; target, auxiliary, draft, and combined transport reported separately |
 | Seed v3 native migration | exact parity on 8/8 inherited tensor outputs for Micro and 5M | SHA-first migration of shared trained GRU/CRSA/SwiGLU weights; new receipt, quotient, route-value, and expected-work heads added under a strict inference-only manifest |
 | Full Qwen MLP layer map | 640/640 cells; content promotion 0 | every layer repeats the same 146/549 template hits; 1,370/1,389 candidate admissions equal their matched random controls, closing the exhaustive exact-key line |
