@@ -6,6 +6,25 @@ All notable changes to IMMER are recorded here.
 
 ### Arbitrary local Qwen runtime
 
+- Added the first practical packed execution plane for arbitrary local
+  Qwen3.8-27B chat. A resumable builder converts all 498 text matrices into
+  mmap-native Q4_0/Q8_0 payloads bound to the original repository, revision,
+  inventory fingerprint, bundle manifest, layout, and graph revision. The
+  original BF16 weights remain untouched and available as fallback.
+- Added a package-shipped C ABI with scalar and AVX2 Q4×Q8/Q8×Q8 kernels,
+  direct row decoding, activation quantization, OpenMP execution, native-code
+  cache identity, and correct FP16 round-to-nearest-even for normal and
+  subnormal block scales. Codec ABI 2 rejects the earlier invalid-scale bank.
+- Routed ordinary pager linears, multi-row continuations, embeddings,
+  candidate rows, and the complete LM-head scan through the packed plane.
+  Q4 mmap residency bypasses the BF16 pressure-GC rule because Python GC
+  cannot release mapped weight pages. Per-request evidence now reports TTFT,
+  output tokens/s, Q4 bytes/calls, physical storage reads, and process peak RSS.
+- The real 16-core AVX2 run reduced the 53.79 GB text source to a 22.03 GB
+  packed plane and produced readable arbitrary German output. The first
+  eight-token result completed in 73.21 seconds with 22.58-second TTFT and
+  21.65 GB peak RSS; this is the new runtime baseline, not the finish line.
+
 - Generalized correction-first rolling verification from fixed K=4 to a
   configurable K=2–16 target window; `immer chat` defaults to K=8. All target
   positions remain layer-major, so one checkpoint-matrix read serves the whole

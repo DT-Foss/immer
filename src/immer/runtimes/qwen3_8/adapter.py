@@ -10,7 +10,9 @@ import math
 from numbers import Integral
 import os
 from pathlib import Path
+import resource
 import stat
+import sys
 import threading
 import time
 from typing import Any
@@ -50,6 +52,7 @@ from .markov_draft import (
     FingerprintRollingK4DraftProvider,
 )
 from .pager import Qwen38WeightPager
+from .q4 import Q4Bank
 from .speculative import Qwen38K4SpeculativeDecoder
 from .semantic_state_cache import (
     AnchorReceipt,
@@ -242,6 +245,17 @@ def _compact_generation_receipt(
             "generation evidence is incomplete: " + ", ".join(missing)
         )
     compact = {key: evidence[key] for key in _GENERATION_RECEIPT_FIELDS}
+    for key in ("time_to_first_token_seconds", "output_tokens_per_second"):
+        if key in evidence:
+            item = evidence[key]
+            if (
+                isinstance(item, bool)
+                or not isinstance(item, (int, float))
+                or not math.isfinite(float(item))
+                or float(item) < 0
+            ):
+                raise Qwen38ChatError(f"generation evidence {key} is invalid")
+            compact[key] = float(item)
     for key in ("forward_passes", "source_body_bytes", "linear_calls", "state_bytes"):
         item = compact[key]
         if isinstance(item, bool) or not isinstance(item, int) or item < 0:
@@ -358,6 +372,43 @@ def _runtime_source_body_bytes(runtime: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return 0
     return value
+
+
+def _runtime_q4_metrics(runtime: object) -> dict[str, Any]:
+    model = getattr(runtime, "model", None)
+    pager = getattr(model, "pager", None)
+    bank = getattr(pager, "q4_bank", None)
+    metrics = getattr(bank, "metrics", None)
+    if not callable(metrics):
+        return {}
+    try:
+        value = metrics()
+    except Exception:
+        return {}
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _linux_process_read_bytes() -> int | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        for line in Path("/proc/self/io").read_text(encoding="ascii").splitlines():
+            if line.startswith("read_bytes:"):
+                value = int(line.split(":", 1)[1])
+                return value if value >= 0 else None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _process_peak_rss_bytes() -> int | None:
+    try:
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (OSError, ValueError):
+        return None
+    if value < 0:
+        return None
+    return value if sys.platform == "darwin" else value * 1024
 
 
 def _anchor_model_state(model: object) -> tuple[int, bool, int, int | None]:
@@ -531,6 +582,7 @@ class _OwnedRuntime:
         fast_mlp_mount: Qwen38FastMlpMount | None = None,
         exact_head_index: ExactHeadIndex | None = None,
         range_prefetcher: MarkovRangePrefetcher | None = None,
+        q4_bank: Q4Bank | None = None,
     ) -> None:
         self.mount = mount
         self.pager = pager
@@ -542,6 +594,8 @@ class _OwnedRuntime:
         self.fast_mlp_mount = fast_mlp_mount
         self.exact_head_index = exact_head_index
         self.range_prefetcher = range_prefetcher
+        self.q4_bank = q4_bank
+        self.q4_receipt = None if q4_bank is None else q4_bank.metrics()
         self.exact_head_receipt = (
             None
             if exact_head_index is None
@@ -626,6 +680,8 @@ def _open_local_runtime(
     range_prefetch_beam_horizon: int = 3,
     range_prefetch_beam_width: int = 4,
     range_prefetch_hint_cooldown: int = 2,
+    q4_root: Path | None = None,
+    q4_threads: int | None = None,
 ) -> _OwnedRuntime:
     """Open one pinned local causal model; no remote source exists here."""
 
@@ -639,6 +695,7 @@ def _open_local_runtime(
     fast_mlp_mount: Qwen38FastMlpMount | None = None
     exact_head_index: ExactHeadIndex | None = None
     range_prefetcher: MarkovRangePrefetcher | None = None
+    q4_bank: Q4Bank | None = None
     try:
         mount = CausalWeightMount(
             bundle_path,
@@ -653,6 +710,19 @@ def _open_local_runtime(
             mount.weights_root / "config.json",
             require_official=require_official_config,
         )
+        if q4_root is not None:
+            source_metrics = mount.source.metrics()
+            fingerprint = source_metrics.get("inventory_source_fingerprint")
+            if not isinstance(fingerprint, str):
+                raise Qwen38ChatError("verified Qwen source lacks an inventory pin")
+            q4_bank = Q4Bank.load(
+                q4_root,
+                bundle_receipt=bundle_receipt,
+                repo_id=identity.repo_id,
+                revision=identity.revision,
+                inventory_fingerprint=fingerprint,
+                threads=q4_threads,
+            )
         pager = Qwen38WeightPager(
             mount.source,
             device=device,
@@ -661,6 +731,7 @@ def _open_local_runtime(
             close_source=False,
             require_source_identity=True,
             causal_tensor_reader=mount.tensor_reader,
+            q4_bank=q4_bank,
         )
         if exact_head_root is not None:
             if exact_head_block_rows is None:
@@ -752,6 +823,7 @@ def _open_local_runtime(
             fast_mlp_mount=fast_mlp_mount,
             exact_head_index=exact_head_index,
             range_prefetcher=range_prefetcher,
+            q4_bank=q4_bank,
         )
     except Exception:
         if model is not None:
@@ -785,6 +857,12 @@ def _open_local_runtime(
                 pager.close()
             except Exception:
                 pass
+            q4_bank = None
+        if q4_bank is not None:
+            try:
+                q4_bank.close()
+            except Exception:
+                pass
         if mount is not None:
             mount.close()
         raise
@@ -814,6 +892,8 @@ def _open_official_runtime(
     range_prefetch_beam_horizon: int = 3,
     range_prefetch_beam_width: int = 4,
     range_prefetch_hint_cooldown: int = 2,
+    q4_root: Path | None = None,
+    q4_threads: int | None = None,
 ) -> _OwnedRuntime:
     return _open_local_runtime(
         bundle_path=bundle_path,
@@ -840,6 +920,8 @@ def _open_official_runtime(
         range_prefetch_beam_horizon=range_prefetch_beam_horizon,
         range_prefetch_beam_width=range_prefetch_beam_width,
         range_prefetch_hint_cooldown=range_prefetch_hint_cooldown,
+        q4_root=q4_root,
+        q4_threads=q4_threads,
     )
 
 
@@ -886,6 +968,8 @@ class Qwen38CausalChat:
         range_prefetch_beam_horizon: int = 3,
         range_prefetch_beam_width: int = 4,
         range_prefetch_hint_cooldown: int = 2,
+        q4_root: str | Path | None = None,
+        q4_threads: int | None = None,
     ) -> None:
         if not isinstance(bundle_path, (str, Path)):
             raise TypeError("bundle_path must be a local filesystem path")
@@ -899,6 +983,15 @@ class Qwen38CausalChat:
             raise ValueError(
                 "compute_dtype must be auto, float16, bfloat16, or float32"
             )
+        if q4_root is not None and not isinstance(q4_root, (str, Path)):
+            raise TypeError("q4_root must be a local path or None")
+        if q4_threads is not None:
+            q4_threads = _positive_int(q4_threads, "q4_threads")
+        if q4_root is not None:
+            if device == "mps":
+                raise ValueError("Q4 execution requires the CPU device")
+            if device == "auto":
+                device = "cpu"
         source_budget_mb = _positive_number(source_budget_mb, "source_budget_mb")
         draft_source_budget_mb = _positive_number(
             draft_source_budget_mb, "draft_source_budget_mb"
@@ -1047,6 +1140,13 @@ class Qwen38CausalChat:
             raise ValueError("fast-MLP options require fast_mlp_root")
         if fast_mlp_root is not None and fast_mlp_max_resident_bytes is None:
             fast_mlp_max_resident_bytes = 64 * 1024**2
+        if q4_root is not None and any(
+            value is not None
+            for value in (fast_mlp_root, exact_head_root, range_markov_state_path)
+        ):
+            raise ValueError(
+                "Q4 execution replaces Fast-MLP, exact-head, and BF16 range prefetch"
+            )
         if result_cell_code_revision is not None and (
             not isinstance(result_cell_code_revision, str)
             or len(result_cell_code_revision)
@@ -1077,6 +1177,10 @@ class Qwen38CausalChat:
             else Path(exact_head_root).expanduser().absolute()
         )
         self._exact_head_max_bytes = exact_head_max_bytes
+        self._q4_root = (
+            None if q4_root is None else Path(q4_root).expanduser().absolute()
+        )
+        self._q4_threads = q4_threads
         self._anchor_cache = anchor_cache
         self._draft_bundle_path = (
             None
@@ -1341,6 +1445,12 @@ class Qwen38CausalChat:
             )
             if receipt is not None:
                 policy["exact_head"]["artifact"] = dict(receipt)
+        if self._q4_root is not None:
+            policy["q4"] = {"enabled": True, "threads": self._q4_threads}
+            runtime = self._runtime
+            receipt = None if runtime is None else getattr(runtime, "q4_receipt", None)
+            if receipt is not None:
+                policy["q4"]["manifest_sha256"] = receipt["manifest_sha256"]
         return _digest(policy)
 
     def _draft_window_runtime_identity(self) -> str:
@@ -1485,6 +1595,8 @@ class Qwen38CausalChat:
             range_prefetch_beam_horizon=self._range_prefetch_beam_horizon,
             range_prefetch_beam_width=self._range_prefetch_beam_width,
             range_prefetch_hint_cooldown=self._range_prefetch_hint_cooldown,
+            q4_root=self._q4_root,
+            q4_threads=self._q4_threads,
         )
 
     def _open_draft_runtime(self) -> _OwnedRuntime:
@@ -1956,6 +2068,13 @@ class Qwen38CausalChat:
         )
         if exact_head_receipt is not None:
             evidence["exact_head"] = dict(exact_head_receipt)
+        q4_receipt = (
+            None
+            if self._runtime is None
+            else getattr(self._runtime, "q4_receipt", None)
+        )
+        if q4_receipt is not None:
+            evidence["q4"] = dict(q4_receipt)
         range_prefetcher = (
             None
             if self._runtime is None
@@ -2134,11 +2253,17 @@ class Qwen38CausalChat:
                     }
                 )
 
+        q4_before = _runtime_q4_metrics(runtime)
+        physical_read_before = _linux_process_read_bytes()
+        request_started = time.perf_counter()
         raw_generated, raw_evidence = self._generate_locked(
             runtime,
             prompt_ids,
             generation_options,
         )
+        request_seconds = time.perf_counter() - request_started
+        q4_after = _runtime_q4_metrics(runtime)
+        physical_read_after = _linux_process_read_bytes()
         generated_ids = _token_ids(raw_generated, "generated output")
         if len(generated_ids) > self._max_new_tokens:
             raise Qwen38ChatError("generated output exceeds its token budget")
@@ -2173,7 +2298,36 @@ class Qwen38CausalChat:
             **self._base_evidence(),
             "generation": receipt,
             "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+            "runtime_metrics": {
+                "generation_wall_seconds": request_seconds,
+                "physical_read_bytes": (
+                    None
+                    if physical_read_before is None or physical_read_after is None
+                    else max(0, physical_read_after - physical_read_before)
+                ),
+                "process_peak_rss_bytes": _process_peak_rss_bytes(),
+            },
         }
+        if q4_after:
+            fields = (
+                "candidate_rows",
+                "embedding_rows",
+                "head_calls",
+                "linear_calls",
+                "linear_input_rows",
+                "logical_weight_bytes",
+                "mapped_payload_bytes",
+                "mapped_tensors",
+                "output_bytes",
+            )
+            q4_request = {
+                field: int(q4_after.get(field, 0)) - int(q4_before.get(field, 0))
+                for field in fields
+            }
+            evidence["q4"] = {
+                **dict(evidence.get("q4", {})),
+                "request": q4_request,
+            }
         if self._last_draft_evidence is not None:
             evidence["draft"] = dict(self._last_draft_evidence)
         if self._last_fast_mlp_evidence is not None:

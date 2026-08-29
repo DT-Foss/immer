@@ -63,6 +63,7 @@ address graph.
 `src/immer/runtimes/qwen3_8/` implements the primary local neural path:
 
 - authenticated causal-bundle mounting and exact range paging;
+- source-bound mmap Q4/Q8 execution through a package-shipped AVX2 kernel;
 - stable direct-to-Torch local `preadv` transport;
 - residual-certified exact LM-head branch-and-bound;
 - stateful full-attention and Gated DeltaNet execution;
@@ -80,6 +81,17 @@ address graph.
 The anchor cache can restore the deepest exact prompt prefix before generation.
 An exact hit uses the authenticated final-hidden seed; a shorter hit evaluates
 only the suffix. The output token loop remains the ordinary Qwen loop.
+
+The packed execution plane is a derived view inside the local bundle. Its
+manifest binds all 498 text matrices to the original model identity, inventory
+fingerprint, bundle manifest, layout fingerprint, and causal graph revision.
+Each 32-value Q4_0 block stores one FP16 scale plus 16 packed nibbles; Q8_0
+stores one scale plus 32 signed bytes. Gate/Up and full-attention matrices use
+Q4_0. Recurrent Linear-Attention projections, MLP Down, embeddings, and the LM
+head use Q8_0. Files are opened lazily and retained as read-only mmaps, so the
+native kernel operates on the causal-addressed payload without reconstructing
+a full floating matrix. Unsupported or uncovered tensors continue through the
+original BF16 pager.
 
 Rolling generation stages one target-known token followed by up to 15
 untrusted drafts. The target executes the K=2–16 rows in one layer-major

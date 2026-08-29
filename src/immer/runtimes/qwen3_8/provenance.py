@@ -20,6 +20,8 @@ _QWEN_RUNTIME_FILES = (
     "native_fork.py",
     "pager.py",
     "provenance.py",
+    "q4.py",
+    "q4_native.c",
     "snapshot.py",
 )
 

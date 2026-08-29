@@ -167,6 +167,19 @@ from .native_fork import (
     Qwen38NativeFork,
 )
 from .pager import Qwen38PagerError, Qwen38WeightPager
+from .q4 import (
+    Q4_0,
+    Q8_0,
+    Q4_BANK_SCHEMA,
+    Q4_BALANCED_POLICY,
+    Q4_BASE_POLICY,
+    Q4_FORMAT_POLICIES,
+    Q4Bank,
+    Q4BankBuilder,
+    Q4BankError,
+    Q4NativeKernel,
+    Q4TensorEntry,
+)
 from .probe import (
     DELTANET_COMPARISON_SCHEMA,
     DELTANET_COMPONENTS,
@@ -452,6 +465,17 @@ __all__ = [
     "Qwen38StableCrsaGraft",
     "Qwen38Tokenizer",
     "Qwen38WeightPager",
+    "Q4_0",
+    "Q8_0",
+    "Q4_BANK_SCHEMA",
+    "Q4_BALANCED_POLICY",
+    "Q4_BASE_POLICY",
+    "Q4_FORMAT_POLICIES",
+    "Q4Bank",
+    "Q4BankBuilder",
+    "Q4BankError",
+    "Q4NativeKernel",
+    "Q4TensorEntry",
     "REPLICA_RECEIPT_SCHEMA",
     "RUNTIME_PROVENANCE_SCHEMA",
     "ReplicaReceipt",

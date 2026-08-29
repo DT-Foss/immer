@@ -12,10 +12,13 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from functools import lru_cache
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from ..deepseek_v4.causal_weights import CausalTensorReader
 from .config import validate_source_identity
+
+if TYPE_CHECKING:
+    from .q4 import Q4Bank
 
 
 class Qwen38PagerError(RuntimeError):
@@ -138,6 +141,7 @@ class PagerMetrics:
     gc_collections_pressure: int = 0
     gc_collections_interval: int = 0
     gc_collections_fail_closed: int = 0
+    gc_q4_mmap_skips: int = 0
     gc_objects_collected: int = 0
     gc_rss_measurement_failures: int = 0
     gc_last_observed_rss_bytes: int = 0
@@ -178,6 +182,7 @@ class Qwen38WeightPager:
     WEIGHT_CACHE_POLICY = "one-shot-qwen35-direct-fill/v4"
     HEAD_SCORE_POLICY = "cpu-bf16-explicit-fp32-accumulate-rne/v1"
     LEGACY_HEAD_SCORE_POLICY = "backend-bf16-linear/v1"
+    Q4_WEIGHT_CACHE_POLICY = "causal-mmap-q4_0-q8_0/v1"
 
     def __init__(
         self,
@@ -192,6 +197,7 @@ class Qwen38WeightPager:
         require_source_identity: bool = False,
         causal_tensor_reader: CausalTensorReader | None = None,
         exact_head_index: Any | None = None,
+        q4_bank: Q4Bank | None = None,
     ) -> None:
         try:
             import torch
@@ -246,6 +252,16 @@ class Qwen38WeightPager:
             getattr(exact_head_index, "topk_logits", None)
         ):
             raise TypeError("exact_head_index must expose topk_logits() or be None")
+        if q4_bank is not None:
+            if torch.device(device).type != "cpu":
+                raise ValueError("Q4 execution requires the CPU device")
+            if exact_head_index is not None:
+                raise ValueError("Q4 execution and the exact BF16 head are exclusive")
+            if not all(
+                callable(getattr(q4_bank, method, None))
+                for method in ("has", "linear", "rows", "metrics", "close")
+            ):
+                raise TypeError("q4_bank does not expose the Q4 execution contract")
 
         self.torch = torch
         self.source = source
@@ -266,6 +282,9 @@ class Qwen38WeightPager:
         self.close_source = close_source
         self.causal_tensor_reader = causal_tensor_reader
         self.exact_head_index = exact_head_index
+        self.q4_bank = q4_bank
+        if q4_bank is not None:
+            self.WEIGHT_CACHE_POLICY = self.Q4_WEIGHT_CACHE_POLICY
         self.source_identity = validate_source_identity(
             getattr(source, "repo_id", None),
             getattr(source, "revision", None),
@@ -291,6 +310,8 @@ class Qwen38WeightPager:
             self._ensure_open()
             if index is not None and not callable(getattr(index, "topk_logits", None)):
                 raise TypeError("exact head index must expose topk_logits()")
+            if index is not None and self.q4_bank is not None:
+                raise ValueError("Q4 execution and the exact BF16 head are exclusive")
             self.exact_head_index = index
 
     @property
@@ -350,6 +371,71 @@ class Qwen38WeightPager:
             )
         self._stats.peak_planned_resident_bytes = max(
             self._stats.peak_planned_resident_bytes, planned
+        )
+        return planned
+
+    def _preflight_q4_linear(
+        self,
+        layout: _TensorLayout,
+        *,
+        input_rows: int,
+        output_dtype: Any | None,
+        label: str,
+        extra_bytes: int = 0,
+    ) -> int:
+        if input_rows <= 0 or len(layout.shape) != 2:
+            raise Qwen38PagerError("Q4 linear preflight received an invalid shape")
+        output_rows, input_columns = layout.shape
+        final_dtype = self.compute_dtype if output_dtype is None else output_dtype
+        final_item_bytes = self._dtype_bytes(final_dtype)
+        input_float_bytes = input_rows * input_columns * 4
+        input_q8_bytes = input_rows * (input_columns // 32) * 34
+        output_float_bytes = input_rows * output_rows * 4
+        output_final_bytes = input_rows * output_rows * final_item_bytes
+        planned = (
+            input_float_bytes
+            + input_q8_bytes
+            + output_float_bytes
+            + output_final_bytes
+            + extra_bytes
+        )
+        if planned > self.max_resident_bytes:
+            raise Qwen38PagerError(
+                f"{label} needs {planned} transient Q4 bytes, limit is "
+                f"{self.max_resident_bytes}"
+            )
+        self._stats.peak_planned_resident_bytes = max(
+            self._stats.peak_planned_resident_bytes,
+            planned,
+        )
+        return planned
+
+    def _preflight_q4_rows(
+        self,
+        layout: _TensorLayout,
+        token_ids: tuple[int, ...],
+    ) -> int:
+        unique_rows = len(set(token_ids))
+        columns = layout.shape[1]
+        decoded_bytes = unique_rows * columns * 4
+        unique_final_bytes = unique_rows * columns * self._dtype_bytes(
+            self.compute_dtype
+        )
+        restored_bytes = (
+            0
+            if unique_rows == len(token_ids)
+            else len(token_ids)
+            * (columns * self._dtype_bytes(self.compute_dtype) + 8)
+        )
+        planned = decoded_bytes + unique_final_bytes + restored_bytes
+        if planned > self.max_resident_bytes:
+            raise Qwen38PagerError(
+                f"selected Q4 rows from {layout.name!r} need {planned} transient "
+                f"bytes, limit is {self.max_resident_bytes}"
+            )
+        self._stats.peak_planned_resident_bytes = max(
+            self._stats.peak_planned_resident_bytes,
+            planned,
         )
         return planned
 
@@ -797,6 +883,35 @@ class Qwen38WeightPager:
                 x = self.torch.as_tensor(x)
             weight_name = self._weight_name(name)
             compute_x = x.to(device=self.device, dtype=self.compute_dtype)
+            q4_bank = self.q4_bank
+            if q4_bank is not None and q4_bank.has(weight_name):
+                layout = self._layout(weight_name)
+                if len(layout.shape) != 2:
+                    raise Qwen38PagerError(
+                        f"linear weight {weight_name!r} must be 2D"
+                    )
+                if compute_x.shape[-1] != layout.shape[1]:
+                    raise Qwen38PagerError(
+                        f"linear input width {compute_x.shape[-1]} disagrees with "
+                        f"{weight_name}{layout.shape}"
+                    )
+                if weight_observer is not None:
+                    raise Qwen38PagerError(
+                        "Q4 execution cannot expose a materialized floating weight"
+                    )
+                self._preflight_q4_linear(
+                    layout,
+                    input_rows=compute_x.numel() // compute_x.shape[-1],
+                    output_dtype=output_dtype,
+                    label=weight_name,
+                )
+                result = q4_bank.linear(
+                    compute_x,
+                    weight_name,
+                    output_dtype=output_dtype,
+                )
+                self._stats.linear_calls += 1
+                return result
             with self._source_access_scope(tensor=weight_name, read_kind="linear"):
                 weight = self._read_tensor(
                     weight_name,
@@ -891,6 +1006,44 @@ class Qwen38WeightPager:
                 # accepts exactly the dtype forms understood by Tensor.to.
                 self.torch.empty((), device=self.device).to(dtype=output_dtype)
 
+            q4_bank = self.q4_bank
+            if q4_bank is not None and q4_bank.has(weight_name):
+                if weight_observer is not None:
+                    raise Qwen38PagerError(
+                        "Q4 execution cannot expose a materialized floating weight"
+                    )
+                shapes = [tuple(value.shape) for value in compute_inputs]
+                counts = [value.numel() // value.shape[-1] for value in compute_inputs]
+                self._preflight_q4_linear(
+                    layout,
+                    input_rows=sum(counts),
+                    output_dtype=output_dtype,
+                    label=weight_name,
+                )
+                combined = self.torch.cat(
+                    [value.reshape(-1, input_width) for value in compute_inputs],
+                    dim=0,
+                )
+                packed_result = q4_bank.linear(
+                    combined,
+                    weight_name,
+                    output_dtype=output_dtype,
+                )
+                results = []
+                offset = 0
+                for shape, count in zip(shapes, counts, strict=True):
+                    results.append(
+                        packed_result[offset : offset + count].reshape(
+                            (*shape[:-1], layout.shape[0])
+                        )
+                    )
+                    offset += count
+                self._stats.linear_calls += 1 if packed else len(compute_inputs)
+                if packed:
+                    self._stats.packed_linear_calls += 1
+                    self._stats.packed_linear_rows += sum(counts)
+                return tuple(results)
+
             with self._source_access_scope(
                 tensor=weight_name,
                 read_kind="linear-many",
@@ -957,6 +1110,10 @@ class Qwen38WeightPager:
         return ids
 
     def _selected_rows(self, name: str, token_ids: tuple[int, ...]) -> Any:
+        q4_bank = self.q4_bank
+        if q4_bank is not None and q4_bank.has(name):
+            self._preflight_q4_rows(self._layout(name), token_ids)
+            return q4_bank.rows(name, token_ids, dtype=self.compute_dtype)
         if not token_ids:
             columns = self._layout(name).shape[1]
             return self.torch.empty(
@@ -1058,6 +1215,8 @@ class Qwen38WeightPager:
             ids = self._validate_ids(name, token_ids)
             with self._source_access_scope(tensor=name, read_kind="embedding"):
                 rows = self._selected_rows(name, ids)
+            if self.q4_bank is not None and self.q4_bank.has(name):
+                self.q4_bank.record_embedding(len(ids))
             self._stats.embedding_rows += len(ids)
             return rows
 
@@ -1092,6 +1251,8 @@ class Qwen38WeightPager:
                 del rows
                 raise Qwen38PagerError("hidden width disagrees with LM head")
             try:
+                if self.q4_bank is not None and self.q4_bank.has(name):
+                    self.q4_bank.record_candidates(len(ids))
                 return self._score_head_rows(compute_hidden, rows)
             finally:
                 del rows
@@ -1130,6 +1291,43 @@ class Qwen38WeightPager:
             compute_hidden = hidden.to(device=self.device, dtype=self.compute_dtype)
             if compute_hidden.shape[-1] != columns:
                 raise Qwen38PagerError("hidden width disagrees with LM head")
+            q4_bank = self.q4_bank
+            if q4_bank is not None and q4_bank.has(name):
+                # Stable top-k materializes ordering/index workspaces after the
+                # packed linear returns; include a conservative per-vocab row
+                # allowance in the same transient cap.
+                head_extra = vocab * 48
+                self._preflight_q4_linear(
+                    layout,
+                    input_rows=compute_hidden.numel() // columns,
+                    output_dtype=self.compute_dtype,
+                    label=f"{name} head",
+                    extra_bytes=head_extra,
+                )
+                logits = q4_bank.linear(
+                    compute_hidden,
+                    name,
+                    output_dtype=self.compute_dtype,
+                )
+                token_ids = self.torch.arange(
+                    vocab,
+                    device=self.device,
+                    dtype=self.torch.long,
+                ).expand_as(logits)
+                values, token_ids = self._stable_topk(logits, token_ids, k)
+                del logits
+                self._stats.head_rows += vocab
+                q4_bank.record_head()
+                if progress is not None:
+                    progress(
+                        {
+                            "start_row": 0,
+                            "rows": vocab,
+                            "rows_done": vocab,
+                            "vocab_rows": vocab,
+                        }
+                    )
+                return values, token_ids
             self._preflight_head_score(
                 query_rows=compute_hidden.numel() // columns,
                 head_rows=min(block_rows, vocab),
@@ -1320,6 +1518,25 @@ class Qwen38WeightPager:
         self._stats.release_boundaries += 1
         if force_gc:
             self._collect_locked("forced")
+        elif self.q4_bank is not None:
+            # Packed weights are stable read-only mmaps owned by Q4Bank.  Python
+            # GC cannot release those pages, so the BF16 one-shot RSS pressure
+            # rule would perform a full collection after every decoder layer
+            # once the OS page cache is warm.  Activation tensors are released
+            # by refcount at the same boundaries; retain the RSS measurement
+            # while skipping work that cannot reduce this execution plane.
+            self._stats.gc_policy_boundaries += 1
+            rss = _process_rss_bytes()
+            if rss is None:
+                self._stats.gc_rss_measurement_failures += 1
+            else:
+                self._stats.gc_last_observed_rss_bytes = rss
+                self._stats.gc_peak_observed_rss_bytes = max(
+                    self._stats.gc_peak_observed_rss_bytes,
+                    rss,
+                )
+            self._stats.gc_collections_skipped += 1
+            self._stats.gc_q4_mmap_skips += 1
         else:
             self._stats.gc_policy_boundaries += 1
             rss = _process_rss_bytes()
@@ -1366,6 +1583,8 @@ class Qwen38WeightPager:
                 close = getattr(self.source, "close", None)
                 if callable(close):
                     close()
+            if self.q4_bank is not None:
+                self.q4_bank.close()
             self._closed = True
 
     def metrics(self) -> dict[str, Any]:
@@ -1391,16 +1610,27 @@ class Qwen38WeightPager:
             if callable(exact_head_metrics_method)
             else {}
         )
+        q4_bank = self.q4_bank
+        q4_metrics = (
+            {
+                f"q4_{key}": value
+                for key, value in q4_bank.metrics().items()
+            }
+            if q4_bank is not None
+            else {}
+        )
         with self._lock:
             return {
                 **source_metrics,
                 **asdict(self._stats),
                 **causal_metrics,
                 **exact_head_metrics,
+                **q4_metrics,
                 "causal_tensor_reader_attached": (
                     self.causal_tensor_reader is not None
                 ),
                 "exact_head_index_attached": exact_head is not None,
+                "q4_bank_attached": q4_bank is not None,
                 "device": self.resolved_device,
                 "compute_dtype": self.resolved_dtype,
                 "max_resident_bytes": self.max_resident_bytes,

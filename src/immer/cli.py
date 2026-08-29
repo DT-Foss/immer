@@ -119,6 +119,8 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             head_block_rows=args.head_block_rows,
             exact_head_root=args.exact_head,
             exact_head_max_bytes=int(args.exact_head_max_mb * 1024**2),
+            q4_root=args.qwen38_q4,
+            q4_threads=args.q4_threads,
             anchor_cache=anchor_cache,
             draft_bundle_path=args.draft_bundle,
             draft_mode=args.draft_mode,
@@ -742,6 +744,16 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("message")
     chat.add_argument("--qwen38-causal-bundle", required=True)
     chat.add_argument("--qwen38-tokenizer", required=True)
+    chat.add_argument(
+        "--qwen38-q4",
+        metavar="BANK",
+        help="causal-bound mmap Q4/Q8 execution bank for the local Qwen bundle",
+    )
+    chat.add_argument(
+        "--q4-threads",
+        type=int,
+        help="CPU worker count for the native Q4/Q8 kernel (default: up to 16)",
+    )
     chat.add_argument(
         "--draft-bundle",
         help="optional local causal Qwen3.5-0.8B bundle for rolling drafting",

@@ -482,6 +482,30 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertFalse(component.loaded)
         component.close()
 
+    def test_q4_selects_cpu_and_rejects_obsolete_bf16_accelerators(self) -> None:
+        component = Qwen38CausalChat(
+            "unused.causal",
+            "unused-tokenizer.json",
+            q4_root="/models/qwen-q4",
+        )
+        self.assertEqual(component._device, "cpu")
+        component.close()
+
+        for options in (
+            {"fast_mlp_root": "/artifacts/fast"},
+            {"exact_head_root": "/artifacts/head"},
+            {"range_markov_state_path": "/state/ranges"},
+        ):
+            with self.subTest(options=options), self.assertRaisesRegex(
+                ValueError, "Q4 execution replaces"
+            ):
+                Qwen38CausalChat(
+                    "unused.causal",
+                    "unused-tokenizer.json",
+                    q4_root="/models/qwen-q4",
+                    **options,
+                )
+
     def test_success_is_lazy_uses_no_thinking_prompt_and_returns_compact_receipts(
         self,
     ) -> None:
@@ -1186,6 +1210,33 @@ class Qwen38CausalChatTests(unittest.TestCase):
             options["fast_mlp_online_state_path"],
             "/state/qwen-fast.json",
         )
+
+    def test_cli_wires_q4_bank_and_native_threads(self) -> None:
+        qwen = _chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor:
+            with redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--qwen38-q4",
+                        "/models/qwen-q4",
+                        "--q4-threads",
+                        "12",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["q4_root"], "/models/qwen-q4")
+        self.assertEqual(options["q4_threads"], 12)
 
     def test_cli_wires_exact_head_index_root(self) -> None:
         qwen = _chat(_Runtime())

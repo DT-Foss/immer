@@ -134,6 +134,8 @@ class GenerationEvidence:
     state_bytes: int
     stopped_on_eos: bool
     final_state_committed: bool
+    time_to_first_token_seconds: float
+    output_tokens_per_second: float
 
 
 LayerState = AttentionState | DeltaNetState
@@ -636,6 +638,8 @@ class StreamedQwen38:
             include_transport=not transport_neutral
         )
         dependencies = runtime_dependency_versions()
+        q4_bank = getattr(self.pager, "q4_bank", None)
+        q4_identity = None if q4_bank is None else dict(q4_bank.identity)
         math_execution = {
             "device": str(self.pager.device),
             "compute_dtype": str(self.pager.compute_dtype).removeprefix("torch."),
@@ -644,6 +648,7 @@ class StreamedQwen38:
             "max_position_embeddings": self.config.max_position_embeddings,
             "state_policy": "native-kv+deltanet-transactional/v1",
             "packed_continuation_gemm": self.packed_continuation_gemm,
+            "quantized_weight_plane": q4_identity,
         }
         transport_execution = {
             "source_kind": source_kind,
@@ -1502,15 +1507,22 @@ class StreamedQwen38:
         activated = swiglu(gate, up)
         self._observe_layer_boundary(layer, "mlp.activated", activated)
 
-        def observe_down(weight: Any, result: Any) -> None:
-            self._observe_exact_mlp(
-                layer=layer,
-                gate=gate,
-                up=up,
-                activated=activated,
-                output=result,
-                down_weight=weight,
-            )
+        observe_full = (
+            None
+            if self.mlp_sparse_executor is None
+            else getattr(self.mlp_sparse_executor, "observe_full", None)
+        )
+        observe_down = None
+        if callable(observe_full):
+            def observe_down(weight: Any, result: Any) -> None:
+                self._observe_exact_mlp(
+                    layer=layer,
+                    gate=gate,
+                    up=up,
+                    activated=activated,
+                    output=result,
+                    down_weight=weight,
+                )
 
         output = self.pager.linear(
             activated,
@@ -2115,6 +2127,11 @@ class StreamedQwen38:
                 "device": str(self.pager.device),
                 "compute_dtype": str(self.pager.compute_dtype),
                 "packed_continuation_gemm": self.packed_continuation_gemm,
+                "quantized_weight_plane": (
+                    None
+                    if getattr(self.pager, "q4_bank", None) is None
+                    else dict(self.pager.q4_bank.identity)
+                ),
                 "delta_probe": None
                 if self.delta_probe is None
                 else id(self.delta_probe),
@@ -3689,6 +3706,7 @@ class StreamedQwen38:
         generated: list[int] = []
         stopped_on_eos = False
         forward_count = len(forwards)
+        first_token_seconds: float | None = None
         for step in range(max_new_tokens):
             values, token_ids = self.pager.topk_logits(
                 hidden[:, -1],
@@ -3699,6 +3717,8 @@ class StreamedQwen38:
             )
             token_id = int(token_ids[0, 0].item())
             generated.append(token_id)
+            if first_token_seconds is None:
+                first_token_seconds = time.perf_counter() - started
             if progress is not None:
                 progress(
                     {
@@ -3724,6 +3744,7 @@ class StreamedQwen38:
         prompt_ids = tuple(
             int(value) for value in prompt[0].detach().to("cpu").tolist()
         )
+        elapsed = time.perf_counter() - started
         evidence = GenerationEvidence(
             prompt_token_ids=prompt_ids,
             generated_token_ids=tuple(generated),
@@ -3736,10 +3757,14 @@ class StreamedQwen38:
                 self._metric(source, "network_or_source_body_bytes") - start_bytes
             ),
             linear_calls=self._metric(self.pager, "linear_calls") - start_linears,
-            seconds=time.perf_counter() - started,
+            seconds=elapsed,
             state_bytes=self.state_bytes,
             stopped_on_eos=stopped_on_eos,
             final_state_committed=retain_final_state,
+            time_to_first_token_seconds=(
+                elapsed if first_token_seconds is None else first_token_seconds
+            ),
+            output_tokens_per_second=(len(generated) / elapsed if elapsed else 0.0),
         )
         return tuple(generated), evidence
 
