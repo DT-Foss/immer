@@ -6,6 +6,21 @@ All notable changes to IMMER are recorded here.
 
 ### Arbitrary local Qwen runtime
 
+- Upgraded the hybrid provider to a one-way per-round cascade. Markov is
+  reconsidered on every adaptive wave and can execute any number of learned
+  prefixes. Its first K1 decision initializes MTP from the complete
+  target-confirmed hidden history and permanently hands off the remaining
+  request; no target replay or additional Qwen prefill is required.
+- Extended rolling reconciliation with cloned committed hidden rows. K1 sends
+  one row and accepted speculative prefixes send exactly their committed
+  width; discarded terminal stages send none. Mutation is detected under the
+  same target-state isolation guard as provider initialization and proposals.
+- A live 24-token continuation used four Markov K4 rounds for the known prefix,
+  then one hidden-state handoff and four MTP rounds for the novel suffix. It
+  accepted 15 draft tokens, needed only `9` target forwards, and completed in
+  `29.9317 s` at `1,456,226,304` bytes peak RSS. The handoff retained 41 hidden
+  rows in 419,840 bytes; MTP itself used four head scans and `0.5838 s`.
+
 - Removed the second confidence penalty from target-confirmed dialect phrases.
   Dialect similarity still chooses the applicable memory; once selected, an
   exact suffix match uses its own empirical support instead of multiplying the

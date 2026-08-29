@@ -79,11 +79,15 @@ release surface.
   K2 accepted eight drafts and reduced exact generation from 34.05 to 26.74
   seconds while cutting complete target forwards from 16 to 9. Normal deployed
   chat now asks the zero-weight Markov Council first: a useful continuation
-  locks the request to Markov, while Council K1 abstention lazily opens MTP.
+  keeps the current wave on Markov, while Council K1 abstention hands the
+  remaining request to MTP.
   Novel MTP requests teach their complete target-confirmed episode back to the
   Council. After two confirmed copies, the same context can execute from its
   exact dialect phrase: a live third request used no MTP, accepted seven Markov
-  drafts, and completed 16 output tokens in nine target forwards.
+  drafts, and completed 16 output tokens in nine target forwards. Longer
+  outputs can now cross the boundary inside one request: Markov executes every
+  known prefix wave, then hands the complete target-hidden history to MTP at
+  the first K1 decision without replaying Qwen.
 - **All-layer Fast MLP.** A prompt-free weight initializer derives p4/k32
   pilots for every Qwen MLP layer from exact Gate/Up Gaussian joint moments.
   Existing full-path tensors update bounded recursive-ridge route statistics;
@@ -217,10 +221,10 @@ explicit bank outside the canonical deployment.
 
 The canonical Q4 deployment mounts the MTP-capable local bank and its persistent
 token-level Markov council. The Council gets a zero-model-cost first proposal;
-useful known continuations stay entirely on Markov, while K1 abstention lazily
-activates embedded MTP for the request. Both routes learn only target-confirmed
-output, and Full Q4 still verifies every emitted token. `--no-markov-draft`
-forces direct K1 decoding.
+each useful known continuation stays on Markov, while the first K1 abstention
+hands the complete committed hidden history to embedded MTP. Both routes learn
+only target-confirmed output, and Full Q4 still verifies every emitted token.
+`--no-markov-draft` forces direct K1 decoding.
 
 Cold general chat now grows the warm bank automatically. The first successful
 Full-Q4/FERTIG path charges an exact ResultCell, derives a prompt-native Markov
@@ -250,6 +254,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Native DeltaNet K=4 convolution | 79.05 → 23.01 s generation; 3.44x | direct causal channelwise kernel replaces generic 10,240-group Conv1d; identical output/token trace; TTFT 25.05 → 13.65 s |
 | Adaptive embedded MTP | 34.05 → 26.74 s generation; 16 → 9 target forwards | arbitrary 16-token counting request; identical target trace; eight accepted drafts; eight provider head scans; 1.58 GB peak RSS |
 | Automatic Markov→MTP→Markov learning | 30.38 → 26.79 s; 12 → 9 target forwards | first novel request opened MTP and taught Council memory; after two confirmations the third request stayed entirely on a seven-token dialect phrase, loaded no MTP, preserved identical output, and used 1.34 GB peak RSS |
+| In-request Markov→MTP handoff | 24 output tokens in 9 target forwards | four learned Markov K4 waves followed by one exact 41-row hidden-state handoff and four MTP waves; 15 accepted drafts; no Qwen replay; 29.93 s generation and 1.46 GB peak RSS |
 | Rolling K=2–16 continuation | accepted prefixes commit with zero weight reads | one target-known token plus up to 15 drafts; DeltaNet Conv/recurrent state, next-token continuation, Graft, and native Prefix-Sinkhorn state remain bit-exact |
 | Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed variable phrase options up to 15 tokens |
 | Persistent draft-window policy | request ceiling plus per-wave K4/K8/K16 | real Fixed-Share ceiling sampling after bootstrap; each Markov proposal supplies prefix-local expected acceptance/work utility and only the chosen prefix enters the target; full provider tails remain unauthoritative; model/tokenizer/provider-bound state; K2/K3 terminal fallback |
