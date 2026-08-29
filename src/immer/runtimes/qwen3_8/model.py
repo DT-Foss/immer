@@ -1465,38 +1465,7 @@ class StreamedQwen38:
                 and callable(getattr(q4_bank, "deltanet_step", None))
                 and tuple(active.shape[:2]) == (1, 1)
             )
-            full_fused = (
-                fused
-                and hidden.dtype == torch.bfloat16
-                and callable(getattr(q4_bank, "deltanet_full_step", None))
-            )
-            if full_fused:
-                mixed, next_conv, next_recurrent = q4_bank.deltanet_full_step(
-                    active,
-                    (
-                        f"{base}.in_proj_qkv.weight",
-                        f"{base}.in_proj_z.weight",
-                        f"{base}.in_proj_b.weight",
-                        f"{base}.in_proj_a.weight",
-                    ),
-                    conv_weight=conv_weight,
-                    A_log=a_log,
-                    dt_bias=dt_bias,
-                    norm_weight=norm_weight,
-                    conv_state=state.conv,
-                    recurrent_state=state.recurrent,
-                    key_heads=self.config.linear_num_key_heads,
-                    value_heads=self.config.linear_num_value_heads,
-                    key_dim=self.config.linear_key_head_dim,
-                    value_dim=self.config.linear_value_head_dim,
-                    rms_eps=self.config.rms_norm_eps,
-                    output_dtype=hidden.dtype,
-                )
-                next_state = DeltaNetState(
-                    conv=next_conv,
-                    recurrent=next_recurrent,
-                )
-            elif fused:
+            if fused:
                 projected_qkv, projected_z, projected_b, projected_a, next_conv = (
                     q4_bank.deltanet_step(
                         active,
