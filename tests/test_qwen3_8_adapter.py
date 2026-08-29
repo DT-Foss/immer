@@ -351,6 +351,22 @@ class _ExactBackend:
 
 
 class Qwen38CausalChatTests(unittest.TestCase):
+    def test_template_anchor_stops_before_user_specific_tokens(self) -> None:
+        class Tokenizer:
+            @staticmethod
+            def encode(text):
+                marker = 41 if "\nA<|im_end|>" in text else 57
+                return (11, 12, 13, marker, 99)
+
+        chat = _chat(_Runtime())
+        prefix = chat._template_anchor_prefix(
+            SimpleNamespace(tokenizer=Tokenizer()),
+            (11, 12, 13, 77, 88),
+        )
+
+        self.assertEqual(prefix, (11, 12, 13))
+        chat.close()
+
     def test_runtime_mounts_and_closes_range_markov_observer(self) -> None:
         from immer.runtimes.deepseek_v4.causal_weights import LogicalModelIdentity
         from immer.runtimes.qwen3_8.adapter import _open_local_runtime

@@ -902,6 +902,34 @@ class Qwen38SpeculativeTests(unittest.TestCase):
             tuple(provider.proposal_hidden[0].shape), (1, 1, self.config.dim)
         )
 
+    def test_rolling_markov_provider_continues_from_restored_prefix(self) -> None:
+        prompt = (1, 4)
+        baseline = self._model()
+        tokens, _evidence = baseline.generate_greedy(
+            [prompt], max_new_tokens=4, head_block_rows=7
+        )
+        candidate = self._model()
+        candidate.prefill([[prompt[0]]], reset=True)
+        provider = _RollingFromTokens(
+            prompt,
+            tokens,
+            accepted_per_wave=3,
+            vocab_size=self.config.vocab_size,
+        )
+
+        result = Qwen38K4SpeculativeDecoder(
+            candidate,
+            provider,
+        ).generate_rolling(
+            [prompt],
+            max_new_tokens=4,
+            restored_prefix_length=1,
+            head_block_rows=7,
+        )
+
+        self.assertEqual(result.token_ids, tokens)
+        self._assert_state_equal(candidate, baseline)
+
     def test_rolling_state_provider_cannot_mutate_target_hidden(self) -> None:
         prompt = (1, 4)
         baseline = self._model()

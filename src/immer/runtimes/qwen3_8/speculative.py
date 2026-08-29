@@ -1822,6 +1822,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         prompt_token_ids: object,
         *,
         max_new_tokens: int = 1,
+        restored_prefix_length: int | None = None,
+        restored_seed_hidden: torch.Tensor | None = None,
         eos_token_ids: Iterable[int] = (),
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
         retain_final_state: bool = True,
@@ -1853,6 +1855,21 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         )
         if len(prompt) + max_new_tokens > self.model.max_seq_len:
             raise ValueError("generation would exceed max_seq_len")
+        if restored_prefix_length is None:
+            if restored_seed_hidden is not None:
+                raise ValueError("restored_seed_hidden requires restored_prefix_length")
+        elif (
+            isinstance(restored_prefix_length, bool)
+            or not isinstance(restored_prefix_length, int)
+            or not 1 <= restored_prefix_length < len(prompt)
+            or restored_seed_hidden is not None
+            or self.model.next_position != restored_prefix_length
+            or self.model.state_batch_size != 1
+            or self.model.state_poisoned
+        ):
+            raise ValueError(
+                "rolling restore requires a committed strict prompt prefix"
+            )
         if isinstance(eos_token_ids, (str, bytes)):
             raise TypeError("eos_token_ids must be an iterable of integers")
         eos: set[int] = set()
@@ -1872,9 +1889,16 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         source_start = _owner_metric(source, "network_or_source_body_bytes")
         linears_start = _owner_metric(self.model.pager, "linear_calls")
         started = time.perf_counter()
-        hidden, prefill_evidence = self.model.prefill(
-            [prompt], reset=True, tokenwise=False
-        )
+        if restored_prefix_length is None:
+            hidden, prefill_evidence = self.model.prefill(
+                [prompt], reset=True, tokenwise=False
+            )
+        else:
+            hidden, prefill_evidence = self.model.prefill(
+                [prompt[restored_prefix_length:]],
+                reset=False,
+                tokenwise=False,
+            )
         begin_guard_bytes, begin_guard_seconds = self._begin_rolling_provider(
             prompt,
             hidden,

@@ -530,6 +530,15 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             bundle_path,
             q4_root,
         )
+        if bool(getattr(args, "no_anchor_cache", False)):
+            if args.qwen38_anchor_cache is not None:
+                raise ValueError(
+                    "--qwen38-anchor-cache and --no-anchor-cache are mutually exclusive"
+                )
+            anchor_cache_path = None
+        else:
+            anchor_cache_path = args.qwen38_anchor_cache
+        args.qwen38_anchor_cache = anchor_cache_path
         warm_runtime_code_revision = (
             None if args.raw_qwen else _qwen38_runtime_code_revision()
         )
@@ -1587,6 +1596,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--qwen38-anchor-cache",
         default=os.environ.get("IMMER_QWEN38_ANCHOR_CACHE"),
         help="local authenticated semantic anchor cache",
+    )
+    chat.add_argument(
+        "--no-anchor-cache",
+        action="store_true",
+        help="disable the deployed shared chat-template state battery",
     )
     chat.add_argument("--system-prompt", default="")
     chat.add_argument("--device", choices=("auto", "cpu", "mps"), default="auto")

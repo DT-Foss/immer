@@ -68,6 +68,7 @@ from .semantic_state_cache import (
     RestoredAnchor,
     SEMANTIC_ANCHOR_SEED_SCHEMA,
     SemanticStateAnchorCache,
+    SemanticStateCacheConflict,
     token_prefix_sha256,
 )
 
@@ -1175,10 +1176,8 @@ class Qwen38CausalChat:
             DRAFT_WINDOW_ACTIONS
         ):
             raise ValueError("adaptive draft-window ceiling must admit at least K=4")
-        if draft_mode is not None and anchor_cache is not None:
-            raise ValueError(
-                "rolling drafting and anchor restore cannot share a request"
-            )
+        if draft_mode not in {None, "markov"} and anchor_cache is not None:
+            raise ValueError("only Markov rolling drafting can share anchor restore")
         if fast_mlp_root is not None and not isinstance(fast_mlp_root, (str, Path)):
             raise TypeError("fast_mlp_root must be a local path or None")
         if fast_mlp_online_state_path is not None and not isinstance(
@@ -1914,6 +1913,8 @@ class Qwen38CausalChat:
             ).generate_rolling(
                 [prompt_ids],
                 max_new_tokens=self._max_new_tokens,
+                restored_prefix_length=generation_options.get("restored_prefix_length"),
+                restored_seed_hidden=generation_options.get("restored_seed_hidden"),
                 eos_token_ids=eos,
                 head_block_rows=self._head_block_rows,
                 retain_final_state=False,
@@ -2383,6 +2384,84 @@ class Qwen38CausalChat:
         self._tokenizer_sha256 = str(tokenizer_sha256)
         return runtime
 
+    def _template_anchor_prefix(
+        self,
+        runtime: Any,
+        prompt_ids: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        rendered = (
+            Qwen38Tokenizer.render_no_thinking_prompt(
+                self._system_prompt,
+                marker,
+            )
+            for marker in ("A", "Z")
+        )
+        encoded = [
+            _token_ids(
+                getattr(value, "ids", value),
+                "template anchor prompt",
+            )
+            for value in (runtime.tokenizer.encode(text) for text in rendered)
+        ]
+        width = 0
+        for left, right in zip(encoded[0], encoded[1], strict=False):
+            if left != right:
+                break
+            width += 1
+        prefix = encoded[0][:width]
+        if not prefix or len(prefix) >= len(prompt_ids) or prompt_ids[:width] != prefix:
+            return ()
+        return prefix
+
+    def _charge_template_anchor(
+        self,
+        runtime: Any,
+        prompt_ids: tuple[int, ...],
+    ) -> dict[str, Any]:
+        cache = self._anchor_cache
+        if cache is None:
+            return {"status": "disabled"}
+        if not isinstance(getattr(cache, "root", None), Path):
+            return {"status": "unavailable"}
+        prefix = self._template_anchor_prefix(runtime, prompt_ids)
+        if not prefix:
+            return {"status": "no-shared-prefix"}
+        started = time.perf_counter()
+        try:
+            hidden, forwards = runtime.model.prefill(
+                [prefix],
+                reset=True,
+                tokenwise=False,
+            )
+            anchor = cache.store(
+                runtime.model,
+                prefix,
+                boundary_kind="custom",
+                seed_hidden=hidden[:, -1:],
+            )
+            return {
+                "cache_bytes": anchor.cache_bytes,
+                "prefix_tokens": len(prefix),
+                "seconds": time.perf_counter() - started,
+                "status": "stored",
+                "target_forwards": len(forwards),
+            }
+        except SemanticStateCacheConflict:
+            return {
+                "prefix_tokens": len(prefix),
+                "seconds": time.perf_counter() - started,
+                "status": "concurrent-store",
+            }
+        except Exception as exc:
+            return {
+                "error": f"{type(exc).__module__}.{type(exc).__qualname__}",
+                "prefix_tokens": len(prefix),
+                "seconds": time.perf_counter() - started,
+                "status": "error",
+            }
+        finally:
+            runtime.model.reset_state(release=True)
+
     def _execute_locked(self, runtime: Any, text: str) -> Result:
         prompt = Qwen38Tokenizer.render_no_thinking_prompt(
             self._system_prompt,
@@ -2428,6 +2507,7 @@ class Qwen38CausalChat:
         restored = None
         restore_seconds = 0.0
         anchor_miss: dict[str, Any] | None = None
+        anchor_charge: dict[str, Any] | None = None
         generation_options: dict[str, Any] = {
             "max_new_tokens": self._max_new_tokens,
             "prefill_tokenwise": False,
@@ -2444,6 +2524,15 @@ class Qwen38CausalChat:
                 prompt_ids,
             )
             restore_seconds = time.perf_counter() - restore_started
+            if restored is None:
+                anchor_charge = self._charge_template_anchor(runtime, prompt_ids)
+                if anchor_charge.get("status") in {"stored", "concurrent-store"}:
+                    retry_started = time.perf_counter()
+                    restored = self._anchor_cache.restore_deepest(
+                        runtime.model,
+                        prompt_ids,
+                    )
+                    restore_seconds += time.perf_counter() - retry_started
             if restored is None:
                 if _anchor_model_state(runtime.model) != before_restore:
                     raise Qwen38ChatError("anchor-cache miss mutated model state")
@@ -2618,7 +2707,7 @@ class Qwen38CausalChat:
         if result_cell_binding is not None:
             evidence["result_cell_binding_receipt"] = result_cell_binding
         if restored is not None:
-            evidence["anchor_cache"] = _anchor_hit_evidence(
+            anchor_evidence = _anchor_hit_evidence(
                 restored,
                 prompt_tokens=len(prompt_ids),
                 generation=receipt,
@@ -2629,7 +2718,12 @@ class Qwen38CausalChat:
                 ),
                 final_state_committed=False,
             )
+            if anchor_charge is not None:
+                anchor_evidence["charge"] = anchor_charge
+            evidence["anchor_cache"] = anchor_evidence
         elif anchor_miss is not None:
+            if anchor_charge is not None:
+                anchor_miss["charge"] = anchor_charge
             evidence["anchor_cache"] = anchor_miss
         if not output:
             return Result(
