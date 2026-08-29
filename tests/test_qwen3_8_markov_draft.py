@@ -159,7 +159,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(provider.metrics().expert_weights), 8)
         provider.close()
 
-    def test_v2_council_state_migrates_to_v7_horizon_memory(self) -> None:
+    def test_v2_council_state_migrates_to_v8_dialect_horizon_memory(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         state = seed._state
         seed.close()
@@ -199,11 +199,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((1, 2, 3, 4))
         provider.close()
 
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x07"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x08"))
         migrated = MarkovDraftState.from_bytes(path.read_bytes())
         self.assertEqual(len(migrated.dialects), 1)
 
-    def test_v3_dialect_state_migrates_episode_bindings_to_v7(self) -> None:
+    def test_v3_dialect_state_migrates_episode_bindings_to_v8(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -236,9 +236,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.episode_dialects, (None,))
         provider.observe_final((1, 2, 3, 4))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x07"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x08"))
 
-    def test_v4_state_migrates_empty_import_inventory_to_v7(self) -> None:
+    def test_v4_state_migrates_empty_import_inventory_to_v8(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -269,9 +269,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider.imported_episode_sha256s(), ())
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x07"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x08"))
 
-    def test_v5_state_migrates_unknown_prompt_boundaries_to_v7(self) -> None:
+    def test_v5_state_migrates_unknown_prompt_boundaries_to_v8(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -301,9 +301,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider._state.episode_prompt_lengths, (None,))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x07"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x08"))
 
-    def test_v6_state_migrates_zeroed_position_expert_memory_to_v7(self) -> None:
+    def test_v6_state_migrates_zeroed_position_expert_memory_to_v8(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -335,7 +335,38 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             all(not any(row) for row in provider._state.horizon_expert_observations)
         )
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x07"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x08"))
+
+    def test_v7_state_migrates_dialect_position_memory_to_v8(self) -> None:
+        seed = FingerprintRollingK4DraftProvider(vocab_size=32)
+        seed.observe_final((1, 2, 3))
+        document = json.loads(zlib.decompress(seed._state.to_bytes()[5:]))
+        seed.close()
+        for dialect in document["dialects"]:
+            dialect.pop("horizon_hits")
+            dialect.pop("horizon_observations")
+        document["schema"] = "immer.qwen3.8-markov-draft-state/v7"
+        raw = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        path = self.root / "v7-state.bin"
+        path.write_bytes(b"IMMD\x07" + zlib.compress(raw, level=9))
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=path,
+        )
+
+        self.assertEqual(len(provider._state.dialects), 1)
+        dialect = provider._state.dialects[0]
+        self.assertEqual(len(dialect.horizon_observations), 16)
+        self.assertTrue(all(not any(row) for row in dialect.horizon_observations))
+        provider.close()
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x08"))
 
     def test_import_digest_survives_episode_eviction_and_prevents_replay(self) -> None:
         state_path = self.root / "imported-markov.bin"
@@ -738,7 +769,10 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             for index in range(width)
         )
         global_weights = provider._weights()
-        position_weights, maturity = provider._position_weighting(1, global_weights)
+        position_weights, maturity, dialect_maturity = provider._position_weighting(
+            1,
+            global_weights,
+        )
 
         tokens, _feedback, _confidence, _disagreement = provider._predict_council(
             (1,), 2
@@ -746,6 +780,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(tokens, (7, 8))
         self.assertAlmostEqual(maturity, 20 / 28)
+        self.assertEqual(dialect_maturity, 0.0)
         self.assertLess(position_weights[4], global_weights[4])
         self.assertGreater(sum(position_weights[5:]), sum(global_weights[5:]))
         self.assertAlmostEqual(sum(position_weights), 1.0)
@@ -754,6 +789,73 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         self.assertEqual(provider.metrics().last_position, 1)
         self.assertAlmostEqual(provider.metrics().last_position_maturity, 20 / 28)
+        self.assertEqual(provider.metrics().position_specialist_predictions, 1)
+        self.assertAlmostEqual(provider.metrics().max_position_maturity, 20 / 28)
+        provider.close()
+
+    def test_dialect_beta_skill_changes_the_contextual_specialist_choice(self) -> None:
+        class TokenExpert:
+            def __init__(self, token: int) -> None:
+                self.token = token
+
+            def distribution(self, _context):
+                other = 8 if self.token == 7 else 7
+                return {
+                    f"{self.token:02d}": 0.9,
+                    f"{other:02d}": 0.05,
+                    markov_module._UNKNOWN_TOKEN: 0.05,
+                }
+
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        width = len(provider._experts)
+        provider._state = replace(
+            provider._state,
+            expert_log_weights=(-2.0, -2.0, -2.0, -2.0, 4.0, -2.0, -2.0, -2.0),
+        )
+        provider._expert_models = lambda _history: tuple(
+            (TokenExpert(8 if index >= 5 else 7), [])
+            for index in range(width)
+        )
+        global_token = provider._predict_council((1,), 1)[0]
+        dialect_observations = [[0] * width for _ in range(16)]
+        dialect_hits = [[0] * width for _ in range(16)]
+        dialect_observations[0] = [20] * width
+        dialect_hits[0] = [0, 0, 0, 0, 0, 20, 20, 20]
+        provider._active_dialect = MarkovDialectState(
+            dialect_id="d" * 64,
+            signature=(1,),
+            visits=1,
+            last_seen=0,
+            rapidities=(0.0,) * width,
+            observations=(20,) * width,
+            hits=(0, 0, 0, 0, 0, 20, 20, 20),
+            horizon_observations=tuple(
+                tuple(row) for row in dialect_observations
+            ),
+            horizon_hits=tuple(tuple(row) for row in dialect_hits),
+        )
+        provider._active_dialect_similarity = 1.0
+
+        dialect_token = provider._predict_council((1,), 1)[0]
+        dialect_metrics = provider.metrics()
+        deep_unobserved = provider._predict_council(
+            (1,),
+            1,
+            position_offset=7,
+        )[0]
+
+        self.assertEqual(global_token, (7,))
+        self.assertEqual(dialect_token, (8,))
+        self.assertAlmostEqual(
+            dialect_metrics.last_dialect_skill_maturity,
+            20 / 28,
+        )
+        self.assertEqual(deep_unobserved, (7,))
+        metrics = provider.metrics()
+        self.assertEqual(metrics.last_position_maturity, 0.0)
+        self.assertEqual(metrics.last_dialect_skill_maturity, 0.0)
+        self.assertEqual(metrics.dialect_specialist_predictions, 1)
+        self.assertAlmostEqual(metrics.max_dialect_skill_maturity, 20 / 28)
         provider.close()
 
     def test_persistent_history_keeps_explicit_episode_boundaries(self) -> None:

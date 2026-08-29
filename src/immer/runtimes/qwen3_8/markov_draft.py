@@ -33,16 +33,18 @@ try:
 except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
-MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v16"
+MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v18"
+V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
 V5_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
 V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v13"
-_STATE_PREFIX = b"IMMD\x07"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v15"
+_STATE_PREFIX = b"IMMD\x08"
+_V7_STATE_PREFIX = b"IMMD\x07"
 _V6_STATE_PREFIX = b"IMMD\x06"
 _V5_STATE_PREFIX = b"IMMD\x05"
 _V4_STATE_PREFIX = b"IMMD\x04"
@@ -257,6 +259,8 @@ class MarkovDialectState:
     rapidities: tuple[float, ...]
     observations: tuple[int, ...]
     hits: tuple[int, ...]
+    horizon_observations: tuple[tuple[int, ...], ...] = ()
+    horizon_hits: tuple[tuple[int, ...], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -300,15 +304,61 @@ class MarkovDialectState:
             or any(hit > seen for hit, seen in zip(hits, observations, strict=True))
         ):
             raise ValueError("dialect expert state is invalid")
+        horizon_observations = tuple(
+            tuple(row) for row in self.horizon_observations
+        )
+        horizon_hits = tuple(tuple(row) for row in self.horizon_hits)
+        if bool(horizon_observations) != bool(horizon_hits) or (
+            horizon_observations
+            and (
+                len(horizon_observations) != _MAX_PROPOSAL_POSITIONS
+                or len(horizon_hits) != _MAX_PROPOSAL_POSITIONS
+                or any(
+                    len(observed) != len(rapidities) or len(hit) != len(rapidities)
+                    for observed, hit in zip(
+                        horizon_observations,
+                        horizon_hits,
+                        strict=True,
+                    )
+                )
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    for row in (*horizon_observations, *horizon_hits)
+                    for value in row
+                )
+                or any(
+                    hit > observed
+                    for observed_row, hit_row in zip(
+                        horizon_observations,
+                        horizon_hits,
+                        strict=True,
+                    )
+                    for observed, hit in zip(
+                        observed_row,
+                        hit_row,
+                        strict=True,
+                    )
+                )
+            )
+        ):
+            raise ValueError("dialect horizon expert state is invalid")
         object.__setattr__(self, "signature", signature)
         object.__setattr__(self, "rapidities", rapidities)
         object.__setattr__(self, "observations", observations)
         object.__setattr__(self, "hits", hits)
+        object.__setattr__(self, "horizon_observations", horizon_observations)
+        object.__setattr__(self, "horizon_hits", horizon_hits)
 
     def to_record(self) -> dict[str, object]:
         return {
             "dialect_id": self.dialect_id,
             "hits": list(self.hits),
+            "horizon_hits": [list(row) for row in self.horizon_hits],
+            "horizon_observations": [
+                list(row) for row in self.horizon_observations
+            ],
             "last_seen": self.last_seen,
             "observations": list(self.observations),
             "rapidities": [value.hex() for value in self.rapidities],
@@ -317,8 +367,13 @@ class MarkovDialectState:
         }
 
     @classmethod
-    def from_record(cls, value: object) -> "MarkovDialectState":
-        if not isinstance(value, Mapping) or set(value) != {
+    def from_record(
+        cls,
+        value: object,
+        *,
+        legacy: bool = False,
+    ) -> "MarkovDialectState":
+        expected = {
             "dialect_id",
             "hits",
             "last_seen",
@@ -326,7 +381,10 @@ class MarkovDialectState:
             "rapidities",
             "signature",
             "visits",
-        }:
+        }
+        if not legacy:
+            expected |= {"horizon_hits", "horizon_observations"}
+        if not isinstance(value, Mapping) or set(value) != expected:
             raise ValueError("dialect record is invalid")
         try:
             return cls(
@@ -337,6 +395,12 @@ class MarkovDialectState:
                 rapidities=tuple(float.fromhex(item) for item in value["rapidities"]),
                 observations=tuple(value["observations"]),
                 hits=tuple(value["hits"]),
+                horizon_observations=tuple(
+                    tuple(row) for row in value.get("horizon_observations", ())
+                ),
+                horizon_hits=tuple(
+                    tuple(row) for row in value.get("horizon_hits", ())
+                ),
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("dialect record values are invalid") from exc
@@ -634,6 +698,7 @@ class MarkovDraftState:
             or not data.startswith(
                 (
                     _STATE_PREFIX,
+                    _V7_STATE_PREFIX,
                     _V6_STATE_PREFIX,
                     _V5_STATE_PREFIX,
                     _V4_STATE_PREFIX,
@@ -650,21 +715,25 @@ class MarkovDraftState:
                 _STATE_PREFIX
                 if data.startswith(_STATE_PREFIX)
                 else (
-                    _V6_STATE_PREFIX
-                    if data.startswith(_V6_STATE_PREFIX)
+                    _V7_STATE_PREFIX
+                    if data.startswith(_V7_STATE_PREFIX)
                     else (
-                        _V5_STATE_PREFIX
-                        if data.startswith(_V5_STATE_PREFIX)
+                        _V6_STATE_PREFIX
+                        if data.startswith(_V6_STATE_PREFIX)
                         else (
-                            _V4_STATE_PREFIX
-                            if data.startswith(_V4_STATE_PREFIX)
+                            _V5_STATE_PREFIX
+                            if data.startswith(_V5_STATE_PREFIX)
                             else (
-                                _V2_STATE_PREFIX
-                                if data.startswith(_V2_STATE_PREFIX)
+                                _V4_STATE_PREFIX
+                                if data.startswith(_V4_STATE_PREFIX)
                                 else (
-                                    _V3_STATE_PREFIX
-                                    if data.startswith(_V3_STATE_PREFIX)
-                                    else _LEGACY_STATE_PREFIX
+                                    _V2_STATE_PREFIX
+                                    if data.startswith(_V2_STATE_PREFIX)
+                                    else (
+                                        _V3_STATE_PREFIX
+                                        if data.startswith(_V3_STATE_PREFIX)
+                                        else _LEGACY_STATE_PREFIX
+                                    )
                                 )
                             )
                         )
@@ -704,6 +773,10 @@ class MarkovDraftState:
         v6 = (
             isinstance(value, dict)
             and value.get("schema") == V6_MARKOV_DRAFT_STATE_SCHEMA
+        )
+        v7 = (
+            isinstance(value, dict)
+            and value.get("schema") == V7_MARKOV_DRAFT_STATE_SCHEMA
         )
         v2_fields = {
             "expert_hits",
@@ -856,6 +929,7 @@ class MarkovDraftState:
             or value.get("schema")
             not in {
                 MARKOV_DRAFT_STATE_SCHEMA,
+                V7_MARKOV_DRAFT_STATE_SCHEMA,
                 V6_MARKOV_DRAFT_STATE_SCHEMA,
                 V5_MARKOV_DRAFT_STATE_SCHEMA,
                 V4_MARKOV_DRAFT_STATE_SCHEMA,
@@ -902,7 +976,10 @@ class MarkovDraftState:
                 regime_generation=value.get("regime_generation", 0),
                 clock=value.get("clock", 0),
                 dialects=tuple(
-                    MarkovDialectState.from_record(row)
+                    MarkovDialectState.from_record(
+                        row,
+                        legacy=value.get("schema") != MARKOV_DRAFT_STATE_SCHEMA,
+                    )
                     for row in value.get("dialects", ())
                 ),
             )
@@ -940,7 +1017,12 @@ class MarkovDraftMetrics:
     horizon_weighted_accuracy: tuple[float, ...]
     last_position: int
     last_position_maturity: float
+    last_dialect_skill_maturity: float
     last_position_weights: tuple[tuple[str, float], ...]
+    position_specialist_predictions: int
+    dialect_specialist_predictions: int
+    max_position_maturity: float
+    max_dialect_skill_maturity: float
     regime_generation: int
     surprise_mean: float
     surprise_cusum: float
@@ -1099,6 +1181,23 @@ class FingerprintRollingK4DraftProvider:
                 horizon_expert_observations=horizon_zeros,
                 horizon_expert_hits=horizon_zeros,
             )
+        if any(not row.horizon_observations for row in self._state.dialects):
+            dialect_zeros = tuple(
+                (0,) * len(names) for _ in range(_MAX_PROPOSAL_POSITIONS)
+            )
+            self._state = replace(
+                self._state,
+                dialects=tuple(
+                    row
+                    if row.horizon_observations
+                    else replace(
+                        row,
+                        horizon_observations=dialect_zeros,
+                        horizon_hits=dialect_zeros,
+                    )
+                    for row in self._state.dialects
+                ),
+            )
         self._pending_base: tuple[int, ...] | None = None
         self._pending_proposal: tuple[int, ...] | None = None
         self._pending_feedback: tuple[
@@ -1151,7 +1250,12 @@ class FingerprintRollingK4DraftProvider:
         self._last_disagreement = 0.0
         self._last_position = 0
         self._last_position_maturity = 0.0
+        self._last_dialect_skill_maturity = 0.0
         self._last_position_weights = self._weights()
+        self._position_specialist_predictions = 0
+        self._dialect_specialist_predictions = 0
+        self._max_position_maturity = 0.0
+        self._max_dialect_skill_maturity = 0.0
         self._adaptive_proposal_calls = 0
         self._recommended_window_counts = {1: 0, 4: 0, 8: 0, 16: 0}
         self._last_round_proposal: RollingDraftProposal | None = None
@@ -1292,6 +1396,14 @@ class FingerprintRollingK4DraftProvider:
             rapidities=(0.0,) * len(self._experts),
             observations=(0,) * len(self._experts),
             hits=(0,) * len(self._experts),
+            horizon_observations=tuple(
+                (0,) * len(self._experts)
+                for _ in range(_MAX_PROPOSAL_POSITIONS)
+            ),
+            horizon_hits=tuple(
+                (0,) * len(self._experts)
+                for _ in range(_MAX_PROPOSAL_POSITIONS)
+            ),
         )
         self._active_dialect_similarity = 0.0
         self._active_dialect_is_new = True
@@ -1745,8 +1857,8 @@ class FingerprintRollingK4DraftProvider:
         self,
         position: int,
         base_weights: Sequence[float],
-    ) -> tuple[tuple[float, ...], float]:
-        """Blend global Rapidity with position-local Beta specialist skill."""
+    ) -> tuple[tuple[float, ...], float, float]:
+        """Blend global Rapidity with position and dialect Beta specialist skill."""
 
         base = tuple(float(value) for value in base_weights)
         if len(base) != len(self._experts) or not 0 <= position < (
@@ -1756,21 +1868,80 @@ class FingerprintRollingK4DraftProvider:
         observations = self._state.horizon_expert_observations[position]
         hits = self._state.horizon_expert_hits[position]
         maximum_observations = max(observations, default=0)
-        if maximum_observations <= 0:
-            return base, 0.0
-        maturity = maximum_observations / (
-            maximum_observations + self.POSITION_WEIGHT_SATURATION
+        position_maturity = (
+            0.0
+            if maximum_observations <= 0
+            else maximum_observations
+            / (maximum_observations + self.POSITION_WEIGHT_SATURATION)
         )
-        posterior = tuple(
-            (hit + 1.0) / (observed + 2.0)
-            for observed, hit in zip(observations, hits, strict=True)
+        position_posterior = tuple(
+            (
+                (hit + 1.0) / (observed + 2.0)
+                if observed > 0
+                else (global_hit + 1.0) / (global_observed + 2.0)
+                if global_observed > 0
+                else 0.5
+            )
+            for observed, hit, global_observed, global_hit in zip(
+                observations,
+                hits,
+                self._state.expert_observations,
+                self._state.expert_hits,
+                strict=True,
+            )
         )
-        total = sum(posterior)
+        dialect = self._active_dialect
+        dialect_maturity = 0.0
+        if (
+            dialect is None
+            or not dialect.horizon_observations
+            or max(dialect.horizon_observations[position], default=0) <= 0
+        ):
+            contextual_posterior = position_posterior
+        else:
+            dialect_position_observations = dialect.horizon_observations[position]
+            dialect_position_hits = dialect.horizon_hits[position]
+            dialect_observations = max(dialect_position_observations)
+            dialect_maturity = min(
+                1.0,
+                max(0.0, self._active_dialect_similarity)
+                * dialect_observations
+                / (dialect_observations + self.POSITION_WEIGHT_SATURATION),
+            )
+            dialect_posterior = tuple(
+                (
+                    (hit + 1.0) / (observed + 2.0)
+                    if observed > 0
+                    else position_value
+                )
+                for observed, hit, position_value in zip(
+                    dialect_position_observations,
+                    dialect_position_hits,
+                    position_posterior,
+                    strict=True,
+                )
+            )
+            contextual_posterior = tuple(
+                (1.0 - dialect_maturity) * position_value
+                + dialect_maturity * dialect_value
+                for position_value, dialect_value in zip(
+                    position_posterior,
+                    dialect_posterior,
+                    strict=True,
+                )
+            )
+        combined_maturity = 1.0 - (
+            (1.0 - position_maturity) * (1.0 - dialect_maturity)
+        )
+        if combined_maturity <= 0.0:
+            return base, 0.0, 0.0
+        total = sum(contextual_posterior)
         if total <= 0.0 or not math.isfinite(total):
             raise MarkovDraftError("Markov position posterior is invalid")
-        specialist = tuple(value / total for value in posterior)
+        specialist = tuple(value / total for value in contextual_posterior)
         blended = tuple(
-            (1.0 - maturity) * global_weight + maturity * local_weight
+            (1.0 - combined_maturity) * global_weight
+            + combined_maturity * local_weight
             for global_weight, local_weight in zip(base, specialist, strict=True)
         )
         count = len(blended)
@@ -1778,7 +1949,7 @@ class FingerprintRollingK4DraftProvider:
             (1.0 - self.FIXED_SHARE) * value + self.FIXED_SHARE / count
             for value in blended
         )
-        return result, maturity
+        return result, position_maturity, dialect_maturity
 
     def _calibrated_confidence(
         self,
@@ -1892,9 +2063,11 @@ class FingerprintRollingK4DraftProvider:
             raise ValueError("forced Council prefix is invalid")
         for position in range(count):
             horizon_position = position_offset + position
-            weights, position_maturity = self._position_weighting(
+            weights, position_maturity, dialect_skill_maturity = (
+                self._position_weighting(
                 horizon_position,
                 base_weights,
+                )
             )
             distributions = tuple(
                 model.distribution(context) for model, context in experts
@@ -1981,7 +2154,20 @@ class FingerprintRollingK4DraftProvider:
             )
             self._last_position = horizon_position
             self._last_position_maturity = position_maturity
+            self._last_dialect_skill_maturity = dialect_skill_maturity
             self._last_position_weights = weights
+            if position_maturity > 0.0:
+                self._position_specialist_predictions += 1
+                self._max_position_maturity = max(
+                    self._max_position_maturity,
+                    position_maturity,
+                )
+            if dialect_skill_maturity > 0.0:
+                self._dialect_specialist_predictions += 1
+                self._max_dialect_skill_maturity = max(
+                    self._max_dialect_skill_maturity,
+                    dialect_skill_maturity,
+                )
             confidences.append(self._last_confidence)
             disagreements.append(self._last_disagreement)
             feedback_rows.append(tuple(expert_row))
@@ -2014,7 +2200,12 @@ class FingerprintRollingK4DraftProvider:
             self._last_disagreement,
             self._last_position,
             self._last_position_maturity,
+            self._last_dialect_skill_maturity,
             self._last_position_weights,
+            self._position_specialist_predictions,
+            self._dialect_specialist_predictions,
+            self._max_position_maturity,
+            self._max_dialect_skill_maturity,
         )
         try:
             tokens, feedback, _confidence, _disagreement = self._predict_council(
@@ -2033,7 +2224,12 @@ class FingerprintRollingK4DraftProvider:
                 self._last_disagreement,
                 self._last_position,
                 self._last_position_maturity,
+                self._last_dialect_skill_maturity,
                 self._last_position_weights,
+                self._position_specialist_predictions,
+                self._dialect_specialist_predictions,
+                self._max_position_maturity,
+                self._max_dialect_skill_maturity,
             ) = snapshot
 
     def _apply_council_feedback(
@@ -2058,7 +2254,7 @@ class FingerprintRollingK4DraftProvider:
             list(row) for row in self._state.horizon_expert_observations
         ]
         horizon_hits = [list(row) for row in self._state.horizon_expert_hits]
-        weights, _position_maturity = self._position_weighting(
+        weights, _position_maturity, _dialect_skill_maturity = self._position_weighting(
             position,
             self._weights(),
         )
@@ -2122,6 +2318,22 @@ class FingerprintRollingK4DraftProvider:
             local_logs = list(dialect.rapidities)
             local_observations = list(dialect.observations)
             local_hits = list(dialect.hits)
+            local_horizon_observations = (
+                [list(row) for row in dialect.horizon_observations]
+                if dialect.horizon_observations
+                else [
+                    [0] * len(self._experts)
+                    for _ in range(_MAX_PROPOSAL_POSITIONS)
+                ]
+            )
+            local_horizon_hits = (
+                [list(row) for row in dialect.horizon_hits]
+                if dialect.horizon_hits
+                else [
+                    [0] * len(self._experts)
+                    for _ in range(_MAX_PROPOSAL_POSITIONS)
+                ]
+            )
             for index, (_distribution, prediction) in enumerate(feedback):
                 advantage = math.log(max(probabilities[index], 1e-12)) - math.log(
                     max(mixture_probability, 1e-12)
@@ -2132,6 +2344,8 @@ class FingerprintRollingK4DraftProvider:
                 )
                 local_observations[index] += 1
                 local_hits[index] += int(prediction == token)
+                local_horizon_observations[position][index] += 1
+                local_horizon_hits[position][index] += int(prediction == token)
             local_center = sum(local_logs) / len(local_logs)
             local_logs = [value - local_center for value in local_logs]
             if regime_change:
@@ -2143,6 +2357,10 @@ class FingerprintRollingK4DraftProvider:
                 rapidities=tuple(local_logs),
                 observations=tuple(local_observations),
                 hits=tuple(local_hits),
+                horizon_observations=tuple(
+                    tuple(row) for row in local_horizon_observations
+                ),
+                horizon_hits=tuple(tuple(row) for row in local_horizon_hits),
             )
         after_leader = max(range(len(logs)), key=logs.__getitem__)
         self._state = replace(
@@ -2757,6 +2975,7 @@ class FingerprintRollingK4DraftProvider:
             ),
             last_position=self._last_position,
             last_position_maturity=self._last_position_maturity,
+            last_dialect_skill_maturity=self._last_dialect_skill_maturity,
             last_position_weights=tuple(
                 zip(
                     self._state.expert_names,
@@ -2764,6 +2983,10 @@ class FingerprintRollingK4DraftProvider:
                     strict=True,
                 )
             ),
+            position_specialist_predictions=self._position_specialist_predictions,
+            dialect_specialist_predictions=self._dialect_specialist_predictions,
+            max_position_maturity=self._max_position_maturity,
+            max_dialect_skill_maturity=self._max_dialect_skill_maturity,
             regime_generation=self._state.regime_generation,
             surprise_mean=self._state.surprise_mean,
             surprise_cusum=self._state.surprise_cusum,
@@ -2859,6 +3082,8 @@ __all__ = [
     "V3_MARKOV_DRAFT_STATE_SCHEMA",
     "V4_MARKOV_DRAFT_STATE_SCHEMA",
     "V5_MARKOV_DRAFT_STATE_SCHEMA",
+    "V6_MARKOV_DRAFT_STATE_SCHEMA",
+    "V7_MARKOV_DRAFT_STATE_SCHEMA",
     "MARKOV_DRAFT_METRICS_SCHEMA",
     "MARKOV_DRAFT_PROVIDER_ABI",
     "MARKOV_DRAFT_STATE_SCHEMA",
