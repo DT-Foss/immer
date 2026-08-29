@@ -82,16 +82,24 @@ release surface.
   frontier selected by that policy. On an arbitrary 16-token counting request,
   K2 accepted eight drafts and reduced exact generation from 34.05 to 26.74
   seconds while cutting complete target forwards from 16 to 9. Normal deployed
-  chat now asks the zero-weight Markov Council first: a useful continuation
-  keeps the current wave on Markov, while Council K1 abstention hands the
-  remaining request to MTP.
+  chat now runs a round-wise Markov/MTP Council. Markov gets first refusal on
+  every response round; MTP covers novelty, and the next round can return to
+  Markov as soon as a learned answer continuation applies. Both providers
+  consume every exact target-confirmed prefix, so switching requires neither
+  target replay nor another prefill.
   Novel MTP requests teach their complete target-confirmed episode back to the
   Council. After two confirmed copies, the same context can execute from its
   exact dialect phrase: a live third request used no MTP, accepted seven Markov
-  drafts, and completed 16 output tokens in nine target forwards. Longer
-  outputs can now cross the boundary inside one request: Markov executes every
-  known prefix wave, then hands the complete target-hidden history to MTP at
-  the first K1 decision without replaying Qwen.
+  drafts, and completed 16 output tokens in nine target forwards. The persistent
+  Council corpus contains generated answers rather than chat templates or user
+  prompts. Embedded MTP evaluates its complete high-confidence proposal
+  horizon, and existing v1 calibration state migrates into the current provider
+  without discarding learned reliability. On Beast, an unseen German
+  metal-spoon request produced 24 tokens in 16 target forwards, saving eight
+  forwards (33.3%). A second unseen one-sentence request produced `Eis schwimmt
+  auf Wasser, weil es eine geringere Dichte als flüssiges Wasser besitzt.` in 22
+  tokens and 11 target forwards, with 11 accepted drafts; its K4 round accepted
+  all three staged drafts.
 - **All-layer Fast MLP.** A prompt-free weight initializer derives p4/k32
   pilots for every Qwen MLP layer from exact Gate/Up Gaussian joint moments.
   Existing full-path tensors update bounded recursive-ridge route statistics;
@@ -224,11 +232,12 @@ full Q4. `--no-ooe-warm` disables this route, and `--ooe-warm-root` mounts an
 explicit bank outside the canonical deployment.
 
 The canonical Q4 deployment mounts the MTP-capable local bank and its persistent
-token-level Markov council. The Council gets a zero-model-cost first proposal;
-each useful known continuation stays on Markov, while the first K1 abstention
-hands the complete committed hidden history to embedded MTP. Both routes learn
-only target-confirmed output, and Full Q4 still verifies every emitted token.
-`--no-markov-draft` forces direct K1 decoding.
+token-level Markov council. Every response round starts with the zero-model-cost
+Council and falls through to embedded MTP only for that round when Markov has no
+useful continuation. Exact committed target-hidden rows advance the inactive
+provider, allowing later rounds to switch in either direction without replay.
+The Markov corpus learns only target-confirmed answer tokens, and Full Q4 still
+verifies every emitted token. `--no-markov-draft` forces direct K1 decoding.
 
 Markov state v6 also retains prompt/output boundaries for composition. Two or
 more distinct target-confirmed bindings can induce literal/copy programs over a
@@ -263,6 +272,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Persistent JSONL chat | second request opens 0 tensors | one process retains the verified mmap plane; observed one-token generation 15.01 s then 16.90 s |
 | Native DeltaNet K=4 convolution | 79.05 → 23.01 s generation; 3.44x | direct causal channelwise kernel replaces generic 10,240-group Conv1d; identical output/token trace; TTFT 25.05 → 13.65 s |
 | Adaptive embedded MTP | 34.05 → 26.74 s generation; 16 → 9 target forwards | arbitrary 16-token counting request; identical target trace; eight accepted drafts; eight provider head scans; 1.58 GB peak RSS |
+| Round-wise arbitrary chat | 22 tokens in 11 target forwards; 11 drafts accepted | unseen German one-sentence request; complete correct answer; one K4 wave accepted all three drafts; 33.11 s generation; 1.46 GB peak RSS; deeper MTP positions learned online |
 | Automatic Markov→MTP→Markov learning | 30.38 → 26.79 s; 12 → 9 target forwards | first novel request opened MTP and taught Council memory; after two confirmations the third request stayed entirely on a seven-token dialect phrase, loaded no MTP, preserved identical output, and used 1.34 GB peak RSS |
 | In-request Markov→MTP handoff | 24 output tokens in 9 target forwards | four learned Markov K4 waves followed by one exact 41-row hidden-state handoff and four MTP waves; 15 accepted drafts; no Qwen replay; 29.93 s generation and 1.46 GB peak RSS |
 | Compositional unseen token slot | unseen `CODE_DD44` via Markov only | three distinct target-confirmed code bindings induced unanimous Literal+Copy programs; fourth slot loaded no MTP, returned the exact requested code in three target forwards, and remained fully Qwen-verified |
