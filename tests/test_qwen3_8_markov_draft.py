@@ -882,6 +882,59 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((*prompt, 3, 4, 5, 6))
         provider.close()
 
+    def test_exact_dialect_phrase_is_not_damped_twice(self) -> None:
+        prompt = tuple((1, 2) * 20)
+        episode = (*prompt, 3, 4, 5, 6)
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=256,
+        )
+        dialect_id = "a" * 64
+        signature = provider._context_signature(prompt)
+        extra_signature = tuple(
+            value
+            for value in range(10_000, 11_000)
+            if value not in set(signature)
+        )[: max(0, 32 - len(signature))]
+        dialect_signature = tuple(sorted((*signature, *extra_signature)))
+        expert_count = len(provider._state.expert_names)
+        provider._state = replace(
+            provider._state,
+            token_ids=episode * 2,
+            episode_lengths=(len(episode),) * 2,
+            episode_dialects=(dialect_id,) * 2,
+            dialects=(
+                MarkovDialectState(
+                    dialect_id=dialect_id,
+                    signature=dialect_signature,
+                    visits=2,
+                    last_seen=1,
+                    rapidities=(0.0,) * expert_count,
+                    observations=(0,) * expert_count,
+                    hits=(0,) * expert_count,
+                ),
+            ),
+            clock=1,
+        )
+        provider.begin_request(prompt)
+        self.assertGreaterEqual(provider.metrics().active_dialect_similarity, 0.20)
+        self.assertLess(provider.metrics().active_dialect_similarity, 1.0)
+
+        proposal = provider.propose_round(prompt, 3)
+        policy = proposal.select_window(
+            request_window_ceiling=4,
+            remaining_tokens=4,
+            window_work_costs={1: 1.0, 2: 1.6, 4: 2.8},
+        )
+
+        self.assertEqual(proposal.token_ids, (4, 5, 6))
+        self.assertEqual(proposal.phrase_source, "dialect")
+        self.assertEqual(proposal.phrase_support, 2)
+        self.assertEqual(proposal.phrase_confidence, 1.0)
+        self.assertEqual(policy.chosen_window, 2)
+        provider.discard_pending_proposal()
+        provider.close()
+
     def test_stronger_global_phrase_beats_weak_dialect_phrase(self) -> None:
         prompt = (9, 1, 2)
         local_episode = (1, 2, 3, 4, 5)

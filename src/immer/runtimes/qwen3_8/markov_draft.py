@@ -1645,11 +1645,6 @@ class FingerprintRollingK4DraftProvider:
                 0.0
                 if option is None
                 else option.confidence
-                * (
-                    self._active_dialect_similarity
-                    if option.source == "dialect"
-                    else 1.0
-                )
             ),
             phrase_width=(
                 0 if option is None else min(len(option.token_ids), self.proposal_width)
