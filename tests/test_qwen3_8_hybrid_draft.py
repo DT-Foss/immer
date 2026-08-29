@@ -58,6 +58,7 @@ class _Markov:
         self.discard_calls = 0
         self.verification_calls = []
         self.reconcile_calls = []
+        self.advance_calls = []
         self.final_calls = []
         self.pending = False
         self.closed = False
@@ -93,6 +94,11 @@ class _Markov:
         self.pending = False
         self.reconcile_calls.append(history)
 
+    def advance_confirmed_prefix(self, history):
+        if self.pending:
+            raise AssertionError("advance with pending proposal")
+        self.advance_calls.append(history)
+
     def observe_final(self, history):
         if self.pending:
             raise AssertionError("final with pending proposal")
@@ -124,6 +130,7 @@ class _Mtp:
         self.propose_calls = []
         self.verification_calls = []
         self.reconcile_calls = []
+        self.advance_calls = []
         self.final_calls = []
         self.pending = False
         self.closed = False
@@ -153,6 +160,22 @@ class _Mtp:
             raise AssertionError("reconcile without MTP proposal")
         self.pending = False
         self.reconcile_calls.append(history)
+
+    def advance_confirmed_prefix_state(
+        self,
+        history,
+        previous_target_hidden,
+        committed_hidden,
+    ):
+        if self.pending:
+            raise AssertionError("advance with pending MTP proposal")
+        self.advance_calls.append(
+            (
+                history,
+                previous_target_hidden.detach().clone(),
+                committed_hidden.detach().clone(),
+            )
+        )
 
     def observe_final(self, history):
         self.final_calls.append(history)
@@ -210,7 +233,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         provider.close()
         self.assertTrue(markov.closed)
 
-    def test_k1_discards_markov_lazily_loads_mtp_and_never_switches(self) -> None:
+    def test_k1_lazily_loads_mtp_and_rechecks_markov_each_round(self) -> None:
         markov = _Markov(0.01)
         mtp = _Mtp()
         factory_calls = []
@@ -253,7 +276,12 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         provider.observe_final(final)
 
         self.assertEqual(factory_calls, ["mtp"])
-        self.assertEqual(len(markov.propose_calls), 1)
+        self.assertEqual(len(markov.propose_calls), 2)
+        self.assertEqual(markov.discard_calls, 2)
+        self.assertEqual(
+            markov.advance_calls,
+            [(*prompt, 5, 7), (*next_history, 6)],
+        )
         self.assertEqual(mtp.verification_calls, [(1, 2), (0, 1)])
         self.assertEqual(mtp.final_calls, [final])
         self.assertEqual(markov.final_calls, [final])
@@ -261,7 +289,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(metrics.selected_provider, "mtp")
         self.assertEqual(metrics.source_body_bytes, 4096)
         self.assertEqual(metrics.linear_calls, 9)
-        self.assertEqual(metrics.mtp_selections, 1)
+        self.assertEqual(metrics.mtp_selections, 2)
         self.assertEqual(metrics.to_dict()["mtp"]["linear_calls"], 9)
         close_order = []
 
@@ -281,7 +309,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(markov.closed)
         self.assertTrue(mtp.closed)
 
-    def test_markov_rounds_then_one_way_mtp_handoff_uses_complete_hidden(self) -> None:
+    def test_round_council_switches_back_to_markov_and_keeps_mtp_synced(self) -> None:
         markov = _Markov([0.99, 0.99, 0.01, 0.99])
         mtp = _Mtp()
         factory_calls = []
@@ -341,30 +369,43 @@ class Qwen38HybridDraftTests(unittest.TestCase):
             torch.tensor([[[50.0, 51.0, 52.0, 53.0], [60.0, 61.0, 62.0, 63.0]]]),
         )
 
-        provider.propose_round_state(
+        returned = provider.propose_round_state(
             mtp_history,
             13,
             torch.full((1, 1, 4), 13.0),
         )
         self.assertEqual(factory_calls, ["mtp"])
-        self.assertEqual(len(markov.propose_calls), 3)
-        self.assertEqual(len(mtp.propose_calls), 2)
-        provider.observe_verification(0, 1)
+        self.assertEqual(returned.token_ids, (3, 4, 5))
+        self.assertEqual(provider.selected_provider, "markov")
+        self.assertEqual(len(markov.propose_calls), 4)
+        self.assertEqual(len(mtp.propose_calls), 1)
+        provider.observe_verification(1, 1)
+        final_hidden = torch.full((1, 2, 4), 70.0)
         provider.reconcile_prefix_state(
-            (*mtp_history, 13),
-            torch.full((1, 1, 4), 70.0),
+            (*mtp_history, 13, 3),
+            final_hidden,
         )
-        final = (*mtp_history, 13, 14)
+        final = (*mtp_history, 13, 3, 14)
         provider.observe_final(final)
         self.assertEqual(markov.final_calls, [final])
+        self.assertEqual(markov.advance_calls, [mtp_history])
+        self.assertEqual(len(mtp.advance_calls), 1)
+        self.assertEqual(mtp.advance_calls[0][0], (*mtp_history, 13, 3))
+        self.assertTrue(
+            torch.equal(
+                mtp.advance_calls[0][1],
+                torch.full((1, 1, 4), 13.0),
+            )
+        )
+        self.assertTrue(torch.equal(mtp.advance_calls[0][2], final_hidden))
 
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v2")
-        self.assertEqual(metrics.selected_provider, "mtp")
-        self.assertEqual(metrics.selection_calls, 3)
-        self.assertEqual(metrics.markov_rounds, 2)
-        self.assertEqual(metrics.mtp_rounds, 2)
-        self.assertEqual(metrics.provider_switches, 1)
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v3")
+        self.assertEqual(metrics.selected_provider, "markov")
+        self.assertEqual(metrics.selection_calls, 4)
+        self.assertEqual(metrics.markov_rounds, 3)
+        self.assertEqual(metrics.mtp_rounds, 1)
+        self.assertEqual(metrics.provider_switches, 2)
         self.assertEqual(metrics.hidden_history_rows, len(second_history))
         self.assertEqual(
             metrics.hidden_history_bytes,

@@ -1501,9 +1501,11 @@ class Qwen38CausalChat:
             else:
                 policy["hybrid_draft"] = {
                     "provider_abi": QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
-                    "selection": "markov-prefix-then-one-way-mtp/v2",
+                    "selection": "round-wise-markov-first-mtp-fallback/v3",
                     "request_provider_lock": False,
-                    "one_way_handoff": True,
+                    "one_way_handoff": False,
+                    "round_reselection": True,
+                    "cross_provider_target_state_sync": True,
                     "committed_hidden_handoff": True,
                     "markov_provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
                     "markov_persistent": self._markov_draft_state_path is not None,

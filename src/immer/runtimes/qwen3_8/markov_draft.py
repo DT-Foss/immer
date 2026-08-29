@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v9"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v10"
 V5_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
 V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
@@ -1190,15 +1190,10 @@ class FingerprintRollingK4DraftProvider:
 
     def _persistent_symbols(self) -> tuple[str, ...]:
         rows: list[str] = []
-        offset = 0
-        for index, length in enumerate(self._state.episode_lengths):
+        for index, episode in enumerate(self._generation_episodes()):
             if index:
                 rows.append(_EPISODE_TOKEN)
-            rows.extend(
-                self._symbol(token)
-                for token in self._state.token_ids[offset : offset + length]
-            )
-            offset += length
+            rows.extend(self._symbol(token) for token in episode)
         return tuple(rows)
 
     def _episodes(self, dialect_id: str | None = None) -> tuple[tuple[int, ...], ...]:
@@ -1213,6 +1208,35 @@ class FingerprintRollingK4DraftProvider:
             offset += length
             if dialect_id is None or bound_dialect == dialect_id:
                 rows.append(episode)
+        return tuple(rows)
+
+    def _generation_episodes(
+        self,
+        dialect_id: str | None = None,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Return the Qwen-generated side of every confirmed transition.
+
+        The Council is a draft language model, so its persistent PPM corpus must
+        contain Qwen's answers rather than repeated chat templates and arbitrary
+        user prompts.  Legacy promptless episodes remain usable as answer-only
+        rows; structured episodes start exactly at their stored prompt boundary.
+        """
+
+        rows = []
+        offset = 0
+        for length, bound_dialect, prompt_length in zip(
+            self._state.episode_lengths,
+            self._state.episode_dialects,
+            self._state.episode_prompt_lengths,
+            strict=True,
+        ):
+            episode = self._state.token_ids[offset : offset + length]
+            offset += length
+            if dialect_id is not None and bound_dialect != dialect_id:
+                continue
+            generated = episode if prompt_length is None else episode[prompt_length:]
+            if generated:
+                rows.append(generated)
         return tuple(rows)
 
     def _structured_episodes(
@@ -1439,7 +1463,7 @@ class FingerprintRollingK4DraftProvider:
         dialect_id: str | None,
         minimum_support: int,
     ) -> MarkovPhraseOption | None:
-        episodes = self._episodes(dialect_id)
+        episodes = self._generation_episodes(dialect_id)
         candidates: list[MarkovPhraseOption] = []
         max_width = min(self.proposal_width, self.PHRASE_MAX_WIDTH)
         if max_width < 2:
@@ -2066,6 +2090,37 @@ class FingerprintRollingK4DraftProvider:
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._last_round_proposal = None
+
+    def advance_confirmed_prefix(self, history: tuple[int, ...], /) -> None:
+        """Follow target-confirmed tokens emitted by another draft expert.
+
+        This keeps the cheap Council eligible on every later decode round while
+        another provider owns the current proposal.  No synthetic expert
+        feedback is invented; the complete target episode is learned once at
+        finalization as usual.
+        """
+
+        if self._closed:
+            raise MarkovDraftError("Markov draft provider is closed")
+        if not self._request_started or self._request_completed:
+            raise MarkovDraftError("Markov request is not active")
+        if self._pending_base is not None or self._pending_proposal is not None:
+            raise MarkovDraftError("cannot advance an unreconciled Markov proposal")
+        committed = self._token_tuple(history, label="advanced Markov history")
+        prompt = self._request_prompt
+        if prompt is None or committed[: len(prompt)] != prompt:
+            raise MarkovDraftError("advanced Markov history changed its request prompt")
+        previous = self._last_confirmed_length
+        if previous is None:
+            previous = len(prompt)
+        if len(committed) < previous:
+            raise MarkovDraftError("advanced Markov history moved backwards")
+        if self._carry_feedback is not None and len(committed) > previous:
+            self._episode_feedback.append(
+                (self._carry_feedback, committed[previous])
+            )
+            self._carry_feedback = None
+        self._last_confirmed_length = len(committed)
 
     def observe_final(self, history: tuple[int, ...], /) -> None:
         committed = self._token_tuple(history, label="final Markov history")

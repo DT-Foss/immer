@@ -20,7 +20,10 @@ from .kernels import AttentionState, full_attention_core, rms_norm
 from .pager import Qwen38WeightPager
 
 
-QWEN35_MTP_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v1"
+QWEN35_MTP_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v2"
+_QWEN35_MTP_DRAFT_PROVIDER_LEGACY_SCHEMA = (
+    "immer.qwen3.5-mtp-draft-provider/v1"
+)
 QWEN35_MTP_CALIBRATION_SCHEMA = "immer.qwen3.5-mtp-markov-calibration/v1"
 MTP_MATRIX_NAMES = (
     "mtp.fc.weight",
@@ -68,6 +71,8 @@ def _state_bytes(state: AttentionState | None) -> int:
 class Qwen35MtpDraftMetrics:
     schema: str
     begin_calls: int
+    advance_calls: int
+    advanced_tokens: int
     proposal_calls: int
     reconcile_calls: int
     draft_steps: int
@@ -176,6 +181,8 @@ class Qwen35MtpDraftProvider:
         self._load_calibration()
         self._closed = False
         self._begin_calls = 0
+        self._advance_calls = 0
+        self._advanced_tokens = 0
         self._proposal_calls = 0
         self._reconcile_calls = 0
         self._draft_steps = 0
@@ -209,10 +216,15 @@ class Qwen35MtpDraftProvider:
             return
         try:
             document = json.loads(path.read_bytes())
+            identity = self._calibration_identity()
+            legacy_identity = {
+                **identity,
+                "provider": _QWEN35_MTP_DRAFT_PROVIDER_LEGACY_SCHEMA,
+            }
             if (
                 not isinstance(document, dict)
                 or document.get("schema") != QWEN35_MTP_CALIBRATION_SCHEMA
-                or document.get("identity") != self._calibration_identity()
+                or document.get("identity") not in (identity, legacy_identity)
                 or not isinstance(document.get("rows"), list)
                 or isinstance(document.get("updates"), bool)
                 or not isinstance(document.get("updates"), int)
@@ -490,10 +502,11 @@ class Qwen35MtpDraftProvider:
         gap = max(0.0, float(values[0, 0].item()) - float(values[0, 1].item()))
         raw_confidence = max(0.0, min(0.999, 1.0 - math.exp(-gap)))
         bucket = self._gap_bucket(gap)
-        alpha, beta = self._reliability.get(
-            (proposal_index, bucket, self._previous_outcome),
-            [1, 1],
-        )
+        previous = self._previous_outcome if proposal_index == 0 else 1
+        exact = self._reliability.get((proposal_index, bucket, previous))
+        if exact is None and proposal_index > 0:
+            exact = self._reliability.get((0, bucket, previous))
+        alpha, beta = [1, 1] if exact is None else exact
         confidence = min(raw_confidence, alpha / (alpha + beta))
         del values, selected
         if not 0 <= token < self.config.vocab_size:
@@ -533,6 +546,59 @@ class Qwen35MtpDraftProvider:
         raise Qwen35MtpDraftError(
             "embedded MTP requires target-hidden rolling callbacks"
         )
+
+    def advance_confirmed_prefix_state(
+        self,
+        history: tuple[int, ...],
+        previous_target_hidden: torch.Tensor,
+        committed_hidden: torch.Tensor,
+        /,
+    ) -> None:
+        """Append a target-confirmed prefix without replaying the MTP cache.
+
+        For an extension ``x[0:m]``, the exact shifted MTP pairs are
+        ``(x[0], h[-1])`` followed by ``(x[i], h[i-1])``.  The caller supplies
+        the previous committed target row ``h[-1]`` and the target rows for the
+        extension; the final row remains the conditioner for the next token.
+        """
+
+        if self._closed:
+            raise Qwen35MtpDraftError("MTP provider is closed")
+        base = self._committed_history
+        if base is None:
+            raise Qwen35MtpDraftError("MTP request state is not initialized")
+        if self._pending_base is not None:
+            raise Qwen35MtpDraftError(
+                "cannot advance MTP state with a pending proposal"
+            )
+        committed = self._history(history, label="MTP confirmed history")
+        if len(committed) <= len(base) or committed[: len(base)] != base:
+            raise Qwen35MtpDraftError(
+                "MTP confirmed history is not a contiguous extension"
+            )
+        added = len(committed) - len(base)
+        previous = self._hidden(
+            previous_target_hidden,
+            rows=1,
+            label="MTP previous target hidden",
+        )
+        fragment = self._hidden(
+            committed_hidden,
+            rows=added,
+            label="MTP committed target hidden",
+        )
+        conditioning = torch.cat((previous, fragment[:, :-1]), dim=1)
+        _output, state = self._step(
+            committed[len(base) :],
+            conditioning,
+            state=self._committed_state,
+            start_pos=self._next_position,
+        )
+        self._committed_history = committed
+        self._committed_state = state
+        self._next_position = len(committed) - 1
+        self._advance_calls += 1
+        self._advanced_tokens += added
 
     def propose_after_state(
         self,
@@ -582,7 +648,7 @@ class Qwen35MtpDraftProvider:
             proposal.append(token)
             confidences.append(confidence)
             gap_buckets.append(bucket)
-            if self._adaptive_round_call and proposal_index == 0 and confidence < 0.6:
+            if self._adaptive_round_call and confidence < 0.6:
                 missing = self.proposal_width - len(proposal)
                 self._padded_proposal_tokens += missing
                 proposal.extend([token] * missing)
@@ -607,14 +673,6 @@ class Qwen35MtpDraftProvider:
                 start_pos=self._next_position + len(proposal),
             )
             states.append(state)
-            if self._adaptive_round_call and proposal_index == 0:
-                missing = self.proposal_width - len(proposal)
-                self._padded_proposal_tokens += missing
-                proposal.extend([token] * missing)
-                confidences.extend([0.0] * missing)
-                gap_buckets.extend([bucket] * missing)
-                states.extend([state] * (self.proposal_width + 1 - len(states)))
-                break
 
         result = tuple(proposal)
         if len(result) != self.proposal_width or len(states) != self.proposal_width + 1:
@@ -717,6 +775,8 @@ class Qwen35MtpDraftProvider:
         return Qwen35MtpDraftMetrics(
             schema=QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
             begin_calls=self._begin_calls,
+            advance_calls=self._advance_calls,
+            advanced_tokens=self._advanced_tokens,
             proposal_calls=self._proposal_calls,
             reconcile_calls=self._reconcile_calls,
             draft_steps=self._draft_steps,

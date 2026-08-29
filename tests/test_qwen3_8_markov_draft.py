@@ -87,6 +87,50 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.episode_prompt_lengths, (3,))
         provider.close()
 
+    def test_draft_corpus_contains_generated_answers_not_chat_prompts(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=64)
+        episodes = (
+            (1, 2, 3, 40, 41, 42),
+            (7, 8, 9, 50, 51),
+            (60, 61),
+        )
+        provider._state = replace(
+            provider._state,
+            token_ids=tuple(token for episode in episodes for token in episode),
+            episode_lengths=tuple(map(len, episodes)),
+            episode_dialects=(None, None, None),
+            episode_prompt_lengths=(3, 3, None),
+        )
+
+        self.assertEqual(
+            provider._generation_episodes(),
+            ((40, 41, 42), (50, 51), (60, 61)),
+        )
+        self.assertEqual(
+            provider._persistent_symbols(),
+            ("40", "41", "42", "<episode>", "50", "51", "<episode>", "60", "61"),
+        )
+        provider.close()
+
+    def test_council_can_resume_after_another_provider_commits_prefix(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            proposal_width=3,
+        )
+        prompt = (1, 2, 3)
+        provider.begin_request(prompt)
+        external = (*prompt, 40, 41)
+
+        provider.advance_confirmed_prefix(external)
+        proposal = provider.propose_round(external, 42)
+
+        self.assertEqual(len(proposal.token_ids), 3)
+        provider.discard_pending_proposal()
+        provider.advance_confirmed_prefix((*external, 42))
+        provider.observe_final((*external, 42, 43))
+        self.assertEqual(provider.confirmed_transitions(), ((prompt, (40, 41, 42, 43)),))
+        provider.close()
+
     def test_v1_state_migrates_into_one_episode_and_initializes_council(self) -> None:
         legacy = {
             "max_history_tokens": 64,
