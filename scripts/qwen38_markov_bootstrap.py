@@ -18,6 +18,7 @@ from immer.runtimes.qwen3_8.markov_draft import (
 
 
 IMPORT_JOURNAL_SCHEMA = "immer.qwen3.8-markov-receipt-imports/v1"
+Episode = tuple[tuple[int, ...], tuple[int, ...]]
 
 
 def _canonical(value: object) -> bytes:
@@ -34,8 +35,22 @@ def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
-def _episode_digest(tokens: tuple[int, ...]) -> str:
-    return _digest(list(tokens))
+def _episode_tokens(episode: Episode) -> tuple[int, ...]:
+    prompt, generated = episode
+    return (*prompt, *generated)
+
+
+def _episode_digest(episode: Episode) -> str:
+    prompt, generated = episode
+    if not prompt:
+        return _digest(list(generated))
+    return _digest(
+        {
+            "generated_token_ids": list(generated),
+            "prompt_token_ids": list(prompt),
+            "schema": "immer.qwen3.8-structured-episode/v1",
+        }
+    )
 
 
 def _token_tuple(value: object, *, vocab_size: int) -> tuple[int, ...] | None:
@@ -55,10 +70,12 @@ def _extract_document(
     vocab_size: int,
     min_tokens: int,
     source: Path,
-    episodes: dict[tuple[int, ...], str],
+    episodes: dict[Episode, str],
 ) -> None:
     if isinstance(value, dict):
-        generated = _token_tuple(value.get("generated_token_ids"), vocab_size=vocab_size)
+        generated = _token_tuple(
+            value.get("generated_token_ids"), vocab_size=vocab_size
+        )
         if generated:
             prompt = None
             for key in (
@@ -69,8 +86,8 @@ def _extract_document(
                 prompt = _token_tuple(value.get(key), vocab_size=vocab_size)
                 if prompt is not None:
                     break
-            episode = (*(prompt or ()), *generated)
-            if len(episode) >= min_tokens:
+            episode = (prompt or (), generated)
+            if len(_episode_tokens(episode)) >= min_tokens:
                 episodes.setdefault(episode, str(source))
         for child in value.values():
             _extract_document(
@@ -97,8 +114,8 @@ def scan_receipts(
     vocab_size: int,
     min_tokens: int,
     max_file_bytes: int,
-) -> tuple[dict[tuple[int, ...], str], int, int]:
-    episodes: dict[tuple[int, ...], str] = {}
+) -> tuple[dict[Episode, str], int, int]:
+    episodes: dict[Episode, str] = {}
     scanned = 0
     rejected = 0
     files: set[Path] = set()
@@ -113,7 +130,9 @@ def scan_receipts(
                 if path.is_file() and not path.is_symlink()
             )
         else:
-            raise FileNotFoundError(f"receipt root is not a regular file/directory: {root}")
+            raise FileNotFoundError(
+                f"receipt root is not a regular file/directory: {root}"
+            )
     for path in sorted(files):
         try:
             metadata = path.stat()
@@ -190,7 +209,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise MarkovDraftError("Markov import journal exists without its state")
     legacy_imported = _load_journal(journal_path, vocab_size=args.vocab_size)
     imported = set(legacy_imported)
-    retained: tuple[tuple[int, ...], ...] = ()
     if state_path.exists():
         provider = _provider(
             state_path,
@@ -198,9 +216,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             proposal_width=args.proposal_width,
         )
         try:
-            retained = provider.confirmed_episodes()
+            retained_transitions = provider.confirmed_transitions()
             imported.update(provider.imported_episode_sha256s())
-            retained_digests = {_episode_digest(row) for row in retained}
+            retained_digests = {
+                _episode_digest((prompt or (), generated))
+                for prompt, generated in retained_transitions
+            }
             imported.update(retained_digests)
             if not args.dry_run:
                 provider.register_imported_episode_sha256s(
@@ -226,9 +247,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 proposal_width=args.proposal_width,
             )
             try:
-                added = provider.import_confirmed_episode(
-                    episode,
-                    _episode_digest(episode),
+                prompt, generated = episode
+                added = (
+                    provider.import_confirmed_transition(
+                        prompt,
+                        generated,
+                        _episode_digest(episode),
+                    )
+                    if prompt
+                    else provider.import_confirmed_episode(
+                        generated,
+                        _episode_digest(episode),
+                    )
                 )
             finally:
                 provider.close()
@@ -236,7 +266,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 continue
             imported.add(_episode_digest(episode))
             imported_now += 1
-            imported_tokens += len(episode)
+            imported_tokens += len(_episode_tokens(episode))
     metrics: dict[str, Any] = {}
     if state_path.exists():
         provider = _provider(

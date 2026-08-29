@@ -7,9 +7,47 @@ import tempfile
 import unittest
 
 from scripts.qwen38_markov_bootstrap import run
+from immer.runtimes.qwen3_8.markov_draft import MarkovDraftState
 
 
 class Qwen38MarkovBootstrapTests(unittest.TestCase):
+    def test_structured_identity_does_not_flatten_the_prompt_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            (receipts / "a.json").write_text(
+                json.dumps(
+                    {
+                        "prompt_token_ids": [1, 2],
+                        "generated_token_ids": [3, 4],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (receipts / "b.json").write_text(
+                json.dumps({"generated_token_ids": [1, 2, 3, 4]}),
+                encoding="utf-8",
+            )
+            state = root / "state" / "markov.bin"
+            args = SimpleNamespace(
+                state=state,
+                root=[receipts],
+                vocab_size=32,
+                proposal_width=3,
+                min_tokens=4,
+                max_file_mb=1.0,
+                limit=None,
+                dry_run=False,
+            )
+
+            result = run(args)
+
+            self.assertEqual(result["episodes_extracted"], 2)
+            self.assertEqual(result["episodes_imported"], 2)
+            learned = MarkovDraftState.from_bytes(state.read_bytes())
+            self.assertEqual(learned.episode_prompt_lengths, (2, None))
+
     def test_receipt_import_is_read_only_atomic_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -74,6 +112,8 @@ class Qwen38MarkovBootstrapTests(unittest.TestCase):
             self.assertEqual(imported["metrics"]["imported_episode_count"], 2)
             self.assertEqual(imported["metrics"]["learned_tokens"], 8)
             self.assertEqual(imported["metrics"]["updates"], 2)
+            learned = MarkovDraftState.from_bytes(state.read_bytes())
+            self.assertEqual(learned.episode_prompt_lengths, (2, None))
 
             repeated = run(args())
             self.assertEqual(repeated["episodes_pending"], 0)

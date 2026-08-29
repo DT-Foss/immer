@@ -1478,6 +1478,13 @@ class Qwen38CausalChat:
                         max(0, int(policy["draft_window"]) - 1),
                     ),
                     "provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
+                    "composition": {
+                        "atoms": ["literal", "relative-prompt-copy"],
+                        "maximum_atoms": 8,
+                        "maximum_context_tokens": 64,
+                        "minimum_distinct_bindings": 2,
+                        "prompt_boundary_persistent": True,
+                    },
                     "round_window_selector": "markov-prefix-utility/v2",
                     "persistent": self._markov_draft_state_path is not None,
                 }
@@ -1500,6 +1507,7 @@ class Qwen38CausalChat:
                     "committed_hidden_handoff": True,
                     "markov_provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
                     "markov_persistent": self._markov_draft_state_path is not None,
+                    "markov_composition": "literal+relative-prompt-copy/v1",
                     "mtp_provider_abi": QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
                     "mtp_persistent_calibration": (
                         self._mtp_draft_state_path is not None

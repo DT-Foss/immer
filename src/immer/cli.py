@@ -308,7 +308,7 @@ def _qwen38_growing_warm_profile(
         "markov_provider_abi": (
             "immer.qwen3.8-markov-mtp-hybrid-provider/v2"
             if draft_mode == "hybrid"
-            else "immer.qwen3.8-markov-draft-provider/v8"
+            else "immer.qwen3.8-markov-draft-provider/v9"
             if draft_mode == "markov"
             else None
         ),

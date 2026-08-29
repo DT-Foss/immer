@@ -21,20 +21,28 @@ from typing import Sequence
 import zlib
 
 from .draft_protocol import RollingDraftProposal
+from .markov_composition import (
+    CompositionBounds,
+    ConfirmedTokenEpisode,
+    MarkovCompositionProgram,
+    derive_programs,
+)
 
 try:
     import fcntl
 except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
-MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v8"
+MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v9"
+V5_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
 V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v8"
-_STATE_PREFIX = b"IMMD\x05"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v9"
+_STATE_PREFIX = b"IMMD\x06"
+_V5_STATE_PREFIX = b"IMMD\x05"
 _V4_STATE_PREFIX = b"IMMD\x04"
 _V3_STATE_PREFIX = b"IMMD\x03"
 _V2_STATE_PREFIX = b"IMMD\x02"
@@ -338,6 +346,7 @@ class MarkovPhraseOption:
     context_order: int
     support: int
     total: int
+    kind: str = "literal"
 
     @property
     def confidence(self) -> float:
@@ -346,8 +355,10 @@ class MarkovPhraseOption:
     def __post_init__(self) -> None:
         if self.source not in {"dialect", "global"}:
             raise ValueError("phrase option source is invalid")
+        if self.kind not in {"composition", "literal"}:
+            raise ValueError("phrase option kind is invalid")
         if (
-            not 2 <= len(self.token_ids) <= 15
+            not 1 <= len(self.token_ids) <= 15
             or any(
                 isinstance(token, bool) or not isinstance(token, int) or token < 0
                 for token in self.token_ids
@@ -379,6 +390,7 @@ class MarkovDraftState:
     clock: int = 0
     dialects: tuple[MarkovDialectState, ...] = ()
     episode_dialects: tuple[str | None, ...] = ()
+    episode_prompt_lengths: tuple[int | None, ...] = ()
     imported_episode_sha256s: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -418,6 +430,23 @@ class MarkovDraftState:
             for value in episode_dialects
         ):
             raise ValueError("Markov episode dialect bindings are invalid")
+        episode_prompt_lengths = tuple(self.episode_prompt_lengths)
+        if episode_lengths and not episode_prompt_lengths:
+            episode_prompt_lengths = (None,) * len(episode_lengths)
+        if len(episode_prompt_lengths) != len(episode_lengths) or any(
+            value is not None
+            and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value < episode_length
+            )
+            for value, episode_length in zip(
+                episode_prompt_lengths,
+                episode_lengths,
+                strict=True,
+            )
+        ):
+            raise ValueError("Markov episode prompt boundaries are invalid")
         if (
             isinstance(self.updates, bool)
             or not isinstance(self.updates, int)
@@ -500,6 +529,11 @@ class MarkovDraftState:
         object.__setattr__(self, "episode_lengths", episode_lengths)
         object.__setattr__(self, "dialects", dialects)
         object.__setattr__(self, "episode_dialects", episode_dialects)
+        object.__setattr__(
+            self,
+            "episode_prompt_lengths",
+            episode_prompt_lengths,
+        )
         object.__setattr__(self, "imported_episode_sha256s", imported)
 
     def to_bytes(self) -> bytes:
@@ -515,6 +549,7 @@ class MarkovDraftState:
                 "leader_changes": self.leader_changes,
                 "episode_lengths": list(self.episode_lengths),
                 "episode_dialects": list(self.episode_dialects),
+                "episode_prompt_lengths": list(self.episode_prompt_lengths),
                 "imported_episode_sha256s": list(self.imported_episode_sha256s),
                 "clock": self.clock,
                 "dialects": [row.to_record() for row in self.dialects],
@@ -542,6 +577,7 @@ class MarkovDraftState:
             or not data.startswith(
                 (
                     _STATE_PREFIX,
+                    _V5_STATE_PREFIX,
                     _V4_STATE_PREFIX,
                     _V3_STATE_PREFIX,
                     _V2_STATE_PREFIX,
@@ -556,15 +592,19 @@ class MarkovDraftState:
                 _STATE_PREFIX
                 if data.startswith(_STATE_PREFIX)
                 else (
-                    _V4_STATE_PREFIX
-                    if data.startswith(_V4_STATE_PREFIX)
+                    _V5_STATE_PREFIX
+                    if data.startswith(_V5_STATE_PREFIX)
                     else (
-                        _V2_STATE_PREFIX
-                        if data.startswith(_V2_STATE_PREFIX)
+                        _V4_STATE_PREFIX
+                        if data.startswith(_V4_STATE_PREFIX)
                         else (
-                            _V3_STATE_PREFIX
-                            if data.startswith(_V3_STATE_PREFIX)
-                            else _LEGACY_STATE_PREFIX
+                            _V2_STATE_PREFIX
+                            if data.startswith(_V2_STATE_PREFIX)
+                            else (
+                                _V3_STATE_PREFIX
+                                if data.startswith(_V3_STATE_PREFIX)
+                                else _LEGACY_STATE_PREFIX
+                            )
                         )
                     )
                 )
@@ -594,6 +634,10 @@ class MarkovDraftState:
         v4 = (
             isinstance(value, dict)
             and value.get("schema") == V4_MARKOV_DRAFT_STATE_SCHEMA
+        )
+        v5 = (
+            isinstance(value, dict)
+            and value.get("schema") == V5_MARKOV_DRAFT_STATE_SCHEMA
         )
         v2_fields = {
             "expert_hits",
@@ -689,6 +733,30 @@ class MarkovDraftState:
                 "updates",
                 "vocab_size",
             }
+            if v5
+            else {
+                "expert_hits",
+                "expert_log_weights",
+                "expert_names",
+                "expert_observations",
+                "leader_changes",
+                "episode_lengths",
+                "episode_dialects",
+                "episode_prompt_lengths",
+                "imported_episode_sha256s",
+                "clock",
+                "dialects",
+                "feedback_count",
+                "max_history_tokens",
+                "regime_generation",
+                "schema",
+                "surprise_cusum",
+                "surprise_deviation",
+                "surprise_mean",
+                "token_ids",
+                "updates",
+                "vocab_size",
+            }
         )
         if (
             not isinstance(value, dict)
@@ -696,6 +764,7 @@ class MarkovDraftState:
             or value.get("schema")
             not in {
                 MARKOV_DRAFT_STATE_SCHEMA,
+                V5_MARKOV_DRAFT_STATE_SCHEMA,
                 V4_MARKOV_DRAFT_STATE_SCHEMA,
                 V3_MARKOV_DRAFT_STATE_SCHEMA,
                 V2_MARKOV_DRAFT_STATE_SCHEMA,
@@ -720,6 +789,7 @@ class MarkovDraftState:
                 leader_changes=value.get("leader_changes", 0),
                 episode_lengths=tuple(value.get("episode_lengths", ())),
                 episode_dialects=tuple(value.get("episode_dialects", ())),
+                episode_prompt_lengths=tuple(value.get("episode_prompt_lengths", ())),
                 imported_episode_sha256s=tuple(
                     value.get("imported_episode_sha256s", ())
                 ),
@@ -769,6 +839,12 @@ class MarkovDraftMetrics:
     phrase_option_calls: int
     phrase_draft_tokens: int
     phrase_accepted_tokens: int
+    composition_programs: int
+    composition_option_calls: int
+    composition_draft_tokens: int
+    composition_accepted_tokens: int
+    last_composition_support: int
+    last_composition_copy_tokens: int
     last_phrase_source: str | None
     last_phrase_support: int
     last_phrase_confidence: float
@@ -812,6 +888,7 @@ class FingerprintRollingK4DraftProvider:
     PHRASE_MAX_WIDTH = 15
     DIALECT_PHRASE_MIN_SUPPORT = 2
     GLOBAL_PHRASE_MIN_SUPPORT = 3
+    COMPOSITION_BOUNDS = CompositionBounds()
 
     def __init__(
         self,
@@ -909,11 +986,23 @@ class FingerprintRollingK4DraftProvider:
         self._dialect_evictions = 0
         self._request_started = False
         self._request_completed = False
+        self._request_prompt: tuple[int, ...] | None = None
+        self._request_prompt_length: int | None = None
         self._pending_phrase_option: MarkovPhraseOption | None = None
         self._phrase_option_calls = 0
         self._phrase_draft_tokens = 0
         self._phrase_accepted_tokens = 0
         self._last_phrase_option: MarkovPhraseOption | None = None
+        self._composition_cache: dict[
+            str | None,
+            tuple[MarkovCompositionProgram, ...],
+        ] = {}
+        self._composition_program_count = 0
+        self._composition_option_calls = 0
+        self._composition_draft_tokens = 0
+        self._composition_accepted_tokens = 0
+        self._last_composition_program: MarkovCompositionProgram | None = None
+        self._pending_composition_program: MarkovCompositionProgram | None = None
         self._last_confirmed_length: int | None = None
         self._draft_calls = 0
         self._reconcile_calls = 0
@@ -1095,6 +1184,8 @@ class FingerprintRollingK4DraftProvider:
             raise MarkovDraftError("Markov provider accepts exactly one request")
         committed = self._token_tuple(history, label="Markov request history")
         self._activate_dialect(committed)
+        self._request_prompt = committed
+        self._request_prompt_length = len(committed)
         self._request_started = True
 
     def _persistent_symbols(self) -> tuple[str, ...]:
@@ -1124,12 +1215,133 @@ class FingerprintRollingK4DraftProvider:
                 rows.append(episode)
         return tuple(rows)
 
+    def _structured_episodes(
+        self,
+        dialect_id: str | None = None,
+    ) -> tuple[ConfirmedTokenEpisode, ...]:
+        rows = []
+        offset = 0
+        for length, bound_dialect, prompt_length in zip(
+            self._state.episode_lengths,
+            self._state.episode_dialects,
+            self._state.episode_prompt_lengths,
+            strict=True,
+        ):
+            episode = self._state.token_ids[offset : offset + length]
+            offset += length
+            if prompt_length is None or (
+                dialect_id is not None and bound_dialect != dialect_id
+            ):
+                continue
+            rows.append(
+                ConfirmedTokenEpisode(
+                    prompt=episode[:prompt_length],
+                    output=episode[prompt_length:],
+                )
+            )
+        return tuple(rows)
+
+    def _composition_programs(
+        self,
+        dialect_id: str | None,
+    ) -> tuple[MarkovCompositionProgram, ...]:
+        if dialect_id not in self._composition_cache:
+            self._composition_cache[dialect_id] = derive_programs(
+                self._structured_episodes(dialect_id),
+                self.COMPOSITION_BOUNDS,
+            )
+            self._composition_program_count = len(
+                {
+                    row.canonical_key
+                    for programs in self._composition_cache.values()
+                    for row in programs
+                }
+            )
+        return self._composition_cache[dialect_id]
+
+    def _composition_option_from(
+        self,
+        history: tuple[int, ...],
+        *,
+        source: str,
+        dialect_id: str | None,
+    ) -> tuple[MarkovPhraseOption, MarkovCompositionProgram] | None:
+        prompt = self._request_prompt
+        prompt_length = self._request_prompt_length
+        if (
+            prompt is None
+            or prompt_length is None
+            or history[:prompt_length] != prompt
+            or len(history) <= prompt_length
+        ):
+            return None
+        confirmed_output = history[prompt_length:]
+        matches: list[tuple[tuple[int, ...], MarkovCompositionProgram]] = []
+        for program in self._composition_programs(dialect_id):
+            continuation = program.match(
+                prompt,
+                confirmed_output,
+                limit=self.proposal_width,
+            )
+            if continuation:
+                matches.append((continuation, program))
+        continuations = {row[0] for row in matches}
+        if len(continuations) != 1:
+            return None
+        continuation = continuations.pop()
+        program = max(
+            (row[1] for row in matches if row[0] == continuation),
+            key=lambda row: (
+                row.support,
+                row.distinct_bindings,
+                row.copied_tokens,
+                row.context_width,
+                tuple(-len(atom.canonical_key) for atom in row.atoms),
+                row.canonical_key,
+            ),
+        )
+        return (
+            MarkovPhraseOption(
+                token_ids=continuation,
+                source=source,
+                context_order=program.context_width,
+                support=program.support,
+                total=program.total,
+                kind="composition",
+            ),
+            program,
+        )
+
     def confirmed_episodes(self) -> tuple[tuple[int, ...], ...]:
         """Return immutable target-confirmed episodes for idempotent import."""
 
         if self._closed:
             raise MarkovDraftError("Markov draft provider is closed")
         return self._episodes()
+
+    def confirmed_transitions(
+        self,
+    ) -> tuple[tuple[tuple[int, ...] | None, tuple[int, ...]], ...]:
+        """Return retained prompt/output splits, including unknown legacy ones."""
+
+        if self._closed:
+            raise MarkovDraftError("Markov draft provider is closed")
+        rows = []
+        offset = 0
+        for length, prompt_length in zip(
+            self._state.episode_lengths,
+            self._state.episode_prompt_lengths,
+            strict=True,
+        ):
+            episode = self._state.token_ids[offset : offset + length]
+            offset += length
+            rows.append(
+                (
+                    None if prompt_length is None else episode[:prompt_length],
+                    episode if prompt_length is None else episode[prompt_length:],
+                )
+            )
+        return tuple(rows)
 
     @staticmethod
     def _import_digest(value: object) -> str:
@@ -1186,6 +1398,35 @@ class FingerprintRollingK4DraftProvider:
         self._pending_import_digest = digest
         try:
             self.observe_final(history)
+        finally:
+            self._pending_import_digest = None
+        return True
+
+    def import_confirmed_transition(
+        self,
+        prompt: tuple[int, ...],
+        generated: tuple[int, ...],
+        receipt_sha256: str,
+        /,
+    ) -> bool:
+        """Atomically learn one receipt with its prompt/output boundary."""
+
+        if self._closed:
+            raise MarkovDraftError("Markov draft provider is closed")
+        prompt_tokens = self._token_tuple(prompt, label="imported prompt")
+        generated_tokens = self._token_tuple(
+            generated,
+            label="imported generation",
+        )
+        digest = self._import_digest(receipt_sha256)
+        if digest in self._state.imported_episode_sha256s:
+            return False
+        if self._pending_import_digest is not None:
+            raise MarkovDraftError("another receipt import is pending")
+        self._pending_import_digest = digest
+        try:
+            self.begin_request(prompt_tokens)
+            self.observe_final((*prompt_tokens, *generated_tokens))
         finally:
             self._pending_import_digest = None
         return True
@@ -1267,6 +1508,7 @@ class FingerprintRollingK4DraftProvider:
     def _phrase_option(self, history: tuple[int, ...]) -> MarkovPhraseOption | None:
         dialect = self._active_dialect
         candidates: list[MarkovPhraseOption] = []
+        composition_rows: list[tuple[MarkovPhraseOption, MarkovCompositionProgram]] = []
         if dialect is not None and not self._active_dialect_is_new:
             local = self._phrase_option_from(
                 history,
@@ -1276,6 +1518,13 @@ class FingerprintRollingK4DraftProvider:
             )
             if local is not None:
                 candidates.append(local)
+            local_composition = self._composition_option_from(
+                history,
+                source="dialect",
+                dialect_id=dialect.dialect_id,
+            )
+            if local_composition is not None:
+                composition_rows.append(local_composition)
         global_option = self._phrase_option_from(
             history,
             source="global",
@@ -1284,10 +1533,25 @@ class FingerprintRollingK4DraftProvider:
         )
         if global_option is not None:
             candidates.append(global_option)
+        global_composition = self._composition_option_from(
+            history,
+            source="global",
+            dialect_id=None,
+        )
+        if global_composition is not None:
+            composition_rows.append(global_composition)
+        composition_outputs = {row[0].token_ids for row in composition_rows}
+        if len(composition_outputs) == 1:
+            candidates.extend(row[0] for row in composition_rows)
         if not candidates:
+            self._pending_composition_program = None
             return None
-
-        return max(candidates, key=self._phrase_option_score)
+        selected = max(candidates, key=self._phrase_option_score)
+        self._pending_composition_program = next(
+            (program for option, program in composition_rows if option == selected),
+            None,
+        )
+        return selected
 
     def _expert_models(
         self, history: tuple[int, ...]
@@ -1601,6 +1865,13 @@ class FingerprintRollingK4DraftProvider:
                 self.proposal_width,
             )
             self._last_phrase_option = option
+            if option.kind == "composition":
+                self._composition_option_calls += 1
+                self._composition_draft_tokens += min(
+                    len(option.token_ids),
+                    self.proposal_width,
+                )
+                self._last_composition_program = self._pending_composition_program
         self._draft_calls += 1
         return (
             proposal,
@@ -1641,11 +1912,7 @@ class FingerprintRollingK4DraftProvider:
             provider_abi=MARKOV_DRAFT_PROVIDER_ABI,
             phrase_source=None if option is None else option.source,
             phrase_support=0 if option is None else option.support,
-            phrase_confidence=(
-                0.0
-                if option is None
-                else option.confidence
-            ),
+            phrase_confidence=(0.0 if option is None else option.confidence),
             phrase_width=(
                 0 if option is None else min(len(option.token_ids), self.proposal_width)
             ),
@@ -1655,34 +1922,51 @@ class FingerprintRollingK4DraftProvider:
         self._last_round_proposal = result
         return result
 
-    def _learn_episode(self, tokens: Sequence[int]) -> None:
+    def _learn_episode(
+        self,
+        tokens: Sequence[int],
+        *,
+        prompt_length: int | None,
+    ) -> None:
         episode = tuple(tokens)
         if not episode:
             return
+        if prompt_length is not None and (
+            isinstance(prompt_length, bool)
+            or not isinstance(prompt_length, int)
+            or not 1 <= prompt_length < len(episode)
+        ):
+            raise MarkovDraftError("confirmed episode prompt boundary is invalid")
         if self._active_dialect is None:
             raise MarkovDraftError("confirmed episode has no dialect binding")
         episodes = []
         dialect_ids = list(self._state.episode_dialects)
+        prompt_lengths = list(self._state.episode_prompt_lengths)
         offset = 0
         for length in self._state.episode_lengths:
             episodes.append(self._state.token_ids[offset : offset + length])
             offset += length
         episodes.append(episode)
         dialect_ids.append(self._active_dialect.dialect_id)
+        prompt_lengths.append(prompt_length)
         total = sum(len(row) for row in episodes)
         while len(episodes) > 1 and total > self.max_history_tokens:
             total -= len(episodes.pop(0))
             dialect_ids.pop(0)
+            prompt_lengths.pop(0)
         if total > self.max_history_tokens:
             episodes[0] = episodes[0][-self.max_history_tokens :]
+            prompt_lengths[0] = None
         combined = tuple(token for row in episodes for token in row)
         self._state = replace(
             self._state,
             token_ids=combined,
             episode_lengths=tuple(len(row) for row in episodes),
             episode_dialects=tuple(dialect_ids),
+            episode_prompt_lengths=tuple(prompt_lengths),
             updates=self._state.updates + 1,
         )
+        self._composition_cache.clear()
 
     def _commit_active_dialect(self) -> None:
         dialect = self._active_dialect
@@ -1748,12 +2032,18 @@ class FingerprintRollingK4DraftProvider:
                 len(delta),
                 len(self._pending_phrase_option.token_ids),
             )
+            if self._pending_phrase_option.kind == "composition":
+                self._composition_accepted_tokens += min(
+                    len(delta),
+                    len(self._pending_phrase_option.token_ids),
+                )
         self._carry_feedback = self._pending_feedback[len(delta)]
         self._last_confirmed_length = len(committed)
         self._pending_base = None
         self._pending_proposal = None
         self._pending_feedback = ()
         self._pending_phrase_option = None
+        self._pending_composition_program = None
         self._reconcile_calls += 1
 
     def discard_pending_proposal(self) -> None:
@@ -1774,6 +2064,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_proposal = None
         self._pending_feedback = ()
         self._pending_phrase_option = None
+        self._pending_composition_program = None
         self._last_round_proposal = None
 
     def observe_final(self, history: tuple[int, ...], /) -> None:
@@ -1812,7 +2103,10 @@ class FingerprintRollingK4DraftProvider:
             for feedback, token in self._episode_feedback:
                 self._apply_council_feedback(feedback, token)
             self._episode_feedback.clear()
-            self._learn_episode(committed)
+            self._learn_episode(
+                committed,
+                prompt_length=self._request_prompt_length,
+            )
             if self._pending_import_digest is not None:
                 self._state = replace(
                     self._state,
@@ -1922,6 +2216,20 @@ class FingerprintRollingK4DraftProvider:
             phrase_option_calls=self._phrase_option_calls,
             phrase_draft_tokens=self._phrase_draft_tokens,
             phrase_accepted_tokens=self._phrase_accepted_tokens,
+            composition_programs=self._composition_program_count,
+            composition_option_calls=self._composition_option_calls,
+            composition_draft_tokens=self._composition_draft_tokens,
+            composition_accepted_tokens=self._composition_accepted_tokens,
+            last_composition_support=(
+                0
+                if self._last_composition_program is None
+                else self._last_composition_program.support
+            ),
+            last_composition_copy_tokens=(
+                0
+                if self._last_composition_program is None
+                else self._last_composition_program.copied_tokens
+            ),
             last_phrase_source=(
                 None
                 if self._last_phrase_option is None
@@ -1971,6 +2279,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_feedback = ()
         self._carry_feedback = None
         self._pending_phrase_option = None
+        self._pending_composition_program = None
         self._pending_import_digest = None
         self._episode_feedback.clear()
         try:
@@ -1985,6 +2294,7 @@ __all__ = [
     "V2_MARKOV_DRAFT_STATE_SCHEMA",
     "V3_MARKOV_DRAFT_STATE_SCHEMA",
     "V4_MARKOV_DRAFT_STATE_SCHEMA",
+    "V5_MARKOV_DRAFT_STATE_SCHEMA",
     "MARKOV_DRAFT_METRICS_SCHEMA",
     "MARKOV_DRAFT_PROVIDER_ABI",
     "MARKOV_DRAFT_STATE_SCHEMA",

@@ -77,6 +77,16 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         with self.assertRaises(MarkovDraftError):
             MarkovDraftState.from_bytes(bytes(damaged))
 
+    def test_confirmed_request_persists_its_prompt_boundary(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        prompt = (1, 4, 7)
+        provider.begin_request(prompt)
+        provider.observe_final((*prompt, 9, 10))
+
+        self.assertEqual(provider._state.episode_lengths, (5,))
+        self.assertEqual(provider._state.episode_prompt_lengths, (3,))
+        provider.close()
+
     def test_v1_state_migrates_into_one_episode_and_initializes_council(self) -> None:
         legacy = {
             "max_history_tokens": 64,
@@ -105,7 +115,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(provider.metrics().expert_weights), 8)
         provider.close()
 
-    def test_v2_council_state_migrates_to_v5_phrase_memory(self) -> None:
+    def test_v2_council_state_migrates_to_v6_composition_memory(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         state = seed._state
         seed.close()
@@ -145,11 +155,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((1, 2, 3, 4))
         provider.close()
 
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x05"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x06"))
         migrated = MarkovDraftState.from_bytes(path.read_bytes())
         self.assertEqual(len(migrated.dialects), 1)
 
-    def test_v3_dialect_state_migrates_episode_bindings_to_v5(self) -> None:
+    def test_v3_dialect_state_migrates_episode_bindings_to_v6(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -158,6 +168,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         ).to_bytes()
         document = json.loads(zlib.decompress(encoded[5:]))
         document.pop("episode_dialects")
+        document.pop("episode_prompt_lengths")
         document.pop("imported_episode_sha256s")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v3"
         raw = json.dumps(
@@ -179,9 +190,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.episode_dialects, (None,))
         provider.observe_final((1, 2, 3, 4))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x05"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x06"))
 
-    def test_v4_state_migrates_empty_import_inventory_to_v5(self) -> None:
+    def test_v4_state_migrates_empty_import_inventory_to_v6(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -190,6 +201,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         ).to_bytes()
         document = json.loads(zlib.decompress(encoded[5:]))
         document.pop("imported_episode_sha256s")
+        document.pop("episode_prompt_lengths")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v4"
         raw = json.dumps(
             document,
@@ -209,7 +221,37 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider.imported_episode_sha256s(), ())
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x05"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x06"))
+
+    def test_v5_state_migrates_unknown_prompt_boundaries_to_v6(self) -> None:
+        encoded = MarkovDraftState(
+            vocab_size=32,
+            max_history_tokens=64,
+            token_ids=(1, 2, 3),
+            episode_lengths=(3,),
+        ).to_bytes()
+        document = json.loads(zlib.decompress(encoded[5:]))
+        document.pop("episode_prompt_lengths")
+        document["schema"] = "immer.qwen3.8-markov-draft-state/v5"
+        raw = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        path = self.root / "v5-state.bin"
+        path.write_bytes(b"IMMD\x05" + zlib.compress(raw, level=9))
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=path,
+            max_history_tokens=64,
+        )
+
+        self.assertEqual(provider._state.episode_prompt_lengths, (None,))
+        provider.close()
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x06"))
 
     def test_import_digest_survives_episode_eviction_and_prevents_replay(self) -> None:
         state_path = self.root / "imported-markov.bin"
@@ -892,9 +934,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         dialect_id = "a" * 64
         signature = provider._context_signature(prompt)
         extra_signature = tuple(
-            value
-            for value in range(10_000, 11_000)
-            if value not in set(signature)
+            value for value in range(10_000, 11_000) if value not in set(signature)
         )[: max(0, 32 - len(signature))]
         dialect_signature = tuple(sorted((*signature, *extra_signature)))
         expert_count = len(provider._state.expert_names)
@@ -933,6 +973,51 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(proposal.phrase_confidence, 1.0)
         self.assertEqual(policy.chosen_window, 2)
         provider.discard_pending_proposal()
+        provider.close()
+
+    def test_composition_copies_unseen_slots_into_a_literal_program(self) -> None:
+        first_prompt = (1, 20, 2, 30)
+        second_prompt = (1, 21, 2, 31)
+        first_output = (50, 20, 9, 30, 51)
+        second_output = (50, 21, 9, 31, 51)
+        episodes = (
+            (*first_prompt, *first_output),
+            (*second_prompt, *second_output),
+        )
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_history_tokens=128,
+            proposal_width=7,
+        )
+        provider._state = replace(
+            provider._state,
+            token_ids=tuple(token for episode in episodes for token in episode),
+            episode_lengths=tuple(len(episode) for episode in episodes),
+            episode_dialects=(None, None),
+            episode_prompt_lengths=(len(first_prompt), len(second_prompt)),
+        )
+        prompt = (1, 22, 2, 32)
+        expected_output = (50, 22, 9, 32, 51)
+        provider.begin_request(prompt)
+
+        proposal = provider.propose_round(prompt, expected_output[0])
+
+        self.assertEqual(proposal.token_ids[:4], expected_output[1:])
+        self.assertEqual(proposal.phrase_source, "global")
+        self.assertEqual(proposal.phrase_support, 2)
+        self.assertEqual(proposal.phrase_confidence, 1.0)
+        metrics = provider.metrics()
+        self.assertGreaterEqual(metrics.composition_programs, 1)
+        self.assertEqual(metrics.composition_option_calls, 1)
+        self.assertEqual(metrics.composition_draft_tokens, 4)
+        self.assertEqual(metrics.last_composition_support, 2)
+        self.assertEqual(metrics.last_composition_copy_tokens, 2)
+
+        provider.reconcile_prefix((*prompt, *expected_output[:3]))
+        self.assertEqual(provider.metrics().composition_accepted_tokens, 2)
+        provider.observe_final((*prompt, *expected_output))
+        self.assertEqual(provider._state.episode_prompt_lengths[-1], len(prompt))
+        self.assertGreaterEqual(provider.metrics().composition_programs, 1)
         provider.close()
 
     def test_stronger_global_phrase_beats_weak_dialect_phrase(self) -> None:
