@@ -6,6 +6,24 @@ All notable changes to IMMER are recorded here.
 
 ### Arbitrary local Qwen runtime
 
+- Removed model-sized process residency from the exact Full-Q4 product path.
+  Q4Bank now tracks mappings touched by each already-existing layer execution
+  boundary and applies `MADV_DONTNEED` after the synchronous native kernels
+  finish. Platforms without mmap advice fall back to unmapping and reopening
+  the same authenticated local payload. No weight, activation, dot product, or
+  token is approximated.
+- Replaced the 1.35 GB all-at-once Q8 LM-head call with one native bounded
+  global Top-K kernel. It quantizes Hidden once, preserves BF16 output rounding
+  and stable lower-token-ID ties, carries Top-K across row intervals, and drops
+  each consumed interval before scanning the next. A 9,001-row multi-interval
+  reference test matches the former complete Q8 scan exactly.
+- On Beast, the same unseen German request and token trace moved from
+  `16,011,718,656` to `1,170,735,104` peak RSS (`-92.69%`). Generation is
+  `12.8842 s` versus the former `12.4907 s`; complete one-shot wall time was
+  `18.01 s` versus `18.80 s`. An unrestricted eight-token budget stopped on
+  EOS after five tokens with the real answer `Fledermaus` while remaining at
+  `1,180,954,624` peak RSS.
+
 - Added the first practical packed execution plane for arbitrary local
   Qwen3.8-27B chat. A resumable builder converts all 498 text matrices into
   mmap-native Q4_0/Q8_0 payloads bound to the original repository, revision,
@@ -17,9 +35,9 @@ All notable changes to IMMER are recorded here.
   subnormal block scales. Codec ABI 2 rejects the earlier invalid-scale bank.
 - Routed ordinary pager linears, multi-row continuations, embeddings,
   candidate rows, and the complete LM-head scan through the packed plane.
-  Q4 mmap residency bypasses the BF16 pressure-GC rule because Python GC
-  cannot release mapped weight pages. Per-request evidence now reports TTFT,
-  output tokens/s, Q4 bytes/calls, physical storage reads, and process peak RSS.
+  Packed pages use native mmap residency release rather than Python GC.
+  Per-request evidence reports TTFT, output tokens/s, Q4 bytes/calls, native
+  Top-K and discard counters, physical storage reads, and process peak RSS.
 - The real 16-core AVX2 run reduced the 53.79 GB text source to a 22.03 GB
   packed plane and produced readable arbitrary German output. The first
   eight-token result completed in 73.21 seconds with 22.58-second TTFT and

@@ -26,7 +26,13 @@ release surface.
   head use Q8.
   The C kernel consumes mmap pages directly with AVX2 and retains the
   existing Qwen Attention, DeltaNet, Sinkhorn, state, tokenizer, and FERTIG
-  paths. The complete text plane is 16.40 GB instead of 53.79 GB.
+  paths. The complete text plane is 16.40 GB instead of 53.79 GB. Consumed
+  read-only pages leave process RSS at every existing layer boundary; the Q8
+  LM head performs one native bounded Top-K scan and releases each completed
+  interval from inside the kernel. On the 16-core AVX2 deployment, arbitrary
+  Full-Q4 chat now peaks at 1.17 GB instead of 16.01 GB while preserving the
+  exact generated token trace. The two-token reference generation takes
+  12.88 seconds versus 12.49 seconds before bounded residency.
 - **Predictive weight transport.** A persistent two-agent operation Markov
   model learns the exact tensor/range sequence already emitted by the
   Streamer. Order-1/2 Fixed Share, surprise regimes, and Ricci retention
