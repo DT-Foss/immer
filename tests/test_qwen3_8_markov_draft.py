@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from dataclasses import replace
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -858,6 +859,159 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertAlmostEqual(metrics.max_dialect_skill_maturity, 20 / 28)
         provider.close()
 
+    def test_dialect_council_uses_similarity_visits_and_ricci_age(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=64)
+        prompt = tuple((1, 2, 3, 4) * 16)
+        signature = provider._context_signature(prompt)
+        shared = signature[: max(1, len(signature) // 2)]
+        extras = tuple(
+            value
+            for value in range(1_000, 2_000)
+            if value not in set(signature)
+        )[: len(signature) - len(shared)]
+        partial_signature = tuple(sorted((*shared, *extras)))
+        width = len(provider._experts)
+        zeros = tuple((0,) * width for _ in range(16))
+
+        def dialect(digest: str, dialect_signature, *, visits: int, last_seen: int):
+            return MarkovDialectState(
+                dialect_id=digest * 64,
+                signature=dialect_signature,
+                visits=visits,
+                last_seen=last_seen,
+                rapidities=(0.0,) * width,
+                observations=(0,) * width,
+                hits=(0,) * width,
+                horizon_observations=zeros,
+                horizon_hits=zeros,
+            )
+
+        exact = dialect("a", signature, visits=1, last_seen=0)
+        popular = dialect("b", partial_signature, visits=10, last_seen=100)
+        weak = tuple(
+            dialect(
+                digest,
+                tuple(sorted((*signature[:-1], 10_000 + index))),
+                visits=1,
+                last_seen=0,
+            )
+            for index, digest in enumerate(("c", "d", "e"))
+        )
+        provider._state = replace(
+            provider._state,
+            clock=100,
+            dialects=tuple(
+                sorted((exact, popular, *weak), key=lambda row: row.dialect_id)
+            ),
+        )
+
+        provider.begin_request(prompt)
+
+        neighbors = provider._dialect_neighbors
+        self.assertEqual(provider._active_dialect.dialect_id, exact.dialect_id)
+        self.assertEqual(len(neighbors), 4)
+        self.assertAlmostEqual(sum(row[1] for row in neighbors), 1.0)
+        weights = {row[2].dialect_id: row[1] for row in neighbors}
+        self.assertIn(popular.dialect_id, weights)
+        self.assertGreater(weights[popular.dialect_id], weights[exact.dialect_id])
+        expected_ratio = (
+            provider._dialect_similarity(signature, partial_signature) * 10
+        ) / math.exp(-provider.RICCI_AGE_ALPHA * 100)
+        self.assertAlmostEqual(
+            weights[popular.dialect_id] / weights[exact.dialect_id],
+            expected_ratio,
+        )
+        metrics = provider.metrics()
+        self.assertEqual(metrics.dialect_neighbor_count, 4)
+        self.assertGreater(metrics.dialect_neighbor_effective, 1.0)
+        self.assertEqual(metrics.dialect_neighbor_max_similarity, 1.0)
+        self.assertIn("a" * 64, metrics.dialect_neighbor_ids)
+        self.assertIn("b" * 64, metrics.dialect_neighbor_ids)
+        provider.close()
+
+    def test_below_threshold_prompt_starts_global_without_neighbor_leakage(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=64)
+        prompt = tuple((1, 2, 3, 4) * 16)
+        signature = provider._context_signature(prompt)
+        shared = signature[: max(2, (len(signature) + 5) // 6)]
+        extras = tuple(
+            value for value in range(20_000, 21_000) if value not in set(signature)
+        )[: len(signature) - len(shared)]
+        neighbor_signature = tuple(sorted((*shared, *extras)))
+        similarity = provider._dialect_similarity(signature, neighbor_signature)
+        self.assertGreaterEqual(similarity, provider.MIN_DIALECT_NEIGHBOR_SIMILARITY)
+        self.assertLess(similarity, provider.DIALECT_SIMILARITY_THRESHOLD)
+        width = len(provider._experts)
+        zeros = tuple((0,) * width for _ in range(16))
+        old = MarkovDialectState(
+            dialect_id="f" * 64,
+            signature=neighbor_signature,
+            visits=100,
+            last_seen=0,
+            rapidities=(10.0,) + (0.0,) * (width - 1),
+            observations=(100,) * width,
+            hits=(100,) + (0,) * (width - 1),
+            horizon_observations=zeros,
+            horizon_hits=zeros,
+        )
+        provider._state = replace(provider._state, dialects=(old,))
+        global_weights = provider._weights()
+
+        provider.begin_request(prompt)
+
+        self.assertTrue(provider._active_dialect_is_new)
+        self.assertEqual(provider._active_dialect_similarity, 0.0)
+        self.assertEqual(provider._dialect_neighbors, ())
+        self.assertEqual(provider._weights(), global_weights)
+        self.assertEqual(provider.metrics().dialect_neighbor_count, 0)
+        provider.close()
+
+    def test_active_dialect_always_keeps_one_council_seat(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=64)
+        prompt = tuple((1, 2, 3, 4) * 16)
+        signature = provider._context_signature(prompt)
+        width = len(provider._experts)
+        zeros = tuple((0,) * width for _ in range(16))
+
+        def dialect(digest: str, dialect_signature, *, visits: int):
+            return MarkovDialectState(
+                dialect_id=digest * 64,
+                signature=dialect_signature,
+                visits=visits,
+                last_seen=100,
+                rapidities=(0.0,) * width,
+                observations=(0,) * width,
+                hits=(0,) * width,
+                horizon_observations=zeros,
+                horizon_hits=zeros,
+            )
+
+        active = dialect("a", signature, visits=1)
+        heavy = tuple(
+            dialect(
+                digest,
+                tuple(sorted((*signature[:-1], 30_000 + index))),
+                visits=100,
+            )
+            for index, digest in enumerate(("b", "c", "d", "e"))
+        )
+        provider._state = replace(
+            provider._state,
+            clock=100,
+            dialects=tuple(sorted((active, *heavy), key=lambda row: row.dialect_id)),
+        )
+
+        provider.begin_request(prompt)
+
+        neighbor_ids = {row[2].dialect_id for row in provider._dialect_neighbors}
+        self.assertEqual(provider._active_dialect.dialect_id, active.dialect_id)
+        self.assertEqual(len(neighbor_ids), 4)
+        self.assertIn(active.dialect_id, neighbor_ids)
+        self.assertEqual(len(neighbor_ids & {row.dialect_id for row in heavy}), 3)
+        provider.close()
+
     def test_persistent_history_keeps_explicit_episode_boundaries(self) -> None:
         state_path = self.root / "episodes.bin"
         state_path.write_bytes(
@@ -1111,7 +1265,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         with self.assertRaisesRegex(MarkovDraftError, "exactly one request"):
             provider.begin_request((40, 41, 42, 43))
 
-    def test_dialect_influence_scales_with_context_similarity(self) -> None:
+    def test_single_dialect_normalization_does_not_square_similarity(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=64)
         width = len(provider._experts)
         provider._active_dialect = MarkovDialectState(
@@ -1128,8 +1282,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider._active_dialect_similarity = 1.0
         exact = provider._weights()
 
-        self.assertGreater(sum(exact[4:]), sum(low[4:]))
-        self.assertLess(sum(exact[:4]), sum(low[:4]))
+        self.assertEqual(exact, low)
 
     def test_global_phrase_agent_emits_only_repeated_three_token_option(self) -> None:
         episode = (1, 2, 3, 4, 5, 6)

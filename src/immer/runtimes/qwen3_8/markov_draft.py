@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v18"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v19"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
 V5_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
@@ -42,7 +42,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v15"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v16"
 _STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
 _V6_STATE_PREFIX = b"IMMD\x06"
@@ -1027,6 +1027,10 @@ class MarkovDraftMetrics:
     surprise_mean: float
     surprise_cusum: float
     dialect_count: int
+    dialect_neighbor_count: int
+    dialect_neighbor_effective: float
+    dialect_neighbor_max_similarity: float
+    dialect_neighbor_ids: tuple[str, ...]
     active_dialect_id: str | None
     active_dialect_similarity: float
     dialect_evictions: int
@@ -1075,6 +1079,8 @@ class FingerprintRollingK4DraftProvider:
     REGIME_WARMUP = 16
     REGIME_RAPIDITY_SHRINK = 0.25
     MAX_DIALECTS = 64
+    MAX_DIALECT_NEIGHBORS = 4
+    MIN_DIALECT_NEIGHBOR_SIMILARITY = 0.05
     DIALECT_SKETCH_SIZE = 32
     DIALECT_SIMILARITY_THRESHOLD = 0.20
     DIALECT_STRENGTH = 2.0
@@ -1210,6 +1216,9 @@ class FingerprintRollingK4DraftProvider:
             tuple[tuple[tuple[dict[str, float], int], ...], int, int]
         ] = []
         self._active_dialect: MarkovDialectState | None = None
+        self._dialect_neighbors: tuple[
+            tuple[float, float, MarkovDialectState], ...
+        ] = ()
         self._active_dialect_is_new = False
         self._request_signature: tuple[int, ...] = ()
         self._active_dialect_similarity = 0.0
@@ -1379,12 +1388,70 @@ class FingerprintRollingK4DraftProvider:
             )
             for row in self._state.dialects
         ]
+        raw_neighbor_candidates = tuple(
+            (
+                similarity,
+                similarity
+                * profile.visits
+                * math.exp(
+                    -self.RICCI_AGE_ALPHA
+                    * max(0, self._state.clock - profile.last_seen)
+                ),
+                visits,
+                dialect_id,
+                profile,
+            )
+            for similarity, visits, dialect_id, profile in candidates
+            if similarity >= self.MIN_DIALECT_NEIGHBOR_SIMILARITY
+        )
+        raw_neighbors = tuple(
+            sorted(
+                raw_neighbor_candidates,
+                key=lambda row: (row[1], row[0], row[2], row[3]),
+                reverse=True,
+            )[: self.MAX_DIALECT_NEIGHBORS]
+        )
+        neighbor_total = sum(row[1] for row in raw_neighbors)
+        self._dialect_neighbors = (
+            ()
+            if neighbor_total <= 0.0
+            else tuple(
+                (similarity, raw_weight / neighbor_total, profile)
+                for similarity, raw_weight, _visits, _dialect_id, profile in raw_neighbors
+            )
+        )
         selected = max(candidates, default=None)
         if selected is not None and selected[0] >= self.DIALECT_SIMILARITY_THRESHOLD:
+            active_profile = selected[3]
+            if all(
+                row[2].dialect_id != active_profile.dialect_id
+                for row in self._dialect_neighbors
+            ):
+                active_raw = next(
+                    row
+                    for row in raw_neighbor_candidates
+                    if row[4].dialect_id == active_profile.dialect_id
+                )
+                selected_raw = (
+                    active_raw,
+                    *tuple(
+                        row
+                        for row in raw_neighbors
+                        if row[4].dialect_id != active_profile.dialect_id
+                    )[: self.MAX_DIALECT_NEIGHBORS - 1],
+                )
+                selected_total = sum(row[1] for row in selected_raw)
+                self._dialect_neighbors = tuple(
+                    (similarity, raw_weight / selected_total, profile)
+                    for similarity, raw_weight, _visits, _dialect_id, profile in (
+                        selected_raw
+                    )
+                )
             self._active_dialect_similarity = selected[0]
-            self._active_dialect = selected[3]
+            self._active_dialect = active_profile
             self._active_dialect_is_new = False
             return
+        self._dialect_neighbors = ()
         dialect_id = hashlib.sha256(
             _canonical([f"{value:016x}" for value in signature])
         ).hexdigest()
@@ -1408,17 +1475,33 @@ class FingerprintRollingK4DraftProvider:
         self._active_dialect_similarity = 0.0
         self._active_dialect_is_new = True
 
+    def _inference_dialects(
+        self,
+    ) -> tuple[tuple[float, float, MarkovDialectState], ...]:
+        if self._dialect_neighbors:
+            return self._dialect_neighbors
+        if self._active_dialect is not None and self._active_dialect_similarity > 0.0:
+            return (
+                (
+                    self._active_dialect_similarity,
+                    1.0,
+                    self._active_dialect,
+                ),
+            )
+        return ()
+
     def _weights(self) -> tuple[float, ...]:
         rapidities = self._state.expert_log_weights
-        if self._active_dialect is not None:
+        dialects = self._inference_dialects()
+        if dialects:
             rapidities = tuple(
                 global_value
-                + self.DIALECT_STRENGTH * self._active_dialect_similarity * local_value
-                for global_value, local_value in zip(
-                    rapidities,
-                    self._active_dialect.rapidities,
-                    strict=True,
+                + self.DIALECT_STRENGTH
+                * sum(
+                    neighbor_weight * profile.rapidities[index]
+                    for _similarity, neighbor_weight, profile in dialects
                 )
+                for index, global_value in enumerate(rapidities)
             )
         scaled = tuple(value / self.EXPERT_TEMPERATURE for value in rapidities)
         maximum = max(scaled)
@@ -1890,24 +1973,22 @@ class FingerprintRollingK4DraftProvider:
                 strict=True,
             )
         )
-        dialect = self._active_dialect
-        dialect_maturity = 0.0
-        if (
-            dialect is None
-            or not dialect.horizon_observations
-            or max(dialect.horizon_observations[position], default=0) <= 0
-        ):
-            contextual_posterior = position_posterior
-        else:
+        dialect_evidence = []
+        for _similarity, neighbor_weight, dialect in self._inference_dialects():
+            if not dialect.horizon_observations:
+                continue
             dialect_position_observations = dialect.horizon_observations[position]
             dialect_position_hits = dialect.horizon_hits[position]
-            dialect_observations = max(dialect_position_observations)
-            dialect_maturity = min(
-                1.0,
-                max(0.0, self._active_dialect_similarity)
+            dialect_observations = max(dialect_position_observations, default=0)
+            if dialect_observations <= 0:
+                continue
+            evidence_weight = (
+                neighbor_weight
                 * dialect_observations
-                / (dialect_observations + self.POSITION_WEIGHT_SATURATION),
+                / (dialect_observations + self.POSITION_WEIGHT_SATURATION)
             )
+            if evidence_weight <= 0.0:
+                continue
             dialect_posterior = tuple(
                 (
                     (hit + 1.0) / (observed + 2.0)
@@ -1920,6 +2001,20 @@ class FingerprintRollingK4DraftProvider:
                     position_posterior,
                     strict=True,
                 )
+            )
+            dialect_evidence.append((evidence_weight, dialect_posterior))
+        dialect_evidence_total = sum(row[0] for row in dialect_evidence)
+        dialect_maturity = min(1.0, dialect_evidence_total)
+        if dialect_maturity <= 0.0:
+            contextual_posterior = position_posterior
+        else:
+            dialect_posterior = tuple(
+                sum(
+                    evidence_weight * posterior[index]
+                    for evidence_weight, posterior in dialect_evidence
+                )
+                / dialect_evidence_total
+                for index in range(len(self._experts))
             )
             contextual_posterior = tuple(
                 (1.0 - dialect_maturity) * position_value
@@ -2918,6 +3013,7 @@ class FingerprintRollingK4DraftProvider:
 
     def metrics(self) -> MarkovDraftMetrics:
         weights = self._weights()
+        dialect_neighbors = self._inference_dialects()
         accuracy = tuple(
             0.0 if seen == 0 else hit / seen
             for hit, seen in zip(
@@ -2991,6 +3087,17 @@ class FingerprintRollingK4DraftProvider:
             surprise_mean=self._state.surprise_mean,
             surprise_cusum=self._state.surprise_cusum,
             dialect_count=len(self._state.dialects),
+            dialect_neighbor_count=len(dialect_neighbors),
+            dialect_neighbor_effective=(
+                0.0
+                if not dialect_neighbors
+                else 1.0 / sum(row[1] * row[1] for row in dialect_neighbors)
+            ),
+            dialect_neighbor_max_similarity=max(
+                (row[0] for row in dialect_neighbors),
+                default=0.0,
+            ),
+            dialect_neighbor_ids=tuple(row[2].dialect_id for row in dialect_neighbors),
             active_dialect_id=(
                 None
                 if self._active_dialect is None
