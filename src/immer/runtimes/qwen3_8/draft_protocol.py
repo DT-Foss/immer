@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
 from typing import Sequence
 
 
-ROLLING_DRAFT_HORIZON_SCHEMA = "immer.qwen3.8-rolling-draft-horizon/v1"
-ROLLING_DRAFT_PROPOSAL_SCHEMA = "immer.qwen3.8-rolling-draft-proposal/v1"
-ROUND_WINDOW_POLICY_SCHEMA = "immer.qwen3.8-round-window-policy/v1"
+ROLLING_DRAFT_HORIZON_SCHEMA = "immer.qwen3.8-rolling-draft-horizon/v2"
+ROLLING_DRAFT_PROPOSAL_SCHEMA = "immer.qwen3.8-rolling-draft-proposal/v2"
+ROUND_WINDOW_POLICY_SCHEMA = "immer.qwen3.8-round-window-policy/v2"
 STANDARD_ROLLING_WINDOWS = (4, 8, 16)
+ROUND_ROLLING_WINDOWS = (1, *STANDARD_ROLLING_WINDOWS)
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -81,7 +83,7 @@ class RollingDraftHorizon:
     utility: float
 
     def __post_init__(self) -> None:
-        if self.window not in STANDARD_ROLLING_WINDOWS:
+        if self.window not in ROUND_ROLLING_WINDOWS:
             raise ValueError("rolling horizon window is invalid")
         if self.proposed_draft_tokens != self.window - 1:
             raise ValueError("rolling horizon proposal width is invalid")
@@ -137,7 +139,7 @@ class RoundWindowPolicy:
     phrase_width: int
 
     def __post_init__(self) -> None:
-        if self.selector != "markov-prefix-utility/v1":
+        if self.selector != "markov-prefix-utility/v2":
             raise ValueError("round-window selector is invalid")
         if self.request_window_ceiling not in STANDARD_ROLLING_WINDOWS:
             raise ValueError("request window ceiling is invalid")
@@ -146,14 +148,14 @@ class RoundWindowPolicy:
         if (
             tuple(sorted(set(eligible))) != eligible
             or any(
-                window not in STANDARD_ROLLING_WINDOWS
+                window not in ROUND_ROLLING_WINDOWS
                 or window > self.request_window_ceiling
                 for window in eligible
             )
         ):
             raise ValueError("eligible round windows are invalid")
         if (
-            self.chosen_window not in STANDARD_ROLLING_WINDOWS
+            self.chosen_window not in ROUND_ROLLING_WINDOWS
             or self.chosen_window > self.request_window_ceiling
         ):
             raise ValueError("chosen round window is invalid")
@@ -311,7 +313,20 @@ class RollingDraftProposal:
             raise ValueError("phrase width exceeds rolling proposal")
         support_strength = 1.0 - math.exp(-float(phrase_support) / 1.5)
         phrase_probability = phrase_confidence * support_strength
-        horizons = []
+        horizons = [
+            RollingDraftHorizon(
+                window=1,
+                proposed_draft_tokens=0,
+                expected_accepted_draft_tokens=0.0,
+                prefix_survival_probabilities=(),
+                mean_confidence=0.0,
+                minimum_confidence=0.0,
+                mean_disagreement=0.0,
+                phrase_covered_tokens=0,
+                work_proxy=1.0,
+                utility=1.0,
+            )
+        ]
         for window in STANDARD_ROLLING_WINDOWS:
             if window > request_window_ceiling:
                 continue
@@ -375,6 +390,7 @@ class RollingDraftProposal:
         *,
         request_window_ceiling: int,
         remaining_tokens: int,
+        window_work_costs: Mapping[int, float] | None = None,
     ) -> RoundWindowPolicy:
         if request_window_ceiling != len(self.token_ids) + 1:
             raise ValueError("proposal differs from request window ceiling")
@@ -384,6 +400,28 @@ class RollingDraftProposal:
             row for row in self.horizons
             if row.window <= request_window_ceiling
         )
+        if window_work_costs is not None:
+            costs = dict(window_work_costs)
+            if any(
+                window not in ROUND_ROLLING_WINDOWS
+                for window in costs
+            ):
+                raise ValueError("round window work costs contain an invalid window")
+            adjusted = []
+            for row in eligible:
+                cost = _finite(
+                    costs.get(row.window, row.work_proxy),
+                    field="round_window_work_cost",
+                    lower=1.0,
+                )
+                adjusted.append(
+                    replace(
+                        row,
+                        work_proxy=cost,
+                        utility=(1.0 + row.expected_accepted_draft_tokens) / cost,
+                    )
+                )
+            eligible = tuple(adjusted)
 
         def remaining_utility(row: RollingDraftHorizon) -> float:
             expected = sum(
@@ -400,7 +438,7 @@ class RollingDraftProposal:
             ),
         ).window
         return RoundWindowPolicy(
-            selector="markov-prefix-utility/v1",
+            selector="markov-prefix-utility/v2",
             request_window_ceiling=request_window_ceiling,
             remaining_tokens=remaining_tokens,
             eligible_windows=tuple(row.window for row in eligible),
@@ -434,6 +472,7 @@ __all__ = [
     "ROLLING_DRAFT_HORIZON_SCHEMA",
     "ROLLING_DRAFT_PROPOSAL_SCHEMA",
     "ROUND_WINDOW_POLICY_SCHEMA",
+    "ROUND_ROLLING_WINDOWS",
     "STANDARD_ROLLING_WINDOWS",
     "RollingDraftHorizon",
     "RollingDraftProposal",

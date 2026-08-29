@@ -1832,15 +1832,22 @@ class StreamedQwen38:
             swiglu(gate[index], up[index]) for index in range(len(hidden))
         )
 
-        def observe_down(weight: Any, result: tuple[Any, ...]) -> None:
-            self._observe_exact_mlp(
-                layer=layer,
-                gate=gate,
-                up=up,
-                activated=activated,
-                output=result,
-                down_weight=weight,
-            )
+        observe_full = (
+            None
+            if self.mlp_sparse_executor is None
+            else getattr(self.mlp_sparse_executor, "observe_full", None)
+        )
+        observe_down = None
+        if callable(observe_full):
+            def observe_down(weight: Any, result: tuple[Any, ...]) -> None:
+                self._observe_exact_mlp(
+                    layer=layer,
+                    gate=gate,
+                    up=up,
+                    activated=activated,
+                    output=result,
+                    down_weight=weight,
+                )
 
         output = self._linear_token_rows(
             activated,

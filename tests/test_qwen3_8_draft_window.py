@@ -611,7 +611,7 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.assertEqual(result.evidence["draft"]["window_size"], 8)
         chat.close()
 
-    def test_adapter_records_round_local_k4_under_k8_ceiling(self) -> None:
+    def test_adapter_records_round_local_k1_abstention_under_k8_ceiling(self) -> None:
         proposal = RollingDraftProposal.build(
             tuple(range(7)),
             (0.10,) * 7,
@@ -624,11 +624,12 @@ class DraftWindowAdapterTests(unittest.TestCase):
             remaining_tokens=8,
         )
         runtime = _Runtime()
+        runtime.model.pager = SimpleNamespace(q4_bank=object())
         chat = self._adaptive_chat(runtime)
         generated = _rolling_result(
             window=8,
-            executed_window=4,
-            accepted=3,
+            executed_window=1,
+            accepted=0,
             round_policy=policy,
         )
         decoder = SimpleNamespace(generate_rolling=lambda *args, **kwargs: generated)
@@ -641,13 +642,17 @@ class DraftWindowAdapterTests(unittest.TestCase):
 
         self.assertTrue(result.ok, result.reason)
         self.assertTrue(constructor.call_args.kwargs["adaptive_round_windows"])
+        self.assertEqual(
+            constructor.call_args.kwargs["round_window_work_costs"],
+            {1: 1.0, 4: 3.7, 8: 7.3, 16: 14.5},
+        )
         draft = result.evidence["draft"]
         self.assertTrue(draft["adaptive_windows"])
         self.assertEqual(draft["window_size"], 8)
-        self.assertEqual(draft["used_window_sizes"], [4])
+        self.assertEqual(draft["used_window_sizes"], [1])
         self.assertEqual(
             draft["round_window_policies"][0]["round_policy"]["chosen_window"],
-            4,
+            1,
         )
         self.assertEqual(
             result.evidence["draft_window"]["feedback"]["nested_horizons"],

@@ -1687,15 +1687,28 @@ class Qwen38CausalChat:
             )
         rolling_started = time.perf_counter()
         rolling_source_start = _runtime_source_body_bytes(runtime)
+        adaptive_rounds = (
+            self._draft_mode == "markov" and draft_window in DRAFT_WINDOW_ACTIONS
+        )
+        decoder_options: dict[str, Any] = {
+            "window_size": draft_window,
+            "adaptive_round_windows": adaptive_rounds,
+        }
+        q4_bank = getattr(getattr(runtime.model, "pager", None), "q4_bank", None)
+        if adaptive_rounds and q4_bank is not None:
+            # The AVX2 packed plane is compute-bound across token rows: mmap
+            # reuse removes transport, but K staged rows still execute K neural
+            # rows.  A 10% reuse credit allows only near-certain phrases to beat
+            # direct K1 instead of letting marginal confidence multiply work.
+            decoder_options["round_window_work_costs"] = {
+                window: 1.0 + 0.9 * (window - 1)
+                for window in (1, 4, 8, 16)
+            }
         try:
             generated = Qwen38K4SpeculativeDecoder(
                 runtime.model,
                 provider,
-                window_size=draft_window,
-                adaptive_round_windows=(
-                    adaptive_selection is not None
-                    and self._draft_mode == "markov"
-                ),
+                **decoder_options,
             ).generate_rolling(
                 [prompt_ids],
                 max_new_tokens=self._max_new_tokens,
@@ -1782,7 +1795,8 @@ class Qwen38CausalChat:
                         "window_size": row.window_size,
                     }
                     for row in evidence.rounds
-                    if getattr(row, "proposed_token_ids", ())
+                    if getattr(row, "target_token_ids", ())
+                    or getattr(row, "round_policy", None) is not None
                 ],
                 "adaptive_windows": getattr(evidence, "adaptive_windows", False),
                 "used_window_sizes": list(

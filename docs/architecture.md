@@ -100,6 +100,14 @@ reconstruct recurrent state; compact Conv-prefix inputs recover the exact
 rolling Conv state even beyond its kernel width. Native Prefix-Sinkhorn usage
 and Graft history remain aligned without another weight read.
 
+The Markov round policy also owns K1. Its objective remains expected confirmed
+tokens divided by work, but the packed CPU backend supplies neural-row cost
+`C(K)=1+0.9(K-1)` because mmap has already removed checkpoint transport.
+Low-confidence K1 consumes the known token through ordinary decode, scans the
+next token, and trains the Council without creating a speculative state clone.
+Only near-certain phrase continuations can beat direct execution and open a
+wider transactional window.
+
 Ordinary non-speculative decode consumes its committed continuation cache.
 After layer `l` returns, the old state for `l` loses its final owner and the
 replacement takes its slot. The public cursor and evidence commit only after

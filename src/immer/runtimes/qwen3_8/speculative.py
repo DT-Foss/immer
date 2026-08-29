@@ -7,7 +7,7 @@ vocabulary scan and publishes only target-confirmed continuation state.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
 import inspect
@@ -830,9 +830,9 @@ class RollingK4SpeculativeRoundEvidence:
         if (
             isinstance(self.window_size, bool)
             or not isinstance(self.window_size, int)
-            or not 2 <= self.window_size <= StreamedQwen38.MAX_CONTINUATION_BLOCK_WIDTH
+            or not 1 <= self.window_size <= StreamedQwen38.MAX_CONTINUATION_BLOCK_WIDTH
         ):
-            raise ValueError("rolling target window is outside [2, 16]")
+            raise ValueError("rolling target window is outside [1, 16]")
         ceiling = (
             self.window_size
             if self.request_window_ceiling is None
@@ -997,7 +997,7 @@ class RollingK4SpeculativeGenerationEvidence:
     @property
     def used_window_sizes(self) -> tuple[int, ...]:
         return tuple(
-            row.window_size for row in self.rounds if row.proposed_token_ids
+            row.window_size for row in self.rounds if row.target_token_ids
         )
 
 
@@ -1388,6 +1388,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         *,
         window_size: int = 4,
         adaptive_round_windows: bool = False,
+        round_window_work_costs: Mapping[int, float] | None = None,
     ) -> None:
         if (
             isinstance(window_size, bool)
@@ -1401,6 +1402,26 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             raise TypeError("adaptive_round_windows must be boolean")
         if adaptive_round_windows and window_size not in {4, 8, 16}:
             raise ValueError("adaptive round windows require a K4/K8/K16 ceiling")
+        if round_window_work_costs is not None:
+            if not adaptive_round_windows:
+                raise ValueError("round work costs require adaptive windows")
+            costs = dict(round_window_work_costs)
+            if any(
+                isinstance(window, bool)
+                or not isinstance(window, int)
+                or window not in {1, 4, 8, 16}
+                or isinstance(cost, bool)
+                or not isinstance(cost, (int, float))
+                or not math.isfinite(float(cost))
+                or float(cost) < 1.0
+                for window, cost in costs.items()
+            ):
+                raise ValueError("round window work costs are invalid")
+            self.round_window_work_costs = {
+                window: float(cost) for window, cost in costs.items()
+            }
+        else:
+            self.round_window_work_costs = None
         self.adaptive_round_windows = adaptive_round_windows
 
     def _proposal_k4(
@@ -1796,6 +1817,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                 round_policy = proposal_evidence.select_window(
                     request_window_ceiling=self.window_size,
                     remaining_tokens=remaining,
+                    window_work_costs=self.round_window_work_costs,
                 )
                 active_window = round_policy.chosen_window
                 proposal = provider_proposal[: active_window - 1]
@@ -1806,6 +1828,59 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             if round_index == 0:
                 guard_bytes += begin_guard_bytes
                 guard_seconds += begin_guard_seconds
+            if active_window == 1:
+                # A low-confidence Markov action is true abstention, not a
+                # one-row transactional speculative stage.  Consume the known
+                # token directly so K1 does not clone the complete 157 MB
+                # continuation state merely to commit its only row.
+                hidden, _direct_evidence = self.model.decode([[pending_token]])
+                targets = self._scan(hidden[:, -1:], block_rows=head_block_rows)
+                if len(targets) != 1:
+                    raise Qwen38SpeculativeError(
+                        "direct Markov target scan returned wrong width"
+                    )
+                emitted = (pending_token,)
+                reconcile_bytes, reconcile_seconds = self._reconcile_rolling_provider(
+                    (*prompt, *generated, *emitted)
+                )
+                guard_bytes += reconcile_bytes
+                guard_seconds += reconcile_seconds
+                rounds.append(
+                    RollingK4SpeculativeRoundEvidence(
+                        round_index=round_index,
+                        start_pos=start_pos,
+                        end_pos=self.model.next_position,
+                        known_token_id=pending_token,
+                        proposed_token_ids=(),
+                        target_token_ids=targets,
+                        emitted_token_ids=emitted,
+                        accepted_prefix_length=0,
+                        correction_token_id=targets[0],
+                        forward_passes=1,
+                        head_scans=1,
+                        source_body_bytes=(
+                            _owner_metric(source, "network_or_source_body_bytes")
+                            - round_source
+                        ),
+                        linear_calls=(
+                            _owner_metric(self.model.pager, "linear_calls")
+                            - round_linears
+                        ),
+                        provider_guard_bytes=guard_bytes,
+                        provider_guard_seconds=guard_seconds,
+                        seconds=time.perf_counter() - round_started,
+                        state_bytes=self.model.state_bytes,
+                        state_committed=True,
+                        stopped_on_eos=False,
+                        window_size=1,
+                        request_window_ceiling=self.window_size,
+                        provider_proposed_token_ids=provider_proposal,
+                        round_policy=round_policy,
+                    )
+                )
+                generated.extend(emitted)
+                pending_token = targets[0]
+                continue
             stage = self.model.stage_continuation_block(
                 [[pending_token, *proposal]]
             )

@@ -24,6 +24,20 @@ All notable changes to IMMER are recorded here.
   packed plane and produced readable arbitrary German output. The first
   eight-token result completed in 73.21 seconds with 22.58-second TTFT and
   21.65 GB peak RSS; this is the new runtime baseline, not the finish line.
+- Added backend-aware K1 abstention to the Markov per-wave controller. Direct
+  execution competes with K4/K8/K16 under the same expected-token/work
+  equation. On the mmap Q4 CPU plane, `C(K)=1+0.9(K-1)` reflects neural-row
+  compute after transport has already vanished. Low-confidence waves consume
+  state directly without a transactional clone, still receive target feedback,
+  and persist the confirmed episode. The real Meerwasser request used seven K1
+  waves, zero draft bytes, preserved the direct token trace, and completed in
+  74.58 seconds versus 79.05 seconds direct. Local Qwen3.5 accepted five draft
+  tokens but took 112.97 seconds, so it is not the CPU product provider.
+- Packed payload acceptance now uses a stat-bound SHA cache: the builder knows
+  every digest while writing, normal 498-file mount takes 0.046 seconds, and a
+  changed inode/size/mtime/ctime triggers a full digest check. Repeated Q4 rows
+  decode once and restore caller order. Transient Q4 input, activation, output,
+  row-restore, and head-sort workspaces obey the existing resident-memory cap.
 
 - Generalized correction-first rolling verification from fixed K=4 to a
   configurable K=2–16 target window; `immer chat` defaults to K=8. All target

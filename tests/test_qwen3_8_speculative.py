@@ -868,7 +868,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         )
         rows = []
         for confidence, expected_windows in (
-            (0.10, (4, 4)),
+            (0.10, (1, 1, 1, 1, 1, 1, 1)),
             (0.99, (8,)),
         ):
             baseline = self._model()
@@ -901,7 +901,11 @@ class Qwen38SpeculativeTests(unittest.TestCase):
             self.assertTrue(result.evidence.adaptive_windows)
             self.assertEqual(result.evidence.used_window_sizes, expected_windows)
             self.assertEqual(
-                tuple(row.window_size for row in result.evidence.rounds),
+                tuple(
+                    row.window_size
+                    for row in result.evidence.rounds
+                    if row.target_token_ids
+                ),
                 expected_windows,
             )
             self.assertTrue(
@@ -912,6 +916,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
                     and row.head_scans == 1
                     and row.forward_passes == 1
                     for row in result.evidence.rounds
+                    if row.target_token_ids
                 )
             )
             first = result.evidence.rounds[0]
@@ -961,7 +966,46 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         self.assertEqual(row.window_size, 4)
         self.assertEqual(len(row.proposed_token_ids), 3)
         self.assertEqual(len(row.provider_proposed_token_ids), 7)
-        self.assertEqual(row.round_policy.selector, "markov-prefix-utility/v1")
+        self.assertEqual(row.round_policy.selector, "markov-prefix-utility/v2")
+
+    def test_low_confidence_k1_uses_direct_decode_without_transactional_stage(
+        self,
+    ) -> None:
+        prompt = (1, 4)
+        reference = self._model()
+        expected, baseline = reference.generate_greedy(
+            [prompt], max_new_tokens=4, head_block_rows=7
+        )
+        provider = _AdaptiveRollingFromTokens(
+            prompt,
+            expected,
+            accepted_per_wave=3,
+            vocab_size=self.config.vocab_size,
+            proposal_width=3,
+            confidence=0.10,
+        )
+        candidate = self._model()
+
+        with mock.patch.object(
+            candidate,
+            "stage_continuation_block",
+            side_effect=AssertionError("K1 must not stage"),
+        ):
+            result = Qwen38K4SpeculativeDecoder(
+                candidate,
+                provider,
+                window_size=4,
+                adaptive_round_windows=True,
+            ).generate_rolling(
+                [prompt],
+                max_new_tokens=4,
+                head_block_rows=7,
+            )
+
+        self.assertEqual(result.token_ids, expected)
+        self.assertEqual(result.evidence.used_window_sizes, (1, 1, 1))
+        self.assertEqual(result.evidence.forward_passes, baseline.forward_passes)
+        self._assert_state_equal(candidate, reference)
 
     def test_rolling_k16_full_acceptance_uses_one_target_wave(self) -> None:
         prompt = (1, 4)

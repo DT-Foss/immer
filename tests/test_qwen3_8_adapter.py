@@ -681,6 +681,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotIn("draft_bundle", result.evidence)
         provider = decoder_constructor.call_args.args[1]
         self.assertEqual(provider.metrics().source_body_bytes, 0)
+        self.assertTrue(
+            decoder_constructor.call_args.kwargs["adaptive_round_windows"]
+        )
         chat.close()
 
     def test_short_generation_policy_records_plain_greedy_draft_fallback(self) -> None:

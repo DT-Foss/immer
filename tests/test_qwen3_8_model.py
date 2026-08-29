@@ -438,6 +438,36 @@ class Qwen38ModelTests(unittest.TestCase):
                 max_seq_len=32,
             )
 
+    def test_exact_mlp_without_sparse_executor_requests_no_weight_observer(self) -> None:
+        hidden = torch.ones(1, 1, self.config.dim)
+        with mock.patch.object(
+            self.pager,
+            "linear",
+            wraps=self.pager.linear,
+        ) as linear:
+            self.model._mlp(hidden, layer=1)
+        down = [
+            call
+            for call in linear.call_args_list
+            if call.args[1].endswith(".down_proj")
+        ]
+        self.assertEqual(len(down), 1)
+        self.assertIsNone(down[0].kwargs["weight_observer"])
+
+        with mock.patch.object(
+            self.pager,
+            "linear_many",
+            wraps=self.pager.linear_many,
+        ) as linear_many:
+            self.model._mlp_token_rows((hidden.clone(), hidden.clone()), layer=1)
+        down_many = [
+            call
+            for call in linear_many.call_args_list
+            if call.args[1].endswith(".down_proj")
+        ]
+        self.assertEqual(len(down_many), 1)
+        self.assertIsNone(down_many[0].kwargs["weight_observer"])
+
     def test_online_sparse_decision_learns_from_the_unchanged_exact_path(self) -> None:
         class NonBeneficialRoute(RuntimeError):
             exact_mlp_fallback = True

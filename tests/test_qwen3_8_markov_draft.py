@@ -718,7 +718,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertIsInstance(proposal, RollingDraftProposal)
         self.assertEqual(proposal.token_ids, (3, 4, 5, 6, 7, 8, 9))
-        self.assertEqual(tuple(row.window for row in proposal.horizons), (4, 8))
+        self.assertEqual(tuple(row.window for row in proposal.horizons), (1, 4, 8))
         self.assertEqual(proposal.recommended_window, 8)
         self.assertEqual(proposal.phrase_width, 7)
         policy = proposal.select_window(

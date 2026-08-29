@@ -28,11 +28,11 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v6"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v7"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v5"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v6"
 _STATE_PREFIX = b"IMMD\x04"
 _V3_STATE_PREFIX = b"IMMD\x03"
 _V2_STATE_PREFIX = b"IMMD\x02"
@@ -863,7 +863,7 @@ class FingerprintRollingK4DraftProvider:
         self._last_confidence = 0.0
         self._last_disagreement = 0.0
         self._adaptive_proposal_calls = 0
-        self._recommended_window_counts = {4: 0, 8: 0, 16: 0}
+        self._recommended_window_counts = {1: 0, 4: 0, 8: 0, 16: 0}
         self._last_round_proposal: RollingDraftProposal | None = None
         self._closed = False
 

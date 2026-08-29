@@ -46,7 +46,10 @@ release surface.
   global and contextual-dialect agents compete by support, confidence, context
   depth, and dialect similarity. Under an adaptive request ceiling, the
   Council emits one maximum tail with prefix-local confidence/disagreement;
-  every target wave then selects K4/K8/K16 and stages only that prefix.
+  every target wave selects direct K1 or K4/K8/K16 and stages only that prefix.
+  On the compute-bound packed CPU plane, backend row cost prevents marginal
+  confidence from multiplying neural work; K1 learns from the confirmed token
+  without cloning transactional state.
 - **All-layer Fast MLP.** A prompt-free weight initializer derives p4/k32
   pilots for every Qwen MLP layer from exact Gate/Up Gaussian joint moments.
   Existing full-path tensors update bounded recursive-ridge route statistics;

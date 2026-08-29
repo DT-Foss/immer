@@ -32,16 +32,16 @@ class RollingDraftProtocolTests(unittest.TestCase):
             phrase_width=phrase_width,
         )
 
-    def test_low_confidence_prefers_k4_under_k16_ceiling(self) -> None:
+    def test_low_confidence_abstains_to_k1_under_k16_ceiling(self) -> None:
         proposal = self._proposal(ceiling=16, confidence=0.10)
 
-        self.assertEqual(proposal.recommended_window, 4)
+        self.assertEqual(proposal.recommended_window, 1)
         self.assertEqual(
             proposal.select_window(
                 request_window_ceiling=16,
                 remaining_tokens=16,
             ).chosen_window,
-            4,
+            1,
         )
 
     def test_high_confidence_prefers_k16(self) -> None:
@@ -50,6 +50,29 @@ class RollingDraftProtocolTests(unittest.TestCase):
         self.assertEqual(proposal.recommended_window, 16)
         utilities = [row.utility for row in proposal.horizons]
         self.assertEqual(utilities, sorted(utilities))
+
+    def test_compute_bound_row_cost_requires_near_certain_speculation(self) -> None:
+        marginal = self._proposal(ceiling=4, confidence=0.50)
+        certain = self._proposal(ceiling=4, confidence=0.99)
+        costs = {1: 1.0, 4: 3.7}
+
+        marginal_policy = marginal.select_window(
+            request_window_ceiling=4,
+            remaining_tokens=4,
+            window_work_costs=costs,
+        )
+        certain_policy = certain.select_window(
+            request_window_ceiling=4,
+            remaining_tokens=4,
+            window_work_costs=costs,
+        )
+
+        self.assertEqual(marginal_policy.chosen_window, 1)
+        self.assertEqual(certain_policy.chosen_window, 4)
+        self.assertEqual(
+            {row.window: row.work_proxy for row in marginal_policy.horizons},
+            costs,
+        )
 
     def test_repeated_long_phrase_can_open_k8(self) -> None:
         proposal = self._proposal(
@@ -84,9 +107,9 @@ class RollingDraftProtocolTests(unittest.TestCase):
         )
 
         self.assertEqual(k8.chosen_window, 8)
-        self.assertEqual(k8.eligible_windows, (4, 8, 16))
+        self.assertEqual(k8.eligible_windows, (1, 4, 8, 16))
         self.assertEqual(k3.chosen_window, 4)
-        self.assertEqual(k3.selector, "markov-prefix-utility/v1")
+        self.assertEqual(k3.selector, "markov-prefix-utility/v2")
 
     def test_policy_rejects_a_window_outside_its_eligible_set(self) -> None:
         proposal = self._proposal(ceiling=8, confidence=0.99)
