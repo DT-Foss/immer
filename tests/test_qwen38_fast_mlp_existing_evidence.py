@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -177,6 +178,81 @@ class ExistingEvidenceCalibrationTests(unittest.TestCase):
         for value in ("", "train,train", "train,unknown"):
             with self.subTest(value=value), self.assertRaises(Exception):
                 self.script._split_list(value)
+
+    def test_persisted_evidence_budget_is_reopened_exactly(self) -> None:
+        budget = self.script.MlpEvidenceBudget(max_total_referenced_bytes=8192)
+        body = {
+            "budget_sha256": budget.sha256,
+            "limits": {
+                name: getattr(budget, name)
+                for name in budget.__dataclass_fields__
+            },
+        }
+        document = {
+            "body": body,
+            "body_sha256": self.script.hashlib.sha256(
+                self.script.canonical_json_bytes(body)
+            ).hexdigest(),
+            "schema": self.script.EVIDENCE_BUDGET_SCHEMA,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "BUDGET.json").write_bytes(
+                self.script.canonical_json_bytes(document)
+            )
+            self.assertEqual(self.script._evidence_budget(root), budget)
+            document["body_sha256"] = "0" * 64
+            (root / "BUDGET.json").write_bytes(
+                self.script.canonical_json_bytes(document)
+            )
+            with self.assertRaises(self.script.CliError):
+                self.script._evidence_budget(root)
+
+    def test_pre_mount_failure_removes_candidate_state(self) -> None:
+        budget = self.script.MlpEvidenceBudget()
+        body = {
+            "budget_sha256": budget.sha256,
+            "limits": {
+                name: getattr(budget, name)
+                for name in budget.__dataclass_fields__
+            },
+        }
+        document = {
+            "body": body,
+            "body_sha256": self.script.hashlib.sha256(
+                self.script.canonical_json_bytes(body)
+            ).hexdigest(),
+            "schema": self.script.EVIDENCE_BUDGET_SCHEMA,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = root / "evidence"
+            evidence.mkdir()
+            (evidence / "BUDGET.json").write_bytes(
+                self.script.canonical_json_bytes(document)
+            )
+            source = root / "source-state.json"
+            output = root / "candidate-state.json"
+            source.write_bytes(b'{"state":"existing"}')
+            args = SimpleNamespace(
+                bundle=root / "bundle",
+                evidence_root=evidence,
+                fast_mlp_root=root / "fast",
+                input_state=source,
+                output_state=output,
+                splits=("train",),
+                source_budget_mb=1.0,
+                fast_source_budget_mb=1.0,
+                max_resident_mb=1,
+                fast_max_resident_mb=1,
+            )
+            with mock.patch.object(
+                self.script,
+                "QwenMlpEvidenceBank",
+                side_effect=RuntimeError("bank open failed"),
+            ), self.assertRaisesRegex(RuntimeError, "bank open failed"):
+                self.script.run(args)
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

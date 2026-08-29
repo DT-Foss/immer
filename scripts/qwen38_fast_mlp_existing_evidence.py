@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,11 @@ from immer.runtimes.deepseek_v4.causal_weights import (
     LogicalModelIdentity,
 )
 from immer.runtimes.ooe.qwen_mlp_evidence import QwenMlpEvidenceBank
+from immer.runtimes.ooe.identity import canonical_json_bytes
+from immer.runtimes.ooe.qwen_mlp_evidence import (
+    EVIDENCE_BUDGET_SCHEMA,
+    MlpEvidenceBudget,
+)
 from immer.runtimes.qwen3_8.bundle import verify_qwen38_causal_mount
 from immer.runtimes.qwen3_8.config import (
     OFFICIAL_REPO_ID,
@@ -146,6 +152,40 @@ def _clone_state(input_state: Path | None, output_state: Path) -> None:
     _publish_new(output_state, _stable_read(input_state, _STATE_MAX_BYTES))
 
 
+def _evidence_budget(root: Path) -> MlpEvidenceBudget:
+    data = _stable_read(root / "BUDGET.json", 64 * 1024)
+    try:
+        document = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CliError("evidence budget is not JSON") from exc
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"body", "body_sha256", "schema"}
+        or document.get("schema") != EVIDENCE_BUDGET_SCHEMA
+        or not isinstance(document.get("body"), dict)
+        or canonical_json_bytes(document) != data
+    ):
+        raise CliError("evidence budget envelope is invalid")
+    body = document["body"]
+    limits = body.get("limits")
+    expected = set(MlpEvidenceBudget.__dataclass_fields__)
+    if (
+        set(body) != {"budget_sha256", "limits"}
+        or not isinstance(limits, dict)
+        or set(limits) != expected
+        or document.get("body_sha256")
+        != hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+    ):
+        raise CliError("evidence budget body is invalid")
+    try:
+        budget = MlpEvidenceBudget(**limits)
+    except (TypeError, ValueError) as exc:
+        raise CliError("evidence budget limits are invalid") from exc
+    if body.get("budget_sha256") != budget.sha256:
+        raise CliError("evidence budget digest changed")
+    return budget
+
+
 def _pairs_by_layer(
     pairs: Iterable[tuple[Any, Any]],
     *,
@@ -252,11 +292,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     )
     output_state = Path(args.output_state).expanduser().absolute()
     _clone_state(input_state, output_state)
-    bank = QwenMlpEvidenceBank(evidence_root)
-    audit = bank.audit()
-    if not audit.clean:
-        raise CliError("existing MLP evidence bank audit is not clean")
-    pairs = _pairs_by_layer(bank.committed_pairs(), splits=args.splits)
+    try:
+        bank = QwenMlpEvidenceBank(
+            evidence_root,
+            budget=_evidence_budget(evidence_root),
+        )
+        audit = bank.audit()
+        if not audit.clean:
+            raise CliError("existing MLP evidence bank audit is not clean")
+        pairs = _pairs_by_layer(bank.committed_pairs(), splits=args.splits)
+    except Exception:
+        output_state.unlink(missing_ok=True)
+        raise
 
     identity = LogicalModelIdentity(OFFICIAL_REPO_ID, OFFICIAL_REVISION)
     fast = None
