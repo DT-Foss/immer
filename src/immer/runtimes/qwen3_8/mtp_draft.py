@@ -73,6 +73,9 @@ class Qwen35MtpDraftMetrics:
     draft_steps: int
     head_scans: int
     proposed_tokens: int
+    computed_proposal_tokens: int
+    padded_proposal_tokens: int
+    verified_proposal_tokens: int
     accepted_tokens: int
     rejected_tokens: int
     source_body_bytes: int
@@ -178,6 +181,9 @@ class Qwen35MtpDraftProvider:
         self._draft_steps = 0
         self._head_scans = 0
         self._proposed_tokens = 0
+        self._computed_proposal_tokens = 0
+        self._padded_proposal_tokens = 0
+        self._verified_proposal_tokens = 0
         self._accepted_tokens = 0
         self._rejected_tokens = 0
         self._linear_calls = 0
@@ -572,18 +578,22 @@ class Qwen35MtpDraftProvider:
                 output,
                 proposal_index=proposal_index,
             )
+            self._computed_proposal_tokens += 1
             proposal.append(token)
             confidences.append(confidence)
             gap_buckets.append(bucket)
             if self._adaptive_round_call and proposal_index == 0 and confidence < 0.6:
                 missing = self.proposal_width - len(proposal)
+                self._padded_proposal_tokens += missing
                 proposal.extend([token] * missing)
                 confidences.extend([0.0] * missing)
                 gap_buckets.extend([bucket] * missing)
                 states.extend([state] * (self.proposal_width + 1 - len(states)))
                 break
             if token in self.eos_token_ids:
-                proposal.extend([token] * (self.proposal_width - len(proposal)))
+                missing = self.proposal_width - len(proposal)
+                self._padded_proposal_tokens += missing
+                proposal.extend([token] * missing)
                 confidences.extend(
                     [confidence] * (self.proposal_width - len(confidences))
                 )
@@ -597,6 +607,14 @@ class Qwen35MtpDraftProvider:
                 start_pos=self._next_position + len(proposal),
             )
             states.append(state)
+            if self._adaptive_round_call and proposal_index == 0:
+                missing = self.proposal_width - len(proposal)
+                self._padded_proposal_tokens += missing
+                proposal.extend([token] * missing)
+                confidences.extend([0.0] * missing)
+                gap_buckets.extend([bucket] * missing)
+                states.extend([state] * (self.proposal_width + 1 - len(states)))
+                break
 
         result = tuple(proposal)
         if len(result) != self.proposal_width or len(states) != self.proposal_width + 1:
@@ -648,6 +666,8 @@ class Qwen35MtpDraftProvider:
             or not 0 <= accepted_prefix_length <= verified_proposals <= len(proposal)
         ):
             raise ValueError("MTP verification prefix is invalid")
+        self._verified_proposal_tokens += verified_proposals
+        self._rejected_tokens += verified_proposals - accepted_prefix_length
         previous = self._previous_outcome
         for index in range(verified_proposals):
             outcome = index < accepted_prefix_length
@@ -684,7 +704,6 @@ class Qwen35MtpDraftProvider:
         self._committed_state = self._pending_states[accepted]
         self._next_position = len(committed) - 1
         self._accepted_tokens += accepted
-        self._rejected_tokens += len(proposal) - accepted
         self._pending_base = None
         self._pending_proposal = None
         self._pending_states = ()
@@ -703,6 +722,9 @@ class Qwen35MtpDraftProvider:
             draft_steps=self._draft_steps,
             head_scans=self._head_scans,
             proposed_tokens=self._proposed_tokens,
+            computed_proposal_tokens=self._computed_proposal_tokens,
+            padded_proposal_tokens=self._padded_proposal_tokens,
+            verified_proposal_tokens=self._verified_proposal_tokens,
             accepted_tokens=self._accepted_tokens,
             rejected_tokens=self._rejected_tokens,
             source_body_bytes=self._source_body_bytes,

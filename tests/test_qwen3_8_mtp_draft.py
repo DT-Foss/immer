@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 
@@ -236,7 +237,11 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         metrics = provider.metrics()
         self.assertFalse(metrics.pending)
         self.assertEqual(metrics.accepted_tokens, 0)
-        self.assertEqual(metrics.rejected_tokens, 3)
+        self.assertEqual(metrics.proposed_tokens, 3)
+        self.assertEqual(metrics.computed_proposal_tokens, 1)
+        self.assertEqual(metrics.padded_proposal_tokens, 2)
+        self.assertEqual(metrics.verified_proposal_tokens, 1)
+        self.assertEqual(metrics.rejected_tokens, 1)
         self.assertEqual(metrics.proposal_calls, 1)
         self.assertEqual(metrics.head_scans, 1)
         self.assertEqual(metrics.calibration_updates, 1)
@@ -265,6 +270,58 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         self.assertEqual(restored.metrics().calibration_updates, 1)
         self.assertEqual(restored.metrics().calibration_states, 1)
         restored.close()
+
+    def test_adaptive_high_confidence_computes_only_committable_k2_frontier(
+        self,
+    ) -> None:
+        config = _config()
+        pager = _Pager(_tensors(config))
+        provider = Qwen35MtpDraftProvider(
+            config,
+            pager,
+            proposal_width=15,
+            eos_token_ids=(),
+            head_block_rows=32,
+        )
+        history = (4, 7, 11, 19)
+        target_hidden = torch.randn((1, len(history), config.dim)).to(torch.bfloat16)
+        provider.begin_request_state(history, target_hidden)
+        steps_before = provider.metrics().draft_steps
+        provider._reliability[(0, 6, -1)] = [9, 1]
+        head = (
+            torch.tensor([[16.0, 0.0]], dtype=torch.bfloat16),
+            torch.tensor([[5, 6]], dtype=torch.long),
+        )
+
+        with mock.patch.object(pager, "topk_logits", return_value=head) as scan:
+            evidence = provider.propose_round_state(
+                history,
+                23,
+                target_hidden[:, -1:],
+            )
+
+        self.assertEqual(scan.call_count, 1)
+        self.assertEqual(len(evidence.token_ids), 15)
+        self.assertEqual(evidence.token_ids[0], 5)
+        self.assertEqual(evidence.token_confidences[0], 0.9)
+        self.assertEqual(evidence.token_confidences[1:], (0.0,) * 14)
+        self.assertEqual(provider.metrics().draft_steps, steps_before + 2)
+        self.assertEqual(len(provider._pending_states), 16)
+        committed_state = provider._pending_states[1]
+        self.assertIs(provider._pending_states[-1], committed_state)
+
+        provider.observe_verification(1, 1)
+        provider.reconcile_prefix((*history, 23, 5))
+        metrics = provider.metrics()
+        self.assertIs(provider._committed_state, committed_state)
+        self.assertEqual(metrics.head_scans, 1)
+        self.assertEqual(metrics.proposed_tokens, 15)
+        self.assertEqual(metrics.computed_proposal_tokens, 1)
+        self.assertEqual(metrics.padded_proposal_tokens, 14)
+        self.assertEqual(metrics.verified_proposal_tokens, 1)
+        self.assertEqual(metrics.accepted_tokens, 1)
+        self.assertEqual(metrics.rejected_tokens, 0)
+        provider.close()
 
 
 if __name__ == "__main__":

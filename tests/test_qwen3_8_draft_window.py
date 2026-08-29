@@ -644,7 +644,7 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.assertTrue(constructor.call_args.kwargs["adaptive_round_windows"])
         self.assertEqual(
             constructor.call_args.kwargs["round_window_work_costs"],
-            {1: 1.0, 4: 3.7, 8: 7.3, 16: 14.5},
+            {1: 1.0, 2: 1.6, 4: 2.8, 8: 5.2, 16: 10.0},
         )
         draft = result.evidence["draft"]
         self.assertTrue(draft["adaptive_windows"])
