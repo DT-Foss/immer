@@ -1494,8 +1494,10 @@ class Qwen38CausalChat:
             else:
                 policy["hybrid_draft"] = {
                     "provider_abi": QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
-                    "selection": "markov-council-first-then-embedded-mtp/v1",
-                    "request_provider_lock": True,
+                    "selection": "markov-prefix-then-one-way-mtp/v2",
+                    "request_provider_lock": False,
+                    "one_way_handoff": True,
+                    "committed_hidden_handoff": True,
                     "markov_provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
                     "markov_persistent": self._markov_draft_state_path is not None,
                     "mtp_provider_abi": QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
@@ -1687,7 +1689,7 @@ class Qwen38CausalChat:
                     "identity",
                     {},
                 ).get("manifest_sha256"),
-                "selection": "markov-council-first-then-embedded-mtp/v1",
+                "selection": "markov-prefix-then-one-way-mtp/v2",
             }
         else:
             raise Qwen38ChatError("draft-window identity lacks a draft provider")

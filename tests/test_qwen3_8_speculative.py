@@ -122,6 +122,7 @@ class _StateRollingFromTokens(_RollingFromTokens):
         super().__init__(*args, **kwargs)
         self.begin_hidden: torch.Tensor | None = None
         self.proposal_hidden: list[torch.Tensor] = []
+        self.reconcile_hidden: list[torch.Tensor] = []
 
     def begin_request_state(
         self,
@@ -141,6 +142,14 @@ class _StateRollingFromTokens(_RollingFromTokens):
         self.proposal_hidden.append(target_hidden.detach().clone())
         return super().propose_after(history, known_token)
 
+    def reconcile_prefix_state(
+        self,
+        history: tuple[int, ...],
+        target_hidden: torch.Tensor,
+    ) -> None:
+        self.reconcile_hidden.append(target_hidden.detach().clone())
+        super().reconcile_prefix(history)
+
 
 class _MutatingStateRollingFromTokens(_StateRollingFromTokens):
     def __init__(self, *args, mutate_at: str, **kwargs) -> None:
@@ -157,6 +166,11 @@ class _MutatingStateRollingFromTokens(_StateRollingFromTokens):
         if self.mutate_at == "proposal":
             target_hidden.data.zero_()
         return proposal
+
+    def reconcile_prefix_state(self, history, target_hidden) -> None:
+        super().reconcile_prefix_state(history, target_hidden)
+        if self.mutate_at == "reconcile":
+            target_hidden.data.zero_()
 
 
 class _MutatingPair(Sequence[int]):
@@ -871,7 +885,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         prompt = (1, 4)
         baseline = self._model()
         tokens, _evidence = baseline.generate_greedy(
-            [prompt], max_new_tokens=4, head_block_rows=7
+            [prompt], max_new_tokens=8, head_block_rows=7
         )
         provider = _StateRollingFromTokens(
             prompt,
@@ -886,7 +900,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
             provider,
         ).generate_rolling(
             [prompt],
-            max_new_tokens=4,
+            max_new_tokens=8,
             head_block_rows=7,
         )
 
@@ -897,9 +911,16 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         self.assertEqual(
             tuple(provider.begin_hidden.shape), (1, len(prompt), self.config.dim)
         )
-        self.assertEqual(len(provider.proposal_hidden), 1)
+        self.assertEqual(len(provider.proposal_hidden), 2)
         self.assertEqual(
             tuple(provider.proposal_hidden[0].shape), (1, 1, self.config.dim)
+        )
+        self.assertEqual(len(provider.reconcile_hidden), 2)
+        self.assertTrue(
+            all(
+                tuple(value.shape) == (1, 4, self.config.dim)
+                for value in provider.reconcile_hidden
+            )
         )
 
     def test_rolling_markov_provider_continues_from_restored_prefix(self) -> None:
@@ -936,7 +957,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         tokens, _evidence = baseline.generate_greedy(
             [prompt], max_new_tokens=4, head_block_rows=7
         )
-        for mutate_at in ("begin", "proposal"):
+        for mutate_at in ("begin", "proposal", "reconcile"):
             with self.subTest(mutate_at=mutate_at):
                 provider = _MutatingStateRollingFromTokens(
                     prompt,
@@ -955,7 +976,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
                         provider,
                     ).generate_rolling(
                         [prompt],
-                        max_new_tokens=4,
+                        max_new_tokens=8,
                         head_block_rows=7,
                     )
                 self.assertEqual(candidate.next_position, 0)

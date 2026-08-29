@@ -45,8 +45,14 @@ class _MarkovMetrics:
 
 
 class _Markov:
-    def __init__(self, confidence: float) -> None:
-        self.confidence = confidence
+    def __init__(self, confidence: float | list[float]) -> None:
+        self.confidences = (
+            [float(confidence)]
+            if isinstance(confidence, (int, float))
+            else [float(value) for value in confidence]
+        )
+        self.confidence = self.confidences[0]
+        self._proposal_index = 0
         self.begin_calls = []
         self.propose_calls = []
         self.discard_calls = 0
@@ -62,6 +68,9 @@ class _Markov:
     def propose_round(self, history, known_token):
         self.propose_calls.append((history, known_token, "round"))
         self.pending = True
+        index = min(self._proposal_index, len(self.confidences) - 1)
+        self.confidence = self.confidences[index]
+        self._proposal_index += 1
         return _proposal(confidence=self.confidence)
 
     def propose_after(self, history, known_token):
@@ -271,6 +280,179 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(close_order, ["mtp", "markov"])
         self.assertTrue(markov.closed)
         self.assertTrue(mtp.closed)
+
+    def test_markov_rounds_then_one_way_mtp_handoff_uses_complete_hidden(self) -> None:
+        markov = _Markov([0.99, 0.99, 0.01, 0.99])
+        mtp = _Mtp()
+        factory_calls = []
+
+        def factory():
+            factory_calls.append("mtp")
+            return mtp
+
+        provider = Qwen38MarkovMtpDraftProvider(markov, factory)
+        prompt = (1, 2)
+        prompt_hidden = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4)
+        expected_prompt = prompt_hidden.clone()
+        provider.begin_request_state(prompt, prompt_hidden)
+        prompt_hidden.add_(1000)
+
+        provider.propose_round_state(prompt, 10, torch.full((1, 1, 4), 10.0))
+        provider.observe_verification(1, 2)
+        first_history = (*prompt, 10, 3)
+        first_hidden = torch.tensor(
+            [[[10.0, 11.0, 12.0, 13.0], [30.0, 31.0, 32.0, 33.0]]]
+        )
+        first_snapshot = first_hidden.clone()
+        provider.reconcile_prefix_state(first_history, first_hidden)
+        self.assertTrue(torch.equal(first_hidden, first_snapshot))
+
+        provider.propose_round_state(
+            first_history,
+            11,
+            torch.full((1, 1, 4), 11.0),
+        )
+        provider.observe_verification(0, 1)
+        second_history = (*first_history, 11)
+        second_hidden = torch.tensor([[[40.0, 41.0, 42.0, 43.0]]])
+        provider.reconcile_prefix_state(second_history, second_hidden)
+
+        switched = provider.propose_round_state(
+            second_history,
+            12,
+            torch.full((1, 1, 4), 12.0),
+        )
+
+        expected_history_hidden = torch.cat(
+            (expected_prompt, first_snapshot, second_hidden),
+            dim=1,
+        )
+        self.assertEqual(switched.token_ids, (7, 8, 9))
+        self.assertEqual(provider.selected_provider, "mtp")
+        self.assertEqual(factory_calls, ["mtp"])
+        self.assertEqual(markov.discard_calls, 1)
+        self.assertEqual(len(markov.propose_calls), 3)
+        self.assertEqual(mtp.begin_calls[0][0], second_history)
+        self.assertTrue(torch.equal(mtp.begin_calls[0][1], expected_history_hidden))
+        provider.observe_verification(1, 1)
+        mtp_history = (*second_history, 12, 7)
+        provider.reconcile_prefix_state(
+            mtp_history,
+            torch.tensor([[[50.0, 51.0, 52.0, 53.0], [60.0, 61.0, 62.0, 63.0]]]),
+        )
+
+        provider.propose_round_state(
+            mtp_history,
+            13,
+            torch.full((1, 1, 4), 13.0),
+        )
+        self.assertEqual(factory_calls, ["mtp"])
+        self.assertEqual(len(markov.propose_calls), 3)
+        self.assertEqual(len(mtp.propose_calls), 2)
+        provider.observe_verification(0, 1)
+        provider.reconcile_prefix_state(
+            (*mtp_history, 13),
+            torch.full((1, 1, 4), 70.0),
+        )
+        final = (*mtp_history, 13, 14)
+        provider.observe_final(final)
+        self.assertEqual(markov.final_calls, [final])
+
+        metrics = provider.metrics()
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v2")
+        self.assertEqual(metrics.selected_provider, "mtp")
+        self.assertEqual(metrics.selection_calls, 3)
+        self.assertEqual(metrics.markov_rounds, 2)
+        self.assertEqual(metrics.mtp_rounds, 2)
+        self.assertEqual(metrics.provider_switches, 1)
+        self.assertEqual(metrics.hidden_history_rows, len(second_history))
+        self.assertEqual(
+            metrics.hidden_history_bytes,
+            expected_history_hidden.numel() * expected_history_hidden.element_size(),
+        )
+        self.assertFalse(metrics.switch_available)
+        provider.close()
+
+    def test_regular_reconcile_permanently_falls_back_to_markov(self) -> None:
+        markov = _Markov([0.99, 0.01])
+        factory_calls = []
+        provider = Qwen38MarkovMtpDraftProvider(
+            markov,
+            lambda: factory_calls.append("mtp"),
+        )
+        prompt = (1, 2)
+        hidden = torch.zeros((1, 2, 4))
+        provider.begin_request_state(prompt, hidden)
+        provider.propose_round_state(prompt, 3, hidden[:, -1:])
+        provider.observe_verification(1, 1)
+        history = (*prompt, 3, 3)
+        provider.reconcile_prefix(history)
+
+        proposal = provider.propose_round_state(
+            history,
+            4,
+            hidden[:, -1:],
+        )
+
+        self.assertEqual(provider.selected_provider, "markov")
+        self.assertEqual(factory_calls, [])
+        self.assertEqual(markov.discard_calls, 0)
+        self.assertEqual(proposal.token_ids, (3, 4, 5))
+        metrics = provider.metrics()
+        self.assertEqual(metrics.markov_rounds, 2)
+        self.assertEqual(metrics.provider_switches, 0)
+        self.assertFalse(metrics.switch_available)
+        provider.observe_verification(0, 1)
+        provider.reconcile_prefix((*history, 4))
+        provider.observe_final((*history, 4, 8))
+        provider.close()
+
+    def test_hidden_callbacks_are_isolated_and_shape_bound(self) -> None:
+        class MutatingMtp(_Mtp):
+            def begin_request_state(self, history, hidden):
+                super().begin_request_state(history, hidden)
+                hidden.add_(500)
+
+            def propose_round_state(self, history, known_token, hidden):
+                result = super().propose_round_state(history, known_token, hidden)
+                hidden.mul_(0)
+                return result
+
+        markov = _Markov(0.01)
+        mtp = MutatingMtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        prompt = (1, 2)
+        prompt_hidden = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4)
+        prompt_snapshot = prompt_hidden.clone()
+        provider.begin_request_state(prompt, prompt_hidden)
+        proposal_hidden = torch.full((1, 1, 4), 7.0)
+        proposal_snapshot = proposal_hidden.clone()
+
+        provider.propose_round_state(prompt, 3, proposal_hidden)
+
+        self.assertTrue(torch.equal(prompt_hidden, prompt_snapshot))
+        self.assertTrue(torch.equal(proposal_hidden, proposal_snapshot))
+        provider.observe_verification(0, 1)
+        committed = torch.full((1, 1, 4), 9.0)
+        committed_snapshot = committed.clone()
+        provider.reconcile_prefix_state((*prompt, 3), committed)
+        self.assertTrue(torch.equal(committed, committed_snapshot))
+        provider.observe_final((*prompt, 3, 8))
+        provider.close()
+
+        bad = Qwen38MarkovMtpDraftProvider(_Markov(0.99), _Mtp)
+        bad.begin_request_state(prompt, prompt_snapshot)
+        bad.propose_round_state(prompt, 3, proposal_snapshot)
+        bad.observe_verification(0, 1)
+        with self.assertRaisesRegex(
+            Qwen38MarkovMtpDraftError,
+            "committed hidden rows",
+        ):
+            bad.reconcile_prefix_state(
+                (*prompt, 3),
+                torch.zeros((1, 2, 4)),
+            )
+        bad.close()
 
     def test_mtp_request_persists_full_target_episode_into_real_markov(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

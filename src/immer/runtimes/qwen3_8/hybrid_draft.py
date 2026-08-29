@@ -1,4 +1,4 @@
-"""Request-locked Markov-first cascade over the embedded Qwen MTP branch."""
+"""One-way Markov-to-MTP cascade over target-confirmed hidden history."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from .draft_protocol import RollingDraftProposal
 from .mtp_draft import Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v1"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v2"
 MARKOV_MTP_WINDOW_WORK_COSTS = {
     1: 1.0,
     2: 1.6,
@@ -23,7 +23,7 @@ MARKOV_MTP_WINDOW_WORK_COSTS = {
 
 
 class Qwen38MarkovMtpDraftError(RuntimeError):
-    """The Markov/MTP request cascade violated its one-provider contract."""
+    """The Markov/MTP cascade violated its one-way handoff contract."""
 
 
 def _metrics_record(owner: object | None) -> dict[str, Any] | None:
@@ -75,6 +75,12 @@ class Qwen38MarkovMtpDraftMetrics:
     selection_calls: int
     markov_selections: int
     mtp_selections: int
+    markov_rounds: int
+    mtp_rounds: int
+    provider_switches: int
+    hidden_history_rows: int
+    hidden_history_bytes: int
+    switch_available: bool
     source_body_bytes: int
     linear_calls: int
     last_confidence: float
@@ -100,11 +106,12 @@ MtpFactory = Callable[[], Qwen35MtpDraftProvider]
 
 
 class Qwen38MarkovMtpDraftProvider:
-    """Ask Markov for a free first-round route, then lock the request.
+    """Serve Markov rounds until one safe, permanent handoff to target MTP.
 
-    Markov already has the prompt and can produce its proposal without reading
-    model weights.  Only a K1 selection constructs the embedded MTP provider.
-    The selected provider cannot change for the remainder of the request.
+    Markov proposals are free of model-weight reads, so every adaptive round
+    asks the Council first.  A useful horizon remains on Markov.  K1 triggers
+    MTP only while the complete target-confirmed hidden history is available;
+    after that one-way handoff, the request can never switch back.
     """
 
     target_state_isolation = "hidden-argument+shared-pager-only/v1"
@@ -127,14 +134,23 @@ class Qwen38MarkovMtpDraftProvider:
         self._mtp_provider: Qwen35MtpDraftProvider | object | None = None
         self._selected_provider: Literal["markov", "mtp"] | None = None
         self._request_history: tuple[int, ...] | None = None
-        self._prompt_hidden: torch.Tensor | None = None
+        self._hidden_history: torch.Tensor | None = None
+        self._hidden_device: torch.device | None = None
+        self._hidden_dtype: torch.dtype | None = None
+        self._hidden_width = 0
+        self._hidden_history_rows = 0
+        self._hidden_history_bytes = 0
+        self._switch_available = False
         self._request_started = False
         self._request_completed = False
         self._closed = False
         self._selection_calls = 0
         self._markov_selections = 0
         self._mtp_selections = 0
-        self._pending = False
+        self._markov_rounds = 0
+        self._mtp_rounds = 0
+        self._provider_switches = 0
+        self._pending_provider: Literal["markov", "mtp"] | None = None
 
     @property
     def selected_provider(self) -> Literal["markov", "mtp"] | None:
@@ -166,12 +182,64 @@ class Qwen38MarkovMtpDraftProvider:
             raise ValueError("hybrid request history must be a non-empty tuple")
         if not isinstance(target_hidden, torch.Tensor):
             raise TypeError("target_hidden must be a torch.Tensor")
-        if target_hidden.ndim != 3 or target_hidden.shape[1] != len(history):
+        if (
+            target_hidden.ndim != 3
+            or target_hidden.shape[0] != 1
+            or target_hidden.shape[1] != len(history)
+            or target_hidden.shape[2] <= 0
+            or not target_hidden.is_floating_point()
+        ):
             raise ValueError("prompt hidden rows must match request history")
         self.markov_provider.begin_request(history)
         self._request_history = history
-        self._prompt_hidden = target_hidden.detach().clone()
+        self._hidden_history = target_hidden.detach().clone().contiguous()
+        self._hidden_device = target_hidden.device
+        self._hidden_dtype = target_hidden.dtype
+        self._hidden_width = int(target_hidden.shape[2])
+        self._hidden_history_rows = len(history)
+        self._hidden_history_bytes = (
+            target_hidden.numel() * target_hidden.element_size()
+        )
+        self._switch_available = True
         self._request_started = True
+
+    def _validate_history(self, history: tuple[int, ...]) -> None:
+        if not isinstance(history, tuple) or not history:
+            raise ValueError("hybrid history must be a non-empty tuple")
+        current = self._request_history
+        if (
+            current is None
+            or len(history) < len(current)
+            or history[: len(current)] != current
+        ):
+            raise Qwen38MarkovMtpDraftError(
+                "hybrid history does not extend its confirmed prefix"
+            )
+
+    def _state_fragment(
+        self,
+        history: tuple[int, ...],
+        committed_hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        self._validate_history(history)
+        if not isinstance(committed_hidden, torch.Tensor):
+            raise TypeError("committed_hidden must be a torch.Tensor")
+        current = self._request_history
+        assert current is not None
+        added = len(history) - len(current)
+        if (
+            added <= 0
+            or self._hidden_width <= 0
+            or committed_hidden.ndim != 3
+            or committed_hidden.shape != (1, added, self._hidden_width)
+            or committed_hidden.device != self._hidden_device
+            or committed_hidden.dtype != self._hidden_dtype
+            or not committed_hidden.is_floating_point()
+        ):
+            raise Qwen38MarkovMtpDraftError(
+                "committed hidden rows do not match the history extension"
+            )
+        return committed_hidden.detach().clone().contiguous()
 
     def __call__(self, _history: tuple[int, ...], /) -> tuple[int, ...]:
         raise Qwen38MarkovMtpDraftError(
@@ -217,38 +285,65 @@ class Qwen38MarkovMtpDraftProvider:
         self._mtp_provider = provider
         return provider
 
-    def _choose_first_provider(
+    def _markov_round_or_handoff(
         self,
         history: tuple[int, ...],
         known_token: int,
     ) -> RollingDraftProposal | None:
-        if self._selected_provider is not None:
+        if self._selected_provider == "mtp":
             return None
+        self._validate_history(history)
         proposal = self.markov_provider.propose_round(history, known_token)
         if not isinstance(proposal, RollingDraftProposal):
             raise Qwen38MarkovMtpDraftError(
                 "Markov council returned no RollingDraftProposal"
             )
         self._selection_calls += 1
-        if self._select_markov(proposal):
+        if self._select_markov(proposal) or not self._switch_available:
             self._selected_provider = "markov"
             self._markov_selections += 1
-            self._prompt_hidden = None
+            self._markov_rounds += 1
+            return proposal
+
+        hidden_history = self._hidden_history
+        request_history = self._request_history
+        if (
+            hidden_history is None
+            or request_history != history
+            or hidden_history.shape[1] != len(history)
+        ):
+            # Missing target state is a safe Markov-only fallback.  Keep its
+            # pending K1 proposal so the decoder can reconcile the direct row.
+            self._switch_available = False
+            self._hidden_history = None
+            self._selected_provider = "markov"
+            self._markov_selections += 1
+            self._markov_rounds += 1
             return proposal
 
         self.markov_provider.discard_pending_proposal()
         mtp = self._load_mtp()
-        prompt_hidden = self._prompt_hidden
-        request_history = self._request_history
-        if prompt_hidden is None or request_history is None:
-            raise Qwen38MarkovMtpDraftError("stored prompt state is missing")
-        # MTP owns a private copy.  Neither the caller's tensor nor the saved
-        # selection copy can be mutated by provider initialization.
-        mtp.begin_request_state(request_history, prompt_hidden.detach().clone())
-        self._prompt_hidden = None
+        mtp.begin_request_state(history, hidden_history.detach().clone())
+        self._hidden_history = None
+        self._switch_available = False
         self._selected_provider = "mtp"
         self._mtp_selections += 1
+        self._provider_switches += 1
         return None
+
+    def _mtp_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        if not isinstance(target_hidden, torch.Tensor):
+            raise TypeError("target_hidden must be a torch.Tensor")
+        if (
+            target_hidden.shape != (1, 1, self._hidden_width)
+            or target_hidden.device != self._hidden_device
+            or target_hidden.dtype != self._hidden_dtype
+            or not target_hidden.is_floating_point()
+        ):
+            raise Qwen38MarkovMtpDraftError(
+                "MTP proposal hidden does not match the target history"
+            )
+        return target_hidden.detach().clone().contiguous()
 
     def propose_round_state(
         self,
@@ -258,26 +353,29 @@ class Qwen38MarkovMtpDraftProvider:
         /,
     ) -> RollingDraftProposal:
         self._require_open_request()
-        selected = self._choose_first_provider(history, known_token)
+        if self._pending_provider is not None:
+            raise Qwen38MarkovMtpDraftError(
+                "previous hybrid proposal was not reconciled"
+            )
+        selected = self._markov_round_or_handoff(history, known_token)
         if selected is not None:
-            self._pending = True
+            self._pending_provider = "markov"
             return selected
-        if self._selected_provider == "markov":
-            proposal = self.markov_provider.propose_round(history, known_token)
-        elif self._selected_provider == "mtp":
+        if self._selected_provider == "mtp":
             assert self._mtp_provider is not None
             proposal = self._mtp_provider.propose_round_state(
                 history,
                 known_token,
-                target_hidden,
+                self._mtp_hidden(target_hidden),
             )
-        else:  # pragma: no cover - guarded by the selection transition.
+            self._mtp_rounds += 1
+        else:  # pragma: no cover - guarded by the handoff transition.
             raise Qwen38MarkovMtpDraftError("hybrid provider was not selected")
         if not isinstance(proposal, RollingDraftProposal):
             raise Qwen38MarkovMtpDraftError(
                 "selected provider returned no RollingDraftProposal"
             )
-        self._pending = True
+        self._pending_provider = "mtp"
         return proposal
 
     def propose_after_state(
@@ -288,6 +386,10 @@ class Qwen38MarkovMtpDraftProvider:
         /,
     ) -> tuple[int, ...]:
         self._require_open_request()
+        if self._pending_provider is not None:
+            raise Qwen38MarkovMtpDraftError(
+                "previous hybrid proposal was not reconciled"
+            )
         # Fixed short windows do not expose the K4/K8/K16 horizon contract
         # required by ``propose_round``.  They are already the cheap path, so
         # lock directly to Markov and never materialize MTP for this request.
@@ -295,19 +397,22 @@ class Qwen38MarkovMtpDraftProvider:
             self._selected_provider = "markov"
             self._selection_calls += 1
             self._markov_selections += 1
-            self._prompt_hidden = None
+            self._switch_available = False
+            self._hidden_history = None
         if self._selected_provider == "markov":
             proposal = self.markov_provider.propose_after(history, known_token)
+            self._markov_rounds += 1
         elif self._selected_provider == "mtp":
             assert self._mtp_provider is not None
             proposal = self._mtp_provider.propose_after_state(
                 history,
                 known_token,
-                target_hidden,
+                self._mtp_hidden(target_hidden),
             )
+            self._mtp_rounds += 1
         else:  # pragma: no cover - guarded by the selection transition.
             raise Qwen38MarkovMtpDraftError("hybrid provider was not selected")
-        self._pending = True
+        self._pending_provider = self._selected_provider
         return tuple(proposal)
 
     def observe_verification(
@@ -317,51 +422,101 @@ class Qwen38MarkovMtpDraftProvider:
         /,
     ) -> None:
         self._require_open_request()
-        if not self._pending:
+        pending = self._pending_provider
+        if pending is None:
             raise Qwen38MarkovMtpDraftError(
                 "verification has no pending hybrid proposal"
             )
-        owner = (
-            self.markov_provider
-            if self._selected_provider == "markov"
-            else self._mtp_provider
-        )
+        owner = self.markov_provider if pending == "markov" else self._mtp_provider
         callback = getattr(owner, "observe_verification", None)
         if callable(callback):
             callback(accepted_prefix_length, verified_proposals)
 
     def reconcile_prefix(self, history: tuple[int, ...], /) -> None:
         self._require_open_request()
-        if not self._pending:
+        pending = self._pending_provider
+        if pending is None:
             raise Qwen38MarkovMtpDraftError(
                 "reconciliation has no pending hybrid proposal"
             )
-        owner = (
-            self.markov_provider
-            if self._selected_provider == "markov"
-            else self._mtp_provider
-        )
+        self._validate_history(history)
+        owner = self.markov_provider if pending == "markov" else self._mtp_provider
         if owner is None:  # pragma: no cover - selection invariant.
             raise Qwen38MarkovMtpDraftError("hybrid provider was not selected")
         owner.reconcile_prefix(history)
-        self._pending = False
+        self._request_history = history
+        self._pending_provider = None
+        # Without the committed target hidden rows, a later MTP initialization
+        # could not reconstruct its exact shifted-pair cache.  Continue safely
+        # on Markov for the remainder of this request.
+        self._switch_available = False
+        self._hidden_history = None
+
+    def reconcile_prefix_state(
+        self,
+        history: tuple[int, ...],
+        committed_hidden: torch.Tensor,
+        /,
+    ) -> None:
+        """Reconcile one prefix and retain its exact target-hidden extension."""
+
+        self._require_open_request()
+        pending = self._pending_provider
+        if pending is None:
+            raise Qwen38MarkovMtpDraftError(
+                "reconciliation has no pending hybrid proposal"
+            )
+        fragment = self._state_fragment(history, committed_hidden)
+        caller_snapshot = committed_hidden.detach().clone()
+        owner = self.markov_provider if pending == "markov" else self._mtp_provider
+        if owner is None:  # pragma: no cover - pending-provider invariant.
+            raise Qwen38MarkovMtpDraftError("hybrid provider was not selected")
+        owner.reconcile_prefix(history)
+        if not torch.equal(committed_hidden, caller_snapshot):
+            raise Qwen38MarkovMtpDraftError(
+                "hybrid reconciliation mutated its hidden argument"
+            )
+        if pending == "markov" and self._switch_available:
+            hidden_history = self._hidden_history
+            if hidden_history is None:
+                self._switch_available = False
+            else:
+                self._hidden_history = torch.cat(
+                    (hidden_history, fragment),
+                    dim=1,
+                ).contiguous()
+                self._hidden_history_rows = int(self._hidden_history.shape[1])
+                self._hidden_history_bytes = (
+                    self._hidden_history.numel() * self._hidden_history.element_size()
+                )
+        self._request_history = history
+        self._pending_provider = None
 
     def observe_final(self, history: tuple[int, ...], /) -> None:
         self._require_open_request()
-        if self._pending:
+        if self._pending_provider is not None:
             raise Qwen38MarkovMtpDraftError(
                 "cannot finalize an unreconciled hybrid proposal"
             )
         if self._selected_provider == "mtp":
             assert self._mtp_provider is not None
-            self._mtp_provider.observe_final(history)
+            mtp_failure: Exception | None = None
+            try:
+                self._mtp_provider.observe_final(history)
+            except Exception as exc:
+                mtp_failure = exc
             # The MTP branch executes the request, while Markov receives only
             # the final target-confirmed episode and therefore learns without
             # treating its discarded speculative tokens as observations.
             self.markov_provider.observe_final(history)
         else:
+            mtp_failure = None
             self.markov_provider.observe_final(history)
         self._request_completed = True
+        self._switch_available = False
+        self._hidden_history = None
+        if mtp_failure is not None:
+            raise mtp_failure
 
     def metrics(self) -> Qwen38MarkovMtpDraftMetrics:
         markov = _metrics_record(self.markov_provider)
@@ -372,6 +527,12 @@ class Qwen38MarkovMtpDraftProvider:
             selection_calls=self._selection_calls,
             markov_selections=self._markov_selections,
             mtp_selections=self._mtp_selections,
+            markov_rounds=self._markov_rounds,
+            mtp_rounds=self._mtp_rounds,
+            provider_switches=self._provider_switches,
+            hidden_history_rows=self._hidden_history_rows,
+            hidden_history_bytes=self._hidden_history_bytes,
+            switch_available=self._switch_available,
             source_body_bytes=(
                 _nonnegative_metric(markov, "source_body_bytes")
                 + _nonnegative_metric(mtp, "source_body_bytes")
@@ -393,7 +554,7 @@ class Qwen38MarkovMtpDraftProvider:
                 if markov is None or markov.get("effective_experts") is None
                 else float(markov["effective_experts"])
             ),
-            pending=self._pending,
+            pending=self._pending_provider is not None,
             closed=self._closed,
             markov=markov,
             mtp=mtp,
@@ -417,7 +578,8 @@ class Qwen38MarkovMtpDraftProvider:
         except BaseException as exc:
             if failure is None:
                 failure = exc
-        self._prompt_hidden = None
+        self._hidden_history = None
+        self._switch_available = False
         self._closed = True
         if failure is not None:
             raise failure

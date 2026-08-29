@@ -1689,27 +1689,56 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
     def _reconcile_rolling_provider(
         self,
         history: tuple[int, ...],
+        target_hidden: torch.Tensor | None = None,
     ) -> tuple[int, float]:
         missing = object()
+        state_callback = (
+            target_hidden is not None
+            and inspect.getattr_static(
+                self.draft_provider,
+                "reconcile_prefix_state",
+                missing,
+            )
+            is not missing
+        )
+        callback_name = (
+            "reconcile_prefix_state" if state_callback else "reconcile_prefix"
+        )
         if (
-            inspect.getattr_static(self.draft_provider, "reconcile_prefix", missing)
+            inspect.getattr_static(self.draft_provider, callback_name, missing)
             is missing
         ):
             raise Qwen38SpeculativeError(
-                "rolling generation requires draft_provider.reconcile_prefix"
+                f"rolling generation requires draft_provider.{callback_name}"
             )
         stamp_started = time.perf_counter()
         before = self._provider_state_stamp()
         integrity_seconds = time.perf_counter() - stamp_started
         integrity_bytes = self.model.state_bytes
         failure: Exception | None = None
+        provider_hidden = (
+            None if target_hidden is None else target_hidden.detach().clone()
+        )
+        provider_hidden_stamp = (
+            None if provider_hidden is None else _tensor_stamp(provider_hidden)
+        )
         try:
-            callback = getattr(self.draft_provider, "reconcile_prefix")
+            callback = getattr(self.draft_provider, callback_name)
             if not callable(callback):
-                raise TypeError("draft provider reconcile_prefix is not callable")
-            callback(history)
+                raise TypeError(f"draft provider {callback_name} is not callable")
+            if state_callback:
+                callback(history, provider_hidden)
+            else:
+                callback(history)
         except Exception as exc:
             failure = exc
+        if (
+            provider_hidden is not None
+            and _tensor_stamp(provider_hidden) != provider_hidden_stamp
+        ):
+            failure = Qwen38SpeculativeError(
+                "rolling reconciliation mutated its hidden argument"
+            )
         stamp_started = time.perf_counter()
         try:
             changed = self._provider_state_stamp() != before
@@ -2024,7 +2053,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                 guard_seconds += verification_seconds
                 emitted = (pending_token,)
                 reconcile_bytes, reconcile_seconds = self._reconcile_rolling_provider(
-                    (*prompt, *generated, *emitted)
+                    (*prompt, *generated, *emitted),
+                    hidden,
                 )
                 guard_bytes += reconcile_bytes
                 guard_seconds += reconcile_seconds
@@ -2126,7 +2156,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             else:
                 self.model.discard_continuation_block(stage)
             reconcile_bytes, reconcile_seconds = self._reconcile_rolling_provider(
-                (*prompt, *generated, *emitted)
+                (*prompt, *generated, *emitted),
+                hidden if state_committed else None,
             )
             guard_bytes += reconcile_bytes
             guard_seconds += reconcile_seconds

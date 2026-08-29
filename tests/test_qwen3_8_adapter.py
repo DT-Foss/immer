@@ -906,9 +906,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
         hybrid = policy["hybrid_draft"]
         self.assertEqual(
             hybrid["selection"],
-            "markov-council-first-then-embedded-mtp/v1",
+            "markov-prefix-then-one-way-mtp/v2",
         )
-        self.assertTrue(hybrid["request_provider_lock"])
+        self.assertFalse(hybrid["request_provider_lock"])
+        self.assertTrue(hybrid["one_way_handoff"])
+        self.assertTrue(hybrid["committed_hidden_handoff"])
         self.assertTrue(hybrid["markov_persistent"])
         self.assertTrue(hybrid["mtp_persistent_calibration"])
         self.assertEqual(
