@@ -31,7 +31,8 @@ All notable changes to IMMER are recorded here.
   with no certified byte saving uses the former contiguous read once. A
   transport cost gate also requires at least 50% row removal and at most four
   survivor runs, preventing small logical savings from exploding into tens of
-  thousands of tiny local reads.
+  thousands of tiny local reads. Row-cap evaluation itself stops after 64 leaf
+  probes when none produces a physical saving.
 - Added a complete prompt-free Fast-MLP builder for all 64 Qwen layers. It
   computes Gate/Up Gaussian joint moments directly from local causal weights,
   constructs deterministic p4/k32 pilots, and publishes the existing packed
@@ -48,6 +49,13 @@ All notable changes to IMMER are recorded here.
   admit the minimum width reaching `0.50`, up to 128 blocks; layers missing the
   floor stay full. Later waves widen for current pilot-score mass, reuse the
   existing 13.55 GB payload unchanged, and migrate v1 online state in place.
+- Capture-only Fast-MLP admission is disabled. Weight-only layers now require
+  prequential sparse-Down shadow calibration with recent worst cosine
+  `>=0.999`, relative L2 `<=0.05`, and a persisted scalar correction; v1/v2
+  states migrate output-unconfirmed. A pre-dynamic-read economics guard also
+  returns to the full MLP when combined sparse row transport exceeds `90%`.
+  Shadow calibration masks one worst-row activation and reuses the exact Down
+  matrix while resident, adding no checkpoint or auxiliary source read.
 - Added a deterministic all-layer p4/k32 Fast-MLP builder over authenticated
   local weights. Isotropic Gate/Up joint moments seed all 64 routers; local
   transpose and packed-pilot banks replace the `34.23 GB` full MLP target wave

@@ -25,6 +25,7 @@ from ..ooe.identity import canonical_json_bytes, require_sha256
 EXACT_HEAD_SCHEMA = "immer.qwen3.8-exact-head-pq/v1"
 EXACT_HEAD_MANIFEST_SCHEMA = "immer.qwen3.8-exact-head-manifest/v1"
 EXACT_HEAD_SCORE_ABI = "cpu-bf16-explicit-fp32-accumulate-rne/v1"
+_ROW_BOUND_PROBE_PAGES = 64
 _MANIFEST_NAME = "manifest.json"
 _PAYLOAD_NAME = "index.safetensors"
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -196,6 +197,8 @@ class ExactHeadMetrics:
     selected_rows_scored: int = 0
     full_leaf_fallbacks: int = 0
     selected_row_cost_fallbacks: int = 0
+    row_bound_probe_pages: int = 0
+    row_bound_disabled_calls: int = 0
     selected_row_logical_bytes: int = 0
     row_certificate_logical_bytes_avoided: int = 0
     logical_head_bytes_avoided: int = 0
@@ -1317,11 +1320,19 @@ class ExactHeadIndex:
             selected_rows_scored = 0
             full_leaf_fallbacks = 0
             selected_row_cost_fallbacks = 0
+            row_bound_probe_pages = 0
+            row_bound_saving_pages = 0
+            row_bounds_enabled = True
+            row_bounds_disabled = False
             row_certificate_rows_pruned = 0
             while frontier:
                 _priority, node = heapq.heappop(frontier)
                 bound_nodes += 1
-                if best_values is not None and best_values.shape[-1] == k:
+                if (
+                    row_bounds_enabled
+                    and best_values is not None
+                    and best_values.shape[-1] == k
+                ):
                     skip = all(
                         self.prunable(
                             float(caps[row, node]),
@@ -1364,6 +1375,7 @@ class ExactHeadIndex:
                         page_ids,
                     )
                     row_bound_rows += count
+                    row_bound_probe_pages += 1
                     selected_ids = tuple(
                         int(token_id)
                         for column, token_id in enumerate(page_ids)
@@ -1381,6 +1393,7 @@ class ExactHeadIndex:
                     rows_pruned += certified
                     row_certificate_rows_pruned += certified
                     if not selected_ids:
+                        row_bound_saving_pages += 1
                         pages_pruned += 1
                         continue
 
@@ -1393,6 +1406,7 @@ class ExactHeadIndex:
                     and self._selected_read_is_economic(selected_ids, count)
                 )
                 if use_selected:
+                    row_bound_saving_pages += 1
                     score_preflight(
                         query_rows=len(flat),
                         head_rows=count,
@@ -1431,6 +1445,13 @@ class ExactHeadIndex:
                         device=pager.device,
                     )
                     logits = pager._score_head_rows(flat, rows)
+                if (
+                    row_bounds_enabled
+                    and row_bound_probe_pages >= _ROW_BOUND_PROBE_PAGES
+                    and row_bound_saving_pages == 0
+                ):
+                    row_bounds_enabled = False
+                    row_bounds_disabled = True
                 token_ids = torch.tensor(
                     selected_ids,
                     device=pager.device,
@@ -1471,6 +1492,8 @@ class ExactHeadIndex:
                 self._metrics.selected_row_cost_fallbacks += (
                     selected_row_cost_fallbacks
                 )
+                self._metrics.row_bound_probe_pages += row_bound_probe_pages
+                self._metrics.row_bound_disabled_calls += int(row_bounds_disabled)
                 selected_bytes = (
                     selected_rows_scored * self.binding.hidden_size * 2
                 )

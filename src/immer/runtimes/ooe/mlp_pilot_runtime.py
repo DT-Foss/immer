@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -31,6 +31,20 @@ PILOT_TRANSPOSE_MANIFEST_SCHEMA = "immer.qwen-mlp-pilot-transpose-manifest/v1"
 
 class MlpPilotSparseRuntimeError(RuntimeError):
     pass
+
+
+class MlpPilotNonBeneficialRoute(MlpPilotSparseRuntimeError):
+    """Pilot scoring proved that sparse transport cannot beat the full MLP."""
+
+    exact_mlp_fallback = True
+
+    def __init__(self, *, layer: int, estimated_fraction: float) -> None:
+        self.layer = layer
+        self.estimated_fraction = estimated_fraction
+        super().__init__(
+            f"layer {layer} adaptive route needs {estimated_fraction:.6f} "
+            "of full MLP row transport"
+        )
 
 
 def _digest(value: object) -> str:
@@ -513,17 +527,178 @@ class MlpPilotSparseExecutor:
         up: torch.Tensor | Sequence[torch.Tensor],
         output: torch.Tensor | Sequence[torch.Tensor],
         activated: torch.Tensor | Sequence[torch.Tensor] | None = None,
+        down_weight: torch.Tensor | None = None,
     ) -> MlpPilotOnlineObservation | None:
         """Ingest values already produced by an exact full-MLP fallback."""
 
         if self.online_controller is None:
             return None
-        return self.online_controller.observe_full(
+        observation = self.online_controller.observe_full(
             layer=layer,
             gate=gate,
             up=up,
             output=output,
             activated=activated,
+        )
+        if not observation.shadow_row_indices:
+            return observation
+        model = self._router_models[layer]
+        affine = self._affine_models[layer]
+        if activated is None:
+            activated_rows = self.online_controller._observation_rows(
+                gate,
+                width=model.intermediate_dimension,
+                field="Gate",
+            )
+            up_rows = self.online_controller._observation_rows(
+                up,
+                width=model.intermediate_dimension,
+                field="Up",
+            )
+            activated_rows = swiglu(activated_rows, up_rows)
+        else:
+            activated_rows = self.online_controller._observation_rows(
+                activated,
+                width=model.intermediate_dimension,
+                field="activated",
+            )
+        exact_rows = self.online_controller._observation_rows(
+            output,
+            width=affine.output_dimension,
+            field="output",
+        )
+        pilots = model.pilot_neuron_indices()
+        if down_weight is not None:
+            if (
+                not isinstance(down_weight, torch.Tensor)
+                or not down_weight.is_floating_point()
+                or tuple(down_weight.shape)
+                != (affine.output_dimension, model.intermediate_dimension)
+                or down_weight.device != activated_rows.device
+            ):
+                raise ValueError("resident Down weight differs from shadow ABI")
+            shadow_outputs = []
+            truth_outputs = []
+            for row, blocks in zip(
+                observation.shadow_row_indices,
+                observation.shadow_selected_blocks,
+                strict=True,
+            ):
+                selected = set(int(value) for value in pilots)
+                for block in blocks:
+                    selected.update(
+                        range(
+                            block * model.block_size,
+                            (block + 1) * model.block_size,
+                        )
+                    )
+                ids = torch.tensor(
+                    sorted(selected),
+                    device=activated_rows.device,
+                    dtype=torch.long,
+                )
+                source = activated_rows[row : row + 1]
+                masked = torch.zeros_like(source)
+                masked.index_copy_(1, ids, source.index_select(1, ids))
+                shadow_outputs.append(
+                    torch.nn.functional.linear(
+                        masked.to(down_weight.dtype),
+                        down_weight,
+                    )
+                )
+                truth_outputs.append(exact_rows[row : row + 1])
+            metrics = self.online_controller.observe_output_shadow(
+                layer=layer,
+                sparse_output=torch.cat(shadow_outputs, dim=0),
+                exact_output=torch.cat(truth_outputs, dim=0),
+            )
+            return replace(
+                observation,
+                output_confirmed_rows=cast(int, metrics["output_confirmed_rows"]),
+                output_worst_cosine=cast(float, metrics["output_worst_cosine"]),
+                output_worst_relative_l2=cast(
+                    float,
+                    metrics["output_worst_relative_l2"],
+                ),
+            )
+        if self.pilot_pager is None:
+            down_pilot_weight = self._rows(
+                self.down_transpose_pager,
+                self.transpose_name(layer),
+                pilots,
+                columns=affine.output_dimension,
+            )
+        else:
+            down_pilot_weight = self._rows(
+                self.pilot_pager,
+                self.pilot_name(layer, "down_transpose"),
+                np.arange(len(pilots), dtype=np.int64),
+                columns=affine.output_dimension,
+            )
+        pilot_ids = torch.tensor(
+            pilots,
+            device=activated_rows.device,
+            dtype=torch.long,
+        )
+        shadow_outputs = []
+        truth_outputs = []
+        pilot_set = set(int(value) for value in pilots)
+        try:
+            for row, blocks in zip(
+                observation.shadow_row_indices,
+                observation.shadow_selected_blocks,
+                strict=True,
+            ):
+                ids = np.asarray(
+                    [
+                        neuron
+                        for block in blocks
+                        for neuron in range(
+                            block * model.block_size,
+                            (block + 1) * model.block_size,
+                        )
+                        if self.pilot_pager is not None or neuron not in pilot_set
+                    ],
+                    dtype=np.int64,
+                )
+                down_weight = self._rows(
+                    self.down_transpose_pager,
+                    self.transpose_name(layer),
+                    ids,
+                    columns=affine.output_dimension,
+                )
+                dynamic_ids = torch.tensor(
+                    ids,
+                    device=activated_rows.device,
+                    dtype=torch.long,
+                )
+                dynamic = activated_rows[row : row + 1].index_select(1, dynamic_ids)
+                if self.pilot_pager is not None:
+                    dynamic = dynamic.clone()
+                    for block_index, block in enumerate(blocks):
+                        for offset in model.pilot_offsets[block]:
+                            dynamic[:, block_index * model.block_size + offset] = 0
+                pilot_activation = activated_rows[row : row + 1].index_select(
+                    1, pilot_ids
+                )
+                shadow_outputs.append(
+                    pilot_activation.to(down_pilot_weight.dtype) @ down_pilot_weight
+                    + dynamic.to(down_weight.dtype) @ down_weight
+                )
+                truth_outputs.append(exact_rows[row : row + 1])
+                del down_weight
+        finally:
+            del down_pilot_weight
+        metrics = self.online_controller.observe_output_shadow(
+            layer=layer,
+            sparse_output=torch.cat(shadow_outputs, dim=0),
+            exact_output=torch.cat(truth_outputs, dim=0),
+        )
+        return replace(
+            observation,
+            output_confirmed_rows=cast(int, metrics["output_confirmed_rows"]),
+            output_worst_cosine=cast(float, metrics["output_worst_cosine"]),
+            output_worst_relative_l2=cast(float, metrics["output_worst_relative_l2"]),
         )
 
     def online_metrics(self) -> dict[str, object] | None:
@@ -855,6 +1030,66 @@ class MlpPilotSparseExecutor:
             if self.pilot_pager is None
             else model.block_size
         )
+        if self.online_controller is not None:
+            estimated_orders = tuple(
+                (
+                    tuple(sorted(int(block) for block in blocks))
+                    if self.pilot_pager is None
+                    else tuple(int(block) for block in blocks)
+                )
+                for blocks in selected
+            )
+            estimated_routes = tuple(frozenset(row) for row in estimated_orders)
+            estimated_order = self._route_processing_order(estimated_orders)
+            active_route: frozenset[int] = frozenset()
+            planned_blocks = 0
+            for row in estimated_order:
+                planned_blocks += len(estimated_routes[row] - active_route)
+                active_route = estimated_routes[row]
+            dtype_bytes = int(
+                torch.empty(
+                    (), dtype=self.down_transpose_pager.compute_dtype
+                ).element_size()
+            )
+            route_bytes = per_row_dynamic * affine.output_dimension * dtype_bytes
+            assembled_bytes = 0 if selected_block_count == 1 else route_bytes
+            same_pager_pilots = (
+                len(pilots) * affine.output_dimension * dtype_bytes
+                if self.pilot_pager is None
+                else 0
+            )
+            resident_limit = getattr(
+                self.down_transpose_pager, "max_resident_bytes", None
+            )
+            cache_fits = not (
+                isinstance(resident_limit, int)
+                and not isinstance(resident_limit, bool)
+                and route_bytes + assembled_bytes + same_pager_pilots > resident_limit
+            )
+            requested_blocks = len(hidden) * selected_block_count
+            use_cache = planned_blocks < requested_blocks and cache_fits
+            down_rows_per_block = (
+                model.block_size - model.pilot_count
+                if self.pilot_pager is None
+                else model.block_size
+            )
+            estimated_down_rows = (
+                planned_blocks * down_rows_per_block
+                if use_cache
+                else len(hidden) * per_row_dynamic
+            )
+            estimated_rows = (
+                3 * len(pilots) + 2 * len(union_extra) + estimated_down_rows
+            )
+            estimated_fraction = estimated_rows / (3 * model.intermediate_dimension)
+            if (
+                estimated_fraction
+                > self.online_controller.width_config.max_sparse_transport_fraction
+            ):
+                raise MlpPilotNonBeneficialRoute(
+                    layer=layer,
+                    estimated_fraction=estimated_fraction,
+                )
         gate_extra = self._project_union_rows(
             compute_hidden,
             name=f"{base}.gate_proj.weight",
@@ -996,7 +1231,13 @@ class MlpPilotSparseExecutor:
             [output for output in outputs if output is not None],
             dim=0,
         )
-        corrected = affine.apply(sparse).to(dtype=self.output_dtype)
+        corrected = affine.apply(sparse)
+        if self.online_controller is not None:
+            corrected = self.online_controller.correct_sparse_output(
+                layer=layer,
+                sparse_output=corrected,
+            )
+        corrected = corrected.to(dtype=self.output_dtype)
         trace = MlpPilotSparseTrace(
             layer=layer,
             row_count=len(hidden),
@@ -1080,6 +1321,7 @@ __all__ = [
     "PILOT_TRANSPOSE_ENTRY_SCHEMA",
     "PILOT_TRANSPOSE_MANIFEST_SCHEMA",
     "MlpPilotSparseExecutor",
+    "MlpPilotNonBeneficialRoute",
     "MlpPilotSparseRuntimeError",
     "MlpPilotSparseTrace",
     "MlpPilotTransposeEntry",

@@ -19,7 +19,8 @@ around every domain that supports it.
   Prefix-Sinkhorn state; K=8 is the local chat default.
 - [x] Prompt-free all-layer p4/k32 Fast-MLP builder, deterministic Gate/Up
   joint-moment initialization, fixed-size online recursive-ridge routing,
-  persistent state, and confidence-driven full-MLP fallback.
+  persistent state, resident-Down output-shadow calibration, scalar correction,
+  transport economics, and full-MLP fallback.
 - [x] Deterministic weight-only p4/k32 Fast-MLP banks for all 64 layers, with
   bounded target-confirmed online learning, periodic confirmation, and exact
   low-confidence fallback.

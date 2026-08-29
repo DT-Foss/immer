@@ -1311,6 +1311,8 @@ class Qwen38CausalChat:
         for field in (
             "online_confirmed_rows",
             "online_exact_waves",
+            "online_output_confirmed_rows",
+            "online_output_shadow_waves",
             "online_sparse_rows",
             "online_sparse_waves",
             "online_surprises",

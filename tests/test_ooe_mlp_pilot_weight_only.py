@@ -17,6 +17,7 @@ from immer.runtimes.ooe.mlp_pilot_weight_only import (
     MlpPilotAdaptiveWidthConfig,
     LEGACY_PILOT_ONLINE_STATE_SCHEMA,
     PILOT_ONLINE_STATE_SCHEMA,
+    V2_PILOT_ONLINE_STATE_SCHEMA,
     MlpPilotOnlineConfig,
     MlpPilotOnlineController,
     MlpPilotOnlineStateError,
@@ -196,6 +197,15 @@ class OnlinePilotControllerTests(unittest.TestCase):
             )
             self.assertEqual(observation.rows, 2)
             self.assertEqual(observation.confirmed_rows, 2)
+            unconfirmed = controller.decision(layer=0, row_count=1)
+            self.assertFalse(unconfirmed.use_sparse)
+            self.assertEqual(unconfirmed.reason, "output-calibration-required")
+            truth = output.repeat(4, 1)
+            controller.observe_output_shadow(
+                layer=0,
+                sparse_output=truth,
+                exact_output=truth,
+            )
             confirmed = controller.decision(layer=0, row_count=1)
             self.assertTrue(confirmed.use_sparse)
             self.assertEqual(confirmed.reason, "target-confirmed")
@@ -217,6 +227,7 @@ class OnlinePilotControllerTests(unittest.TestCase):
             self.assertTrue(observation.surprising)
             decision = controller.decision(layer=0, row_count=1)
             self.assertFalse(decision.use_sparse)
+            self.assertFalse(controller.output_calibrated(layer=0))
             self.assertEqual(decision.reason, "low-confirmed-capture")
             wide = controller.decision(layer=0, row_count=5)
             self.assertFalse(wide.use_sparse)
@@ -296,7 +307,8 @@ class OnlinePilotControllerTests(unittest.TestCase):
             decision = controller.decision(layer=0, row_count=1)
             self.assertEqual(observation.selected_block_count, 2)
             self.assertAlmostEqual(observation.route_capture, 0.775, places=6)
-            self.assertTrue(decision.use_sparse)
+            self.assertFalse(decision.use_sparse)
+            self.assertEqual(decision.reason, "output-calibration-required")
             self.assertEqual(decision.selected_block_count, 2)
             self.assertEqual(decision.max_selected_block_count, 3)
             diffuse = np.ones((2, 4), dtype=np.float64)
@@ -369,7 +381,9 @@ class OnlinePilotControllerTests(unittest.TestCase):
             )
             self.assertEqual(observation.selected_block_count, 2)
             self.assertAlmostEqual(observation.route_capture, 0.6625, places=6)
-            self.assertTrue(controller.decision(layer=0, row_count=1).use_sparse)
+            decision = controller.decision(layer=0, row_count=1)
+            self.assertFalse(decision.use_sparse)
+            self.assertEqual(decision.reason, "output-calibration-required")
         finally:
             controller.close()
 
@@ -413,6 +427,70 @@ class OnlinePilotControllerTests(unittest.TestCase):
                     ),
                 )
 
+    def test_high_capture_wrong_output_remains_full(self) -> None:
+        width = MlpPilotAdaptiveWidthConfig(
+            max_selected_block_count=3,
+            selected_block_step=1,
+            target_capture=0.1,
+            min_output_cosine=0.999,
+            max_output_relative_l2=0.05,
+            min_output_confirmed_rows=2,
+            output_metric_window_rows=2,
+        )
+        controller = MlpPilotOnlineController(_plan(), width_config=width)
+        gate, up, output = self._exact_rows()
+        try:
+            controller.observe_full(layer=0, gate=gate, up=up, output=output)
+            controller.observe_output_shadow(
+                layer=0,
+                sparse_output=-output,
+                exact_output=output,
+            )
+            decision = controller.decision(layer=0, row_count=1)
+            self.assertFalse(decision.use_sparse)
+            self.assertEqual(decision.reason, "output-calibration-failed")
+            metrics = controller.metrics()["layers"][0]
+            self.assertEqual(metrics["output_worst_cosine"], 0.0)
+            self.assertGreater(metrics["output_worst_relative_l2"], 1.0)
+        finally:
+            controller.close()
+
+    def test_scalar_output_correction_is_learned_prequentially(self) -> None:
+        width = MlpPilotAdaptiveWidthConfig(
+            max_selected_block_count=3,
+            selected_block_step=1,
+            target_capture=0.1,
+            min_output_cosine=0.999,
+            max_output_relative_l2=0.01,
+            min_output_confirmed_rows=2,
+            output_metric_window_rows=2,
+        )
+        controller = MlpPilotOnlineController(_plan(), width_config=width)
+        gate, up, output = self._exact_rows()
+        raw = torch.tensor([[1.0, 2.0, 3.0], [2.0, 4.0, 6.0]])
+        truth = raw * 2.0 + 0.5
+        try:
+            controller.observe_full(layer=0, gate=gate, up=up, output=output)
+            controller.observe_output_shadow(
+                layer=0,
+                sparse_output=raw,
+                exact_output=truth,
+            )
+            controller.observe_output_shadow(
+                layer=0,
+                sparse_output=raw,
+                exact_output=truth,
+            )
+            corrected = controller.correct_sparse_output(
+                layer=0,
+                sparse_output=raw,
+            )
+            torch.testing.assert_close(corrected, truth)
+            self.assertTrue(controller.output_calibrated(layer=0))
+            self.assertTrue(controller.decision(layer=0, row_count=1).use_sparse)
+        finally:
+            controller.close()
+
     def test_v1_state_migrates_without_losing_confirmed_statistics(self) -> None:
         plan = _plan()
         gate, up, output = self._exact_rows()
@@ -432,6 +510,18 @@ class OnlinePilotControllerTests(unittest.TestCase):
                 "required_score_mass",
                 "selected_block_count",
                 "width_updates",
+                "output_bias",
+                "output_calibration_block_count",
+                "output_confirmed_rows",
+                "output_cosines",
+                "output_element_count",
+                "output_relative_l2s",
+                "output_scale",
+                "output_shadow_waves",
+                "output_sum_x",
+                "output_sum_xx",
+                "output_sum_xy",
+                "output_sum_y",
             }
             for layer in body["layers"]:
                 for field in adaptive_fields:
@@ -448,11 +538,48 @@ class OnlinePilotControllerTests(unittest.TestCase):
                 metrics = migrated.metrics()["layers"]
                 self.assertEqual(metrics[0]["confirmed_rows"], 2)
                 self.assertEqual(metrics[0]["selected_block_count"], 1)
+                self.assertEqual(metrics[0]["output_confirmed_rows"], 0)
+                self.assertFalse(migrated.decision(layer=0, row_count=1).use_sparse)
             finally:
                 migrated.close()
             self.assertEqual(
                 json.loads(path.read_bytes())["schema"], PILOT_ONLINE_STATE_SCHEMA
             )
+
+            document = json.loads(path.read_bytes())
+            body = document["body"]
+            output_fields = {
+                "output_bias",
+                "output_calibration_block_count",
+                "output_confirmed_rows",
+                "output_cosines",
+                "output_element_count",
+                "output_relative_l2s",
+                "output_scale",
+                "output_shadow_waves",
+                "output_sum_x",
+                "output_sum_xx",
+                "output_sum_xy",
+                "output_sum_y",
+            }
+            for layer in body["layers"]:
+                for field in output_fields:
+                    layer.pop(field)
+            v2 = {
+                "body": body,
+                "body_sha256": hashlib.sha256(canonical_json_bytes(body)).hexdigest(),
+                "schema": V2_PILOT_ONLINE_STATE_SCHEMA,
+            }
+            path.write_bytes(canonical_json_bytes(v2))
+            migrated_v2 = MlpPilotOnlineController(plan, state_path=path)
+            try:
+                self.assertEqual(
+                    migrated_v2.metrics()["layers"][0]["output_confirmed_rows"],
+                    0,
+                )
+                self.assertFalse(migrated_v2.decision(layer=0, row_count=1).use_sparse)
+            finally:
+                migrated_v2.close()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import numpy as np
 import torch
 
 from immer.runtimes.qwen3_8.exact_head import (
@@ -458,6 +459,65 @@ class Qwen38ExactHeadTests(unittest.TestCase):
         self.assertEqual(index.metrics()["selected_row_reads"], 0)
         self.assertEqual(index.metrics()["full_leaf_fallbacks"], 1)
         self.assertEqual(index.metrics()["rows_pruned"], 0)
+        self.assertEqual(
+            source.metrics()["network_or_source_body_bytes"],
+            head.numel() * head.element_size(),
+        )
+
+    def test_useless_row_bounds_stop_after_sixty_four_leaf_probes(self) -> None:
+        head = torch.arange(520, dtype=torch.float32).reshape(260, 2).to(
+            torch.bfloat16
+        )
+        config = ExactHeadConfig(
+            subspace_width=1,
+            codebook_size=4,
+            page_rows=4,
+            fanout=4,
+            kmeans_iterations=2,
+            assignment_chunk_rows=32,
+            max_query_rows=16,
+        )
+        index = ExactHeadIndex.build(
+            head,
+            binding=_binding(head),
+            config=config,
+        )
+        source = _BoundHeadSource(head)
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=4096,
+            exact_head_index=index,
+        )
+        node_count = len(index._tensors["node_presence"])
+
+        with mock.patch.object(
+            index,
+            "_node_caps_from_tables",
+            return_value=np.full((1, node_count), np.inf),
+        ), mock.patch.object(
+            index,
+            "_row_caps_from_tables",
+            side_effect=lambda _tables, ids: np.full((1, len(ids)), np.inf),
+        ):
+            actual = pager.topk_logits(
+                torch.ones((1, 2), dtype=torch.bfloat16),
+                k=1,
+                block_rows=4,
+            )
+
+        baseline = torch.nn.functional.linear(
+            torch.ones((1, 2), dtype=torch.float32),
+            head.float(),
+        ).to(torch.bfloat16)
+        self.assertEqual(float(actual[0][0, 0]), float(baseline.max()))
+        metrics = index.metrics()
+        self.assertEqual(metrics["row_bound_probe_pages"], 64)
+        self.assertEqual(metrics["row_bound_rows"], 256)
+        self.assertEqual(metrics["row_bound_disabled_calls"], 1)
+        self.assertEqual(metrics["selected_row_reads"], 0)
+        self.assertEqual(metrics["full_leaf_fallbacks"], 65)
         self.assertEqual(
             source.metrics()["network_or_source_body_bytes"],
             head.numel() * head.element_size(),

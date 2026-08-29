@@ -439,11 +439,16 @@ class Qwen38ModelTests(unittest.TestCase):
             )
 
     def test_online_sparse_decision_learns_from_the_unchanged_exact_path(self) -> None:
+        class NonBeneficialRoute(RuntimeError):
+            exact_mlp_fallback = True
+
         class AdaptiveStub:
             def __init__(self) -> None:
                 self.use_sparse = False
                 self.decisions = []
                 self.observations = []
+                self.nonbeneficial = False
+                self.failure = None
 
             def supports_layer(self, layer: int) -> bool:
                 return layer == 1
@@ -464,9 +469,17 @@ class Qwen38ModelTests(unittest.TestCase):
                 return {"rows": len(values["gate"])}
 
             def execute(self, hidden: torch.Tensor, *, layer: int):
+                if self.failure is not None:
+                    raise self.failure
+                if self.nonbeneficial:
+                    raise NonBeneficialRoute("full MLP is cheaper")
                 return torch.zeros_like(hidden), {"layer": layer}
 
             def execute_many(self, hidden, *, layer: int):
+                if self.failure is not None:
+                    raise self.failure
+                if self.nonbeneficial:
+                    raise NonBeneficialRoute("full MLP is cheaper")
                 rows = tuple(hidden)
                 return tuple(torch.zeros_like(row) for row in rows), {"layer": layer}
 
@@ -508,6 +521,16 @@ class Qwen38ModelTests(unittest.TestCase):
         sparse = model._mlp(hidden, layer=1)
         self.assertTrue(torch.equal(sparse, torch.zeros_like(hidden)))
         self.assertEqual(len(adaptive.observations), 3)
+
+        adaptive.nonbeneficial = True
+        economic_fallback = model._mlp(hidden, layer=1)
+        self.assertFalse(torch.equal(economic_fallback, torch.zeros_like(hidden)))
+        self.assertEqual(len(adaptive.observations), 4)
+
+        adaptive.nonbeneficial = False
+        adaptive.failure = RuntimeError("unexpected sparse failure")
+        with self.assertRaisesRegex(RuntimeError, "unexpected sparse failure"):
+            model._mlp(hidden, layer=1)
 
     def test_explicit_fast_mode_packs_continuation_projection_rows(self) -> None:
         pager = Qwen38WeightPager(

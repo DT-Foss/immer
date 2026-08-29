@@ -320,6 +320,8 @@ class Qwen38FastMlpMount:
                 "sparse_waves",
                 "surprises",
                 "width_updates",
+                "output_confirmed_rows",
+                "output_shadow_waves",
             ):
                 result[f"online_{field}"] = sum(
                     int(row.get(field, 0))
@@ -804,6 +806,14 @@ def open_qwen38_fast_mlp(
                 selected_block_step=width_config.selected_block_step,
                 score_mass_margin=width_config.score_mass_margin,
                 target_capture=width_config.target_capture,
+                min_output_cosine=width_config.min_output_cosine,
+                max_output_relative_l2=width_config.max_output_relative_l2,
+                min_output_confirmed_rows=width_config.min_output_confirmed_rows,
+                output_metric_window_rows=width_config.output_metric_window_rows,
+                max_shadow_rows=width_config.max_shadow_rows,
+                max_sparse_transport_fraction=(
+                    width_config.max_sparse_transport_fraction
+                ),
             )
             online_controller = MlpPilotOnlineController(
                 router,

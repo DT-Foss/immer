@@ -767,11 +767,14 @@ class Qwen38WeightPager:
         name: str,
         *,
         output_dtype: Any | None = None,
+        weight_observer: Callable[[Any, Any], None] | None = None,
     ) -> Any:
         """Apply one bias-free checkpoint matrix and release it before return."""
 
         with self._lock:
             self._ensure_open()
+            if weight_observer is not None and not callable(weight_observer):
+                raise TypeError("weight_observer must be callable or None")
             if not isinstance(x, self.torch.Tensor):
                 x = self.torch.as_tensor(x)
             weight_name = self._weight_name(name)
@@ -796,6 +799,8 @@ class Qwen38WeightPager:
                 result = self.torch.nn.functional.linear(compute_x, weight)
                 if output_dtype is not None:
                     result = result.to(dtype=output_dtype)
+                if weight_observer is not None:
+                    weight_observer(weight, result)
                 self._stats.linear_calls += 1
                 return result
             finally:
@@ -809,6 +814,7 @@ class Qwen38WeightPager:
         *,
         output_dtype: Any | None = None,
         packed: bool = False,
+        weight_observer: Callable[[Any, tuple[Any, ...]], None] | None = None,
     ) -> tuple[Any, ...]:
         """Apply one matrix to multiple inputs with sequential or packed GEMMs.
 
@@ -829,6 +835,8 @@ class Qwen38WeightPager:
                 raise ValueError("linear_many requires at least two inputs")
             if not isinstance(packed, bool):
                 raise TypeError("packed must be boolean")
+            if weight_observer is not None and not callable(weight_observer):
+                raise TypeError("weight_observer must be callable or None")
 
             weight_name = self._weight_name(name)
             layout = self._layout(weight_name)
@@ -893,7 +901,10 @@ class Qwen38WeightPager:
                     self._stats.linear_calls += 1
                     self._stats.packed_linear_calls += 1
                     self._stats.packed_linear_rows += sum(counts)
-                    return tuple(results)
+                    final = tuple(results)
+                    if weight_observer is not None:
+                        weight_observer(weight, final)
+                    return final
                 results: list[Any] = []
                 for compute_x in compute_inputs:
                     result = self.torch.nn.functional.linear(compute_x, weight)
@@ -901,7 +912,10 @@ class Qwen38WeightPager:
                         result = result.to(dtype=output_dtype)
                     results.append(result)
                     self._stats.linear_calls += 1
-                return tuple(results)
+                final = tuple(results)
+                if weight_observer is not None:
+                    weight_observer(weight, final)
+                return final
             finally:
                 del weight
                 self._stats.materialized_weight_releases += 1

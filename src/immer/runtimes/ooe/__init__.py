@@ -798,6 +798,7 @@ from .mlp_pilot_residual import (
 )
 from .mlp_pilot_weight_only import (
     LEGACY_PILOT_ONLINE_STATE_SCHEMA,
+    V2_PILOT_ONLINE_STATE_SCHEMA,
     PILOT_ADAPTIVE_WIDTH_CONFIG_SCHEMA,
     PILOT_ONLINE_CONFIG_SCHEMA,
     PILOT_ONLINE_OBSERVATION_SCHEMA,
@@ -824,6 +825,7 @@ from .mlp_pilot_runtime import (
     PILOT_TRANSPOSE_ENTRY_SCHEMA,
     PILOT_TRANSPOSE_MANIFEST_SCHEMA,
     MlpPilotSparseExecutor,
+    MlpPilotNonBeneficialRoute,
     MlpPilotSparseRuntimeError,
     MlpPilotSparseTrace,
     MlpPilotTransposeEntry,
@@ -1935,6 +1937,7 @@ __all__ = [
     "MlpPilotResidualIntegrityError",
     "PILOT_ONLINE_CONFIG_SCHEMA",
     "LEGACY_PILOT_ONLINE_STATE_SCHEMA",
+    "V2_PILOT_ONLINE_STATE_SCHEMA",
     "PILOT_ADAPTIVE_WIDTH_CONFIG_SCHEMA",
     "PILOT_ONLINE_OBSERVATION_SCHEMA",
     "PILOT_ONLINE_STATE_SCHEMA",
@@ -1958,6 +1961,7 @@ __all__ = [
     "PILOT_TRANSPOSE_ENTRY_SCHEMA",
     "PILOT_TRANSPOSE_MANIFEST_SCHEMA",
     "MlpPilotSparseExecutor",
+    "MlpPilotNonBeneficialRoute",
     "MlpPilotSparseRuntimeError",
     "MlpPilotSparseTrace",
     "MlpPilotTransposeEntry",

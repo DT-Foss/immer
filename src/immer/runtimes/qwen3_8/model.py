@@ -1463,6 +1463,7 @@ class StreamedQwen38:
         up: Any,
         activated: Any,
         output: Any,
+        down_weight: Any | None = None,
     ) -> None:
         self.mlp_sparse_last_observation = None
         executor = self.mlp_sparse_executor
@@ -1475,16 +1476,23 @@ class StreamedQwen38:
             up=up,
             activated=activated,
             output=output,
+            down_weight=down_weight,
         )
 
     def _mlp(self, hidden: torch.Tensor, *, layer: int) -> torch.Tensor:
         row_count = hidden.numel() // hidden.shape[-1]
         if row_count == 1 and self._sparse_mlp_allowed(layer, row_count):
-            output, trace = self.mlp_sparse_executor.execute(hidden, layer=layer)
-            self.mlp_sparse_last_trace = trace
-            output = output.to(device=hidden.device, dtype=hidden.dtype)
-            self._observe_layer_boundary(layer, "mlp.output", output)
-            return output
+            try:
+                output, trace = self.mlp_sparse_executor.execute(hidden, layer=layer)
+            except Exception as exc:
+                if getattr(type(exc), "exact_mlp_fallback", False) is not True:
+                    raise
+                self.mlp_sparse_last_trace = None
+            else:
+                self.mlp_sparse_last_trace = trace
+                output = output.to(device=hidden.device, dtype=hidden.dtype)
+                self._observe_layer_boundary(layer, "mlp.output", output)
+                return output
         self.mlp_sparse_last_trace = None
         base = f"model.language_model.layers.{layer}.mlp"
         gate = self.pager.linear(hidden, f"{base}.gate_proj")
@@ -1493,15 +1501,22 @@ class StreamedQwen38:
         self._observe_layer_boundary(layer, "mlp.up", up)
         activated = swiglu(gate, up)
         self._observe_layer_boundary(layer, "mlp.activated", activated)
-        output = self.pager.linear(activated, f"{base}.down_proj")
-        self._observe_exact_mlp(
-            layer=layer,
-            gate=gate,
-            up=up,
-            activated=activated,
-            output=output,
+
+        def observe_down(weight: Any, result: Any) -> None:
+            self._observe_exact_mlp(
+                layer=layer,
+                gate=gate,
+                up=up,
+                activated=activated,
+                output=result,
+                down_weight=weight,
+            )
+
+        output = self.pager.linear(
+            activated,
+            f"{base}.down_proj",
+            weight_observer=observe_down,
         )
-        del gate, up, activated
         self._observe_layer_boundary(layer, "mlp.output", output)
         return output
 
@@ -1509,15 +1524,29 @@ class StreamedQwen38:
         self,
         hidden: tuple[torch.Tensor, ...],
         name: str,
+        *,
+        weight_observer: Callable[[Any, tuple[Any, ...]], None] | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Apply one matrix once to one-to-sixteen independent token rows."""
 
         if len(hidden) == 1:
-            return (self.pager.linear(hidden[0], name),)
+            observed = None
+            if weight_observer is not None:
+                def observed(weight: Any, result: Any) -> None:
+                    weight_observer(weight, (result,))
+
+            return (
+                self.pager.linear(
+                    hidden[0],
+                    name,
+                    weight_observer=observed,
+                ),
+            )
         return self.pager.linear_many(
             hidden,
             name,
             packed=self.packed_continuation_gemm,
+            weight_observer=weight_observer,
         )
 
     def _norm_token_rows(
@@ -1768,12 +1797,21 @@ class StreamedQwen38:
     ) -> tuple[torch.Tensor, ...]:
         row_count = sum(row.numel() // row.shape[-1] for row in hidden)
         if self._sparse_mlp_allowed(layer, row_count):
-            outputs, trace = self.mlp_sparse_executor.execute_many(hidden, layer=layer)
-            self.mlp_sparse_last_trace = trace
-            return tuple(
-                output.to(device=row.device, dtype=row.dtype)
-                for output, row in zip(outputs, hidden, strict=True)
-            )
+            try:
+                outputs, trace = self.mlp_sparse_executor.execute_many(
+                    hidden,
+                    layer=layer,
+                )
+            except Exception as exc:
+                if getattr(type(exc), "exact_mlp_fallback", False) is not True:
+                    raise
+                self.mlp_sparse_last_trace = None
+            else:
+                self.mlp_sparse_last_trace = trace
+                return tuple(
+                    output.to(device=row.device, dtype=row.dtype)
+                    for output, row in zip(outputs, hidden, strict=True)
+                )
         self.mlp_sparse_last_trace = None
         base = f"model.language_model.layers.{layer}.mlp"
         gate = self._linear_token_rows(hidden, f"{base}.gate_proj")
@@ -1781,15 +1819,22 @@ class StreamedQwen38:
         activated = tuple(
             swiglu(gate[index], up[index]) for index in range(len(hidden))
         )
-        output = self._linear_token_rows(activated, f"{base}.down_proj")
-        self._observe_exact_mlp(
-            layer=layer,
-            gate=gate,
-            up=up,
-            activated=activated,
-            output=output,
+
+        def observe_down(weight: Any, result: tuple[Any, ...]) -> None:
+            self._observe_exact_mlp(
+                layer=layer,
+                gate=gate,
+                up=up,
+                activated=activated,
+                output=result,
+                down_weight=weight,
+            )
+
+        output = self._linear_token_rows(
+            activated,
+            f"{base}.down_proj",
+            weight_observer=observe_down,
         )
-        del gate, up, activated
         return output
 
     def _mlp_k2_pair(

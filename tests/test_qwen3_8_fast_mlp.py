@@ -21,6 +21,7 @@ from immer.runtimes.ooe.mlp_pilot_router import (
     fit_mlp_pilot_router,
 )
 from immer.runtimes.ooe.mlp_pilot_runtime import (
+    MlpPilotNonBeneficialRoute,
     MlpPilotSparseExecutor,
     MlpPilotTransposeEntry,
     MlpPilotTransposeManifest,
@@ -496,6 +497,18 @@ class Qwen38FastMlpMountTests(unittest.TestCase):
         self,
     ) -> None:
         plan = self.fixture.enable_weight_only()
+        (self.fixture.paths.analysis_root / ADAPTIVE_WIDTH_CONFIG_NAME).write_bytes(
+            MlpPilotAdaptiveWidthConfig(
+                max_selected_block_count=3,
+                selected_block_step=1,
+                target_capture=0.1,
+                min_output_cosine=0.0,
+                max_output_relative_l2=1.0,
+                min_output_confirmed_rows=1,
+                output_metric_window_rows=1,
+                max_sparse_transport_fraction=1.0,
+            ).to_bytes()
+        )
         state_path = Path(self.temporary.name) / "fast-mlp-online.json"
         mount = self.fixture.open(online_state_path=state_path)
         generator = torch.Generator().manual_seed(441)
@@ -526,20 +539,35 @@ class Qwen38FastMlpMountTests(unittest.TestCase):
             second_up = up * 1.25
             second_activated = torch.nn.functional.silu(second_gate) * second_up
             second_output = second_activated @ self.fixture.down[0].float().T
+            shadow_target_before = self.fixture.target_source.bytes_moved()
+            shadow_aux_before = mount.metrics()["source_body_bytes"]
             observation = mount.executor.observe_full(
                 layer=0,
                 gate=torch.cat((gate, second_gate), dim=0),
                 up=torch.cat((up, second_up), dim=0),
                 activated=torch.cat((activated, second_activated), dim=0),
                 output=torch.cat((output, second_output), dim=0),
+                down_weight=self.fixture.down[0],
+            )
+            self.assertEqual(
+                self.fixture.target_source.bytes_moved(),
+                shadow_target_before,
+            )
+            self.assertEqual(
+                mount.metrics()["source_body_bytes"],
+                shadow_aux_before,
             )
             self.assertIsNotNone(observation)
             assert observation is not None
             decision = mount.executor.decision(layer=0, row_count=1)
             self.assertTrue(decision.use_sparse)
-            self.assertEqual(
+            self.assertGreaterEqual(
                 decision.selected_block_count,
                 observation.selected_block_count,
+            )
+            self.assertEqual(
+                decision.selected_block_count,
+                decision.max_selected_block_count,
             )
             _adaptive_output, adaptive_trace = mount.executor.execute(
                 hidden,
@@ -611,6 +639,45 @@ class Qwen38FastMlpMountTests(unittest.TestCase):
         path.write_bytes(payload)
         with self.assertRaises(MlpPilotWeightOnlyError):
             self.fixture.open()
+
+    def test_nonbeneficial_route_falls_back_before_dynamic_target_rows(self) -> None:
+        self.fixture.enable_weight_only()
+        (self.fixture.paths.analysis_root / ADAPTIVE_WIDTH_CONFIG_NAME).write_bytes(
+            MlpPilotAdaptiveWidthConfig(
+                max_selected_block_count=3,
+                selected_block_step=1,
+                target_capture=0.1,
+                min_output_cosine=0.0,
+                max_output_relative_l2=1.0,
+                min_output_confirmed_rows=1,
+                output_metric_window_rows=1,
+                max_sparse_transport_fraction=0.9,
+            ).to_bytes()
+        )
+        mount = self.fixture.open()
+        hidden = torch.randn(1, self.fixture.config.dim, dtype=torch.bfloat16).repeat(
+            2, 1
+        )
+        gate = hidden.float() @ self.fixture.gate[0].float().T
+        up = hidden.float() @ self.fixture.up[0].float().T
+        activated = torch.nn.functional.silu(gate) * up
+        output = activated @ self.fixture.down[0].float().T
+        try:
+            mount.executor.observe_full(
+                layer=0,
+                gate=gate,
+                up=up,
+                activated=activated,
+                output=output,
+            )
+            self.assertTrue(mount.executor.decision(layer=0, row_count=2).use_sparse)
+            target_before = self.fixture.target_source.bytes_moved()
+            with self.assertRaises(MlpPilotNonBeneficialRoute) as caught:
+                mount.executor.execute(hidden, layer=0)
+            self.assertGreater(caught.exception.estimated_fraction, 0.9)
+            self.assertEqual(self.fixture.target_source.bytes_moved(), target_before)
+        finally:
+            mount.close()
 
 
 if __name__ == "__main__":

@@ -108,8 +108,11 @@ the exact Gaussian joint moment of each Gate/Up weight pair. It uses no prompt
 or model forward. During ordinary exact MLP execution, the runtime consumes
 the Gate, Up, activated, and Down outputs that already exist, updates bounded
 recursive-ridge block scores, and discards the rows. Sparse execution begins
-only after confirmation meets the configured capture floor; wide, cold,
-low-capture, or periodically due routes take the unchanged full path.
+only after confirmation meets the configured capture floor and a prequential
+worst-row sparse shadow passes strict output cosine/L2 limits. The shadow masks
+one activation row and reuses the exact Down matrix while resident, so it adds
+no source read. Wide, cold, low-capture, output-uncalibrated, uneconomic, or
+periodically due routes take the unchanged full path.
 
 The local transport has a caller-owned direct-fill plane. LiveCausal resolves
 the tensor plan first; the pager allocates the final CPU weight tensor; then
@@ -132,7 +135,9 @@ leaf row's actual PQ code tuple and residual radius, unions survivors across
 K<=16 queries, fills omitted positions with zero, and scores the survivors in
 the unchanged page shape. Unsupported or zero-saving selection reads the full
 leaf once. Scattered transport is also rejected unless at least half the leaf
-is removed and the survivors occupy at most four contiguous runs.
+is removed and the survivors occupy at most four contiguous runs. If the first
+64 row-bound leaf probes save no physical read, the rest of that head call uses
+the ordinary page path directly.
 
 The Markov draft council contains eight sparse PPM experts across orders
 `0..16` and windows `128..4096`. Their Qwen-ID distributions are pooled by

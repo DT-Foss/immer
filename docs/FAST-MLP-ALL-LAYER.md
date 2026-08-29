@@ -160,3 +160,34 @@ update count. Existing v1 state is migrated in place: recursive-ridge arrays,
 capture history, and counters are retained, width starts at the original
 p4/k32 value, and the next exact path computes the first authoritative curve.
 The immutable weight-only plan and all payload/manifest hashes remain unchanged.
+
+## Output calibration and economic fallback
+
+Activation capture is not an output-quality certificate. Weight-only layers
+therefore remain exact until a bounded sparse-Down shadow has been confirmed.
+After an exact MLP finishes, the executor takes only the configured worst
+capture row (default one), masks its activation to the residency-capped route,
+and applies the exact Down matrix while that matrix is still resident for the
+ordinary full projection. It compares this shadow with the exact output already
+in memory. The shadow performs no model forward or additional source read,
+does not alter the current exact result, and retains no activation or output.
+
+Metrics are prequential: the prior scalar correction is scored before the new
+row updates its sufficient statistics. One layer is sparse-eligible only when
+the recent bounded window has at least eight confirmed rows, worst cosine is
+at least `0.999`, worst relative L2 is at most `0.05`, and the exact capture
+floor also passes. The learned `y ≈ scale × sparse + bias` correction is then
+applied to sparse execution. A failed metric window keeps the full MLP.
+
+State v3 persists only scalar sufficient statistics, the bounded metric
+window, correction coefficients, and counters. Both v1 capture-only state and
+v2 adaptive-width state migrate with `output_confirmed_rows=0`; neither can
+authorize sparse execution until new exact-path output shadows pass.
+
+Pilot scoring also estimates the complete wave's target-plus-auxiliary row
+transport before any dynamic Gate/Up/Down range is read. Packed-pilot rows,
+the Gate/Up union, route-cache transitions, and residency are included. If the
+estimate exceeds the configured material-benefit ceiling (default `0.90` of
+the full `3 × 17,408` rows), `MlpPilotNonBeneficialRoute` requests the
+unchanged full MLP immediately. This prevents a sparse target-byte saving from
+being outweighed by auxiliary transport.

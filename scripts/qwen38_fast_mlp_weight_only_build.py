@@ -320,6 +320,12 @@ def _width_config(args: argparse.Namespace) -> MlpPilotAdaptiveWidthConfig:
         selected_block_step=args.selected_block_step,
         score_mass_margin=args.score_mass_margin,
         target_capture=args.target_capture,
+        min_output_cosine=args.min_output_cosine,
+        max_output_relative_l2=args.max_output_relative_l2,
+        min_output_confirmed_rows=args.min_output_confirmed_rows,
+        output_metric_window_rows=args.output_metric_window_rows,
+        max_shadow_rows=args.max_shadow_rows,
+        max_sparse_transport_fraction=args.max_sparse_transport_fraction,
     )
 
 
@@ -661,6 +667,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--selected-block-step", type=int, default=8)
     parser.add_argument("--score-mass-margin", type=float, default=0.02)
     parser.add_argument("--target-capture", type=float, default=0.50)
+    parser.add_argument("--min-output-cosine", type=float, default=0.999)
+    parser.add_argument("--max-output-relative-l2", type=float, default=0.05)
+    parser.add_argument("--min-output-confirmed-rows", type=int, default=8)
+    parser.add_argument("--output-metric-window-rows", type=int, default=8)
+    parser.add_argument("--max-shadow-rows", type=int, default=1)
+    parser.add_argument("--max-sparse-transport-fraction", type=float, default=0.90)
     parser.add_argument("--source-budget-mb", type=float, default=8192.0)
     parser.add_argument("--max-resident-mb", type=int, default=384)
     parser.add_argument("--max-working-gb", type=float, default=1.0)

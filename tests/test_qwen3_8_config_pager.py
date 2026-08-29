@@ -630,15 +630,26 @@ class Qwen38PagerTests(unittest.TestCase):
             kernel_shapes.append(tuple(x.shape))
             return original_linear(x, weight)
 
+        observed_weights: list[tuple[tuple[int, ...], tuple[tuple[int, ...], ...]]] = []
         with mock.patch.object(
             torch.nn.functional,
             "linear",
             side_effect=observed_linear,
         ):
-            actual = pager.linear_many((first, second), "dense")
+            actual = pager.linear_many(
+                (first, second),
+                "dense",
+                weight_observer=lambda weight, results: observed_weights.append(
+                    (
+                        tuple(weight.shape),
+                        tuple(tuple(result.shape) for result in results),
+                    )
+                ),
+            )
 
         self.assertIsInstance(actual, tuple)
         self.assertEqual(kernel_shapes, [(1, 2), (2, 2)])
+        self.assertEqual(observed_weights, [((2, 2), ((1, 2), (2, 2)))])
         for value, wanted in zip(actual, expected, strict=True):
             self.assertTrue(torch.equal(value, wanted))
         self.assertEqual(len(source.raw_calls), 1)
@@ -650,6 +661,33 @@ class Qwen38PagerTests(unittest.TestCase):
         self.assertEqual(metrics["materialized_tensor_bytes"], 8)
         self.assertEqual(metrics["materialized_weight_releases"], 1)
         self.assertEqual(metrics["network_or_source_body_bytes"], 8)
+
+    def test_linear_observer_sees_resident_weight_and_returned_result(self) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        source = self._source()
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=16,
+        )
+        seen = []
+        result = pager.linear(
+            torch.ones((1, 2)),
+            "dense",
+            weight_observer=lambda weight, output: seen.append(
+                (tuple(weight.shape), output.clone())
+            ),
+        )
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], (2, 2))
+        self.assertTrue(torch.equal(seen[0][1], result))
+        self.assertEqual(len(source.raw_calls), 1)
+        self.assertEqual(pager.metrics()["materialized_weight_releases"], 1)
 
     def test_linear_many_rejects_all_inputs_before_reading_weight(self) -> None:
         import torch
