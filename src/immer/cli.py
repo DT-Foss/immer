@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import TextIO
 
 from .contracts import Request
 from .resource_paths import s3_ship_manifest
@@ -135,6 +136,79 @@ def _resolve_qwen38_chat_paths(
     return bundle, tokenizer, q4, fast_mlp
 
 
+class _LiveTextWriter:
+    """Render cumulative decoder snapshots as one readable terminal stream."""
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+        self._snapshot = ""
+        self._wrote = False
+        self._finished = False
+
+    def update(self, snapshot: str) -> None:
+        if not isinstance(snapshot, str):
+            raise TypeError("streaming snapshot must be text")
+        if self._finished:
+            raise RuntimeError("text stream is already finished")
+        snapshot = snapshot.strip()
+        if snapshot == self._snapshot:
+            return
+        if snapshot.startswith(self._snapshot):
+            delta = snapshot[len(self._snapshot) :]
+        else:
+            delta = ("\n[rewrite]\n" if self._wrote else "") + snapshot
+        if delta:
+            self._stream.write(delta)
+            self._stream.flush()
+            self._wrote = True
+        self._snapshot = snapshot
+
+    def finish(self, final_text: str) -> None:
+        if self._finished:
+            return
+        if not isinstance(final_text, str):
+            raise TypeError("final chat output must be text")
+        final_text = final_text.strip()
+        if not self._wrote:
+            self._stream.write(final_text)
+        elif final_text.startswith(self._snapshot):
+            self._stream.write(final_text[len(self._snapshot) :])
+        elif final_text != self._snapshot:
+            self._stream.write(f"\n[final]\n{final_text}")
+        self._stream.write("\n")
+        self._stream.flush()
+        self._snapshot = final_text
+        self._wrote = self._wrote or bool(final_text)
+        self._finished = True
+
+    def fail(self) -> None:
+        if not self._finished and self._wrote:
+            self._stream.write("\n")
+            self._stream.flush()
+        self._finished = True
+
+
+class _LiveProgressWriter:
+    """Show decode progress without exposing provisional routed text."""
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+        self._tokens = 0
+        self._active = False
+
+    def update(self, _snapshot: str) -> None:
+        self._tokens += 1
+        self._stream.write(f"\rQwen: {self._tokens} tokens")
+        self._stream.flush()
+        self._active = True
+
+    def finish(self) -> None:
+        if self._active:
+            self._stream.write("\r\x1b[2K")
+            self._stream.flush()
+        self._active = False
+
+
 def _components() -> int:
     for name, role, integration in COMPONENTS:
         print(f"{name:10}  {role}  [{integration}]")
@@ -176,8 +250,45 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
     jsonl = bool(getattr(args, "jsonl", False))
     message = getattr(args, "message", None)
     max_requests = getattr(args, "max_requests", None)
+    output_mode = getattr(args, "output", None) or (
+        "json" if jsonl else "text"
+    )
+    stream_enabled = (
+        not jsonl
+        and output_mode == "text"
+        and not bool(getattr(args, "no_stream", False))
+    )
+    live_writer = (
+        _LiveTextWriter(sys.stdout)
+        if stream_enabled and bool(getattr(args, "raw_qwen", False))
+        else None
+    )
+    progress_writer = (
+        _LiveProgressWriter(sys.stderr)
+        if stream_enabled
+        and not bool(getattr(args, "raw_qwen", False))
+        and sys.stderr.isatty()
+        else None
+    )
 
     def emit(result, *, request_id=None, include_id: bool = False) -> None:
+        if output_mode == "text":
+            if progress_writer is not None:
+                progress_writer.finish()
+            if result.ok and isinstance(result.output, str):
+                if live_writer is None:
+                    print(result.output, flush=True)
+                else:
+                    live_writer.finish(result.output)
+            else:
+                if live_writer is not None:
+                    live_writer.fail()
+                print(
+                    f"error: {result.reason or 'chat returned no text'}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return
         value = {
             "status": result.status.value,
             "component": result.component,
@@ -203,6 +314,8 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
 
     try:
         if jsonl:
+            if output_mode != "json":
+                raise ValueError("JSONL chat requires --output json")
             if message is not None:
                 raise ValueError("chat message and --jsonl are mutually exclusive")
             if (
@@ -287,6 +400,13 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             fast_mlp_active_layers=fast_mlp_layers,
             fast_mlp_selected_block_count=fast_mlp_blocks,
             delta_head_state_path=args.delta_head_online_state,
+            text_snapshot_sink=(
+                live_writer.update
+                if live_writer is not None
+                else progress_writer.update
+                if progress_writer is not None
+                else None
+            ),
         )
         component = qwen
         if not args.raw_qwen:
@@ -339,11 +459,22 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             return 0 if failures == 0 else 2
         result = component.handle(Request("chat", message))
     except (DraftWindowError, OSError, TypeError, ValueError) as exc:
-        print(json.dumps({
-            "status": "error",
-            "component": "qwen3.8.fertig-chat",
-            "reason": f"{type(exc).__name__}: {exc}",
-        }, ensure_ascii=False, sort_keys=True))
+        if live_writer is not None:
+            live_writer.fail()
+        if progress_writer is not None:
+            progress_writer.finish()
+        if output_mode == "text":
+            print(
+                f"error: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(json.dumps({
+                "status": "error",
+                "component": "qwen3.8.fertig-chat",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }, ensure_ascii=False, sort_keys=True))
         return 2
     finally:
         close = getattr(component, "close", None)
@@ -927,6 +1058,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--jsonl",
         action="store_true",
         help="keep one loaded runtime and process stdin as raw-text or JSONL requests",
+    )
+    chat.add_argument(
+        "--output",
+        choices=("text", "json"),
+        help="single-request output (default: live text; JSONL always uses json)",
+    )
+    chat.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="buffer a text response and print it only after generation completes",
     )
     chat.add_argument(
         "--max-requests",

@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import Mock, patch
 
 import torch
@@ -146,6 +146,29 @@ class _Model:
         self.reset_calls.append(release)
         if self.cleanup_error is not None:
             raise self.cleanup_error
+
+
+class _StreamingModel(_Model):
+    def generate_greedy(self, prompt, **kwargs):
+        progress = kwargs.get("progress")
+        if callable(progress):
+            for step, token_id in enumerate(self.generated):
+                progress(
+                    {
+                        "event": "generated_token",
+                        "step": step,
+                        "token_id": token_id,
+                    }
+                )
+        return super().generate_greedy(prompt, **kwargs)
+
+
+class _StreamingTokenizer(_Tokenizer):
+    def decode(self, token_ids):
+        ids = tuple(token_ids)
+        self.decoded_ids.append(ids)
+        pieces = {7: "Hello", 8: " world", 9: "!"}
+        return "".join(pieces[token_id] for token_id in ids)
 
 
 class _AnchorModel(_Model):
@@ -578,6 +601,58 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotIn("prompt_token_ids", generation)
         self.assertNotIn("generated_token_ids", generation)
         self.assertNotIn("result_cell_binding_receipt", result.evidence)
+
+    def test_direct_generation_emits_cumulative_text_snapshots(self) -> None:
+        runtime = _Runtime()
+        runtime.model = _StreamingModel(generated=(7, 8, 9))
+        runtime.tokenizer = _StreamingTokenizer()
+        snapshots: list[str] = []
+        chat = _chat(runtime, text_snapshot_sink=snapshots.append)
+
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(result.output, "Hello world!")
+        self.assertEqual(snapshots, ["Hello", "Hello world", "Hello world!"])
+        self.assertEqual(runtime.model.reset_calls, [True])
+        chat.close()
+
+    def test_draft_round_expands_to_one_snapshot_per_accepted_token(self) -> None:
+        runtime = _Runtime(tokenizer=_StreamingTokenizer())
+        snapshots: list[str] = []
+        chat = _chat(runtime, text_snapshot_sink=snapshots.append)
+        progress = chat._draft_generation_progress(runtime)
+        assert progress is not None
+
+        progress((7, 8))
+        progress((7, 8, 9))
+
+        self.assertEqual(snapshots, ["Hello", "Hello world", "Hello world!"])
+        with self.assertRaisesRegex(Qwen38ChatError, "moved backwards"):
+            progress((7,))
+        chat.close()
+
+    def test_stream_sink_failure_is_a_generation_error_and_state_is_released(
+        self,
+    ) -> None:
+        runtime = _Runtime()
+        runtime.model = _StreamingModel(generated=(7,))
+        runtime.tokenizer = _StreamingTokenizer()
+
+        def fail(_snapshot: str) -> None:
+            raise BrokenPipeError("closed output")
+
+        chat = _chat(runtime, text_snapshot_sink=fail)
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertIn("BrokenPipeError", result.reason or "")
+        self.assertEqual(runtime.model.reset_calls, [True])
+        chat.close()
+
+    def test_stream_sink_must_be_callable(self) -> None:
+        with self.assertRaisesRegex(TypeError, "text_snapshot_sink"):
+            _chat(_Runtime(), text_snapshot_sink="stdout")
 
     def test_optional_k4_drafter_is_used_by_general_chat(self) -> None:
         target = _Runtime()
@@ -1179,6 +1254,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         "--qwen38-tokenizer",
                         "/models/tokenizer.json",
                         "--raw-qwen",
+                        "--output",
+                        "json",
                         "--max-new-tokens",
                         "4",
                     ]
@@ -1192,6 +1269,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         options = constructor.call_args.kwargs
         self.assertEqual(options["max_new_tokens"], 4)
+        self.assertIsNone(options["text_snapshot_sink"])
         self.assertEqual(options["source_budget_mb"], 4194304)
         self.assertEqual(options["draft_source_budget_mb"], 1048576)
         self.assertEqual(options["max_resident_bytes"], 192 * 1024**2)
@@ -1199,6 +1277,98 @@ class Qwen38CausalChatTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["component"], "qwen3.8.causal-chat")
         self.assertEqual(payload["output"], "local answer")
+
+    def test_cli_streams_text_snapshots_without_reprinting_the_final(self) -> None:
+        sink: dict[str, object] = {}
+        qwen = Mock()
+
+        def construct(*_args, **options):
+            sink["callback"] = options["text_snapshot_sink"]
+            return qwen
+
+        def handle(_request):
+            callback = sink["callback"]
+            assert callable(callback)
+            callback("Hello")
+            callback("Hello world")
+            return Result(
+                ExecutionStatus.OK,
+                "qwen3.8.causal-chat",
+                output="Hello world",
+            )
+
+        qwen.handle.side_effect = handle
+        output = io.StringIO()
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            side_effect=construct,
+        ), redirect_stdout(output):
+            code = main(
+                [
+                    "chat",
+                    "hello",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                    "--raw-qwen",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue(), "Hello world\n")
+        qwen.close.assert_called_once_with()
+
+    def test_cli_wrapped_stream_exposes_progress_but_only_final_text(self) -> None:
+        sink: dict[str, object] = {}
+        qwen = Mock()
+        wrapped = Mock()
+
+        class _Tty(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        def construct(*_args, **options):
+            sink["callback"] = options["text_snapshot_sink"]
+            return qwen
+
+        def handle(_request):
+            callback = sink["callback"]
+            assert callable(callback)
+            callback("provisional")
+            return Result(
+                ExecutionStatus.OK,
+                "qwen3.8.fertig-chat",
+                output="final exact answer",
+            )
+
+        wrapped.handle.side_effect = handle
+        wrapped.close.side_effect = qwen.close
+        output = io.StringIO()
+        progress = _Tty()
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            side_effect=construct,
+        ), patch(
+            "immer.cognition.qwen_fertig_chat.QwenFertigChat",
+            return_value=wrapped,
+        ), redirect_stdout(output), redirect_stderr(progress):
+            code = main(
+                [
+                    "chat",
+                    "hello",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue(), "final exact answer\n")
+        self.assertIn("Qwen: 1 tokens", progress.getvalue())
+        self.assertNotIn("provisional", progress.getvalue())
+        wrapped.close.assert_called_once_with()
 
     def test_cli_resolves_local_stack_and_wraps_fertig_by_default(self) -> None:
         qwen = _chat(_Runtime())
@@ -1363,6 +1533,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         constructor.assert_called_once()
+        self.assertIsNone(
+            constructor.call_args.kwargs["text_snapshot_sink"]
+        )
         self.assertTrue(qwen.closed)
         rows = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(len(rows), 2)

@@ -162,13 +162,18 @@ PYTHONPATH=src python3 -m immer chat "<arbitrary text>"
 
 # Keep the mounted model alive for multiple raw-text or JSONL requests.
 PYTHONPATH=src python3 -m immer chat --jsonl
+
+# Emit one final machine-readable receipt instead of live text.
+PYTHONPATH=src python3 -m immer chat "<arbitrary text>" --output json
 ```
 
 Outside the canonical deployment, set `IMMER_QWEN38_ROOT` and optionally
 `IMMER_QWEN38_Q4` and `IMMER_QWEN38_FAST_MLP`. Explicit CLI paths remain
 available as overrides. The sparse MLP plan is explicit because full Q4 keeps
 the general-chat language intact. `--raw-qwen` bypasses the normal
-FERTIG-first route.
+FERTIG-first route. Normal single-request chat shows live token progress while
+stdout remains exactly the final FERTIG-routed answer. `--raw-qwen` streams the
+actual decoder text, and `--no-stream` buffers either mode until completion.
 
 ## Selected trial evidence
 

@@ -780,6 +780,125 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         self.assertFalse(result.evidence.final_state_committed)
         self.assertEqual(candidate.next_position, 4)
 
+    def test_k4_on_tokens_reports_cumulative_output_after_each_round(self) -> None:
+        baseline, tokens, _evidence = self._baseline(count=5)
+        candidate = self._model()
+        updates: list[tuple[int, ...]] = []
+
+        result = Qwen38K4SpeculativeDecoder(
+            candidate,
+            _Quads(tokens[:4]),  # type: ignore[arg-type]
+        ).generate(
+            [[1, 4]],
+            max_new_tokens=5,
+            head_block_rows=7,
+            on_tokens=updates.append,
+        )
+
+        self.assertEqual(result.token_ids, tokens)
+        self._assert_state_equal(candidate, baseline)
+        self.assertEqual(updates, [tokens[:4], tokens])
+        self.assertTrue(all(isinstance(update, tuple) for update in updates))
+
+    def test_rolling_on_tokens_reports_once_per_multi_token_round(self) -> None:
+        prompt = (1, 4)
+        baseline = self._model()
+        tokens, _evidence = baseline.generate_greedy(
+            [prompt], max_new_tokens=8, head_block_rows=7
+        )
+        provider = _RollingFromTokens(
+            prompt,
+            tokens,
+            accepted_per_wave=3,
+            vocab_size=self.config.vocab_size,
+        )
+        candidate = self._model()
+        updates: list[tuple[int, ...]] = []
+
+        result = Qwen38K4SpeculativeDecoder(
+            candidate, provider
+        ).generate_rolling(
+            [prompt],
+            max_new_tokens=8,
+            head_block_rows=7,
+            on_tokens=updates.append,
+        )
+
+        self.assertEqual(result.token_ids, tokens)
+        self._assert_state_equal(candidate, baseline)
+        self.assertEqual(updates, [tokens[:4], tokens])
+
+    def test_k4_on_tokens_reports_terminal_eos_round(self) -> None:
+        _baseline, tokens, _evidence = self._baseline(count=4)
+        eos_baseline, stopped, _evidence = self._baseline(
+            count=4,
+            eos=(tokens[2],),
+        )
+        candidate = self._model()
+        updates: list[tuple[int, ...]] = []
+
+        result = Qwen38K4SpeculativeDecoder(
+            candidate,
+            _Quads(tokens),  # type: ignore[arg-type]
+        ).generate(
+            [[1, 4]],
+            max_new_tokens=4,
+            eos_token_ids=(tokens[2],),
+            head_block_rows=7,
+            on_tokens=updates.append,
+        )
+
+        self.assertEqual(result.token_ids, stopped)
+        self._assert_state_equal(candidate, eos_baseline)
+        self.assertEqual(updates, [stopped])
+
+    def test_k4_on_tokens_rejects_non_callable_for_both_modes(self) -> None:
+        for method_name in ("generate", "generate_rolling"):
+            with self.subTest(method=method_name):
+                candidate = self._model()
+                decoder = Qwen38K4SpeculativeDecoder(
+                    candidate,
+                    lambda _history: (0, 0, 0, 0),
+                )
+                method = getattr(decoder, method_name)
+                with self.assertRaisesRegex(
+                    TypeError, "on_tokens must be callable or None"
+                ):
+                    method(
+                        [[1, 4]],
+                        max_new_tokens=1,
+                        head_block_rows=7,
+                        on_tokens=object(),
+                    )
+                self.assertEqual(candidate.next_position, 0)
+                self.assertEqual(candidate.state_bytes, 0)
+
+    def test_k4_on_tokens_failures_propagate_for_both_modes(self) -> None:
+        class CallbackFailure(RuntimeError):
+            pass
+
+        failure = CallbackFailure("stream consumer failed")
+
+        def fail(_tokens: tuple[int, ...]) -> None:
+            raise failure
+
+        for method_name in ("generate", "generate_rolling"):
+            with self.subTest(method=method_name):
+                candidate = self._model()
+                decoder = Qwen38K4SpeculativeDecoder(
+                    candidate,
+                    lambda _history: (0, 0, 0, 0),
+                )
+                method = getattr(decoder, method_name)
+                with self.assertRaises(CallbackFailure) as raised:
+                    method(
+                        [[1, 4]],
+                        max_new_tokens=1,
+                        head_block_rows=7,
+                        on_tokens=fail,
+                    )
+                self.assertIs(raised.exception, failure)
+
     def test_rolling_k4_matches_greedy_for_every_acceptance_prefix(self) -> None:
         prompt = (1, 4)
         reference = self._model()

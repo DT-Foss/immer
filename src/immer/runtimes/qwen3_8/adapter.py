@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 import hashlib
 import json
@@ -1044,6 +1044,7 @@ class Qwen38CausalChat:
         range_prefetch_hint_cooldown: int = 2,
         q4_root: str | Path | None = None,
         q4_threads: int | None = None,
+        text_snapshot_sink: Callable[[str], None] | None = None,
     ) -> None:
         if not isinstance(bundle_path, (str, Path)):
             raise TypeError("bundle_path must be a local filesystem path")
@@ -1061,6 +1062,8 @@ class Qwen38CausalChat:
             raise TypeError("q4_root must be a local path or None")
         if q4_threads is not None:
             q4_threads = _positive_int(q4_threads, "q4_threads")
+        if text_snapshot_sink is not None and not callable(text_snapshot_sink):
+            raise TypeError("text_snapshot_sink must be callable or None")
         if q4_root is not None:
             if device == "mps":
                 raise ValueError("Q4 execution requires the CPU device")
@@ -1271,6 +1274,7 @@ class Qwen38CausalChat:
             None if q4_root is None else Path(q4_root).expanduser().absolute()
         )
         self._q4_threads = q4_threads
+        self._text_snapshot_sink = text_snapshot_sink
         self._anchor_cache = anchor_cache
         self._draft_bundle_path = (
             None
@@ -1744,6 +1748,62 @@ class Qwen38CausalChat:
             raise Qwen38ChatError("target and rolling drafter vocabularies differ")
         return draft
 
+    def _emit_text_snapshot(
+        self,
+        runtime: _OwnedRuntime,
+        token_ids: Sequence[int],
+    ) -> None:
+        sink = self._text_snapshot_sink
+        if sink is None:
+            return
+        decoded = runtime.tokenizer.decode(token_ids)
+        if not isinstance(decoded, str):
+            raise Qwen38ChatError(
+                "runtime tokenizer returned a non-text streaming snapshot"
+            )
+        sink(decoded.strip())
+
+    def _direct_generation_progress(
+        self,
+        runtime: _OwnedRuntime,
+    ) -> Callable[[dict[str, Any]], None] | None:
+        if self._text_snapshot_sink is None:
+            return None
+        generated: list[int] = []
+
+        def emit(event: dict[str, Any]) -> None:
+            if event.get("event") != "generated_token":
+                return
+            token_id = event.get("token_id")
+            if (
+                isinstance(token_id, bool)
+                or not isinstance(token_id, Integral)
+                or not 0 <= int(token_id) < runtime.model.config.vocab_size
+            ):
+                raise Qwen38ChatError("generation emitted an invalid stream token")
+            generated.append(int(token_id))
+            self._emit_text_snapshot(runtime, generated)
+
+        return emit
+
+    def _draft_generation_progress(
+        self,
+        runtime: _OwnedRuntime,
+    ) -> Callable[[tuple[int, ...]], None] | None:
+        if self._text_snapshot_sink is None:
+            return None
+        emitted = 0
+
+        def emit(token_ids: tuple[int, ...]) -> None:
+            nonlocal emitted
+            if len(token_ids) < emitted:
+                raise Qwen38ChatError("draft stream token sequence moved backwards")
+            for width in range(emitted + 1, len(token_ids) + 1):
+                self._emit_text_snapshot(runtime, token_ids[:width])
+            emitted = len(token_ids)
+
+        return emit
+
     def _generate_locked(
         self,
         runtime: _OwnedRuntime,
@@ -1770,10 +1830,14 @@ class Qwen38CausalChat:
             )
         )
         if not draft_enabled:
+            direct_progress = self._direct_generation_progress(runtime)
+            direct_options = dict(generation_options)
+            if direct_progress is not None:
+                direct_options["progress"] = direct_progress
             generated, evidence = runtime.model.generate_greedy(
                 [list(prompt_ids)],
                 retain_final_state=False,
-                **generation_options,
+                **direct_options,
             )
             mapped = _mapping(evidence, "generation evidence")
             self._record_fast_mlp_request(
@@ -1835,6 +1899,7 @@ class Qwen38CausalChat:
                 eos_token_ids=eos,
                 head_block_rows=self._head_block_rows,
                 retain_final_state=False,
+                on_tokens=self._draft_generation_progress(runtime),
             )
             evidence = generated.evidence
             if (

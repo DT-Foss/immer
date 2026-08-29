@@ -7,7 +7,7 @@ vocabulary scan and publishes only target-confirmed continuation state.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
 import inspect
@@ -1683,6 +1683,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         eos_token_ids: Iterable[int] = (),
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
         retain_final_state: bool = True,
+        on_tokens: Callable[[tuple[int, ...]], None] | None = None,
     ) -> RollingK4SpeculativeGenerationResult:
         """Generate with one target-known token plus a configurable draft window."""
 
@@ -1700,6 +1701,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             raise ValueError("head_block_rows must be a positive integer")
         if not isinstance(retain_final_state, bool):
             raise TypeError("retain_final_state must be a boolean")
+        if on_tokens is not None and not callable(on_tokens):
+            raise TypeError("on_tokens must be callable or None")
         prompt_tensor = self.model._token_tensor(prompt_token_ids)
         if tuple(prompt_tensor.shape[:1]) != (1,):
             raise ValueError("rolling generation requires batch size one")
@@ -1798,6 +1801,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                     )
                 )
                 generated.extend(emitted)
+                if on_tokens is not None:
+                    on_tokens(tuple(generated))
                 continue
 
             round_source = _owner_metric(source, "network_or_source_body_bytes")
@@ -1879,6 +1884,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                     )
                 )
                 generated.extend(emitted)
+                if on_tokens is not None:
+                    on_tokens(tuple(generated))
                 pending_token = targets[0]
                 continue
             stage = self.model.stage_continuation_block(
@@ -1976,6 +1983,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                 )
             )
             generated.extend(emitted)
+            if on_tokens is not None:
+                on_tokens(tuple(generated))
             if correction is not None:
                 pending_token = correction
 
@@ -2090,6 +2099,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         eos_token_ids: Iterable[int] = (),
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
         retain_final_state: bool = True,
+        on_tokens: Callable[[tuple[int, ...]], None] | None = None,
     ) -> K4SpeculativeGenerationResult:
         """Generate exact greedy K=4 continuation and commit every output token."""
 
@@ -2107,6 +2117,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             raise ValueError("head_block_rows must be a positive integer")
         if not isinstance(retain_final_state, bool):
             raise TypeError("retain_final_state must be a boolean")
+        if on_tokens is not None and not callable(on_tokens):
+            raise TypeError("on_tokens must be callable or None")
         prompt_tensor = self.model._token_tensor(prompt_token_ids)
         if prompt_tensor.shape[0] != 1:
             raise ValueError("speculative generation requires batch size one")
@@ -2162,6 +2174,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                 generated.extend(row.emitted_token_ids)
                 rounds.append(row)
                 stopped = row.stopped_on_eos
+                if on_tokens is not None:
+                    on_tokens(tuple(generated))
                 continue
 
             round_source_start = _owner_metric(
@@ -2316,6 +2330,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             )
             generated.extend(emitted)
             rounds.append(row)
+            if on_tokens is not None:
+                on_tokens(tuple(generated))
 
         generation_seconds = time.perf_counter() - started
         evidence = _sealed_k4_generation(
