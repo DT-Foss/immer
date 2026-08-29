@@ -1178,6 +1178,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         "/models/qwen.causal",
                         "--qwen38-tokenizer",
                         "/models/tokenizer.json",
+                        "--raw-qwen",
                         "--max-new-tokens",
                         "4",
                     ]
@@ -1198,6 +1199,50 @@ class Qwen38CausalChatTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["component"], "qwen3.8.causal-chat")
         self.assertEqual(payload["output"], "local answer")
+
+    def test_cli_resolves_local_stack_and_wraps_fertig_by_default(self) -> None:
+        qwen = _chat(_Runtime())
+        output = io.StringIO()
+        environment = {
+            "IMMER_QWEN38_ROOT": "/models/Qwen3.8-27B",
+            "IMMER_QWEN38_Q4": "/models/Qwen3.8-27B/causal/q4-base-v2",
+            "IMMER_QWEN38_FAST_MLP": "/state/qwen-q4-fast-mlp-all64-v1",
+        }
+        with patch.dict("os.environ", environment, clear=True), patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor, patch(
+            "immer.cognition.qwen_fertig_chat.QwenFertigChat",
+            side_effect=lambda raw, _fertig: raw,
+        ) as wrapper, redirect_stdout(output):
+            code = main(["chat", "hello"])
+
+        self.assertEqual(code, 0)
+        self.assertTrue(qwen.closed)
+        self.assertEqual(
+            constructor.call_args.args,
+            (
+                "/models/Qwen3.8-27B",
+                "/models/Qwen3.8-27B/tokenizer.json",
+            ),
+        )
+        options = constructor.call_args.kwargs
+        self.assertEqual(
+            options["q4_root"],
+            "/models/Qwen3.8-27B/causal/q4-base-v2",
+        )
+        self.assertEqual(
+            options["fast_mlp_root"],
+            "/state/qwen-q4-fast-mlp-all64-v1",
+        )
+        self.assertEqual(
+            options["fast_mlp_active_layers"],
+            (*range(18), *range(55, 64)),
+        )
+        self.assertEqual(options["fast_mlp_selected_block_count"], 32)
+        wrapper.assert_called_once()
+        self.assertIs(wrapper.call_args.args[0], qwen)
+        self.assertIsInstance(wrapper.call_args.args[1], FertigSolver)
 
     def test_cli_jsonl_reuses_one_loaded_component_for_multiple_requests(self) -> None:
         qwen = _chat(_Runtime())

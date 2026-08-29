@@ -63,6 +63,73 @@ def _artifact_root(manifest: str | Path, configured: str | Path | None = None) -
     return artifact_root(manifest, configured)
 
 
+_QWEN38_DEPLOYMENT_ROOT = Path("/app/models/Qwen3.8-27B")
+_QWEN38_DEPLOYMENT_FAST_MLP = Path(
+    "/root/immer-state/qwen-q4-fast-mlp-all64-v1"
+)
+
+
+def _chat_path(
+    explicit: str | Path | None,
+    environment: str,
+) -> Path | None:
+    value = explicit or os.environ.get(environment)
+    if value is None:
+        return None
+    return Path(value).expanduser().absolute()
+
+
+def _resolve_qwen38_chat_paths(
+    args: argparse.Namespace,
+) -> tuple[Path, Path, Path | None, Path | None]:
+    """Resolve the deployed local chat stack without requiring flag repetition."""
+
+    root = _chat_path(getattr(args, "qwen38_root", None), "IMMER_QWEN38_ROOT")
+    if root is None and _QWEN38_DEPLOYMENT_ROOT.is_dir():
+        root = _QWEN38_DEPLOYMENT_ROOT
+
+    bundle = _chat_path(
+        getattr(args, "qwen38_causal_bundle", None),
+        "IMMER_QWEN38_CAUSAL_BUNDLE",
+    )
+    if bundle is None:
+        bundle = root
+
+    tokenizer = _chat_path(
+        getattr(args, "qwen38_tokenizer", None),
+        "IMMER_QWEN38_TOKENIZER",
+    )
+    if tokenizer is None and root is not None:
+        tokenizer = root / "tokenizer.json"
+
+    q4 = _chat_path(
+        getattr(args, "qwen38_q4", None),
+        "IMMER_QWEN38_Q4",
+    )
+    if q4 is None and root is not None:
+        candidate = root / "causal" / "q4-base-v2"
+        if candidate.is_dir():
+            q4 = candidate
+
+    fast_mlp = _chat_path(
+        getattr(args, "fast_mlp", None),
+        "IMMER_QWEN38_FAST_MLP",
+    )
+    if (
+        fast_mlp is None
+        and q4 is not None
+        and _QWEN38_DEPLOYMENT_FAST_MLP.is_dir()
+    ):
+        fast_mlp = _QWEN38_DEPLOYMENT_FAST_MLP
+
+    if bundle is None or tokenizer is None:
+        raise ValueError(
+            "local Qwen is not configured; set --qwen38-root or "
+            "IMMER_QWEN38_ROOT"
+        )
+    return bundle, tokenizer, q4, fast_mlp
+
+
 def _components() -> int:
     for name, role, integration in COMPONENTS:
         print(f"{name:10}  {role}  [{integration}]")
@@ -94,6 +161,8 @@ def _solve(
 def _chat_qwen38(args: argparse.Namespace) -> int:
     """Run one turn or a persistent JSONL stream through local Qwen3.8."""
 
+    from .cognition.fertig.adapter import FertigSolver
+    from .cognition.qwen_fertig_chat import QwenFertigChat
     from .runtimes.qwen3_8.adapter import Qwen38CausalChat
     from .runtimes.qwen3_8.draft_window import DraftWindowError
     from .runtimes.qwen3_8.semantic_state_cache import SemanticStateAnchorCache
@@ -142,6 +211,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 raise ValueError("max_requests must be a positive integer")
         elif not isinstance(message, str) or not message.strip():
             raise ValueError("chat requires a message or --jsonl")
+        bundle_path, tokenizer_path, q4_root, fast_mlp_root = (
+            _resolve_qwen38_chat_paths(args)
+        )
         anchor_cache = (
             None
             if args.qwen38_anchor_cache is None
@@ -149,7 +221,14 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         )
         fast_mlp_layers = args.fast_mlp_layers
         fast_mlp_blocks = args.fast_mlp_blocks
-        if args.fast_mlp_policy == "structure-edge":
+        fast_mlp_policy = args.fast_mlp_policy
+        if fast_mlp_policy == "auto":
+            fast_mlp_policy = (
+                "structure-edge"
+                if q4_root is not None and fast_mlp_root is not None
+                else "manual"
+            )
+        if fast_mlp_policy == "structure-edge":
             if fast_mlp_layers is not None:
                 raise ValueError(
                     "--fast-mlp-policy structure-edge replaces --fast-mlp-layers"
@@ -157,9 +236,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             fast_mlp_layers = (*range(18), *range(55, 64))
             if fast_mlp_blocks is None:
                 fast_mlp_blocks = 64 if args.fast_mlp_online_state else 32
-        component = Qwen38CausalChat(
-            args.qwen38_causal_bundle,
-            args.qwen38_tokenizer,
+        qwen = Qwen38CausalChat(
+            str(bundle_path),
+            str(tokenizer_path),
             system_prompt=args.system_prompt,
             device=args.device,
             compute_dtype=args.compute_dtype,
@@ -171,7 +250,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             head_block_rows=args.head_block_rows,
             exact_head_root=args.exact_head,
             exact_head_max_bytes=int(args.exact_head_max_mb * 1024**2),
-            q4_root=args.qwen38_q4,
+            q4_root=None if q4_root is None else str(q4_root),
             q4_threads=args.q4_threads,
             anchor_cache=anchor_cache,
             draft_bundle_path=args.draft_bundle,
@@ -192,7 +271,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             range_prefetch_beam_horizon=args.range_prefetch_beam_horizon,
             range_prefetch_beam_width=args.range_prefetch_beam_width,
             range_prefetch_hint_cooldown=args.range_prefetch_hint_cooldown,
-            fast_mlp_root=args.fast_mlp,
+            fast_mlp_root=None if fast_mlp_root is None else str(fast_mlp_root),
             fast_mlp_online_state_path=args.fast_mlp_online_state,
             fast_mlp_source_budget_mb=args.fast_mlp_source_budget_mb,
             fast_mlp_max_resident_bytes=(
@@ -204,6 +283,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             fast_mlp_selected_block_count=fast_mlp_blocks,
             delta_head_state_path=args.delta_head_online_state,
         )
+        component = qwen
+        if not args.raw_qwen:
+            component = QwenFertigChat(qwen, FertigSolver())
         if jsonl:
             failures = 0
             handled = 0
@@ -846,8 +928,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="stop the persistent JSONL loop after this many non-empty lines",
     )
-    chat.add_argument("--qwen38-causal-bundle", required=True)
-    chat.add_argument("--qwen38-tokenizer", required=True)
+    chat.add_argument(
+        "--qwen38-root",
+        help=(
+            "local Qwen root containing config, weights, tokenizer and causal/; "
+            "default: IMMER_QWEN38_ROOT or the deployed /app model"
+        ),
+    )
+    chat.add_argument(
+        "--qwen38-causal-bundle",
+        help="override the local causal bundle (default: Qwen root)",
+    )
+    chat.add_argument(
+        "--qwen38-tokenizer",
+        help="override tokenizer.json (default: Qwen root/tokenizer.json)",
+    )
     chat.add_argument(
         "--qwen38-q4",
         metavar="BANK",
@@ -944,9 +1039,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chat.add_argument(
         "--fast-mlp-policy",
-        choices=("manual", "structure-edge"),
-        default="manual",
-        help="structure-edge keeps layers 18-54 full and routes only the edges",
+        choices=("auto", "manual", "structure-edge"),
+        default="auto",
+        help=(
+            "auto uses structure-edge for the packed Q4 plan; structure-edge "
+            "keeps layers 18-54 full and routes only the edges"
+        ),
     )
     chat.add_argument(
         "--fast-mlp-online-state",
@@ -955,6 +1053,11 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--delta-head-online-state",
         help="persistent Markov-Sinkhorn state for packed DeltaNet head routing",
+    )
+    chat.add_argument(
+        "--raw-qwen",
+        action="store_true",
+        help="bypass FERTIG exact short-circuiting and call raw Qwen directly",
     )
     chat.add_argument(
         "--qwen38-anchor-cache",

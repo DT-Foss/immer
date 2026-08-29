@@ -156,20 +156,17 @@ release surface.
 ## Local packed runtime
 
 ```bash
-# Optional zero-forward bootstrap from existing target receipts.
-PYTHONPATH=src python3 scripts/qwen38_markov_bootstrap.py \
-  --state /root/immer-state/qwen-markov-q4-v1.bin \
-  --root artifacts/private/qwen3.8-fertig-local
+# On the IMMER server this auto-mounts local Qwen, Q4/Q8, the packed
+# Structure-Edge MLP plan, native DeltaNet and FERTIG.
+PYTHONPATH=src python3 -m immer chat "<arbitrary text>"
 
-# One long-lived model process; every confirmed request updates Markov memory.
-PYTHONPATH=src python3 -m immer chat --jsonl \
-  --qwen38-causal-bundle /app/models/Qwen3.8-27B \
-  --qwen38-tokenizer /app/models/Qwen3.8-27B/tokenizer.json \
-  --qwen38-q4 /app/models/Qwen3.8-27B/causal/q4-base-v2 \
-  --q4-threads 16 --device cpu --compute-dtype bfloat16 \
-  --markov-draft-state /root/immer-state/qwen-markov-q4-v1.bin \
-  --draft-window 4
+# Keep the mounted model alive for multiple raw-text or JSONL requests.
+PYTHONPATH=src python3 -m immer chat --jsonl
 ```
+
+Outside the canonical deployment, set `IMMER_QWEN38_ROOT` and optionally
+`IMMER_QWEN38_Q4` and `IMMER_QWEN38_FAST_MLP`. Explicit CLI paths remain
+available as overrides. `--raw-qwen` bypasses the normal FERTIG-first route.
 
 ## Selected trial evidence
 
