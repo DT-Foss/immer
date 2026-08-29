@@ -178,6 +178,9 @@ the recent bounded window has at least eight confirmed rows, worst cosine is
 at least `0.999`, worst relative L2 is at most `0.05`, and the exact capture
 floor also passes. The learned `y ≈ scale × sparse + bias` correction is then
 applied to sparse execution. A failed metric window keeps the full MLP.
+When the maximum-width exact capture curve already misses its floor, output
+shadowing is skipped entirely because no output metric could authorize that
+route.
 
 State v3 persists only scalar sufficient statistics, the bounded metric
 window, correction coefficients, and counters. Both v1 capture-only state and
@@ -191,3 +194,22 @@ estimate exceeds the configured material-benefit ceiling (default `0.90` of
 the full `3 × 17,408` rows), `MlpPilotNonBeneficialRoute` requests the
 unchanged full MLP immediately. This prevents a sparse target-byte saving from
 being outweighed by auxiliary transport.
+
+## Existing O1 evidence import
+
+Previously captured exact MLP banks can populate a fresh candidate state
+without another prompt or model forward:
+
+```bash
+PYTHONPATH=src python scripts/qwen38_fast_mlp_existing_evidence.py \
+  /path/to/qwen-causal-bundle \
+  /path/to/mlp-evidence-all64 \
+  /path/to/fast-mlp-artifacts \
+  /path/to/new-candidate-state.json \
+  --input-state /path/to/current-state.json
+```
+
+The importer reopens the bank's persisted budget, verifies its audit, restores
+Gate/Up/Output groups in chronological layer order, reads each exact Down
+weight once through direct fill, and calibrates all rows into a new state. The
+input state is never overwritten. A failed import removes its candidate.

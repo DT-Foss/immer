@@ -1906,11 +1906,15 @@ class MlpPilotOnlineController:
                 0.0,
                 1.0,
             )
-            shadow_row_indices = tuple(
-                int(row)
-                for row in np.argsort(calibration_capture, kind="stable")[
-                    : self.width_config.max_shadow_rows
-                ]
+            shadow_row_indices = (
+                ()
+                if route_capture < target_capture
+                else tuple(
+                    int(row)
+                    for row in np.argsort(calibration_capture, kind="stable")[
+                        : self.width_config.max_shadow_rows
+                    ]
+                )
             )
             shadow_selected_blocks = tuple(
                 tuple(int(block) for block in ranked[row, :calibration_width])

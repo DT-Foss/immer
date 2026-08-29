@@ -44,6 +44,11 @@ All notable changes to IMMER are recorded here.
   persistence is locked, atomic, plan-bound, and contains no prompt or hidden
   tensor content. All 64 layer updates flush once at the request boundary
   instead of rewriting the fixed-size state after every layer.
+- Added `qwen38_fast_mlp_existing_evidence.py`. It reuses authenticated
+  Gate/Up/Output tensors already stored by O1, reads each layer's exact Down
+  weight once, and writes a separate calibrated candidate state with no prompt
+  or model forward. Persisted evidence budgets are reopened exactly; failures
+  remove the candidate and never overwrite the input state.
 - Fast-MLP width is now an exact-confirmed action instead of a fixed 32-block
   constant. Exact paths measure the worst-row cumulative capture curve and
   admit the minimum width reaching `0.50`, up to 128 blocks; layers missing the
@@ -55,7 +60,8 @@ All notable changes to IMMER are recorded here.
   states migrate output-unconfirmed. A pre-dynamic-read economics guard also
   returns to the full MLP when combined sparse row transport exceeds `90%`.
   Shadow calibration masks one worst-row activation and reuses the exact Down
-  matrix while resident, adding no checkpoint or auxiliary source read.
+  matrix while resident, adding no checkpoint or auxiliary source read. A
+  maximum-width capture miss skips output shadowing entirely.
 - Added a deterministic all-layer p4/k32 Fast-MLP builder over authenticated
   local weights. Isotropic Gate/Up joint moments seed all 64 routers; local
   transpose and packed-pilot banks replace the `34.23 GB` full MLP target wave

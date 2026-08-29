@@ -225,6 +225,7 @@ class OnlinePilotControllerTests(unittest.TestCase):
                 output=output,
             )
             self.assertTrue(observation.surprising)
+            self.assertEqual(observation.shadow_row_indices, ())
             decision = controller.decision(layer=0, row_count=1)
             self.assertFalse(decision.use_sparse)
             self.assertFalse(controller.output_calibrated(layer=0))
