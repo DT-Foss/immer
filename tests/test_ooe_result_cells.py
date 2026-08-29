@@ -332,6 +332,41 @@ class ResultCellPayloadTests(unittest.TestCase):
                 binding=_binding(),
             )
 
+        request_bearing = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal",
+            output="42",
+            evidence={"request": {"message": _RAW_QUESTION}},
+        )
+        with self.assertRaisesRegex(ValueError, "raw prompt metadata"):
+            attach_cold_qwen_generation_receipt(
+                request_bearing,
+                binding=_binding(),
+            )
+
+    def test_numeric_q4_request_metrics_are_not_prompt_metadata(self) -> None:
+        binding = _binding()
+        original = _raw_qwen_result(binding=binding)
+        metrics = Result(
+            original.status,
+            original.component,
+            output=original.output,
+            reason=original.reason,
+            evidence={
+                **dict(original.evidence),
+                "q4": {
+                    "request": {
+                        "head_calls": 4,
+                        "linear_calls": 1408,
+                    }
+                },
+            },
+        )
+
+        attached = attach_cold_qwen_generation_receipt(metrics, binding=binding)
+
+        self.assertIn("cold_qwen_generation_receipt", attached.evidence)
+
     def test_hashed_fertig_status_cannot_disagree_with_claimed_status(self) -> None:
         with self.assertRaisesRegex(ValueError, "must match"):
             ResultCell.from_cold(

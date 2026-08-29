@@ -86,6 +86,7 @@ _RAW_METADATA_KEYS = frozenset(
         "input",
         "input_ids",
         "input_text",
+        "message",
         "messages",
         "prompt",
         "question",
@@ -452,7 +453,13 @@ def _validate_no_raw_prompt_metadata(result: Result) -> None:
                     raise ValueError("result evidence keys must be text")
                 key = raw_key.strip().lower().replace("-", "_")
                 protected = key.endswith(_HASH_OR_SIZE_SUFFIXES)
-                if key in _RAW_METADATA_KEYS and not protected and child is not None:
+                structured_request = key == "request" and isinstance(child, Mapping)
+                if (
+                    key in _RAW_METADATA_KEYS
+                    and not protected
+                    and not structured_request
+                    and child is not None
+                ):
                     if isinstance(child, (str, list, tuple, Mapping)):
                         raise ValueError(
                             f"result evidence contains raw prompt metadata at {path}.{raw_key}"
