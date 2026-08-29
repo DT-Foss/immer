@@ -495,9 +495,19 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertIsInstance(adaptive.observations[-1]["gate"], tuple)
 
         adaptive.use_sparse = True
+        adaptive.online_controller = object()
+        guarded = model._mlp(hidden, layer=1)
+        self.assertFalse(torch.equal(guarded, torch.zeros_like(hidden)))
+        self.assertEqual(len(adaptive.observations), 3)
+
+        adaptive.online_controller = type(
+            "OutputCalibrated",
+            (),
+            {"output_calibrated": lambda self, *, layer: layer == 1},
+        )()
         sparse = model._mlp(hidden, layer=1)
         self.assertTrue(torch.equal(sparse, torch.zeros_like(hidden)))
-        self.assertEqual(len(adaptive.observations), 2)
+        self.assertEqual(len(adaptive.observations), 3)
 
     def test_explicit_fast_mode_packs_continuation_projection_rows(self) -> None:
         pager = Qwen38WeightPager(

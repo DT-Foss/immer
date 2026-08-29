@@ -1446,6 +1446,13 @@ class StreamedQwen38:
         if not isinstance(use_sparse, bool):
             raise Qwen38RuntimeError("fast-MLP decision returned an invalid action")
         self.mlp_sparse_last_decision = decision
+        controller = getattr(executor, "online_controller", None)
+        if use_sparse and controller is not None:
+            output_calibrated = getattr(controller, "output_calibrated", None)
+            if not callable(output_calibrated) or not bool(
+                output_calibrated(layer=layer)
+            ):
+                return False
         return use_sparse
 
     def _observe_exact_mlp(
