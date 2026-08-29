@@ -112,7 +112,9 @@ release surface.
   can specialize the mixture. Inference uses a four-profile dialect Council:
   the active learning dialect keeps one seat, while the remaining seats are
   ranked by similarity × visits × Ricci age; prompts below the activation
-  threshold stay global.
+  threshold stay global. A bounded one-step planner evaluates the current top
+  four tokens against their position-/dialect-specific next state and overrides
+  greedy choice only after a positive discounted log-probability margin.
   Novel MTP requests teach their complete target-confirmed episode back to the
   Council. After two confirmed copies, the same context can execute from its
   exact dialect phrase: a live third request used no MTP, accepted seven Markov
@@ -308,6 +310,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Position-specialist consensus | 9 consensus rounds; 12 shared-prefix tokens | unseen sky question; position-specific experts contributed `+0.2095` confidence while MTP retained execution; position-1 observations reached 28 and specialist-weighted accuracy 32.55%; 24 tokens in 16 target forwards |
 | Dialect × position specialists | 28 contextual specialist predictions | unseen silver-corrosion question matched the preceding iron-corrosion dialect at similarity 0.2549; dialect maturity 0.1622, two consensus tokens and positive gain; 24 tokens in 15 target forwards |
 | Multi-dialect inference Council | 4 profiles; effective size 3.47 | unseen cloud question; active dialect plus three Ricci-ranked transfer neighbors jointly drove 28 contextual positions, three consensus rounds, four shared tokens and `+0.0425` confidence; 24 tokens in 15 target forwards |
+| One-step Markov planning | 86 decisions; 344 bounded candidate evaluations | unseen thunder/lightning question; three greedy tokens changed, maximum sequence gain 0.8285, complete 20-token answer in 13 target forwards; forced phrases and position 15 bypass planning |
 | Automatic Markov→MTP→Markov learning | 30.38 → 26.79 s; 12 → 9 target forwards | first novel request opened MTP and taught Council memory; after two confirmations the third request stayed entirely on a seven-token dialect phrase, loaded no MTP, preserved identical output, and used 1.34 GB peak RSS |
 | In-request Markov→MTP handoff | 24 output tokens in 9 target forwards | four learned Markov K4 waves followed by one exact 41-row hidden-state handoff and four MTP waves; 15 accepted drafts; no Qwen replay; 29.93 s generation and 1.46 GB peak RSS |
 | Compositional unseen token slot | unseen `CODE_DD44` via Markov only | three distinct target-confirmed code bindings induced unanimous Literal+Copy programs; fourth slot loaded no MTP, returned the exact requested code in three target forwards, and remained fully Qwen-verified |
