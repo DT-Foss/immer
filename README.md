@@ -97,7 +97,10 @@ release surface.
   until a position acquires its own target-confirmed evidence. After the first
   shadow mismatch, the zero-weight Council re-predicts later verified tokens on
   their actual prefix, so deeper positions learn without scoring a
-  counterfactual Markov suffix or running Qwen again.
+  counterfactual Markov suffix or running Qwen again. It also predicts a new
+  carry from the complete accepted MTP prefix; the next target token therefore
+  trains the next recursive position even when Markov's original first token
+  was wrong.
   Novel MTP requests teach their complete target-confirmed episode back to the
   Council. After two confirmed copies, the same context can execute from its
   exact dialect phrase: a live third request used no MTP, accepted seven Markov
@@ -288,6 +291,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Reliability-driven Markov takeover | one Markov round inside an unseen response | unseen glass question; learned Fixed-Share/Beta confidence switched MTP→Markov→MTP without a stored phrase or replay; 24 output tokens in 14 target forwards, ten drafts accepted, 1.32 GB peak RSS |
 | Position-specific Council memory | live v6→v7 migration; 16 feedback positions | unseen snow question trained position 0 exactly 15 times while leaving unobserved deeper positions at zero; Markov still owned one round; 24 output tokens in 16 target forwards; no synthetic horizon evidence |
 | Online horizon growth | position observations `[15,0,…] → [28,3,0,…]` | unseen soap-bubble question; ordinary K2 carries supplied three exact position-1 observations, teacher replay remained zero because no wider mismatch suffix existed; 24 output tokens in 14 target forwards |
+| Teacher-carry depth learning | position 1 observations `3 → 11` in one request | unseen autumn-leaves question; eight actual-prefix teacher predictions, seven confirmed by the following target token, zero replay failures; low measured position-1 accuracy correctly kept Markov from claiming that round |
 | Automatic Markov→MTP→Markov learning | 30.38 → 26.79 s; 12 → 9 target forwards | first novel request opened MTP and taught Council memory; after two confirmations the third request stayed entirely on a seven-token dialect phrase, loaded no MTP, preserved identical output, and used 1.34 GB peak RSS |
 | In-request Markov→MTP handoff | 24 output tokens in 9 target forwards | four learned Markov K4 waves followed by one exact 41-row hidden-state handoff and four MTP waves; 15 accepted drafts; no Qwen replay; 29.93 s generation and 1.46 GB peak RSS |
 | Compositional unseen token slot | unseen `CODE_DD44` via Markov only | three distinct target-confirmed code bindings induced unanimous Literal+Copy programs; fourth slot loaded no MTP, returned the exact requested code in three target forwards, and remained fully Qwen-verified |
