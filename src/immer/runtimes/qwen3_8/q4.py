@@ -49,12 +49,8 @@ Q4_HEAD_TENSORS = frozenset(
     }
 )
 Q4_BASE_POLICY = "q4_0-text-matrices+q8_0-embedding-head/v1"
-Q4_BALANCED_POLICY = (
-    "q4_0-gate-up-full-attn+q8_0-linear-attn-down-embedding-head/v1"
-)
-Q4_RECURRENT_POLICY = (
-    "q4_0-mlp-full-attn+q8_0-linear-attn-embedding-head/v1"
-)
+Q4_BALANCED_POLICY = "q4_0-gate-up-full-attn+q8_0-linear-attn-down-embedding-head/v1"
+Q4_RECURRENT_POLICY = "q4_0-mlp-full-attn+q8_0-linear-attn-embedding-head/v1"
 Q4_FORMAT_POLICIES = frozenset(
     (Q4_BASE_POLICY, Q4_BALANCED_POLICY, Q4_RECURRENT_POLICY)
 )
@@ -190,7 +186,9 @@ def _native_library() -> "Q4NativeKernel":
 class Q4NativeKernel:
     """Small ctypes bridge to the package-shipped native CPU kernel."""
 
-    def __init__(self, library: ctypes.CDLL, *, path: Path, build_seconds: float) -> None:
+    def __init__(
+        self, library: ctypes.CDLL, *, path: Path, build_seconds: float
+    ) -> None:
         self.library = library
         self.path = path
         self.build_seconds = float(build_seconds)
@@ -444,11 +442,17 @@ class Q4NativeKernel:
             raise Q4BankError("Q4 tensor width must be divisible by 32")
         return value
 
-    def quantize(self, values: Any, output: np.ndarray, *, fmt: str, threads: int) -> None:
+    def quantize(
+        self, values: Any, output: np.ndarray, *, fmt: str, threads: int
+    ) -> None:
         if values.ndim != 2 or values.dtype != values.new_empty(()).float().dtype:
             raise TypeError("native Q4 quantization requires a 2D float32 tensor")
         expected = values.shape[0] * self.row_bytes(fmt, values.shape[1])
-        if output.dtype != np.uint8 or not output.flags.c_contiguous or output.size != expected:
+        if (
+            output.dtype != np.uint8
+            or not output.flags.c_contiguous
+            or output.size != expected
+        ):
             raise ValueError("native Q4 output buffer has the wrong size")
         code = self.library.immer_q4_quantize_f32(
             self._pointer(values),
@@ -493,7 +497,10 @@ class Q4TensorEntry:
             not isinstance(entry.name, str)
             or not entry.name
             or len(entry.shape) != 2
-            or any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in entry.shape)
+            or any(
+                isinstance(x, bool) or not isinstance(x, int) or x <= 0
+                for x in entry.shape
+            )
             or entry.shape[1] % Q4_BLOCK_SIZE
             or entry.format not in _FORMAT_CODES
             or not isinstance(entry.file, str)
@@ -608,15 +615,49 @@ class _MappedTensor:
         try:
             metadata = os.fstat(descriptor)
             linked = _regular_file(path, "Q4 payload")
-            if (
-                metadata.st_size != entry.payload_bytes
-                or (metadata.st_dev, metadata.st_ino) != (linked.st_dev, linked.st_ino)
-            ):
+            if metadata.st_size != entry.payload_bytes or (
+                metadata.st_dev,
+                metadata.st_ino,
+            ) != (linked.st_dev, linked.st_ino):
                 raise Q4BankError(f"Q4 payload identity differs: {path}")
             self.mapping = mmap.mmap(descriptor, 0, access=mmap.ACCESS_READ)
         finally:
             os.close(descriptor)
         self.bytes = np.frombuffer(self.mapping, dtype=np.uint8)
+
+    def discard(self, *, offset: int = 0, length: int | None = None) -> bool:
+        """Drop resident read-only pages while keeping the stable mapping open."""
+
+        advice = getattr(mmap, "MADV_DONTNEED", None)
+        madvise = getattr(self.mapping, "madvise", None)
+        if advice is None or not callable(madvise):
+            return False
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+            or (
+                length is not None
+                and (
+                    isinstance(length, bool)
+                    or not isinstance(length, int)
+                    or length <= 0
+                )
+            )
+        ):
+            raise ValueError("mmap discard range is invalid")
+        size = len(self.mapping)
+        if offset >= size:
+            raise ValueError("mmap discard offset exceeds the payload")
+        stop = size if length is None else min(size, offset + length)
+        page = int(getattr(mmap, "PAGESIZE", 4096))
+        start_aligned = offset - offset % page
+        stop_aligned = min(size, ((stop + page - 1) // page) * page)
+        try:
+            madvise(advice, start_aligned, stop_aligned - start_aligned)
+        except (OSError, ValueError):
+            return False
+        return True
 
     def close(self) -> None:
         self.bytes = np.empty(0, dtype=np.uint8)
@@ -627,6 +668,10 @@ class _MappedTensor:
 class Q4BankMetrics:
     mapped_tensors: int = 0
     mapped_payload_bytes: int = 0
+    mapping_discard_calls: int = 0
+    mapping_discard_bytes: int = 0
+    mapping_discard_fallback_closes: int = 0
+    mapping_reopens: int = 0
     linear_calls: int = 0
     linear_group_calls: int = 0
     linear_row_calls: int = 0
@@ -665,6 +710,8 @@ class Q4Bank:
         self.threads = threads
         self.native = _native_library()
         self._mapped: dict[str, _MappedTensor] = {}
+        self._mapped_once: set[str] = set()
+        self._touched: set[str] = set()
         self._stats = Q4BankMetrics()
         self._lock = threading.RLock()
         self._closed = False
@@ -734,7 +781,64 @@ class Q4Bank:
             self._mapped[name] = mapped
             self._stats.mapped_tensors += 1
             self._stats.mapped_payload_bytes += entry.payload_bytes
+            if name in self._mapped_once:
+                self._stats.mapping_reopens += 1
+            else:
+                self._mapped_once.add(name)
+        self._touched.add(name)
         return entry, mapped
+
+    def discard_rows(self, name: str, start_row: int, row_count: int) -> None:
+        """Discard one consumed packed row interval without changing its bytes."""
+
+        with self._lock:
+            if self._closed:
+                raise Q4BankError("Q4 bank is closed")
+            entry = self.entries.get(name)
+            mapped = self._mapped.get(name)
+            if entry is None:
+                raise KeyError(name)
+            if (
+                isinstance(start_row, bool)
+                or not isinstance(start_row, int)
+                or start_row < 0
+                or isinstance(row_count, bool)
+                or not isinstance(row_count, int)
+                or row_count <= 0
+                or start_row + row_count > entry.shape[0]
+            ):
+                raise ValueError("Q4 discard row interval is invalid")
+            if mapped is None:
+                return
+            offset = start_row * entry.row_bytes
+            length = row_count * entry.row_bytes
+            if mapped.discard(offset=offset, length=length):
+                self._stats.mapping_discard_calls += 1
+                self._stats.mapping_discard_bytes += length
+
+    def release_touched(self) -> None:
+        """Remove residency accumulated since the previous execution boundary."""
+
+        with self._lock:
+            if self._closed:
+                raise Q4BankError("Q4 bank is closed")
+            names = tuple(self._touched)
+            self._touched.clear()
+            for name in names:
+                mapped = self._mapped.get(name)
+                if mapped is None:
+                    continue
+                entry = self.entries[name]
+                if mapped.discard():
+                    self._stats.mapping_discard_calls += 1
+                    self._stats.mapping_discard_bytes += entry.payload_bytes
+                    continue
+                # Platforms without MADV_DONTNEED still get the same bounded
+                # residency by unmapping. The next exact access reopens bytes.
+                self._mapped.pop(name).close()
+                self._stats.mapping_discard_fallback_closes += 1
+                self._stats.mapping_discard_calls += 1
+                self._stats.mapping_discard_bytes += entry.payload_bytes
 
     def linear(self, values: Any, name: str, *, output_dtype: Any | None = None) -> Any:
         import torch
@@ -749,9 +853,12 @@ class Q4Bank:
                 raise Q4BankError("Q4 execution is currently CPU-only")
             leading = tuple(values.shape[:-1])
             input_rows = values.numel() // values.shape[-1]
-            compute = values.detach().to(dtype=torch.float32).reshape(
-                input_rows, entry.shape[1]
-            ).contiguous()
+            compute = (
+                values.detach()
+                .to(dtype=torch.float32)
+                .reshape(input_rows, entry.shape[1])
+                .contiguous()
+            )
             output = torch.empty((input_rows, entry.shape[0]), dtype=torch.float32)
             code = self.native.library.immer_q4_linear_f32(
                 self.native._pointer(compute),
@@ -800,9 +907,12 @@ class Q4Bank:
                 raise Q4BankError("Q4 execution is currently CPU-only")
             leading = tuple(values.shape[:-1])
             input_rows = values.numel() // input_columns
-            compute = values.detach().to(dtype=torch.float32).reshape(
-                input_rows, input_columns
-            ).contiguous()
+            compute = (
+                values.detach()
+                .to(dtype=torch.float32)
+                .reshape(input_rows, input_columns)
+                .contiguous()
+            )
             outputs = [
                 torch.empty((input_rows, entry.shape[0]), dtype=torch.float32)
                 for entry in entries
@@ -879,9 +989,12 @@ class Q4Bank:
                 raise Q4BankError("Q4 execution is currently CPU-only")
             leading = tuple(values.shape[:-1])
             input_rows = values.numel() // values.shape[-1]
-            compute = values.detach().to(dtype=torch.float32).reshape(
-                input_rows, entry.shape[1]
-            ).contiguous()
+            compute = (
+                values.detach()
+                .to(dtype=torch.float32)
+                .reshape(input_rows, entry.shape[1])
+                .contiguous()
+            )
             ids = torch.tensor(row_ids, dtype=torch.int64)
             output = torch.empty((input_rows, len(row_ids)), dtype=torch.float32)
             code = self.native.library.immer_q4_linear_rows_f32(
@@ -897,7 +1010,9 @@ class Q4Bank:
                 self.threads,
             )
             if code:
-                raise Q4BankError(f"native Q4 selected-row linear failed with code {code}")
+                raise Q4BankError(
+                    f"native Q4 selected-row linear failed with code {code}"
+                )
             dtype = values.dtype if output_dtype is None else output_dtype
             result = output.to(dtype=dtype).reshape(*leading, len(row_ids))
             self._stats.linear_calls += 1
@@ -946,9 +1061,12 @@ class Q4Bank:
                 raise Q4BankError("Q4 execution is currently CPU-only")
             leading = tuple(values.shape[:-1])
             input_rows = values.numel() // input_columns
-            compute = values.detach().to(dtype=torch.float32).reshape(
-                input_rows, input_columns
-            ).contiguous()
+            compute = (
+                values.detach()
+                .to(dtype=torch.float32)
+                .reshape(input_rows, input_columns)
+                .contiguous()
+            )
             ids = torch.tensor(row_ids, dtype=torch.int64)
             outputs = tuple(
                 torch.empty((input_rows, len(row_ids)), dtype=torch.float32)
@@ -1083,7 +1201,9 @@ class Q4Bank:
                 sparse_values,
                 sparse_coords,
             ):
-                tensors.append(value if isinstance(value, torch.Tensor) else torch.as_tensor(value))
+                tensors.append(
+                    value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+                )
             full_value, full_ids, sparse_value, sparse_ids = tensors
             if (
                 full_value.ndim != 3
@@ -1212,15 +1332,25 @@ class Q4Bank:
             ):
                 raise ValueError("Q4 fused MLP block topology is invalid")
             ids = (
-                pilot_ids
-                if isinstance(pilot_ids, torch.Tensor)
-                else torch.tensor(pilot_ids)
-            ).detach().to(dtype=torch.int64).contiguous()
+                (
+                    pilot_ids
+                    if isinstance(pilot_ids, torch.Tensor)
+                    else torch.tensor(pilot_ids)
+                )
+                .detach()
+                .to(dtype=torch.int64)
+                .contiguous()
+            )
             coeff = (
-                coefficients
-                if isinstance(coefficients, torch.Tensor)
-                else torch.tensor(coefficients)
-            ).detach().to(dtype=torch.float64).contiguous()
+                (
+                    coefficients
+                    if isinstance(coefficients, torch.Tensor)
+                    else torch.tensor(coefficients)
+                )
+                .detach()
+                .to(dtype=torch.float64)
+                .contiguous()
+            )
             block_count = gate_entry.shape[0] // block_size
             if (
                 ids.ndim != 2
@@ -1230,22 +1360,35 @@ class Q4Bank:
             ):
                 raise ValueError("Q4 fused MLP pilots and coefficients disagree")
             scale = (
-                affine_scale
-                if isinstance(affine_scale, torch.Tensor)
-                else torch.tensor(affine_scale)
-            ).detach().to(dtype=torch.float32).contiguous()
+                (
+                    affine_scale
+                    if isinstance(affine_scale, torch.Tensor)
+                    else torch.tensor(affine_scale)
+                )
+                .detach()
+                .to(dtype=torch.float32)
+                .contiguous()
+            )
             bias = (
-                affine_bias
-                if isinstance(affine_bias, torch.Tensor)
-                else torch.tensor(affine_bias)
-            ).detach().to(dtype=torch.float32).contiguous()
+                (
+                    affine_bias
+                    if isinstance(affine_bias, torch.Tensor)
+                    else torch.tensor(affine_bias)
+                )
+                .detach()
+                .to(dtype=torch.float32)
+                .contiguous()
+            )
             if scale.shape != (down_entry.shape[0],) or bias.shape != scale.shape:
                 raise ValueError("Q4 fused MLP affine vectors disagree with Down")
             leading = tuple(values.shape[:-1])
             input_rows = values.numel() // values.shape[-1]
-            compute = values.detach().to(dtype=torch.float32).reshape(
-                input_rows, values.shape[-1]
-            ).contiguous()
+            compute = (
+                values.detach()
+                .to(dtype=torch.float32)
+                .reshape(input_rows, values.shape[-1])
+                .contiguous()
+            )
             output = torch.empty((input_rows, down_entry.shape[0]), dtype=torch.float32)
             selected = torch.empty(
                 (input_rows, selected_block_count), dtype=torch.int64
@@ -1292,8 +1435,8 @@ class Q4Bank:
             self._stats.input_quantizations += input_rows * (1 + down_blocks)
             self._stats.linear_input_rows += input_rows * 3
             self._stats.selected_input_blocks += input_rows * down_blocks
-            self._stats.selected_output_rows += input_rows * 2 * (
-                pilot_count + selected_neurons
+            self._stats.selected_output_rows += (
+                input_rows * 2 * (pilot_count + selected_neurons)
             )
             self._stats.logical_weight_bytes += actual
             self._stats.output_bytes += result.numel() * result.element_size()
@@ -1359,7 +1502,9 @@ class Q4Bank:
                 raise Q4BankError("Q4 fused DeltaNet projection topology changed")
 
             def f32(value: Any, field: str) -> Any:
-                tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+                tensor = (
+                    value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+                )
                 if tensor.device.type != "cpu" or not tensor.is_floating_point():
                     raise ValueError(f"{field} must be a floating CPU tensor")
                 return tensor.detach().to(dtype=torch.float32).contiguous()
@@ -1381,8 +1526,7 @@ class Q4Bank:
                 or delta_bias.shape != (value_heads,)
                 or norm.shape != (value_dim,)
                 or previous_conv.shape != (1, qkv_rows, kernel_size)
-                or previous_recurrent.shape
-                != (1, value_heads, key_dim, value_dim)
+                or previous_recurrent.shape != (1, value_heads, key_dim, value_dim)
             ):
                 raise ValueError("Q4 fused DeltaNet control/state shape is invalid")
             if (
@@ -1530,6 +1674,7 @@ class Q4Bank:
             for mapped in self._mapped.values():
                 mapped.close()
             self._mapped.clear()
+            self._touched.clear()
             self._closed = True
 
 
@@ -1547,7 +1692,11 @@ class Q4BankBuilder:
         format_policy: str = Q4_BASE_POLICY,
         reuse_root: str | Path | None = None,
     ) -> None:
-        if isinstance(row_chunk, bool) or not isinstance(row_chunk, int) or row_chunk <= 0:
+        if (
+            isinstance(row_chunk, bool)
+            or not isinstance(row_chunk, int)
+            or row_chunk <= 0
+        ):
             raise ValueError("Q4 row chunk must be a positive integer")
         if threads is None:
             threads = min(16, os.cpu_count() or 1)
@@ -1604,11 +1753,16 @@ class Q4BankBuilder:
             dtype = str(raw.get("dtype", "")).upper()
             if (
                 not isinstance(name, str)
-                or not (name.startswith("model.language_model.") or name == "lm_head.weight")
+                or not (
+                    name.startswith("model.language_model.") or name == "lm_head.weight"
+                )
                 or not isinstance(shape, (list, tuple))
                 or len(shape) != 2
                 or dtype != "BF16"
-                or any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in shape)
+                or any(
+                    isinstance(x, bool) or not isinstance(x, int) or x <= 0
+                    for x in shape
+                )
                 or shape[1] % Q4_BLOCK_SIZE
             ):
                 continue
@@ -1655,8 +1809,7 @@ class Q4BankBuilder:
             "payload_bytes": sum(row["payload_bytes"] for row in tensors),
             "reused_payload_bytes": reusable_payload_bytes,
             "new_payload_bytes": (
-                sum(row["payload_bytes"] for row in tensors)
-                - reusable_payload_bytes
+                sum(row["payload_bytes"] for row in tensors) - reusable_payload_bytes
             ),
             "tensors": tensors,
         }
@@ -1839,10 +1992,15 @@ class Q4BankBuilder:
                 raise Q4BankError("Q4 build state contains an invalid tensor")
             entry = Q4TensorEntry.from_document(raw)
             path = self.root / "weights" / entry.file
-            if _regular_file(path, "completed Q4 payload").st_size != entry.payload_bytes:
+            if (
+                _regular_file(path, "completed Q4 payload").st_size
+                != entry.payload_bytes
+            ):
                 raise Q4BankError("completed Q4 payload differs from build state")
             if _file_sha256(path) != entry.payload_sha256:
-                raise Q4BankError("completed Q4 payload digest differs from build state")
+                raise Q4BankError(
+                    "completed Q4 payload digest differs from build state"
+                )
             completed[entry.name] = entry
         eligible = self._eligible()
         started = time.time_ns()
@@ -1907,7 +2065,10 @@ class Q4BankBuilder:
                 progress=progress,
             )
             completed[name] = entry
-            state = {**state, "completed": [asdict(completed[key]) for key in sorted(completed)]}
+            state = {
+                **state,
+                "completed": [asdict(completed[key]) for key in sorted(completed)],
+            }
             self._save_state(state)
             if progress is not None:
                 progress(

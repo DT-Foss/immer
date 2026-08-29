@@ -92,9 +92,7 @@ _GENERATION_RECEIPT_FIELDS = (
     "state_bytes",
     "stopped_on_eos",
 )
-RESULT_CELL_GENERATION_POLICY_SCHEMA = (
-    "immer.qwen3.8-result-cell-generation-policy/v1"
-)
+RESULT_CELL_GENERATION_POLICY_SCHEMA = "immer.qwen3.8-result-cell-generation-policy/v1"
 _RESULT_CELL_CODE_REVISION_LENGTHS = frozenset((40, 64))
 
 
@@ -327,9 +325,7 @@ def _nested_draft_horizons(value: object) -> tuple[DraftWindowNestedHorizon, ...
                 or not isinstance(row_window, int)
                 or not 2 <= row_window <= observed_window
             ):
-                raise Qwen38ChatError(
-                    "rolling evidence has an invalid executed window"
-                )
+                raise Qwen38ChatError("rolling evidence has an invalid executed window")
             if candidate >= row_window:
                 continue
             if (
@@ -342,9 +338,7 @@ def _nested_draft_horizons(value: object) -> tuple[DraftWindowNestedHorizon, ...
                 )
             visible = candidate - 1
             if len(row_proposal) < visible:
-                raise Qwen38ChatError(
-                    "rolling evidence lacks its staged nested prefix"
-                )
+                raise Qwen38ChatError("rolling evidence lacks its staged nested prefix")
             if visible <= 0:
                 continue
             wave_count += 1
@@ -530,9 +524,7 @@ def _anchor_hit_evidence(
     suffix_tokens = prompt_tokens - prefix_tokens
     prefill_sweeps_executed = int(suffix_tokens > 0)
     expected_forwards = (
-        generation["generated_tokens"]
-        + prefill_sweeps_executed
-        - (1 - final_commit)
+        generation["generated_tokens"] + prefill_sweeps_executed - (1 - final_commit)
     )
     if forward_executed != expected_forwards:
         raise Qwen38ChatError("anchor generation forward count is inconsistent")
@@ -604,9 +596,7 @@ class _OwnedRuntime:
         self.delta_head_router = delta_head_router
         self.q4_receipt = None if q4_bank is None else q4_bank.metrics()
         self.exact_head_receipt = (
-            None
-            if exact_head_index is None
-            else exact_head_index.receipt.to_record()
+            None if exact_head_index is None else exact_head_index.receipt.to_record()
         )
         self.fast_mlp_receipt = (
             None if fast_mlp_mount is None else fast_mlp_mount.receipt.to_record()
@@ -817,14 +807,11 @@ def _open_local_runtime(
         ):
             configured_delta_layers = fast_mlp_active_layers
             if configured_delta_layers is None:
-                configured_delta_layers = tuple(
-                    fast_mlp_mount.executor.active_layers
-                )
+                configured_delta_layers = tuple(fast_mlp_mount.executor.active_layers)
             delta_layers = tuple(
                 layer
                 for layer in configured_delta_layers
-                if 0 <= layer < config.n_layers
-                and not config.is_full_attention(layer)
+                if 0 <= layer < config.n_layers and not config.is_full_attention(layer)
             )
             if delta_layers:
                 delta_head_router = PackedDeltaHeadRouter(
@@ -1096,9 +1083,7 @@ class Qwen38CausalChat:
         max_new_tokens = _positive_int(max_new_tokens, "max_new_tokens")
         max_context_tokens = _positive_int(max_context_tokens, "max_context_tokens")
         head_block_rows = _positive_int(head_block_rows, "head_block_rows")
-        if exact_head_root is not None and not isinstance(
-            exact_head_root, (str, Path)
-        ):
+        if exact_head_root is not None and not isinstance(exact_head_root, (str, Path)):
             raise TypeError("exact_head_root must be a local path or None")
         exact_head_max_bytes = _positive_int(
             exact_head_max_bytes, "exact_head_max_bytes"
@@ -1181,7 +1166,9 @@ class Qwen38CausalChat:
         ):
             raise ValueError("adaptive draft-window ceiling must admit at least K=4")
         if draft_mode is not None and anchor_cache is not None:
-            raise ValueError("rolling drafting and anchor restore cannot share a request")
+            raise ValueError(
+                "rolling drafting and anchor restore cannot share a request"
+            )
         if fast_mlp_root is not None and not isinstance(fast_mlp_root, (str, Path)):
             raise TypeError("fast_mlp_root must be a local path or None")
         if fast_mlp_online_state_path is not None and not isinstance(
@@ -1203,12 +1190,9 @@ class Qwen38CausalChat:
                 ) from exc
             if (
                 not fast_mlp_active_layers
-                or fast_mlp_active_layers
-                != tuple(sorted(set(fast_mlp_active_layers)))
+                or fast_mlp_active_layers != tuple(sorted(set(fast_mlp_active_layers)))
                 or any(
-                    isinstance(layer, bool)
-                    or not isinstance(layer, int)
-                    or layer < 0
+                    isinstance(layer, bool) or not isinstance(layer, int) or layer < 0
                     for layer in fast_mlp_active_layers
                 )
             ):
@@ -1234,16 +1218,12 @@ class Qwen38CausalChat:
         if delta_head_state_path is not None and q4_root is None:
             raise ValueError("delta_head_state_path requires Q4 execution")
         if q4_root is not None and any(
-            value is not None
-            for value in (exact_head_root, range_markov_state_path)
+            value is not None for value in (exact_head_root, range_markov_state_path)
         ):
-            raise ValueError(
-                "Q4 execution replaces exact-head and BF16 range prefetch"
-            )
+            raise ValueError("Q4 execution replaces exact-head and BF16 range prefetch")
         if result_cell_code_revision is not None and (
             not isinstance(result_cell_code_revision, str)
-            or len(result_cell_code_revision)
-            not in _RESULT_CELL_CODE_REVISION_LENGTHS
+            or len(result_cell_code_revision) not in _RESULT_CELL_CODE_REVISION_LENGTHS
             or set(result_cell_code_revision) - _SHA256
         ):
             raise ValueError(
@@ -1487,9 +1467,7 @@ class Qwen38CausalChat:
                 "max_prefetch_bytes": self._range_prefetch_max_bytes,
                 "beam_horizon": self._range_prefetch_beam_horizon,
                 "beam_width": self._range_prefetch_beam_width,
-                "hint_cooldown_operations": (
-                    self._range_prefetch_hint_cooldown
-                ),
+                "hint_cooldown_operations": (self._range_prefetch_hint_cooldown),
                 "min_confidence": self._range_prefetch_min_confidence,
                 "min_support": self._range_prefetch_min_support,
                 "prefetch": "local-posix-fadvise-willneed/v1",
@@ -1508,9 +1486,7 @@ class Qwen38CausalChat:
             }
             runtime = self._runtime
             receipt = (
-                None
-                if runtime is None
-                else getattr(runtime, "fast_mlp_receipt", None)
+                None if runtime is None else getattr(runtime, "fast_mlp_receipt", None)
             )
             if receipt is not None:
                 policy["fast_mlp"]["artifacts"] = {
@@ -1665,9 +1641,7 @@ class Qwen38CausalChat:
             system_prompt_sha256=hashlib.sha256(
                 self._system_prompt.encode("utf-8")
             ).hexdigest(),
-            generation_policy_sha256=(
-                self._result_cell_generation_policy_sha256()
-            ),
+            generation_policy_sha256=(self._result_cell_generation_policy_sha256()),
         )
         return qwen_result_binding_evidence(binding)
 
@@ -1885,8 +1859,7 @@ class Qwen38CausalChat:
             # rows.  A 10% reuse credit allows only near-certain phrases to beat
             # direct K1 instead of letting marginal confidence multiply work.
             decoder_options["round_window_work_costs"] = {
-                window: 1.0 + 0.9 * (window - 1)
-                for window in (1, 4, 8, 16)
+                window: 1.0 + 0.9 * (window - 1) for window in (1, 4, 8, 16)
             }
         try:
             generated = Qwen38K4SpeculativeDecoder(
@@ -1985,9 +1958,7 @@ class Qwen38CausalChat:
                     or getattr(row, "round_policy", None) is not None
                 ],
                 "adaptive_windows": getattr(evidence, "adaptive_windows", False),
-                "used_window_sizes": list(
-                    getattr(evidence, "used_window_sizes", ())
-                ),
+                "used_window_sizes": list(getattr(evidence, "used_window_sizes", ())),
                 "window_size": getattr(evidence, "window_size", draft_window),
                 "schema": evidence.schema,
                 "nested_horizons": [
@@ -2039,7 +2010,10 @@ class Qwen38CausalChat:
             self._record_exact_head_request(runtime, exact_before)
             return generated.token_ids, mapped_evidence
         except TimeoutError:
-            if adaptive_selection is not None and self._pending_draft_window_feedback is None:
+            if (
+                adaptive_selection is not None
+                and self._pending_draft_window_feedback is None
+            ):
                 elapsed = time.perf_counter() - rolling_started
                 source_bytes = max(
                     0,
@@ -2180,9 +2154,7 @@ class Qwen38CausalChat:
             ):
                 delta = value - previous
                 if delta < 0:
-                    raise Qwen38ChatError(
-                        "exact-head request counters moved backwards"
-                    )
+                    raise Qwen38ChatError("exact-head request counters moved backwards")
                 counters[key] = delta
         request = {
             **counters,
@@ -2205,10 +2177,7 @@ class Qwen38CausalChat:
         if mount is None or before is None:
             return None
         after = mount.metrics()
-        delta = {
-            key: int(after.get(key, 0)) - int(before.get(key, 0))
-            for key in after
-        }
+        delta = {key: int(after.get(key, 0)) - int(before.get(key, 0)) for key in after}
         if any(value < 0 for value in delta.values()):
             raise Qwen38ChatError("fast-MLP request counters moved backwards")
         aux = delta["source_body_bytes"]
@@ -2222,9 +2191,7 @@ class Qwen38CausalChat:
             "total_source_body_bytes": (
                 target_source_body_bytes + draft_source_body_bytes + aux
             ),
-            "transpose_source_body_bytes": delta[
-                "transpose_source_body_bytes"
-            ],
+            "transpose_source_body_bytes": delta["transpose_source_body_bytes"],
         }
         for field in (
             "online_confirmed_rows",
@@ -2258,10 +2225,7 @@ class Qwen38CausalChat:
         if router is None or before is None:
             return None
         after = router.metrics()
-        delta = {
-            key: int(after.get(key, 0)) - int(before.get(key, 0))
-            for key in after
-        }
+        delta = {key: int(after.get(key, 0)) - int(before.get(key, 0)) for key in after}
         if any(value < 0 for value in delta.values()):
             raise Qwen38ChatError("Delta head request counters moved backwards")
         request: dict[str, Any] = {
@@ -2562,6 +2526,10 @@ class Qwen38CausalChat:
                 "logical_weight_bytes",
                 "mapped_payload_bytes",
                 "mapped_tensors",
+                "mapping_discard_bytes",
+                "mapping_discard_calls",
+                "mapping_discard_fallback_closes",
+                "mapping_reopens",
                 "output_bytes",
                 "selected_input_blocks",
                 "selected_input_coordinates",

@@ -108,10 +108,7 @@ class _ExactPackedBank:
                 start = block * 32
                 dense[row, start : start + 32] = block_values[row, offset]
         self.logical_weight_bytes += (
-            len(block_values)
-            * block_values.shape[1]
-            * self.weights[name].shape[0]
-            * 18
+            len(block_values) * block_values.shape[1] * self.weights[name].shape[0] * 18
         )
         return torch.nn.functional.linear(dense, self.weights[name]).to(output_dtype)
 
@@ -520,13 +517,9 @@ class Q4BankTests(unittest.TestCase):
             }
             self.assertEqual(len(formats), 5)
             self.assertEqual(formats["lm_head.weight"], Q8_0)
+            self.assertEqual(formats["model.language_model.embed_tokens.weight"], Q8_0)
             self.assertEqual(
-                formats["model.language_model.embed_tokens.weight"], Q8_0
-            )
-            self.assertEqual(
-                formats[
-                    "model.language_model.layers.0.mlp.gate_proj.weight"
-                ],
+                formats["model.language_model.layers.0.mlp.gate_proj.weight"],
                 Q4_0,
             )
             self.assertEqual(
@@ -624,9 +617,7 @@ class Q4BankTests(unittest.TestCase):
                 routed_sparse_values = torch.tensor(
                     [[0.25, -0.75], [0.5, 0.125]], dtype=torch.float32
                 )
-                routed_sparse_ids = torch.tensor(
-                    [[40, 50], [3, 7]], dtype=torch.int64
-                )
+                routed_sparse_ids = torch.tensor([[40, 50], [3, 7]], dtype=torch.int64)
                 routed = bank.linear_routed(
                     block_values,
                     block_ids,
@@ -656,6 +647,27 @@ class Q4BankTests(unittest.TestCase):
                 self.assertEqual(metrics["selected_output_rows"], 9)
                 self.assertEqual(metrics["selected_input_blocks"], 4)
                 self.assertEqual(metrics["selected_input_coordinates"], 4)
+                before_release = bank.linear(
+                    value,
+                    name,
+                    output_dtype=torch.float32,
+                )
+                bank.release_touched()
+                after_release = bank.linear(
+                    value,
+                    name,
+                    output_dtype=torch.float32,
+                )
+                torch.testing.assert_close(
+                    after_release,
+                    before_release,
+                    rtol=0.0,
+                    atol=0.0,
+                )
+                self.assertGreater(
+                    bank.metrics()["mapping_discard_calls"],
+                    0,
+                )
             finally:
                 bank.close()
 
@@ -665,15 +677,9 @@ class Q4BankTests(unittest.TestCase):
             generator = torch.Generator().manual_seed(991)
             base = "model.language_model.layers.0.mlp"
             tensors = {
-                f"{base}.gate_proj.weight": torch.randn(
-                    (64, 64), generator=generator
-                ),
-                f"{base}.up_proj.weight": torch.randn(
-                    (64, 64), generator=generator
-                ),
-                f"{base}.down_proj.weight": torch.randn(
-                    (32, 64), generator=generator
-                ),
+                f"{base}.gate_proj.weight": torch.randn((64, 64), generator=generator),
+                f"{base}.up_proj.weight": torch.randn((64, 64), generator=generator),
+                f"{base}.down_proj.weight": torch.randn((32, 64), generator=generator),
             }
             Q4BankBuilder(
                 root,
@@ -729,8 +735,7 @@ class Q4BankTests(unittest.TestCase):
                 ).to(torch.float64)
                 coeff = torch.tensor(coefficients, dtype=torch.float64)
                 scores = torch.clamp_min(
-                    coeff[None, :, 0]
-                    + (features * coeff[None, :, 1:]).sum(dim=2),
+                    coeff[None, :, 0] + (features * coeff[None, :, 1:]).sum(dim=2),
                     0.0,
                 )
                 expected_selected = torch.tensor(
@@ -742,9 +747,7 @@ class Q4BankTests(unittest.TestCase):
                 masked = torch.zeros_like(activated)
                 for row, (block,) in enumerate(expected_selected.tolist()):
                     start = block * 32
-                    masked[row, start : start + 32] = activated[
-                        row, start : start + 32
-                    ]
+                    masked[row, start : start + 32] = activated[row, start : start + 32]
                 expected = bank.linear(
                     masked,
                     f"{base}.down_proj.weight",
@@ -799,14 +802,19 @@ class Q4BankTests(unittest.TestCase):
                 hidden = torch.randn(
                     (1, 1, hidden_dim), generator=generator, dtype=torch.bfloat16
                 )
-                conv_weight = torch.randn(
-                    (qkv_rows, 1, 4), generator=generator, dtype=torch.bfloat16
-                ) * 0.05
+                conv_weight = (
+                    torch.randn(
+                        (qkv_rows, 1, 4), generator=generator, dtype=torch.bfloat16
+                    )
+                    * 0.05
+                )
                 a_log = torch.randn(value_heads, generator=generator) * 0.1
                 dt_bias = torch.randn(value_heads, generator=generator) * 0.1
-                norm_weight = torch.randn(
-                    value_dim, generator=generator, dtype=torch.bfloat16
-                ) * 0.1 + 1.0
+                norm_weight = (
+                    torch.randn(value_dim, generator=generator, dtype=torch.bfloat16)
+                    * 0.1
+                    + 1.0
+                )
                 state = DeltaNetState(
                     conv=torch.randn(
                         (1, qkv_rows, 4), generator=generator, dtype=torch.bfloat16
@@ -1032,7 +1040,9 @@ class Q4BankTests(unittest.TestCase):
                     inventory_fingerprint=_SOURCE["inventory_fingerprint"],
                 )
 
-    def test_weight_pager_routes_linears_embeddings_and_head_without_bf16_reads(self) -> None:
+    def test_weight_pager_routes_linears_embeddings_and_head_without_bf16_reads(
+        self,
+    ) -> None:
         from immer.runtimes.qwen3_8.pager import Qwen38PagerError, Qwen38WeightPager
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -1070,18 +1080,36 @@ class Q4BankTests(unittest.TestCase):
                 self.assertEqual(tuple(grouped[1].shape), (1, 4))
                 embedding = pager.embedding((6, 2, 6))
                 self.assertEqual(tuple(embedding.shape), (3, 64))
+                head_hidden = torch.ones((1, 64), dtype=torch.bfloat16)
+                complete_logits = bank.linear(
+                    head_hidden,
+                    "lm_head.weight",
+                    output_dtype=torch.bfloat16,
+                )
+                complete_ids = torch.arange(9, dtype=torch.long).reshape(1, -1)
+                expected_values, expected_ids = pager._stable_topk(
+                    complete_logits,
+                    complete_ids,
+                    2,
+                )
+                bank.release_touched()
                 values, token_ids = pager.topk_logits(
-                    torch.ones((1, 64), dtype=torch.bfloat16),
+                    head_hidden,
                     k=2,
+                    block_rows=3,
                 )
                 self.assertEqual(tuple(values.shape), (1, 2))
                 self.assertEqual(tuple(token_ids.shape), (1, 2))
+                torch.testing.assert_close(values, expected_values, rtol=0.0, atol=0.0)
+                torch.testing.assert_close(token_ids, expected_ids, rtol=0.0, atol=0.0)
                 self.assertEqual(source.raw_calls, [])
                 metrics = pager.metrics()
                 self.assertTrue(metrics["q4_bank_attached"])
                 self.assertEqual(metrics["logical_weight_bytes"], 0)
                 self.assertGreater(metrics["q4_logical_weight_bytes"], 0)
                 self.assertEqual(metrics["grouped_linear_calls"], 1)
+                self.assertGreaterEqual(metrics["q4_linear_row_calls"], 3)
+                self.assertGreater(metrics["q4_mapping_discard_calls"], 0)
                 with mock.patch("immer.runtimes.qwen3_8.pager.gc.collect") as collect:
                     pager.release()
                 collect.assert_not_called()
