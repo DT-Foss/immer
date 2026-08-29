@@ -23,6 +23,12 @@ All notable changes to IMMER are recorded here.
 - Expanded the exact residual-PQ head query union from four to sixteen rows.
   Certified pruning and stable top-k parity now cover the complete rolling
   window; the weight-only builder records the same K16 scorer bound.
+- Added a second exact pruning tier inside surviving head leaves. It evaluates
+  each vocabulary row's existing PQ code tuple plus residual radius, unions the
+  possible winners across K<=16 queries, and direct-fills only those checkpoint
+  rows. Selected rows are zero-filled into the canonical page shape before the
+  unchanged FP32/BF16 scorer, preserving kernel shape and stable ties. A leaf
+  with no certified byte saving uses the former contiguous read once.
 - Added a complete prompt-free Fast-MLP builder for all 64 Qwen layers. It
   computes Gate/Up Gaussian joint moments directly from local causal weights,
   constructs deterministic p4/k32 pilots, and publishes the existing packed

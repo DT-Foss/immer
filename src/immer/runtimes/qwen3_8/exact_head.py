@@ -191,8 +191,21 @@ class ExactHeadMetrics:
     rows_scored: int = 0
     rows_pruned: int = 0
     bound_nodes: int = 0
+    row_bound_rows: int = 0
+    selected_row_reads: int = 0
+    selected_rows_scored: int = 0
+    full_leaf_fallbacks: int = 0
+    selected_row_logical_bytes: int = 0
+    row_certificate_logical_bytes_avoided: int = 0
     logical_head_bytes_avoided: int = 0
     last_fallback_reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _QueryBoundTables:
+    scores: np.ndarray
+    absolute: np.ndarray
+    hnorm: np.ndarray
 
 
 def _sha256_bytes(data: bytes | memoryview) -> str:
@@ -1092,49 +1105,58 @@ class ExactHeadIndex:
             return False, "query-subnormal"
         return True, ""
 
-    def node_caps(self, hidden: torch.Tensor) -> np.ndarray:
+    def _query_bound_tables(self, hidden: torch.Tensor) -> _QueryBoundTables:
         flat = np.asarray(hidden.detach().cpu().float().numpy(), dtype=np.float64).reshape(
             -1, self.binding.hidden_size
         )
         codebooks = np.asarray(self._tensors["codebooks"].numpy(), dtype=np.float64)
-        presence = np.asarray(self._tensors["node_presence"].numpy())
-        residual = np.asarray(
-            self._tensors["node_max_residual"].numpy(),
-            dtype=np.float64,
-        )
-        k = codebooks.shape[1]
-        node_count = len(presence)
-        caps = np.zeros((len(flat), node_count), dtype=np.float64)
-        absolute = np.zeros_like(caps)
+        queries = len(flat)
+        subspaces, k, _width = codebooks.shape
+        scores = np.empty((queries, subspaces, k), dtype=np.float64)
+        absolute = np.empty_like(scores)
         hnorm = np.asarray(_norm_upper(flat), dtype=np.float64)
-        for subspace in range(codebooks.shape[0]):
+        for subspace in range(subspaces):
             begin = subspace * self.config.subspace_width
             end = min(self.binding.hidden_size, begin + self.config.subspace_width)
             h = flat[:, begin:end]
             c = codebooks[subspace, :, : end - begin]
-            scores = h @ c.T
-            abs_scores = np.abs(h) @ np.abs(c).T
+            raw_scores = h @ c.T
+            raw_absolute = np.abs(h) @ np.abs(c).T
             u64 = 2.0**-53
             gamma64 = (end - begin) * u64 / (1.0 - (end - begin) * u64)
-            scores = np.nextafter(scores + gamma64 * abs_scores, np.inf)
-            abs_scores = np.nextafter((1.0 + gamma64) * abs_scores, np.inf)
-            unpacked = np.unpackbits(
-                presence[:, subspace], axis=-1, bitorder="little"
-            )[:, :k].astype(bool)
-            for node in range(node_count):
-                codes = unpacked[node]
-                caps[:, node] += np.max(scores[:, codes], axis=1)
-                absolute[:, node] += np.max(abs_scores[:, codes], axis=1)
-        u64 = 2.0**-53
-        gamma_subspaces = codebooks.shape[0] * u64 / (
-            1.0 - codebooks.shape[0] * u64
+            scores[:, subspace] = np.nextafter(
+                raw_scores + gamma64 * raw_absolute,
+                np.inf,
+            )
+            absolute[:, subspace] = np.nextafter(
+                raw_absolute / (1.0 - gamma64),
+                np.inf,
+            )
+        return _QueryBoundTables(
+            scores=scores,
+            absolute=absolute,
+            hnorm=hnorm,
         )
+
+    def _finish_caps(
+        self,
+        caps: np.ndarray,
+        absolute: np.ndarray,
+        *,
+        hnorm: np.ndarray,
+        residual: np.ndarray,
+    ) -> np.ndarray:
+        subspaces = self._tensors["codebooks"].shape[0]
+        u64 = 2.0**-53
+        gamma_subspaces = subspaces * u64 / (1.0 - subspaces * u64)
         caps = np.nextafter(caps + gamma_subspaces * absolute, np.inf)
         absolute = np.nextafter(
-            absolute / (1.0 - gamma_subspaces), np.inf
+            absolute / (1.0 - gamma_subspaces),
+            np.inf,
         )
         residual_term = np.nextafter(
-            hnorm[:, None] * residual[None, :], np.inf
+            hnorm[:, None] * residual[None, :],
+            np.inf,
         )
         caps = np.nextafter(caps + residual_term, np.inf)
         absolute = np.nextafter(absolute + residual_term, np.inf)
@@ -1155,6 +1177,79 @@ class ExactHeadIndex:
         ) | (accumulator > float(torch.finfo(torch.bfloat16).max))
         accumulator[overflow] = np.inf
         return accumulator
+
+    def _node_caps_from_tables(self, tables: _QueryBoundTables) -> np.ndarray:
+        presence = np.asarray(self._tensors["node_presence"].numpy())
+        residual = np.asarray(
+            self._tensors["node_max_residual"].numpy(),
+            dtype=np.float64,
+        )
+        k = tables.scores.shape[2]
+        node_count = len(presence)
+        caps = np.zeros((len(tables.hnorm), node_count), dtype=np.float64)
+        absolute = np.zeros_like(caps)
+        for subspace in range(tables.scores.shape[1]):
+            unpacked = np.unpackbits(
+                presence[:, subspace], axis=-1, bitorder="little"
+            )[:, :k].astype(bool)
+            for node in range(node_count):
+                codes = unpacked[node]
+                caps[:, node] += np.max(
+                    tables.scores[:, subspace, codes], axis=1
+                )
+                absolute[:, node] += np.max(
+                    tables.absolute[:, subspace, codes], axis=1
+                )
+        return self._finish_caps(
+            caps,
+            absolute,
+            hnorm=tables.hnorm,
+            residual=residual,
+        )
+
+    def _row_caps_from_tables(
+        self,
+        tables: _QueryBoundTables,
+        row_ids: np.ndarray,
+    ) -> np.ndarray:
+        codes = np.asarray(self._tensors["codes"].numpy()[row_ids], dtype=np.int64)
+        residual = np.asarray(
+            self._tensors["residual_radii"].numpy()[row_ids],
+            dtype=np.float64,
+        )
+        caps = np.zeros((len(tables.hnorm), len(row_ids)), dtype=np.float64)
+        absolute = np.zeros_like(caps)
+        for subspace in range(tables.scores.shape[1]):
+            selected = codes[:, subspace]
+            caps += tables.scores[:, subspace, selected]
+            absolute += tables.absolute[:, subspace, selected]
+        return self._finish_caps(
+            caps,
+            absolute,
+            hnorm=tables.hnorm,
+            residual=residual,
+        )
+
+    def node_caps(self, hidden: torch.Tensor) -> np.ndarray:
+        return self._node_caps_from_tables(self._query_bound_tables(hidden))
+
+    def row_caps(
+        self,
+        hidden: torch.Tensor,
+        row_ids: Any,
+    ) -> np.ndarray:
+        try:
+            ids = tuple(int(value) for value in row_ids)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("row_ids must be an iterable of token IDs") from exc
+        if not ids:
+            return np.empty((hidden.numel() // hidden.shape[-1], 0), dtype=np.float64)
+        if any(value < 0 or value >= self.binding.vocab_size for value in ids):
+            raise IndexError("row ID is outside the bound vocabulary")
+        return self._row_caps_from_tables(
+            self._query_bound_tables(hidden),
+            np.asarray(ids, dtype=np.int64),
+        )
 
     def leaf_caps(self, hidden: torch.Tensor) -> np.ndarray:
         return self.node_caps(hidden)[:, : self.leaf_count]
@@ -1187,7 +1282,8 @@ class ExactHeadIndex:
                 self._metrics.applicable_calls += 1
             leading = tuple(hidden.shape[:-1])
             flat = hidden.reshape(-1, self.binding.hidden_size)
-            caps = self.node_caps(flat)
+            bound_tables = self._query_bound_tables(flat)
+            caps = self._node_caps_from_tables(bound_tables)
             child_start = self._tensors["node_child_start"]
             child_count = self._tensors["node_child_count"]
             start_page = self._tensors["node_start_page"]
@@ -1200,6 +1296,11 @@ class ExactHeadIndex:
             best_ids: torch.Tensor | None = None
             pages_scored = pages_pruned = rows_scored = rows_pruned = 0
             bound_nodes = 0
+            row_bound_rows = 0
+            selected_row_reads = 0
+            selected_rows_scored = 0
+            full_leaf_fallbacks = 0
+            row_certificate_rows_pruned = 0
             while frontier:
                 _priority, node = heapq.heappop(frontier)
                 bound_nodes += 1
@@ -1238,28 +1339,94 @@ class ExactHeadIndex:
                 count = min(
                     self.config.page_rows, self.binding.vocab_size - start
                 )
-                rows = pager._read_rows(
-                    name,
-                    start,
-                    count,
-                    dtype=pager.compute_dtype,
-                    device=pager.device,
+                selected_ids = tuple(range(start, start + count))
+                if best_values is not None and best_values.shape[-1] == k:
+                    page_ids = np.arange(start, start + count, dtype=np.int64)
+                    per_row_caps = self._row_caps_from_tables(
+                        bound_tables,
+                        page_ids,
+                    )
+                    row_bound_rows += count
+                    selected_ids = tuple(
+                        int(token_id)
+                        for column, token_id in enumerate(page_ids)
+                        if not all(
+                            self.prunable(
+                                float(per_row_caps[row, column]),
+                                float(best_values[row, -1]),
+                                int(token_id),
+                                int(best_ids[row, -1]),
+                            )
+                            for row in range(len(flat))
+                        )
+                    )
+                    certified = count - len(selected_ids)
+                    rows_pruned += certified
+                    row_certificate_rows_pruned += certified
+                    if not selected_ids:
+                        pages_pruned += 1
+                        continue
+
+                selected_reader = getattr(pager, "_selected_rows", None)
+                score_preflight = getattr(pager, "_preflight_head_score", None)
+                use_selected = (
+                    len(selected_ids) < count
+                    and callable(selected_reader)
+                    and callable(score_preflight)
                 )
-                logits = pager._score_head_rows(flat, rows)
-                token_ids = torch.arange(
-                    start,
-                    start + count,
+                if use_selected:
+                    score_preflight(
+                        query_rows=len(flat),
+                        head_rows=count,
+                        columns=self.binding.hidden_size,
+                    )
+                    rows = selected_reader(name, selected_ids)
+                    selected_offsets = torch.tensor(
+                        [token_id - start for token_id in selected_ids],
+                        device=pager.device,
+                        dtype=torch.long,
+                    )
+                    score_rows = torch.zeros(
+                        (count, self.binding.hidden_size),
+                        device=pager.device,
+                        dtype=pager.compute_dtype,
+                    )
+                    score_rows.index_copy_(0, selected_offsets, rows)
+                    del rows
+                    page_logits = pager._score_head_rows(flat, score_rows)
+                    logits = page_logits.index_select(-1, selected_offsets)
+                    del page_logits, score_rows, selected_offsets
+                    selected_row_reads += 1
+                    selected_rows_scored += len(selected_ids)
+                else:
+                    if len(selected_ids) < count:
+                        rows_pruned -= count - len(selected_ids)
+                        row_certificate_rows_pruned -= count - len(selected_ids)
+                        selected_ids = tuple(range(start, start + count))
+                    full_leaf_fallbacks += 1
+                    rows = pager._read_rows(
+                        name,
+                        start,
+                        count,
+                        dtype=pager.compute_dtype,
+                        device=pager.device,
+                    )
+                    logits = pager._score_head_rows(flat, rows)
+                token_ids = torch.tensor(
+                    selected_ids,
                     device=pager.device,
                     dtype=torch.long,
                 ).expand_as(logits)
                 values, ids = pager._stable_topk(
-                    logits, token_ids, min(k, count)
+                    logits, token_ids, min(k, len(selected_ids))
                 )
-                del logits, rows
-                pager._stats.head_rows += count
+                del logits
+                if not use_selected:
+                    del rows
+                pager._stats.head_rows += len(selected_ids)
                 pager._stats.materialized_weight_releases += 1
                 pages_scored += 1
-                rows_scored += count
+                rows_scored += len(selected_ids)
                 if best_values is None:
                     best_values, best_ids = values, ids
                 else:
@@ -1278,6 +1445,20 @@ class ExactHeadIndex:
                 self._metrics.rows_scored += rows_scored
                 self._metrics.rows_pruned += rows_pruned
                 self._metrics.bound_nodes += bound_nodes
+                self._metrics.row_bound_rows += row_bound_rows
+                self._metrics.selected_row_reads += selected_row_reads
+                self._metrics.selected_rows_scored += selected_rows_scored
+                self._metrics.full_leaf_fallbacks += full_leaf_fallbacks
+                selected_bytes = (
+                    selected_rows_scored * self.binding.hidden_size * 2
+                )
+                row_avoided_bytes = (
+                    row_certificate_rows_pruned * self.binding.hidden_size * 2
+                )
+                self._metrics.selected_row_logical_bytes += selected_bytes
+                self._metrics.row_certificate_logical_bytes_avoided += (
+                    row_avoided_bytes
+                )
                 self._metrics.logical_head_bytes_avoided += (
                     rows_pruned * self.binding.hidden_size * 2
                 )

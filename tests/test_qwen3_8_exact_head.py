@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 
@@ -219,6 +220,238 @@ class Qwen38ExactHeadTests(unittest.TestCase):
                 hidden.float(), rows.float()
             ).to(torch.bfloat16)
             self.assertGreaterEqual(caps[0, page], float(scores.max()))
+
+    def test_row_caps_dominate_every_score_through_sixteen_queries(self) -> None:
+        generator = torch.Generator().manual_seed(812)
+        for query_rows in (1, 4, 8, 16):
+            hidden = torch.randn(
+                (query_rows, self.head.shape[1]),
+                generator=generator,
+                dtype=torch.bfloat16,
+            )
+            row_ids = tuple(range(self.head.shape[0]))
+            caps = self.index.row_caps(hidden, row_ids)
+            scores = torch.nn.functional.linear(
+                hidden.float(), self.head.float()
+            ).to(torch.bfloat16)
+            with self.subTest(query_rows=query_rows):
+                self.assertTrue(
+                    bool(
+                        (
+                            torch.from_numpy(caps)
+                            >= scores.to(torch.float64)
+                        ).all()
+                    )
+                )
+
+    def test_row_certificate_keeps_an_omitted_winner_and_reads_it_once(self) -> None:
+        head = torch.tensor(
+            [
+                [40.0, 0.0],
+                [0.0, 40.0],
+                [40.0, 0.0],
+                [0.0, 40.0],
+                [50.0, -5.0],
+                [30.0, -5.0],
+                [30.0, -5.0],
+                [30.0, -5.0],
+            ],
+            dtype=torch.bfloat16,
+        )
+        config = ExactHeadConfig(
+            subspace_width=1,
+            codebook_size=8,
+            page_rows=4,
+            fanout=2,
+            kmeans_iterations=2,
+            assignment_chunk_rows=8,
+            max_query_rows=16,
+        )
+        index = ExactHeadIndex.build(
+            head,
+            binding=_binding(head),
+            config=config,
+        )
+        source = _BoundHeadSource(head)
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=256,
+            exact_head_index=index,
+        )
+
+        score_shapes: list[tuple[int, ...]] = []
+        scorer = pager._score_head_rows
+
+        def observe(hidden: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+            score_shapes.append(tuple(rows.shape))
+            return scorer(hidden, rows)
+
+        with mock.patch.object(pager, "_score_head_rows", side_effect=observe):
+            values, ids = pager.topk_logits(
+                torch.ones((1, 2), dtype=torch.bfloat16),
+                k=1,
+                block_rows=4,
+            )
+
+        self.assertEqual((float(values[0, 0]), int(ids[0, 0])), (45.0, 4))
+        self.assertEqual(score_shapes, [(4, 2), (4, 2)])
+        metrics = index.metrics()
+        self.assertEqual(metrics["selected_row_reads"], 1)
+        self.assertEqual(metrics["selected_rows_scored"], 1)
+        self.assertEqual(metrics["row_bound_rows"], 4)
+        self.assertEqual(metrics["row_certificate_logical_bytes_avoided"], 12)
+        self.assertEqual(metrics["selected_row_logical_bytes"], 4)
+        self.assertEqual(metrics["full_leaf_fallbacks"], 1)
+        self.assertEqual(
+            source.metrics()["network_or_source_body_bytes"],
+            5 * head.shape[1] * head.element_size(),
+        )
+
+    def test_row_certificate_retains_lower_id_on_cross_page_tie(self) -> None:
+        head = torch.tensor(
+            [
+                [40.0, 0.0],
+                [0.0, 40.0],
+                [1.0, 1.0],
+                [1.0, 1.0],
+                [50.0, -10.0],
+                [-10.0, 50.0],
+                [1.0, 1.0],
+                [1.0, 1.0],
+            ],
+            dtype=torch.bfloat16,
+        )
+        config = ExactHeadConfig(
+            subspace_width=1,
+            codebook_size=8,
+            page_rows=4,
+            fanout=2,
+            kmeans_iterations=2,
+            assignment_chunk_rows=8,
+            max_query_rows=16,
+        )
+        index = ExactHeadIndex.build(
+            head,
+            binding=_binding(head),
+            config=config,
+        )
+        pager = Qwen38WeightPager(
+            _BoundHeadSource(head),
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=256,
+            exact_head_index=index,
+        )
+
+        values, ids = pager.topk_logits(
+            torch.ones((1, 2), dtype=torch.bfloat16),
+            k=1,
+            block_rows=4,
+        )
+
+        self.assertEqual((float(values[0, 0]), int(ids[0, 0])), (40.0, 0))
+        self.assertGreater(index.metrics()["row_certificate_logical_bytes_avoided"], 0)
+
+    def test_row_survivors_are_unioned_once_across_sixteen_queries(self) -> None:
+        head = torch.tensor(
+            [
+                [40.0, 0.0, 40.0, 0.0],
+                [0.0, 40.0, 0.0, 40.0],
+                [1.0, 1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0, 1.0],
+                [45.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 45.0, 0.0],
+                [1.0, 1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0, 1.0],
+            ],
+            dtype=torch.bfloat16,
+        )
+        config = ExactHeadConfig(
+            subspace_width=1,
+            codebook_size=8,
+            page_rows=4,
+            fanout=2,
+            kmeans_iterations=2,
+            assignment_chunk_rows=8,
+            max_query_rows=16,
+        )
+        index = ExactHeadIndex.build(
+            head,
+            binding=_binding(head),
+            config=config,
+        )
+        source = _BoundHeadSource(head)
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=2048,
+            exact_head_index=index,
+        )
+        first = torch.tensor([1.0, 1.0, 0.0, 0.0], dtype=torch.bfloat16)
+        second = torch.tensor([0.0, 0.0, 1.0, 1.0], dtype=torch.bfloat16)
+        hidden = torch.stack((first, second) * 8)
+
+        values, ids = pager.topk_logits(hidden, k=1, block_rows=4)
+
+        self.assertTrue(torch.equal(values, torch.full_like(values, 45.0)))
+        self.assertEqual(tuple(int(value) for value in ids[:, 0]), (4, 5) * 8)
+        metrics = index.metrics()
+        self.assertEqual(metrics["selected_row_reads"], 1)
+        self.assertEqual(metrics["selected_rows_scored"], 2)
+        self.assertEqual(metrics["row_certificate_logical_bytes_avoided"], 16)
+        self.assertEqual(
+            source.metrics()["network_or_source_body_bytes"],
+            6 * head.shape[1] * head.element_size(),
+        )
+
+    def test_zero_row_pruning_uses_unchanged_full_leaf_read(self) -> None:
+        head = torch.arange(8, dtype=torch.float32).reshape(4, 2).to(
+            torch.bfloat16
+        )
+        config = ExactHeadConfig(
+            subspace_width=1,
+            codebook_size=4,
+            page_rows=4,
+            fanout=2,
+            kmeans_iterations=2,
+            assignment_chunk_rows=4,
+            max_query_rows=16,
+        )
+        index = ExactHeadIndex.build(
+            head,
+            binding=_binding(head),
+            config=config,
+        )
+        source = _BoundHeadSource(head)
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=1024,
+            exact_head_index=index,
+        )
+
+        actual = pager.topk_logits(
+            torch.ones((16, 2), dtype=torch.bfloat16),
+            k=3,
+            block_rows=4,
+        )
+        baseline = torch.nn.functional.linear(
+            torch.ones((16, 2), dtype=torch.float32),
+            head.float(),
+        ).to(torch.bfloat16)
+
+        self.assertTrue(torch.equal(actual[0], torch.topk(baseline, 3).values))
+        self.assertEqual(index.metrics()["selected_row_reads"], 0)
+        self.assertEqual(index.metrics()["full_leaf_fallbacks"], 1)
+        self.assertEqual(index.metrics()["rows_pruned"], 0)
+        self.assertEqual(
+            source.metrics()["network_or_source_body_bytes"],
+            head.numel() * head.element_size(),
+        )
 
     def test_resealed_negative_radius_and_unused_mask_bits_are_rejected(self) -> None:
         negative = {

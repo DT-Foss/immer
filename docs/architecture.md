@@ -127,7 +127,11 @@ residuals over contiguous canonical pages. Query-specific codebook LUTs plus
 the residual and IEEE accumulation envelope produce an upper score cap.
 Best-first traversal drops a node only when all active query rows prove it
 cannot enter their stable top-k. Every surviving leaf is read and scored by the
-canonical page scorer; a completely loose tree reads the full head once.
+canonical page scorer. If the node mask is loose, the runtime evaluates each
+leaf row's actual PQ code tuple and residual radius, unions survivors across
+K<=16 queries, fills omitted positions with zero, and scores the survivors in
+the unchanged page shape. Unsupported or zero-saving selection reads the full
+leaf once.
 
 The Markov draft council contains eight sparse PPM experts across orders
 `0..16` and windows `128..4096`. Their Qwen-ID distributions are pooled by
