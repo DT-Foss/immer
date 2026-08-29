@@ -22,11 +22,11 @@ release surface.
   ranges fill Torch-owned weight storage directly through `preadv`.
 - **Native packed execution.** A source-bound derived weight plane maps the
   original causal graph onto row-addressable Q4_0/Q8_0 files without changing
-  the BF16 bundle. MLP Gate/Up/Down and full-attention matrices execute as Q4;
-  recurrent Linear-Attention projections, embeddings, and the LM head use Q8.
+  the BF16 bundle. Every text projection executes as Q4; embeddings and the LM
+  head use Q8.
   The C kernel consumes mmap pages directly with AVX2 and retains the
   existing Qwen Attention, DeltaNet, Sinkhorn, state, tokenizer, and FERTIG
-  paths. The complete text plane is 19.18 GB instead of 53.79 GB.
+  paths. The complete text plane is 16.40 GB instead of 53.79 GB.
 - **Predictive weight transport.** A persistent two-agent operation Markov
   model learns the exact tensor/range sequence already emitted by the
   Streamer. Order-1/2 Fixed Share, surprise regimes, and Ricci retention
@@ -156,7 +156,7 @@ release surface.
 | Trial | Result | Scope |
 |---|---:|---|
 | Local causal bundle reopen | 77.77 → 1.20 s; 64.90x | complete 55.6 GB Qwen3.8 bundle; first full-content verification followed by unchanged next-process stat+digest reuse; no model forward |
-| Native causal Q4/Q8 chat | readable arbitrary German output; TTFT 12.10 s; 8 tokens in 20.50 s | real 27B CPU run on 16 AVX2 cores; 498 text matrices; 18.79 GB peak RSS; 19.18 GB derived payload; original BF16 graph remains authoritative |
+| Native causal Q4/Q8 chat | readable arbitrary German output; TTFT 11.95 s; 8 tokens in 20.12 s | real 27B CPU run on 16 AVX2 cores; 498 text matrices; 16.02 GB peak RSS; 16.40 GB derived payload; two prior token traces preserved exactly |
 | Cost-aware Markov abstention | 74.58 s vs 79.05 s direct; identical token trace | seven K1 waves on an unseen German request; zero draft bytes/linears; confirmed episode still updates Council state |
 | Persistent JSONL chat | second request opens 0 tensors | one process retains the verified mmap plane; observed one-token generation 15.01 s then 16.90 s |
 | Native DeltaNet K=4 convolution | 79.05 → 23.01 s generation; 3.44x | direct causal channelwise kernel replaces generic 10,240-group Conv1d; identical output/token trace; TTFT 25.05 → 13.65 s |

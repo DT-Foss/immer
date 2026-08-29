@@ -63,6 +63,13 @@ All notable changes to IMMER are recorded here.
   seconds with 12.10-second TTFT. The superseded Balanced directory was removed
   only after 434 shared hardlink inodes were verified; original BF16 weights
   remain unchanged.
+- Promoted the complete Q4 projection bank after both known arbitrary German
+  prompts preserved their prior token traces exactly. Only embedding and LM
+  head remain Q8. Payload falls again from 19.18 to 16.40 GB and peak RSS to
+  16.02 GB; the Himmel request completes in 20.12 seconds with 11.95-second
+  TTFT. The recurrent directory was removed only after 258 shared hardlinks
+  were verified; its 240 superseded Q8 Linear-Attention files were the only
+  payloads released.
 
 - Generalized correction-first rolling verification from fixed K=4 to a
   configurable K=2–16 target window; `immer chat` defaults to K=8. All target
