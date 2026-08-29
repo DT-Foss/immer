@@ -12,6 +12,8 @@ around every domain that supports it.
 ## Complete
 
 - [x] Primary local Qwen3.8 causal runtime with exact stateful generation.
+- [x] Weight-only residual-PQ LM-head rail with certified pruning, stable ties,
+  exact page fallback, bounded mount, and arbitrary-chat/K4 pager integration.
 - [x] O1-State cartography over real contextual Qwen measurements.
 - [x] Append-only SemanticWeightAtlas with exact historical revision proofs.
 - [x] Markov-OoE site agents, mobile reservoirs, Möbius rapidity, PS-Lifted

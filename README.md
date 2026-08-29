@@ -25,6 +25,10 @@ release surface.
   and commits. Target-confirmed episodes become reusable three-token options;
   global and contextual-dialect agents compete by support, confidence, context
   depth, and dialect similarity.
+- **Exact causal LM-head rail.** A weight-only residual-PQ tree supplies
+  certified upper bounds for canonical token pages. Proven-impossible pages
+  require no checkpoint read; every unresolved page uses the same explicit
+  FP32-accumulate/BF16-output scorer and stable lower-token-ID tie rule.
 - **Grounded composition.** [FERTIG](https://github.com/DT-Foss/FERTIG)
   supplies deterministic parsing, verification, and explicit abstention.
 - **Organism of Experts.** O1 measurements become authenticated Atlas evidence;
@@ -121,6 +125,7 @@ release surface.
 | Consuming ordinary decode | one continuation cache plus one replacement layer | removes simultaneous ownership of complete old and new cache stacks; official static cache cut is `154,927,104 + 65,552 × prefix_tokens` bytes |
 | K4 Fast-MLP route reuse | repeated K2/K4 target and auxiliary bytes equal one route | Gate/Up rows are wave-unioned; one-route down cache uses maximum-overlap row ordering while preserving each reduction; identical K4 routes remove 180 MiB per active p4/k32 layer |
 | Direct-to-Torch local ranges | one final tensor for sorted selected-row routes | inode-stable `preadv` fills caller-owned Torch storage; no intermediate Python body, no row-stack duplicate, exact cache/budget/causal-plan accounting |
+| Exact residual-PQ LM head | K=1–4 and k=1/3/7 parity; certified page pruning | deterministic weight-only build, best-first tree, outward residual/roundoff bounds, overflow/tie/subnormal guards, and one-pass exact fallback; no model forward |
 | Arbitrary local Qwen chat | one terminal 64-layer sweep removed per request | authenticated causal Qwen3.8 path; rolling local-Qwen or zero-model-byte Markov drafting plus row-routed fast MLP; target, auxiliary, draft, and combined transport reported separately |
 | Seed v3 native migration | exact parity on 8/8 inherited tensor outputs for Micro and 5M | SHA-first migration of shared trained GRU/CRSA/SwiGLU weights; new receipt, quotient, route-value, and expected-work heads added under a strict inference-only manifest |
 | Full Qwen MLP layer map | 640/640 cells; content promotion 0 | every layer repeats the same 146/549 template hits; 1,370/1,389 candidate admissions equal their matched random controls, closing the exhaustive exact-key line |

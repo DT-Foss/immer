@@ -64,6 +64,7 @@ address graph.
 
 - authenticated causal-bundle mounting and exact range paging;
 - stable direct-to-Torch local `preadv` transport;
+- residual-certified exact LM-head branch-and-bound;
 - stateful full-attention and Gated DeltaNet execution;
 - native Causal Prefix Sinkhorn Attention;
 - correction-first rolling K=4 continuation with zero-read prefix commits;
@@ -108,6 +109,15 @@ Sorted unique row routes are filled directly into their final tensor slices;
 only requests whose order or repetition requires restoration allocate a
 second gathered output. Remote sources and dtype/device conversions retain the
 portable owned-byte path.
+
+The optional exact-head rail is built from `lm_head.weight` alone. PQ codes
+approximate each row, while an outward residual norm makes the approximation a
+certificate rather than an authority. Tree nodes union code masks and maximum
+residuals over contiguous canonical pages. Query-specific codebook LUTs plus
+the residual and IEEE accumulation envelope produce an upper score cap.
+Best-first traversal drops a node only when all active query rows prove it
+cannot enter their stable top-k. Every surviving leaf is read and scored by the
+canonical page scorer; a completely loose tree reads the full head once.
 
 The Markov draft council contains eight sparse PPM experts across orders
 `0..16` and windows `128..4096`. Their Qwen-ID distributions are pooled by

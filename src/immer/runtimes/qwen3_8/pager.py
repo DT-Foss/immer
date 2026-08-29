@@ -175,6 +175,8 @@ class Qwen38WeightPager:
     DEFAULT_GC_INTERVAL_BOUNDARIES = 256
     DEFAULT_GC_RSS_HEADROOM_BYTES = 1024**3
     WEIGHT_CACHE_POLICY = "one-shot-qwen35-direct-fill/v4"
+    HEAD_SCORE_POLICY = "cpu-bf16-explicit-fp32-accumulate-rne/v1"
+    LEGACY_HEAD_SCORE_POLICY = "backend-bf16-linear/v1"
 
     def __init__(
         self,
@@ -188,6 +190,7 @@ class Qwen38WeightPager:
         close_source: bool = False,
         require_source_identity: bool = False,
         causal_tensor_reader: CausalTensorReader | None = None,
+        exact_head_index: Any | None = None,
     ) -> None:
         try:
             import torch
@@ -238,6 +241,10 @@ class Qwen38WeightPager:
                 raise TypeError("causal_tensor_reader must be a CausalTensorReader")
             if causal_tensor_reader.source is not source:
                 raise ValueError("causal tensor reader must own this exact source")
+        if exact_head_index is not None and not callable(
+            getattr(exact_head_index, "topk_logits", None)
+        ):
+            raise TypeError("exact_head_index must expose topk_logits() or be None")
 
         self.torch = torch
         self.source = source
@@ -257,6 +264,7 @@ class Qwen38WeightPager:
         self.gc_rss_limit_bytes = gc_rss_limit_bytes
         self.close_source = close_source
         self.causal_tensor_reader = causal_tensor_reader
+        self.exact_head_index = exact_head_index
         self.source_identity = validate_source_identity(
             getattr(source, "repo_id", None),
             getattr(source, "revision", None),
@@ -268,6 +276,15 @@ class Qwen38WeightPager:
             self._stats.gc_peak_observed_rss_bytes = initial_rss
         self._lock = threading.RLock()
         self._closed = False
+
+    def attach_exact_head_index(self, index: Any | None) -> None:
+        """Attach or detach one exact, target-bound LM-head accelerator."""
+
+        with self._lock:
+            self._ensure_open()
+            if index is not None and not callable(getattr(index, "topk_logits", None)):
+                raise TypeError("exact head index must expose topk_logits()")
+            self.exact_head_index = index
 
     @property
     def resolved_device(self) -> str:
@@ -1023,12 +1040,20 @@ class Qwen38WeightPager:
             if not isinstance(hidden, self.torch.Tensor):
                 hidden = self.torch.as_tensor(hidden)
             compute_hidden = hidden.to(device=self.device, dtype=self.compute_dtype)
+            columns = self._layout(name).shape[1]
+            if compute_hidden.shape[-1] != columns:
+                raise Qwen38PagerError("hidden width disagrees with LM head")
+            self._preflight_head_score(
+                query_rows=compute_hidden.numel() // columns,
+                head_rows=len(ids),
+                columns=columns,
+            )
             rows = self._selected_rows(name, ids)
-            if compute_hidden.shape[-1] != rows.shape[1]:
+            if rows.shape[1] != columns:
                 del rows
                 raise Qwen38PagerError("hidden width disagrees with LM head")
             try:
-                return self.torch.nn.functional.linear(compute_hidden, rows)
+                return self._score_head_rows(compute_hidden, rows)
             finally:
                 del rows
                 self._stats.head_rows += len(ids)
@@ -1043,7 +1068,7 @@ class Qwen38WeightPager:
         block_rows: int = DEFAULT_HEAD_BLOCK_ROWS,
         progress: Callable[[dict[str, int]], None] | None = None,
     ) -> tuple[Any, Any]:
-        """Compute exact global top-k logits via bounded contiguous head blocks."""
+        """Compute exact global top-k through a certificate or the full scan."""
 
         with self._lock:
             self._ensure_open()
@@ -1066,61 +1091,112 @@ class Qwen38WeightPager:
             compute_hidden = hidden.to(device=self.device, dtype=self.compute_dtype)
             if compute_hidden.shape[-1] != columns:
                 raise Qwen38PagerError("hidden width disagrees with LM head")
-            leading_shape = tuple(compute_hidden.shape[:-1])
-            flat = compute_hidden.reshape(-1, columns)
-            best_values = None
-            best_ids = None
-            for start in range(0, vocab, block_rows):
-                count = min(block_rows, vocab - start)
-                rows = self._read_rows(
-                    name,
-                    start,
-                    count,
-                    dtype=self.compute_dtype,
-                    device=self.device,
+            self._preflight_head_score(
+                query_rows=compute_hidden.numel() // columns,
+                head_rows=min(block_rows, vocab),
+                columns=columns,
+            )
+            index = self.exact_head_index
+            if index is not None and progress is None:
+                indexed = index.topk_logits(
+                    self,
+                    compute_hidden,
+                    k=k,
+                    name=name,
+                    block_rows=block_rows,
                 )
-                logits = self.torch.nn.functional.linear(flat, rows)
-                local_k = min(k, count)
-                token_ids = self.torch.arange(
-                    start,
-                    start + count,
-                    device=logits.device,
-                    dtype=self.torch.long,
-                ).expand_as(logits)
-                values, indices = self._stable_topk(logits, token_ids, local_k)
-                del logits
-                del rows
-                self._stats.head_rows += count
-                self._stats.materialized_weight_releases += 1
-                if best_values is None:
-                    best_values, best_ids = values, indices
-                    if progress is not None:
-                        progress(
-                            {
-                                "start_row": start,
-                                "rows": count,
-                                "rows_done": start + count,
-                                "vocab_rows": vocab,
-                            }
+                if indexed is not None:
+                    try:
+                        values, token_ids = indexed
+                    except (TypeError, ValueError) as exc:
+                        raise Qwen38PagerError(
+                            "exact head index returned an invalid result"
+                        ) from exc
+                    expected = (*compute_hidden.shape[:-1], k)
+                    if (
+                        not isinstance(values, self.torch.Tensor)
+                        or not isinstance(token_ids, self.torch.Tensor)
+                        or tuple(values.shape) != expected
+                        or tuple(token_ids.shape) != expected
+                        or values.device != self.device
+                        or token_ids.device != self.device
+                        or values.dtype != self.compute_dtype
+                        or token_ids.dtype != self.torch.long
+                    ):
+                        raise Qwen38PagerError(
+                            "exact head index result differs from the pager ABI"
                         )
-                    continue
+                    return values, token_ids
+            return self._topk_logits_full_locked(
+                compute_hidden,
+                k=k,
+                name=name,
+                block_rows=block_rows,
+                progress=progress,
+            )
+
+    def _topk_logits_full_locked(
+        self,
+        compute_hidden: Any,
+        *,
+        k: int,
+        name: str,
+        block_rows: int,
+        progress: Callable[[dict[str, int]], None] | None = None,
+    ) -> tuple[Any, Any]:
+        """Run the canonical full scan; caller owns the pager lock and ABI checks."""
+
+        layout = self._layout(name)
+        vocab, columns = layout.shape
+        leading_shape = tuple(compute_hidden.shape[:-1])
+        flat = compute_hidden.reshape(-1, columns)
+        best_values = None
+        best_ids = None
+        for start in range(0, vocab, block_rows):
+            count = min(block_rows, vocab - start)
+            rows = self._read_rows(
+                name,
+                start,
+                count,
+                dtype=self.compute_dtype,
+                device=self.device,
+            )
+            logits = self._score_head_rows(flat, rows)
+            local_k = min(k, count)
+            token_ids = self.torch.arange(
+                start,
+                start + count,
+                device=logits.device,
+                dtype=self.torch.long,
+            ).expand_as(logits)
+            values, indices = self._stable_topk(logits, token_ids, local_k)
+            del logits
+            del rows
+            self._stats.head_rows += count
+            self._stats.materialized_weight_releases += 1
+            if best_values is None:
+                best_values, best_ids = values, indices
+            else:
                 merged_values = self.torch.cat((best_values, values), dim=-1)
                 merged_ids = self.torch.cat((best_ids, indices), dim=-1)
-                best_values, best_ids = self._stable_topk(merged_values, merged_ids, k)
-                if progress is not None:
-                    progress(
-                        {
-                            "start_row": start,
-                            "rows": count,
-                            "rows_done": start + count,
-                            "vocab_rows": vocab,
-                        }
-                    )
-            assert best_values is not None and best_ids is not None
-            return (
-                best_values.reshape(*leading_shape, k),
-                best_ids.reshape(*leading_shape, k),
-            )
+                merge_k = min(k, merged_values.shape[-1])
+                best_values, best_ids = self._stable_topk(
+                    merged_values, merged_ids, merge_k
+                )
+            if progress is not None:
+                progress(
+                    {
+                        "start_row": start,
+                        "rows": count,
+                        "rows_done": start + count,
+                        "vocab_rows": vocab,
+                    }
+                )
+        assert best_values is not None and best_ids is not None
+        return (
+            best_values.reshape(*leading_shape, k),
+            best_ids.reshape(*leading_shape, k),
+        )
 
     def _stable_topk(self, values: Any, ids: Any, k: int) -> tuple[Any, Any]:
         """Sort by descending logit and then ascending token ID on exact ties."""
@@ -1139,6 +1215,52 @@ class Qwen38WeightPager:
             self.torch.gather(ordered_values, -1, value_order),
             self.torch.gather(ordered_ids, -1, value_order),
         )
+
+    def _score_head_rows(self, hidden: Any, rows: Any) -> Any:
+        """Canonical CPU head scorer: FP32 accumulate, BF16 output RNE."""
+
+        if (
+            self.exact_head_index is not None
+            and self.device.type == "cpu"
+            and self.compute_dtype == self.torch.bfloat16
+            and hidden.dtype == self.torch.bfloat16
+            and rows.dtype == self.torch.bfloat16
+        ):
+            return self.torch.nn.functional.linear(
+                hidden.float(), rows.float()
+            ).to(self.torch.bfloat16)
+        return self.torch.nn.functional.linear(hidden, rows)
+
+    def _preflight_head_score(
+        self,
+        *,
+        query_rows: int,
+        head_rows: int,
+        columns: int,
+    ) -> int:
+        """Bound the explicit FP32 scorer's simultaneous CPU tensors."""
+
+        if (
+            self.exact_head_index is None
+            or self.device.type != "cpu"
+            or self.compute_dtype != self.torch.bfloat16
+        ):
+            return 0
+        planned = (
+            head_rows * columns * (2 + 4)
+            + query_rows * columns * 4
+            + query_rows * head_rows * (4 + 2)
+        )
+        if planned > self.max_resident_bytes:
+            raise Qwen38PagerError(
+                f"canonical head scorer needs {planned} resident bytes, "
+                f"limit is {self.max_resident_bytes}"
+            )
+        self._stats.peak_planned_resident_bytes = max(
+            self._stats.peak_planned_resident_bytes,
+            planned,
+        )
+        return planned
 
     def _collect_locked(self, kind: str) -> None:
         collected = gc.collect()
@@ -1220,20 +1342,37 @@ class Qwen38WeightPager:
                 for key, value in self.causal_tensor_reader.metrics().items()
             }
         )
+        exact_head = self.exact_head_index
+        exact_head_metrics_method = getattr(exact_head, "metrics", None)
+        exact_head_metrics = (
+            {
+                f"exact_head_{key}": value
+                for key, value in dict(exact_head_metrics_method()).items()
+            }
+            if callable(exact_head_metrics_method)
+            else {}
+        )
         with self._lock:
             return {
                 **source_metrics,
                 **asdict(self._stats),
                 **causal_metrics,
+                **exact_head_metrics,
                 "causal_tensor_reader_attached": (
                     self.causal_tensor_reader is not None
                 ),
+                "exact_head_index_attached": exact_head is not None,
                 "device": self.resolved_device,
                 "compute_dtype": self.resolved_dtype,
                 "max_resident_bytes": self.max_resident_bytes,
                 "gc_interval_boundaries": self.gc_interval_boundaries,
                 "gc_rss_limit_bytes": self.gc_rss_limit_bytes,
                 "weight_cache_policy": self.WEIGHT_CACHE_POLICY,
+                "head_score_policy": (
+                    self.HEAD_SCORE_POLICY
+                    if exact_head is not None
+                    else self.LEGACY_HEAD_SCORE_POLICY
+                ),
                 "source_identity": self.source_identity,
                 "closed": self._closed,
             }

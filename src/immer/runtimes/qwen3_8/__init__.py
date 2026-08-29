@@ -57,6 +57,18 @@ from .fast_mlp import (
     Qwen38FastMlpReceipt,
     open_qwen38_fast_mlp,
 )
+from .exact_head import (
+    EXACT_HEAD_MANIFEST_SCHEMA,
+    EXACT_HEAD_SCHEMA,
+    EXACT_HEAD_SCORE_ABI,
+    ExactHeadBinding,
+    ExactHeadConfig,
+    ExactHeadError,
+    ExactHeadIndex,
+    ExactHeadMetrics,
+    ExactHeadNotApplicable,
+    ExactHeadReceipt,
+)
 from .kernels import AttentionState, DeltaNetProbe, DeltaNetState
 from .local_draft import (
     QWEN35_K2_DRAFT_PROVIDER_SCHEMA,
@@ -252,6 +264,16 @@ __all__ = [
     "DELTANET_PROBE_SCHEMA",
     "END_OF_TEXT_TOKEN_ID",
     "EVIDENCE_POLICY_SCHEMA",
+    "EXACT_HEAD_MANIFEST_SCHEMA",
+    "EXACT_HEAD_SCHEMA",
+    "EXACT_HEAD_SCORE_ABI",
+    "ExactHeadBinding",
+    "ExactHeadConfig",
+    "ExactHeadError",
+    "ExactHeadIndex",
+    "ExactHeadMetrics",
+    "ExactHeadNotApplicable",
+    "ExactHeadReceipt",
     "EvidencePolicy",
     "FAST_MLP_MOUNT_SCHEMA",
     "DraftProvider",

@@ -33,6 +33,7 @@ from .fast_mlp import (
     Qwen38FastMlpPaths,
     open_qwen38_fast_mlp,
 )
+from .exact_head import ExactHeadIndex, ExactHeadNotApplicable
 from .model import StreamedQwen38
 from .local_draft import Qwen35K4DraftProvider
 from .markov_draft import FingerprintRollingK4DraftProvider
@@ -439,6 +440,7 @@ class _OwnedRuntime:
         bundle_receipt: Mapping[str, Any],
         preflight_receipt: Mapping[str, Any],
         fast_mlp_mount: Qwen38FastMlpMount | None = None,
+        exact_head_index: ExactHeadIndex | None = None,
     ) -> None:
         self.mount = mount
         self.pager = pager
@@ -448,6 +450,12 @@ class _OwnedRuntime:
         self.bundle_receipt = dict(bundle_receipt)
         self.preflight_receipt = dict(preflight_receipt)
         self.fast_mlp_mount = fast_mlp_mount
+        self.exact_head_index = exact_head_index
+        self.exact_head_receipt = (
+            None
+            if exact_head_index is None
+            else exact_head_index.receipt.to_record()
+        )
         self.fast_mlp_receipt = (
             None if fast_mlp_mount is None else fast_mlp_mount.receipt.to_record()
         )
@@ -462,6 +470,15 @@ class _OwnedRuntime:
         except Exception as exc:  # release the remaining owners regardless
             failures.append(exc)
         self.model.mlp_sparse_executor = None
+        try:
+            self.pager.attach_exact_head_index(None)
+        except Exception as exc:
+            failures.append(exc)
+        if self.exact_head_index is not None:
+            try:
+                self.exact_head_index.close()
+            except Exception as exc:
+                failures.append(exc)
         if self.fast_mlp_mount is not None:
             try:
                 self.fast_mlp_mount.close()
@@ -498,6 +515,9 @@ def _open_local_runtime(
     fast_mlp_source_budget_mb: float | None = None,
     fast_mlp_max_resident_bytes: int | None = None,
     fast_mlp_active_layers: Sequence[int] | None = None,
+    exact_head_root: Path | None = None,
+    exact_head_block_rows: int | None = None,
+    exact_head_max_bytes: int = 128 * 1024**2,
 ) -> _OwnedRuntime:
     """Open one pinned local causal model; no remote source exists here."""
 
@@ -509,6 +529,7 @@ def _open_local_runtime(
     pager: Qwen38WeightPager | None = None
     model: StreamedQwen38 | None = None
     fast_mlp_mount: Qwen38FastMlpMount | None = None
+    exact_head_index: ExactHeadIndex | None = None
     try:
         mount = CausalWeightMount(
             bundle_path,
@@ -532,6 +553,31 @@ def _open_local_runtime(
             require_source_identity=True,
             causal_tensor_reader=mount.tensor_reader,
         )
+        if exact_head_root is not None:
+            if exact_head_block_rows is None:
+                raise Qwen38ChatError(
+                    "exact head index requires its configured head block rows"
+                )
+            exact_head_index = ExactHeadIndex.load(
+                exact_head_root,
+                max_payload_bytes=exact_head_max_bytes,
+            )
+            output_head_name = (
+                "model.language_model.embed_tokens.weight"
+                if config.tie_word_embeddings
+                else "lm_head.weight"
+            )
+            try:
+                exact_head_index.validate_mount(
+                    pager,
+                    name=output_head_name,
+                    block_rows=exact_head_block_rows,
+                )
+            except ExactHeadNotApplicable:
+                exact_head_index.close()
+                exact_head_index = None
+            else:
+                pager.attach_exact_head_index(exact_head_index)
         if fast_mlp_paths is not None:
             fast_mlp_mount = open_qwen38_fast_mlp(
                 paths=fast_mlp_paths,
@@ -573,6 +619,7 @@ def _open_local_runtime(
             bundle_receipt=bundle_receipt,
             preflight_receipt=preflight_receipt,
             fast_mlp_mount=fast_mlp_mount,
+            exact_head_index=exact_head_index,
         )
     except Exception:
         if model is not None:
@@ -581,6 +628,15 @@ def _open_local_runtime(
             except Exception:
                 pass
         if pager is not None:
+            try:
+                pager.attach_exact_head_index(None)
+            except Exception:
+                pass
+            if exact_head_index is not None:
+                try:
+                    exact_head_index.close()
+                except Exception:
+                    pass
             if fast_mlp_mount is not None:
                 try:
                     fast_mlp_mount.close()
@@ -608,6 +664,9 @@ def _open_official_runtime(
     fast_mlp_source_budget_mb: float | None = None,
     fast_mlp_max_resident_bytes: int | None = None,
     fast_mlp_active_layers: Sequence[int] | None = None,
+    exact_head_root: Path | None = None,
+    exact_head_block_rows: int | None = None,
+    exact_head_max_bytes: int = 128 * 1024**2,
 ) -> _OwnedRuntime:
     return _open_local_runtime(
         bundle_path=bundle_path,
@@ -623,6 +682,9 @@ def _open_official_runtime(
         fast_mlp_source_budget_mb=fast_mlp_source_budget_mb,
         fast_mlp_max_resident_bytes=fast_mlp_max_resident_bytes,
         fast_mlp_active_layers=fast_mlp_active_layers,
+        exact_head_root=exact_head_root,
+        exact_head_block_rows=exact_head_block_rows,
+        exact_head_max_bytes=exact_head_max_bytes,
     )
 
 
@@ -646,6 +708,8 @@ class Qwen38CausalChat:
         max_new_tokens: int = 64,
         max_context_tokens: int = 2048,
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
+        exact_head_root: str | Path | None = None,
+        exact_head_max_bytes: int = 128 * 1024**2,
         anchor_cache: SemanticStateAnchorCache | None = None,
         result_cell_code_revision: str | None = None,
         draft_bundle_path: str | Path | None = None,
@@ -692,6 +756,13 @@ class Qwen38CausalChat:
         max_new_tokens = _positive_int(max_new_tokens, "max_new_tokens")
         max_context_tokens = _positive_int(max_context_tokens, "max_context_tokens")
         head_block_rows = _positive_int(head_block_rows, "head_block_rows")
+        if exact_head_root is not None and not isinstance(
+            exact_head_root, (str, Path)
+        ):
+            raise TypeError("exact_head_root must be a local path or None")
+        exact_head_max_bytes = _positive_int(
+            exact_head_max_bytes, "exact_head_max_bytes"
+        )
         if (
             anchor_cache is not None
             and type(anchor_cache) is not SemanticStateAnchorCache
@@ -778,6 +849,12 @@ class Qwen38CausalChat:
         self._max_new_tokens = max_new_tokens
         self._max_context_tokens = max_context_tokens
         self._head_block_rows = head_block_rows
+        self._exact_head_root = (
+            None
+            if exact_head_root is None
+            else Path(exact_head_root).expanduser().absolute()
+        )
+        self._exact_head_max_bytes = exact_head_max_bytes
         self._anchor_cache = anchor_cache
         self._draft_bundle_path = (
             None
@@ -805,6 +882,7 @@ class Qwen38CausalChat:
         self._draft_runtime: Any | None = None
         self._last_draft_evidence: dict[str, Any] | None = None
         self._last_fast_mlp_evidence: dict[str, Any] | None = None
+        self._last_exact_head_evidence: dict[str, Any] | None = None
         self._bundle_receipt: dict[str, Any] | None = None
         self._tokenizer_sha256: str | None = None
         self._load_error: str | None = None
@@ -884,6 +962,19 @@ class Qwen38CausalChat:
                         "weights_index_sha256",
                     )
                 }
+        if self._exact_head_root is not None:
+            policy["exact_head"] = {
+                "enabled": True,
+                "max_bytes": self._exact_head_max_bytes,
+            }
+            runtime = self._runtime
+            receipt = (
+                None
+                if runtime is None
+                else getattr(runtime, "exact_head_receipt", None)
+            )
+            if receipt is not None:
+                policy["exact_head"]["artifact"] = dict(receipt)
         return _digest(policy)
 
     def _result_cell_binding_receipt(
@@ -966,6 +1057,9 @@ class Qwen38CausalChat:
             fast_mlp_source_budget_mb=self._fast_mlp_source_budget_mb,
             fast_mlp_max_resident_bytes=self._fast_mlp_max_resident_bytes,
             fast_mlp_active_layers=self._fast_mlp_active_layers,
+            exact_head_root=self._exact_head_root,
+            exact_head_block_rows=self._head_block_rows,
+            exact_head_max_bytes=self._exact_head_max_bytes,
         )
 
     def _open_draft_runtime(self) -> _OwnedRuntime:
@@ -1005,8 +1099,11 @@ class Qwen38CausalChat:
     ) -> tuple[tuple[int, ...], Mapping[str, Any]]:
         self._last_draft_evidence = None
         self._last_fast_mlp_evidence = None
+        self._last_exact_head_evidence = None
         fast_mount = getattr(runtime, "fast_mlp_mount", None)
         fast_before = None if fast_mount is None else fast_mount.metrics()
+        exact_head = getattr(runtime, "exact_head_index", None)
+        exact_before = None if exact_head is None else exact_head.metrics()
         if self._draft_mode is None or self._max_new_tokens < 4:
             generated, evidence = runtime.model.generate_greedy(
                 [list(prompt_ids)],
@@ -1020,6 +1117,7 @@ class Qwen38CausalChat:
                 target_source_body_bytes=int(mapped["source_body_bytes"]),
                 draft_source_body_bytes=0,
             )
+            self._record_exact_head_request(runtime, exact_before)
             return generated, evidence
         eos = tuple(generation_options["eos_token_ids"])
         if self._draft_mode == "qwen35":
@@ -1080,6 +1178,7 @@ class Qwen38CausalChat:
             provider_record = getattr(provider_metrics, "to_dict", None)
             if callable(provider_record):
                 self._last_draft_evidence["provider"] = provider_record()
+            self._record_exact_head_request(runtime, exact_before)
             return generated.token_ids, {
                 "prompt_token_ids": evidence.prompt_token_ids,
                 "generated_token_ids": evidence.generated_token_ids,
@@ -1097,6 +1196,39 @@ class Qwen38CausalChat:
             }
         finally:
             provider.close()
+
+    def _record_exact_head_request(
+        self,
+        runtime: _OwnedRuntime,
+        before: Mapping[str, object] | None,
+    ) -> dict[str, Any] | None:
+        index = getattr(runtime, "exact_head_index", None)
+        if index is None or before is None:
+            return None
+        after = index.metrics()
+        counters = {}
+        for key, value in after.items():
+            previous = before.get(key)
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and isinstance(previous, int)
+                and not isinstance(previous, bool)
+            ):
+                delta = value - previous
+                if delta < 0:
+                    raise Qwen38ChatError(
+                        "exact-head request counters moved backwards"
+                    )
+                counters[key] = delta
+        request = {
+            **counters,
+            "last_fallback_reason": after.get("last_fallback_reason", ""),
+            "manifest_sha256": after.get("manifest_sha256"),
+            "schema": "immer.qwen3.8-exact-head-request/v1",
+        }
+        self._last_exact_head_evidence = request
+        return request
 
     def _record_fast_mlp_request(
         self,
@@ -1154,6 +1286,13 @@ class Qwen38CausalChat:
         )
         if fast_mlp_receipt is not None:
             evidence["fast_mlp"] = dict(fast_mlp_receipt)
+        exact_head_receipt = (
+            None
+            if self._runtime is None
+            else getattr(self._runtime, "exact_head_receipt", None)
+        )
+        if exact_head_receipt is not None:
+            evidence["exact_head"] = dict(exact_head_receipt)
         return evidence
 
     def _load_locked(self) -> Any:
@@ -1349,6 +1488,11 @@ class Qwen38CausalChat:
             evidence["fast_mlp"] = {
                 **dict(evidence["fast_mlp"]),
                 "request": dict(self._last_fast_mlp_evidence),
+            }
+        if self._last_exact_head_evidence is not None:
+            evidence["exact_head"] = {
+                **dict(evidence["exact_head"]),
+                "request": dict(self._last_exact_head_evidence),
             }
         result_cell_binding = self._result_cell_binding_receipt(
             question=text,

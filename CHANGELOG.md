@@ -113,6 +113,26 @@ All notable changes to IMMER are recorded here.
   repeated IDs retain one bounded restore gather. Transport policy is
   `local-range-direct-fill/v2`; pager policy is
   `one-shot-qwen35-direct-fill/v4`.
+- Added the exact causal LM-head rail. A deterministic weight-only builder
+  trains product-quantized subspace codebooks, stores per-row outward residual
+  radii, and builds a best-first tree of code-presence masks over canonical
+  token pages. A 160-subspace/256-code/64-row design is about 67 MB
+  for the official 2.54 GB head.
+- Mounted head search uses an explicit scorer ABI: FP32 accumulation followed
+  by BF16 round-to-nearest-even. Residual, LUT, norm, accumulation, underflow,
+  and output-rounding bounds are outward; BF16 subnormals are rejected by raw
+  bit inspection; possible overflow produces an infinite, never-prunable cap.
+  Internal nodes prune only when every K<=4 query is certified, and stable ties
+  retain the lower token ID.
+- Unproved leaves run the ordinary canonical page read and score exactly once.
+  Loose certificates therefore degrade to one complete head scan without
+  duplicate page reads. Missing indexes preserve the legacy backend scorer;
+  valid but non-applicable indexes detach and use the full scan, while corrupt
+  or cross-model artifacts fail during mount.
+- Added `qwen38_exact_head_build.py`, `immer chat --exact-head`, a bounded
+  artifact mount, request-level pruning evidence, deterministic serialization,
+  dirfd/O_NOFOLLOW loading, source-identity bracketing, and structural tree,
+  mask, radius, hash, and payload validation.
 - The explicit Fast-MLP mode now packs the independent K-token projection rows
   into one physical GEMM per matrix. Exact mode retains the original separate
   kernels; packed execution is bound into the Fast runtime identity and

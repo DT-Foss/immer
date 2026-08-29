@@ -254,6 +254,22 @@ class _FastMount:
         }
 
 
+class _ExactHeadMetrics:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def metrics(self):
+        current = self.calls
+        self.calls += 1
+        return {
+            "calls": current,
+            "pages_pruned": 2 * current,
+            "rows_pruned": 8 * current,
+            "last_fallback_reason": "",
+            "manifest_sha256": _EXACT_HEAD_RECEIPT["manifest_sha256"],
+        }
+
+
 _FAST_RECEIPT = {
     "active_layers": [0, 9],
     "affine_fit_sha256": "1" * 64,
@@ -267,6 +283,14 @@ _FAST_RECEIPT = {
     "transport_row_fraction_by_layer": {"0": 0.2, "9": 0.2},
     "transpose_manifest_sha256": "5" * 64,
     "weights_index_sha256": "6" * 64,
+}
+
+_EXACT_HEAD_RECEIPT = {
+    "index_bytes": 67_000_000,
+    "manifest_sha256": "7" * 64,
+    "payload_bytes": 68_000_000,
+    "payload_sha256": "8" * 64,
+    "tensor_sha256": "9" * 64,
 }
 
 
@@ -304,6 +328,18 @@ class _ExactBackend:
 
 
 class Qwen38CausalChatTests(unittest.TestCase):
+    def test_exact_head_non_cpu_configuration_is_lazy_nonapplicable(self) -> None:
+        component = Qwen38CausalChat(
+            "unused.causal",
+            "unused-tokenizer.json",
+            device="mps",
+            compute_dtype="float32",
+            exact_head_root="/artifacts/qwen-head",
+        )
+
+        self.assertFalse(component.loaded)
+        component.close()
+
     def test_success_is_lazy_uses_no_thinking_prompt_and_returns_compact_receipts(
         self,
     ) -> None:
@@ -995,6 +1031,55 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(options["fast_mlp_active_layers"], (0, 9, 18, 63))
         self.assertEqual(options["fast_mlp_source_budget_mb"], 8192.0)
         self.assertEqual(options["fast_mlp_max_resident_bytes"], 96 * 1024**2)
+
+    def test_cli_wires_exact_head_index_root(self) -> None:
+        qwen = _chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor:
+            with redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--exact-head",
+                        "/artifacts/qwen-head",
+                        "--head-block-rows",
+                        "64",
+                        "--exact-head-max-mb",
+                        "96",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["exact_head_root"], "/artifacts/qwen-head")
+        self.assertEqual(options["head_block_rows"], 64)
+        self.assertEqual(options["exact_head_max_bytes"], 96 * 1024**2)
+
+    def test_exact_head_receipt_reaches_general_chat_evidence(self) -> None:
+        runtime = _Runtime()
+        runtime.exact_head_receipt = dict(_EXACT_HEAD_RECEIPT)
+        runtime.exact_head_index = _ExactHeadMetrics()
+        result = _chat(
+            runtime,
+            exact_head_root="/artifacts/qwen-head",
+        ).handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok)
+        exact = result.evidence["exact_head"]
+        self.assertEqual(
+            {key: exact[key] for key in _EXACT_HEAD_RECEIPT},
+            _EXACT_HEAD_RECEIPT,
+        )
+        self.assertEqual(exact["request"]["calls"], 1)
+        self.assertEqual(exact["request"]["pages_pruned"], 2)
+        self.assertEqual(exact["request"]["rows_pruned"], 8)
 
     def test_cli_wires_persistent_markov_drafting_without_bundle(self) -> None:
         qwen = _chat(_Runtime())

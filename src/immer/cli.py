@@ -116,6 +116,8 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             max_new_tokens=args.max_new_tokens,
             max_context_tokens=args.max_context_tokens,
             head_block_rows=args.head_block_rows,
+            exact_head_root=args.exact_head,
+            exact_head_max_bytes=int(args.exact_head_max_mb * 1024**2),
             anchor_cache=anchor_cache,
             draft_bundle_path=args.draft_bundle,
             draft_mode=args.draft_mode,
@@ -774,6 +776,11 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--max-new-tokens", type=int, default=64)
     chat.add_argument("--max-context-tokens", type=int, default=2048)
     chat.add_argument("--head-block-rows", type=int, default=2048)
+    chat.add_argument(
+        "--exact-head",
+        help="local residual-certified exact LM-head index directory",
+    )
+    chat.add_argument("--exact-head-max-mb", type=int, default=128)
     organs = sub.add_parser("organs", help="inspect the cold organ bank")
     organs.add_argument("--manifest", help="SHIP-v6/OrganBank manifest")
     organs.add_argument("--artifact-root", help="external SHIP artifact directory")

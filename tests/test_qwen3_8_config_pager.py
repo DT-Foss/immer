@@ -217,6 +217,31 @@ class _RawBF16IntoSource(_RawBF16Source):
         }
 
 
+class _ExactHeadFixture:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str, int]] = []
+
+    def topk_logits(self, pager, hidden, *, k, name, block_rows):
+        self.calls.append((k, name, block_rows))
+        shape = (*hidden.shape[:-1], k)
+        return (
+            pager.torch.full(
+                shape,
+                7.0,
+                device=pager.device,
+                dtype=pager.compute_dtype,
+            ),
+            pager.torch.zeros(
+                shape,
+                device=pager.device,
+                dtype=pager.torch.long,
+            ),
+        )
+
+    def metrics(self) -> dict[str, int]:
+        return {"calls": len(self.calls)}
+
+
 class Qwen38ConfigTests(unittest.TestCase):
     def test_official_nested_config_is_strict_and_maps_runtime_fields(self) -> None:
         from immer.runtimes.qwen3_8.config import Qwen38Config
@@ -381,6 +406,10 @@ class Qwen38PagerTests(unittest.TestCase):
         self.assertEqual(
             metrics["weight_cache_policy"], "one-shot-qwen35-direct-fill/v4"
         )
+        self.assertEqual(
+            metrics["head_score_policy"],
+            "backend-bf16-linear/v1",
+        )
 
     def test_direct_fill_linear_reads_into_torch_storage_without_body_copy(
         self,
@@ -491,6 +520,54 @@ class Qwen38PagerTests(unittest.TestCase):
             )
         )
         self.assertEqual(pager.metrics()["peak_planned_resident_bytes"], 44)
+
+    def test_exact_head_dispatch_and_progress_fallback_preserve_public_abi(
+        self,
+    ) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        source = self._source()
+        index = _ExactHeadFixture()
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=256,
+            exact_head_index=index,
+        )
+        hidden = torch.tensor([[1.0, 1.0]])
+
+        values, ids = pager.topk_logits(hidden, k=1, block_rows=2)
+
+        self.assertEqual(index.calls, [(1, "lm_head.weight", 2)])
+        self.assertEqual(float(values[0, 0]), 7.0)
+        self.assertEqual(int(ids[0, 0]), 0)
+        self.assertEqual(source.raw_calls, [])
+        self.assertTrue(pager.metrics()["exact_head_index_attached"])
+        self.assertEqual(pager.metrics()["exact_head_calls"], 1)
+        self.assertEqual(
+            pager.metrics()["head_score_policy"],
+            "cpu-bf16-explicit-fp32-accumulate-rne/v1",
+        )
+
+        progress = []
+        baseline_values, baseline_ids = pager.topk_logits(
+            hidden,
+            k=1,
+            block_rows=2,
+            progress=progress.append,
+        )
+        self.assertEqual(index.calls, [(1, "lm_head.weight", 2)])
+        self.assertEqual(len(progress), 3)
+        self.assertEqual(int(baseline_ids[0, 0]), 2)
+        self.assertEqual(float(baseline_values[0, 0]), 2.0)
+
+        pager.attach_exact_head_index(None)
+        self.assertFalse(pager.metrics()["exact_head_index_attached"])
+        with self.assertRaises(TypeError):
+            pager.attach_exact_head_index(object())
 
     def test_real_qwen35_f32_control_tensor_is_range_decoded_exactly(self) -> None:
         import torch
