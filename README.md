@@ -61,6 +61,10 @@ release surface.
   depth, and dialect similarity. Under an adaptive request ceiling, the
   Council emits one maximum tail with prefix-local confidence/disagreement;
   every target wave selects direct K1 or K4/K8/K16 and stages only that prefix.
+  Confirmed prompt/output boundaries additionally induce bounded token
+  programs made from literal spans and relative prompt-copy actions. Programs
+  with different internal bindings execute only when they agree on one
+  concrete continuation for the new prompt.
   On the compute-bound packed CPU plane, backend row cost prevents marginal
   confidence from multiplying neural work; K1 learns from the confirmed token
   without cloning transactional state. Existing target receipts can be
@@ -226,6 +230,12 @@ hands the complete committed hidden history to embedded MTP. Both routes learn
 only target-confirmed output, and Full Q4 still verifies every emitted token.
 `--no-markov-draft` forces direct K1 decoding.
 
+Markov state v6 also retains prompt/output boundaries for composition. Two or
+more distinct target-confirmed bindings can induce literal/copy programs over a
+bounded 64-token prompt suffix. An unseen slot is materialized as ordinary
+draft tokens and remains subject to the same exact Qwen prefix verification;
+ambiguous or conflicting programs abstain rather than execute.
+
 Cold general chat now grows the warm bank automatically. The first successful
 Full-Q4/FERTIG path charges an exact ResultCell, derives a prompt-native Markov
 feature, teaches `qwen_fallback → mount_organ`, promotes the per-runtime
@@ -255,6 +265,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Adaptive embedded MTP | 34.05 → 26.74 s generation; 16 → 9 target forwards | arbitrary 16-token counting request; identical target trace; eight accepted drafts; eight provider head scans; 1.58 GB peak RSS |
 | Automatic Markov→MTP→Markov learning | 30.38 → 26.79 s; 12 → 9 target forwards | first novel request opened MTP and taught Council memory; after two confirmations the third request stayed entirely on a seven-token dialect phrase, loaded no MTP, preserved identical output, and used 1.34 GB peak RSS |
 | In-request Markov→MTP handoff | 24 output tokens in 9 target forwards | four learned Markov K4 waves followed by one exact 41-row hidden-state handoff and four MTP waves; 15 accepted drafts; no Qwen replay; 29.93 s generation and 1.46 GB peak RSS |
+| Compositional unseen token slot | unseen `CODE_DD44` via Markov only | three distinct target-confirmed code bindings induced unanimous Literal+Copy programs; fourth slot loaded no MTP, returned the exact requested code in three target forwards, and remained fully Qwen-verified |
 | Rolling K=2–16 continuation | accepted prefixes commit with zero weight reads | one target-known token plus up to 15 drafts; DeltaNet Conv/recurrent state, next-token continuation, Graft, and native Prefix-Sinkhorn state remain bit-exact |
 | Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed variable phrase options up to 15 tokens |
 | Persistent draft-window policy | request ceiling plus per-wave K4/K8/K16 | real Fixed-Share ceiling sampling after bootstrap; each Markov proposal supplies prefix-local expected acceptance/work utility and only the chosen prefix enters the target; full provider tails remain unauthoritative; model/tokenizer/provider-bound state; K2/K3 terminal fallback |

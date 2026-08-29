@@ -6,6 +6,25 @@ All notable changes to IMMER are recorded here.
 
 ### Arbitrary local Qwen runtime
 
+- Added token-native compositional Markov options. State v6 records each
+  target-confirmed prompt/output boundary; Provider ABI v9 deterministically
+  derives bounded programs from `Literal(tokens)` and
+  `Copy(relative_prompt_span)` atoms instead of persisting duplicate templates.
+- Promotion requires at least two distinct confirmed bindings, complete
+  support over every compatible episode, two static prompt guards, and copy
+  coverage for every variable prompt position. Syntactically ambiguous copy
+  programs may coexist only when they materialize one unanimous continuation
+  on the concrete new prompt; conflicts abstain to MTP.
+- Three ordinary teacher requests produced `CODE_AA11`, `CODE_BB22`, and
+  `CODE_CC33`. A fourth unseen `CODE_DD44` request was materialized by the
+  Council, target-verified as `CODE_DD44`, loaded no MTP, accepted two
+  compositional draft tokens, and completed in three target forwards at
+  `1,314,713,600` bytes peak RSS.
+- Receipt bootstrap now preserves structured prompt/output identity. A
+  prompted `[1,2]→[3,4]` transition no longer collides with a promptless
+  `[1,2,3,4]` output; legacy v1–v5 states migrate with unknown boundaries and
+  become composition-capable as new confirmed traffic arrives.
+
 - Upgraded the hybrid provider to a one-way per-round cascade. Markov is
   reconsidered on every adaptive wave and can execute any number of learned
   prefixes. Its first K1 decision initializes MTP from the complete
