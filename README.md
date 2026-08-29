@@ -106,7 +106,10 @@ release surface.
   divergence and cannot revive MTP's zero-confidence padding. Each recursive
   position also blends global Rapidity with its own Beta-normalized specialist
   weights according to evidence maturity, allowing different Markov experts to
-  own token selection at positions 0 and 1 while retaining Fixed Share.
+  own token selection at positions 0 and 1 while retaining Fixed Share. State
+  v8 carries the same 16×8 matrices inside every prompt dialect, so only
+  evidence from the current similar dialect at the current recursive position
+  can specialize the mixture.
   Novel MTP requests teach their complete target-confirmed episode back to the
   Council. After two confirmed copies, the same context can execute from its
   exact dialect phrase: a live third request used no MTP, accepted seven Markov
@@ -300,6 +303,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Teacher-carry depth learning | position 1 observations `3 → 11` in one request | unseen autumn-leaves question; eight actual-prefix teacher predictions, seven confirmed by the following target token, zero replay failures; low measured position-1 accuracy correctly kept Markov from claiming that round |
 | Causal Markov/MTP consensus | one shared-prefix agreement, zero unjustified gain | unseen salt-water question; Markov confidence below 0.5 kept consensus gain at exactly zero while eight teacher carries grew position-1 observations `11→20`; 24 tokens in 15 target forwards |
 | Position-specialist consensus | 9 consensus rounds; 12 shared-prefix tokens | unseen sky question; position-specific experts contributed `+0.2095` confidence while MTP retained execution; position-1 observations reached 28 and specialist-weighted accuracy 32.55%; 24 tokens in 16 target forwards |
+| Dialect × position specialists | 28 contextual specialist predictions | unseen silver-corrosion question matched the preceding iron-corrosion dialect at similarity 0.2549; dialect maturity 0.1622, two consensus tokens and positive gain; 24 tokens in 15 target forwards |
 | Automatic Markov→MTP→Markov learning | 30.38 → 26.79 s; 12 → 9 target forwards | first novel request opened MTP and taught Council memory; after two confirmations the third request stayed entirely on a seven-token dialect phrase, loaded no MTP, preserved identical output, and used 1.34 GB peak RSS |
 | In-request Markov→MTP handoff | 24 output tokens in 9 target forwards | four learned Markov K4 waves followed by one exact 41-row hidden-state handoff and four MTP waves; 15 accepted drafts; no Qwen replay; 29.93 s generation and 1.46 GB peak RSS |
 | Compositional unseen token slot | unseen `CODE_DD44` via Markov only | three distinct target-confirmed code bindings induced unanimous Literal+Copy programs; fourth slot loaded no MTP, returned the exact requested code in three target forwards, and remained fully Qwen-verified |
