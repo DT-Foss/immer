@@ -104,6 +104,36 @@ def _prompt_sketch(question: str, dimensions: int) -> tuple[float, ...]:
     return tuple(0.0 if value == 0.0 else value / norm for value in values)
 
 
+def _json_safe(value: object, *, path: str = "evidence") -> object:
+    if isinstance(value, Mapping):
+        normalized: dict[str, object] = {}
+        for raw_key, child in value.items():
+            if isinstance(raw_key, str):
+                key = raw_key
+            elif isinstance(raw_key, int) and not isinstance(raw_key, bool):
+                key = str(raw_key)
+            else:
+                raise QwenWarmGrowthError(
+                    f"{path} contains a non-JSON object key"
+                )
+            if key in normalized:
+                raise QwenWarmGrowthError(
+                    f"{path} contains colliding JSON object keys"
+                )
+            normalized[key] = _json_safe(child, path=f"{path}.{key}")
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [
+            _json_safe(child, path=f"{path}[{index}]")
+            for index, child in enumerate(value)
+        ]
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    raise QwenWarmGrowthError(f"{path} contains a non-JSON value")
+
+
 def _binding_from_qwen_result(question: str, result: Result) -> ResultCellBinding:
     evidence = result.evidence
     raw_binding = evidence.get(COLD_QWEN_BINDING_EVIDENCE_KEY)
@@ -471,9 +501,16 @@ class GrowingQwenWarmBank:
         qwen_result: Result,
         final_result: Result,
     ) -> GrowingWarmEntry:
-        binding = _binding_from_qwen_result(question, qwen_result)
+        sanitized_qwen = Result(
+            qwen_result.status,
+            qwen_result.component,
+            output=qwen_result.output,
+            reason=qwen_result.reason,
+            evidence=_json_safe(qwen_result.evidence),
+        )
+        binding = _binding_from_qwen_result(question, sanitized_qwen)
         attached = attach_cold_qwen_generation_receipt(
-            qwen_result,
+            sanitized_qwen,
             binding=binding,
         )
         fertig_status, judgment = _fertig_judgment(final_result)
@@ -547,7 +584,7 @@ class GrowingQwenWarmBank:
             transition=transition,
             cell_payload_sha256=cell.payload_sha256,
             output_sha256=hashlib.sha256(
-                str(qwen_result.output).encode("utf-8")
+                str(sanitized_qwen.output).encode("utf-8")
             ).hexdigest(),
         )
 

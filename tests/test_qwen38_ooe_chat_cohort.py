@@ -583,6 +583,9 @@ class Qwen38OoeChatCohortTests(unittest.TestCase):
         qwen_evidence["output_sha256"] = hashlib.sha256(
             output.encode()
         ).hexdigest()
+        qwen_evidence["draft"] = {
+            "last_horizon_utilities": {1: 1.0, 4: 0.5},
+        }
         qwen_result = Result(
             ExecutionStatus.OK,
             "qwen3.8.causal-chat",
