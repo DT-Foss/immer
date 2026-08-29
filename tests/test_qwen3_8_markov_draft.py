@@ -518,6 +518,109 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertGreaterEqual(provider.metrics().regime_generation, 1)
         self.assertGreater(provider.metrics().surprise_mean, 0.0)
 
+    def test_target_confirmed_expert_evidence_calibrates_draft_confidence(
+        self,
+    ) -> None:
+        class FixedExpert:
+            @staticmethod
+            def distribution(_context):
+                return {
+                    "07": 0.9,
+                    "08": 0.05,
+                    markov_module._UNKNOWN_TOKEN: 0.05,
+                }
+
+        def fixed_models(provider):
+            return tuple((FixedExpert(), []) for _ in provider._experts)
+
+        cold = FingerprintRollingK4DraftProvider(vocab_size=32)
+        cold._expert_models = lambda _history: fixed_models(cold)
+        _tokens, _feedback, cold_confidence, _disagreement = cold._predict_council(
+            (1,), 1
+        )
+        self.assertAlmostEqual(cold_confidence[0], 0.9)
+        self.assertEqual(cold.metrics().last_empirical_evidence, 0.0)
+        cold.close()
+
+        trained = FingerprintRollingK4DraftProvider(vocab_size=32)
+        trained._state = replace(
+            trained._state,
+            expert_observations=(100,) * len(trained._experts),
+            expert_hits=(70,) * len(trained._experts),
+        )
+        trained._expert_models = lambda _history: fixed_models(trained)
+
+        tokens, _feedback, confidence, disagreement = trained._predict_council(
+            (1,), 3
+        )
+        proposal = RollingDraftProposal.build(
+            tokens,
+            confidence,
+            disagreement,
+            request_window_ceiling=4,
+            provider_abi=markov_module.MARKOV_DRAFT_PROVIDER_ABI,
+        )
+
+        expected_evidence = (100 / 108) * (71 / 102) * (0.85 / 0.95)
+        expected_confidence = 1.0 - (1.0 - 0.9) * (1.0 - expected_evidence)
+        self.assertTrue(all(token == 7 for token in tokens))
+        self.assertTrue(
+            all(abs(value - expected_confidence) < 1e-12 for value in confidence)
+        )
+        metrics = trained.metrics()
+        self.assertAlmostEqual(metrics.last_raw_confidence, 0.9)
+        self.assertAlmostEqual(metrics.last_empirical_evidence, expected_evidence)
+        self.assertEqual(
+            proposal.select_window(
+                request_window_ceiling=4,
+                remaining_tokens=4,
+                window_work_costs={1: 1.0, 2: 1.6, 4: 2.8},
+            ).chosen_window,
+            4,
+        )
+
+        class NearTieExpert:
+            @staticmethod
+            def distribution(_context):
+                return {
+                    "07": 0.101,
+                    "08": 0.1,
+                    markov_module._UNKNOWN_TOKEN: 0.799,
+                }
+
+        trained._expert_models = lambda _history: tuple(
+            (NearTieExpert(), []) for _ in trained._experts
+        )
+        _tokens, _feedback, near_tie, _disagreement = trained._predict_council(
+            (1,), 1
+        )
+        self.assertLess(near_tie[0], 0.12)
+
+        class UnknownDominantExpert:
+            @staticmethod
+            def distribution(_context):
+                return {
+                    "07": 0.11,
+                    markov_module._UNKNOWN_TOKEN: 0.89,
+                }
+
+        trained._expert_models = lambda _history: tuple(
+            (UnknownDominantExpert(), []) for _ in trained._experts
+        )
+        _tokens, _feedback, unknown_dominant, _disagreement = (
+            trained._predict_council((1,), 1)
+        )
+        self.assertAlmostEqual(unknown_dominant[0], 0.11)
+        self.assertEqual(trained.metrics().last_empirical_evidence, 0.0)
+
+        trained._expert_models = lambda _history: fixed_models(trained)
+        _tokens, _feedback, forced_confidence, _disagreement = (
+            trained._predict_council((1,), 1, forced_prefix=(7,))
+        )
+        self.assertAlmostEqual(forced_confidence[0], 0.9)
+        self.assertEqual(trained.metrics().last_empirical_evidence, 0.0)
+        trained.close()
+
     def test_persistent_history_keeps_explicit_episode_boundaries(self) -> None:
         state_path = self.root / "episodes.bin"
         state_path.write_bytes(

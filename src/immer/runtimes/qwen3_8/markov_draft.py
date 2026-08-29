@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v11"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v12"
 V5_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
 V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
@@ -830,6 +830,8 @@ class MarkovDraftMetrics:
     expert_accuracy: tuple[tuple[str, float], ...]
     effective_experts: float
     last_confidence: float
+    last_raw_confidence: float
+    last_empirical_evidence: float
     last_disagreement: float
     regime_generation: int
     surprise_mean: float
@@ -891,6 +893,7 @@ class FingerprintRollingK4DraftProvider:
     DIALECT_PHRASE_MIN_SUPPORT = 2
     GLOBAL_PHRASE_MIN_SUPPORT = 3
     COMPOSITION_BOUNDS = CompositionBounds()
+    EMPIRICAL_EVIDENCE_SATURATION = 8.0
 
     def __init__(
         self,
@@ -1014,6 +1017,8 @@ class FingerprintRollingK4DraftProvider:
         self._external_reconcile_calls = 0
         self._external_feedback_tokens = 0
         self._last_confidence = 0.0
+        self._last_raw_confidence = 0.0
+        self._last_empirical_evidence = 0.0
         self._last_disagreement = 0.0
         self._adaptive_proposal_calls = 0
         self._recommended_window_counts = {1: 0, 4: 0, 8: 0, 16: 0}
@@ -1604,6 +1609,76 @@ class FingerprintRollingK4DraftProvider:
             rows.append((model, list(selected)))
         return tuple(rows)
 
+    def _calibrated_confidence(
+        self,
+        token: int,
+        raw_confidence: float,
+        expert_row: Sequence[tuple[Mapping[str, float], int]],
+        weights: Sequence[float],
+        *,
+        allow_empirical: bool = True,
+    ) -> tuple[float, float]:
+        """Fuse PPM mass with target-confirmed Fixed-Share expert evidence.
+
+        Each agreeing expert contributes its Beta(1,1) posterior correctness,
+        discounted by ``n / (n + tau)`` and by its current normalized Top-1
+        margin ``(p1-p2)/(p1+p2)``.  An unobserved or undecided Council therefore
+        cannot create confidence from its prior alone.  The weighted evidence
+        is joined with the current PPM probability by the complement product
+        ``1 - (1-p_raw)(1-e)``.  Target disagreement remains a separate prefix
+        penalty in :class:`RollingDraftProposal`.  Forced phrase tokens disable
+        this path because phrase support is already scored independently.
+        """
+
+        if len(expert_row) != len(self._experts) or len(weights) != len(self._experts):
+            raise MarkovDraftError("Markov empirical confidence width changed")
+        evidence = 0.0
+        token_symbol = self._symbol(token)
+        for index, ((_distribution, predicted), weight) in enumerate(
+            zip(expert_row, weights, strict=True)
+        ):
+            if not allow_empirical or predicted != token:
+                continue
+            token_mass = float(_distribution.get(token_symbol, 0.0))
+            runner_up = max(
+                (
+                    float(probability)
+                    for symbol, probability in _distribution.items()
+                    if symbol != token_symbol
+                    and (
+                        symbol == _UNKNOWN_TOKEN
+                        or (
+                            symbol.isdecimal()
+                            and 0 <= int(symbol) < self.vocab_size
+                        )
+                    )
+                ),
+                default=0.0,
+            )
+            denominator = token_mass + runner_up
+            decisiveness = (
+                1.0
+                if denominator <= 0.0 and token_mass > 0.0
+                else 0.0
+                if denominator <= 0.0
+                else max(0.0, min(1.0, (token_mass - runner_up) / denominator))
+            )
+            if decisiveness <= 0.0:
+                continue
+            observations = self._state.expert_observations[index]
+            if observations <= 0:
+                continue
+            hits = self._state.expert_hits[index]
+            posterior = (hits + 1.0) / (observations + 2.0)
+            maturity = observations / (
+                observations + self.EMPIRICAL_EVIDENCE_SATURATION
+            )
+            evidence += float(weight) * maturity * posterior * decisiveness
+        evidence = max(0.0, min(0.999, evidence))
+        raw = max(0.0, min(0.999, float(raw_confidence)))
+        calibrated = 1.0 - (1.0 - raw) * (1.0 - evidence)
+        return max(raw, min(0.999, calibrated)), evidence
+
     def _predict_council(
         self,
         history: tuple[int, ...],
@@ -1680,7 +1755,6 @@ class FingerprintRollingK4DraftProvider:
                     if value > 0.0
                 )
 
-            self._last_confidence = mixture.get(self._symbol(token), 0.0)
             self._last_disagreement = max(
                 0.0,
                 entropy(pooled)
@@ -1689,8 +1763,6 @@ class FingerprintRollingK4DraftProvider:
                     for weight, distribution in zip(weights, distributions, strict=True)
                 ),
             )
-            confidences.append(self._last_confidence)
-            disagreements.append(self._last_disagreement)
             expert_row = []
             for distribution in distributions:
                 predicted = max(
@@ -1705,6 +1777,19 @@ class FingerprintRollingK4DraftProvider:
                     and 0 <= int(symbol) < self.vocab_size
                 )[2]
                 expert_row.append((distribution, predicted))
+            self._last_raw_confidence = mixture.get(self._symbol(token), 0.0)
+            (
+                self._last_confidence,
+                self._last_empirical_evidence,
+            ) = self._calibrated_confidence(
+                token,
+                self._last_raw_confidence,
+                expert_row,
+                weights,
+                allow_empirical=position >= len(forced),
+            )
+            confidences.append(self._last_confidence)
+            disagreements.append(self._last_disagreement)
             feedback_rows.append(tuple(expert_row))
             symbol = self._symbol(token)
             for _model, context in experts:
@@ -2319,6 +2404,8 @@ class FingerprintRollingK4DraftProvider:
             expert_accuracy=tuple(zip(self._state.expert_names, accuracy, strict=True)),
             effective_experts=1.0 / sum(value * value for value in weights),
             last_confidence=self._last_confidence,
+            last_raw_confidence=self._last_raw_confidence,
+            last_empirical_evidence=self._last_empirical_evidence,
             last_disagreement=self._last_disagreement,
             regime_generation=self._state.regime_generation,
             surprise_mean=self._state.surprise_mean,

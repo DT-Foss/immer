@@ -12,7 +12,11 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from immer.cli import _qwen38_runtime_code_paths, main
+from immer.cli import (
+    _qwen38_growing_warm_profile,
+    _qwen38_runtime_code_paths,
+    main,
+)
 from immer.cognition.fertig import FertigSolver
 from immer.cognition.qwen_fertig_chat import QwenFertigChat
 from immer.composition import CompositionRoot, compose_runtime
@@ -906,7 +910,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         hybrid = policy["hybrid_draft"]
         self.assertEqual(
             hybrid["selection"],
-            "round-wise-markov-first-mtp-fallback/v4",
+            "round-wise-markov-first-mtp-fallback/v5",
         )
         self.assertFalse(hybrid["request_provider_lock"])
         self.assertFalse(hybrid["one_way_handoff"])
@@ -914,6 +918,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertTrue(hybrid["cross_provider_target_state_sync"])
         self.assertTrue(hybrid["cross_provider_target_feedback"])
         self.assertTrue(hybrid["committed_hidden_handoff"])
+        self.assertEqual(
+            hybrid["markov_confidence"],
+            "fixed-share-beta-evidence/v1",
+        )
         self.assertTrue(hybrid["markov_persistent"])
         self.assertTrue(hybrid["mtp_persistent_calibration"])
         self.assertEqual(
@@ -945,7 +953,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         self.assertEqual(
             identity["provider"]["selection"],
-            "round-wise-markov-first-mtp-fallback/v4",
+            "round-wise-markov-first-mtp-fallback/v5",
         )
         chat.close()
 
@@ -1723,6 +1731,49 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIn("cartography_probe.py", names)
         self.assertIn("adapter.py", names)
         self.assertIn("qwen_warm_growth.py", names)
+
+    def test_hybrid_warm_profile_changes_with_markov_confidence_abi(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            q4 = root / "q4"
+            q4.mkdir()
+            (q4 / "manifest.json").write_bytes(b"manifest")
+            tokenizer = root / "tokenizer.json"
+            tokenizer.write_bytes(b"tokenizer")
+            args = SimpleNamespace(
+                compute_dtype="auto",
+                device="auto",
+                draft_window=8,
+                head_block_rows=2048,
+                max_context_tokens=2048,
+                max_new_tokens=64,
+                max_prompt_tokens=1024,
+                q4_threads=None,
+                qwen38_anchor_cache=None,
+                system_prompt="",
+            )
+            current = _qwen38_growing_warm_profile(
+                args,
+                tokenizer_path=tokenizer,
+                q4_root=q4,
+                fast_mlp_root=None,
+                draft_mode="hybrid",
+                runtime_code_revision="a" * 64,
+            )
+            with patch(
+                "immer.cli._QWEN38_MARKOV_DRAFT_ABI",
+                "immer.qwen3.8-markov-draft-provider/v999",
+            ):
+                changed = _qwen38_growing_warm_profile(
+                    args,
+                    tokenizer_path=tokenizer,
+                    q4_root=q4,
+                    fast_mlp_root=None,
+                    draft_mode="hybrid",
+                    runtime_code_revision="a" * 64,
+                )
+
+        self.assertNotEqual(current, changed)
 
     def test_cli_explicit_layout_does_not_inherit_deployed_q4(self) -> None:
         qwen = _chat(_Runtime())

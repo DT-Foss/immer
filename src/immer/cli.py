@@ -106,8 +106,11 @@ _QWEN38_DEPLOYMENT_WARM_ROOT = Path(
 )
 _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE = Path("/root/immer-state/qwen-markov-q4-v1.bin")
 _QWEN38_DEPLOYMENT_MTP_STATE = Path("/root/immer-state/qwen-mtp-q4-v1.json")
+_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v12"
+_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v5"
+_QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v2"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
-    b"immer:qwen3.8-growing-warm-runtime/v1"
+    b"immer:qwen3.8-growing-warm-runtime/v2"
 ).hexdigest()
 
 
@@ -305,12 +308,22 @@ def _qwen38_growing_warm_profile(
         "draft_mode": draft_mode,
         "draft_window": args.draft_window,
         "head_block_rows": args.head_block_rows,
-        "markov_provider_abi": (
-            "immer.qwen3.8-markov-mtp-hybrid-provider/v4"
+        "draft_provider_abi": (
+            _QWEN38_HYBRID_DRAFT_ABI
             if draft_mode == "hybrid"
-            else "immer.qwen3.8-markov-draft-provider/v11"
+            else _QWEN38_MARKOV_DRAFT_ABI
             if draft_mode == "markov"
+            else _QWEN38_MTP_DRAFT_ABI
+            if draft_mode == "mtp"
             else None
+        ),
+        "markov_provider_abi": (
+            _QWEN38_MARKOV_DRAFT_ABI
+            if draft_mode in {"hybrid", "markov"}
+            else None
+        ),
+        "mtp_provider_abi": (
+            _QWEN38_MTP_DRAFT_ABI if draft_mode in {"hybrid", "mtp"} else None
         ),
         "max_context_tokens": args.max_context_tokens,
         "max_new_tokens": args.max_new_tokens,
@@ -318,7 +331,7 @@ def _qwen38_growing_warm_profile(
         "q4_manifest_file_sha256": _path_sha256(q4_manifest),
         "q4_threads": args.q4_threads or min(16, os.cpu_count() or 1),
         "runtime_code_revision": runtime_code_revision,
-        "schema": "immer.qwen3.8-growing-warm-runtime/v1",
+        "schema": "immer.qwen3.8-growing-warm-runtime/v2",
         "system_prompt_sha256": hashlib.sha256(
             args.system_prompt.strip().encode("utf-8")
         ).hexdigest(),
