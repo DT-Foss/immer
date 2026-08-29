@@ -733,11 +733,14 @@ class Qwen38WeightPager:
         *,
         dtype: Any | None = None,
         device: str | Any | None = None,
+        zero_copy_cpu: bool = False,
     ) -> Any:
         """Read one BF16/F32 tensor with exact range and resident preflight."""
 
         with self._lock:
             self._ensure_open()
+            if not isinstance(zero_copy_cpu, bool):
+                raise TypeError("zero_copy_cpu must be boolean")
             target_dtype = self.compute_dtype if dtype is None else dtype
             if target_dtype not in {
                 self.torch.float16,
@@ -746,7 +749,12 @@ class Qwen38WeightPager:
             }:
                 raise ValueError("dtype must be float16, bfloat16, or float32")
             target_device = self.device if device is None else self.torch.device(device)
-            return self._read_tensor(name, dtype=target_dtype, device=target_device)
+            return self._read_tensor(
+                name,
+                dtype=target_dtype,
+                device=target_device,
+                zero_copy_cpu=zero_copy_cpu,
+            )
 
     def tensor_rows(self, name: str, row_ids: Iterable[int]) -> Any:
         """Read arbitrary 2D rows through the active authenticated range plane.

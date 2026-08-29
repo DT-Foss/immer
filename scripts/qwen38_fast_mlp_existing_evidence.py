@@ -251,6 +251,7 @@ def _calibrate_layer(
         down_name,
         dtype=torch.bfloat16,
         device="cpu",
+        zero_copy_cpu=True,
     )
     expected = (config.dim, config.intermediate_size)
     if tuple(down.shape) != expected:

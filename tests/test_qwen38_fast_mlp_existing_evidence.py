@@ -111,9 +111,10 @@ class ExistingEvidenceCalibrationTests(unittest.TestCase):
                 self.releases = 0
                 self.down = torch.randn(hidden, intermediate, dtype=torch.bfloat16)
 
-            def tensor_torch(self, name, *, dtype, device):
+            def tensor_torch(self, name, *, dtype, device, zero_copy_cpu=False):
                 self.reads += 1
                 self.assert_name = name
+                self.zero_copy_cpu = zero_copy_cpu
                 return self.down.to(dtype=dtype, device=device)
 
             def release(self, *, force_gc=False):
@@ -142,6 +143,7 @@ class ExistingEvidenceCalibrationTests(unittest.TestCase):
 
         self.assertEqual(observed, 2)
         self.assertEqual(pager.reads, 1)
+        self.assertTrue(pager.zero_copy_cpu)
         self.assertEqual(pager.releases, 1)
         self.assertEqual(
             pager.assert_name,

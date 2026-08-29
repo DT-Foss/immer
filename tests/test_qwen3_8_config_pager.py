@@ -450,6 +450,45 @@ class Qwen38PagerTests(unittest.TestCase):
         self.assertEqual(metrics["peak_planned_resident_bytes"], 8)
         self.assertEqual(metrics["materialized_tensor_bytes"], 8)
 
+    def test_tensor_torch_can_request_one_final_direct_fill_storage(self) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        source = _RawBF16IntoSource(
+            {
+                "dense.weight": np.asarray(
+                    [[1.0, 2.0], [3.0, 4.0]], dtype=np.float32
+                )
+            }
+        )
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=8,
+        )
+        with mock.patch.object(
+            source,
+            "raw_bytes",
+            side_effect=AssertionError("intermediate body read"),
+        ):
+            result = pager.tensor_torch(
+                "dense.weight",
+                zero_copy_cpu=True,
+            )
+
+        torch.testing.assert_close(
+            result.float(),
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            rtol=0,
+            atol=0,
+        )
+        self.assertEqual(source.into_calls, [(source.shard, source.data_start, 8)])
+        self.assertEqual(pager.metrics()["peak_planned_resident_bytes"], 8)
+        with self.assertRaisesRegex(TypeError, "zero_copy_cpu"):
+            pager.tensor_torch("dense.weight", zero_copy_cpu=1)
+
     def test_direct_fill_sorted_rows_use_one_final_resident_tensor(self) -> None:
         import torch
 
