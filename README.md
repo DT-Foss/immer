@@ -156,8 +156,8 @@ release surface.
 ## Local packed runtime
 
 ```bash
-# On the IMMER server this auto-mounts local Qwen, Q4/Q8, the packed
-# Structure-Edge MLP plan, native DeltaNet and FERTIG.
+# On the IMMER server this auto-mounts local Qwen, full Q4/Q8, native
+# DeltaNet and FERTIG.
 PYTHONPATH=src python3 -m immer chat "<arbitrary text>"
 
 # Keep the mounted model alive for multiple raw-text or JSONL requests.
@@ -166,7 +166,9 @@ PYTHONPATH=src python3 -m immer chat --jsonl
 
 Outside the canonical deployment, set `IMMER_QWEN38_ROOT` and optionally
 `IMMER_QWEN38_Q4` and `IMMER_QWEN38_FAST_MLP`. Explicit CLI paths remain
-available as overrides. `--raw-qwen` bypasses the normal FERTIG-first route.
+available as overrides. The sparse MLP plan is explicit because full Q4 keeps
+the general-chat language intact. `--raw-qwen` bypasses the normal
+FERTIG-first route.
 
 ## Selected trial evidence
 

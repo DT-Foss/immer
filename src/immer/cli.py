@@ -64,9 +64,6 @@ def _artifact_root(manifest: str | Path, configured: str | Path | None = None) -
 
 
 _QWEN38_DEPLOYMENT_ROOT = Path("/app/models/Qwen3.8-27B")
-_QWEN38_DEPLOYMENT_FAST_MLP = Path(
-    "/root/immer-state/qwen-q4-fast-mlp-all64-v1"
-)
 
 
 def _chat_path(
@@ -130,15 +127,6 @@ def _resolve_qwen38_chat_paths(
             "IMMER_QWEN38_FAST_MLP",
         )
     )
-    if (
-        not disable_fast_mlp
-        and fast_mlp is None
-        and q4 is not None
-        and root == _QWEN38_DEPLOYMENT_ROOT
-        and _QWEN38_DEPLOYMENT_FAST_MLP.is_dir()
-    ):
-        fast_mlp = _QWEN38_DEPLOYMENT_FAST_MLP
-
     if bundle is None or tokenizer is None:
         raise ValueError(
             "local Qwen is not configured; set --qwen38-root or "
