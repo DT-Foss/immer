@@ -1898,12 +1898,12 @@ class Qwen38CausalChat:
         }
         q4_bank = getattr(getattr(runtime.model, "pager", None), "q4_bank", None)
         if adaptive_rounds and q4_bank is not None:
-            # The AVX2 packed plane is compute-bound across token rows: mmap
-            # reuse removes transport, but K staged rows still execute K neural
-            # rows.  A 10% reuse credit allows only near-certain phrases to beat
-            # direct K1 instead of letting marginal confidence multiply work.
+            # Fused BF16 MLP rows and F16C scale decode reuse each packed weight
+            # row across the staged prefix. Real K2 target work is about 1.32x
+            # K1; the extra margin covers the embedded provider/head. Wider
+            # actions retain the conservative 0.6 marginal-row slope.
             decoder_options["round_window_work_costs"] = {
-                window: 1.0 + 0.9 * (window - 1) for window in (1, 2, 4, 8, 16)
+                window: 1.0 + 0.6 * (window - 1) for window in (1, 2, 4, 8, 16)
             }
         try:
             generated = Qwen38K4SpeculativeDecoder(

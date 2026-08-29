@@ -575,7 +575,7 @@ class Qwen35MtpDraftProvider:
             proposal.append(token)
             confidences.append(confidence)
             gap_buckets.append(bucket)
-            if self._adaptive_round_call and proposal_index == 0 and confidence < 0.9:
+            if self._adaptive_round_call and proposal_index == 0 and confidence < 0.6:
                 missing = self.proposal_width - len(proposal)
                 proposal.extend([token] * missing)
                 confidences.extend([0.0] * missing)
