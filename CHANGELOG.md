@@ -6,6 +6,25 @@ All notable changes to IMMER are recorded here.
 
 ### Arbitrary local Qwen runtime
 
+- Promoted embedded MTP from an explicit mode into the normal deployed chat
+  path through a request-locked Markov-first cascade. The zero-weight token
+  Council proposes first; a useful K2/K4/K8 continuation keeps the complete
+  request on Markov, while K1 abstention lazily opens MTP. The provider cannot
+  switch again inside the request.
+- MTP fallback feeds the complete target-confirmed episode back into the
+  Council, so novel traffic strengthens the cheaper future route. Fixed K2/K3
+  tails stay on Markov and never instantiate MTP. Active prefix-anchor caches
+  retain their compatible Markov path.
+- A fresh ordinary CLI request selected `hybrid → mtp`, generated new German
+  text, accepted five draft tokens, and reduced full target forwards from `16`
+  to `12`. Generation took `30.3833 s` at `1,492,398,080` bytes peak RSS; the
+  MTP provider used eleven physical proposal scans and `1.2700 s`.
+- Corrected shared-pager receipts: MTP linears and source bytes are split out
+  of the decoder total rather than counted twice. Provider setup, timeout, and
+  broken-auxiliary paths retain one complete work receipt. MTP state persists
+  before the Council releases its cross-process lock, and banks without all
+  embedded MTP matrices fail at runtime load.
+
 - Stopped adaptive embedded-MTP generation at the only frontier the live
   Markov action can consume. K1 now computes the target-known MTP step plus one
   confidence scan; K2 additionally materializes exactly the first proposal

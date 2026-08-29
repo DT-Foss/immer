@@ -74,7 +74,11 @@ release surface.
   an uneconomic target wave. Adaptive execution computes only the proposal
   frontier selected by that policy. On an arbitrary 16-token counting request,
   K2 accepted eight drafts and reduced exact generation from 34.05 to 26.74
-  seconds while cutting complete target forwards from 16 to 9.
+  seconds while cutting complete target forwards from 16 to 9. Normal deployed
+  chat now asks the zero-weight Markov Council first: a useful continuation
+  locks the request to Markov, while Council K1 abstention lazily opens MTP.
+  Novel MTP requests teach their complete target-confirmed episode back to the
+  Council.
 - **All-layer Fast MLP.** A prompt-free weight initializer derives p4/k32
   pilots for every Qwen MLP layer from exact Gate/Up Gaussian joint moments.
   Existing full-path tensors update bounded recursive-ridge route statistics;
@@ -206,11 +210,12 @@ persists the Markov accounting; an unknown prompt falls directly through to
 full Q4. `--no-ooe-warm` disables this route, and `--ooe-warm-root` mounts an
 explicit bank outside the canonical deployment.
 
-The canonical Q4 deployment also mounts its persistent token-level Markov
-council. It proposes variable continuation windows, abstains to K1 when their
-expected work is worse, and learns only target-confirmed output. Full Q4 still
-verifies every emitted token, so the council changes work scheduling rather
-than answer quality. `--no-markov-draft` forces direct K1 decoding.
+The canonical Q4 deployment mounts the MTP-capable local bank and its persistent
+token-level Markov council. The Council gets a zero-model-cost first proposal;
+useful known continuations stay entirely on Markov, while K1 abstention lazily
+activates embedded MTP for the request. Both routes learn only target-confirmed
+output, and Full Q4 still verifies every emitted token. `--no-markov-draft`
+forces direct K1 decoding.
 
 Cold general chat now grows the warm bank automatically. The first successful
 Full-Q4/FERTIG path charges an exact ResultCell, derives a prompt-native Markov
@@ -239,6 +244,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Persistent JSONL chat | second request opens 0 tensors | one process retains the verified mmap plane; observed one-token generation 15.01 s then 16.90 s |
 | Native DeltaNet K=4 convolution | 79.05 → 23.01 s generation; 3.44x | direct causal channelwise kernel replaces generic 10,240-group Conv1d; identical output/token trace; TTFT 25.05 → 13.65 s |
 | Adaptive embedded MTP | 34.05 → 26.74 s generation; 16 → 9 target forwards | arbitrary 16-token counting request; identical target trace; eight accepted drafts; eight provider head scans; 1.58 GB peak RSS |
+| Automatic Markov→MTP cascade | 12 target forwards for 16 generated tokens | ordinary fresh CLI request; Council K1 abstention opened MTP lazily; five accepted drafts; 30.38 s generation; 1.49 GB peak RSS; confirmed episode persisted back into Council memory |
 | Rolling K=2–16 continuation | accepted prefixes commit with zero weight reads | one target-known token plus up to 15 drafts; DeltaNet Conv/recurrent state, next-token continuation, Graft, and native Prefix-Sinkhorn state remain bit-exact |
 | Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed variable phrase options up to 15 tokens |
 | Persistent draft-window policy | request ceiling plus per-wave K4/K8/K16 | real Fixed-Share ceiling sampling after bootstrap; each Markov proposal supplies prefix-local expected acceptance/work utility and only the chosen prefix enters the target; full provider tails remain unauthoritative; model/tokenizer/provider-bound state; K2/K3 terminal fallback |
