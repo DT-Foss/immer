@@ -288,6 +288,22 @@ class Q4NativeKernel:
             integer,
         )
         self.library.immer_q4_linear_f32.restype = integer
+        self.library.immer_q4_topk_bf16_f32.argtypes = (
+            void,
+            i64,
+            i64,
+            void,
+            integer,
+            i64,
+            i64,
+            i64,
+            void,
+            void,
+            void,
+            void,
+            integer,
+        )
+        self.library.immer_q4_topk_bf16_f32.restype = integer
         self.library.immer_q4_linear_rows_f32.argtypes = (
             void,
             i64,
@@ -672,6 +688,9 @@ class Q4BankMetrics:
     mapping_discard_bytes: int = 0
     mapping_discard_fallback_closes: int = 0
     mapping_reopens: int = 0
+    native_topk_calls: int = 0
+    native_topk_rows: int = 0
+    native_topk_discard_bytes: int = 0
     linear_calls: int = 0
     linear_group_calls: int = 0
     linear_row_calls: int = 0
@@ -880,6 +899,88 @@ class Q4Bank:
             self._stats.logical_weight_bytes += entry.payload_bytes
             self._stats.output_bytes += result.numel() * result.element_size()
             return result
+
+    def topk(
+        self,
+        values: Any,
+        name: str,
+        *,
+        k: int,
+        block_rows: int,
+        output_dtype: Any,
+    ) -> tuple[Any, Any]:
+        """Scan one packed matrix once and discard each consumed row interval."""
+
+        import torch
+
+        with self._lock:
+            entry, mapped = self._mapping(name)
+            if not isinstance(values, torch.Tensor):
+                values = torch.as_tensor(values)
+            if (
+                values.ndim < 1
+                or values.shape[-1] != entry.shape[1]
+                or values.device.type != "cpu"
+                or output_dtype != torch.bfloat16
+            ):
+                raise ValueError("native Q4 top-k requires BF16-output CPU rows")
+            if (
+                isinstance(k, bool)
+                or not isinstance(k, int)
+                or not 1 <= k <= min(256, entry.shape[0])
+                or isinstance(block_rows, bool)
+                or not isinstance(block_rows, int)
+                or block_rows <= 0
+            ):
+                raise ValueError("native Q4 top-k dimensions are invalid")
+            leading = tuple(values.shape[:-1])
+            input_rows = values.numel() // values.shape[-1]
+            compute = (
+                values.detach()
+                .to(dtype=torch.float32)
+                .reshape(input_rows, entry.shape[1])
+                .contiguous()
+            )
+            top_values = torch.empty((input_rows, k), dtype=torch.float32)
+            top_ids = torch.empty((input_rows, k), dtype=torch.int64)
+            discarded_bytes = ctypes.c_int64()
+            discard_calls = ctypes.c_int64()
+            native_block_rows = min(entry.shape[0], max(block_rows, 8192))
+            code = self.native.library.immer_q4_topk_bf16_f32(
+                self.native._pointer(compute),
+                input_rows,
+                entry.shape[1],
+                self.native._pointer(mapped.bytes),
+                _FORMAT_CODES[entry.format],
+                entry.shape[0],
+                k,
+                native_block_rows,
+                self.native._pointer(top_values),
+                self.native._pointer(top_ids),
+                ctypes.byref(discarded_bytes),
+                ctypes.byref(discard_calls),
+                self.threads,
+            )
+            if code == 2:
+                raise ValueError("native Q4 top-k values are non-finite")
+            if code:
+                raise Q4BankError(f"native Q4 top-k failed with code {code}")
+            result_values = top_values.to(dtype=output_dtype).reshape(*leading, k)
+            result_ids = top_ids.reshape(*leading, k)
+            self._stats.linear_calls += 1
+            self._stats.input_quantizations += input_rows
+            self._stats.linear_input_rows += input_rows
+            self._stats.logical_weight_bytes += entry.payload_bytes
+            self._stats.output_bytes += (
+                result_values.numel() * result_values.element_size()
+            )
+            self._stats.native_topk_calls += 1
+            self._stats.native_topk_rows += input_rows * entry.shape[0]
+            if discard_calls.value > 0:
+                self._stats.mapping_discard_calls += discard_calls.value
+                self._stats.mapping_discard_bytes += discarded_bytes.value
+                self._stats.native_topk_discard_bytes += discarded_bytes.value
+            return result_values, result_ids
 
     def linear_group(
         self,

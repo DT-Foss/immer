@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 /*
  * IMMER row-addressable Q4_0/Q8_0 CPU kernels.
  *
@@ -15,6 +19,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -535,6 +544,29 @@ static float immer_dot_sparse_packed_f32(
     );
 }
 
+static int64_t immer_discard_read_pages(const uint8_t *start, size_t length) {
+#if defined(_WIN32)
+    (void) start;
+    (void) length;
+    return 0;
+#else
+    if (!start || length == 0) return 0;
+    long raw_page = sysconf(_SC_PAGESIZE);
+    if (raw_page <= 0) return 0;
+    const uintptr_t page = (uintptr_t) raw_page;
+    const uintptr_t begin = (uintptr_t) start;
+    const uintptr_t aligned = begin - begin % page;
+    if (length > (size_t) (UINTPTR_MAX - begin)) return 0;
+    const uintptr_t end = begin + (uintptr_t) length;
+    if (end > UINTPTR_MAX - (page - 1u)) return 0;
+    const uintptr_t aligned_end = ((end + page - 1u) / page) * page;
+    const size_t aligned_length = (size_t) (aligned_end - aligned);
+    return madvise((void *) aligned, aligned_length, MADV_DONTNEED) == 0
+        ? (int64_t) length
+        : 0;
+#endif
+}
+
 static float immer_silu_f32(float value) {
     if (value >= 0.0f) {
         return value / (1.0f + expf(-value));
@@ -786,6 +818,173 @@ IMMER_EXPORT int immer_q4_linear_f32(
     }
     free(quantized_input);
     return 0;
+}
+
+IMMER_EXPORT int immer_q4_topk_bf16_f32(
+    const float *input,
+    int64_t input_rows,
+    int64_t input_cols,
+    const uint8_t *weights,
+    int format,
+    int64_t output_rows,
+    int64_t k,
+    int64_t block_rows,
+    float *top_values,
+    int64_t *top_ids,
+    int64_t *discarded_bytes_out,
+    int64_t *discard_calls_out,
+    int threads
+) {
+    int64_t packed_blocks;
+    size_t row_bytes;
+    if (
+        !input || !weights || !top_values || !top_ids
+        || !discarded_bytes_out || !discard_calls_out
+        || input_rows <= 0 || input_cols <= 0 || output_rows <= 0
+        || k <= 0 || k > output_rows || k > 256
+        || block_rows <= 0 || threads <= 0
+        || !immer_checked_row_layout(
+            format, input_cols, &packed_blocks, &row_bytes
+        )
+        || !immer_size_product_fits(
+            input_rows, packed_blocks, sizeof(immer_block_q8_0)
+        )
+        || !immer_size_product_fits(input_rows, k, sizeof(float))
+        || !immer_size_product_fits(input_rows, k, sizeof(int64_t))
+        || !immer_size_product_fits(
+            input_rows,
+            block_rows < output_rows ? block_rows : output_rows,
+            sizeof(float)
+        )
+    ) return 1;
+    const size_t input_count = (size_t) input_rows * (size_t) input_cols;
+    if (!immer_f32_values_are_finite(input, input_count)) return 2;
+
+    const size_t quantized_count =
+        (size_t) input_rows * (size_t) packed_blocks;
+    const int64_t chunk_capacity = block_rows < output_rows
+        ? block_rows
+        : output_rows;
+    immer_block_q8_0 *quantized = (immer_block_q8_0 *) malloc(
+        quantized_count * sizeof(immer_block_q8_0)
+    );
+    float *chunk = (float *) malloc(
+        (size_t) input_rows * (size_t) chunk_capacity * sizeof(float)
+    );
+    if (!quantized || !chunk) {
+        free(quantized);
+        free(chunk);
+        return 3;
+    }
+
+    for (int64_t row = 0; row < input_rows; ++row) {
+        immer_quantize_q8_row(
+            input + (size_t) row * (size_t) input_cols,
+            quantized + (size_t) row * (size_t) packed_blocks,
+            input_cols
+        );
+        for (int64_t block = 0; block < packed_blocks; ++block) {
+            if (!isfinite(immer_half_to_float(
+                quantized[(size_t) row * (size_t) packed_blocks + block].d
+            ))) {
+                free(quantized);
+                free(chunk);
+                return 2;
+            }
+        }
+    }
+    for (int64_t row = 0; row < input_rows; ++row) {
+        for (int64_t index = 0; index < k; ++index) {
+            top_values[(size_t) row * (size_t) k + index] = -INFINITY;
+            top_ids[(size_t) row * (size_t) k + index] = INT64_MAX;
+        }
+    }
+    *discarded_bytes_out = 0;
+    *discard_calls_out = 0;
+    int numeric_error = 0;
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(threads)
+#endif
+    {
+        for (int64_t start = 0; start < output_rows; start += block_rows) {
+            const int64_t count = output_rows - start < block_rows
+                ? output_rows - start
+                : block_rows;
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+            for (int64_t local = 0; local < count; ++local) {
+                const int64_t output_row = start + local;
+                const uint8_t *weight_row = weights
+                    + (size_t) output_row * row_bytes;
+                for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+                    const immer_block_q8_0 *active_input = quantized
+                        + (size_t) input_row * (size_t) packed_blocks;
+                    float value = immer_dot_packed_q8(
+                        weight_row, format, active_input, packed_blocks
+                    );
+                    value = immer_round_bf16(value);
+                    if (!isfinite(value)) numeric_error = 1;
+                    chunk[(size_t) input_row * (size_t) chunk_capacity + local] = value;
+                }
+            }
+#ifdef _OPENMP
+#pragma omp single
+#endif
+            {
+                if (!numeric_error) {
+                    for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+                        float *active_values = top_values
+                            + (size_t) input_row * (size_t) k;
+                        int64_t *active_ids = top_ids
+                            + (size_t) input_row * (size_t) k;
+                        for (int64_t local = 0; local < count; ++local) {
+                            const float value = chunk[
+                                (size_t) input_row * (size_t) chunk_capacity + local
+                            ];
+                            const int64_t token_id = start + local;
+                            int64_t insert = 0;
+                            while (
+                                insert < k
+                                && (
+                                    active_values[insert] > value
+                                    || (
+                                        active_values[insert] == value
+                                        && active_ids[insert] < token_id
+                                    )
+                                )
+                            ) ++insert;
+                            if (insert < k) {
+                                for (
+                                    int64_t position = k - 1;
+                                    position > insert;
+                                    --position
+                                ) {
+                                    active_values[position] = active_values[position - 1];
+                                    active_ids[position] = active_ids[position - 1];
+                                }
+                                active_values[insert] = value;
+                                active_ids[insert] = token_id;
+                            }
+                        }
+                    }
+                    const size_t consumed = (size_t) count * row_bytes;
+                    const int64_t discarded = immer_discard_read_pages(
+                        weights + (size_t) start * row_bytes,
+                        consumed
+                    );
+                    if (discarded > 0) {
+                        *discarded_bytes_out += discarded;
+                        *discard_calls_out += 1;
+                    }
+                }
+            }
+        }
+    }
+    free(quantized);
+    free(chunk);
+    return numeric_error ? 2 : 0;
 }
 
 IMMER_EXPORT int immer_q4_linear_rows_f32(

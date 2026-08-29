@@ -671,6 +671,60 @@ class Q4BankTests(unittest.TestCase):
             finally:
                 bank.close()
 
+    def test_native_topk_matches_full_q8_scan_across_discard_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q8-head"
+            generator = torch.Generator().manual_seed(8181)
+            head = torch.randn((9001, 64), generator=generator)
+            Q4BankBuilder(
+                root,
+                pager=_Pager({"lm_head.weight": head}),
+                bundle_receipt=_BUNDLE,
+                row_chunk=1024,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                hidden = torch.randn((2, 64), generator=generator).to(torch.bfloat16)
+                complete = bank.linear(
+                    hidden,
+                    "lm_head.weight",
+                    output_dtype=torch.bfloat16,
+                )
+                order = torch.argsort(
+                    complete,
+                    dim=-1,
+                    descending=True,
+                    stable=True,
+                )[:, :5]
+                expected = torch.gather(complete, -1, order)
+                bank.release_touched()
+
+                values, ids = bank.topk(
+                    hidden,
+                    "lm_head.weight",
+                    k=5,
+                    block_rows=257,
+                    output_dtype=torch.bfloat16,
+                )
+
+                torch.testing.assert_close(values, expected, rtol=0.0, atol=0.0)
+                torch.testing.assert_close(ids, order, rtol=0.0, atol=0.0)
+                metrics = bank.metrics()
+                self.assertEqual(metrics["native_topk_calls"], 1)
+                self.assertEqual(metrics["native_topk_rows"], 2 * len(head))
+                self.assertGreaterEqual(metrics["mapping_discard_calls"], 2)
+                self.assertGreater(metrics["native_topk_discard_bytes"], 0)
+            finally:
+                bank.close()
+
     def test_fused_sparse_mlp_matches_the_selected_dense_q4_route(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "q4-fused-mlp"
@@ -1108,7 +1162,8 @@ class Q4BankTests(unittest.TestCase):
                 self.assertEqual(metrics["logical_weight_bytes"], 0)
                 self.assertGreater(metrics["q4_logical_weight_bytes"], 0)
                 self.assertEqual(metrics["grouped_linear_calls"], 1)
-                self.assertGreaterEqual(metrics["q4_linear_row_calls"], 3)
+                self.assertEqual(metrics["q4_native_topk_calls"], 1)
+                self.assertEqual(metrics["q4_native_topk_rows"], 9)
                 self.assertGreater(metrics["q4_mapping_discard_calls"], 0)
                 with mock.patch("immer.runtimes.qwen3_8.pager.gc.collect") as collect:
                     pager.release()

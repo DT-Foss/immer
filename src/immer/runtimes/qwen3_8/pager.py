@@ -1430,7 +1430,39 @@ class Qwen38WeightPager:
                 # native selected-row kernel uses the same Q8 input quantizer
                 # and dot product as the former all-vocabulary call, while each
                 # consumed mmap interval can leave RSS immediately.
-                if all(
+                native_topk = getattr(q4_bank, "topk", None)
+                if (
+                    callable(native_topk)
+                    and self.compute_dtype == self.torch.bfloat16
+                    and k <= 256
+                ):
+                    active_rows = min(max(block_rows, 8192), vocab)
+                    self._preflight_q4_linear_rows(
+                        layout,
+                        input_rows=compute_hidden.numel() // columns,
+                        selected_rows=active_rows,
+                        output_dtype=self.compute_dtype,
+                        label=f"{name} head",
+                        extra_bytes=active_rows * 16,
+                    )
+                    values, token_ids = native_topk(
+                        compute_hidden,
+                        name,
+                        k=k,
+                        block_rows=block_rows,
+                        output_dtype=self.compute_dtype,
+                    )
+                    self._stats.head_rows += vocab
+                    if progress is not None:
+                        progress(
+                            {
+                                "start_row": 0,
+                                "rows": vocab,
+                                "rows_done": vocab,
+                                "vocab_rows": vocab,
+                            }
+                        )
+                elif all(
                     callable(getattr(q4_bank, method, None))
                     for method in ("linear_rows", "discard_rows")
                 ):
