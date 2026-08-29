@@ -34,14 +34,14 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v14"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v15"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
 V5_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
 V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v11"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v12"
 _STATE_PREFIX = b"IMMD\x07"
 _V6_STATE_PREFIX = b"IMMD\x06"
 _V5_STATE_PREFIX = b"IMMD\x05"
@@ -1101,6 +1101,7 @@ class FingerprintRollingK4DraftProvider:
         ] = ()
         self._carry_feedback: tuple[tuple[dict[str, float], int], ...] | None = None
         self._carry_feedback_position: int | None = None
+        self._carry_feedback_teacher_forced = False
         self._episode_feedback: list[
             tuple[tuple[tuple[dict[str, float], int], ...], int, int]
         ] = []
@@ -2109,6 +2110,21 @@ class FingerprintRollingK4DraftProvider:
         )
         return proposal[0], proposal[1], proposal[2], proposal[3]
 
+    def _consume_carry_feedback(self, token: int) -> None:
+        feedback = self._carry_feedback
+        if feedback is None:
+            return
+        position = self._carry_feedback_position
+        if position is None:
+            raise MarkovDraftError("Markov carry feedback position is missing")
+        self._episode_feedback.append((feedback, token, position))
+        if self._carry_feedback_teacher_forced:
+            self._teacher_forced_feedback_tokens += 1
+            self._external_feedback_tokens += 1
+        self._carry_feedback = None
+        self._carry_feedback_position = None
+        self._carry_feedback_teacher_forced = False
+
     def _prepare_rolling_proposal(
         self,
         history: tuple[int, ...],
@@ -2140,17 +2156,7 @@ class FingerprintRollingK4DraftProvider:
         elif len(committed) != self._last_confirmed_length:
             raise MarkovDraftError("rolling Markov history length is discontinuous")
         if self._carry_feedback is not None:
-            if self._carry_feedback_position is None:
-                raise MarkovDraftError("Markov carry feedback position is missing")
-            self._episode_feedback.append(
-                (
-                    self._carry_feedback,
-                    known_token,
-                    self._carry_feedback_position,
-                )
-            )
-            self._carry_feedback = None
-            self._carry_feedback_position = None
+            self._consume_carry_feedback(known_token)
         base = (*committed, known_token)
         option = self._phrase_option(base)
         complete, feedback, confidences, disagreements = self._predict_council(
@@ -2348,6 +2354,7 @@ class FingerprintRollingK4DraftProvider:
                 )
         self._carry_feedback = self._pending_feedback[len(delta)]
         self._carry_feedback_position = len(delta)
+        self._carry_feedback_teacher_forced = False
         self._last_confirmed_length = len(committed)
         self._pending_base = None
         self._pending_proposal = None
@@ -2361,9 +2368,9 @@ class FingerprintRollingK4DraftProvider:
 
         Feedback remains valid through the first mismatch: later Council rows
         were conditioned on its rejected token rather than the actual target
-        prefix.  A fully matching observed prefix retains the next-token carry;
-        a mismatch drops that counterfactual tail and the next round rebuilds
-        directly from the confirmed history.
+        prefix.  A fully matching observed prefix retains the original carry;
+        after a mismatch, a new carry is predicted from the actual confirmed
+        prefix and scored by the next target token.
         """
 
         if self._closed:
@@ -2395,6 +2402,7 @@ class FingerprintRollingK4DraftProvider:
         verified = 0
         prefix_matches = True
         mismatch_index: int | None = None
+        teacher_failed = False
         for index, token in enumerate(delta):
             self._episode_feedback.append(
                 (self._pending_feedback[index], token, index)
@@ -2416,6 +2424,7 @@ class FingerprintRollingK4DraftProvider:
                     )
                 except (MarkovDraftError, ValueError):
                     self._teacher_forced_failures += 1
+                    teacher_failed = True
                     break
                 self._episode_feedback.append(
                     (teacher_feedback, delta[index], index)
@@ -2423,10 +2432,30 @@ class FingerprintRollingK4DraftProvider:
                 verified += 1
                 self._teacher_forced_predictions += 1
                 self._teacher_forced_feedback_tokens += 1
-        self._carry_feedback = (
-            self._pending_feedback[len(delta)] if prefix_matches else None
-        )
-        self._carry_feedback_position = len(delta) if prefix_matches else None
+        if prefix_matches:
+            self._carry_feedback = self._pending_feedback[len(delta)]
+            self._carry_feedback_position = len(delta)
+            self._carry_feedback_teacher_forced = False
+        elif not teacher_failed and len(delta) < _MAX_PROPOSAL_POSITIONS:
+            try:
+                teacher_carry, _teacher_token = self._teacher_forced_prediction(
+                    (*base, *delta),
+                    position=len(delta),
+                )
+            except (MarkovDraftError, ValueError):
+                self._teacher_forced_failures += 1
+                self._carry_feedback = None
+                self._carry_feedback_position = None
+                self._carry_feedback_teacher_forced = False
+            else:
+                self._carry_feedback = teacher_carry
+                self._carry_feedback_position = len(delta)
+                self._carry_feedback_teacher_forced = True
+                self._teacher_forced_predictions += 1
+        else:
+            self._carry_feedback = None
+            self._carry_feedback_position = None
+            self._carry_feedback_teacher_forced = False
         self._last_confirmed_length = len(committed)
         self._pending_base = None
         self._pending_proposal = None
@@ -2483,17 +2512,7 @@ class FingerprintRollingK4DraftProvider:
         if len(committed) < previous:
             raise MarkovDraftError("advanced Markov history moved backwards")
         if self._carry_feedback is not None and len(committed) > previous:
-            if self._carry_feedback_position is None:
-                raise MarkovDraftError("Markov carry feedback position is missing")
-            self._episode_feedback.append(
-                (
-                    self._carry_feedback,
-                    committed[previous],
-                    self._carry_feedback_position,
-                )
-            )
-            self._carry_feedback = None
-            self._carry_feedback_position = None
+            self._consume_carry_feedback(committed[previous])
         self._last_confirmed_length = len(committed)
 
     def observe_final(self, history: tuple[int, ...], /) -> None:
@@ -2509,9 +2528,15 @@ class FingerprintRollingK4DraftProvider:
         original_dialect = self._active_dialect
         original_carry = self._carry_feedback
         original_carry_position = self._carry_feedback_position
+        original_carry_teacher_forced = self._carry_feedback_teacher_forced
         original_feedback = list(self._episode_feedback)
         original_confirmed_length = self._last_confirmed_length
         original_evictions = self._dialect_evictions
+        original_council_feedback = self._council_feedback
+        original_external_feedback_tokens = self._external_feedback_tokens
+        original_teacher_forced_feedback_tokens = (
+            self._teacher_forced_feedback_tokens
+        )
         try:
             if (
                 self._last_confirmed_length is not None
@@ -2523,17 +2548,12 @@ class FingerprintRollingK4DraftProvider:
                 and self._last_confirmed_length is not None
                 and len(committed) > self._last_confirmed_length
             ):
-                if self._carry_feedback_position is None:
-                    raise MarkovDraftError("Markov carry feedback position is missing")
-                self._episode_feedback.append(
-                    (
-                        self._carry_feedback,
-                        committed[self._last_confirmed_length],
-                        self._carry_feedback_position,
-                    )
+                self._consume_carry_feedback(
+                    committed[self._last_confirmed_length]
                 )
             self._carry_feedback = None
             self._carry_feedback_position = None
+            self._carry_feedback_teacher_forced = False
             for feedback, token, position in self._episode_feedback:
                 self._apply_council_feedback(feedback, token, position)
             self._episode_feedback.clear()
@@ -2562,9 +2582,15 @@ class FingerprintRollingK4DraftProvider:
             self._active_dialect = original_dialect
             self._carry_feedback = original_carry
             self._carry_feedback_position = original_carry_position
+            self._carry_feedback_teacher_forced = original_carry_teacher_forced
             self._episode_feedback = original_feedback
             self._last_confirmed_length = original_confirmed_length
             self._dialect_evictions = original_evictions
+            self._council_feedback = original_council_feedback
+            self._external_feedback_tokens = original_external_feedback_tokens
+            self._teacher_forced_feedback_tokens = (
+                original_teacher_forced_feedback_tokens
+            )
             raise
 
     def _persist(self) -> None:
@@ -2741,6 +2767,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_feedback = ()
         self._carry_feedback = None
         self._carry_feedback_position = None
+        self._carry_feedback_teacher_forced = False
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._pending_import_digest = None

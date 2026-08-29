@@ -1127,9 +1127,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         interim = provider.metrics()
         self.assertEqual(interim.external_reconcile_calls, 1)
         self.assertEqual(interim.external_feedback_tokens, 2)
-        self.assertEqual(interim.teacher_forced_predictions, 1)
+        self.assertEqual(interim.teacher_forced_predictions, 2)
         self.assertEqual(interim.teacher_forced_feedback_tokens, 1)
         self.assertEqual(interim.teacher_forced_failures, 0)
+        self.assertTrue(provider._carry_feedback_teacher_forced)
+        self.assertEqual(provider._carry_feedback_position, 2)
         self.assertEqual(interim.predictions, served.predictions)
         self.assertEqual(interim.council_predictions, served.council_predictions)
         self.assertEqual(interim.last_raw_confidence, served.last_raw_confidence)
@@ -1159,6 +1161,87 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                 )
             )
         )
+        provider.close()
+
+    def test_mismatch_teacher_carry_trains_next_recursive_position(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        proposal = provider.propose_round(prompt, 2)
+        mismatch = (proposal.token_ids[0] + 1) % provider.vocab_size
+        history = (*prompt, 2, mismatch)
+
+        provider.reconcile_external_prefix(history)
+
+        self.assertTrue(provider._carry_feedback_teacher_forced)
+        self.assertEqual(provider._carry_feedback_position, 1)
+        self.assertEqual(provider.metrics().teacher_forced_predictions, 1)
+        provider.propose_round(history, 7)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.teacher_forced_feedback_tokens, 1)
+        self.assertEqual(metrics.external_feedback_tokens, 2)
+        provider.discard_pending_proposal()
+        provider.observe_final((*history, 7))
+        metrics = provider.metrics()
+        self.assertEqual(metrics.council_feedback, 2)
+        self.assertEqual(metrics.horizon_observations[:2], (1, 1))
+        provider.close()
+
+    def test_teacher_carry_finalization_failure_rolls_back_for_retry(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        proposal = provider.propose_round(prompt, 2)
+        mismatch = (proposal.token_ids[0] + 1) % provider.vocab_size
+        history = (*prompt, 2, mismatch)
+        provider.reconcile_external_prefix(history)
+        before_metrics = provider.metrics()
+        before_state = provider._state
+        before_feedback = list(provider._episode_feedback)
+        before_carry = provider._carry_feedback
+
+        with (
+            mock.patch.object(
+                provider,
+                "_persist",
+                side_effect=OSError("disk unavailable"),
+            ),
+            self.assertRaisesRegex(OSError, "disk unavailable"),
+        ):
+            provider.observe_final((*history, 7))
+
+        after_failure = provider.metrics()
+        self.assertEqual(provider._state, before_state)
+        self.assertEqual(provider._episode_feedback, before_feedback)
+        self.assertIs(provider._carry_feedback, before_carry)
+        self.assertEqual(provider._carry_feedback_position, 1)
+        self.assertTrue(provider._carry_feedback_teacher_forced)
+        self.assertEqual(
+            after_failure.council_feedback,
+            before_metrics.council_feedback,
+        )
+        self.assertEqual(
+            after_failure.external_feedback_tokens,
+            before_metrics.external_feedback_tokens,
+        )
+        self.assertEqual(
+            after_failure.teacher_forced_feedback_tokens,
+            before_metrics.teacher_forced_feedback_tokens,
+        )
+
+        provider.observe_final((*history, 7))
+        after_retry = provider.metrics()
+        self.assertEqual(after_retry.council_feedback, 2)
+        self.assertEqual(after_retry.external_feedback_tokens, 2)
+        self.assertEqual(after_retry.teacher_forced_feedback_tokens, 1)
         provider.close()
 
     def test_external_k1_reconciliation_carries_feedback_to_next_known_token(
