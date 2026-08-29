@@ -1100,7 +1100,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         provider.close()
 
-    def test_external_provider_mismatch_trains_only_the_valid_council_row(
+    def test_external_mismatch_teacher_forces_the_confirmed_suffix(
         self,
     ) -> None:
         provider = FingerprintRollingK4DraftProvider(
@@ -1120,23 +1120,45 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             if token not in first_predictions and token != proposal.token_ids[0]
         )
         before = provider._state
+        served = provider.metrics()
 
         provider.reconcile_external_prefix((*prompt, 2, external, 17))
 
         interim = provider.metrics()
         self.assertEqual(interim.external_reconcile_calls, 1)
-        self.assertEqual(interim.external_feedback_tokens, 1)
+        self.assertEqual(interim.external_feedback_tokens, 2)
+        self.assertEqual(interim.teacher_forced_predictions, 1)
+        self.assertEqual(interim.teacher_forced_feedback_tokens, 1)
+        self.assertEqual(interim.teacher_forced_failures, 0)
+        self.assertEqual(interim.predictions, served.predictions)
+        self.assertEqual(interim.council_predictions, served.council_predictions)
+        self.assertEqual(interim.last_raw_confidence, served.last_raw_confidence)
+        self.assertEqual(
+            interim.last_empirical_evidence,
+            served.last_empirical_evidence,
+        )
+        self.assertEqual(interim.last_confidence, served.last_confidence)
+        self.assertEqual(interim.last_disagreement, served.last_disagreement)
         self.assertEqual(interim.council_feedback, 0)
         self.assertEqual(interim.phrase_accepted_tokens, 0)
         provider.observe_final((*prompt, 2, external, 17))
         after = provider.metrics()
-        self.assertEqual(after.council_feedback, 1)
-        self.assertEqual(after.horizon_observations[:2], (1, 0))
+        self.assertEqual(after.council_feedback, 2)
+        self.assertEqual(after.horizon_observations[:2], (1, 1))
         self.assertEqual(
             provider._state.expert_observations,
-            tuple(value + 1 for value in before.expert_observations),
+            tuple(value + 2 for value in before.expert_observations),
         )
-        self.assertEqual(provider._state.expert_hits, before.expert_hits)
+        self.assertTrue(
+            all(
+                old <= new <= old + 1
+                for old, new in zip(
+                    before.expert_hits,
+                    provider._state.expert_hits,
+                    strict=True,
+                )
+            )
+        )
         provider.close()
 
     def test_external_k1_reconciliation_carries_feedback_to_next_known_token(
@@ -1160,6 +1182,33 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(provider._episode_feedback), 1)
         provider.discard_pending_proposal()
         provider.observe_final((*history, 7))
+        self.assertEqual(provider.metrics().council_feedback, 1)
+        provider.close()
+
+    def test_teacher_forced_suffix_failure_keeps_verified_request_usable(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        proposal = provider.propose_round(prompt, 2)
+        mismatch = (proposal.token_ids[0] + 1) % provider.vocab_size
+        with mock.patch.object(
+            provider,
+            "_predict_council",
+            side_effect=MarkovDraftError("teacher unavailable"),
+        ):
+            provider.reconcile_external_prefix((*prompt, 2, mismatch, 17))
+
+        metrics = provider.metrics()
+        self.assertEqual(metrics.external_feedback_tokens, 1)
+        self.assertEqual(metrics.teacher_forced_feedback_tokens, 0)
+        self.assertEqual(metrics.teacher_forced_failures, 1)
+        provider.observe_final((*prompt, 2, mismatch, 17))
         self.assertEqual(provider.metrics().council_feedback, 1)
         provider.close()
 

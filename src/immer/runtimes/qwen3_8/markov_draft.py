@@ -34,14 +34,14 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v13"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v14"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
 V5_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
 V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v10"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v11"
 _STATE_PREFIX = b"IMMD\x07"
 _V6_STATE_PREFIX = b"IMMD\x06"
 _V5_STATE_PREFIX = b"IMMD\x05"
@@ -925,6 +925,9 @@ class MarkovDraftMetrics:
     council_feedback: int
     external_reconcile_calls: int
     external_feedback_tokens: int
+    teacher_forced_predictions: int
+    teacher_forced_feedback_tokens: int
+    teacher_forced_failures: int
     leader_changes: int
     expert_weights: tuple[tuple[str, float], ...]
     expert_accuracy: tuple[tuple[str, float], ...]
@@ -1133,6 +1136,9 @@ class FingerprintRollingK4DraftProvider:
         self._council_feedback = 0
         self._external_reconcile_calls = 0
         self._external_feedback_tokens = 0
+        self._teacher_forced_predictions = 0
+        self._teacher_forced_feedback_tokens = 0
+        self._teacher_forced_failures = 0
         self._last_confidence = 0.0
         self._last_raw_confidence = 0.0
         self._last_empirical_evidence = 0.0
@@ -1808,6 +1814,7 @@ class FingerprintRollingK4DraftProvider:
         count: int,
         *,
         forced_prefix: Sequence[int] = (),
+        position_offset: int = 0,
     ) -> tuple[
         tuple[int, ...],
         tuple[tuple[tuple[dict[str, float], int], ...], ...],
@@ -1821,6 +1828,13 @@ class FingerprintRollingK4DraftProvider:
         confidences = []
         disagreements = []
         forced = tuple(forced_prefix)
+        if (
+            isinstance(position_offset, bool)
+            or not isinstance(position_offset, int)
+            or position_offset < 0
+            or position_offset + count > _MAX_PROPOSAL_POSITIONS
+        ):
+            raise ValueError("Council position range is invalid")
         if len(forced) > count or any(
             isinstance(token, bool)
             or not isinstance(token, int)
@@ -1829,6 +1843,7 @@ class FingerprintRollingK4DraftProvider:
         ):
             raise ValueError("forced Council prefix is invalid")
         for position in range(count):
+            horizon_position = position_offset + position
             distributions = tuple(
                 model.distribution(context) for model, context in experts
             )
@@ -1909,7 +1924,7 @@ class FingerprintRollingK4DraftProvider:
                 self._last_raw_confidence,
                 expert_row,
                 weights,
-                position,
+                horizon_position,
                 allow_empirical=position >= len(forced),
             )
             confidences.append(self._last_confidence)
@@ -1926,6 +1941,39 @@ class FingerprintRollingK4DraftProvider:
             tuple(confidences),
             tuple(disagreements),
         )
+
+    def _teacher_forced_prediction(
+        self,
+        history: tuple[int, ...],
+        *,
+        position: int,
+    ) -> tuple[tuple[tuple[dict[str, float], int], ...], int]:
+        """Predict one retrospective row without changing served-draft metrics."""
+
+        snapshot = (
+            self._predictions,
+            self._council_predictions,
+            self._last_raw_confidence,
+            self._last_empirical_evidence,
+            self._last_confidence,
+            self._last_disagreement,
+        )
+        try:
+            tokens, feedback, _confidence, _disagreement = self._predict_council(
+                history,
+                1,
+                position_offset=position,
+            )
+            return feedback[0], tokens[0]
+        finally:
+            (
+                self._predictions,
+                self._council_predictions,
+                self._last_raw_confidence,
+                self._last_empirical_evidence,
+                self._last_confidence,
+                self._last_disagreement,
+            ) = snapshot
 
     def _apply_council_feedback(
         self,
@@ -2346,6 +2394,7 @@ class FingerprintRollingK4DraftProvider:
         assert self._last_confirmed_length is not None
         verified = 0
         prefix_matches = True
+        mismatch_index: int | None = None
         for index, token in enumerate(delta):
             self._episode_feedback.append(
                 (self._pending_feedback[index], token, index)
@@ -2353,7 +2402,27 @@ class FingerprintRollingK4DraftProvider:
             verified += 1
             if token != proposal[index]:
                 prefix_matches = False
+                mismatch_index = index
                 break
+        if mismatch_index is not None:
+            for index in range(mismatch_index + 1, len(delta)):
+                actual_context = (*base, *delta[:index])
+                try:
+                    teacher_feedback, _teacher_token = (
+                        self._teacher_forced_prediction(
+                            actual_context,
+                            position=index,
+                        )
+                    )
+                except (MarkovDraftError, ValueError):
+                    self._teacher_forced_failures += 1
+                    break
+                self._episode_feedback.append(
+                    (teacher_feedback, delta[index], index)
+                )
+                verified += 1
+                self._teacher_forced_predictions += 1
+                self._teacher_forced_feedback_tokens += 1
         self._carry_feedback = (
             self._pending_feedback[len(delta)] if prefix_matches else None
         )
@@ -2564,6 +2633,9 @@ class FingerprintRollingK4DraftProvider:
             council_feedback=self._council_feedback,
             external_reconcile_calls=self._external_reconcile_calls,
             external_feedback_tokens=self._external_feedback_tokens,
+            teacher_forced_predictions=self._teacher_forced_predictions,
+            teacher_forced_feedback_tokens=self._teacher_forced_feedback_tokens,
+            teacher_forced_failures=self._teacher_forced_failures,
             leader_changes=self._state.leader_changes,
             expert_weights=tuple(zip(self._state.expert_names, weights, strict=True)),
             expert_accuracy=tuple(zip(self._state.expert_names, accuracy, strict=True)),
