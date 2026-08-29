@@ -1040,6 +1040,178 @@ class Q4BankTests(unittest.TestCase):
             finally:
                 bank.close()
 
+    def test_full_fused_deltanet_step_is_bf16_bit_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-full-fused-deltanet"
+            weight_generator = torch.Generator().manual_seed(2401)
+            base = "model.language_model.layers.0.linear_attn"
+            hidden_dim = 64
+            key_heads, value_heads = 1, 2
+            key_dim = value_dim = 16
+            qkv_rows = 2 * key_heads * key_dim + value_heads * value_dim
+            z_rows = value_heads * value_dim
+            names = (
+                f"{base}.in_proj_qkv.weight",
+                f"{base}.in_proj_z.weight",
+                f"{base}.in_proj_b.weight",
+                f"{base}.in_proj_a.weight",
+            )
+            tensors = {
+                names[0]: torch.randn(
+                    (qkv_rows, hidden_dim), generator=weight_generator
+                ),
+                names[1]: torch.randn(
+                    (z_rows, hidden_dim), generator=weight_generator
+                ),
+                names[2]: torch.randn(
+                    (value_heads, hidden_dim), generator=weight_generator
+                ),
+                names[3]: torch.randn(
+                    (value_heads, hidden_dim), generator=weight_generator
+                ),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=16,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                for seed in (17, 311, 992, 65537):
+                    generator = torch.Generator().manual_seed(seed)
+                    hidden = torch.randn(
+                        (1, 1, hidden_dim),
+                        generator=generator,
+                        dtype=torch.bfloat16,
+                    )
+                    conv_weight = (
+                        torch.randn(
+                            (qkv_rows, 1, 4),
+                            generator=generator,
+                            dtype=torch.bfloat16,
+                        )
+                        * 0.05
+                    )
+                    a_log = (
+                        torch.randn(
+                            value_heads,
+                            generator=generator,
+                            dtype=torch.bfloat16,
+                        )
+                        * 0.1
+                    )
+                    dt_bias = (
+                        torch.randn(
+                            value_heads,
+                            generator=generator,
+                            dtype=torch.bfloat16,
+                        )
+                        * 0.1
+                    )
+                    norm_weight = (
+                        torch.randn(
+                            value_dim,
+                            generator=generator,
+                            dtype=torch.bfloat16,
+                        )
+                        * 0.1
+                        + 1.0
+                    )
+                    conv_state = torch.randn(
+                        (1, qkv_rows, 4),
+                        generator=generator,
+                        dtype=torch.bfloat16,
+                    )
+                    recurrent_state = torch.randn(
+                        (1, value_heads, key_dim, value_dim),
+                        generator=generator,
+                        dtype=torch.float32,
+                    )
+                    qkv, z, b, a, expected_conv = bank.deltanet_step(
+                        hidden,
+                        names,
+                        conv_weight=conv_weight,
+                        A_log=a_log,
+                        dt_bias=dt_bias,
+                        norm_weight=norm_weight,
+                        conv_state=conv_state,
+                        recurrent_state=recurrent_state,
+                        key_heads=key_heads,
+                        value_heads=value_heads,
+                        key_dim=key_dim,
+                        value_dim=value_dim,
+                        rms_eps=1e-6,
+                        output_dtype=torch.bfloat16,
+                    )
+                    expected, expected_recurrent = gated_delta_net_postconv_core(
+                        qkv,
+                        z,
+                        b,
+                        a,
+                        A_log=a_log,
+                        dt_bias=dt_bias,
+                        norm_weight=norm_weight,
+                        num_key_heads=key_heads,
+                        num_value_heads=value_heads,
+                        key_head_dim=key_dim,
+                        value_head_dim=value_dim,
+                        recurrent_state=recurrent_state,
+                        rms_norm_eps=1e-6,
+                        native_recurrence=True,
+                    )
+                    metrics_before = bank.metrics()
+
+                    actual, actual_conv, actual_recurrent = (
+                        bank.deltanet_full_step(
+                            hidden,
+                            names,
+                            conv_weight=conv_weight,
+                            A_log=a_log,
+                            dt_bias=dt_bias,
+                            norm_weight=norm_weight,
+                            conv_state=conv_state,
+                            recurrent_state=recurrent_state,
+                            key_heads=key_heads,
+                            value_heads=value_heads,
+                            key_dim=key_dim,
+                            value_dim=value_dim,
+                            rms_eps=1e-6,
+                            output_dtype=torch.bfloat16,
+                        )
+                    )
+
+                    self.assertTrue(torch.equal(actual, expected))
+                    self.assertTrue(torch.equal(actual_conv, expected_conv))
+                    self.assertTrue(
+                        torch.equal(actual_recurrent, expected_recurrent)
+                    )
+                    metrics_after = bank.metrics()
+                    self.assertEqual(
+                        metrics_after["linear_calls"]
+                        - metrics_before["linear_calls"],
+                        4,
+                    )
+                    self.assertEqual(
+                        metrics_after["input_quantizations"]
+                        - metrics_before["input_quantizations"],
+                        1,
+                    )
+                metrics = bank.metrics()
+                self.assertEqual(metrics["full_fused_deltanet_calls"], 4)
+                self.assertEqual(metrics["full_fused_deltanet_rows"], 4)
+                self.assertEqual(metrics["fused_deltanet_calls"], 4)
+            finally:
+                bank.close()
+
     def test_builder_is_tensor_resumable_and_manifest_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "q4"
@@ -1218,6 +1390,57 @@ class Q4BankTests(unittest.TestCase):
                 )
                 self.assertEqual(tuple(grouped[0].shape), (1, 5))
                 self.assertEqual(tuple(grouped[1].shape), (1, 4))
+                token_rows = tuple(
+                    torch.randn((1, 1, 64), dtype=torch.bfloat16)
+                    for _ in range(3)
+                )
+                group_names = (
+                    "model.language_model.layers.0.mlp.gate_proj",
+                    "model.language_model.layers.0.mlp.down_proj",
+                )
+                expected_many = tuple(
+                    pager.linear_many(token_rows, name) for name in group_names
+                )
+                bank.release_touched()
+                pager_before = pager.metrics()
+                bank_before = bank.metrics()
+                grouped_many = pager.linear_group_many(token_rows, group_names)
+                for actual_rows, expected_rows in zip(
+                    grouped_many,
+                    expected_many,
+                    strict=True,
+                ):
+                    self.assertTrue(
+                        all(
+                            torch.equal(actual, expected)
+                            for actual, expected in zip(
+                                actual_rows,
+                                expected_rows,
+                                strict=True,
+                            )
+                        )
+                    )
+                pager_after = pager.metrics()
+                bank_after = bank.metrics()
+                self.assertEqual(
+                    pager_after["linear_calls"] - pager_before["linear_calls"],
+                    len(token_rows) * len(group_names),
+                )
+                self.assertEqual(
+                    pager_after["grouped_linear_calls"]
+                    - pager_before["grouped_linear_calls"],
+                    1,
+                )
+                self.assertEqual(
+                    bank_after["linear_group_calls"]
+                    - bank_before["linear_group_calls"],
+                    1,
+                )
+                self.assertEqual(
+                    bank_after["input_quantizations"]
+                    - bank_before["input_quantizations"],
+                    1,
+                )
                 embedding = pager.embedding((6, 2, 6))
                 self.assertEqual(tuple(embedding.shape), (3, 64))
                 head_hidden = torch.ones((1, 64), dtype=torch.bfloat16)
@@ -1247,7 +1470,7 @@ class Q4BankTests(unittest.TestCase):
                 self.assertTrue(metrics["q4_bank_attached"])
                 self.assertEqual(metrics["logical_weight_bytes"], 0)
                 self.assertGreater(metrics["q4_logical_weight_bytes"], 0)
-                self.assertEqual(metrics["grouped_linear_calls"], 1)
+                self.assertEqual(metrics["grouped_linear_calls"], 2)
                 self.assertEqual(metrics["q4_native_topk_calls"], 1)
                 self.assertEqual(metrics["q4_native_topk_rows"], 9)
                 self.assertGreater(metrics["q4_mapping_discard_calls"], 0)

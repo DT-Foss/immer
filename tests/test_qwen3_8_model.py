@@ -360,6 +360,120 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(evidence.linear_calls, 31)
         self.assertGreater(evidence.source_body_bytes, 0)
 
+    def test_grouped_token_row_projections_are_bit_exact(self) -> None:
+        generator = torch.Generator().manual_seed(381)
+        rows = tuple(
+            torch.randn((1, 1, self.config.dim), generator=generator)
+            for _ in range(3)
+        )
+        groups = (
+            tuple(
+                f"model.language_model.layers.3.self_attn.{name}_proj"
+                for name in ("q", "k", "v")
+            ),
+            tuple(
+                f"model.language_model.layers.0.linear_attn.in_proj_{name}"
+                for name in ("qkv", "z", "b", "a")
+            ),
+        )
+
+        for names in groups:
+            with self.subTest(names=names):
+                expected = tuple(
+                    self.model._linear_token_rows(rows, name) for name in names
+                )
+                actual = self.model._linear_group_token_rows(rows, names)
+                self.assertEqual(len(actual), len(expected))
+                for actual_projection, expected_projection in zip(
+                    actual,
+                    expected,
+                    strict=True,
+                ):
+                    self.assertEqual(len(actual_projection), len(rows))
+                    self.assertTrue(
+                        all(
+                            torch.equal(actual_row, expected_row)
+                            for actual_row, expected_row in zip(
+                                actual_projection,
+                                expected_projection,
+                                strict=True,
+                            )
+                        )
+                    )
+
+    def test_bf16_q4_decode_uses_the_complete_deltanet_fusion(self) -> None:
+        class FullDeltaBank:
+            def __init__(self) -> None:
+                self.calls = []
+
+            @staticmethod
+            def has(_name: str) -> bool:
+                return False
+
+            @staticmethod
+            def deltanet_step(*_args, **_kwargs):
+                raise AssertionError("pre-recurrence DeltaNet path was used")
+
+            def deltanet_full_step(self, hidden, names, **kwargs):
+                self.calls.append((hidden.detach().clone(), names, kwargs))
+                return (
+                    torch.zeros(
+                        (1, 1, self_value_features),
+                        dtype=torch.bfloat16,
+                    ),
+                    kwargs["conv_state"].clone(),
+                    kwargs["recurrent_state"].clone(),
+                )
+
+        self_value_features = (
+            self.config.linear_num_value_heads * self.config.linear_value_head_dim
+        )
+        bank = FullDeltaBank()
+        self.pager.q4_bank = bank
+        self.model.native_deltanet_recurrence = True
+        self.model.native_deltanet_fusion = True
+        hidden = torch.randn((1, 1, self.config.dim)).to(torch.bfloat16)
+        state = DeltaNetState(
+            conv=torch.zeros(
+                (
+                    1,
+                    2
+                    * self.config.linear_num_key_heads
+                    * self.config.linear_key_head_dim
+                    + self_value_features,
+                    self.config.linear_conv_kernel_dim,
+                ),
+                dtype=torch.bfloat16,
+            ),
+            recurrent=torch.zeros(
+                (
+                    1,
+                    self.config.linear_num_value_heads,
+                    self.config.linear_key_head_dim,
+                    self.config.linear_value_head_dim,
+                ),
+                dtype=torch.float32,
+            ),
+        )
+
+        with mock.patch.object(
+            qwen_model_module,
+            "gated_delta_net_postconv_core",
+            side_effect=AssertionError("post-Conv recurrence was called"),
+        ):
+            output, next_state = self.model._linear_attention(
+                hidden,
+                layer=0,
+                token_mask=torch.ones((1, 1), dtype=torch.bool),
+                state=state,
+            )
+
+        self.assertEqual(tuple(output.shape), (1, 1, self.config.dim))
+        self.assertEqual(len(bank.calls), 1)
+        self.assertTrue(torch.equal(next_state.conv, state.conv))
+        self.assertTrue(torch.equal(next_state.recurrent, state.recurrent))
+        self.pager.q4_bank = None
+
     def test_optional_sparse_mlp_mount_is_decode_only_and_observer_safe(self) -> None:
         class SparseStub:
             def __init__(self) -> None:

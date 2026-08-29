@@ -1106,6 +1106,100 @@ class Qwen38WeightPager:
             self._stats.grouped_linear_matrices += len(weight_names)
             return results
 
+    def linear_group_many(
+        self,
+        inputs: Iterable[Any],
+        names: Iterable[str],
+        *,
+        output_dtype: Any | None = None,
+        packed: bool = False,
+    ) -> tuple[tuple[Any, ...], ...]:
+        """Apply a same-input matrix group to independent token rows once."""
+
+        with self._lock:
+            self._ensure_open()
+            try:
+                values = tuple(inputs)
+                prefixes = tuple(names)
+            except TypeError as exc:
+                raise TypeError("grouped inputs and names must be iterable") from exc
+            if len(values) < 2:
+                raise ValueError("linear_group_many requires at least two inputs")
+            if len(prefixes) < 2:
+                raise ValueError("linear_group_many requires at least two matrices")
+            if not isinstance(packed, bool):
+                raise TypeError("packed must be boolean")
+            weight_names = tuple(self._weight_name(name) for name in prefixes)
+            if len(set(weight_names)) != len(weight_names):
+                raise ValueError("linear group names must be distinct")
+            q4_bank = self.q4_bank
+            if q4_bank is None or not all(q4_bank.has(name) for name in weight_names):
+                return tuple(
+                    self.linear_many(
+                        values,
+                        name,
+                        output_dtype=output_dtype,
+                        packed=packed,
+                    )
+                    for name in weight_names
+                )
+
+            layouts = tuple(self._layout(name) for name in weight_names)
+            input_width = layouts[0].shape[1]
+            if any(
+                len(layout.shape) != 2 or layout.shape[1] != input_width
+                for layout in layouts
+            ):
+                raise Qwen38PagerError("grouped linear input widths disagree")
+            compute_inputs = []
+            for index, value in enumerate(values):
+                if not isinstance(value, self.torch.Tensor):
+                    try:
+                        value = self.torch.as_tensor(value)
+                    except (TypeError, ValueError) as exc:
+                        raise TypeError(
+                            f"linear input {index} cannot be converted to a tensor"
+                        ) from exc
+                if value.ndim < 1 or value.shape[-1] != input_width:
+                    raise Qwen38PagerError(
+                        f"linear input {index} disagrees with grouped weights"
+                    )
+                compute_inputs.append(
+                    value.to(device=self.device, dtype=self.compute_dtype)
+                )
+            shapes = tuple(tuple(value.shape) for value in compute_inputs)
+            counts = tuple(
+                value.numel() // value.shape[-1] for value in compute_inputs
+            )
+            combined = self.torch.cat(
+                tuple(value.reshape(-1, input_width) for value in compute_inputs),
+                dim=0,
+            )
+            grouped = self.linear_group(
+                combined,
+                weight_names,
+                output_dtype=output_dtype,
+            )
+            if not packed:
+                self._stats.linear_calls += (
+                    (len(compute_inputs) - 1) * len(weight_names)
+                )
+            outputs = []
+            for result, layout in zip(grouped, layouts, strict=True):
+                rows = []
+                offset = 0
+                for shape, count in zip(shapes, counts, strict=True):
+                    rows.append(
+                        result[offset : offset + count].reshape(
+                            (*shape[:-1], layout.shape[0])
+                        )
+                    )
+                    offset += count
+                if offset != result.shape[0]:
+                    raise Qwen38PagerError("grouped linear lost an input row")
+                outputs.append(tuple(rows))
+            return tuple(outputs)
+
     def mlp(self, x: Any, names: Iterable[str]) -> Any:
         """Execute a complete packed BF16 SwiGLU MLP in one native call."""
 

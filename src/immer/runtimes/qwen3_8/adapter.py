@@ -2821,6 +2821,8 @@ class Qwen38CausalChat:
                 "full_mlp_rows",
                 "fused_deltanet_calls",
                 "fused_deltanet_rows",
+                "full_fused_deltanet_calls",
+                "full_fused_deltanet_rows",
                 "input_quantizations",
                 "linear_calls",
                 "linear_group_calls",
