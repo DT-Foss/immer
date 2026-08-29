@@ -27,6 +27,7 @@ from immer.runtimes.qwen3_8.draft_window import (
     DraftWindowState,
     contextual_bottom_k_signature,
 )
+from immer.runtimes.qwen3_8.draft_protocol import RollingDraftProposal
 
 from test_qwen3_8_adapter import _Runtime, _Tokenizer, _chat
 
@@ -58,10 +59,17 @@ def _rolling_result(
     *,
     accepted: int = 4,
     token_ids: tuple[int, ...] = (7, 8, 9, 10),
+    executed_window: int | None = None,
+    round_policy=None,
 ):
+    active_window = window if executed_window is None else executed_window
     round_evidence = SimpleNamespace(
         accepted_prefix_length=accepted,
-        proposed_token_ids=tuple(range(window - 1)),
+        provider_proposed_token_ids=tuple(range(window - 1)),
+        proposed_token_ids=tuple(range(active_window - 1)),
+        round_index=0,
+        round_policy=round_policy,
+        window_size=active_window,
     )
     evidence = SimpleNamespace(
         accepted_draft_tokens=accepted,
@@ -77,6 +85,8 @@ def _rolling_result(
         schema="immer.qwen3.8-rolling-speculative-generation/v2",
         final_state_committed=False,
         window_size=window,
+        adaptive_windows=round_policy is not None,
+        used_window_sizes=(active_window,),
     )
     return SimpleNamespace(token_ids=token_ids, evidence=evidence)
 
@@ -599,6 +609,50 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.assertEqual(nested[0]["accepted_draft_tokens"], 3)
         self.assertEqual(nested[0]["proposed_draft_tokens"], 3)
         self.assertEqual(result.evidence["draft"]["window_size"], 8)
+        chat.close()
+
+    def test_adapter_records_round_local_k4_under_k8_ceiling(self) -> None:
+        proposal = RollingDraftProposal.build(
+            tuple(range(7)),
+            (0.10,) * 7,
+            (0.0,) * 7,
+            request_window_ceiling=8,
+            provider_abi="test-provider/v1",
+        )
+        policy = proposal.select_window(
+            request_window_ceiling=8,
+            remaining_tokens=8,
+        )
+        runtime = _Runtime()
+        chat = self._adaptive_chat(runtime)
+        generated = _rolling_result(
+            window=8,
+            executed_window=4,
+            accepted=3,
+            round_policy=policy,
+        )
+        decoder = SimpleNamespace(generate_rolling=lambda *args, **kwargs: generated)
+
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+            return_value=decoder,
+        ) as constructor:
+            result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertTrue(constructor.call_args.kwargs["adaptive_round_windows"])
+        draft = result.evidence["draft"]
+        self.assertTrue(draft["adaptive_windows"])
+        self.assertEqual(draft["window_size"], 8)
+        self.assertEqual(draft["used_window_sizes"], [4])
+        self.assertEqual(
+            draft["round_window_policies"][0]["round_policy"]["chosen_window"],
+            4,
+        )
+        self.assertEqual(
+            result.evidence["draft_window"]["feedback"]["nested_horizons"],
+            [],
+        )
         chat.close()
 
     def test_markov_provider_abi_change_cannot_reuse_window_policy(self) -> None:

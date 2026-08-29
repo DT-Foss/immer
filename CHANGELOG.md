@@ -37,6 +37,13 @@ All notable changes to IMMER are recorded here.
   post-generation infrastructure fault no longer poisons window learning.
   Target timeouts persist their elapsed work and source-byte delta as negative
   feedback, preventing an unobserved long arm from being bootstrapped forever.
+- Markov request windows are now hard ceilings around a per-wave selector.
+  One zero-weight Council call emits the maximum tail plus prefix-local
+  confidence, disagreement, and phrase evidence. Expected accepted-prefix
+  utility chooses K4/K8/K16 before target staging; only the selected prefix is
+  scanned, while the unused provider suffix remains explicitly unauthoritative.
+  Mixed-window generation receipts bind request ceiling, actual K, provider
+  tail, staged prefix, selector inputs, and accepted prefix for every round.
 - Expanded the exact residual-PQ head query union from four to sixteen rows.
   Certified pruning and stable top-k parity now cover the complete rolling
   window; the weight-only builder records the same K16 scorer bound.

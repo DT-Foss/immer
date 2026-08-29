@@ -105,6 +105,15 @@ from .local_draft import (
     Qwen35K4DraftProviderError,
     Qwen35K4DraftProviderMetrics,
 )
+from .draft_protocol import (
+    ROLLING_DRAFT_HORIZON_SCHEMA,
+    ROLLING_DRAFT_PROPOSAL_SCHEMA,
+    ROUND_WINDOW_POLICY_SCHEMA,
+    STANDARD_ROLLING_WINDOWS,
+    RollingDraftHorizon,
+    RollingDraftProposal,
+    RoundWindowPolicy,
+)
 from .markov_draft import (
     LEGACY_MARKOV_DRAFT_STATE_SCHEMA,
     V2_MARKOV_DRAFT_STATE_SCHEMA,
@@ -348,6 +357,13 @@ __all__ = [
     "RollingK4SpeculativeGenerationEvidence",
     "RollingK4SpeculativeGenerationResult",
     "RollingK4SpeculativeRoundEvidence",
+    "ROLLING_DRAFT_HORIZON_SCHEMA",
+    "ROLLING_DRAFT_PROPOSAL_SCHEMA",
+    "ROUND_WINDOW_POLICY_SCHEMA",
+    "STANDARD_ROLLING_WINDOWS",
+    "RollingDraftHorizon",
+    "RollingDraftProposal",
+    "RoundWindowPolicy",
     "LABEL_PROMOTION_SCHEMA",
     "MEASUREMENT_RECEIPT_SCHEMA",
     "MARKOV_DRAFT_METRICS_SCHEMA",

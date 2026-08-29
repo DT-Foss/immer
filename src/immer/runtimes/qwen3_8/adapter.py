@@ -299,7 +299,18 @@ def _nested_draft_horizons(value: object) -> tuple[DraftWindowNestedHorizon, ...
         for row in rounds:
             row_proposal = getattr(row, "proposed_token_ids", ())
             row_accepted = getattr(row, "accepted_prefix_length", None)
+            row_window = getattr(row, "window_size", observed_window)
             if not isinstance(row_proposal, tuple) or not row_proposal:
+                continue
+            if (
+                isinstance(row_window, bool)
+                or not isinstance(row_window, int)
+                or not 2 <= row_window <= observed_window
+            ):
+                raise Qwen38ChatError(
+                    "rolling evidence has an invalid executed window"
+                )
+            if candidate >= row_window:
                 continue
             if (
                 isinstance(row_accepted, bool)
@@ -309,7 +320,11 @@ def _nested_draft_horizons(value: object) -> tuple[DraftWindowNestedHorizon, ...
                 raise Qwen38ChatError(
                     "rolling evidence has invalid nested-prefix acceptance"
                 )
-            visible = min(candidate - 1, len(row_proposal))
+            visible = candidate - 1
+            if len(row_proposal) < visible:
+                raise Qwen38ChatError(
+                    "rolling evidence lacks its staged nested prefix"
+                )
             if visible <= 0:
                 continue
             wave_count += 1
@@ -1084,6 +1099,11 @@ class Qwen38CausalChat:
                         "phrase-confidence",
                         "phrase-width",
                     ],
+                    "round_window_selector": (
+                        "markov-prefix-utility/v1"
+                        if self._draft_mode == "markov"
+                        else "fixed-request-window"
+                    ),
                     "short_window_fallback": short_fixed_eligible,
                     "updates_require_target_receipt": True,
                 }
@@ -1109,6 +1129,12 @@ class Qwen38CausalChat:
                     "phrase_max_width": min(
                         15,
                         max(0, int(policy["draft_window"]) - 1),
+                    ),
+                    "provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
+                    "round_window_selector": (
+                        "markov-prefix-utility/v1"
+                        if self._draft_window_controller is not None
+                        else "fixed-request-window"
                     ),
                     "persistent": self._markov_draft_state_path is not None,
                 }
@@ -1417,6 +1443,10 @@ class Qwen38CausalChat:
                 runtime.model,
                 provider,
                 window_size=draft_window,
+                adaptive_round_windows=(
+                    adaptive_selection is not None
+                    and self._draft_mode == "markov"
+                ),
             ).generate_rolling(
                 [prompt_ids],
                 max_new_tokens=self._max_new_tokens,
@@ -1487,6 +1517,28 @@ class Qwen38CausalChat:
                 ),
                 "final_state_committed": evidence.final_state_committed,
                 "rounds": len(evidence.rounds),
+                "round_window_policies": [
+                    {
+                        "accepted_prefix_length": row.accepted_prefix_length,
+                        "provider_proposal_width": len(
+                            getattr(row, "provider_proposed_token_ids", ())
+                        ),
+                        "round_index": row.round_index,
+                        "round_policy": (
+                            None
+                            if getattr(row, "round_policy", None) is None
+                            else row.round_policy.to_dict()
+                        ),
+                        "staged_proposal_width": len(row.proposed_token_ids),
+                        "window_size": row.window_size,
+                    }
+                    for row in evidence.rounds
+                    if getattr(row, "proposed_token_ids", ())
+                ],
+                "adaptive_windows": getattr(evidence, "adaptive_windows", False),
+                "used_window_sizes": list(
+                    getattr(evidence, "used_window_sizes", ())
+                ),
                 "window_size": getattr(evidence, "window_size", draft_window),
                 "schema": evidence.schema,
                 "nested_horizons": [

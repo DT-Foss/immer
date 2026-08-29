@@ -18,6 +18,7 @@ from immer.runtimes.qwen3_8.markov_draft import (
     MarkovDraftError,
     MarkovDraftState,
 )
+from immer.runtimes.qwen3_8.draft_protocol import RollingDraftProposal
 import immer.runtimes.qwen3_8.markov_draft as markov_module
 from immer.runtimes.qwen3_8.model import StreamedQwen38
 from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
@@ -276,6 +277,51 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(restored.updates, 33)
         self.assertEqual(restored.episode_lengths[-1], len(prompt) + len(expected))
 
+    def test_real_markov_council_drives_adaptive_k8_target_wave(self) -> None:
+        prompt = (1, 4)
+        reference = self._model()
+        expected, _ = reference.generate_greedy(
+            [prompt], max_new_tokens=8, head_block_rows=7
+        )
+        episode = (*prompt, *expected)
+        state_path = self.root / "adaptive-markov.bin"
+        state_path.write_bytes(
+            MarkovDraftState(
+                vocab_size=self.config.vocab_size,
+                max_history_tokens=4096,
+                token_ids=episode * 8,
+                episode_lengths=(len(episode),) * 8,
+                updates=8,
+            ).to_bytes()
+        )
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=self.config.vocab_size,
+            state_path=state_path,
+            proposal_width=7,
+        )
+        candidate = self._model()
+
+        result = Qwen38K4SpeculativeDecoder(
+            candidate,
+            provider,
+            window_size=8,
+            adaptive_round_windows=True,
+        ).generate_rolling(
+            [prompt],
+            max_new_tokens=8,
+            head_block_rows=7,
+        )
+
+        self.assertEqual(result.token_ids, expected)
+        _assert_layer_states_equal(self, candidate._layer_states, reference._layer_states)
+        self.assertEqual(result.evidence.used_window_sizes, (8,))
+        self.assertEqual(result.evidence.rounds[0].round_policy.chosen_window, 8)
+        self.assertEqual(len(result.evidence.rounds[0].provider_proposed_token_ids), 7)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.adaptive_proposal_calls, 1)
+        self.assertEqual(metrics.last_recommended_window, 8)
+        provider.close()
+
     def test_one_token_rolling_request_persists_its_terminal_token(self) -> None:
         state_path = self.root / "one-token-markov.bin"
         provider = FingerprintRollingK4DraftProvider(
@@ -301,7 +347,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
     def test_council_reweights_and_recovers_after_regime_flip(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         history = tuple((1, 2, 1, 3) * 20) + (2, 1)
-        proposal, feedback = provider._predict_council(history, 1)
+        proposal, feedback, _confidence, _disagreement = (
+            provider._predict_council(history, 1)
+        )
         self.assertEqual(proposal, (3,))
 
         for _ in range(30):
@@ -649,6 +697,41 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.reconcile_prefix((20, 1, 2, *proposal))
         provider.observe_final((20, 1, 2, *proposal))
         self.assertEqual(provider.metrics().phrase_accepted_tokens, 7)
+        provider.close()
+
+    def test_adaptive_proposal_exposes_prefix_local_horizon_evidence(self) -> None:
+        episode = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=7,
+        )
+        provider._state = replace(
+            provider._state,
+            token_ids=episode * 3,
+            episode_lengths=(len(episode),) * 3,
+            episode_dialects=(None,) * 3,
+        )
+        provider.begin_request((20, 1))
+
+        proposal = provider.propose_round((20, 1), 2)
+
+        self.assertIsInstance(proposal, RollingDraftProposal)
+        self.assertEqual(proposal.token_ids, (3, 4, 5, 6, 7, 8, 9))
+        self.assertEqual(tuple(row.window for row in proposal.horizons), (4, 8))
+        self.assertEqual(proposal.recommended_window, 8)
+        self.assertEqual(proposal.phrase_width, 7)
+        policy = proposal.select_window(
+            request_window_ceiling=8,
+            remaining_tokens=8,
+        )
+        self.assertEqual(policy.chosen_window, 8)
+        provider.reconcile_prefix((20, 1, 2, *proposal.token_ids))
+        provider.observe_final((20, 1, 2, *proposal.token_ids))
+        metrics = provider.metrics()
+        self.assertEqual(metrics.adaptive_proposal_calls, 1)
+        self.assertEqual(dict(metrics.recommended_windows)[8], 1)
+        self.assertEqual(metrics.last_recommended_window, 8)
         provider.close()
 
     def test_phrase_agent_uses_longest_prefix_with_repeated_support(self) -> None:

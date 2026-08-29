@@ -20,17 +20,19 @@ import stat
 from typing import Sequence
 import zlib
 
+from .draft_protocol import RollingDraftProposal
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v5"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v6"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v4"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v5"
 _STATE_PREFIX = b"IMMD\x04"
 _V3_STATE_PREFIX = b"IMMD\x03"
 _V2_STATE_PREFIX = b"IMMD\x02"
@@ -723,6 +725,10 @@ class MarkovDraftMetrics:
     last_phrase_support: int
     last_phrase_confidence: float
     last_phrase_width: int
+    adaptive_proposal_calls: int
+    recommended_windows: tuple[tuple[int, int], ...]
+    last_recommended_window: int | None
+    last_horizon_utilities: tuple[tuple[int, float], ...]
     source_body_bytes: int = 0
     linear_calls: int = 0
     proposal_width: int = 3
@@ -731,6 +737,8 @@ class MarkovDraftMetrics:
         value = asdict(self)
         value["expert_weights"] = dict(self.expert_weights)
         value["expert_accuracy"] = dict(self.expert_accuracy)
+        value["recommended_windows"] = dict(self.recommended_windows)
+        value["last_horizon_utilities"] = dict(self.last_horizon_utilities)
         return value
 
 
@@ -854,6 +862,9 @@ class FingerprintRollingK4DraftProvider:
         self._council_feedback = 0
         self._last_confidence = 0.0
         self._last_disagreement = 0.0
+        self._adaptive_proposal_calls = 0
+        self._recommended_window_counts = {4: 0, 8: 0, 16: 0}
+        self._last_round_proposal: RollingDraftProposal | None = None
         self._closed = False
 
     def _acquire_state_lock(self) -> None:
@@ -1195,11 +1206,15 @@ class FingerprintRollingK4DraftProvider:
     ) -> tuple[
         tuple[int, ...],
         tuple[tuple[tuple[dict[str, float], int], ...], ...],
+        tuple[float, ...],
+        tuple[float, ...],
     ]:
         experts = self._expert_models(history)
         weights = self._weights()
         proposal: list[int] = []
         feedback_rows = []
+        confidences = []
+        disagreements = []
         forced = tuple(forced_prefix)
         if len(forced) > count or any(
             isinstance(token, bool)
@@ -1260,7 +1275,7 @@ class FingerprintRollingK4DraftProvider:
                     if value > 0.0
                 )
 
-            self._last_confidence = mixture[self._symbol(token)]
+            self._last_confidence = mixture.get(self._symbol(token), 0.0)
             self._last_disagreement = max(
                 0.0,
                 entropy(pooled)
@@ -1271,6 +1286,8 @@ class FingerprintRollingK4DraftProvider:
                     )
                 ),
             )
+            confidences.append(self._last_confidence)
+            disagreements.append(self._last_disagreement)
             expert_row = []
             for distribution in distributions:
                 predicted = max(
@@ -1291,7 +1308,12 @@ class FingerprintRollingK4DraftProvider:
                 context.append(symbol)
         self._predictions += count
         self._council_predictions += count
-        return tuple(proposal), tuple(feedback_rows)
+        return (
+            tuple(proposal),
+            tuple(feedback_rows),
+            tuple(confidences),
+            tuple(disagreements),
+        )
 
     def _apply_council_feedback(
         self,
@@ -1418,15 +1440,22 @@ class FingerprintRollingK4DraftProvider:
 
     def __call__(self, history: tuple[int, ...], /) -> tuple[int, int, int, int]:
         committed = self._token_tuple(history, label="Markov draft history")
-        proposal, _feedback = self._predict_council(committed, 4)
+        proposal, _feedback, _confidence, _disagreement = self._predict_council(
+            committed,
+            4,
+        )
         return proposal[0], proposal[1], proposal[2], proposal[3]
 
-    def propose_after(
+    def _prepare_rolling_proposal(
         self,
         history: tuple[int, ...],
         known_token: int,
-        /,
-    ) -> tuple[int, ...]:
+    ) -> tuple[
+        tuple[int, ...],
+        tuple[float, ...],
+        tuple[float, ...],
+        MarkovPhraseOption | None,
+    ]:
         if self._closed:
             raise MarkovDraftError("Markov draft provider is closed")
         if self._request_completed:
@@ -1448,7 +1477,7 @@ class FingerprintRollingK4DraftProvider:
             self._carry_feedback = None
         base = (*committed, known_token)
         option = self._phrase_option(base)
-        complete, feedback = self._predict_council(
+        complete, feedback, confidences, disagreements = self._predict_council(
             base,
             self.proposal_width + 1,
             forced_prefix=(
@@ -1468,7 +1497,65 @@ class FingerprintRollingK4DraftProvider:
             )
             self._last_phrase_option = option
         self._draft_calls += 1
+        return (
+            proposal,
+            confidences[: self.proposal_width],
+            disagreements[: self.proposal_width],
+            option,
+        )
+
+    def propose_after(
+        self,
+        history: tuple[int, ...],
+        known_token: int,
+        /,
+    ) -> tuple[int, ...]:
+        proposal, _confidence, _disagreement, _option = (
+            self._prepare_rolling_proposal(history, known_token)
+        )
         return proposal
+
+    def propose_round(
+        self,
+        history: tuple[int, ...],
+        known_token: int,
+        /,
+    ) -> RollingDraftProposal:
+        if self.proposal_width + 1 not in {4, 8, 16}:
+            raise MarkovDraftError(
+                "adaptive Markov proposal requires a K4/K8/K16 ceiling"
+            )
+        proposal, confidences, disagreements, option = (
+            self._prepare_rolling_proposal(history, known_token)
+        )
+        result = RollingDraftProposal.build(
+            proposal,
+            confidences,
+            disagreements,
+            request_window_ceiling=self.proposal_width + 1,
+            provider_abi=MARKOV_DRAFT_PROVIDER_ABI,
+            phrase_source=None if option is None else option.source,
+            phrase_support=0 if option is None else option.support,
+            phrase_confidence=(
+                0.0
+                if option is None
+                else option.confidence
+                * (
+                    self._active_dialect_similarity
+                    if option.source == "dialect"
+                    else 1.0
+                )
+            ),
+            phrase_width=(
+                0
+                if option is None
+                else min(len(option.token_ids), self.proposal_width)
+            ),
+        )
+        self._adaptive_proposal_calls += 1
+        self._recommended_window_counts[result.recommended_window] += 1
+        self._last_round_proposal = result
+        return result
 
     def _learn_episode(self, tokens: Sequence[int]) -> None:
         episode = tuple(tokens)
@@ -1725,6 +1812,24 @@ class FingerprintRollingK4DraftProvider:
                 0
                 if self._last_phrase_option is None
                 else len(self._last_phrase_option.token_ids)
+            ),
+            adaptive_proposal_calls=self._adaptive_proposal_calls,
+            recommended_windows=tuple(
+                (window, self._recommended_window_counts[window])
+                for window in (4, 8, 16)
+            ),
+            last_recommended_window=(
+                None
+                if self._last_round_proposal is None
+                else self._last_round_proposal.recommended_window
+            ),
+            last_horizon_utilities=(
+                ()
+                if self._last_round_proposal is None
+                else tuple(
+                    (row.window, row.utility)
+                    for row in self._last_round_proposal.horizons
+                )
             ),
             proposal_width=self.proposal_width,
         )

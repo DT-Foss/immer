@@ -211,6 +211,28 @@ instead of falling back to extra greedy target passes. Without
 `--draft-window-state`, `--draft-window` retains its fixed-window meaning and
 old state-free deployments are unchanged.
 
+For the native Markov provider, the selected request window is a hard ceiling,
+not a command to spend that entire width on every wave. The Council generates
+one ceiling-length tail and retains confidence and disagreement for every
+position. For each allowed prefix K, it computes
+
+```text
+p_i = max(council_confidence_i * (1 - 0.5 * disagreement_i),
+          supported_phrase_probability_i)
+E[accepted_K] = sum_(j=1..K-1) product_(i=1..j) p_i
+U(K) = (1 + E[accepted_K]) / (1 + (K - 1) / 16).
+```
+
+The remaining output budget truncates each expected-acceptance curve, then the
+highest-utility standard K within the request ceiling is staged. The target
+therefore sees exactly one `[known, draft-prefix]` block
+and performs one scan; no comparison forward is added. Evidence separates the
+full provider tail from the staged prefix, records the actual K and policy for
+every wave, and treats only staged positions as target-authoritative. A K8
+ceiling can consequently execute K4 on an uncertain wave and K8 on a later
+repeated phrase inside the same request. Qwen3.5 keeps its fixed request window
+because it does not expose a zero-cost maximum-tail confidence frontier.
+
 ## 4. Organism of Experts
 
 OoE learns runtime actions around Qwen without modifying Qwen's weights or

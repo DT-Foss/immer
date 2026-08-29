@@ -20,6 +20,7 @@ from immer.runtimes.qwen3_8 import (
     Qwen38SpeculativeError,
     Qwen38WeightPager,
     StreamedQwen38,
+    RollingDraftProposal,
 )
 
 from test_qwen3_8_model import (
@@ -95,6 +96,26 @@ class _RollingFromTokens:
 
     def reconcile_prefix(self, history: tuple[int, ...]) -> None:
         self.reconciled.append(history)
+
+
+class _AdaptiveRollingFromTokens(_RollingFromTokens):
+    def __init__(self, *args, confidence: float, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.confidence = confidence
+
+    def propose_round(
+        self,
+        history: tuple[int, ...],
+        known_token: int,
+    ) -> RollingDraftProposal:
+        proposal = self.propose_after(history, known_token)
+        return RollingDraftProposal.build(
+            proposal,
+            (self.confidence,) * len(proposal),
+            (0.0,) * len(proposal),
+            request_window_ceiling=self.proposal_width + 1,
+            provider_abi="test-adaptive-provider/v1",
+        )
 
 
 class _MutatingPair(Sequence[int]):
@@ -837,6 +858,111 @@ class Qwen38SpeculativeTests(unittest.TestCase):
                     all(row.window_size == 8 for row in result.evidence.rounds)
                 )
 
+    def test_adaptive_k8_ceiling_uses_round_local_k4_or_k8_without_extra_scan(
+        self,
+    ) -> None:
+        prompt = (1, 4)
+        reference = self._model()
+        expected, _ = reference.generate_greedy(
+            [prompt], max_new_tokens=8, head_block_rows=7
+        )
+        rows = []
+        for confidence, expected_windows in (
+            (0.10, (4, 4)),
+            (0.99, (8,)),
+        ):
+            baseline = self._model()
+            baseline.generate_greedy(
+                [prompt], max_new_tokens=8, head_block_rows=7
+            )
+            provider = _AdaptiveRollingFromTokens(
+                prompt,
+                expected,
+                accepted_per_wave=7,
+                vocab_size=self.config.vocab_size,
+                proposal_width=7,
+                confidence=confidence,
+            )
+            candidate = self._model()
+
+            result = Qwen38K4SpeculativeDecoder(
+                candidate,
+                provider,
+                window_size=8,
+                adaptive_round_windows=True,
+            ).generate_rolling(
+                [prompt],
+                max_new_tokens=8,
+                head_block_rows=7,
+            )
+
+            self.assertEqual(result.token_ids, expected)
+            self._assert_state_equal(candidate, baseline)
+            self.assertTrue(result.evidence.adaptive_windows)
+            self.assertEqual(result.evidence.used_window_sizes, expected_windows)
+            self.assertEqual(
+                tuple(row.window_size for row in result.evidence.rounds),
+                expected_windows,
+            )
+            self.assertTrue(
+                all(
+                    len(row.provider_proposed_token_ids) == 7
+                    and len(row.proposed_token_ids) == row.window_size - 1
+                    and row.round_policy is not None
+                    and row.head_scans == 1
+                    and row.forward_passes == 1
+                    for row in result.evidence.rounds
+                )
+            )
+            first = result.evidence.rounds[0]
+            with self.assertRaises(ValueError):
+                replace(
+                    first,
+                    provider_proposed_token_ids=(99,) * 7,
+                )
+            with self.assertRaises(ValueError):
+                replace(result.evidence, adaptive_windows=False)
+            rows.append(result.evidence.forward_passes)
+        self.assertGreater(rows[0], rows[1])
+
+    def test_adaptive_terminal_budget_stages_only_the_remaining_three_tokens(
+        self,
+    ) -> None:
+        prompt = (1, 4)
+        baseline = self._model()
+        expected, _ = baseline.generate_greedy(
+            [prompt], max_new_tokens=3, head_block_rows=7
+        )
+        provider = _AdaptiveRollingFromTokens(
+            prompt,
+            expected,
+            accepted_per_wave=7,
+            vocab_size=self.config.vocab_size,
+            proposal_width=7,
+            confidence=0.99,
+        )
+        candidate = self._model()
+
+        result = Qwen38K4SpeculativeDecoder(
+            candidate,
+            provider,
+            window_size=8,
+            adaptive_round_windows=True,
+        ).generate_rolling(
+            [prompt],
+            max_new_tokens=3,
+            head_block_rows=7,
+        )
+
+        self.assertEqual(result.token_ids, expected)
+        self._assert_state_equal(candidate, baseline)
+        self.assertEqual(result.evidence.used_window_sizes, (4,))
+        row = result.evidence.rounds[0]
+        self.assertEqual(row.window_size, 4)
+        self.assertEqual(len(row.proposed_token_ids), 3)
+        self.assertEqual(len(row.provider_proposed_token_ids), 7)
+        self.assertEqual(row.round_policy.selector, "markov-prefix-utility/v1")
+
     def test_rolling_k16_full_acceptance_uses_one_target_wave(self) -> None:
         prompt = (1, 4)
         baseline = self._model(max_seq_len=32)
@@ -868,6 +994,30 @@ class Qwen38SpeculativeTests(unittest.TestCase):
             result.evidence.forward_passes,
             baseline_evidence.forward_passes,
         )
+
+        adaptive_provider = _AdaptiveRollingFromTokens(
+            prompt,
+            expected,
+            accepted_per_wave=15,
+            vocab_size=self.config.vocab_size,
+            proposal_width=15,
+            confidence=0.99,
+        )
+        adaptive = self._model(max_seq_len=32)
+        adaptive_result = Qwen38K4SpeculativeDecoder(
+            adaptive,
+            adaptive_provider,
+            window_size=16,
+            adaptive_round_windows=True,
+        ).generate_rolling(
+            [prompt],
+            max_new_tokens=16,
+            head_block_rows=7,
+        )
+        self.assertEqual(adaptive_result.token_ids, expected)
+        self._assert_state_equal(adaptive, baseline)
+        self.assertEqual(adaptive_result.evidence.used_window_sizes, (16,))
+        self.assertEqual(adaptive_result.evidence.forward_passes, 2)
 
     def test_rolling_k4_one_shot_discards_only_terminal_state(self) -> None:
         prompt = (1, 4)

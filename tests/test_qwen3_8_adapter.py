@@ -455,6 +455,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             target.model,
             provider,
             window_size=4,
+            adaptive_round_windows=False,
         )
         chat.close()
 
