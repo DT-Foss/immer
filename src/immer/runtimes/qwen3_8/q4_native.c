@@ -1938,14 +1938,11 @@ IMMER_EXPORT int immer_q4_deltanet_step_f32(
     if (
         !hidden || !qkv_weights || !z_weights || !b_weights || !a_weights
         || !conv_weight || !conv_state
-        || !next_conv
+        || !qkv_output || !z_output || !b_output || !a_output || !next_conv
         || (pre_recurrence_only != 0 && pre_recurrence_only != 1)
-        || (pre_recurrence_only && (
-            !qkv_output || !z_output || !b_output || !a_output
-        ))
         || (!pre_recurrence_only && (
             !A_log || !dt_bias || !norm_weight || !recurrent_state
-            || !mixed_output || !next_recurrent
+            || !mixed_output || !core_output || !next_recurrent
         ))
         || input_cols <= 0 || qkv_rows <= 0 || z_rows <= 0
         || b_rows <= 0 || a_rows <= 0 || key_heads <= 0
@@ -2031,31 +2028,21 @@ IMMER_EXPORT int immer_q4_deltanet_step_f32(
     const void *output_pointers[8];
     size_t output_bytes[8];
     int output_count = 0;
-    if (qkv_output) {
-        output_pointers[output_count] = qkv_output;
-        output_bytes[output_count++] = (size_t) qkv_rows * sizeof(float);
-    }
-    if (z_output) {
-        output_pointers[output_count] = z_output;
-        output_bytes[output_count++] = mixed_bytes;
-    }
-    if (b_output) {
-        output_pointers[output_count] = b_output;
-        output_bytes[output_count++] = control_bytes;
-    }
-    if (a_output) {
-        output_pointers[output_count] = a_output;
-        output_bytes[output_count++] = control_bytes;
-    }
+    output_pointers[output_count] = qkv_output;
+    output_bytes[output_count++] = (size_t) qkv_rows * sizeof(float);
+    output_pointers[output_count] = z_output;
+    output_bytes[output_count++] = mixed_bytes;
+    output_pointers[output_count] = b_output;
+    output_bytes[output_count++] = control_bytes;
+    output_pointers[output_count] = a_output;
+    output_bytes[output_count++] = control_bytes;
     output_pointers[output_count] = next_conv;
     output_bytes[output_count++] = conv_bytes;
     if (!pre_recurrence_only) {
         output_pointers[output_count] = mixed_output;
         output_bytes[output_count++] = mixed_bytes;
-        if (core_output) {
-            output_pointers[output_count] = core_output;
-            output_bytes[output_count++] = mixed_bytes;
-        }
+        output_pointers[output_count] = core_output;
+        output_bytes[output_count++] = mixed_bytes;
         output_pointers[output_count] = next_recurrent;
         output_bytes[output_count++] = recurrent_bytes;
     }
@@ -2267,7 +2254,7 @@ IMMER_EXPORT int immer_q4_deltanet_step_f32(
                     immer_silu_f32(convolved)
                 );
                 projected_qkv[channel] = activated;
-                    if (qkv_output) qkv_output[channel] = activated;
+                qkv_output[channel] = activated;
                 if (!isfinite(activated)) numeric_error = 1;
             }
         }
@@ -2393,10 +2380,8 @@ IMMER_EXPORT int immer_q4_deltanet_step_f32(
                     active_output[value] = immer_round_bf16(
                         active_output[value]
                     );
-                    if (core_output) {
-                        core_output[value_offset + (size_t) value] =
-                            active_output[value];
-                    }
+                    core_output[value_offset + (size_t) value] =
+                        active_output[value];
                     if (!isfinite(active_output[value])) numeric_error = 1;
                 }
             }
