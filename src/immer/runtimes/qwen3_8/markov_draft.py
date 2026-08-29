@@ -723,6 +723,7 @@ class MarkovDraftMetrics:
     last_phrase_confidence: float
     source_body_bytes: int = 0
     linear_calls: int = 0
+    proposal_width: int = 3
 
     def to_dict(self) -> dict[str, object]:
         value = asdict(self)
@@ -763,6 +764,7 @@ class FingerprintRollingK4DraftProvider:
         backoff_strength: float = 3.0,
         min_count: int = 1,
         max_history_tokens: int = 4096,
+        proposal_width: int = 3,
     ) -> None:
         if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size <= 1:
             raise ValueError("vocab_size must be greater than one")
@@ -782,6 +784,12 @@ class FingerprintRollingK4DraftProvider:
             raise ValueError("max_history_tokens is too small")
         if state_path is not None and not isinstance(state_path, (str, Path)):
             raise TypeError("state_path must be a filesystem path or None")
+        if (
+            isinstance(proposal_width, bool)
+            or not isinstance(proposal_width, int)
+            or not 1 <= proposal_width <= 15
+        ):
+            raise ValueError("proposal_width must lie in [1, 15]")
         self.vocab_size = vocab_size
         self.width = len(str(vocab_size - 1))
         self.state_path = (
@@ -792,6 +800,7 @@ class FingerprintRollingK4DraftProvider:
         self.backoff_strength = float(backoff_strength)
         self.min_count = min_count
         self.max_history_tokens = max_history_tokens
+        self.proposal_width = proposal_width
         self._experts = _expert_specs(max_order, max_history_tokens)
         self._state_lock_descriptor: int | None = None
         self._acquire_state_lock()
@@ -1388,7 +1397,7 @@ class FingerprintRollingK4DraftProvider:
         history: tuple[int, ...],
         known_token: int,
         /,
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, ...]:
         if self._closed:
             raise MarkovDraftError("Markov draft provider is closed")
         if self._request_completed:
@@ -1412,20 +1421,22 @@ class FingerprintRollingK4DraftProvider:
         option = self._phrase_option(base)
         complete, feedback = self._predict_council(
             base,
-            4,
-            forced_prefix=() if option is None else option.token_ids,
+            self.proposal_width + 1,
+            forced_prefix=(
+                () if option is None else option.token_ids[: self.proposal_width]
+            ),
         )
-        proposal = complete[:3]
+        proposal = complete[: self.proposal_width]
         self._pending_base = base
         self._pending_proposal = proposal
         self._pending_feedback = feedback
         self._pending_phrase_option = option
         if option is not None:
             self._phrase_option_calls += 1
-            self._phrase_draft_tokens += 3
+            self._phrase_draft_tokens += min(3, self.proposal_width)
             self._last_phrase_option = option
         self._draft_calls += 1
-        return proposal[0], proposal[1], proposal[2]
+        return proposal
 
     def _learn_episode(self, tokens: Sequence[int]) -> None:
         episode = tuple(tokens)
@@ -1505,18 +1516,18 @@ class FingerprintRollingK4DraftProvider:
         proposal = self._pending_proposal
         if base is None or proposal is None:
             raise MarkovDraftError("reconcile_prefix requires a pending proposal")
-        if len(self._pending_feedback) != 4:
+        if len(self._pending_feedback) != self.proposal_width + 1:
             raise MarkovDraftError("Markov council proposal feedback is missing")
         if committed[: len(base)] != base:
             raise MarkovDraftError("Markov reconciliation changed its known base")
         delta = committed[len(base) :]
-        if len(delta) > 3 or delta != proposal[: len(delta)]:
+        if len(delta) > self.proposal_width or delta != proposal[: len(delta)]:
             raise MarkovDraftError("Markov reconciliation is not a proposal prefix")
         assert self._last_confirmed_length is not None
         for index, token in enumerate(delta):
             self._episode_feedback.append((self._pending_feedback[index], token))
         if self._pending_phrase_option is not None:
-            self._phrase_accepted_tokens += len(delta)
+            self._phrase_accepted_tokens += min(len(delta), 3)
         self._carry_feedback = self._pending_feedback[len(delta)]
         self._last_confirmed_length = len(committed)
         self._pending_base = None
@@ -1675,6 +1686,7 @@ class FingerprintRollingK4DraftProvider:
                 if self._last_phrase_option is None
                 else self._last_phrase_option.confidence
             ),
+            proposal_width=self.proposal_width,
         )
 
     def close(self) -> None:

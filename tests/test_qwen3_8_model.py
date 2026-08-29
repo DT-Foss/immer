@@ -438,6 +438,67 @@ class Qwen38ModelTests(unittest.TestCase):
                 max_seq_len=32,
             )
 
+    def test_online_sparse_decision_learns_from_the_unchanged_exact_path(self) -> None:
+        class AdaptiveStub:
+            def __init__(self) -> None:
+                self.use_sparse = False
+                self.decisions = []
+                self.observations = []
+
+            def supports_layer(self, layer: int) -> bool:
+                return layer == 1
+
+            def snapshot_identity(self, *, transport_neutral: bool = False):
+                return {
+                    "layers": [1],
+                    "schema": "test-adaptive-sparse/v1",
+                    "transport_neutral": transport_neutral,
+                }
+
+            def decision(self, *, layer: int, row_count: int):
+                self.decisions.append((layer, row_count))
+                return type("Decision", (), {"use_sparse": self.use_sparse})()
+
+            def observe_full(self, **values):
+                self.observations.append(values)
+                return {"rows": len(values["gate"])}
+
+            def execute(self, hidden: torch.Tensor, *, layer: int):
+                return torch.zeros_like(hidden), {"layer": layer}
+
+            def execute_many(self, hidden, *, layer: int):
+                rows = tuple(hidden)
+                return tuple(torch.zeros_like(row) for row in rows), {"layer": layer}
+
+        adaptive = AdaptiveStub()
+        model = StreamedQwen38(
+            self.config,
+            self.pager,
+            mlp_sparse_executor=adaptive,
+            max_batch_size=3,
+            max_seq_len=32,
+        )
+        hidden = torch.ones(1, 1, self.config.dim)
+        exact = model._mlp(hidden, layer=1)
+        self.assertTrue(torch.isfinite(exact).all())
+        self.assertEqual(adaptive.decisions, [(1, 1)])
+        self.assertEqual(len(adaptive.observations), 1)
+        observation = adaptive.observations[0]
+        self.assertEqual(tuple(observation["gate"].shape[:-1]), (1, 1))
+        self.assertEqual(tuple(observation["output"].shape), tuple(exact.shape))
+        self.assertEqual(model.mlp_sparse_last_observation, {"rows": 1})
+
+        rows = (hidden.clone(), hidden.clone())
+        model._mlp_token_rows(rows, layer=1)
+        self.assertEqual(adaptive.decisions[-1], (1, 2))
+        self.assertEqual(len(adaptive.observations), 2)
+        self.assertIsInstance(adaptive.observations[-1]["gate"], tuple)
+
+        adaptive.use_sparse = True
+        sparse = model._mlp(hidden, layer=1)
+        self.assertTrue(torch.equal(sparse, torch.zeros_like(hidden)))
+        self.assertEqual(len(adaptive.observations), 2)
+
     def test_explicit_fast_mode_packs_continuation_projection_rows(self) -> None:
         pager = Qwen38WeightPager(
             self.source,
@@ -789,9 +850,12 @@ class Qwen38ModelTests(unittest.TestCase):
     def test_continuation_prefix_commit_is_bit_exact_and_reads_no_weights(
         self,
     ) -> None:
-        tokens = (9, 7, 6, 5)
-        for stage_width in range(2, 5):
-            for commit_width in range(1, stage_width):
+        tokens = tuple(range(5, 21))
+        for stage_width in (2, 4, 8, 16):
+            commit_widths = tuple(
+                sorted({1, stage_width // 2, stage_width - 1})
+            )
+            for commit_width in commit_widths:
                 with self.subTest(
                     stage_width=stage_width,
                     commit_width=commit_width,
@@ -810,7 +874,7 @@ class Qwen38ModelTests(unittest.TestCase):
                             self.config,
                             pager,
                             max_batch_size=1,
-                            max_seq_len=16,
+                            max_seq_len=32,
                         )
                         for pager in pagers
                     )
@@ -822,7 +886,11 @@ class Qwen38ModelTests(unittest.TestCase):
                         )
                         trace = block_model._pending_block_stage.prefix_trace
                         self.assertEqual(trace.width, stage_width)
-                        self.assertLess(trace.nbytes, stage.evidence.staged_state_bytes)
+                        if stage_width <= self.config.linear_conv_kernel_dim:
+                            self.assertLess(
+                                trace.nbytes,
+                                stage.evidence.staged_state_bytes,
+                            )
                         expected_rows = []
                         for token in tokens[:commit_width]:
                             hidden, _evidence = token_model.decode([[token]])
@@ -1041,8 +1109,8 @@ class Qwen38ModelTests(unittest.TestCase):
         self.model.prefill([[1, 4]])
         with self.assertRaisesRegex(ValueError, "dimensions must be non-empty"):
             self.model.stage_continuation_block(torch.empty((1, 0), dtype=torch.long))
-        with self.assertRaisesRegex(Qwen38RuntimeError, "K in \\[1, 4\\]"):
-            self.model.stage_continuation_block([[9, 7, 6, 5, 4]])
+        with self.assertRaisesRegex(Qwen38RuntimeError, "K in \\[1, 16\\]"):
+            self.model.stage_continuation_block([list(range(17))])
 
         self.model.reset_state()
         self.model.prefill([[1, 4], [2, 5]])
@@ -1200,8 +1268,8 @@ class Qwen38ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
             self.model.commit_continuation_block(first)
 
-        full = self.model.stage_continuation_block([[9, 7, 6, 5]])
-        with self.assertRaisesRegex(Qwen38RuntimeError, "exceeds K=4"):
+        full = self.model.stage_continuation_block([list(range(16))])
+        with self.assertRaisesRegex(Qwen38RuntimeError, "exceeds K=16"):
             self.model.extend_continuation_block(full, [[4]])
         self.assertIsNone(self.model._pending_block_stage)
         with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):

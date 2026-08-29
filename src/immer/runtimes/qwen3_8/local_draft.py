@@ -21,6 +21,7 @@ from .pager import Qwen38WeightPager
 
 QWEN35_K2_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-k2-draft-provider/v1"
 QWEN35_K4_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-k4-draft-provider/v1"
+QWEN35_ROLLING_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-rolling-draft-provider/v2"
 
 
 class Qwen35K2DraftProviderError(RuntimeError):
@@ -463,13 +464,15 @@ class Qwen35K4DraftProviderMetrics:
     state_bytes: int
     pending: bool
     poisoned: bool
+    window_size: int = 4
+    accepted_prefix_counts: tuple[int, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 class Qwen35K4DraftProvider:
-    """Build an opaque four-token local draft without moving its commit cursor.
+    """Build an opaque bounded local draft without moving its commit cursor.
 
     The first token opens a width-one continuation stage.  Three opaque
     extensions grow it to K=4 while the model's public committed cursor stays
@@ -483,6 +486,7 @@ class Qwen35K4DraftProvider:
         *,
         eos_token_ids: Iterable[int] = (),
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
+        window_size: int = 4,
     ) -> None:
         if not isinstance(model, StreamedQwen38):
             raise TypeError("model must be a StreamedQwen38")
@@ -492,6 +496,12 @@ class Qwen35K4DraftProvider:
             or head_block_rows <= 0
         ):
             raise ValueError("head_block_rows must be a positive integer")
+        if (
+            isinstance(window_size, bool)
+            or not isinstance(window_size, int)
+            or not 2 <= window_size <= model.MAX_CONTINUATION_BLOCK_WIDTH
+        ):
+            raise ValueError("window_size must lie in [2, 16]")
         if isinstance(eos_token_ids, (str, bytes)):
             raise TypeError("eos_token_ids must be an iterable of integers")
         eos: set[int] = set()
@@ -518,6 +528,7 @@ class Qwen35K4DraftProvider:
         self.model = model
         self.eos_token_ids = frozenset(eos)
         self.head_block_rows = head_block_rows
+        self.window_size = window_size
         self._committed_history: tuple[int, ...] | None = None
         self._last_hidden: torch.Tensor | None = None
         self._pending_base: tuple[int, ...] | None = None
@@ -530,7 +541,7 @@ class Qwen35K4DraftProvider:
         self._draft_calls = 0
         self._extension_calls = 0
         self._reconcile_calls = 0
-        self._accepted = [0, 0, 0, 0, 0]
+        self._accepted = [0] * (window_size + 1)
         self._restaged_blocks = 0
         self._committed_tokens = 0
         self._source_start = _metric(model.pager.source, "network_or_source_body_bytes")
@@ -555,7 +566,11 @@ class Qwen35K4DraftProvider:
 
     def metrics(self) -> Qwen35K4DraftProviderMetrics:
         return Qwen35K4DraftProviderMetrics(
-            schema=QWEN35_K4_DRAFT_PROVIDER_SCHEMA,
+            schema=(
+                QWEN35_K4_DRAFT_PROVIDER_SCHEMA
+                if self.window_size == 4
+                else QWEN35_ROLLING_DRAFT_PROVIDER_SCHEMA
+            ),
             prefill_calls=self._prefill_calls,
             draft_calls=self._draft_calls,
             extension_calls=self._extension_calls,
@@ -563,8 +578,12 @@ class Qwen35K4DraftProvider:
             accepted_prefix_0=self._accepted[0],
             accepted_prefix_1=self._accepted[1],
             accepted_prefix_2=self._accepted[2],
-            accepted_prefix_3=self._accepted[3],
-            accepted_prefix_4=self._accepted[4],
+            accepted_prefix_3=(
+                self._accepted[3] if len(self._accepted) > 3 else 0
+            ),
+            accepted_prefix_4=(
+                self._accepted[4] if len(self._accepted) > 4 else 0
+            ),
             restaged_blocks=self._restaged_blocks,
             committed_tokens=self._committed_tokens,
             source_body_bytes=(
@@ -576,6 +595,8 @@ class Qwen35K4DraftProvider:
             state_bytes=self.model.state_bytes,
             pending=self._pending_stage is not None,
             poisoned=self._poisoned,
+            window_size=self.window_size,
+            accepted_prefix_counts=tuple(self._accepted),
         )
 
     def _pending_stamp(self) -> object:
@@ -674,14 +695,14 @@ class Qwen35K4DraftProvider:
             )
         return token
 
-    def __call__(self, history: tuple[int, ...], /) -> tuple[int, int, int, int]:
+    def __call__(self, history: tuple[int, ...], /) -> tuple[int, ...]:
         self._assert_ready()
         try:
             committed = self._history(history, name="draft history")
             if self._pending_stage is not None:
                 self._abort("previous draft proposal was not reconciled before reuse")
             if self._committed_history is None:
-                if len(committed) + 4 > self.model.max_seq_len:
+                if len(committed) + self.window_size > self.model.max_seq_len:
                     raise ValueError("draft block would exceed max_seq_len")
                 hidden, _evidence = self.model.prefill([committed], reset=True)
                 self._last_hidden = hidden[:, -1:].detach().clone()
@@ -691,7 +712,7 @@ class Qwen35K4DraftProvider:
                 self._abort("draft history differs from committed local history")
             if self.model.next_position != len(committed):
                 self._abort("draft model cursor disagrees with committed history")
-            if len(committed) + 4 > self.model.max_seq_len:
+            if len(committed) + self.window_size > self.model.max_seq_len:
                 raise ValueError("draft block would exceed max_seq_len")
             if committed[-1] in self.eos_token_ids:
                 raise ValueError("cannot draft after a committed EOS token")
@@ -700,7 +721,7 @@ class Qwen35K4DraftProvider:
 
             proposal = [self._scan(self._last_hidden[:, -1])]
             stage = self.model.stage_continuation_block([[proposal[0]]])
-            while len(proposal) < 4:
+            while len(proposal) < self.window_size:
                 token = (
                     proposal[-1]
                     if proposal[-1] in self.eos_token_ids
@@ -710,7 +731,7 @@ class Qwen35K4DraftProvider:
                 stage = self.model.extend_continuation_block(stage, [[token]])
                 self._extension_calls += 1
 
-            block = (proposal[0], proposal[1], proposal[2], proposal[3])
+            block = tuple(proposal)
             if self.model.next_position != len(committed):
                 self._abort("draft proposal moved the committed model cursor")
             self._pending_base = committed
@@ -732,8 +753,8 @@ class Qwen35K4DraftProvider:
         history: tuple[int, ...],
         known_token: int,
         /,
-    ) -> tuple[int, int, int]:
-        """Commit one target-known token, then stage three following drafts."""
+    ) -> tuple[int, ...]:
+        """Commit one target-known token, then stage the configured draft tail."""
 
         self._assert_ready()
         try:
@@ -750,7 +771,8 @@ class Qwen35K4DraftProvider:
             if self._pending_stage is not None:
                 self._abort("previous rolling draft was not reconciled")
             combined = (*committed, known)
-            if len(combined) + 3 > self.model.max_seq_len:
+            proposal_width = self.window_size - 1
+            if len(combined) + proposal_width > self.model.max_seq_len:
                 raise ValueError("rolling draft block would exceed max_seq_len")
             if self._committed_history is None:
                 hidden, _evidence = self.model.prefill([combined], reset=True)
@@ -772,7 +794,7 @@ class Qwen35K4DraftProvider:
 
             proposal = [self._scan(self._last_hidden[:, -1])]
             stage = self.model.stage_continuation_block([[proposal[0]]])
-            while len(proposal) < 3:
+            while len(proposal) < proposal_width:
                 token = (
                     proposal[-1]
                     if proposal[-1] in self.eos_token_ids
@@ -781,7 +803,7 @@ class Qwen35K4DraftProvider:
                 proposal.append(token)
                 stage = self.model.extend_continuation_block(stage, [[token]])
                 self._extension_calls += 1
-            block = (proposal[0], proposal[1], proposal[2])
+            block = tuple(proposal)
             self._pending_base = combined
             self._pending_proposal = block
             self._pending_stage = stage
@@ -800,7 +822,7 @@ class Qwen35K4DraftProvider:
             )
 
     def reconcile_prefix(self, history: tuple[int, ...], /) -> None:
-        """Commit zero through three target-accepted rolling draft tokens."""
+        """Commit the target-accepted prefix of the configured draft tail."""
 
         self._assert_ready()
         try:
@@ -813,13 +835,16 @@ class Qwen35K4DraftProvider:
                 or proposal is None
                 or stage is None
                 or not self._pending_rolling
-                or len(proposal) != 3
+                or len(proposal) != self.window_size - 1
             ):
                 self._abort("reconcile_prefix requires one rolling proposal")
             if committed[: len(base)] != base:
                 self._abort("rolling reconciliation changed its committed base")
             delta = committed[len(base) :]
-            if len(delta) > 3 or tuple(delta) != proposal[: len(delta)]:
+            if (
+                len(delta) > self.window_size - 1
+                or tuple(delta) != proposal[: len(delta)]
+            ):
                 self._abort("rolling reconciliation is not an accepted draft prefix")
             if any(token in self.eos_token_ids for token in delta[:-1]):
                 self._abort("rolling reconciliation contains tokens after EOS")
@@ -880,14 +905,14 @@ class Qwen35K4DraftProvider:
             if committed[: len(base)] != base:
                 self._abort("reconciled history changed the committed draft prefix")
             delta = committed[len(base) :]
-            if len(delta) not in (1, 2, 3, 4):
-                self._abort("reconciled history must commit one through four tokens")
+            if not 1 <= len(delta) <= self.window_size:
+                self._abort("reconciled history has the wrong committed width")
             if any(token in self.eos_token_ids for token in delta[:-1]):
                 self._abort("reconciled history contains a token after EOS")
             if delta[:-1] != proposal[: len(delta) - 1]:
                 self._abort("reconciled delta rejects a token before its final item")
             if (
-                len(delta) < 4
+                len(delta) < self.window_size
                 and delta[-1] == proposal[len(delta) - 1]
                 and delta[-1] not in self.eos_token_ids
             ):
@@ -898,7 +923,7 @@ class Qwen35K4DraftProvider:
             accepted = 0
             while accepted < len(delta) and delta[accepted] == proposal[accepted]:
                 accepted += 1
-            if len(delta) == 4 and delta == proposal:
+            if len(delta) == self.window_size and delta == proposal:
                 hidden, _evidence = self.model.commit_continuation_block(stage)
             else:
                 self.model.discard_continuation_block(stage)
@@ -950,7 +975,7 @@ class Qwen35K4DraftProvider:
         self._seal = self._runtime_stamp()
 
     def close(self) -> None:
-        """Discard unconfirmed K=4 state and release resident draft weights."""
+        """Discard unconfirmed draft state and release resident draft weights."""
 
         if self._closed:
             return
@@ -969,6 +994,7 @@ class Qwen35K4DraftProvider:
 __all__ = [
     "QWEN35_K2_DRAFT_PROVIDER_SCHEMA",
     "QWEN35_K4_DRAFT_PROVIDER_SCHEMA",
+    "QWEN35_ROLLING_DRAFT_PROVIDER_SCHEMA",
     "Qwen35K2DraftProvider",
     "Qwen35K2DraftProviderError",
     "Qwen35K2DraftProviderMetrics",

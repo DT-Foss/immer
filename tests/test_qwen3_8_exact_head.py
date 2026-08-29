@@ -76,7 +76,7 @@ def _config() -> ExactHeadConfig:
         fanout=2,
         kmeans_iterations=3,
         assignment_chunk_rows=8,
-        max_query_rows=4,
+        max_query_rows=16,
     )
 
 
@@ -106,7 +106,7 @@ class Qwen38ExactHeadTests(unittest.TestCase):
             source,
             device="cpu",
             compute_dtype="bfloat16",
-            max_resident_bytes=512,
+            max_resident_bytes=2048,
             exact_head_index=index,
         )
         return pager, source
@@ -179,9 +179,9 @@ class Qwen38ExactHeadTests(unittest.TestCase):
         self.assertTrue(torch.equal(actual[0], expected[0]))
         self.assertTrue(torch.equal(actual[1], expected[1]))
 
-    def test_indexed_topk_matches_full_scan_for_one_to_four_queries(self) -> None:
+    def test_indexed_topk_matches_full_scan_through_sixteen_queries(self) -> None:
         generator = torch.Generator().manual_seed(91)
-        for query_rows in range(1, 5):
+        for query_rows in (1, 2, 4, 8, 16):
             hidden = torch.randn(
                 (query_rows, self.head.shape[1]),
                 generator=generator,

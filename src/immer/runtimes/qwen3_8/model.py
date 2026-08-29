@@ -158,10 +158,17 @@ class _DeltaNetPrefixUpdate:
 class _LayerPrefixTrace:
     attention_log_usage: tuple[torch.Tensor | None, ...] = ()
     delta_updates: tuple[_DeltaNetPrefixUpdate, ...] = ()
+    # Raw one-position Conv inputs that have fallen out of the final rolling
+    # Conv state.  Windows no wider than the kernel retain no extra copy.
+    delta_conv_prefix: tuple[torch.Tensor, ...] = ()
 
     @property
     def width(self) -> int:
-        return max(len(self.attention_log_usage), len(self.delta_updates))
+        return max(
+            len(self.attention_log_usage),
+            len(self.delta_updates),
+            len(self.delta_conv_prefix),
+        )
 
     @property
     def nbytes(self) -> int:
@@ -169,7 +176,8 @@ class _LayerPrefixTrace:
             0 if row is None else row.numel() * row.element_size()
             for row in self.attention_log_usage
         )
-        return usage + sum(row.nbytes for row in self.delta_updates)
+        conv = sum(row.numel() * row.element_size() for row in self.delta_conv_prefix)
+        return usage + conv + sum(row.nbytes for row in self.delta_updates)
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,7 +255,11 @@ class _PendingStatefulBlock:
 class StreamedQwen38:
     """Qwen3.5 text decoder with bounded, sequential weight residency."""
 
-    MAX_CONTINUATION_BLOCK_WIDTH = 4
+    # One target weight pass can verify this many draft positions.  Prefix
+    # traces retain every recurrent/Conv boundary, so a rejected suffix can be
+    # dropped without replay even when the window is wider than the DeltaNet
+    # convolution kernel.
+    MAX_CONTINUATION_BLOCK_WIDTH = 16
     EMBED_NAME = "model.language_model.embed_tokens.weight"
     FINAL_NORM_NAME = "model.language_model.norm.weight"
     HEAD_NAME = "lm_head.weight"
@@ -433,6 +445,8 @@ class StreamedQwen38:
         self.mlp_sparse_executor = mlp_sparse_executor
         self.packed_continuation_gemm = packed_continuation_gemm
         self.mlp_sparse_last_trace: Any | None = None
+        self.mlp_sparse_last_decision: Any | None = None
+        self.mlp_sparse_last_observation: Any | None = None
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self._layer_states: list[LayerState | None] = [
@@ -1406,17 +1420,54 @@ class StreamedQwen38:
             or row_count > self.MAX_CONTINUATION_BLOCK_WIDTH
             or not executor.supports_layer(layer)
         ):
+            self.mlp_sparse_last_decision = None
             return False
         if self.layer_boundary_observer is None:
-            return True
-        if (
+            boundary_allows = True
+        elif (
             self.layer_boundary_layers is not None
             and layer not in self.layer_boundary_layers
         ):
+            boundary_allows = True
+        else:
+            boundary_allows = not any(
+                stage in self.layer_boundary_stages
+                for stage in ("mlp.gate", "mlp.up", "mlp.activated")
+            )
+        if not boundary_allows:
+            self.mlp_sparse_last_decision = None
+            return False
+        decide = getattr(executor, "decision", None)
+        if not callable(decide):
+            self.mlp_sparse_last_decision = None
             return True
-        return not any(
-            stage in self.layer_boundary_stages
-            for stage in ("mlp.gate", "mlp.up", "mlp.activated")
+        decision = decide(layer=layer, row_count=row_count)
+        use_sparse = getattr(decision, "use_sparse", None)
+        if not isinstance(use_sparse, bool):
+            raise Qwen38RuntimeError("fast-MLP decision returned an invalid action")
+        self.mlp_sparse_last_decision = decision
+        return use_sparse
+
+    def _observe_exact_mlp(
+        self,
+        *,
+        layer: int,
+        gate: Any,
+        up: Any,
+        activated: Any,
+        output: Any,
+    ) -> None:
+        self.mlp_sparse_last_observation = None
+        executor = self.mlp_sparse_executor
+        observe = None if executor is None else getattr(executor, "observe_full", None)
+        if not callable(observe):
+            return
+        self.mlp_sparse_last_observation = observe(
+            layer=layer,
+            gate=gate,
+            up=up,
+            activated=activated,
+            output=output,
         )
 
     def _mlp(self, hidden: torch.Tensor, *, layer: int) -> torch.Tensor:
@@ -1433,12 +1484,17 @@ class StreamedQwen38:
         self._observe_layer_boundary(layer, "mlp.gate", gate)
         up = self.pager.linear(hidden, f"{base}.up_proj")
         self._observe_layer_boundary(layer, "mlp.up", up)
-        try:
-            activated = swiglu(gate, up)
-            self._observe_layer_boundary(layer, "mlp.activated", activated)
-        finally:
-            del gate, up
+        activated = swiglu(gate, up)
+        self._observe_layer_boundary(layer, "mlp.activated", activated)
         output = self.pager.linear(activated, f"{base}.down_proj")
+        self._observe_exact_mlp(
+            layer=layer,
+            gate=gate,
+            up=up,
+            activated=activated,
+            output=output,
+        )
+        del gate, up, activated
         self._observe_layer_boundary(layer, "mlp.output", output)
         return output
 
@@ -1447,7 +1503,7 @@ class StreamedQwen38:
         hidden: tuple[torch.Tensor, ...],
         name: str,
     ) -> tuple[torch.Tensor, ...]:
-        """Apply one matrix once to one-to-four independent token rows."""
+        """Apply one matrix once to one-to-sixteen independent token rows."""
 
         if len(hidden) == 1:
             return (self.pager.linear(hidden[0], name),)
@@ -1628,6 +1684,7 @@ class StreamedQwen38:
         norm_weight = self._control(f"{base}.norm.weight", dtype=hidden[0].dtype)
         mixed_rows: list[torch.Tensor] = []
         updates: list[_DeltaNetPrefixUpdate] = []
+        conv_inputs: list[torch.Tensor] = []
         next_state = state
         try:
             for offset in range(len(hidden)):
@@ -1659,14 +1716,21 @@ class StreamedQwen38:
                     ),
                 )
                 mixed_rows.append(mixed)
+                if not isinstance(next_state, DeltaNetState):
+                    raise Qwen38RuntimeError(
+                        "continuation DeltaNet returned no state"
+                    )
+                conv_inputs.append(next_state.conv[..., -1:].detach().clone())
         finally:
             del projected_qkv, projected_z, projected_b, projected_a
             del conv_weight, a_log, dt_bias, norm_weight
         if not isinstance(next_state, DeltaNetState):  # pragma: no cover - kernel.
             raise Qwen38RuntimeError("continuation DeltaNet returned no state")
         projected = self._linear_token_rows(tuple(mixed_rows), f"{base}.out_proj")
+        kernel_size = int(next_state.conv.shape[-1])
         return projected, next_state, _LayerPrefixTrace(
-            delta_updates=tuple(updates)
+            delta_updates=tuple(updates),
+            delta_conv_prefix=tuple(conv_inputs[:-kernel_size]),
         )
 
     def _linear_attention_k2_pair(
@@ -1707,13 +1771,19 @@ class StreamedQwen38:
         base = f"model.language_model.layers.{layer}.mlp"
         gate = self._linear_token_rows(hidden, f"{base}.gate_proj")
         up = self._linear_token_rows(hidden, f"{base}.up_proj")
-        try:
-            activated = tuple(
-                swiglu(gate[index], up[index]) for index in range(len(hidden))
-            )
-        finally:
-            del gate, up
-        return self._linear_token_rows(activated, f"{base}.down_proj")
+        activated = tuple(
+            swiglu(gate[index], up[index]) for index in range(len(hidden))
+        )
+        output = self._linear_token_rows(activated, f"{base}.down_proj")
+        self._observe_exact_mlp(
+            layer=layer,
+            gate=gate,
+            up=up,
+            activated=activated,
+            output=output,
+        )
+        del gate, up, activated
+        return output
 
     def _mlp_k2_pair(
         self,
@@ -2568,18 +2638,40 @@ class StreamedQwen38:
     def _merge_prefix_traces(
         left: _ContinuationPrefixTrace,
         right: _ContinuationPrefixTrace,
+        left_states: tuple[LayerState | None, ...],
     ) -> _ContinuationPrefixTrace:
-        if right.width != 1 or len(left.layers) != len(right.layers):
+        if (
+            right.width != 1
+            or len(left.layers) != len(right.layers)
+            or len(left_states) != len(left.layers)
+        ):
             raise Qwen38RuntimeError("continuation prefix traces cannot be merged")
-        layers = tuple(
-            _LayerPrefixTrace(
-                attention_log_usage=(
-                    before.attention_log_usage + after.attention_log_usage
-                ),
-                delta_updates=before.delta_updates + after.delta_updates,
+        rows: list[_LayerPrefixTrace] = []
+        for before, after, left_state in zip(
+            left.layers, right.layers, left_states, strict=True
+        ):
+            conv_prefix = before.delta_conv_prefix + after.delta_conv_prefix
+            if before.delta_updates:
+                if not isinstance(left_state, DeltaNetState):
+                    raise Qwen38RuntimeError(
+                        "continuation DeltaNet prefix state is missing"
+                    )
+                kernel_size = int(left_state.conv.shape[-1])
+                expected = max(0, left.width + 1 - kernel_size)
+                if len(conv_prefix) < expected:
+                    conv_prefix += (
+                        left_state.conv[..., :1].detach().clone(),
+                    )
+            rows.append(
+                _LayerPrefixTrace(
+                    attention_log_usage=(
+                        before.attention_log_usage + after.attention_log_usage
+                    ),
+                    delta_updates=before.delta_updates + after.delta_updates,
+                    delta_conv_prefix=conv_prefix,
+                )
             )
-            for before, after in zip(left.layers, right.layers, strict=True)
-        )
+        layers = tuple(rows)
         if any(row.width != left.width + 1 for row in layers):
             raise Qwen38RuntimeError("merged continuation trace lost a token row")
         return _ContinuationPrefixTrace(
@@ -2618,7 +2710,7 @@ class StreamedQwen38:
             or not 1 <= ids.shape[1] <= self.MAX_CONTINUATION_BLOCK_WIDTH
         ):
             raise Qwen38RuntimeError(
-                "continuation block staging requires batch 1 and K in [1, 4]"
+                "continuation block staging requires batch 1 and K in [1, 16]"
             )
         if ids.shape[0] != self._state_batch_size:
             raise ValueError("continuation block batch differs from committed prefix")
@@ -2768,7 +2860,7 @@ class StreamedQwen38:
                     "continuation block extension requires batch 1 and one token"
                 )
             if not 1 <= width < self.MAX_CONTINUATION_BLOCK_WIDTH:
-                raise Qwen38RuntimeError("continuation block extension exceeds K=4")
+                raise Qwen38RuntimeError("continuation block extension exceeds K=16")
             if self._next_position != row.start_pos:
                 raise Qwen38RuntimeError("continuation block base state changed")
             if self._state_batch_size != 1 or len(row.input_token_ids) != 1:
@@ -2820,6 +2912,7 @@ class StreamedQwen38:
             prefix_trace = self._merge_prefix_traces(
                 pending.prefix_trace,
                 staged.prefix_trace,
+                pending.layer_states,
             )
             final_row = self._norm_token_rows(
                 (staged.hidden,),
@@ -2918,6 +3011,7 @@ class StreamedQwen38:
                     or not isinstance(final, AttentionState)
                     or len(layer_trace.attention_log_usage) != stage_width
                     or layer_trace.delta_updates
+                    or layer_trace.delta_conv_prefix
                 ):
                     raise Qwen38RuntimeError(
                         f"attention prefix trace is invalid at layer {layer}"
@@ -2949,12 +3043,31 @@ class StreamedQwen38:
                     initial_state=recurrent,
                 )
             kernel_size = int(final.conv.shape[-1])
-            if stage_width > kernel_size:
-                raise Qwen38RuntimeError("continuation block exceeds Conv state")
-            appended = final.conv[..., -stage_width:]
-            conv = torch.cat((base.conv, appended[..., :width]), dim=-1)[
+            prefix_count = max(0, stage_width - kernel_size)
+            if len(layer_trace.delta_conv_prefix) != prefix_count:
+                raise Qwen38RuntimeError(
+                    f"DeltaNet Conv prefix trace is invalid at layer {layer}"
+                )
+            stored = layer_trace.delta_conv_prefix[: min(width, prefix_count)]
+            suffix_count = max(0, width - prefix_count)
+            staged_suffix = final.conv[..., -min(kernel_size, stage_width) :]
+            pieces = (*stored, staged_suffix[..., :suffix_count])
+            appended = (
+                staged_suffix[..., :0]
+                if not pieces
+                else torch.cat(pieces, dim=-1)
+            )
+            conv = torch.cat((base.conv, appended), dim=-1)[
                 ..., -kernel_size:
             ].contiguous()
+            if (
+                tuple(conv.shape) != tuple(base.conv.shape)
+                or conv.dtype != base.conv.dtype
+                or conv.device != base.conv.device
+            ):
+                raise Qwen38RuntimeError(
+                    f"DeltaNet Conv prefix trace is invalid at layer {layer}"
+                )
             candidate[layer] = DeltaNetState(conv=conv, recurrent=recurrent)
         graft_history = trace.graft_histories[width - 1]
         if any(not isinstance(state, (AttentionState, DeltaNetState)) for state in candidate):

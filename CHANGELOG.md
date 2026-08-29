@@ -6,6 +6,45 @@ All notable changes to IMMER are recorded here.
 
 ### Arbitrary local Qwen runtime
 
+- Generalized correction-first rolling verification from fixed K=4 to a
+  configurable K=2–16 target window; `immer chat` defaults to K=8. All target
+  positions remain layer-major, so one checkpoint-matrix read serves the whole
+  wave. Full K16 acceptance emits 16 exact greedy tokens with one target stack
+  pass after prefill.
+- DeltaNet prefix traces now retain the compact Conv inputs that fall out of
+  the final rolling kernel state. Any accepted prefix through K16 reconstructs
+  exact Conv and recurrent state without a replaying weight pass; K<=kernel
+  windows retain no extra Conv-prefix copy.
+- Qwen3.5 transactional drafting and the zero-model-byte Markov Council now
+  emit variable tails up to 15 tokens. Reconciliation advances only through
+  the target-confirmed prefix, phrase options occupy only their proven first
+  three positions, and all later Council predictions receive ordinary
+  target-only feedback.
+- Expanded the exact residual-PQ head query union from four to sixteen rows.
+  Certified pruning and stable top-k parity now cover the complete rolling
+  window; the weight-only builder records the same K16 scorer bound.
+- Added a complete prompt-free Fast-MLP builder for all 64 Qwen layers. It
+  computes Gate/Up Gaussian joint moments directly from local causal weights,
+  constructs deterministic p4/k32 pilots, and publishes the existing packed
+  pilot plus Down-transpose mount ABI without a tokenizer or model forward.
+- Added bounded online Fast-MLP routing. The unchanged exact MLP path feeds its
+  already-computed Gate, Up, activation, and output tensors into a fixed-size
+  recursive-ridge controller. Cold, low-capture, wide, and periodically due
+  routes stay exact; confirmed routes use the sparse executor. Optional state
+  persistence is locked, atomic, plan-bound, and contains no prompt or hidden
+  tensor content. All 64 layer updates flush once at the request boundary
+  instead of rewriting the fixed-size state after every layer.
+- Added a deterministic all-layer p4/k32 Fast-MLP builder over authenticated
+  local weights. Isotropic Gate/Up joint moments seed all 64 routers; local
+  transpose and packed-pilot banks replace the `34.23 GB` full MLP target wave
+  with an `18.0147%` single/reused-route row footprint without prompts, model
+  forwards, cartography, holdout data, or Hugging Face.
+- Added bounded target-confirmed Fast-MLP learning. Exact paths feed their
+  already-materialized Gate/Up/activation/output tensors into fixed-size
+  recursive-ridge state, while low confidence, warmup, width mismatches, and
+  periodic checks request the unchanged full MLP. Optional state is locked,
+  SHA-bound to its plan, atomic, and content-free.
+
 - `immer chat` now opens the authenticated local Qwen3.8 causal bundle
   directly. General chat no longer depends on an unrelated S3 or FERTIG
   composition manifest.

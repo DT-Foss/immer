@@ -77,7 +77,7 @@ class ExactHeadConfig:
     fanout: int = 16
     kmeans_iterations: int = 4
     assignment_chunk_rows: int = 4096
-    max_query_rows: int = 4
+    max_query_rows: int = 16
 
     def __post_init__(self) -> None:
         for field in (
@@ -96,8 +96,8 @@ class ExactHeadConfig:
             raise ValueError("codebook_size must fit uint8")
         if self.fanout < 2:
             raise ValueError("fanout must be at least two")
-        if self.max_query_rows > 4:
-            raise ValueError("max_query_rows must not exceed rolling K4")
+        if self.max_query_rows > 16:
+            raise ValueError("max_query_rows must not exceed the rolling window")
 
     def to_record(self) -> dict[str, int]:
         return asdict(self)

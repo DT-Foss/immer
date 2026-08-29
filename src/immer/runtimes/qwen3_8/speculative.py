@@ -29,6 +29,9 @@ QWEN38_K4_SPECULATIVE_ROUND_SCHEMA = "immer.qwen3.8-k4-speculative-round/v1"
 QWEN38_ROLLING_K4_SPECULATIVE_SCHEMA = (
     "immer.qwen3.8-rolling-k4-speculative-generation/v1"
 )
+QWEN38_ROLLING_SPECULATIVE_SCHEMA = (
+    "immer.qwen3.8-rolling-speculative-generation/v2"
+)
 
 ReplayKind = Literal[
     "commit-k2",
@@ -801,6 +804,7 @@ class RollingK4SpeculativeRoundEvidence:
     state_bytes: int
     state_committed: bool
     stopped_on_eos: bool
+    window_size: int = 4
 
     def __post_init__(self) -> None:
         for name in (
@@ -819,13 +823,20 @@ class RollingK4SpeculativeRoundEvidence:
             _plain_nonnegative(getattr(self, name), name)
         _finite_nonnegative(self.provider_guard_seconds, "provider_guard_seconds")
         _finite_nonnegative(self.seconds, "seconds")
+        if (
+            isinstance(self.window_size, bool)
+            or not isinstance(self.window_size, int)
+            or not 2 <= self.window_size <= StreamedQwen38.MAX_CONTINUATION_BLOCK_WIDTH
+        ):
+            raise ValueError("rolling target window is outside [2, 16]")
         tail = not self.proposed_token_ids and not self.target_token_ids
         if not tail and (
-            len(self.proposed_token_ids) != 3 or len(self.target_token_ids) != 4
+            len(self.proposed_token_ids) != self.window_size - 1
+            or len(self.target_token_ids) != self.window_size
         ):
-            raise ValueError("rolling K=4 round has the wrong proposal width")
-        if not 0 <= self.accepted_prefix_length <= 3:
-            raise ValueError("rolling accepted prefix is outside K=3")
+            raise ValueError("rolling round has the wrong proposal width")
+        if not 0 <= self.accepted_prefix_length < self.window_size:
+            raise ValueError("rolling accepted prefix is outside the target window")
         if self.end_pos - self.start_pos != len(self.emitted_token_ids):
             raise ValueError("rolling cursor delta differs from emitted tokens")
         if tail:
@@ -865,16 +876,30 @@ class RollingK4SpeculativeGenerationEvidence:
     seconds: float
     state_bytes: int
     stopped_on_eos: bool
+    window_size: int = 4
 
     @property
     def final_state_committed(self) -> bool:
         return self.rounds[-1].state_committed
 
     def __post_init__(self) -> None:
-        if self.schema != QWEN38_ROLLING_K4_SPECULATIVE_SCHEMA:
-            raise ValueError("rolling K=4 generation schema is invalid")
+        expected_schema = (
+            QWEN38_ROLLING_K4_SPECULATIVE_SCHEMA
+            if self.window_size == 4
+            else QWEN38_ROLLING_SPECULATIVE_SCHEMA
+        )
+        if self.schema != expected_schema:
+            raise ValueError("rolling generation schema is invalid")
+        if (
+            isinstance(self.window_size, bool)
+            or not isinstance(self.window_size, int)
+            or not 2 <= self.window_size <= StreamedQwen38.MAX_CONTINUATION_BLOCK_WIDTH
+        ):
+            raise ValueError("rolling target window is outside [2, 16]")
         if not self.prompt_token_ids or not self.rounds:
-            raise ValueError("rolling K=4 generation requires prompt and rounds")
+            raise ValueError("rolling generation requires prompt and rounds")
+        if any(row.window_size != self.window_size for row in self.rounds):
+            raise ValueError("rolling rounds disagree on target window")
         emitted = tuple(
             token for row in self.rounds for token in row.emitted_token_ids
         )
@@ -1280,7 +1305,7 @@ class Qwen38K2SpeculativeDecoder:
 
 
 class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
-    """Generate exact greedy tokens with one K=4 target stage and head scan.
+    """Generate exact greedy tokens with one bounded target stage and head scan.
 
     A proposal is authority-free.  The target either commits the complete
     verified K=4 stage or discards it and replays only the proven prefix plus
@@ -1288,12 +1313,29 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
     committed continuation state.
     """
 
-    def __init__(self, model: StreamedQwen38, draft_provider: K4DraftProvider) -> None:
+    def __init__(
+        self,
+        model: StreamedQwen38,
+        draft_provider: K4DraftProvider,
+        *,
+        window_size: int = 4,
+    ) -> None:
+        if (
+            isinstance(window_size, bool)
+            or not isinstance(window_size, int)
+            or not 2 <= window_size <= model.MAX_CONTINUATION_BLOCK_WIDTH
+        ):
+            raise ValueError("window_size must lie in [2, 16]")
         super().__init__(model, draft_provider)
+        self.window_size = window_size
 
     def _proposal_k4(
         self, history: tuple[int, ...]
     ) -> tuple[tuple[int, int, int, int], int, float]:
+        if self.window_size != 4:
+            raise Qwen38SpeculativeError(
+                "one-shot K=4 generation requires window_size=4"
+            )
         stamp_started = time.perf_counter()
         before = _model_state_stamp(self.model)
         integrity_seconds = time.perf_counter() - stamp_started
@@ -1350,14 +1392,14 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         self,
         history: tuple[int, ...],
         known_token: int,
-    ) -> tuple[tuple[int, int, int], int, float]:
+    ) -> tuple[tuple[int, ...], int, float]:
         missing = object()
         if (
             inspect.getattr_static(self.draft_provider, "propose_after", missing)
             is missing
         ):
             raise Qwen38SpeculativeError(
-                "rolling K=4 requires draft_provider.propose_after"
+                "rolling generation requires draft_provider.propose_after"
             )
         stamp_started = time.perf_counter()
         before = _model_state_stamp(self.model)
@@ -1372,8 +1414,8 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             raw = callback(history, known_token)
             proposal = _token_tuple(
                 raw,
-                "rolling K=4 draft proposal",
-                lengths=frozenset({3}),
+                "rolling draft proposal",
+                lengths=frozenset({self.window_size - 1}),
             )
             if any(
                 token < 0 or token >= self.model.config.vocab_size
@@ -1400,7 +1442,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                 f"rolling draft provider failed: {type(failure).__name__}: {failure}"
             ) from failure
         assert proposal is not None
-        return (proposal[0], proposal[1], proposal[2]), integrity_bytes, integrity_seconds
+        return proposal, integrity_bytes, integrity_seconds
 
     def _begin_rolling_provider(
         self,
@@ -1453,7 +1495,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             is missing
         ):
             raise Qwen38SpeculativeError(
-                "rolling K=4 requires draft_provider.reconcile_prefix"
+                "rolling generation requires draft_provider.reconcile_prefix"
             )
         stamp_started = time.perf_counter()
         before = _model_state_stamp(self.model)
@@ -1536,7 +1578,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
         retain_final_state: bool = True,
     ) -> RollingK4SpeculativeGenerationResult:
-        """Generate with one target-known token plus three speculative drafts."""
+        """Generate with one target-known token plus a configurable draft window."""
 
         if (
             isinstance(max_new_tokens, bool)
@@ -1554,7 +1596,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             raise TypeError("retain_final_state must be a boolean")
         prompt_tensor = self.model._token_tensor(prompt_token_ids)
         if tuple(prompt_tensor.shape[:1]) != (1,):
-            raise ValueError("rolling K=4 generation requires batch size one")
+            raise ValueError("rolling generation requires batch size one")
         prompt = tuple(
             int(value)
             for value in prompt_tensor[0].detach().to(device="cpu").tolist()
@@ -1645,6 +1687,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                         state_bytes=self.model.state_bytes,
                         state_committed=commit,
                         stopped_on_eos=stopped,
+                        window_size=self.window_size,
                     )
                 )
                 generated.extend(emitted)
@@ -1665,7 +1708,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             )
             try:
                 targets = self._scan(stage.hidden, block_rows=head_block_rows)
-                if len(targets) != 4:
+                if len(targets) != self.window_size:
                     raise Qwen38SpeculativeError(
                         "rolling target scan returned wrong width"
                     )
@@ -1676,7 +1719,10 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                     pass
                 raise
             accepted = 0
-            while accepted < 3 and proposal[accepted] == targets[accepted]:
+            while (
+                accepted < self.window_size - 1
+                and proposal[accepted] == targets[accepted]
+            ):
                 accepted += 1
             accepted = min(accepted, remaining - 1)
             eos_offset = next(
@@ -1695,7 +1741,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             state_committed = retain_final_state or not terminal
             if state_committed:
                 width = len(emitted)
-                if width == 4:
+                if width == self.window_size:
                     hidden, _state_evidence = self.model.commit_continuation_block(
                         stage
                     )
@@ -1725,7 +1771,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                     end_pos=start_pos + len(emitted),
                     known_token_id=pending_token,
                     proposed_token_ids=proposal,
-                    target_token_ids=(targets[0], targets[1], targets[2], targets[3]),
+                    target_token_ids=targets,
                     emitted_token_ids=emitted,
                     accepted_prefix_length=accepted,
                     correction_token_id=correction,
@@ -1745,6 +1791,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                     state_bytes=self.model.state_bytes,
                     state_committed=state_committed,
                     stopped_on_eos=stopped,
+                    window_size=self.window_size,
                 )
             )
             generated.extend(emitted)
@@ -1752,7 +1799,11 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                 pending_token = correction
 
         evidence = RollingK4SpeculativeGenerationEvidence(
-            schema=QWEN38_ROLLING_K4_SPECULATIVE_SCHEMA,
+            schema=(
+                QWEN38_ROLLING_K4_SPECULATIVE_SCHEMA
+                if self.window_size == 4
+                else QWEN38_ROLLING_SPECULATIVE_SCHEMA
+            ),
             prompt_token_ids=prompt,
             generated_token_ids=tuple(generated),
             rounds=tuple(rounds),
@@ -1776,6 +1827,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             seconds=time.perf_counter() - started,
             state_bytes=self.model.state_bytes,
             stopped_on_eos=stopped,
+            window_size=self.window_size,
         )
         return RollingK4SpeculativeGenerationResult(tuple(generated), evidence)
 
@@ -2129,6 +2181,7 @@ __all__ = [
     "QWEN38_K4_SPECULATIVE_ROUND_SCHEMA",
     "QWEN38_K4_SPECULATIVE_SCHEMA",
     "QWEN38_ROLLING_K4_SPECULATIVE_SCHEMA",
+    "QWEN38_ROLLING_SPECULATIVE_SCHEMA",
     "Qwen38K2SpeculativeDecoder",
     "Qwen38K4SpeculativeDecoder",
     "Qwen38SpeculativeError",

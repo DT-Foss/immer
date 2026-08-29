@@ -29,6 +29,7 @@ SCRIPTS = (
     "qwen38_o1_mlp_evidence.py",
     "qwen38_mlp_pilot_layer_budget.py",
     "qwen38_exact_head_build.py",
+    "qwen38_fast_mlp_weight_only_build.py",
     "ooe_intelligence_benchmark.py",
     "ooe_boundary_blanket.py",
     "ooe_demand_blanket_benchmark.py",

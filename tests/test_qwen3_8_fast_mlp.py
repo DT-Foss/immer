@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -24,9 +25,16 @@ from immer.runtimes.ooe.mlp_pilot_runtime import (
     MlpPilotTransposeEntry,
     MlpPilotTransposeManifest,
 )
+from immer.runtimes.ooe.mlp_pilot_weight_only import (
+    MlpPilotOnlineConfig,
+    MlpPilotWeightOnlyPlan,
+    weight_only_model_pin,
+)
 from immer.runtimes.deepseek_v4.causal_weights import CausalWeightMount
 from immer.runtimes.qwen3_8.fast_mlp import (
     PILOT_WEIGHT_MANIFEST_SCHEMA,
+    PILOT_WEIGHT_MANIFEST_V2_SCHEMA,
+    WEIGHT_ONLY_PLAN_NAME,
     Qwen38FastMlpError,
     Qwen38FastMlpPaths,
     open_qwen38_fast_mlp,
@@ -49,7 +57,11 @@ def _file_sha256(path: Path) -> str:
 class _Fixture:
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.config = _tiny_config()
+        self.config = replace(
+            _tiny_config(),
+            n_layers=2,
+            layer_types=("linear_attention", "linear_attention"),
+        )
         corpus, prompts = _corpus("fast-mount", 5)
         self.router = fit_mlp_pilot_router(
             corpus,
@@ -104,9 +116,7 @@ class _Fixture:
                     for tensor in target_tensors.values()
                 )
             },
-            "weight_map": {
-                name: target_shard for name in sorted(target_tensors)
-            },
+            "weight_map": {name: target_shard for name in sorted(target_tensors)},
         }
         self.index_bytes = canonical_json_bytes(target_index) + b"\n"
         (self.weights_root / "model.safetensors.index.json").write_bytes(
@@ -161,8 +171,7 @@ class _Fixture:
                 MlpPilotTransposeEntry(
                     layer=layer,
                     source_tensor=(
-                        f"model.language_model.layers.{layer}.mlp."
-                        "down_proj.weight"
+                        f"model.language_model.layers.{layer}.mlp." "down_proj.weight"
                     ),
                     transpose_tensor=tensor_name,
                     shard=shard,
@@ -203,17 +212,18 @@ class _Fixture:
                 MlpPilotSparseExecutor.pilot_name(layer, "up"): self.up[layer][
                     indices
                 ].contiguous(),
-                MlpPilotSparseExecutor.pilot_name(
-                    layer, "down_transpose"
-                ): self.down[layer].T.contiguous()[indices].contiguous(),
+                MlpPilotSparseExecutor.pilot_name(layer, "down_transpose"): self.down[
+                    layer
+                ]
+                .T.contiguous()[indices]
+                .contiguous(),
             }
             shard = f"pilot-weights-layer-{layer:02d}.safetensors"
             shard_path = self.paths.pilot_root / shard
             save_file(tensors, shard_path)
             pilot_map.update({name: shard for name in tensors})
             total_payload += sum(
-                tensor.numel() * tensor.element_size()
-                for tensor in tensors.values()
+                tensor.numel() * tensor.element_size() for tensor in tensors.values()
             )
             pilot_entries.append(
                 {
@@ -245,9 +255,7 @@ class _Fixture:
         }
         self.pilot_manifest = {
             "body": pilot_body,
-            "body_sha256": hashlib.sha256(
-                canonical_json_bytes(pilot_body)
-            ).hexdigest(),
+            "body_sha256": hashlib.sha256(canonical_json_bytes(pilot_body)).hexdigest(),
             "schema": PILOT_WEIGHT_MANIFEST_SCHEMA,
         }
         (self.paths.pilot_root / "pilot-weight-manifest.json").write_bytes(
@@ -281,7 +289,12 @@ class _Fixture:
         self.target_pager.close()
         self.target_source.close()
 
-    def open(self, *, layers: tuple[int, ...] | None = None):
+    def open(
+        self,
+        *,
+        layers: tuple[int, ...] | None = None,
+        online_state_path: Path | None = None,
+    ):
         return open_qwen38_fast_mlp(
             paths=self.paths,
             target_mount=self.target_mount,
@@ -290,7 +303,72 @@ class _Fixture:
             source_budget_mb=64,
             max_resident_bytes=4 * 1024**2,
             active_layers=layers,
+            online_state_path=online_state_path,
         )
+
+    def enable_weight_only(self) -> MlpPilotWeightOnlyPlan:
+        index_sha256 = hashlib.sha256(self.index_bytes).hexdigest()
+        plan = MlpPilotWeightOnlyPlan(
+            repo_id="local/tiny-qwen",
+            revision="tiny-revision",
+            model_pin_sha256=weight_only_model_pin(
+                repo_id="local/tiny-qwen",
+                revision="tiny-revision",
+                bundle_manifest_sha256=_hash("fast-mount-bundle"),
+                layout_fingerprint=_hash("fast-mount-layout"),
+                weights_index_sha256=index_sha256,
+            ),
+            bundle_manifest_sha256=_hash("fast-mount-bundle"),
+            layout_fingerprint=_hash("fast-mount-layout"),
+            weights_index_sha256=index_sha256,
+            hidden_dimension=self.config.dim,
+            n_layers=self.config.n_layers,
+            config=self.router.config,
+            online_config=MlpPilotOnlineConfig(
+                min_confirmed_rows=2,
+                min_capture=0.0,
+                confirmation_interval=2,
+                cold_start_sparse_waves=1,
+                max_sparse_rows=4,
+            ),
+            models=self.router.models,
+            source_layer_sha256s=tuple(
+                (model.layer, _hash(f"fast-mount-weight-source:{model.layer}"))
+                for model in self.router.models
+            ),
+        )
+        affine = plan.affine_fit
+        transpose = MlpPilotTransposeManifest(
+            model_pin_sha256=plan.model_pin_sha256,
+            router_fit_sha256=plan.sha256,
+            affine_fit_sha256=affine.sha256,
+            weights_index_sha256=index_sha256,
+            entries=self.transpose_manifest.entries,
+        )
+        (self.paths.transpose_root / "pilot-transpose-manifest.json").write_bytes(
+            transpose.to_bytes()
+        )
+        pilot_body = {
+            "entries": self.pilot_manifest["body"]["entries"],
+            "identity_affine_sha256": affine.sha256,
+            "model_pin_sha256": plan.model_pin_sha256,
+            "tensor_payload_bytes": self.pilot_manifest["body"]["tensor_payload_bytes"],
+            "transpose_manifest_sha256": transpose.sha256,
+            "weight_plan_sha256": plan.sha256,
+            "weights_index_sha256": index_sha256,
+        }
+        pilot_manifest = {
+            "body": pilot_body,
+            "body_sha256": hashlib.sha256(canonical_json_bytes(pilot_body)).hexdigest(),
+            "schema": PILOT_WEIGHT_MANIFEST_V2_SCHEMA,
+        }
+        (self.paths.pilot_root / "pilot-weight-manifest.json").write_bytes(
+            canonical_json_bytes(pilot_manifest)
+        )
+        (self.paths.analysis_root / "fit.json").unlink()
+        (self.paths.analysis_root / "affine-fit.json").unlink()
+        (self.paths.analysis_root / WEIGHT_ONLY_PLAN_NAME).write_bytes(plan.to_bytes())
+        return plan
 
 
 class Qwen38FastMlpMountTests(unittest.TestCase):
@@ -302,16 +380,16 @@ class Qwen38FastMlpMountTests(unittest.TestCase):
         self.fixture.close()
         self.temporary.cleanup()
 
-    def test_valid_artifacts_mount_execute_and_leave_target_pager_borrowed(self) -> None:
+    def test_valid_artifacts_mount_execute_and_leave_target_pager_borrowed(
+        self,
+    ) -> None:
         mount = self.fixture.open(layers=(0,))
         hidden = torch.randn(1, self.fixture.config.dim, dtype=torch.bfloat16)
 
         source_before = self.fixture.target_source.bytes_moved()
         aux_before = mount.metrics()["source_body_bytes"]
         output, trace = mount.executor.execute(hidden, layer=0)
-        single_target_bytes = (
-            self.fixture.target_source.bytes_moved() - source_before
-        )
+        single_target_bytes = self.fixture.target_source.bytes_moved() - source_before
         single_aux_bytes = mount.metrics()["source_body_bytes"] - aux_before
         source_before = self.fixture.target_source.bytes_moved()
         aux_before = mount.metrics()["source_body_bytes"]
@@ -345,9 +423,7 @@ class Qwen38FastMlpMountTests(unittest.TestCase):
             self.fixture.target_pager.metrics()["direct_tensor_fills"], 0
         )
         self.assertGreater(mount.pilot_pager.metrics()["direct_tensor_fills"], 0)
-        self.assertGreater(
-            mount.transpose_pager.metrics()["direct_tensor_fills"], 0
-        )
+        self.assertGreater(mount.transpose_pager.metrics()["direct_tensor_fills"], 0)
         mount.close()
         mount.close()
         rows = self.fixture.target_pager.tensor_rows(
@@ -412,6 +488,69 @@ class Qwen38FastMlpMountTests(unittest.TestCase):
             with self.subTest(layers=layers):
                 with self.assertRaisesRegex(Qwen38FastMlpError, "sorted fitted"):
                     self.fixture.open(layers=layers)
+
+    def test_weight_only_plan_mounts_every_layer_and_persists_confirmation(
+        self,
+    ) -> None:
+        plan = self.fixture.enable_weight_only()
+        state_path = Path(self.temporary.name) / "fast-mlp-online.json"
+        mount = self.fixture.open(online_state_path=state_path)
+        generator = torch.Generator().manual_seed(441)
+        hidden = torch.randn(
+            1,
+            self.fixture.config.dim,
+            generator=generator,
+            dtype=torch.bfloat16,
+        )
+        try:
+            self.assertEqual(mount.executor.active_layers, (0, 1))
+            self.assertEqual(mount.receipt.initialization, plan.initializer)
+            self.assertEqual(
+                mount.receipt.online_config_sha256,
+                plan.online_config.sha256,
+            )
+            self.assertTrue(mount.receipt.online_state_persistent)
+            cold = mount.executor.decision(layer=0, row_count=1)
+            self.assertTrue(cold.use_sparse)
+            mount.executor.execute(hidden, layer=0)
+            self.assertFalse(mount.executor.decision(layer=0, row_count=1).use_sparse)
+
+            gate = hidden.float() @ self.fixture.gate[0].float().T
+            up = hidden.float() @ self.fixture.up[0].float().T
+            activated = torch.nn.functional.silu(gate) * up
+            output = activated @ self.fixture.down[0].float().T
+            second_gate = gate * 0.75
+            second_up = up * 1.25
+            second_activated = torch.nn.functional.silu(second_gate) * second_up
+            second_output = second_activated @ self.fixture.down[0].float().T
+            observation = mount.executor.observe_full(
+                layer=0,
+                gate=torch.cat((gate, second_gate), dim=0),
+                up=torch.cat((up, second_up), dim=0),
+                activated=torch.cat((activated, second_activated), dim=0),
+                output=torch.cat((output, second_output), dim=0),
+            )
+            self.assertIsNotNone(observation)
+            self.assertTrue(mount.executor.decision(layer=0, row_count=1).use_sparse)
+            self.assertEqual(mount.metrics()["online_confirmed_rows"], 2)
+        finally:
+            mount.close()
+
+        reopened = self.fixture.open(online_state_path=state_path)
+        try:
+            decision = reopened.executor.decision(layer=0, row_count=1)
+            self.assertEqual(decision.reason, "target-confirmed")
+            self.assertEqual(decision.confirmed_rows, 2)
+        finally:
+            reopened.close()
+
+    def test_weight_only_plan_rejects_mixed_legacy_analysis(self) -> None:
+        self.fixture.enable_weight_only()
+        (self.fixture.paths.analysis_root / "fit.json").write_bytes(
+            self.fixture.router.to_bytes()
+        )
+        with self.assertRaisesRegex(Qwen38FastMlpError, "mixes fitted"):
+            self.fixture.open()
 
 
 if __name__ == "__main__":

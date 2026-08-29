@@ -405,6 +405,76 @@ class Qwen35LocalDraftTests(unittest.TestCase):
         self.assertEqual(metrics.restaged_blocks, 0)
         self.assertEqual(metrics.committed_tokens, 8)
 
+    def test_k8_rolling_identical_model_emits_eight_tokens_in_one_wave(self) -> None:
+        baseline = self._model()
+        expected, baseline_evidence = baseline.generate_greedy(
+            [[1, 4]], max_new_tokens=8, head_block_rows=7
+        )
+        target = self._model()
+        draft = self._model()
+        provider = Qwen35K4DraftProvider(
+            draft,
+            head_block_rows=7,
+            window_size=8,
+        )
+
+        result = Qwen38K4SpeculativeDecoder(
+            target,
+            provider,
+            window_size=8,
+        ).generate_rolling(
+            [[1, 4]],
+            max_new_tokens=8,
+            head_block_rows=7,
+        )
+
+        self.assertEqual(result.token_ids, expected)
+        self.assertEqual(len(result.evidence.rounds), 1)
+        self.assertEqual(result.evidence.forward_passes, 2)
+        self.assertLess(result.evidence.forward_passes, baseline_evidence.forward_passes)
+        self._assert_model_state_equal(target, baseline)
+        self._assert_model_state_equal(draft, baseline)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.window_size, 8)
+        self.assertEqual(metrics.accepted_prefix_counts[7], 1)
+        self.assertEqual(metrics.committed_tokens, 8)
+
+    def test_k8_rolling_partial_prefix_commits_without_weight_replay(self) -> None:
+        base = (1, 4)
+        source = self._model()
+        expected, _ = source.generate_greedy(
+            [base], max_new_tokens=8, head_block_rows=7
+        )
+        for accepted in (0, 1, 3, 6, 7):
+            with self.subTest(accepted=accepted):
+                draft = self._model()
+                provider = Qwen35K4DraftProvider(
+                    draft,
+                    head_block_rows=7,
+                    window_size=8,
+                )
+                proposal = provider.propose_after(base, expected[0])
+                committed = (*base, expected[0], *proposal[:accepted])
+                before = draft.pager.metrics()
+                provider.reconcile_prefix(committed)
+                after = draft.pager.metrics()
+
+                reference = self._model()
+                reference.prefill([base])
+                for token in committed[len(base) :]:
+                    reference.decode([[token]])
+                self._assert_model_state_equal(draft, reference)
+                for key in (
+                    "tensor_reads",
+                    "linear_calls",
+                    "network_or_source_body_bytes",
+                ):
+                    self.assertEqual(after[key], before[key])
+                self.assertEqual(
+                    provider.metrics().accepted_prefix_counts[accepted],
+                    1,
+                )
+
     def test_k4_proposal_is_opaque_and_does_not_move_committed_cursor(self) -> None:
         draft = self._model()
         provider = Qwen35K4DraftProvider(draft, head_block_rows=7)

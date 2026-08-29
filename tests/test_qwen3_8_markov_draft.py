@@ -201,6 +201,24 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(restored.expert_names), 8)
         self.assertEqual(restored.feedback_count, 3)
 
+    def test_variable_window_markov_proposes_and_learns_seven_tokens(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=64,
+            proposal_width=7,
+        )
+
+        proposal = provider.propose_after((1, 2), 3)
+        self.assertEqual(len(proposal), 7)
+        provider.reconcile_prefix((1, 2, 3, *proposal[:5]))
+        provider.observe_final((1, 2, 3, *proposal[:5], 7))
+
+        metrics = provider.metrics()
+        self.assertEqual(metrics.proposal_width, 7)
+        self.assertEqual(metrics.predictions, 8)
+        self.assertEqual(metrics.council_feedback, 6)
+        provider.close()
+
     def test_persisted_markov_memory_drafts_native_qwen_ids_without_model(self) -> None:
         prompt = (1, 4)
         baseline_long = self._model()

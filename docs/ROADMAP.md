@@ -13,7 +13,16 @@ around every domain that supports it.
 
 - [x] Primary local Qwen3.8 causal runtime with exact stateful generation.
 - [x] Weight-only residual-PQ LM-head rail with certified pruning, stable ties,
-  exact page fallback, bounded mount, and arbitrary-chat/K4 pager integration.
+  exact page fallback, bounded mount, and arbitrary-chat K=1–16 integration.
+- [x] Correction-first rolling K=2–16 draft verification with exact zero-read
+  partial-prefix commits across KV, DeltaNet Conv/recurrent, Graft, and native
+  Prefix-Sinkhorn state; K=8 is the local chat default.
+- [x] Prompt-free all-layer p4/k32 Fast-MLP builder, deterministic Gate/Up
+  joint-moment initialization, fixed-size online recursive-ridge routing,
+  persistent state, and confidence-driven full-MLP fallback.
+- [x] Deterministic weight-only p4/k32 Fast-MLP banks for all 64 layers, with
+  bounded target-confirmed online learning, periodic confirmation, and exact
+  low-confidence fallback.
 - [x] O1-State cartography over real contextual Qwen measurements.
 - [x] Append-only SemanticWeightAtlas with exact historical revision proofs.
 - [x] Markov-OoE site agents, mobile reservoirs, Möbius rapidity, PS-Lifted

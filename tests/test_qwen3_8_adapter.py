@@ -451,7 +451,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(result.evidence["draft"]["total_linear_calls"], 13)
         self.assertEqual(result.evidence["generation"]["linear_calls"], 10)
         self.assertEqual(result.evidence["fast_mlp"]["request"]["aux_source_body_bytes"], 20)
-        decoder_constructor.assert_called_once_with(target.model, provider)
+        decoder_constructor.assert_called_once_with(
+            target.model,
+            provider,
+            window_size=4,
+        )
         chat.close()
 
     def test_fast_mlp_identity_and_request_traffic_reach_general_chat(self) -> None:
@@ -513,7 +517,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
         chat.close()
 
     def test_short_generation_policy_records_plain_greedy_draft_fallback(self) -> None:
-        chat = _chat(_Runtime(), draft_mode="markov", max_new_tokens=3)
+        runtime = _Runtime()
+        runtime.model.generated = (7,)
+        chat = _chat(runtime, draft_mode="markov", max_new_tokens=1)
         with patch(
             "immer.runtimes.qwen3_8.adapter._digest",
             side_effect=lambda value: value,
@@ -525,7 +531,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             policy["draft_fallback"],
             {
                 "configured_mode": "markov",
-                "reason": "max-new-tokens-below-4",
+                "reason": "max-new-tokens-below-2",
             },
         )
         result = chat.handle(Request("chat", "hello"))
@@ -1022,6 +1028,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         "8192",
                         "--fast-mlp-max-resident-mb",
                         "96",
+                        "--fast-mlp-online-state",
+                        "/state/qwen-fast.json",
                     ]
                 )
 
@@ -1031,6 +1039,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(options["fast_mlp_active_layers"], (0, 9, 18, 63))
         self.assertEqual(options["fast_mlp_source_budget_mb"], 8192.0)
         self.assertEqual(options["fast_mlp_max_resident_bytes"], 96 * 1024**2)
+        self.assertEqual(
+            options["fast_mlp_online_state_path"],
+            "/state/qwen-fast.json",
+        )
 
     def test_cli_wires_exact_head_index_root(self) -> None:
         qwen = _chat(_Runtime())

@@ -79,11 +79,12 @@ The anchor cache can restore the deepest exact prompt prefix before generation.
 An exact hit uses the authenticated final-hidden seed; a shorter hit evaluates
 only the suffix. The output token loop remains the ordinary Qwen loop.
 
-Rolling K=4 stages one target-known token followed by three untrusted drafts.
-The target executes the four rows once and commits only the accepted prefix.
-DeltaNet update operands reconstruct recurrent state without another weight
-read; native Prefix-Sinkhorn usage and Graft history remain aligned to the
-same prefix.
+Rolling generation stages one target-known token followed by up to 15
+untrusted drafts. The target executes the K=2–16 rows in one layer-major
+weight pass and commits only the accepted prefix. DeltaNet update operands
+reconstruct recurrent state; compact Conv-prefix inputs recover the exact
+rolling Conv state even beyond its kernel width. Native Prefix-Sinkhorn usage
+and Graft history remain aligned without another weight read.
 
 Ordinary non-speculative decode consumes its committed continuation cache.
 After layer `l` returns, the old state for `l` loses its final owner and the
@@ -96,10 +97,19 @@ Fast-MLP routing evaluates every row's pilots first, then forms the union of
 the selected Gate/Up neurons across the K-token wave. The union is streamed in
 chunks no larger than one route, projected rowwise, and restored to each
 route's original order before SwiGLU. Down-transpose blocks live in a cache no
-larger than one route. K<=4 rows use exhaustive minimum-reload ordering, then
-assemble each original route in its original block order before the unchanged
+larger than one route. Up to 12 unique rows use exhaustive minimum-reload
+ordering; larger windows use deterministic maximum-overlap ordering. Every
+original route is assembled in its original block order before the unchanged
 rowwise reduction. The cache plus assembled route remains inside the auxiliary
 resident bound.
+
+The all-layer Fast-MLP initializer derives pilot offsets and coefficients from
+the exact Gaussian joint moment of each Gate/Up weight pair. It uses no prompt
+or model forward. During ordinary exact MLP execution, the runtime consumes
+the Gate, Up, activated, and Down outputs that already exist, updates bounded
+recursive-ridge block scores, and discards the rows. Sparse execution begins
+only after confirmation meets the configured capture floor; wide, cold,
+low-capture, or periodically due routes take the unchanged full path.
 
 The local transport has a caller-owned direct-fill plane. LiveCausal resolves
 the tensor plan first; the pager allocates the final CPU weight tensor; then
@@ -131,7 +141,7 @@ Global and dialect-local agents mine only within those episode boundaries and
 offer a three-token phrase after repeated target confirmation. Competing
 options are ranked by confidence, support, matched context depth, and dialect
 similarity. The selected phrase is teacher-forced through the same Council
-rows, verified by the same rolling K=4 target wave, and learned only when the
+rows, verified inside the same configurable target window, and learned only when the
 request reaches its terminal atomic commit.
 
 Context dialects sit above the global Council weights. A bounded bottom-k

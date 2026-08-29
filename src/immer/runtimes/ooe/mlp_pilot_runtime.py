@@ -16,7 +16,13 @@ from ..qwen3_8.kernels import swiglu
 from .identity import canonical_json_bytes, require_sha256
 from .mlp_pilot_residual import MlpPilotAffineFit, MlpPilotAffineLayer
 from .mlp_pilot_router import MlpPilotLayerModel, MlpPilotRouterFit
-
+from .mlp_pilot_weight_only import (
+    MlpPilotIdentityAffinePlan,
+    MlpPilotOnlineController,
+    MlpPilotOnlineObservation,
+    MlpPilotSparseDecision,
+    MlpPilotWeightOnlyPlan,
+)
 
 PILOT_SPARSE_RUNTIME_SCHEMA = "immer.qwen-mlp-pilot-sparse-runtime/v3"
 PILOT_TRANSPOSE_ENTRY_SCHEMA = "immer.qwen-mlp-pilot-transpose-entry/v1"
@@ -339,19 +345,29 @@ class MlpPilotSparseExecutor:
 
     def __init__(
         self,
-        router_fit: MlpPilotRouterFit,
-        affine_fit: MlpPilotAffineFit,
+        router_fit: MlpPilotRouterFit | MlpPilotWeightOnlyPlan,
+        affine_fit: MlpPilotAffineFit | MlpPilotIdentityAffinePlan | None,
         weight_pager: SelectedRowPager,
         down_transpose_pager: SelectedRowPager,
         *,
         pilot_pager: SelectedRowPager | None = None,
         active_layers: Sequence[int] | None = None,
         output_dtype: torch.dtype = torch.float32,
+        online_controller: MlpPilotOnlineController | None = None,
     ) -> None:
-        if not isinstance(router_fit, MlpPilotRouterFit):
-            raise TypeError("router_fit must be MlpPilotRouterFit")
-        if not isinstance(affine_fit, MlpPilotAffineFit):
-            raise TypeError("affine_fit must be MlpPilotAffineFit")
+        if not isinstance(router_fit, (MlpPilotRouterFit, MlpPilotWeightOnlyPlan)):
+            raise TypeError("router_fit must be a fitted or weight-only pilot plan")
+        if isinstance(router_fit, MlpPilotWeightOnlyPlan):
+            expected_affine = router_fit.affine_fit
+            if affine_fit is None:
+                affine_fit = expected_affine
+            if (
+                not isinstance(affine_fit, MlpPilotIdentityAffinePlan)
+                or affine_fit.sha256 != expected_affine.sha256
+            ):
+                raise ValueError("weight-only plan requires its identity affine plan")
+        elif not isinstance(affine_fit, MlpPilotAffineFit):
+            raise TypeError("fitted router requires MlpPilotAffineFit")
         if affine_fit.router_fit_sha256 != router_fit.sha256:
             raise ValueError("affine fit differs from the router fit")
         if affine_fit.model_pin_sha256 != router_fit.model_pin_sha256:
@@ -372,6 +388,12 @@ class MlpPilotSparseExecutor:
             raise ValueError("pilot pager must share the selected-row pager ABI")
         if output_dtype not in {torch.bfloat16, torch.float16, torch.float32}:
             raise ValueError("output_dtype must be bfloat16, float16, or float32")
+        if online_controller is not None and (
+            not isinstance(router_fit, MlpPilotWeightOnlyPlan)
+            or not isinstance(online_controller, MlpPilotOnlineController)
+            or online_controller.plan.sha256 != router_fit.sha256
+        ):
+            raise ValueError("online controller differs from the weight-only plan")
         router_models = {model.layer: model for model in router_fit.models}
         affine_models = {model.layer: model for model in affine_fit.models}
         if set(router_models) != set(affine_models):
@@ -403,6 +425,7 @@ class MlpPilotSparseExecutor:
         self.down_transpose_pager = down_transpose_pager
         self.pilot_pager = pilot_pager
         self.output_dtype = output_dtype
+        self.online_controller = online_controller
         self._router_models = router_models
         self._affine_models = affine_models
         self._active_layers = frozenset(selected_layers)
@@ -455,6 +478,57 @@ class MlpPilotSparseExecutor:
     def supports_layer(self, layer: int) -> bool:
         return layer in self._active_layers
 
+    def decision(self, *, layer: int, row_count: int) -> MlpPilotSparseDecision:
+        """Choose sparse execution or the caller's unchanged exact MLP path."""
+
+        if not self.supports_layer(layer):
+            return MlpPilotSparseDecision(
+                layer=layer,
+                row_count=row_count,
+                use_sparse=False,
+                reason="unsupported-layer",
+                confirmed_rows=0,
+                capture_ema=0.0,
+                sparse_waves_since_confirmation=0,
+            )
+        if self.online_controller is not None:
+            return self.online_controller.decision(layer=layer, row_count=row_count)
+        return MlpPilotSparseDecision(
+            layer=layer,
+            row_count=row_count,
+            use_sparse=True,
+            reason="sealed-prompt-fit",
+            confirmed_rows=0,
+            capture_ema=0.0,
+            sparse_waves_since_confirmation=0,
+        )
+
+    def observe_full(
+        self,
+        *,
+        layer: int,
+        gate: torch.Tensor | Sequence[torch.Tensor],
+        up: torch.Tensor | Sequence[torch.Tensor],
+        output: torch.Tensor | Sequence[torch.Tensor],
+        activated: torch.Tensor | Sequence[torch.Tensor] | None = None,
+    ) -> MlpPilotOnlineObservation | None:
+        """Ingest values already produced by an exact full-MLP fallback."""
+
+        if self.online_controller is None:
+            return None
+        return self.online_controller.observe_full(
+            layer=layer,
+            gate=gate,
+            up=up,
+            output=output,
+            activated=activated,
+        )
+
+    def online_metrics(self) -> dict[str, object] | None:
+        return (
+            None if self.online_controller is None else self.online_controller.metrics()
+        )
+
     @property
     def active_layers(self) -> tuple[int, ...]:
         return tuple(sorted(self._active_layers))
@@ -475,6 +549,9 @@ class MlpPilotSparseExecutor:
             "router_fit_sha256": self.router_fit.sha256,
             "schema": PILOT_SPARSE_RUNTIME_SCHEMA,
         }
+        if self.online_controller is not None:
+            identity["online_config_sha256"] = self.online_controller.config.sha256
+            identity["weight_only_plan_sha256"] = self.router_fit.sha256
         if transport_neutral:
             return identity
         return {**identity, "sources": list(self._transport_sources)}
@@ -576,12 +653,9 @@ class MlpPilotSparseExecutor:
         """Order rows by exact unique-route DP, then bounded greedy fallback."""
 
         routes = tuple(frozenset(int(block) for block in row) for row in block_orders)
-        if (
-            not routes
-            or any(
-                not route or len(route) != len(tuple(row))
-                for route, row in zip(routes, block_orders, strict=True)
-            )
+        if not routes or any(
+            not route or len(route) != len(tuple(row))
+            for route, row in zip(routes, block_orders, strict=True)
         ):
             raise MlpPilotSparseRuntimeError("down route inventory is invalid")
 
@@ -615,8 +689,7 @@ class MlpPilotSparseExecutor:
                         if mask & bit:
                             continue
                         candidate = (
-                            cost
-                            + len(unique_routes[following] - unique_routes[last]),
+                            cost + len(unique_routes[following] - unique_routes[last]),
                             (*path, following),
                         )
                         key = (mask | bit, following)
@@ -624,9 +697,7 @@ class MlpPilotSparseExecutor:
                         if previous is None or candidate < previous:
                             states[key] = candidate
             complete = (1 << count) - 1
-            unique_order = min(
-                states[(complete, last)] for last in range(count)
-            )[1]
+            unique_order = min(states[(complete, last)] for last in range(count))[1]
         else:
             order: list[int] = []
             remaining = set(range(count))
@@ -644,11 +715,7 @@ class MlpPilotSparseExecutor:
                 active = unique_routes[index]
             unique_order = tuple(order)
 
-        return tuple(
-            row
-            for index in unique_order
-            for row in rows_by_route[index]
-        )
+        return tuple(row for index in unique_order for row in rows_by_route[index])
 
     def _execute_flat(
         self, hidden: torch.Tensor, *, layer: int
@@ -716,9 +783,18 @@ class MlpPilotSparseExecutor:
         finally:
             del gate_pilot_weight, up_pilot_weight
         pilot_activation = swiglu(gate_pilot, up_pilot)
-        scores = model.score_pilot_arrays(
-            gate_pilot.detach().to(device="cpu", dtype=torch.float64).numpy(),
-            up_pilot.detach().to(device="cpu", dtype=torch.float64).numpy(),
+        gate_pilot_array = (
+            gate_pilot.detach().to(device="cpu", dtype=torch.float64).numpy()
+        )
+        up_pilot_array = up_pilot.detach().to(device="cpu", dtype=torch.float64).numpy()
+        scores = (
+            model.score_pilot_arrays(gate_pilot_array, up_pilot_array)
+            if self.online_controller is None
+            else self.online_controller.score_pilot_arrays(
+                layer=layer,
+                gate=gate_pilot_array,
+                up=up_pilot_array,
+            )
         )
         selected = np.argsort(-scores, axis=1, kind="stable")[
             :, : model.selected_block_count
@@ -758,13 +834,7 @@ class MlpPilotSparseExecutor:
             extra_by_row.append(extra)
 
         union_extra = np.asarray(
-            sorted(
-                {
-                    int(neuron)
-                    for extra in extra_by_row
-                    for neuron in extra
-                }
-            ),
+            sorted({int(neuron) for extra in extra_by_row for neuron in extra}),
             dtype=np.int64,
         )
         per_row_dynamic = model.selected_block_count * (
@@ -813,9 +883,7 @@ class MlpPilotSparseExecutor:
         }
         for blocks, extra in zip(down_block_orders, extra_by_row, strict=True):
             reconstructed = tuple(
-                int(neuron)
-                for block in blocks
-                for neuron in down_ids_by_block[block]
+                int(neuron) for block in blocks for neuron in down_ids_by_block[block]
             )
             if reconstructed != tuple(int(neuron) for neuron in extra):
                 raise MlpPilotSparseRuntimeError(
@@ -825,7 +893,9 @@ class MlpPilotSparseExecutor:
         routes = tuple(frozenset(blocks) for blocks in down_block_orders)
         processing_order = self._route_processing_order(down_block_orders)
         dtype_bytes = int(
-            torch.empty((), dtype=self.down_transpose_pager.compute_dtype).element_size()
+            torch.empty(
+                (), dtype=self.down_transpose_pager.compute_dtype
+            ).element_size()
         )
         route_bytes = per_row_dynamic * affine.output_dimension * dtype_bytes
         same_pager_pilot_bytes = (
@@ -833,12 +903,8 @@ class MlpPilotSparseExecutor:
             if self.pilot_pager is None
             else 0
         )
-        assembled_route_bytes = (
-            0 if model.selected_block_count == 1 else route_bytes
-        )
-        resident_required = (
-            route_bytes + assembled_route_bytes + same_pager_pilot_bytes
-        )
+        assembled_route_bytes = 0 if model.selected_block_count == 1 else route_bytes
+        resident_required = route_bytes + assembled_route_bytes + same_pager_pilot_bytes
         resident_limit = getattr(
             self.down_transpose_pager,
             "max_resident_bytes",
@@ -867,9 +933,7 @@ class MlpPilotSparseExecutor:
                 extra_activation = extra_activation.clone()
                 for block_index, block in enumerate(selected_blocks[row]):
                     for offset in model.pilot_offsets[block]:
-                        extra_activation[
-                            :, block_index * model.block_size + offset
-                        ] = 0
+                        extra_activation[:, block_index * model.block_size + offset] = 0
             pilot_output = pilot_activation[row : row + 1] @ down_pilot_weight
             return pilot_output + extra_activation @ weight
 
@@ -929,9 +993,7 @@ class MlpPilotSparseExecutor:
             selected_neuron_count=model.selected_neuron_count,
             intermediate_dimension=model.intermediate_dimension,
             source_weight_rows=(
-                3 * len(pilots)
-                + 2 * len(union_extra)
-                + down_loaded_rows
+                3 * len(pilots) + 2 * len(union_extra) + down_loaded_rows
             ),
             full_weight_rows=3 * model.intermediate_dimension,
             dynamic_requested_rows=len(hidden) * per_row_dynamic,
@@ -945,6 +1007,11 @@ class MlpPilotSparseExecutor:
                 else "consolidated-pilot+union-target+route-cache-down"
             ),
         )
+        if self.online_controller is not None:
+            self.online_controller.record_sparse(
+                layer=layer,
+                row_count=len(hidden),
+            )
         return corrected, trace
 
     def execute(

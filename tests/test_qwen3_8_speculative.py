@@ -62,12 +62,14 @@ class _RollingFromTokens:
         *,
         accepted_per_wave: int,
         vocab_size: int,
+        proposal_width: int = 3,
     ) -> None:
         self.prompt = prompt
         self.tokens = tokens
         self.accepted_per_wave = accepted_per_wave
         self.vocab_size = vocab_size
-        self.proposals: list[tuple[int, tuple[int, int, int]]] = []
+        self.proposal_width = proposal_width
+        self.proposals: list[tuple[int, tuple[int, ...]]] = []
         self.reconciled: list[tuple[int, ...]] = []
 
     def __call__(self, _history):
@@ -75,17 +77,19 @@ class _RollingFromTokens:
 
     def propose_after(
         self, history: tuple[int, ...], known_token: int
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, ...]:
         position = len(history) - len(self.prompt)
         if known_token != self.tokens[position]:
             raise AssertionError("rolling known token differs from target")
-        proposal = list(self.tokens[position + 1 : position + 4])
-        while len(proposal) < 3:
+        proposal = list(
+            self.tokens[position + 1 : position + 1 + self.proposal_width]
+        )
+        while len(proposal) < self.proposal_width:
             proposal.append((proposal[-1] + 1) % self.vocab_size)
-        if self.accepted_per_wave < 3:
+        if self.accepted_per_wave < self.proposal_width:
             index = self.accepted_per_wave
             proposal[index] = (proposal[index] + 1) % self.vocab_size
-        block = (proposal[0], proposal[1], proposal[2])
+        block = tuple(proposal)
         self.proposals.append((known_token, block))
         return block
 
@@ -141,6 +145,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def _model(self, **kwargs) -> StreamedQwen38:
+        max_seq_len = kwargs.pop("max_seq_len", 16)
         pager = Qwen38WeightPager(
             self.source,
             device="cpu",
@@ -152,7 +157,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
             self.config,
             pager,
             max_batch_size=1,
-            max_seq_len=16,
+            max_seq_len=max_seq_len,
             **kwargs,
         )
 
@@ -795,6 +800,74 @@ class Qwen38SpeculativeTests(unittest.TestCase):
                         for row in result.evidence.rounds
                     ),
                 )
+
+    def test_rolling_k8_matches_greedy_across_conv_boundary(self) -> None:
+        prompt = (1, 4)
+        reference = self._model()
+        expected, _ = reference.generate_greedy(
+            [prompt], max_new_tokens=8, head_block_rows=7
+        )
+        for accepted in (0, 3, 7):
+            with self.subTest(accepted=accepted):
+                baseline = self._model()
+                baseline.generate_greedy(
+                    [prompt], max_new_tokens=8, head_block_rows=7
+                )
+                provider = _RollingFromTokens(
+                    prompt,
+                    expected,
+                    accepted_per_wave=accepted,
+                    vocab_size=self.config.vocab_size,
+                    proposal_width=7,
+                )
+                candidate = self._model()
+                result = Qwen38K4SpeculativeDecoder(
+                    candidate,
+                    provider,
+                    window_size=8,
+                ).generate_rolling(
+                    [prompt],
+                    max_new_tokens=8,
+                    head_block_rows=7,
+                )
+                self.assertEqual(result.token_ids, expected)
+                self._assert_state_equal(candidate, baseline)
+                self.assertEqual(result.evidence.window_size, 8)
+                self.assertTrue(
+                    all(row.window_size == 8 for row in result.evidence.rounds)
+                )
+
+    def test_rolling_k16_full_acceptance_uses_one_target_wave(self) -> None:
+        prompt = (1, 4)
+        baseline = self._model(max_seq_len=32)
+        expected, baseline_evidence = baseline.generate_greedy(
+            [prompt], max_new_tokens=16, head_block_rows=7
+        )
+        provider = _RollingFromTokens(
+            prompt,
+            expected,
+            accepted_per_wave=15,
+            vocab_size=self.config.vocab_size,
+            proposal_width=15,
+        )
+        candidate = self._model(max_seq_len=32)
+        result = Qwen38K4SpeculativeDecoder(
+            candidate,
+            provider,
+            window_size=16,
+        ).generate_rolling(
+            [prompt],
+            max_new_tokens=16,
+            head_block_rows=7,
+        )
+        self.assertEqual(result.token_ids, expected)
+        self._assert_state_equal(candidate, baseline)
+        self.assertEqual(len(result.evidence.rounds), 1)
+        self.assertEqual(result.evidence.forward_passes, 2)
+        self.assertLess(
+            result.evidence.forward_passes,
+            baseline_evidence.forward_passes,
+        )
 
     def test_rolling_k4_one_shot_discards_only_terminal_state(self) -> None:
         prompt = (1, 4)

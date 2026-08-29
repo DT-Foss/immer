@@ -515,6 +515,7 @@ def _open_local_runtime(
     fast_mlp_source_budget_mb: float | None = None,
     fast_mlp_max_resident_bytes: int | None = None,
     fast_mlp_active_layers: Sequence[int] | None = None,
+    fast_mlp_online_state_path: Path | None = None,
     exact_head_root: Path | None = None,
     exact_head_block_rows: int | None = None,
     exact_head_max_bytes: int = 128 * 1024**2,
@@ -595,6 +596,7 @@ def _open_local_runtime(
                     else fast_mlp_max_resident_bytes
                 ),
                 active_layers=fast_mlp_active_layers,
+                online_state_path=fast_mlp_online_state_path,
             )
         model = StreamedQwen38(
             config,
@@ -664,6 +666,7 @@ def _open_official_runtime(
     fast_mlp_source_budget_mb: float | None = None,
     fast_mlp_max_resident_bytes: int | None = None,
     fast_mlp_active_layers: Sequence[int] | None = None,
+    fast_mlp_online_state_path: Path | None = None,
     exact_head_root: Path | None = None,
     exact_head_block_rows: int | None = None,
     exact_head_max_bytes: int = 128 * 1024**2,
@@ -682,6 +685,7 @@ def _open_official_runtime(
         fast_mlp_source_budget_mb=fast_mlp_source_budget_mb,
         fast_mlp_max_resident_bytes=fast_mlp_max_resident_bytes,
         fast_mlp_active_layers=fast_mlp_active_layers,
+        fast_mlp_online_state_path=fast_mlp_online_state_path,
         exact_head_root=exact_head_root,
         exact_head_block_rows=exact_head_block_rows,
         exact_head_max_bytes=exact_head_max_bytes,
@@ -714,6 +718,7 @@ class Qwen38CausalChat:
         result_cell_code_revision: str | None = None,
         draft_bundle_path: str | Path | None = None,
         draft_mode: str | None = None,
+        draft_window: int = 8,
         draft_source_budget_mb: float = 1_048_576,
         draft_max_resident_bytes: int | None = None,
         markov_draft_state_path: str | Path | None = None,
@@ -721,6 +726,7 @@ class Qwen38CausalChat:
         fast_mlp_source_budget_mb: float | None = None,
         fast_mlp_max_resident_bytes: int | None = None,
         fast_mlp_active_layers: Sequence[int] | None = None,
+        fast_mlp_online_state_path: str | Path | None = None,
     ) -> None:
         if not isinstance(bundle_path, (str, Path)):
             raise TypeError("bundle_path must be a local filesystem path")
@@ -774,6 +780,12 @@ class Qwen38CausalChat:
             raise TypeError("draft_bundle_path must be a local path or None")
         if draft_mode is not None and draft_mode not in {"qwen35", "markov"}:
             raise ValueError("draft_mode must be qwen35, markov, or None")
+        if (
+            isinstance(draft_window, bool)
+            or not isinstance(draft_window, int)
+            or not 2 <= draft_window <= StreamedQwen38.MAX_CONTINUATION_BLOCK_WIDTH
+        ):
+            raise ValueError("draft_window must lie in [2, 16]")
         if markov_draft_state_path is not None and not isinstance(
             markov_draft_state_path, (str, Path)
         ):
@@ -793,6 +805,11 @@ class Qwen38CausalChat:
             raise ValueError("rolling drafting and anchor restore cannot share a request")
         if fast_mlp_root is not None and not isinstance(fast_mlp_root, (str, Path)):
             raise TypeError("fast_mlp_root must be a local path or None")
+        if fast_mlp_online_state_path is not None and not isinstance(
+            fast_mlp_online_state_path,
+            (str, Path),
+        ):
+            raise TypeError("fast_mlp_online_state_path must be a local path or None")
         if fast_mlp_active_layers is not None:
             try:
                 fast_mlp_active_layers = tuple(fast_mlp_active_layers)
@@ -820,6 +837,7 @@ class Qwen38CausalChat:
                 fast_mlp_source_budget_mb,
                 fast_mlp_max_resident_bytes,
                 fast_mlp_active_layers,
+                fast_mlp_online_state_path,
             )
         ):
             raise ValueError("fast-MLP options require fast_mlp_root")
@@ -862,6 +880,7 @@ class Qwen38CausalChat:
             else Path(draft_bundle_path).expanduser().absolute()
         )
         self._draft_mode = draft_mode
+        self._draft_window = draft_window
         self._draft_source_budget_mb = draft_source_budget_mb
         self._draft_max_resident_bytes = draft_max_resident_bytes
         self._markov_draft_state_path = (
@@ -877,6 +896,11 @@ class Qwen38CausalChat:
         self._fast_mlp_source_budget_mb = fast_mlp_source_budget_mb
         self._fast_mlp_max_resident_bytes = fast_mlp_max_resident_bytes
         self._fast_mlp_active_layers = fast_mlp_active_layers
+        self._fast_mlp_online_state_path = (
+            None
+            if fast_mlp_online_state_path is None
+            else Path(fast_mlp_online_state_path).expanduser().absolute()
+        )
         self._result_cell_code_revision = result_cell_code_revision
         self._runtime: Any | None = None
         self._draft_runtime: Any | None = None
@@ -908,9 +932,13 @@ class Qwen38CausalChat:
             "source_budget_mb": self._source_budget_mb,
             "thinking": False,
         }
-        if self._draft_mode is not None and self._max_new_tokens >= 4:
-            policy["decoding"] = "greedy-rolling-k4-draft-verify"
+        if self._draft_mode is not None and self._max_new_tokens >= 2:
+            policy["decoding"] = "greedy-rolling-window-draft-verify"
             policy["draft_mode"] = self._draft_mode
+            policy["draft_window"] = min(
+                self._draft_window,
+                self._max_new_tokens,
+            )
             if self._draft_mode == "qwen35":
                 policy["draft_model"] = {
                     "repo_id": QWEN35_DRAFTER_REPO_ID,
@@ -933,7 +961,7 @@ class Qwen38CausalChat:
         elif self._draft_mode is not None:
             policy["draft_fallback"] = {
                 "configured_mode": self._draft_mode,
-                "reason": "max-new-tokens-below-4",
+                "reason": "max-new-tokens-below-2",
             }
         if self._fast_mlp_paths is not None:
             policy["fast_mlp"] = {
@@ -943,6 +971,7 @@ class Qwen38CausalChat:
                     else list(self._fast_mlp_active_layers)
                 ),
                 "enabled": True,
+                "online_state": self._fast_mlp_online_state_path is not None,
             }
             runtime = self._runtime
             receipt = (
@@ -962,6 +991,13 @@ class Qwen38CausalChat:
                         "weights_index_sha256",
                     )
                 }
+                for key in (
+                    "initialization",
+                    "online_config_sha256",
+                    "online_state_persistent",
+                ):
+                    if key in receipt:
+                        policy["fast_mlp"]["artifacts"][key] = receipt[key]
         if self._exact_head_root is not None:
             policy["exact_head"] = {
                 "enabled": True,
@@ -1057,6 +1093,7 @@ class Qwen38CausalChat:
             fast_mlp_source_budget_mb=self._fast_mlp_source_budget_mb,
             fast_mlp_max_resident_bytes=self._fast_mlp_max_resident_bytes,
             fast_mlp_active_layers=self._fast_mlp_active_layers,
+            fast_mlp_online_state_path=self._fast_mlp_online_state_path,
             exact_head_root=self._exact_head_root,
             exact_head_block_rows=self._head_block_rows,
             exact_head_max_bytes=self._exact_head_max_bytes,
@@ -1064,7 +1101,7 @@ class Qwen38CausalChat:
 
     def _open_draft_runtime(self) -> _OwnedRuntime:
         if self._draft_bundle_path is None:
-            raise Qwen38ChatError("K=4 draft bundle is not configured")
+            raise Qwen38ChatError("rolling draft bundle is not configured")
         return _open_local_runtime(
             bundle_path=self._draft_bundle_path,
             tokenizer_path=self._tokenizer_path,
@@ -1088,7 +1125,7 @@ class Qwen38CausalChat:
             draft.tokenizer_sha256 != target.tokenizer_sha256
             or draft.model.config.vocab_size != target.model.config.vocab_size
         ):
-            raise Qwen38ChatError("target and K=4 drafter vocabularies differ")
+            raise Qwen38ChatError("target and rolling drafter vocabularies differ")
         return draft
 
     def _generate_locked(
@@ -1104,7 +1141,7 @@ class Qwen38CausalChat:
         fast_before = None if fast_mount is None else fast_mount.metrics()
         exact_head = getattr(runtime, "exact_head_index", None)
         exact_before = None if exact_head is None else exact_head.metrics()
-        if self._draft_mode is None or self._max_new_tokens < 4:
+        if self._draft_mode is None or self._max_new_tokens < 2:
             generated, evidence = runtime.model.generate_greedy(
                 [list(prompt_ids)],
                 retain_final_state=False,
@@ -1120,22 +1157,26 @@ class Qwen38CausalChat:
             self._record_exact_head_request(runtime, exact_before)
             return generated, evidence
         eos = tuple(generation_options["eos_token_ids"])
+        draft_window = min(self._draft_window, self._max_new_tokens)
         if self._draft_mode == "qwen35":
             draft = self._load_draft_locked(runtime)
             provider: Any = Qwen35K4DraftProvider(
                 draft.model,
                 eos_token_ids=eos,
                 head_block_rows=self._head_block_rows,
+                window_size=draft_window,
             )
         else:
             provider = FingerprintRollingK4DraftProvider(
                 vocab_size=runtime.model.config.vocab_size,
                 state_path=self._markov_draft_state_path,
+                proposal_width=draft_window - 1,
             )
         try:
             generated = Qwen38K4SpeculativeDecoder(
                 runtime.model,
                 provider,
+                window_size=draft_window,
             ).generate_rolling(
                 [prompt_ids],
                 max_new_tokens=self._max_new_tokens,
@@ -1173,6 +1214,7 @@ class Qwen38CausalChat:
                 ),
                 "final_state_committed": evidence.final_state_committed,
                 "rounds": len(evidence.rounds),
+                "window_size": getattr(evidence, "window_size", draft_window),
                 "schema": evidence.schema,
             }
             provider_record = getattr(provider_metrics, "to_dict", None)
@@ -1263,6 +1305,15 @@ class Qwen38CausalChat:
                 "transpose_source_body_bytes"
             ],
         }
+        for field in (
+            "online_confirmed_rows",
+            "online_exact_waves",
+            "online_sparse_rows",
+            "online_sparse_waves",
+            "online_surprises",
+        ):
+            if field in delta:
+                request[field] = delta[field]
         self._last_fast_mlp_evidence = request
         return request
 

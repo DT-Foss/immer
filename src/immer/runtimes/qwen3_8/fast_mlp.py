@@ -19,12 +19,19 @@ from ..ooe.mlp_pilot_runtime import (
     MlpPilotSparseExecutor,
     MlpPilotTransposeManifest,
 )
+from ..ooe.mlp_pilot_weight_only import (
+    WEIGHT_ONLY_INITIALIZER,
+    MlpPilotIdentityAffinePlan,
+    MlpPilotOnlineController,
+    MlpPilotWeightOnlyPlan,
+)
 from .pager import Qwen38WeightPager
 from .config import Qwen38Config
 
-
 FAST_MLP_MOUNT_SCHEMA = "immer.qwen3.8-fast-mlp-mount/v1"
 PILOT_WEIGHT_MANIFEST_SCHEMA = "immer.qwen3.8-mlp-pilot-weight-bank/v1"
+PILOT_WEIGHT_MANIFEST_V2_SCHEMA = "immer.qwen3.8-mlp-pilot-weight-bank/v2"
+WEIGHT_ONLY_PLAN_NAME = "weight-only-plan.json"
 
 
 class Qwen38FastMlpError(RuntimeError):
@@ -108,7 +115,11 @@ def _regular_shard(root: Path, name: object, size: object) -> Path:
         row = path.lstat()
     except OSError as exc:
         raise Qwen38FastMlpError(f"fast-MLP shard is missing: {path}") from exc
-    if stat.S_ISLNK(row.st_mode) or not stat.S_ISREG(row.st_mode) or row.st_size != size:
+    if (
+        stat.S_ISLNK(row.st_mode)
+        or not stat.S_ISREG(row.st_mode)
+        or row.st_size != size
+    ):
         raise Qwen38FastMlpError(f"fast-MLP shard identity changed: {path}")
     return path
 
@@ -210,6 +221,9 @@ class Qwen38FastMlpReceipt:
     active_layers: tuple[int, ...]
     selected_neuron_fraction_by_layer: tuple[tuple[int, float], ...]
     transport_row_fraction_by_layer: tuple[tuple[int, float], ...]
+    initialization: str = "sealed-prompt-fit/v1"
+    online_config_sha256: str | None = None
+    online_state_persistent: bool = False
 
     def to_record(self) -> dict[str, object]:
         return {
@@ -217,7 +231,10 @@ class Qwen38FastMlpReceipt:
             "affine_fit_sha256": self.affine_fit_sha256,
             "execution": "row-routed-sparse-mlp",
             "fitted_layers": list(self.fitted_layers),
+            "initialization": self.initialization,
             "model_pin_sha256": self.model_pin_sha256,
+            "online_config_sha256": self.online_config_sha256,
+            "online_state_persistent": self.online_state_persistent,
             "pilot_manifest_body_sha256": self.pilot_manifest_body_sha256,
             "router_fit_sha256": self.router_fit_sha256,
             "schema": FAST_MLP_MOUNT_SCHEMA,
@@ -251,6 +268,8 @@ class Qwen38FastMlpMount:
         self._closed = False
 
     def metrics(self) -> dict[str, int]:
+        if self.executor.online_controller is not None:
+            self.executor.online_controller.flush()
         result: dict[str, int] = {}
         for prefix, pager in (
             ("pilot", self.pilot_pager),
@@ -269,19 +288,40 @@ class Qwen38FastMlpMount:
                     else 0
                 )
         result["source_body_bytes"] = (
-            result["pilot_source_body_bytes"]
-            + result["transpose_source_body_bytes"]
+            result["pilot_source_body_bytes"] + result["transpose_source_body_bytes"]
         )
         result["logical_weight_bytes"] = (
             result["pilot_logical_weight_bytes"]
             + result["transpose_logical_weight_bytes"]
         )
+        online = self.executor.online_metrics()
+        layers = None if online is None else online.get("layers")
+        if isinstance(layers, list):
+            for field in (
+                "confirmed_rows",
+                "exact_waves",
+                "sparse_rows",
+                "sparse_waves",
+                "surprises",
+            ):
+                result[f"online_{field}"] = sum(
+                    int(row.get(field, 0))
+                    for row in layers
+                    if isinstance(row, Mapping)
+                    and isinstance(row.get(field, 0), int)
+                    and not isinstance(row.get(field, 0), bool)
+                )
         return result
 
     def close(self) -> None:
         if self._closed:
             return
         failures: list[Exception] = []
+        if self.executor.online_controller is not None:
+            try:
+                self.executor.online_controller.close()
+            except Exception as exc:
+                failures.append(exc)
         for pager in (self.pilot_pager, self.transpose_pager):
             try:
                 pager.close()
@@ -297,34 +337,55 @@ class Qwen38FastMlpMount:
 def _pilot_manifest(
     root: Path,
     *,
-    router: MlpPilotRouterFit,
-    affine: MlpPilotAffineFit,
+    router: MlpPilotRouterFit | MlpPilotWeightOnlyPlan,
+    affine: MlpPilotAffineFit | MlpPilotIdentityAffinePlan,
     transpose: MlpPilotTransposeManifest,
 ) -> tuple[Mapping[str, object], str]:
     data = _stable_read(root / "pilot-weight-manifest.json")
     document = _strict_json(data, label="pilot weight manifest")
-    if (
-        set(document) != {"body", "body_sha256", "schema"}
-        or document.get("schema") != PILOT_WEIGHT_MANIFEST_SCHEMA
-        or not isinstance(document.get("body"), Mapping)
+    schema = document.get("schema")
+    if set(document) != {"body", "body_sha256", "schema"} or not isinstance(
+        document.get("body"), Mapping
     ):
         raise Qwen38FastMlpError("pilot weight manifest envelope is invalid")
     body = cast(Mapping[str, object], document["body"])
-    expected = {
-        "affine_fit_sha256",
-        "entries",
-        "model_pin_sha256",
-        "router_fit_sha256",
-        "tensor_payload_bytes",
-        "transpose_manifest_sha256",
-        "weights_index_sha256",
-    }
+    if schema == PILOT_WEIGHT_MANIFEST_SCHEMA and isinstance(router, MlpPilotRouterFit):
+        expected = {
+            "affine_fit_sha256",
+            "entries",
+            "model_pin_sha256",
+            "router_fit_sha256",
+            "tensor_payload_bytes",
+            "transpose_manifest_sha256",
+            "weights_index_sha256",
+        }
+        identities_match = (
+            body.get("router_fit_sha256") == router.sha256
+            and body.get("affine_fit_sha256") == affine.sha256
+        )
+    elif schema == PILOT_WEIGHT_MANIFEST_V2_SCHEMA and isinstance(
+        router, MlpPilotWeightOnlyPlan
+    ):
+        expected = {
+            "entries",
+            "identity_affine_sha256",
+            "model_pin_sha256",
+            "tensor_payload_bytes",
+            "transpose_manifest_sha256",
+            "weight_plan_sha256",
+            "weights_index_sha256",
+        }
+        identities_match = (
+            body.get("weight_plan_sha256") == router.sha256
+            and body.get("identity_affine_sha256") == affine.sha256
+        )
+    else:
+        raise Qwen38FastMlpError("pilot weight manifest initialization mode changed")
     if (
         set(body) != expected
         or document.get("body_sha256") != _digest(body)
         or body.get("model_pin_sha256") != router.model_pin_sha256
-        or body.get("router_fit_sha256") != router.sha256
-        or body.get("affine_fit_sha256") != affine.sha256
+        or not identities_match
         or body.get("transpose_manifest_sha256") != transpose.sha256
         or body.get("weights_index_sha256") != affine.weights_index_sha256
         or not isinstance(body.get("entries"), list)
@@ -335,8 +396,8 @@ def _pilot_manifest(
 
 def _validate_artifact_inventory(
     *,
-    router: MlpPilotRouterFit,
-    affine: MlpPilotAffineFit,
+    router: MlpPilotRouterFit | MlpPilotWeightOnlyPlan,
+    affine: MlpPilotAffineFit | MlpPilotIdentityAffinePlan,
     transpose: MlpPilotTransposeManifest,
     pilot_body: Mapping[str, object],
     transpose_root: Path,
@@ -358,17 +419,14 @@ def _validate_artifact_inventory(
             or affine_row.output_dimension != config.dim
             or entry.source_tensor
             != f"model.language_model.layers.{layer}.mlp.down_proj.weight"
-            or entry.transpose_tensor
-            != MlpPilotSparseExecutor.transpose_name(layer)
+            or entry.transpose_tensor != MlpPilotSparseExecutor.transpose_name(layer)
             or entry.shape
             != (model.intermediate_dimension, affine_row.output_dimension)
         ):
             raise Qwen38FastMlpError(f"transpose ABI changed at layer {layer}")
         require_sha256(entry.shard_sha256, field="transpose shard SHA")
         if layer in active_layers:
-            shard = _regular_shard(
-                transpose_root, entry.shard, entry.shard_bytes
-            )
+            shard = _regular_shard(transpose_root, entry.shard, entry.shard_bytes)
             if _stable_sha256(shard, entry.shard_bytes) != entry.shard_sha256:
                 raise Qwen38FastMlpError(
                     f"transpose shard hash changed at layer {layer}"
@@ -387,7 +445,11 @@ def _validate_artifact_inventory(
         }:
             raise Qwen38FastMlpError("pilot weight entry is invalid")
         layer = raw.get("layer")
-        if isinstance(layer, bool) or not isinstance(layer, int) or layer in pilot_entries:
+        if (
+            isinstance(layer, bool)
+            or not isinstance(layer, int)
+            or layer in pilot_entries
+        ):
             raise Qwen38FastMlpError("pilot weight layers are invalid")
         pilot_entries[layer] = raw
     if set(pilot_entries) != set(models):
@@ -399,21 +461,22 @@ def _validate_artifact_inventory(
         pilot_indices_sha256 = require_sha256(
             raw.get("pilot_indices_sha256"), field="pilot index SHA"
         )
-        if pilot_indices_sha256 != hashlib.sha256(
-            canonical_json_bytes(model.pilot_neuron_indices().tolist())
-        ).hexdigest():
+        if (
+            pilot_indices_sha256
+            != hashlib.sha256(
+                canonical_json_bytes(model.pilot_neuron_indices().tolist())
+            ).hexdigest()
+        ):
             raise Qwen38FastMlpError(f"pilot indices changed at layer {layer}")
         require_sha256(raw.get("shard_sha256"), field="pilot shard SHA")
         if layer in active_layers:
             pilot_shard = _regular_shard(
                 pilot_root, raw.get("shard"), raw.get("shard_bytes")
             )
-            if _stable_sha256(
-                pilot_shard, cast(int, raw["shard_bytes"])
-            ) != raw.get("shard_sha256"):
-                raise Qwen38FastMlpError(
-                    f"pilot shard hash changed at layer {layer}"
-                )
+            if _stable_sha256(pilot_shard, cast(int, raw["shard_bytes"])) != raw.get(
+                "shard_sha256"
+            ):
+                raise Qwen38FastMlpError(f"pilot shard hash changed at layer {layer}")
         tensors = raw.get("tensors")
         if not isinstance(tensors, list) or len(tensors) != 3:
             raise Qwen38FastMlpError(f"pilot tensor inventory changed at layer {layer}")
@@ -461,8 +524,8 @@ def _validate_source_tensor(
 
 def _validate_open_sources(
     *,
-    router: MlpPilotRouterFit,
-    affine: MlpPilotAffineFit,
+    router: MlpPilotRouterFit | MlpPilotWeightOnlyPlan,
+    affine: MlpPilotAffineFit | MlpPilotIdentityAffinePlan,
     transpose: MlpPilotTransposeManifest,
     pilot_body: Mapping[str, object],
     active_layers: tuple[int, ...],
@@ -507,6 +570,7 @@ def open_qwen38_fast_mlp(
     source_budget_mb: float,
     max_resident_bytes: int,
     active_layers: Sequence[int] | None = None,
+    online_state_path: str | Path | None = None,
 ) -> Qwen38FastMlpMount:
     """Mount an existing sparse MLP bank without opening any training corpus."""
 
@@ -518,6 +582,8 @@ def open_qwen38_fast_mlp(
         raise TypeError("target_pager must be a Qwen38WeightPager")
     if not isinstance(config, Qwen38Config):
         raise TypeError("config must be a Qwen38Config")
+    if online_state_path is not None and not isinstance(online_state_path, (str, Path)):
+        raise TypeError("online_state_path must be a filesystem path or None")
     if target_pager.resolved_dtype != "bfloat16":
         raise Qwen38FastMlpError("fast-MLP execution requires target BF16 compute")
     if target_pager.source is not target_mount.source:
@@ -531,10 +597,60 @@ def open_qwen38_fast_mlp(
         paths.pilot_root,
     ):
         _plain_directory(root)
-    router = MlpPilotRouterFit.from_bytes(_stable_read(paths.analysis_root / "fit.json"))
-    affine = MlpPilotAffineFit.from_bytes(
-        _stable_read(paths.analysis_root / "affine-fit.json")
+    plan_path = paths.analysis_root / WEIGHT_ONLY_PLAN_NAME
+    legacy_paths = (
+        paths.analysis_root / "fit.json",
+        paths.analysis_root / "affine-fit.json",
     )
+    plan_present = plan_path.exists() or plan_path.is_symlink()
+    legacy_present = tuple(path.exists() or path.is_symlink() for path in legacy_paths)
+    if plan_present and any(legacy_present):
+        raise Qwen38FastMlpError(
+            "fast-MLP analysis mixes fitted and weight-only initialization"
+        )
+    if plan_present:
+        router: MlpPilotRouterFit | MlpPilotWeightOnlyPlan = (
+            MlpPilotWeightOnlyPlan.from_bytes(_stable_read(plan_path))
+        )
+        if (
+            router.n_layers != config.n_layers
+            or router.hidden_dimension != config.dim
+            or any(
+                row.intermediate_dimension != config.intermediate_size
+                for row in router.models
+            )
+        ):
+            raise Qwen38FastMlpError(
+                "weight-only plan differs from the mounted Qwen topology"
+            )
+        mounted_model = getattr(target_mount, "model", None)
+        if mounted_model is not None and (
+            getattr(mounted_model, "repo_id", None) != router.repo_id
+            or getattr(mounted_model, "revision", None) != router.revision
+        ):
+            raise Qwen38FastMlpError(
+                "weight-only plan differs from the mounted logical model"
+            )
+        mounted_layout = getattr(target_mount, "layout", None)
+        if mounted_layout is not None and (
+            getattr(mounted_layout, "layout_fingerprint", None)
+            != router.layout_fingerprint
+        ):
+            raise Qwen38FastMlpError(
+                "weight-only plan differs from the mounted weight layout"
+            )
+        affine: MlpPilotAffineFit | MlpPilotIdentityAffinePlan = router.affine_fit
+        initialization = WEIGHT_ONLY_INITIALIZER
+    else:
+        if legacy_present != (True, True):
+            raise Qwen38FastMlpError("fast-MLP analysis artifacts are incomplete")
+        router = MlpPilotRouterFit.from_bytes(_stable_read(legacy_paths[0]))
+        affine = MlpPilotAffineFit.from_bytes(_stable_read(legacy_paths[1]))
+        initialization = "sealed-prompt-fit/v1"
+        if online_state_path is not None:
+            raise Qwen38FastMlpError(
+                "online state is available only for a weight-only plan"
+            )
     transpose = MlpPilotTransposeManifest.from_bytes(
         _stable_read(paths.transpose_root / "pilot-transpose-manifest.json")
     )
@@ -553,7 +669,9 @@ def open_qwen38_fast_mlp(
         or transpose.affine_fit_sha256 != affine.sha256
         or transpose.weights_index_sha256 != index_sha256
     ):
-        raise Qwen38FastMlpError("fast-MLP artifacts differ from the mounted Qwen weights")
+        raise Qwen38FastMlpError(
+            "fast-MLP artifacts differ from the mounted Qwen weights"
+        )
     pilot_body, pilot_body_sha256 = _pilot_manifest(
         paths.pilot_root,
         router=router,
@@ -596,6 +714,7 @@ def open_qwen38_fast_mlp(
     pilot_source: Streamer | None = None
     transpose_pager: Qwen38WeightPager | None = None
     pilot_pager: Qwen38WeightPager | None = None
+    online_controller: MlpPilotOnlineController | None = None
     try:
         transpose_source = Streamer.from_local(
             paths.transpose_root,
@@ -632,6 +751,11 @@ def open_qwen38_fast_mlp(
             max_resident_bytes=max_resident_bytes,
             close_source=True,
         )
+        if isinstance(router, MlpPilotWeightOnlyPlan):
+            online_controller = MlpPilotOnlineController(
+                router,
+                state_path=online_state_path,
+            )
         executor = MlpPilotSparseExecutor(
             router,
             affine,
@@ -640,6 +764,7 @@ def open_qwen38_fast_mlp(
             pilot_pager=pilot_pager,
             active_layers=selected_layers,
             output_dtype=target_pager.compute_dtype,
+            online_controller=online_controller,
         )
         selected_fractions = tuple(
             (row.layer, row.selected_neuron_count / row.intermediate_dimension)
@@ -669,9 +794,16 @@ def open_qwen38_fast_mlp(
             active_layers=executor.active_layers,
             selected_neuron_fraction_by_layer=selected_fractions,
             transport_row_fraction_by_layer=transport_fractions,
+            initialization=initialization,
+            online_config_sha256=(
+                None if online_controller is None else online_controller.config.sha256
+            ),
+            online_state_persistent=online_state_path is not None,
         )
         return Qwen38FastMlpMount(executor, transpose_pager, pilot_pager, receipt)
     except Exception:
+        if online_controller is not None:
+            online_controller.close()
         if pilot_pager is not None:
             pilot_pager.close()
         elif pilot_source is not None:
@@ -686,6 +818,8 @@ def open_qwen38_fast_mlp(
 __all__ = [
     "FAST_MLP_MOUNT_SCHEMA",
     "PILOT_WEIGHT_MANIFEST_SCHEMA",
+    "PILOT_WEIGHT_MANIFEST_V2_SCHEMA",
+    "WEIGHT_ONLY_PLAN_NAME",
     "Qwen38FastMlpError",
     "Qwen38FastMlpMount",
     "Qwen38FastMlpPaths",

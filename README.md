@@ -21,10 +21,16 @@ release surface.
   decode replaces continuation state layer by layer, while stable local
   ranges fill Torch-owned weight storage directly through `preadv`.
 - **Native local drafting.** A causalized Qwen3.5-0.8B or a zero-weight Markov
-  council proposes transactional K=4 continuations that Qwen3.8 alone verifies
-  and commits. Target-confirmed episodes become reusable three-token options;
+  council proposes transactional continuations in a configurable K=2–16
+  target window. Qwen3.8 alone verifies and commits them; K=8 is the product
+  default. Target-confirmed episodes become reusable three-token options;
   global and contextual-dialect agents compete by support, confidence, context
   depth, and dialect similarity.
+- **All-layer Fast MLP.** A prompt-free weight initializer derives p4/k32
+  pilots for every Qwen MLP layer from exact Gate/Up Gaussian joint moments.
+  Existing full-path tensors update bounded recursive-ridge route statistics;
+  confidence, width, warmup, and periodic checks select the unchanged full
+  MLP without adding a model forward. [All-layer runtime](docs/FAST-MLP-ALL-LAYER.md).
 - **Exact causal LM-head rail.** A weight-only residual-PQ tree supplies
   certified upper bounds for canonical token pages. Proven-impossible pages
   require no checkpoint read; every unresolved page uses the same explicit
@@ -120,16 +126,17 @@ release surface.
 | Trial | Result | Scope |
 |---|---:|---|
 | Local causal bundle reopen | 77.77 → 1.20 s; 64.90x | complete 55.6 GB Qwen3.8 bundle; first full-content verification followed by unchanged next-process stat+digest reuse; no model forward |
-| Rolling K=4 continuation | accepted prefixes commit with zero weight reads | target-known token + three drafts; widths 1–4, next-token continuation, Graft and native Prefix-Sinkhorn state remain bit-exact |
+| Rolling K=2–16 continuation | accepted prefixes commit with zero weight reads | one target-known token plus up to 15 drafts; DeltaNet Conv/recurrent state, next-token continuation, Graft, and native Prefix-Sinkhorn state remain bit-exact |
 | Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed three-token phrase options |
 | Consuming ordinary decode | one continuation cache plus one replacement layer | removes simultaneous ownership of complete old and new cache stacks; official static cache cut is `154,927,104 + 65,552 × prefix_tokens` bytes |
 | K4 Fast-MLP route reuse | repeated K2/K4 target and auxiliary bytes equal one route | Gate/Up rows are wave-unioned; one-route down cache uses maximum-overlap row ordering while preserving each reduction; identical K4 routes remove 180 MiB per active p4/k32 layer |
 | Direct-to-Torch local ranges | one final tensor for sorted selected-row routes | inode-stable `preadv` fills caller-owned Torch storage; no intermediate Python body, no row-stack duplicate, exact cache/budget/causal-plan accounting |
-| Exact residual-PQ LM head | K=1–4 and k=1/3/7 parity; certified page pruning | deterministic weight-only build, best-first tree, outward residual/roundoff bounds, overflow/tie/subnormal guards, and one-pass exact fallback; no model forward |
+| Weight-only all-layer Fast MLP | deterministic 64-layer p4/k32 plan; exact-path online learning | no prompts or model forwards in the build; one/reused route addresses 18.0147% of MLP rows; fixed-size target-confirmed state and full-MLP fallback |
+| Exact residual-PQ LM head | K=1–16 and k=1/3/7 parity; certified page pruning | deterministic weight-only build, best-first tree, outward residual/roundoff bounds, overflow/tie/subnormal guards, and one-pass exact fallback; no model forward |
 | Arbitrary local Qwen chat | one terminal 64-layer sweep removed per request | authenticated causal Qwen3.8 path; rolling local-Qwen or zero-model-byte Markov drafting plus row-routed fast MLP; target, auxiliary, draft, and combined transport reported separately |
 | Seed v3 native migration | exact parity on 8/8 inherited tensor outputs for Micro and 5M | SHA-first migration of shared trained GRU/CRSA/SwiGLU weights; new receipt, quotient, route-value, and expected-work heads added under a strict inference-only manifest |
 | Full Qwen MLP layer map | 640/640 cells; content promotion 0 | every layer repeats the same 146/549 template hits; 1,370/1,389 candidate admissions equal their matched random controls, closing the exhaustive exact-key line |
-| Qwen3.8 exact continuation | bit-identical K=1–4 state | exact transactional core with tokenwise hidden, KV, DeltaNet, and Prefix-Sinkhorn parity |
+| Qwen3.8 exact continuation | bit-identical K=1–16 state | exact transactional core with tokenwise hidden, KV, DeltaNet Conv/recurrent, and Prefix-Sinkhorn parity |
 | Markov-OoE PoC | 96.10% PS-Lifted; 100% warm | 17.28% local baseline, 13.50% shuffled-Crystal placebo, 338→64 consensus rounds, 588-byte raw kernel payload |
 | Consequence-grounded Markov language | 100% primitive, unseen-program, contextual-word, held-out grammar, option-word, cultural-transfer, and self-hosted execution | 5 seeds × 1,000 unseen programs; shuffled semantics 2.02%, fixed no-message policy 0.98%, no-action abstain 2.90%, shuffled grammar 5.00%, holistic held-out 0%, all in-vocabulary unknown words abstain |
 | Recursive executable word DAG | 8,191 actions → 36 references → one Crystal; 8.380x fair VM speedup | 99.5605% reference reduction, 99.9878% deployment-symbol reduction, exact future-input parity, 1,638,000 historical work units released across 25 states |

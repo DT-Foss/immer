@@ -34,6 +34,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--kmeans-iterations", type=int, default=4)
     parser.add_argument("--assignment-chunk-rows", type=int, default=4096)
     parser.add_argument("--sample-rows", type=int, default=4096)
+    parser.add_argument("--max-query-rows", type=int, default=16)
     parser.add_argument("--source-budget-mb", type=float, default=8192.0)
     parser.add_argument("--max-resident-mb", type=int, default=192)
     return parser
@@ -48,6 +49,7 @@ def main(argv: list[str] | None = None) -> int:
         fanout=args.fanout,
         kmeans_iterations=args.kmeans_iterations,
         assignment_chunk_rows=args.assignment_chunk_rows,
+        max_query_rows=args.max_query_rows,
     )
     identity = LogicalModelIdentity(OFFICIAL_REPO_ID, OFFICIAL_REVISION)
     with CausalWeightMount(
