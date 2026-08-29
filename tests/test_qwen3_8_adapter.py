@@ -328,6 +328,145 @@ class _ExactBackend:
 
 
 class Qwen38CausalChatTests(unittest.TestCase):
+    def test_runtime_mounts_and_closes_range_markov_observer(self) -> None:
+        from immer.runtimes.deepseek_v4.causal_weights import LogicalModelIdentity
+        from immer.runtimes.qwen3_8.adapter import _open_local_runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tokenizer_path = root / "tokenizer.json"
+            tokenizer_path.write_text("{}", encoding="utf-8")
+            lifecycle = []
+            source = SimpleNamespace(
+                prefetch_range=Mock(return_value=True),
+                set_access_observer=Mock(
+                    side_effect=lambda *_args, **_kwargs: lifecycle.append("attach")
+                ),
+                repo_id="Qwen/test",
+                revision="a" * 40,
+                metrics=Mock(
+                    return_value={"inventory_source_fingerprint": "b" * 64}
+                ),
+            )
+            mount = SimpleNamespace(
+                source=source,
+                tensor_reader=object(),
+                weights_root=root,
+                close=Mock(),
+            )
+            pager = SimpleNamespace(
+                attach_exact_head_index=Mock(),
+                close=Mock(),
+            )
+            model = SimpleNamespace(
+                checkpoint_preflight=Mock(
+                    side_effect=lambda: (
+                        lifecycle.append("preflight") or {"ok": True}
+                    )
+                ),
+                reset_state=Mock(),
+                mlp_sparse_executor=None,
+            )
+            tokenizer = SimpleNamespace()
+            prefetcher = SimpleNamespace(
+                bind_source_identity=Mock(),
+                close=Mock(),
+                metrics=lambda: {},
+            )
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.CausalWeightMount",
+                    return_value=mount,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.verify_qwen38_causal_mount",
+                    return_value=_BUNDLE_RECEIPT,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38Config.from_file",
+                    return_value=SimpleNamespace(),
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38WeightPager",
+                    return_value=pager,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.StreamedQwen38",
+                    return_value=model,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38Tokenizer",
+                    return_value=tokenizer,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter._file_sha256",
+                    return_value=_DIGEST,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.MarkovRangePrefetcher",
+                    return_value=prefetcher,
+                ) as constructor,
+            ):
+                runtime = _open_local_runtime(
+                    bundle_path=root,
+                    tokenizer_path=tokenizer_path,
+                    identity=LogicalModelIdentity("Qwen/test", "a" * 40),
+                    require_official_config=False,
+                    device="cpu",
+                    compute_dtype="bfloat16",
+                    source_budget_mb=1,
+                    max_resident_bytes=1024,
+                    max_context_tokens=16,
+                    range_markov_state_path=root / "ranges.bin",
+                    range_prefetch_max_bytes=123,
+                    range_prefetch_min_support=3,
+                    range_prefetch_min_confidence=0.8,
+                )
+
+            constructor.assert_called_once_with(
+                root / "ranges.bin",
+                prefetch_range=source.prefetch_range,
+                min_support=3,
+                min_confidence=0.8,
+                max_prefetch_bytes=123,
+            )
+            source.set_access_observer.assert_called_once_with(
+                prefetcher,
+                prepare_identity=False,
+            )
+            prefetcher.bind_source_identity.assert_called_once_with(
+                "Qwen/test",
+                "a" * 40,
+                "b" * 64,
+            )
+            self.assertEqual(lifecycle[:2], ["preflight", "attach"])
+            runtime.close()
+            prefetcher.close.assert_called_once_with()
+            self.assertEqual(
+                source.set_access_observer.call_args_list[-1].args,
+                (None,),
+            )
+            mount.close.assert_called_once_with()
+
+    def test_range_markov_metrics_are_exposed_without_changing_generation(self) -> None:
+        runtime = _Runtime()
+        runtime.range_prefetcher = SimpleNamespace(
+            metrics=lambda: {
+                "schema": "immer.range-markov-metrics/v1",
+                "operations": 12,
+                "predictions": 7,
+                "prefetch_hints": 5,
+            }
+        )
+        chat = _chat(runtime, range_markov_state_path="/state/ranges.bin")
+
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(result.evidence["range_markov"]["prefetch_hints"], 5)
+        self.assertEqual(result.output, runtime.tokenizer.decoded.strip())
+        chat.close()
+
     def test_exact_head_non_cpu_configuration_is_lazy_nonapplicable(self) -> None:
         component = Qwen38CausalChat(
             "unused.causal",

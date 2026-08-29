@@ -88,6 +88,54 @@ class LocalPreadRangeReaderTests(unittest.TestCase):
                 self.assertEqual(budget.body, 12)
                 self.assertEqual(budget.requests, 2)
 
+    def test_local_prefetch_hint_uses_no_logical_read_or_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.joinpath("weights.bin").write_bytes(b"0123456789abcdef")
+            budget = HardByteBudget(1.0)
+            reader = LocalRangeReader(root, budget=budget)
+            advised = []
+
+            def advise(fd: int, offset: int, length: int, advice: int) -> None:
+                advised.append((os.fstat(fd).st_size, offset, length, advice))
+
+            try:
+                with (
+                    mock.patch.object(os, "posix_fadvise", advise, create=True),
+                    mock.patch.object(os, "POSIX_FADV_WILLNEED", 3, create=True),
+                ):
+                    self.assertTrue(reader.prefetch_range("weights.bin", 4, 8))
+
+                self.assertEqual(advised, [(16, 4, 8, 3)])
+                self.assertEqual(budget.body, 0)
+                self.assertEqual(budget.requests, 0)
+                metrics = reader.transport_metrics()
+                self.assertEqual(metrics["transport_prefetch_hints"], 1)
+                self.assertEqual(metrics["transport_prefetch_hint_bytes"], 8)
+                self.assertEqual(metrics["transport_prefetch_failures"], 0)
+            finally:
+                reader.close()
+
+    def test_streamer_prefetch_is_unobserved_and_unsupported_is_neutral(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.joinpath("weights.bin").write_bytes(b"abcdefgh")
+            streamer = Streamer.from_local(root, use_cache=False)
+            observer = mock.Mock(return_value=True)
+            streamer.set_access_observer(observer, prepare_identity=False)
+            try:
+                with mock.patch.object(os, "posix_fadvise", None, create=True):
+                    self.assertFalse(streamer.prefetch_range("weights.bin", 0, 4))
+                observer.assert_not_called()
+                self.assertEqual(streamer.budget.body, 0)
+                self.assertEqual(streamer.budget.requests, 0)
+                self.assertEqual(
+                    streamer.metrics()["transport_prefetch_unsupported"],
+                    1,
+                )
+            finally:
+                streamer.close()
+
     def test_direct_over_budget_calls_fail_before_any_pread(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

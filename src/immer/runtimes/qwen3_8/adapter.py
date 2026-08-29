@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 
+from ...knowledge.range_markov import MarkovRangePrefetcher
 from ...contracts import ExecutionStatus, Request, Result
 from ..deepseek_v4.causal_weights import CausalWeightMount, LogicalModelIdentity
 from .bundle import verify_qwen38_causal_mount
@@ -529,6 +530,7 @@ class _OwnedRuntime:
         preflight_receipt: Mapping[str, Any],
         fast_mlp_mount: Qwen38FastMlpMount | None = None,
         exact_head_index: ExactHeadIndex | None = None,
+        range_prefetcher: MarkovRangePrefetcher | None = None,
     ) -> None:
         self.mount = mount
         self.pager = pager
@@ -539,6 +541,7 @@ class _OwnedRuntime:
         self.preflight_receipt = dict(preflight_receipt)
         self.fast_mlp_mount = fast_mlp_mount
         self.exact_head_index = exact_head_index
+        self.range_prefetcher = range_prefetcher
         self.exact_head_receipt = (
             None
             if exact_head_index is None
@@ -570,6 +573,15 @@ class _OwnedRuntime:
         if self.fast_mlp_mount is not None:
             try:
                 self.fast_mlp_mount.close()
+            except Exception as exc:
+                failures.append(exc)
+        if self.range_prefetcher is not None:
+            try:
+                self.mount.source.set_access_observer(
+                    None,
+                    prepare_identity=False,
+                )
+                self.range_prefetcher.close()
             except Exception as exc:
                 failures.append(exc)
         try:
@@ -607,6 +619,10 @@ def _open_local_runtime(
     exact_head_root: Path | None = None,
     exact_head_block_rows: int | None = None,
     exact_head_max_bytes: int = 128 * 1024**2,
+    range_markov_state_path: Path | None = None,
+    range_prefetch_max_bytes: int = 64 * 1024**2,
+    range_prefetch_min_support: int = 2,
+    range_prefetch_min_confidence: float = 0.65,
 ) -> _OwnedRuntime:
     """Open one pinned local causal model; no remote source exists here."""
 
@@ -619,6 +635,7 @@ def _open_local_runtime(
     model: StreamedQwen38 | None = None
     fast_mlp_mount: Qwen38FastMlpMount | None = None
     exact_head_index: ExactHeadIndex | None = None
+    range_prefetcher: MarkovRangePrefetcher | None = None
     try:
         mount = CausalWeightMount(
             bundle_path,
@@ -700,6 +717,24 @@ def _open_local_runtime(
         tokenizer = Qwen38Tokenizer(tokenizer_path, require_official=True)
         if _file_sha256(tokenizer_path) != tokenizer_sha256:
             raise Qwen38ChatError("local tokenizer changed while it was loaded")
+        if range_markov_state_path is not None:
+            range_prefetcher = MarkovRangePrefetcher(
+                range_markov_state_path,
+                prefetch_range=mount.source.prefetch_range,
+                min_support=range_prefetch_min_support,
+                min_confidence=range_prefetch_min_confidence,
+                max_prefetch_bytes=range_prefetch_max_bytes,
+            )
+            source_metrics = mount.source.metrics()
+            range_prefetcher.bind_source_identity(
+                mount.source.repo_id,
+                mount.source.revision,
+                source_metrics.get("inventory_source_fingerprint"),
+            )
+            mount.source.set_access_observer(
+                range_prefetcher,
+                prepare_identity=False,
+            )
         return _OwnedRuntime(
             mount=mount,
             pager=pager,
@@ -710,11 +745,19 @@ def _open_local_runtime(
             preflight_receipt=preflight_receipt,
             fast_mlp_mount=fast_mlp_mount,
             exact_head_index=exact_head_index,
+            range_prefetcher=range_prefetcher,
         )
     except Exception:
         if model is not None:
             try:
                 model.reset_state(release=True)
+            except Exception:
+                pass
+        if range_prefetcher is not None:
+            try:
+                if mount is not None:
+                    mount.source.set_access_observer(None, prepare_identity=False)
+                range_prefetcher.close()
             except Exception:
                 pass
         if pager is not None:
@@ -758,6 +801,10 @@ def _open_official_runtime(
     exact_head_root: Path | None = None,
     exact_head_block_rows: int | None = None,
     exact_head_max_bytes: int = 128 * 1024**2,
+    range_markov_state_path: Path | None = None,
+    range_prefetch_max_bytes: int = 64 * 1024**2,
+    range_prefetch_min_support: int = 2,
+    range_prefetch_min_confidence: float = 0.65,
 ) -> _OwnedRuntime:
     return _open_local_runtime(
         bundle_path=bundle_path,
@@ -777,6 +824,10 @@ def _open_official_runtime(
         exact_head_root=exact_head_root,
         exact_head_block_rows=exact_head_block_rows,
         exact_head_max_bytes=exact_head_max_bytes,
+        range_markov_state_path=range_markov_state_path,
+        range_prefetch_max_bytes=range_prefetch_max_bytes,
+        range_prefetch_min_support=range_prefetch_min_support,
+        range_prefetch_min_confidence=range_prefetch_min_confidence,
     )
 
 
@@ -816,6 +867,10 @@ class Qwen38CausalChat:
         fast_mlp_max_resident_bytes: int | None = None,
         fast_mlp_active_layers: Sequence[int] | None = None,
         fast_mlp_online_state_path: str | Path | None = None,
+        range_markov_state_path: str | Path | None = None,
+        range_prefetch_max_bytes: int = 64 * 1024**2,
+        range_prefetch_min_support: int = 2,
+        range_prefetch_min_confidence: float = 0.65,
     ) -> None:
         if not isinstance(bundle_path, (str, Path)):
             raise TypeError("bundle_path must be a local filesystem path")
@@ -858,6 +913,27 @@ class Qwen38CausalChat:
         exact_head_max_bytes = _positive_int(
             exact_head_max_bytes, "exact_head_max_bytes"
         )
+        if range_markov_state_path is not None and not isinstance(
+            range_markov_state_path,
+            (str, Path),
+        ):
+            raise TypeError("range_markov_state_path must be a local path or None")
+        range_prefetch_max_bytes = _positive_int(
+            range_prefetch_max_bytes,
+            "range_prefetch_max_bytes",
+        )
+        range_prefetch_min_support = _positive_int(
+            range_prefetch_min_support,
+            "range_prefetch_min_support",
+        )
+        if (
+            isinstance(range_prefetch_min_confidence, bool)
+            or not isinstance(range_prefetch_min_confidence, (int, float))
+            or not math.isfinite(float(range_prefetch_min_confidence))
+            or not 0.0 <= float(range_prefetch_min_confidence) <= 1.0
+        ):
+            raise ValueError("range_prefetch_min_confidence must lie in [0, 1]")
+        range_prefetch_min_confidence = float(range_prefetch_min_confidence)
         if (
             anchor_cache is not None
             and type(anchor_cache) is not SemanticStateAnchorCache
@@ -1010,6 +1086,14 @@ class Qwen38CausalChat:
             if fast_mlp_online_state_path is None
             else Path(fast_mlp_online_state_path).expanduser().absolute()
         )
+        self._range_markov_state_path = (
+            None
+            if range_markov_state_path is None
+            else Path(range_markov_state_path).expanduser().absolute()
+        )
+        self._range_prefetch_max_bytes = range_prefetch_max_bytes
+        self._range_prefetch_min_support = range_prefetch_min_support
+        self._range_prefetch_min_confidence = range_prefetch_min_confidence
         self._result_cell_code_revision = result_cell_code_revision
         self._runtime: Any | None = None
         self._draft_runtime: Any | None = None
@@ -1160,6 +1244,15 @@ class Qwen38CausalChat:
                     "persistent": True,
                     "updates_require_target_receipt": True,
                 }
+        if self._range_markov_state_path is not None:
+            policy["range_markov"] = {
+                "enabled": True,
+                "max_prefetch_bytes": self._range_prefetch_max_bytes,
+                "min_confidence": self._range_prefetch_min_confidence,
+                "min_support": self._range_prefetch_min_support,
+                "prefetch": "local-posix-fadvise-willneed/v1",
+                "state": "operation-order1-order2-ricci/v1",
+            }
         if self._fast_mlp_paths is not None:
             policy["fast_mlp"] = {
                 "active_layers": (
@@ -1348,6 +1441,10 @@ class Qwen38CausalChat:
             exact_head_root=self._exact_head_root,
             exact_head_block_rows=self._head_block_rows,
             exact_head_max_bytes=self._exact_head_max_bytes,
+            range_markov_state_path=self._range_markov_state_path,
+            range_prefetch_max_bytes=self._range_prefetch_max_bytes,
+            range_prefetch_min_support=self._range_prefetch_min_support,
+            range_prefetch_min_confidence=self._range_prefetch_min_confidence,
         )
 
     def _open_draft_runtime(self) -> _OwnedRuntime:
@@ -1819,6 +1916,13 @@ class Qwen38CausalChat:
         )
         if exact_head_receipt is not None:
             evidence["exact_head"] = dict(exact_head_receipt)
+        range_prefetcher = (
+            None
+            if self._runtime is None
+            else getattr(self._runtime, "range_prefetcher", None)
+        )
+        if range_prefetcher is not None:
+            evidence["range_markov"] = range_prefetcher.metrics()
         return evidence
 
     def _load_locked(self) -> Any:

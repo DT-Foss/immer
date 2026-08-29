@@ -936,6 +936,14 @@ class DraftWindowAdapterTests(unittest.TestCase):
                         "12",
                         "--draft-window-state",
                         "/state/qwen-window.bin",
+                        "--range-markov-state",
+                        "/state/qwen-ranges.bin",
+                        "--range-prefetch-max-mb",
+                        "32",
+                        "--range-prefetch-min-support",
+                        "3",
+                        "--range-prefetch-min-confidence",
+                        "0.8",
                     ]
                 )
 
@@ -946,6 +954,10 @@ class DraftWindowAdapterTests(unittest.TestCase):
             options["draft_window_state_path"],
             "/state/qwen-window.bin",
         )
+        self.assertEqual(options["range_markov_state_path"], "/state/qwen-ranges.bin")
+        self.assertEqual(options["range_prefetch_max_bytes"], 32 * 1024**2)
+        self.assertEqual(options["range_prefetch_min_support"], 3)
+        self.assertEqual(options["range_prefetch_min_confidence"], 0.8)
 
     def test_no_state_keeps_the_existing_fixed_window_contract(self) -> None:
         runtime = _Runtime()

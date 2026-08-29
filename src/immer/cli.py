@@ -131,6 +131,10 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             ),
             markov_draft_state_path=args.markov_draft_state,
             draft_window_state_path=args.draft_window_state,
+            range_markov_state_path=args.range_markov_state,
+            range_prefetch_max_bytes=int(args.range_prefetch_max_mb * 1024**2),
+            range_prefetch_min_support=args.range_prefetch_min_support,
+            range_prefetch_min_confidence=args.range_prefetch_min_confidence,
             fast_mlp_root=args.fast_mlp,
             fast_mlp_online_state_path=args.fast_mlp_online_state,
             fast_mlp_source_budget_mb=args.fast_mlp_source_budget_mb,
@@ -762,6 +766,29 @@ def build_parser() -> argparse.ArgumentParser:
             "persistent target-receipt controller for contextual K=4/8/16; "
             "--draft-window becomes its maximum ceiling"
         ),
+    )
+    chat.add_argument(
+        "--range-markov-state",
+        default=os.environ.get("IMMER_QWEN38_RANGE_MARKOV_STATE"),
+        help="persistent operation-Markov state for local weight-range prefetch",
+    )
+    chat.add_argument(
+        "--range-prefetch-max-mb",
+        type=float,
+        default=64.0,
+        help="maximum OS-cache hint bytes after one predicted operation",
+    )
+    chat.add_argument(
+        "--range-prefetch-min-support",
+        type=int,
+        default=2,
+        help="minimum learned transition support before a range hint",
+    )
+    chat.add_argument(
+        "--range-prefetch-min-confidence",
+        type=float,
+        default=0.65,
+        help="minimum next-operation probability before a range hint",
     )
     chat.add_argument(
         "--fast-mlp",

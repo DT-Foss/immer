@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import json
 import tempfile
 import unittest
@@ -409,6 +410,42 @@ class Qwen38PagerTests(unittest.TestCase):
         self.assertEqual(
             metrics["head_score_policy"],
             "backend-bf16-linear/v1",
+        )
+
+    def test_pager_labels_linear_and_embedding_source_ranges(self) -> None:
+        import torch
+
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        source = self._source()
+        scopes = []
+
+        @contextmanager
+        def access_scope(**tags):
+            scopes.append(tags)
+            yield
+
+        source.access_scope = access_scope
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=64,
+        )
+
+        pager.linear(torch.tensor([[1.0, 1.0]]), "dense")
+        pager.embedding((1, 2))
+
+        self.assertIn(
+            {"tensor": "dense.weight", "read_kind": "linear"},
+            scopes,
+        )
+        self.assertIn(
+            {
+                "tensor": "model.language_model.embed_tokens.weight",
+                "read_kind": "embedding",
+            },
+            scopes,
         )
 
     def test_direct_fill_linear_reads_into_torch_storage_without_body_copy(

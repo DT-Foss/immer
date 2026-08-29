@@ -233,6 +233,36 @@ ceiling can consequently execute K4 on an uncertain wave and K8 on a later
 repeated phrase inside the same request. Qwen3.5 keeps its fixed request window
 because it does not expose a zero-cost maximum-tail confidence frontier.
 
+The weight transport has a separate Markov organism below every model pager.
+Streamer demand events are grouped as one operation
+
+```text
+s_t = (operation kind, ordered unique exact leaves, tensor/read-kind tags).
+```
+
+Order-1 and order-2 agents estimate `P(s_(t+1) | s_t)` and
+`P(s_(t+1) | s_(t-1), s_t)`. Rapidity with 5% Fixed Share pools both
+distributions; target arrival supplies hit feedback and surprise/CUSUM regime
+movement. Nodes and contexts are bounded by the same Ricci value used by the
+other Markov memories:
+
+```text
+R = visits * exp(-0.001 * age).
+```
+
+After minimum support and confidence, the highest-probability next grouped
+operation yields a bounded exact hint plan. The production local path calls
+`posix_fadvise(..., POSIX_FADV_WILLNEED)` for at most the configured bytes and
+leaves. This call returns no payload, creates no logical Streamer operation,
+does not charge the source budget, and owns no Torch tensor or pager resident
+state. Unsupported kernels decline only the hint while demand learning
+continues. Semantic Qwen pager scopes label tensor, read kind, and exact causal
+leaves without moving prediction or persistence into the pager hot state. The
+observer binds the pinned repo, revision, and inventory fingerprint before it
+is attached, and attachment occurs only after bundle verification, accelerator
+mounting, checkpoint preflight, and tokenizer load, so startup reads cannot
+train or trigger the request-demand predictor.
+
 ## 4. Organism of Experts
 
 OoE learns runtime actions around Qwen without modifying Qwen's weights or

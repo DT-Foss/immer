@@ -30,12 +30,13 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from .access_trace import AccessLeaf, AccessOperation
+from .access_trace import AccessLeaf, AccessOperation, canonical_tags
 from ._hf_source import (
     Budget,
     BudgetExceeded,
@@ -426,6 +427,10 @@ class LocalRangeReader:
         self._direct_fill_bytes = 0
         self._preadv_calls = 0
         self._pread_fallback_calls = 0
+        self._prefetch_hints = 0
+        self._prefetch_hint_bytes = 0
+        self._prefetch_unsupported = 0
+        self._prefetch_failures = 0
         self._closed = False
 
     @staticmethod
@@ -835,6 +840,56 @@ class LocalRangeReader:
         self._remember(key, identity)
         return _LocalRangeIntoResult(length=target.nbytes, identity=identity)
 
+    def prefetch_range(self, filename: str, start: int, length: int) -> bool:
+        """Hint one exact local range into the OS page cache without reading it."""
+
+        start = _validate_nonnegative_int(start, "Prefetch-Start")
+        length = _validate_nonnegative_int(length, "Prefetch-Laenge")
+        if length == 0:
+            raise RangeValidationError("Prefetch-Range darf nicht leer sein")
+        fadvise = getattr(os, "posix_fadvise", None)
+        will_need = getattr(os, "POSIX_FADV_WILLNEED", None)
+        if not callable(fadvise) or not isinstance(will_need, int):
+            with self._condition:
+                self._prefetch_unsupported += 1
+            return False
+        key, parts = self._normalise_filename(filename)
+        for _attempt in range(self._MAX_REPLACEMENT_RETRIES):
+            try:
+                entry = self._lease_entry(key, parts)
+            except (FileNotFoundError, RangeValidationError):
+                continue
+            try:
+                if start + length > entry.identity.size:
+                    raise RangeValidationError(
+                        f"Prefetch-Range ausserhalb {key}: "
+                        f"[{start}, {start + length - 1}] bei "
+                        f"{entry.identity.size} Bytes"
+                    )
+                try:
+                    fadvise(entry.fd, start, length, will_need)
+                except (NotImplementedError, OSError):
+                    with self._condition:
+                        self._prefetch_failures += 1
+                    return False
+                with self._condition:
+                    current = self._stat_locked(key, parts)
+                    stable = current == entry.identity
+                    if not stable:
+                        self._fd_reopens += 1
+                        self._retire_entry_locked(entry)
+                if not stable:
+                    continue
+                with self._condition:
+                    self._prefetch_hints += 1
+                    self._prefetch_hint_bytes += length
+                return True
+            finally:
+                self._release_entry(entry)
+        with self._condition:
+            self._prefetch_failures += 1
+        return False
+
     def fetch_file(self, filename: str) -> bytes:
         key, parts = self._normalise_filename(filename)
         last_error: Exception | None = None
@@ -887,6 +942,10 @@ class LocalRangeReader:
                 "transport_direct_fill_bytes": self._direct_fill_bytes,
                 "transport_preadv_calls": self._preadv_calls,
                 "transport_pread_fallback_calls": self._pread_fallback_calls,
+                "transport_prefetch_hints": self._prefetch_hints,
+                "transport_prefetch_hint_bytes": self._prefetch_hint_bytes,
+                "transport_prefetch_unsupported": self._prefetch_unsupported,
+                "transport_prefetch_failures": self._prefetch_failures,
                 "transport_closed": self._closed,
             }
 
@@ -2106,6 +2165,10 @@ class Streamer:
         self.verbose = bool(verbose)
         self._access_observer_lock = threading.Lock()
         self._access_observer: Any | None = None
+        self._access_scope_tags: ContextVar[tuple[tuple[str, Any], ...]] = ContextVar(
+            f"immer_streamer_access_scope_{id(self)}",
+            default=(),
+        )
         self._access_sequence = 0
         self._access_observer_events = 0
         self._access_observer_leaves = 0
@@ -2805,6 +2868,18 @@ class Streamer:
             self._access_observer = observer
         return previous
 
+    @contextmanager
+    def access_scope(self, **tags: Any) -> Any:
+        """Attach canonical semantic tags to logical reads in this context."""
+
+        merged = dict(self._access_scope_tags.get())
+        merged.update(tags)
+        token = self._access_scope_tags.set(canonical_tags(merged))
+        try:
+            yield self
+        finally:
+            self._access_scope_tags.reset(token)
+
     @property
     def raw_bytes_into_available(self) -> bool:
         """Whether this source supports direct caller-owned range fills."""
@@ -2814,6 +2889,22 @@ class Streamer:
                 self._reader.upstream if self._reader is not None else self._upstream
             )
         return self._cache_dir is None and isinstance(upstream, LocalRangeReader)
+
+    def prefetch_range(self, shard: str, offset: int, length: int) -> bool:
+        """Issue a local OS-cache hint without a logical read or budget charge."""
+
+        offset = _validate_nonnegative_int(offset, "prefetch offset")
+        length = _validate_nonnegative_int(length, "prefetch length")
+        if length == 0:
+            raise RangeValidationError("prefetch length must be positive")
+        with self._state_lock:
+            upstream = (
+                self._reader.upstream if self._reader is not None else self._upstream
+            )
+        callback = getattr(upstream, "prefetch_range", None)
+        if not callable(callback):
+            return False
+        return bool(callback(shard, offset, length))
 
     def _emit_access_operation(
         self,
@@ -2849,6 +2940,7 @@ class Streamer:
                 source_requests=source_requests,
                 source_bytes=source_bytes,
                 cache_hits=cache_hits,
+                tags=self._access_scope_tags.get(),
             )
             callback = getattr(observer, "observe", None)
             accepted = callback(event) if callable(callback) else observer(event)

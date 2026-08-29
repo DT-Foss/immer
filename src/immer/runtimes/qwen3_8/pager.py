@@ -9,6 +9,7 @@ import sys
 import threading
 import warnings
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from typing import Any, Iterable
@@ -276,6 +277,12 @@ class Qwen38WeightPager:
             self._stats.gc_peak_observed_rss_bytes = initial_rss
         self._lock = threading.RLock()
         self._closed = False
+
+    def _source_access_scope(self, *, tensor: str, read_kind: str) -> Any:
+        scope = getattr(self.source, "access_scope", None)
+        if not callable(scope):
+            return nullcontext()
+        return scope(tensor=tensor, read_kind=read_kind)
 
     def attach_exact_head_index(self, index: Any | None) -> None:
         """Attach or detach one exact, target-bound LM-head accelerator."""
@@ -684,44 +691,45 @@ class Qwen38WeightPager:
             target_materialized=not direct_fill,
         )
         relative_offset = start_row * row_bytes
-        result = self._direct_fill_tensor(
-            layout,
-            relative_offset=relative_offset,
-            shape=(n_rows, columns),
-            dtype=dtype,
-            device=device,
-        )
-        if result is None:
-            if self.causal_tensor_reader is None:
-                raw = self.source.raw_bytes(
-                    layout.shard,
-                    layout.absolute + relative_offset,
-                    payload_bytes,
-                )
-            else:
-                receipt = self.causal_tensor_reader.read_tensor_range(
-                    name,
-                    relative_offset=relative_offset,
-                    length=payload_bytes,
-                )
-                if (
-                    receipt.plan.shard != layout.shard
-                    or receipt.plan.absolute_offset != layout.absolute
-                    or receipt.relative_offset != relative_offset
-                    or receipt.length != payload_bytes
-                ):
-                    raise Qwen38PagerError(
-                        "causal tensor row receipt disagrees with layout"
-                    )
-                raw = receipt.part
-            result = self._decode_tensor(
-                raw,
+        with self._source_access_scope(tensor=name, read_kind="rows"):
+            result = self._direct_fill_tensor(
+                layout,
+                relative_offset=relative_offset,
                 shape=(n_rows, columns),
-                source_dtype=layout.dtype,
                 dtype=dtype,
                 device=device,
-                name=name,
             )
+            if result is None:
+                if self.causal_tensor_reader is None:
+                    raw = self.source.raw_bytes(
+                        layout.shard,
+                        layout.absolute + relative_offset,
+                        payload_bytes,
+                    )
+                else:
+                    receipt = self.causal_tensor_reader.read_tensor_range(
+                        name,
+                        relative_offset=relative_offset,
+                        length=payload_bytes,
+                    )
+                    if (
+                        receipt.plan.shard != layout.shard
+                        or receipt.plan.absolute_offset != layout.absolute
+                        or receipt.relative_offset != relative_offset
+                        or receipt.length != payload_bytes
+                    ):
+                        raise Qwen38PagerError(
+                            "causal tensor row receipt disagrees with layout"
+                        )
+                    raw = receipt.part
+                result = self._decode_tensor(
+                    raw,
+                    shape=(n_rows, columns),
+                    source_dtype=layout.dtype,
+                    dtype=dtype,
+                    device=device,
+                    name=name,
+                )
         self._stats.row_reads += 1
         self._stats.logical_weight_bytes += payload_bytes
         self._stats.materialized_tensor_bytes += result.numel() * result.element_size()
@@ -749,12 +757,13 @@ class Qwen38WeightPager:
             }:
                 raise ValueError("dtype must be float16, bfloat16, or float32")
             target_device = self.device if device is None else self.torch.device(device)
-            return self._read_tensor(
-                name,
-                dtype=target_dtype,
-                device=target_device,
-                zero_copy_cpu=zero_copy_cpu,
-            )
+            with self._source_access_scope(tensor=name, read_kind="tensor"):
+                return self._read_tensor(
+                    name,
+                    dtype=target_dtype,
+                    device=target_device,
+                    zero_copy_cpu=zero_copy_cpu,
+                )
 
     def tensor_rows(self, name: str, row_ids: Iterable[int]) -> Any:
         """Read arbitrary 2D rows through the active authenticated range plane.
@@ -767,7 +776,8 @@ class Qwen38WeightPager:
         with self._lock:
             self._ensure_open()
             ids = self._validate_ids(name, row_ids)
-            return self._selected_rows(name, ids)
+            with self._source_access_scope(tensor=name, read_kind="selected-rows"):
+                return self._selected_rows(name, ids)
 
     def linear(
         self,
@@ -787,12 +797,13 @@ class Qwen38WeightPager:
                 x = self.torch.as_tensor(x)
             weight_name = self._weight_name(name)
             compute_x = x.to(device=self.device, dtype=self.compute_dtype)
-            weight = self._read_tensor(
-                weight_name,
-                dtype=self.compute_dtype,
-                device=self.device,
-                zero_copy_cpu=True,
-            )
+            with self._source_access_scope(tensor=weight_name, read_kind="linear"):
+                weight = self._read_tensor(
+                    weight_name,
+                    dtype=self.compute_dtype,
+                    device=self.device,
+                    zero_copy_cpu=True,
+                )
             if weight.ndim != 2:
                 del weight
                 raise Qwen38PagerError(f"linear weight {weight_name!r} must be 2D")
@@ -880,12 +891,16 @@ class Qwen38WeightPager:
                 # accepts exactly the dtype forms understood by Tensor.to.
                 self.torch.empty((), device=self.device).to(dtype=output_dtype)
 
-            weight = self._read_tensor(
-                weight_name,
-                dtype=self.compute_dtype,
-                device=self.device,
-                zero_copy_cpu=True,
-            )
+            with self._source_access_scope(
+                tensor=weight_name,
+                read_kind="linear-many",
+            ):
+                weight = self._read_tensor(
+                    weight_name,
+                    dtype=self.compute_dtype,
+                    device=self.device,
+                    zero_copy_cpu=True,
+                )
             try:
                 if packed:
                     shapes = [tuple(value.shape) for value in compute_inputs]
@@ -1041,7 +1056,8 @@ class Qwen38WeightPager:
         with self._lock:
             self._ensure_open()
             ids = self._validate_ids(name, token_ids)
-            rows = self._selected_rows(name, ids)
+            with self._source_access_scope(tensor=name, read_kind="embedding"):
+                rows = self._selected_rows(name, ids)
             self._stats.embedding_rows += len(ids)
             return rows
 
@@ -1070,7 +1086,8 @@ class Qwen38WeightPager:
                 head_rows=len(ids),
                 columns=columns,
             )
-            rows = self._selected_rows(name, ids)
+            with self._source_access_scope(tensor=name, read_kind="candidate-head"):
+                rows = self._selected_rows(name, ids)
             if rows.shape[1] != columns:
                 del rows
                 raise Qwen38PagerError("hidden width disagrees with LM head")

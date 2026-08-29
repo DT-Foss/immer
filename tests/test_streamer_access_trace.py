@@ -61,20 +61,21 @@ class StreamerAccessTraceTests(unittest.TestCase):
                 access_observer=recorder,
             )
 
-            with recorder.scope(prompt_digest="abc", layer=7, attempt=1):
-                self.assertEqual(
-                    source.raw_bytes("a.safetensors", first, 4),
-                    bytes(range(4)),
-                )
-                self.assertEqual(
-                    source.raw_bytes("a.safetensors", first, 4),
-                    bytes(range(4)),
-                )
-                result = source.raw_bytes_many(
-                    "a.safetensors",
-                    [(first + 4, 2), (first + 6, 2), (first + 4, 2)],
-                    resident_limit_bytes=4,
-                )
+            with source.access_scope(tensor="layer.7.mlp", read_kind="rows"):
+                with recorder.scope(prompt_digest="abc", layer=7, attempt=1):
+                    self.assertEqual(
+                        source.raw_bytes("a.safetensors", first, 4),
+                        bytes(range(4)),
+                    )
+                    self.assertEqual(
+                        source.raw_bytes("a.safetensors", first, 4),
+                        bytes(range(4)),
+                    )
+                    result = source.raw_bytes_many(
+                        "a.safetensors",
+                        [(first + 4, 2), (first + 6, 2), (first + 4, 2)],
+                        resident_limit_bytes=4,
+                    )
             self.assertEqual(
                 [bytes(part) for part in result.parts],
                 [b"\x04\x05", b"\x06\x07", b"\x04\x05"],
@@ -93,7 +94,13 @@ class StreamerAccessTraceTests(unittest.TestCase):
             )
             self.assertEqual(
                 dict(batch.tags),
-                {"attempt": 1, "layer": 7, "prompt_digest": "abc"},
+                {
+                    "attempt": 1,
+                    "layer": 7,
+                    "prompt_digest": "abc",
+                    "read_kind": "rows",
+                    "tensor": "layer.7.mlp",
+                },
             )
             self.assertEqual(source.metrics()["access_observer_events"], 3)
             self.assertEqual(source.metrics()["access_observer_leaves"], 5)

@@ -44,6 +44,15 @@ All notable changes to IMMER are recorded here.
   scanned, while the unused provider suffix remains explicitly unauthoritative.
   Mixed-window generation receipts bind request ceiling, actual K, provider
   tail, staged prefix, selector inputs, and accepted prefix for every round.
+- Added persistent Markov intelligence below the model pagers. Streamer access
+  events become grouped operation states with tensor/read-kind tags; order-1
+  and order-2 experts learn next-operation distributions with Fixed Share,
+  surprise/CUSUM regimes, and Ricci-bounded node/context retention. Confident
+  predictions issue bounded Linux `POSIX_FADV_WILLNEED` hints for exact local
+  ranges without producing payload bytes, observer recursion, budget charges,
+  tensor residency, or a second weight cache. CLI exposes state, confidence,
+  support, and per-operation byte bounds. Source identity is validated before
+  observer attachment, which occurs after every one-time runtime/preflight read.
 - Expanded the exact residual-PQ head query union from four to sixteen rows.
   Certified pruning and stable top-k parity now cover the complete rolling
   window; the weight-only builder records the same K16 scorer bound.
