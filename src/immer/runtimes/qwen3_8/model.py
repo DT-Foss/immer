@@ -290,6 +290,8 @@ class StreamedQwen38:
         layer_boundary_stages: Sequence[str] | None = None,
         layer_boundary_layers: Sequence[int] | None = None,
         mlp_sparse_executor: Any | None = None,
+        delta_head_router: Any | None = None,
+        native_deltanet_recurrence: bool = False,
         packed_continuation_gemm: bool = False,
         max_batch_size: int = 8,
         max_seq_len: int = 4096,
@@ -314,6 +316,8 @@ class StreamedQwen38:
             raise ValueError("max_seq_len exceeds the checkpoint context bound")
         if not isinstance(packed_continuation_gemm, bool):
             raise TypeError("packed_continuation_gemm must be boolean")
+        if not isinstance(native_deltanet_recurrence, bool):
+            raise TypeError("native_deltanet_recurrence must be boolean")
         if graft is not None and native_head_crsa is not None:
             raise ValueError(
                 "hidden graft and native Head-CRSA intervention are mutually exclusive"
@@ -360,6 +364,26 @@ class StreamedQwen38:
                 )
             ):
                 raise ValueError("mlp_sparse_executor identity is invalid")
+        if delta_head_router is not None:
+            required = ("project", "project_many", "snapshot_identity", "supports_layer")
+            if any(
+                not callable(getattr(delta_head_router, name, None))
+                for name in required
+            ):
+                raise TypeError("delta_head_router lacks the runtime contract")
+            identity = delta_head_router.snapshot_identity(transport_neutral=True)
+            if (
+                not isinstance(identity, dict)
+                or not isinstance(identity.get("layers"), list)
+                or any(
+                    isinstance(layer, bool)
+                    or not isinstance(layer, int)
+                    or not 0 <= layer < config.n_layers
+                    or config.is_full_attention(layer)
+                    for layer in identity["layers"]
+                )
+            ):
+                raise ValueError("delta_head_router identity is invalid")
         selected_boundary_stages = (
             ()
             if layer_boundary_observer is None
@@ -445,6 +469,8 @@ class StreamedQwen38:
         self.layer_boundary_stages = tuple(selected_boundary_stages)
         self.layer_boundary_layers = selected_boundary_layers
         self.mlp_sparse_executor = mlp_sparse_executor
+        self.delta_head_router = delta_head_router
+        self.native_deltanet_recurrence = native_deltanet_recurrence
         self.packed_continuation_gemm = packed_continuation_gemm
         self.mlp_sparse_last_trace: Any | None = None
         self.mlp_sparse_last_decision: Any | None = None
@@ -617,6 +643,31 @@ class StreamedQwen38:
             ) from exc
         return {"kind": "pilot-sparse", "identity": canonical}
 
+    def _delta_head_snapshot_identity(
+        self, *, transport_neutral: bool = False
+    ) -> dict[str, Any]:
+        router = self.delta_head_router
+        if router is None:
+            return {"kind": "none"}
+        identity = router.snapshot_identity(transport_neutral=transport_neutral)
+        if not isinstance(identity, dict):
+            raise Qwen38SnapshotError("Delta head router identity is not a mapping")
+        try:
+            canonical = json.loads(
+                json.dumps(
+                    identity,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise Qwen38SnapshotError(
+                "Delta head router identity is not canonical JSON"
+            ) from exc
+        return {"kind": "markov-sinkhorn-head-route", "identity": canonical}
+
     def _snapshot_identity(self, *, transport_neutral: bool = False) -> dict[str, Any]:
         source = self.pager.source
         source.inventory()
@@ -648,6 +699,7 @@ class StreamedQwen38:
             "max_position_embeddings": self.config.max_position_embeddings,
             "state_policy": "native-kv+deltanet-transactional/v1",
             "packed_continuation_gemm": self.packed_continuation_gemm,
+            "native_deltanet_recurrence": self.native_deltanet_recurrence,
             "quantized_weight_plane": q4_identity,
         }
         transport_execution = {
@@ -683,6 +735,9 @@ class StreamedQwen38:
             },
             "execution": execution,
             "graft": self._graft_snapshot_identity(),
+            "delta_head_router": self._delta_head_snapshot_identity(
+                transport_neutral=transport_neutral
+            ),
             "mlp_sparse_executor": self._mlp_sparse_snapshot_identity(
                 transport_neutral=transport_neutral
             ),
@@ -1421,11 +1476,26 @@ class StreamedQwen38:
                 state=state,
                 rms_norm_eps=self.config.rms_norm_eps,
                 probe=probe,
+                native_recurrence=self.native_deltanet_recurrence,
             )
         finally:
             del projected_qkv, projected_z, projected_b, projected_a
             del conv_weight, a_log, dt_bias, norm_weight
-        return self.pager.linear(mixed, f"{base}.out_proj"), next_state
+        router = self.delta_head_router
+        if (
+            state is not None
+            and router is not None
+            and router.supports_layer(layer)
+            and mixed.numel() // mixed.shape[-1] <= self.MAX_CONTINUATION_BLOCK_WIDTH
+        ):
+            projected = router.project(
+                mixed,
+                f"{base}.out_proj.weight",
+                layer=layer,
+            )
+        else:
+            projected = self.pager.linear(mixed, f"{base}.out_proj")
+        return projected, next_state
 
     def _sparse_mlp_allowed(self, layer: int, row_count: int) -> bool:
         executor = self.mlp_sparse_executor
@@ -1785,6 +1855,7 @@ class StreamedQwen38:
                     state=next_state,
                     rms_norm_eps=self.config.rms_norm_eps,
                     probe=None,
+                    native_recurrence=self.native_deltanet_recurrence,
                     state_update_observer=lambda key, value, beta, log_decay: (
                         updates.append(
                             _DeltaNetPrefixUpdate(
@@ -1807,7 +1878,17 @@ class StreamedQwen38:
             del conv_weight, a_log, dt_bias, norm_weight
         if not isinstance(next_state, DeltaNetState):  # pragma: no cover - kernel.
             raise Qwen38RuntimeError("continuation DeltaNet returned no state")
-        projected = self._linear_token_rows(tuple(mixed_rows), f"{base}.out_proj")
+        router = self.delta_head_router
+        if state is not None and router is not None and router.supports_layer(layer):
+            projected = router.project_many(
+                tuple(mixed_rows),
+                f"{base}.out_proj.weight",
+                layer=layer,
+            )
+        else:
+            projected = self._linear_token_rows(
+                tuple(mixed_rows), f"{base}.out_proj"
+            )
         kernel_size = int(next_state.conv.shape[-1])
         return projected, next_state, _LayerPrefixTrace(
             delta_updates=tuple(updates),
@@ -2172,6 +2253,7 @@ class StreamedQwen38:
                 "device": str(self.pager.device),
                 "compute_dtype": str(self.pager.compute_dtype),
                 "packed_continuation_gemm": self.packed_continuation_gemm,
+                "native_deltanet_recurrence": self.native_deltanet_recurrence,
                 "quantized_weight_plane": (
                     None
                     if getattr(self.pager, "q4_bank", None) is None
@@ -2192,6 +2274,7 @@ class StreamedQwen38:
                     else list(self.layer_boundary_layers)
                 ),
                 "graft": self._graft_snapshot_identity(),
+                "delta_head_router": self._delta_head_snapshot_identity(),
                 "mlp_sparse_executor": self._mlp_sparse_snapshot_identity(),
                 "native_head_crsa": native,
             }
@@ -3155,6 +3238,7 @@ class StreamedQwen38:
                     update.log_decay,
                     update.beta,
                     initial_state=recurrent,
+                    native_sequence_one=self.native_deltanet_recurrence,
                 )
             kernel_size = int(final.conv.shape[-1])
             prefix_count = max(0, stage_width - kernel_size)

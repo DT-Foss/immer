@@ -24,6 +24,7 @@ import math
 import torch
 import torch.nn.functional as F
 
+from .deltanet_native import deltanet_sequence_one
 from .native_crsa import (
     NativeHeadCrsaEvidence,
     NativePrefixSinkhornOperatorObserver,
@@ -1093,6 +1094,7 @@ def recurrent_gated_delta_rule(
     initial_state: torch.Tensor | None = None,
     l2_norm_eps: float = 1e-6,
     _probe_delta_norms: list[float] | None = None,
+    native_sequence_one: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the official causal recurrent gated-delta inference rule.
 
@@ -1118,6 +1120,8 @@ def recurrent_gated_delta_rule(
     value_width = v.shape[-1]
     if min(batch_size, sequence_length, heads, key_width, value_width) <= 0:
         raise ValueError("gated delta tensors must have non-empty dimensions")
+    if not isinstance(native_sequence_one, bool):
+        raise TypeError("native_sequence_one must be boolean")
 
     q = l2_normalize(q, eps=l2_norm_eps).float() * (key_width**-0.5)
     k = l2_normalize(k, eps=l2_norm_eps).float()
@@ -1137,6 +1141,22 @@ def recurrent_gated_delta_rule(
         if recurrent.device != q.device:
             raise ValueError("initial_state must be on the same device as query")
         recurrent = recurrent.float()
+
+    if (
+        native_sequence_one
+        and sequence_length == 1
+        and q.device.type == "cpu"
+        and _probe_delta_norms is None
+    ):
+        native_output, native_state = deltanet_sequence_one(
+            q,
+            k,
+            v,
+            decay,
+            step,
+            recurrent,
+        )
+        return native_output.to(dtype=query.dtype), native_state
 
     outputs: list[torch.Tensor] = []
     for index in range(sequence_length):
@@ -1177,6 +1197,7 @@ def gated_delta_net_core(
         [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None
     ]
     | None = None,
+    native_recurrence: bool = False,
 ) -> tuple[torch.Tensor, DeltaNetState]:
     """Run Qwen3.5 Gated DeltaNet from individually streamed projections.
 
@@ -1272,6 +1293,7 @@ def gated_delta_net_core(
         beta,
         initial_state=previous_recurrent,
         _probe_delta_norms=probe_delta_norms,
+        native_sequence_one=native_recurrence,
     )
 
     if probe is not None:

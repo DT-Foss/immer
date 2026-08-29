@@ -34,7 +34,7 @@ Documentation = "https://github.com/DT-Foss/immer/tree/main/docs"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"immer.runtimes.qwen3_8" = ["q4_native.c"]
+"immer.runtimes.qwen3_8" = ["deltanet_native.c", "q4_native.c"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -53,6 +53,7 @@ from .markov_draft import (
 )
 from .pager import Qwen38WeightPager
 from .q4 import Q4Bank
+from .q4_delta_router import PackedDeltaHeadRouter
 from .q4_fast_mlp import (
     Qwen38PackedFastMlpMount,
     open_qwen38_packed_fast_mlp,
@@ -587,6 +588,7 @@ class _OwnedRuntime:
         exact_head_index: ExactHeadIndex | None = None,
         range_prefetcher: MarkovRangePrefetcher | None = None,
         q4_bank: Q4Bank | None = None,
+        delta_head_router: PackedDeltaHeadRouter | None = None,
     ) -> None:
         self.mount = mount
         self.pager = pager
@@ -599,6 +601,7 @@ class _OwnedRuntime:
         self.exact_head_index = exact_head_index
         self.range_prefetcher = range_prefetcher
         self.q4_bank = q4_bank
+        self.delta_head_router = delta_head_router
         self.q4_receipt = None if q4_bank is None else q4_bank.metrics()
         self.exact_head_receipt = (
             None
@@ -607,6 +610,11 @@ class _OwnedRuntime:
         )
         self.fast_mlp_receipt = (
             None if fast_mlp_mount is None else fast_mlp_mount.receipt.to_record()
+        )
+        self.delta_head_receipt = (
+            None
+            if delta_head_router is None
+            else delta_head_router.snapshot_identity(transport_neutral=True)
         )
         self._closed = False
 
@@ -619,6 +627,7 @@ class _OwnedRuntime:
         except Exception as exc:  # release the remaining owners regardless
             failures.append(exc)
         self.model.mlp_sparse_executor = None
+        self.model.delta_head_router = None
         try:
             self.pager.attach_exact_head_index(None)
         except Exception as exc:
@@ -631,6 +640,11 @@ class _OwnedRuntime:
         if self.fast_mlp_mount is not None:
             try:
                 self.fast_mlp_mount.close()
+            except Exception as exc:
+                failures.append(exc)
+        if self.delta_head_router is not None:
+            try:
+                self.delta_head_router.close()
             except Exception as exc:
                 failures.append(exc)
         if self.range_prefetcher is not None:
@@ -675,6 +689,7 @@ def _open_local_runtime(
     fast_mlp_active_layers: Sequence[int] | None = None,
     fast_mlp_selected_block_count: int | None = None,
     fast_mlp_online_state_path: Path | None = None,
+    delta_head_state_path: Path | None = None,
     exact_head_root: Path | None = None,
     exact_head_block_rows: int | None = None,
     exact_head_max_bytes: int = 128 * 1024**2,
@@ -701,6 +716,7 @@ def _open_local_runtime(
     exact_head_index: ExactHeadIndex | None = None
     range_prefetcher: MarkovRangePrefetcher | None = None
     q4_bank: Q4Bank | None = None
+    delta_head_router: PackedDeltaHeadRouter | None = None
     try:
         mount = CausalWeightMount(
             bundle_path,
@@ -794,6 +810,31 @@ def _open_local_runtime(
                     selected_block_count=fast_mlp_selected_block_count,
                     markov_state_path=fast_mlp_online_state_path,
                 )
+        if (
+            q4_bank is not None
+            and delta_head_state_path is not None
+            and fast_mlp_mount is not None
+        ):
+            configured_delta_layers = fast_mlp_active_layers
+            if configured_delta_layers is None:
+                configured_delta_layers = tuple(
+                    fast_mlp_mount.executor.active_layers
+                )
+            delta_layers = tuple(
+                layer
+                for layer in configured_delta_layers
+                if 0 <= layer < config.n_layers
+                and not config.is_full_attention(layer)
+            )
+            if delta_layers:
+                delta_head_router = PackedDeltaHeadRouter(
+                    q4_bank,
+                    active_layers=delta_layers,
+                    state_path=delta_head_state_path,
+                    value_heads=config.linear_num_value_heads,
+                    head_dim=config.linear_value_head_dim,
+                    max_selected_heads=40,
+                )
         model = StreamedQwen38(
             config,
             pager,
@@ -802,6 +843,8 @@ def _open_local_runtime(
             mlp_sparse_executor=(
                 None if fast_mlp_mount is None else fast_mlp_mount.executor
             ),
+            delta_head_router=delta_head_router,
+            native_deltanet_recurrence=q4_bank is not None,
             packed_continuation_gemm=fast_mlp_mount is not None,
         )
         preflight_receipt = model.checkpoint_preflight()
@@ -841,6 +884,7 @@ def _open_local_runtime(
             exact_head_index=exact_head_index,
             range_prefetcher=range_prefetcher,
             q4_bank=q4_bank,
+            delta_head_router=delta_head_router,
         )
     except Exception:
         if model is not None:
@@ -848,6 +892,7 @@ def _open_local_runtime(
                 model.reset_state(release=True)
             except Exception:
                 pass
+            model.delta_head_router = None
         if range_prefetcher is not None:
             try:
                 if mount is not None:
@@ -868,6 +913,11 @@ def _open_local_runtime(
             if fast_mlp_mount is not None:
                 try:
                     fast_mlp_mount.close()
+                except Exception:
+                    pass
+            if delta_head_router is not None:
+                try:
+                    delta_head_router.close()
                 except Exception:
                     pass
             try:
@@ -900,6 +950,7 @@ def _open_official_runtime(
     fast_mlp_active_layers: Sequence[int] | None = None,
     fast_mlp_selected_block_count: int | None = None,
     fast_mlp_online_state_path: Path | None = None,
+    delta_head_state_path: Path | None = None,
     exact_head_root: Path | None = None,
     exact_head_block_rows: int | None = None,
     exact_head_max_bytes: int = 128 * 1024**2,
@@ -929,6 +980,7 @@ def _open_official_runtime(
         fast_mlp_active_layers=fast_mlp_active_layers,
         fast_mlp_selected_block_count=fast_mlp_selected_block_count,
         fast_mlp_online_state_path=fast_mlp_online_state_path,
+        delta_head_state_path=delta_head_state_path,
         exact_head_root=exact_head_root,
         exact_head_block_rows=exact_head_block_rows,
         exact_head_max_bytes=exact_head_max_bytes,
@@ -981,6 +1033,7 @@ class Qwen38CausalChat:
         fast_mlp_active_layers: Sequence[int] | None = None,
         fast_mlp_selected_block_count: int | None = None,
         fast_mlp_online_state_path: str | Path | None = None,
+        delta_head_state_path: str | Path | None = None,
         range_markov_state_path: str | Path | None = None,
         range_prefetch_max_bytes: int = 64 * 1024**2,
         range_prefetch_min_support: int = 2,
@@ -1132,6 +1185,11 @@ class Qwen38CausalChat:
             (str, Path),
         ):
             raise TypeError("fast_mlp_online_state_path must be a local path or None")
+        if delta_head_state_path is not None and not isinstance(
+            delta_head_state_path,
+            (str, Path),
+        ):
+            raise TypeError("delta_head_state_path must be a local path or None")
         if fast_mlp_active_layers is not None:
             try:
                 fast_mlp_active_layers = tuple(fast_mlp_active_layers)
@@ -1161,6 +1219,7 @@ class Qwen38CausalChat:
                 fast_mlp_active_layers,
                 fast_mlp_selected_block_count,
                 fast_mlp_online_state_path,
+                delta_head_state_path,
             )
         ):
             raise ValueError("fast-MLP options require fast_mlp_root")
@@ -1168,6 +1227,8 @@ class Qwen38CausalChat:
             fast_mlp_max_resident_bytes = 64 * 1024**2
         if fast_mlp_selected_block_count is not None and q4_root is None:
             raise ValueError("fast_mlp_selected_block_count requires Q4 execution")
+        if delta_head_state_path is not None and q4_root is None:
+            raise ValueError("delta_head_state_path requires Q4 execution")
         if q4_root is not None and any(
             value is not None
             for value in (exact_head_root, range_markov_state_path)
@@ -1248,6 +1309,11 @@ class Qwen38CausalChat:
             if fast_mlp_online_state_path is None
             else Path(fast_mlp_online_state_path).expanduser().absolute()
         )
+        self._delta_head_state_path = (
+            None
+            if delta_head_state_path is None
+            else Path(delta_head_state_path).expanduser().absolute()
+        )
         self._range_markov_state_path = (
             None
             if range_markov_state_path is None
@@ -1264,6 +1330,7 @@ class Qwen38CausalChat:
         self._draft_runtime: Any | None = None
         self._last_draft_evidence: dict[str, Any] | None = None
         self._last_fast_mlp_evidence: dict[str, Any] | None = None
+        self._last_delta_head_evidence: dict[str, Any] | None = None
         self._last_exact_head_evidence: dict[str, Any] | None = None
         self._draft_window_selection: DraftWindowSelection | None = None
         self._draft_window_policy_metrics: dict[str, Any] | None = None
@@ -1470,6 +1537,14 @@ class Qwen38CausalChat:
                 ):
                     if key in receipt:
                         policy["fast_mlp"]["artifacts"][key] = receipt[key]
+        if self._delta_head_state_path is not None:
+            policy["delta_head_router"] = {
+                "active_layers": list(self._fast_mlp_active_layers or ()),
+                "max_selected_heads": 40,
+                "policy": "mean-square+sinkhorn-first-order/v1",
+                "persistent": True,
+                "width_actions": [24, 32, 40],
+            }
         if self._exact_head_root is not None:
             policy["exact_head"] = {
                 "enabled": True,
@@ -1624,6 +1699,7 @@ class Qwen38CausalChat:
             fast_mlp_active_layers=self._fast_mlp_active_layers,
             fast_mlp_selected_block_count=self._fast_mlp_selected_block_count,
             fast_mlp_online_state_path=self._fast_mlp_online_state_path,
+            delta_head_state_path=self._delta_head_state_path,
             exact_head_root=self._exact_head_root,
             exact_head_block_rows=self._head_block_rows,
             exact_head_max_bytes=self._exact_head_max_bytes,
@@ -1675,9 +1751,12 @@ class Qwen38CausalChat:
     ) -> tuple[tuple[int, ...], Mapping[str, Any]]:
         self._last_draft_evidence = None
         self._last_fast_mlp_evidence = None
+        self._last_delta_head_evidence = None
         self._last_exact_head_evidence = None
         fast_mount = getattr(runtime, "fast_mlp_mount", None)
         fast_before = None if fast_mount is None else fast_mount.metrics()
+        delta_router = getattr(runtime, "delta_head_router", None)
+        delta_before = None if delta_router is None else delta_router.metrics()
         exact_head = getattr(runtime, "exact_head_index", None)
         exact_before = None if exact_head is None else exact_head.metrics()
         adaptive_selection = self._draft_window_selection
@@ -1702,6 +1781,7 @@ class Qwen38CausalChat:
                 target_source_body_bytes=int(mapped["source_body_bytes"]),
                 draft_source_body_bytes=0,
             )
+            self._record_delta_head_request(runtime, delta_before)
             self._record_exact_head_request(runtime, exact_before)
             return generated, evidence
         eos = tuple(generation_options["eos_token_ids"])
@@ -1795,6 +1875,7 @@ class Qwen38CausalChat:
                 target_source_body_bytes=evidence.source_body_bytes,
                 draft_source_body_bytes=provider_metrics.source_body_bytes,
             )
+            self._record_delta_head_request(runtime, delta_before)
             aux_source_body_bytes = (
                 0
                 if fast_request is None
@@ -2102,6 +2183,28 @@ class Qwen38CausalChat:
         self._last_fast_mlp_evidence = request
         return request
 
+    def _record_delta_head_request(
+        self,
+        runtime: _OwnedRuntime,
+        before: Mapping[str, int] | None,
+    ) -> dict[str, Any] | None:
+        router = getattr(runtime, "delta_head_router", None)
+        if router is None or before is None:
+            return None
+        after = router.metrics()
+        delta = {
+            key: int(after.get(key, 0)) - int(before.get(key, 0))
+            for key in after
+        }
+        if any(value < 0 for value in delta.values()):
+            raise Qwen38ChatError("Delta head request counters moved backwards")
+        request: dict[str, Any] = {
+            **delta,
+            "schema": "immer.qwen3.8-delta-head-request/v1",
+        }
+        self._last_delta_head_evidence = request
+        return request
+
     def _base_evidence(self) -> dict[str, Any]:
         evidence: dict[str, Any] = {
             "execution": "local-authenticated-causal-bundle/v1",
@@ -2122,6 +2225,13 @@ class Qwen38CausalChat:
         )
         if fast_mlp_receipt is not None:
             evidence["fast_mlp"] = dict(fast_mlp_receipt)
+        delta_head_receipt = (
+            None
+            if self._runtime is None
+            else getattr(self._runtime, "delta_head_receipt", None)
+        )
+        if delta_head_receipt is not None:
+            evidence["delta_head_router"] = dict(delta_head_receipt)
         exact_head_receipt = (
             None
             if self._runtime is None
@@ -2405,6 +2515,11 @@ class Qwen38CausalChat:
             evidence["fast_mlp"] = {
                 **dict(evidence["fast_mlp"]),
                 "request": dict(self._last_fast_mlp_evidence),
+            }
+        if self._last_delta_head_evidence is not None:
+            evidence["delta_head_router"] = {
+                **dict(evidence["delta_head_router"]),
+                "request": dict(self._last_delta_head_evidence),
             }
         if self._last_exact_head_evidence is not None:
             evidence["exact_head"] = {

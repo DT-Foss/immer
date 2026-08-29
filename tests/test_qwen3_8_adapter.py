@@ -497,10 +497,15 @@ class Qwen38CausalChatTests(unittest.TestCase):
             q4_root="/models/qwen-q4",
             fast_mlp_root="/artifacts/fast",
             fast_mlp_selected_block_count=96,
+            delta_head_state_path="/state/delta-head.json",
         )
         self.assertEqual(component._device, "cpu")
         self.assertIsNotNone(component._fast_mlp_paths)
         self.assertEqual(component._fast_mlp_selected_block_count, 96)
+        self.assertEqual(
+            component._delta_head_state_path,
+            Path("/state/delta-head.json"),
+        )
         component.close()
 
         with self.assertRaisesRegex(ValueError, "requires Q4"):
@@ -1288,6 +1293,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         "/state/qwen-fast-all64",
                         "--fast-mlp-policy",
                         "structure-edge",
+                        "--delta-head-online-state",
+                        "/state/qwen-delta-head.json",
                     ]
                 )
 
@@ -1300,7 +1307,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
             options["fast_mlp_active_layers"],
             (*range(18), *range(55, 64)),
         )
-        self.assertEqual(options["fast_mlp_selected_block_count"], 64)
+        self.assertEqual(options["fast_mlp_selected_block_count"], 32)
+        self.assertEqual(
+            options["delta_head_state_path"],
+            "/state/qwen-delta-head.json",
+        )
 
     def test_cli_wires_exact_head_index_root(self) -> None:
         qwen = _chat(_Runtime())

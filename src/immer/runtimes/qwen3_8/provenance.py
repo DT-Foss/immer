@@ -12,6 +12,8 @@ import stat
 _QWEN_RUNTIME_FILES = (
     "__init__.py",
     "config.py",
+    "deltanet_native.c",
+    "deltanet_native.py",
     "encoding.py",
     "graft.py",
     "kernels.py",
@@ -21,6 +23,7 @@ _QWEN_RUNTIME_FILES = (
     "pager.py",
     "provenance.py",
     "q4.py",
+    "q4_delta_router.py",
     "q4_fast_mlp.py",
     "q4_native.c",
     "snapshot.py",

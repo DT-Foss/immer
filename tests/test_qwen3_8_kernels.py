@@ -840,6 +840,38 @@ class Qwen38KernelTests(unittest.TestCase):
         torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(actual_state, expected_state, atol=1e-6, rtol=1e-6)
 
+    def test_native_sequence_one_recurrence_matches_the_torch_state_step(self) -> None:
+        from immer.runtimes.qwen3_8.kernels import recurrent_gated_delta_rule
+
+        torch.manual_seed(53)
+        query = torch.randn(2, 1, 4, 8)
+        key = torch.randn(2, 1, 4, 8)
+        value = torch.randn(2, 1, 4, 6)
+        decay = -torch.rand(2, 1, 4)
+        beta = torch.sigmoid(torch.randn(2, 1, 4))
+        state = torch.randn(2, 4, 8, 6)
+        expected, expected_state = recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            decay,
+            beta,
+            initial_state=state,
+        )
+
+        actual, actual_state = recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            decay,
+            beta,
+            initial_state=state,
+            native_sequence_one=True,
+        )
+
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(actual_state, expected_state, atol=2e-6, rtol=2e-6)
+
     def test_delta_net_prefill_batch_and_continuation_are_exact(self) -> None:
         from immer.runtimes.qwen3_8.kernels import gated_delta_net_core
 

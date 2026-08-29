@@ -631,6 +631,66 @@ class Qwen38ModelTests(unittest.TestCase):
             )
             self.assertTrue(torch.isfinite(values).all())
 
+    def test_delta_head_router_changes_only_continuation_output_projection(self) -> None:
+        class Router:
+            def __init__(self, width: int) -> None:
+                self.width = width
+                self.single = []
+                self.many = []
+
+            @staticmethod
+            def supports_layer(layer: int) -> bool:
+                return layer == 0
+
+            @staticmethod
+            def snapshot_identity(*, transport_neutral: bool = False):
+                return {"layers": [0], "transport_neutral": transport_neutral}
+
+            def project(self, mixed, name: str, *, layer: int):
+                self.single.append((layer, name, tuple(mixed.shape)))
+                return torch.zeros((*mixed.shape[:-1], self.width), dtype=mixed.dtype)
+
+            def project_many(self, mixed, name: str, *, layer: int):
+                rows = tuple(mixed)
+                self.many.append((layer, name, len(rows)))
+                return tuple(
+                    torch.zeros((*row.shape[:-1], self.width), dtype=row.dtype)
+                    for row in rows
+                )
+
+        router = Router(self.config.dim)
+        model = StreamedQwen38(
+            self.config,
+            self.pager,
+            delta_head_router=router,
+            max_batch_size=1,
+            max_seq_len=16,
+        )
+        model.prefill([[1, 4]])
+        self.assertEqual(router.single, [])
+
+        hidden, evidence = model.decode([[9]])
+
+        self.assertEqual(tuple(hidden.shape), (1, 1, self.config.dim))
+        self.assertEqual(evidence.end_pos, 3)
+        self.assertEqual(
+            router.single,
+            [
+                (
+                    0,
+                    "model.language_model.layers.0.linear_attn.out_proj.weight",
+                    (1, 1, 6),
+                )
+            ],
+        )
+        stage = model.stage_continuation_block([[7, 6]])
+        self.assertEqual(
+            router.many[-1][:2],
+            (0, "model.language_model.layers.0.linear_attn.out_proj.weight"),
+        )
+        self.assertEqual(router.many[-1][2], 2)
+        model.discard_continuation_block(stage)
+
     def test_layer_boundary_observer_is_ordered_and_cannot_mutate_math(self) -> None:
         token_ids = torch.tensor([[1, 4, 9]])
         baseline, _ = self.model.forward_prefill(token_ids)

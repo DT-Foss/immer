@@ -156,7 +156,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 )
             fast_mlp_layers = (*range(18), *range(55, 64))
             if fast_mlp_blocks is None:
-                fast_mlp_blocks = 64
+                fast_mlp_blocks = 64 if args.fast_mlp_online_state else 32
         component = Qwen38CausalChat(
             args.qwen38_causal_bundle,
             args.qwen38_tokenizer,
@@ -202,6 +202,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             ),
             fast_mlp_active_layers=fast_mlp_layers,
             fast_mlp_selected_block_count=fast_mlp_blocks,
+            delta_head_state_path=args.delta_head_online_state,
         )
         if jsonl:
             failures = 0
@@ -950,6 +951,10 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--fast-mlp-online-state",
         help="persistent target-confirmed state for a weight-only Fast-MLP bank",
+    )
+    chat.add_argument(
+        "--delta-head-online-state",
+        help="persistent Markov-Sinkhorn state for packed DeltaNet head routing",
     )
     chat.add_argument(
         "--qwen38-anchor-cache",

@@ -40,6 +40,11 @@ from .cartography_probe import (
     prompt_token_sha256,
 )
 from .draft_verification import Qwen38DraftVerifier
+from .deltanet_native import (
+    DELTANET_NATIVE_ABI,
+    DeltaNetNativeError,
+    deltanet_sequence_one,
+)
 from .draft_window import (
     DRAFT_WINDOW_ACTIONS,
     DRAFT_WINDOW_FEEDBACK_SCHEMA,
@@ -190,6 +195,13 @@ from .q4_fast_mlp import (
     Qwen38PackedFastMlpReceipt,
     open_qwen38_packed_fast_mlp,
 )
+from .q4_delta_router import (
+    PACKED_DELTA_HEAD_ROUTER_SCHEMA,
+    PACKED_DELTA_HEAD_STATE_SCHEMA,
+    PackedDeltaHeadRouter,
+    PackedDeltaHeadRouterError,
+    PackedDeltaHeadRouterStateError,
+)
 from .probe import (
     DELTANET_COMPARISON_SCHEMA,
     DELTANET_COMPONENTS,
@@ -319,7 +331,9 @@ __all__ = [
     "DeltaNetProbeRecorder",
     "DELTANET_COMPARISON_SCHEMA",
     "DELTANET_COMPONENTS",
+    "DELTANET_NATIVE_ABI",
     "DELTANET_PROBE_SCHEMA",
+    "DeltaNetNativeError",
     "END_OF_TEXT_TOKEN_ID",
     "EVIDENCE_POLICY_SCHEMA",
     "EXACT_HEAD_MANIFEST_SCHEMA",
@@ -506,6 +520,11 @@ __all__ = [
     "PILOT_WEIGHT_MANIFEST_SCHEMA",
     "PILOT_WEIGHT_MANIFEST_V2_SCHEMA",
     "PACKED_FAST_MLP_SCHEMA",
+    "PACKED_DELTA_HEAD_ROUTER_SCHEMA",
+    "PACKED_DELTA_HEAD_STATE_SCHEMA",
+    "PackedDeltaHeadRouter",
+    "PackedDeltaHeadRouterError",
+    "PackedDeltaHeadRouterStateError",
     "WEIGHT_ONLY_PLAN_NAME",
     "StatefulEvidence",
     "StatefulBlockEvidence",
@@ -533,6 +552,7 @@ __all__ = [
     "bind_causal_tensor_plans",
     "build_probe_document",
     "compare_probe_documents",
+    "deltanet_sequence_one",
     "project_hidden_sketch",
     "prompt_token_sha256",
     "semantic_label_sha256",
