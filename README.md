@@ -58,6 +58,15 @@ release surface.
   without cloning transactional state. Existing target receipts can be
   imported atomically and idempotently; normal persistent traffic then grows
   the same episode, dialect, expert-rapidity, and phrase memory online.
+- **Embedded MTP drafting.** The target checkpoint's own one-layer Qwen3.5 MTP
+  branch now runs through the same causal Q4 bank, shared embedding, native
+  bounded LM head, and exact rolling target verifier. Shifted token embeddings
+  pair with the preceding final-normalized target hidden state; accepted draft
+  prefixes alone advance the private MTP attention state. A persistent
+  first-order Markov/Beta calibrator learns reliability by proposal position,
+  logit-gap bucket, and previous outcome. The cost-aware selector chooses
+  K1/K2/K4/K8/K16 from verified prefix yield, so raw MTP confidence cannot open
+  an uneconomic target wave.
 - **All-layer Fast MLP.** A prompt-free weight initializer derives p4/k32
   pilots for every Qwen MLP layer from exact Gate/Up Gaussian joint moments.
   Existing full-path tensors update bounded recursive-ridge route statistics;

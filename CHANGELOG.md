@@ -6,6 +6,28 @@ All notable changes to IMMER are recorded here.
 
 ### Arbitrary local Qwen runtime
 
+- Activated the embedded Qwen3.5 MTP branch that was already present in the
+  official checkpoint. Eight matrices add `238,878,720` Q4 bytes; all 498
+  target matrices are hardlink-reused. The 506-tensor bank built in `5.413 s`
+  and is bound to the same local causal graph and source identity.
+- Added exact EAGLE-style shifted conditioning: `embedding(x[i+1])` pairs with
+  final-normalized target hidden `h[i]` at unchanged position `i`. The MTP
+  layer reuses IMMER RMSNorm, gated GQA, SwiGLU, shared embedding, bounded
+  native LM-head Top-K, and explicit attention state. Target-prefix
+  reconciliation publishes only accepted MTP states.
+- Added a persistent cost-learning selector over K1/K2/K4/K8/K16. Raw MTP
+  Top-2 margins are capped by a first-order Markov/Beta reliability state keyed
+  by proposal position, margin bucket, and previous correctness. K1 target
+  corrections teach first-token accuracy without opening a speculative stage;
+  low-confidence tails stop after one MTP head scan. The target remains the
+  sole output authority.
+- Real Beast execution preserved output `Fledermaus` and target trace
+  `d833f5...b6b81a`. Blind K4 accepted `2/9` drafts and took `25.824 s`; blind
+  K2 accepted `2/3` and took `21.638 s`. The calibrated selector chose K1 for
+  all rounds, reduced MTP work to `0.593 s`, and completed in `19.855 s` at
+  `1.200 GB` peak RSS. MTP remains explicit until learned K2/K4 yield beats the
+  measured CPU row cost.
+
 - Removed model-sized process residency from the exact Full-Q4 product path.
   Q4Bank now tracks mappings touched by each already-existing layer execution
   boundary and applies `MADV_DONTNEED` after the synchronous native kernels
