@@ -195,6 +195,15 @@ profile, question and rendered-token identity then executes the stored cell
 without loading Qwen. FERTIG mismatches are never charged; profile, token,
 model, Q4, tokenizer and current runtime-code changes produce a cold miss.
 
+The same cold stream induces parametric Markov programs when two distinct
+ResultCells prove the same deterministic span transformation. Copy and case
+operators are promoted from whole-result consequences, not predefined prompt
+phrases. A new slot under the learned static context can then execute without
+Qwen. Conflicting transforms, insufficient support, FERTIG mismatches, wrong
+prompt-token identity, non-ASCII output, or output beyond `max_new_tokens`
+abstain. Executable template descriptors live only in the explicitly private
+per-profile store and are revalidated against their source ResultCells.
+
 ## Selected trial evidence
 
 | Trial | Result | Scope |
