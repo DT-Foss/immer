@@ -2436,6 +2436,7 @@ class OoeController:
         expected_old_manifest_generation: int | None = None,
         expected_old_manifest_sha256: str | None = None,
         expected_old_state_sha256: str | None = None,
+        legacy_gap_compatible_crystal_sha256s: Iterable[str] = (),
     ) -> tuple["OoeController", ControllerRecoveryReceipt]:
         """Recover only promotion-complete manifest drift from an older state."""
 
@@ -2499,6 +2500,9 @@ class OoeController:
                 expected_weight_graph_revision_sha256
             ),
             expected_atlas_graph_revision=expected_atlas_graph_revision,
+            legacy_gap_compatible_crystal_sha256s=(
+                legacy_gap_compatible_crystal_sha256s
+            ),
             _allow_manifest_forward_recovery=True,
         )
         if hashlib.sha256(crystal_store.restore_state(name)).hexdigest() != (

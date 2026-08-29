@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
@@ -178,6 +178,7 @@ class OoeChatAttempt:
     result: Result | None
     evidence: Mapping[str, Any]
     decision: OoeDecision | None = None
+    _owner: Any | None = field(default=None, repr=False, compare=False)
 
     @property
     def hit(self) -> bool:
@@ -444,6 +445,9 @@ class OoeChatHook:
 
         return self._settle_warm(attempt, accept=False)
 
+    def abstention_commit_authorized(self, _attempt: OoeChatAttempt) -> bool:
+        return self.commit_on_fertig_abstention
+
     def observe_cold(
         self,
         question: str,
@@ -470,7 +474,11 @@ class OoeChatHook:
                 "question_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
                 "schema": CHAT_OBSERVATION_SCHEMA,
             }
-            return {"receipt": receipt, "status": "observed"}
+            return {
+                "observation": normalized,
+                "receipt": receipt,
+                "status": "observed",
+            }
         except Exception as exc:
             return {
                 "error": f"{type(exc).__module__}.{type(exc).__qualname__}",
@@ -478,9 +486,103 @@ class OoeChatHook:
             }
 
 
+class ChainedOoeChatHook(OoeChatHook):
+    """Try independent verified Markov authorities in deterministic order."""
+
+    def __init__(self, hooks: tuple[OoeChatHook, ...]) -> None:
+        if (
+            not isinstance(hooks, tuple)
+            or len(hooks) < 2
+            or any(type(hook) is not OoeChatHook for hook in hooks)
+        ):
+            raise TypeError("hooks must contain at least two production OoE hooks")
+        self.hooks = hooks
+        self.controller = hooks[0].controller
+        self.commit_on_fertig_abstention = any(
+            hook.commit_on_fertig_abstention for hook in hooks
+        )
+        self.cold_observer = self.observe_cold
+        self._lock = threading.RLock()
+
+    def try_warm(
+        self,
+        question: str,
+        metadata: Mapping[str, Any],
+    ) -> OoeChatAttempt:
+        attempts = []
+        with self._lock:
+            for index, hook in enumerate(self.hooks):
+                attempt = hook.try_warm(question, metadata)
+                attempts.append({"authority": index, **dict(attempt.evidence)})
+                if attempt.hit:
+                    self.controller = hook.controller
+                    return OoeChatAttempt(
+                        attempt.result,
+                        {
+                            "attempts": attempts,
+                            "authority": index,
+                            "status": "hit",
+                        },
+                        attempt.decision,
+                        hook,
+                    )
+        return OoeChatAttempt(
+            None,
+            {"attempts": attempts, "status": "miss"},
+        )
+
+    @staticmethod
+    def _owner(attempt: OoeChatAttempt) -> OoeChatHook:
+        owner = attempt._owner
+        if type(owner) is not OoeChatHook:
+            raise OoeChatIntegrityError("chained warm attempt lost its authority")
+        return owner
+
+    def commit_warm(self, attempt: OoeChatAttempt) -> WarmAccountingReceipt:
+        owner = self._owner(attempt)
+        receipt = owner.commit_warm(attempt)
+        self.controller = owner.controller
+        return receipt
+
+    def reject_warm(self, attempt: OoeChatAttempt) -> WarmAccountingReceipt:
+        owner = self._owner(attempt)
+        receipt = owner.reject_warm(attempt)
+        self.controller = owner.controller
+        return receipt
+
+    def abstention_commit_authorized(self, attempt: OoeChatAttempt) -> bool:
+        return self._owner(attempt).abstention_commit_authorized(attempt)
+
+    def observe_cold(
+        self,
+        question: str,
+        metadata: Mapping[str, Any],
+        qwen_result: Result,
+        final_result: Result,
+    ) -> dict[str, Any]:
+        observations = []
+        for index, hook in enumerate(self.hooks):
+            if hook.cold_observer is None:
+                continue
+            observations.append(
+                {
+                    "authority": index,
+                    **hook.observe_cold(
+                        question,
+                        metadata,
+                        qwen_result,
+                        final_result,
+                    ),
+                }
+            )
+            self.controller = hook.controller
+        return {"authorities": observations, "status": "observed"}
+
+
 __all__ = [
     "CHAT_OBSERVATION_SCHEMA",
     "CHAT_RESULT_SCHEMA",
+    "ChainedOoeChatHook",
     "ColdObserver",
     "ControllerPromptFeatureProvider",
     "FeatureProvider",

@@ -8,13 +8,18 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
-from immer.contracts import ExecutionStatus, Result
+from immer.cognition.fertig.adapter import CandidateVerificationStatus
+from immer.cognition.qwen_fertig_chat import QwenFertigChat
+from immer.contracts import ExecutionStatus, Request, Result
 from immer.knowledge.livecausal import LiveGraph
 from immer.runtimes.deepseek_v4.causal_weights import TensorRangePlan
+from immer.runtimes.ooe.controller import OoeController
 from immer.runtimes.ooe.crystal import CrystalStore
 from immer.runtimes.ooe.identity import canonical_json_bytes
 from immer.runtimes.ooe.result_cells import (
+    COLD_QWEN_GENERATION_EVIDENCE_KEY,
     ResultCell,
     ResultCellBinding,
     qwen_result_binding_evidence,
@@ -22,6 +27,10 @@ from immer.runtimes.ooe.result_cells import (
 from immer.runtimes.ooe.qwen_warm_bank import (
     QwenWarmBankError,
     open_verified_qwen_warm_bank,
+)
+from immer.runtimes.ooe.qwen_warm_growth import (
+    QwenWarmGrowthError,
+    _fertig_judgment,
 )
 from immer.runtimes.qwen3_8.semantic_atlas import (
     GraphRevision,
@@ -34,6 +43,7 @@ from immer.runtimes.qwen3_8.semantic_atlas import (
     SemanticWeightAtlas,
     WeightCoordinate,
 )
+from test_qwen_fertig_chat import _Qwen, _patched_solver, _verification
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -522,6 +532,374 @@ class Qwen38OoeChatCohortTests(unittest.TestCase):
         verification_path.write_bytes(cohort._document_bytes(document))
         with self.assertRaisesRegex(QwenWarmBankError, "authorize"):
             open_verified_qwen_warm_bank(self.fixture.root)
+
+    def test_cold_chat_grows_a_restart_safe_zero_forward_warm_cell(self) -> None:
+        manifest = self.fixture.prepare()
+        result = self.fixture.execute()
+        verification = cohort.verify(self.fixture.verify_args())
+        (self.fixture.root / "verification.json").write_bytes(
+            cohort._document_bytes(verification)
+        )
+        profile = _hash("growing-runtime-profile")
+        runtime_code = _hash("growing-runtime-code")
+        mount = open_verified_qwen_warm_bank(
+            self.fixture.root,
+            runtime_profile_sha256=profile,
+            runtime_code_revision=runtime_code,
+        )
+
+        question = "A new ordinary prompt that should become an exact warm cell."
+        output = "dynamic answer"
+        template_binding = ResultCellBinding.from_record(
+            manifest["body"]["items"][0]["binding"]
+        )
+        dynamic_pin = ModelPin(
+            repo_id=template_binding.model_pin.repo_id,
+            revision=template_binding.model_pin.revision,
+            bundle_fingerprint=template_binding.model_pin.bundle_fingerprint,
+            bundle_manifest_sha256=(
+                template_binding.model_pin.bundle_manifest_sha256
+            ),
+            code_revision=runtime_code,
+        )
+        binding = ResultCellBinding(
+            model_pin=dynamic_pin,
+            tokenizer_sha256=template_binding.tokenizer_sha256,
+            question_sha256=hashlib.sha256(question.encode()).hexdigest(),
+            rendered_prompt_sha256=_hash("dynamic-rendered-prompt"),
+            rendered_prompt_token_sha256=_hash("dynamic-rendered-tokens"),
+            system_prompt_sha256=template_binding.system_prompt_sha256,
+            generation_policy_sha256=template_binding.generation_policy_sha256,
+        )
+        template_cell = cohort.ResultCellBank(self.fixture.organ).restore_payload(
+            result["body"]["cold_rows"][0]["cell_payload_sha256"]
+        )
+        template_qwen = template_cell.cold_qwen_result
+        qwen_evidence = dict(template_qwen.evidence)
+        qwen_evidence.pop(COLD_QWEN_GENERATION_EVIDENCE_KEY)
+        qwen_evidence["result_cell_binding_receipt"] = (
+            qwen_result_binding_evidence(binding)
+        )
+        qwen_evidence["output_sha256"] = hashlib.sha256(
+            output.encode()
+        ).hexdigest()
+        qwen_result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output=output,
+            evidence=qwen_evidence,
+        )
+        judgment = {
+            "candidate": None,
+            "evidence": {
+                "exact_solution": None,
+                "question_sha256": binding.question_sha256,
+                "reason": "no_exact_certificate",
+            },
+            "expected": None,
+            "kind": "fertig-candidate-verification/v1",
+            "status": "abstained",
+        }
+        final_result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.fertig-chat",
+            output=output,
+            evidence={
+                "receipt": {
+                    "fertig": {
+                        "status": "abstained",
+                        "verification": judgment,
+                    }
+                }
+            },
+        )
+        metadata = {
+            "qwen_token_sha256": binding.rendered_prompt_token_sha256,
+            "qwen_warm_runtime_profile_sha256": profile,
+        }
+
+        observation = mount.hook.observe_cold(
+            question,
+            metadata,
+            qwen_result,
+            final_result,
+        )
+        first = mount.hook.try_warm(question, metadata)
+
+        self.assertEqual(observation["status"], "observed")
+        self.assertEqual(
+            observation["authorities"][0]["observation"]["status"],
+            "charged",
+        )
+        self.assertTrue(first.hit)
+        assert first.result is not None
+        self.assertEqual(first.result.output, output)
+        assert first.decision is not None
+        self.assertEqual(
+            first.evidence["attempts"][1]["decision"][
+                "execution_receipt_sha256"
+            ],
+            first.decision.execution_receipt_sha256,
+        )
+        mount.hook.commit_warm(first)
+
+        restarted = open_verified_qwen_warm_bank(
+            self.fixture.root,
+            runtime_profile_sha256=profile,
+            runtime_code_revision=runtime_code,
+        )
+        forbidden_qwen = _Qwen(
+            RuntimeError("Qwen must not run for a grown exact warm hit")
+        )
+        with _patched_solver(
+            None,
+            _verification(
+                CandidateVerificationStatus.ABSTAINED,
+                candidate=None,
+                expected=None,
+                question=question,
+            ),
+        ) as (solver, _certify, _verify):
+            wrapped = QwenFertigChat(
+                forbidden_qwen,
+                solver,
+                ooe_hook=restarted.hook,
+            ).handle(Request("chat", question, metadata))
+        self.assertTrue(wrapped.ok)
+        self.assertEqual(wrapped.output, output)
+        self.assertEqual(forbidden_qwen.requests, [])
+        self.assertIs(
+            restarted.hook.controller,
+            restarted.hook.hooks[1].controller,
+        )
+        self.assertEqual(
+            restarted.hook.controller.metrics.saved_qwen_forwards,
+            restarted.hook.hooks[1].controller.metrics.saved_qwen_forwards,
+        )
+
+        replay = restarted.hook.try_warm(question, metadata)
+        self.assertTrue(replay.hit)
+        assert replay.result is not None
+        self.assertEqual(replay.result.output, output)
+        restarted.hook.commit_warm(replay)
+        self.assertFalse(
+            restarted.hook.try_warm(
+                question,
+                {
+                    "qwen_token_sha256": binding.rendered_prompt_token_sha256,
+                    "qwen_warm_runtime_profile_sha256": _hash("other-profile"),
+                },
+            ).hit
+        )
+        self.assertFalse(
+            restarted.hook.try_warm(
+                question,
+                {
+                    "qwen_token_sha256": "0" * 64,
+                    "qwen_warm_runtime_profile_sha256": profile,
+                },
+            ).hit
+        )
+        self.assertFalse(
+            restarted.hook.try_warm("another question", metadata).hit
+        )
+        self.assertEqual(restarted.growing_entries, 1)
+
+        second_question = "A cold result interrupted after its index commit."
+        second_output = "recovered dynamic answer"
+        second_binding = ResultCellBinding(
+            model_pin=dynamic_pin,
+            tokenizer_sha256=template_binding.tokenizer_sha256,
+            question_sha256=hashlib.sha256(second_question.encode()).hexdigest(),
+            rendered_prompt_sha256=_hash("second-rendered-prompt"),
+            rendered_prompt_token_sha256=_hash("second-rendered-tokens"),
+            system_prompt_sha256=template_binding.system_prompt_sha256,
+            generation_policy_sha256=template_binding.generation_policy_sha256,
+        )
+        second_evidence = dict(qwen_evidence)
+        second_evidence["result_cell_binding_receipt"] = (
+            qwen_result_binding_evidence(second_binding)
+        )
+        second_evidence["output_sha256"] = hashlib.sha256(
+            second_output.encode()
+        ).hexdigest()
+        second_qwen = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output=second_output,
+            evidence=second_evidence,
+        )
+        second_judgment = {
+            **judgment,
+            "evidence": {
+                **judgment["evidence"],
+                "question_sha256": second_binding.question_sha256,
+            },
+        }
+        second_final = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.fertig-chat",
+            output=second_output,
+            evidence={
+                "receipt": {
+                    "fertig": {
+                        "status": "abstained",
+                        "verification": second_judgment,
+                    }
+                }
+            },
+        )
+        second_metadata = {
+            "qwen_token_sha256": second_binding.rendered_prompt_token_sha256,
+            "qwen_warm_runtime_profile_sha256": profile,
+        }
+        growth = getattr(restarted.hook.hooks[1].cold_observer, "__self__")
+        with mock.patch.object(
+            growth,
+            "_publish_controller_growth",
+            side_effect=RuntimeError("simulated crash after index publication"),
+        ):
+            interrupted = restarted.hook.observe_cold(
+                second_question,
+                second_metadata,
+                second_qwen,
+                second_final,
+            )
+        self.assertEqual(interrupted["status"], "observed")
+        self.assertEqual(interrupted["authorities"][0]["status"], "error")
+
+        recovered = open_verified_qwen_warm_bank(
+            self.fixture.root,
+            runtime_profile_sha256=profile,
+            runtime_code_revision=runtime_code,
+        )
+        recovered_hit = recovered.hook.try_warm(
+            second_question,
+            second_metadata,
+        )
+        self.assertTrue(recovered_hit.hit)
+        assert recovered_hit.result is not None
+        self.assertEqual(recovered_hit.result.output, second_output)
+        recovered.hook.commit_warm(recovered_hit)
+        self.assertEqual(recovered.growing_entries, 2)
+
+        third_question = "A cold result interrupted after Crystal promotion."
+        third_output = "promotion recovered answer"
+        third_binding = ResultCellBinding(
+            model_pin=dynamic_pin,
+            tokenizer_sha256=template_binding.tokenizer_sha256,
+            question_sha256=hashlib.sha256(third_question.encode()).hexdigest(),
+            rendered_prompt_sha256=_hash("third-rendered-prompt"),
+            rendered_prompt_token_sha256=_hash("third-rendered-tokens"),
+            system_prompt_sha256=template_binding.system_prompt_sha256,
+            generation_policy_sha256=template_binding.generation_policy_sha256,
+        )
+        third_evidence = dict(qwen_evidence)
+        third_evidence["result_cell_binding_receipt"] = (
+            qwen_result_binding_evidence(third_binding)
+        )
+        third_evidence["output_sha256"] = hashlib.sha256(
+            third_output.encode()
+        ).hexdigest()
+        third_qwen = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output=third_output,
+            evidence=third_evidence,
+        )
+        third_judgment = {
+            **judgment,
+            "evidence": {
+                **judgment["evidence"],
+                "question_sha256": third_binding.question_sha256,
+            },
+        }
+        third_final = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.fertig-chat",
+            output=third_output,
+            evidence={
+                "receipt": {
+                    "fertig": {
+                        "status": "abstained",
+                        "verification": third_judgment,
+                    }
+                }
+            },
+        )
+        third_metadata = {
+            "qwen_token_sha256": third_binding.rendered_prompt_token_sha256,
+            "qwen_warm_runtime_profile_sha256": profile,
+        }
+        original_save = OoeController.save_snapshot
+        save_calls = 0
+
+        def crash_on_second_save(controller, *args, **kwargs):
+            nonlocal save_calls
+            save_calls += 1
+            if save_calls == 2:
+                raise RuntimeError("simulated crash after Crystal promotion")
+            return original_save(controller, *args, **kwargs)
+
+        with mock.patch.object(
+            OoeController,
+            "save_snapshot",
+            new=crash_on_second_save,
+        ):
+            interrupted_promotion = recovered.hook.observe_cold(
+                third_question,
+                third_metadata,
+                third_qwen,
+                third_final,
+            )
+        self.assertEqual(interrupted_promotion["status"], "observed")
+        self.assertEqual(
+            interrupted_promotion["authorities"][0]["status"],
+            "error",
+        )
+
+        promotion_recovered = open_verified_qwen_warm_bank(
+            self.fixture.root,
+            runtime_profile_sha256=profile,
+            runtime_code_revision=runtime_code,
+        )
+        third_hit = promotion_recovered.hook.try_warm(
+            third_question,
+            third_metadata,
+        )
+        self.assertTrue(third_hit.hit)
+        assert third_hit.result is not None
+        self.assertEqual(third_hit.result.output, third_output)
+        promotion_recovered.hook.commit_warm(third_hit)
+        self.assertEqual(promotion_recovered.growing_entries, 3)
+
+    def test_growing_warm_bank_never_charges_a_fertig_mismatch(self) -> None:
+        question = "A mismatch must not become reusable."
+        judgment = {
+            "candidate": "999",
+            "evidence": {
+                "exact_solution": {"answer": "2"},
+                "question_sha256": hashlib.sha256(question.encode()).hexdigest(),
+            },
+            "expected": "2",
+            "kind": "fertig-candidate-verification/v1",
+            "status": "mismatch",
+        }
+        final = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.fertig-chat",
+            output="2",
+            evidence={
+                "receipt": {
+                    "fertig": {
+                        "status": "mismatch",
+                        "verification": judgment,
+                    }
+                }
+            },
+        )
+        with self.assertRaisesRegex(QwenWarmGrowthError, "mismatch"):
+            _fertig_judgment(final)
 
     def test_manifest_organ_crystal_and_gold_tamper_fail_closed(self) -> None:
         manifest = self.fixture.prepare()

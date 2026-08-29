@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from immer.cli import main
+from immer.cli import _qwen38_runtime_code_paths, main
 from immer.cognition.fertig import FertigSolver
 from immer.cognition.qwen_fertig_chat import QwenFertigChat
 from immer.composition import CompositionRoot, compose_runtime
@@ -1443,8 +1443,76 @@ class Qwen38CausalChatTests(unittest.TestCase):
             )
 
         self.assertEqual(code, 0)
-        opener.assert_called_once_with(Path("/state/qwen-warm"))
+        opener.assert_called_once_with(
+            Path("/state/qwen-warm"),
+            runtime_profile_sha256=None,
+            runtime_code_revision=None,
+        )
         self.assertIs(wrapper.call_args.kwargs["ooe_hook"], hook)
+
+    def test_cli_binds_growing_warm_cells_to_the_preload_runtime_profile(
+        self,
+    ) -> None:
+        qwen = _chat(_Runtime())
+        hook = object()
+
+        def open_mount(_root, **options):
+            return SimpleNamespace(
+                hook=hook,
+                result_cell_code_revision=options["runtime_code_revision"],
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Qwen"
+            q4 = root / "causal" / "q4-base-v2"
+            q4.mkdir(parents=True)
+            (q4 / "manifest.json").write_bytes(b"q4-manifest")
+            (root / "tokenizer.json").write_bytes(b"tokenizer")
+            prompt_tokenizer = SimpleNamespace(
+                encode=lambda _text: (11, 12),
+                render_no_thinking_prompt=(
+                    lambda _system, question: f"prompt:{question}"
+                ),
+            )
+            with patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ) as constructor, patch(
+                "immer.runtimes.ooe.qwen_warm_bank.open_verified_qwen_warm_bank",
+                side_effect=open_mount,
+            ) as opener, patch(
+                "immer.cognition.qwen_fertig_chat.QwenFertigChat",
+                side_effect=lambda raw, _fertig, **_options: raw,
+            ), patch(
+                "immer.runtimes.qwen3_8.encoding.Qwen38Tokenizer",
+                return_value=prompt_tokenizer,
+            ), redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-root",
+                        str(root),
+                        "--ooe-warm-root",
+                        "/state/qwen-warm",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        profile = opener.call_args.kwargs["runtime_profile_sha256"]
+        code_revision = opener.call_args.kwargs["runtime_code_revision"]
+        self.assertEqual(len(profile), 64)
+        self.assertEqual(len(code_revision), 64)
+        self.assertEqual(
+            constructor.call_args.kwargs["result_cell_code_revision"],
+            code_revision,
+        )
+
+    def test_growing_warm_code_revision_covers_prompt_identity_sources(self) -> None:
+        names = {path.name for path in _qwen38_runtime_code_paths()}
+        self.assertIn("encoding.py", names)
+        self.assertIn("cartography_probe.py", names)
+        self.assertIn("adapter.py", names)
+        self.assertIn("qwen_warm_growth.py", names)
 
     def test_cli_explicit_layout_does_not_inherit_deployed_q4(self) -> None:
         qwen = _chat(_Runtime())

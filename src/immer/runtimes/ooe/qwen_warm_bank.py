@@ -12,11 +12,19 @@ import stat
 from typing import Any
 
 from ...knowledge.livecausal import LiveGraph
-from .chat import OoeChatHook
-from .controller import ActionExecution, OoeController, WarmAccountingReceipt
+from ..qwen3_8.semantic_atlas import ModelPin
+from .chat import ChainedOoeChatHook, OoeChatHook
+from .controller import (
+    ActionExecution,
+    ControllerConfig,
+    OoeController,
+    OoeControllerIntegrityError,
+    WarmAccountingReceipt,
+)
 from .crystal import CrystalStore
 from .identity import canonical_json_bytes, require_sha256
 from .qwen_bridge import QwenOoeFeatureReceipt
+from .qwen_warm_growth import GrowingQwenWarmBank, load_growing_index
 from .result_cells import ResultCellBank, ResultCellBinding, ResultCellExecutor
 
 
@@ -102,6 +110,8 @@ class VerifiedQwenWarmMount:
     cell_payload_sha256: str
     execution_sha256: str
     saved_qwen_forwards: int
+    result_cell_code_revision: str
+    growing_entries: int
 
     def identity(self) -> dict[str, object]:
         return {
@@ -109,10 +119,12 @@ class VerifiedQwenWarmMount:
             "cell_payload_sha256": self.cell_payload_sha256,
             "execution_sha256": self.execution_sha256,
             "feature_sha256": self.feature_sha256,
+            "growing_entries": self.growing_entries,
             "manifest_sha256": self.manifest_sha256,
             "parity_sha256": self.parity_sha256,
             "question_sha256": self.question_sha256,
             "result_sha256": self.result_sha256,
+            "result_cell_code_revision": self.result_cell_code_revision,
             "root": str(self.root),
             "saved_qwen_forwards": self.saved_qwen_forwards,
             "schema": "immer.qwen3.8-verified-warm-mount/v1",
@@ -122,10 +134,30 @@ class VerifiedQwenWarmMount:
 
 def open_verified_qwen_warm_bank(
     root: str | os.PathLike[str],
+    *,
+    runtime_profile_sha256: str | None = None,
+    runtime_code_revision: str | None = None,
 ) -> VerifiedQwenWarmMount:
     """Open one existing verified warm cell without running or probing Qwen."""
 
     selected = Path(root).expanduser().absolute()
+    runtime_profile = (
+        None
+        if runtime_profile_sha256 is None
+        else require_sha256(
+            runtime_profile_sha256,
+            field="runtime_profile_sha256",
+        )
+    )
+    runtime_code = (
+        None
+        if runtime_code_revision is None
+        else require_sha256(runtime_code_revision, field="runtime_code_revision")
+    )
+    if (runtime_profile is None) != (runtime_code is None):
+        raise QwenWarmBankError(
+            "growing warm profile and runtime code revision must be configured together"
+        )
     try:
         root_stat = selected.lstat()
     except FileNotFoundError as exc:
@@ -305,8 +337,8 @@ def open_verified_qwen_warm_bank(
     bank = ResultCellBank(organ_root)
     if not store.audit().clean or not bank.store.audit().clean:
         raise QwenWarmBankError("warm Crystal or ResultCell store failed audit")
-    if not set(store.manifest().objects).issubset(legacy_crystal_sha256s):
-        raise QwenWarmBankError("warm Crystal manifest escaped its verified inventory")
+    if not set(legacy_crystal_sha256s).issubset(store.manifest().objects):
+        raise QwenWarmBankError("warm Crystal manifest lost its verified inventory")
     cell = bank.restore(binding)
     if (
         cell.payload_sha256 != cell_payload_sha256
@@ -320,20 +352,43 @@ def open_verified_qwen_warm_bank(
 
     state_name = f"qwen38-ooe-chat-controller-{manifest_sha256[:24]}"
     def restore_controller() -> OoeController:
-        return OoeController.restore(
-            crystal_store=store,
-            name=state_name,
-            action_executors={"mount_organ": executor},
-            atlas_revision_verifier=lambda revision: graph.store.contains_revision(
+        def verifier(revision: Any) -> bool:
+            return graph.store.contains_revision(
                 revision.sequence,
                 revision.event_sha256,
-            ),
-            expected_model_pin_sha256=binding.model_pin.sha256,
-            expected_weight_graph_revision_sha256=(
+            )
+        options = {
+            "crystal_store": store,
+            "name": state_name,
+            "action_executors": {"mount_organ": executor},
+            "atlas_revision_verifier": verifier,
+            "expected_model_pin_sha256": binding.model_pin.sha256,
+            "expected_weight_graph_revision_sha256": (
                 feature.weight_graph_revision_sha256
             ),
-            legacy_gap_compatible_crystal_sha256s=legacy_crystal_sha256s,
-        )
+            "legacy_gap_compatible_crystal_sha256s": (
+                legacy_crystal_sha256s
+            ),
+        }
+        try:
+            return OoeController.restore(**options)
+        except OoeControllerIntegrityError:
+            raw_state = store.restore_state(state_name)
+            try:
+                state_body = json.loads(raw_state)["body"]
+                old_generation = state_body["crystal_manifest_generation"]
+                old_manifest_sha256 = state_body["crystal_manifest_sha256"]
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise QwenWarmBankError(
+                    "controller recovery state is invalid"
+                ) from exc
+            recovered, _receipt = OoeController.restore_recoverable(
+                **options,
+                expected_old_manifest_generation=old_generation,
+                expected_old_manifest_sha256=old_manifest_sha256,
+                expected_old_state_sha256=hashlib.sha256(raw_state).hexdigest(),
+            )
+            return recovered
 
     controller = restore_controller()
 
@@ -341,28 +396,29 @@ def open_verified_qwen_warm_bank(
         question: str,
         metadata: Mapping[str, Any],
     ) -> QwenOoeFeatureReceipt | None:
-        if hashlib.sha256(question.encode("utf-8")).hexdigest() != question_sha256:
-            return None
-        raw_token = metadata.get("qwen_token_sha256")
-        if raw_token is not None and require_sha256(
-            raw_token,
-            field="qwen_token_sha256",
-        ) != feature.probe.token_sha256:
-            return None
-        return feature
+        if hashlib.sha256(question.encode("utf-8")).hexdigest() == question_sha256:
+            raw_token = metadata.get("qwen_token_sha256")
+            if raw_token is not None and require_sha256(
+                raw_token,
+                field="qwen_token_sha256",
+            ) != feature.probe.token_sha256:
+                return None
+            return feature
+        return None
 
     def quality_verifier(
         receipt: QwenOoeFeatureReceipt,
         candidate: ActionExecution,
     ) -> bool:
-        return (
-            receipt == feature
-            and candidate.to_document() == execution_document
-            and candidate.qwen_forwards == 0
-            and candidate.teacher_baseline_qwen_forwards == saved
-        )
+        if receipt == feature:
+            return (
+                candidate.to_document() == execution_document
+                and candidate.qwen_forwards == 0
+                and candidate.teacher_baseline_qwen_forwards == saved
+            )
+        return False
 
-    hook = OoeChatHook(
+    base_hook = OoeChatHook(
         controller=controller,
         feature_provider=feature_provider,
         quality_verifier=quality_verifier,
@@ -370,6 +426,128 @@ def open_verified_qwen_warm_bank(
         snapshot_restorer=restore_controller,
         commit_on_fertig_abstention=True,
     )
+    hook: OoeChatHook = base_hook
+    growth = None
+    if runtime_profile is not None and runtime_code is not None:
+        growing_root = selected / "growing-crystals" / runtime_profile[:24]
+        growing_root.mkdir(parents=True, exist_ok=True)
+        growing_store = CrystalStore(growing_root)
+        growing_entries, growing_index_sha256 = load_growing_index(
+            growing_store,
+            bank,
+        )
+        dynamic_pin = ModelPin(
+            repo_id=binding.model_pin.repo_id,
+            revision=binding.model_pin.revision,
+            bundle_fingerprint=binding.model_pin.bundle_fingerprint,
+            bundle_manifest_sha256=binding.model_pin.bundle_manifest_sha256,
+            code_revision=runtime_code,
+        )
+        if any(
+            entry.runtime_profile_sha256 != runtime_profile
+            or entry.binding.model_pin != dynamic_pin
+            for entry in growing_entries.values()
+        ):
+            raise QwenWarmBankError(
+                "growing warm index belongs to another runtime authority"
+            )
+        growing_bindings = {
+            entry.feature.sha256: entry.binding
+            for entry in growing_entries.values()
+        }
+
+        def resolve_growing(
+            receipt: QwenOoeFeatureReceipt,
+        ) -> ResultCellBinding:
+            try:
+                return growing_bindings[receipt.sha256]
+            except KeyError as exc:
+                raise QwenWarmBankError(
+                    "no growing ResultCell binding for warm feature"
+                ) from exc
+
+        growing_executor = ResultCellExecutor(bank, resolve_growing)
+        growing_state_name = f"qwen38-growing-controller-{runtime_profile[:24]}"
+
+        def growing_verifier(revision: Any) -> bool:
+            return graph.store.contains_revision(
+                revision.sequence,
+                revision.event_sha256,
+            )
+
+        def restore_growing_controller() -> OoeController:
+            options = {
+                "crystal_store": growing_store,
+                "name": growing_state_name,
+                "action_executors": {"mount_organ": growing_executor},
+                "atlas_revision_verifier": growing_verifier,
+                "expected_model_pin_sha256": dynamic_pin.sha256,
+                "expected_weight_graph_revision_sha256": (
+                    feature.weight_graph_revision_sha256
+                ),
+            }
+            try:
+                return OoeController.restore(**options)
+            except KeyError:
+                created = OoeController(
+                    model_pin_sha256=dynamic_pin.sha256,
+                    weight_graph_revision_sha256=(
+                        feature.weight_graph_revision_sha256
+                    ),
+                    atlas_graph_revision=controller.atlas_graph_revision,
+                    crystal_store=growing_store,
+                    config=ControllerConfig(**controller.config.to_dict()),
+                    action_executors={"mount_organ": growing_executor},
+                    atlas_revision_verifier=growing_verifier,
+                )
+                created.save_snapshot(name=growing_state_name)
+                return created
+            except OoeControllerIntegrityError:
+                raw_state = growing_store.restore_state(growing_state_name)
+                try:
+                    state_body = json.loads(raw_state)["body"]
+                except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                    raise QwenWarmBankError(
+                        "growing controller recovery state is invalid"
+                    ) from exc
+                recovered, _receipt = OoeController.restore_recoverable(
+                    **options,
+                    expected_old_manifest_generation=(
+                        state_body["crystal_manifest_generation"]
+                    ),
+                    expected_old_manifest_sha256=(
+                        state_body["crystal_manifest_sha256"]
+                    ),
+                    expected_old_state_sha256=hashlib.sha256(
+                        raw_state
+                    ).hexdigest(),
+                )
+                return recovered
+
+        growth = GrowingQwenWarmBank(
+            root=growing_root,
+            store=growing_store,
+            bank=bank,
+            template_feature=feature,
+            runtime_profile_sha256=runtime_profile,
+            controller_state_name=growing_state_name,
+            restore_controller=restore_growing_controller,
+            bindings_by_feature=growing_bindings,
+            entries=growing_entries,
+            index_sha256=growing_index_sha256,
+        )
+        growth.reconcile()
+        growing_hook = OoeChatHook(
+            controller=growth.controller,
+            feature_provider=growth.feature_provider,
+            quality_verifier=growth.quality_verifier,
+            cold_observer=growth.observe_cold,
+            snapshot_name=growing_state_name,
+            snapshot_restorer=restore_growing_controller,
+            commit_on_fertig_abstention=True,
+        )
+        growth.hook = growing_hook
+        hook = ChainedOoeChatHook((base_hook, growing_hook))
     return VerifiedQwenWarmMount(
         hook=hook,
         root=selected,
@@ -383,6 +561,12 @@ def open_verified_qwen_warm_bank(
         cell_payload_sha256=cell_payload_sha256,
         execution_sha256=execution.sha256,
         saved_qwen_forwards=saved,
+        result_cell_code_revision=(
+            binding.model_pin.code_revision
+            if runtime_code is None
+            else runtime_code
+        ),
+        growing_entries=0 if growth is None else len(growth.entries),
     )
 
 

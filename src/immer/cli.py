@@ -71,6 +71,9 @@ _QWEN38_DEPLOYMENT_WARM_ROOT = Path(
 _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE = Path(
     "/root/immer-state/qwen-markov-q4-v1.bin"
 )
+_QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
+    b"immer:qwen3.8-growing-warm-runtime/v1"
+).hexdigest()
 
 
 def _chat_path(
@@ -81,6 +84,14 @@ def _chat_path(
     if value is None:
         return None
     return Path(value).expanduser().absolute()
+
+
+def _path_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb", buffering=0) as handle:
+        while chunk := handle.read(4 * 1024**2):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _resolve_qwen38_chat_paths(
@@ -190,6 +201,91 @@ def _resolve_qwen38_markov_draft(
     ):
         return "markov", str(_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE)
     return draft_mode, markov_state
+
+
+def _qwen38_growing_warm_profile(
+    args: argparse.Namespace,
+    *,
+    tokenizer_path: Path,
+    q4_root: Path | None,
+    fast_mlp_root: Path | None,
+    draft_mode: str | None,
+    runtime_code_revision: str,
+) -> str | None:
+    """Bind reusable cold cells to the exact pre-load product runtime."""
+
+    if q4_root is None or fast_mlp_root is not None:
+        return None
+    q4_manifest = q4_root / "manifest.json"
+    if not q4_manifest.is_file() or not tokenizer_path.is_file():
+        return None
+    profile = {
+        "abi_sha256": _QWEN38_GROWING_WARM_ABI_SHA256,
+        "anchor_cache": args.qwen38_anchor_cache is not None,
+        "compute_dtype": args.compute_dtype,
+        "device": "cpu" if args.device == "auto" else args.device,
+        "draft_mode": draft_mode,
+        "draft_window": args.draft_window,
+        "head_block_rows": args.head_block_rows,
+        "markov_provider_abi": (
+            "immer.qwen3.8-markov-draft-provider/v8"
+            if draft_mode == "markov"
+            else None
+        ),
+        "max_context_tokens": args.max_context_tokens,
+        "max_new_tokens": args.max_new_tokens,
+        "max_prompt_tokens": args.max_prompt_tokens,
+        "q4_manifest_file_sha256": _path_sha256(q4_manifest),
+        "q4_threads": args.q4_threads or min(16, os.cpu_count() or 1),
+        "runtime_code_revision": runtime_code_revision,
+        "schema": "immer.qwen3.8-growing-warm-runtime/v1",
+        "system_prompt_sha256": hashlib.sha256(
+            args.system_prompt.strip().encode("utf-8")
+        ).hexdigest(),
+        "tokenizer_sha256": _path_sha256(tokenizer_path),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            profile,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _qwen38_runtime_code_paths() -> tuple[Path, ...]:
+    package = Path(__file__).resolve().parent
+    fixed = (
+        package / "cli.py",
+        package / "contracts.py",
+        package / "cognition" / "qwen_fertig_chat.py",
+        package / "knowledge" / "livecausal.py",
+        package / "runtimes" / "ooe" / "chat.py",
+        package / "runtimes" / "ooe" / "controller.py",
+        package / "runtimes" / "ooe" / "qwen_warm_bank.py",
+        package / "runtimes" / "ooe" / "qwen_warm_growth.py",
+        package / "runtimes" / "ooe" / "result_cells.py",
+    )
+    qwen_runtime = tuple(
+        sorted(
+            (package / "runtimes" / "qwen3_8").glob("*.py"),
+            key=lambda path: path.name,
+        )
+    )
+    return tuple(sorted({*fixed, *qwen_runtime}, key=lambda path: str(path)))
+
+
+def _qwen38_runtime_code_revision() -> str:
+    package = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in _qwen38_runtime_code_paths():
+        digest.update(str(path.relative_to(package)).encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb", buffering=0) as handle:
+            while chunk := handle.read(1024**2):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 class _LiveTextWriter:
@@ -396,11 +492,60 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             bundle_path,
             q4_root,
         )
+        warm_runtime_code_revision = (
+            None if args.raw_qwen else _qwen38_runtime_code_revision()
+        )
+        warm_profile_sha256 = (
+            None
+            if args.raw_qwen
+            else _qwen38_growing_warm_profile(
+                args,
+                tokenizer_path=tokenizer_path,
+                q4_root=q4_root,
+                fast_mlp_root=fast_mlp_root,
+                draft_mode=draft_mode,
+                runtime_code_revision=warm_runtime_code_revision,
+            )
+        )
+        warm_prompt_tokenizer = None
+        if warm_profile_sha256 is not None:
+            from .runtimes.qwen3_8.encoding import Qwen38Tokenizer
+
+            warm_prompt_tokenizer = Qwen38Tokenizer(
+                tokenizer_path,
+                require_official=True,
+            )
+
+        def request_metadata_for(text: str) -> dict[str, str]:
+            if warm_profile_sha256 is None or warm_prompt_tokenizer is None:
+                return {}
+            from .runtimes.qwen3_8.cartography_probe import (
+                prompt_token_sha256,
+            )
+
+            rendered = warm_prompt_tokenizer.render_no_thinking_prompt(
+                args.system_prompt,
+                text,
+            )
+            return {
+                "qwen_token_sha256": prompt_token_sha256(
+                    warm_prompt_tokenizer.encode(rendered)
+                ),
+                "qwen_warm_runtime_profile_sha256": warm_profile_sha256,
+            }
         warm_mount = None
         if not args.raw_qwen:
             warm_root = _resolve_qwen38_warm_root(args, bundle_path)
             if warm_root is not None:
-                warm_mount = open_verified_qwen_warm_bank(warm_root)
+                warm_mount = open_verified_qwen_warm_bank(
+                    warm_root,
+                    runtime_profile_sha256=warm_profile_sha256,
+                    runtime_code_revision=(
+                        warm_runtime_code_revision
+                        if warm_profile_sha256 is not None
+                        else None
+                    ),
+                )
         anchor_cache = (
             None
             if args.qwen38_anchor_cache is None
@@ -469,6 +614,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             fast_mlp_active_layers=fast_mlp_layers,
             fast_mlp_selected_block_count=fast_mlp_blocks,
             delta_head_state_path=args.delta_head_online_state,
+            result_cell_code_revision=(
+                None
+                if warm_mount is None or warm_profile_sha256 is None
+                else warm_mount.result_cell_code_revision
+            ),
             text_snapshot_sink=(
                 live_writer.update
                 if live_writer is not None
@@ -513,7 +663,13 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                         line_message = line
                     if not isinstance(line_message, str) or not line_message.strip():
                         raise ValueError("JSONL request message must be non-empty text")
-                    result = component.handle(Request("chat", line_message))
+                    result = component.handle(
+                        Request(
+                            "chat",
+                            line_message,
+                            request_metadata_for(line_message),
+                        )
+                    )
                     emit(
                         result,
                         request_id=request_id,
@@ -530,7 +686,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 if max_requests is not None and handled >= max_requests:
                     break
             return 0 if failures == 0 else 2
-        result = component.handle(Request("chat", message))
+        result = component.handle(
+            Request("chat", message, request_metadata_for(message))
+        )
     except (
         DraftWindowError,
         OSError,

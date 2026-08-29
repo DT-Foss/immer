@@ -369,9 +369,15 @@ class QwenFertigChat:
         if type(fertig) is not FertigSolver:
             raise TypeError("fertig must be the production FertigSolver")
         if ooe_hook is not None:
-            from ..runtimes.ooe.chat import OoeChatHook as ProductionOoeChatHook
+            from ..runtimes.ooe.chat import (
+                ChainedOoeChatHook,
+                OoeChatHook as ProductionOoeChatHook,
+            )
 
-            if type(ooe_hook) is not ProductionOoeChatHook:
+            if type(ooe_hook) not in {
+                ProductionOoeChatHook,
+                ChainedOoeChatHook,
+            }:
                 raise TypeError("ooe_hook must be the production OoeChatHook")
         self._qwen = qwen
         self._fertig = fertig
@@ -829,7 +835,7 @@ class QwenFertigChat:
             abstention_authorized = (
                 candidate_origin == "ooe"
                 and self._ooe_hook is not None
-                and self._ooe_hook.commit_on_fertig_abstention
+                and self._ooe_hook.abstention_commit_authorized(warm_attempt)
             )
             settlement_error = settle_warm(accept=abstention_authorized)
             if settlement_error is not None:

@@ -187,6 +187,14 @@ expected work is worse, and learns only target-confirmed output. Full Q4 still
 verifies every emitted token, so the council changes work scheduling rather
 than answer quality. `--no-markov-draft` forces direct K1 decoding.
 
+Cold general chat now grows the warm bank automatically. The first successful
+Full-Q4/FERTIG path charges an exact ResultCell, derives a prompt-native Markov
+feature, teaches `qwen_fallback → mount_organ`, promotes the per-runtime
+controller, and persists the index. A repeated request with the same runtime
+profile, question and rendered-token identity then executes the stored cell
+without loading Qwen. FERTIG mismatches are never charged; profile, token,
+model, Q4, tokenizer and current runtime-code changes produce a cold miss.
+
 ## Selected trial evidence
 
 | Trial | Result | Scope |
