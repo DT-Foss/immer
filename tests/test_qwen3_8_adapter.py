@@ -910,13 +910,17 @@ class Qwen38CausalChatTests(unittest.TestCase):
         hybrid = policy["hybrid_draft"]
         self.assertEqual(
             hybrid["selection"],
-            "round-wise-markov-first-mtp-fallback/v8",
+            "round-wise-markov-first-mtp-fallback/v9",
         )
         self.assertFalse(hybrid["request_provider_lock"])
         self.assertFalse(hybrid["one_way_handoff"])
         self.assertTrue(hybrid["round_reselection"])
         self.assertTrue(hybrid["cross_provider_target_state_sync"])
         self.assertTrue(hybrid["cross_provider_target_feedback"])
+        self.assertEqual(
+            hybrid["consensus"],
+            "discounted-confidence-surplus/v1",
+        )
         self.assertTrue(hybrid["committed_hidden_handoff"])
         self.assertEqual(
             hybrid["markov_confidence"],
@@ -953,7 +957,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         self.assertEqual(
             identity["provider"]["selection"],
-            "round-wise-markov-first-mtp-fallback/v8",
+            "round-wise-markov-first-mtp-fallback/v9",
         )
         chat.close()
 

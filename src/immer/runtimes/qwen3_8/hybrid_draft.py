@@ -12,7 +12,7 @@ from .draft_protocol import RollingDraftProposal
 from .mtp_draft import Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v8"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v9"
 MARKOV_MTP_WINDOW_WORK_COSTS = {
     1: 1.0,
     2: 1.6,
@@ -80,6 +80,11 @@ class Qwen38MarkovMtpDraftMetrics:
     markov_external_feedback_rounds: int
     provider_switches: int
     mtp_init_failures: int
+    consensus_rounds: int
+    consensus_agreement_tokens: int
+    consensus_confidence_gain: float
+    last_consensus_agreement_tokens: int
+    last_consensus_confidence_gain: float
     hidden_history_rows: int
     hidden_history_bytes: int
     switch_available: bool
@@ -158,6 +163,12 @@ class Qwen38MarkovMtpDraftProvider:
         self._markov_external_feedback_rounds = 0
         self._provider_switches = 0
         self._mtp_init_failures = 0
+        self._consensus_rounds = 0
+        self._consensus_agreement_tokens = 0
+        self._consensus_confidence_gain = 0.0
+        self._last_consensus_agreement_tokens = 0
+        self._last_consensus_confidence_gain = 0.0
+        self._shadow_markov_proposal: RollingDraftProposal | None = None
         self._pending_provider: Literal["markov", "mtp"] | None = None
 
     @property
@@ -311,6 +322,9 @@ class Qwen38MarkovMtpDraftProvider:
         known_token: int,
     ) -> RollingDraftProposal | None:
         self._validate_history(history)
+        self._shadow_markov_proposal = None
+        self._last_consensus_agreement_tokens = 0
+        self._last_consensus_confidence_gain = 0.0
         proposal = self.markov_provider.propose_round(history, known_token)
         if not isinstance(proposal, RollingDraftProposal):
             raise Qwen38MarkovMtpDraftError(
@@ -362,7 +376,64 @@ class Qwen38MarkovMtpDraftProvider:
             self._provider_switches += 1
         self._selected_provider = "mtp"
         self._mtp_selections += 1
+        self._shadow_markov_proposal = proposal
         return None
+
+    def _fuse_mtp_consensus(
+        self,
+        mtp: RollingDraftProposal,
+    ) -> RollingDraftProposal:
+        """Discount exact Markov/MTP token agreement into MTP confidence."""
+
+        markov = self._shadow_markov_proposal
+        self._shadow_markov_proposal = None
+        self._last_consensus_agreement_tokens = 0
+        self._last_consensus_confidence_gain = 0.0
+        if markov is None:
+            return mtp
+        if len(markov.token_ids) != len(mtp.token_ids):
+            raise Qwen38MarkovMtpDraftError(
+                "Markov/MTP consensus proposal widths disagree"
+            )
+        fused = list(mtp.token_confidences)
+        agreements = 0
+        gain = 0.0
+        for index, (markov_token, mtp_token) in enumerate(
+            zip(markov.token_ids, mtp.token_ids, strict=True)
+        ):
+            if markov_token != mtp_token:
+                break
+            if mtp.token_confidences[index] <= 0.0:
+                break
+            agreements += 1
+            markov_confidence = float(markov.token_confidences[index])
+            markov_disagreement = min(
+                1.0,
+                max(0.0, float(markov.token_disagreements[index])),
+            )
+            surplus = max(0.0, 2.0 * markov_confidence - 1.0)
+            agreement_evidence = 0.5 * surplus * (1.0 - markov_disagreement)
+            previous = fused[index]
+            fused[index] = min(
+                0.999,
+                1.0 - (1.0 - previous) * (1.0 - agreement_evidence),
+            )
+            gain += fused[index] - previous
+        self._last_consensus_agreement_tokens = agreements
+        self._last_consensus_confidence_gain = gain
+        if agreements:
+            self._consensus_rounds += 1
+            self._consensus_agreement_tokens += agreements
+            self._consensus_confidence_gain += gain
+        if gain <= 0.0:
+            return mtp
+        return RollingDraftProposal.build(
+            mtp.token_ids,
+            fused,
+            mtp.token_disagreements,
+            request_window_ceiling=len(mtp.token_ids) + 1,
+            provider_abi=QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
+        )
 
     def _mtp_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         if not isinstance(target_hidden, torch.Tensor):
@@ -410,6 +481,8 @@ class Qwen38MarkovMtpDraftProvider:
             raise Qwen38MarkovMtpDraftError(
                 "selected provider returned no RollingDraftProposal"
             )
+        if self._selected_provider == "mtp":
+            proposal = self._fuse_mtp_consensus(proposal)
         self._pending_provider = "mtp"
         return proposal
 
@@ -590,6 +663,13 @@ class Qwen38MarkovMtpDraftProvider:
             markov_external_feedback_rounds=self._markov_external_feedback_rounds,
             provider_switches=self._provider_switches,
             mtp_init_failures=self._mtp_init_failures,
+            consensus_rounds=self._consensus_rounds,
+            consensus_agreement_tokens=self._consensus_agreement_tokens,
+            consensus_confidence_gain=self._consensus_confidence_gain,
+            last_consensus_agreement_tokens=(
+                self._last_consensus_agreement_tokens
+            ),
+            last_consensus_confidence_gain=self._last_consensus_confidence_gain,
             hidden_history_rows=self._hidden_history_rows,
             hidden_history_bytes=self._hidden_history_bytes,
             switch_available=self._switch_available,
@@ -640,6 +720,7 @@ class Qwen38MarkovMtpDraftProvider:
                 failure = exc
         self._hidden_history = None
         self._round_target_hidden = None
+        self._shadow_markov_proposal = None
         self._switch_available = False
         self._closed = True
         if failure is not None:

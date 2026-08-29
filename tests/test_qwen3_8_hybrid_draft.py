@@ -45,13 +45,19 @@ class _MarkovMetrics:
 
 
 class _Markov:
-    def __init__(self, confidence: float | list[float]) -> None:
+    def __init__(
+        self,
+        confidence: float | list[float],
+        *,
+        tokens: tuple[int, ...] = (3, 4, 5),
+    ) -> None:
         self.confidences = (
             [float(confidence)]
             if isinstance(confidence, (int, float))
             else [float(value) for value in confidence]
         )
         self.confidence = self.confidences[0]
+        self.tokens = tokens
         self._proposal_index = 0
         self.begin_calls = []
         self.propose_calls = []
@@ -73,12 +79,12 @@ class _Markov:
         index = min(self._proposal_index, len(self.confidences) - 1)
         self.confidence = self.confidences[index]
         self._proposal_index += 1
-        return _proposal(confidence=self.confidence)
+        return _proposal(confidence=self.confidence, tokens=self.tokens)
 
     def propose_after(self, history, known_token):
         self.propose_calls.append((history, known_token, "plain"))
         self.pending = True
-        return (3, 4, 5)
+        return self.tokens
 
     def discard_pending_proposal(self):
         if not self.pending:
@@ -263,6 +269,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         )
 
         self.assertEqual(first.token_ids, (7, 8, 9))
+        self.assertEqual(first.provider_abi, "test-draft/v1")
         self.assertEqual(provider.selected_provider, "mtp")
         self.assertEqual(factory_calls, ["mtp"])
         self.assertEqual(markov.discard_calls, 0)
@@ -297,6 +304,9 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(metrics.source_body_bytes, 4096)
         self.assertEqual(metrics.linear_calls, 9)
         self.assertEqual(metrics.mtp_selections, 2)
+        self.assertEqual(metrics.consensus_rounds, 0)
+        self.assertEqual(metrics.consensus_agreement_tokens, 0)
+        self.assertEqual(metrics.consensus_confidence_gain, 0.0)
         self.assertEqual(metrics.markov_external_feedback_rounds, 2)
         self.assertEqual(metrics.to_dict()["mtp"]["linear_calls"], 9)
         close_order = []
@@ -316,6 +326,97 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(close_order, ["mtp", "markov"])
         self.assertTrue(markov.closed)
         self.assertTrue(mtp.closed)
+
+    def test_mtp_proposal_gains_discounted_confidence_from_markov_agreement(
+        self,
+    ) -> None:
+        markov = _Markov(0.55, tokens=(7, 8, 9))
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        proposal = provider.propose_round_state(
+            prompt,
+            4,
+            hidden[:, -1:],
+        )
+
+        self.assertEqual(provider.selected_provider, "mtp")
+        self.assertEqual(proposal.token_ids, (7, 8, 9))
+        self.assertEqual(
+            proposal.provider_abi,
+            "immer.qwen3.8-markov-mtp-hybrid-provider/v9",
+        )
+        self.assertTrue(
+            all(abs(value - 0.7625) < 1e-12 for value in proposal.token_confidences)
+        )
+        metrics = provider.metrics()
+        self.assertEqual(metrics.consensus_rounds, 1)
+        self.assertEqual(metrics.consensus_agreement_tokens, 3)
+        self.assertEqual(metrics.last_consensus_agreement_tokens, 3)
+        self.assertAlmostEqual(metrics.consensus_confidence_gain, 0.0375)
+        self.assertAlmostEqual(metrics.last_consensus_confidence_gain, 0.0375)
+        provider.observe_verification(1, 1)
+        provider.reconcile_prefix((*prompt, 4, 7))
+        provider.observe_final((*prompt, 4, 7, 10))
+        provider.close()
+
+    def test_consensus_stops_at_first_divergence(self) -> None:
+        markov = _Markov(0.55, tokens=(7, 31, 9))
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        proposal = provider.propose_round_state(prompt, 4, hidden[:, -1:])
+
+        self.assertEqual(proposal.token_ids, (7, 8, 9))
+        self.assertAlmostEqual(proposal.token_confidences[0], 0.7625)
+        self.assertEqual(proposal.token_confidences[1:], (0.75, 0.75))
+        metrics = provider.metrics()
+        self.assertEqual(metrics.consensus_agreement_tokens, 1)
+        self.assertAlmostEqual(metrics.consensus_confidence_gain, 0.0125)
+        provider.observe_verification(0, 1)
+        provider.reconcile_prefix((*prompt, 4))
+        provider.observe_final((*prompt, 4, 10))
+        provider.close()
+
+    def test_consensus_never_revives_mtp_zero_confidence_padding(self) -> None:
+        class PaddedMtp(_Mtp):
+            def propose_round_state(self, history, known_token, hidden):
+                self.propose_calls.append(
+                    (history, known_token, hidden.detach().clone(), "round")
+                )
+                self.pending = True
+                return RollingDraftProposal.build(
+                    (7, 8, 9),
+                    (0.75, 0.0, 0.0),
+                    (0.0, 0.0, 0.0),
+                    request_window_ceiling=4,
+                    provider_abi="test-mtp-padded/v1",
+                )
+
+        markov = _Markov(0.55, tokens=(7, 8, 9))
+        mtp = PaddedMtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        proposal = provider.propose_round_state(prompt, 4, hidden[:, -1:])
+
+        self.assertAlmostEqual(proposal.token_confidences[0], 0.7625)
+        self.assertEqual(proposal.token_confidences[1:], (0.0, 0.0))
+        metrics = provider.metrics()
+        self.assertEqual(metrics.consensus_agreement_tokens, 1)
+        self.assertAlmostEqual(metrics.consensus_confidence_gain, 0.0125)
+        provider.observe_verification(0, 1)
+        provider.reconcile_prefix((*prompt, 4))
+        provider.observe_final((*prompt, 4, 10))
+        provider.close()
 
     def test_mtp_initialization_failure_keeps_the_pending_markov_fallback(
         self,
@@ -473,7 +574,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(mtp.advance_calls[0][2], final_hidden))
 
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v8")
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v9")
         self.assertEqual(metrics.selected_provider, "markov")
         self.assertEqual(metrics.selection_calls, 4)
         self.assertEqual(metrics.markov_rounds, 3)
