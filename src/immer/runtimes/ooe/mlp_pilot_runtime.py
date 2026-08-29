@@ -501,6 +501,8 @@ class MlpPilotSparseExecutor:
             confirmed_rows=0,
             capture_ema=0.0,
             sparse_waves_since_confirmation=0,
+            selected_block_count=self._router_models[layer].selected_block_count,
+            max_selected_block_count=self._router_models[layer].selected_block_count,
         )
 
     def observe_full(
@@ -552,6 +554,9 @@ class MlpPilotSparseExecutor:
         if self.online_controller is not None:
             identity["online_config_sha256"] = self.online_controller.config.sha256
             identity["weight_only_plan_sha256"] = self.router_fit.sha256
+            identity["adaptive_width_policy_sha256"] = (
+                self.online_controller.width_policy_sha256
+            )
         if transport_neutral:
             return identity
         return {**identity, "sources": list(self._transport_sources)}
@@ -724,6 +729,11 @@ class MlpPilotSparseExecutor:
             raise KeyError(f"no sparse MLP model for layer {layer}")
         model: MlpPilotLayerModel = self._router_models[layer]
         affine: MlpPilotAffineLayer = self._affine_models[layer]
+        selected_block_count = (
+            model.selected_block_count
+            if self.online_controller is None
+            else self.online_controller.selected_block_count(layer=layer)
+        )
         if (
             not isinstance(hidden, torch.Tensor)
             or hidden.ndim != 2
@@ -796,8 +806,13 @@ class MlpPilotSparseExecutor:
                 up=up_pilot_array,
             )
         )
+        if self.online_controller is not None:
+            selected_block_count = self.online_controller.route_block_count(
+                layer=layer,
+                scores=np.asarray(scores, dtype=np.float64),
+            )
         selected = np.argsort(-scores, axis=1, kind="stable")[
-            :, : model.selected_block_count
+            :, :selected_block_count
         ].astype(np.int64, copy=False)
         pilot_set = set(int(row) for row in pilots)
         extra_by_row: list[np.ndarray] = []
@@ -815,9 +830,7 @@ class MlpPilotSparseExecutor:
                     ),
                     dtype=np.int64,
                 )
-                expected = model.selected_block_count * (
-                    model.block_size - model.pilot_count
-                )
+                expected = selected_block_count * (model.block_size - model.pilot_count)
             else:
                 extra = np.concatenate(
                     [
@@ -828,7 +841,7 @@ class MlpPilotSparseExecutor:
                         for block in blocks
                     ]
                 ).astype(np.int64, copy=False)
-                expected = model.selected_block_count * model.block_size
+                expected = selected_block_count * model.block_size
             if len(extra) != expected or len(set(extra.tolist())) != len(extra):
                 raise MlpPilotSparseRuntimeError("router emitted invalid block ranges")
             extra_by_row.append(extra)
@@ -837,7 +850,7 @@ class MlpPilotSparseExecutor:
             sorted({int(neuron) for extra in extra_by_row for neuron in extra}),
             dtype=np.int64,
         )
-        per_row_dynamic = model.selected_block_count * (
+        per_row_dynamic = selected_block_count * (
             model.block_size - model.pilot_count
             if self.pilot_pager is None
             else model.block_size
@@ -903,7 +916,7 @@ class MlpPilotSparseExecutor:
             if self.pilot_pager is None
             else 0
         )
-        assembled_route_bytes = 0 if model.selected_block_count == 1 else route_bytes
+        assembled_route_bytes = 0 if selected_block_count == 1 else route_bytes
         resident_required = route_bytes + assembled_route_bytes + same_pager_pilot_bytes
         resident_limit = getattr(
             self.down_transpose_pager,
@@ -915,7 +928,7 @@ class MlpPilotSparseExecutor:
         for row in processing_order:
             planned_loaded_blocks += len(routes[row] - active)
             active = routes[row]
-        requested_blocks = len(hidden) * model.selected_block_count
+        requested_blocks = len(hidden) * selected_block_count
         cache_reuses_blocks = planned_loaded_blocks < requested_blocks
         cache_fits = not (
             isinstance(resident_limit, int)
@@ -990,7 +1003,10 @@ class MlpPilotSparseExecutor:
             selected_blocks=tuple(
                 tuple(int(block) for block in row) for row in selected
             ),
-            selected_neuron_count=model.selected_neuron_count,
+            selected_neuron_count=(
+                model.block_count * model.pilot_count
+                + selected_block_count * (model.block_size - model.pilot_count)
+            ),
             intermediate_dimension=model.intermediate_dimension,
             source_weight_rows=(
                 3 * len(pilots) + 2 * len(union_extra) + down_loaded_rows
@@ -1011,6 +1027,7 @@ class MlpPilotSparseExecutor:
             self.online_controller.record_sparse(
                 layer=layer,
                 row_count=len(hidden),
+                selected_block_count=selected_block_count,
             )
         return corrected, trace
 

@@ -40,6 +40,11 @@ All notable changes to IMMER are recorded here.
   persistence is locked, atomic, plan-bound, and contains no prompt or hidden
   tensor content. All 64 layer updates flush once at the request boundary
   instead of rewriting the fixed-size state after every layer.
+- Fast-MLP width is now an exact-confirmed action instead of a fixed 32-block
+  constant. Exact paths measure the worst-row cumulative capture curve and
+  admit the minimum width reaching `0.50`, up to 128 blocks; layers missing the
+  floor stay full. Later waves widen for current pilot-score mass, reuse the
+  existing 13.55 GB payload unchanged, and migrate v1 online state in place.
 - Added a deterministic all-layer p4/k32 Fast-MLP builder over authenticated
   local weights. Isotropic Gate/Up joint moments seed all 64 routers; local
   transpose and packed-pilot banks replace the `34.23 GB` full MLP target wave

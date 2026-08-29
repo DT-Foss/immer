@@ -117,3 +117,46 @@ Legacy prompt-fitted banks retain their existing behavior. They continue to
 load `fit.json` plus `affine-fit.json`, return `sealed-prompt-fit` decisions,
 and ignore exact observations. Mixing legacy and weight-only analysis files is
 rejected rather than guessing which authority should win.
+
+## Adaptive block width
+
+The packed pilot and full transpose artifacts already contain every neuron, so
+route width can grow without rebuilding or copying their `13.55 GB` payload.
+For every exact observation the controller orders blocks by the pre-update
+pilot score and evaluates the actual cumulative capture curve
+
+```text
+C(w) = min_rows((pilot_energy + sum(top-w nonpilot block energy)) / total_energy)
+```
+
+at widths `32, 40, …, max`. It persists the smallest measured width reaching
+`max(plan_min_capture, 0.50)`. If even the configured maximum (default `128`)
+misses that exact floor, the layer stays on the full MLP path. There is no
+linear extrapolation from the old width-32 result.
+
+The matching predicted score mass is also persisted. On a later sparse wave,
+each row is widened until its current cumulative pilot-score mass reaches that
+confirmed mass plus the configured safety margin; the wave uses the widest
+row and never exceeds the exact-observed maximum. Thus cross-context score
+diffusion can increase work but cannot silently narrow a confirmed route.
+
+For the official topology, the packed single/reused-route row fraction is
+
+```text
+F(w) = (272 × 4 + 64 × w) / 17,408.
+```
+
+Representative bounds are `18.0147%` at width 32, `29.7794%` at 64,
+`41.5441%` at 96, and `53.3088%` at 128. Against the `34.23 GB` full 64-layer
+MLP wave these correspond to about `6.17`, `10.19`, `14.22`, and `18.25 GB`
+for one/reused routes. Width 128 needs about `80 MiB` for one Down route and
+`160 MiB` when the overlap cache also assembles it, so a `192 MiB` auxiliary
+resident limit admits the full configured range. Smaller mounts automatically
+cap the width to one route that fits.
+
+Online state v2 binds the effective width policy and persists the selected
+width, exact capture, predicted/required score mass, last executed width, and
+update count. Existing v1 state is migrated in place: recursive-ridge arrays,
+capture history, and counters are retained, width starts at the original
+p4/k32 value, and the next exact path computes the first authoritative curve.
+The immutable weight-only plan and all payload/manifest hashes remain unchanged.

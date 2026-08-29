@@ -33,6 +33,7 @@ from immer.runtimes.ooe.mlp_pilot_runtime import (
     MlpPilotTransposeManifest,
 )
 from immer.runtimes.ooe.mlp_pilot_weight_only import (
+    MlpPilotAdaptiveWidthConfig,
     MlpPilotOnlineConfig,
     MlpPilotWeightOnlyPlan,
     build_weight_only_layer_model,
@@ -46,6 +47,7 @@ from immer.runtimes.qwen3_8.config import (
     Qwen38Config,
 )
 from immer.runtimes.qwen3_8.fast_mlp import (
+    ADAPTIVE_WIDTH_CONFIG_NAME,
     PILOT_WEIGHT_MANIFEST_V2_SCHEMA,
     WEIGHT_ONLY_PLAN_NAME,
     Qwen38FastMlpPaths,
@@ -312,6 +314,15 @@ def _online_config(args: argparse.Namespace) -> MlpPilotOnlineConfig:
     )
 
 
+def _width_config(args: argparse.Namespace) -> MlpPilotAdaptiveWidthConfig:
+    return MlpPilotAdaptiveWidthConfig(
+        max_selected_block_count=args.max_selected_block_count,
+        selected_block_step=args.selected_block_step,
+        score_mass_margin=args.score_mass_margin,
+        target_capture=args.target_capture,
+    )
+
+
 def _build_plan(
     *,
     pager: Qwen38WeightPager,
@@ -536,6 +547,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         _plain_directory(path)
     router_config = _router_config(args)
     online_config = _online_config(args)
+    width_config = _width_config(args)
     if args.moment_chunk_rows % router_config.block_size:
         raise CliError("--moment-chunk-rows must be block aligned")
     identity = LogicalModelIdentity(args.repo_id, args.revision)
@@ -587,6 +599,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 chunk_rows=args.moment_chunk_rows,
             )
             _persist_exact(paths.analysis_root / WEIGHT_ONLY_PLAN_NAME, plan.to_bytes())
+            _persist_exact(
+                paths.analysis_root / ADAPTIVE_WIDTH_CONFIG_NAME,
+                width_config.to_bytes(),
+            )
             transpose, pilot = _build_weight_banks(
                 pager=pager,
                 plan=plan,
@@ -608,6 +624,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "bundle": bundle,
                 "cold_start": "weight-only/no-forward",
                 "online_config_sha256": online_config.sha256,
+                "adaptive_width_config_sha256": width_config.sha256,
                 "pager": pager.metrics(),
                 "pilot_manifest_body_sha256": pilot["body_sha256"],
                 "schema": BUILD_REPORT_SCHEMA,
@@ -640,6 +657,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--statistics-decay", type=float, default=0.99)
     parser.add_argument("--confidence-decay", type=float, default=0.80)
     parser.add_argument("--max-sparse-rows", type=int, default=16)
+    parser.add_argument("--max-selected-block-count", type=int, default=128)
+    parser.add_argument("--selected-block-step", type=int, default=8)
+    parser.add_argument("--score-mass-margin", type=float, default=0.02)
+    parser.add_argument("--target-capture", type=float, default=0.50)
     parser.add_argument("--source-budget-mb", type=float, default=8192.0)
     parser.add_argument("--max-resident-mb", type=int, default=384)
     parser.add_argument("--max-working-gb", type=float, default=1.0)

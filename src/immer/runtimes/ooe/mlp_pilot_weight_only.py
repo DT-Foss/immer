@@ -48,9 +48,11 @@ WEIGHT_ONLY_PLAN_SCHEMA = "immer.qwen-mlp-pilot-weight-only-plan/v1"
 WEIGHT_ONLY_AFFINE_SCHEMA = "immer.qwen-mlp-pilot-identity-affine/v1"
 WEIGHT_ONLY_INITIALIZER = "isotropic-gaussian-joint-moment-stratified/v1"
 PILOT_ONLINE_CONFIG_SCHEMA = "immer.qwen-mlp-pilot-online-config/v1"
-PILOT_ONLINE_STATE_SCHEMA = "immer.qwen-mlp-pilot-online-state/v1"
-PILOT_SPARSE_DECISION_SCHEMA = "immer.qwen-mlp-pilot-sparse-decision/v1"
-PILOT_ONLINE_OBSERVATION_SCHEMA = "immer.qwen-mlp-pilot-online-observation/v1"
+PILOT_ADAPTIVE_WIDTH_CONFIG_SCHEMA = "immer.qwen-mlp-pilot-adaptive-width-config/v1"
+LEGACY_PILOT_ONLINE_STATE_SCHEMA = "immer.qwen-mlp-pilot-online-state/v1"
+PILOT_ONLINE_STATE_SCHEMA = "immer.qwen-mlp-pilot-online-state/v2"
+PILOT_SPARSE_DECISION_SCHEMA = "immer.qwen-mlp-pilot-sparse-decision/v2"
+PILOT_ONLINE_OBSERVATION_SCHEMA = "immer.qwen-mlp-pilot-online-observation/v2"
 _MAX_PLAN_BYTES = 64 * 1024 * 1024
 _MAX_STATE_BYTES = 16 * 1024 * 1024
 
@@ -237,6 +239,93 @@ class MlpPilotOnlineConfig:
             raise MlpPilotWeightOnlyError(
                 "online pilot config validation failed"
             ) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class MlpPilotAdaptiveWidthConfig:
+    """Bound the dynamic p4 route width without changing bank payloads."""
+
+    max_selected_block_count: int = 128
+    selected_block_step: int = 8
+    score_mass_margin: float = 0.02
+    target_capture: float = 0.50
+
+    def __post_init__(self) -> None:
+        for field in ("max_selected_block_count", "selected_block_step"):
+            value = getattr(self, field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{field} must be a positive integer")
+        margin = _finite_probability(
+            self.score_mass_margin,
+            field="score_mass_margin",
+            inclusive_zero=True,
+        )
+        if margin >= 1.0:
+            raise ValueError("score_mass_margin must be smaller than one")
+        object.__setattr__(self, "score_mass_margin", margin)
+        object.__setattr__(
+            self,
+            "target_capture",
+            _finite_probability(
+                self.target_capture,
+                field="target_capture",
+                inclusive_zero=False,
+            ),
+        )
+
+    @property
+    def sha256(self) -> str:
+        return _digest(self.to_record())
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "max_selected_block_count": self.max_selected_block_count,
+            "schema": PILOT_ADAPTIVE_WIDTH_CONFIG_SCHEMA,
+            "score_mass_margin": self.score_mass_margin,
+            "selected_block_step": self.selected_block_step,
+            "target_capture": self.target_capture,
+        }
+
+    def to_bytes(self) -> bytes:
+        return _sealed(PILOT_ADAPTIVE_WIDTH_CONFIG_SCHEMA, self.to_record())
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "MlpPilotAdaptiveWidthConfig":
+        document = _strict_document(
+            data,
+            schema=PILOT_ADAPTIVE_WIDTH_CONFIG_SCHEMA,
+            label="adaptive width config",
+            maximum=64 * 1024,
+        )
+        body = cast(Mapping[str, object], document["body"])
+        expected = {
+            "max_selected_block_count",
+            "schema",
+            "score_mass_margin",
+            "selected_block_step",
+            "target_capture",
+        }
+        if (
+            set(body) != expected
+            or body.get("schema") != PILOT_ADAPTIVE_WIDTH_CONFIG_SCHEMA
+        ):
+            raise MlpPilotWeightOnlyError("adaptive width config is invalid")
+        try:
+            result = cls(
+                max_selected_block_count=cast(int, body["max_selected_block_count"]),
+                selected_block_step=cast(int, body["selected_block_step"]),
+                score_mass_margin=cast(float, body["score_mass_margin"]),
+                target_capture=cast(float, body["target_capture"]),
+            )
+        except (TypeError, ValueError) as exc:
+            raise MlpPilotWeightOnlyError(
+                "adaptive width config validation failed"
+            ) from exc
+        if result.to_bytes() != data:
+            raise MlpPilotWeightOnlyError(
+                "adaptive width config reconstruction changed"
+            )
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -665,6 +754,9 @@ class MlpPilotSparseDecision:
     confirmed_rows: int
     capture_ema: float
     sparse_waves_since_confirmation: int
+    selected_block_count: int = 0
+    max_selected_block_count: int = 0
+    required_score_mass: float = 0.0
 
     def to_record(self) -> dict[str, object]:
         return {
@@ -674,6 +766,9 @@ class MlpPilotSparseDecision:
             "reason": self.reason,
             "row_count": self.row_count,
             "schema": PILOT_SPARSE_DECISION_SCHEMA,
+            "selected_block_count": self.selected_block_count,
+            "max_selected_block_count": self.max_selected_block_count,
+            "required_score_mass": self.required_score_mass,
             "sparse_waves_since_confirmation": self.sparse_waves_since_confirmation,
             "use_sparse": self.use_sparse,
         }
@@ -687,6 +782,9 @@ class MlpPilotOnlineObservation:
     capture_ema: float
     confirmed_rows: int
     surprising: bool
+    selected_block_count: int = 0
+    predicted_score_mass: float = 0.0
+    required_score_mass: float = 0.0
 
     def to_record(self) -> dict[str, object]:
         return {
@@ -696,6 +794,9 @@ class MlpPilotOnlineObservation:
             "route_capture": self.route_capture,
             "rows": self.rows,
             "schema": PILOT_ONLINE_OBSERVATION_SCHEMA,
+            "selected_block_count": self.selected_block_count,
+            "predicted_score_mass": self.predicted_score_mass,
+            "required_score_mass": self.required_score_mass,
             "surprising": self.surprising,
         }
 
@@ -713,6 +814,12 @@ class _LayerState:
     capture_ema: float = 0.0
     last_capture: float = 0.0
     surprises: int = 0
+    selected_block_count: int = 0
+    confirmed_capture_at_width: float = 0.0
+    predicted_score_mass: float = 0.0
+    required_score_mass: float = 0.0
+    last_sparse_block_count: int = 0
+    width_updates: int = 0
 
 
 def _array_record(value: np.ndarray) -> dict[str, object]:
@@ -804,12 +911,42 @@ class MlpPilotOnlineController:
         plan: MlpPilotWeightOnlyPlan,
         *,
         state_path: str | Path | None = None,
+        width_config: MlpPilotAdaptiveWidthConfig = MlpPilotAdaptiveWidthConfig(),
     ) -> None:
         if not isinstance(plan, MlpPilotWeightOnlyPlan):
             raise TypeError("plan must be MlpPilotWeightOnlyPlan")
         self.plan = plan
         self.config = plan.online_config
+        if not isinstance(width_config, MlpPilotAdaptiveWidthConfig):
+            raise TypeError("width_config must be MlpPilotAdaptiveWidthConfig")
+        self.width_config = width_config
         self._models = {row.layer: row for row in plan.models}
+        self._max_blocks = {
+            row.layer: min(
+                width_config.max_selected_block_count,
+                row.block_count - 1,
+            )
+            for row in plan.models
+        }
+        if any(
+            self._max_blocks[row.layer] < row.selected_block_count
+            for row in plan.models
+        ):
+            raise ValueError("adaptive width maximum is below the p4 plan width")
+        self.width_policy_sha256 = _digest(
+            {
+                "maximum_by_layer": {
+                    str(layer): count
+                    for layer, count in sorted(self._max_blocks.items())
+                },
+                "minimum_by_layer": {
+                    str(row.layer): row.selected_block_count for row in plan.models
+                },
+                "plan_sha256": plan.sha256,
+                "schema": "immer.qwen-mlp-pilot-adaptive-width-policy/v1",
+                "width_config": width_config.to_record(),
+            }
+        )
         self._lock = threading.RLock()
         self._closed = False
         self._dirty = False
@@ -837,11 +974,86 @@ class MlpPilotOnlineController:
         )
         coefficients = np.array(model.coefficients, dtype=np.float64, copy=True)
         rhs = np.einsum("bij,bj->bi", gram, coefficients)
-        return _LayerState(gram=gram, rhs=rhs, coefficients=coefficients)
+        return _LayerState(
+            gram=gram,
+            rhs=rhs,
+            coefficients=coefficients,
+            selected_block_count=model.selected_block_count,
+            last_sparse_block_count=model.selected_block_count,
+        )
 
     def _require_open(self) -> None:
         if self._closed:
             raise MlpPilotOnlineStateError("online pilot controller is closed")
+
+    def _width_candidates(self, layer: int) -> tuple[int, ...]:
+        model = self._models[layer]
+        maximum = self._max_blocks[layer]
+        candidates = list(
+            range(
+                model.selected_block_count,
+                maximum + 1,
+                self.width_config.selected_block_step,
+            )
+        )
+        if candidates[-1] != maximum:
+            candidates.append(maximum)
+        return tuple(candidates)
+
+    def selected_block_count(self, *, layer: int) -> int:
+        """Return the latest exact-confirmed width for one sparse wave."""
+
+        with self._lock:
+            self._require_open()
+            state = self._states.get(layer)
+            if state is None:
+                raise KeyError(f"no online pilot model for layer {layer}")
+            return state.selected_block_count
+
+    def max_selected_block_count(self, *, layer: int) -> int:
+        if isinstance(layer, bool) or not isinstance(layer, int):
+            raise TypeError("layer must be an integer")
+        try:
+            return self._max_blocks[layer]
+        except KeyError as exc:
+            raise KeyError(f"no online pilot model for layer {layer}") from exc
+
+    def route_block_count(self, *, layer: int, scores: np.ndarray) -> int:
+        """Widen a confirmed route until every row reaches its score-mass floor."""
+
+        with self._lock:
+            self._require_open()
+            model = self._models.get(layer)
+            state = self._states.get(layer)
+            if model is None or state is None:
+                raise KeyError(f"no online pilot model for layer {layer}")
+            values = np.asarray(scores)
+            if (
+                values.dtype != np.dtype(np.float64)
+                or values.ndim != 2
+                or values.shape[1] != model.block_count
+                or not bool(np.isfinite(values).all())
+                or bool((values < 0.0).any())
+            ):
+                raise ValueError("adaptive route scores differ from the width ABI")
+            required = state.required_score_mass
+            if required <= 0.0:
+                return state.selected_block_count
+            ranked = np.sort(values, axis=1)[:, ::-1]
+            cumulative = np.cumsum(ranked, axis=1, dtype=np.float64)
+            totals = cumulative[:, -1]
+            maximum = self._max_blocks[layer]
+            selected = state.selected_block_count
+            for row in range(len(values)):
+                if totals[row] <= np.finfo(np.float64).tiny:
+                    selected = maximum
+                    continue
+                threshold = required * totals[row]
+                reached = (
+                    int(np.searchsorted(cumulative[row], threshold, side="left")) + 1
+                )
+                selected = max(selected, min(maximum, reached))
+            return selected
 
     def _acquire_file_lock(self) -> None:
         assert self._state_path is not None
@@ -906,28 +1118,53 @@ class MlpPilotOnlineController:
 
     def _load_state(self) -> None:
         assert self._state_path is not None
+        data = _read_regular(self._state_path, _MAX_STATE_BYTES)
+        legacy = False
         try:
-            document = _strict_document(
-                _read_regular(self._state_path, _MAX_STATE_BYTES),
-                schema=PILOT_ONLINE_STATE_SCHEMA,
-                label="online pilot state",
-                maximum=_MAX_STATE_BYTES,
-            )
+            try:
+                document = _strict_document(
+                    data,
+                    schema=PILOT_ONLINE_STATE_SCHEMA,
+                    label="online pilot state",
+                    maximum=_MAX_STATE_BYTES,
+                )
+            except MlpPilotWeightOnlyError:
+                document = _strict_document(
+                    data,
+                    schema=LEGACY_PILOT_ONLINE_STATE_SCHEMA,
+                    label="legacy online pilot state",
+                    maximum=_MAX_STATE_BYTES,
+                )
+                legacy = True
         except MlpPilotOnlineStateError:
             raise
         except MlpPilotWeightOnlyError as exc:
             raise MlpPilotOnlineStateError("online pilot state is corrupt") from exc
         body = cast(Mapping[str, object], document["body"])
+        body_fields = (
+            {"config_sha256", "layers", "plan_sha256"}
+            if legacy
+            else {
+                "config_sha256",
+                "layers",
+                "plan_sha256",
+                "width_policy_sha256",
+            }
+        )
         if (
-            set(body) != {"config_sha256", "layers", "plan_sha256"}
+            set(body) != body_fields
             or body.get("plan_sha256") != self.plan.sha256
             or body.get("config_sha256") != self.config.sha256
+            or (
+                not legacy
+                and body.get("width_policy_sha256") != self.width_policy_sha256
+            )
             or not isinstance(body.get("layers"), list)
         ):
             raise MlpPilotOnlineStateError("online pilot state identity changed")
         restored: dict[int, _LayerState] = {}
         for raw in cast(list[object], body["layers"]):
-            expected = {
+            legacy_fields = {
                 "capture_ema",
                 "coefficients",
                 "confirmed_rows",
@@ -941,6 +1178,19 @@ class MlpPilotOnlineController:
                 "sparse_waves",
                 "surprises",
             }
+            expected = (
+                legacy_fields
+                if legacy
+                else legacy_fields
+                | {
+                    "confirmed_capture_at_width",
+                    "last_sparse_block_count",
+                    "predicted_score_mass",
+                    "required_score_mass",
+                    "selected_block_count",
+                    "width_updates",
+                }
+            )
             if not isinstance(raw, Mapping) or set(raw) != expected:
                 raise MlpPilotOnlineStateError("online layer state is invalid")
             layer = raw.get("layer")
@@ -981,13 +1231,66 @@ class MlpPilotOnlineController:
                 capture_ema=self._capture(raw["capture_ema"], field="capture_ema"),
                 last_capture=self._capture(raw["last_capture"], field="last_capture"),
                 surprises=self._counter(raw["surprises"], field="surprises"),
+                selected_block_count=(
+                    model.selected_block_count
+                    if legacy
+                    else self._counter(
+                        raw["selected_block_count"], field="selected_block_count"
+                    )
+                ),
+                confirmed_capture_at_width=(
+                    self._capture(raw["capture_ema"], field="capture_ema")
+                    if legacy
+                    else self._capture(
+                        raw["confirmed_capture_at_width"],
+                        field="confirmed_capture_at_width",
+                    )
+                ),
+                predicted_score_mass=(
+                    0.0
+                    if legacy
+                    else self._capture(
+                        raw["predicted_score_mass"], field="predicted_score_mass"
+                    )
+                ),
+                required_score_mass=(
+                    0.0
+                    if legacy
+                    else self._capture(
+                        raw["required_score_mass"], field="required_score_mass"
+                    )
+                ),
+                last_sparse_block_count=(
+                    model.selected_block_count
+                    if legacy
+                    else self._counter(
+                        raw["last_sparse_block_count"],
+                        field="last_sparse_block_count",
+                    )
+                ),
+                width_updates=(
+                    0
+                    if legacy
+                    else self._counter(raw["width_updates"], field="width_updates")
+                ),
             )
             if state.confirmed_rows > self.config.max_confirmed_rows:
                 raise MlpPilotOnlineStateError("confirmed row bound changed")
+            if not (
+                model.selected_block_count
+                <= state.selected_block_count
+                <= self._max_blocks[layer]
+                and model.selected_block_count
+                <= state.last_sparse_block_count
+                <= self._max_blocks[layer]
+            ):
+                raise MlpPilotOnlineStateError("adaptive selected width is invalid")
             restored[layer] = state
         if set(restored) != set(self._models):
             raise MlpPilotOnlineStateError("online state layer inventory changed")
         self._states = restored
+        if legacy:
+            self._dirty = True
 
     def _state_bytes(self) -> bytes:
         layers = []
@@ -996,16 +1299,22 @@ class MlpPilotOnlineController:
                 {
                     "capture_ema": state.capture_ema,
                     "coefficients": _array_record(state.coefficients),
+                    "confirmed_capture_at_width": state.confirmed_capture_at_width,
                     "confirmed_rows": state.confirmed_rows,
                     "exact_waves": state.exact_waves,
                     "gram": _array_record(state.gram),
                     "last_capture": state.last_capture,
+                    "last_sparse_block_count": state.last_sparse_block_count,
                     "layer": layer,
+                    "predicted_score_mass": state.predicted_score_mass,
+                    "required_score_mass": state.required_score_mass,
                     "rhs": _array_record(state.rhs),
                     "sparse_rows": state.sparse_rows,
                     "sparse_since_confirmation": state.sparse_since_confirmation,
                     "sparse_waves": state.sparse_waves,
                     "surprises": state.surprises,
+                    "selected_block_count": state.selected_block_count,
+                    "width_updates": state.width_updates,
                 }
             )
         data = _sealed(
@@ -1014,6 +1323,7 @@ class MlpPilotOnlineController:
                 "config_sha256": self.config.sha256,
                 "layers": layers,
                 "plan_sha256": self.plan.sha256,
+                "width_policy_sha256": self.width_policy_sha256,
             },
         )
         if len(data) > _MAX_STATE_BYTES:
@@ -1085,6 +1395,10 @@ class MlpPilotOnlineController:
                 return MlpPilotSparseDecision(
                     layer, row_count, False, "unsupported-layer", 0, 0.0, 0
                 )
+            target_capture = max(
+                self.config.min_capture,
+                self.width_config.target_capture,
+            )
             if row_count > self.config.max_sparse_rows:
                 use_sparse, reason = False, "row-width"
             elif state.confirmed_rows == 0:
@@ -1094,7 +1408,7 @@ class MlpPilotOnlineController:
                 )
             elif state.confirmed_rows < self.config.min_confirmed_rows:
                 use_sparse, reason = False, "confirmation-warmup"
-            elif state.capture_ema < self.config.min_capture:
+            elif state.confirmed_capture_at_width < target_capture:
                 use_sparse, reason = False, "low-confirmed-capture"
             elif state.sparse_since_confirmation >= self.config.confirmation_interval:
                 use_sparse, reason = False, "periodic-confirmation"
@@ -1106,8 +1420,11 @@ class MlpPilotOnlineController:
                 use_sparse=use_sparse,
                 reason=reason,
                 confirmed_rows=state.confirmed_rows,
-                capture_ema=state.capture_ema,
+                capture_ema=state.confirmed_capture_at_width,
                 sparse_waves_since_confirmation=state.sparse_since_confirmation,
+                selected_block_count=state.selected_block_count,
+                max_selected_block_count=self._max_blocks[layer],
+                required_score_mass=state.required_score_mass,
             )
 
     def _pilot_square_numpy(
@@ -1146,7 +1463,13 @@ class MlpPilotOnlineController:
             )
             return np.maximum(scores, 0.0)
 
-    def record_sparse(self, *, layer: int, row_count: int) -> None:
+    def record_sparse(
+        self,
+        *,
+        layer: int,
+        row_count: int,
+        selected_block_count: int | None = None,
+    ) -> None:
         """Commit one successfully executed sparse wave to the bounded ledger."""
 
         if (
@@ -1160,9 +1483,23 @@ class MlpPilotOnlineController:
             state = self._states.get(layer)
             if state is None:
                 raise KeyError(f"no online pilot model for layer {layer}")
+            executed_width = (
+                state.selected_block_count
+                if selected_block_count is None
+                else selected_block_count
+            )
+            if (
+                isinstance(executed_width, bool)
+                or not isinstance(executed_width, int)
+                or not self._models[layer].selected_block_count
+                <= executed_width
+                <= self._max_blocks[layer]
+            ):
+                raise ValueError("executed adaptive block width is invalid")
             state.sparse_waves += 1
             state.sparse_rows += row_count
             state.sparse_since_confirmation += 1
+            state.last_sparse_block_count = executed_width
             self._dirty = True
 
     @staticmethod
@@ -1271,17 +1608,52 @@ class MlpPilotOnlineController:
             pre_scores = state.coefficients[None, :, 0] + np.sum(
                 normalized * state.coefficients[None, :, 1:], axis=2
             )
-            selected = np.argsort(-pre_scores, axis=1, kind="stable")[
-                :, : model.selected_block_count
-            ]
-            captured = pilot.sum(axis=(1, 2), dtype=np.float64)
+            pre_scores = np.maximum(pre_scores, 0.0)
+            ranked = np.argsort(-pre_scores, axis=1, kind="stable")
+            pilot_total = pilot.sum(axis=(1, 2), dtype=np.float64)
             pilot_by_block = pilot.sum(axis=2, dtype=np.float64)
-            for row in range(rows):
-                blocks = selected[row]
-                captured[row] += float(
-                    (target[row, blocks] - pilot_by_block[row, blocks]).sum()
+            extra_target = np.maximum(target - pilot_by_block, 0.0)
+            ranked_extra = np.take_along_axis(extra_target, ranked, axis=1)
+            cumulative_extra = np.cumsum(ranked_extra, axis=1, dtype=np.float64)
+            ranked_scores = np.take_along_axis(pre_scores, ranked, axis=1)
+            cumulative_scores = np.cumsum(ranked_scores, axis=1, dtype=np.float64)
+            score_total = pre_scores.sum(axis=1, dtype=np.float64)
+            candidates = self._width_candidates(layer)
+            capture_by_width: dict[int, float] = {}
+            mass_by_width: dict[int, float] = {}
+            for count in candidates:
+                capture = np.clip(
+                    (pilot_total + cumulative_extra[:, count - 1]) / total,
+                    0.0,
+                    1.0,
                 )
-            route_capture = float(np.mean(np.clip(captured / total, 0.0, 1.0)))
+                score_mass = np.divide(
+                    cumulative_scores[:, count - 1],
+                    score_total,
+                    out=np.full(
+                        rows,
+                        count / model.block_count,
+                        dtype=np.float64,
+                    ),
+                    where=score_total > np.finfo(np.float64).tiny,
+                )
+                capture_by_width[count] = float(np.min(capture))
+                mass_by_width[count] = float(np.max(np.clip(score_mass, 0.0, 1.0)))
+            target_capture = max(
+                self.config.min_capture,
+                self.width_config.target_capture,
+            )
+            selected_block_count = candidates[-1]
+            for count in candidates:
+                if capture_by_width[count] >= target_capture:
+                    selected_block_count = count
+                    break
+            route_capture = capture_by_width[selected_block_count]
+            predicted_score_mass = mass_by_width[selected_block_count]
+            required_score_mass = min(
+                1.0,
+                predicted_score_mass + self.width_config.score_mass_margin,
+            )
 
             if bool(valid.any()):
                 valid_normalized = normalized[valid]
@@ -1313,19 +1685,26 @@ class MlpPilotOnlineController:
                     state.rhs = candidate_rhs
                     state.coefficients = coefficients
             previous_rows = state.confirmed_rows
+            previous_width = state.selected_block_count
             state.confirmed_rows = min(
                 self.config.max_confirmed_rows, previous_rows + rows
             )
             state.exact_waves += 1
             state.sparse_since_confirmation = 0
             state.last_capture = route_capture
+            state.selected_block_count = selected_block_count
+            state.predicted_score_mass = predicted_score_mass
+            state.required_score_mass = required_score_mass
+            if selected_block_count != previous_width:
+                state.width_updates += 1
             state.capture_ema = (
                 route_capture
-                if previous_rows == 0
+                if previous_rows == 0 or selected_block_count != previous_width
                 else self.config.confidence_decay * state.capture_ema
                 + (1.0 - self.config.confidence_decay) * route_capture
             )
-            surprising = route_capture < self.config.min_capture
+            state.confirmed_capture_at_width = state.capture_ema
+            surprising = route_capture < target_capture
             if surprising:
                 state.surprises += 1
             self._dirty = True
@@ -1336,6 +1715,9 @@ class MlpPilotOnlineController:
                 capture_ema=state.capture_ema,
                 confirmed_rows=state.confirmed_rows,
                 surprising=surprising,
+                selected_block_count=selected_block_count,
+                predicted_score_mass=predicted_score_mass,
+                required_score_mass=required_score_mass,
             )
 
     def flush(self) -> None:
@@ -1353,13 +1735,20 @@ class MlpPilotOnlineController:
             layers = [
                 {
                     "capture_ema": state.capture_ema,
+                    "confirmed_capture_at_width": state.confirmed_capture_at_width,
                     "confirmed_rows": state.confirmed_rows,
                     "exact_waves": state.exact_waves,
                     "last_capture": state.last_capture,
+                    "last_sparse_block_count": state.last_sparse_block_count,
                     "layer": layer,
+                    "max_selected_block_count": self._max_blocks[layer],
+                    "predicted_score_mass": state.predicted_score_mass,
+                    "required_score_mass": state.required_score_mass,
+                    "selected_block_count": state.selected_block_count,
                     "sparse_rows": state.sparse_rows,
                     "sparse_waves": state.sparse_waves,
                     "surprises": state.surprises,
+                    "width_updates": state.width_updates,
                 }
                 for layer, state in sorted(self._states.items())
             ]
@@ -1368,7 +1757,8 @@ class MlpPilotOnlineController:
                 "layers": layers,
                 "persistent": self._state_path is not None,
                 "plan_sha256": self.plan.sha256,
-                "schema": "immer.qwen-mlp-pilot-online-metrics/v1",
+                "schema": "immer.qwen-mlp-pilot-online-metrics/v2",
+                "width_policy_sha256": self.width_policy_sha256,
             }
 
     def close(self) -> None:
@@ -1391,6 +1781,8 @@ class MlpPilotOnlineController:
 
 
 __all__ = [
+    "LEGACY_PILOT_ONLINE_STATE_SCHEMA",
+    "PILOT_ADAPTIVE_WIDTH_CONFIG_SCHEMA",
     "PILOT_ONLINE_CONFIG_SCHEMA",
     "PILOT_ONLINE_OBSERVATION_SCHEMA",
     "PILOT_ONLINE_STATE_SCHEMA",
@@ -1399,6 +1791,7 @@ __all__ = [
     "WEIGHT_ONLY_INITIALIZER",
     "WEIGHT_ONLY_PLAN_SCHEMA",
     "MlpPilotIdentityAffinePlan",
+    "MlpPilotAdaptiveWidthConfig",
     "MlpPilotOnlineConfig",
     "MlpPilotOnlineController",
     "MlpPilotOnlineObservation",

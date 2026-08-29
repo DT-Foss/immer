@@ -797,6 +797,8 @@ from .mlp_pilot_residual import (
     MlpPilotResidualIntegrityError,
 )
 from .mlp_pilot_weight_only import (
+    LEGACY_PILOT_ONLINE_STATE_SCHEMA,
+    PILOT_ADAPTIVE_WIDTH_CONFIG_SCHEMA,
     PILOT_ONLINE_CONFIG_SCHEMA,
     PILOT_ONLINE_OBSERVATION_SCHEMA,
     PILOT_ONLINE_STATE_SCHEMA,
@@ -804,6 +806,7 @@ from .mlp_pilot_weight_only import (
     WEIGHT_ONLY_AFFINE_SCHEMA,
     WEIGHT_ONLY_INITIALIZER,
     WEIGHT_ONLY_PLAN_SCHEMA,
+    MlpPilotAdaptiveWidthConfig,
     MlpPilotIdentityAffinePlan,
     MlpPilotOnlineConfig,
     MlpPilotOnlineController,
@@ -1066,7 +1069,6 @@ from .world_model import (
     WorldFusionReceipt,
     WorldModelTamperError,
 )
-
 
 __all__ = [
     "ACTION_AUTHORITY_SCHEMA",
@@ -1932,12 +1934,15 @@ __all__ = [
     "MlpPilotResidualError",
     "MlpPilotResidualIntegrityError",
     "PILOT_ONLINE_CONFIG_SCHEMA",
+    "LEGACY_PILOT_ONLINE_STATE_SCHEMA",
+    "PILOT_ADAPTIVE_WIDTH_CONFIG_SCHEMA",
     "PILOT_ONLINE_OBSERVATION_SCHEMA",
     "PILOT_ONLINE_STATE_SCHEMA",
     "PILOT_SPARSE_DECISION_SCHEMA",
     "WEIGHT_ONLY_AFFINE_SCHEMA",
     "WEIGHT_ONLY_INITIALIZER",
     "WEIGHT_ONLY_PLAN_SCHEMA",
+    "MlpPilotAdaptiveWidthConfig",
     "MlpPilotIdentityAffinePlan",
     "MlpPilotOnlineConfig",
     "MlpPilotOnlineController",

@@ -26,12 +26,15 @@ from immer.runtimes.ooe.mlp_pilot_runtime import (
     MlpPilotTransposeManifest,
 )
 from immer.runtimes.ooe.mlp_pilot_weight_only import (
+    MlpPilotAdaptiveWidthConfig,
     MlpPilotOnlineConfig,
     MlpPilotWeightOnlyPlan,
+    MlpPilotWeightOnlyError,
     weight_only_model_pin,
 )
 from immer.runtimes.deepseek_v4.causal_weights import CausalWeightMount
 from immer.runtimes.qwen3_8.fast_mlp import (
+    ADAPTIVE_WIDTH_CONFIG_NAME,
     PILOT_WEIGHT_MANIFEST_SCHEMA,
     PILOT_WEIGHT_MANIFEST_V2_SCHEMA,
     WEIGHT_ONLY_PLAN_NAME,
@@ -531,8 +534,37 @@ class Qwen38FastMlpMountTests(unittest.TestCase):
                 output=torch.cat((output, second_output), dim=0),
             )
             self.assertIsNotNone(observation)
-            self.assertTrue(mount.executor.decision(layer=0, row_count=1).use_sparse)
+            assert observation is not None
+            decision = mount.executor.decision(layer=0, row_count=1)
+            self.assertTrue(decision.use_sparse)
+            self.assertEqual(
+                decision.selected_block_count,
+                observation.selected_block_count,
+            )
+            _adaptive_output, adaptive_trace = mount.executor.execute(
+                hidden,
+                layer=0,
+            )
+            executed_width = len(adaptive_trace.selected_blocks[0])
+            self.assertTrue(
+                all(
+                    len(blocks) == executed_width
+                    for blocks in adaptive_trace.selected_blocks
+                )
+            )
+            self.assertGreaterEqual(executed_width, decision.selected_block_count)
+            self.assertLessEqual(executed_width, decision.max_selected_block_count)
+            model = plan.models[0]
+            self.assertEqual(
+                adaptive_trace.selected_neuron_count,
+                model.block_count * model.pilot_count
+                + executed_width * (model.block_size - model.pilot_count),
+            )
             self.assertEqual(mount.metrics()["online_confirmed_rows"], 2)
+            self.assertEqual(
+                dict(mount.receipt.maximum_selected_block_count_by_layer)[0],
+                model.block_count - 1,
+            )
         finally:
             mount.close()
 
@@ -550,6 +582,34 @@ class Qwen38FastMlpMountTests(unittest.TestCase):
             self.fixture.router.to_bytes()
         )
         with self.assertRaisesRegex(Qwen38FastMlpError, "mixes fitted"):
+            self.fixture.open()
+
+    def test_adaptive_width_sidecar_is_bound_and_tamper_rejected(self) -> None:
+        self.fixture.enable_weight_only()
+        path = self.fixture.paths.analysis_root / ADAPTIVE_WIDTH_CONFIG_NAME
+        config = MlpPilotAdaptiveWidthConfig(
+            max_selected_block_count=2,
+            selected_block_step=1,
+            target_capture=0.6,
+        )
+        path.write_bytes(config.to_bytes())
+        mount = self.fixture.open()
+        try:
+            self.assertEqual(
+                dict(mount.receipt.maximum_selected_block_count_by_layer),
+                {0: 2, 1: 2},
+            )
+            self.assertEqual(
+                mount.executor.online_controller.width_config.sha256,
+                config.sha256,
+            )
+        finally:
+            mount.close()
+
+        payload = bytearray(path.read_bytes())
+        payload[-1] ^= 1
+        path.write_bytes(payload)
+        with self.assertRaises(MlpPilotWeightOnlyError):
             self.fixture.open()
 
 

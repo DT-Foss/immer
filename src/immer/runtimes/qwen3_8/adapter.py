@@ -992,7 +992,10 @@ class Qwen38CausalChat:
                     )
                 }
                 for key in (
+                    "adaptive_width_policy_sha256",
                     "initialization",
+                    "maximum_selected_block_count_by_layer",
+                    "maximum_transport_row_fraction_by_layer",
                     "online_config_sha256",
                     "online_state_persistent",
                 ):
@@ -1311,6 +1314,7 @@ class Qwen38CausalChat:
             "online_sparse_rows",
             "online_sparse_waves",
             "online_surprises",
+            "online_width_updates",
         ):
             if field in delta:
                 request[field] = delta[field]

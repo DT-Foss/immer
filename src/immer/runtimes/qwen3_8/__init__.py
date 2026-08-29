@@ -49,6 +49,7 @@ from .encoding import (
 )
 from .graft import Qwen38StableCrsaGraft
 from .fast_mlp import (
+    ADAPTIVE_WIDTH_CONFIG_NAME,
     FAST_MLP_MOUNT_SCHEMA,
     PILOT_WEIGHT_MANIFEST_SCHEMA,
     PILOT_WEIGHT_MANIFEST_V2_SCHEMA,
@@ -233,7 +234,6 @@ from .speculative import (
     ReconciledDraftProvider,
 )
 
-
 __all__ = [
     "ANCHOR_BATTERY_STATE_SCHEMA",
     "AnchorBatteryController",
@@ -280,6 +280,7 @@ __all__ = [
     "ExactHeadReceipt",
     "EvidencePolicy",
     "FAST_MLP_MOUNT_SCHEMA",
+    "ADAPTIVE_WIDTH_CONFIG_NAME",
     "DraftProvider",
     "K4DraftProvider",
     "K4ReconciledDraftProvider",

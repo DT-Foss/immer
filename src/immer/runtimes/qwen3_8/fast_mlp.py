@@ -10,6 +10,8 @@ from pathlib import Path
 import stat
 from typing import Mapping, Sequence, cast
 
+import torch
+
 from ...knowledge.streamer import Streamer
 from ..deepseek_v4.causal_weights import CausalWeightMount
 from ..ooe.identity import canonical_json_bytes, require_sha256
@@ -21,6 +23,7 @@ from ..ooe.mlp_pilot_runtime import (
 )
 from ..ooe.mlp_pilot_weight_only import (
     WEIGHT_ONLY_INITIALIZER,
+    MlpPilotAdaptiveWidthConfig,
     MlpPilotIdentityAffinePlan,
     MlpPilotOnlineController,
     MlpPilotWeightOnlyPlan,
@@ -32,6 +35,7 @@ FAST_MLP_MOUNT_SCHEMA = "immer.qwen3.8-fast-mlp-mount/v1"
 PILOT_WEIGHT_MANIFEST_SCHEMA = "immer.qwen3.8-mlp-pilot-weight-bank/v1"
 PILOT_WEIGHT_MANIFEST_V2_SCHEMA = "immer.qwen3.8-mlp-pilot-weight-bank/v2"
 WEIGHT_ONLY_PLAN_NAME = "weight-only-plan.json"
+ADAPTIVE_WIDTH_CONFIG_NAME = "adaptive-width.json"
 
 
 class Qwen38FastMlpError(RuntimeError):
@@ -224,15 +228,27 @@ class Qwen38FastMlpReceipt:
     initialization: str = "sealed-prompt-fit/v1"
     online_config_sha256: str | None = None
     online_state_persistent: bool = False
+    adaptive_width_policy_sha256: str | None = None
+    maximum_selected_block_count_by_layer: tuple[tuple[int, int], ...] = ()
+    maximum_transport_row_fraction_by_layer: tuple[tuple[int, float], ...] = ()
 
     def to_record(self) -> dict[str, object]:
         return {
             "active_layers": list(self.active_layers),
+            "adaptive_width_policy_sha256": self.adaptive_width_policy_sha256,
             "affine_fit_sha256": self.affine_fit_sha256,
             "execution": "row-routed-sparse-mlp",
             "fitted_layers": list(self.fitted_layers),
             "initialization": self.initialization,
             "model_pin_sha256": self.model_pin_sha256,
+            "maximum_selected_block_count_by_layer": {
+                str(layer): count
+                for layer, count in self.maximum_selected_block_count_by_layer
+            },
+            "maximum_transport_row_fraction_by_layer": {
+                str(layer): fraction
+                for layer, fraction in self.maximum_transport_row_fraction_by_layer
+            },
             "online_config_sha256": self.online_config_sha256,
             "online_state_persistent": self.online_state_persistent,
             "pilot_manifest_body_sha256": self.pilot_manifest_body_sha256,
@@ -303,6 +319,7 @@ class Qwen38FastMlpMount:
                 "sparse_rows",
                 "sparse_waves",
                 "surprises",
+                "width_updates",
             ):
                 result[f"online_{field}"] = sum(
                     int(row.get(field, 0))
@@ -604,6 +621,7 @@ def open_qwen38_fast_mlp(
     )
     plan_present = plan_path.exists() or plan_path.is_symlink()
     legacy_present = tuple(path.exists() or path.is_symlink() for path in legacy_paths)
+    width_config: MlpPilotAdaptiveWidthConfig | None = None
     if plan_present and any(legacy_present):
         raise Qwen38FastMlpError(
             "fast-MLP analysis mixes fitted and weight-only initialization"
@@ -640,6 +658,12 @@ def open_qwen38_fast_mlp(
                 "weight-only plan differs from the mounted weight layout"
             )
         affine: MlpPilotAffineFit | MlpPilotIdentityAffinePlan = router.affine_fit
+        width_path = paths.analysis_root / ADAPTIVE_WIDTH_CONFIG_NAME
+        width_config = (
+            MlpPilotAdaptiveWidthConfig.from_bytes(_stable_read(width_path, 64 * 1024))
+            if width_path.exists() or width_path.is_symlink()
+            else MlpPilotAdaptiveWidthConfig()
+        )
         initialization = WEIGHT_ONLY_INITIALIZER
     else:
         if legacy_present != (True, True):
@@ -752,9 +776,39 @@ def open_qwen38_fast_mlp(
             close_source=True,
         )
         if isinstance(router, MlpPilotWeightOnlyPlan):
+            assert width_config is not None
+            block_bytes = (
+                router.config.block_size
+                * router.hidden_dimension
+                * torch.empty((), dtype=target_pager.compute_dtype).element_size()
+            )
+            resident_limits = (
+                max_resident_bytes,
+                getattr(target_pager, "max_resident_bytes", max_resident_bytes),
+            )
+            resident_block_limit = min(
+                int(limit) // block_bytes
+                for limit in resident_limits
+                if isinstance(limit, int) and not isinstance(limit, bool)
+            )
+            effective_maximum = min(
+                width_config.max_selected_block_count,
+                resident_block_limit,
+            )
+            if effective_maximum < router.config.selected_block_count:
+                raise Qwen38FastMlpError(
+                    "fast-MLP residency cannot hold its minimum adaptive route"
+                )
+            effective_width_config = MlpPilotAdaptiveWidthConfig(
+                max_selected_block_count=effective_maximum,
+                selected_block_step=width_config.selected_block_step,
+                score_mass_margin=width_config.score_mass_margin,
+                target_capture=width_config.target_capture,
+            )
             online_controller = MlpPilotOnlineController(
                 router,
                 state_path=online_state_path,
+                width_config=effective_width_config,
             )
         executor = MlpPilotSparseExecutor(
             router,
@@ -783,6 +837,35 @@ def open_qwen38_fast_mlp(
             for row in router.models
             if executor.supports_layer(row.layer)
         )
+        maximum_block_counts = (
+            ()
+            if online_controller is None
+            else tuple(
+                (
+                    row.layer,
+                    online_controller.max_selected_block_count(layer=row.layer),
+                )
+                for row in router.models
+                if executor.supports_layer(row.layer)
+            )
+        )
+        maximum_transport_fractions = (
+            ()
+            if online_controller is None
+            else tuple(
+                (
+                    row.layer,
+                    (
+                        row.block_count * row.pilot_count
+                        + online_controller.max_selected_block_count(layer=row.layer)
+                        * row.block_size
+                    )
+                    / row.intermediate_dimension,
+                )
+                for row in router.models
+                if executor.supports_layer(row.layer)
+            )
+        )
         receipt = Qwen38FastMlpReceipt(
             model_pin_sha256=router.model_pin_sha256,
             router_fit_sha256=router.sha256,
@@ -799,6 +882,13 @@ def open_qwen38_fast_mlp(
                 None if online_controller is None else online_controller.config.sha256
             ),
             online_state_persistent=online_state_path is not None,
+            adaptive_width_policy_sha256=(
+                None
+                if online_controller is None
+                else online_controller.width_policy_sha256
+            ),
+            maximum_selected_block_count_by_layer=maximum_block_counts,
+            maximum_transport_row_fraction_by_layer=maximum_transport_fractions,
         )
         return Qwen38FastMlpMount(executor, transpose_pager, pilot_pager, receipt)
     except Exception:
@@ -816,6 +906,7 @@ def open_qwen38_fast_mlp(
 
 
 __all__ = [
+    "ADAPTIVE_WIDTH_CONFIG_NAME",
     "FAST_MLP_MOUNT_SCHEMA",
     "PILOT_WEIGHT_MANIFEST_SCHEMA",
     "PILOT_WEIGHT_MANIFEST_V2_SCHEMA",
