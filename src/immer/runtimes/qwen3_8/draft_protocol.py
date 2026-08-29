@@ -13,7 +13,7 @@ from typing import Sequence
 ROLLING_DRAFT_HORIZON_SCHEMA = "immer.qwen3.8-rolling-draft-horizon/v2"
 ROLLING_DRAFT_PROPOSAL_SCHEMA = "immer.qwen3.8-rolling-draft-proposal/v2"
 ROUND_WINDOW_POLICY_SCHEMA = "immer.qwen3.8-round-window-policy/v2"
-STANDARD_ROLLING_WINDOWS = (4, 8, 16)
+STANDARD_ROLLING_WINDOWS = (2, 4, 8, 16)
 ROUND_ROLLING_WINDOWS = (1, *STANDARD_ROLLING_WINDOWS)
 _HEX = frozenset("0123456789abcdef")
 
@@ -38,11 +38,7 @@ def _finite(
 
 
 def _uint(value: object, *, field: str, positive: bool = False) -> int:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < int(positive)
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or value < int(positive):
         qualifier = "positive" if positive else "non-negative"
         raise ValueError(f"{field} must be a {qualifier} integer")
     return value
@@ -145,13 +141,9 @@ class RoundWindowPolicy:
             raise ValueError("request window ceiling is invalid")
         _uint(self.remaining_tokens, field="remaining_tokens", positive=True)
         eligible = tuple(self.eligible_windows)
-        if (
-            tuple(sorted(set(eligible))) != eligible
-            or any(
-                window not in ROUND_ROLLING_WINDOWS
-                or window > self.request_window_ceiling
-                for window in eligible
-            )
+        if tuple(sorted(set(eligible))) != eligible or any(
+            window not in ROUND_ROLLING_WINDOWS or window > self.request_window_ceiling
+            for window in eligible
         ):
             raise ValueError("eligible round windows are invalid")
         if (
@@ -167,9 +159,7 @@ class RoundWindowPolicy:
         visible_drafts = max(0, self.remaining_tokens - 1)
 
         def utility(row: RollingDraftHorizon) -> float:
-            expected = sum(
-                row.prefix_survival_probabilities[:visible_drafts]
-            )
+            expected = sum(row.prefix_survival_probabilities[:visible_drafts])
             return (1.0 + expected) / row.work_proxy
 
         expected_window = max(
@@ -344,7 +334,7 @@ class RollingDraftProposal:
                 effective_probabilities.append(probability)
                 survival *= probability
                 expected += survival
-            work_proxy = 1.0 + width / 16.0
+            work_proxy = 1.9 if window == 2 else 1.0 + width / 16.0
             horizons.append(
                 RollingDraftHorizon(
                     window=window,
@@ -397,15 +387,11 @@ class RollingDraftProposal:
         _uint(remaining_tokens, field="remaining_tokens", positive=True)
         visible_drafts = max(0, remaining_tokens - 1)
         eligible = tuple(
-            row for row in self.horizons
-            if row.window <= request_window_ceiling
+            row for row in self.horizons if row.window <= request_window_ceiling
         )
         if window_work_costs is not None:
             costs = dict(window_work_costs)
-            if any(
-                window not in ROUND_ROLLING_WINDOWS
-                for window in costs
-            ):
+            if any(window not in ROUND_ROLLING_WINDOWS for window in costs):
                 raise ValueError("round window work costs contain an invalid window")
             adjusted = []
             for row in eligible:
@@ -424,9 +410,7 @@ class RollingDraftProposal:
             eligible = tuple(adjusted)
 
         def remaining_utility(row: RollingDraftHorizon) -> float:
-            expected = sum(
-                row.prefix_survival_probabilities[:visible_drafts]
-            )
+            expected = sum(row.prefix_survival_probabilities[:visible_drafts])
             return (1.0 + expected) / row.work_proxy
 
         chosen = max(

@@ -51,6 +51,10 @@ from .markov_draft import (
     MARKOV_DRAFT_STATE_SCHEMA,
     FingerprintRollingK4DraftProvider,
 )
+from .mtp_draft import (
+    QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
+    Qwen35MtpDraftProvider,
+)
 from .pager import Qwen38WeightPager
 from .q4 import Q4Bank
 from .q4_delta_router import PackedDeltaHeadRouter
@@ -1132,8 +1136,8 @@ class Qwen38CausalChat:
             draft_bundle_path, (str, Path)
         ):
             raise TypeError("draft_bundle_path must be a local path or None")
-        if draft_mode is not None and draft_mode not in {"qwen35", "markov"}:
-            raise ValueError("draft_mode must be qwen35, markov, or None")
+        if draft_mode is not None and draft_mode not in {"qwen35", "markov", "mtp"}:
+            raise ValueError("draft_mode must be qwen35, markov, mtp, or None")
         if (
             isinstance(draft_window, bool)
             or not isinstance(draft_window, int)
@@ -1157,8 +1161,14 @@ class Qwen38CausalChat:
             raise ValueError("qwen35 draft mode requires draft_bundle_path")
         if draft_mode == "markov" and draft_bundle_path is not None:
             raise ValueError("markov draft mode does not use a draft bundle")
-        if draft_mode != "markov" and markov_draft_state_path is not None:
-            raise ValueError("markov_draft_state_path requires markov draft mode")
+        if draft_mode == "mtp" and draft_bundle_path is not None:
+            raise ValueError("MTP draft mode uses the target checkpoint branch")
+        if draft_mode == "mtp" and q4_root is None:
+            raise ValueError("MTP draft mode requires the local Q4 bank")
+        if draft_mode not in {"markov", "mtp"} and markov_draft_state_path is not None:
+            raise ValueError(
+                "markov_draft_state_path requires markov or MTP draft mode"
+            )
         if draft_window_state_path is not None and draft_mode is None:
             raise ValueError("draft_window_state_path requires a rolling draft mode")
         if draft_window_state_path is not None and draft_window < min(
@@ -1401,8 +1411,8 @@ class Qwen38CausalChat:
                         "phrase-width",
                     ],
                     "round_window_selector": (
-                        "markov-prefix-utility/v1"
-                        if self._draft_mode == "markov"
+                        "markov-prefix-utility/v2"
+                        if self._draft_mode in {"markov", "mtp"}
                         else "fixed-request-window"
                     ),
                     "short_window_fallback": short_fixed_eligible,
@@ -1416,7 +1426,7 @@ class Qwen38CausalChat:
                     "repo_id": QWEN35_DRAFTER_REPO_ID,
                     "revision": QWEN35_DRAFTER_REVISION,
                 }
-            else:
+            elif self._draft_mode == "markov":
                 policy["markov_draft"] = {
                     "max_history_tokens": 4096,
                     "max_order": 16,
@@ -1432,12 +1442,18 @@ class Qwen38CausalChat:
                         max(0, int(policy["draft_window"]) - 1),
                     ),
                     "provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
-                    "round_window_selector": (
-                        "markov-prefix-utility/v1"
-                        if self._draft_window_controller is not None
-                        else "fixed-request-window"
-                    ),
+                    "round_window_selector": "markov-prefix-utility/v2",
                     "persistent": self._markov_draft_state_path is not None,
+                }
+            else:
+                policy["mtp_draft"] = {
+                    "provider_abi": QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
+                    "layers": 1,
+                    "shared_embedding": True,
+                    "shared_lm_head": True,
+                    "target_hidden_conditioning": True,
+                    "persistent_calibration": self._markov_draft_state_path is not None,
+                    "round_window_selector": "markov-prefix-utility/v2",
                 }
         elif self._draft_mode is not None:
             policy["draft_fallback"] = {
@@ -1584,6 +1600,21 @@ class Qwen38CausalChat:
                 "kind": "qwen35",
                 "repo_id": QWEN35_DRAFTER_REPO_ID,
                 "revision": QWEN35_DRAFTER_REVISION,
+            }
+        elif self._draft_mode == "mtp":
+            provider = {
+                "kind": "embedded-qwen35-mtp",
+                "schema": QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
+                "q4_manifest_sha256": getattr(
+                    getattr(self._runtime, "q4_bank", None),
+                    "identity",
+                    {},
+                ).get("manifest_sha256"),
+                "state_path": (
+                    None
+                    if self._markov_draft_state_path is None
+                    else str(self._markov_draft_state_path)
+                ),
             }
         else:
             raise Qwen38ChatError("draft-window identity lacks a draft provider")
@@ -1837,16 +1868,30 @@ class Qwen38CausalChat:
                 head_block_rows=self._head_block_rows,
                 window_size=draft_window,
             )
-        else:
+        elif self._draft_mode == "markov":
             provider = FingerprintRollingK4DraftProvider(
                 vocab_size=runtime.model.config.vocab_size,
                 state_path=self._markov_draft_state_path,
                 proposal_width=draft_window - 1,
             )
+        else:
+            provider = Qwen35MtpDraftProvider(
+                runtime.model.config,
+                runtime.model.pager,
+                eos_token_ids=eos,
+                head_block_rows=self._head_block_rows,
+                proposal_width=draft_window - 1,
+                state_path=self._markov_draft_state_path,
+            )
         rolling_started = time.perf_counter()
         rolling_source_start = _runtime_source_body_bytes(runtime)
         adaptive_rounds = (
-            self._draft_mode == "markov" and draft_window in DRAFT_WINDOW_ACTIONS
+            self._draft_mode
+            in {
+                "markov",
+                "mtp",
+            }
+            and draft_window in DRAFT_WINDOW_ACTIONS
         )
         decoder_options: dict[str, Any] = {
             "window_size": draft_window,
@@ -1859,7 +1904,7 @@ class Qwen38CausalChat:
             # rows.  A 10% reuse credit allows only near-certain phrases to beat
             # direct K1 instead of letting marginal confidence multiply work.
             decoder_options["round_window_work_costs"] = {
-                window: 1.0 + 0.9 * (window - 1) for window in (1, 4, 8, 16)
+                window: 1.0 + 0.9 * (window - 1) for window in (1, 2, 4, 8, 16)
             }
         try:
             generated = Qwen38K4SpeculativeDecoder(

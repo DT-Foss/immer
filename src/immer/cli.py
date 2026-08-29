@@ -15,18 +15,50 @@ from .substrate import LifeDaemon
 
 
 COMPONENTS = (
-    ("FERTIG", "grounded deterministic execution and verification", "vendored + runtime adapter"),
+    (
+        "FERTIG",
+        "grounded deterministic execution and verification",
+        "vendored + runtime adapter",
+    ),
     ("CRSA", "Causal Prefix Sinkhorn Attention", "integrated operators"),
-    ("WorldStream", "exact local and pinned-remote Safetensors ranges", "integrated tensor source"),
+    (
+        "WorldStream",
+        "exact local and pinned-remote Safetensors ranges",
+        "integrated tensor source",
+    ),
     ("LiveCausal", "append-only causal control plane", "integrated lazy graph"),
-    ("CausalWeights", "local weight bundle and exact causal range routes", "integrated Qwen pager path"),
-    ("Qwen3.8", "complete local causal teacher and novelty fallback", "primary runtime"),
-    ("OoE", "persistent PS-Lifted Markov agents and executable Crystals", "integrated runtime"),
+    (
+        "CausalWeights",
+        "local weight bundle and exact causal range routes",
+        "integrated Qwen pager path",
+    ),
+    (
+        "Qwen3.8",
+        "complete local causal teacher and novelty fallback",
+        "primary runtime",
+    ),
+    (
+        "OoE",
+        "persistent PS-Lifted Markov agents and executable Crystals",
+        "integrated runtime",
+    ),
     ("AnchorBattery", "authenticated prefix-state restoration", "integrated Qwen path"),
     ("DeepSeekV4", "complete 43-layer frontier decoder", "retained backend"),
-    ("MarkovRouter", "label-free next-layer expert transport hints", "integrated evaluation path"),
-    ("OrganBank", "digest-addressed exact capabilities", "integrated artifact registry"),
-    ("o1-state", "persistent life stream outside frozen execution", "integrated runtime"),
+    (
+        "MarkovRouter",
+        "label-free next-layer expert transport hints",
+        "integrated evaluation path",
+    ),
+    (
+        "OrganBank",
+        "digest-addressed exact capabilities",
+        "integrated artifact registry",
+    ),
+    (
+        "o1-state",
+        "persistent life stream outside frozen execution",
+        "integrated runtime",
+    ),
 )
 
 
@@ -47,6 +79,7 @@ def _sorted_layer_list(value: str) -> tuple[int, ...]:
         )
     return layers
 
+
 def _s3_manifest(configured: str | Path | None = None) -> Path:
     """Resolve the one deployment manifest used by solve, serve and organs."""
 
@@ -59,7 +92,9 @@ def _s3_manifest(configured: str | Path | None = None) -> Path:
     return Path(selected).expanduser().resolve()
 
 
-def _artifact_root(manifest: str | Path, configured: str | Path | None = None) -> Path | None:
+def _artifact_root(
+    manifest: str | Path, configured: str | Path | None = None
+) -> Path | None:
     from .artifacts import artifact_root
 
     return artifact_root(manifest, configured)
@@ -69,9 +104,8 @@ _QWEN38_DEPLOYMENT_ROOT = Path("/app/models/Qwen3.8-27B")
 _QWEN38_DEPLOYMENT_WARM_ROOT = Path(
     "/root/immer-runtime/artifacts/private/qwen3.8-ooe-chat-real"
 )
-_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE = Path(
-    "/root/immer-state/qwen-markov-q4-v1.bin"
-)
+_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE = Path("/root/immer-state/qwen-markov-q4-v1.bin")
+_QWEN38_DEPLOYMENT_MTP_STATE = Path("/root/immer-state/qwen-mtp-q4-v1.json")
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
     b"immer:qwen3.8-growing-warm-runtime/v1"
 ).hexdigest()
@@ -131,9 +165,12 @@ def _resolve_qwen38_chat_paths(
         "IMMER_QWEN38_Q4",
     )
     if q4 is None and root is not None:
-        candidate = root / "causal" / "q4-base-v2"
-        if candidate.is_dir():
-            q4 = candidate
+        candidates = (
+            (root / "causal" / "q4-base-v3-mtp", root / "causal" / "q4-base-v2")
+            if getattr(args, "draft_mode", None) == "mtp"
+            else (root / "causal" / "q4-base-v2",)
+        )
+        q4 = next((candidate for candidate in candidates if candidate.is_dir()), None)
 
     disable_fast_mlp = bool(getattr(args, "no_fast_mlp", False))
     if disable_fast_mlp and getattr(args, "fast_mlp", None) is not None:
@@ -148,8 +185,7 @@ def _resolve_qwen38_chat_paths(
     )
     if bundle is None or tokenizer is None:
         raise ValueError(
-            "local Qwen is not configured; set --qwen38-root or "
-            "IMMER_QWEN38_ROOT"
+            "local Qwen is not configured; set --qwen38-root or IMMER_QWEN38_ROOT"
         )
     return bundle, tokenizer, q4, fast_mlp
 
@@ -160,9 +196,7 @@ def _resolve_qwen38_warm_root(
 ) -> Path | None:
     if bool(getattr(args, "no_ooe_warm", False)):
         if getattr(args, "ooe_warm_root", None) is not None:
-            raise ValueError(
-                "--ooe-warm-root and --no-ooe-warm are mutually exclusive"
-            )
+            raise ValueError("--ooe-warm-root and --no-ooe-warm are mutually exclusive")
         return None
     configured = _chat_path(
         getattr(args, "ooe_warm_root", None),
@@ -170,10 +204,7 @@ def _resolve_qwen38_warm_root(
     )
     if configured is not None:
         return configured
-    if (
-        bundle_path == _QWEN38_DEPLOYMENT_ROOT
-        and _QWEN38_DEPLOYMENT_WARM_ROOT.is_dir()
-    ):
+    if bundle_path == _QWEN38_DEPLOYMENT_ROOT and _QWEN38_DEPLOYMENT_WARM_ROOT.is_dir():
         return _QWEN38_DEPLOYMENT_WARM_ROOT
     return None
 
@@ -201,6 +232,13 @@ def _resolve_qwen38_markov_draft(
         and _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE.is_file()
     ):
         return "markov", str(_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE)
+    if (
+        draft_mode == "mtp"
+        and markov_state is None
+        and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+        and q4_root is not None
+    ):
+        return "mtp", str(_QWEN38_DEPLOYMENT_MTP_STATE)
     return draft_mode, markov_state
 
 
@@ -229,9 +267,7 @@ def _qwen38_growing_warm_profile(
         "draft_window": args.draft_window,
         "head_block_rows": args.head_block_rows,
         "markov_provider_abi": (
-            "immer.qwen3.8-markov-draft-provider/v8"
-            if draft_mode == "markov"
-            else None
+            "immer.qwen3.8-markov-draft-provider/v8" if draft_mode == "markov" else None
         ),
         "max_context_tokens": args.max_context_tokens,
         "max_new_tokens": args.max_new_tokens,
@@ -380,13 +416,19 @@ def _solve(
         s3_artifact_root=artifact_root,
     )
     result = composition.dispatch("exact_math", question)
-    print(json.dumps({
-        "status": result.status.value,
-        "component": result.component,
-        "output": result.output,
-        "reason": result.reason,
-        "evidence": dict(result.evidence),
-    }, ensure_ascii=False, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "status": result.status.value,
+                "component": result.component,
+                "output": result.output,
+                "reason": result.reason,
+                "evidence": dict(result.evidence),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
     return 0 if result.ok else 2
 
 
@@ -406,9 +448,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
     jsonl = bool(getattr(args, "jsonl", False))
     message = getattr(args, "message", None)
     max_requests = getattr(args, "max_requests", None)
-    output_mode = getattr(args, "output", None) or (
-        "json" if jsonl else "text"
-    )
+    output_mode = getattr(args, "output", None) or ("json" if jsonl else "text")
     stream_enabled = (
         not jsonl
         and output_mode == "text"
@@ -474,13 +514,10 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 raise ValueError("JSONL chat requires --output json")
             if message is not None:
                 raise ValueError("chat message and --jsonl are mutually exclusive")
-            if (
-                max_requests is not None
-                and (
-                    isinstance(max_requests, bool)
-                    or not isinstance(max_requests, int)
-                    or max_requests <= 0
-                )
+            if max_requests is not None and (
+                isinstance(max_requests, bool)
+                or not isinstance(max_requests, int)
+                or max_requests <= 0
             ):
                 raise ValueError("max_requests must be a positive integer")
         elif not isinstance(message, str) or not message.strip():
@@ -528,9 +565,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 args.system_prompt,
                 text,
             )
-            token_sha256 = prompt_token_sha256(
-                warm_prompt_tokenizer.encode(rendered)
-            )
+            token_sha256 = prompt_token_sha256(warm_prompt_tokenizer.encode(rendered))
             return {
                 "qwen_token_sha256": token_sha256,
                 "qwen_warm_runtime_profile_sha256": warm_profile_sha256,
@@ -540,6 +575,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             metadata = request_metadata_for(question)
             expected = metadata.get("qwen_token_sha256")
             return expected is not None and hmac.compare_digest(expected, claimed)
+
         warm_mount = None
         if not args.raw_qwen:
             warm_root = _resolve_qwen38_warm_root(args, bundle_path)
@@ -553,14 +589,10 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                         else None
                     ),
                     template_output_character_limit=(
-                        args.max_new_tokens
-                        if warm_profile_sha256 is not None
-                        else None
+                        args.max_new_tokens if warm_profile_sha256 is not None else None
                     ),
                     prompt_token_verifier=(
-                        verify_prompt_token
-                        if warm_profile_sha256 is not None
-                        else None
+                        verify_prompt_token if warm_profile_sha256 is not None else None
                     ),
                 )
         anchor_cache = (
@@ -724,11 +756,17 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 flush=True,
             )
         else:
-            print(json.dumps({
-                "status": "error",
-                "component": "qwen3.8.fertig-chat",
-                "reason": f"{type(exc).__name__}: {exc}",
-            }, ensure_ascii=False, sort_keys=True))
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "component": "qwen3.8.fertig-chat",
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
         return 2
     finally:
         close = getattr(component, "close", None)
@@ -742,11 +780,16 @@ def _doctor(*, deep: bool = False, artifact_root: str | Path | None = None) -> i
     from .runtimes.o1_state.adapter import is_available as o1state_available
 
     fertig_root = os.environ.get("IMMER_FERTIG_ROOT")
-    vendor_solver = Path(__file__).parent / "cognition" / "fertig" / "_vendor" / "fertig" / "solver.py"
+    vendor_solver = (
+        Path(__file__).parent
+        / "cognition"
+        / "fertig"
+        / "_vendor"
+        / "fertig"
+        / "solver.py"
+    )
     configured_solver = (
-        Path(fertig_root).expanduser() / "fertig" / "solver.py"
-        if fertig_root
-        else None
+        Path(fertig_root).expanduser() / "fertig" / "solver.py" if fertig_root else None
     )
     solver_ready = vendor_solver.is_file() or bool(
         configured_solver is not None and configured_solver.is_file()
@@ -771,15 +814,23 @@ def _doctor(*, deep: bool = False, artifact_root: str | Path | None = None) -> i
         (
             "FERTIG-graph",
             graph_ready,
-            str(Path(graph_setting).expanduser()) if graph_setting else "optional; set IMMER_FERTIG_GRAPH",
+            str(Path(graph_setting).expanduser())
+            if graph_setting
+            else "optional; set IMMER_FERTIG_GRAPH",
             False,
         ),
-        ("Action-gates", True, "desktop/recorder/mutations require explicit backends", True),
+        (
+            "Action-gates",
+            True,
+            "desktop/recorder/mutations require explicit backends",
+            True,
+        ),
         ("o1-state", o1state_available(), "pip install -e '.[neural]'", True),
         ("SHIP-v6", organ_ready, organ_detail, True),
     ]
     try:
         import torch  # noqa: F401
+
         crsa = True
     except ImportError:
         crsa = False
@@ -829,12 +880,22 @@ def _organs(args: argparse.Namespace) -> int:
             print(f"{name:24} {descriptor.capability:16} {descriptor.group}")
         return 0
     artifact = bank.verify(args.name)
-    print(json.dumps({"organ": args.name, "verified": True, "artifact": str(artifact)}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {"organ": args.name, "verified": True, "artifact": str(artifact)},
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 
 def _artifacts(args: argparse.Namespace) -> int:
-    from .artifacts import ArtifactBootstrapError, import_artifacts, load_artifact_specs, sha256_file
+    from .artifacts import (
+        ArtifactBootstrapError,
+        import_artifacts,
+        load_artifact_specs,
+        sha256_file,
+    )
 
     manifest = _s3_manifest(args.manifest)
     if args.artifact_command == "verify":
@@ -845,7 +906,11 @@ def _artifacts(args: argparse.Namespace) -> int:
             )
             rows = []
             for spec in specs:
-                actual = sha256_file(spec.destination) if spec.destination.is_file() else None
+                actual = (
+                    sha256_file(spec.destination)
+                    if spec.destination.is_file()
+                    else None
+                )
                 rows.append(
                     {
                         "label": spec.label,
@@ -856,10 +921,18 @@ def _artifacts(args: argparse.Namespace) -> int:
                     }
                 )
             passed = all(row["verified"] for row in rows)
-            print(json.dumps({"status": "ok" if passed else "missing", "artifacts": rows}, sort_keys=True))
+            print(
+                json.dumps(
+                    {"status": "ok" if passed else "missing", "artifacts": rows},
+                    sort_keys=True,
+                )
+            )
             return 0 if passed else 1
         except ArtifactBootstrapError as exc:
-            print(json.dumps({"status": "error", "reason": str(exc)}, sort_keys=True), file=sys.stderr)
+            print(
+                json.dumps({"status": "error", "reason": str(exc)}, sort_keys=True),
+                file=sys.stderr,
+            )
             return 2
     try:
         report = import_artifacts(
@@ -870,7 +943,10 @@ def _artifacts(args: argparse.Namespace) -> int:
             configured_root=args.artifact_root,
         )
     except ArtifactBootstrapError as exc:
-        print(json.dumps({"status": "error", "reason": str(exc)}, sort_keys=True), file=sys.stderr)
+        print(
+            json.dumps({"status": "error", "reason": str(exc)}, sort_keys=True),
+            file=sys.stderr,
+        )
         return 2
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0
@@ -1039,7 +1115,10 @@ def _serve(args: argparse.Namespace) -> int:
         )
     harvester = donor if donor.available() else qwen
     library = Library(SpanStore(state.parent / "memory.json"), harvester=harvester)
-    metrics = Metrics(status_path=state.parent / "status.json", jsonl_path=state.parent / "metrics.jsonl")
+    metrics = Metrics(
+        status_path=state.parent / "status.json",
+        jsonl_path=state.parent / "metrics.jsonl",
+    )
 
     bank = None
     manifest = _s3_manifest(args.manifest)
@@ -1104,7 +1183,9 @@ def _serve(args: argparse.Namespace) -> int:
         if text == "/quit":
             break
         if text == "/state":
-            print(json.dumps(metrics.emit(gauges()), ensure_ascii=False, sort_keys=True))
+            print(
+                json.dumps(metrics.emit(gauges()), ensure_ascii=False, sort_keys=True)
+            )
             continue
         if text.startswith("/say "):
             daemon.say("utterance", text[5:])
@@ -1154,16 +1235,30 @@ def _serve(args: argparse.Namespace) -> int:
                 metrics.bump("math_abstained")
                 # Abstinenz heißt nicht Endstation: gleiche Kaskade wie Chat
                 _answer_via_cascade(
-                    intent.payload, library, council, donor, qwen, daemon, history,
-                    metrics, stream,
+                    intent.payload,
+                    library,
+                    council,
+                    donor,
+                    qwen,
+                    daemon,
+                    history,
+                    metrics,
+                    stream,
                 )
         elif intent.kind == "STATUS":
             metrics.bump("status")
             print(json.dumps(metrics.snapshot(gauges()), ensure_ascii=False))
         else:  # CHAT — Stufen: Bibliothek (0 ms) → Entwurf → Donor → Veredelung im Hintergrund
             _answer_via_cascade(
-                intent.payload, library, council, donor, qwen, daemon, history,
-                metrics, stream,
+                intent.payload,
+                library,
+                council,
+                donor,
+                qwen,
+                daemon,
+                history,
+                metrics,
+                stream,
             )
             metrics.bump("chat")
 
@@ -1211,7 +1306,9 @@ def _answer_via_cascade(
         latency = int((_time.perf_counter() - t0) * 1000)
         metrics.bump("tier_bibliothek")
         metrics.emit_gauge("last_latency_ms", latency)
-        print(f"[bibliothek] {hits[0]['text']}  ({latency} ms, quelle: {hits[0].get('source', '?')})")
+        print(
+            f"[bibliothek] {hits[0]['text']}  ({latency} ms, quelle: {hits[0].get('source', '?')})"
+        )
         history.append({"role": "user", "content": payload})
         history.append({"role": "assistant", "content": hits[0]["text"]})
         return
@@ -1288,7 +1385,11 @@ def _answer_via_cascade(
         history.append({"role": "user", "content": payload})
         history.append({"role": "assistant", "content": result.output})
     else:
-        reason = result.reason if result is not None else "kein Mund konfiguriert (--local-brain?)"
+        reason = (
+            result.reason
+            if result is not None
+            else "kein Mund konfiguriert (--local-brain?)"
+        )
         print(f"[stille] ({reason})")
 
 
@@ -1297,11 +1398,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("components", help="show the system component map")
     doctor = sub.add_parser("doctor", help="inspect runtime integrations")
-    doctor.add_argument("--deep", action="store_true", help="also run the cold 152-case SHIP eval")
+    doctor.add_argument(
+        "--deep", action="store_true", help="also run the cold 152-case SHIP eval"
+    )
     doctor.add_argument("--artifact-root", help="external SHIP artifact directory")
     solve = sub.add_parser("solve", help="run the guarded S3 + FERTIG exact cascade")
     solve.add_argument("question")
-    solve.add_argument("--manifest", help="SHIP-v6 manifest (default: bundled manifest)")
+    solve.add_argument(
+        "--manifest", help="SHIP-v6 manifest (default: bundled manifest)"
+    )
     solve.add_argument("--artifact-root", help="external SHIP artifact directory")
     chat = sub.add_parser(
         "chat",
@@ -1359,7 +1464,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chat.add_argument(
         "--draft-mode",
-        choices=("qwen35", "markov"),
+        choices=("qwen35", "markov", "mtp"),
         help="rolling draft provider; inferred as qwen35 when --draft-bundle is set",
     )
     chat.add_argument(
@@ -1512,9 +1617,15 @@ def build_parser() -> argparse.ArgumentParser:
     organs_sub.add_parser("list", help="list registered organs")
     mount = organs_sub.add_parser("mount", help="verify one organ's digest")
     mount.add_argument("name")
-    artifacts = sub.add_parser("artifacts", help="verify or bootstrap external SHIP artifacts")
-    artifacts.add_argument("--manifest", help="SHIP-v6 manifest (default: bundled manifest)")
-    artifacts.add_argument("--artifact-root", help="destination directory for the five blobs")
+    artifacts = sub.add_parser(
+        "artifacts", help="verify or bootstrap external SHIP artifacts"
+    )
+    artifacts.add_argument(
+        "--manifest", help="SHIP-v6 manifest (default: bundled manifest)"
+    )
+    artifacts.add_argument(
+        "--artifact-root", help="destination directory for the five blobs"
+    )
     artifact_sub = artifacts.add_subparsers(dest="artifact_command", required=True)
     artifact_sub.add_parser("verify", help="verify all five host/organ blobs")
     artifact_import = artifact_sub.add_parser(
@@ -1528,15 +1639,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="replace an existing wrong target only after a matching source is found",
     )
-    evaluate = sub.add_parser("eval", help="run the cold, training-free SHIP-v6 proof suite")
-    evaluate.add_argument("--manifest", help="SHIP-v6 manifest (default: bundled manifest)")
+    evaluate = sub.add_parser(
+        "eval", help="run the cold, training-free SHIP-v6 proof suite"
+    )
+    evaluate.add_argument(
+        "--manifest", help="SHIP-v6 manifest (default: bundled manifest)"
+    )
     evaluate.add_argument("--artifact-root", help="external SHIP artifact directory")
     export_hf = sub.add_parser(
         "export-hf",
         help="build and offline-verify the final license-gated HF PoC folder",
     )
     export_hf.add_argument("output", help="new export directory")
-    export_hf.add_argument("--manifest", help="SHIP-v6 manifest (default: bundled manifest)")
+    export_hf.add_argument(
+        "--manifest", help="SHIP-v6 manifest (default: bundled manifest)"
+    )
     export_hf.add_argument("--artifact-root", help="external SHIP artifact directory")
     export_hf.add_argument(
         "--replace",
@@ -1547,28 +1664,60 @@ def build_parser() -> argparse.ArgumentParser:
         "stream",
         help="inspect safetensors or read exact rows under a hard byte budget",
     )
-    stream.add_argument("source", help="HF repo id, or a directory together with --local")
-    stream.add_argument("--local", action="store_true", help="treat source as an offline directory")
-    stream.add_argument("--revision", default="main", help="source revision; pin a commit for remote use")
-    stream.add_argument("--budget-mb", type=float, default=200.0, help="hard total transfer ceiling")
+    stream.add_argument(
+        "source", help="HF repo id, or a directory together with --local"
+    )
+    stream.add_argument(
+        "--local", action="store_true", help="treat source as an offline directory"
+    )
+    stream.add_argument(
+        "--revision",
+        default="main",
+        help="source revision; pin a commit for remote use",
+    )
+    stream.add_argument(
+        "--budget-mb", type=float, default=200.0, help="hard total transfer ceiling"
+    )
     stream.add_argument("--cache-dir", help="verified resume-cache directory")
-    stream.add_argument("--no-cache", action="store_true", help="disable inventory/range resume caches")
-    stream.add_argument("--refresh", action="store_true", help="bypass cached inventory")
-    stream.add_argument("--limit", type=int, default=20, help="maximum tensor names in inventory output")
-    stream.add_argument("--tensor", help="read this exact 2D tensor instead of listing the inventory")
+    stream.add_argument(
+        "--no-cache", action="store_true", help="disable inventory/range resume caches"
+    )
+    stream.add_argument(
+        "--refresh", action="store_true", help="bypass cached inventory"
+    )
+    stream.add_argument(
+        "--limit", type=int, default=20, help="maximum tensor names in inventory output"
+    )
+    stream.add_argument(
+        "--tensor", help="read this exact 2D tensor instead of listing the inventory"
+    )
     stream.add_argument("--start-row", type=int, default=0)
     stream.add_argument("--rows", type=int, default=8)
     serve = sub.add_parser("serve", help="let the organism live in this terminal")
     serve.add_argument("--state", default="~/.immer/life.json")
-    serve.add_argument("--manifest", help="SHIP-v6 manifest (default: bundled manifest)")
+    serve.add_argument(
+        "--manifest", help="SHIP-v6 manifest (default: bundled manifest)"
+    )
     serve.add_argument("--artifact-root", help="external SHIP artifact directory")
     serve.add_argument(
-        "--dashboard", nargs="?", const=8787, type=int, default=8787,
+        "--dashboard",
+        nargs="?",
+        const=8787,
+        type=int,
+        default=8787,
         help="metrics UI port (default 8787)",
     )
-    serve.add_argument("--no-dashboard", action="store_true", help="disable the metrics UI")
-    serve.add_argument("--council", action="store_true", help="chat through the rat (donor council)")
-    serve.add_argument("--local-brain", action="store_true", help="allow the local Qwen as fallback mouth")
+    serve.add_argument(
+        "--no-dashboard", action="store_true", help="disable the metrics UI"
+    )
+    serve.add_argument(
+        "--council", action="store_true", help="chat through the rat (donor council)"
+    )
+    serve.add_argument(
+        "--local-brain",
+        action="store_true",
+        help="allow the local Qwen as fallback mouth",
+    )
     return parser
 
 

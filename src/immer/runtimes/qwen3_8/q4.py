@@ -1855,7 +1855,8 @@ class Q4BankBuilder:
             if (
                 not isinstance(name, str)
                 or not (
-                    name.startswith("model.language_model.") or name == "lm_head.weight"
+                    name.startswith(("model.language_model.", "mtp."))
+                    or name == "lm_head.weight"
                 )
                 or not isinstance(shape, (list, tuple))
                 or len(shape) != 2

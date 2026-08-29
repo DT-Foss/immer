@@ -725,6 +725,25 @@ class Q4BankTests(unittest.TestCase):
             finally:
                 bank.close()
 
+    def test_builder_includes_embedded_mtp_matrices(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-mtp"
+            tensors = {
+                "mtp.fc.weight": torch.linspace(-1, 1, 64 * 128).reshape(64, 128),
+                "mtp.pre_fc_norm_hidden.weight": torch.zeros(64),
+            }
+            manifest = Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=16,
+                threads=2,
+            ).build()
+
+            rows = {row["name"]: row for row in manifest["body"]["tensors"]}
+            self.assertEqual(set(rows), {"mtp.fc.weight"})
+            self.assertEqual(rows["mtp.fc.weight"]["format"], Q4_0)
+
     def test_fused_sparse_mlp_matches_the_selected_dense_q4_route(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "q4-fused-mlp"

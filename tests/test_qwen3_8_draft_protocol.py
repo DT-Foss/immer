@@ -54,7 +54,7 @@ class RollingDraftProtocolTests(unittest.TestCase):
     def test_compute_bound_row_cost_requires_near_certain_speculation(self) -> None:
         marginal = self._proposal(ceiling=4, confidence=0.50)
         certain = self._proposal(ceiling=4, confidence=0.99)
-        costs = {1: 1.0, 4: 3.7}
+        costs = {1: 1.0, 2: 1.9, 4: 3.7}
 
         marginal_policy = marginal.select_window(
             request_window_ceiling=4,
@@ -107,7 +107,7 @@ class RollingDraftProtocolTests(unittest.TestCase):
         )
 
         self.assertEqual(k8.chosen_window, 8)
-        self.assertEqual(k8.eligible_windows, (1, 4, 8, 16))
+        self.assertEqual(k8.eligible_windows, (1, 2, 4, 8, 16))
         self.assertEqual(k3.chosen_window, 4)
         self.assertEqual(k3.selector, "markov-prefix-utility/v2")
 

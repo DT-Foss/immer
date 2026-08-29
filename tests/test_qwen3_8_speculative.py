@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from safetensors.torch import save_file
+import torch
 
 from immer.knowledge import Streamer
 from immer.runtimes.qwen3_8 import (
@@ -82,9 +83,7 @@ class _RollingFromTokens:
         position = len(history) - len(self.prompt)
         if known_token != self.tokens[position]:
             raise AssertionError("rolling known token differs from target")
-        proposal = list(
-            self.tokens[position + 1 : position + 1 + self.proposal_width]
-        )
+        proposal = list(self.tokens[position + 1 : position + 1 + self.proposal_width])
         while len(proposal) < self.proposal_width:
             proposal.append((proposal[-1] + 1) % self.vocab_size)
         if self.accepted_per_wave < self.proposal_width:
@@ -116,6 +115,48 @@ class _AdaptiveRollingFromTokens(_RollingFromTokens):
             request_window_ceiling=self.proposal_width + 1,
             provider_abi="test-adaptive-provider/v1",
         )
+
+
+class _StateRollingFromTokens(_RollingFromTokens):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.begin_hidden: torch.Tensor | None = None
+        self.proposal_hidden: list[torch.Tensor] = []
+
+    def begin_request_state(
+        self,
+        history: tuple[int, ...],
+        target_hidden: torch.Tensor,
+    ) -> None:
+        if history != self.prompt:
+            raise AssertionError("state provider received another prompt")
+        self.begin_hidden = target_hidden.detach().clone()
+
+    def propose_after_state(
+        self,
+        history: tuple[int, ...],
+        known_token: int,
+        target_hidden: torch.Tensor,
+    ) -> tuple[int, ...]:
+        self.proposal_hidden.append(target_hidden.detach().clone())
+        return super().propose_after(history, known_token)
+
+
+class _MutatingStateRollingFromTokens(_StateRollingFromTokens):
+    def __init__(self, *args, mutate_at: str, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.mutate_at = mutate_at
+
+    def begin_request_state(self, history, target_hidden) -> None:
+        super().begin_request_state(history, target_hidden)
+        if self.mutate_at == "begin":
+            target_hidden.data.zero_()
+
+    def propose_after_state(self, history, known_token, target_hidden):
+        proposal = super().propose_after_state(history, known_token, target_hidden)
+        if self.mutate_at == "proposal":
+            target_hidden.data.zero_()
+        return proposal
 
 
 class _MutatingPair(Sequence[int]):
@@ -815,9 +856,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         candidate = self._model()
         updates: list[tuple[int, ...]] = []
 
-        result = Qwen38K4SpeculativeDecoder(
-            candidate, provider
-        ).generate_rolling(
+        result = Qwen38K4SpeculativeDecoder(candidate, provider).generate_rolling(
             [prompt],
             max_new_tokens=8,
             head_block_rows=7,
@@ -827,6 +866,71 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         self.assertEqual(result.token_ids, tokens)
         self._assert_state_equal(candidate, baseline)
         self.assertEqual(updates, [tokens[:4], tokens])
+
+    def test_rolling_state_provider_receives_target_hidden_rows(self) -> None:
+        prompt = (1, 4)
+        baseline = self._model()
+        tokens, _evidence = baseline.generate_greedy(
+            [prompt], max_new_tokens=4, head_block_rows=7
+        )
+        provider = _StateRollingFromTokens(
+            prompt,
+            tokens,
+            accepted_per_wave=3,
+            vocab_size=self.config.vocab_size,
+        )
+        candidate = self._model()
+
+        result = Qwen38K4SpeculativeDecoder(
+            candidate,
+            provider,
+        ).generate_rolling(
+            [prompt],
+            max_new_tokens=4,
+            head_block_rows=7,
+        )
+
+        self.assertEqual(result.token_ids, tokens)
+        self._assert_state_equal(candidate, baseline)
+        self.assertIsNotNone(provider.begin_hidden)
+        assert provider.begin_hidden is not None
+        self.assertEqual(
+            tuple(provider.begin_hidden.shape), (1, len(prompt), self.config.dim)
+        )
+        self.assertEqual(len(provider.proposal_hidden), 1)
+        self.assertEqual(
+            tuple(provider.proposal_hidden[0].shape), (1, 1, self.config.dim)
+        )
+
+    def test_rolling_state_provider_cannot_mutate_target_hidden(self) -> None:
+        prompt = (1, 4)
+        baseline = self._model()
+        tokens, _evidence = baseline.generate_greedy(
+            [prompt], max_new_tokens=4, head_block_rows=7
+        )
+        for mutate_at in ("begin", "proposal"):
+            with self.subTest(mutate_at=mutate_at):
+                provider = _MutatingStateRollingFromTokens(
+                    prompt,
+                    tokens,
+                    accepted_per_wave=3,
+                    vocab_size=self.config.vocab_size,
+                    mutate_at=mutate_at,
+                )
+                candidate = self._model()
+                with self.assertRaisesRegex(
+                    Qwen38SpeculativeError,
+                    "mutated its hidden argument",
+                ):
+                    Qwen38K4SpeculativeDecoder(
+                        candidate,
+                        provider,
+                    ).generate_rolling(
+                        [prompt],
+                        max_new_tokens=4,
+                        head_block_rows=7,
+                    )
+                self.assertEqual(candidate.next_position, 0)
 
     def test_k4_on_tokens_reports_terminal_eos_round(self) -> None:
         _baseline, tokens, _evidence = self._baseline(count=4)
@@ -931,14 +1035,15 @@ class Qwen38SpeculativeTests(unittest.TestCase):
                 self.assertEqual(result.token_ids, expected)
                 self.assertEqual(result.token_ids, baseline_tokens)
                 self._assert_state_equal(candidate, baseline)
-                self.assertTrue(all(row.forward_passes <= 1 for row in result.evidence.rounds))
-                self.assertTrue(all(row.head_scans <= 1 for row in result.evidence.rounds))
+                self.assertTrue(
+                    all(row.forward_passes <= 1 for row in result.evidence.rounds)
+                )
+                self.assertTrue(
+                    all(row.head_scans <= 1 for row in result.evidence.rounds)
+                )
                 self.assertEqual(
                     result.evidence.accepted_draft_tokens,
-                    sum(
-                        row.accepted_prefix_length
-                        for row in result.evidence.rounds
-                    ),
+                    sum(row.accepted_prefix_length for row in result.evidence.rounds),
                 )
 
     def test_rolling_k8_matches_greedy_across_conv_boundary(self) -> None:
@@ -950,9 +1055,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         for accepted in (0, 3, 7):
             with self.subTest(accepted=accepted):
                 baseline = self._model()
-                baseline.generate_greedy(
-                    [prompt], max_new_tokens=8, head_block_rows=7
-                )
+                baseline.generate_greedy([prompt], max_new_tokens=8, head_block_rows=7)
                 provider = _RollingFromTokens(
                     prompt,
                     expected,
@@ -991,9 +1094,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
             (0.99, (8,)),
         ):
             baseline = self._model()
-            baseline.generate_greedy(
-                [prompt], max_new_tokens=8, head_block_rows=7
-            )
+            baseline.generate_greedy([prompt], max_new_tokens=8, head_block_rows=7)
             provider = _AdaptiveRollingFromTokens(
                 prompt,
                 expected,
@@ -1196,9 +1297,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         )
         candidate = self._model()
 
-        result = Qwen38K4SpeculativeDecoder(
-            candidate, provider
-        ).generate_rolling(
+        result = Qwen38K4SpeculativeDecoder(candidate, provider).generate_rolling(
             [prompt],
             max_new_tokens=8,
             head_block_rows=7,

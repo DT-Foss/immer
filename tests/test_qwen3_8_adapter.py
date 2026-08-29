@@ -367,9 +367,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 ),
                 repo_id="Qwen/test",
                 revision="a" * 40,
-                metrics=Mock(
-                    return_value={"inventory_source_fingerprint": "b" * 64}
-                ),
+                metrics=Mock(return_value={"inventory_source_fingerprint": "b" * 64}),
             )
             mount = SimpleNamespace(
                 source=source,
@@ -383,9 +381,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             )
             model = SimpleNamespace(
                 checkpoint_preflight=Mock(
-                    side_effect=lambda: (
-                        lifecycle.append("preflight") or {"ok": True}
-                    )
+                    side_effect=lambda: lifecycle.append("preflight") or {"ok": True}
                 ),
                 reset_state=Mock(),
                 mlp_sparse_executor=None,
@@ -543,8 +539,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
             {"exact_head_root": "/artifacts/head"},
             {"range_markov_state_path": "/state/ranges"},
         ):
-            with self.subTest(options=options), self.assertRaisesRegex(
-                ValueError, "Q4 execution replaces"
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(ValueError, "Q4 execution replaces"),
             ):
                 Qwen38CausalChat(
                     "unused.causal",
@@ -693,16 +690,17 @@ class Qwen38CausalChatTests(unittest.TestCase):
             final_state_committed=False,
         )
         generated = SimpleNamespace(token_ids=(7, 8, 9, 10), evidence=evidence)
-        decoder = SimpleNamespace(
-            generate_rolling=lambda *args, **kwargs: generated
-        )
-        with patch(
-            "immer.runtimes.qwen3_8.adapter.Qwen35K4DraftProvider",
-            return_value=provider,
-        ), patch(
-            "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
-            return_value=decoder,
-        ) as decoder_constructor:
+        decoder = SimpleNamespace(generate_rolling=lambda *args, **kwargs: generated)
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen35K4DraftProvider",
+                return_value=provider,
+            ),
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+                return_value=decoder,
+            ) as decoder_constructor,
+        ):
             result = chat.handle(Request("chat", "hello"))
 
         self.assertTrue(result.ok, result.reason)
@@ -715,7 +713,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(result.evidence["draft"]["target_linear_calls"], 10)
         self.assertEqual(result.evidence["draft"]["total_linear_calls"], 13)
         self.assertEqual(result.evidence["generation"]["linear_calls"], 10)
-        self.assertEqual(result.evidence["fast_mlp"]["request"]["aux_source_body_bytes"], 20)
+        self.assertEqual(
+            result.evidence["fast_mlp"]["request"]["aux_source_body_bytes"], 20
+        )
         decoder_constructor.assert_called_once_with(
             target.model,
             provider,
@@ -764,9 +764,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             final_state_committed=False,
         )
         generated = SimpleNamespace(token_ids=(7, 8, 9, 10), evidence=evidence)
-        decoder = SimpleNamespace(
-            generate_rolling=lambda *args, **kwargs: generated
-        )
+        decoder = SimpleNamespace(generate_rolling=lambda *args, **kwargs: generated)
         with patch(
             "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
             return_value=decoder,
@@ -780,9 +778,38 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotIn("draft_bundle", result.evidence)
         provider = decoder_constructor.call_args.args[1]
         self.assertEqual(provider.metrics().source_body_bytes, 0)
-        self.assertTrue(
-            decoder_constructor.call_args.kwargs["adaptive_round_windows"]
+        self.assertTrue(decoder_constructor.call_args.kwargs["adaptive_round_windows"])
+        with patch(
+            "immer.runtimes.qwen3_8.adapter._digest",
+            side_effect=lambda value: value,
+        ):
+            policy = chat._result_cell_generation_policy_sha256()
+        self.assertEqual(
+            policy["markov_draft"]["round_window_selector"],
+            "markov-prefix-utility/v2",
         )
+        chat.close()
+
+    def test_mtp_generation_policy_matches_adaptive_round_execution(self) -> None:
+        chat = _chat(
+            _Runtime(),
+            draft_mode="mtp",
+            q4_root="/models/q4-mtp",
+            markov_draft_state_path="/state/mtp.json",
+            max_new_tokens=4,
+        )
+        with patch(
+            "immer.runtimes.qwen3_8.adapter._digest",
+            side_effect=lambda value: value,
+        ):
+            policy = chat._result_cell_generation_policy_sha256()
+
+        self.assertEqual(policy["decoding"], "greedy-rolling-window-draft-verify")
+        self.assertEqual(
+            policy["mtp_draft"]["round_window_selector"],
+            "markov-prefix-utility/v2",
+        )
+        self.assertTrue(policy["mtp_draft"]["persistent_calibration"])
         chat.close()
 
     def test_short_generation_policy_records_plain_greedy_draft_fallback(self) -> None:
@@ -845,16 +872,17 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         generated = SimpleNamespace(token_ids=(7, 8, 9, 10), evidence=evidence)
         decoder = SimpleNamespace(
-            generate_rolling=Mock(
-                side_effect=[RuntimeError("first failed"), generated]
-            )
+            generate_rolling=Mock(side_effect=[RuntimeError("first failed"), generated])
         )
-        with patch(
-            "immer.runtimes.qwen3_8.adapter.Qwen35K4DraftProvider",
-            return_value=provider,
-        ), patch(
-            "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
-            return_value=decoder,
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen35K4DraftProvider",
+                return_value=provider,
+            ),
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+                return_value=decoder,
+            ),
         ):
             failed = chat.handle(Request("chat", "hello"))
             succeeded = chat.handle(Request("chat", "hello"))
@@ -863,9 +891,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotIn("request", failed.evidence["fast_mlp"])
         self.assertTrue(succeeded.ok, succeeded.reason)
         self.assertEqual(
-            succeeded.evidence["fast_mlp"]["request"][
-                "aux_source_body_bytes"
-            ],
+            succeeded.evidence["fast_mlp"]["request"]["aux_source_body_bytes"],
             20,
         )
         chat.close()
@@ -1299,10 +1325,13 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         qwen.handle.side_effect = handle
         output = io.StringIO()
-        with patch(
-            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
-            side_effect=construct,
-        ), redirect_stdout(output):
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                side_effect=construct,
+            ),
+            redirect_stdout(output),
+        ):
             code = main(
                 [
                     "chat",
@@ -1346,13 +1375,18 @@ class Qwen38CausalChatTests(unittest.TestCase):
         wrapped.close.side_effect = qwen.close
         output = io.StringIO()
         progress = _Tty()
-        with patch(
-            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
-            side_effect=construct,
-        ), patch(
-            "immer.cognition.qwen_fertig_chat.QwenFertigChat",
-            return_value=wrapped,
-        ), redirect_stdout(output), redirect_stderr(progress):
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                side_effect=construct,
+            ),
+            patch(
+                "immer.cognition.qwen_fertig_chat.QwenFertigChat",
+                return_value=wrapped,
+            ),
+            redirect_stdout(output),
+            redirect_stderr(progress),
+        ):
             code = main(
                 [
                     "chat",
@@ -1378,13 +1412,18 @@ class Qwen38CausalChatTests(unittest.TestCase):
             "IMMER_QWEN38_Q4": "/models/Qwen3.8-27B/causal/q4-base-v2",
             "IMMER_QWEN38_FAST_MLP": "/state/qwen-q4-fast-mlp-all64-v1",
         }
-        with patch.dict("os.environ", environment, clear=True), patch(
-            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
-            return_value=qwen,
-        ) as constructor, patch(
-            "immer.cognition.qwen_fertig_chat.QwenFertigChat",
-            side_effect=lambda raw, _fertig, **_options: raw,
-        ) as wrapper, redirect_stdout(output):
+        with (
+            patch.dict("os.environ", environment, clear=True),
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ) as constructor,
+            patch(
+                "immer.cognition.qwen_fertig_chat.QwenFertigChat",
+                side_effect=lambda raw, _fertig, **_options: raw,
+            ) as wrapper,
+            redirect_stdout(output),
+        ):
             code = main(["chat", "hello"])
 
         self.assertEqual(code, 0)
@@ -1419,16 +1458,21 @@ class Qwen38CausalChatTests(unittest.TestCase):
         qwen = _chat(_Runtime())
         hook = object()
         mount = SimpleNamespace(hook=hook)
-        with patch(
-            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
-            return_value=qwen,
-        ), patch(
-            "immer.runtimes.ooe.qwen_warm_bank.open_verified_qwen_warm_bank",
-            return_value=mount,
-        ) as opener, patch(
-            "immer.cognition.qwen_fertig_chat.QwenFertigChat",
-            side_effect=lambda raw, _fertig, **_options: raw,
-        ) as wrapper, redirect_stdout(io.StringIO()):
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ),
+            patch(
+                "immer.runtimes.ooe.qwen_warm_bank.open_verified_qwen_warm_bank",
+                return_value=mount,
+            ) as opener,
+            patch(
+                "immer.cognition.qwen_fertig_chat.QwenFertigChat",
+                side_effect=lambda raw, _fertig, **_options: raw,
+            ) as wrapper,
+            redirect_stdout(io.StringIO()),
+        ):
             code = main(
                 [
                     "chat",
@@ -1463,6 +1507,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 hook=hook,
                 result_cell_code_revision=options["runtime_code_revision"],
             )
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Qwen"
             q4 = root / "causal" / "q4-base-v2"
@@ -1475,19 +1520,25 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     lambda _system, question: f"prompt:{question}"
                 ),
             )
-            with patch(
-                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
-                return_value=qwen,
-            ) as constructor, patch(
-                "immer.runtimes.ooe.qwen_warm_bank.open_verified_qwen_warm_bank",
-                side_effect=open_mount,
-            ) as opener, patch(
-                "immer.cognition.qwen_fertig_chat.QwenFertigChat",
-                side_effect=lambda raw, _fertig, **_options: raw,
-            ), patch(
-                "immer.runtimes.qwen3_8.encoding.Qwen38Tokenizer",
-                return_value=prompt_tokenizer,
-            ), redirect_stdout(io.StringIO()):
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                patch(
+                    "immer.runtimes.ooe.qwen_warm_bank.open_verified_qwen_warm_bank",
+                    side_effect=open_mount,
+                ) as opener,
+                patch(
+                    "immer.cognition.qwen_fertig_chat.QwenFertigChat",
+                    side_effect=lambda raw, _fertig, **_options: raw,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.encoding.Qwen38Tokenizer",
+                    return_value=prompt_tokenizer,
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
                 code = main(
                     [
                         "chat",
@@ -1526,13 +1577,18 @@ class Qwen38CausalChatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             deployed = Path(temporary) / "deployed"
             (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
-            with patch.dict("os.environ", {}, clear=True), patch(
-                "immer.cli._QWEN38_DEPLOYMENT_ROOT",
-                deployed,
-            ), patch(
-                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
-                return_value=qwen,
-            ) as constructor, redirect_stdout(io.StringIO()):
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_ROOT",
+                    deployed,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
                 code = main(
                     [
                         "chat",
@@ -1563,17 +1619,22 @@ class Qwen38CausalChatTests(unittest.TestCase):
             (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
             deployed_fast = Path(temporary) / "deployed-fast"
             deployed_fast.mkdir()
-            with patch.dict(
-                "os.environ",
-                {"IMMER_QWEN38_FAST_MLP": str(deployed_fast)},
-                clear=True,
-            ), patch(
-                "immer.cli._QWEN38_DEPLOYMENT_ROOT",
-                deployed,
-            ), patch(
-                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
-                return_value=qwen,
-            ) as constructor, redirect_stdout(io.StringIO()):
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"IMMER_QWEN38_FAST_MLP": str(deployed_fast)},
+                    clear=True,
+                ),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_ROOT",
+                    deployed,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
                 code = main(
                     [
                         "chat",
@@ -1598,13 +1659,18 @@ class Qwen38CausalChatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             deployed = Path(temporary) / "deployed"
             (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
-            with patch.dict("os.environ", {}, clear=True), patch(
-                "immer.cli._QWEN38_DEPLOYMENT_ROOT",
-                deployed,
-            ), patch(
-                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
-                return_value=qwen,
-            ) as constructor, redirect_stdout(io.StringIO()):
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_ROOT",
+                    deployed,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
                 code = main(
                     [
                         "chat",
@@ -1634,16 +1700,22 @@ class Qwen38CausalChatTests(unittest.TestCase):
             (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
             state = Path(temporary) / "qwen-markov.bin"
             state.write_bytes(b"fixture")
-            with patch.dict("os.environ", {}, clear=True), patch(
-                "immer.cli._QWEN38_DEPLOYMENT_ROOT",
-                deployed,
-            ), patch(
-                "immer.cli._QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE",
-                state,
-            ), patch(
-                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
-                return_value=qwen,
-            ) as constructor, redirect_stdout(io.StringIO()):
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_ROOT",
+                    deployed,
+                ),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE",
+                    state,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
                 code = main(["chat", "hello", "--raw-qwen"])
 
         self.assertEqual(code, 0)
@@ -1651,16 +1723,58 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(options["draft_mode"], "markov")
         self.assertEqual(options["markov_draft_state_path"], str(state))
 
+    def test_cli_explicit_mtp_uses_persistent_calibration_state(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            deployed.mkdir()
+            q4 = deployed / "causal" / "q4-base-v3-mtp"
+            q4.mkdir(parents=True)
+            state = Path(temporary) / "qwen-mtp.json"
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_ROOT",
+                    deployed,
+                ),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_MTP_STATE",
+                    state,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--raw-qwen",
+                        "--draft-mode",
+                        "mtp",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["draft_mode"], "mtp")
+        self.assertEqual(options["q4_root"], str(q4))
+        self.assertEqual(options["markov_draft_state_path"], str(state))
+
     def test_cli_jsonl_reuses_one_loaded_component_for_multiple_requests(self) -> None:
         qwen = _chat(_Runtime())
         output = io.StringIO()
-        stream = io.StringIO(
-            '{"id":"first","message":"hello"}\nworld\n{"bad":true}\n'
-        )
-        with patch(
-            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
-            return_value=qwen,
-        ) as constructor, patch("sys.stdin", stream), redirect_stdout(output):
+        stream = io.StringIO('{"id":"first","message":"hello"}\nworld\n{"bad":true}\n')
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ) as constructor,
+            patch("sys.stdin", stream),
+            redirect_stdout(output),
+        ):
             code = main(
                 [
                     "chat",
@@ -1676,9 +1790,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         constructor.assert_called_once()
-        self.assertIsNone(
-            constructor.call_args.kwargs["text_snapshot_sink"]
-        )
+        self.assertIsNone(constructor.call_args.kwargs["text_snapshot_sink"])
         self.assertTrue(qwen.closed)
         rows = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(len(rows), 2)
