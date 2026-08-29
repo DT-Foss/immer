@@ -33,6 +33,10 @@ release surface.
   Full-Q4 chat now peaks at 1.17 GB instead of 16.01 GB while preserving the
   exact generated token trace. The two-token reference generation takes
   12.88 seconds versus 12.49 seconds before bounded residency.
+  Gate, Up, BF16 SwiGLU, activation quantization, and Down now execute inside
+  one native OpenMP team. A complete 65,536-entry BF16-SiLU table is generated
+  from the installed Torch semantics, keeping the fused path bit-identical
+  across host libm implementations.
 - **Predictive weight transport.** A persistent two-agent operation Markov
   model learns the exact tensor/range sequence already emitted by the
   Streamer. Order-1/2 Fixed Share, surprise regimes, and Ricci retention

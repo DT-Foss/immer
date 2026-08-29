@@ -6,6 +6,19 @@ All notable changes to IMMER are recorded here.
 
 ### Arbitrary local Qwen runtime
 
+- Fused the complete dense Q4 MLP into one native team: Hidden-Q8, Gate/Up,
+  Torch-authoritative BF16 SiLU and product rounding, activation-Q8, and Down.
+  The dot-product order and packed weights are unchanged. Observer, sparse-MLP,
+  FP16, and FP32 configurations retain the composed fallback path.
+- Removed the final cross-host numerical ambiguity with a 128 KiB lookup table
+  covering all 65,536 BF16 SiLU inputs, generated from the installed Torch
+  backend and consumed directly by C. Random multi-row Q4 MLPs match the old
+  composition bit-for-bit on Mac and Beast.
+- On the identical `Paris` prompt and token trace, generation fell from
+  `13.1823` to `12.6874 s` and TTFT from `11.4121` to `10.8587 s`, with peak
+  RSS unchanged near `1.176 GB`. The five-token `Fledermaus` trace completed in
+  `18.7056 s`; 320 full MLP executions used the fused path.
+
 - Made explicit Qwen prefix batteries self-charging. On the first miss, the
   runtime derives the question-independent chat-template prefix, executes it
   once, stores native continuation state plus final hidden, resets, and resumes
