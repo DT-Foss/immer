@@ -1315,9 +1315,12 @@ class StreamedQwen38:
         native_head_crsa_tokenwise_usage: bool = False,
     ) -> tuple[torch.Tensor, AttentionState]:
         base = f"model.language_model.layers.{layer}.self_attn"
-        projected_query_gate = self.pager.linear(hidden, f"{base}.q_proj")
-        projected_key = self.pager.linear(hidden, f"{base}.k_proj")
-        projected_value = self.pager.linear(hidden, f"{base}.v_proj")
+        projected_query_gate, projected_key, projected_value = (
+            self.pager.linear_group(
+                hidden,
+                (f"{base}.q_proj", f"{base}.k_proj", f"{base}.v_proj"),
+            )
+        )
         q_norm_weight = self._control(f"{base}.q_norm.weight")
         k_norm_weight = self._control(f"{base}.k_norm.weight")
         positions = (
@@ -1381,10 +1384,17 @@ class StreamedQwen38:
         base = f"model.language_model.layers.{layer}.linear_attn"
         # Official Qwen masks padding before every Gated DeltaNet projection.
         active = hidden * token_mask.unsqueeze(-1).to(dtype=hidden.dtype)
-        projected_qkv = self.pager.linear(active, f"{base}.in_proj_qkv")
-        projected_z = self.pager.linear(active, f"{base}.in_proj_z")
-        projected_b = self.pager.linear(active, f"{base}.in_proj_b")
-        projected_a = self.pager.linear(active, f"{base}.in_proj_a")
+        projected_qkv, projected_z, projected_b, projected_a = (
+            self.pager.linear_group(
+                active,
+                (
+                    f"{base}.in_proj_qkv",
+                    f"{base}.in_proj_z",
+                    f"{base}.in_proj_b",
+                    f"{base}.in_proj_a",
+                ),
+            )
+        )
         conv_weight = self._control(f"{base}.conv1d.weight", dtype=hidden.dtype)
         a_log = self._control(f"{base}.A_log")
         dt_bias = self._control(f"{base}.dt_bias")
@@ -1500,9 +1510,11 @@ class StreamedQwen38:
                 return output
         self.mlp_sparse_last_trace = None
         base = f"model.language_model.layers.{layer}.mlp"
-        gate = self.pager.linear(hidden, f"{base}.gate_proj")
+        gate, up = self.pager.linear_group(
+            hidden,
+            (f"{base}.gate_proj", f"{base}.up_proj"),
+        )
         self._observe_layer_boundary(layer, "mlp.gate", gate)
-        up = self.pager.linear(hidden, f"{base}.up_proj")
         self._observe_layer_boundary(layer, "mlp.up", up)
         activated = swiglu(gate, up)
         self._observe_layer_boundary(layer, "mlp.activated", activated)

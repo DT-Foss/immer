@@ -289,6 +289,34 @@ static float immer_dot_q8_q8_scalar(
     return sum;
 }
 
+static float immer_dot_packed_q8(
+    const uint8_t *weight,
+    int format,
+    const immer_block_q8_0 *input,
+    int64_t blocks
+) {
+    if (format == IMMER_FORMAT_Q4_0) {
+#if defined(__AVX2__)
+        return immer_dot_q4_q8_avx2(
+            (const immer_block_q4_0 *) weight, input, blocks
+        );
+#else
+        return immer_dot_q4_q8_scalar(
+            (const immer_block_q4_0 *) weight, input, blocks
+        );
+#endif
+    }
+#if defined(__AVX2__)
+    return immer_dot_q8_q8_avx2(
+        (const immer_block_q8_0 *) weight, input, blocks
+    );
+#else
+    return immer_dot_q8_q8_scalar(
+        (const immer_block_q8_0 *) weight, input, blocks
+    );
+#endif
+}
+
 IMMER_EXPORT uint32_t immer_q4_abi(void) {
     return IMMER_Q4_ABI;
 }
@@ -427,31 +455,87 @@ IMMER_EXPORT int immer_q4_linear_f32(
         for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
             const immer_block_q8_0 *active_input =
                 quantized_input + input_row * blocks;
-            float value;
-            if (format == IMMER_FORMAT_Q4_0) {
-#if defined(__AVX2__)
-                value = immer_dot_q4_q8_avx2(
-                    (const immer_block_q4_0 *) weight_row, active_input, blocks
-                );
-#else
-                value = immer_dot_q4_q8_scalar(
-                    (const immer_block_q4_0 *) weight_row, active_input, blocks
-                );
-#endif
-            } else {
-#if defined(__AVX2__)
-                value = immer_dot_q8_q8_avx2(
-                    (const immer_block_q8_0 *) weight_row, active_input, blocks
-                );
-#else
-                value = immer_dot_q8_q8_scalar(
-                    (const immer_block_q8_0 *) weight_row, active_input, blocks
-                );
-#endif
-            }
-            output[input_row * output_rows + output_row] = value;
+            output[input_row * output_rows + output_row] = immer_dot_packed_q8(
+                weight_row, format, active_input, blocks
+            );
         }
     }
     free(quantized_input);
+    return 0;
+}
+
+IMMER_EXPORT int immer_q4_linear_group_f32(
+    const float *input,
+    int64_t input_rows,
+    int64_t input_cols,
+    const uint8_t * const *weights,
+    const int *formats,
+    const int64_t *output_rows,
+    float * const *outputs,
+    int tensor_count,
+    int threads
+) {
+    if (
+        !input || !weights || !formats || !output_rows || !outputs
+        || input_rows <= 0 || input_cols <= 0 || input_cols % IMMER_QK != 0
+        || tensor_count <= 0 || threads <= 0
+    ) return 1;
+    int64_t total_output_rows = 0;
+    int64_t *prefix = (int64_t *) malloc(
+        (size_t) (tensor_count + 1) * sizeof(int64_t)
+    );
+    if (!prefix) return 3;
+    prefix[0] = 0;
+    for (int tensor = 0; tensor < tensor_count; ++tensor) {
+        if (
+            !weights[tensor] || !outputs[tensor] || output_rows[tensor] <= 0
+            || immer_q4_row_bytes(formats[tensor], input_cols) <= 0
+        ) {
+            free(prefix);
+            return 1;
+        }
+        total_output_rows += output_rows[tensor];
+        prefix[tensor + 1] = total_output_rows;
+    }
+    const int64_t blocks = input_cols / IMMER_QK;
+    immer_block_q8_0 *quantized_input = (immer_block_q8_0 *) malloc(
+        (size_t) input_rows * (size_t) blocks * sizeof(immer_block_q8_0)
+    );
+    if (!quantized_input) {
+        free(prefix);
+        return 3;
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int64_t row = 0; row < input_rows; ++row) {
+        immer_quantize_q8_row(
+            input + row * input_cols,
+            quantized_input + row * blocks,
+            input_cols
+        );
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int64_t global_row = 0; global_row < total_output_rows; ++global_row) {
+        int tensor = 0;
+        while (global_row >= prefix[tensor + 1]) ++tensor;
+        const int64_t local_row = global_row - prefix[tensor];
+        const int64_t row_bytes = immer_q4_row_bytes(
+            formats[tensor], input_cols
+        );
+        const uint8_t *weight_row = weights[tensor] + local_row * row_bytes;
+        for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+            const immer_block_q8_0 *active_input =
+                quantized_input + input_row * blocks;
+            outputs[tensor][input_row * output_rows[tensor] + local_row] =
+                immer_dot_packed_q8(
+                    weight_row, formats[tensor], active_input, blocks
+                );
+        }
+    }
+    free(quantized_input);
+    free(prefix);
     return 0;
 }

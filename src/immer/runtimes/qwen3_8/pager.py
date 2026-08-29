@@ -122,6 +122,8 @@ class PagerMetrics:
     linear_calls: int = 0
     packed_linear_calls: int = 0
     packed_linear_rows: int = 0
+    grouped_linear_calls: int = 0
+    grouped_linear_matrices: int = 0
     embedding_rows: int = 0
     head_rows: int = 0
     logical_weight_bytes: int = 0
@@ -259,7 +261,14 @@ class Qwen38WeightPager:
                 raise ValueError("Q4 execution and the exact BF16 head are exclusive")
             if not all(
                 callable(getattr(q4_bank, method, None))
-                for method in ("has", "linear", "rows", "metrics", "close")
+                for method in (
+                    "has",
+                    "linear",
+                    "linear_group",
+                    "rows",
+                    "metrics",
+                    "close",
+                )
             ):
                 raise TypeError("q4_bank does not expose the Q4 execution contract")
 
@@ -432,6 +441,42 @@ class Qwen38WeightPager:
             raise Qwen38PagerError(
                 f"selected Q4 rows from {layout.name!r} need {planned} transient "
                 f"bytes, limit is {self.max_resident_bytes}"
+            )
+        self._stats.peak_planned_resident_bytes = max(
+            self._stats.peak_planned_resident_bytes,
+            planned,
+        )
+        return planned
+
+    def _preflight_q4_group(
+        self,
+        layouts: tuple[_TensorLayout, ...],
+        *,
+        input_rows: int,
+        output_dtype: Any | None,
+        label: str,
+    ) -> int:
+        if not layouts or input_rows <= 0:
+            raise Qwen38PagerError("Q4 group preflight received an invalid shape")
+        input_columns = layouts[0].shape[1]
+        if any(len(layout.shape) != 2 or layout.shape[1] != input_columns for layout in layouts):
+            raise Qwen38PagerError("Q4 grouped matrix widths differ")
+        final_dtype = self.compute_dtype if output_dtype is None else output_dtype
+        input_float_bytes = input_rows * input_columns * 4
+        input_q8_bytes = input_rows * (input_columns // 32) * 34
+        output_rows = sum(layout.shape[0] for layout in layouts)
+        output_float_bytes = input_rows * output_rows * 4
+        output_final_bytes = input_rows * output_rows * self._dtype_bytes(final_dtype)
+        planned = (
+            input_float_bytes
+            + input_q8_bytes
+            + output_float_bytes
+            + output_final_bytes
+        )
+        if planned > self.max_resident_bytes:
+            raise Qwen38PagerError(
+                f"{label} needs {planned} transient grouped Q4 bytes, limit is "
+                f"{self.max_resident_bytes}"
             )
         self._stats.peak_planned_resident_bytes = max(
             self._stats.peak_planned_resident_bytes,
@@ -940,6 +985,61 @@ class Qwen38WeightPager:
             finally:
                 del weight
                 self._stats.materialized_weight_releases += 1
+
+    def linear_group(
+        self,
+        x: Any,
+        names: Iterable[str],
+        *,
+        output_dtype: Any | None = None,
+    ) -> tuple[Any, ...]:
+        """Apply multiple same-input matrices with one packed activation pass."""
+
+        with self._lock:
+            self._ensure_open()
+            try:
+                prefixes = tuple(names)
+            except TypeError as exc:
+                raise TypeError("linear group names must be iterable") from exc
+            if len(prefixes) < 2:
+                raise ValueError("linear group requires at least two matrices")
+            weight_names = tuple(self._weight_name(name) for name in prefixes)
+            if len(set(weight_names)) != len(weight_names):
+                raise ValueError("linear group names must be distinct")
+            if not isinstance(x, self.torch.Tensor):
+                x = self.torch.as_tensor(x)
+            compute_x = x.to(device=self.device, dtype=self.compute_dtype)
+            q4_bank = self.q4_bank
+            if q4_bank is None or not all(q4_bank.has(name) for name in weight_names):
+                return tuple(
+                    self.linear(
+                        compute_x,
+                        name,
+                        output_dtype=output_dtype,
+                    )
+                    for name in weight_names
+                )
+            layouts = tuple(self._layout(name) for name in weight_names)
+            input_columns = layouts[0].shape[1]
+            if compute_x.shape[-1] != input_columns or any(
+                layout.shape[1] != input_columns for layout in layouts
+            ):
+                raise Qwen38PagerError("grouped linear input widths disagree")
+            self._preflight_q4_group(
+                layouts,
+                input_rows=compute_x.numel() // compute_x.shape[-1],
+                output_dtype=output_dtype,
+                label=" + ".join(weight_names),
+            )
+            results = q4_bank.linear_group(
+                compute_x,
+                weight_names,
+                output_dtype=output_dtype,
+            )
+            self._stats.linear_calls += len(weight_names)
+            self._stats.grouped_linear_calls += 1
+            self._stats.grouped_linear_matrices += len(weight_names)
+            return results
 
     def linear_many(
         self,

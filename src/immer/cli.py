@@ -92,14 +92,56 @@ def _solve(
 
 
 def _chat_qwen38(args: argparse.Namespace) -> int:
-    """Run one turn through the verified local causal Qwen3.8 facade."""
+    """Run one turn or a persistent JSONL stream through local Qwen3.8."""
 
     from .runtimes.qwen3_8.adapter import Qwen38CausalChat
     from .runtimes.qwen3_8.draft_window import DraftWindowError
     from .runtimes.qwen3_8.semantic_state_cache import SemanticStateAnchorCache
 
     component = None
+    jsonl = bool(getattr(args, "jsonl", False))
+    message = getattr(args, "message", None)
+    max_requests = getattr(args, "max_requests", None)
+
+    def emit(result, *, request_id=None, include_id: bool = False) -> None:
+        value = {
+            "status": result.status.value,
+            "component": result.component,
+            "output": result.output,
+            "reason": result.reason,
+            "evidence": dict(result.evidence),
+        }
+        if include_id:
+            value["id"] = request_id
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True), flush=True)
+
+    def emit_line_error(reason: str, *, request_id=None, include_id=False) -> None:
+        value = {
+            "status": "error",
+            "component": "qwen3.8.causal-chat",
+            "output": None,
+            "reason": reason,
+            "evidence": {},
+        }
+        if include_id:
+            value["id"] = request_id
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True), flush=True)
+
     try:
+        if jsonl:
+            if message is not None:
+                raise ValueError("chat message and --jsonl are mutually exclusive")
+            if (
+                max_requests is not None
+                and (
+                    isinstance(max_requests, bool)
+                    or not isinstance(max_requests, int)
+                    or max_requests <= 0
+                )
+            ):
+                raise ValueError("max_requests must be a positive integer")
+        elif not isinstance(message, str) or not message.strip():
+            raise ValueError("chat requires a message or --jsonl")
         anchor_cache = (
             None
             if args.qwen38_anchor_cache is None
@@ -150,7 +192,53 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             ),
             fast_mlp_active_layers=args.fast_mlp_layers,
         )
-        result = component.handle(Request("chat", args.message))
+        if jsonl:
+            failures = 0
+            handled = 0
+            for raw in sys.stdin:
+                line = raw.strip()
+                if not line:
+                    continue
+                if max_requests is not None and handled >= max_requests:
+                    break
+                handled += 1
+                request_id = None
+                include_id = False
+                try:
+                    if line.startswith("{"):
+                        document = json.loads(line)
+                        if not isinstance(document, dict) or set(document) - {
+                            "id",
+                            "message",
+                        }:
+                            raise ValueError(
+                                "JSONL request must contain only id/message"
+                            )
+                        include_id = "id" in document
+                        request_id = document.get("id")
+                        line_message = document.get("message")
+                    else:
+                        line_message = line
+                    if not isinstance(line_message, str) or not line_message.strip():
+                        raise ValueError("JSONL request message must be non-empty text")
+                    result = component.handle(Request("chat", line_message))
+                    emit(
+                        result,
+                        request_id=request_id,
+                        include_id=include_id,
+                    )
+                    failures += int(not result.ok)
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    failures += 1
+                    emit_line_error(
+                        f"{type(exc).__name__}: {exc}",
+                        request_id=request_id,
+                        include_id=include_id,
+                    )
+                if max_requests is not None and handled >= max_requests:
+                    break
+            return 0 if failures == 0 else 2
+        result = component.handle(Request("chat", message))
     except (DraftWindowError, OSError, TypeError, ValueError) as exc:
         print(json.dumps({
             "status": "error",
@@ -162,13 +250,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         close = getattr(component, "close", None)
         if callable(close):
             close()
-    print(json.dumps({
-        "status": result.status.value,
-        "component": result.component,
-        "output": result.output,
-        "reason": result.reason,
-        "evidence": dict(result.evidence),
-    }, ensure_ascii=False, sort_keys=True))
+    emit(result)
     return 0 if result.ok else 2
 
 
@@ -741,7 +823,17 @@ def build_parser() -> argparse.ArgumentParser:
         "chat",
         help="run one greedy turn through a verified local Qwen3.8 causal bundle",
     )
-    chat.add_argument("message")
+    chat.add_argument("message", nargs="?")
+    chat.add_argument(
+        "--jsonl",
+        action="store_true",
+        help="keep one loaded runtime and process stdin as raw-text or JSONL requests",
+    )
+    chat.add_argument(
+        "--max-requests",
+        type=int,
+        help="stop the persistent JSONL loop after this many non-empty lines",
+    )
     chat.add_argument("--qwen38-causal-bundle", required=True)
     chat.add_argument("--qwen38-tokenizer", required=True)
     chat.add_argument(

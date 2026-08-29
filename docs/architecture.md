@@ -93,6 +93,18 @@ native kernel operates on the causal-addressed payload without reconstructing
 a full floating matrix. Unsupported or uncovered tensors continue through the
 original BF16 pager.
 
+Packed execution also groups projections that consume the same activation.
+Full Attention submits Q/K/V together, DeltaNet submits QKV/Z/B/A together,
+and the MLP submits Gate/Up together. The native group kernel quantizes the
+activation once and schedules the combined output-row space across one thread
+team while retaining separate mmap pointers and result tensors.
+
+`immer chat --jsonl` keeps this complete mount alive. Every input line is raw
+text or a JSON object containing `message` and an optional `id`; every result
+is flushed as one JSON line. Model continuation state is cleared between
+requests while immutable packed mappings, tokenizer, graph, and kernel remain
+resident.
+
 Rolling generation stages one target-known token followed by up to 15
 untrusted drafts. The target executes the K=2–16 rows in one layer-major
 weight pass and commits only the accepted prefix. DeltaNet update operands

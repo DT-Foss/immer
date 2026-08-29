@@ -311,6 +311,19 @@ class Q4BankTests(unittest.TestCase):
                 self.assertEqual(metrics["mapped_tensors"], 1)
                 self.assertEqual(metrics["linear_calls"], 1)
                 self.assertEqual(metrics["linear_input_rows"], 2)
+                grouped = bank.linear_group(
+                    value,
+                    (name, "lm_head.weight"),
+                )
+                separate = (
+                    bank.linear(value, name),
+                    bank.linear(value, "lm_head.weight"),
+                )
+                for actual, expected in zip(grouped, separate, strict=True):
+                    torch.testing.assert_close(actual, expected)
+                metrics = bank.metrics()
+                self.assertEqual(metrics["linear_group_calls"], 1)
+                self.assertEqual(metrics["input_quantizations"], 4)
             finally:
                 bank.close()
 
@@ -457,6 +470,15 @@ class Q4BankTests(unittest.TestCase):
                     "model.language_model.layers.0.mlp.gate_proj",
                 )
                 self.assertEqual(tuple(output.shape), (1, 5))
+                grouped = pager.linear_group(
+                    torch.ones((1, 64), dtype=torch.bfloat16),
+                    (
+                        "model.language_model.layers.0.mlp.gate_proj",
+                        "model.language_model.layers.0.mlp.down_proj",
+                    ),
+                )
+                self.assertEqual(tuple(grouped[0].shape), (1, 5))
+                self.assertEqual(tuple(grouped[1].shape), (1, 4))
                 embedding = pager.embedding((6, 2, 6))
                 self.assertEqual(tuple(embedding.shape), (3, 64))
                 values, token_ids = pager.topk_logits(
@@ -470,6 +492,7 @@ class Q4BankTests(unittest.TestCase):
                 self.assertTrue(metrics["q4_bank_attached"])
                 self.assertEqual(metrics["logical_weight_bytes"], 0)
                 self.assertGreater(metrics["q4_logical_weight_bytes"], 0)
+                self.assertEqual(metrics["grouped_linear_calls"], 1)
                 with mock.patch("immer.runtimes.qwen3_8.pager.gc.collect") as collect:
                     pager.release()
                 collect.assert_not_called()

@@ -1175,6 +1175,38 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(payload["component"], "qwen3.8.causal-chat")
         self.assertEqual(payload["output"], "local answer")
 
+    def test_cli_jsonl_reuses_one_loaded_component_for_multiple_requests(self) -> None:
+        qwen = _chat(_Runtime())
+        output = io.StringIO()
+        stream = io.StringIO(
+            '{"id":"first","message":"hello"}\nworld\n{"bad":true}\n'
+        )
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor, patch("sys.stdin", stream), redirect_stdout(output):
+            code = main(
+                [
+                    "chat",
+                    "--jsonl",
+                    "--max-requests",
+                    "2",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        constructor.assert_called_once()
+        self.assertTrue(qwen.closed)
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["id"], "first")
+        self.assertNotIn("id", rows[1])
+        self.assertEqual([row["output"] for row in rows], ["local answer"] * 2)
+
     def test_cli_wires_fast_mlp_root_and_layer_subset(self) -> None:
         qwen = _chat(_Runtime())
         with patch(

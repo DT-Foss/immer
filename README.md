@@ -157,6 +157,8 @@ release surface.
 |---|---:|---|
 | Local causal bundle reopen | 77.77 → 1.20 s; 64.90x | complete 55.6 GB Qwen3.8 bundle; first full-content verification followed by unchanged next-process stat+digest reuse; no model forward |
 | Native causal Q4/Q8 chat | readable arbitrary German output; TTFT 22.58 s; 8 tokens in 73.21 s | real 27B CPU run on 16 AVX2 cores; 498 text matrices; 21.65 GB peak RSS; 22.03 GB derived payload; original BF16 graph remains authoritative |
+| Cost-aware Markov abstention | 74.58 s vs 79.05 s direct; identical token trace | seven K1 waves on an unseen German request; zero draft bytes/linears; confirmed episode still updates Council state |
+| Persistent JSONL chat | second request opens 0 tensors | one process retains the verified 22.03 GB mmap plane; observed one-token generation 15.01 s then 16.90 s |
 | Rolling K=2–16 continuation | accepted prefixes commit with zero weight reads | one target-known token plus up to 15 drafts; DeltaNet Conv/recurrent state, next-token continuation, Graft, and native Prefix-Sinkhorn state remain bit-exact |
 | Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed variable phrase options up to 15 tokens |
 | Persistent draft-window policy | request ceiling plus per-wave K4/K8/K16 | real Fixed-Share ceiling sampling after bootstrap; each Markov proposal supplies prefix-local expected acceptance/work utility and only the chosen prefix enters the target; full provider tails remain unauthoritative; model/tokenizer/provider-bound state; K2/K3 terminal fallback |

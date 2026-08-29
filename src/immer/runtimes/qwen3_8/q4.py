@@ -284,6 +284,18 @@ class Q4NativeKernel:
             integer,
         )
         self.library.immer_q4_linear_f32.restype = integer
+        self.library.immer_q4_linear_group_f32.argtypes = (
+            void,
+            i64,
+            i64,
+            void,
+            void,
+            void,
+            void,
+            integer,
+            integer,
+        )
+        self.library.immer_q4_linear_group_f32.restype = integer
 
     @staticmethod
     def _pointer(value: Any) -> ctypes.c_void_p:
@@ -487,6 +499,8 @@ class Q4BankMetrics:
     mapped_tensors: int = 0
     mapped_payload_bytes: int = 0
     linear_calls: int = 0
+    linear_group_calls: int = 0
+    input_quantizations: int = 0
     linear_input_rows: int = 0
     embedding_rows: int = 0
     candidate_rows: int = 0
@@ -615,10 +629,87 @@ class Q4Bank:
             dtype = values.dtype if output_dtype is None else output_dtype
             result = output.to(dtype=dtype).reshape(*leading, entry.shape[0])
             self._stats.linear_calls += 1
+            self._stats.input_quantizations += 1
             self._stats.linear_input_rows += input_rows
             self._stats.logical_weight_bytes += entry.payload_bytes
             self._stats.output_bytes += result.numel() * result.element_size()
             return result
+
+    def linear_group(
+        self,
+        values: Any,
+        names: tuple[str, ...],
+        *,
+        output_dtype: Any | None = None,
+    ) -> tuple[Any, ...]:
+        import torch
+
+        with self._lock:
+            if len(names) < 2 or len(set(names)) != len(names):
+                raise ValueError("Q4 linear group requires distinct matrix names")
+            resolved = [self._mapping(name) for name in names]
+            entries = [row[0] for row in resolved]
+            mapped = [row[1] for row in resolved]
+            input_columns = entries[0].shape[1]
+            if any(entry.shape[1] != input_columns for entry in entries):
+                raise Q4BankError("Q4 linear group input widths differ")
+            if not isinstance(values, torch.Tensor):
+                values = torch.as_tensor(values)
+            if values.ndim < 1 or values.shape[-1] != input_columns:
+                raise Q4BankError("Q4 grouped input width disagrees with its weights")
+            if values.device.type != "cpu":
+                raise Q4BankError("Q4 execution is currently CPU-only")
+            leading = tuple(values.shape[:-1])
+            input_rows = values.numel() // input_columns
+            compute = values.detach().to(dtype=torch.float32).reshape(
+                input_rows, input_columns
+            ).contiguous()
+            outputs = [
+                torch.empty((input_rows, entry.shape[0]), dtype=torch.float32)
+                for entry in entries
+            ]
+            count = len(entries)
+            weight_pointers = (ctypes.c_void_p * count)(
+                *(self.native._pointer(row.bytes).value for row in mapped)
+            )
+            formats = (ctypes.c_int * count)(
+                *(_FORMAT_CODES[entry.format] for entry in entries)
+            )
+            output_rows = (ctypes.c_int64 * count)(
+                *(entry.shape[0] for entry in entries)
+            )
+            output_pointers = (ctypes.c_void_p * count)(
+                *(self.native._pointer(output).value for output in outputs)
+            )
+            code = self.native.library.immer_q4_linear_group_f32(
+                self.native._pointer(compute),
+                input_rows,
+                input_columns,
+                ctypes.cast(weight_pointers, ctypes.c_void_p),
+                ctypes.cast(formats, ctypes.c_void_p),
+                ctypes.cast(output_rows, ctypes.c_void_p),
+                ctypes.cast(output_pointers, ctypes.c_void_p),
+                count,
+                self.threads,
+            )
+            if code:
+                raise Q4BankError(f"native Q4 linear group failed with code {code}")
+            dtype = values.dtype if output_dtype is None else output_dtype
+            results = tuple(
+                output.to(dtype=dtype).reshape(*leading, entry.shape[0])
+                for output, entry in zip(outputs, entries, strict=True)
+            )
+            self._stats.linear_calls += count
+            self._stats.linear_group_calls += 1
+            self._stats.input_quantizations += 1
+            self._stats.linear_input_rows += input_rows * count
+            self._stats.logical_weight_bytes += sum(
+                entry.payload_bytes for entry in entries
+            )
+            self._stats.output_bytes += sum(
+                result.numel() * result.element_size() for result in results
+            )
+            return results
 
     def rows(self, name: str, row_ids: tuple[int, ...], *, dtype: Any) -> Any:
         import torch

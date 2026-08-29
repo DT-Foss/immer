@@ -38,6 +38,17 @@ All notable changes to IMMER are recorded here.
   changed inode/size/mtime/ctime triggers a full digest check. Repeated Q4 rows
   decode once and restore caller order. Transient Q4 input, activation, output,
   row-restore, and head-sort workspaces obey the existing resident-memory cap.
+- Added native same-input projection groups. Q/K/V, DeltaNet QKV/Z/B/A, and
+  MLP Gate/Up share one Q8 activation quantization and one native thread team
+  while preserving separate tensor payloads, outputs, logical call accounting,
+  and the exact generated token trace. The full eight-token wall time remained
+  neutral; the grouped counters make that result explicit instead of claiming
+  a false speedup.
+- `immer chat --jsonl` now keeps the verified bundle, tokenizer, model, native
+  kernel, and 498 mmap tensors alive across raw-text or `{id,message}` lines.
+  The real two-request process generated first tokens in 15.01 and 16.90
+  seconds; request two opened zero new tensors. `--max-requests` exits directly
+  after the configured line count.
 
 - Generalized correction-first rolling verification from fixed K=4 to a
   configurable K=2–16 target window; `immer chat` defaults to K=8. All target
