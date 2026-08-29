@@ -181,6 +181,12 @@ persists the Markov accounting; an unknown prompt falls directly through to
 full Q4. `--no-ooe-warm` disables this route, and `--ooe-warm-root` mounts an
 explicit bank outside the canonical deployment.
 
+The canonical Q4 deployment also mounts its persistent token-level Markov
+council. It proposes variable continuation windows, abstains to K1 when their
+expected work is worse, and learns only target-confirmed output. Full Q4 still
+verifies every emitted token, so the council changes work scheduling rather
+than answer quality. `--no-markov-draft` forces direct K1 decoding.
+
 ## Selected trial evidence
 
 | Trial | Result | Scope |

@@ -1504,6 +1504,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         "chat",
                         "hello",
                         "--no-fast-mlp",
+                        "--no-markov-draft",
                         "--raw-qwen",
                     ]
                 )
@@ -1529,7 +1530,14 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
                 return_value=qwen,
             ) as constructor, redirect_stdout(io.StringIO()):
-                code = main(["chat", "hello", "--raw-qwen"])
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
 
         self.assertEqual(code, 0)
         options = constructor.call_args.kwargs
@@ -1539,6 +1547,34 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         self.assertIsNone(options["fast_mlp_root"])
         self.assertIsNone(options["fast_mlp_active_layers"])
+        self.assertIsNone(options["draft_mode"])
+        self.assertIsNone(options["markov_draft_state_path"])
+
+    def test_cli_deployment_mounts_the_persistent_markov_token_council(
+        self,
+    ) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
+            state = Path(temporary) / "qwen-markov.bin"
+            state.write_bytes(b"fixture")
+            with patch.dict("os.environ", {}, clear=True), patch(
+                "immer.cli._QWEN38_DEPLOYMENT_ROOT",
+                deployed,
+            ), patch(
+                "immer.cli._QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE",
+                state,
+            ), patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ) as constructor, redirect_stdout(io.StringIO()):
+                code = main(["chat", "hello", "--raw-qwen"])
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["draft_mode"], "markov")
+        self.assertEqual(options["markov_draft_state_path"], str(state))
 
     def test_cli_jsonl_reuses_one_loaded_component_for_multiple_requests(self) -> None:
         qwen = _chat(_Runtime())

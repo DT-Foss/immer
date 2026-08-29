@@ -68,6 +68,9 @@ _QWEN38_DEPLOYMENT_ROOT = Path("/app/models/Qwen3.8-27B")
 _QWEN38_DEPLOYMENT_WARM_ROOT = Path(
     "/root/immer-runtime/artifacts/private/qwen3.8-ooe-chat-real"
 )
+_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE = Path(
+    "/root/immer-state/qwen-markov-q4-v1.bin"
+)
 
 
 def _chat_path(
@@ -161,6 +164,32 @@ def _resolve_qwen38_warm_root(
     ):
         return _QWEN38_DEPLOYMENT_WARM_ROOT
     return None
+
+
+def _resolve_qwen38_markov_draft(
+    args: argparse.Namespace,
+    bundle_path: Path,
+    q4_root: Path | None,
+) -> tuple[str | None, str | None]:
+    draft_mode = getattr(args, "draft_mode", None)
+    markov_state = getattr(args, "markov_draft_state", None)
+    disabled = bool(getattr(args, "no_markov_draft", False))
+    if disabled:
+        if draft_mode == "markov" or markov_state is not None:
+            raise ValueError(
+                "Markov draft options and --no-markov-draft are mutually exclusive"
+            )
+        return draft_mode, markov_state
+    if (
+        draft_mode is None
+        and getattr(args, "draft_bundle", None) is None
+        and markov_state is None
+        and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+        and q4_root is not None
+        and _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE.is_file()
+    ):
+        return "markov", str(_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE)
+    return draft_mode, markov_state
 
 
 class _LiveTextWriter:
@@ -362,6 +391,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         bundle_path, tokenizer_path, q4_root, fast_mlp_root = (
             _resolve_qwen38_chat_paths(args)
         )
+        draft_mode, markov_draft_state = _resolve_qwen38_markov_draft(
+            args,
+            bundle_path,
+            q4_root,
+        )
         warm_mount = None
         if not args.raw_qwen:
             warm_root = _resolve_qwen38_warm_root(args, bundle_path)
@@ -407,7 +441,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             q4_threads=args.q4_threads,
             anchor_cache=anchor_cache,
             draft_bundle_path=args.draft_bundle,
-            draft_mode=args.draft_mode,
+            draft_mode=draft_mode,
             draft_window=args.draft_window,
             draft_source_budget_mb=args.draft_source_budget_mb,
             draft_max_resident_bytes=(
@@ -415,7 +449,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 if args.draft_max_resident_mb is None
                 else int(args.draft_max_resident_mb * 1024**2)
             ),
-            markov_draft_state_path=args.markov_draft_state,
+            markov_draft_state_path=markov_draft_state,
             draft_window_state_path=args.draft_window_state,
             range_markov_state_path=args.range_markov_state,
             range_prefetch_max_bytes=int(args.range_prefetch_max_mb * 1024**2),
@@ -1164,6 +1198,11 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--markov-draft-state",
         help="persistent sparse Qwen-token Markov memory",
+    )
+    chat.add_argument(
+        "--no-markov-draft",
+        action="store_true",
+        help="disable the deployed target-verified Markov token council",
     )
     chat.add_argument(
         "--draft-window-state",
