@@ -6,6 +6,18 @@ All notable changes to IMMER are recorded here.
 
 ### Arbitrary local Qwen runtime
 
+- Enabled F16C half-to-float conversion in the packed Q4/Q8 inner loop on
+  capable x86 hosts. Scale values and dot ordering remain identical; other
+  architectures retain the scalar IEEE conversion. On Beast, the five-token
+  `Fledermaus` generation fell from `18.7056` to `13.4470 s` and TTFT from
+  `11.5832` to `7.1037 s`, preserving the exact target trace and ~1.18 GB RSS.
+- Repriced Markov K1/K2/K4/K8/K16 actions for the fused F16C backend. A fresh
+  persistent MTP run learned through three K1 corrections, opened K2 at a
+  `0.667` posterior, accepted its token, and retained the exact target trace.
+  Mixed K1/K2 completed in `14.8022 s` versus `14.7884 s` for MTP-K1-only;
+  longer high-reliability contexts can now amortize the provider while weak
+  contexts remain K1.
+
 - Fused the complete dense Q4 MLP into one native team: Hidden-Q8, Gate/Up,
   Torch-authoritative BF16 SiLU and product rounding, activation-Q8, and Down.
   The dot-product order and packed weights are unchanged. Observer, sparse-MLP,

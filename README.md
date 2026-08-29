@@ -36,7 +36,8 @@ release surface.
   Gate, Up, BF16 SwiGLU, activation quantization, and Down now execute inside
   one native OpenMP team. A complete 65,536-entry BF16-SiLU table is generated
   from the installed Torch semantics, keeping the fused path bit-identical
-  across host libm implementations.
+  across host libm implementations. AVX2 hosts with F16C decode every packed
+  FP16 block scale in hardware; other hosts retain the scalar IEEE reference.
 - **Predictive weight transport.** A persistent two-agent operation Markov
   model learns the exact tensor/range sequence already emitted by the
   Streamer. Order-1/2 Fixed Share, surprise regimes, and Ricci retention
