@@ -1244,6 +1244,46 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIs(wrapper.call_args.args[0], qwen)
         self.assertIsInstance(wrapper.call_args.args[1], FertigSolver)
 
+    def test_cli_explicit_layout_does_not_inherit_deployed_q4(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
+            deployed_fast = Path(temporary) / "deployed-fast"
+            deployed_fast.mkdir()
+            with patch.dict("os.environ", {}, clear=True), patch(
+                "immer.cli._QWEN38_DEPLOYMENT_ROOT",
+                deployed,
+            ), patch(
+                "immer.cli._QWEN38_DEPLOYMENT_FAST_MLP",
+                deployed_fast,
+            ), patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ) as constructor, redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/other.causal",
+                        "--qwen38-tokenizer",
+                        "/models/other-tokenizer.json",
+                        "--fast-mlp",
+                        "/models/other-fast",
+                        "--fast-mlp-layers",
+                        "0,9",
+                        "--raw-qwen",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertIsNone(constructor.call_args.kwargs["q4_root"])
+        self.assertEqual(
+            constructor.call_args.kwargs["fast_mlp_active_layers"],
+            (0, 9),
+        )
+
     def test_cli_jsonl_reuses_one_loaded_component_for_multiple_requests(self) -> None:
         qwen = _chat(_Runtime())
         output = io.StringIO()

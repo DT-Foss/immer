@@ -85,7 +85,15 @@ def _resolve_qwen38_chat_paths(
     """Resolve the deployed local chat stack without requiring flag repetition."""
 
     root = _chat_path(getattr(args, "qwen38_root", None), "IMMER_QWEN38_ROOT")
-    if root is None and _QWEN38_DEPLOYMENT_ROOT.is_dir():
+    custom_layout = any(
+        (
+            getattr(args, "qwen38_causal_bundle", None),
+            getattr(args, "qwen38_tokenizer", None),
+            os.environ.get("IMMER_QWEN38_CAUSAL_BUNDLE"),
+            os.environ.get("IMMER_QWEN38_TOKENIZER"),
+        )
+    )
+    if root is None and not custom_layout and _QWEN38_DEPLOYMENT_ROOT.is_dir():
         root = _QWEN38_DEPLOYMENT_ROOT
 
     bundle = _chat_path(
