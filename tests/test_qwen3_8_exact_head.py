@@ -244,6 +244,16 @@ class Qwen38ExactHeadTests(unittest.TestCase):
                     )
                 )
 
+    def test_selected_row_transport_requires_large_low_run_savings(self) -> None:
+        economic = ExactHeadIndex._selected_read_is_economic
+
+        self.assertTrue(economic((4,), 4))
+        self.assertTrue(economic((4, 5), 4))
+        self.assertFalse(economic((4, 5, 6), 4))
+        self.assertTrue(economic((0, 2, 4, 6), 16))
+        self.assertFalse(economic((0, 2, 4, 6, 8), 16))
+        self.assertFalse(economic(tuple(range(9)), 16))
+
     def test_row_certificate_keeps_an_omitted_winner_and_reads_it_once(self) -> None:
         head = torch.tensor(
             [

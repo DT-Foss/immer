@@ -195,6 +195,7 @@ class ExactHeadMetrics:
     selected_row_reads: int = 0
     selected_rows_scored: int = 0
     full_leaf_fallbacks: int = 0
+    selected_row_cost_fallbacks: int = 0
     selected_row_logical_bytes: int = 0
     row_certificate_logical_bytes_avoided: int = 0
     logical_head_bytes_avoided: int = 0
@@ -1260,6 +1261,21 @@ class ExactHeadIndex:
             cap == threshold_value and page_min_token >= threshold_token
         )
 
+    @staticmethod
+    def _selected_read_is_economic(
+        selected_ids: tuple[int, ...],
+        page_rows: int,
+    ) -> bool:
+        """Use scattered transport only for a material, low-run byte cut."""
+
+        if not selected_ids or len(selected_ids) * 2 > page_rows:
+            return False
+        runs = 1 + sum(
+            following != previous + 1
+            for previous, following in zip(selected_ids, selected_ids[1:])
+        )
+        return runs <= 4
+
     def topk_logits(
         self,
         pager: Any,
@@ -1300,6 +1316,7 @@ class ExactHeadIndex:
             selected_row_reads = 0
             selected_rows_scored = 0
             full_leaf_fallbacks = 0
+            selected_row_cost_fallbacks = 0
             row_certificate_rows_pruned = 0
             while frontier:
                 _priority, node = heapq.heappop(frontier)
@@ -1373,6 +1390,7 @@ class ExactHeadIndex:
                     len(selected_ids) < count
                     and callable(selected_reader)
                     and callable(score_preflight)
+                    and self._selected_read_is_economic(selected_ids, count)
                 )
                 if use_selected:
                     score_preflight(
@@ -1400,6 +1418,7 @@ class ExactHeadIndex:
                     selected_rows_scored += len(selected_ids)
                 else:
                     if len(selected_ids) < count:
+                        selected_row_cost_fallbacks += 1
                         rows_pruned -= count - len(selected_ids)
                         row_certificate_rows_pruned -= count - len(selected_ids)
                         selected_ids = tuple(range(start, start + count))
@@ -1449,6 +1468,9 @@ class ExactHeadIndex:
                 self._metrics.selected_row_reads += selected_row_reads
                 self._metrics.selected_rows_scored += selected_rows_scored
                 self._metrics.full_leaf_fallbacks += full_leaf_fallbacks
+                self._metrics.selected_row_cost_fallbacks += (
+                    selected_row_cost_fallbacks
+                )
                 selected_bytes = (
                     selected_rows_scored * self.binding.hidden_size * 2
                 )

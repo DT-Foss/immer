@@ -35,7 +35,8 @@ release surface.
   certified upper bounds for canonical token pages. Proven-impossible pages
   require no checkpoint read; surviving pages apply the actual stored PQ code
   tuple and residual radius per vocabulary row, then read only the K<=16 union
-  of rows still capable of winning. The unchanged page-shaped
+  of rows still capable of winning when that removes at least half the page in
+  at most four contiguous runs. The unchanged page-shaped
   FP32-accumulate/BF16-output scorer preserves stable lower-token-ID ties.
 - **Grounded composition.** [FERTIG](https://github.com/DT-Foss/FERTIG)
   supplies deterministic parsing, verification, and explicit abstention.
@@ -134,7 +135,7 @@ release surface.
 | K4 Fast-MLP route reuse | repeated K2/K4 target and auxiliary bytes equal one route | Gate/Up rows are wave-unioned; one-route down cache uses maximum-overlap row ordering while preserving each reduction; identical K4 routes remove 180 MiB per active p4/k32 layer |
 | Direct-to-Torch local ranges | one final tensor for sorted selected-row routes | inode-stable `preadv` fills caller-owned Torch storage; no intermediate Python body, no row-stack duplicate, exact cache/budget/causal-plan accounting |
 | Weight-only all-layer Fast MLP | deterministic 64-layer p4/k32 plan; exact-path online learning | no prompts or model forwards in the build; one/reused route addresses 18.0147% of MLP rows; fixed-size target-confirmed state and full-MLP fallback |
-| Exact residual-PQ LM head | K=1–16 and k=1/3/7 parity; certified page + row pruning | deterministic weight-only build, best-first tree, actual row-code caps, K-query survivor union, outward residual/roundoff bounds, overflow/tie/subnormal guards, and exact full-leaf fallback; no model forward |
+| Exact residual-PQ LM head | K=1–16 and k=1/3/7 parity; certified page + economic row pruning | deterministic weight-only build, best-first tree, actual row-code caps, K-query survivor union, contiguous-read cost gate, outward residual/roundoff bounds, overflow/tie/subnormal guards, and exact full-leaf fallback; no model forward |
 | Arbitrary local Qwen chat | one terminal 64-layer sweep removed per request | authenticated causal Qwen3.8 path; rolling local-Qwen or zero-model-byte Markov drafting plus row-routed fast MLP; target, auxiliary, draft, and combined transport reported separately |
 | Seed v3 native migration | exact parity on 8/8 inherited tensor outputs for Micro and 5M | SHA-first migration of shared trained GRU/CRSA/SwiGLU weights; new receipt, quotient, route-value, and expected-work heads added under a strict inference-only manifest |
 | Full Qwen MLP layer map | 640/640 cells; content promotion 0 | every layer repeats the same 146/549 template hits; 1,370/1,389 candidate admissions equal their matched random controls, closing the exhaustive exact-key line |

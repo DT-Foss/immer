@@ -131,7 +131,8 @@ canonical page scorer. If the node mask is loose, the runtime evaluates each
 leaf row's actual PQ code tuple and residual radius, unions survivors across
 K<=16 queries, fills omitted positions with zero, and scores the survivors in
 the unchanged page shape. Unsupported or zero-saving selection reads the full
-leaf once.
+leaf once. Scattered transport is also rejected unless at least half the leaf
+is removed and the survivors occupy at most four contiguous runs.
 
 The Markov draft council contains eight sparse PPM experts across orders
 `0..16` and windows `128..4096`. Their Qwen-ID distributions are pooled by

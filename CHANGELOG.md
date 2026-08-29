@@ -28,7 +28,10 @@ All notable changes to IMMER are recorded here.
   possible winners across K<=16 queries, and direct-fills only those checkpoint
   rows. Selected rows are zero-filled into the canonical page shape before the
   unchanged FP32/BF16 scorer, preserving kernel shape and stable ties. A leaf
-  with no certified byte saving uses the former contiguous read once.
+  with no certified byte saving uses the former contiguous read once. A
+  transport cost gate also requires at least 50% row removal and at most four
+  survivor runs, preventing small logical savings from exploding into tens of
+  thousands of tiny local reads.
 - Added a complete prompt-free Fast-MLP builder for all 64 Qwen layers. It
   computes Gate/Up Gaussian joint moments directly from local causal weights,
   constructs deterministic p4/k32 pilots, and publishes the existing packed
