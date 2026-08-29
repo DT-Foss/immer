@@ -269,6 +269,31 @@ receive a prefix. Exact duplicate ranges and recently hinted leaves are
 removed with a bounded operation cooldown. Hits and misses remain separate for
 each forecast distance.
 
+An OS-accepted hint is a delayed action, not a success claim. Its exact range,
+creation operation, predicted distance, and due operation remain pending until
+later real demand. Interval union computes useful overlap bytes without double
+counting overlapping demand leaves. Early arrival counts as useful; a due hint
+with zero overlap is a miss. For distance `d`, the agent receives
+
+```text
+r_d = 2 * useful_bytes / hinted_bytes - 1.
+```
+
+Eight persistent distance rapidities use decay and 5% Fixed Share. Their
+normalized weights multiply the corresponding beam scores, so productive lead
+distances rise while every distance keeps an exploration floor. A global
+utility EMA scales the effective reservoir budget inside the configured hard
+maximum:
+
+```text
+budget_fraction = 0.125 + 0.875 * utility_ema.
+```
+
+Only accepted hints enter feedback or cooldown. Declines and errors remain
+neutral and immediately retryable. Pending actions are never invented across
+restart; state v2 persists only settled distance statistics and migrates v1 on
+the next real demand.
+
 The production local path calls
 `posix_fadvise(..., POSIX_FADV_WILLNEED)` for at most the configured reservoir
 bytes and leaves. This call returns no payload, creates no logical Streamer

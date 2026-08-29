@@ -8,6 +8,7 @@ import struct
 import tempfile
 import unittest
 from unittest import mock
+import zlib
 
 from immer.knowledge import AccessLeaf, AccessOperation, Streamer
 from immer.knowledge.range_markov import (
@@ -16,6 +17,7 @@ from immer.knowledge.range_markov import (
     RangeMarkovError,
     RangeMarkovState,
 )
+import immer.knowledge.range_markov as range_module
 
 
 IDENTITY = ("local:test", "a" * 40, "b" * 64)
@@ -135,7 +137,8 @@ class RangeMarkovTests(unittest.TestCase):
         plan = controller.last_beam_plan
         self.assertIsNotNone(plan)
         self.assertLessEqual(len(plan.hints), 2)
-        self.assertEqual(plan.hint_bytes, 100)
+        self.assertEqual(plan.hint_bytes, plan.effective_hint_budget_bytes)
+        self.assertLessEqual(plan.hint_bytes, 100)
         self.assertEqual(
             (plan.hints[0].leaf.shard, plan.hints[0].leaf.offset),
             ("a", 0),
@@ -356,6 +359,241 @@ class RangeMarkovTests(unittest.TestCase):
         self.assertGreater(metrics["prefetch_attempts"], 0)
         self.assertEqual(metrics["prefetch_declines"], metrics["prefetch_attempts"])
         self.assertEqual(metrics["reservoir_cooldown_leaves_skipped"], 0)
+
+    def test_delayed_hint_feedback_reweights_distance_and_shrinks_budget(self) -> None:
+        controller = MarkovRangePrefetcher(
+            None,
+            prefetch_range=lambda *_row: False,
+            min_support=1,
+            min_confidence=0.0,
+            beam_horizon=3,
+            beam_width=2,
+            max_prefetch_bytes=120,
+            max_prefetch_leaves=3,
+            hint_cooldown_operations=1,
+        )
+        names = ("A", "B", "C") * 4
+        for index, name in enumerate(names, start=1):
+            controller.observe(_operation(index, name))
+        controller.prefetch_range = lambda *_row: True
+        start = len(names) + 1
+        controller.observe(_operation(start, "A"))
+        controller.prefetch_range = lambda *_row: False
+        controller.observe(_operation(start + 1, "B"))
+        controller.observe(_operation(start + 2, "X"))
+        controller.observe(_operation(start + 3, "Y"))
+
+        metrics = controller.metrics()
+        self.assertEqual(metrics["distance_byte_utility"]["1"], 1.0)
+        self.assertEqual(metrics["distance_byte_utility"]["2"], 0.0)
+        self.assertEqual(metrics["distance_byte_utility"]["3"], 0.0)
+        self.assertGreater(
+            metrics["distance_weights"]["1"],
+            metrics["distance_weights"]["2"],
+        )
+        self.assertLess(metrics["effective_prefetch_bytes"], 120)
+        self.assertGreater(metrics["hint_feedback_count"], 0)
+
+    def test_v1_state_migrates_distance_agents_on_next_demand(self) -> None:
+        path = self.root / "range-v1.bin"
+        seed = MarkovRangePrefetcher(
+            None,
+            prefetch_range=lambda *_row: False,
+        )
+        seed.observe(_operation(1, "A"))
+        body = seed._state.to_record()
+        for field in (
+            "distance_hinted_bytes",
+            "distance_hits",
+            "distance_observations",
+            "distance_rapidities",
+            "distance_useful_bytes",
+            "hint_feedback_count",
+            "hint_utility_ema",
+        ):
+            body.pop(field)
+        body["schema"] = range_module.V1_RANGE_MARKOV_STATE_SCHEMA
+        envelope = range_module._canonical(
+            {"body": body, "body_sha256": range_module._digest(body)}
+        )
+        path.write_bytes(b"IMRM\x01" + zlib.compress(envelope, level=9))
+
+        migrated = MarkovRangePrefetcher(
+            path,
+            prefetch_range=lambda *_row: False,
+        )
+        self.assertEqual(migrated._state.hint_feedback_count, 0)
+        self.assertEqual(migrated._state.hint_utility_ema, 1.0)
+        migrated.observe(_operation(1, "B"))
+        migrated.close()
+
+        self.assertTrue(path.read_bytes().startswith(b"IMRM\x02"))
+        restored = RangeMarkovState.from_bytes(path.read_bytes())
+        self.assertEqual(len(restored.distance_rapidities), 8)
+
+    def test_partial_early_use_accumulates_until_due_before_reward(self) -> None:
+        controller = MarkovRangePrefetcher(
+            None,
+            prefetch_range=lambda *_row: True,
+        )
+        controller.bind_source_identity(*IDENTITY)
+        hinted = AccessLeaf("weights", 0, 100)
+        controller._pending_hints = [
+            range_module._PendingHint(
+                created_operation=1,
+                due_operation=3,
+                distance=2,
+                leaf=hinted,
+                original_length=100,
+            )
+        ]
+        first = AccessState(
+            "raw_bytes",
+            (AccessLeaf("weights", 0, 10),),
+            (("tensor", "partial"),),
+        )
+        second = AccessState(
+            "raw_bytes",
+            (AccessLeaf("weights", 10, 90),),
+            (("tensor", "rest"),),
+        )
+
+        unchanged = controller._settle_pending_hints_locked(
+            controller._state,
+            current_operation=2,
+            demand=first,
+        )
+        self.assertEqual(unchanged.hint_feedback_count, 0)
+        self.assertEqual(controller._pending_hints[0].covered_bytes, 10)
+        settled = controller._settle_pending_hints_locked(
+            unchanged,
+            current_operation=3,
+            demand=second,
+        )
+
+        self.assertEqual(settled.hint_feedback_count, 1)
+        self.assertEqual(settled.distance_hinted_bytes[1], 100)
+        self.assertEqual(settled.distance_useful_bytes[1], 100)
+        self.assertEqual(controller._pending_hints, [])
+
+    def test_oversize_real_demand_settles_due_hint_without_training_state(self) -> None:
+        controller = MarkovRangePrefetcher(
+            None,
+            prefetch_range=lambda *_row: True,
+            max_operation_leaves=1,
+        )
+        controller.bind_source_identity(*IDENTITY)
+        controller._last_operation_sequence = 1
+        hinted = AccessLeaf("weights", 0, 64)
+        controller._pending_hints = [
+            range_module._PendingHint(
+                created_operation=1,
+                due_operation=2,
+                distance=1,
+                leaf=hinted,
+                original_length=64,
+            )
+        ]
+        operation = _operation(
+            2,
+            "oversize",
+            leaves=(hinted, AccessLeaf("weights", 128, 64)),
+        )
+
+        self.assertFalse(controller.observe(operation))
+
+        self.assertEqual(controller.metrics()["observations"], 0)
+        self.assertEqual(controller._state.hint_feedback_count, 1)
+        self.assertEqual(controller._state.distance_useful_bytes[0], 64)
+        self.assertEqual(controller.metrics()["demand_operations"], 1)
+
+    def test_distance_reward_is_byte_weighted_not_hint_fragment_weighted(self) -> None:
+        whole = MarkovRangePrefetcher(None, prefetch_range=lambda *_row: True)
+        split = MarkovRangePrefetcher(None, prefetch_range=lambda *_row: True)
+        whole.bind_source_identity(*IDENTITY)
+        split.bind_source_identity(*IDENTITY)
+        whole._pending_hints = [
+            range_module._PendingHint(
+                created_operation=1,
+                due_operation=2,
+                distance=1,
+                leaf=AccessLeaf("weights", 0, 100),
+                original_length=100,
+            )
+        ]
+        split._pending_hints = [
+            range_module._PendingHint(
+                created_operation=1,
+                due_operation=2,
+                distance=1,
+                leaf=AccessLeaf("weights", 0, 40),
+                original_length=40,
+            ),
+            range_module._PendingHint(
+                created_operation=1,
+                due_operation=2,
+                distance=1,
+                leaf=AccessLeaf("weights", 40, 60),
+                original_length=60,
+            ),
+        ]
+        demand = AccessState(
+            "raw_bytes",
+            (AccessLeaf("weights", 0, 100),),
+            (("tensor", "whole"),),
+        )
+
+        whole_state = whole._settle_pending_hints_locked(
+            whole._state,
+            current_operation=2,
+            demand=demand,
+        )
+        split_state = split._settle_pending_hints_locked(
+            split._state,
+            current_operation=2,
+            demand=demand,
+        )
+
+        self.assertEqual(whole_state.distance_rapidities, split_state.distance_rapidities)
+        self.assertEqual(split_state.distance_observations[0], 1)
+        self.assertEqual(split_state.distance_hinted_bytes[0], 100)
+        self.assertEqual(split_state.distance_useful_bytes[0], 100)
+        self.assertEqual(split_state.hint_feedback_count, 1)
+
+    def test_unresolved_exact_hint_blocks_duplicate_reservoir_action(self) -> None:
+        controller = MarkovRangePrefetcher(
+            None,
+            prefetch_range=lambda *_row: True,
+            min_support=1,
+            min_confidence=0.0,
+        )
+        for index, name in enumerate(("A", "B") * 3 + ("A",), start=1):
+            controller.observe(_operation(index, name))
+        prediction = controller.last_prediction
+        leaf = prediction.state.leaves[0]
+        controller._pending_hints = [
+            range_module._PendingHint(
+                created_operation=7,
+                due_operation=10,
+                distance=3,
+                leaf=leaf,
+                original_length=leaf.length,
+            )
+        ]
+
+        plan = controller._beam_plan_locked(
+            controller._state,
+            current_operation=8,
+        )
+
+        self.assertTrue(
+            all(
+                (row.leaf.shard, row.leaf.offset, row.original_length)
+                != (leaf.shard, leaf.offset, leaf.length)
+                for row in plan.hints
+            )
+        )
+        self.assertGreater(plan.cooldown_leaves_skipped, 0)
 
     def test_streamer_demand_trains_live_while_os_hints_stay_unobserved(self) -> None:
         header = {

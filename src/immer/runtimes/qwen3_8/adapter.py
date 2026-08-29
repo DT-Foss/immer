@@ -1288,7 +1288,7 @@ class Qwen38CausalChat:
                 "min_confidence": self._range_prefetch_min_confidence,
                 "min_support": self._range_prefetch_min_support,
                 "prefetch": "local-posix-fadvise-willneed/v1",
-                "state": "operation-order1-order2-ricci/v1",
+                "state": "operation-order1-order2-ricci-distance/v2",
             }
         if self._fast_mlp_paths is not None:
             policy["fast_mlp"] = {

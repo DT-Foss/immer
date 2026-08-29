@@ -61,6 +61,13 @@ All notable changes to IMMER are recorded here.
   global byte/leaf budget, and protected from repeated hints by an operation
   cooldown. Metrics expose candidates, paths, reservoir truncation/dedupe,
   exact hinted leaves, and hit/miss coverage separately for each distance.
+- Closed the range-prefetch learning loop. Kernel-accepted hints remain delayed
+  actions until later exact demand settles byte-overlap utility. Persistent
+  d1–d8 rapidities learn from `2*useful/hinted-1` with a Fixed-Share floor and
+  reweight future beam scores. A settled utility EMA scales the effective
+  reservoir from 12.5% to 100% of the configured hard byte maximum. Early hits
+  count, due misses settle negative, declined/error hints consume neither
+  feedback nor cooldown, and v1 range state migrates to distance-agent v2.
 - Expanded the exact residual-PQ head query union from four to sixteen rows.
   Certified pruning and stable top-k parity now cover the complete rolling
   window; the weight-only builder records the same K16 scorer bound.

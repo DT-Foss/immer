@@ -25,7 +25,10 @@ release surface.
   Streamer. Order-1/2 Fixed Share, surprise regimes, and Ricci retention
   roll a bounded multi-step beam over future grouped operations. Path
   probability, Ricci value, and reuse distance rank a deduplicated leaf
-  reservoir under one global byte/leaf budget. Linux warms it via
+  reservoir under one global byte/leaf budget. Accepted hints become delayed
+  actions: later exact demand supplies useful/hinted bytes to persistent
+  distance agents, which reweight the beam and scale its budget between 12.5%
+  and 100% of the hard maximum. Linux warms it via
   `POSIX_FADV_WILLNEED`: no payload copy, logical read, budget charge, or pager
   weight cache is introduced.
 - **Native local drafting.** A causalized Qwen3.5-0.8B or a zero-weight Markov
@@ -149,7 +152,7 @@ release surface.
 | Consuming ordinary decode | one continuation cache plus one replacement layer | removes simultaneous ownership of complete old and new cache stacks; official static cache cut is `154,927,104 + 65,552 × prefix_tokens` bytes |
 | K4 Fast-MLP route reuse | repeated K2/K4 target and auxiliary bytes equal one route | Gate/Up rows are wave-unioned; one-route down cache uses maximum-overlap row ordering while preserving each reduction; identical K4 routes remove 180 MiB per active p4/k32 layer |
 | Direct-to-Torch local ranges | one final tensor for sorted selected-row routes | inode-stable `preadv` fills caller-owned Torch storage; no intermediate Python body, no row-stack duplicate, exact cache/budget/causal-plan accounting |
-| Markov range prefetch | zero additional logical/source bytes | grouped tensor operations with semantic tags; order-1/2 agents; depth-3/width-4 beam; probability×Ricci/reuse scoring; cross-operation leaf dedupe, cooldown, one global reservoir budget, distance-specific hit metrics, and bounded local OS-page hints |
+| Markov range prefetch | zero additional logical/source bytes | grouped operations; order-1/2 beam; probability×Ricci/reuse scoring; cross-operation dedupe; accepted-only cooldown; delayed exact-byte utility for d1–d8 agents; adaptive 12.5–100% reservoir budget; bounded local OS-page hints |
 | Weight-only all-layer Fast MLP | deterministic 64-layer p4/k32 plan; capture-only target use forbidden | no prompts or model forwards in the build; exact paths learn adaptive width plus prequential sparse-output cosine/L2 and scalar correction; non-beneficial or uncalibrated routes use the full MLP |
 | Exact residual-PQ LM head | K=1–16 and k=1/3/7 parity; certified page + economic row pruning | deterministic weight-only build, best-first tree, actual row-code caps, K-query survivor union, contiguous-read cost gate, 64-leaf no-saving stop, outward residual/roundoff bounds, overflow/tie/subnormal guards, and exact full-leaf fallback; no model forward |
 | Arbitrary local Qwen chat | one terminal 64-layer sweep removed per request | authenticated causal Qwen3.8 path; rolling local-Qwen or zero-model-byte Markov drafting plus row-routed fast MLP; target, auxiliary, draft, and combined transport reported separately |

@@ -23,17 +23,20 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 
-RANGE_MARKOV_STATE_SCHEMA = "immer.range-markov-state/v1"
+RANGE_MARKOV_STATE_SCHEMA = "immer.range-markov-state/v2"
+V1_RANGE_MARKOV_STATE_SCHEMA = "immer.range-markov-state/v1"
 RANGE_MARKOV_PREDICTION_SCHEMA = "immer.range-markov-prediction/v1"
-RANGE_MARKOV_METRICS_SCHEMA = "immer.range-markov-metrics/v2"
-RANGE_MARKOV_BEAM_STEP_SCHEMA = "immer.range-markov-beam-step/v1"
-RANGE_MARKOV_BEAM_PLAN_SCHEMA = "immer.range-markov-beam-plan/v1"
+RANGE_MARKOV_METRICS_SCHEMA = "immer.range-markov-metrics/v3"
+RANGE_MARKOV_BEAM_STEP_SCHEMA = "immer.range-markov-beam-step/v2"
+RANGE_MARKOV_BEAM_PLAN_SCHEMA = "immer.range-markov-beam-plan/v2"
 
-_STATE_PREFIX = b"IMRM\x01"
+_STATE_PREFIX = b"IMRM\x02"
+_V1_STATE_PREFIX = b"IMRM\x01"
 _MAX_STATE_BYTES = 16 * 1024 * 1024
 _MAX_JSON_BYTES = 64 * 1024 * 1024
 _HEX = frozenset("0123456789abcdef")
 _SEMANTIC_TAGS = frozenset({"layer", "phase", "read_kind", "tensor"})
+_MAX_DISTANCE_AGENTS = 8
 
 
 class RangeMarkovError(RuntimeError):
@@ -303,6 +306,13 @@ class RangeMarkovState:
     regime_generation: int = 0
     node_evictions: int = 0
     context_evictions: int = 0
+    distance_rapidities: tuple[float, ...] = (0.0,) * _MAX_DISTANCE_AGENTS
+    distance_observations: tuple[int, ...] = (0,) * _MAX_DISTANCE_AGENTS
+    distance_hits: tuple[int, ...] = (0,) * _MAX_DISTANCE_AGENTS
+    distance_hinted_bytes: tuple[int, ...] = (0,) * _MAX_DISTANCE_AGENTS
+    distance_useful_bytes: tuple[int, ...] = (0,) * _MAX_DISTANCE_AGENTS
+    hint_feedback_count: int = 0
+    hint_utility_ema: float = 1.0
 
     def __post_init__(self) -> None:
         identities = (self.repo_id, self.revision, self.inventory_fingerprint)
@@ -362,12 +372,72 @@ class RangeMarkovState:
             (self.context_evictions, "context_evictions"),
         ):
             _uint(value, field=field)
+        distance_rapidities = tuple(float(value) for value in self.distance_rapidities)
+        distance_observations = tuple(self.distance_observations)
+        distance_hits = tuple(self.distance_hits)
+        distance_hinted_bytes = tuple(self.distance_hinted_bytes)
+        distance_useful_bytes = tuple(self.distance_useful_bytes)
+        if (
+            any(
+                len(row) != _MAX_DISTANCE_AGENTS
+                for row in (
+                    distance_rapidities,
+                    distance_observations,
+                    distance_hits,
+                    distance_hinted_bytes,
+                    distance_useful_bytes,
+                )
+            )
+            or any(
+                not math.isfinite(value) or abs(value) > 20.0
+                for value in distance_rapidities
+            )
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for row in (
+                    distance_observations,
+                    distance_hits,
+                    distance_hinted_bytes,
+                    distance_useful_bytes,
+                )
+                for value in row
+            )
+            or any(
+                hit > seen
+                for hit, seen in zip(
+                    distance_hits,
+                    distance_observations,
+                    strict=True,
+                )
+            )
+            or any(
+                useful > hinted
+                for useful, hinted in zip(
+                    distance_useful_bytes,
+                    distance_hinted_bytes,
+                    strict=True,
+                )
+            )
+        ):
+            raise ValueError("range Markov distance-agent state is invalid")
+        _uint(self.hint_feedback_count, field="hint_feedback_count")
+        _finite(
+            self.hint_utility_ema,
+            field="hint_utility_ema",
+            lower=0.0,
+            upper=1.0,
+        )
         object.__setattr__(self, "nodes", nodes)
         object.__setattr__(self, "contexts", contexts)
         object.__setattr__(self, "history", history)
         object.__setattr__(self, "expert_rapidities", rapidities)
         object.__setattr__(self, "expert_observations", expert_observations)
         object.__setattr__(self, "expert_hits", expert_hits)
+        object.__setattr__(self, "distance_rapidities", distance_rapidities)
+        object.__setattr__(self, "distance_observations", distance_observations)
+        object.__setattr__(self, "distance_hits", distance_hits)
+        object.__setattr__(self, "distance_hinted_bytes", distance_hinted_bytes)
+        object.__setattr__(self, "distance_useful_bytes", distance_useful_bytes)
 
     @property
     def source_identity(self) -> tuple[str, str, str] | None:
@@ -380,12 +450,21 @@ class RangeMarkovState:
             "clock": self.clock,
             "context_evictions": self.context_evictions,
             "contexts": [row.to_record() for row in self.contexts],
+            "distance_hinted_bytes": list(self.distance_hinted_bytes),
+            "distance_hits": list(self.distance_hits),
+            "distance_observations": list(self.distance_observations),
+            "distance_rapidities": [
+                _float_record(value) for value in self.distance_rapidities
+            ],
+            "distance_useful_bytes": list(self.distance_useful_bytes),
             "expert_hits": list(self.expert_hits),
             "expert_observations": list(self.expert_observations),
             "expert_rapidities": [
                 _float_record(value) for value in self.expert_rapidities
             ],
             "history": list(self.history),
+            "hint_feedback_count": self.hint_feedback_count,
+            "hint_utility_ema": _float_record(self.hint_utility_ema),
             "inventory_fingerprint": self.inventory_fingerprint,
             "node_evictions": self.node_evictions,
             "nodes": [row.to_record() for row in self.nodes],
@@ -413,10 +492,17 @@ class RangeMarkovState:
             "clock",
             "context_evictions",
             "contexts",
+            "distance_hinted_bytes",
+            "distance_hits",
+            "distance_observations",
+            "distance_rapidities",
+            "distance_useful_bytes",
             "expert_hits",
             "expert_observations",
             "expert_rapidities",
             "history",
+            "hint_feedback_count",
+            "hint_utility_ema",
             "inventory_fingerprint",
             "node_evictions",
             "nodes",
@@ -443,6 +529,18 @@ class RangeMarkovState:
             contexts=tuple(
                 RangeContext.from_record(row) for row in value["contexts"]
             ),
+            distance_rapidities=tuple(
+                _record_float(row, field="distance rapidity")
+                for row in value["distance_rapidities"]
+            ),
+            distance_observations=tuple(value["distance_observations"]),
+            distance_hits=tuple(value["distance_hits"]),
+            distance_hinted_bytes=tuple(value["distance_hinted_bytes"]),
+            distance_useful_bytes=tuple(value["distance_useful_bytes"]),
+            hint_feedback_count=value["hint_feedback_count"],
+            hint_utility_ema=_record_float(
+                value["hint_utility_ema"], field="hint_utility_ema"
+            ),
             history=tuple(value["history"]),
             expert_rapidities=tuple(
                 _record_float(row, field="expert rapidity")
@@ -465,16 +563,39 @@ class RangeMarkovState:
         )
 
     @classmethod
-    def from_bytes(cls, value: bytes) -> "RangeMarkovState":
-        if (
-            not isinstance(value, bytes)
-            or not value.startswith(_STATE_PREFIX)
-            or not 5 < len(value) <= _MAX_STATE_BYTES
+    def _from_v1_record(cls, value: object) -> "RangeMarkovState":
+        if not isinstance(value, Mapping) or value.get("schema") != (
+            V1_RANGE_MARKOV_STATE_SCHEMA
         ):
+            raise ValueError("v1 range Markov state schema is invalid")
+        migrated = dict(value)
+        migrated["schema"] = RANGE_MARKOV_STATE_SCHEMA
+        migrated["distance_rapidities"] = [
+            _float_record(0.0)
+        ] * _MAX_DISTANCE_AGENTS
+        migrated["distance_observations"] = [0] * _MAX_DISTANCE_AGENTS
+        migrated["distance_hits"] = [0] * _MAX_DISTANCE_AGENTS
+        migrated["distance_hinted_bytes"] = [0] * _MAX_DISTANCE_AGENTS
+        migrated["distance_useful_bytes"] = [0] * _MAX_DISTANCE_AGENTS
+        migrated["hint_feedback_count"] = 0
+        migrated["hint_utility_ema"] = _float_record(1.0)
+        return cls.from_record(migrated)
+
+    @classmethod
+    def from_bytes(cls, value: bytes) -> "RangeMarkovState":
+        if not isinstance(value, bytes) or not 5 < len(value) <= _MAX_STATE_BYTES:
+            raise RangeMarkovError("range Markov state header is invalid")
+        if value.startswith(_STATE_PREFIX):
+            version = 2
+            payload = value[len(_STATE_PREFIX) :]
+        elif value.startswith(_V1_STATE_PREFIX):
+            version = 1
+            payload = value[len(_V1_STATE_PREFIX) :]
+        else:
             raise RangeMarkovError("range Markov state header is invalid")
         try:
             decoder = zlib.decompressobj()
-            raw = decoder.decompress(value[len(_STATE_PREFIX) :], _MAX_JSON_BYTES + 1)
+            raw = decoder.decompress(payload, _MAX_JSON_BYTES + 1)
             raw += decoder.flush()
             if (
                 len(raw) > _MAX_JSON_BYTES
@@ -491,6 +612,8 @@ class RangeMarkovState:
                 raise ValueError("range Markov envelope is invalid")
             if envelope["body_sha256"] != _digest(envelope["body"]):
                 raise ValueError("range Markov checksum differs")
+            if version == 1:
+                return cls._from_v1_record(envelope["body"])
             return cls.from_record(envelope["body"])
         except (TypeError, ValueError, zlib.error, json.JSONDecodeError) as exc:
             raise RangeMarkovError("range Markov state is corrupt") from exc
@@ -553,6 +676,7 @@ class RangeBeamStep:
     path_min_support: int
     ricci_value: float
     expected_reuse_distance: float
+    distance_weight: float
     score: float
     path: tuple[str, ...]
 
@@ -595,6 +719,7 @@ class RangeBeamStep:
             field="beam expected reuse distance",
             lower=0.0,
         )
+        _finite(self.distance_weight, field="beam distance weight", lower=0.0)
         _finite(self.score, field="beam score", lower=0.0)
         path = tuple(self.path)
         if (
@@ -608,6 +733,7 @@ class RangeBeamStep:
     def to_dict(self) -> dict[str, object]:
         return {
             "distance": self.distance,
+            "distance_weight": self.distance_weight,
             "expected_reuse_distance": self.expected_reuse_distance,
             "path": list(self.path),
             "path_probability": self.path_probability,
@@ -662,12 +788,107 @@ class RangeHint:
 
 
 @dataclass(frozen=True, slots=True)
+class _PendingHint:
+    created_operation: int
+    due_operation: int
+    distance: int
+    leaf: AccessLeaf
+    original_length: int
+    covered_intervals: tuple[tuple[int, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        _uint(self.created_operation, field="hint created_operation", positive=True)
+        _uint(self.due_operation, field="hint due_operation", positive=True)
+        _uint(self.distance, field="hint feedback distance", positive=True)
+        if self.due_operation != self.created_operation + self.distance:
+            raise ValueError("hint due operation differs from its distance")
+        if not isinstance(self.leaf, AccessLeaf):
+            raise TypeError("pending hint requires AccessLeaf")
+        _uint(self.original_length, field="pending original_length", positive=True)
+        if self.leaf.length > self.original_length:
+            raise ValueError("pending hint exceeds its original range")
+        intervals = tuple(self.covered_intervals)
+        if (
+            tuple(sorted(intervals)) != intervals
+            or any(
+                not isinstance(start, int)
+                or not isinstance(stop, int)
+                or not self.leaf.offset <= start < stop
+                or stop > self.leaf.offset + self.leaf.length
+                for start, stop in intervals
+            )
+            or any(
+                right[0] <= left[1]
+                for left, right in zip(intervals, intervals[1:], strict=False)
+            )
+        ):
+            raise ValueError("pending hint coverage intervals are invalid")
+        object.__setattr__(self, "covered_intervals", intervals)
+
+    @property
+    def covered_bytes(self) -> int:
+        return sum(stop - start for start, stop in self.covered_intervals)
+
+    @property
+    def original_key(self) -> tuple[str, int, int]:
+        return self.leaf.shard, self.leaf.offset, self.original_length
+
+    def observe_demand(self, demand: Sequence[AccessLeaf]) -> "_PendingHint":
+        intervals = [*self.covered_intervals, *_range_overlap_intervals(self.leaf, demand)]
+        if not intervals:
+            return self
+        intervals.sort()
+        merged = []
+        for start, stop in intervals:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
+            else:
+                merged.append((start, stop))
+        return replace(self, covered_intervals=tuple(merged))
+
+
+def _range_overlap_intervals(
+    hint: AccessLeaf,
+    demand: Sequence[AccessLeaf],
+) -> tuple[tuple[int, int], ...]:
+    intervals = []
+    hint_start = hint.offset
+    hint_stop = hint.offset + hint.length
+    for leaf in demand:
+        if leaf.shard != hint.shard:
+            continue
+        start = max(hint_start, leaf.offset)
+        stop = min(hint_stop, leaf.offset + leaf.length)
+        if stop > start:
+            intervals.append((start, stop))
+    if not intervals:
+        return ()
+    intervals.sort()
+    merged = []
+    for start, stop in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
+        else:
+            merged.append((start, stop))
+    return tuple(merged)
+
+
+def _range_overlap_bytes(hint: AccessLeaf, demand: Sequence[AccessLeaf]) -> int:
+    return sum(
+        stop - start for start, stop in _range_overlap_intervals(hint, demand)
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RangeBeamPlan:
     horizon: int
     beam_width: int
     candidates_considered: int
     steps: tuple[RangeBeamStep, ...]
     hints: tuple[RangeHint, ...]
+    distance_weights: tuple[tuple[int, float], ...]
+    configured_hint_bytes: int
+    effective_hint_budget_bytes: int
     duplicate_leaves_avoided: int
     cooldown_leaves_skipped: int
     truncated_by_bytes: bool
@@ -682,12 +903,39 @@ class RangeBeamPlan:
         )
         steps = tuple(self.steps)
         hints = tuple(self.hints)
+        distance_weights = tuple(self.distance_weights)
         if (
             any(not isinstance(row, RangeBeamStep) for row in steps)
             or any(row.distance > self.horizon for row in steps)
             or any(not isinstance(row, RangeHint) for row in hints)
         ):
             raise ValueError("range beam plan contents are invalid")
+        if (
+            tuple(distance for distance, _weight in distance_weights)
+            != tuple(range(1, self.horizon + 1))
+            or any(
+                not math.isfinite(weight) or not 0.0 < weight <= 1.0
+                for _distance, weight in distance_weights
+            )
+            or not math.isclose(
+                sum(weight for _distance, weight in distance_weights),
+                1.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError("beam distance weights are invalid")
+        _uint(
+            self.configured_hint_bytes,
+            field="configured_hint_bytes",
+            positive=True,
+        )
+        _uint(
+            self.effective_hint_budget_bytes,
+            field="effective_hint_budget_bytes",
+            positive=True,
+        )
+        if self.effective_hint_budget_bytes > self.configured_hint_bytes:
+            raise ValueError("effective hint budget exceeds configured maximum")
         _uint(
             self.duplicate_leaves_avoided,
             field="duplicate_leaves_avoided",
@@ -703,6 +951,7 @@ class RangeBeamPlan:
             raise TypeError("beam truncation flags must be boolean")
         object.__setattr__(self, "steps", steps)
         object.__setattr__(self, "hints", hints)
+        object.__setattr__(self, "distance_weights", distance_weights)
 
     @property
     def hint_bytes(self) -> int:
@@ -728,6 +977,9 @@ class RangeBeamPlan:
             "candidates_considered": self.candidates_considered,
             "cooldown_leaves_skipped": self.cooldown_leaves_skipped,
             "duplicate_leaves_avoided": self.duplicate_leaves_avoided,
+            "configured_hint_bytes": self.configured_hint_bytes,
+            "distance_weights": dict(self.distance_weights),
+            "effective_hint_budget_bytes": self.effective_hint_budget_bytes,
             "hint_bytes": self.hint_bytes,
             "hints": [row.to_dict() for row in self.hints],
             "horizon": self.horizon,
@@ -754,6 +1006,11 @@ class MarkovRangePrefetcher:
     REGIME_WARMUP = 16
     REGIME_SHRINK = 0.25
     RICCI_ALPHA = 0.001
+    DISTANCE_FIXED_SHARE = 0.05
+    DISTANCE_RAPIDITY_DECAY = 0.995
+    DISTANCE_LEARNING_RATE = 0.35
+    HINT_UTILITY_RATE = 0.10
+    MIN_BUDGET_FRACTION = 0.125
 
     def __init__(
         self,
@@ -825,6 +1082,8 @@ class MarkovRangePrefetcher:
             dict[int, frozenset[str]],
         ] = {}
         self._recent_hint_operations: dict[tuple[str, int, int], int] = {}
+        self._pending_hints: list[_PendingHint] = []
+        self._inflight_hint_keys: set[tuple[str, int, int]] = set()
         self._horizon_hits = {distance: 0 for distance in range(1, beam_horizon + 1)}
         self._horizon_misses = {
             distance: 0 for distance in range(1, beam_horizon + 1)
@@ -833,6 +1092,7 @@ class MarkovRangePrefetcher:
             distance: 0 for distance in range(1, beam_horizon + 1)
         }
         self._metrics = {
+            "demand_operations": 0,
             "operations": 0,
             "leaves": 0,
             "predictions": 0,
@@ -857,6 +1117,10 @@ class MarkovRangePrefetcher:
             "reservoir_cooldown_leaves_skipped": 0,
             "reservoir_truncated_by_bytes": 0,
             "reservoir_truncated_by_leaves": 0,
+            "hint_feedback": 0,
+            "hint_useful_bytes": 0,
+            "hint_wasted_bytes": 0,
+            "hint_early_hits": 0,
         }
         self._acquire_state_lock()
         try:
@@ -915,6 +1179,26 @@ class MarkovRangePrefetcher:
             + MarkovRangePrefetcher.FIXED_SHARE / 2.0
             for value in raw
         )
+
+    def _distance_weights(self, state: RangeMarkovState) -> tuple[float, ...]:
+        rapidities = state.distance_rapidities[: self.beam_horizon]
+        maximum = max(rapidities)
+        raw = tuple(math.exp(value - maximum) for value in rapidities)
+        total = sum(raw)
+        count = len(raw)
+        return tuple(
+            (1.0 - self.DISTANCE_FIXED_SHARE) * value / total
+            + self.DISTANCE_FIXED_SHARE / count
+            for value in raw
+        )
+
+    def _adaptive_prefetch_bytes(self, state: RangeMarkovState) -> int:
+        if state.hint_feedback_count == 0:
+            return self.max_prefetch_bytes
+        fraction = self.MIN_BUDGET_FRACTION + (
+            1.0 - self.MIN_BUDGET_FRACTION
+        ) * state.hint_utility_ema
+        return max(1, min(self.max_prefetch_bytes, int(self.max_prefetch_bytes * fraction)))
 
     @staticmethod
     def _source_identity(operation: AccessOperation) -> tuple[str, str, str]:
@@ -1121,8 +1405,16 @@ class MarkovRangePrefetcher:
             expected_reuse_distance=(age + 1.0) / node.visits,
         )
 
-    def _beam_plan_locked(self, state: RangeMarkovState) -> RangeBeamPlan | None:
+    def _beam_plan_locked(
+        self,
+        state: RangeMarkovState,
+        *,
+        current_operation: int | None = None,
+    ) -> RangeBeamPlan | None:
+        if current_operation is None:
+            current_operation = int(self._metrics["demand_operations"]) + 1
         nodes = {row.state.key: row for row in state.nodes}
+        distance_weights = self._distance_weights(state)
         frontier: list[
             tuple[tuple[str, ...], float, tuple[str, ...], float, int]
         ] = [
@@ -1163,6 +1455,8 @@ class MarkovRangePrefetcher:
                     score = (
                         next_path_probability
                         * ricci_factor
+                        * distance_weights[distance - 1]
+                        * self.beam_horizon
                         / (distance * max(1.0, reuse_distance))
                     )
                     next_path = (*path, key)
@@ -1180,6 +1474,7 @@ class MarkovRangePrefetcher:
                         path_min_support=min(path_min_support, supports[key]),
                         ricci_value=ricci,
                         expected_reuse_distance=reuse_distance,
+                        distance_weight=distance_weights[distance - 1],
                         score=score,
                         path=next_path,
                     )
@@ -1209,8 +1504,13 @@ class MarkovRangePrefetcher:
             ]
         if not steps:
             return None
+        effective_hint_budget = self._adaptive_prefetch_bytes(state)
         hints, duplicates, cooldown, truncated_bytes, truncated_leaves = (
-            self._reservoir_hints_locked(steps)
+            self._reservoir_hints_locked(
+                steps,
+                effective_hint_budget=effective_hint_budget,
+                current_operation=current_operation,
+            )
         )
         return RangeBeamPlan(
             horizon=self.beam_horizon,
@@ -1218,6 +1518,12 @@ class MarkovRangePrefetcher:
             candidates_considered=candidates_considered,
             steps=tuple(steps),
             hints=hints,
+            distance_weights=tuple(
+                (index + 1, value)
+                for index, value in enumerate(distance_weights)
+            ),
+            configured_hint_bytes=self.max_prefetch_bytes,
+            effective_hint_budget_bytes=effective_hint_budget,
             duplicate_leaves_avoided=duplicates,
             cooldown_leaves_skipped=cooldown,
             truncated_by_bytes=truncated_bytes,
@@ -1227,6 +1533,9 @@ class MarkovRangePrefetcher:
     def _reservoir_hints_locked(
         self,
         steps: Sequence[RangeBeamStep],
+        *,
+        effective_hint_budget: int,
+        current_operation: int,
     ) -> tuple[tuple[RangeHint, ...], int, int, bool, bool]:
         ranked = sorted(
             (
@@ -1246,7 +1555,9 @@ class MarkovRangePrefetcher:
         candidates: list[tuple[RangeBeamStep, AccessLeaf]] = []
         duplicates = 0
         cooldown = 0
-        current_operation = int(self._metrics["operations"]) + 1
+        pending_keys = {
+            row.original_key for row in self._pending_hints
+        } | self._inflight_hint_keys
         state_keys: set[str] = set()
         states = []
         for step in ranked:
@@ -1269,6 +1580,9 @@ class MarkovRangePrefetcher:
                     duplicates += 1
                     continue
                 seen.add(key)
+                if key in pending_keys:
+                    cooldown += 1
+                    continue
                 last_hint = self._recent_hint_operations.get(key)
                 if (
                     last_hint is not None
@@ -1283,8 +1597,8 @@ class MarkovRangePrefetcher:
         if not selected:
             return (), duplicates, cooldown, False, truncated_by_leaves
         state_order = tuple(dict.fromkeys(step.state.key for step, _leaf in selected))
-        base = self.max_prefetch_bytes // len(state_order)
-        extra = self.max_prefetch_bytes % len(state_order)
+        base = effective_hint_budget // len(state_order)
+        extra = effective_hint_budget % len(state_order)
         state_budgets = {
             key: base + int(index < extra)
             for index, key in enumerate(state_order)
@@ -1294,7 +1608,7 @@ class MarkovRangePrefetcher:
             amount = min(leaf.length, state_budgets[step.state.key])
             allocations[index] = amount
             state_budgets[step.state.key] -= amount
-        remaining = self.max_prefetch_bytes - sum(allocations)
+        remaining = effective_hint_budget - sum(allocations)
         for index, (_step, leaf) in enumerate(selected):
             if remaining <= 0:
                 break
@@ -1411,6 +1725,80 @@ class MarkovRangePrefetcher:
             regime,
         )
 
+    def _settle_pending_hints_locked(
+        self,
+        state: RangeMarkovState,
+        *,
+        current_operation: int,
+        demand: AccessState,
+    ) -> RangeMarkovState:
+        remaining = []
+        settled: list[tuple[_PendingHint, int]] = []
+        for hint in self._pending_hints:
+            updated = hint.observe_demand(demand.leaves)
+            if updated.covered_bytes == updated.leaf.length:
+                settled.append((updated, updated.covered_bytes))
+                if current_operation < hint.due_operation:
+                    self._metrics["hint_early_hits"] += 1
+            elif current_operation >= hint.due_operation:
+                settled.append((updated, updated.covered_bytes))
+            else:
+                remaining.append(updated)
+        self._pending_hints = remaining
+        if not settled:
+            return state
+        rapidities = list(state.distance_rapidities)
+        observations = list(state.distance_observations)
+        hits = list(state.distance_hits)
+        hinted_bytes = list(state.distance_hinted_bytes)
+        useful_bytes = list(state.distance_useful_bytes)
+        by_distance: dict[int, list[int]] = {}
+        for hint, useful in settled:
+            index = hint.distance - 1
+            totals = by_distance.setdefault(index, [0, 0])
+            totals[0] += hint.leaf.length
+            totals[1] += useful
+        rapidities = [
+            self.DISTANCE_RAPIDITY_DECAY * value for value in rapidities
+        ]
+        for index, (distance_hinted, distance_useful) in sorted(
+            by_distance.items()
+        ):
+            ratio = distance_useful / distance_hinted
+            rapidities[index] += self.DISTANCE_LEARNING_RATE * (2.0 * ratio - 1.0)
+            observations[index] += 1
+            hits[index] += int(distance_useful > 0)
+            hinted_bytes[index] += distance_hinted
+            useful_bytes[index] += distance_useful
+        center = sum(rapidities) / len(rapidities)
+        rapidities = [
+            max(-20.0, min(20.0, value - center))
+            for value in rapidities
+        ]
+        total_hinted = sum(row[0] for row in by_distance.values())
+        total_useful = sum(row[1] for row in by_distance.values())
+        ratio = total_useful / total_hinted
+        rate = (
+            1.0
+            if state.hint_feedback_count == 0
+            else self.HINT_UTILITY_RATE
+        )
+        utility_ema = (1.0 - rate) * state.hint_utility_ema + rate * ratio
+        feedback_updates = len(by_distance)
+        self._metrics["hint_feedback"] += feedback_updates
+        self._metrics["hint_useful_bytes"] += total_useful
+        self._metrics["hint_wasted_bytes"] += total_hinted - total_useful
+        return replace(
+            state,
+            distance_rapidities=tuple(rapidities),
+            distance_observations=tuple(observations),
+            distance_hits=tuple(hits),
+            distance_hinted_bytes=tuple(hinted_bytes),
+            distance_useful_bytes=tuple(useful_bytes),
+            hint_feedback_count=state.hint_feedback_count + feedback_updates,
+            hint_utility_ema=utility_ema,
+        )
+
     def _updated_state(
         self,
         state: RangeMarkovState,
@@ -1506,6 +1894,13 @@ class MarkovRangePrefetcher:
             regime_generation=state.regime_generation + int(regime),
             node_evictions=node_evictions,
             context_evictions=context_evictions,
+            distance_rapidities=state.distance_rapidities,
+            distance_observations=state.distance_observations,
+            distance_hits=state.distance_hits,
+            distance_hinted_bytes=state.distance_hinted_bytes,
+            distance_useful_bytes=state.distance_useful_bytes,
+            hint_feedback_count=state.hint_feedback_count,
+            hint_utility_ema=state.hint_utility_ema,
         )
 
     def observe(self, operation: AccessOperation) -> bool:
@@ -1516,10 +1911,6 @@ class MarkovRangePrefetcher:
                 self._metrics["ignored_prefetch_operations"] += 1
             return False
         access = AccessState.from_operation(operation)
-        if len(access.leaves) > self.max_operation_leaves:
-            with self._lock:
-                self._metrics["oversize_operations"] += 1
-            return False
         with self._lock:
             if self._closed:
                 return False
@@ -1530,6 +1921,8 @@ class MarkovRangePrefetcher:
                 self._metrics["out_of_order_operations"] += 1
                 return False
             self._last_operation_sequence = operation.operation_sequence
+            current_operation = operation.operation_sequence
+            self._metrics["demand_operations"] += 1
             identity = self._source_identity(operation)
             if self._state.source_identity is None:
                 self._state = replace(
@@ -1542,7 +1935,6 @@ class MarkovRangePrefetcher:
                 raise RangeMarkovError(
                     "range Markov state belongs to a different source"
                 )
-            current_operation = int(self._metrics["operations"]) + 1
             hint_cutoff = (
                 current_operation
                 - self.hint_cooldown_operations
@@ -1554,12 +1946,31 @@ class MarkovRangePrefetcher:
                 for key, value in self._recent_hint_operations.items()
                 if value >= hint_cutoff
             }
-            forecasts = self._pending_forecasts.pop(current_operation, {})
-            for distance, candidates in forecasts.items():
-                if access.key in candidates:
-                    self._horizon_hits[distance] += 1
-                else:
-                    self._horizon_misses[distance] += 1
+            due_forecasts = tuple(
+                due
+                for due in self._pending_forecasts
+                if due <= current_operation
+            )
+            for due in sorted(due_forecasts):
+                forecasts = self._pending_forecasts.pop(due)
+                for distance, candidates in forecasts.items():
+                    if due == current_operation and access.key in candidates:
+                        self._horizon_hits[distance] += 1
+                    else:
+                        self._horizon_misses[distance] += 1
+            settled_state = self._settle_pending_hints_locked(
+                self._state,
+                current_operation=current_operation,
+                demand=access,
+            )
+            feedback_changed = settled_state != self._state
+            self._state = settled_state
+            if len(access.leaves) > self.max_operation_leaves:
+                self._metrics["oversize_operations"] += 1
+                self._dirty_operations += int(feedback_changed)
+                if self._dirty_operations >= self.flush_interval:
+                    self._persist_locked()
+                return False
             if self._pending_prediction_key is not None:
                 if self._pending_prediction_key == access.key:
                     self._metrics["prediction_hits"] += 1
@@ -1567,7 +1978,10 @@ class MarkovRangePrefetcher:
                     self._metrics["prediction_misses"] += 1
             self._state = self._updated_state(self._state, access)
             prediction = self._prediction_locked(self._state)
-            beam_plan = self._beam_plan_locked(self._state)
+            beam_plan = self._beam_plan_locked(
+                self._state,
+                current_operation=current_operation,
+            )
             self._last_prediction = prediction
             self._last_beam_plan = beam_plan
             self._pending_prediction_key = (
@@ -1616,7 +2030,19 @@ class MarkovRangePrefetcher:
             if self._dirty_operations >= self.flush_interval:
                 self._persist_locked()
         for hint in hints:
+            original_key = (
+                hint.leaf.shard,
+                hint.leaf.offset,
+                hint.original_length,
+            )
             with self._lock:
+                if original_key in self._inflight_hint_keys or any(
+                    row.original_key == original_key
+                    for row in self._pending_hints
+                ):
+                    self._metrics["reservoir_cooldown_leaves_skipped"] += 1
+                    continue
+                self._inflight_hint_keys.add(original_key)
                 self._metrics["prefetch_attempts"] += 1
                 self._hints_by_distance[hint.distance] += 1
             try:
@@ -1627,19 +2053,24 @@ class MarkovRangePrefetcher:
                 )
             except Exception:
                 with self._lock:
+                    self._inflight_hint_keys.discard(original_key)
                     self._metrics["prefetch_errors"] += 1
                 continue
             with self._lock:
+                self._inflight_hint_keys.discard(original_key)
                 if accepted:
                     self._metrics["prefetch_hints"] += 1
                     self._metrics["prefetch_hint_bytes"] += hint.leaf.length
-                    self._recent_hint_operations[
-                        (
-                            hint.leaf.shard,
-                            hint.leaf.offset,
-                            hint.original_length,
+                    self._pending_hints.append(
+                        _PendingHint(
+                            created_operation=current_operation,
+                            due_operation=current_operation + hint.distance,
+                            distance=hint.distance,
+                            leaf=hint.leaf,
+                            original_length=hint.original_length,
                         )
-                    ] = current_operation
+                    )
+                    self._recent_hint_operations[original_key] = current_operation
                 else:
                     self._metrics["prefetch_declines"] += 1
         return True
@@ -1663,6 +2094,8 @@ class MarkovRangePrefetcher:
     def metrics(self) -> dict[str, object]:
         with self._lock:
             weights = self._weights(self._state.expert_rapidities)
+            distance_weights = self._distance_weights(self._state)
+            effective_prefetch_bytes = self._adaptive_prefetch_bytes(self._state)
             return {
                 **self._metrics,
                 "beam_horizon": self.beam_horizon,
@@ -1671,6 +2104,10 @@ class MarkovRangePrefetcher:
                 "context_evictions": self._state.context_evictions,
                 "contexts": len(self._state.contexts),
                 "effective_experts": 1.0 / sum(value * value for value in weights),
+                "effective_prefetch_bytes": effective_prefetch_bytes,
+                "effective_prefetch_fraction": (
+                    effective_prefetch_bytes / self.max_prefetch_bytes
+                ),
                 "expert_accuracy": {
                     name: (
                         0.0 if seen == 0 else hit / seen
@@ -1686,6 +2123,30 @@ class MarkovRangePrefetcher:
                     "order-1": weights[0],
                     "order-2": weights[1],
                 },
+                "distance_weights": {
+                    str(index + 1): value
+                    for index, value in enumerate(distance_weights)
+                },
+                "distance_accuracy": {
+                    str(index + 1): (
+                        0.0
+                        if self._state.distance_observations[index] == 0
+                        else self._state.distance_hits[index]
+                        / self._state.distance_observations[index]
+                    )
+                    for index in range(self.beam_horizon)
+                },
+                "distance_byte_utility": {
+                    str(index + 1): (
+                        0.0
+                        if self._state.distance_hinted_bytes[index] == 0
+                        else self._state.distance_useful_bytes[index]
+                        / self._state.distance_hinted_bytes[index]
+                    )
+                    for index in range(self.beam_horizon)
+                },
+                "hint_feedback_count": self._state.hint_feedback_count,
+                "hint_utility_ema": self._state.hint_utility_ema,
                 "last_prediction": (
                     None
                     if self._last_prediction is None
@@ -1708,6 +2169,7 @@ class MarkovRangePrefetcher:
                 "node_evictions": self._state.node_evictions,
                 "nodes": len(self._state.nodes),
                 "observations": self._state.observations,
+                "pending_hint_feedback": len(self._pending_hints),
                 "regime_generation": self._state.regime_generation,
                 "schema": RANGE_MARKOV_METRICS_SCHEMA,
                 "state_bytes": len(self._state.to_bytes()),
