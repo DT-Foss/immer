@@ -701,11 +701,59 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider._apply_council_feedback(feedback[2], 7, 2)
         metrics = provider.metrics()
         self.assertEqual(metrics.horizon_observations[:3], (100, 100, 1))
-        self.assertGreater(metrics.horizon_mean_accuracy[0], 0.8)
-        self.assertLess(metrics.horizon_mean_accuracy[1], 0.2)
+        self.assertGreater(metrics.horizon_weighted_accuracy[0], 0.8)
+        self.assertLess(metrics.horizon_weighted_accuracy[1], 0.2)
         restored = MarkovDraftState.from_bytes(provider._state.to_bytes())
         self.assertEqual(restored.horizon_expert_observations[2], (1,) * width)
         self.assertEqual(restored.horizon_expert_hits[2], (1,) * width)
+        provider.close()
+
+    def test_position_specialists_can_change_the_recursive_token_choice(self) -> None:
+        class TokenExpert:
+            def __init__(self, token: int) -> None:
+                self.token = token
+
+            def distribution(self, _context):
+                other = 8 if self.token == 7 else 7
+                return {
+                    f"{self.token:02d}": 0.9,
+                    f"{other:02d}": 0.05,
+                    markov_module._UNKNOWN_TOKEN: 0.05,
+                }
+
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        width = len(provider._experts)
+        observations = [[0] * width for _ in range(16)]
+        hits = [[0] * width for _ in range(16)]
+        observations[1] = [20] * width
+        hits[1] = [0, 0, 0, 0, 0, 20, 20, 20]
+        provider._state = replace(
+            provider._state,
+            expert_log_weights=(-2.0, -2.0, -2.0, -2.0, 4.0, -2.0, -2.0, -2.0),
+            horizon_expert_observations=tuple(tuple(row) for row in observations),
+            horizon_expert_hits=tuple(tuple(row) for row in hits),
+        )
+        provider._expert_models = lambda _history: tuple(
+            (TokenExpert(8 if index >= 5 else 7), [])
+            for index in range(width)
+        )
+        global_weights = provider._weights()
+        position_weights, maturity = provider._position_weighting(1, global_weights)
+
+        tokens, _feedback, _confidence, _disagreement = provider._predict_council(
+            (1,), 2
+        )
+
+        self.assertEqual(tokens, (7, 8))
+        self.assertAlmostEqual(maturity, 20 / 28)
+        self.assertLess(position_weights[4], global_weights[4])
+        self.assertGreater(sum(position_weights[5:]), sum(global_weights[5:]))
+        self.assertAlmostEqual(sum(position_weights), 1.0)
+        self.assertTrue(
+            all(value >= provider.FIXED_SHARE / width for value in position_weights)
+        )
+        self.assertEqual(provider.metrics().last_position, 1)
+        self.assertAlmostEqual(provider.metrics().last_position_maturity, 20 / 28)
         provider.close()
 
     def test_persistent_history_keeps_explicit_episode_boundaries(self) -> None:

@@ -34,14 +34,14 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v15"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v16"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
 V5_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
 V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v12"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v13"
 _STATE_PREFIX = b"IMMD\x07"
 _V6_STATE_PREFIX = b"IMMD\x06"
 _V5_STATE_PREFIX = b"IMMD\x05"
@@ -937,7 +937,10 @@ class MarkovDraftMetrics:
     last_empirical_evidence: float
     last_disagreement: float
     horizon_observations: tuple[int, ...]
-    horizon_mean_accuracy: tuple[float, ...]
+    horizon_weighted_accuracy: tuple[float, ...]
+    last_position: int
+    last_position_maturity: float
+    last_position_weights: tuple[tuple[str, float], ...]
     regime_generation: int
     surprise_mean: float
     surprise_cusum: float
@@ -970,6 +973,7 @@ class MarkovDraftMetrics:
         value = asdict(self)
         value["expert_weights"] = dict(self.expert_weights)
         value["expert_accuracy"] = dict(self.expert_accuracy)
+        value["last_position_weights"] = dict(self.last_position_weights)
         value["recommended_windows"] = dict(self.recommended_windows)
         value["last_horizon_utilities"] = dict(self.last_horizon_utilities)
         return value
@@ -999,6 +1003,7 @@ class FingerprintRollingK4DraftProvider:
     GLOBAL_PHRASE_MIN_SUPPORT = 3
     COMPOSITION_BOUNDS = CompositionBounds()
     EMPIRICAL_EVIDENCE_SATURATION = 8.0
+    POSITION_WEIGHT_SATURATION = 8.0
 
     def __init__(
         self,
@@ -1144,6 +1149,9 @@ class FingerprintRollingK4DraftProvider:
         self._last_raw_confidence = 0.0
         self._last_empirical_evidence = 0.0
         self._last_disagreement = 0.0
+        self._last_position = 0
+        self._last_position_maturity = 0.0
+        self._last_position_weights = self._weights()
         self._adaptive_proposal_calls = 0
         self._recommended_window_counts = {1: 0, 4: 0, 8: 0, 16: 0}
         self._last_round_proposal: RollingDraftProposal | None = None
@@ -1733,6 +1741,45 @@ class FingerprintRollingK4DraftProvider:
             rows.append((model, list(selected)))
         return tuple(rows)
 
+    def _position_weighting(
+        self,
+        position: int,
+        base_weights: Sequence[float],
+    ) -> tuple[tuple[float, ...], float]:
+        """Blend global Rapidity with position-local Beta specialist skill."""
+
+        base = tuple(float(value) for value in base_weights)
+        if len(base) != len(self._experts) or not 0 <= position < (
+            _MAX_PROPOSAL_POSITIONS
+        ):
+            raise MarkovDraftError("Markov position weighting shape is invalid")
+        observations = self._state.horizon_expert_observations[position]
+        hits = self._state.horizon_expert_hits[position]
+        maximum_observations = max(observations, default=0)
+        if maximum_observations <= 0:
+            return base, 0.0
+        maturity = maximum_observations / (
+            maximum_observations + self.POSITION_WEIGHT_SATURATION
+        )
+        posterior = tuple(
+            (hit + 1.0) / (observed + 2.0)
+            for observed, hit in zip(observations, hits, strict=True)
+        )
+        total = sum(posterior)
+        if total <= 0.0 or not math.isfinite(total):
+            raise MarkovDraftError("Markov position posterior is invalid")
+        specialist = tuple(value / total for value in posterior)
+        blended = tuple(
+            (1.0 - maturity) * global_weight + maturity * local_weight
+            for global_weight, local_weight in zip(base, specialist, strict=True)
+        )
+        count = len(blended)
+        result = tuple(
+            (1.0 - self.FIXED_SHARE) * value + self.FIXED_SHARE / count
+            for value in blended
+        )
+        return result, maturity
+
     def _calibrated_confidence(
         self,
         token: int,
@@ -1823,7 +1870,7 @@ class FingerprintRollingK4DraftProvider:
         tuple[float, ...],
     ]:
         experts = self._expert_models(history)
-        weights = self._weights()
+        base_weights = self._weights()
         proposal: list[int] = []
         feedback_rows = []
         confidences = []
@@ -1845,6 +1892,10 @@ class FingerprintRollingK4DraftProvider:
             raise ValueError("forced Council prefix is invalid")
         for position in range(count):
             horizon_position = position_offset + position
+            weights, position_maturity = self._position_weighting(
+                horizon_position,
+                base_weights,
+            )
             distributions = tuple(
                 model.distribution(context) for model, context in experts
             )
@@ -1928,6 +1979,9 @@ class FingerprintRollingK4DraftProvider:
                 horizon_position,
                 allow_empirical=position >= len(forced),
             )
+            self._last_position = horizon_position
+            self._last_position_maturity = position_maturity
+            self._last_position_weights = weights
             confidences.append(self._last_confidence)
             disagreements.append(self._last_disagreement)
             feedback_rows.append(tuple(expert_row))
@@ -1958,6 +2012,9 @@ class FingerprintRollingK4DraftProvider:
             self._last_empirical_evidence,
             self._last_confidence,
             self._last_disagreement,
+            self._last_position,
+            self._last_position_maturity,
+            self._last_position_weights,
         )
         try:
             tokens, feedback, _confidence, _disagreement = self._predict_council(
@@ -1974,6 +2031,9 @@ class FingerprintRollingK4DraftProvider:
                 self._last_empirical_evidence,
                 self._last_confidence,
                 self._last_disagreement,
+                self._last_position,
+                self._last_position_maturity,
+                self._last_position_weights,
             ) = snapshot
 
     def _apply_council_feedback(
@@ -1998,7 +2058,10 @@ class FingerprintRollingK4DraftProvider:
             list(row) for row in self._state.horizon_expert_observations
         ]
         horizon_hits = [list(row) for row in self._state.horizon_expert_hits]
-        weights = self._weights()
+        weights, _position_maturity = self._position_weighting(
+            position,
+            self._weights(),
+        )
         probabilities = []
         for distribution, _prediction in feedback:
             if symbol in distribution:
@@ -2674,19 +2737,30 @@ class FingerprintRollingK4DraftProvider:
                 max(row, default=0)
                 for row in self._state.horizon_expert_observations
             ),
-            horizon_mean_accuracy=tuple(
+            horizon_weighted_accuracy=tuple(
                 sum(
-                    weight * (hit / observed if observed else 0.0)
-                    for weight, observed, hit in zip(
-                        weights,
+                    position_weight * (hit / observed if observed else 0.0)
+                    for position_weight, observed, hit in zip(
+                        self._position_weighting(position, weights)[0],
                         observed_row,
                         hit_row,
                         strict=True,
                     )
                 )
-                for observed_row, hit_row in zip(
-                    self._state.horizon_expert_observations,
-                    self._state.horizon_expert_hits,
+                for position, (observed_row, hit_row) in enumerate(
+                    zip(
+                        self._state.horizon_expert_observations,
+                        self._state.horizon_expert_hits,
+                        strict=True,
+                    )
+                )
+            ),
+            last_position=self._last_position,
+            last_position_maturity=self._last_position_maturity,
+            last_position_weights=tuple(
+                zip(
+                    self._state.expert_names,
+                    self._last_position_weights,
                     strict=True,
                 )
             ),

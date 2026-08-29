@@ -1479,7 +1479,7 @@ class Qwen38CausalChat:
                     ),
                     "provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
                     "confidence": (
-                        "teacher-carry-position-fixed-share-beta-evidence/v4"
+                        "position-specialist-teacher-carry-beta-evidence/v5"
                     ),
                     "empirical_evidence_saturation": 8.0,
                     "composition": {
@@ -1505,7 +1505,7 @@ class Qwen38CausalChat:
             else:
                 policy["hybrid_draft"] = {
                     "provider_abi": QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
-                    "selection": "round-wise-markov-first-mtp-fallback/v9",
+                    "selection": "round-wise-markov-first-mtp-fallback/v10",
                     "request_provider_lock": False,
                     "one_way_handoff": False,
                     "round_reselection": True,
@@ -1515,8 +1515,9 @@ class Qwen38CausalChat:
                     "committed_hidden_handoff": True,
                     "markov_provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
                     "markov_confidence": (
-                        "teacher-carry-position-fixed-share-beta-evidence/v4"
+                        "position-specialist-teacher-carry-beta-evidence/v5"
                     ),
+                    "position_specialists": "beta-maturity-fixed-share/v1",
                     "markov_persistent": self._markov_draft_state_path is not None,
                     "markov_composition": "literal+relative-prompt-copy/v1",
                     "mtp_provider_abi": QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
@@ -1708,7 +1709,7 @@ class Qwen38CausalChat:
                     "identity",
                     {},
                 ).get("manifest_sha256"),
-                "selection": "round-wise-markov-first-mtp-fallback/v9",
+                "selection": "round-wise-markov-first-mtp-fallback/v10",
             }
         else:
             raise Qwen38ChatError("draft-window identity lacks a draft provider")
