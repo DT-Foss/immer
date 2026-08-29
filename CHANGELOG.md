@@ -6,6 +6,22 @@ All notable changes to IMMER are recorded here.
 
 ### Arbitrary local Qwen runtime
 
+- Stopped adaptive embedded-MTP generation at the only frontier the live
+  Markov action can consume. K1 now computes the target-known MTP step plus one
+  confidence scan; K2 additionally materializes exactly the first proposal
+  state. The provider no longer evaluates an unused 15-token tail on every
+  round.
+- On the same arbitrary 16-token counting request and exact target trace,
+  adaptive K2 reduced generation from `34.0514` to `26.7434 s`, target forwards
+  from `16` to `9`, and provider head scans from `107` to `8`. Eight draft
+  tokens were accepted; provider time was `0.9849 s` and peak RSS remained
+  bounded at `1,579,130,880` bytes. This is the first measured Markov/MTP
+  speedup over direct local Qwen on previously unknown answer text.
+- Split MTP accounting into returned proposal width, physically computed
+  proposals, ABI padding, verified proposals, accepted proposals, and actual
+  verification rejections. Padded unauthoritative slots no longer masquerade
+  as computed or rejected work.
+
 - Enabled F16C half-to-float conversion in the packed Q4/Q8 inner loop on
   capable x86 hosts. Scale values and dot ordering remain identical; other
   architectures retain the scalar IEEE conversion. On Beast, the five-token

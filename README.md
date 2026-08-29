@@ -31,8 +31,8 @@ release surface.
   LM head performs one native bounded Top-K scan and releases each completed
   interval from inside the kernel. On the 16-core AVX2 deployment, arbitrary
   Full-Q4 chat now peaks at 1.17 GB instead of 16.01 GB while preserving the
-  exact generated token trace. The two-token reference generation takes
-  12.88 seconds versus 12.49 seconds before bounded residency.
+  exact generated token trace. F16C scale conversion brings the two-token
+  reference generation to 8.66 seconds without changing its trace or RSS.
   Gate, Up, BF16 SwiGLU, activation quantization, and Down now execute inside
   one native OpenMP team. A complete 65,536-entry BF16-SiLU table is generated
   from the installed Torch semantics, keeping the fused path bit-identical
@@ -71,7 +71,10 @@ release surface.
   first-order Markov/Beta calibrator learns reliability by proposal position,
   logit-gap bucket, and previous outcome. The cost-aware selector chooses
   K1/K2/K4/K8/K16 from verified prefix yield, so raw MTP confidence cannot open
-  an uneconomic target wave.
+  an uneconomic target wave. Adaptive execution computes only the proposal
+  frontier selected by that policy. On an arbitrary 16-token counting request,
+  K2 accepted eight drafts and reduced exact generation from 34.05 to 26.74
+  seconds while cutting complete target forwards from 16 to 9.
 - **All-layer Fast MLP.** A prompt-free weight initializer derives p4/k32
   pilots for every Qwen MLP layer from exact Gate/Up Gaussian joint moments.
   Existing full-path tensors update bounded recursive-ridge route statistics;
@@ -235,6 +238,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Cost-aware Markov abstention | 74.58 s vs 79.05 s direct; identical token trace | seven K1 waves on an unseen German request; zero draft bytes/linears; confirmed episode still updates Council state |
 | Persistent JSONL chat | second request opens 0 tensors | one process retains the verified mmap plane; observed one-token generation 15.01 s then 16.90 s |
 | Native DeltaNet K=4 convolution | 79.05 → 23.01 s generation; 3.44x | direct causal channelwise kernel replaces generic 10,240-group Conv1d; identical output/token trace; TTFT 25.05 → 13.65 s |
+| Adaptive embedded MTP | 34.05 → 26.74 s generation; 16 → 9 target forwards | arbitrary 16-token counting request; identical target trace; eight accepted drafts; eight provider head scans; 1.58 GB peak RSS |
 | Rolling K=2–16 continuation | accepted prefixes commit with zero weight reads | one target-known token plus up to 15 drafts; DeltaNet Conv/recurrent state, next-token continuation, Graft, and native Prefix-Sinkhorn state remain bit-exact |
 | Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed variable phrase options up to 15 tokens |
 | Persistent draft-window policy | request ceiling plus per-wave K4/K8/K16 | real Fixed-Share ceiling sampling after bootstrap; each Markov proposal supplies prefix-local expected acceptance/work utility and only the chosen prefix enters the target; full provider tails remain unauthoritative; model/tokenizer/provider-bound state; K2/K3 terminal fallback |
