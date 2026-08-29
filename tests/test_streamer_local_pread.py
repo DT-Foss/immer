@@ -136,6 +136,23 @@ class LocalPreadRangeReaderTests(unittest.TestCase):
             finally:
                 streamer.close()
 
+    @unittest.skipUnless(
+        hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_WILLNEED"),
+        "platform has no POSIX_FADV_WILLNEED",
+    )
+    def test_platform_posix_fadvise_path_accepts_exact_local_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.joinpath("weights.bin").write_bytes(b"x" * 8192)
+            budget = HardByteBudget(1.0)
+            with LocalRangeReader(root, budget=budget) as reader:
+                self.assertTrue(reader.prefetch_range("weights.bin", 4096, 4096))
+                metrics = reader.transport_metrics()
+                self.assertEqual(metrics["transport_prefetch_hints"], 1)
+                self.assertEqual(metrics["transport_prefetch_hint_bytes"], 4096)
+                self.assertEqual(budget.requests, 0)
+                self.assertEqual(budget.body, 0)
+
     def test_direct_over_budget_calls_fail_before_any_pread(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
