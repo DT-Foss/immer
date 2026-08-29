@@ -1383,7 +1383,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             return_value=qwen,
         ) as constructor, patch(
             "immer.cognition.qwen_fertig_chat.QwenFertigChat",
-            side_effect=lambda raw, _fertig: raw,
+            side_effect=lambda raw, _fertig, **_options: raw,
         ) as wrapper, redirect_stdout(output):
             code = main(["chat", "hello"])
 
@@ -1413,6 +1413,38 @@ class Qwen38CausalChatTests(unittest.TestCase):
         wrapper.assert_called_once()
         self.assertIs(wrapper.call_args.args[0], qwen)
         self.assertIsInstance(wrapper.call_args.args[1], FertigSolver)
+        self.assertIsNone(wrapper.call_args.kwargs["ooe_hook"])
+
+    def test_cli_mounts_an_explicit_verified_ooe_warm_bank(self) -> None:
+        qwen = _chat(_Runtime())
+        hook = object()
+        mount = SimpleNamespace(hook=hook)
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ), patch(
+            "immer.runtimes.ooe.qwen_warm_bank.open_verified_qwen_warm_bank",
+            return_value=mount,
+        ) as opener, patch(
+            "immer.cognition.qwen_fertig_chat.QwenFertigChat",
+            side_effect=lambda raw, _fertig, **_options: raw,
+        ) as wrapper, redirect_stdout(io.StringIO()):
+            code = main(
+                [
+                    "chat",
+                    "hello",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                    "--ooe-warm-root",
+                    "/state/qwen-warm",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        opener.assert_called_once_with(Path("/state/qwen-warm"))
+        self.assertIs(wrapper.call_args.kwargs["ooe_hook"], hook)
 
     def test_cli_explicit_layout_does_not_inherit_deployed_q4(self) -> None:
         qwen = _chat(_Runtime())

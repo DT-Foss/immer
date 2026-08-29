@@ -19,6 +19,10 @@ from immer.runtimes.ooe.result_cells import (
     ResultCellBinding,
     qwen_result_binding_evidence,
 )
+from immer.runtimes.ooe.qwen_warm_bank import (
+    QwenWarmBankError,
+    open_verified_qwen_warm_bank,
+)
 from immer.runtimes.qwen3_8.semantic_atlas import (
     GraphRevision,
     InterventionIdentity,
@@ -415,6 +419,7 @@ class Qwen38OoeChatCohortTests(unittest.TestCase):
         self.assertFalse(self.fixture.gold.exists())
         self.fixture.gold.write_bytes(gold_bytes)
         self.assertEqual(len(self.fixture.runtime.generate_calls), 5)
+
         headline = result["body"]["headline"]
         self.assertEqual(headline["cold_qwen_forwards_total"], 15)
         self.assertEqual(headline["holdout_teacher_baseline_qwen_forwards"], 3)
@@ -477,6 +482,46 @@ class Qwen38OoeChatCohortTests(unittest.TestCase):
         self.assertEqual(replay, result)
         self.assertEqual(self.fixture.result.read_bytes(), first_bytes)
         self.assertEqual(len(self.fixture.runtime.generate_calls), 5)
+
+    def test_verified_warm_bank_mount_executes_without_qwen_and_misses_unknown(
+        self,
+    ) -> None:
+        self.fixture.prepare()
+        result = self.fixture.execute()
+        verification = cohort.verify(self.fixture.verify_args())
+        verification_path = self.fixture.root / "verification.json"
+        verification_path.write_bytes(cohort._document_bytes(verification))
+
+        mount = open_verified_qwen_warm_bank(self.fixture.root)
+        attempt = mount.hook.try_warm(QUESTIONS[4], {})
+
+        self.assertTrue(attempt.hit)
+        assert attempt.result is not None
+        self.assertEqual(
+            attempt.result.output,
+            result["body"]["warm"]["warm_qwen_result"]["body"]["output"],
+        )
+        assert attempt.decision is not None
+        self.assertEqual(
+            attempt.evidence["decision"]["execution_receipt_sha256"],
+            mount.execution_sha256,
+        )
+        accounting = mount.hook.commit_warm(attempt)
+        self.assertEqual(accounting.saved_qwen_forwards, mount.saved_qwen_forwards)
+        miss = mount.hook.try_warm("an unrelated prompt", {})
+        self.assertFalse(miss.hit)
+        self.assertEqual(miss.evidence["status"], "no-feature")
+
+        document = json.loads(verification_path.read_bytes())
+        document["body"]["benchmark"]["body"][
+            "evaluator_quality_verified"
+        ] = False
+        benchmark = document["body"]["benchmark"]
+        benchmark["sha256"] = cohort._digest(benchmark["body"])
+        document["sha256"] = cohort._digest(document["body"])
+        verification_path.write_bytes(cohort._document_bytes(document))
+        with self.assertRaisesRegex(QwenWarmBankError, "authorize"):
+            open_verified_qwen_warm_bank(self.fixture.root)
 
     def test_manifest_organ_crystal_and_gold_tamper_fail_closed(self) -> None:
         manifest = self.fixture.prepare()

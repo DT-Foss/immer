@@ -12,6 +12,7 @@ from immer.contracts import ExecutionStatus, Request, Result
 from immer.runtimes.ooe.chat import (
     ControllerPromptFeatureProvider,
     OoeChatHook,
+    OoeChatIntegrityError,
     result_from_document,
     result_to_document,
 )
@@ -163,6 +164,164 @@ class OoeChatHookTests(unittest.TestCase):
             self.assertEqual(receipt["ooe"]["warm"]["status"], "hit")
             self.assertEqual(controller.metrics.saved_qwen_forwards, 1)
             self.assertEqual(controller.metrics.teacher_calls, 0)
+
+    def test_quality_verified_warm_result_commits_when_fertig_abstains(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller, warm = self._controller(Path(tmp))
+            hook = OoeChatHook(
+                controller=controller,
+                feature_provider=lambda _question, _metadata: warm,
+                quality_verifier=lambda _receipt, _execution: True,
+                commit_on_fertig_abstention=True,
+            )
+            qwen = _Qwen(RuntimeError("Qwen must not run on a warm hit"))
+            with _patched_solver(
+                None,
+                _verification(
+                    CandidateVerificationStatus.ABSTAINED,
+                    candidate="500",
+                    expected=None,
+                ),
+            ) as (solver, _certify, _verify):
+                result = QwenFertigChat(qwen, solver, ooe_hook=hook).handle(
+                    Request("chat", MATH_QUESTION)
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.output, "500")
+            self.assertEqual(qwen.requests, [])
+            receipt = _receipt(result)
+            self.assertEqual(receipt["route"], "ooe_verification_abstained")
+            self.assertEqual(
+                receipt["ooe"]["accounting"]["disposition"],
+                "committed",
+            )
+            self.assertEqual(controller.metrics.saved_qwen_forwards, 1)
+            self.assertEqual(controller.metrics.quality_failures, 0)
+
+    def test_generic_warm_result_rejects_accounting_when_fertig_abstains(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller, warm = self._controller(Path(tmp))
+            hook = OoeChatHook(
+                controller=controller,
+                feature_provider=lambda _question, _metadata: warm,
+                quality_verifier=lambda _receipt, _execution: True,
+            )
+            qwen = _Qwen(RuntimeError("Qwen must not run on a warm hit"))
+            with _patched_solver(
+                None,
+                _verification(
+                    CandidateVerificationStatus.ABSTAINED,
+                    candidate="500",
+                    expected=None,
+                ),
+            ) as (solver, _certify, _verify):
+                result = QwenFertigChat(qwen, solver, ooe_hook=hook).handle(
+                    Request("chat", MATH_QUESTION)
+                )
+
+            self.assertTrue(result.ok)
+            receipt = _receipt(result)
+            self.assertEqual(receipt["route"], "ooe_verification_abstained")
+            self.assertEqual(
+                receipt["ooe"]["accounting"]["disposition"],
+                "rejected",
+            )
+            self.assertEqual(controller.metrics.saved_qwen_forwards, 0)
+            self.assertEqual(controller.metrics.quality_failures, 1)
+
+    def test_warm_accounting_persists_with_the_controller_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller, warm = self._controller(Path(tmp))
+            state_name = "chat-controller"
+            controller.save_snapshot(name=state_name)
+            hook = OoeChatHook(
+                controller=controller,
+                feature_provider=lambda _question, _metadata: warm,
+                quality_verifier=lambda _receipt, _execution: True,
+                snapshot_name=state_name,
+            )
+
+            attempt = hook.try_warm(MATH_QUESTION, {})
+            self.assertTrue(attempt.hit)
+            accounting = hook.commit_warm(attempt)
+
+            restored = OoeController.restore(
+                crystal_store=controller.crystal_store,
+                name=state_name,
+                action_executors=controller._executors,
+            )
+            self.assertEqual(accounting.disposition, "committed")
+            self.assertEqual(
+                restored.metrics.saved_qwen_forwards,
+                accounting.saved_qwen_forwards,
+            )
+            self.assertEqual(restored.metrics.crystal_executions, 1)
+            self.assertEqual(restored.metrics.verified_results, 1)
+
+    def test_snapshot_cas_conflict_recovers_the_winning_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first, warm = self._controller(Path(tmp))
+            state_name = "chat-controller"
+            first.save_snapshot(name=state_name)
+            second = OoeController.restore(
+                crystal_store=first.crystal_store,
+                name=state_name,
+                action_executors=first._executors,
+            )
+            first_hook = OoeChatHook(
+                controller=first,
+                feature_provider=lambda _question, _metadata: warm,
+                quality_verifier=lambda _receipt, _execution: True,
+                snapshot_name=state_name,
+            )
+            second_hook = OoeChatHook(
+                controller=second,
+                feature_provider=lambda _question, _metadata: warm,
+                quality_verifier=lambda _receipt, _execution: True,
+                snapshot_name=state_name,
+            )
+            first_attempt = first_hook.try_warm(
+                MATH_QUESTION,
+                {"conversation_id": "first"},
+            )
+            second_attempt = second_hook.try_warm(
+                MATH_QUESTION,
+                {"conversation_id": "second"},
+            )
+            self.assertTrue(first_attempt.hit)
+            self.assertTrue(second_attempt.hit)
+            second_hook.commit_warm(second_attempt)
+
+            with self.assertRaisesRegex(
+                OoeChatIntegrityError,
+                "warm accounting integrity",
+            ):
+                first_hook.commit_warm(first_attempt)
+
+            winner = OoeController.restore(
+                crystal_store=first.crystal_store,
+                name=state_name,
+                action_executors=first._executors,
+            )
+            self.assertEqual(
+                first_hook.controller.snapshot_bytes(),
+                winner.snapshot_bytes(),
+            )
+            retry = first_hook.try_warm(
+                MATH_QUESTION,
+                {"conversation_id": "retry"},
+            )
+            self.assertTrue(retry.hit)
+            first_hook.commit_warm(retry)
+            recovered = OoeController.restore(
+                crystal_store=first.crystal_store,
+                name=state_name,
+                action_executors=first._executors,
+            )
+            self.assertEqual(recovered.metrics.saved_qwen_forwards, 2)
 
     def test_miss_calls_qwen_once_and_observes_final_result(self) -> None:
         observations = []

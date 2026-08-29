@@ -10,7 +10,7 @@ back to Qwen instead of being guessed.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from functools import wraps
 import hashlib
@@ -57,6 +57,7 @@ CONTROLLER_STATE_NAME = "qwen-ooe-controller"
 _ACTION_INDEX = {action: index for index, action in enumerate(OOE_ACTIONS)}
 _MAX_HISTORY = 1_000_000
 _MAX_WARM_TRANSACTIONS = 1_000_000
+_LEGACY_ADAPTIVE_LIFT_GAP_TOLERANCE = 1e-12
 
 
 def _locked(method):
@@ -92,6 +93,115 @@ class OoePromotionError(OoeControllerError):
 
 def _digest(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _canonical_equal(left: object, right: object) -> bool:
+    return canonical_json_bytes(left) == canonical_json_bytes(right)
+
+
+def _adaptive_lift_gap_compatible(
+    stored_receipt: Mapping[str, object],
+    derived_receipt: Mapping[str, object],
+) -> bool:
+    """Match one authenticated legacy receipt with diagnostic gap drift only."""
+
+    if set(stored_receipt) != set(derived_receipt):
+        return False
+    stored_lift = stored_receipt.get("adaptive_lift")
+    derived_lift = derived_receipt.get("adaptive_lift")
+    stored_lift_sha256 = stored_receipt.get("adaptive_lift_sha256")
+    derived_lift_sha256 = derived_receipt.get("adaptive_lift_sha256")
+    if (
+        not isinstance(stored_lift, Mapping)
+        or not isinstance(derived_lift, Mapping)
+        or stored_lift_sha256 != _digest(stored_lift)
+        or derived_lift_sha256 != _digest(derived_lift)
+    ):
+        return False
+
+    stored_outer = dict(stored_receipt)
+    derived_outer = dict(derived_receipt)
+    for receipt_field in ("adaptive_lift", "adaptive_lift_sha256"):
+        stored_outer.pop(receipt_field, None)
+        derived_outer.pop(receipt_field, None)
+    if not _canonical_equal(stored_outer, derived_outer):
+        return False
+    if set(stored_lift) != set(derived_lift):
+        return False
+
+    stored_parameters = dict(stored_lift)
+    derived_parameters = dict(derived_lift)
+    stored_candidates = stored_parameters.pop("spectral_candidates", None)
+    derived_candidates = derived_parameters.pop("spectral_candidates", None)
+    if not _canonical_equal(stored_parameters, derived_parameters):
+        return False
+    if (
+        not isinstance(stored_candidates, list)
+        or not isinstance(derived_candidates, list)
+        or len(stored_candidates) != len(derived_candidates)
+    ):
+        return False
+
+    for stored_candidate, derived_candidate in zip(
+        stored_candidates,
+        derived_candidates,
+        strict=True,
+    ):
+        if (
+            not isinstance(stored_candidate, Mapping)
+            or not isinstance(derived_candidate, Mapping)
+            or set(stored_candidate) != set(derived_candidate)
+            or "gap" not in stored_candidate
+            or "pc" not in stored_candidate
+        ):
+            return False
+        stored_binding = dict(stored_candidate)
+        derived_binding = dict(derived_candidate)
+        stored_gap = stored_binding.pop("gap")
+        derived_gap = derived_binding.pop("gap")
+        if not _canonical_equal(stored_binding, derived_binding):
+            return False
+        if (
+            isinstance(stored_gap, bool)
+            or isinstance(derived_gap, bool)
+            or not isinstance(stored_gap, (int, float))
+            or not isinstance(derived_gap, (int, float))
+        ):
+            return False
+        stored_gap_value = float(stored_gap)
+        derived_gap_value = float(derived_gap)
+        if (
+            not math.isfinite(stored_gap_value)
+            or not math.isfinite(derived_gap_value)
+            or abs(stored_gap_value - derived_gap_value)
+            > _LEGACY_ADAPTIVE_LIFT_GAP_TOLERANCE
+        ):
+            return False
+    return True
+
+
+def _legacy_crystal_gap_compatible(
+    stored: CrystalPayload,
+    derived: CrystalPayload,
+) -> bool:
+    """Allow no legacy variation outside authenticated spectral diagnostics."""
+
+    executable_bindings_match = (
+        stored.name == derived.name
+        and stored.identity == derived.identity
+        and stored.kernel_rows == derived.kernel_rows
+        and stored.kernel_columns == derived.kernel_columns
+        and stored.quantization_levels == derived.quantization_levels
+        and stored.quantized_kernel == derived.quantized_kernel
+        and stored.coverage_sha256 == derived.coverage_sha256
+        and stored.calibration_sha256 == derived.calibration_sha256
+        and stored.verifier_hashes == derived.verifier_hashes
+        and stored.evidence_hashes == derived.evidence_hashes
+    )
+    return executable_bindings_match and _adaptive_lift_gap_compatible(
+        stored.consensus_receipt,
+        derived.consensus_receipt,
+    )
 
 
 def _uint(value: object, *, field: str, positive: bool = False) -> int:
@@ -1834,9 +1944,27 @@ class OoeController:
         expected_model_pin_sha256: str | None = None,
         expected_weight_graph_revision_sha256: str | None = None,
         expected_atlas_graph_revision: GraphRevision | None = None,
+        legacy_gap_compatible_crystal_sha256s: Iterable[str] = (),
         _allow_manifest_forward_recovery: bool = False,
     ) -> "OoeController":
         """Restore, re-derive all replica state, and audit active Crystals."""
+
+        if isinstance(legacy_gap_compatible_crystal_sha256s, (str, bytes)):
+            raise TypeError(
+                "legacy_gap_compatible_crystal_sha256s must be an iterable of digests"
+            )
+        try:
+            legacy_gap_compatible_digests = frozenset(
+                require_sha256(
+                    value,
+                    field="legacy_gap_compatible_crystal_sha256s",
+                )
+                for value in legacy_gap_compatible_crystal_sha256s
+            )
+        except TypeError as exc:
+            raise TypeError(
+                "legacy_gap_compatible_crystal_sha256s must be an iterable of digests"
+            ) from exc
 
         raw = crystal_store.restore_state(name)
         try:
@@ -2145,6 +2273,15 @@ class OoeController:
                 raise OoeControllerIntegrityError(
                     "snapshot Crystal is not active in the manifest"
                 ) from exc
+            payload_is_exact = (
+                payload.to_bytes() == expected_payload.to_bytes()
+                and crystal_digest == expected_payload.sha256
+            )
+            payload_is_legacy_gap_compatible = (
+                not payload_is_exact
+                and crystal_digest in legacy_gap_compatible_digests
+                and _legacy_crystal_gap_compatible(payload, expected_payload)
+            )
             if (
                 payload.name != site_sha256
                 or payload.identity != site.identity
@@ -2152,8 +2289,7 @@ class OoeController:
                 or payload.calibration_sha256 != calibration_sha256
                 or manifest_entry.payload_sha256 != crystal_digest
                 or manifest_entry.identity_sha256 != site.identity.sha256
-                or payload.to_bytes() != expected_payload.to_bytes()
-                or crystal_digest != expected_payload.sha256
+                or not (payload_is_exact or payload_is_legacy_gap_compatible)
             ):
                 raise OoeControllerIntegrityError(
                     "snapshot Crystal payload cannot be rederived from history"

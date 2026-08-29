@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import math
 from pathlib import Path
 import tempfile
 import threading
@@ -502,6 +503,11 @@ class OoeControllerTests(unittest.TestCase):
             lift["formula"],
             "clip(0.85-0.05*log(lambda2),floor,ceiling)",
         )
+        raw_candidates = controller._lift_parameters.spectral_candidates
+        self.assertEqual(
+            [row["gap"] for row in lift["spectral_candidates"]],
+            [round(gap, 12) for _, gap in raw_candidates],
+        )
         return site_sha256, temporal_start + len(OOE_ACTIONS)
 
     def test_cold_teacher_then_warm_crystal_saves_qwen_forwards(self) -> None:
@@ -698,6 +704,145 @@ class OoeControllerTests(unittest.TestCase):
                     coverage_sha256=strict_coverage.sha256,
                     verifier_sha256s=strict_coverage.verifier_sha256s,
                 )
+
+    def test_restore_accepts_only_authenticated_legacy_gap_drift(self) -> None:
+        def prepared_controller(
+            root: Path,
+        ) -> tuple[OoeController, str, CrystalPayload]:
+            controller = self._controller(root)
+            receipt, _ = _feature(0)
+            controller.ingest_teacher(
+                receipt,
+                _transition(receipt, OOE_ACTIONS[0], OOE_ACTIONS[1]),
+            )
+            site_sha256 = receipt.site_identity.sha256
+            coverage = controller.coverage_receipt(site_sha256)
+            publication = controller.promote(
+                site_sha256,
+                coverage_sha256=coverage.sha256,
+                verifier_sha256s=coverage.verifier_sha256s,
+            )
+            payload = controller.crystal_store.restore(publication.payload_sha256)
+            self.assertTrue(
+                payload.consensus_receipt["adaptive_lift"]["spectral_candidates"]
+            )
+            return controller, site_sha256, payload
+
+        def publish_mutation(
+            controller: OoeController,
+            site_sha256: str,
+            payload: CrystalPayload,
+        ) -> None:
+            publication = controller.crystal_store.publish(
+                payload,
+                expected_generation=controller.crystal_store.manifest().generation,
+            )
+            controller._sites[site_sha256].crystal_sha256 = publication.payload_sha256
+            controller.save_snapshot()
+
+        with self.subTest("tiny authenticated legacy gap"):
+            with tempfile.TemporaryDirectory() as tmp:
+                controller, site_sha256, original = prepared_controller(Path(tmp))
+                consensus = original.consensus_receipt
+                lift = consensus["adaptive_lift"]
+                candidate = lift["spectral_candidates"][0]
+                original_gap = candidate["gap"]
+                candidate["gap"] += 5.0e-13
+                self.assertLessEqual(abs(candidate["gap"] - original_gap), 1.0e-12)
+                consensus["adaptive_lift_sha256"] = hashlib.sha256(
+                    canonical_json_bytes(lift)
+                ).hexdigest()
+                legacy = replace(
+                    original,
+                    consensus_receipt_json=canonical_json_bytes(consensus),
+                )
+                publish_mutation(controller, site_sha256, legacy)
+                with self.assertRaisesRegex(
+                    OoeControllerIntegrityError,
+                    "cannot be rederived",
+                ):
+                    OoeController.restore(
+                        crystal_store=controller.crystal_store,
+                        action_executors=controller._executors,
+                    )
+                with self.assertRaisesRegex(
+                    OoeControllerIntegrityError,
+                    "cannot be rederived",
+                ):
+                    OoeController.restore(
+                        crystal_store=controller.crystal_store,
+                        action_executors=controller._executors,
+                        legacy_gap_compatible_crystal_sha256s=(original.sha256,),
+                    )
+                restored = OoeController.restore(
+                    crystal_store=controller.crystal_store,
+                    action_executors=controller._executors,
+                    legacy_gap_compatible_crystal_sha256s=(legacy.sha256,),
+                )
+                self.assertEqual(
+                    restored._sites[site_sha256].crystal_sha256,
+                    legacy.sha256,
+                )
+
+        def assert_rejected(kind: str) -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                controller, site_sha256, original = prepared_controller(Path(tmp))
+                consensus = original.consensus_receipt
+                lift = consensus["adaptive_lift"]
+                candidate = lift["spectral_candidates"][0]
+                mutated = original
+                if kind == "large-gap":
+                    original_gap = candidate["gap"]
+                    candidate["gap"] += 2.0e-12
+                    self.assertGreater(abs(candidate["gap"] - original_gap), 1.0e-12)
+                    consensus["adaptive_lift_sha256"] = hashlib.sha256(
+                        canonical_json_bytes(lift)
+                    ).hexdigest()
+                    mutated = replace(
+                        original,
+                        consensus_receipt_json=canonical_json_bytes(consensus),
+                    )
+                elif kind == "pc":
+                    candidate["pc"] = math.nextafter(candidate["pc"], math.inf)
+                    consensus["adaptive_lift_sha256"] = hashlib.sha256(
+                        canonical_json_bytes(lift)
+                    ).hexdigest()
+                    mutated = replace(
+                        original,
+                        consensus_receipt_json=canonical_json_bytes(consensus),
+                    )
+                elif kind == "kernel":
+                    quantized = np.frombuffer(
+                        original.quantized_kernel,
+                        dtype="<u2",
+                    ).reshape(original.kernel_rows, original.kernel_columns)
+                    mutated = replace(
+                        original,
+                        quantized_kernel=np.roll(quantized, 1, axis=1).tobytes(),
+                    )
+                elif kind == "adaptive-hash":
+                    candidate["gap"] = math.nextafter(candidate["gap"], math.inf)
+                    consensus["adaptive_lift_sha256"] = "0" * 64
+                    mutated = replace(
+                        original,
+                        consensus_receipt_json=canonical_json_bytes(consensus),
+                    )
+                else:  # pragma: no cover - test table is closed below
+                    raise AssertionError(f"unknown mutation: {kind}")
+                publish_mutation(controller, site_sha256, mutated)
+                with self.assertRaisesRegex(
+                    OoeControllerIntegrityError,
+                    "cannot be rederived",
+                ):
+                    OoeController.restore(
+                        crystal_store=controller.crystal_store,
+                        action_executors=controller._executors,
+                        legacy_gap_compatible_crystal_sha256s=(mutated.sha256,),
+                    )
+
+        for kind in ("large-gap", "pc", "kernel", "adaptive-hash"):
+            with self.subTest(kind):
+                assert_rejected(kind)
 
     def test_restore_rederives_promoted_kernel_from_verified_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

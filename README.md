@@ -175,6 +175,12 @@ FERTIG-first route. Normal single-request chat shows live token progress while
 stdout remains exactly the final FERTIG-routed answer. `--raw-qwen` streams the
 actual decoder text, and `--no-stream` buffers either mode until completion.
 
+When a verified local OoE warm bank is present, chat mounts it before opening
+Qwen. An authenticated ResultCell hit executes with zero Qwen forwards and
+persists the Markov accounting; an unknown prompt falls directly through to
+full Q4. `--no-ooe-warm` disables this route, and `--ooe-warm-root` mounts an
+explicit bank outside the canonical deployment.
+
 ## Selected trial evidence
 
 | Trial | Result | Scope |

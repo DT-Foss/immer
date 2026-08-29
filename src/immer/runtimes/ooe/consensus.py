@@ -431,6 +431,14 @@ class AdaptiveLiftParameters:
     spectral_candidates: tuple[tuple[float, float], ...]
 
     def to_dict(self) -> dict[str, Any]:
+        # Spectral gaps are diagnostic only: ``pc`` has already been selected
+        # from the full-precision measurements above.  Round their serialized
+        # representation so platform BLAS eigensolver noise does not change a
+        # future Crystal's content address.
+        def canonical_gap(value: float) -> float:
+            rounded = round(float(value), 12)
+            return 0.0 if rounded == 0.0 else rounded
+
         return {
             "schema": "immer-ooe-adaptive-ps-lift/v1",
             "adjacency_sha256": self.adjacency_sha256,
@@ -442,7 +450,7 @@ class AdaptiveLiftParameters:
             "formula_pc": self.formula_pc,
             "selection": self.selection,
             "spectral_candidates": [
-                {"gap": gap, "pc": candidate_pc}
+                {"gap": canonical_gap(gap), "pc": candidate_pc}
                 for candidate_pc, gap in self.spectral_candidates
             ],
             "formula": "clip(0.85-0.05*log(lambda2),floor,ceiling)",

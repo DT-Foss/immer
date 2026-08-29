@@ -823,7 +823,15 @@ class QwenFertigChat:
                         ooe=ooe_summary,
                     )
                 )
-            settlement_error = settle_warm(accept=False)
+            # Only an explicitly benchmark-authorized warm mount may count
+            # savings when FERTIG has no contrary exact evidence.  Generic
+            # hooks retain the conservative rejection contract.
+            abstention_authorized = (
+                candidate_origin == "ooe"
+                and self._ooe_hook is not None
+                and self._ooe_hook.commit_on_fertig_abstention
+            )
+            settlement_error = settle_warm(accept=abstention_authorized)
             if settlement_error is not None:
                 return settlement_error
             return finish(

@@ -65,6 +65,9 @@ def _artifact_root(manifest: str | Path, configured: str | Path | None = None) -
 
 
 _QWEN38_DEPLOYMENT_ROOT = Path("/app/models/Qwen3.8-27B")
+_QWEN38_DEPLOYMENT_WARM_ROOT = Path(
+    "/root/immer-runtime/artifacts/private/qwen3.8-ooe-chat-real"
+)
 
 
 def _chat_path(
@@ -134,6 +137,30 @@ def _resolve_qwen38_chat_paths(
             "IMMER_QWEN38_ROOT"
         )
     return bundle, tokenizer, q4, fast_mlp
+
+
+def _resolve_qwen38_warm_root(
+    args: argparse.Namespace,
+    bundle_path: Path,
+) -> Path | None:
+    if bool(getattr(args, "no_ooe_warm", False)):
+        if getattr(args, "ooe_warm_root", None) is not None:
+            raise ValueError(
+                "--ooe-warm-root and --no-ooe-warm are mutually exclusive"
+            )
+        return None
+    configured = _chat_path(
+        getattr(args, "ooe_warm_root", None),
+        "IMMER_QWEN38_OOE_WARM_ROOT",
+    )
+    if configured is not None:
+        return configured
+    if (
+        bundle_path == _QWEN38_DEPLOYMENT_ROOT
+        and _QWEN38_DEPLOYMENT_WARM_ROOT.is_dir()
+    ):
+        return _QWEN38_DEPLOYMENT_WARM_ROOT
+    return None
 
 
 class _LiveTextWriter:
@@ -242,6 +269,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
 
     from .cognition.fertig.adapter import FertigSolver
     from .cognition.qwen_fertig_chat import QwenFertigChat
+    from .runtimes.ooe.qwen_warm_bank import (
+        open_verified_qwen_warm_bank,
+    )
     from .runtimes.qwen3_8.adapter import Qwen38CausalChat
     from .runtimes.qwen3_8.draft_window import DraftWindowError
     from .runtimes.qwen3_8.semantic_state_cache import SemanticStateAnchorCache
@@ -332,6 +362,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         bundle_path, tokenizer_path, q4_root, fast_mlp_root = (
             _resolve_qwen38_chat_paths(args)
         )
+        warm_mount = None
+        if not args.raw_qwen:
+            warm_root = _resolve_qwen38_warm_root(args, bundle_path)
+            if warm_root is not None:
+                warm_mount = open_verified_qwen_warm_bank(warm_root)
         anchor_cache = (
             None
             if args.qwen38_anchor_cache is None
@@ -410,7 +445,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         )
         component = qwen
         if not args.raw_qwen:
-            component = QwenFertigChat(qwen, FertigSolver())
+            component = QwenFertigChat(
+                qwen,
+                FertigSolver(),
+                ooe_hook=None if warm_mount is None else warm_mount.hook,
+            )
         if jsonl:
             failures = 0
             handled = 0
@@ -458,7 +497,13 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     break
             return 0 if failures == 0 else 2
         result = component.handle(Request("chat", message))
-    except (DraftWindowError, OSError, TypeError, ValueError) as exc:
+    except (
+        DraftWindowError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
         if live_writer is not None:
             live_writer.fail()
         if progress_writer is not None:
@@ -1209,6 +1254,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--raw-qwen",
         action="store_true",
         help="bypass FERTIG exact short-circuiting and call raw Qwen directly",
+    )
+    chat.add_argument(
+        "--ooe-warm-root",
+        help="verified local Markov/OoE ResultCell bank",
+    )
+    chat.add_argument(
+        "--no-ooe-warm",
+        action="store_true",
+        help="disable the deployed zero-Qwen-forward warm path",
     )
     chat.add_argument(
         "--qwen38-anchor-cache",

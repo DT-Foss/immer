@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hashlib
 import json
+from pathlib import Path
 import threading
 from typing import Any
 
@@ -39,6 +40,7 @@ FeatureProvider = Callable[[str, Mapping[str, Any]], QwenOoeFeatureReceipt | Non
 ColdObserver = Callable[
     [str, Mapping[str, Any], Result, Result], Mapping[str, Any] | None
 ]
+ControllerRestorer = Callable[[], OoeController]
 
 
 class OoeChatIntegrityError(RuntimeError):
@@ -193,6 +195,9 @@ class OoeChatHook:
         quality_verifier: ExecutionQualityVerifier,
         source_action: OoeAction | str = "qwen_fallback",
         cold_observer: ColdObserver | None = None,
+        snapshot_name: str | None = None,
+        snapshot_restorer: ControllerRestorer | None = None,
+        commit_on_fertig_abstention: bool = False,
     ) -> None:
         if not isinstance(controller, OoeController):
             raise TypeError("controller must be an OoeController")
@@ -202,11 +207,33 @@ class OoeChatHook:
             raise TypeError("quality_verifier must be callable")
         if cold_observer is not None and not callable(cold_observer):
             raise TypeError("cold_observer must be callable or None")
+        if snapshot_name is not None and (
+            not isinstance(snapshot_name, str)
+            or not snapshot_name
+            or "\x00" in snapshot_name
+        ):
+            raise ValueError("snapshot_name must be non-empty text or None")
+        if snapshot_restorer is not None and not callable(snapshot_restorer):
+            raise TypeError("snapshot_restorer must be callable or None")
+        if snapshot_restorer is not None and snapshot_name is None:
+            raise ValueError("snapshot_restorer requires snapshot_name")
+        if not isinstance(commit_on_fertig_abstention, bool):
+            raise TypeError("commit_on_fertig_abstention must be boolean")
         self.controller = controller
         self.feature_provider = feature_provider
         self.quality_verifier = quality_verifier
         self.source_action = validate_action(source_action)
         self.cold_observer = cold_observer
+        self.snapshot_name = snapshot_name
+        self.snapshot_restorer = snapshot_restorer
+        self.commit_on_fertig_abstention = commit_on_fertig_abstention
+        self._snapshot_sha256 = (
+            None
+            if snapshot_name is None
+            else hashlib.sha256(
+                controller.crystal_store.restore_state(snapshot_name)
+            ).hexdigest()
+        )
         self._lock = threading.RLock()
 
     @classmethod
@@ -217,6 +244,9 @@ class OoeChatHook:
         quality_verifier: ExecutionQualityVerifier,
         source_action: OoeAction | str = "qwen_fallback",
         cold_observer: ColdObserver | None = None,
+        snapshot_name: str | None = None,
+        snapshot_restorer: ControllerRestorer | None = None,
+        commit_on_fertig_abstention: bool = False,
     ) -> "OoeChatHook":
         """Build the direct exact-prompt hook over persisted controller history."""
 
@@ -226,6 +256,9 @@ class OoeChatHook:
             quality_verifier=quality_verifier,
             source_action=source_action,
             cold_observer=cold_observer,
+            snapshot_name=snapshot_name,
+            snapshot_restorer=snapshot_restorer,
+            commit_on_fertig_abstention=commit_on_fertig_abstention,
         )
 
     @staticmethod
@@ -333,6 +366,40 @@ class OoeChatHook:
                     },
                 )
 
+    def _restore_persisted_controller(self) -> None:
+        if self.snapshot_name is None:
+            return
+        current = self.controller
+        if self.snapshot_restorer is None:
+            restored = OoeController.restore(
+                crystal_store=current.crystal_store,
+                name=self.snapshot_name,
+                action_executors=current._executors,
+                atlas_revision_verifier=current._atlas_revision_verifier,
+                expected_model_pin_sha256=current.model_pin_sha256,
+                expected_weight_graph_revision_sha256=(
+                    current.weight_graph_revision_sha256
+                ),
+            )
+        else:
+            restored = self.snapshot_restorer()
+        if (
+            not isinstance(restored, OoeController)
+            or restored.model_pin_sha256 != current.model_pin_sha256
+            or restored.weight_graph_revision_sha256
+            != current.weight_graph_revision_sha256
+            or Path(restored.crystal_store.root)
+            != Path(current.crystal_store.root)
+        ):
+            raise OoeChatIntegrityError(
+                "snapshot restorer returned another controller authority"
+            )
+        raw = restored.crystal_store.restore_state(self.snapshot_name)
+        self.controller = restored
+        if isinstance(self.feature_provider, ControllerPromptFeatureProvider):
+            self.feature_provider.controller = restored
+        self._snapshot_sha256 = hashlib.sha256(raw).hexdigest()
+
     def _settle_warm(
         self,
         attempt: OoeChatAttempt,
@@ -345,12 +412,26 @@ class OoeChatHook:
         if not isinstance(decision, OoeDecision):
             raise OoeChatIntegrityError("warm hit lost its controller decision")
         try:
-            return (
+            receipt = (
                 self.controller.commit_warm(decision)
                 if accept
                 else self.controller.reject_warm(decision)
             )
-        except OoeControllerIntegrityError as exc:
+            if self.snapshot_name is not None:
+                publication = self.controller.save_snapshot(
+                    name=self.snapshot_name,
+                    expected_sha256=self._snapshot_sha256,
+                )
+                self._snapshot_sha256 = publication.payload_sha256
+            return receipt
+        except (OoeControllerIntegrityError, CrystalStoreError) as exc:
+            if self.snapshot_name is not None:
+                try:
+                    self._restore_persisted_controller()
+                except Exception as restore_exc:
+                    raise OoeChatIntegrityError(
+                        "warm accounting failed and controller recovery failed"
+                    ) from restore_exc
             raise OoeChatIntegrityError("warm accounting integrity failure") from exc
 
     def commit_warm(self, attempt: OoeChatAttempt) -> WarmAccountingReceipt:
