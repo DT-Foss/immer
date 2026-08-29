@@ -70,6 +70,8 @@ address graph.
 - correction-first rolling K=4 continuation with zero-read prefix commits;
 - local Qwen3.5 and zero-model-byte native-token Markov drafting with
   target-confirmed phrase options;
+- optional receipt-trained contextual selection of the actual rolling target
+  window from `K={4,8,16}`;
 - packed K-token projection GEMMs in the explicit Fast-MLP mode;
 - wave-unioned Fast-MLP Gate/Up row transport;
 - semantic state snapshots and prefix batteries;
@@ -160,6 +162,43 @@ profiles. Similarity continuously scales local influence; an exact match gets
 full dialect rapidity while a threshold match remains mostly global. Profiles
 store sketches and expert state, never raw text. Ricci value
 `visits * exp(-0.001 * age)` selects eviction at capacity.
+
+The optional draft-window controller is a separate policy around that exact
+decoder; it cannot produce or accept a token. For each tokenized prompt it
+forms the same bounded bottom-k unigram/bigram/trigram dialect sketch and
+restricts its action set to
+
+```text
+A = {K in {4,8,16} : K <= --draft-window and K <= max_new_tokens}.
+```
+
+With no settled receipt it chooses K=8 (or K=4 when K=8 is outside `A`).
+Thereafter global and matching-dialect rapidities `xi` give the Fixed-Share
+policy
+
+```text
+pi(K) = 0.95 * softmax(xi_global + similarity * xi_dialect)[K]
+        + 0.05 / |A|.
+```
+
+Only an adapter-authenticated terminal target receipt may settle a choice. Its
+work is `1 + target_forwards + seconds + total_bytes / GiB`, where total bytes
+include target, draft, and auxiliary transport. A successful reward combines
+`8 * accepted_draft_tokens / work` with twice the accepted/emitted fraction.
+Zero acceptance receives a reward below -6; abstention, error, abort, and
+timeout receive progressively stronger negative rewards. Rapidity updates use
+the bounded Möbius coordinate `atanh(tanh(reward/8))`, surprise updates an EMA
+and CUSUM, and a detected regime shrinks all rapidities before learning
+continues. Context profiles use the same Ricci retention value above and are
+bounded at 64.
+
+Selection is read-only. Settlement reloads under an `O_NOFOLLOW` process lock,
+deduplicates the selection/target-receipt pair, updates all cumulative agent
+work counters, and replaces one checksummed state file after `fsync`. Thus an
+exception before a verified target receipt cannot mutate policy state, while
+an error after such a receipt is committed atomically as negative evidence.
+Without `--draft-window-state`, `--draft-window` retains its fixed-window
+meaning and old state-free deployments are unchanged.
 
 ## 4. Organism of Experts
 

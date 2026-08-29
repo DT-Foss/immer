@@ -95,6 +95,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
     """Run one turn through the verified local causal Qwen3.8 facade."""
 
     from .runtimes.qwen3_8.adapter import Qwen38CausalChat
+    from .runtimes.qwen3_8.draft_window import DraftWindowError
     from .runtimes.qwen3_8.semantic_state_cache import SemanticStateAnchorCache
 
     component = None
@@ -129,6 +130,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 else int(args.draft_max_resident_mb * 1024**2)
             ),
             markov_draft_state_path=args.markov_draft_state,
+            draft_window_state_path=args.draft_window_state,
             fast_mlp_root=args.fast_mlp,
             fast_mlp_online_state_path=args.fast_mlp_online_state,
             fast_mlp_source_budget_mb=args.fast_mlp_source_budget_mb,
@@ -140,7 +142,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             fast_mlp_active_layers=args.fast_mlp_layers,
         )
         result = component.handle(Request("chat", args.message))
-    except (OSError, TypeError, ValueError) as exc:
+    except (DraftWindowError, OSError, TypeError, ValueError) as exc:
         print(json.dumps({
             "status": "error",
             "component": "qwen3.8.fertig-chat",
@@ -753,6 +755,13 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--markov-draft-state",
         help="persistent sparse Qwen-token Markov memory",
+    )
+    chat.add_argument(
+        "--draft-window-state",
+        help=(
+            "persistent target-receipt controller for contextual K=4/8/16; "
+            "--draft-window becomes its maximum ceiling"
+        ),
     )
     chat.add_argument(
         "--fast-mlp",

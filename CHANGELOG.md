@@ -20,6 +20,12 @@ All notable changes to IMMER are recorded here.
   the target-confirmed prefix, phrase options occupy only their proven first
   three positions, and all later Council predictions receive ordinary
   target-only feedback.
+- Added an opt-in persistent Markov controller for the real rolling window.
+  It chooses K4/K8/K16 below the configured ceiling from bounded contextual
+  token sketches and terminal target receipts, optimizing accepted drafts per
+  target/draft/aux bytes, forwards, and time. Cold traffic stays at K8; zero
+  acceptance, errors, and timeouts move later arbitrary chats toward cheaper
+  windows without any calibration prompt or additional model execution.
 - Expanded the exact residual-PQ head query union from four to sixteen rows.
   Certified pruning and stable top-k parity now cover the complete rolling
   window; the weight-only builder records the same K16 scorer bound.

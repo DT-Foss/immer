@@ -28,6 +28,12 @@ from .config import (
     Qwen38Config,
 )
 from .encoding import END_OF_TEXT_TOKEN_ID, IM_END_TOKEN_ID, Qwen38Tokenizer
+from .draft_window import (
+    DRAFT_WINDOW_ACTIONS,
+    DraftWindowController,
+    DraftWindowFeedback,
+    DraftWindowSelection,
+)
 from .fast_mlp import (
     Qwen38FastMlpMount,
     Qwen38FastMlpPaths,
@@ -722,6 +728,7 @@ class Qwen38CausalChat:
         draft_source_budget_mb: float = 1_048_576,
         draft_max_resident_bytes: int | None = None,
         markov_draft_state_path: str | Path | None = None,
+        draft_window_state_path: str | Path | None = None,
         fast_mlp_root: str | Path | None = None,
         fast_mlp_source_budget_mb: float | None = None,
         fast_mlp_max_resident_bytes: int | None = None,
@@ -790,6 +797,10 @@ class Qwen38CausalChat:
             markov_draft_state_path, (str, Path)
         ):
             raise TypeError("markov_draft_state_path must be a local path or None")
+        if draft_window_state_path is not None and not isinstance(
+            draft_window_state_path, (str, Path)
+        ):
+            raise TypeError("draft_window_state_path must be a local path or None")
         if draft_mode is None:
             if draft_bundle_path is not None:
                 draft_mode = "qwen35"
@@ -801,6 +812,12 @@ class Qwen38CausalChat:
             raise ValueError("markov draft mode does not use a draft bundle")
         if draft_mode != "markov" and markov_draft_state_path is not None:
             raise ValueError("markov_draft_state_path requires markov draft mode")
+        if draft_window_state_path is not None and draft_mode is None:
+            raise ValueError("draft_window_state_path requires a rolling draft mode")
+        if draft_window_state_path is not None and draft_window < min(
+            DRAFT_WINDOW_ACTIONS
+        ):
+            raise ValueError("adaptive draft-window ceiling must admit at least K=4")
         if draft_mode is not None and anchor_cache is not None:
             raise ValueError("rolling drafting and anchor restore cannot share a request")
         if fast_mlp_root is not None and not isinstance(fast_mlp_root, (str, Path)):
@@ -888,6 +905,16 @@ class Qwen38CausalChat:
             if markov_draft_state_path is None
             else Path(markov_draft_state_path).expanduser().absolute()
         )
+        self._draft_window_state_path = (
+            None
+            if draft_window_state_path is None
+            else Path(draft_window_state_path).expanduser().absolute()
+        )
+        self._draft_window_controller = (
+            None
+            if self._draft_window_state_path is None
+            else DraftWindowController(self._draft_window_state_path)
+        )
         self._fast_mlp_paths = (
             None
             if fast_mlp_root is None
@@ -907,6 +934,9 @@ class Qwen38CausalChat:
         self._last_draft_evidence: dict[str, Any] | None = None
         self._last_fast_mlp_evidence: dict[str, Any] | None = None
         self._last_exact_head_evidence: dict[str, Any] | None = None
+        self._draft_window_selection: DraftWindowSelection | None = None
+        self._draft_window_policy_metrics: dict[str, Any] | None = None
+        self._pending_draft_window_feedback: dict[str, Any] | None = None
         self._bundle_receipt: dict[str, Any] | None = None
         self._tokenizer_sha256: str | None = None
         self._load_error: str | None = None
@@ -932,13 +962,50 @@ class Qwen38CausalChat:
             "source_budget_mb": self._source_budget_mb,
             "thinking": False,
         }
-        if self._draft_mode is not None and self._max_new_tokens >= 2:
+        adaptive_eligible = self._draft_window_controller is not None and any(
+            window <= self._draft_window and window <= self._max_new_tokens
+            for window in DRAFT_WINDOW_ACTIONS
+        )
+        fixed_eligible = (
+            self._draft_window_controller is None and self._max_new_tokens >= 2
+        )
+        if self._draft_mode is not None and (adaptive_eligible or fixed_eligible):
             policy["decoding"] = "greedy-rolling-window-draft-verify"
             policy["draft_mode"] = self._draft_mode
-            policy["draft_window"] = min(
-                self._draft_window,
-                self._max_new_tokens,
+            selection = self._draft_window_selection
+            policy["draft_window"] = (
+                selection.proposed_window
+                if selection is not None
+                else (
+                    8
+                    if self._draft_window_controller is not None
+                    and 8 <= self._draft_window
+                    and 8 <= self._max_new_tokens
+                    else (
+                        4
+                        if self._draft_window_controller is not None
+                        else min(self._draft_window, self._max_new_tokens)
+                    )
+                )
             )
+            if self._draft_window_controller is not None:
+                metrics = self._draft_window_policy_metrics
+                if metrics is None:
+                    metrics = self._draft_window_controller.metrics().to_dict()
+                controller_policy: dict[str, Any] = {
+                    "actions": list(DRAFT_WINDOW_ACTIONS),
+                    "configured_ceiling": self._draft_window,
+                    "cold_choice": 8,
+                    "context": "bottom-k-token-ngram-dialect",
+                    "fixed_share": self._draft_window_controller.FIXED_SHARE,
+                    "learning_source": "terminal-target-confirmed-receipts",
+                    "metrics": metrics,
+                    "persistent": True,
+                    "updates_require_target_receipt": True,
+                }
+                if selection is not None:
+                    controller_policy["selection"] = selection.to_dict()
+                policy["draft_window_controller"] = controller_policy
             if self._draft_mode == "qwen35":
                 policy["draft_model"] = {
                     "repo_id": QWEN35_DRAFTER_REPO_ID,
@@ -961,8 +1028,25 @@ class Qwen38CausalChat:
         elif self._draft_mode is not None:
             policy["draft_fallback"] = {
                 "configured_mode": self._draft_mode,
-                "reason": "max-new-tokens-below-2",
+                "reason": (
+                    "no-adaptive-window-below-ceiling-and-output-budget"
+                    if self._draft_window_controller is not None
+                    else "max-new-tokens-below-2"
+                ),
             }
+            if self._draft_window_controller is not None:
+                metrics = self._draft_window_policy_metrics
+                if metrics is None:
+                    metrics = self._draft_window_controller.metrics().to_dict()
+                policy["draft_window_controller"] = {
+                    "actions": list(DRAFT_WINDOW_ACTIONS),
+                    "configured_ceiling": self._draft_window,
+                    "cold_choice": 8,
+                    "learning_source": "terminal-target-confirmed-receipts",
+                    "metrics": metrics,
+                    "persistent": True,
+                    "updates_require_target_receipt": True,
+                }
         if self._fast_mlp_paths is not None:
             policy["fast_mlp"] = {
                 "active_layers": (
@@ -1144,7 +1228,12 @@ class Qwen38CausalChat:
         fast_before = None if fast_mount is None else fast_mount.metrics()
         exact_head = getattr(runtime, "exact_head_index", None)
         exact_before = None if exact_head is None else exact_head.metrics()
-        if self._draft_mode is None or self._max_new_tokens < 2:
+        adaptive_selection = self._draft_window_selection
+        draft_enabled = self._draft_mode is not None and (
+            (self._draft_window_controller is None and self._max_new_tokens >= 2)
+            or adaptive_selection is not None
+        )
+        if not draft_enabled:
             generated, evidence = runtime.model.generate_greedy(
                 [list(prompt_ids)],
                 retain_final_state=False,
@@ -1160,7 +1249,11 @@ class Qwen38CausalChat:
             self._record_exact_head_request(runtime, exact_before)
             return generated, evidence
         eos = tuple(generation_options["eos_token_ids"])
-        draft_window = min(self._draft_window, self._max_new_tokens)
+        draft_window = (
+            adaptive_selection.proposed_window
+            if adaptive_selection is not None
+            else min(self._draft_window, self._max_new_tokens)
+        )
         if self._draft_mode == "qwen35":
             draft = self._load_draft_locked(runtime)
             provider: Any = Qwen35K4DraftProvider(
@@ -1187,8 +1280,31 @@ class Qwen38CausalChat:
                 head_block_rows=self._head_block_rows,
                 retain_final_state=False,
             )
-            provider_metrics = provider.metrics()
             evidence = generated.evidence
+            mapped_evidence = {
+                "prompt_token_ids": evidence.prompt_token_ids,
+                "generated_token_ids": evidence.generated_token_ids,
+                "context_mode": "stateful_autoregressive",
+                "stateful_cache": True,
+                "general_generation": True,
+                "prefill_mode": "batched",
+                "forward_passes": evidence.forward_passes,
+                "source_body_bytes": evidence.source_body_bytes,
+                "linear_calls": evidence.linear_calls,
+                "seconds": evidence.seconds,
+                "state_bytes": runtime.model.state_bytes,
+                "stopped_on_eos": evidence.stopped_on_eos,
+                "final_state_committed": evidence.final_state_committed,
+            }
+            self._stage_draft_window_feedback(
+                prompt_ids=prompt_ids,
+                generated_ids=tuple(generated.token_ids),
+                generation_evidence=mapped_evidence,
+                accepted_draft_tokens=evidence.accepted_draft_tokens,
+                draft_source_body_bytes=0,
+                aux_source_body_bytes=0,
+            )
+            provider_metrics = provider.metrics()
             fast_request = self._record_fast_mlp_request(
                 runtime,
                 fast_before,
@@ -1204,6 +1320,7 @@ class Qwen38CausalChat:
                 "accepted_draft_tokens": evidence.accepted_draft_tokens,
                 "mode": self._draft_mode,
                 "draft_source_body_bytes": provider_metrics.source_body_bytes,
+                "aux_source_body_bytes": aux_source_body_bytes,
                 "draft_linear_calls": provider_metrics.linear_calls,
                 "target_source_body_bytes": evidence.source_body_bytes,
                 "target_linear_calls": evidence.linear_calls,
@@ -1220,27 +1337,70 @@ class Qwen38CausalChat:
                 "window_size": getattr(evidence, "window_size", draft_window),
                 "schema": evidence.schema,
             }
+            if adaptive_selection is not None:
+                self._last_draft_evidence["window_selection"] = (
+                    adaptive_selection.to_dict()
+                )
             provider_record = getattr(provider_metrics, "to_dict", None)
             if callable(provider_record):
                 self._last_draft_evidence["provider"] = provider_record()
+            self._stage_draft_window_feedback(
+                prompt_ids=prompt_ids,
+                generated_ids=tuple(generated.token_ids),
+                generation_evidence=mapped_evidence,
+            )
             self._record_exact_head_request(runtime, exact_before)
-            return generated.token_ids, {
-                "prompt_token_ids": evidence.prompt_token_ids,
-                "generated_token_ids": evidence.generated_token_ids,
-                "context_mode": "stateful_autoregressive",
-                "stateful_cache": True,
-                "general_generation": True,
-                "prefill_mode": "batched",
-                "forward_passes": evidence.forward_passes,
-                "source_body_bytes": evidence.source_body_bytes,
-                "linear_calls": evidence.linear_calls,
-                "seconds": evidence.seconds,
-                "state_bytes": runtime.model.state_bytes,
-                "stopped_on_eos": evidence.stopped_on_eos,
-                "final_state_committed": evidence.final_state_committed,
-            }
+            return generated.token_ids, mapped_evidence
         finally:
             provider.close()
+
+    def _stage_draft_window_feedback(
+        self,
+        *,
+        prompt_ids: tuple[int, ...],
+        generated_ids: tuple[int, ...],
+        generation_evidence: Mapping[str, Any],
+        accepted_draft_tokens: int | None = None,
+        draft_source_body_bytes: int | None = None,
+        aux_source_body_bytes: int | None = None,
+    ) -> None:
+        selection = self._draft_window_selection
+        if selection is None or self._draft_window_controller is None:
+            return
+        draft = self._last_draft_evidence
+        if draft is None and any(
+            value is None
+            for value in (
+                accepted_draft_tokens,
+                draft_source_body_bytes,
+                aux_source_body_bytes,
+            )
+        ):
+            raise Qwen38ChatError(
+                "adaptive draft-window request lacks rolling draft evidence"
+            )
+        if accepted_draft_tokens is None:
+            accepted_draft_tokens = int(draft["accepted_draft_tokens"])
+        if draft_source_body_bytes is None:
+            draft_source_body_bytes = int(draft["draft_source_body_bytes"])
+        if aux_source_body_bytes is None:
+            aux_source_body_bytes = int(draft["aux_source_body_bytes"])
+        receipt = _compact_generation_receipt(
+            generation_evidence,
+            prompt_ids=prompt_ids,
+            generated_ids=generated_ids,
+        )
+        self._pending_draft_window_feedback = {
+            "accepted_draft_tokens": accepted_draft_tokens,
+            "aux_source_body_bytes": aux_source_body_bytes,
+            "draft_source_body_bytes": draft_source_body_bytes,
+            "emitted_tokens": len(generated_ids),
+            "proposed_window": selection.proposed_window,
+            "seconds": float(receipt["seconds"]),
+            "target_forwards": int(receipt["forward_passes"]),
+            "target_receipt_sha256": _digest(receipt),
+            "target_source_body_bytes": int(receipt["source_body_bytes"]),
+        }
 
     def _record_exact_head_request(
         self,
@@ -1430,6 +1590,20 @@ class Qwen38CausalChat:
         if any(token_id >= vocab_size for token_id in prompt_ids):
             raise _RequestRejected("prompt token is outside the checkpoint vocabulary")
 
+        if self._draft_window_controller is not None:
+            self._draft_window_selection = self._draft_window_controller.choose(
+                prompt_ids,
+                max_window=self._draft_window,
+                max_new_tokens=self._max_new_tokens,
+            )
+            self._draft_window_policy_metrics = (
+                self._draft_window_controller.metrics().to_dict()
+                if self._draft_window_selection is None
+                else self._draft_window_controller.metrics_for_selection(
+                    self._draft_window_selection
+                ).to_dict()
+            )
+
         restored = None
         restore_seconds = 0.0
         anchor_miss: dict[str, Any] | None = None
@@ -1528,6 +1702,11 @@ class Qwen38CausalChat:
             prompt_ids=prompt_ids,
             generated_ids=generated_ids,
         )
+        self._stage_draft_window_feedback(
+            prompt_ids=prompt_ids,
+            generated_ids=generated_ids,
+            generation_evidence=raw_evidence,
+        )
         if bool(receipt["stopped_on_eos"]) != bool(eos_positions):
             raise Qwen38ChatError("generation EOS receipt differs from output")
         decoded = runtime.tokenizer.decode(generated_ids)
@@ -1605,6 +1784,84 @@ class Qwen38CausalChat:
                 detail += f"; draft close: {type(close_exc).__name__}: {close_exc}"
         return detail
 
+    def _finalize_draft_window_result(
+        self,
+        result: Result,
+        *,
+        failure_outcome: str | None = None,
+    ) -> Result:
+        selection = self._draft_window_selection
+        controller = self._draft_window_controller
+        if selection is None or controller is None:
+            return result
+        record: dict[str, Any] = {
+            "schema": "immer.qwen3.8-draft-window-request/v1",
+            "selection": selection.to_dict(),
+            "settled": False,
+        }
+        pending = self._pending_draft_window_feedback
+        if pending is None:
+            record["reason"] = "no-verified-target-receipt"
+            metrics = self._draft_window_policy_metrics
+            if metrics is None:
+                metrics = controller.metrics().to_dict()
+            record["metrics"] = metrics
+            return Result(
+                result.status,
+                result.component,
+                output=result.output,
+                reason=result.reason,
+                evidence={**dict(result.evidence), "draft_window": record},
+            )
+        outcome = failure_outcome
+        if outcome is None:
+            outcome = {
+                ExecutionStatus.OK: "ok",
+                ExecutionStatus.ABSTAINED: "abstained",
+                ExecutionStatus.ERROR: "error",
+                ExecutionStatus.UNAVAILABLE: "aborted",
+                ExecutionStatus.REJECTED: "aborted",
+            }[result.status]
+        try:
+            feedback = DraftWindowFeedback(**pending, outcome=outcome)
+            metrics = controller.settle(selection, feedback)
+        except Exception as exc:
+            record["settlement"] = {
+                "detail": f"{type(exc).__name__}: {exc}",
+                "status": "error",
+            }
+            return Result(
+                ExecutionStatus.ERROR,
+                self.name,
+                reason="Qwen3.8 draft-window settlement failed",
+                evidence={**dict(result.evidence), "draft_window": record},
+            )
+        record.update(
+            {
+                "feedback": feedback.to_dict(),
+                "metrics": metrics.to_dict(),
+                "settled": True,
+            }
+        )
+        evidence = {**dict(result.evidence), "draft_window": record}
+        draft = evidence.get("draft")
+        if isinstance(draft, Mapping):
+            evidence["draft"] = {
+                **dict(draft),
+                "window_controller": {
+                    "proposed_window": selection.proposed_window,
+                    "reward": feedback.reward,
+                    "settled": True,
+                },
+            }
+        return Result(
+            result.status,
+            result.component,
+            output=result.output,
+            reason=result.reason,
+            evidence=evidence,
+        )
+
     def handle(self, request: Request) -> Result:
         if request.capability not in self.capabilities:
             return Result(
@@ -1620,6 +1877,9 @@ class Qwen38CausalChat:
             )
 
         with self._lock:
+            self._draft_window_selection = None
+            self._draft_window_policy_metrics = None
+            self._pending_draft_window_feedback = None
             if self._closed:
                 return Result(
                     ExecutionStatus.UNAVAILABLE,
@@ -1637,6 +1897,8 @@ class Qwen38CausalChat:
                     evidence=self._base_evidence(),
                 )
 
+            failure_outcome: str | None = None
+            abort: BaseException | None = None
             try:
                 result = self._execute_locked(runtime, request.payload.strip())
             except _RequestRejected as exc:
@@ -1647,17 +1909,29 @@ class Qwen38CausalChat:
                     evidence=self._base_evidence(),
                 )
             except Exception as exc:
+                failure_outcome = (
+                    "timeout" if isinstance(exc, TimeoutError) else "error"
+                )
                 result = Result(
                     ExecutionStatus.ERROR,
                     self.name,
                     reason=f"Qwen3.8 generation failed: {type(exc).__name__}: {exc}",
                     evidence=self._base_evidence(),
                 )
+            except BaseException as exc:
+                abort = exc
+                failure_outcome = "aborted"
+                result = Result(
+                    ExecutionStatus.ERROR,
+                    self.name,
+                    reason=f"Qwen3.8 generation aborted: {type(exc).__name__}: {exc}",
+                    evidence=self._base_evidence(),
+                )
             try:
                 runtime.model.reset_state(release=True)
             except Exception as exc:
                 cleanup = self._retire_runtime_locked(exc)
-                return Result(
+                failed = Result(
                     ExecutionStatus.ERROR,
                     self.name,
                     reason="Qwen3.8 state cleanup failed",
@@ -1666,7 +1940,20 @@ class Qwen38CausalChat:
                         "cleanup": {"status": "error", "detail": cleanup},
                     },
                 )
-            return result
+                finalized = self._finalize_draft_window_result(
+                    failed,
+                    failure_outcome=("aborted" if abort is not None else "error"),
+                )
+                if abort is not None:
+                    raise abort
+                return finalized
+            finalized = self._finalize_draft_window_result(
+                result,
+                failure_outcome=failure_outcome,
+            )
+            if abort is not None:
+                raise abort
+            return finalized
 
     def close(self) -> None:
         with self._lock:
