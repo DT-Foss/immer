@@ -33,15 +33,17 @@ try:
 except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
-MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v12"
+MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v13"
+V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
 V5_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
 V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v9"
-_STATE_PREFIX = b"IMMD\x06"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v10"
+_STATE_PREFIX = b"IMMD\x07"
+_V6_STATE_PREFIX = b"IMMD\x06"
 _V5_STATE_PREFIX = b"IMMD\x05"
 _V4_STATE_PREFIX = b"IMMD\x04"
 _V3_STATE_PREFIX = b"IMMD\x03"
@@ -52,6 +54,7 @@ _UNKNOWN_TOKEN = "<unknown>"
 _EPISODE_TOKEN = "<episode>"
 _HEX = frozenset("0123456789abcdef")
 _MAX_IMPORTED_EPISODE_DIGESTS = 65_536
+_MAX_PROPOSAL_POSITIONS = 16
 
 
 class MarkovDraftError(RuntimeError):
@@ -380,6 +383,8 @@ class MarkovDraftState:
     expert_log_weights: tuple[float, ...] = ()
     expert_observations: tuple[int, ...] = ()
     expert_hits: tuple[int, ...] = ()
+    horizon_expert_observations: tuple[tuple[int, ...], ...] = ()
+    horizon_expert_hits: tuple[tuple[int, ...], ...] = ()
     leader_changes: int = 0
     episode_lengths: tuple[int, ...] = ()
     feedback_count: int = 0
@@ -472,6 +477,46 @@ class MarkovDraftState:
             )
         ):
             raise ValueError("Markov expert state is invalid")
+        horizon_observations = tuple(
+            tuple(row) for row in self.horizon_expert_observations
+        )
+        horizon_hits = tuple(tuple(row) for row in self.horizon_expert_hits)
+        if bool(horizon_observations) != bool(horizon_hits) or (
+            horizon_observations
+            and (
+                len(horizon_observations) != _MAX_PROPOSAL_POSITIONS
+                or len(horizon_hits) != _MAX_PROPOSAL_POSITIONS
+                or any(
+                    len(observed) != len(names) or len(hit) != len(names)
+                    for observed, hit in zip(
+                        horizon_observations,
+                        horizon_hits,
+                        strict=True,
+                    )
+                )
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    for row in (*horizon_observations, *horizon_hits)
+                    for value in row
+                )
+                or any(
+                    hit > observed
+                    for observed_row, hit_row in zip(
+                        horizon_observations,
+                        horizon_hits,
+                        strict=True,
+                    )
+                    for observed, hit in zip(
+                        observed_row,
+                        hit_row,
+                        strict=True,
+                    )
+                )
+            )
+        ):
+            raise ValueError("Markov horizon expert state is invalid")
         if (
             isinstance(self.leader_changes, bool)
             or not isinstance(self.leader_changes, int)
@@ -526,6 +571,12 @@ class MarkovDraftState:
         object.__setattr__(self, "expert_log_weights", log_weights)
         object.__setattr__(self, "expert_observations", observations)
         object.__setattr__(self, "expert_hits", hits)
+        object.__setattr__(
+            self,
+            "horizon_expert_observations",
+            horizon_observations,
+        )
+        object.__setattr__(self, "horizon_expert_hits", horizon_hits)
         object.__setattr__(self, "episode_lengths", episode_lengths)
         object.__setattr__(self, "dialects", dialects)
         object.__setattr__(self, "episode_dialects", episode_dialects)
@@ -546,6 +597,12 @@ class MarkovDraftState:
                 ],
                 "expert_names": list(self.expert_names),
                 "expert_observations": list(self.expert_observations),
+                "horizon_expert_hits": [
+                    list(row) for row in self.horizon_expert_hits
+                ],
+                "horizon_expert_observations": [
+                    list(row) for row in self.horizon_expert_observations
+                ],
                 "leader_changes": self.leader_changes,
                 "episode_lengths": list(self.episode_lengths),
                 "episode_dialects": list(self.episode_dialects),
@@ -577,6 +634,7 @@ class MarkovDraftState:
             or not data.startswith(
                 (
                     _STATE_PREFIX,
+                    _V6_STATE_PREFIX,
                     _V5_STATE_PREFIX,
                     _V4_STATE_PREFIX,
                     _V3_STATE_PREFIX,
@@ -592,18 +650,22 @@ class MarkovDraftState:
                 _STATE_PREFIX
                 if data.startswith(_STATE_PREFIX)
                 else (
-                    _V5_STATE_PREFIX
-                    if data.startswith(_V5_STATE_PREFIX)
+                    _V6_STATE_PREFIX
+                    if data.startswith(_V6_STATE_PREFIX)
                     else (
-                        _V4_STATE_PREFIX
-                        if data.startswith(_V4_STATE_PREFIX)
+                        _V5_STATE_PREFIX
+                        if data.startswith(_V5_STATE_PREFIX)
                         else (
-                            _V2_STATE_PREFIX
-                            if data.startswith(_V2_STATE_PREFIX)
+                            _V4_STATE_PREFIX
+                            if data.startswith(_V4_STATE_PREFIX)
                             else (
-                                _V3_STATE_PREFIX
-                                if data.startswith(_V3_STATE_PREFIX)
-                                else _LEGACY_STATE_PREFIX
+                                _V2_STATE_PREFIX
+                                if data.startswith(_V2_STATE_PREFIX)
+                                else (
+                                    _V3_STATE_PREFIX
+                                    if data.startswith(_V3_STATE_PREFIX)
+                                    else _LEGACY_STATE_PREFIX
+                                )
                             )
                         )
                     )
@@ -638,6 +700,10 @@ class MarkovDraftState:
         v5 = (
             isinstance(value, dict)
             and value.get("schema") == V5_MARKOV_DRAFT_STATE_SCHEMA
+        )
+        v6 = (
+            isinstance(value, dict)
+            and value.get("schema") == V6_MARKOV_DRAFT_STATE_SCHEMA
         )
         v2_fields = {
             "expert_hits",
@@ -757,6 +823,32 @@ class MarkovDraftState:
                 "updates",
                 "vocab_size",
             }
+            if v6
+            else {
+                "expert_hits",
+                "expert_log_weights",
+                "expert_names",
+                "expert_observations",
+                "horizon_expert_hits",
+                "horizon_expert_observations",
+                "leader_changes",
+                "episode_lengths",
+                "episode_dialects",
+                "episode_prompt_lengths",
+                "imported_episode_sha256s",
+                "clock",
+                "dialects",
+                "feedback_count",
+                "max_history_tokens",
+                "regime_generation",
+                "schema",
+                "surprise_cusum",
+                "surprise_deviation",
+                "surprise_mean",
+                "token_ids",
+                "updates",
+                "vocab_size",
+            }
         )
         if (
             not isinstance(value, dict)
@@ -764,6 +856,7 @@ class MarkovDraftState:
             or value.get("schema")
             not in {
                 MARKOV_DRAFT_STATE_SCHEMA,
+                V6_MARKOV_DRAFT_STATE_SCHEMA,
                 V5_MARKOV_DRAFT_STATE_SCHEMA,
                 V4_MARKOV_DRAFT_STATE_SCHEMA,
                 V3_MARKOV_DRAFT_STATE_SCHEMA,
@@ -786,6 +879,13 @@ class MarkovDraftState:
                 ),
                 expert_observations=tuple(value.get("expert_observations", ())),
                 expert_hits=tuple(value.get("expert_hits", ())),
+                horizon_expert_observations=tuple(
+                    tuple(row)
+                    for row in value.get("horizon_expert_observations", ())
+                ),
+                horizon_expert_hits=tuple(
+                    tuple(row) for row in value.get("horizon_expert_hits", ())
+                ),
                 leader_changes=value.get("leader_changes", 0),
                 episode_lengths=tuple(value.get("episode_lengths", ())),
                 episode_dialects=tuple(value.get("episode_dialects", ())),
@@ -833,6 +933,8 @@ class MarkovDraftMetrics:
     last_raw_confidence: float
     last_empirical_evidence: float
     last_disagreement: float
+    horizon_observations: tuple[int, ...]
+    horizon_mean_accuracy: tuple[float, ...]
     regime_generation: int
     surprise_mean: float
     surprise_cusum: float
@@ -965,24 +1067,39 @@ class FingerprintRollingK4DraftProvider:
         names = tuple(row.name for row in self._experts)
         if not self._state.expert_names:
             uniform = -math.log(len(names))
+            horizon_zeros = tuple(
+                (0,) * len(names) for _ in range(_MAX_PROPOSAL_POSITIONS)
+            )
             self._state = replace(
                 self._state,
                 expert_names=names,
                 expert_log_weights=(uniform,) * len(names),
                 expert_observations=(0,) * len(names),
                 expert_hits=(0,) * len(names),
+                horizon_expert_observations=horizon_zeros,
+                horizon_expert_hits=horizon_zeros,
             )
         elif self._state.expert_names != names:
             self._release_state_lock()
             raise MarkovDraftError("Markov council topology changed")
+        elif not self._state.horizon_expert_observations:
+            horizon_zeros = tuple(
+                (0,) * len(names) for _ in range(_MAX_PROPOSAL_POSITIONS)
+            )
+            self._state = replace(
+                self._state,
+                horizon_expert_observations=horizon_zeros,
+                horizon_expert_hits=horizon_zeros,
+            )
         self._pending_base: tuple[int, ...] | None = None
         self._pending_proposal: tuple[int, ...] | None = None
         self._pending_feedback: tuple[
             tuple[tuple[dict[str, float], int], ...], ...
         ] = ()
         self._carry_feedback: tuple[tuple[dict[str, float], int], ...] | None = None
+        self._carry_feedback_position: int | None = None
         self._episode_feedback: list[
-            tuple[tuple[tuple[dict[str, float], int], ...], int]
+            tuple[tuple[tuple[dict[str, float], int], ...], int, int]
         ] = []
         self._active_dialect: MarkovDialectState | None = None
         self._active_dialect_is_new = False
@@ -1615,6 +1732,7 @@ class FingerprintRollingK4DraftProvider:
         raw_confidence: float,
         expert_row: Sequence[tuple[Mapping[str, float], int]],
         weights: Sequence[float],
+        position: int,
         *,
         allow_empirical: bool = True,
     ) -> tuple[float, float]:
@@ -1632,6 +1750,8 @@ class FingerprintRollingK4DraftProvider:
 
         if len(expert_row) != len(self._experts) or len(weights) != len(self._experts):
             raise MarkovDraftError("Markov empirical confidence width changed")
+        if not 0 <= position < _MAX_PROPOSAL_POSITIONS:
+            raise MarkovDraftError("Markov confidence position is invalid")
         evidence = 0.0
         token_symbol = self._symbol(token)
         for index, ((_distribution, predicted), weight) in enumerate(
@@ -1665,10 +1785,13 @@ class FingerprintRollingK4DraftProvider:
             )
             if decisiveness <= 0.0:
                 continue
-            observations = self._state.expert_observations[index]
+            observations = self._state.horizon_expert_observations[position][index]
+            hits = self._state.horizon_expert_hits[position][index]
+            if observations <= 0:
+                observations = self._state.expert_observations[index]
+                hits = self._state.expert_hits[index]
             if observations <= 0:
                 continue
-            hits = self._state.expert_hits[index]
             posterior = (hits + 1.0) / (observations + 2.0)
             maturity = observations / (
                 observations + self.EMPIRICAL_EVIDENCE_SATURATION
@@ -1786,6 +1909,7 @@ class FingerprintRollingK4DraftProvider:
                 self._last_raw_confidence,
                 expert_row,
                 weights,
+                position,
                 allow_empirical=position >= len(forced),
             )
             confidences.append(self._last_confidence)
@@ -1807,9 +1931,12 @@ class FingerprintRollingK4DraftProvider:
         self,
         feedback: tuple[tuple[dict[str, float], int], ...],
         token: int,
+        position: int = 0,
     ) -> None:
         if len(feedback) != len(self._experts):
             raise MarkovDraftError("Markov council feedback width changed")
+        if not 0 <= position < _MAX_PROPOSAL_POSITIONS:
+            raise MarkovDraftError("Markov feedback position is invalid")
         symbol = self._symbol(token)
         before_leader = max(
             range(len(self._experts)),
@@ -1818,6 +1945,10 @@ class FingerprintRollingK4DraftProvider:
         logs = list(self._state.expert_log_weights)
         observations = list(self._state.expert_observations)
         hits = list(self._state.expert_hits)
+        horizon_observations = [
+            list(row) for row in self._state.horizon_expert_observations
+        ]
+        horizon_hits = [list(row) for row in self._state.horizon_expert_hits]
         weights = self._weights()
         probabilities = []
         for distribution, _prediction in feedback:
@@ -1863,6 +1994,8 @@ class FingerprintRollingK4DraftProvider:
             )
             observations[index] += 1
             hits[index] += int(prediction == token)
+            horizon_observations[position][index] += 1
+            horizon_hits[position][index] += int(prediction == token)
         center = sum(logs) / len(logs)
         logs = [value - center for value in logs]
         regime_change = (
@@ -1905,6 +2038,10 @@ class FingerprintRollingK4DraftProvider:
             expert_log_weights=tuple(logs),
             expert_observations=tuple(observations),
             expert_hits=tuple(hits),
+            horizon_expert_observations=tuple(
+                tuple(row) for row in horizon_observations
+            ),
+            horizon_expert_hits=tuple(tuple(row) for row in horizon_hits),
             leader_changes=(
                 self._state.leader_changes + int(before_leader != after_leader)
             ),
@@ -1955,8 +2092,17 @@ class FingerprintRollingK4DraftProvider:
         elif len(committed) != self._last_confirmed_length:
             raise MarkovDraftError("rolling Markov history length is discontinuous")
         if self._carry_feedback is not None:
-            self._episode_feedback.append((self._carry_feedback, known_token))
+            if self._carry_feedback_position is None:
+                raise MarkovDraftError("Markov carry feedback position is missing")
+            self._episode_feedback.append(
+                (
+                    self._carry_feedback,
+                    known_token,
+                    self._carry_feedback_position,
+                )
+            )
             self._carry_feedback = None
+            self._carry_feedback_position = None
         base = (*committed, known_token)
         option = self._phrase_option(base)
         complete, feedback, confidences, disagreements = self._predict_council(
@@ -2139,7 +2285,9 @@ class FingerprintRollingK4DraftProvider:
             raise MarkovDraftError("Markov reconciliation is not a proposal prefix")
         assert self._last_confirmed_length is not None
         for index, token in enumerate(delta):
-            self._episode_feedback.append((self._pending_feedback[index], token))
+            self._episode_feedback.append(
+                (self._pending_feedback[index], token, index)
+            )
         if self._pending_phrase_option is not None:
             self._phrase_accepted_tokens += min(
                 len(delta),
@@ -2151,6 +2299,7 @@ class FingerprintRollingK4DraftProvider:
                     len(self._pending_phrase_option.token_ids),
                 )
         self._carry_feedback = self._pending_feedback[len(delta)]
+        self._carry_feedback_position = len(delta)
         self._last_confirmed_length = len(committed)
         self._pending_base = None
         self._pending_proposal = None
@@ -2198,7 +2347,9 @@ class FingerprintRollingK4DraftProvider:
         verified = 0
         prefix_matches = True
         for index, token in enumerate(delta):
-            self._episode_feedback.append((self._pending_feedback[index], token))
+            self._episode_feedback.append(
+                (self._pending_feedback[index], token, index)
+            )
             verified += 1
             if token != proposal[index]:
                 prefix_matches = False
@@ -2206,6 +2357,7 @@ class FingerprintRollingK4DraftProvider:
         self._carry_feedback = (
             self._pending_feedback[len(delta)] if prefix_matches else None
         )
+        self._carry_feedback_position = len(delta) if prefix_matches else None
         self._last_confirmed_length = len(committed)
         self._pending_base = None
         self._pending_proposal = None
@@ -2262,10 +2414,17 @@ class FingerprintRollingK4DraftProvider:
         if len(committed) < previous:
             raise MarkovDraftError("advanced Markov history moved backwards")
         if self._carry_feedback is not None and len(committed) > previous:
+            if self._carry_feedback_position is None:
+                raise MarkovDraftError("Markov carry feedback position is missing")
             self._episode_feedback.append(
-                (self._carry_feedback, committed[previous])
+                (
+                    self._carry_feedback,
+                    committed[previous],
+                    self._carry_feedback_position,
+                )
             )
             self._carry_feedback = None
+            self._carry_feedback_position = None
         self._last_confirmed_length = len(committed)
 
     def observe_final(self, history: tuple[int, ...], /) -> None:
@@ -2280,6 +2439,7 @@ class FingerprintRollingK4DraftProvider:
         original_state = self._state
         original_dialect = self._active_dialect
         original_carry = self._carry_feedback
+        original_carry_position = self._carry_feedback_position
         original_feedback = list(self._episode_feedback)
         original_confirmed_length = self._last_confirmed_length
         original_evictions = self._dialect_evictions
@@ -2294,15 +2454,19 @@ class FingerprintRollingK4DraftProvider:
                 and self._last_confirmed_length is not None
                 and len(committed) > self._last_confirmed_length
             ):
+                if self._carry_feedback_position is None:
+                    raise MarkovDraftError("Markov carry feedback position is missing")
                 self._episode_feedback.append(
                     (
                         self._carry_feedback,
                         committed[self._last_confirmed_length],
+                        self._carry_feedback_position,
                     )
                 )
             self._carry_feedback = None
-            for feedback, token in self._episode_feedback:
-                self._apply_council_feedback(feedback, token)
+            self._carry_feedback_position = None
+            for feedback, token, position in self._episode_feedback:
+                self._apply_council_feedback(feedback, token, position)
             self._episode_feedback.clear()
             self._learn_episode(
                 committed,
@@ -2328,6 +2492,7 @@ class FingerprintRollingK4DraftProvider:
             self._state = original_state
             self._active_dialect = original_dialect
             self._carry_feedback = original_carry
+            self._carry_feedback_position = original_carry_position
             self._episode_feedback = original_feedback
             self._last_confirmed_length = original_confirmed_length
             self._dialect_evictions = original_evictions
@@ -2407,6 +2572,26 @@ class FingerprintRollingK4DraftProvider:
             last_raw_confidence=self._last_raw_confidence,
             last_empirical_evidence=self._last_empirical_evidence,
             last_disagreement=self._last_disagreement,
+            horizon_observations=tuple(
+                max(row, default=0)
+                for row in self._state.horizon_expert_observations
+            ),
+            horizon_mean_accuracy=tuple(
+                sum(
+                    weight * (hit / observed if observed else 0.0)
+                    for weight, observed, hit in zip(
+                        weights,
+                        observed_row,
+                        hit_row,
+                        strict=True,
+                    )
+                )
+                for observed_row, hit_row in zip(
+                    self._state.horizon_expert_observations,
+                    self._state.horizon_expert_hits,
+                    strict=True,
+                )
+            ),
             regime_generation=self._state.regime_generation,
             surprise_mean=self._state.surprise_mean,
             surprise_cusum=self._state.surprise_cusum,
@@ -2483,6 +2668,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_proposal = None
         self._pending_feedback = ()
         self._carry_feedback = None
+        self._carry_feedback_position = None
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._pending_import_digest = None

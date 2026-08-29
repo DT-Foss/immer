@@ -159,7 +159,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(provider.metrics().expert_weights), 8)
         provider.close()
 
-    def test_v2_council_state_migrates_to_v6_composition_memory(self) -> None:
+    def test_v2_council_state_migrates_to_v7_horizon_memory(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         state = seed._state
         seed.close()
@@ -199,11 +199,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((1, 2, 3, 4))
         provider.close()
 
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x06"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x07"))
         migrated = MarkovDraftState.from_bytes(path.read_bytes())
         self.assertEqual(len(migrated.dialects), 1)
 
-    def test_v3_dialect_state_migrates_episode_bindings_to_v6(self) -> None:
+    def test_v3_dialect_state_migrates_episode_bindings_to_v7(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -214,6 +214,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("episode_dialects")
         document.pop("episode_prompt_lengths")
         document.pop("imported_episode_sha256s")
+        document.pop("horizon_expert_hits")
+        document.pop("horizon_expert_observations")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v3"
         raw = json.dumps(
             document,
@@ -234,9 +236,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.episode_dialects, (None,))
         provider.observe_final((1, 2, 3, 4))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x06"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x07"))
 
-    def test_v4_state_migrates_empty_import_inventory_to_v6(self) -> None:
+    def test_v4_state_migrates_empty_import_inventory_to_v7(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -246,6 +248,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document = json.loads(zlib.decompress(encoded[5:]))
         document.pop("imported_episode_sha256s")
         document.pop("episode_prompt_lengths")
+        document.pop("horizon_expert_hits")
+        document.pop("horizon_expert_observations")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v4"
         raw = json.dumps(
             document,
@@ -265,9 +269,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider.imported_episode_sha256s(), ())
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x06"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x07"))
 
-    def test_v5_state_migrates_unknown_prompt_boundaries_to_v6(self) -> None:
+    def test_v5_state_migrates_unknown_prompt_boundaries_to_v7(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -276,6 +280,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         ).to_bytes()
         document = json.loads(zlib.decompress(encoded[5:]))
         document.pop("episode_prompt_lengths")
+        document.pop("horizon_expert_hits")
+        document.pop("horizon_expert_observations")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v5"
         raw = json.dumps(
             document,
@@ -295,7 +301,41 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider._state.episode_prompt_lengths, (None,))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x06"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x07"))
+
+    def test_v6_state_migrates_zeroed_position_expert_memory_to_v7(self) -> None:
+        encoded = MarkovDraftState(
+            vocab_size=32,
+            max_history_tokens=64,
+            token_ids=(1, 2, 3),
+            episode_lengths=(3,),
+        ).to_bytes()
+        document = json.loads(zlib.decompress(encoded[5:]))
+        document.pop("horizon_expert_hits")
+        document.pop("horizon_expert_observations")
+        document["schema"] = "immer.qwen3.8-markov-draft-state/v6"
+        raw = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        path = self.root / "v6-state.bin"
+        path.write_bytes(b"IMMD\x06" + zlib.compress(raw, level=9))
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=path,
+            max_history_tokens=64,
+        )
+
+        self.assertEqual(len(provider._state.horizon_expert_observations), 16)
+        self.assertTrue(
+            all(not any(row) for row in provider._state.horizon_expert_observations)
+        )
+        provider.close()
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x07"))
 
     def test_import_digest_survives_episode_eviction_and_prevents_replay(self) -> None:
         state_path = self.root / "imported-markov.bin"
@@ -620,6 +660,53 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertAlmostEqual(forced_confidence[0], 0.9)
         self.assertEqual(trained.metrics().last_empirical_evidence, 0.0)
         trained.close()
+
+    def test_horizon_position_uses_its_own_target_confirmed_posterior(self) -> None:
+        class DecisiveExpert:
+            @staticmethod
+            def distribution(_context):
+                return {
+                    "07": 0.4,
+                    "08": 0.1,
+                    markov_module._UNKNOWN_TOKEN: 0.1,
+                }
+
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        width = len(provider._experts)
+        observations = [[0] * width for _ in range(16)]
+        hits = [[0] * width for _ in range(16)]
+        observations[0] = [100] * width
+        hits[0] = [90] * width
+        observations[1] = [100] * width
+        hits[1] = [10] * width
+        provider._state = replace(
+            provider._state,
+            expert_observations=(100,) * width,
+            expert_hits=(70,) * width,
+            horizon_expert_observations=tuple(tuple(row) for row in observations),
+            horizon_expert_hits=tuple(tuple(row) for row in hits),
+        )
+        provider._expert_models = lambda _history: tuple(
+            (DecisiveExpert(), []) for _ in provider._experts
+        )
+
+        tokens, feedback, confidence, _disagreement = provider._predict_council(
+            (1,), 3
+        )
+
+        self.assertEqual(tokens, (7, 7, 7))
+        self.assertGreater(confidence[0], confidence[2])
+        self.assertGreater(confidence[2], confidence[1])
+        self.assertGreater(confidence[1], 0.4)
+        provider._apply_council_feedback(feedback[2], 7, 2)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.horizon_observations[:3], (100, 100, 1))
+        self.assertGreater(metrics.horizon_mean_accuracy[0], 0.8)
+        self.assertLess(metrics.horizon_mean_accuracy[1], 0.2)
+        restored = MarkovDraftState.from_bytes(provider._state.to_bytes())
+        self.assertEqual(restored.horizon_expert_observations[2], (1,) * width)
+        self.assertEqual(restored.horizon_expert_hits[2], (1,) * width)
+        provider.close()
 
     def test_persistent_history_keeps_explicit_episode_boundaries(self) -> None:
         state_path = self.root / "episodes.bin"
@@ -1044,6 +1131,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((*prompt, 2, external, 17))
         after = provider.metrics()
         self.assertEqual(after.council_feedback, 1)
+        self.assertEqual(after.horizon_observations[:2], (1, 0))
         self.assertEqual(
             provider._state.expert_observations,
             tuple(value + 1 for value in before.expert_observations),
@@ -1094,7 +1182,29 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertIsNotNone(provider._carry_feedback)
         provider.observe_final((*prompt, 2, *matched, 9))
         self.assertEqual(provider.metrics().council_feedback, 3)
+        self.assertEqual(provider.metrics().horizon_observations[:3], (1, 1, 1))
         self.assertEqual(provider.metrics().phrase_accepted_tokens, 0)
+        provider.close()
+
+    def test_k16_external_prefix_trains_position_fifteen_carry(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=15,
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        proposal = provider.propose_round(prompt, 2)
+        committed = (*prompt, 2, *proposal.token_ids)
+
+        provider.reconcile_external_prefix(committed)
+        self.assertEqual(provider._carry_feedback_position, 15)
+        provider.observe_final((*committed, 9))
+
+        metrics = provider.metrics()
+        self.assertEqual(metrics.external_feedback_tokens, 15)
+        self.assertEqual(metrics.council_feedback, 16)
+        self.assertEqual(metrics.horizon_observations, (1,) * 16)
         provider.close()
 
     def test_external_reconciliation_rejects_missing_or_noncontiguous_state(
