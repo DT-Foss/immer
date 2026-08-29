@@ -72,6 +72,9 @@ typedef char immer_q4_size_check[(sizeof(immer_block_q4_0) == 18) ? 1 : -1];
 typedef char immer_q8_size_check[(sizeof(immer_block_q8_0) == 34) ? 1 : -1];
 
 static float immer_half_to_float(uint16_t h) {
+#if defined(__F16C__)
+    return _cvtsh_ss(h);
+#else
     const uint32_t sign = ((uint32_t) h & 0x8000u) << 16;
     int32_t exponent = (int32_t) (((uint32_t) h >> 10) & 0x1fu);
     uint32_t fraction = (uint32_t) h & 0x03ffu;
@@ -96,6 +99,7 @@ static float immer_half_to_float(uint16_t h) {
     float value;
     memcpy(&value, &bits, sizeof(value));
     return value;
+#endif
 }
 
 static uint16_t immer_float_to_half(float value) {

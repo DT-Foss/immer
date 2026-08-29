@@ -174,6 +174,8 @@ def _compiler_command(source: Path, output: Path) -> tuple[str, ...]:
     cpu = _cpu_flags()
     if machine in {"x86_64", "amd64"} and {"avx2", "fma"}.issubset(cpu):
         flags.extend(("-mavx2", "-mfma", "-mssse3"))
+        if "f16c" in cpu:
+            flags.append("-mf16c")
     flags.extend((str(source), "-o", str(output), "-lm"))
     return tuple(flags)
 
