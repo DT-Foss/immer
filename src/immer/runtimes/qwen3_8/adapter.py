@@ -32,6 +32,7 @@ from .draft_window import (
     DRAFT_WINDOW_ACTIONS,
     DraftWindowController,
     DraftWindowFeedback,
+    DraftWindowNestedHorizon,
     DraftWindowSelection,
 )
 from .fast_mlp import (
@@ -42,7 +43,11 @@ from .fast_mlp import (
 from .exact_head import ExactHeadIndex, ExactHeadNotApplicable
 from .model import StreamedQwen38
 from .local_draft import Qwen35K4DraftProvider
-from .markov_draft import FingerprintRollingK4DraftProvider
+from .markov_draft import (
+    MARKOV_DRAFT_PROVIDER_ABI,
+    MARKOV_DRAFT_STATE_SCHEMA,
+    FingerprintRollingK4DraftProvider,
+)
 from .pager import Qwen38WeightPager
 from .speculative import Qwen38K4SpeculativeDecoder
 from .semantic_state_cache import (
@@ -275,6 +280,68 @@ def _compact_generation_receipt(
         }
     )
     return compact
+
+
+def _nested_draft_horizons(value: object) -> tuple[DraftWindowNestedHorizon, ...]:
+    """Recover exact shorter-prefix reliability from an already verified wave."""
+
+    observed_window = getattr(value, "window_size", None)
+    rounds = getattr(value, "rounds", None)
+    if observed_window not in DRAFT_WINDOW_ACTIONS or not isinstance(rounds, tuple):
+        return ()
+    horizons = []
+    for candidate in DRAFT_WINDOW_ACTIONS:
+        if candidate >= observed_window:
+            continue
+        wave_count = 0
+        accepted = 0
+        proposed = 0
+        for row in rounds:
+            row_proposal = getattr(row, "proposed_token_ids", ())
+            row_accepted = getattr(row, "accepted_prefix_length", None)
+            if not isinstance(row_proposal, tuple) or not row_proposal:
+                continue
+            if (
+                isinstance(row_accepted, bool)
+                or not isinstance(row_accepted, int)
+                or row_accepted < 0
+            ):
+                raise Qwen38ChatError(
+                    "rolling evidence has invalid nested-prefix acceptance"
+                )
+            visible = min(candidate - 1, len(row_proposal))
+            if visible <= 0:
+                continue
+            wave_count += 1
+            proposed += visible
+            accepted += min(row_accepted, visible)
+        if proposed:
+            horizons.append(
+                DraftWindowNestedHorizon(
+                    candidate_window=candidate,
+                    observed_window=observed_window,
+                    wave_count=wave_count,
+                    accepted_draft_tokens=accepted,
+                    proposed_draft_tokens=proposed,
+                )
+            )
+    return tuple(horizons)
+
+
+def _runtime_source_body_bytes(runtime: object) -> int:
+    model = getattr(runtime, "model", None)
+    pager = getattr(model, "pager", None)
+    source = getattr(pager, "source", None)
+    metrics = getattr(source, "metrics", None)
+    if not callable(metrics):
+        return 0
+    try:
+        value = metrics().get("network_or_source_body_bytes", 0)
+    except Exception:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def _anchor_model_state(model: object) -> tuple[int, bool, int, int | None]:
@@ -969,13 +1036,21 @@ class Qwen38CausalChat:
         fixed_eligible = (
             self._draft_window_controller is None and self._max_new_tokens >= 2
         )
-        if self._draft_mode is not None and (adaptive_eligible or fixed_eligible):
+        short_fixed_eligible = (
+            self._draft_window_controller is not None
+            and 2 <= self._max_new_tokens < min(DRAFT_WINDOW_ACTIONS)
+        )
+        if self._draft_mode is not None and (
+            adaptive_eligible or fixed_eligible or short_fixed_eligible
+        ):
             policy["decoding"] = "greedy-rolling-window-draft-verify"
             policy["draft_mode"] = self._draft_mode
             selection = self._draft_window_selection
             policy["draft_window"] = (
                 selection.proposed_window
                 if selection is not None
+                else min(self._draft_window, self._max_new_tokens)
+                if short_fixed_eligible
                 else (
                     8
                     if self._draft_window_controller is not None
@@ -1000,7 +1075,16 @@ class Qwen38CausalChat:
                     "fixed_share": self._draft_window_controller.FIXED_SHARE,
                     "learning_source": "terminal-target-confirmed-receipts",
                     "metrics": metrics,
+                    "nested_horizon_learning": "exact-shorter-prefix/v1",
                     "persistent": True,
+                    "policy": "k8-cold-bootstrap-then-sampled-fixed-share",
+                    "provider_signals": [
+                        "council-confidence",
+                        "council-disagreement",
+                        "phrase-confidence",
+                        "phrase-width",
+                    ],
+                    "short_window_fallback": short_fixed_eligible,
                     "updates_require_target_receipt": True,
                 }
                 if selection is not None:
@@ -1022,7 +1106,10 @@ class Qwen38CausalChat:
                     "dialect_similarity_threshold": 0.20,
                     "dialect_phrase_min_support": 2,
                     "global_phrase_min_support": 3,
-                    "phrase_width": 3,
+                    "phrase_max_width": min(
+                        15,
+                        max(0, int(policy["draft_window"]) - 1),
+                    ),
                     "persistent": self._markov_draft_state_path is not None,
                 }
         elif self._draft_mode is not None:
@@ -1099,6 +1186,57 @@ class Qwen38CausalChat:
             if receipt is not None:
                 policy["exact_head"]["artifact"] = dict(receipt)
         return _digest(policy)
+
+    def _draft_window_runtime_identity(self) -> str:
+        bundle = self._bundle_receipt
+        tokenizer_sha256 = self._tokenizer_sha256
+        if bundle is None or not _is_sha256(tokenizer_sha256):
+            raise Qwen38ChatError(
+                "draft-window identity requires a loaded target runtime"
+            )
+        if self._draft_mode == "markov":
+            provider: dict[str, Any] = {
+                "abi": MARKOV_DRAFT_PROVIDER_ABI,
+                "alpha": 0.5,
+                "backoff_strength": 3.0,
+                "experts": 8,
+                "fixed_share": 0.05,
+                "kind": "markov-council",
+                "max_history_tokens": 4096,
+                "max_order": 16,
+                "min_count": 1,
+                "phrase_max_context": 8,
+                "phrase_max_width": 15,
+                "schema": MARKOV_DRAFT_STATE_SCHEMA,
+                "state_path": (
+                    None
+                    if self._markov_draft_state_path is None
+                    else str(self._markov_draft_state_path)
+                ),
+            }
+        elif self._draft_mode == "qwen35":
+            provider = {
+                "bundle_path": (
+                    None
+                    if self._draft_bundle_path is None
+                    else str(self._draft_bundle_path)
+                ),
+                "kind": "qwen35",
+                "repo_id": QWEN35_DRAFTER_REPO_ID,
+                "revision": QWEN35_DRAFTER_REVISION,
+            }
+        else:
+            raise Qwen38ChatError("draft-window identity lacks a draft provider")
+        return _digest(
+            {
+                "provider": provider,
+                "schema": "immer.qwen3.8-draft-window-runtime-identity/v1",
+                "target_bundle": bundle,
+                "target_repo_id": OFFICIAL_REPO_ID,
+                "target_revision": OFFICIAL_REVISION,
+                "tokenizer_sha256": tokenizer_sha256,
+            }
+        )
 
     def _result_cell_binding_receipt(
         self,
@@ -1232,6 +1370,10 @@ class Qwen38CausalChat:
         draft_enabled = self._draft_mode is not None and (
             (self._draft_window_controller is None and self._max_new_tokens >= 2)
             or adaptive_selection is not None
+            or (
+                self._draft_window_controller is not None
+                and 2 <= self._max_new_tokens < min(DRAFT_WINDOW_ACTIONS)
+            )
         )
         if not draft_enabled:
             generated, evidence = runtime.model.generate_greedy(
@@ -1268,6 +1410,8 @@ class Qwen38CausalChat:
                 state_path=self._markov_draft_state_path,
                 proposal_width=draft_window - 1,
             )
+        rolling_started = time.perf_counter()
+        rolling_source_start = _runtime_source_body_bytes(runtime)
         try:
             generated = Qwen38K4SpeculativeDecoder(
                 runtime.model,
@@ -1281,6 +1425,14 @@ class Qwen38CausalChat:
                 retain_final_state=False,
             )
             evidence = generated.evidence
+            if (
+                adaptive_selection is not None
+                and getattr(evidence, "window_size", None)
+                != adaptive_selection.proposed_window
+            ):
+                raise Qwen38ChatError(
+                    "rolling execution window differs from its Markov selection"
+                )
             mapped_evidence = {
                 "prompt_token_ids": evidence.prompt_token_ids,
                 "generated_token_ids": evidence.generated_token_ids,
@@ -1303,6 +1455,7 @@ class Qwen38CausalChat:
                 accepted_draft_tokens=evidence.accepted_draft_tokens,
                 draft_source_body_bytes=0,
                 aux_source_body_bytes=0,
+                nested_horizons=_nested_draft_horizons(evidence),
             )
             provider_metrics = provider.metrics()
             fast_request = self._record_fast_mlp_request(
@@ -1336,6 +1489,9 @@ class Qwen38CausalChat:
                 "rounds": len(evidence.rounds),
                 "window_size": getattr(evidence, "window_size", draft_window),
                 "schema": evidence.schema,
+                "nested_horizons": [
+                    row.to_dict() for row in _nested_draft_horizons(evidence)
+                ],
             }
             if adaptive_selection is not None:
                 self._last_draft_evidence["window_selection"] = (
@@ -1348,9 +1504,72 @@ class Qwen38CausalChat:
                 prompt_ids=prompt_ids,
                 generated_ids=tuple(generated.token_ids),
                 generation_evidence=mapped_evidence,
+                council_confidence=getattr(
+                    provider_metrics,
+                    "last_confidence",
+                    None,
+                ),
+                council_disagreement=getattr(
+                    provider_metrics,
+                    "last_disagreement",
+                    None,
+                ),
+                effective_experts=getattr(
+                    provider_metrics,
+                    "effective_experts",
+                    None,
+                ),
+                phrase_confidence=getattr(
+                    provider_metrics,
+                    "last_phrase_confidence",
+                    None,
+                ),
+                phrase_support=getattr(
+                    provider_metrics,
+                    "last_phrase_support",
+                    None,
+                ),
+                phrase_width=getattr(
+                    provider_metrics,
+                    "last_phrase_width",
+                    None,
+                ),
             )
             self._record_exact_head_request(runtime, exact_before)
             return generated.token_ids, mapped_evidence
+        except TimeoutError:
+            if adaptive_selection is not None and self._pending_draft_window_feedback is None:
+                elapsed = time.perf_counter() - rolling_started
+                source_bytes = max(
+                    0,
+                    _runtime_source_body_bytes(runtime) - rolling_source_start,
+                )
+                timeout_receipt = {
+                    "elapsed_seconds": elapsed,
+                    "schema": "immer.qwen3.8-draft-window-timeout/v1",
+                    "selection_id": adaptive_selection.selection_id,
+                    "target_source_body_bytes": source_bytes,
+                }
+                self._pending_draft_window_feedback = {
+                    "_terminal_outcome": "timeout",
+                    "accepted_draft_tokens": 0,
+                    "aux_source_body_bytes": 0,
+                    "council_confidence": None,
+                    "council_disagreement": None,
+                    "draft_source_body_bytes": 0,
+                    "effective_experts": None,
+                    "emitted_tokens": 0,
+                    "nested_horizons": (),
+                    "phrase_confidence": None,
+                    "phrase_support": 0,
+                    "phrase_width": 0,
+                    "proposed_window": adaptive_selection.proposed_window,
+                    "seconds": elapsed,
+                    "target_forwards": 1,
+                    "target_receipt_sha256": _digest(timeout_receipt),
+                    "target_source_body_bytes": source_bytes,
+                }
+            raise
         finally:
             provider.close()
 
@@ -1363,6 +1582,13 @@ class Qwen38CausalChat:
         accepted_draft_tokens: int | None = None,
         draft_source_body_bytes: int | None = None,
         aux_source_body_bytes: int | None = None,
+        nested_horizons: tuple[DraftWindowNestedHorizon, ...] | None = None,
+        council_confidence: float | None = None,
+        council_disagreement: float | None = None,
+        effective_experts: float | None = None,
+        phrase_confidence: float | None = None,
+        phrase_support: int | None = None,
+        phrase_width: int | None = None,
     ) -> None:
         selection = self._draft_window_selection
         if selection is None or self._draft_window_controller is None:
@@ -1385,6 +1611,30 @@ class Qwen38CausalChat:
             draft_source_body_bytes = int(draft["draft_source_body_bytes"])
         if aux_source_body_bytes is None:
             aux_source_body_bytes = int(draft["aux_source_body_bytes"])
+        if nested_horizons is None:
+            nested_horizons = (
+                ()
+                if self._pending_draft_window_feedback is None
+                else tuple(
+                    self._pending_draft_window_feedback.get(
+                        "nested_horizons",
+                        (),
+                    )
+                )
+            )
+        pending = self._pending_draft_window_feedback or {}
+        if council_confidence is None:
+            council_confidence = pending.get("council_confidence")
+        if council_disagreement is None:
+            council_disagreement = pending.get("council_disagreement")
+        if effective_experts is None:
+            effective_experts = pending.get("effective_experts")
+        if phrase_confidence is None:
+            phrase_confidence = pending.get("phrase_confidence")
+        if phrase_support is None:
+            phrase_support = int(pending.get("phrase_support", 0))
+        if phrase_width is None:
+            phrase_width = int(pending.get("phrase_width", 0))
         receipt = _compact_generation_receipt(
             generation_evidence,
             prompt_ids=prompt_ids,
@@ -1393,8 +1643,15 @@ class Qwen38CausalChat:
         self._pending_draft_window_feedback = {
             "accepted_draft_tokens": accepted_draft_tokens,
             "aux_source_body_bytes": aux_source_body_bytes,
+            "council_confidence": council_confidence,
+            "council_disagreement": council_disagreement,
             "draft_source_body_bytes": draft_source_body_bytes,
             "emitted_tokens": len(generated_ids),
+            "effective_experts": effective_experts,
+            "nested_horizons": nested_horizons,
+            "phrase_confidence": phrase_confidence,
+            "phrase_support": phrase_support,
+            "phrase_width": phrase_width,
             "proposed_window": selection.proposed_window,
             "seconds": float(receipt["seconds"]),
             "target_forwards": int(receipt["forward_passes"]),
@@ -1591,6 +1848,9 @@ class Qwen38CausalChat:
             raise _RequestRejected("prompt token is outside the checkpoint vocabulary")
 
         if self._draft_window_controller is not None:
+            self._draft_window_controller.bind_policy_identity(
+                self._draft_window_runtime_identity()
+            )
             self._draft_window_selection = self._draft_window_controller.choose(
                 prompt_ids,
                 max_window=self._draft_window,
@@ -1795,7 +2055,7 @@ class Qwen38CausalChat:
         if selection is None or controller is None:
             return result
         record: dict[str, Any] = {
-            "schema": "immer.qwen3.8-draft-window-request/v1",
+            "schema": "immer.qwen3.8-draft-window-request/v2",
             "selection": selection.to_dict(),
             "settled": False,
         }
@@ -1813,17 +2073,13 @@ class Qwen38CausalChat:
                 reason=result.reason,
                 evidence={**dict(result.evidence), "draft_window": record},
             )
-        outcome = failure_outcome
-        if outcome is None:
-            outcome = {
-                ExecutionStatus.OK: "ok",
-                ExecutionStatus.ABSTAINED: "abstained",
-                ExecutionStatus.ERROR: "error",
-                ExecutionStatus.UNAVAILABLE: "aborted",
-                ExecutionStatus.REJECTED: "aborted",
-            }[result.status]
+        feedback_values = dict(pending)
+        outcome = str(feedback_values.pop("_terminal_outcome", "ok"))
+        record["request_status"] = result.status.value
+        if failure_outcome is not None:
+            record["post_generation_outcome"] = failure_outcome
         try:
-            feedback = DraftWindowFeedback(**pending, outcome=outcome)
+            feedback = DraftWindowFeedback(**feedback_values, outcome=outcome)
             metrics = controller.settle(selection, feedback)
         except Exception as exc:
             record["settlement"] = {

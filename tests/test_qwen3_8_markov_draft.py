@@ -621,6 +621,64 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider.metrics().phrase_accepted_tokens, 2)
         provider.close()
 
+    def test_phrase_agent_fills_a_seven_token_window_from_repeated_episode(self) -> None:
+        episode = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+        state_path = self.root / "wide-global-phrases.bin"
+        state_path.write_bytes(
+            MarkovDraftState(
+                vocab_size=32,
+                max_history_tokens=128,
+                token_ids=episode * 3,
+                episode_lengths=(len(episode),) * 3,
+            ).to_bytes()
+        )
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=128,
+            proposal_width=7,
+        )
+        provider.begin_request((20, 1))
+
+        proposal = provider.propose_after((20, 1), 2)
+
+        self.assertEqual(proposal, (3, 4, 5, 6, 7, 8, 9))
+        metrics = provider.metrics()
+        self.assertEqual(metrics.last_phrase_width, 7)
+        self.assertEqual(metrics.phrase_draft_tokens, 7)
+        provider.reconcile_prefix((20, 1, 2, *proposal))
+        provider.observe_final((20, 1, 2, *proposal))
+        self.assertEqual(provider.metrics().phrase_accepted_tokens, 7)
+        provider.close()
+
+    def test_phrase_agent_uses_longest_prefix_with_repeated_support(self) -> None:
+        episodes = (
+            (1, 2, 3, 4, 5, 6, 7, 8),
+            (1, 2, 3, 4, 5, 6, 9, 10),
+            (1, 2, 3, 4, 5, 6, 11, 12),
+        )
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=7,
+        )
+        provider._state = replace(
+            provider._state,
+            token_ids=tuple(token for episode in episodes for token in episode),
+            episode_lengths=tuple(len(episode) for episode in episodes),
+            episode_dialects=(None,) * len(episodes),
+        )
+        provider.begin_request((20, 1))
+
+        proposal = provider.propose_after((20, 1), 2)
+
+        self.assertEqual(proposal[:4], (3, 4, 5, 6))
+        self.assertEqual(provider.metrics().last_phrase_width, 4)
+        self.assertEqual(provider.metrics().last_phrase_support, 3)
+        provider.reconcile_prefix((20, 1, 2, *proposal[:4]))
+        provider.observe_final((20, 1, 2, *proposal[:4]))
+        provider.close()
+
     def test_dialect_phrase_agent_activates_before_global_support_threshold(self) -> None:
         state_path = self.root / "dialect-phrases.bin"
         prompt = tuple((1, 2) * 20)

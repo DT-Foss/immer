@@ -150,11 +150,11 @@ transaction. Draft consensus never overrides the target.
 
 State v4 binds each completed episode to its selected contextual dialect.
 Global and dialect-local agents mine only within those episode boundaries and
-offer a three-token phrase after repeated target confirmation. Competing
-options are ranked by confidence, support, matched context depth, and dialect
-similarity. The selected phrase is teacher-forced through the same Council
-rows, verified inside the same configurable target window, and learned only when the
-request reaches its terminal atomic commit.
+offer the longest useful repeated continuation up to 15 tokens. Every prefix
+width competes by confidence, support, matched context depth, option length,
+and dialect similarity. The selected option is teacher-forced through the same
+Council rows, verified inside the same configurable target window, and learned
+only when the request reaches its terminal atomic commit.
 
 Context dialects sit above the global Council weights. A bounded bottom-k
 sketch of token unigrams, bigrams, and trigrams selects one of at most 64
@@ -172,9 +172,9 @@ restricts its action set to
 A = {K in {4,8,16} : K <= --draft-window and K <= max_new_tokens}.
 ```
 
-With no settled receipt it chooses K=8 (or K=4 when K=8 is outside `A`).
-Thereafter global and matching-dialect rapidities `xi` give the Fixed-Share
-policy
+With no settled receipt it chooses K=8 (or K=4 when K=8 is outside `A`). It
+then executes each remaining allowed arm once. Thereafter global and
+matching-dialect rapidities `xi` give the sampled Fixed-Share policy
 
 ```text
 pi(K) = 0.95 * softmax(xi_global + similarity * xi_dialect)[K]
@@ -185,20 +185,31 @@ Only an adapter-authenticated terminal target receipt may settle a choice. Its
 work is `1 + target_forwards + seconds + total_bytes / GiB`, where total bytes
 include target, draft, and auxiliary transport. A successful reward combines
 `8 * accepted_draft_tokens / work` with twice the accepted/emitted fraction.
-Zero acceptance receives a reward below -6; abstention, error, abort, and
-timeout receive progressively stronger negative rewards. Rapidity updates use
+Zero acceptance receives a reward below -6. A wider verified wave also exposes
+the exact correctness of every shorter nested prefix: K8 teaches the K4
+reliability coordinate, while K16 teaches both K4 and K8, without another
+target execution. These full-information coordinates never masquerade as
+measured request work. They populate a separate smoothed acceptance prior and
+satisfy the shorter arm's bootstrap;
+only an executed arm updates work/reward rapidity. Rapidity updates use
 the bounded Möbius coordinate `atanh(tanh(reward/8))`, surprise updates an EMA
 and CUSUM, and a detected regime shrinks all rapidities before learning
-continues. Context profiles use the same Ricci retention value above and are
-bounded at 64.
+continues. Council confidence, expert disagreement, and verified phrase width
+form an expected-prefix/work prior over K4/K8/K16. Context profiles use the
+same Ricci retention value above and are bounded at 64.
 
 Selection is read-only. Settlement reloads under an `O_NOFOLLOW` process lock,
 deduplicates the selection/target-receipt pair, updates all cumulative agent
-work counters, and replaces one checksummed state file after `fsync`. Thus an
-exception before a verified target receipt cannot mutate policy state, while
-an error after such a receipt is committed atomically as negative evidence.
-Without `--draft-window-state`, `--draft-window` retains its fixed-window
-meaning and old state-free deployments are unchanged.
+work counters, and replaces one checksummed state file after `fsync`. The state
+is bound to the target bundle, tokenizer, draft family, and provider revision.
+An exception before a verified target receipt cannot mutate learning; a later
+decode or cleanup fault cannot rewrite a successfully realized window as a bad
+window. A target timeout is different: its elapsed work and source-byte delta
+form a terminal negative receipt, so the same long-window bootstrap cannot
+repeat forever. Output budgets of two or three tokens retain fixed rolling drafting
+instead of falling back to extra greedy target passes. Without
+`--draft-window-state`, `--draft-window` retains its fixed-window meaning and
+old state-free deployments are unchanged.
 
 ## 4. Organism of Experts
 

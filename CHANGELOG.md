@@ -17,15 +17,26 @@ All notable changes to IMMER are recorded here.
   windows retain no extra Conv-prefix copy.
 - Qwen3.5 transactional drafting and the zero-model-byte Markov Council now
   emit variable tails up to 15 tokens. Reconciliation advances only through
-  the target-confirmed prefix, phrase options occupy only their proven first
-  three positions, and all later Council predictions receive ordinary
-  target-only feedback.
+  the target-confirmed prefix. Repeated global or dialect episodes now produce
+  the longest supported option up to 15 tokens instead of a fixed triple; all
+  option tokens remain ordinary target-trained Council rows.
 - Added an opt-in persistent Markov controller for the real rolling window.
   It chooses K4/K8/K16 below the configured ceiling from bounded contextual
   token sketches and terminal target receipts, optimizing accepted drafts per
   target/draft/aux bytes, forwards, and time. Cold traffic stays at K8; zero
   acceptance, errors, and timeouts move later arbitrary chats toward cheaper
   windows without any calibration prompt or additional model execution.
+- The window controller now executes a real policy: K8 cold start, one
+  bootstrap observation for each allowed arm, then sampled Fixed Share with
+  the true action propensity. Wider verified waves teach exact shorter-prefix
+  reliability through a separate acceptance prior without inventing unobserved
+  work cost; that evidence also satisfies shorter-arm bootstrap. Council
+  confidence, disagreement, and variable phrase strength shape the next
+  horizon. State is bound to the
+  target, tokenizer, and provider identity; K2/K3 retain rolling drafting; a
+  post-generation infrastructure fault no longer poisons window learning.
+  Target timeouts persist their elapsed work and source-byte delta as negative
+  feedback, preventing an unobserved long arm from being bootstrapped forever.
 - Expanded the exact residual-PQ head query union from four to sixteen rows.
   Certified pruning and stable top-k parity now cover the complete rolling
   window; the weight-only builder records the same K16 scorer bound.
@@ -146,9 +157,10 @@ All notable changes to IMMER are recorded here.
   profile, global Council update, regime state, episode boundary, and confirmed
   tokens share the same terminal atomic write and process lock.
 - Added target-confirmed phrase-option agents above the native-token Council.
-  Completed episodes produce three-token continuations only after repeated
-  support: two matching episodes inside the active dialect or three globally.
-  Options never cross episode boundaries and never bypass Qwen verification.
+  Completed episodes produce variable continuations up to 15 tokens after
+  repeated support: two matching episodes inside the active dialect or three
+  globally. Options never cross episode boundaries and never bypass Qwen
+  verification.
 - Markov state v4 binds every completed episode to its active dialect and
   migrates v1, v2, and v3 state in place. Dialect and global phrase candidates
   compete by confidence, support, matched context depth, and dialect

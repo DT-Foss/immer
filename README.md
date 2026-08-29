@@ -23,7 +23,8 @@ release surface.
 - **Native local drafting.** A causalized Qwen3.5-0.8B or a zero-weight Markov
   council proposes transactional continuations in a configurable K=2–16
   target window. Qwen3.8 alone verifies and commits them; K=8 is the product
-  default. Target-confirmed episodes become reusable three-token options;
+  default. Target-confirmed episodes become reusable variable options up to
+  15 tokens;
   global and contextual-dialect agents compete by support, confidence, context
   depth, and dialect similarity.
 - **All-layer Fast MLP.** A prompt-free weight initializer derives p4/k32
@@ -133,8 +134,8 @@ release surface.
 |---|---:|---|
 | Local causal bundle reopen | 77.77 → 1.20 s; 64.90x | complete 55.6 GB Qwen3.8 bundle; first full-content verification followed by unchanged next-process stat+digest reuse; no model forward |
 | Rolling K=2–16 continuation | accepted prefixes commit with zero weight reads | one target-known token plus up to 15 drafts; DeltaNet Conv/recurrent state, next-token continuation, Graft, and native Prefix-Sinkhorn state remain bit-exact |
-| Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed three-token phrase options |
-| Persistent draft-window policy | cold K=8; contextual K=4/8/16 under a hard ceiling | generic bottom-k Qwen-token n-gram dialects; target-receipt-only Rapidity/Fixed-Share learning; accepted tokens per total target/draft/aux work; strong zero-acceptance/error/timeout penalties; CUSUM regime reset, Ricci-bounded profiles, and atomic `O_NOFOLLOW` state |
+| Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed variable phrase options up to 15 tokens |
+| Persistent draft-window policy | cold K=8; contextual K=4/8/16 under a hard ceiling | real Fixed-Share sampling after one bootstrap per allowed arm; exact shorter-prefix learning from wider target waves; Council confidence/disagreement and phrase strength shape the horizon; model/tokenizer/provider-bound state; K2/K3 fixed rolling fallback |
 | Consuming ordinary decode | one continuation cache plus one replacement layer | removes simultaneous ownership of complete old and new cache stacks; official static cache cut is `154,927,104 + 65,552 × prefix_tokens` bytes |
 | K4 Fast-MLP route reuse | repeated K2/K4 target and auxiliary bytes equal one route | Gate/Up rows are wave-unioned; one-route down cache uses maximum-overlap row ordering while preserving each reduction; identical K4 routes remove 180 MiB per active p4/k32 layer |
 | Direct-to-Torch local ranges | one final tensor for sorted selected-row routes | inode-stable `preadv` fills caller-owned Torch storage; no intermediate Python body, no row-stack duplicate, exact cache/budget/causal-plan accounting |

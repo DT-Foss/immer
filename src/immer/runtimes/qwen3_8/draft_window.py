@@ -30,13 +30,18 @@ except ImportError:  # pragma: no cover - the production runtime is POSIX.
 
 
 DRAFT_WINDOW_ACTIONS = (4, 8, 16)
-DRAFT_WINDOW_STATE_SCHEMA = "immer.qwen3.8-draft-window-state/v1"
+DRAFT_WINDOW_STATE_SCHEMA = "immer.qwen3.8-draft-window-state/v2"
+V1_DRAFT_WINDOW_STATE_SCHEMA = "immer.qwen3.8-draft-window-state/v1"
 LEGACY_DRAFT_WINDOW_STATE_SCHEMA = "immer.qwen3.8-draft-window-state/v0"
-DRAFT_WINDOW_SELECTION_SCHEMA = "immer.qwen3.8-draft-window-selection/v1"
-DRAFT_WINDOW_FEEDBACK_SCHEMA = "immer.qwen3.8-draft-window-feedback/v1"
-DRAFT_WINDOW_METRICS_SCHEMA = "immer.qwen3.8-draft-window-metrics/v1"
+DRAFT_WINDOW_SELECTION_SCHEMA = "immer.qwen3.8-draft-window-selection/v2"
+DRAFT_WINDOW_FEEDBACK_SCHEMA = "immer.qwen3.8-draft-window-feedback/v2"
+DRAFT_WINDOW_NESTED_HORIZON_SCHEMA = (
+    "immer.qwen3.8-draft-window-nested-horizon/v1"
+)
+DRAFT_WINDOW_METRICS_SCHEMA = "immer.qwen3.8-draft-window-metrics/v2"
 
-_STATE_PREFIX = b"IMDW\x01"
+_STATE_PREFIX = b"IMDW\x02"
+_V1_STATE_PREFIX = b"IMDW\x01"
 _LEGACY_STATE_PREFIX = b"IMDW\x00"
 _MAX_STATE_BYTES = 1024 * 1024
 _MAX_JSON_BYTES = 4 * 1024 * 1024
@@ -44,7 +49,7 @@ _MAX_COUNTER = (1 << 63) - 1
 _MAX_SECONDS = 1.0e12
 _HEX = frozenset("0123456789abcdef")
 _OUTCOMES = frozenset({"ok", "abstained", "error", "timeout", "aborted"})
-_PREFERENCE = {8: 2, 4: 1, 16: 0}
+_BOOTSTRAP_ORDER = {8: 0, 4: 1, 16: 2}
 
 
 class DraftWindowError(RuntimeError):
@@ -220,6 +225,10 @@ class DraftWindowAgentState:
     target_forwards: int = 0
     seconds: float = 0.0
     reward_sum: float = 0.0
+    nested_observations: int = 0
+    nested_accepted_draft_tokens: int = 0
+    nested_proposed_draft_tokens: int = 0
+    nested_acceptance_score_sum: float = 0.0
 
     def __post_init__(self) -> None:
         if self.window not in DRAFT_WINDOW_ACTIONS:
@@ -238,6 +247,9 @@ class DraftWindowAgentState:
             "draft_source_body_bytes",
             "aux_source_body_bytes",
             "target_forwards",
+            "nested_observations",
+            "nested_accepted_draft_tokens",
+            "nested_proposed_draft_tokens",
         )
         for name in names:
             _uint(getattr(self, name), field=f"agent {name}")
@@ -249,6 +261,12 @@ class DraftWindowAgentState:
             raise ValueError("zero-acceptance count exceeds observations")
         _finite(self.seconds, field="agent seconds", lower=0.0, upper=_MAX_SECONDS)
         _finite(self.reward_sum, field="agent reward_sum")
+        _finite(
+            self.nested_acceptance_score_sum,
+            field="agent nested_acceptance_score_sum",
+        )
+        if self.nested_accepted_draft_tokens > self.nested_proposed_draft_tokens:
+            raise ValueError("nested accepted drafts exceed nested proposals")
 
     @property
     def mean_reward(self) -> float:
@@ -323,6 +341,33 @@ class DraftWindowAgentState:
             reward_sum=max(-_MAX_SECONDS, min(_MAX_SECONDS, self.reward_sum + reward)),
         )
 
+    def updated_nested(
+        self,
+        evidence: "DraftWindowNestedHorizon",
+    ) -> "DraftWindowAgentState":
+        if evidence.candidate_window != self.window:
+            raise ValueError("nested evidence belongs to a different window")
+        return replace(
+            self,
+            nested_observations=_bounded_add(self.nested_observations, 1),
+            nested_accepted_draft_tokens=_bounded_add(
+                self.nested_accepted_draft_tokens,
+                evidence.accepted_draft_tokens,
+            ),
+            nested_proposed_draft_tokens=_bounded_add(
+                self.nested_proposed_draft_tokens,
+                evidence.proposed_draft_tokens,
+            ),
+            nested_acceptance_score_sum=max(
+                -_MAX_SECONDS,
+                min(
+                    _MAX_SECONDS,
+                    self.nested_acceptance_score_sum
+                    + evidence.acceptance_score,
+                ),
+            ),
+        )
+
     def to_record(self) -> dict[str, object]:
         return {
             "aborted": self.aborted,
@@ -334,6 +379,12 @@ class DraftWindowAgentState:
             "errors": self.errors,
             "observations": self.observations,
             "ok": self.ok,
+            "nested_accepted_draft_tokens": self.nested_accepted_draft_tokens,
+            "nested_observations": self.nested_observations,
+            "nested_proposed_draft_tokens": self.nested_proposed_draft_tokens,
+            "nested_acceptance_score_sum": _float_record(
+                self.nested_acceptance_score_sum
+            ),
             "reward_sum": _float_record(self.reward_sum),
             "seconds": _float_record(self.seconds),
             "target_forwards": self.target_forwards,
@@ -364,8 +415,18 @@ class DraftWindowAgentState:
             "timeouts",
             "window",
             "zero_acceptance",
+            "nested_accepted_draft_tokens",
+            "nested_observations",
+            "nested_proposed_draft_tokens",
+            "nested_acceptance_score_sum",
         }
-        if set(value) != expected:
+        legacy = expected - {
+            "nested_accepted_draft_tokens",
+            "nested_observations",
+            "nested_proposed_draft_tokens",
+            "nested_acceptance_score_sum",
+        }
+        if frozenset(value) not in {frozenset(expected), frozenset(legacy)}:
             raise ValueError("draft-window agent record fields are invalid")
         return cls(
             window=value["window"],
@@ -384,6 +445,21 @@ class DraftWindowAgentState:
             target_forwards=value["target_forwards"],
             seconds=_record_float(value["seconds"], field="agent seconds"),
             reward_sum=_record_float(value["reward_sum"], field="agent reward_sum"),
+            nested_observations=value.get("nested_observations", 0),
+            nested_accepted_draft_tokens=value.get(
+                "nested_accepted_draft_tokens", 0
+            ),
+            nested_proposed_draft_tokens=value.get(
+                "nested_proposed_draft_tokens", 0
+            ),
+            nested_acceptance_score_sum=(
+                0.0
+                if "nested_acceptance_score_sum" not in value
+                else _record_float(
+                    value["nested_acceptance_score_sum"],
+                    field="agent nested_acceptance_score_sum",
+                )
+            ),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -397,6 +473,16 @@ class DraftWindowAgentState:
             "emitted_tokens": self.emitted_tokens,
             "errors": self.errors,
             "mean_reward": self.mean_reward,
+            "nested_accepted_draft_tokens": self.nested_accepted_draft_tokens,
+            "nested_observations": self.nested_observations,
+            "nested_proposed_draft_tokens": self.nested_proposed_draft_tokens,
+            "nested_reliability": (
+                0.0
+                if self.nested_proposed_draft_tokens == 0
+                else self.nested_accepted_draft_tokens
+                / self.nested_proposed_draft_tokens
+            ),
+            "nested_acceptance_score_sum": self.nested_acceptance_score_sum,
             "observations": self.observations,
             "ok": self.ok,
             "reward_sum": self.reward_sum,
@@ -506,6 +592,7 @@ class DraftWindowDialectState:
 
 @dataclass(frozen=True, slots=True)
 class DraftWindowState:
+    policy_identity_sha256: str | None = None
     updates: int = 0
     clock: int = 0
     rapidities: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -517,8 +604,18 @@ class DraftWindowState:
     dialect_evictions: int = 0
     dialects: tuple[DraftWindowDialectState, ...] = ()
     recent_settlement_sha256s: tuple[str, ...] = ()
+    signal_observations: int = 0
+    council_confidence_ema: float = 0.0
+    council_disagreement_ema: float = 0.0
+    phrase_confidence_ema: float = 0.0
+    phrase_support_ema: float = 0.0
+    phrase_width_ema: float = 0.0
 
     def __post_init__(self) -> None:
+        if self.policy_identity_sha256 is not None and not _is_sha256(
+            self.policy_identity_sha256
+        ):
+            raise ValueError("draft-window policy identity must be a SHA-256 digest")
         _uint(self.updates, field="draft-window updates")
         _uint(self.clock, field="draft-window clock")
         if self.clock < self.updates:
@@ -545,6 +642,15 @@ class DraftWindowState:
             _finite(value, field=field, lower=0.0)
         _uint(self.regime_generation, field="regime_generation")
         _uint(self.dialect_evictions, field="dialect_evictions")
+        _uint(self.signal_observations, field="signal_observations")
+        for value, field, upper in (
+            (self.council_confidence_ema, "council_confidence_ema", 1.0),
+            (self.council_disagreement_ema, "council_disagreement_ema", 1.0),
+            (self.phrase_confidence_ema, "phrase_confidence_ema", 1.0),
+            (self.phrase_support_ema, "phrase_support_ema", _MAX_SECONDS),
+            (self.phrase_width_ema, "phrase_width_ema", 15.0),
+        ):
+            _finite(value, field=field, lower=0.0, upper=upper)
         dialects = tuple(self.dialects)
         if (
             len(dialects) > 64
@@ -569,12 +675,23 @@ class DraftWindowState:
         return {
             "agents": [agent.to_record() for agent in self.agents],
             "clock": self.clock,
+            "council_confidence_ema": _float_record(
+                self.council_confidence_ema
+            ),
+            "council_disagreement_ema": _float_record(
+                self.council_disagreement_ema
+            ),
             "dialect_evictions": self.dialect_evictions,
             "dialects": [dialect.to_record() for dialect in self.dialects],
+            "policy_identity_sha256": self.policy_identity_sha256,
+            "phrase_confidence_ema": _float_record(self.phrase_confidence_ema),
+            "phrase_support_ema": _float_record(self.phrase_support_ema),
+            "phrase_width_ema": _float_record(self.phrase_width_ema),
             "rapidities": [_float_record(value) for value in self.rapidities],
             "recent_settlement_sha256s": list(self.recent_settlement_sha256s),
             "regime_generation": self.regime_generation,
             "schema": DRAFT_WINDOW_STATE_SCHEMA,
+            "signal_observations": self.signal_observations,
             "surprise_cusum": _float_record(self.surprise_cusum),
             "surprise_deviation": _float_record(self.surprise_deviation),
             "surprise_mean": _float_record(self.surprise_mean),
@@ -598,12 +715,19 @@ class DraftWindowState:
         if not isinstance(value, Mapping) or set(value) != {
             "agents",
             "clock",
+            "council_confidence_ema",
+            "council_disagreement_ema",
             "dialect_evictions",
             "dialects",
+            "policy_identity_sha256",
+            "phrase_confidence_ema",
+            "phrase_support_ema",
+            "phrase_width_ema",
             "rapidities",
             "recent_settlement_sha256s",
             "regime_generation",
             "schema",
+            "signal_observations",
             "surprise_cusum",
             "surprise_deviation",
             "surprise_mean",
@@ -614,6 +738,28 @@ class DraftWindowState:
             raise ValueError("draft-window state schema is invalid")
         try:
             return cls(
+                policy_identity_sha256=value["policy_identity_sha256"],
+                signal_observations=value["signal_observations"],
+                council_confidence_ema=_record_float(
+                    value["council_confidence_ema"],
+                    field="council_confidence_ema",
+                ),
+                council_disagreement_ema=_record_float(
+                    value["council_disagreement_ema"],
+                    field="council_disagreement_ema",
+                ),
+                phrase_confidence_ema=_record_float(
+                    value["phrase_confidence_ema"],
+                    field="phrase_confidence_ema",
+                ),
+                phrase_support_ema=_record_float(
+                    value["phrase_support_ema"],
+                    field="phrase_support_ema",
+                ),
+                phrase_width_ema=_record_float(
+                    value["phrase_width_ema"],
+                    field="phrase_width_ema",
+                ),
                 updates=value["updates"],
                 clock=value["clock"],
                 rapidities=tuple(
@@ -642,6 +788,23 @@ class DraftWindowState:
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("draft-window state values are invalid") from exc
+
+    @classmethod
+    def _from_v1_record(cls, value: object) -> "DraftWindowState":
+        if not isinstance(value, Mapping) or value.get("schema") != (
+            V1_DRAFT_WINDOW_STATE_SCHEMA
+        ):
+            raise ValueError("v1 draft-window state schema is invalid")
+        migrated = dict(value)
+        migrated["schema"] = DRAFT_WINDOW_STATE_SCHEMA
+        migrated["policy_identity_sha256"] = None
+        migrated["signal_observations"] = 0
+        migrated["council_confidence_ema"] = _float_record(0.0)
+        migrated["council_disagreement_ema"] = _float_record(0.0)
+        migrated["phrase_confidence_ema"] = _float_record(0.0)
+        migrated["phrase_support_ema"] = _float_record(0.0)
+        migrated["phrase_width_ema"] = _float_record(0.0)
+        return cls.from_record(migrated)
 
     @classmethod
     def _from_legacy_record(cls, value: object) -> "DraftWindowState":
@@ -693,10 +856,13 @@ class DraftWindowState:
         if not isinstance(value, bytes) or not 5 < len(value) <= _MAX_STATE_BYTES:
             raise DraftWindowError("draft-window state size is invalid")
         if value.startswith(_STATE_PREFIX):
-            legacy = False
+            version = 2
             payload = value[len(_STATE_PREFIX) :]
+        elif value.startswith(_V1_STATE_PREFIX):
+            version = 1
+            payload = value[len(_V1_STATE_PREFIX) :]
         elif value.startswith(_LEGACY_STATE_PREFIX):
-            legacy = True
+            version = 0
             payload = value[len(_LEGACY_STATE_PREFIX) :]
         else:
             raise DraftWindowError("draft-window state header is invalid")
@@ -714,7 +880,7 @@ class DraftWindowState:
             ):
                 raise ValueError("compressed body exceeds its bound")
             document = json.loads(raw)
-            if legacy:
+            if version == 0:
                 return cls._from_legacy_record(document)
             if not isinstance(document, Mapping) or set(document) != {
                 "body",
@@ -726,6 +892,8 @@ class DraftWindowState:
                 or _sha256(document["body"]) != document["body_sha256"]
             ):
                 raise ValueError("state checksum differs")
+            if version == 1:
+                return cls._from_v1_record(document["body"])
             return cls.from_record(document["body"])
         except DraftWindowError:
             raise
@@ -743,6 +911,8 @@ class DraftWindowSelection:
     dialect_id: str | None
     dialect_similarity: float
     policy_weights: tuple[tuple[int, float], ...]
+    selection_mode: str
+    selection_probability: float
     cold_start: bool
     state_updates: int
     state_sha256: str
@@ -797,6 +967,16 @@ class DraftWindowSelection:
             raise ValueError("draft-window policy weights are invalid")
         if not isinstance(self.cold_start, bool):
             raise TypeError("cold_start must be boolean")
+        if self.selection_mode not in {"cold", "bootstrap", "fixed-share"}:
+            raise ValueError("draft-window selection mode is invalid")
+        _finite(
+            self.selection_probability,
+            field="selection_probability",
+            lower=0.0,
+            upper=1.0,
+        )
+        if self.selection_probability <= 0.0:
+            raise ValueError("selection_probability must be positive")
         _uint(self.state_updates, field="selection state_updates")
         if not _is_sha256(self.state_sha256) or not _is_sha256(self.selection_id):
             raise ValueError("draft-window selection digest is invalid")
@@ -822,9 +1002,62 @@ class DraftWindowSelection:
             },
             "proposed_window": self.proposed_window,
             "schema": DRAFT_WINDOW_SELECTION_SCHEMA,
+            "selection_mode": self.selection_mode,
+            "selection_probability": self.selection_probability,
             "selection_id": self.selection_id,
             "state_sha256": self.state_sha256,
             "state_updates": self.state_updates,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DraftWindowNestedHorizon:
+    """Exact shorter-prefix reliability visible inside one wider target wave."""
+
+    candidate_window: int
+    observed_window: int
+    wave_count: int
+    accepted_draft_tokens: int
+    proposed_draft_tokens: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.candidate_window not in DRAFT_WINDOW_ACTIONS
+            or self.observed_window not in DRAFT_WINDOW_ACTIONS
+            or self.candidate_window >= self.observed_window
+        ):
+            raise ValueError("nested draft-window horizon is invalid")
+        _uint(self.wave_count, field="nested wave_count", positive=True)
+        _uint(
+            self.accepted_draft_tokens,
+            field="nested accepted_draft_tokens",
+        )
+        _uint(
+            self.proposed_draft_tokens,
+            field="nested proposed_draft_tokens",
+            positive=True,
+        )
+        if self.accepted_draft_tokens > self.proposed_draft_tokens:
+            raise ValueError("nested accepted drafts exceed proposed drafts")
+
+    @property
+    def reliability(self) -> float:
+        return self.accepted_draft_tokens / self.proposed_draft_tokens
+
+    @property
+    def acceptance_score(self) -> float:
+        return 8.0 * (self.reliability - 0.5)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "accepted_draft_tokens": self.accepted_draft_tokens,
+            "candidate_window": self.candidate_window,
+            "observed_window": self.observed_window,
+            "proposed_draft_tokens": self.proposed_draft_tokens,
+            "reliability": self.reliability,
+            "acceptance_score": self.acceptance_score,
+            "schema": DRAFT_WINDOW_NESTED_HORIZON_SCHEMA,
+            "wave_count": self.wave_count,
         }
 
 
@@ -840,6 +1073,13 @@ class DraftWindowFeedback:
     seconds: float
     outcome: str
     target_receipt_sha256: str
+    nested_horizons: tuple[DraftWindowNestedHorizon, ...] = ()
+    council_confidence: float | None = None
+    council_disagreement: float | None = None
+    effective_experts: float | None = None
+    phrase_confidence: float | None = None
+    phrase_support: int = 0
+    phrase_width: int = 0
 
     def __post_init__(self) -> None:
         if self.proposed_window not in DRAFT_WINDOW_ACTIONS:
@@ -860,6 +1100,35 @@ class DraftWindowFeedback:
             raise ValueError("feedback outcome is invalid")
         if not _is_sha256(self.target_receipt_sha256):
             raise ValueError("feedback lacks a target-confirmed receipt digest")
+        nested = tuple(self.nested_horizons)
+        if (
+            any(not isinstance(row, DraftWindowNestedHorizon) for row in nested)
+            or any(row.observed_window != self.proposed_window for row in nested)
+            or len({row.candidate_window for row in nested}) != len(nested)
+            or tuple(sorted(nested, key=lambda row: row.candidate_window)) != nested
+        ):
+            raise ValueError("feedback nested horizons are invalid")
+        object.__setattr__(self, "nested_horizons", nested)
+        for value, field in (
+            (self.council_confidence, "council_confidence"),
+            (self.council_disagreement, "council_disagreement"),
+            (self.phrase_confidence, "phrase_confidence"),
+        ):
+            if value is not None:
+                _finite(value, field=field, lower=0.0, upper=1.0)
+        if self.effective_experts is not None:
+            _finite(
+                self.effective_experts,
+                field="effective_experts",
+                lower=1.0,
+                upper=64.0,
+            )
+        _uint(self.phrase_support, field="phrase_support")
+        _uint(self.phrase_width, field="phrase_width")
+        if self.phrase_width > 15:
+            raise ValueError("phrase_width exceeds the Markov option bound")
+        if self.phrase_width == 0 and self.phrase_support:
+            raise ValueError("phrase support requires a phrase option")
 
     @property
     def total_source_body_bytes(self) -> int:
@@ -901,9 +1170,16 @@ class DraftWindowFeedback:
         return {
             "accepted_draft_tokens": self.accepted_draft_tokens,
             "aux_source_body_bytes": self.aux_source_body_bytes,
+            "council_confidence": self.council_confidence,
+            "council_disagreement": self.council_disagreement,
             "draft_source_body_bytes": self.draft_source_body_bytes,
             "emitted_tokens": self.emitted_tokens,
+            "effective_experts": self.effective_experts,
             "outcome": self.outcome,
+            "phrase_confidence": self.phrase_confidence,
+            "phrase_support": self.phrase_support,
+            "phrase_width": self.phrase_width,
+            "nested_horizons": [row.to_dict() for row in self.nested_horizons],
             "proposed_window": self.proposed_window,
             "reward": self.reward,
             "schema": DRAFT_WINDOW_FEEDBACK_SCHEMA,
@@ -919,6 +1195,7 @@ class DraftWindowFeedback:
 @dataclass(frozen=True, slots=True)
 class DraftWindowMetrics:
     state_sha256: str
+    policy_identity_sha256: str | None
     updates: int
     clock: int
     policy_weights: tuple[tuple[int, float], ...]
@@ -929,18 +1206,31 @@ class DraftWindowMetrics:
     regime_generation: int
     dialect_count: int
     dialect_evictions: int
+    signal_observations: int
+    council_confidence_ema: float
+    council_disagreement_ema: float
+    phrase_confidence_ema: float
+    phrase_support_ema: float
+    phrase_width_ema: float
 
     def to_dict(self) -> dict[str, object]:
         return {
             "agents": {str(agent.window): agent.to_dict() for agent in self.agents},
             "clock": self.clock,
+            "council_confidence_ema": self.council_confidence_ema,
+            "council_disagreement_ema": self.council_disagreement_ema,
             "dialect_count": self.dialect_count,
             "dialect_evictions": self.dialect_evictions,
             "policy_weights": {
                 str(window): weight for window, weight in self.policy_weights
             },
+            "policy_identity_sha256": self.policy_identity_sha256,
+            "phrase_confidence_ema": self.phrase_confidence_ema,
+            "phrase_support_ema": self.phrase_support_ema,
+            "phrase_width_ema": self.phrase_width_ema,
             "regime_generation": self.regime_generation,
             "schema": DRAFT_WINDOW_METRICS_SCHEMA,
+            "signal_observations": self.signal_observations,
             "state_sha256": self.state_sha256,
             "surprise_cusum": self.surprise_cusum,
             "surprise_deviation": self.surprise_deviation,
@@ -1064,6 +1354,9 @@ class DraftWindowController:
     TEMPERATURE = 1.0
     RAPIDITY_DECAY = 0.995
     LEARNING_RATE = 0.18
+    SIGNAL_RATE = 0.10
+    SIGNAL_STRENGTH = 0.50
+    NESTED_ACCEPTANCE_STRENGTH = 0.50
     DIALECT_STRENGTH = 1.0
     DIALECT_SIMILARITY_THRESHOLD = 0.20
     SURPRISE_RATE = 0.05
@@ -1100,11 +1393,38 @@ class DraftWindowController:
         self.state_path = Path(state_path).expanduser().absolute()
         self.max_dialects = max_dialects
         self.retention_alpha = retention_alpha
+        self._policy_identity_sha256: str | None = None
         self._thread_lock = threading.RLock()
         self._selection_metrics: dict[str, DraftWindowMetrics] = {}
         self._prepare_parent()
         with self._locked_state():
             self._state = self._load_locked()
+
+    def bind_policy_identity(self, policy_identity_sha256: str) -> DraftWindowMetrics:
+        """Bind this state file to one target/tokenizer/drafter runtime."""
+
+        if not _is_sha256(policy_identity_sha256):
+            raise ValueError("policy_identity_sha256 must be a SHA-256 digest")
+        with self._thread_lock, self._locked_state():
+            state = self._load_locked()
+            if (
+                state.policy_identity_sha256 is not None
+                and state.policy_identity_sha256 != policy_identity_sha256
+            ):
+                raise DraftWindowError(
+                    "draft-window state belongs to a different runtime identity"
+                )
+            if state.policy_identity_sha256 is None:
+                state = replace(
+                    state,
+                    policy_identity_sha256=policy_identity_sha256,
+                )
+                _persist_state(self.state_path, state)
+            self._policy_identity_sha256 = policy_identity_sha256
+            self._state = state
+            return self._metrics_for(state)
+
+    bind = bind_policy_identity
 
     def _prepare_parent(self) -> None:
         try:
@@ -1157,7 +1477,15 @@ class DraftWindowController:
             raise DraftWindowError("cannot inspect draft-window state") from exc
         if stat.S_ISLNK(linked.st_mode):
             raise DraftWindowError("draft-window state must not be a symlink")
-        return _read_state(self.state_path)
+        state = _read_state(self.state_path)
+        if (
+            self._policy_identity_sha256 is not None
+            and state.policy_identity_sha256 != self._policy_identity_sha256
+        ):
+            raise DraftWindowError(
+                "draft-window state runtime identity changed"
+            )
+        return state
 
     @classmethod
     def _policy(
@@ -1197,6 +1525,62 @@ class DraftWindowController:
             )
         )
 
+    @classmethod
+    def _signal_rapidities(
+        cls,
+        state: DraftWindowState,
+    ) -> tuple[float, float, float]:
+        if state.signal_observations == 0:
+            return (0.0, 0.0, 0.0)
+        probability = max(
+            0.0,
+            min(
+                0.999,
+                state.council_confidence_ema
+                * (1.0 - 0.5 * state.council_disagreement_ema),
+            ),
+        )
+        utilities = []
+        for window in DRAFT_WINDOW_ACTIONS:
+            council_expected = sum(
+                probability**position for position in range(1, window)
+            )
+            phrase_support = 1.0 - math.exp(-state.phrase_support_ema / 3.0)
+            phrase_expected = (
+                state.phrase_confidence_ema
+                * phrase_support
+                * min(state.phrase_width_ema, window - 1)
+            )
+            expected_tokens = 1.0 + max(council_expected, phrase_expected)
+            work_proxy = 1.0 + (window - 1) / 16.0
+            utilities.append(expected_tokens / work_proxy)
+        center = sum(utilities) / len(utilities)
+        return tuple(cls.SIGNAL_STRENGTH * (value - center) for value in utilities)
+
+    @classmethod
+    def _nested_acceptance_rapidities(
+        cls,
+        state: DraftWindowState,
+    ) -> tuple[float, float, float]:
+        values = []
+        for agent in state.agents:
+            proposed = agent.nested_proposed_draft_tokens
+            if proposed == 0:
+                values.append(0.0)
+                continue
+            reliability = (
+                agent.nested_accepted_draft_tokens + 1.0
+            ) / (proposed + 2.0)
+            evidence_strength = 1.0 - math.exp(-proposed / 8.0)
+            values.append(
+                cls.NESTED_ACCEPTANCE_STRENGTH
+                * evidence_strength
+                * 4.0
+                * (reliability - 0.5)
+            )
+        center = sum(values) / len(values)
+        return tuple(value - center for value in values)
+
     def _match_dialect(
         self,
         state: DraftWindowState,
@@ -1235,19 +1619,51 @@ class DraftWindowController:
             self._state = state
         dialect, similarity = self._match_dialect(state, signature)
         rapidities = self._combined_rapidities(state, dialect, similarity)
+        signal_rapidities = self._signal_rapidities(state)
+        nested_rapidities = self._nested_acceptance_rapidities(state)
+        rapidities = tuple(
+            value + signal + nested
+            for value, signal, nested in zip(
+                rapidities,
+                signal_rapidities,
+                nested_rapidities,
+                strict=True,
+            )
+        )
         policy = self._policy(rapidities, eligible)
         cold = state.updates == 0
         if cold:
             proposed = 8 if 8 in eligible else 4
+            selection_mode = "cold"
+            selection_probability = 1.0
         else:
-            proposed = max(
-                policy,
-                key=lambda item: (item[1], _PREFERENCE[item[0]]),
-            )[0]
+            observations = {
+                agent.window: agent.observations + agent.nested_observations
+                for agent in state.agents
+            }
+            unseen = tuple(
+                window for window in eligible if observations.get(window, 0) == 0
+            )
+            if unseen:
+                proposed = min(unseen, key=_BOOTSTRAP_ORDER.__getitem__)
+                selection_mode = "bootstrap"
+                selection_probability = 1.0
+            else:
+                draw = secrets.randbelow(1 << 53) / float(1 << 53)
+                cumulative = 0.0
+                proposed = policy[-1][0]
+                for window, probability in policy:
+                    cumulative += probability
+                    if draw < cumulative:
+                        proposed = window
+                        break
+                selection_mode = "fixed-share"
+                selection_probability = dict(policy)[proposed]
         selection_material = {
             "context_signature_sha256": _signature_sha256(signature),
             "nonce": secrets.token_hex(16),
             "proposed_window": proposed,
+            "selection_mode": selection_mode,
             "state_sha256": state.sha256,
         }
         selection = DraftWindowSelection(
@@ -1259,6 +1675,8 @@ class DraftWindowController:
             dialect_id=None if dialect is None else dialect.dialect_id,
             dialect_similarity=similarity,
             policy_weights=policy,
+            selection_mode=selection_mode,
+            selection_probability=selection_probability,
             cold_start=cold,
             state_updates=state.updates,
             state_sha256=state.sha256,
@@ -1355,11 +1773,26 @@ class DraftWindowController:
         )
 
     def _metrics_for(self, state: DraftWindowState) -> DraftWindowMetrics:
+        signal = self._signal_rapidities(state)
+        nested = self._nested_acceptance_rapidities(state)
+        policy_rapidities = tuple(
+            value + adjustment + nested_adjustment
+            for value, adjustment, nested_adjustment in zip(
+                state.rapidities,
+                signal,
+                nested,
+                strict=True,
+            )
+        )
         return DraftWindowMetrics(
             state_sha256=state.sha256,
+            policy_identity_sha256=state.policy_identity_sha256,
             updates=state.updates,
             clock=state.clock,
-            policy_weights=self._policy(state.rapidities, DRAFT_WINDOW_ACTIONS),
+            policy_weights=self._policy(
+                policy_rapidities,
+                DRAFT_WINDOW_ACTIONS,
+            ),
             agents=state.agents,
             surprise_mean=state.surprise_mean,
             surprise_deviation=state.surprise_deviation,
@@ -1367,6 +1800,12 @@ class DraftWindowController:
             regime_generation=state.regime_generation,
             dialect_count=len(state.dialects),
             dialect_evictions=state.dialect_evictions,
+            signal_observations=state.signal_observations,
+            council_confidence_ema=state.council_confidence_ema,
+            council_disagreement_ema=state.council_disagreement_ema,
+            phrase_confidence_ema=state.phrase_confidence_ema,
+            phrase_support_ema=state.phrase_support_ema,
+            phrase_width_ema=state.phrase_width_ema,
         )
 
     def metrics(self) -> DraftWindowMetrics:
@@ -1414,7 +1853,7 @@ class DraftWindowController:
                 self._state = state
                 return self._metrics_for(state)
             selected_index = DRAFT_WINDOW_ACTIONS.index(selection.proposed_window)
-            probability = dict(selection.policy_weights)[selection.proposed_window]
+            probability = selection.selection_probability
             reward = feedback.reward
             previous_agent = state.agents[selected_index]
             expected_reward = previous_agent.mean_reward
@@ -1493,10 +1932,53 @@ class DraftWindowController:
                 evictions = _bounded_add(evictions, 1)
             agents = list(state.agents)
             agents[selected_index] = previous_agent.updated(feedback, reward)
+            for nested in feedback.nested_horizons:
+                nested_index = DRAFT_WINDOW_ACTIONS.index(
+                    nested.candidate_window
+                )
+                agents[nested_index] = agents[nested_index].updated_nested(nested)
             recent = (*state.recent_settlement_sha256s, settlement_sha256)
             if len(recent) > self.RECENT_SETTLEMENTS:
                 recent = recent[-self.RECENT_SETTLEMENTS :]
+            signal_observations = state.signal_observations
+            council_confidence_ema = state.council_confidence_ema
+            council_disagreement_ema = state.council_disagreement_ema
+            phrase_confidence_ema = state.phrase_confidence_ema
+            phrase_support_ema = state.phrase_support_ema
+            phrase_width_ema = state.phrase_width_ema
+            if feedback.council_confidence is not None:
+                rate = 1.0 if signal_observations == 0 else self.SIGNAL_RATE
+
+                def update_signal(previous: float, current: float) -> float:
+                    return (1.0 - rate) * previous + rate * current
+
+                council_confidence_ema = update_signal(
+                    council_confidence_ema,
+                    feedback.council_confidence,
+                )
+                council_disagreement_ema = update_signal(
+                    council_disagreement_ema,
+                    0.0
+                    if feedback.council_disagreement is None
+                    else feedback.council_disagreement,
+                )
+                phrase_confidence_ema = update_signal(
+                    phrase_confidence_ema,
+                    0.0
+                    if feedback.phrase_confidence is None
+                    else feedback.phrase_confidence,
+                )
+                phrase_support_ema = update_signal(
+                    phrase_support_ema,
+                    float(feedback.phrase_support),
+                )
+                phrase_width_ema = update_signal(
+                    phrase_width_ema,
+                    float(feedback.phrase_width),
+                )
+                signal_observations = _bounded_add(signal_observations, 1)
             updated = DraftWindowState(
+                policy_identity_sha256=state.policy_identity_sha256,
                 updates=_bounded_add(state.updates, 1),
                 clock=next_clock,
                 rapidities=rapidities,
@@ -1513,6 +1995,12 @@ class DraftWindowController:
                     sorted(dialects.values(), key=lambda row: row.dialect_id)
                 ),
                 recent_settlement_sha256s=tuple(recent),
+                signal_observations=signal_observations,
+                council_confidence_ema=council_confidence_ema,
+                council_disagreement_ema=council_disagreement_ema,
+                phrase_confidence_ema=phrase_confidence_ema,
+                phrase_support_ema=phrase_support_ema,
+                phrase_width_ema=phrase_width_ema,
             )
             _persist_state(self.state_path, updated)
             self._state = updated
@@ -1526,15 +2014,18 @@ __all__ = [
     "DRAFT_WINDOW_ACTIONS",
     "DRAFT_WINDOW_FEEDBACK_SCHEMA",
     "DRAFT_WINDOW_METRICS_SCHEMA",
+    "DRAFT_WINDOW_NESTED_HORIZON_SCHEMA",
     "DRAFT_WINDOW_SELECTION_SCHEMA",
     "DRAFT_WINDOW_STATE_SCHEMA",
     "LEGACY_DRAFT_WINDOW_STATE_SCHEMA",
+    "V1_DRAFT_WINDOW_STATE_SCHEMA",
     "DraftWindowAgentState",
     "DraftWindowController",
     "DraftWindowDialectState",
     "DraftWindowError",
     "DraftWindowFeedback",
     "DraftWindowMetrics",
+    "DraftWindowNestedHorizon",
     "DraftWindowSelection",
     "DraftWindowState",
     "PersistentDraftWindowController",

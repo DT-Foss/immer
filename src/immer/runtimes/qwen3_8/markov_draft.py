@@ -26,10 +26,11 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v5"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v3"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v4"
 _STATE_PREFIX = b"IMMD\x04"
 _V3_STATE_PREFIX = b"IMMD\x03"
 _V2_STATE_PREFIX = b"IMMD\x02"
@@ -327,7 +328,7 @@ class MarkovDialectState:
 
 @dataclass(frozen=True, slots=True)
 class MarkovPhraseOption:
-    token_ids: tuple[int, int, int]
+    token_ids: tuple[int, ...]
     source: str
     context_order: int
     support: int
@@ -341,7 +342,7 @@ class MarkovPhraseOption:
         if self.source not in {"dialect", "global"}:
             raise ValueError("phrase option source is invalid")
         if (
-            len(self.token_ids) != 3
+            not 2 <= len(self.token_ids) <= 15
             or any(
                 isinstance(token, bool)
                 or not isinstance(token, int)
@@ -721,6 +722,7 @@ class MarkovDraftMetrics:
     last_phrase_source: str | None
     last_phrase_support: int
     last_phrase_confidence: float
+    last_phrase_width: int
     source_body_bytes: int = 0
     linear_calls: int = 0
     proposal_width: int = 3
@@ -751,6 +753,7 @@ class FingerprintRollingK4DraftProvider:
     DIALECT_STRENGTH = 2.0
     RICCI_AGE_ALPHA = 0.001
     PHRASE_MAX_CONTEXT = 8
+    PHRASE_MAX_WIDTH = 15
     DIALECT_PHRASE_MIN_SUPPORT = 2
     GLOBAL_PHRASE_MIN_SUPPORT = 3
 
@@ -1066,34 +1069,74 @@ class FingerprintRollingK4DraftProvider:
         minimum_support: int,
     ) -> MarkovPhraseOption | None:
         episodes = self._episodes(dialect_id)
+        candidates: list[MarkovPhraseOption] = []
+        max_width = min(self.proposal_width, self.PHRASE_MAX_WIDTH)
+        if max_width < 2:
+            return None
         for order in range(min(self.PHRASE_MAX_CONTEXT, len(history)), 0, -1):
             suffix = history[-order:]
-            phrases: Counter[tuple[int, int, int]] = Counter()
+            continuations: list[tuple[int, ...]] = []
             for episode in episodes:
-                for position in range(order, len(episode) - 2):
+                for position in range(order, len(episode) - 1):
                     if episode[position - order : position] == suffix:
-                        phrase = episode[position : position + 3]
-                        phrases[(phrase[0], phrase[1], phrase[2])] += 1
-            if not phrases:
+                        continuation = episode[position : position + max_width]
+                        if len(continuation) >= 2:
+                            continuations.append(continuation)
+            if not continuations:
                 continue
-            total = sum(phrases.values())
-            phrase, support = max(
-                phrases.items(),
-                key=lambda row: (
-                    row[1],
-                    tuple(-token for token in row[0]),
-                ),
-            )
-            if support < minimum_support:
-                continue
-            return MarkovPhraseOption(
-                token_ids=phrase,
-                source=source,
-                context_order=order,
-                support=support,
-                total=total,
-            )
-        return None
+            for width in range(2, max_width + 1):
+                phrases = Counter(
+                    continuation[:width]
+                    for continuation in continuations
+                    if len(continuation) >= width
+                )
+                if not phrases:
+                    break
+                phrase, support = max(
+                    phrases.items(),
+                    key=lambda row: (
+                        row[1],
+                        tuple(-token for token in row[0]),
+                    ),
+                )
+                if support >= minimum_support:
+                    candidates.append(
+                        MarkovPhraseOption(
+                            token_ids=phrase,
+                            source=source,
+                            context_order=order,
+                            support=support,
+                            total=sum(phrases.values()),
+                        )
+                    )
+        if not candidates:
+            return None
+        return max(candidates, key=self._phrase_option_score)
+
+    def _phrase_option_score(
+        self,
+        option: MarkovPhraseOption,
+    ) -> tuple[float, int, int, int, tuple[int, ...], str]:
+        scope = (
+            self._active_dialect_similarity
+            if option.source == "dialect"
+            else 1.0
+        )
+        quality = (
+            option.confidence
+            * math.log1p(option.support)
+            * math.sqrt(len(option.token_ids))
+            * (1.0 + option.context_order / self.PHRASE_MAX_CONTEXT)
+            * scope
+        )
+        return (
+            quality,
+            option.context_order,
+            option.support,
+            len(option.token_ids),
+            tuple(-token for token in option.token_ids),
+            option.source,
+        )
 
     def _phrase_option(self, history: tuple[int, ...]) -> MarkovPhraseOption | None:
         dialect = self._active_dialect
@@ -1118,21 +1161,7 @@ class FingerprintRollingK4DraftProvider:
         if not candidates:
             return None
 
-        def score(option: MarkovPhraseOption) -> tuple[float, int, int, str]:
-            scope = (
-                self._active_dialect_similarity
-                if option.source == "dialect"
-                else 1.0
-            )
-            quality = (
-                option.confidence
-                * math.log1p(option.support)
-                * (1.0 + option.context_order / self.PHRASE_MAX_CONTEXT)
-                * scope
-            )
-            return quality, option.context_order, option.support, option.source
-
-        return max(candidates, key=score)
+        return max(candidates, key=self._phrase_option_score)
 
     def _expert_models(
         self, history: tuple[int, ...]
@@ -1433,7 +1462,10 @@ class FingerprintRollingK4DraftProvider:
         self._pending_phrase_option = option
         if option is not None:
             self._phrase_option_calls += 1
-            self._phrase_draft_tokens += min(3, self.proposal_width)
+            self._phrase_draft_tokens += min(
+                len(option.token_ids),
+                self.proposal_width,
+            )
             self._last_phrase_option = option
         self._draft_calls += 1
         return proposal
@@ -1527,7 +1559,10 @@ class FingerprintRollingK4DraftProvider:
         for index, token in enumerate(delta):
             self._episode_feedback.append((self._pending_feedback[index], token))
         if self._pending_phrase_option is not None:
-            self._phrase_accepted_tokens += min(len(delta), 3)
+            self._phrase_accepted_tokens += min(
+                len(delta),
+                len(self._pending_phrase_option.token_ids),
+            )
         self._carry_feedback = self._pending_feedback[len(delta)]
         self._last_confirmed_length = len(committed)
         self._pending_base = None
@@ -1686,6 +1721,11 @@ class FingerprintRollingK4DraftProvider:
                 if self._last_phrase_option is None
                 else self._last_phrase_option.confidence
             ),
+            last_phrase_width=(
+                0
+                if self._last_phrase_option is None
+                else len(self._last_phrase_option.token_ids)
+            ),
             proposal_width=self.proposal_width,
         )
 
@@ -1710,6 +1750,7 @@ __all__ = [
     "V2_MARKOV_DRAFT_STATE_SCHEMA",
     "V3_MARKOV_DRAFT_STATE_SCHEMA",
     "MARKOV_DRAFT_METRICS_SCHEMA",
+    "MARKOV_DRAFT_PROVIDER_ABI",
     "MARKOV_DRAFT_STATE_SCHEMA",
     "FingerprintRollingK4DraftProvider",
     "MarkovDraftError",

@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from dataclasses import replace
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -18,9 +19,11 @@ from immer.runtimes.qwen3_8.draft_window import (
     DRAFT_WINDOW_ACTIONS,
     DRAFT_WINDOW_STATE_SCHEMA,
     LEGACY_DRAFT_WINDOW_STATE_SCHEMA,
+    V1_DRAFT_WINDOW_STATE_SCHEMA,
     DraftWindowController,
     DraftWindowError,
     DraftWindowFeedback,
+    DraftWindowNestedHorizon,
     DraftWindowState,
     contextual_bottom_k_signature,
 )
@@ -50,7 +53,16 @@ def _feedback(
     )
 
 
-def _rolling_result(window: int = 8, *, accepted: int = 4):
+def _rolling_result(
+    window: int = 8,
+    *,
+    accepted: int = 4,
+    token_ids: tuple[int, ...] = (7, 8, 9, 10),
+):
+    round_evidence = SimpleNamespace(
+        accepted_prefix_length=accepted,
+        proposed_token_ids=tuple(range(window - 1)),
+    )
     evidence = SimpleNamespace(
         accepted_draft_tokens=accepted,
         source_body_bytes=100,
@@ -59,14 +71,14 @@ def _rolling_result(window: int = 8, *, accepted: int = 4):
         state_bytes=456,
         stopped_on_eos=False,
         prompt_token_ids=(11, 12),
-        generated_token_ids=(7, 8, 9, 10),
+        generated_token_ids=token_ids,
         forward_passes=3,
-        rounds=(object(),),
+        rounds=(round_evidence,),
         schema="immer.qwen3.8-rolling-speculative-generation/v2",
         final_state_committed=False,
         window_size=window,
     )
-    return SimpleNamespace(token_ids=(7, 8, 9, 10), evidence=evidence)
+    return SimpleNamespace(token_ids=token_ids, evidence=evidence)
 
 
 class DraftWindowControllerTests(unittest.TestCase):
@@ -105,6 +117,57 @@ class DraftWindowControllerTests(unittest.TestCase):
         self.assertTrue(self.state_path.is_file())
         self.assertEqual(settled.updates, 1)
 
+    def test_policy_bootstraps_each_allowed_arm_then_samples_fixed_share(self) -> None:
+        controller = DraftWindowController(self.state_path)
+        first = controller.choose((1, 2, 3), max_window=16, max_new_tokens=16)
+        controller.settle(first, _feedback(first, receipt="1" * 64))
+        second = controller.choose((1, 2, 3), max_window=16, max_new_tokens=16)
+        controller.settle(second, _feedback(second, receipt="2" * 64))
+        third = controller.choose((1, 2, 3), max_window=16, max_new_tokens=16)
+        controller.settle(third, _feedback(third, receipt="3" * 64))
+        with patch(
+            "immer.runtimes.qwen3_8.draft_window.secrets.randbelow",
+            return_value=0,
+        ):
+            sampled = controller.choose(
+                (1, 2, 3), max_window=16, max_new_tokens=16
+            )
+
+        self.assertEqual(
+            (first.proposed_window, second.proposed_window, third.proposed_window),
+            (8, 4, 16),
+        )
+        self.assertEqual(
+            (first.selection_mode, second.selection_mode, third.selection_mode),
+            ("cold", "bootstrap", "bootstrap"),
+        )
+        self.assertEqual(sampled.selection_mode, "fixed-share")
+        self.assertEqual(sampled.proposed_window, 4)
+        self.assertEqual(
+            sampled.selection_probability,
+            dict(sampled.policy_weights)[sampled.proposed_window],
+        )
+
+    def test_default_k8_ceiling_can_never_bootstrap_or_sample_k16(self) -> None:
+        controller = DraftWindowController(self.state_path)
+        selected = []
+        with patch(
+            "immer.runtimes.qwen3_8.draft_window.secrets.randbelow",
+            return_value=(1 << 53) - 1,
+        ):
+            for index in range(8):
+                selection = controller.choose(
+                    (1, 2, 3), max_window=8, max_new_tokens=16
+                )
+                selected.append(selection.proposed_window)
+                controller.settle(
+                    selection,
+                    _feedback(selection, receipt=f"{index + 1:064x}"),
+                )
+
+        self.assertEqual(selected[:2], [8, 4])
+        self.assertNotIn(16, selected)
+
     def test_reward_favors_confirmed_tokens_and_penalizes_failures(self) -> None:
         controller = DraftWindowController(self.state_path)
         selection = controller.choose((1, 2), max_window=16, max_new_tokens=16)
@@ -126,6 +189,124 @@ class DraftWindowControllerTests(unittest.TestCase):
             + useful.draft_source_body_bytes
             + useful.aux_source_body_bytes,
         )
+
+    def test_wider_wave_teaches_exact_shorter_prefix_reliability(self) -> None:
+        controller = DraftWindowController(self.state_path)
+        selection = controller.choose((1, 2, 3), max_window=8, max_new_tokens=16)
+        nested = DraftWindowNestedHorizon(
+            candidate_window=4,
+            observed_window=8,
+            wave_count=2,
+            accepted_draft_tokens=5,
+            proposed_draft_tokens=6,
+        )
+
+        metrics = controller.settle(
+            selection,
+            replace(_feedback(selection), nested_horizons=(nested,)),
+        )
+
+        short = metrics.agents[0]
+        self.assertEqual(short.observations, 0)
+        self.assertEqual(short.nested_observations, 1)
+        self.assertEqual(short.nested_accepted_draft_tokens, 5)
+        self.assertEqual(short.nested_proposed_draft_tokens, 6)
+        self.assertAlmostEqual(short.to_dict()["nested_reliability"], 5 / 6)
+        self.assertGreater(short.nested_acceptance_score_sum, 0.0)
+        with patch(
+            "immer.runtimes.qwen3_8.draft_window.secrets.randbelow",
+            return_value=0,
+        ):
+            next_selection = controller.choose(
+                (1, 2, 3), max_window=8, max_new_tokens=16
+            )
+        self.assertEqual(next_selection.selection_mode, "fixed-share")
+
+    def test_nested_acceptance_never_rewrites_executed_work_reward(self) -> None:
+        plain_path = self.root / "plain-window.bin"
+        nested_path = self.root / "nested-window.bin"
+        plain = DraftWindowController(plain_path)
+        informed = DraftWindowController(nested_path)
+        plain_selection = plain.choose(
+            (1, 2, 3), max_window=8, max_new_tokens=16
+        )
+        informed_selection = informed.choose(
+            (1, 2, 3), max_window=8, max_new_tokens=16
+        )
+        nested = DraftWindowNestedHorizon(
+            candidate_window=4,
+            observed_window=8,
+            wave_count=1,
+            accepted_draft_tokens=3,
+            proposed_draft_tokens=3,
+        )
+
+        plain_metrics = plain.settle(
+            plain_selection,
+            _feedback(plain_selection),
+        )
+        informed_metrics = informed.settle(
+            informed_selection,
+            replace(
+                _feedback(informed_selection),
+                nested_horizons=(nested,),
+            ),
+        )
+        plain_state = DraftWindowState.from_bytes(plain_path.read_bytes())
+        informed_state = DraftWindowState.from_bytes(nested_path.read_bytes())
+
+        self.assertEqual(plain_state.rapidities, informed_state.rapidities)
+        self.assertEqual(
+            plain_state.dialects[0].rapidities,
+            informed_state.dialects[0].rapidities,
+        )
+        self.assertGreater(
+            dict(informed_metrics.policy_weights)[4],
+            dict(plain_metrics.policy_weights)[4],
+        )
+
+    def test_council_signal_formula_moves_horizon_with_predictive_strength(self) -> None:
+        weak = DraftWindowState(
+            signal_observations=1,
+            council_confidence_ema=0.20,
+            council_disagreement_ema=0.50,
+        )
+        strong = DraftWindowState(
+            signal_observations=1,
+            council_confidence_ema=0.99,
+            council_disagreement_ema=0.0,
+            phrase_confidence_ema=1.0,
+            phrase_support_ema=3.0,
+            phrase_width_ema=7.0,
+        )
+
+        weak_signal = DraftWindowController._signal_rapidities(weak)
+        strong_signal = DraftWindowController._signal_rapidities(strong)
+
+        self.assertGreater(weak_signal[0], weak_signal[2])
+        self.assertGreater(strong_signal[2], strong_signal[0])
+
+    def test_target_receipt_persists_council_and_phrase_signal_emas(self) -> None:
+        controller = DraftWindowController(self.state_path)
+        selection = controller.choose((1, 2, 3), max_window=8, max_new_tokens=16)
+        feedback = replace(
+            _feedback(selection),
+            council_confidence=0.90,
+            council_disagreement=0.10,
+            effective_experts=2.5,
+            phrase_confidence=0.80,
+            phrase_support=4,
+            phrase_width=7,
+        )
+
+        metrics = controller.settle(selection, feedback)
+
+        self.assertEqual(metrics.signal_observations, 1)
+        self.assertEqual(metrics.council_confidence_ema, 0.90)
+        self.assertEqual(metrics.council_disagreement_ema, 0.10)
+        self.assertEqual(metrics.phrase_confidence_ema, 0.80)
+        self.assertEqual(metrics.phrase_support_ema, 4.0)
+        self.assertEqual(metrics.phrase_width_ema, 7.0)
 
     def test_settlement_persists_all_cumulative_agent_work_metrics(self) -> None:
         controller = DraftWindowController(self.state_path)
@@ -162,28 +343,36 @@ class DraftWindowControllerTests(unittest.TestCase):
 
     def test_confirmed_surprise_cusum_shrinks_policy_on_regime_change(self) -> None:
         controller = DraftWindowController(self.state_path)
-        for index in range(1, 9):
-            selection = controller.choose((5, 5, 5), max_window=16, max_new_tokens=16)
-            controller.settle(
-                selection,
-                _feedback(
+        with patch(
+            "immer.runtimes.qwen3_8.draft_window.secrets.randbelow",
+            return_value=0,
+        ):
+            for index in range(1, 9):
+                selection = controller.choose(
+                    (5, 5, 5), max_window=16, max_new_tokens=16
+                )
+                controller.settle(
                     selection,
-                    accepted=8,
-                    receipt=f"{index:064x}",
-                ),
-            )
-        for index in range(9, 11):
-            selection = controller.choose((5, 5, 5), max_window=16, max_new_tokens=16)
-            metrics = controller.settle(
-                selection,
-                _feedback(
+                    _feedback(
+                        selection,
+                        accepted=8,
+                        receipt=f"{index:064x}",
+                    ),
+                )
+            for index in range(9, 12):
+                selection = controller.choose(
+                    (5, 5, 5), max_window=16, max_new_tokens=16
+                )
+                metrics = controller.settle(
                     selection,
-                    accepted=0,
-                    emitted=0,
-                    outcome="timeout",
-                    receipt=f"{index:064x}",
-                ),
-            )
+                    _feedback(
+                        selection,
+                        accepted=0,
+                        emitted=0,
+                        outcome="timeout",
+                        receipt=f"{index:064x}",
+                    ),
+                )
 
         self.assertEqual(metrics.regime_generation, 1)
         self.assertEqual(metrics.surprise_cusum, 0.0)
@@ -307,7 +496,39 @@ class DraftWindowControllerTests(unittest.TestCase):
         restored = DraftWindowState.from_bytes(self.state_path.read_bytes())
         self.assertEqual(restored.updates, 1)
         self.assertEqual(restored.to_record()["schema"], DRAFT_WINDOW_STATE_SCHEMA)
-        self.assertTrue(self.state_path.read_bytes().startswith(b"IMDW\x01"))
+        self.assertTrue(self.state_path.read_bytes().startswith(b"IMDW\x02"))
+
+    def test_v1_state_binds_to_one_runtime_identity_and_migrates(self) -> None:
+        body = DraftWindowState().to_record()
+        body.pop("policy_identity_sha256")
+        body["schema"] = V1_DRAFT_WINDOW_STATE_SCHEMA
+        encoded_body = json.dumps(
+            body,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        envelope = json.dumps(
+            {
+                "body": body,
+                "body_sha256": hashlib.sha256(encoded_body).hexdigest(),
+            },
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        self.state_path.write_bytes(b"IMDW\x01" + zlib.compress(envelope, level=9))
+        controller = DraftWindowController(self.state_path)
+
+        metrics = controller.bind_policy_identity("a" * 64)
+
+        self.assertEqual(metrics.policy_identity_sha256, "a" * 64)
+        self.assertTrue(self.state_path.read_bytes().startswith(b"IMDW\x02"))
+        rebound = DraftWindowController(self.state_path)
+        with self.assertRaisesRegex(DraftWindowError, "different runtime identity"):
+            rebound.bind_policy_identity("b" * 64)
 
     def test_feedback_requires_a_target_receipt_and_matching_window(self) -> None:
         controller = DraftWindowController(self.state_path)
@@ -369,10 +590,41 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.assertEqual(receipt["feedback"]["target_forwards"], 3)
         self.assertEqual(receipt["feedback"]["seconds"], 1.0)
         self.assertEqual(receipt["metrics"]["agents"]["8"]["observations"], 1)
+        self.assertEqual(
+            receipt["metrics"]["agents"]["4"]["nested_observations"],
+            1,
+        )
+        nested = receipt["feedback"]["nested_horizons"]
+        self.assertEqual(nested[0]["candidate_window"], 4)
+        self.assertEqual(nested[0]["accepted_draft_tokens"], 3)
+        self.assertEqual(nested[0]["proposed_draft_tokens"], 3)
         self.assertEqual(result.evidence["draft"]["window_size"], 8)
         chat.close()
 
-    def test_error_after_target_receipt_is_an_atomic_negative_outcome(self) -> None:
+    def test_markov_provider_abi_change_cannot_reuse_window_policy(self) -> None:
+        decoder = SimpleNamespace(
+            generate_rolling=lambda *args, **kwargs: _rolling_result()
+        )
+        first = self._adaptive_chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+            return_value=decoder,
+        ):
+            self.assertTrue(first.handle(Request("chat", "hello")).ok)
+        first.close()
+
+        second = self._adaptive_chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.MARKOV_DRAFT_PROVIDER_ABI",
+            "immer.qwen3.8-markov-draft-provider/v999",
+        ):
+            result = second.handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertIn("different runtime identity", result.reason)
+        second.close()
+
+    def test_post_generation_decode_error_keeps_realized_window_outcome(self) -> None:
         class BrokenDecode(_Tokenizer):
             def decode(self, token_ids):
                 raise RuntimeError("decode failed")
@@ -391,14 +643,15 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.assertIs(result.status, ExecutionStatus.ERROR)
         receipt = result.evidence["draft_window"]
         self.assertTrue(receipt["settled"])
-        self.assertEqual(receipt["feedback"]["outcome"], "error")
-        self.assertLess(receipt["feedback"]["reward"], -9.0)
+        self.assertEqual(receipt["feedback"]["outcome"], "ok")
+        self.assertGreater(receipt["feedback"]["reward"], 0.0)
+        self.assertEqual(receipt["post_generation_outcome"], "error")
         restored = DraftWindowState.from_bytes(self.state_path.read_bytes())
         self.assertEqual(restored.updates, 1)
-        self.assertEqual(restored.agents[1].errors, 1)
+        self.assertEqual(restored.agents[1].ok, 1)
         chat.close()
 
-    def test_broken_auxiliary_metrics_still_settle_target_receipt_negative(
+    def test_broken_auxiliary_metrics_keep_realized_target_receipt(
         self,
     ) -> None:
         runtime = _Runtime()
@@ -424,15 +677,15 @@ class DraftWindowAdapterTests(unittest.TestCase):
 
         self.assertIs(result.status, ExecutionStatus.ERROR)
         feedback = result.evidence["draft_window"]["feedback"]
-        self.assertEqual(feedback["outcome"], "error")
+        self.assertEqual(feedback["outcome"], "ok")
         self.assertEqual(feedback["target_source_body_bytes"], 100)
         self.assertEqual(feedback["draft_source_body_bytes"], 0)
         restored = DraftWindowState.from_bytes(self.state_path.read_bytes())
         self.assertEqual(restored.updates, 1)
-        self.assertEqual(restored.agents[1].errors, 1)
+        self.assertEqual(restored.agents[1].ok, 1)
         chat.close()
 
-    def test_timeout_without_target_receipt_does_not_mutate_controller(self) -> None:
+    def test_target_timeout_teaches_the_selected_window_once(self) -> None:
         runtime = _Runtime()
         chat = self._adaptive_chat(runtime)
         decoder = SimpleNamespace(
@@ -447,11 +700,45 @@ class DraftWindowAdapterTests(unittest.TestCase):
             result = chat.handle(Request("chat", "hello"))
 
         self.assertIs(result.status, ExecutionStatus.ERROR)
+        receipt = result.evidence["draft_window"]
+        self.assertTrue(receipt["settled"])
+        self.assertEqual(receipt["feedback"]["outcome"], "timeout")
+        self.assertLess(receipt["feedback"]["reward"], -12.0)
+        restored = DraftWindowState.from_bytes(self.state_path.read_bytes())
+        self.assertEqual(restored.updates, 1)
+        self.assertEqual(restored.agents[1].timeouts, 1)
+        chat.close()
+
+    def test_provider_setup_timeout_does_not_blame_target_window(self) -> None:
+        runtime = _Runtime()
+        chat = self._adaptive_chat(runtime)
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.FingerprintRollingK4DraftProvider",
+            side_effect=TimeoutError("provider setup timed out"),
+        ):
+            result = chat.handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.ERROR)
         self.assertFalse(result.evidence["draft_window"]["settled"])
-        self.assertEqual(
-            result.evidence["draft_window"]["reason"],
-            "no-verified-target-receipt",
+        self.assertEqual(DraftWindowController(self.state_path).metrics().updates, 0)
+        chat.close()
+
+    def test_non_timeout_failure_without_target_result_does_not_teach(self) -> None:
+        runtime = _Runtime()
+        chat = self._adaptive_chat(runtime)
+        decoder = SimpleNamespace(
+            generate_rolling=lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("decoder failed")
+            )
         )
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+            return_value=decoder,
+        ):
+            result = chat.handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertFalse(result.evidence["draft_window"]["settled"])
         self.assertEqual(DraftWindowController(self.state_path).metrics().updates, 0)
         chat.close()
 
@@ -476,8 +763,8 @@ class DraftWindowAdapterTests(unittest.TestCase):
 
         restored = DraftWindowState.from_bytes(self.state_path.read_bytes())
         self.assertEqual(restored.updates, 1)
-        self.assertEqual(restored.agents[1].aborted, 1)
-        self.assertLess(restored.agents[1].reward_sum, -10.0)
+        self.assertEqual(restored.agents[1].ok, 1)
+        self.assertGreater(restored.agents[1].reward_sum, 0.0)
         chat.close()
 
     def test_output_budget_below_k8_selects_k4(self) -> None:
@@ -497,6 +784,27 @@ class DraftWindowAdapterTests(unittest.TestCase):
             result.evidence["draft_window"]["selection"]["eligible_windows"],
             [4],
         )
+        chat.close()
+
+    def test_short_output_budget_keeps_rolling_draft_without_policy_update(self) -> None:
+        runtime = _Runtime()
+        chat = self._adaptive_chat(runtime, max_new_tokens=3)
+        generated = _rolling_result(
+            window=3,
+            accepted=2,
+            token_ids=(7, 8, 9),
+        )
+        decoder = SimpleNamespace(generate_rolling=lambda *args, **kwargs: generated)
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+            return_value=decoder,
+        ) as constructor:
+            result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(constructor.call_args.kwargs["window_size"], 3)
+        self.assertNotIn("draft_window", result.evidence)
+        self.assertEqual(DraftWindowController(self.state_path).metrics().updates, 0)
         chat.close()
 
     def test_policy_exposes_choice_and_pre_request_cumulative_metrics(self) -> None:

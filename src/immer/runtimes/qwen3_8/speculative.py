@@ -93,7 +93,7 @@ class K4ReconciledDraftProvider(K4DraftProvider, Protocol):
 
 
 class RollingK4DraftProvider(Protocol):
-    """Propose three tokens after one target-known rolling token."""
+    """Propose the configured token tail after one target-known token."""
 
     def propose_after(
         self, history: tuple[int, ...], known_token: int, /
