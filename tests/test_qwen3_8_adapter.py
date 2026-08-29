@@ -1447,6 +1447,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
             Path("/state/qwen-warm"),
             runtime_profile_sha256=None,
             runtime_code_revision=None,
+            template_output_character_limit=None,
+            prompt_token_verifier=None,
         )
         self.assertIs(wrapper.call_args.kwargs["ooe_hook"], hook)
 
@@ -1502,6 +1504,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
         code_revision = opener.call_args.kwargs["runtime_code_revision"]
         self.assertEqual(len(profile), 64)
         self.assertEqual(len(code_revision), 64)
+        self.assertEqual(
+            opener.call_args.kwargs["template_output_character_limit"],
+            64,
+        )
+        self.assertTrue(callable(opener.call_args.kwargs["prompt_token_verifier"]))
         self.assertEqual(
             constructor.call_args.kwargs["result_cell_code_revision"],
             code_revision,

@@ -179,6 +179,12 @@ class OoeChatAttempt:
     evidence: Mapping[str, Any]
     decision: OoeDecision | None = None
     _owner: Any | None = field(default=None, repr=False, compare=False)
+    _settler: Any | None = field(default=None, repr=False, compare=False)
+    _abstention_authorized: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def hit(self) -> bool:
@@ -196,6 +202,7 @@ class OoeChatHook:
         quality_verifier: ExecutionQualityVerifier,
         source_action: OoeAction | str = "qwen_fallback",
         cold_observer: ColdObserver | None = None,
+        direct_provider: Any | None = None,
         snapshot_name: str | None = None,
         snapshot_restorer: ControllerRestorer | None = None,
         commit_on_fertig_abstention: bool = False,
@@ -208,6 +215,8 @@ class OoeChatHook:
             raise TypeError("quality_verifier must be callable")
         if cold_observer is not None and not callable(cold_observer):
             raise TypeError("cold_observer must be callable or None")
+        if direct_provider is not None and not callable(direct_provider):
+            raise TypeError("direct_provider must be callable or None")
         if snapshot_name is not None and (
             not isinstance(snapshot_name, str)
             or not snapshot_name
@@ -225,6 +234,7 @@ class OoeChatHook:
         self.quality_verifier = quality_verifier
         self.source_action = validate_action(source_action)
         self.cold_observer = cold_observer
+        self.direct_provider = direct_provider
         self.snapshot_name = snapshot_name
         self.snapshot_restorer = snapshot_restorer
         self.commit_on_fertig_abstention = commit_on_fertig_abstention
@@ -299,6 +309,18 @@ class OoeChatHook:
             raise TypeError("metadata must be a mapping")
         with self._lock:
             try:
+                if self.direct_provider is not None:
+                    direct = self.direct_provider(question, metadata)
+                    if direct is not None:
+                        if (
+                            not isinstance(direct, OoeChatAttempt)
+                            or not direct.hit
+                            or not callable(direct._settler)
+                        ):
+                            raise TypeError(
+                                "direct_provider must return a settled warm attempt or None"
+                            )
+                        return direct
                 feature = self.feature_provider(question, metadata)
                 if feature is None:
                     return OoeChatAttempt(None, {"status": "no-feature"})
@@ -350,6 +372,8 @@ class OoeChatHook:
                         "status": "stale",
                     },
                 )
+            except OoeChatIntegrityError:
+                raise
             except (
                 OoeControllerIntegrityError,
                 QwenOoeBridgeIntegrityError,
@@ -409,6 +433,15 @@ class OoeChatHook:
     ) -> WarmAccountingReceipt:
         if not isinstance(attempt, OoeChatAttempt) or not attempt.hit:
             raise ValueError("only a warm hit can be settled")
+        if attempt._settler is not None:
+            if not callable(attempt._settler):
+                raise OoeChatIntegrityError("direct warm settlement is invalid")
+            receipt = attempt._settler(accept)
+            if not isinstance(receipt, WarmAccountingReceipt):
+                raise OoeChatIntegrityError(
+                    "direct warm settlement returned an invalid receipt"
+                )
+            return receipt
         decision = attempt.decision
         if not isinstance(decision, OoeDecision):
             raise OoeChatIntegrityError("warm hit lost its controller decision")
@@ -446,7 +479,10 @@ class OoeChatHook:
         return self._settle_warm(attempt, accept=False)
 
     def abstention_commit_authorized(self, _attempt: OoeChatAttempt) -> bool:
-        return self.commit_on_fertig_abstention
+        return (
+            _attempt._abstention_authorized
+            or self.commit_on_fertig_abstention
+        )
 
     def observe_cold(
         self,
@@ -524,7 +560,11 @@ class ChainedOoeChatHook(OoeChatHook):
                             "status": "hit",
                         },
                         attempt.decision,
-                        hook,
+                        _owner=hook,
+                        _settler=attempt._settler,
+                        _abstention_authorized=(
+                            attempt._abstention_authorized
+                        ),
                     )
         return OoeChatAttempt(
             None,

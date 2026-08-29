@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import sys
@@ -527,12 +528,18 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 args.system_prompt,
                 text,
             )
+            token_sha256 = prompt_token_sha256(
+                warm_prompt_tokenizer.encode(rendered)
+            )
             return {
-                "qwen_token_sha256": prompt_token_sha256(
-                    warm_prompt_tokenizer.encode(rendered)
-                ),
+                "qwen_token_sha256": token_sha256,
                 "qwen_warm_runtime_profile_sha256": warm_profile_sha256,
             }
+
+        def verify_prompt_token(question: str, claimed: str) -> bool:
+            metadata = request_metadata_for(question)
+            expected = metadata.get("qwen_token_sha256")
+            return expected is not None and hmac.compare_digest(expected, claimed)
         warm_mount = None
         if not args.raw_qwen:
             warm_root = _resolve_qwen38_warm_root(args, bundle_path)
@@ -542,6 +549,16 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     runtime_profile_sha256=warm_profile_sha256,
                     runtime_code_revision=(
                         warm_runtime_code_revision
+                        if warm_profile_sha256 is not None
+                        else None
+                    ),
+                    template_output_character_limit=(
+                        args.max_new_tokens
+                        if warm_profile_sha256 is not None
+                        else None
+                    ),
+                    prompt_token_verifier=(
+                        verify_prompt_token
                         if warm_profile_sha256 is not None
                         else None
                     ),

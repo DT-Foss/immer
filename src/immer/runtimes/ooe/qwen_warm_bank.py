@@ -137,6 +137,8 @@ def open_verified_qwen_warm_bank(
     *,
     runtime_profile_sha256: str | None = None,
     runtime_code_revision: str | None = None,
+    template_output_character_limit: int | None = None,
+    prompt_token_verifier: Any | None = None,
 ) -> VerifiedQwenWarmMount:
     """Open one existing verified warm cell without running or probing Qwen."""
 
@@ -154,9 +156,24 @@ def open_verified_qwen_warm_bank(
         if runtime_code_revision is None
         else require_sha256(runtime_code_revision, field="runtime_code_revision")
     )
-    if (runtime_profile is None) != (runtime_code is None):
+    if template_output_character_limit is not None and (
+        isinstance(template_output_character_limit, bool)
+        or not isinstance(template_output_character_limit, int)
+        or template_output_character_limit <= 0
+    ):
+        raise QwenWarmBankError("template output character limit must be positive")
+    if prompt_token_verifier is not None and not callable(prompt_token_verifier):
+        raise QwenWarmBankError("prompt_token_verifier must be callable or None")
+    if len(
+        {
+            runtime_profile is None,
+            runtime_code is None,
+            template_output_character_limit is None,
+            prompt_token_verifier is None,
+        }
+    ) != 1:
         raise QwenWarmBankError(
-            "growing warm profile and runtime code revision must be configured together"
+            "growing warm profile, code revision and template limit must be configured together"
         )
     try:
         root_stat = selected.lstat()
@@ -535,6 +552,8 @@ def open_verified_qwen_warm_bank(
             bindings_by_feature=growing_bindings,
             entries=growing_entries,
             index_sha256=growing_index_sha256,
+            template_output_character_limit=template_output_character_limit,
+            prompt_token_verifier=prompt_token_verifier,
         )
         growth.reconcile()
         growing_hook = OoeChatHook(
@@ -542,6 +561,7 @@ def open_verified_qwen_warm_bank(
             feature_provider=growth.feature_provider,
             quality_verifier=growth.quality_verifier,
             cold_observer=growth.observe_cold,
+            direct_provider=growth.direct_provider,
             snapshot_name=growing_state_name,
             snapshot_restorer=restore_growing_controller,
             commit_on_fertig_abstention=True,

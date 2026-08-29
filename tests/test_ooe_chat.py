@@ -22,6 +22,10 @@ from immer.runtimes.ooe.controller import (
     OoeController,
 )
 from immer.runtimes.ooe.crystal import CrystalStore
+from immer.runtimes.ooe.qwen_warm_templates import (
+    ParametricWarmBank,
+    TEMPLATE_STATE_NAME,
+)
 
 from test_ooe_qwen_bridge_controller import (
     _ATLAS_GRAPH,
@@ -231,6 +235,121 @@ class OoeChatHookTests(unittest.TestCase):
             )
             self.assertEqual(controller.metrics.saved_qwen_forwards, 0)
             self.assertEqual(controller.metrics.quality_failures, 1)
+
+    def test_promoted_parametric_template_bypasses_qwen_for_unseen_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = _hash("runtime-profile")
+
+            def token_sha256(question: str) -> str:
+                return _hash(f"tokens:{question}")
+
+            templates = ParametricWarmBank(
+                CrystalStore(root / "templates"),
+                profile,
+                output_character_limit=32,
+                prompt_token_verifier=(
+                    lambda question, claimed: claimed == token_sha256(question)
+                ),
+            )
+            for slot in ("ALPHA", "BETA"):
+                templates.observe(
+                    f"Schreibe exakt: {slot}",
+                    slot,
+                    question_sha256=_hash(f"question:{slot}"),
+                    cell_payload_sha256=_hash(f"cell:{slot}"),
+                    teacher_forward_count=4,
+                )
+            controller, _warm = self._controller(root / "controller")
+            hook = OoeChatHook(
+                controller=controller,
+                feature_provider=lambda _question, _metadata: None,
+                quality_verifier=lambda _receipt, _execution: False,
+                direct_provider=templates.try_warm,
+            )
+            question = "Schreibe exakt: GAMMA"
+            metadata = {
+                "qwen_token_sha256": token_sha256(question),
+                "qwen_warm_runtime_profile_sha256": profile,
+            }
+            qwen = _Qwen(RuntimeError("Qwen must not run for a template hit"))
+            with _patched_solver(
+                None,
+                _verification(
+                    CandidateVerificationStatus.ABSTAINED,
+                    candidate=None,
+                    expected=None,
+                    question=question,
+                ),
+            ) as (solver, _certify, _verify):
+                result = QwenFertigChat(qwen, solver, ooe_hook=hook).handle(
+                    Request("chat", question, metadata)
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.output, "GAMMA")
+            self.assertEqual(qwen.requests, [])
+            receipt = _receipt(result)
+            self.assertEqual(receipt["route"], "ooe_verification_abstained")
+            self.assertEqual(
+                receipt["ooe"]["accounting"]["disposition"],
+                "committed",
+            )
+            self.assertEqual(
+                receipt["ooe"]["accounting"]["saved_qwen_forwards"],
+                4,
+            )
+
+    def test_parametric_state_tamper_is_a_hard_ooe_integrity_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = _hash("runtime-profile")
+
+            def token_sha256(question: str) -> str:
+                return _hash(f"tokens:{question}")
+
+            store = CrystalStore(root / "templates")
+            templates = ParametricWarmBank(
+                store,
+                profile,
+                output_character_limit=32,
+                prompt_token_verifier=(
+                    lambda question, claimed: claimed == token_sha256(question)
+                ),
+            )
+            for slot in ("ALPHA", "BETA"):
+                templates.observe(
+                    f"copy:{slot}",
+                    slot,
+                    question_sha256=_hash(f"question:{slot}"),
+                    cell_payload_sha256=_hash(f"cell:{slot}"),
+                    teacher_forward_count=2,
+                )
+            state_path = (
+                Path(store.root)
+                / "state"
+                / store._state_filename(TEMPLATE_STATE_NAME)
+            )
+            payload = bytearray(state_path.read_bytes())
+            payload[-1] ^= 1
+            state_path.chmod(0o600)
+            state_path.write_bytes(payload)
+            controller, _warm = self._controller(root / "controller")
+            hook = OoeChatHook(
+                controller=controller,
+                feature_provider=lambda _question, _metadata: None,
+                quality_verifier=lambda _receipt, _execution: False,
+                direct_provider=templates.try_warm,
+            )
+            question = "copy:GAMMA"
+            with self.assertRaises(OoeChatIntegrityError):
+                hook.try_warm(
+                    question,
+                    {
+                        "qwen_token_sha256": token_sha256(question),
+                        "qwen_warm_runtime_profile_sha256": profile,
+                    },
+                )
 
     def test_warm_accounting_persists_with_the_controller_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -35,6 +35,7 @@ from .result_cells import (
     attach_cold_qwen_generation_receipt,
     qwen_result_binding_evidence,
 )
+from .qwen_warm_templates import ParametricWarmBank
 
 
 GROWING_INDEX_SCHEMA = "immer.qwen3.8-growing-warm-index/v1"
@@ -358,6 +359,8 @@ class GrowingQwenWarmBank:
         bindings_by_feature: dict[str, ResultCellBinding],
         entries: dict[tuple[str, str], GrowingWarmEntry],
         index_sha256: str | None,
+        template_output_character_limit: int,
+        prompt_token_verifier: Callable[[str, str], bool],
     ) -> None:
         self.root = root
         self.store = store
@@ -372,6 +375,25 @@ class GrowingQwenWarmBank:
         self.bindings_by_feature = bindings_by_feature
         self.entries = entries
         self.index_sha256 = index_sha256
+        def verify_template_observation(row: Any) -> bool:
+            try:
+                cell = self.bank.restore_payload(row.cell_payload_sha256)
+            except Exception:
+                return False
+            return (
+                str(cell.cold_qwen_result.output) == row.output
+                and cell.teacher_forward_count == row.teacher_forward_count
+                and cell.binding.question_sha256 == row.question_sha256
+            )
+
+        template_store = CrystalStore(root / "private-parametric-state")
+        self.templates = ParametricWarmBank(
+            template_store,
+            self.runtime_profile_sha256,
+            output_character_limit=template_output_character_limit,
+            observation_verifier=verify_template_observation,
+            prompt_token_verifier=prompt_token_verifier,
+        )
         self.controller = restore_controller()
         self.hook: Any | None = None
         self._lock = threading.RLock()
@@ -414,6 +436,13 @@ class GrowingQwenWarmBank:
         except Exception:
             return False
         return candidate.to_document() == expected.to_document()
+
+    def direct_provider(
+        self,
+        question: str,
+        metadata: Mapping[str, Any],
+    ) -> Any:
+        return self.templates.try_warm(question, metadata)
 
     @staticmethod
     def _history_feature_sha256s(controller: OoeController) -> frozenset[str]:
@@ -609,6 +638,14 @@ class GrowingQwenWarmBank:
             )
             existing = entries.get(key)
             if existing is not None:
+                cell = self.bank.restore(existing.binding)
+                template = self.templates.observe(
+                    question.strip(),
+                    str(cell.cold_qwen_result.output),
+                    question_sha256=existing.question_sha256,
+                    cell_payload_sha256=existing.cell_payload_sha256,
+                    teacher_forward_count=cell.teacher_forward_count,
+                )
                 self.entries = entries
                 self.index_sha256 = index_sha256
                 self.controller = controller
@@ -616,6 +653,7 @@ class GrowingQwenWarmBank:
                     "cell_payload_sha256": existing.cell_payload_sha256,
                     "feature_sha256": existing.feature.sha256,
                     "status": "already-indexed",
+                    "template": template,
                 }
             old_state_sha256 = hashlib.sha256(
                 self.store.restore_state(self.controller_state_name)
@@ -634,6 +672,14 @@ class GrowingQwenWarmBank:
                 expected_sha256=index_sha256,
             )
             self.bindings_by_feature[entry.feature.sha256] = entry.binding
+            charged_cell = self.bank.restore(entry.binding)
+            template = self.templates.observe(
+                question.strip(),
+                str(charged_cell.cold_qwen_result.output),
+                question_sha256=entry.question_sha256,
+                cell_payload_sha256=entry.cell_payload_sha256,
+                teacher_forward_count=charged_cell.teacher_forward_count,
+            )
             controller.ingest_teacher(entry.feature, entry.transition)
             self._publish_controller_growth(controller, old_state_sha256)
             self.entries = entries
@@ -645,6 +691,7 @@ class GrowingQwenWarmBank:
                 "index_entries": len(entries),
                 "runtime_profile_sha256": profile,
                 "status": "charged",
+                "template": template,
                 "teacher_forward_count": self.bank.restore(
                     entry.binding
                 ).teacher_forward_count,
