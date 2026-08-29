@@ -127,6 +127,15 @@ next token, and trains the Council without creating a speculative state clone.
 Only near-certain phrase continuations can beat direct execution and open a
 wider transactional window.
 
+`scripts/qwen38_markov_bootstrap.py` feeds the same memory without generating
+new traffic. It recursively reads explicit JSON roots, extracts valid
+prompt+target token episodes, deduplicates them against both retained state and
+durable receipt digests, and commits each digest together with its episode in
+one atomic provider-state replacement. Digests outlive bounded token-history
+eviction. A legacy side journal is read only for one-time migration; all new
+idempotence authority lives inside state v5. Persistent JSONL requests then
+continue learning through ordinary target reconciliation and final observation.
+
 Ordinary non-speculative decode consumes its committed continuation cache.
 After layer `l` returns, the old state for `l` loses its final owner and the
 replacement takes its slot. The public cursor and evidence commit only after

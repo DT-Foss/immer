@@ -69,6 +69,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             max_history_tokens=64,
             token_ids=(1, 2, 3, 1, 2, 3),
             updates=4,
+            imported_episode_sha256s=("a" * 64,),
         )
         encoded = state.to_bytes()
 
@@ -106,7 +107,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(provider.metrics().expert_weights), 8)
         provider.close()
 
-    def test_v2_council_state_migrates_to_v4_phrase_memory(self) -> None:
+    def test_v2_council_state_migrates_to_v5_phrase_memory(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         state = seed._state
         seed.close()
@@ -146,11 +147,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((1, 2, 3, 4))
         provider.close()
 
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x04"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x05"))
         migrated = MarkovDraftState.from_bytes(path.read_bytes())
         self.assertEqual(len(migrated.dialects), 1)
 
-    def test_v3_dialect_state_migrates_episode_bindings_to_v4(self) -> None:
+    def test_v3_dialect_state_migrates_episode_bindings_to_v5(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -159,6 +160,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         ).to_bytes()
         document = json.loads(zlib.decompress(encoded[5:]))
         document.pop("episode_dialects")
+        document.pop("imported_episode_sha256s")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v3"
         raw = json.dumps(
             document,
@@ -179,7 +181,75 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.episode_dialects, (None,))
         provider.observe_final((1, 2, 3, 4))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x04"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x05"))
+
+    def test_v4_state_migrates_empty_import_inventory_to_v5(self) -> None:
+        encoded = MarkovDraftState(
+            vocab_size=32,
+            max_history_tokens=64,
+            token_ids=(1, 2, 3),
+            episode_lengths=(3,),
+        ).to_bytes()
+        document = json.loads(zlib.decompress(encoded[5:]))
+        document.pop("imported_episode_sha256s")
+        document["schema"] = "immer.qwen3.8-markov-draft-state/v4"
+        raw = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        path = self.root / "v4-state.bin"
+        path.write_bytes(b"IMMD\x04" + zlib.compress(raw, level=9))
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=path,
+            max_history_tokens=64,
+        )
+
+        self.assertEqual(provider.imported_episode_sha256s(), ())
+        provider.close()
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x05"))
+
+    def test_import_digest_survives_episode_eviction_and_prevents_replay(self) -> None:
+        state_path = self.root / "imported-markov.bin"
+        first_episode = tuple(range(1, 41))
+        second_episode = tuple(range(41, 101))
+        first_digest = "1" * 64
+        second_digest = "2" * 64
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=128,
+            state_path=state_path,
+            max_history_tokens=64,
+        )
+        self.assertTrue(
+            provider.import_confirmed_episode(first_episode, first_digest)
+        )
+        provider.close()
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=128,
+            state_path=state_path,
+            max_history_tokens=64,
+        )
+        self.assertFalse(
+            provider.import_confirmed_episode(first_episode, first_digest)
+        )
+        self.assertTrue(
+            provider.import_confirmed_episode(second_episode, second_digest)
+        )
+        provider.close()
+
+        restored = MarkovDraftState.from_bytes(state_path.read_bytes())
+        self.assertNotIn(1, restored.token_ids)
+        self.assertEqual(restored.updates, 2)
+        self.assertEqual(
+            restored.imported_episode_sha256s,
+            (first_digest, second_digest),
+        )
 
     def test_variable_order_provider_predicts_and_learns_confirmed_prefix(self) -> None:
         state_path = self.root / "markov-state.bin"

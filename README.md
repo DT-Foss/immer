@@ -49,7 +49,9 @@ release surface.
   every target wave selects direct K1 or K4/K8/K16 and stages only that prefix.
   On the compute-bound packed CPU plane, backend row cost prevents marginal
   confidence from multiplying neural work; K1 learns from the confirmed token
-  without cloning transactional state.
+  without cloning transactional state. Existing target receipts can be
+  imported atomically and idempotently; normal persistent traffic then grows
+  the same episode, dialect, expert-rapidity, and phrase memory online.
 - **All-layer Fast MLP.** A prompt-free weight initializer derives p4/k32
   pilots for every Qwen MLP layer from exact Gate/Up Gaussian joint moments.
   Existing full-path tensors update bounded recursive-ridge route statistics;
@@ -150,6 +152,24 @@ release surface.
 - **Independent mechanisms.** IMMER includes its own Causal Prefix Sinkhorn
   Attention line,
   persistent O(1) state, and digest-bound exact capability organs.
+
+## Local packed runtime
+
+```bash
+# Optional zero-forward bootstrap from existing target receipts.
+PYTHONPATH=src python3 scripts/qwen38_markov_bootstrap.py \
+  --state /root/immer-state/qwen-markov-q4-v1.bin \
+  --root artifacts/private/qwen3.8-fertig-local
+
+# One long-lived model process; every confirmed request updates Markov memory.
+PYTHONPATH=src python3 -m immer chat --jsonl \
+  --qwen38-causal-bundle /app/models/Qwen3.8-27B \
+  --qwen38-tokenizer /app/models/Qwen3.8-27B/tokenizer.json \
+  --qwen38-q4 /app/models/Qwen3.8-27B/causal/q4-base-v2 \
+  --q4-threads 16 --device cpu --compute-dtype bfloat16 \
+  --markov-draft-state /root/immer-state/qwen-markov-q4-v1.bin \
+  --draft-window 4
+```
 
 ## Selected trial evidence
 

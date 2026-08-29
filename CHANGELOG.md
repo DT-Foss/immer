@@ -70,6 +70,15 @@ All notable changes to IMMER are recorded here.
   TTFT. The recurrent directory was removed only after 258 shared hardlinks
   were verified; its 240 superseded Q8 Linear-Attention files were the only
   payloads released.
+- Added a read-only receipt importer for persistent Markov memory. It extracts
+  deduplicated prompt+generation token episodes from explicit JSON roots,
+  resumes episode-by-episode, and commits each receipt digest in the same
+  atomic state transition as its learned episode. Digests survive bounded
+  history eviction, eliminating the former state/journal crash window. Legacy
+  journals migrate read-only into state v5; dry-run performs no writes and
+  source files remain unchanged. Beast imported the complete 40-token German
+  answer with zero model forwards; a second run imported zero. State now holds
+  869 tokens, nine episodes, four dialects, and nine updates.
 
 - Generalized correction-first rolling verification from fixed K=4 to a
   configurable K=2–16 target window; `immer chat` defaults to K=8. All target

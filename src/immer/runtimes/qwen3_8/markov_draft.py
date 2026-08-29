@@ -27,13 +27,15 @@ try:
 except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
-MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v7"
+MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v8"
+V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v6"
-_STATE_PREFIX = b"IMMD\x04"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v8"
+_STATE_PREFIX = b"IMMD\x05"
+_V4_STATE_PREFIX = b"IMMD\x04"
 _V3_STATE_PREFIX = b"IMMD\x03"
 _V2_STATE_PREFIX = b"IMMD\x02"
 _LEGACY_STATE_PREFIX = b"IMMD\x01"
@@ -41,6 +43,7 @@ _MAX_STATE_BYTES = 16 * 1024 * 1024
 _UNKNOWN_TOKEN = "<unknown>"
 _EPISODE_TOKEN = "<episode>"
 _HEX = frozenset("0123456789abcdef")
+_MAX_IMPORTED_EPISODE_DIGESTS = 65_536
 
 
 class MarkovDraftError(RuntimeError):
@@ -378,6 +381,7 @@ class MarkovDraftState:
     clock: int = 0
     dialects: tuple[MarkovDialectState, ...] = ()
     episode_dialects: tuple[str | None, ...] = ()
+    imported_episode_sha256s: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -472,6 +476,18 @@ class MarkovDraftState:
                 raise ValueError(f"{label} must be finite and non-negative")
         if isinstance(self.clock, bool) or not isinstance(self.clock, int) or self.clock < 0:
             raise ValueError("clock must be a non-negative integer")
+        imported = tuple(self.imported_episode_sha256s)
+        if (
+            len(imported) > _MAX_IMPORTED_EPISODE_DIGESTS
+            or imported != tuple(sorted(set(imported)))
+            or any(
+                not isinstance(value, str)
+                or len(value) != 64
+                or set(value) - _HEX
+                for value in imported
+            )
+        ):
+            raise ValueError("imported episode digest inventory is invalid")
         dialects = tuple(self.dialects)
         if (
             len(dialects) > 64
@@ -491,6 +507,7 @@ class MarkovDraftState:
         object.__setattr__(self, "episode_lengths", episode_lengths)
         object.__setattr__(self, "dialects", dialects)
         object.__setattr__(self, "episode_dialects", episode_dialects)
+        object.__setattr__(self, "imported_episode_sha256s", imported)
 
     def to_bytes(self) -> bytes:
         raw = _canonical(
@@ -503,6 +520,7 @@ class MarkovDraftState:
                 "leader_changes": self.leader_changes,
                 "episode_lengths": list(self.episode_lengths),
                 "episode_dialects": list(self.episode_dialects),
+                "imported_episode_sha256s": list(self.imported_episode_sha256s),
                 "clock": self.clock,
                 "dialects": [row.to_record() for row in self.dialects],
                 "feedback_count": self.feedback_count,
@@ -529,6 +547,7 @@ class MarkovDraftState:
             or not data.startswith(
                 (
                     _STATE_PREFIX,
+                    _V4_STATE_PREFIX,
                     _V3_STATE_PREFIX,
                     _V2_STATE_PREFIX,
                     _LEGACY_STATE_PREFIX,
@@ -542,12 +561,16 @@ class MarkovDraftState:
                 _STATE_PREFIX
                 if data.startswith(_STATE_PREFIX)
                 else (
-                    _V2_STATE_PREFIX
-                    if data.startswith(_V2_STATE_PREFIX)
+                    _V4_STATE_PREFIX
+                    if data.startswith(_V4_STATE_PREFIX)
                     else (
-                        _V3_STATE_PREFIX
-                        if data.startswith(_V3_STATE_PREFIX)
-                        else _LEGACY_STATE_PREFIX
+                        _V2_STATE_PREFIX
+                        if data.startswith(_V2_STATE_PREFIX)
+                        else (
+                            _V3_STATE_PREFIX
+                            if data.startswith(_V3_STATE_PREFIX)
+                            else _LEGACY_STATE_PREFIX
+                        )
                     )
                 )
             )
@@ -572,6 +595,10 @@ class MarkovDraftState:
         v3 = (
             isinstance(value, dict)
             and value.get("schema") == V3_MARKOV_DRAFT_STATE_SCHEMA
+        )
+        v4 = (
+            isinstance(value, dict)
+            and value.get("schema") == V4_MARKOV_DRAFT_STATE_SCHEMA
         )
         v2_fields = {
             "expert_hits",
@@ -644,6 +671,29 @@ class MarkovDraftState:
                 "updates",
                 "vocab_size",
             }
+            if v4
+            else {
+                "expert_hits",
+                "expert_log_weights",
+                "expert_names",
+                "expert_observations",
+                "leader_changes",
+                "episode_lengths",
+                "episode_dialects",
+                "imported_episode_sha256s",
+                "clock",
+                "dialects",
+                "feedback_count",
+                "max_history_tokens",
+                "regime_generation",
+                "schema",
+                "surprise_cusum",
+                "surprise_deviation",
+                "surprise_mean",
+                "token_ids",
+                "updates",
+                "vocab_size",
+            }
         )
         if (
             not isinstance(value, dict)
@@ -651,6 +701,7 @@ class MarkovDraftState:
             or value.get("schema")
             not in {
                 MARKOV_DRAFT_STATE_SCHEMA,
+                V4_MARKOV_DRAFT_STATE_SCHEMA,
                 V3_MARKOV_DRAFT_STATE_SCHEMA,
                 V2_MARKOV_DRAFT_STATE_SCHEMA,
                 LEGACY_MARKOV_DRAFT_STATE_SCHEMA,
@@ -675,6 +726,9 @@ class MarkovDraftState:
                 leader_changes=value.get("leader_changes", 0),
                 episode_lengths=tuple(value.get("episode_lengths", ())),
                 episode_dialects=tuple(value.get("episode_dialects", ())),
+                imported_episode_sha256s=tuple(
+                    value.get("imported_episode_sha256s", ())
+                ),
                 feedback_count=value.get("feedback_count", 0),
                 surprise_mean=float.fromhex(value.get("surprise_mean", "0x0.0p+0")),
                 surprise_deviation=float.fromhex(
@@ -701,6 +755,8 @@ class MarkovDraftMetrics:
     reconcile_calls: int
     predictions: int
     learned_tokens: int
+    episode_count: int
+    imported_episode_count: int
     updates: int
     state_bytes: int
     council_predictions: int
@@ -865,6 +921,7 @@ class FingerprintRollingK4DraftProvider:
         self._adaptive_proposal_calls = 0
         self._recommended_window_counts = {1: 0, 4: 0, 8: 0, 16: 0}
         self._last_round_proposal: RollingDraftProposal | None = None
+        self._pending_import_digest: str | None = None
         self._closed = False
 
     def _acquire_state_lock(self) -> None:
@@ -1070,6 +1127,78 @@ class FingerprintRollingK4DraftProvider:
             if dialect_id is None or bound_dialect == dialect_id:
                 rows.append(episode)
         return tuple(rows)
+
+    def confirmed_episodes(self) -> tuple[tuple[int, ...], ...]:
+        """Return immutable target-confirmed episodes for idempotent import."""
+
+        if self._closed:
+            raise MarkovDraftError("Markov draft provider is closed")
+        return self._episodes()
+
+    @staticmethod
+    def _import_digest(value: object) -> str:
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or set(value) - _HEX
+        ):
+            raise ValueError("import digest must be a SHA-256 value")
+        return value
+
+    def imported_episode_sha256s(self) -> tuple[str, ...]:
+        """Return durable receipt identities retained beyond token eviction."""
+
+        if self._closed:
+            raise MarkovDraftError("Markov draft provider is closed")
+        return self._state.imported_episode_sha256s
+
+    def register_imported_episode_sha256s(
+        self, values: Sequence[str], /
+    ) -> int:
+        """Atomically migrate legacy import identities into provider state."""
+
+        if self._closed:
+            raise MarkovDraftError("Markov draft provider is closed")
+        if self._request_started or self._request_completed:
+            raise MarkovDraftError("cannot migrate imports during a request")
+        digests = tuple(self._import_digest(value) for value in values)
+        merged = tuple(sorted(set(self._state.imported_episode_sha256s) | set(digests)))
+        added = len(merged) - len(self._state.imported_episode_sha256s)
+        if not added:
+            return 0
+        original = self._state
+        try:
+            self._state = replace(
+                self._state,
+                imported_episode_sha256s=merged,
+            )
+            self._persist()
+        except Exception:
+            self._state = original
+            raise
+        return added
+
+    def import_confirmed_episode(
+        self,
+        history: tuple[int, ...],
+        receipt_sha256: str,
+        /,
+    ) -> bool:
+        """Learn one receipt exactly once in the same atomic state commit."""
+
+        if self._closed:
+            raise MarkovDraftError("Markov draft provider is closed")
+        digest = self._import_digest(receipt_sha256)
+        if digest in self._state.imported_episode_sha256s:
+            return False
+        if self._pending_import_digest is not None:
+            raise MarkovDraftError("another receipt import is pending")
+        self._pending_import_digest = digest
+        try:
+            self.observe_final(history)
+        finally:
+            self._pending_import_digest = None
+        return True
 
     def _phrase_option_from(
         self,
@@ -1694,6 +1823,18 @@ class FingerprintRollingK4DraftProvider:
                 self._apply_council_feedback(feedback, token)
             self._episode_feedback.clear()
             self._learn_episode(committed)
+            if self._pending_import_digest is not None:
+                self._state = replace(
+                    self._state,
+                    imported_episode_sha256s=tuple(
+                        sorted(
+                            {
+                                *self._state.imported_episode_sha256s,
+                                self._pending_import_digest,
+                            }
+                        )
+                    ),
+                )
             self._commit_active_dialect()
             self._last_confirmed_length = len(committed)
             self._persist()
@@ -1765,6 +1906,10 @@ class FingerprintRollingK4DraftProvider:
             reconcile_calls=self._reconcile_calls,
             predictions=self._predictions,
             learned_tokens=len(self._state.token_ids),
+            episode_count=len(self._state.episode_lengths),
+            imported_episode_count=len(
+                self._state.imported_episode_sha256s
+            ),
             updates=self._state.updates,
             state_bytes=len(self._state.to_bytes()),
             council_predictions=self._council_predictions,
@@ -1816,7 +1961,7 @@ class FingerprintRollingK4DraftProvider:
             adaptive_proposal_calls=self._adaptive_proposal_calls,
             recommended_windows=tuple(
                 (window, self._recommended_window_counts[window])
-                for window in (4, 8, 16)
+                for window in (1, 4, 8, 16)
             ),
             last_recommended_window=(
                 None
@@ -1842,6 +1987,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_feedback = ()
         self._carry_feedback = None
         self._pending_phrase_option = None
+        self._pending_import_digest = None
         self._episode_feedback.clear()
         try:
             self._persist()
@@ -1854,6 +2000,7 @@ __all__ = [
     "LEGACY_MARKOV_DRAFT_STATE_SCHEMA",
     "V2_MARKOV_DRAFT_STATE_SCHEMA",
     "V3_MARKOV_DRAFT_STATE_SCHEMA",
+    "V4_MARKOV_DRAFT_STATE_SCHEMA",
     "MARKOV_DRAFT_METRICS_SCHEMA",
     "MARKOV_DRAFT_PROVIDER_ABI",
     "MARKOV_DRAFT_STATE_SCHEMA",
