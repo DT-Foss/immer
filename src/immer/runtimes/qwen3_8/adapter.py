@@ -845,6 +845,7 @@ def _open_local_runtime(
             ),
             delta_head_router=delta_head_router,
             native_deltanet_recurrence=q4_bank is not None,
+            native_deltanet_fusion=q4_bank is not None,
             packed_continuation_gemm=fast_mlp_mount is not None,
         )
         preflight_receipt = model.checkpoint_preflight()
@@ -2486,6 +2487,8 @@ class Qwen38CausalChat:
                 "head_calls",
                 "fused_mlp_calls",
                 "fused_mlp_rows",
+                "fused_deltanet_calls",
+                "fused_deltanet_rows",
                 "input_quantizations",
                 "linear_calls",
                 "linear_group_calls",

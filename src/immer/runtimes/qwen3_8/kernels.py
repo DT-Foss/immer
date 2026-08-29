@@ -41,6 +41,7 @@ __all__ = [
     "full_attention_core",
     "full_attention_fork_core",
     "gated_delta_net_core",
+    "gated_delta_net_postconv_core",
     "l2_normalize",
     "recurrent_gated_delta_rule",
     "rms_norm",
@@ -1175,6 +1176,134 @@ def recurrent_gated_delta_rule(
     return output, recurrent
 
 
+def gated_delta_net_postconv_core(
+    convolved_qkv: torch.Tensor,
+    projected_z: torch.Tensor,
+    projected_b: torch.Tensor,
+    projected_a: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    recurrent_state: torch.Tensor | None = None,
+    rms_norm_eps: float = 1e-6,
+    probe: Callable[[DeltaNetProbe], None] | None = None,
+    state_update_observer: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None
+    ]
+    | None = None,
+    native_recurrence: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the exact DeltaNet core after packed projection and causal Conv."""
+
+    mixed = _floating_tensor(convolved_qkv, "convolved_qkv", ndim=3)
+    z = _floating_tensor(projected_z, "projected_z", ndim=3)
+    b = _floating_tensor(projected_b, "projected_b", ndim=3)
+    a = _floating_tensor(projected_a, "projected_a", ndim=3)
+    key_heads = _positive_int(num_key_heads, "num_key_heads")
+    value_heads = _positive_int(num_value_heads, "num_value_heads")
+    key_width = _positive_int(key_head_dim, "key_head_dim")
+    value_width = _positive_int(value_head_dim, "value_head_dim")
+    if value_heads % key_heads:
+        raise ValueError("num_value_heads must be divisible by num_key_heads")
+    if state_update_observer is not None and not callable(state_update_observer):
+        raise TypeError("state_update_observer must be callable or None")
+    if (
+        mixed.shape[:2] != z.shape[:2]
+        or mixed.shape[:2] != b.shape[:2]
+        or mixed.shape[:2] != a.shape[:2]
+    ):
+        raise ValueError("all DeltaNet projections must share batch and sequence axes")
+    for name, tensor in (("projected_z", z), ("projected_b", b), ("projected_a", a)):
+        _same_device_dtype(mixed, tensor, name)
+    batch_size, sequence_length = mixed.shape[:2]
+    key_features = key_heads * key_width
+    value_features = value_heads * value_width
+    expected_qkv = key_features * 2 + value_features
+    if mixed.shape[-1] != expected_qkv:
+        raise ValueError(
+            f"convolved_qkv feature size {mixed.shape[-1]} does not match "
+            f"2 * {key_features} + {value_features} = {expected_qkv}"
+        )
+    if z.shape[-1] != value_features:
+        raise ValueError(f"projected_z feature size must be {value_features}")
+    if b.shape[-1] != value_heads or a.shape[-1] != value_heads:
+        raise ValueError(f"projected_b/projected_a feature size must be {value_heads}")
+
+    query, key, value = torch.split(
+        mixed,
+        (key_features, key_features, value_features),
+        dim=-1,
+    )
+    query = query.reshape(batch_size, sequence_length, key_heads, key_width)
+    key = key.reshape(batch_size, sequence_length, key_heads, key_width)
+    value = value.reshape(batch_size, sequence_length, value_heads, value_width)
+    raw_query = query
+    raw_key = key
+
+    beta = b.sigmoid()
+    a_log = _floating_tensor(A_log, "A_log", ndim=1)
+    delta_bias = _floating_tensor(dt_bias, "dt_bias", ndim=1)
+    if a_log.numel() != value_heads or delta_bias.numel() != value_heads:
+        raise ValueError(f"A_log and dt_bias must each contain {value_heads} values")
+    if a_log.device != mixed.device or delta_bias.device != mixed.device:
+        raise ValueError("A_log, dt_bias, and projections must be on the same device")
+    log_decay = -a_log.float().exp() * F.softplus(a.float() + delta_bias.float())
+
+    repetitions = value_heads // key_heads
+    if repetitions > 1:
+        query = query.repeat_interleave(repetitions, dim=2)
+        key = key.repeat_interleave(repetitions, dim=2)
+    if state_update_observer is not None:
+        state_update_observer(
+            key.detach(),
+            value.detach(),
+            beta.detach(),
+            log_decay.detach(),
+        )
+    probe_delta_norms: list[float] | None = [] if probe is not None else None
+    core_output, next_recurrent = recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        log_decay,
+        beta,
+        initial_state=recurrent_state,
+        _probe_delta_norms=probe_delta_norms,
+        native_sequence_one=native_recurrence,
+    )
+
+    if probe is not None:
+        if not probe_delta_norms:
+            raise RuntimeError("DeltaNet probe captured no recurrent updates")
+        beta_mean, beta_std = _probe_mean_sample_std(beta)
+        decay = log_decay.exp()
+        decay_mean, decay_std = _probe_mean_sample_std(decay)
+        probe(
+            DeltaNetProbe(
+                beta_mean=beta_mean,
+                beta_std=beta_std,
+                decay_mean=decay_mean,
+                decay_std=decay_std,
+                conv_norm=_probe_mean_vector_norm(mixed, mixed.shape[-1]),
+                q_norm=_probe_mean_vector_norm(raw_query, key_features),
+                k_norm=_probe_mean_vector_norm(raw_key, key_features),
+                v_norm=_probe_mean_vector_norm(value, value_width),
+                delta_norm=math.fsum(probe_delta_norms) / len(probe_delta_norms),
+            )
+        )
+
+    core_output = core_output.reshape(-1, value_width)
+    z = z.reshape(-1, value_width)
+    core_output = rms_norm_gated(core_output, norm_weight, z, rms_norm_eps)
+    output = core_output.reshape(batch_size, sequence_length, value_features)
+    return output, next_recurrent
+
+
 def gated_delta_net_core(
     projected_qkv: torch.Tensor,
     projected_z: torch.Tensor,
@@ -1253,71 +1382,22 @@ def gated_delta_net_core(
         conv_state=previous_conv,
         bias=conv1d_bias,
     )
-    query, key, value = torch.split(
+    output, next_recurrent = gated_delta_net_postconv_core(
         mixed,
-        (key_features, key_features, value_features),
-        dim=-1,
+        z,
+        b,
+        a,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        norm_weight=norm_weight,
+        num_key_heads=key_heads,
+        num_value_heads=value_heads,
+        key_head_dim=key_width,
+        value_head_dim=value_width,
+        recurrent_state=previous_recurrent,
+        rms_norm_eps=rms_norm_eps,
+        probe=probe,
+        state_update_observer=state_update_observer,
+        native_recurrence=native_recurrence,
     )
-    query = query.reshape(batch_size, sequence_length, key_heads, key_width)
-    key = key.reshape(batch_size, sequence_length, key_heads, key_width)
-    value = value.reshape(batch_size, sequence_length, value_heads, value_width)
-    raw_query = query
-    raw_key = key
-
-    beta = b.sigmoid()
-    a_log = _floating_tensor(A_log, "A_log", ndim=1)
-    delta_bias = _floating_tensor(dt_bias, "dt_bias", ndim=1)
-    if a_log.numel() != value_heads or delta_bias.numel() != value_heads:
-        raise ValueError(f"A_log and dt_bias must each contain {value_heads} values")
-    if a_log.device != qkv.device or delta_bias.device != qkv.device:
-        raise ValueError("A_log, dt_bias, and projections must be on the same device")
-    log_decay = -a_log.float().exp() * F.softplus(a.float() + delta_bias.float())
-
-    repetitions = value_heads // key_heads
-    if repetitions > 1:
-        query = query.repeat_interleave(repetitions, dim=2)
-        key = key.repeat_interleave(repetitions, dim=2)
-    if state_update_observer is not None:
-        state_update_observer(
-            key.detach(),
-            value.detach(),
-            beta.detach(),
-            log_decay.detach(),
-        )
-    probe_delta_norms: list[float] | None = [] if probe is not None else None
-    core_output, next_recurrent = recurrent_gated_delta_rule(
-        query,
-        key,
-        value,
-        log_decay,
-        beta,
-        initial_state=previous_recurrent,
-        _probe_delta_norms=probe_delta_norms,
-        native_sequence_one=native_recurrence,
-    )
-
-    if probe is not None:
-        if not probe_delta_norms:
-            raise RuntimeError("DeltaNet probe captured no recurrent updates")
-        beta_mean, beta_std = _probe_mean_sample_std(beta)
-        decay = log_decay.exp()
-        decay_mean, decay_std = _probe_mean_sample_std(decay)
-        probe(
-            DeltaNetProbe(
-                beta_mean=beta_mean,
-                beta_std=beta_std,
-                decay_mean=decay_mean,
-                decay_std=decay_std,
-                conv_norm=_probe_mean_vector_norm(mixed, mixed.shape[-1]),
-                q_norm=_probe_mean_vector_norm(raw_query, key_features),
-                k_norm=_probe_mean_vector_norm(raw_key, key_features),
-                v_norm=_probe_mean_vector_norm(value, value_width),
-                delta_norm=math.fsum(probe_delta_norms) / len(probe_delta_norms),
-            )
-        )
-
-    core_output = core_output.reshape(-1, value_width)
-    z = z.reshape(-1, value_width)
-    core_output = rms_norm_gated(core_output, norm_weight, z, rms_norm_eps)
-    output = core_output.reshape(batch_size, sequence_length, value_features)
     return output, DeltaNetState(conv=next_conv, recurrent=next_recurrent)

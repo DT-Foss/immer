@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import math
 import mmap
 import os
 from pathlib import Path, PurePosixPath
@@ -373,6 +374,45 @@ class Q4NativeKernel:
             integer,
         )
         self.library.immer_q4_sparse_mlp_f32.restype = integer
+        self.library.immer_q4_deltanet_step_f32.argtypes = (
+            void,
+            i64,
+            void,
+            integer,
+            i64,
+            void,
+            integer,
+            i64,
+            void,
+            integer,
+            i64,
+            void,
+            integer,
+            i64,
+            void,
+            void,
+            void,
+            void,
+            void,
+            void,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            ctypes.c_float,
+            integer,
+            void,
+            void,
+            void,
+            void,
+            void,
+            void,
+            void,
+            void,
+            integer,
+        )
+        self.library.immer_q4_deltanet_step_f32.restype = integer
         self.library.immer_q4_linear_group_f32.argtypes = (
             void,
             i64,
@@ -594,6 +634,8 @@ class Q4BankMetrics:
     sparse_coordinate_calls: int = 0
     fused_mlp_calls: int = 0
     fused_mlp_rows: int = 0
+    fused_deltanet_calls: int = 0
+    fused_deltanet_rows: int = 0
     input_quantizations: int = 0
     linear_input_rows: int = 0
     selected_output_rows: int = 0
@@ -1258,6 +1300,168 @@ class Q4Bank:
             self._stats.fused_mlp_calls += 1
             self._stats.fused_mlp_rows += input_rows
             return result, selected
+
+    def deltanet_step(
+        self,
+        hidden: Any,
+        names: tuple[str, str, str, str],
+        *,
+        conv_weight: Any,
+        A_log: Any,
+        dt_bias: Any,
+        norm_weight: Any,
+        conv_state: Any,
+        recurrent_state: Any,
+        key_heads: int,
+        value_heads: int,
+        key_dim: int,
+        value_dim: int,
+        rms_eps: float,
+        output_dtype: Any,
+    ) -> tuple[Any, Any, Any, Any, Any]:
+        """Fuse packed input projections with one exact DeltaNet state step."""
+
+        import torch
+
+        with self._lock:
+            if len(names) != 4 or len(set(names)) != 4:
+                raise ValueError("Q4 fused DeltaNet requires QKV/Z/B/A names")
+            resolved = tuple(self._mapping(name) for name in names)
+            entries = tuple(row[0] for row in resolved)
+            mapped = tuple(row[1] for row in resolved)
+            if not isinstance(hidden, torch.Tensor):
+                hidden = torch.as_tensor(hidden)
+            if (
+                hidden.device.type != "cpu"
+                or hidden.ndim != 3
+                or hidden.shape[0] != 1
+                or hidden.shape[1] != 1
+                or hidden.shape[2] != entries[0].shape[1]
+                or any(entry.shape[1] != hidden.shape[2] for entry in entries)
+            ):
+                raise ValueError("Q4 fused DeltaNet hidden shape is invalid")
+            for field, value in (
+                ("key_heads", key_heads),
+                ("value_heads", value_heads),
+                ("key_dim", key_dim),
+                ("value_dim", value_dim),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError(f"{field} must be a positive integer")
+            qkv_rows = 2 * key_heads * key_dim + value_heads * value_dim
+            z_rows = value_heads * value_dim
+            if (
+                entries[0].shape[0] != qkv_rows
+                or entries[1].shape[0] != z_rows
+                or entries[2].shape[0] != value_heads
+                or entries[3].shape[0] != value_heads
+            ):
+                raise Q4BankError("Q4 fused DeltaNet projection topology changed")
+
+            def f32(value: Any, field: str) -> Any:
+                tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+                if tensor.device.type != "cpu" or not tensor.is_floating_point():
+                    raise ValueError(f"{field} must be a floating CPU tensor")
+                return tensor.detach().to(dtype=torch.float32).contiguous()
+
+            compute = f32(hidden, "hidden").reshape(1, hidden.shape[2])
+            conv = f32(conv_weight, "conv_weight")
+            if conv.ndim == 3 and conv.shape[1] == 1:
+                conv = conv[:, 0, :].contiguous()
+            if conv.ndim != 2 or conv.shape[0] != qkv_rows or conv.shape[1] < 1:
+                raise ValueError("conv_weight shape is invalid")
+            kernel_size = int(conv.shape[1])
+            a_log = f32(A_log, "A_log").reshape(-1)
+            delta_bias = f32(dt_bias, "dt_bias").reshape(-1)
+            norm = f32(norm_weight, "norm_weight").reshape(-1)
+            previous_conv = f32(conv_state, "conv_state")
+            previous_recurrent = f32(recurrent_state, "recurrent_state")
+            if (
+                a_log.shape != (value_heads,)
+                or delta_bias.shape != (value_heads,)
+                or norm.shape != (value_dim,)
+                or previous_conv.shape != (1, qkv_rows, kernel_size)
+                or previous_recurrent.shape
+                != (1, value_heads, key_dim, value_dim)
+            ):
+                raise ValueError("Q4 fused DeltaNet control/state shape is invalid")
+            if (
+                isinstance(rms_eps, bool)
+                or not isinstance(rms_eps, (int, float))
+                or not math.isfinite(float(rms_eps))
+                or float(rms_eps) <= 0.0
+            ):
+                raise ValueError("rms_eps must be finite and positive")
+            projected_qkv = torch.empty((1, 1, qkv_rows), dtype=torch.float32)
+            projected_z = torch.empty((1, 1, z_rows), dtype=torch.float32)
+            projected_b = torch.empty((1, 1, value_heads), dtype=torch.float32)
+            projected_a = torch.empty((1, 1, value_heads), dtype=torch.float32)
+            next_conv = torch.empty((1, qkv_rows, kernel_size), dtype=torch.float32)
+            null = ctypes.c_void_p()
+            code = self.native.library.immer_q4_deltanet_step_f32(
+                self.native._pointer(compute),
+                hidden.shape[2],
+                self.native._pointer(mapped[0].bytes),
+                _FORMAT_CODES[entries[0].format],
+                qkv_rows,
+                self.native._pointer(mapped[1].bytes),
+                _FORMAT_CODES[entries[1].format],
+                z_rows,
+                self.native._pointer(mapped[2].bytes),
+                _FORMAT_CODES[entries[2].format],
+                value_heads,
+                self.native._pointer(mapped[3].bytes),
+                _FORMAT_CODES[entries[3].format],
+                value_heads,
+                self.native._pointer(conv),
+                self.native._pointer(a_log),
+                self.native._pointer(delta_bias),
+                self.native._pointer(norm),
+                self.native._pointer(previous_conv),
+                self.native._pointer(previous_recurrent),
+                key_heads,
+                value_heads,
+                key_dim,
+                value_dim,
+                kernel_size,
+                float(rms_eps),
+                1,
+                null,
+                self.native._pointer(projected_qkv),
+                self.native._pointer(projected_z),
+                self.native._pointer(projected_b),
+                self.native._pointer(projected_a),
+                null,
+                self.native._pointer(next_conv),
+                null,
+                self.threads,
+            )
+            if code == 2:
+                raise ValueError("Q4 fused DeltaNet values are non-finite")
+            if code:
+                raise Q4BankError(f"native Q4 DeltaNet step failed with code {code}")
+            qkv_result = projected_qkv.to(dtype=output_dtype)
+            z_result = projected_z.to(dtype=output_dtype)
+            b_result = projected_b.to(dtype=output_dtype)
+            a_result = projected_a.to(dtype=output_dtype)
+            conv_result = next_conv.to(dtype=output_dtype)
+            self._stats.linear_calls += 4
+            self._stats.linear_group_calls += 1
+            self._stats.input_quantizations += 1
+            self._stats.linear_input_rows += 4
+            self._stats.logical_weight_bytes += sum(
+                entry.payload_bytes for entry in entries
+            )
+            self._stats.output_bytes += (
+                qkv_result.numel() * qkv_result.element_size()
+                + z_result.numel() * z_result.element_size()
+                + b_result.numel() * b_result.element_size()
+                + a_result.numel() * a_result.element_size()
+                + conv_result.numel() * conv_result.element_size()
+            )
+            self._stats.fused_deltanet_calls += 1
+            self._stats.fused_deltanet_rows += 1
+            return qkv_result, z_result, b_result, a_result, conv_result
 
     def rows(self, name: str, row_ids: tuple[int, ...], *, dtype: Any) -> Any:
         import torch

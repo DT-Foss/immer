@@ -98,7 +98,12 @@ from .exact_head import (
     ExactHeadNotApplicable,
     ExactHeadReceipt,
 )
-from .kernels import AttentionState, DeltaNetProbe, DeltaNetState
+from .kernels import (
+    AttentionState,
+    DeltaNetProbe,
+    DeltaNetState,
+    gated_delta_net_postconv_core,
+)
 from .local_draft import (
     QWEN35_K2_DRAFT_PROVIDER_SCHEMA,
     QWEN35_K4_DRAFT_PROVIDER_SCHEMA,
@@ -553,6 +558,7 @@ __all__ = [
     "build_probe_document",
     "compare_probe_documents",
     "deltanet_sequence_one",
+    "gated_delta_net_postconv_core",
     "project_hidden_sketch",
     "prompt_token_sha256",
     "semantic_label_sha256",

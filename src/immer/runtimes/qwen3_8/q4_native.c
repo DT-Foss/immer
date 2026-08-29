@@ -125,6 +125,19 @@ static uint16_t immer_float_to_half(float value) {
     return (uint16_t) half;
 }
 
+static float immer_round_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7f800000u) != 0x7f800000u) {
+        bits += 0x00007fffu + ((bits >> 16) & 1u);
+    } else if (bits & 0x007fffffu) {
+        bits |= 0x00400000u;
+    }
+    bits &= 0xffff0000u;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 static void immer_quantize_q8_row(const float *x, immer_block_q8_0 *out, int64_t cols) {
     const int64_t blocks = cols / IMMER_QK;
     for (int64_t block = 0; block < blocks; ++block) {
@@ -530,6 +543,16 @@ static float immer_silu_f32(float value) {
     return value * exponent / (1.0f + exponent);
 }
 
+static float immer_sigmoid_f32(float value) {
+    if (value >= 0.0f) return 1.0f / (1.0f + expf(-value));
+    const float exponent = expf(value);
+    return exponent / (1.0f + exponent);
+}
+
+static float immer_softplus_f32(float value) {
+    return value > 20.0f ? value : log1pf(expf(value));
+}
+
 static double immer_route_feature(float gate, float up) {
     double clipped = (double) gate;
     if (clipped < -60.0) clipped = -60.0;
@@ -569,6 +592,22 @@ static int immer_size_product3_fits(
     const uint64_t first_second =
         (uint64_t) first * (uint64_t) second;
     return (uint64_t) third <= maximum_elements / first_second;
+}
+
+static int immer_byte_ranges_overlap(
+    const void *left,
+    size_t left_bytes,
+    const void *right,
+    size_t right_bytes
+) {
+    const uintptr_t left_start = (uintptr_t) left;
+    const uintptr_t right_start = (uintptr_t) right;
+    if (
+        left_bytes > UINTPTR_MAX - left_start
+        || right_bytes > UINTPTR_MAX - right_start
+    ) return 1;
+    return left_start < right_start + right_bytes
+        && right_start < left_start + left_bytes;
 }
 
 static int immer_checked_row_layout(
@@ -1646,6 +1685,539 @@ IMMER_EXPORT int immer_q4_sparse_mlp_f32(
     free(selected_down_blocks);
     if (allocation_error) return 3;
     return numeric_error ? 1 : 0;
+}
+
+IMMER_EXPORT int immer_q4_deltanet_step_f32(
+    const float *hidden,
+    int64_t input_cols,
+    const uint8_t *qkv_weights,
+    int qkv_format,
+    int64_t qkv_rows,
+    const uint8_t *z_weights,
+    int z_format,
+    int64_t z_rows,
+    const uint8_t *b_weights,
+    int b_format,
+    int64_t b_rows,
+    const uint8_t *a_weights,
+    int a_format,
+    int64_t a_rows,
+    const float *conv_weight,
+    const float *A_log,
+    const float *dt_bias,
+    const float *norm_weight,
+    const float *conv_state,
+    const float *recurrent_state,
+    int64_t key_heads,
+    int64_t value_heads,
+    int64_t key_dim,
+    int64_t value_dim,
+    int64_t kernel_size,
+    float rms_eps,
+    int pre_recurrence_only,
+    float *mixed_output,
+    float *qkv_output,
+    float *z_output,
+    float *b_output,
+    float *a_output,
+    float *core_output,
+    float *next_conv,
+    float *next_recurrent,
+    int threads
+) {
+    if (
+        !hidden || !qkv_weights || !z_weights || !b_weights || !a_weights
+        || !conv_weight || !conv_state
+        || !qkv_output || !z_output || !b_output || !a_output || !next_conv
+        || (pre_recurrence_only != 0 && pre_recurrence_only != 1)
+        || (!pre_recurrence_only && (
+            !A_log || !dt_bias || !norm_weight || !recurrent_state
+            || !mixed_output || !core_output || !next_recurrent
+        ))
+        || input_cols <= 0 || qkv_rows <= 0 || z_rows <= 0
+        || b_rows <= 0 || a_rows <= 0 || key_heads <= 0
+        || value_heads <= 0 || key_dim <= 0 || value_dim <= 0
+        || kernel_size <= 0 || !isfinite(rms_eps) || rms_eps <= 0.0f
+        || threads <= 0 || value_heads % key_heads != 0
+        || key_heads > INT64_MAX / key_dim
+        || value_heads > INT64_MAX / value_dim
+    ) return 1;
+    const int64_t key_features = key_heads * key_dim;
+    const int64_t value_features = value_heads * value_dim;
+    if (
+        key_features > (INT64_MAX - value_features) / 2
+        || qkv_rows != 2 * key_features + value_features
+        || z_rows != value_features
+        || b_rows != value_heads
+        || a_rows != value_heads
+    ) return 1;
+
+    int64_t qkv_input_blocks;
+    int64_t z_input_blocks;
+    int64_t b_input_blocks;
+    int64_t a_input_blocks;
+    size_t qkv_row_bytes;
+    size_t z_row_bytes;
+    size_t b_row_bytes;
+    size_t a_row_bytes;
+    if (
+        !immer_checked_row_layout(
+            qkv_format, input_cols, &qkv_input_blocks, &qkv_row_bytes
+        )
+        || !immer_checked_row_layout(
+            z_format, input_cols, &z_input_blocks, &z_row_bytes
+        )
+        || !immer_checked_row_layout(
+            b_format, input_cols, &b_input_blocks, &b_row_bytes
+        )
+        || !immer_checked_row_layout(
+            a_format, input_cols, &a_input_blocks, &a_row_bytes
+        )
+        || qkv_input_blocks != z_input_blocks
+        || qkv_input_blocks != b_input_blocks
+        || qkv_input_blocks != a_input_blocks
+    ) return 1;
+    if (
+        qkv_rows > INT64_MAX - z_rows
+        || qkv_rows + z_rows > INT64_MAX - b_rows
+        || qkv_rows + z_rows + b_rows > INT64_MAX - a_rows
+    ) return 1;
+    const int64_t projection_rows = qkv_rows + z_rows + b_rows + a_rows;
+    if (
+        !immer_size_product_fits(input_cols, 1, sizeof(float))
+        || !immer_size_product_fits(qkv_rows, 1, qkv_row_bytes)
+        || !immer_size_product_fits(z_rows, 1, z_row_bytes)
+        || !immer_size_product_fits(b_rows, 1, b_row_bytes)
+        || !immer_size_product_fits(a_rows, 1, a_row_bytes)
+        || !immer_size_product_fits(
+            1, qkv_input_blocks, sizeof(immer_block_q8_0)
+        )
+        || !immer_size_product_fits(qkv_rows, kernel_size, sizeof(float))
+        || !immer_size_product_fits(
+            value_heads, key_dim, sizeof(float)
+        )
+        || !immer_size_product3_fits(
+            value_heads, key_dim, value_dim, sizeof(float)
+        )
+        || !immer_size_product_fits(value_features, 1, sizeof(float))
+    ) return 1;
+
+    const size_t hidden_bytes = (size_t) input_cols * sizeof(float);
+    const size_t qkv_weight_bytes = (size_t) qkv_rows * qkv_row_bytes;
+    const size_t z_weight_bytes = (size_t) z_rows * z_row_bytes;
+    const size_t b_weight_bytes = (size_t) b_rows * b_row_bytes;
+    const size_t a_weight_bytes = (size_t) a_rows * a_row_bytes;
+    const size_t conv_count = (size_t) qkv_rows * (size_t) kernel_size;
+    const size_t conv_bytes = conv_count * sizeof(float);
+    const size_t control_bytes = (size_t) value_heads * sizeof(float);
+    const size_t norm_bytes = (size_t) value_dim * sizeof(float);
+    const size_t recurrent_count =
+        (size_t) value_heads * (size_t) key_dim * (size_t) value_dim;
+    const size_t recurrent_bytes = recurrent_count * sizeof(float);
+    const size_t mixed_bytes = (size_t) value_features * sizeof(float);
+    const void *output_pointers[8];
+    size_t output_bytes[8];
+    int output_count = 0;
+    output_pointers[output_count] = qkv_output;
+    output_bytes[output_count++] = (size_t) qkv_rows * sizeof(float);
+    output_pointers[output_count] = z_output;
+    output_bytes[output_count++] = mixed_bytes;
+    output_pointers[output_count] = b_output;
+    output_bytes[output_count++] = control_bytes;
+    output_pointers[output_count] = a_output;
+    output_bytes[output_count++] = control_bytes;
+    output_pointers[output_count] = next_conv;
+    output_bytes[output_count++] = conv_bytes;
+    if (!pre_recurrence_only) {
+        output_pointers[output_count] = mixed_output;
+        output_bytes[output_count++] = mixed_bytes;
+        output_pointers[output_count] = core_output;
+        output_bytes[output_count++] = mixed_bytes;
+        output_pointers[output_count] = next_recurrent;
+        output_bytes[output_count++] = recurrent_bytes;
+    }
+    const void *input_pointers[11];
+    size_t input_bytes[11];
+    int input_count = 0;
+    input_pointers[input_count] = hidden;
+    input_bytes[input_count++] = hidden_bytes;
+    input_pointers[input_count] = qkv_weights;
+    input_bytes[input_count++] = qkv_weight_bytes;
+    input_pointers[input_count] = z_weights;
+    input_bytes[input_count++] = z_weight_bytes;
+    input_pointers[input_count] = b_weights;
+    input_bytes[input_count++] = b_weight_bytes;
+    input_pointers[input_count] = a_weights;
+    input_bytes[input_count++] = a_weight_bytes;
+    input_pointers[input_count] = conv_weight;
+    input_bytes[input_count++] = conv_bytes;
+    input_pointers[input_count] = conv_state;
+    input_bytes[input_count++] = conv_bytes;
+    if (!pre_recurrence_only) {
+        input_pointers[input_count] = A_log;
+        input_bytes[input_count++] = control_bytes;
+        input_pointers[input_count] = dt_bias;
+        input_bytes[input_count++] = control_bytes;
+        input_pointers[input_count] = norm_weight;
+        input_bytes[input_count++] = norm_bytes;
+        input_pointers[input_count] = recurrent_state;
+        input_bytes[input_count++] = recurrent_bytes;
+    }
+    for (int left = 0; left < output_count; ++left) {
+        for (int right = left + 1; right < output_count; ++right) {
+            if (immer_byte_ranges_overlap(
+                output_pointers[left],
+                output_bytes[left],
+                output_pointers[right],
+                output_bytes[right]
+            )) return 1;
+        }
+        for (int source = 0; source < input_count; ++source) {
+            if (immer_byte_ranges_overlap(
+                output_pointers[left],
+                output_bytes[left],
+                input_pointers[source],
+                input_bytes[source]
+            )) return 1;
+        }
+    }
+
+    if (
+        !immer_f32_values_are_finite(hidden, (size_t) input_cols)
+        || !immer_f32_values_are_finite(conv_weight, conv_count)
+        || !immer_f32_values_are_finite(conv_state, conv_count)
+    ) return 2;
+    if (
+        !pre_recurrence_only
+        && (
+            !immer_f32_values_are_finite(A_log, (size_t) value_heads)
+            || !immer_f32_values_are_finite(dt_bias, (size_t) value_heads)
+            || !immer_f32_values_are_finite(norm_weight, (size_t) value_dim)
+            || !immer_f32_values_are_finite(
+                recurrent_state, recurrent_count
+            )
+        )
+    ) return 2;
+
+    immer_block_q8_0 *quantized_hidden = (immer_block_q8_0 *) malloc(
+        (size_t) qkv_input_blocks * sizeof(immer_block_q8_0)
+    );
+    float *projected_qkv = (float *) malloc(
+        (size_t) qkv_rows * sizeof(float)
+    );
+    float *projected_z = (float *) malloc(
+        (size_t) z_rows * sizeof(float)
+    );
+    float *projected_b = (float *) malloc(
+        (size_t) b_rows * sizeof(float)
+    );
+    float *projected_a = (float *) malloc(
+        (size_t) a_rows * sizeof(float)
+    );
+    float *normalized_q = NULL;
+    float *normalized_k = NULL;
+    float *delta = NULL;
+    if (!pre_recurrence_only) {
+        normalized_q = (float *) malloc(
+            (size_t) key_features * sizeof(float)
+        );
+        normalized_k = (float *) malloc(
+            (size_t) key_features * sizeof(float)
+        );
+        delta = (float *) malloc(mixed_bytes);
+    }
+    if (
+        !quantized_hidden || !projected_qkv || !projected_z
+        || !projected_b || !projected_a
+        || (!pre_recurrence_only && (
+            !normalized_q || !normalized_k || !delta
+        ))
+    ) {
+        free(quantized_hidden);
+        free(projected_qkv);
+        free(projected_z);
+        free(projected_b);
+        free(projected_a);
+        free(normalized_q);
+        free(normalized_k);
+        free(delta);
+        return 3;
+    }
+
+    int numeric_error = 0;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(threads)
+#endif
+    {
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        {
+            immer_quantize_q8_row(
+                hidden, quantized_hidden, input_cols
+            );
+            for (
+                int64_t block = 0;
+                block < qkv_input_blocks;
+                ++block
+            ) {
+                if (!isfinite(immer_half_to_float(quantized_hidden[block].d))) {
+                    numeric_error = 1;
+                }
+            }
+        }
+
+        if (!numeric_error) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+            for (int64_t row = 0; row < projection_rows; ++row) {
+                const uint8_t *weights;
+                int format;
+                size_t row_bytes;
+                int64_t local_row;
+                float *target;
+                float *external_target = NULL;
+                if (row < qkv_rows) {
+                    weights = qkv_weights;
+                    format = qkv_format;
+                    row_bytes = qkv_row_bytes;
+                    local_row = row;
+                    target = projected_qkv;
+                } else if (row < qkv_rows + z_rows) {
+                    weights = z_weights;
+                    format = z_format;
+                    row_bytes = z_row_bytes;
+                    local_row = row - qkv_rows;
+                    target = projected_z;
+                    external_target = z_output;
+                } else if (row < qkv_rows + z_rows + b_rows) {
+                    weights = b_weights;
+                    format = b_format;
+                    row_bytes = b_row_bytes;
+                    local_row = row - qkv_rows - z_rows;
+                    target = projected_b;
+                    external_target = b_output;
+                } else {
+                    weights = a_weights;
+                    format = a_format;
+                    row_bytes = a_row_bytes;
+                    local_row = row - qkv_rows - z_rows - b_rows;
+                    target = projected_a;
+                    external_target = a_output;
+                }
+                const float projected = immer_round_bf16(
+                    immer_dot_packed_q8(
+                        weights + (size_t) local_row * row_bytes,
+                        format,
+                        quantized_hidden,
+                        qkv_input_blocks
+                    )
+                );
+                target[local_row] = projected;
+                if (external_target) external_target[local_row] = projected;
+                if (!isfinite(projected)) numeric_error = 1;
+            }
+        }
+
+        if (!numeric_error) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+            for (int64_t channel = 0; channel < qkv_rows; ++channel) {
+                const size_t offset =
+                    (size_t) channel * (size_t) kernel_size;
+                for (int64_t index = 0; index + 1 < kernel_size; ++index) {
+                    next_conv[offset + (size_t) index] = conv_state[
+                        offset + (size_t) index + 1
+                    ];
+                }
+                next_conv[offset + (size_t) kernel_size - 1] =
+                    projected_qkv[channel];
+                float convolved = 0.0f;
+                for (int64_t index = 0; index < kernel_size; ++index) {
+                    convolved += next_conv[offset + (size_t) index]
+                        * conv_weight[offset + (size_t) index];
+                }
+                convolved = immer_round_bf16(convolved);
+                const float activated = immer_round_bf16(
+                    immer_silu_f32(convolved)
+                );
+                projected_qkv[channel] = activated;
+                qkv_output[channel] = activated;
+                if (!isfinite(activated)) numeric_error = 1;
+            }
+        }
+
+        if (!numeric_error && !pre_recurrence_only) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+            for (int64_t head = 0; head < value_heads; ++head) {
+                projected_b[head] = immer_round_bf16(
+                    immer_sigmoid_f32(projected_b[head])
+                );
+                projected_a[head] = -expf(A_log[head]) * immer_softplus_f32(
+                    projected_a[head] + dt_bias[head]
+                );
+                if (
+                    !isfinite(projected_b[head])
+                    || !isfinite(projected_a[head])
+                ) numeric_error = 1;
+            }
+        }
+
+        if (!numeric_error && !pre_recurrence_only) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+            for (int64_t head = 0; head < key_heads; ++head) {
+                const float *raw_q =
+                    projected_qkv + (size_t) head * (size_t) key_dim;
+                const float *raw_k = projected_qkv
+                    + (size_t) key_features
+                    + (size_t) head * (size_t) key_dim;
+                float q_squared = 0.0f;
+                float k_squared = 0.0f;
+                for (int64_t index = 0; index < key_dim; ++index) {
+                    q_squared += immer_round_bf16(
+                        raw_q[index] * raw_q[index]
+                    );
+                    k_squared += immer_round_bf16(
+                        raw_k[index] * raw_k[index]
+                    );
+                }
+                q_squared = immer_round_bf16(q_squared);
+                k_squared = immer_round_bf16(k_squared);
+                const float q_root = immer_round_bf16(
+                    sqrtf(immer_round_bf16(q_squared + 1e-6f))
+                );
+                const float k_root = immer_round_bf16(
+                    sqrtf(immer_round_bf16(k_squared + 1e-6f))
+                );
+                const float q_inverse = immer_round_bf16(1.0f / q_root);
+                const float k_inverse = immer_round_bf16(1.0f / k_root);
+                const float q_scale = 1.0f / sqrtf((float) key_dim);
+                for (int64_t index = 0; index < key_dim; ++index) {
+                    normalized_q[
+                        (size_t) head * (size_t) key_dim + (size_t) index
+                    ] = immer_round_bf16(raw_q[index] * q_inverse) * q_scale;
+                    normalized_k[
+                        (size_t) head * (size_t) key_dim + (size_t) index
+                    ] = immer_round_bf16(raw_k[index] * k_inverse);
+                }
+                if (!isfinite(q_inverse) || !isfinite(k_inverse)) {
+                    numeric_error = 1;
+                }
+            }
+        }
+
+        if (!numeric_error && !pre_recurrence_only) {
+            const int64_t repetitions = value_heads / key_heads;
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+            for (int64_t head = 0; head < value_heads; ++head) {
+                const int64_t key_head = head / repetitions;
+                const float *active_q = normalized_q
+                    + (size_t) key_head * (size_t) key_dim;
+                const float *active_k = normalized_k
+                    + (size_t) key_head * (size_t) key_dim;
+                const float *active_v = projected_qkv
+                    + (size_t) 2 * (size_t) key_features
+                    + (size_t) head * (size_t) value_dim;
+                const float beta = projected_b[head];
+                const float decay = expf(projected_a[head]);
+                const size_t value_offset =
+                    (size_t) head * (size_t) value_dim;
+                const size_t state_offset =
+                    value_offset * (size_t) key_dim;
+                const float *old_state = recurrent_state + state_offset;
+                float *new_state = next_recurrent + state_offset;
+                float *active_output = mixed_output + value_offset;
+                float *active_delta = delta + value_offset;
+                for (int64_t value = 0; value < value_dim; ++value) {
+                    active_output[value] = 0.0f;
+                }
+                for (int64_t key = 0; key < key_dim; ++key) {
+                    const size_t row_offset =
+                        (size_t) key * (size_t) value_dim;
+                    for (int64_t value = 0; value < value_dim; ++value) {
+                        const float remembered =
+                            old_state[row_offset + (size_t) value] * decay;
+                        new_state[row_offset + (size_t) value] = remembered;
+                        active_output[value] += remembered * active_k[key];
+                    }
+                }
+                for (int64_t value = 0; value < value_dim; ++value) {
+                    active_delta[value] =
+                        (active_v[value] - active_output[value]) * beta;
+                    active_output[value] = 0.0f;
+                }
+                for (int64_t key = 0; key < key_dim; ++key) {
+                    const size_t row_offset =
+                        (size_t) key * (size_t) value_dim;
+                    for (int64_t value = 0; value < value_dim; ++value) {
+                        const float updated =
+                            new_state[row_offset + (size_t) value]
+                            + active_k[key] * active_delta[value];
+                        new_state[row_offset + (size_t) value] = updated;
+                        active_output[value] += updated * active_q[key];
+                        if (!isfinite(updated)) numeric_error = 1;
+                    }
+                }
+                for (int64_t value = 0; value < value_dim; ++value) {
+                    active_output[value] = immer_round_bf16(
+                        active_output[value]
+                    );
+                    core_output[value_offset + (size_t) value] =
+                        active_output[value];
+                    if (!isfinite(active_output[value])) numeric_error = 1;
+                }
+            }
+        }
+
+        if (!numeric_error && !pre_recurrence_only) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+            for (int64_t head = 0; head < value_heads; ++head) {
+                const size_t offset =
+                    (size_t) head * (size_t) value_dim;
+                float squared = 0.0f;
+                for (int64_t value = 0; value < value_dim; ++value) {
+                    const float active = mixed_output[offset + (size_t) value];
+                    squared += active * active;
+                }
+                const float inverse = 1.0f / sqrtf(
+                    squared / (float) value_dim + rms_eps
+                );
+                for (int64_t value = 0; value < value_dim; ++value) {
+                    const size_t index = offset + (size_t) value;
+                    const float normalized = immer_round_bf16(
+                        mixed_output[index] * inverse
+                    );
+                    const float scaled = immer_round_bf16(
+                        normalized * immer_round_bf16(norm_weight[value])
+                    );
+                    mixed_output[index] = immer_round_bf16(
+                        scaled * immer_silu_f32(projected_z[index])
+                    );
+                    if (!isfinite(mixed_output[index])) numeric_error = 1;
+                }
+            }
+        }
+    }
+
+    free(quantized_hidden);
+    free(projected_qkv);
+    free(projected_z);
+    free(projected_b);
+    free(projected_a);
+    free(normalized_q);
+    free(normalized_k);
+    free(delta);
+    return numeric_error ? 2 : 0;
 }
 
 IMMER_EXPORT int immer_q4_linear_group_f32(

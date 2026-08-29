@@ -28,6 +28,7 @@ from .kernels import (
     DeltaNetState,
     full_attention_core,
     gated_delta_net_core,
+    gated_delta_net_postconv_core,
     recurrent_gated_delta_rule,
     rms_norm,
     swiglu,
@@ -292,6 +293,7 @@ class StreamedQwen38:
         mlp_sparse_executor: Any | None = None,
         delta_head_router: Any | None = None,
         native_deltanet_recurrence: bool = False,
+        native_deltanet_fusion: bool = False,
         packed_continuation_gemm: bool = False,
         max_batch_size: int = 8,
         max_seq_len: int = 4096,
@@ -318,6 +320,8 @@ class StreamedQwen38:
             raise TypeError("packed_continuation_gemm must be boolean")
         if not isinstance(native_deltanet_recurrence, bool):
             raise TypeError("native_deltanet_recurrence must be boolean")
+        if not isinstance(native_deltanet_fusion, bool):
+            raise TypeError("native_deltanet_fusion must be boolean")
         if graft is not None and native_head_crsa is not None:
             raise ValueError(
                 "hidden graft and native Head-CRSA intervention are mutually exclusive"
@@ -471,6 +475,7 @@ class StreamedQwen38:
         self.mlp_sparse_executor = mlp_sparse_executor
         self.delta_head_router = delta_head_router
         self.native_deltanet_recurrence = native_deltanet_recurrence
+        self.native_deltanet_fusion = native_deltanet_fusion
         self.packed_continuation_gemm = packed_continuation_gemm
         self.mlp_sparse_last_trace: Any | None = None
         self.mlp_sparse_last_decision: Any | None = None
@@ -700,6 +705,7 @@ class StreamedQwen38:
             "state_policy": "native-kv+deltanet-transactional/v1",
             "packed_continuation_gemm": self.packed_continuation_gemm,
             "native_deltanet_recurrence": self.native_deltanet_recurrence,
+            "native_deltanet_fusion": self.native_deltanet_fusion,
             "quantized_weight_plane": q4_identity,
         }
         transport_execution = {
@@ -1439,47 +1445,104 @@ class StreamedQwen38:
         base = f"model.language_model.layers.{layer}.linear_attn"
         # Official Qwen masks padding before every Gated DeltaNet projection.
         active = hidden * token_mask.unsqueeze(-1).to(dtype=hidden.dtype)
-        projected_qkv, projected_z, projected_b, projected_a = (
-            self.pager.linear_group(
-                active,
-                (
-                    f"{base}.in_proj_qkv",
-                    f"{base}.in_proj_z",
-                    f"{base}.in_proj_b",
-                    f"{base}.in_proj_a",
-                ),
-            )
-        )
         conv_weight = self._control(f"{base}.conv1d.weight", dtype=hidden.dtype)
         a_log = self._control(f"{base}.A_log")
         dt_bias = self._control(f"{base}.dt_bias")
         norm_weight = self._control(f"{base}.norm.weight", dtype=hidden.dtype)
         try:
-            probe = (
-                None
-                if self.delta_probe is None
-                else lambda row: self.delta_probe(layer, row)
+            q4_bank = getattr(self.pager, "q4_bank", None)
+            fused = (
+                state is not None
+                and self.delta_probe is None
+                and self.native_deltanet_recurrence
+                and self.native_deltanet_fusion
+                and q4_bank is not None
+                and callable(getattr(q4_bank, "deltanet_step", None))
+                and tuple(active.shape[:2]) == (1, 1)
             )
-            mixed, next_state = gated_delta_net_core(
-                projected_qkv,
-                projected_z,
-                projected_b,
-                projected_a,
-                conv1d_weight=conv_weight,
-                A_log=a_log,
-                dt_bias=dt_bias,
-                norm_weight=norm_weight,
-                num_key_heads=self.config.linear_num_key_heads,
-                num_value_heads=self.config.linear_num_value_heads,
-                key_head_dim=self.config.linear_key_head_dim,
-                value_head_dim=self.config.linear_value_head_dim,
-                state=state,
-                rms_norm_eps=self.config.rms_norm_eps,
-                probe=probe,
-                native_recurrence=self.native_deltanet_recurrence,
-            )
+            if fused:
+                projected_qkv, projected_z, projected_b, projected_a, next_conv = (
+                    q4_bank.deltanet_step(
+                        active,
+                        (
+                            f"{base}.in_proj_qkv.weight",
+                            f"{base}.in_proj_z.weight",
+                            f"{base}.in_proj_b.weight",
+                            f"{base}.in_proj_a.weight",
+                        ),
+                        conv_weight=conv_weight,
+                        A_log=a_log,
+                        dt_bias=dt_bias,
+                        norm_weight=norm_weight,
+                        conv_state=state.conv,
+                        recurrent_state=state.recurrent,
+                        key_heads=self.config.linear_num_key_heads,
+                        value_heads=self.config.linear_num_value_heads,
+                        key_dim=self.config.linear_key_head_dim,
+                        value_dim=self.config.linear_value_head_dim,
+                        rms_eps=self.config.rms_norm_eps,
+                        output_dtype=hidden.dtype,
+                    )
+                )
+                mixed, next_recurrent = gated_delta_net_postconv_core(
+                    projected_qkv,
+                    projected_z,
+                    projected_b,
+                    projected_a,
+                    A_log=a_log,
+                    dt_bias=dt_bias,
+                    norm_weight=norm_weight,
+                    num_key_heads=self.config.linear_num_key_heads,
+                    num_value_heads=self.config.linear_num_value_heads,
+                    key_head_dim=self.config.linear_key_head_dim,
+                    value_head_dim=self.config.linear_value_head_dim,
+                    recurrent_state=state.recurrent,
+                    rms_norm_eps=self.config.rms_norm_eps,
+                    native_recurrence=self.native_deltanet_recurrence,
+                )
+                next_state = DeltaNetState(
+                    conv=next_conv,
+                    recurrent=next_recurrent,
+                )
+            else:
+                projected_qkv, projected_z, projected_b, projected_a = (
+                    self.pager.linear_group(
+                        active,
+                        (
+                            f"{base}.in_proj_qkv",
+                            f"{base}.in_proj_z",
+                            f"{base}.in_proj_b",
+                            f"{base}.in_proj_a",
+                        ),
+                    )
+                )
+                try:
+                    probe = (
+                        None
+                        if self.delta_probe is None
+                        else lambda row: self.delta_probe(layer, row)
+                    )
+                    mixed, next_state = gated_delta_net_core(
+                        projected_qkv,
+                        projected_z,
+                        projected_b,
+                        projected_a,
+                        conv1d_weight=conv_weight,
+                        A_log=a_log,
+                        dt_bias=dt_bias,
+                        norm_weight=norm_weight,
+                        num_key_heads=self.config.linear_num_key_heads,
+                        num_value_heads=self.config.linear_num_value_heads,
+                        key_head_dim=self.config.linear_key_head_dim,
+                        value_head_dim=self.config.linear_value_head_dim,
+                        state=state,
+                        rms_norm_eps=self.config.rms_norm_eps,
+                        probe=probe,
+                        native_recurrence=self.native_deltanet_recurrence,
+                    )
+                finally:
+                    del projected_qkv, projected_z, projected_b, projected_a
         finally:
-            del projected_qkv, projected_z, projected_b, projected_a
             del conv_weight, a_log, dt_bias, norm_weight
         router = self.delta_head_router
         if (
@@ -2254,6 +2317,7 @@ class StreamedQwen38:
                 "compute_dtype": str(self.pager.compute_dtype),
                 "packed_continuation_gemm": self.packed_continuation_gemm,
                 "native_deltanet_recurrence": self.native_deltanet_recurrence,
+                "native_deltanet_fusion": self.native_deltanet_fusion,
                 "quantized_weight_plane": (
                     None
                     if getattr(self.pager, "q4_bank", None) is None

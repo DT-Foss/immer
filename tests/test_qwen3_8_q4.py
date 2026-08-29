@@ -30,6 +30,12 @@ from immer.runtimes.qwen3_8.q4_fast_mlp import (
     PackedFastMlpMarkovController,
     Qwen38PackedFastMlpExecutor,
 )
+from immer.runtimes.qwen3_8.kernels import (
+    causal_depthwise_conv,
+    DeltaNetState,
+    gated_delta_net_core,
+    gated_delta_net_postconv_core,
+)
 
 
 _BUNDLE = {
@@ -749,6 +755,140 @@ class Q4BankTests(unittest.TestCase):
                 metrics = bank.metrics()
                 self.assertEqual(metrics["fused_mlp_calls"], 1)
                 self.assertEqual(metrics["fused_mlp_rows"], 2)
+            finally:
+                bank.close()
+
+    def test_fused_deltanet_step_matches_packed_projection_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-fused-deltanet"
+            generator = torch.Generator().manual_seed(992)
+            base = "model.language_model.layers.0.linear_attn"
+            hidden_dim = 64
+            key_heads, value_heads = 1, 2
+            key_dim = value_dim = 16
+            qkv_rows = 2 * key_heads * key_dim + value_heads * value_dim
+            z_rows = value_heads * value_dim
+            names = (
+                f"{base}.in_proj_qkv.weight",
+                f"{base}.in_proj_z.weight",
+                f"{base}.in_proj_b.weight",
+                f"{base}.in_proj_a.weight",
+            )
+            tensors = {
+                names[0]: torch.randn((qkv_rows, hidden_dim), generator=generator),
+                names[1]: torch.randn((z_rows, hidden_dim), generator=generator),
+                names[2]: torch.randn((value_heads, hidden_dim), generator=generator),
+                names[3]: torch.randn((value_heads, hidden_dim), generator=generator),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=16,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                hidden = torch.randn(
+                    (1, 1, hidden_dim), generator=generator, dtype=torch.bfloat16
+                )
+                conv_weight = torch.randn(
+                    (qkv_rows, 1, 4), generator=generator, dtype=torch.bfloat16
+                ) * 0.05
+                a_log = torch.randn(value_heads, generator=generator) * 0.1
+                dt_bias = torch.randn(value_heads, generator=generator) * 0.1
+                norm_weight = torch.randn(
+                    value_dim, generator=generator, dtype=torch.bfloat16
+                ) * 0.1 + 1.0
+                state = DeltaNetState(
+                    conv=torch.randn(
+                        (1, qkv_rows, 4), generator=generator, dtype=torch.bfloat16
+                    ),
+                    recurrent=torch.randn(
+                        (1, value_heads, key_dim, value_dim), generator=generator
+                    ),
+                )
+                projections = bank.linear_group(
+                    hidden,
+                    names,
+                    output_dtype=torch.bfloat16,
+                )
+                expected, expected_state = gated_delta_net_core(
+                    *projections,
+                    conv1d_weight=conv_weight,
+                    A_log=a_log,
+                    dt_bias=dt_bias,
+                    norm_weight=norm_weight,
+                    num_key_heads=key_heads,
+                    num_value_heads=value_heads,
+                    key_head_dim=key_dim,
+                    value_head_dim=value_dim,
+                    state=state,
+                    native_recurrence=True,
+                )
+                convolved, _ = causal_depthwise_conv(
+                    projections[0],
+                    conv_weight,
+                    conv_state=state.conv,
+                )
+
+                actual_qkv, actual_z, actual_b, actual_a, actual_conv = (
+                    bank.deltanet_step(
+                        hidden,
+                        names,
+                        conv_weight=conv_weight,
+                        A_log=a_log,
+                        dt_bias=dt_bias,
+                        norm_weight=norm_weight,
+                        conv_state=state.conv,
+                        recurrent_state=state.recurrent,
+                        key_heads=key_heads,
+                        value_heads=value_heads,
+                        key_dim=key_dim,
+                        value_dim=value_dim,
+                        rms_eps=1e-6,
+                        output_dtype=torch.bfloat16,
+                    )
+                )
+                actual, actual_recurrent = gated_delta_net_postconv_core(
+                    actual_qkv,
+                    actual_z,
+                    actual_b,
+                    actual_a,
+                    A_log=a_log,
+                    dt_bias=dt_bias,
+                    norm_weight=norm_weight,
+                    num_key_heads=key_heads,
+                    num_value_heads=value_heads,
+                    key_head_dim=key_dim,
+                    value_head_dim=value_dim,
+                    recurrent_state=state.recurrent,
+                    rms_norm_eps=1e-6,
+                    native_recurrence=True,
+                )
+
+                torch.testing.assert_close(actual_qkv, convolved)
+                torch.testing.assert_close(actual_z, projections[1])
+                torch.testing.assert_close(actual_b, projections[2])
+                torch.testing.assert_close(actual_a, projections[3])
+                torch.testing.assert_close(
+                    actual_recurrent,
+                    expected_state.recurrent,
+                    rtol=2e-5,
+                    atol=2e-5,
+                )
+                torch.testing.assert_close(actual, expected, rtol=5e-3, atol=5e-3)
+                torch.testing.assert_close(actual_conv, expected_state.conv)
+                metrics = bank.metrics()
+                self.assertEqual(metrics["fused_deltanet_calls"], 1)
+                self.assertEqual(metrics["fused_deltanet_rows"], 1)
             finally:
                 bank.close()
 
