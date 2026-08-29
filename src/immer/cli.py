@@ -135,6 +135,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             range_prefetch_max_bytes=int(args.range_prefetch_max_mb * 1024**2),
             range_prefetch_min_support=args.range_prefetch_min_support,
             range_prefetch_min_confidence=args.range_prefetch_min_confidence,
+            range_prefetch_beam_horizon=args.range_prefetch_beam_horizon,
+            range_prefetch_beam_width=args.range_prefetch_beam_width,
+            range_prefetch_hint_cooldown=args.range_prefetch_hint_cooldown,
             fast_mlp_root=args.fast_mlp,
             fast_mlp_online_state_path=args.fast_mlp_online_state,
             fast_mlp_source_budget_mb=args.fast_mlp_source_budget_mb,
@@ -789,6 +792,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.65,
         help="minimum next-operation probability before a range hint",
+    )
+    chat.add_argument(
+        "--range-prefetch-beam-horizon",
+        type=int,
+        default=3,
+        help="future operation depth for the bounded range beam",
+    )
+    chat.add_argument(
+        "--range-prefetch-beam-width",
+        type=int,
+        default=4,
+        help="maximum hypothetical paths retained at each range depth",
+    )
+    chat.add_argument(
+        "--range-prefetch-hint-cooldown",
+        type=int,
+        default=2,
+        help="operations before an identical exact range can be hinted again",
     )
     chat.add_argument(
         "--fast-mlp",

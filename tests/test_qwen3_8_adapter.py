@@ -429,6 +429,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 min_support=3,
                 min_confidence=0.8,
                 max_prefetch_bytes=123,
+                beam_horizon=3,
+                beam_width=4,
+                hint_cooldown_operations=2,
             )
             source.set_access_observer.assert_called_once_with(
                 prefetcher,

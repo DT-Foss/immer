@@ -25,7 +25,9 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
 
 RANGE_MARKOV_STATE_SCHEMA = "immer.range-markov-state/v1"
 RANGE_MARKOV_PREDICTION_SCHEMA = "immer.range-markov-prediction/v1"
-RANGE_MARKOV_METRICS_SCHEMA = "immer.range-markov-metrics/v1"
+RANGE_MARKOV_METRICS_SCHEMA = "immer.range-markov-metrics/v2"
+RANGE_MARKOV_BEAM_STEP_SCHEMA = "immer.range-markov-beam-step/v1"
+RANGE_MARKOV_BEAM_PLAN_SCHEMA = "immer.range-markov-beam-plan/v1"
 
 _STATE_PREFIX = b"IMRM\x01"
 _MAX_STATE_BYTES = 16 * 1024 * 1024
@@ -243,8 +245,8 @@ class RangeContext:
             raise ValueError("range context topology is invalid")
         _uint(self.visits, field="context visits", positive=True)
         _uint(self.last_seen, field="context last_seen", positive=True)
-        if self.visits != sum(count for _key, count in targets):
-            raise ValueError("range context visits differ from target counts")
+        if self.visits < sum(count for _key, count in targets):
+            raise ValueError("range context visits trail retained target counts")
         object.__setattr__(self, "history", history)
         object.__setattr__(self, "targets", targets)
 
@@ -539,6 +541,206 @@ class RangePrediction:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class RangeBeamStep:
+    distance: int
+    state: AccessState
+    transition_probability: float
+    path_probability: float
+    path_min_transition_probability: float
+    support: int
+    total: int
+    path_min_support: int
+    ricci_value: float
+    expected_reuse_distance: float
+    score: float
+    path: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _uint(self.distance, field="beam distance", positive=True)
+        if not isinstance(self.state, AccessState):
+            raise TypeError("beam step requires AccessState")
+        _finite(
+            self.transition_probability,
+            field="transition_probability",
+            lower=0.0,
+            upper=1.0,
+        )
+        _finite(
+            self.path_probability,
+            field="path_probability",
+            lower=0.0,
+            upper=1.0,
+        )
+        if self.path_probability > self.transition_probability + 1e-15:
+            raise ValueError("beam path probability exceeds its final transition")
+        _finite(
+            self.path_min_transition_probability,
+            field="path_min_transition_probability",
+            lower=0.0,
+            upper=1.0,
+        )
+        if self.path_min_transition_probability > self.transition_probability:
+            raise ValueError("beam path minimum exceeds final transition")
+        _uint(self.support, field="beam support", positive=True)
+        _uint(self.total, field="beam total", positive=True)
+        if self.support > self.total:
+            raise ValueError("beam support exceeds total")
+        _uint(self.path_min_support, field="beam path_min_support", positive=True)
+        if self.path_min_support > self.support:
+            raise ValueError("beam path support minimum exceeds final support")
+        _finite(self.ricci_value, field="beam Ricci value", lower=0.0)
+        _finite(
+            self.expected_reuse_distance,
+            field="beam expected reuse distance",
+            lower=0.0,
+        )
+        _finite(self.score, field="beam score", lower=0.0)
+        path = tuple(self.path)
+        if (
+            len(path) != self.distance
+            or path[-1] != self.state.key
+            or any(len(key) != 64 or bool(set(key) - _HEX) for key in path)
+        ):
+            raise ValueError("beam path is invalid")
+        object.__setattr__(self, "path", path)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "distance": self.distance,
+            "expected_reuse_distance": self.expected_reuse_distance,
+            "path": list(self.path),
+            "path_probability": self.path_probability,
+            "path_min_support": self.path_min_support,
+            "path_min_transition_probability": (
+                self.path_min_transition_probability
+            ),
+            "ricci_value": self.ricci_value,
+            "schema": RANGE_MARKOV_BEAM_STEP_SCHEMA,
+            "score": self.score,
+            "state": self.state.to_record(),
+            "support": self.support,
+            "total": self.total,
+            "transition_probability": self.transition_probability,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RangeHint:
+    leaf: AccessLeaf
+    source_state_key: str
+    distance: int
+    score: float
+    path_probability: float
+    original_length: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.leaf, AccessLeaf):
+            raise TypeError("range hint requires AccessLeaf")
+        _sha256(self.source_state_key, field="source_state_key")
+        _uint(self.distance, field="hint distance", positive=True)
+        _finite(self.score, field="hint score", lower=0.0)
+        _finite(
+            self.path_probability,
+            field="hint path_probability",
+            lower=0.0,
+            upper=1.0,
+        )
+        _uint(self.original_length, field="hint original_length", positive=True)
+        if self.leaf.length > self.original_length:
+            raise ValueError("hint length exceeds original leaf")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "distance": self.distance,
+            "leaf": self.leaf.to_document(),
+            "original_length": self.original_length,
+            "path_probability": self.path_probability,
+            "score": self.score,
+            "source_state_key": self.source_state_key,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RangeBeamPlan:
+    horizon: int
+    beam_width: int
+    candidates_considered: int
+    steps: tuple[RangeBeamStep, ...]
+    hints: tuple[RangeHint, ...]
+    duplicate_leaves_avoided: int
+    cooldown_leaves_skipped: int
+    truncated_by_bytes: bool
+    truncated_by_leaves: bool
+
+    def __post_init__(self) -> None:
+        _uint(self.horizon, field="beam horizon", positive=True)
+        _uint(self.beam_width, field="beam width", positive=True)
+        _uint(
+            self.candidates_considered,
+            field="beam candidates_considered",
+        )
+        steps = tuple(self.steps)
+        hints = tuple(self.hints)
+        if (
+            any(not isinstance(row, RangeBeamStep) for row in steps)
+            or any(row.distance > self.horizon for row in steps)
+            or any(not isinstance(row, RangeHint) for row in hints)
+        ):
+            raise ValueError("range beam plan contents are invalid")
+        _uint(
+            self.duplicate_leaves_avoided,
+            field="duplicate_leaves_avoided",
+        )
+        _uint(
+            self.cooldown_leaves_skipped,
+            field="cooldown_leaves_skipped",
+        )
+        if not isinstance(self.truncated_by_bytes, bool) or not isinstance(
+            self.truncated_by_leaves,
+            bool,
+        ):
+            raise TypeError("beam truncation flags must be boolean")
+        object.__setattr__(self, "steps", steps)
+        object.__setattr__(self, "hints", hints)
+
+    @property
+    def hint_bytes(self) -> int:
+        return sum(row.leaf.length for row in self.hints)
+
+    @property
+    def predicted_states(self) -> int:
+        return len({row.state.key for row in self.steps})
+
+    @property
+    def path_probability(self) -> float:
+        if not self.steps:
+            return 0.0
+        return max(row.path_probability for row in self.steps)
+
+    @property
+    def score(self) -> float:
+        return sum(row.score for row in self.steps)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "beam_width": self.beam_width,
+            "candidates_considered": self.candidates_considered,
+            "cooldown_leaves_skipped": self.cooldown_leaves_skipped,
+            "duplicate_leaves_avoided": self.duplicate_leaves_avoided,
+            "hint_bytes": self.hint_bytes,
+            "hints": [row.to_dict() for row in self.hints],
+            "horizon": self.horizon,
+            "path_probability": self.path_probability,
+            "predicted_states": self.predicted_states,
+            "schema": RANGE_MARKOV_BEAM_PLAN_SCHEMA,
+            "score": self.score,
+            "steps": [row.to_dict() for row in self.steps],
+            "truncated_by_bytes": self.truncated_by_bytes,
+            "truncated_by_leaves": self.truncated_by_leaves,
+        }
+
+
 class MarkovRangePrefetcher:
     """Two-agent Markov predictor and bounded local OS-page-cache warmer."""
 
@@ -566,6 +768,9 @@ class MarkovRangePrefetcher:
         max_nodes: int = 2048,
         max_contexts: int = 4096,
         max_targets_per_context: int = 16,
+        beam_horizon: int = 3,
+        beam_width: int = 4,
+        hint_cooldown_operations: int = 2,
         flush_interval: int = 1024,
     ) -> None:
         if state_path is not None and not isinstance(state_path, (str, Path)):
@@ -580,12 +785,17 @@ class MarkovRangePrefetcher:
             (max_nodes, "max_nodes"),
             (max_contexts, "max_contexts"),
             (max_targets_per_context, "max_targets_per_context"),
+            (beam_horizon, "beam_horizon"),
+            (beam_width, "beam_width"),
+            (hint_cooldown_operations, "hint_cooldown_operations"),
             (flush_interval, "flush_interval"),
         ):
             _uint(value, field=field, positive=True)
         _finite(min_confidence, field="min_confidence", lower=0.0, upper=1.0)
         if max_nodes < 4 or max_contexts < 4:
             raise ValueError("range Markov capacities are too small")
+        if beam_horizon > 8 or beam_width > 16:
+            raise ValueError("range Markov beam exceeds its bounded topology")
         self.state_path = (
             None if state_path is None else Path(state_path).expanduser().absolute()
         )
@@ -598,6 +808,9 @@ class MarkovRangePrefetcher:
         self.max_nodes = max_nodes
         self.max_contexts = max_contexts
         self.max_targets_per_context = max_targets_per_context
+        self.beam_horizon = beam_horizon
+        self.beam_width = beam_width
+        self.hint_cooldown_operations = hint_cooldown_operations
         self.flush_interval = flush_interval
         self._lock = threading.RLock()
         self._closed = False
@@ -606,6 +819,19 @@ class MarkovRangePrefetcher:
         self._last_operation_sequence = 0
         self._pending_prediction_key: str | None = None
         self._last_prediction: RangePrediction | None = None
+        self._last_beam_plan: RangeBeamPlan | None = None
+        self._pending_forecasts: dict[
+            int,
+            dict[int, frozenset[str]],
+        ] = {}
+        self._recent_hint_operations: dict[tuple[str, int, int], int] = {}
+        self._horizon_hits = {distance: 0 for distance in range(1, beam_horizon + 1)}
+        self._horizon_misses = {
+            distance: 0 for distance in range(1, beam_horizon + 1)
+        }
+        self._hints_by_distance = {
+            distance: 0 for distance in range(1, beam_horizon + 1)
+        }
         self._metrics = {
             "operations": 0,
             "leaves": 0,
@@ -623,6 +849,14 @@ class MarkovRangePrefetcher:
             "out_of_order_operations": 0,
             "ignored_prefetch_operations": 0,
             "flushes": 0,
+            "beam_candidates_considered": 0,
+            "beam_plans": 0,
+            "beam_steps": 0,
+            "reservoir_states": 0,
+            "reservoir_duplicate_leaves_avoided": 0,
+            "reservoir_cooldown_leaves_skipped": 0,
+            "reservoir_truncated_by_bytes": 0,
+            "reservoir_truncated_by_leaves": 0,
         }
         self._acquire_state_lock()
         try:
@@ -798,35 +1032,68 @@ class MarkovRangePrefetcher:
     def _expert_distributions(
         self,
         state: RangeMarkovState,
+        history: Sequence[str] | None = None,
     ) -> tuple[dict[str, float], dict[str, float]]:
+        selected_history = state.history if history is None else tuple(history)[-2:]
         contexts = {row.history: row for row in state.contexts}
         order_1 = (
             {}
-            if not state.history
-            else contexts.get((state.history[-1],), None)
+            if not selected_history
+            else contexts.get((selected_history[-1],), None)
         )
         order_2 = (
             {}
-            if len(state.history) < 2
-            else contexts.get(state.history[-2:], None)
+            if len(selected_history) < 2
+            else contexts.get(selected_history[-2:], None)
         )
         return (
             {} if not isinstance(order_1, RangeContext) else order_1.distribution(),
             {} if not isinstance(order_2, RangeContext) else order_2.distribution(),
         )
 
-    def _prediction_locked(self, state: RangeMarkovState) -> RangePrediction | None:
-        distributions = self._expert_distributions(state)
+    def _mixture_for_history(
+        self,
+        state: RangeMarkovState,
+        history: Sequence[str],
+    ) -> tuple[
+        dict[str, float],
+        tuple[float, float],
+        dict[str, int],
+        dict[str, int],
+    ]:
+        selected_history = tuple(history)[-2:]
+        distributions = self._expert_distributions(state, selected_history)
         available = tuple(index for index, row in enumerate(distributions) if row)
-        if not available:
-            return None
         weights = self._weights(state.expert_rapidities)
+        if not available:
+            return {}, weights, {}, {}
         available_mass = sum(weights[index] for index in available)
         mixture: dict[str, float] = {}
         for index in available:
             scaled = weights[index] / available_mass
             for key, probability in distributions[index].items():
                 mixture[key] = mixture.get(key, 0.0) + scaled * probability
+        contexts = {row.history: row for row in state.contexts}
+        supports: dict[str, int] = {}
+        totals: dict[str, int] = {}
+        for order in (1, 2):
+            if len(selected_history) < order:
+                continue
+            context = contexts.get(selected_history[-order:])
+            if context is None:
+                continue
+            for key, count in context.targets:
+                supports[key] = max(supports.get(key, 0), count)
+                totals[key] = max(totals.get(key, 0), context.visits)
+        return mixture, weights, supports, totals
+
+    def _prediction_locked(self, state: RangeMarkovState) -> RangePrediction | None:
+        mixture, weights, supports, totals = self._mixture_for_history(
+            state,
+            state.history,
+        )
+        if not mixture:
+            return None
         nodes = {row.state.key: row for row in state.nodes}
         target_key, confidence = max(
             mixture.items(),
@@ -839,30 +1106,224 @@ class MarkovRangePrefetcher:
                 row[0],
             ),
         )
-        contexts = {row.history: row for row in state.contexts}
-        supports = []
-        totals = []
-        for order in (1, 2):
-            if len(state.history) < order:
-                continue
-            context = contexts.get(state.history[-order:])
-            if context is None:
-                continue
-            supports.append(dict(context.targets).get(target_key, 0))
-            totals.append(context.visits)
         node = nodes[target_key]
         age = max(0, state.clock - node.last_seen)
         return RangePrediction(
             state=node.state,
             confidence=confidence,
-            support=max(supports),
-            total=max(totals),
+            support=supports[target_key],
+            total=totals[target_key],
             expert_weights=(
                 ("order-1", weights[0]),
                 ("order-2", weights[1]),
             ),
             ricci_value=node.ricci_value(clock=state.clock, alpha=self.RICCI_ALPHA),
             expected_reuse_distance=(age + 1.0) / node.visits,
+        )
+
+    def _beam_plan_locked(self, state: RangeMarkovState) -> RangeBeamPlan | None:
+        nodes = {row.state.key: row for row in state.nodes}
+        frontier: list[
+            tuple[tuple[str, ...], float, tuple[str, ...], float, int]
+        ] = [
+            (state.history, 1.0, (), 1.0, 2**63 - 1)
+        ]
+        steps: list[RangeBeamStep] = []
+        candidates_considered = 0
+        for distance in range(1, self.beam_horizon + 1):
+            candidates: list[
+                tuple[RangeBeamStep, tuple[str, ...]]
+            ] = []
+            for (
+                history,
+                path_probability,
+                path,
+                path_min_probability,
+                path_min_support,
+            ) in frontier:
+                mixture, _weights, supports, totals = self._mixture_for_history(
+                    state,
+                    history,
+                )
+                candidates_considered += len(mixture)
+                for key, transition_probability in mixture.items():
+                    node = nodes.get(key)
+                    if node is None:
+                        continue
+                    next_path_probability = (
+                        path_probability * transition_probability
+                    )
+                    age = max(0, state.clock - node.last_seen)
+                    reuse_distance = (age + distance) / node.visits
+                    ricci = node.ricci_value(
+                        clock=state.clock,
+                        alpha=self.RICCI_ALPHA,
+                    )
+                    ricci_factor = 1.0 + min(4.0, math.log1p(ricci))
+                    score = (
+                        next_path_probability
+                        * ricci_factor
+                        / (distance * max(1.0, reuse_distance))
+                    )
+                    next_path = (*path, key)
+                    step = RangeBeamStep(
+                        distance=distance,
+                        state=node.state,
+                        transition_probability=transition_probability,
+                        path_probability=next_path_probability,
+                        path_min_transition_probability=min(
+                            path_min_probability,
+                            transition_probability,
+                        ),
+                        support=supports[key],
+                        total=totals[key],
+                        path_min_support=min(path_min_support, supports[key]),
+                        ricci_value=ricci,
+                        expected_reuse_distance=reuse_distance,
+                        score=score,
+                        path=next_path,
+                    )
+                    next_history = (*history, key)[-2:]
+                    candidates.append((step, next_history))
+            if not candidates:
+                break
+            candidates.sort(
+                key=lambda row: (
+                    -row[0].score,
+                    -row[0].path_probability,
+                    row[0].state.key,
+                    row[0].path,
+                )
+            )
+            kept = candidates[: self.beam_width]
+            steps.extend(row[0] for row in kept)
+            frontier = [
+                (
+                    row[1],
+                    row[0].path_probability,
+                    row[0].path,
+                    row[0].path_min_transition_probability,
+                    row[0].path_min_support,
+                )
+                for row in kept
+            ]
+        if not steps:
+            return None
+        hints, duplicates, cooldown, truncated_bytes, truncated_leaves = (
+            self._reservoir_hints_locked(steps)
+        )
+        return RangeBeamPlan(
+            horizon=self.beam_horizon,
+            beam_width=self.beam_width,
+            candidates_considered=candidates_considered,
+            steps=tuple(steps),
+            hints=hints,
+            duplicate_leaves_avoided=duplicates,
+            cooldown_leaves_skipped=cooldown,
+            truncated_by_bytes=truncated_bytes,
+            truncated_by_leaves=truncated_leaves,
+        )
+
+    def _reservoir_hints_locked(
+        self,
+        steps: Sequence[RangeBeamStep],
+    ) -> tuple[tuple[RangeHint, ...], int, int, bool, bool]:
+        ranked = sorted(
+            (
+                row
+                for row in steps
+                if row.path_min_support >= self.min_support
+                and row.path_min_transition_probability >= self.min_confidence
+            ),
+            key=lambda row: (
+                -row.score,
+                row.distance,
+                row.state.key,
+                row.path,
+            ),
+        )
+        seen: set[tuple[str, int, int]] = set()
+        candidates: list[tuple[RangeBeamStep, AccessLeaf]] = []
+        duplicates = 0
+        cooldown = 0
+        current_operation = int(self._metrics["operations"]) + 1
+        state_keys: set[str] = set()
+        states = []
+        for step in ranked:
+            if step.state.key in state_keys:
+                duplicates += len(step.state.leaves)
+                continue
+            state_keys.add(step.state.key)
+            states.append(step)
+        max_state_leaves = max(
+            (len(step.state.leaves) for step in states),
+            default=0,
+        )
+        for leaf_index in range(max_state_leaves):
+            for step in states:
+                if leaf_index >= len(step.state.leaves):
+                    continue
+                leaf = step.state.leaves[leaf_index]
+                key = (leaf.shard, leaf.offset, leaf.length)
+                if key in seen:
+                    duplicates += 1
+                    continue
+                seen.add(key)
+                last_hint = self._recent_hint_operations.get(key)
+                if (
+                    last_hint is not None
+                    and current_operation - last_hint
+                    <= self.hint_cooldown_operations
+                ):
+                    cooldown += 1
+                    continue
+                candidates.append((step, leaf))
+        truncated_by_leaves = len(candidates) > self.max_prefetch_leaves
+        selected = candidates[: self.max_prefetch_leaves]
+        if not selected:
+            return (), duplicates, cooldown, False, truncated_by_leaves
+        state_order = tuple(dict.fromkeys(step.state.key for step, _leaf in selected))
+        base = self.max_prefetch_bytes // len(state_order)
+        extra = self.max_prefetch_bytes % len(state_order)
+        state_budgets = {
+            key: base + int(index < extra)
+            for index, key in enumerate(state_order)
+        }
+        allocations = [0] * len(selected)
+        for index, (step, leaf) in enumerate(selected):
+            amount = min(leaf.length, state_budgets[step.state.key])
+            allocations[index] = amount
+            state_budgets[step.state.key] -= amount
+        remaining = self.max_prefetch_bytes - sum(allocations)
+        for index, (_step, leaf) in enumerate(selected):
+            if remaining <= 0:
+                break
+            missing = leaf.length - allocations[index]
+            addition = min(missing, remaining)
+            allocations[index] += addition
+            remaining -= addition
+        hints = tuple(
+            RangeHint(
+                leaf=AccessLeaf(leaf.shard, leaf.offset, amount),
+                source_state_key=step.state.key,
+                distance=step.distance,
+                score=step.score,
+                path_probability=step.path_probability,
+                original_length=leaf.length,
+            )
+            for (step, leaf), amount in zip(selected, allocations, strict=True)
+            if amount > 0
+        )
+        truncated_by_bytes = any(
+            amount < leaf.length
+            for (_step, leaf), amount in zip(selected, allocations, strict=True)
+        ) or (bool(candidates) and not hints)
+        return (
+            hints,
+            duplicates,
+            cooldown,
+            truncated_by_bytes,
+            truncated_by_leaves,
         )
 
     def _update_experts(
@@ -989,7 +1450,9 @@ class MarkovRangePrefetcher:
             contexts[history] = RangeContext(
                 history=history,
                 targets=tuple(sorted(targets.items())),
-                visits=sum(targets.values()),
+                visits=(
+                    1 if prior_context is None else prior_context.visits + 1
+                ),
                 last_seen=clock,
             )
         history = (*state.history, access.key)[-2:]
@@ -1045,19 +1508,6 @@ class MarkovRangePrefetcher:
             context_evictions=context_evictions,
         )
 
-    def _hint_plan(self, prediction: RangePrediction) -> tuple[AccessLeaf, ...]:
-        remaining = self.max_prefetch_bytes
-        hints = []
-        for leaf in prediction.state.leaves[: self.max_prefetch_leaves]:
-            if remaining <= 0:
-                break
-            length = min(leaf.length, remaining)
-            if length <= 0:
-                continue
-            hints.append(AccessLeaf(leaf.shard, leaf.offset, length))
-            remaining -= length
-        return tuple(hints)
-
     def observe(self, operation: AccessOperation) -> bool:
         if not isinstance(operation, AccessOperation):
             raise TypeError("operation must be AccessOperation")
@@ -1092,6 +1542,24 @@ class MarkovRangePrefetcher:
                 raise RangeMarkovError(
                     "range Markov state belongs to a different source"
                 )
+            current_operation = int(self._metrics["operations"]) + 1
+            hint_cutoff = (
+                current_operation
+                - self.hint_cooldown_operations
+                - self.beam_horizon
+                - 1
+            )
+            self._recent_hint_operations = {
+                key: value
+                for key, value in self._recent_hint_operations.items()
+                if value >= hint_cutoff
+            }
+            forecasts = self._pending_forecasts.pop(current_operation, {})
+            for distance, candidates in forecasts.items():
+                if access.key in candidates:
+                    self._horizon_hits[distance] += 1
+                else:
+                    self._horizon_misses[distance] += 1
             if self._pending_prediction_key is not None:
                 if self._pending_prediction_key == access.key:
                     self._metrics["prediction_hits"] += 1
@@ -1099,7 +1567,9 @@ class MarkovRangePrefetcher:
                     self._metrics["prediction_misses"] += 1
             self._state = self._updated_state(self._state, access)
             prediction = self._prediction_locked(self._state)
+            beam_plan = self._beam_plan_locked(self._state)
             self._last_prediction = prediction
+            self._last_beam_plan = beam_plan
             self._pending_prediction_key = (
                 None if prediction is None else prediction.state.key
             )
@@ -1108,24 +1578,52 @@ class MarkovRangePrefetcher:
             self._dirty_operations += 1
             if prediction is not None:
                 self._metrics["predictions"] += 1
+            if beam_plan is not None:
+                self._metrics["beam_plans"] += 1
+                self._metrics["beam_candidates_considered"] += (
+                    beam_plan.candidates_considered
+                )
+                self._metrics["beam_steps"] += len(beam_plan.steps)
+                self._metrics["reservoir_states"] += beam_plan.predicted_states
+                self._metrics["reservoir_duplicate_leaves_avoided"] += (
+                    beam_plan.duplicate_leaves_avoided
+                )
+                self._metrics["reservoir_cooldown_leaves_skipped"] += (
+                    beam_plan.cooldown_leaves_skipped
+                )
+                self._metrics["reservoir_truncated_by_bytes"] += int(
+                    beam_plan.truncated_by_bytes
+                )
+                self._metrics["reservoir_truncated_by_leaves"] += int(
+                    beam_plan.truncated_by_leaves
+                )
+                for distance in range(1, self.beam_horizon + 1):
+                    candidates = frozenset(
+                        row.state.key
+                        for row in beam_plan.steps
+                        if row.distance == distance
+                    )
+                    if candidates:
+                        self._pending_forecasts.setdefault(
+                            current_operation + distance,
+                            {},
+                        )[distance] = candidates
             if prediction is None or prediction.support < self.min_support:
                 self._metrics["low_support"] += int(prediction is not None)
-                hints = ()
             elif prediction.confidence < self.min_confidence:
                 self._metrics["low_confidence"] += 1
-                hints = ()
-            else:
-                hints = self._hint_plan(prediction)
+            hints = () if beam_plan is None else beam_plan.hints
             if self._dirty_operations >= self.flush_interval:
                 self._persist_locked()
-        for leaf in hints:
+        for hint in hints:
             with self._lock:
                 self._metrics["prefetch_attempts"] += 1
+                self._hints_by_distance[hint.distance] += 1
             try:
                 accepted = self.prefetch_range(
-                    leaf.shard,
-                    leaf.offset,
-                    leaf.length,
+                    hint.leaf.shard,
+                    hint.leaf.offset,
+                    hint.leaf.length,
                 )
             except Exception:
                 with self._lock:
@@ -1134,7 +1632,14 @@ class MarkovRangePrefetcher:
             with self._lock:
                 if accepted:
                     self._metrics["prefetch_hints"] += 1
-                    self._metrics["prefetch_hint_bytes"] += leaf.length
+                    self._metrics["prefetch_hint_bytes"] += hint.leaf.length
+                    self._recent_hint_operations[
+                        (
+                            hint.leaf.shard,
+                            hint.leaf.offset,
+                            hint.original_length,
+                        )
+                    ] = current_operation
                 else:
                     self._metrics["prefetch_declines"] += 1
         return True
@@ -1143,6 +1648,11 @@ class MarkovRangePrefetcher:
     def last_prediction(self) -> RangePrediction | None:
         with self._lock:
             return self._last_prediction
+
+    @property
+    def last_beam_plan(self) -> RangeBeamPlan | None:
+        with self._lock:
+            return self._last_beam_plan
 
     def flush(self) -> None:
         with self._lock:
@@ -1155,6 +1665,8 @@ class MarkovRangePrefetcher:
             weights = self._weights(self._state.expert_rapidities)
             return {
                 **self._metrics,
+                "beam_horizon": self.beam_horizon,
+                "beam_width": self.beam_width,
                 "clock": self._state.clock,
                 "context_evictions": self._state.context_evictions,
                 "contexts": len(self._state.contexts),
@@ -1179,6 +1691,20 @@ class MarkovRangePrefetcher:
                     if self._last_prediction is None
                     else self._last_prediction.to_dict()
                 ),
+                "last_beam_plan": (
+                    None
+                    if self._last_beam_plan is None
+                    else self._last_beam_plan.to_dict()
+                ),
+                "horizon_hits": {
+                    str(key): value for key, value in self._horizon_hits.items()
+                },
+                "horizon_misses": {
+                    str(key): value for key, value in self._horizon_misses.items()
+                },
+                "prefetch_hints_by_distance": {
+                    str(key): value for key, value in self._hints_by_distance.items()
+                },
                 "node_evictions": self._state.node_evictions,
                 "nodes": len(self._state.nodes),
                 "observations": self._state.observations,
@@ -1207,12 +1733,17 @@ class MarkovRangePrefetcher:
 
 
 __all__ = [
+    "RANGE_MARKOV_BEAM_PLAN_SCHEMA",
+    "RANGE_MARKOV_BEAM_STEP_SCHEMA",
     "RANGE_MARKOV_METRICS_SCHEMA",
     "RANGE_MARKOV_PREDICTION_SCHEMA",
     "RANGE_MARKOV_STATE_SCHEMA",
     "AccessState",
     "MarkovRangePrefetcher",
     "RangeContext",
+    "RangeBeamPlan",
+    "RangeBeamStep",
+    "RangeHint",
     "RangeMarkovError",
     "RangeMarkovState",
     "RangeNode",

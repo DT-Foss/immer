@@ -251,13 +251,32 @@ R = visits * exp(-0.001 * age).
 ```
 
 After minimum support and confidence, the highest-probability next grouped
-operation yields a bounded exact hint plan. The production local path calls
-`posix_fadvise(..., POSIX_FADV_WILLNEED)` for at most the configured bytes and
-leaves. This call returns no payload, creates no logical Streamer operation,
-does not charge the source budget, and owns no Torch tensor or pager resident
-state. Unsupported kernels decline only the hint while demand learning
-continues. Semantic Qwen pager scopes label tensor, read kind, and exact causal
-leaves without moving prediction or persistence into the pager hot state. The
+operation seeds a bounded hypothetical beam. For a step at distance `d`,
+
+```text
+path_probability = product of conditional Markov probabilities
+reuse = (node_age + d) / visits
+score = path_probability * (1 + min(4, log(1 + Ricci)))
+        / (d * max(1, reuse)).
+```
+
+The default beam retains four paths through three future operations. Rollouts
+never append nodes, contexts, feedback, or accesses. Operations are ranked
+before their leaves are deduplicated. Candidate leaves from different future
+states then share one global byte and leaf reservoir; state-level fair shares
+ensure one huge matrix cannot consume the complete plan before later states
+receive a prefix. Exact duplicate ranges and recently hinted leaves are
+removed with a bounded operation cooldown. Hits and misses remain separate for
+each forecast distance.
+
+The production local path calls
+`posix_fadvise(..., POSIX_FADV_WILLNEED)` for at most the configured reservoir
+bytes and leaves. This call returns no payload, creates no logical Streamer
+operation, does not charge the source budget, and owns no Torch tensor or pager
+resident state. Unsupported kernels decline only the hint while demand
+learning continues. Semantic Qwen pager scopes label tensor, read kind, and
+exact causal leaves without moving prediction or persistence into the pager
+hot state. The
 observer binds the pinned repo, revision, and inventory fingerprint before it
 is attached, and attachment occurs only after bundle verification, accelerator
 mounting, checkpoint preflight, and tokenizer load, so startup reads cannot

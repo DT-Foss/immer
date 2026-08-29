@@ -53,6 +53,14 @@ All notable changes to IMMER are recorded here.
   tensor residency, or a second weight cache. CLI exposes state, confidence,
   support, and per-operation byte bounds. Source identity is validated before
   observer attachment, which occurs after every one-time runtime/preflight read.
+- Expanded range prediction into a multi-step Markov reservoir. A bounded
+  depth/width beam rolls stored order-1/2 distributions without learning from
+  hypothetical states. Cumulative path probability, normalized Ricci value,
+  predicted reuse distance, and forecast distance rank future operations.
+  Leaves are deduplicated only after operation ranking, distributed across one
+  global byte/leaf budget, and protected from repeated hints by an operation
+  cooldown. Metrics expose candidates, paths, reservoir truncation/dedupe,
+  exact hinted leaves, and hit/miss coverage separately for each distance.
 - Expanded the exact residual-PQ head query union from four to sixteen rows.
   Certified pruning and stable top-k parity now cover the complete rolling
   window; the weight-only builder records the same K16 scorer bound.

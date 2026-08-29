@@ -623,6 +623,9 @@ def _open_local_runtime(
     range_prefetch_max_bytes: int = 64 * 1024**2,
     range_prefetch_min_support: int = 2,
     range_prefetch_min_confidence: float = 0.65,
+    range_prefetch_beam_horizon: int = 3,
+    range_prefetch_beam_width: int = 4,
+    range_prefetch_hint_cooldown: int = 2,
 ) -> _OwnedRuntime:
     """Open one pinned local causal model; no remote source exists here."""
 
@@ -724,6 +727,9 @@ def _open_local_runtime(
                 min_support=range_prefetch_min_support,
                 min_confidence=range_prefetch_min_confidence,
                 max_prefetch_bytes=range_prefetch_max_bytes,
+                beam_horizon=range_prefetch_beam_horizon,
+                beam_width=range_prefetch_beam_width,
+                hint_cooldown_operations=range_prefetch_hint_cooldown,
             )
             source_metrics = mount.source.metrics()
             range_prefetcher.bind_source_identity(
@@ -805,6 +811,9 @@ def _open_official_runtime(
     range_prefetch_max_bytes: int = 64 * 1024**2,
     range_prefetch_min_support: int = 2,
     range_prefetch_min_confidence: float = 0.65,
+    range_prefetch_beam_horizon: int = 3,
+    range_prefetch_beam_width: int = 4,
+    range_prefetch_hint_cooldown: int = 2,
 ) -> _OwnedRuntime:
     return _open_local_runtime(
         bundle_path=bundle_path,
@@ -828,6 +837,9 @@ def _open_official_runtime(
         range_prefetch_max_bytes=range_prefetch_max_bytes,
         range_prefetch_min_support=range_prefetch_min_support,
         range_prefetch_min_confidence=range_prefetch_min_confidence,
+        range_prefetch_beam_horizon=range_prefetch_beam_horizon,
+        range_prefetch_beam_width=range_prefetch_beam_width,
+        range_prefetch_hint_cooldown=range_prefetch_hint_cooldown,
     )
 
 
@@ -871,6 +883,9 @@ class Qwen38CausalChat:
         range_prefetch_max_bytes: int = 64 * 1024**2,
         range_prefetch_min_support: int = 2,
         range_prefetch_min_confidence: float = 0.65,
+        range_prefetch_beam_horizon: int = 3,
+        range_prefetch_beam_width: int = 4,
+        range_prefetch_hint_cooldown: int = 2,
     ) -> None:
         if not isinstance(bundle_path, (str, Path)):
             raise TypeError("bundle_path must be a local filesystem path")
@@ -934,6 +949,20 @@ class Qwen38CausalChat:
         ):
             raise ValueError("range_prefetch_min_confidence must lie in [0, 1]")
         range_prefetch_min_confidence = float(range_prefetch_min_confidence)
+        range_prefetch_beam_horizon = _positive_int(
+            range_prefetch_beam_horizon,
+            "range_prefetch_beam_horizon",
+        )
+        range_prefetch_beam_width = _positive_int(
+            range_prefetch_beam_width,
+            "range_prefetch_beam_width",
+        )
+        range_prefetch_hint_cooldown = _positive_int(
+            range_prefetch_hint_cooldown,
+            "range_prefetch_hint_cooldown",
+        )
+        if range_prefetch_beam_horizon > 8 or range_prefetch_beam_width > 16:
+            raise ValueError("range prefetch beam exceeds its bounded topology")
         if (
             anchor_cache is not None
             and type(anchor_cache) is not SemanticStateAnchorCache
@@ -1094,6 +1123,9 @@ class Qwen38CausalChat:
         self._range_prefetch_max_bytes = range_prefetch_max_bytes
         self._range_prefetch_min_support = range_prefetch_min_support
         self._range_prefetch_min_confidence = range_prefetch_min_confidence
+        self._range_prefetch_beam_horizon = range_prefetch_beam_horizon
+        self._range_prefetch_beam_width = range_prefetch_beam_width
+        self._range_prefetch_hint_cooldown = range_prefetch_hint_cooldown
         self._result_cell_code_revision = result_cell_code_revision
         self._runtime: Any | None = None
         self._draft_runtime: Any | None = None
@@ -1248,6 +1280,11 @@ class Qwen38CausalChat:
             policy["range_markov"] = {
                 "enabled": True,
                 "max_prefetch_bytes": self._range_prefetch_max_bytes,
+                "beam_horizon": self._range_prefetch_beam_horizon,
+                "beam_width": self._range_prefetch_beam_width,
+                "hint_cooldown_operations": (
+                    self._range_prefetch_hint_cooldown
+                ),
                 "min_confidence": self._range_prefetch_min_confidence,
                 "min_support": self._range_prefetch_min_support,
                 "prefetch": "local-posix-fadvise-willneed/v1",
@@ -1445,6 +1482,9 @@ class Qwen38CausalChat:
             range_prefetch_max_bytes=self._range_prefetch_max_bytes,
             range_prefetch_min_support=self._range_prefetch_min_support,
             range_prefetch_min_confidence=self._range_prefetch_min_confidence,
+            range_prefetch_beam_horizon=self._range_prefetch_beam_horizon,
+            range_prefetch_beam_width=self._range_prefetch_beam_width,
+            range_prefetch_hint_cooldown=self._range_prefetch_hint_cooldown,
         )
 
     def _open_draft_runtime(self) -> _OwnedRuntime:

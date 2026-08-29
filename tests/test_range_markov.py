@@ -126,12 +126,25 @@ class RangeMarkovTests(unittest.TestCase):
             _operation(2, "GROUP", leaves=group),
             _operation(3, "A"),
             _operation(4, "GROUP", leaves=group),
-            _operation(5, "A"),
+            _operation(5, "X"),
+            _operation(6, "A"),
         )
         for operation in sequence:
             controller.observe(operation)
 
-        self.assertEqual(hinted[-2:], [("a", 0, 70), ("a", 100, 30)])
+        plan = controller.last_beam_plan
+        self.assertIsNotNone(plan)
+        self.assertLessEqual(len(plan.hints), 2)
+        self.assertEqual(plan.hint_bytes, 100)
+        self.assertEqual(
+            (plan.hints[0].leaf.shard, plan.hints[0].leaf.offset),
+            ("a", 0),
+        )
+        self.assertEqual(plan.hints[0].distance, 1)
+        self.assertGreaterEqual(plan.hints[-1].distance, 1)
+        self.assertEqual(len({row.source_state_key for row in plan.hints}), 2)
+        self.assertGreater(plan.duplicate_leaves_avoided, 0)
+        self.assertTrue(plan.truncated_by_bytes)
         self.assertEqual(controller.metrics()["prefetch_hint_bytes"], sum(
             length for _shard, _offset, length in hinted
         ))
@@ -254,6 +267,95 @@ class RangeMarkovTests(unittest.TestCase):
 
         weights = controller.metrics()["expert_weights"]
         self.assertGreater(weights["order-2"], weights["order-1"])
+
+    def test_beam_rolls_three_future_operations_and_scores_horizon_hits(self) -> None:
+        controller = MarkovRangePrefetcher(
+            None,
+            prefetch_range=lambda *_row: True,
+            min_support=2,
+            min_confidence=0.5,
+            beam_horizon=3,
+            beam_width=2,
+            max_prefetch_leaves=3,
+            hint_cooldown_operations=1,
+        )
+        names = ["A", "B", "C"] * 4 + ["A"]
+        for index, name in enumerate(names, start=1):
+            controller.observe(_operation(index, name))
+
+        plan = controller.last_beam_plan
+        best = {
+            distance: max(
+                (row for row in plan.steps if row.distance == distance),
+                key=lambda row: row.score,
+            )
+            for distance in (1, 2, 3)
+        }
+        self.assertEqual(
+            [dict(best[index].state.tags)["tensor"] for index in (1, 2, 3)],
+            ["B", "C", "A"],
+        )
+        self.assertGreater(best[1].path_probability, best[2].path_probability - 1e-12)
+        controller.observe(_operation(len(names) + 1, "B"))
+        controller.observe(_operation(len(names) + 2, "C"))
+        metrics = controller.metrics()
+        self.assertGreater(metrics["horizon_hits"]["1"], 0)
+        self.assertGreater(metrics["horizon_hits"]["2"], 0)
+        self.assertGreater(metrics["beam_candidates_considered"], 0)
+
+    def test_hypothetical_beam_never_mutates_persistent_learning(self) -> None:
+        controller = MarkovRangePrefetcher(
+            None,
+            prefetch_range=lambda *_row: True,
+            min_support=1,
+            min_confidence=0.0,
+        )
+        for index, name in enumerate(("A", "B", "C") * 3, start=1):
+            controller.observe(_operation(index, name))
+        before = controller._state
+
+        first = controller._beam_plan_locked(before)
+        second = controller._beam_plan_locked(before)
+
+        self.assertEqual(first, second)
+        self.assertEqual(controller._state, before)
+        self.assertEqual(controller.metrics()["observations"], before.observations)
+
+    def test_pruned_context_keeps_true_observation_mass(self) -> None:
+        controller = MarkovRangePrefetcher(
+            None,
+            prefetch_range=lambda *_row: False,
+            max_targets_per_context=2,
+            min_support=1000,
+        )
+        names = ("A", "B", "A", "C", "A", "D")
+        for index, name in enumerate(names, start=1):
+            controller.observe(_operation(index, name))
+
+        a_key = AccessState.from_operation(_operation(100, "A")).key
+        context = next(
+            row for row in controller._state.contexts if row.history == (a_key,)
+        )
+        self.assertEqual(context.visits, 3)
+        self.assertEqual(len(context.targets), 2)
+        self.assertEqual(sum(dict(context.targets).values()), 2)
+        self.assertAlmostEqual(sum(context.distribution().values()), 2 / 3)
+
+    def test_declined_hints_never_consume_cooldown(self) -> None:
+        controller = MarkovRangePrefetcher(
+            None,
+            prefetch_range=lambda *_row: False,
+            min_support=1,
+            min_confidence=0.0,
+            hint_cooldown_operations=8,
+        )
+        for index, name in enumerate(("A", "B") * 5, start=1):
+            controller.observe(_operation(index, name))
+
+        metrics = controller.metrics()
+        self.assertGreater(metrics["prefetch_attempts"], 0)
+        self.assertEqual(metrics["prefetch_declines"], metrics["prefetch_attempts"])
+        self.assertEqual(metrics["reservoir_cooldown_leaves_skipped"], 0)
 
     def test_streamer_demand_trains_live_while_os_hints_stay_unobserved(self) -> None:
         header = {
