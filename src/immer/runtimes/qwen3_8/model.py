@@ -2030,6 +2030,33 @@ class StreamedQwen38:
                 )
         self.mlp_sparse_last_trace = None
         base = f"model.language_model.layers.{layer}.mlp"
+        q4_bank = getattr(self.pager, "q4_bank", None)
+        fused_names = (
+            f"{base}.gate_proj.weight",
+            f"{base}.up_proj.weight",
+            f"{base}.down_proj.weight",
+        )
+        if (
+            q4_bank is not None
+            and callable(getattr(q4_bank, "mlp", None))
+            and self.pager.compute_dtype == torch.bfloat16
+            and all(q4_bank.has(name) for name in fused_names)
+            and self.mlp_sparse_executor is None
+            and self.layer_boundary_observer is None
+        ):
+            shapes = [tuple(row.shape) for row in hidden]
+            counts = [row.numel() // row.shape[-1] for row in hidden]
+            combined = torch.cat(
+                [row.reshape(-1, row.shape[-1]) for row in hidden],
+                dim=0,
+            )
+            fused = self.pager.mlp(combined, fused_names)
+            outputs = []
+            offset = 0
+            for shape, count in zip(shapes, counts, strict=True):
+                outputs.append(fused[offset : offset + count].reshape(*shape))
+                offset += count
+            return tuple(outputs)
         gate = self._linear_token_rows(hidden, f"{base}.gate_proj")
         up = self._linear_token_rows(hidden, f"{base}.up_proj")
         activated = tuple(
@@ -2038,7 +2065,7 @@ class StreamedQwen38:
 
         observe_full = self._full_mlp_observer(layer)
         observe_down = None
-        q4_active = getattr(self.pager, "q4_bank", None) is not None
+        q4_active = q4_bank is not None
         if observe_full is not None and not q4_active:
 
             def observe_down(weight: Any, result: tuple[Any, ...]) -> None:
