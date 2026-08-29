@@ -6,6 +6,17 @@ All notable changes to IMMER are recorded here.
 
 ### Arbitrary local Qwen runtime
 
+- Made explicit Qwen prefix batteries self-charging. On the first miss, the
+  runtime derives the question-independent chat-template prefix, executes it
+  once, stores native continuation state plus final hidden, resets, and resumes
+  the unknown suffix. Markov rolling generation now accepts the same restored
+  strict-prefix state instead of forcing a fresh full prompt.
+- The deployed empty-system template shares only three tokens. Its real restore
+  cost was `0.621 s`, cancelling the saved 192 layer-token evaluations, so it
+  is deliberately not enabled by default. Explicit or longer system prefixes
+  retain automatic charging. The two-process proof returned fresh answers
+  `Paris` and `Rom` with the same 3-token anchor and no answer reuse.
+
 - Activated the embedded Qwen3.5 MTP branch that was already present in the
   official checkpoint. Eight matrices add `238,878,720` Q4 bytes; all 498
   target matrices are hardlink-reused. The 506-tensor bank built in `5.413 s`

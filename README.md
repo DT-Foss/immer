@@ -121,7 +121,9 @@ release surface.
   granularity: results, continuation states, numerical operators,
   factorizations, routes, prefixes, and residual states. Native Qwen
   continuation restore is one executable instance of this wider stored-compute
-  system.
+  system. An explicit prefix cache now charges its longest shared chat-template
+  state on the first miss and can restore it underneath the Markov rolling
+  decoder; short prefixes remain direct when restore cost exceeds saved work.
 - **Stored compute.** `ComputeCrystal` programs materialize reusable numerical
   operators. The Markov operator graph charges verified routes, fuses compatible
   chains, applies the deepest charged prefix to previously unseen values, and
