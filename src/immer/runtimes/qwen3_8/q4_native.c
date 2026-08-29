@@ -289,6 +289,104 @@ static float immer_dot_q8_q8_scalar(
     return sum;
 }
 
+#if defined(__AVX2__)
+static float immer_dot_selected_q4_q8_avx2(
+    const immer_block_q4_0 *weight,
+    const immer_block_q8_0 *input,
+    const int64_t *block_ids,
+    int64_t selected_blocks
+) {
+    __m256 accumulator = _mm256_setzero_ps();
+    for (int64_t selected = 0; selected < selected_blocks; ++selected) {
+        const immer_block_q4_0 *weight_block = weight + block_ids[selected];
+        __m256i qweight = immer_unpack_nibbles(weight_block->qs);
+        qweight = _mm256_sub_epi8(qweight, _mm256_set1_epi8(8));
+        const __m256i qinput = _mm256_loadu_si256(
+            (const __m256i *) input[selected].qs
+        );
+        const float scale = immer_half_to_float(weight_block->d)
+            * immer_half_to_float(input[selected].d);
+        accumulator = _mm256_fmadd_ps(
+            _mm256_set1_ps(scale),
+            immer_mul_sum_i8_pairs_float(qweight, qinput),
+            accumulator
+        );
+    }
+    return immer_horizontal_sum(accumulator);
+}
+
+static float immer_dot_selected_q8_q8_avx2(
+    const immer_block_q8_0 *weight,
+    const immer_block_q8_0 *input,
+    const int64_t *block_ids,
+    int64_t selected_blocks
+) {
+    __m256 accumulator = _mm256_setzero_ps();
+    for (int64_t selected = 0; selected < selected_blocks; ++selected) {
+        const immer_block_q8_0 *weight_block = weight + block_ids[selected];
+        const __m256i qweight = _mm256_loadu_si256(
+            (const __m256i *) weight_block->qs
+        );
+        const __m256i qinput = _mm256_loadu_si256(
+            (const __m256i *) input[selected].qs
+        );
+        const float scale = immer_half_to_float(weight_block->d)
+            * immer_half_to_float(input[selected].d);
+        accumulator = _mm256_fmadd_ps(
+            _mm256_set1_ps(scale),
+            immer_mul_sum_i8_pairs_float(qweight, qinput),
+            accumulator
+        );
+    }
+    return immer_horizontal_sum(accumulator);
+}
+#endif
+
+static float immer_dot_selected_q4_q8_scalar(
+    const immer_block_q4_0 *weight,
+    const immer_block_q8_0 *input,
+    const int64_t *block_ids,
+    int64_t selected_blocks
+) {
+    float sum = 0.0f;
+    for (int64_t selected = 0; selected < selected_blocks; ++selected) {
+        const immer_block_q4_0 *weight_block = weight + block_ids[selected];
+        int32_t integer_sum = 0;
+        for (int index = 0; index < 16; ++index) {
+            const uint8_t packed = weight_block->qs[index];
+            integer_sum += ((int32_t) (packed & 0x0f) - 8)
+                * (int32_t) input[selected].qs[index];
+            integer_sum += ((int32_t) (packed >> 4) - 8)
+                * (int32_t) input[selected].qs[index + 16];
+        }
+        sum += (float) integer_sum
+            * immer_half_to_float(weight_block->d)
+            * immer_half_to_float(input[selected].d);
+    }
+    return sum;
+}
+
+static float immer_dot_selected_q8_q8_scalar(
+    const immer_block_q8_0 *weight,
+    const immer_block_q8_0 *input,
+    const int64_t *block_ids,
+    int64_t selected_blocks
+) {
+    float sum = 0.0f;
+    for (int64_t selected = 0; selected < selected_blocks; ++selected) {
+        const immer_block_q8_0 *weight_block = weight + block_ids[selected];
+        int32_t integer_sum = 0;
+        for (int index = 0; index < 32; ++index) {
+            integer_sum += (int32_t) weight_block->qs[index]
+                * (int32_t) input[selected].qs[index];
+        }
+        sum += (float) integer_sum
+            * immer_half_to_float(weight_block->d)
+            * immer_half_to_float(input[selected].d);
+    }
+    return sum;
+}
+
 static float immer_dot_packed_q8(
     const uint8_t *weight,
     int format,
@@ -315,6 +413,193 @@ static float immer_dot_packed_q8(
         (const immer_block_q8_0 *) weight, input, blocks
     );
 #endif
+}
+
+static float immer_dot_selected_packed_q8(
+    const uint8_t *weight,
+    int format,
+    const immer_block_q8_0 *input,
+    const int64_t *block_ids,
+    int64_t selected_blocks
+) {
+    if (format == IMMER_FORMAT_Q4_0) {
+#if defined(__AVX2__)
+        return immer_dot_selected_q4_q8_avx2(
+            (const immer_block_q4_0 *) weight,
+            input,
+            block_ids,
+            selected_blocks
+        );
+#else
+        return immer_dot_selected_q4_q8_scalar(
+            (const immer_block_q4_0 *) weight,
+            input,
+            block_ids,
+            selected_blocks
+        );
+#endif
+    }
+#if defined(__AVX2__)
+    return immer_dot_selected_q8_q8_avx2(
+        (const immer_block_q8_0 *) weight,
+        input,
+        block_ids,
+        selected_blocks
+    );
+#else
+    return immer_dot_selected_q8_q8_scalar(
+        (const immer_block_q8_0 *) weight,
+        input,
+        block_ids,
+        selected_blocks
+    );
+#endif
+}
+
+static float immer_dot_sparse_q4_f32(
+    const immer_block_q4_0 *weight,
+    const float *values,
+    const int64_t *coordinates,
+    int64_t sparse_count
+) {
+    float sum = 0.0f;
+    for (int64_t sparse = 0; sparse < sparse_count; ++sparse) {
+        const int64_t coordinate = coordinates[sparse];
+        const immer_block_q4_0 *weight_block =
+            weight + coordinate / IMMER_QK;
+        const int index = (int) (coordinate % IMMER_QK);
+        const int packed_index = index < IMMER_QK / 2
+            ? index
+            : index - IMMER_QK / 2;
+        const uint8_t packed = weight_block->qs[packed_index];
+        const int quantized = index < IMMER_QK / 2
+            ? (int) (packed & 0x0f) - 8
+            : (int) (packed >> 4) - 8;
+        sum += values[sparse] * (float) quantized
+            * immer_half_to_float(weight_block->d);
+    }
+    return sum;
+}
+
+static float immer_dot_sparse_q8_f32(
+    const immer_block_q8_0 *weight,
+    const float *values,
+    const int64_t *coordinates,
+    int64_t sparse_count
+) {
+    float sum = 0.0f;
+    for (int64_t sparse = 0; sparse < sparse_count; ++sparse) {
+        const int64_t coordinate = coordinates[sparse];
+        const immer_block_q8_0 *weight_block =
+            weight + coordinate / IMMER_QK;
+        const int index = (int) (coordinate % IMMER_QK);
+        sum += values[sparse] * (float) weight_block->qs[index]
+            * immer_half_to_float(weight_block->d);
+    }
+    return sum;
+}
+
+static float immer_dot_sparse_packed_f32(
+    const uint8_t *weight,
+    int format,
+    const float *values,
+    const int64_t *coordinates,
+    int64_t sparse_count
+) {
+    if (format == IMMER_FORMAT_Q4_0) {
+        return immer_dot_sparse_q4_f32(
+            (const immer_block_q4_0 *) weight,
+            values,
+            coordinates,
+            sparse_count
+        );
+    }
+    return immer_dot_sparse_q8_f32(
+        (const immer_block_q8_0 *) weight,
+        values,
+        coordinates,
+        sparse_count
+    );
+}
+
+static float immer_silu_f32(float value) {
+    if (value >= 0.0f) {
+        return value / (1.0f + expf(-value));
+    }
+    const float exponent = expf(value);
+    return value * exponent / (1.0f + exponent);
+}
+
+static double immer_route_feature(float gate, float up) {
+    double clipped = (double) gate;
+    if (clipped < -60.0) clipped = -60.0;
+    if (clipped > 60.0) clipped = 60.0;
+    const double activation = (
+        (double) gate / (1.0 + exp(-clipped))
+    ) * (double) up;
+    return activation * activation;
+}
+
+static int immer_size_product_fits(
+    int64_t first,
+    int64_t second,
+    size_t element_size
+) {
+    if (first < 0 || second < 0 || element_size == 0) return 0;
+    if (first == 0 || second == 0) return 1;
+    const size_t maximum_elements = (size_t) -1 / element_size;
+    return (uint64_t) first
+        <= (uint64_t) maximum_elements / (uint64_t) second;
+}
+
+static int immer_size_product3_fits(
+    int64_t first,
+    int64_t second,
+    int64_t third,
+    size_t element_size
+) {
+    if (first < 0 || second < 0 || third < 0 || element_size == 0) return 0;
+    if (first == 0 || second == 0 || third == 0) return 1;
+    const uint64_t maximum_elements =
+        (uint64_t) ((size_t) -1 / element_size);
+    if (
+        (uint64_t) first
+        > maximum_elements / (uint64_t) second
+    ) return 0;
+    const uint64_t first_second =
+        (uint64_t) first * (uint64_t) second;
+    return (uint64_t) third <= maximum_elements / first_second;
+}
+
+static int immer_checked_row_layout(
+    int format,
+    int64_t cols,
+    int64_t *blocks,
+    size_t *row_bytes
+) {
+    if (!blocks || !row_bytes || cols <= 0 || cols % IMMER_QK != 0) return 0;
+    size_t block_bytes;
+    if (format == IMMER_FORMAT_Q4_0) {
+        block_bytes = sizeof(immer_block_q4_0);
+    } else if (format == IMMER_FORMAT_Q8_0) {
+        block_bytes = sizeof(immer_block_q8_0);
+    } else {
+        return 0;
+    }
+    const int64_t block_count = cols / IMMER_QK;
+    if ((uint64_t) block_count > (uint64_t) ((size_t) -1 / block_bytes)) {
+        return 0;
+    }
+    *blocks = block_count;
+    *row_bytes = (size_t) block_count * block_bytes;
+    return 1;
+}
+
+static int immer_f32_values_are_finite(const float *values, size_t count) {
+    for (size_t index = 0; index < count; ++index) {
+        if (!isfinite(values[index])) return 0;
+    }
+    return 1;
 }
 
 IMMER_EXPORT uint32_t immer_q4_abi(void) {
@@ -462,6 +747,905 @@ IMMER_EXPORT int immer_q4_linear_f32(
     }
     free(quantized_input);
     return 0;
+}
+
+IMMER_EXPORT int immer_q4_linear_rows_f32(
+    const float *input,
+    int64_t input_rows,
+    int64_t input_cols,
+    const uint8_t *weights,
+    int format,
+    int64_t output_rows,
+    const int64_t *row_ids,
+    int64_t selected_output_rows,
+    float *output,
+    int threads
+) {
+    int64_t blocks;
+    size_t row_bytes;
+    if (
+        !input || !weights || !row_ids || !output
+        || input_rows <= 0 || output_rows <= 0 || selected_output_rows < 0
+        || threads <= 0
+        || !immer_checked_row_layout(
+            format, input_cols, &blocks, &row_bytes
+        )
+        || !immer_size_product_fits(
+            input_rows, input_cols, sizeof(float)
+        )
+        || !immer_size_product_fits(
+            output_rows, 1, row_bytes
+        )
+        || !immer_size_product_fits(
+            selected_output_rows, 1, sizeof(int64_t)
+        )
+        || !immer_size_product_fits(
+            input_rows, selected_output_rows, sizeof(float)
+        )
+        || !immer_size_product_fits(
+            input_rows, blocks, sizeof(immer_block_q8_0)
+        )
+    ) return 1;
+    for (int64_t selected = 0; selected < selected_output_rows; ++selected) {
+        if (row_ids[selected] < 0 || row_ids[selected] >= output_rows) return 2;
+    }
+    if (selected_output_rows == 0) return 0;
+    const size_t input_value_count =
+        (size_t) input_rows * (size_t) input_cols;
+    if (!immer_f32_values_are_finite(input, input_value_count)) return 1;
+    const size_t quantized_blocks = (size_t) input_rows * (size_t) blocks;
+    immer_block_q8_0 *quantized_input = (immer_block_q8_0 *) malloc(
+        quantized_blocks * sizeof(immer_block_q8_0)
+    );
+    if (!quantized_input) return 3;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+        immer_quantize_q8_row(
+            input + (size_t) input_row * (size_t) input_cols,
+            quantized_input + (size_t) input_row * (size_t) blocks,
+            input_cols
+        );
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int64_t selected = 0; selected < selected_output_rows; ++selected) {
+        const uint8_t *weight_row = weights
+            + (size_t) row_ids[selected] * row_bytes;
+        for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+            const immer_block_q8_0 *active_input = quantized_input
+                + (size_t) input_row * (size_t) blocks;
+            output[
+                (size_t) input_row * (size_t) selected_output_rows
+                + (size_t) selected
+            ] = immer_dot_packed_q8(
+                weight_row, format, active_input, blocks
+            );
+        }
+    }
+    free(quantized_input);
+    return 0;
+}
+
+IMMER_EXPORT int immer_q4_linear_rows_pair_f32(
+    const float *input,
+    int64_t input_rows,
+    int64_t input_cols,
+    const uint8_t *weights_a,
+    int format_a,
+    int64_t output_rows_a,
+    const uint8_t *weights_b,
+    int format_b,
+    int64_t output_rows_b,
+    const int64_t *row_ids,
+    int64_t selected_rows,
+    float *output_a,
+    float *output_b,
+    int threads
+) {
+    int64_t blocks_a;
+    int64_t blocks_b;
+    size_t row_bytes_a;
+    size_t row_bytes_b;
+    if (
+        !input || !weights_a || !weights_b || !row_ids
+        || !output_a || !output_b
+        || input_rows <= 0 || output_rows_a <= 0 || output_rows_b <= 0
+        || selected_rows < 0 || threads <= 0
+        || !immer_checked_row_layout(
+            format_a, input_cols, &blocks_a, &row_bytes_a
+        )
+        || !immer_checked_row_layout(
+            format_b, input_cols, &blocks_b, &row_bytes_b
+        )
+        || blocks_a != blocks_b
+        || !immer_size_product_fits(
+            input_rows, input_cols, sizeof(float)
+        )
+        || !immer_size_product_fits(
+            output_rows_a, 1, row_bytes_a
+        )
+        || !immer_size_product_fits(
+            output_rows_b, 1, row_bytes_b
+        )
+        || !immer_size_product_fits(
+            selected_rows, 1, sizeof(int64_t)
+        )
+        || !immer_size_product_fits(
+            input_rows, selected_rows, sizeof(float)
+        )
+        || !immer_size_product_fits(
+            input_rows, blocks_a, sizeof(immer_block_q8_0)
+        )
+    ) return 1;
+    for (int64_t selected = 0; selected < selected_rows; ++selected) {
+        if (
+            row_ids[selected] < 0
+            || row_ids[selected] >= output_rows_a
+            || row_ids[selected] >= output_rows_b
+        ) return 2;
+    }
+    if (selected_rows == 0) return 0;
+    const size_t input_value_count =
+        (size_t) input_rows * (size_t) input_cols;
+    if (!immer_f32_values_are_finite(input, input_value_count)) return 1;
+    const size_t quantized_blocks =
+        (size_t) input_rows * (size_t) blocks_a;
+    immer_block_q8_0 *quantized_input = (immer_block_q8_0 *) malloc(
+        quantized_blocks * sizeof(immer_block_q8_0)
+    );
+    if (!quantized_input) return 3;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+        immer_quantize_q8_row(
+            input + (size_t) input_row * (size_t) input_cols,
+            quantized_input + (size_t) input_row * (size_t) blocks_a,
+            input_cols
+        );
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int64_t selected = 0; selected < selected_rows; ++selected) {
+        const size_t weight_row_id = (size_t) row_ids[selected];
+        const uint8_t *weight_row_a = weights_a
+            + weight_row_id * row_bytes_a;
+        const uint8_t *weight_row_b = weights_b
+            + weight_row_id * row_bytes_b;
+        for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+            const immer_block_q8_0 *active_input = quantized_input
+                + (size_t) input_row * (size_t) blocks_a;
+            const size_t output_offset =
+                (size_t) input_row * (size_t) selected_rows
+                + (size_t) selected;
+            output_a[output_offset] = immer_dot_packed_q8(
+                weight_row_a, format_a, active_input, blocks_a
+            );
+            output_b[output_offset] = immer_dot_packed_q8(
+                weight_row_b, format_b, active_input, blocks_a
+            );
+        }
+    }
+    free(quantized_input);
+    return 0;
+}
+
+IMMER_EXPORT int immer_q4_linear_selected_blocks_f32(
+    const float *input_blocks,
+    int64_t input_rows,
+    int64_t selected_blocks,
+    const int64_t *block_ids,
+    int64_t total_input_cols,
+    const uint8_t *weights,
+    int format,
+    int64_t output_rows,
+    float *output,
+    int threads
+) {
+    int64_t total_blocks;
+    size_t row_bytes;
+    if (
+        !input_blocks || !block_ids || !weights || !output
+        || input_rows <= 0 || selected_blocks <= 0 || output_rows <= 0
+        || threads <= 0
+        || !immer_checked_row_layout(
+            format, total_input_cols, &total_blocks, &row_bytes
+        )
+        || selected_blocks > total_blocks
+        || !immer_size_product_fits(
+            input_rows,
+            selected_blocks,
+            (size_t) IMMER_QK * sizeof(float)
+        )
+        || !immer_size_product_fits(
+            input_rows, selected_blocks, sizeof(int64_t)
+        )
+        || !immer_size_product_fits(
+            input_rows, selected_blocks, sizeof(immer_block_q8_0)
+        )
+        || !immer_size_product_fits(
+            output_rows, 1, row_bytes
+        )
+        || !immer_size_product_fits(
+            input_rows, output_rows, sizeof(float)
+        )
+    ) return 1;
+    const size_t compact_block_count =
+        (size_t) input_rows * (size_t) selected_blocks;
+    for (size_t index = 0; index < compact_block_count; ++index) {
+        if (block_ids[index] < 0 || block_ids[index] >= total_blocks) return 2;
+    }
+    const size_t compact_value_count =
+        compact_block_count * (size_t) IMMER_QK;
+    if (!immer_f32_values_are_finite(input_blocks, compact_value_count)) return 1;
+    immer_block_q8_0 *quantized_input = (immer_block_q8_0 *) malloc(
+        compact_block_count * sizeof(immer_block_q8_0)
+    );
+    if (!quantized_input) return 3;
+    const int64_t compact_cols = selected_blocks * IMMER_QK;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+        immer_quantize_q8_row(
+            input_blocks
+                + (size_t) input_row * (size_t) compact_cols,
+            quantized_input
+                + (size_t) input_row * (size_t) selected_blocks,
+            compact_cols
+        );
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int64_t output_row = 0; output_row < output_rows; ++output_row) {
+        const uint8_t *weight_row = weights
+            + (size_t) output_row * row_bytes;
+        for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+            const size_t compact_offset =
+                (size_t) input_row * (size_t) selected_blocks;
+            output[
+                (size_t) input_row * (size_t) output_rows
+                + (size_t) output_row
+            ] = immer_dot_selected_packed_q8(
+                weight_row,
+                format,
+                quantized_input + compact_offset,
+                block_ids + compact_offset,
+                selected_blocks
+            );
+        }
+    }
+    free(quantized_input);
+    return 0;
+}
+
+IMMER_EXPORT int immer_q4_linear_routed_f32(
+    const float *full_block_values,
+    int64_t input_rows,
+    int64_t full_blocks,
+    const int64_t *full_block_ids,
+    const float *sparse_values,
+    const int64_t *sparse_coords,
+    int64_t sparse_count,
+    int64_t total_input_cols,
+    const uint8_t *weights,
+    int format,
+    int64_t output_rows,
+    float *output,
+    int threads
+) {
+    int64_t total_blocks;
+    size_t row_bytes;
+    if (
+        !weights || !output
+        || input_rows <= 0 || full_blocks < 0 || sparse_count < 0
+        || output_rows <= 0 || threads <= 0
+        || (full_blocks > 0 && (!full_block_values || !full_block_ids))
+        || (sparse_count > 0 && (!sparse_values || !sparse_coords))
+        || !immer_checked_row_layout(
+            format, total_input_cols, &total_blocks, &row_bytes
+        )
+        || full_blocks > total_blocks
+        || sparse_count > total_input_cols
+        || !immer_size_product_fits(
+            input_rows,
+            full_blocks,
+            (size_t) IMMER_QK * sizeof(float)
+        )
+        || !immer_size_product_fits(
+            input_rows, full_blocks, sizeof(int64_t)
+        )
+        || !immer_size_product_fits(
+            input_rows, full_blocks, sizeof(immer_block_q8_0)
+        )
+        || !immer_size_product_fits(
+            input_rows, sparse_count, sizeof(float)
+        )
+        || !immer_size_product_fits(
+            input_rows, sparse_count, sizeof(int64_t)
+        )
+        || !immer_size_product_fits(
+            output_rows, 1, row_bytes
+        )
+        || !immer_size_product_fits(
+            input_rows, output_rows, sizeof(float)
+        )
+    ) return 1;
+    const size_t full_block_count =
+        (size_t) input_rows * (size_t) full_blocks;
+    for (size_t index = 0; index < full_block_count; ++index) {
+        if (
+            full_block_ids[index] < 0
+            || full_block_ids[index] >= total_blocks
+        ) return 2;
+    }
+    const size_t sparse_value_count =
+        (size_t) input_rows * (size_t) sparse_count;
+    for (size_t index = 0; index < sparse_value_count; ++index) {
+        if (sparse_coords[index] < 0 || sparse_coords[index] >= total_input_cols) {
+            return 2;
+        }
+    }
+    if (
+        full_blocks > 0
+        && !immer_f32_values_are_finite(
+            full_block_values,
+            full_block_count * (size_t) IMMER_QK
+        )
+    ) return 1;
+    if (
+        sparse_count > 0
+        && !immer_f32_values_are_finite(sparse_values, sparse_value_count)
+    ) return 1;
+    immer_block_q8_0 *quantized_full = NULL;
+    if (full_blocks > 0) {
+        quantized_full = (immer_block_q8_0 *) malloc(
+            full_block_count * sizeof(immer_block_q8_0)
+        );
+        if (!quantized_full) return 3;
+        const int64_t compact_cols = full_blocks * IMMER_QK;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+        for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+            immer_quantize_q8_row(
+                full_block_values
+                    + (size_t) input_row * (size_t) compact_cols,
+                quantized_full
+                    + (size_t) input_row * (size_t) full_blocks,
+                compact_cols
+            );
+        }
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int64_t output_row = 0; output_row < output_rows; ++output_row) {
+        const uint8_t *weight_row = weights
+            + (size_t) output_row * row_bytes;
+        for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+            float sum = 0.0f;
+            if (full_blocks > 0) {
+                const size_t full_offset =
+                    (size_t) input_row * (size_t) full_blocks;
+                sum = immer_dot_selected_packed_q8(
+                    weight_row,
+                    format,
+                    quantized_full + full_offset,
+                    full_block_ids + full_offset,
+                    full_blocks
+                );
+            }
+            if (sparse_count > 0) {
+                const size_t sparse_offset =
+                    (size_t) input_row * (size_t) sparse_count;
+                sum += immer_dot_sparse_packed_f32(
+                    weight_row,
+                    format,
+                    sparse_values + sparse_offset,
+                    sparse_coords + sparse_offset,
+                    sparse_count
+                );
+            }
+            output[
+                (size_t) input_row * (size_t) output_rows
+                + (size_t) output_row
+            ] = sum;
+        }
+    }
+    free(quantized_full);
+    return 0;
+}
+
+IMMER_EXPORT int immer_q4_sparse_mlp_f32(
+    const float *input,
+    int64_t input_rows,
+    int64_t hidden_cols,
+    const uint8_t *gate_weights,
+    int gate_format,
+    const uint8_t *up_weights,
+    int up_format,
+    const uint8_t *down_weights,
+    int down_format,
+    int64_t intermediate_cols,
+    int64_t output_rows,
+    const int64_t *pilot_ids,
+    int64_t block_count,
+    int64_t block_size,
+    int64_t pilot_count,
+    const double *coefficients,
+    int64_t selected_block_count,
+    const float *affine_scale,
+    const float *affine_bias,
+    float *output,
+    int64_t *selected_blocks_out,
+    int threads
+) {
+    if (
+        !input || !gate_weights || !up_weights || !down_weights
+        || !pilot_ids || !coefficients || !affine_scale || !affine_bias
+        || !output || !selected_blocks_out
+        || input_rows <= 0 || hidden_cols <= 0 || intermediate_cols <= 0
+        || output_rows <= 0 || block_count <= 0 || block_size <= 0
+        || pilot_count <= 0 || pilot_count > block_size
+        || selected_block_count <= 0 || selected_block_count >= block_count
+        || block_size % IMMER_QK != 0 || threads <= 0
+        || block_count > INT64_MAX / block_size
+        || intermediate_cols != block_count * block_size
+    ) return 1;
+
+    int64_t hidden_blocks_gate;
+    int64_t hidden_blocks_up;
+    int64_t down_blocks;
+    size_t gate_row_bytes;
+    size_t up_row_bytes;
+    size_t down_row_bytes;
+    if (
+        !immer_checked_row_layout(
+            gate_format, hidden_cols, &hidden_blocks_gate, &gate_row_bytes
+        )
+        || !immer_checked_row_layout(
+            up_format, hidden_cols, &hidden_blocks_up, &up_row_bytes
+        )
+        || !immer_checked_row_layout(
+            down_format, intermediate_cols, &down_blocks, &down_row_bytes
+        )
+        || hidden_blocks_gate != hidden_blocks_up
+        || down_blocks != intermediate_cols / IMMER_QK
+    ) return 1;
+
+    const int64_t packed_blocks_per_logical = block_size / IMMER_QK;
+    if (
+        selected_block_count > INT64_MAX / packed_blocks_per_logical
+    ) return 1;
+    const int64_t selected_packed_blocks =
+        selected_block_count * packed_blocks_per_logical;
+    if (
+        !immer_size_product_fits(
+            input_rows, hidden_cols, sizeof(float)
+        )
+        || !immer_size_product_fits(
+            intermediate_cols, 1, gate_row_bytes
+        )
+        || !immer_size_product_fits(
+            intermediate_cols, 1, up_row_bytes
+        )
+        || !immer_size_product_fits(
+            output_rows, 1, down_row_bytes
+        )
+        || !immer_size_product_fits(
+            block_count, pilot_count, sizeof(int64_t)
+        )
+        || !immer_size_product_fits(
+            block_count, pilot_count + 1, sizeof(double)
+        )
+        || !immer_size_product_fits(
+            input_rows, hidden_blocks_gate, sizeof(immer_block_q8_0)
+        )
+        || !immer_size_product3_fits(
+            input_rows, block_count, pilot_count, sizeof(float)
+        )
+        || !immer_size_product3_fits(
+            input_rows, block_count, pilot_count, sizeof(double)
+        )
+        || !immer_size_product_fits(
+            input_rows, selected_block_count, sizeof(double)
+        )
+        || !immer_size_product_fits(
+            input_rows, selected_block_count, sizeof(int64_t)
+        )
+        || !immer_size_product_fits(
+            input_rows, selected_packed_blocks, sizeof(immer_block_q8_0)
+        )
+        || !immer_size_product_fits(
+            input_rows, selected_packed_blocks, sizeof(int64_t)
+        )
+        || !immer_size_product3_fits(
+            input_rows, selected_block_count, block_size, sizeof(float)
+        )
+        || !immer_size_product_fits(
+            input_rows, output_rows, sizeof(float)
+        )
+    ) return 1;
+
+    for (int64_t block = 0; block < block_count; ++block) {
+        const int64_t first_neuron = block * block_size;
+        const int64_t last_neuron = first_neuron + block_size;
+        const int64_t *block_pilots = pilot_ids + block * pilot_count;
+        for (int64_t pilot = 0; pilot < pilot_count; ++pilot) {
+            const int64_t neuron = block_pilots[pilot];
+            if (neuron < first_neuron || neuron >= last_neuron) return 2;
+            for (int64_t previous = 0; previous < pilot; ++previous) {
+                if (block_pilots[previous] == neuron) return 2;
+            }
+        }
+    }
+    const size_t input_value_count =
+        (size_t) input_rows * (size_t) hidden_cols;
+    if (!immer_f32_values_are_finite(input, input_value_count)) return 1;
+    const size_t coefficient_count =
+        (size_t) block_count * (size_t) (pilot_count + 1);
+    for (size_t index = 0; index < coefficient_count; ++index) {
+        if (!isfinite(coefficients[index])) return 1;
+    }
+    for (int64_t row = 0; row < output_rows; ++row) {
+        if (!isfinite(affine_scale[row]) || !isfinite(affine_bias[row])) return 1;
+    }
+
+    const size_t quantized_hidden_count =
+        (size_t) input_rows * (size_t) hidden_blocks_gate;
+    const size_t pilot_activation_count =
+        (size_t) input_rows * (size_t) block_count * (size_t) pilot_count;
+    const size_t selected_score_count =
+        (size_t) input_rows * (size_t) selected_block_count;
+    const size_t selected_packed_count =
+        (size_t) input_rows * (size_t) selected_packed_blocks;
+    const size_t selected_activation_count =
+        (size_t) input_rows
+        * (size_t) selected_block_count
+        * (size_t) block_size;
+    immer_block_q8_0 *quantized_hidden = (immer_block_q8_0 *) malloc(
+        quantized_hidden_count * sizeof(immer_block_q8_0)
+    );
+    if (!quantized_hidden) return 3;
+    float *pilot_activations = NULL;
+    double *pilot_features = NULL;
+    double *selected_scores = NULL;
+    immer_block_q8_0 *quantized_activations = NULL;
+    int64_t *selected_down_blocks = NULL;
+    float *selected_activations = NULL;
+    int numeric_error = 0;
+    int allocation_error = 0;
+    /* Implicit worksharing/single barriers protect each compact stage. */
+#ifdef _OPENMP
+#pragma omp parallel num_threads(threads)
+#endif
+    {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+        for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+            immer_block_q8_0 *target = quantized_hidden
+                + (size_t) input_row * (size_t) hidden_blocks_gate;
+            immer_quantize_q8_row(
+                input + (size_t) input_row * (size_t) hidden_cols,
+                target,
+                hidden_cols
+            );
+            for (int64_t block = 0; block < hidden_blocks_gate; ++block) {
+                if (!isfinite(immer_half_to_float(target[block].d))) {
+                    numeric_error = 1;
+                }
+            }
+        }
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        {
+            if (!numeric_error) {
+                pilot_activations = (float *) malloc(
+                    pilot_activation_count * sizeof(float)
+                );
+                pilot_features = (double *) malloc(
+                    pilot_activation_count * sizeof(double)
+                );
+                selected_scores = (double *) malloc(
+                    selected_score_count * sizeof(double)
+                );
+                if (
+                    !pilot_activations
+                    || !pilot_features
+                    || !selected_scores
+                ) allocation_error = 1;
+            }
+        }
+
+        if (!numeric_error && !allocation_error) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+            for (
+                int64_t task = 0;
+                task < (int64_t) pilot_activation_count;
+                ++task
+            ) {
+                const int64_t pilot = task % pilot_count;
+                const int64_t row_block = task / pilot_count;
+                const int64_t block = row_block % block_count;
+                const int64_t input_row = row_block / block_count;
+                const immer_block_q8_0 *active_hidden = quantized_hidden
+                    + (size_t) input_row * (size_t) hidden_blocks_gate;
+                const int64_t neuron = pilot_ids[
+                    (size_t) block * (size_t) pilot_count + (size_t) pilot
+                ];
+                float gate = immer_dot_packed_q8(
+                    gate_weights + (size_t) neuron * gate_row_bytes,
+                    gate_format,
+                    active_hidden,
+                    hidden_blocks_gate
+                );
+                float up = immer_dot_packed_q8(
+                    up_weights + (size_t) neuron * up_row_bytes,
+                    up_format,
+                    active_hidden,
+                    hidden_blocks_gate
+                );
+                if (!isfinite(gate) || !isfinite(up)) {
+                    numeric_error = 1;
+                    gate = 0.0f;
+                    up = 0.0f;
+                }
+                float activation = immer_silu_f32(gate) * up;
+                double feature = immer_route_feature(gate, up);
+                if (!isfinite(activation) || !isfinite(feature)) {
+                    numeric_error = 1;
+                    activation = 0.0f;
+                    feature = 0.0;
+                }
+                pilot_activations[task] = activation;
+                pilot_features[task] = feature;
+            }
+        }
+
+        if (!numeric_error && !allocation_error) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+            for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+                const double *active_features = pilot_features
+                    + (size_t) input_row
+                    * (size_t) block_count
+                    * (size_t) pilot_count;
+                double *top_scores = selected_scores
+                    + (size_t) input_row * (size_t) selected_block_count;
+                int64_t *top_blocks = selected_blocks_out
+                    + (size_t) input_row * (size_t) selected_block_count;
+                int64_t filled = 0;
+                for (int64_t block = 0; block < block_count; ++block) {
+                    const double *block_coefficients = coefficients
+                        + block * (pilot_count + 1);
+                    double score = block_coefficients[0];
+                    for (int64_t pilot = 0; pilot < pilot_count; ++pilot) {
+                        score += block_coefficients[pilot + 1]
+                            * active_features[block * pilot_count + pilot];
+                    }
+                    if (!isfinite(score)) {
+                        numeric_error = 1;
+                        score = 0.0;
+                    } else if (score < 0.0) {
+                        score = 0.0;
+                    }
+                    int64_t insert = 0;
+                    while (
+                        insert < filled && score <= top_scores[insert]
+                    ) ++insert;
+                    if (insert < selected_block_count) {
+                        const int64_t last = filled < selected_block_count
+                            ? filled
+                            : selected_block_count - 1;
+                        for (
+                            int64_t position = last;
+                            position > insert;
+                            --position
+                        ) {
+                            top_scores[position] = top_scores[position - 1];
+                            top_blocks[position] = top_blocks[position - 1];
+                        }
+                        top_scores[insert] = score;
+                        top_blocks[insert] = block;
+                        if (filled < selected_block_count) ++filled;
+                    }
+                }
+            }
+        }
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        {
+            free(selected_scores);
+            selected_scores = NULL;
+            free(pilot_features);
+            pilot_features = NULL;
+            if (!numeric_error && !allocation_error) {
+                quantized_activations = (immer_block_q8_0 *) malloc(
+                    selected_packed_count * sizeof(immer_block_q8_0)
+                );
+                selected_down_blocks = (int64_t *) malloc(
+                    selected_packed_count * sizeof(int64_t)
+                );
+                selected_activations = (float *) malloc(
+                    selected_activation_count * sizeof(float)
+                );
+                if (
+                    !quantized_activations
+                    || !selected_down_blocks
+                    || !selected_activations
+                ) allocation_error = 1;
+            }
+        }
+
+        if (!numeric_error && !allocation_error) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+            for (
+                int64_t task = 0;
+                task < (int64_t) selected_activation_count;
+                ++task
+            ) {
+                const int64_t selected_neurons_per_row =
+                    selected_block_count * block_size;
+                const int64_t input_row = task / selected_neurons_per_row;
+                const int64_t within_row = task % selected_neurons_per_row;
+                const int64_t selected = within_row / block_size;
+                const int64_t block_offset = within_row % block_size;
+                const int64_t logical_block = selected_blocks_out[
+                    (size_t) input_row * (size_t) selected_block_count
+                    + (size_t) selected
+                ];
+                const int64_t neuron =
+                    logical_block * block_size + block_offset;
+                const immer_block_q8_0 *active_hidden = quantized_hidden
+                    + (size_t) input_row * (size_t) hidden_blocks_gate;
+                const float *active_pilots = pilot_activations
+                    + (size_t) input_row
+                    * (size_t) block_count
+                    * (size_t) pilot_count;
+                const int64_t *block_pilots =
+                    pilot_ids + logical_block * pilot_count;
+                int64_t cached_pilot = -1;
+                for (int64_t pilot = 0; pilot < pilot_count; ++pilot) {
+                    if (block_pilots[pilot] == neuron) {
+                        cached_pilot = pilot;
+                        break;
+                    }
+                }
+                float activation;
+                if (cached_pilot >= 0) {
+                    activation = active_pilots[
+                        logical_block * pilot_count + cached_pilot
+                    ];
+                } else {
+                    float gate = immer_dot_packed_q8(
+                        gate_weights + (size_t) neuron * gate_row_bytes,
+                        gate_format,
+                        active_hidden,
+                        hidden_blocks_gate
+                    );
+                    float up = immer_dot_packed_q8(
+                        up_weights + (size_t) neuron * up_row_bytes,
+                        up_format,
+                        active_hidden,
+                        hidden_blocks_gate
+                    );
+                    if (!isfinite(gate) || !isfinite(up)) {
+                        numeric_error = 1;
+                        gate = 0.0f;
+                        up = 0.0f;
+                    }
+                    activation = immer_silu_f32(gate) * up;
+                }
+                if (!isfinite(activation)) {
+                    numeric_error = 1;
+                    activation = 0.0f;
+                }
+                selected_activations[task] = activation;
+            }
+        }
+
+        if (!numeric_error && !allocation_error) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+            for (
+                int64_t task = 0;
+                task < (int64_t) selected_packed_count;
+                ++task
+            ) {
+                const int64_t input_row = task / selected_packed_blocks;
+                const int64_t compact_block = task % selected_packed_blocks;
+                const int64_t selected =
+                    compact_block / packed_blocks_per_logical;
+                const int64_t packed =
+                    compact_block % packed_blocks_per_logical;
+                const int64_t logical_block = selected_blocks_out[
+                    (size_t) input_row * (size_t) selected_block_count
+                    + (size_t) selected
+                ];
+                immer_block_q8_0 *target =
+                    quantized_activations + (size_t) task;
+                immer_quantize_q8_row(
+                    selected_activations
+                        + (size_t) task * (size_t) IMMER_QK,
+                    target,
+                    IMMER_QK
+                );
+                if (!isfinite(immer_half_to_float(target->d))) {
+                    numeric_error = 1;
+                }
+                selected_down_blocks[task] =
+                    logical_block * packed_blocks_per_logical + packed;
+            }
+        }
+
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        {
+            free(quantized_hidden);
+            quantized_hidden = NULL;
+            free(pilot_activations);
+            pilot_activations = NULL;
+            free(selected_activations);
+            selected_activations = NULL;
+        }
+
+        if (!numeric_error && !allocation_error) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+            for (int64_t output_row = 0; output_row < output_rows; ++output_row) {
+                const uint8_t *down_weight_row = down_weights
+                    + (size_t) output_row * down_row_bytes;
+                for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+                    const size_t packed_offset =
+                        (size_t) input_row * (size_t) selected_packed_blocks;
+                    float value = immer_dot_selected_packed_q8(
+                        down_weight_row,
+                        down_format,
+                        quantized_activations + packed_offset,
+                        selected_down_blocks + packed_offset,
+                        selected_packed_blocks
+                    );
+                    value = value * affine_scale[output_row]
+                        + affine_bias[output_row];
+                    if (!isfinite(value)) {
+                        numeric_error = 1;
+                        value = 0.0f;
+                    }
+                    output[
+                        (size_t) input_row * (size_t) output_rows
+                        + (size_t) output_row
+                    ] = value;
+                }
+            }
+        }
+    }
+
+    free(quantized_hidden);
+    free(pilot_activations);
+    free(pilot_features);
+    free(selected_scores);
+    free(selected_activations);
+    free(quantized_activations);
+    free(selected_down_blocks);
+    if (allocation_error) return 3;
+    return numeric_error ? 1 : 0;
 }
 
 IMMER_EXPORT int immer_q4_linear_group_f32(

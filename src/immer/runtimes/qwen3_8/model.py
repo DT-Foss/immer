@@ -1494,6 +1494,22 @@ class StreamedQwen38:
             down_weight=down_weight,
         )
 
+    def _full_mlp_observer(self, layer: int) -> Callable[..., Any] | None:
+        """Return the online learner only for layers it can actually update."""
+
+        executor = self.mlp_sparse_executor
+        if executor is None:
+            return None
+        missing = object()
+        controller = getattr(executor, "online_controller", missing)
+        if controller is None:
+            return None
+        supports = getattr(executor, "supports_layer", None)
+        if callable(supports) and not bool(supports(layer)):
+            return None
+        observe = getattr(executor, "observe_full", None)
+        return observe if callable(observe) else None
+
     def _mlp(self, hidden: torch.Tensor, *, layer: int) -> torch.Tensor:
         row_count = hidden.numel() // hidden.shape[-1]
         if row_count == 1 and self._sparse_mlp_allowed(layer, row_count):
@@ -1519,13 +1535,10 @@ class StreamedQwen38:
         activated = swiglu(gate, up)
         self._observe_layer_boundary(layer, "mlp.activated", activated)
 
-        observe_full = (
-            None
-            if self.mlp_sparse_executor is None
-            else getattr(self.mlp_sparse_executor, "observe_full", None)
-        )
+        observe_full = self._full_mlp_observer(layer)
         observe_down = None
-        if callable(observe_full):
+        q4_active = getattr(self.pager, "q4_bank", None) is not None
+        if observe_full is not None and not q4_active:
             def observe_down(weight: Any, result: Any) -> None:
                 self._observe_exact_mlp(
                     layer=layer,
@@ -1541,6 +1554,14 @@ class StreamedQwen38:
             f"{base}.down_proj",
             weight_observer=observe_down,
         )
+        if observe_full is not None and q4_active:
+            self._observe_exact_mlp(
+                layer=layer,
+                gate=gate,
+                up=up,
+                activated=activated,
+                output=output,
+            )
         self._observe_layer_boundary(layer, "mlp.output", output)
         return output
 
@@ -1844,13 +1865,10 @@ class StreamedQwen38:
             swiglu(gate[index], up[index]) for index in range(len(hidden))
         )
 
-        observe_full = (
-            None
-            if self.mlp_sparse_executor is None
-            else getattr(self.mlp_sparse_executor, "observe_full", None)
-        )
+        observe_full = self._full_mlp_observer(layer)
         observe_down = None
-        if callable(observe_full):
+        q4_active = getattr(self.pager, "q4_bank", None) is not None
+        if observe_full is not None and not q4_active:
             def observe_down(weight: Any, result: tuple[Any, ...]) -> None:
                 self._observe_exact_mlp(
                     layer=layer,
@@ -1866,6 +1884,14 @@ class StreamedQwen38:
             f"{base}.down_proj",
             weight_observer=observe_down,
         )
+        if observe_full is not None and q4_active:
+            self._observe_exact_mlp(
+                layer=layer,
+                gate=gate,
+                up=up,
+                activated=activated,
+                output=output,
+            )
         return output
 
     def _mlp_k2_pair(

@@ -315,6 +315,7 @@ class MlpPilotSparseTrace:
             not in {
                 "scattered-pilot+union-target+route-cache-down",
                 "consolidated-pilot+union-target+route-cache-down",
+                "packed-q4-pilot+selected-blocks",
             }
         ):
             raise ValueError("sparse runtime trace is inconsistent")

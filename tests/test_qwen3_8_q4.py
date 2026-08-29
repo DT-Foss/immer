@@ -5,11 +5,15 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 import numpy as np
 import torch
+
+from immer.runtimes.ooe.mlp_pilot_residual import MlpPilotAffineLayer
+from immer.runtimes.ooe.mlp_pilot_router import MlpPilotLayerModel
 
 from immer.runtimes.qwen3_8.q4 import (
     Q4_0,
@@ -21,6 +25,10 @@ from immer.runtimes.qwen3_8.q4 import (
     Q4BankBuilder,
     Q4BankError,
     Q4NativeKernel,
+)
+from immer.runtimes.qwen3_8.q4_fast_mlp import (
+    PackedFastMlpMarkovController,
+    Qwen38PackedFastMlpExecutor,
 )
 
 
@@ -37,6 +45,139 @@ _SOURCE = {
     "layout_fingerprint": _BUNDLE["layout_fingerprint"],
     "graph_revision": _BUNDLE["graph_revision"],
 }
+
+
+class _ExactPackedBank:
+    def __init__(self, weights: dict[str, torch.Tensor]) -> None:
+        self.weights = weights
+        self.entries = {
+            name: SimpleNamespace(
+                payload_bytes=value.shape[0] * (value.shape[1] // 32) * 18
+            )
+            for name, value in weights.items()
+        }
+        self.logical_weight_bytes = 0
+
+    def metrics(self) -> dict[str, int]:
+        return {"logical_weight_bytes": self.logical_weight_bytes}
+
+    def linear_rows(
+        self,
+        values: torch.Tensor,
+        name: str,
+        row_ids: tuple[int, ...],
+        *,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        weight = self.weights[name].index_select(0, torch.tensor(row_ids))
+        self.logical_weight_bytes += len(row_ids) * (weight.shape[1] // 32) * 18
+        return torch.nn.functional.linear(values, weight).to(output_dtype)
+
+    def linear_rows_pair(
+        self,
+        values: torch.Tensor,
+        names: tuple[str, str],
+        row_ids: tuple[int, ...],
+        *,
+        output_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self.linear_rows(values, names[0], row_ids, output_dtype=output_dtype),
+            self.linear_rows(values, names[1], row_ids, output_dtype=output_dtype),
+        )
+
+    def linear_selected_blocks(
+        self,
+        block_values: torch.Tensor,
+        block_ids: torch.Tensor,
+        name: str,
+        *,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        dense = torch.zeros(
+            (len(block_values), self.weights[name].shape[1]), dtype=torch.float32
+        )
+        for row in range(len(block_values)):
+            for offset, block in enumerate(block_ids[row].tolist()):
+                start = block * 32
+                dense[row, start : start + 32] = block_values[row, offset]
+        self.logical_weight_bytes += (
+            len(block_values)
+            * block_values.shape[1]
+            * self.weights[name].shape[0]
+            * 18
+        )
+        return torch.nn.functional.linear(dense, self.weights[name]).to(output_dtype)
+
+    def linear_routed(
+        self,
+        full_block_values: torch.Tensor,
+        full_block_ids: torch.Tensor,
+        sparse_values: torch.Tensor,
+        sparse_coords: torch.Tensor,
+        name: str,
+        *,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        dense = torch.zeros(
+            (len(full_block_values), self.weights[name].shape[1]),
+            dtype=torch.float32,
+        )
+        for row in range(len(full_block_values)):
+            for offset, block in enumerate(full_block_ids[row].tolist()):
+                start = block * 32
+                dense[row, start : start + 32] = full_block_values[row, offset]
+            dense[row, sparse_coords[row]] = sparse_values[row]
+        touched = full_block_values.shape[1] + len(
+            {coordinate // 32 for coordinate in sparse_coords[0].tolist()}
+        )
+        self.logical_weight_bytes += touched * self.weights[name].shape[0] * 18
+        return torch.nn.functional.linear(dense, self.weights[name]).to(output_dtype)
+
+    def sparse_mlp(
+        self,
+        values: torch.Tensor,
+        names: tuple[str, str, str],
+        *,
+        pilot_ids: np.ndarray,
+        coefficients: np.ndarray,
+        block_size: int,
+        selected_block_count: int,
+        affine_scale: np.ndarray,
+        affine_bias: np.ndarray,
+        output_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        gate = torch.nn.functional.linear(values, self.weights[names[0]])
+        up = torch.nn.functional.linear(values, self.weights[names[1]])
+        pilots = torch.tensor(pilot_ids.reshape(-1), dtype=torch.long)
+        pilot_gate = gate.index_select(1, pilots).reshape(
+            len(values), len(pilot_ids), -1
+        )
+        pilot_up = up.index_select(1, pilots).reshape_as(pilot_gate)
+        features = torch.square(torch.nn.functional.silu(pilot_gate) * pilot_up)
+        coeff = torch.tensor(coefficients, dtype=torch.float64)
+        scores = coeff[None, :, 0] + (
+            features.to(torch.float64) * coeff[None, :, 1:]
+        ).sum(dim=2)
+        selected = torch.tensor(
+            np.argsort(-scores.numpy(), axis=1, kind="stable")[
+                :, :selected_block_count
+            ],
+            dtype=torch.int64,
+        )
+        activation = torch.nn.functional.silu(gate) * up
+        masked = torch.zeros_like(activation)
+        for row, blocks in enumerate(selected.tolist()):
+            for block in blocks:
+                start = block * block_size
+                masked[row, start : start + block_size] = activation[
+                    row, start : start + block_size
+                ]
+        output = torch.nn.functional.linear(masked, self.weights[names[2]])
+        output = output * torch.tensor(affine_scale) + torch.tensor(affine_bias)
+        full = sum(self.entries[name].payload_bytes for name in names)
+        self.logical_weight_bytes += full // 2
+        return output.to(output_dtype), selected
 
 
 def _canonical(value: object) -> bytes:
@@ -240,6 +381,103 @@ class Q4NativeKernelTests(unittest.TestCase):
             self.assertGreater(float(actual[0].abs().max()), 0.0, fmt)
 
 
+class PackedQ4FastMlpTests(unittest.TestCase):
+    def test_markov_width_controller_learns_route_continuity_and_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "route-markov.json"
+            identity = {"plan": "a" * 64}
+            controller = PackedFastMlpMarkovController(
+                path,
+                identity=identity,
+                layers=(0,),
+                maximum_width=64,
+            )
+            route = tuple(range(64))
+            self.assertEqual(controller.width(0), 64)
+            controller.observe(0, route)
+            self.assertEqual(controller.width(0), 64)
+            controller.observe(0, route)
+            self.assertEqual(controller.width(0), 32)
+            controller.flush()
+
+            restored = PackedFastMlpMarkovController(
+                path,
+                identity=identity,
+                layers=(0,),
+                maximum_width=64,
+            )
+            self.assertEqual(restored.width(0), 32)
+            self.assertEqual(restored.metrics()["markov_transitions"], 1)
+            changed = PackedFastMlpMarkovController(
+                path,
+                identity={"plan": "b" * 64},
+                layers=(0,),
+                maximum_width=64,
+            )
+            self.assertNotEqual(changed.path, restored.path)
+            self.assertEqual(changed.metrics()["markov_transitions"], 0)
+
+    def test_pilot_route_executes_only_the_selected_q4_block(self) -> None:
+        generator = torch.Generator().manual_seed(71)
+        gate = 0.01 * torch.randn((64, 32), generator=generator)
+        up = 0.01 * torch.randn((64, 32), generator=generator)
+        down = 0.01 * torch.randn((32, 64), generator=generator)
+        gate[0] = 1.0
+        up[0] = 1.0
+        gate[32] = 0.01
+        up[32] = 0.01
+        base = "model.language_model.layers.0.mlp"
+        bank = _ExactPackedBank(
+            {
+                f"{base}.gate_proj.weight": gate,
+                f"{base}.up_proj.weight": up,
+                f"{base}.down_proj.weight": down,
+            }
+        )
+        model = MlpPilotLayerModel(
+            layer=0,
+            intermediate_dimension=64,
+            block_size=32,
+            selected_block_count=1,
+            pilot_offsets=((0,), (0,)),
+            coefficients=np.ones((2, 2), dtype=np.float64),
+            random_pilot_offsets=((1,), (1,)),
+            random_coefficients=np.ones((2, 2), dtype=np.float64),
+            marginal_block_scores=np.ones(2, dtype=np.float64),
+            training_group_sha256s=("a" * 64,),
+        )
+        affine = MlpPilotAffineLayer(
+            layer=0,
+            output_dimension=32,
+            scale=np.ones(32, dtype=np.float64),
+            bias=np.zeros(32, dtype=np.float64),
+            training_group_sha256s=("b" * 64,),
+        )
+        executor = Qwen38PackedFastMlpExecutor(
+            SimpleNamespace(models=(model,)),  # type: ignore[arg-type]
+            SimpleNamespace(models=(affine,)),  # type: ignore[arg-type]
+            bank,  # type: ignore[arg-type]
+            active_layers=(0,),
+            output_dtype=torch.float32,
+        )
+        hidden = torch.ones((1, 32), dtype=torch.float32)
+
+        actual, trace = executor.execute(hidden, layer=0)
+
+        full_gate = torch.nn.functional.linear(hidden, gate)
+        full_up = torch.nn.functional.linear(hidden, up)
+        activation = torch.nn.functional.silu(full_gate) * full_up
+        activation[:, 32:] = 0.0
+        expected = torch.nn.functional.linear(activation, down)
+        torch.testing.assert_close(actual, expected)
+        self.assertEqual(trace.selected_blocks, ((0,),))
+        self.assertEqual(trace.selected_neuron_count, 32)
+        metrics = executor.metrics()
+        self.assertEqual(metrics["packed_sparse_calls"], 1)
+        self.assertEqual(metrics["packed_sparse_rows"], 1)
+        self.assertGreater(metrics["q4_weight_bytes_saved"], 0)
+
+
 class Q4BankTests(unittest.TestCase):
     def _build(self, root: Path) -> tuple[dict[str, torch.Tensor], dict]:
         tensors = {
@@ -322,9 +560,195 @@ class Q4BankTests(unittest.TestCase):
                 )
                 for actual, expected in zip(grouped, separate, strict=True):
                     torch.testing.assert_close(actual, expected)
+                selected_ids = (4, 1, 3)
+                selected = bank.linear_rows(
+                    value,
+                    name,
+                    selected_ids,
+                    output_dtype=torch.float32,
+                )
+                full = bank.linear(value, name, output_dtype=torch.float32)
+                torch.testing.assert_close(
+                    selected,
+                    full.index_select(1, torch.tensor(selected_ids)),
+                    rtol=0.0,
+                    atol=0.0,
+                )
+                paired = bank.linear_rows_pair(
+                    value,
+                    (name, "lm_head.weight"),
+                    selected_ids,
+                    output_dtype=torch.float32,
+                )
+                paired_full = (
+                    bank.linear(value, name, output_dtype=torch.float32),
+                    bank.linear(value, "lm_head.weight", output_dtype=torch.float32),
+                )
+                for actual, complete in zip(paired, paired_full, strict=True):
+                    torch.testing.assert_close(
+                        actual,
+                        complete.index_select(1, torch.tensor(selected_ids)),
+                        rtol=0.0,
+                        atol=0.0,
+                    )
+
+                block_values = torch.stack(
+                    (
+                        torch.linspace(-1.0, 1.0, 32),
+                        torch.linspace(0.5, -0.5, 32),
+                    )
+                ).reshape(2, 1, 32)
+                block_ids = torch.tensor([[0], [1]], dtype=torch.int64)
+                sparse = bank.linear_selected_blocks(
+                    block_values,
+                    block_ids,
+                    "model.language_model.layers.0.mlp.down_proj.weight",
+                    output_dtype=torch.float32,
+                )
+                dense = torch.zeros((2, 64), dtype=torch.float32)
+                dense[0, :32] = block_values[0, 0]
+                dense[1, 32:] = block_values[1, 0]
+                expected_sparse = bank.linear(
+                    dense,
+                    "model.language_model.layers.0.mlp.down_proj.weight",
+                    output_dtype=torch.float32,
+                )
+                torch.testing.assert_close(sparse, expected_sparse, rtol=0.0, atol=0.0)
+
+                routed_sparse_values = torch.tensor(
+                    [[0.25, -0.75], [0.5, 0.125]], dtype=torch.float32
+                )
+                routed_sparse_ids = torch.tensor(
+                    [[40, 50], [3, 7]], dtype=torch.int64
+                )
+                routed = bank.linear_routed(
+                    block_values,
+                    block_ids,
+                    routed_sparse_values,
+                    routed_sparse_ids,
+                    "model.language_model.layers.0.mlp.down_proj.weight",
+                    output_dtype=torch.float32,
+                )
+                routed_dense = dense.clone()
+                routed_dense.scatter_(1, routed_sparse_ids, routed_sparse_values)
+                expected_routed = bank.linear(
+                    routed_dense,
+                    "model.language_model.layers.0.mlp.down_proj.weight",
+                    output_dtype=torch.float32,
+                )
+                torch.testing.assert_close(
+                    routed,
+                    expected_routed,
+                    rtol=2e-3,
+                    atol=2e-3,
+                )
                 metrics = bank.metrics()
                 self.assertEqual(metrics["linear_group_calls"], 1)
-                self.assertEqual(metrics["input_quantizations"], 4)
+                self.assertEqual(metrics["linear_row_calls"], 3)
+                self.assertEqual(metrics["sparse_block_calls"], 1)
+                self.assertEqual(metrics["sparse_coordinate_calls"], 1)
+                self.assertEqual(metrics["selected_output_rows"], 9)
+                self.assertEqual(metrics["selected_input_blocks"], 4)
+                self.assertEqual(metrics["selected_input_coordinates"], 4)
+            finally:
+                bank.close()
+
+    def test_fused_sparse_mlp_matches_the_selected_dense_q4_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-fused-mlp"
+            generator = torch.Generator().manual_seed(991)
+            base = "model.language_model.layers.0.mlp"
+            tensors = {
+                f"{base}.gate_proj.weight": torch.randn(
+                    (64, 64), generator=generator
+                ),
+                f"{base}.up_proj.weight": torch.randn(
+                    (64, 64), generator=generator
+                ),
+                f"{base}.down_proj.weight": torch.randn(
+                    (32, 64), generator=generator
+                ),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=16,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                values = torch.randn((2, 64), generator=generator)
+                pilots = np.asarray(((0, 16), (32, 48)), dtype=np.int64)
+                coefficients = np.asarray(
+                    ((0.1, 0.7, 0.3), (0.2, 0.4, 0.6)), dtype=np.float64
+                )
+                scale = np.linspace(0.8, 1.2, 32, dtype=np.float32)
+                bias = np.linspace(-0.1, 0.1, 32, dtype=np.float32)
+
+                actual, selected = bank.sparse_mlp(
+                    values,
+                    (
+                        f"{base}.gate_proj.weight",
+                        f"{base}.up_proj.weight",
+                        f"{base}.down_proj.weight",
+                    ),
+                    pilot_ids=pilots,
+                    coefficients=coefficients,
+                    block_size=32,
+                    selected_block_count=1,
+                    affine_scale=scale,
+                    affine_bias=bias,
+                    output_dtype=torch.float32,
+                )
+
+                gate = bank.linear(
+                    values, f"{base}.gate_proj.weight", output_dtype=torch.float32
+                )
+                up = bank.linear(
+                    values, f"{base}.up_proj.weight", output_dtype=torch.float32
+                )
+                pilot_indices = torch.tensor(pilots.reshape(-1), dtype=torch.long)
+                pilot_gate = gate.index_select(1, pilot_indices).reshape(2, 2, 2)
+                pilot_up = up.index_select(1, pilot_indices).reshape(2, 2, 2)
+                features = torch.square(
+                    torch.nn.functional.silu(pilot_gate) * pilot_up
+                ).to(torch.float64)
+                coeff = torch.tensor(coefficients, dtype=torch.float64)
+                scores = torch.clamp_min(
+                    coeff[None, :, 0]
+                    + (features * coeff[None, :, 1:]).sum(dim=2),
+                    0.0,
+                )
+                expected_selected = torch.tensor(
+                    np.argsort(-scores.numpy(), axis=1, kind="stable")[:, :1],
+                    dtype=torch.int64,
+                )
+                torch.testing.assert_close(selected, expected_selected)
+                activated = torch.nn.functional.silu(gate) * up
+                masked = torch.zeros_like(activated)
+                for row, (block,) in enumerate(expected_selected.tolist()):
+                    start = block * 32
+                    masked[row, start : start + 32] = activated[
+                        row, start : start + 32
+                    ]
+                expected = bank.linear(
+                    masked,
+                    f"{base}.down_proj.weight",
+                    output_dtype=torch.float32,
+                )
+                expected = expected * torch.tensor(scale) + torch.tensor(bias)
+                torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+                metrics = bank.metrics()
+                self.assertEqual(metrics["fused_mlp_calls"], 1)
+                self.assertEqual(metrics["fused_mlp_rows"], 2)
             finally:
                 bank.close()
 

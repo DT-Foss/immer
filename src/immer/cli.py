@@ -147,6 +147,16 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             if args.qwen38_anchor_cache is None
             else SemanticStateAnchorCache(args.qwen38_anchor_cache)
         )
+        fast_mlp_layers = args.fast_mlp_layers
+        fast_mlp_blocks = args.fast_mlp_blocks
+        if args.fast_mlp_policy == "structure-edge":
+            if fast_mlp_layers is not None:
+                raise ValueError(
+                    "--fast-mlp-policy structure-edge replaces --fast-mlp-layers"
+                )
+            fast_mlp_layers = (*range(18), *range(55, 64))
+            if fast_mlp_blocks is None:
+                fast_mlp_blocks = 64
         component = Qwen38CausalChat(
             args.qwen38_causal_bundle,
             args.qwen38_tokenizer,
@@ -190,7 +200,8 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 if args.fast_mlp_max_resident_mb is None
                 else int(args.fast_mlp_max_resident_mb * 1024**2)
             ),
-            fast_mlp_active_layers=args.fast_mlp_layers,
+            fast_mlp_active_layers=fast_mlp_layers,
+            fast_mlp_selected_block_count=fast_mlp_blocks,
         )
         if jsonl:
             failures = 0
@@ -924,6 +935,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--fast-mlp-layers",
         type=_sorted_layer_list,
         help="sorted fitted layer subset, for example 0,9,18,27,36,45,54,63",
+    )
+    chat.add_argument(
+        "--fast-mlp-blocks",
+        type=int,
+        help="override the packed Q4 route width per active MLP layer",
+    )
+    chat.add_argument(
+        "--fast-mlp-policy",
+        choices=("manual", "structure-edge"),
+        default="manual",
+        help="structure-edge keeps layers 18-54 full and routes only the edges",
     )
     chat.add_argument(
         "--fast-mlp-online-state",

@@ -182,6 +182,14 @@ from .q4 import (
     Q4NativeKernel,
     Q4TensorEntry,
 )
+from .q4_fast_mlp import (
+    PACKED_FAST_MLP_SCHEMA,
+    Qwen38PackedFastMlpError,
+    Qwen38PackedFastMlpExecutor,
+    Qwen38PackedFastMlpMount,
+    Qwen38PackedFastMlpReceipt,
+    open_qwen38_packed_fast_mlp,
+)
 from .probe import (
     DELTANET_COMPARISON_SCHEMA,
     DELTANET_COMPONENTS,
@@ -460,6 +468,10 @@ __all__ = [
     "Qwen38ForkState",
     "Qwen38ForkTraffic",
     "Qwen38PagerError",
+    "Qwen38PackedFastMlpError",
+    "Qwen38PackedFastMlpExecutor",
+    "Qwen38PackedFastMlpMount",
+    "Qwen38PackedFastMlpReceipt",
     "Qwen38RuntimeError",
     "Qwen38K2SpeculativeDecoder",
     "Qwen38K4SpeculativeDecoder",
@@ -493,6 +505,7 @@ __all__ = [
     "QWEN38_ROLLING_SPECULATIVE_SCHEMA",
     "PILOT_WEIGHT_MANIFEST_SCHEMA",
     "PILOT_WEIGHT_MANIFEST_V2_SCHEMA",
+    "PACKED_FAST_MLP_SCHEMA",
     "WEIGHT_ONLY_PLAN_NAME",
     "StatefulEvidence",
     "StatefulBlockEvidence",
@@ -526,6 +539,7 @@ __all__ = [
     "tensor_range_plan_from_source",
     "token_prefix_sha256",
     "open_qwen38_fast_mlp",
+    "open_qwen38_packed_fast_mlp",
     "verify_probe_document",
     "verify_qwen38_causal_mount",
     "contextual_bottom_k_signature",

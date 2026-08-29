@@ -482,7 +482,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertFalse(component.loaded)
         component.close()
 
-    def test_q4_selects_cpu_and_rejects_obsolete_bf16_accelerators(self) -> None:
+    def test_q4_selects_cpu_and_composes_with_sparse_mlp(self) -> None:
         component = Qwen38CausalChat(
             "unused.causal",
             "unused-tokenizer.json",
@@ -491,8 +491,27 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(component._device, "cpu")
         component.close()
 
+        component = Qwen38CausalChat(
+            "unused.causal",
+            "unused-tokenizer.json",
+            q4_root="/models/qwen-q4",
+            fast_mlp_root="/artifacts/fast",
+            fast_mlp_selected_block_count=96,
+        )
+        self.assertEqual(component._device, "cpu")
+        self.assertIsNotNone(component._fast_mlp_paths)
+        self.assertEqual(component._fast_mlp_selected_block_count, 96)
+        component.close()
+
+        with self.assertRaisesRegex(ValueError, "requires Q4"):
+            Qwen38CausalChat(
+                "unused.causal",
+                "unused-tokenizer.json",
+                fast_mlp_root="/artifacts/fast",
+                fast_mlp_selected_block_count=96,
+            )
+
         for options in (
-            {"fast_mlp_root": "/artifacts/fast"},
             {"exact_head_root": "/artifacts/head"},
             {"range_markov_state_path": "/state/ranges"},
         ):
@@ -1265,6 +1284,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         "/models/qwen-q4",
                         "--q4-threads",
                         "12",
+                        "--fast-mlp",
+                        "/state/qwen-fast-all64",
+                        "--fast-mlp-policy",
+                        "structure-edge",
                     ]
                 )
 
@@ -1272,6 +1295,12 @@ class Qwen38CausalChatTests(unittest.TestCase):
         options = constructor.call_args.kwargs
         self.assertEqual(options["q4_root"], "/models/qwen-q4")
         self.assertEqual(options["q4_threads"], 12)
+        self.assertEqual(options["fast_mlp_root"], "/state/qwen-fast-all64")
+        self.assertEqual(
+            options["fast_mlp_active_layers"],
+            (*range(18), *range(55, 64)),
+        )
+        self.assertEqual(options["fast_mlp_selected_block_count"], 64)
 
     def test_cli_wires_exact_head_index_root(self) -> None:
         qwen = _chat(_Runtime())

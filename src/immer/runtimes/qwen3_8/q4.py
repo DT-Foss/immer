@@ -289,6 +289,90 @@ class Q4NativeKernel:
             integer,
         )
         self.library.immer_q4_linear_f32.restype = integer
+        self.library.immer_q4_linear_rows_f32.argtypes = (
+            void,
+            i64,
+            i64,
+            void,
+            integer,
+            i64,
+            void,
+            i64,
+            void,
+            integer,
+        )
+        self.library.immer_q4_linear_rows_f32.restype = integer
+        self.library.immer_q4_linear_rows_pair_f32.argtypes = (
+            void,
+            i64,
+            i64,
+            void,
+            integer,
+            i64,
+            void,
+            integer,
+            i64,
+            void,
+            i64,
+            void,
+            void,
+            integer,
+        )
+        self.library.immer_q4_linear_rows_pair_f32.restype = integer
+        self.library.immer_q4_linear_selected_blocks_f32.argtypes = (
+            void,
+            i64,
+            i64,
+            void,
+            i64,
+            void,
+            integer,
+            i64,
+            void,
+            integer,
+        )
+        self.library.immer_q4_linear_selected_blocks_f32.restype = integer
+        self.library.immer_q4_linear_routed_f32.argtypes = (
+            void,
+            i64,
+            i64,
+            void,
+            void,
+            void,
+            i64,
+            i64,
+            void,
+            integer,
+            i64,
+            void,
+            integer,
+        )
+        self.library.immer_q4_linear_routed_f32.restype = integer
+        self.library.immer_q4_sparse_mlp_f32.argtypes = (
+            void,
+            i64,
+            i64,
+            void,
+            integer,
+            void,
+            integer,
+            void,
+            integer,
+            i64,
+            i64,
+            void,
+            i64,
+            i64,
+            i64,
+            void,
+            i64,
+            void,
+            void,
+            void,
+            void,
+            integer,
+        )
+        self.library.immer_q4_sparse_mlp_f32.restype = integer
         self.library.immer_q4_linear_group_f32.argtypes = (
             void,
             i64,
@@ -505,8 +589,16 @@ class Q4BankMetrics:
     mapped_payload_bytes: int = 0
     linear_calls: int = 0
     linear_group_calls: int = 0
+    linear_row_calls: int = 0
+    sparse_block_calls: int = 0
+    sparse_coordinate_calls: int = 0
+    fused_mlp_calls: int = 0
+    fused_mlp_rows: int = 0
     input_quantizations: int = 0
     linear_input_rows: int = 0
+    selected_output_rows: int = 0
+    selected_input_blocks: int = 0
+    selected_input_coordinates: int = 0
     embedding_rows: int = 0
     candidate_rows: int = 0
     head_calls: int = 0
@@ -715,6 +807,457 @@ class Q4Bank:
                 result.numel() * result.element_size() for result in results
             )
             return results
+
+    def linear_rows(
+        self,
+        values: Any,
+        name: str,
+        row_ids: tuple[int, ...],
+        *,
+        output_dtype: Any | None = None,
+    ) -> Any:
+        """Apply only selected matrix rows without dequantizing them."""
+
+        import torch
+
+        with self._lock:
+            entry, mapped = self._mapping(name)
+            if not row_ids or any(
+                isinstance(row, bool)
+                or not isinstance(row, int)
+                or not 0 <= row < entry.shape[0]
+                for row in row_ids
+            ):
+                raise ValueError("Q4 selected linear rows are invalid")
+            if not isinstance(values, torch.Tensor):
+                values = torch.as_tensor(values)
+            if values.ndim < 1 or values.shape[-1] != entry.shape[1]:
+                raise Q4BankError(f"Q4 input width disagrees with {name!r}")
+            if values.device.type != "cpu":
+                raise Q4BankError("Q4 execution is currently CPU-only")
+            leading = tuple(values.shape[:-1])
+            input_rows = values.numel() // values.shape[-1]
+            compute = values.detach().to(dtype=torch.float32).reshape(
+                input_rows, entry.shape[1]
+            ).contiguous()
+            ids = torch.tensor(row_ids, dtype=torch.int64)
+            output = torch.empty((input_rows, len(row_ids)), dtype=torch.float32)
+            code = self.native.library.immer_q4_linear_rows_f32(
+                self.native._pointer(compute),
+                input_rows,
+                entry.shape[1],
+                self.native._pointer(mapped.bytes),
+                _FORMAT_CODES[entry.format],
+                entry.shape[0],
+                self.native._pointer(ids),
+                len(row_ids),
+                self.native._pointer(output),
+                self.threads,
+            )
+            if code:
+                raise Q4BankError(f"native Q4 selected-row linear failed with code {code}")
+            dtype = values.dtype if output_dtype is None else output_dtype
+            result = output.to(dtype=dtype).reshape(*leading, len(row_ids))
+            self._stats.linear_calls += 1
+            self._stats.linear_row_calls += 1
+            self._stats.input_quantizations += 1
+            self._stats.linear_input_rows += input_rows
+            self._stats.selected_output_rows += len(row_ids)
+            self._stats.logical_weight_bytes += len(row_ids) * entry.row_bytes
+            self._stats.output_bytes += result.numel() * result.element_size()
+            return result
+
+    def linear_rows_pair(
+        self,
+        values: Any,
+        names: tuple[str, str],
+        row_ids: tuple[int, ...],
+        *,
+        output_dtype: Any | None = None,
+    ) -> tuple[Any, Any]:
+        """Apply the same selected rows from two matrices with one input pass."""
+
+        import torch
+
+        with self._lock:
+            if len(names) != 2 or names[0] == names[1]:
+                raise ValueError("Q4 selected-row pair requires two distinct matrices")
+            resolved = tuple(self._mapping(name) for name in names)
+            entries = tuple(row[0] for row in resolved)
+            mapped = tuple(row[1] for row in resolved)
+            if entries[0].shape[1] != entries[1].shape[1]:
+                raise Q4BankError("Q4 selected-row pair input widths differ")
+            if not row_ids or any(
+                isinstance(row, bool)
+                or not isinstance(row, int)
+                or row < 0
+                or any(row >= entry.shape[0] for entry in entries)
+                for row in row_ids
+            ):
+                raise ValueError("Q4 selected linear rows are invalid")
+            if not isinstance(values, torch.Tensor):
+                values = torch.as_tensor(values)
+            input_columns = entries[0].shape[1]
+            if values.ndim < 1 or values.shape[-1] != input_columns:
+                raise Q4BankError("Q4 selected-row pair input width differs")
+            if values.device.type != "cpu":
+                raise Q4BankError("Q4 execution is currently CPU-only")
+            leading = tuple(values.shape[:-1])
+            input_rows = values.numel() // input_columns
+            compute = values.detach().to(dtype=torch.float32).reshape(
+                input_rows, input_columns
+            ).contiguous()
+            ids = torch.tensor(row_ids, dtype=torch.int64)
+            outputs = tuple(
+                torch.empty((input_rows, len(row_ids)), dtype=torch.float32)
+                for _ in entries
+            )
+            code = self.native.library.immer_q4_linear_rows_pair_f32(
+                self.native._pointer(compute),
+                input_rows,
+                input_columns,
+                self.native._pointer(mapped[0].bytes),
+                _FORMAT_CODES[entries[0].format],
+                entries[0].shape[0],
+                self.native._pointer(mapped[1].bytes),
+                _FORMAT_CODES[entries[1].format],
+                entries[1].shape[0],
+                self.native._pointer(ids),
+                len(row_ids),
+                self.native._pointer(outputs[0]),
+                self.native._pointer(outputs[1]),
+                self.threads,
+            )
+            if code:
+                raise Q4BankError(
+                    f"native Q4 selected-row pair failed with code {code}"
+                )
+            dtype = values.dtype if output_dtype is None else output_dtype
+            results = tuple(
+                output.to(dtype=dtype).reshape(*leading, len(row_ids))
+                for output in outputs
+            )
+            self._stats.linear_calls += 2
+            self._stats.linear_row_calls += 2
+            self._stats.input_quantizations += 1
+            self._stats.linear_input_rows += input_rows * 2
+            self._stats.selected_output_rows += 2 * len(row_ids)
+            self._stats.logical_weight_bytes += sum(
+                len(row_ids) * entry.row_bytes for entry in entries
+            )
+            self._stats.output_bytes += sum(
+                result.numel() * result.element_size() for result in results
+            )
+            return results[0], results[1]
+
+    def linear_selected_blocks(
+        self,
+        block_values: Any,
+        block_ids: Any,
+        name: str,
+        *,
+        output_dtype: Any | None = None,
+    ) -> Any:
+        """Multiply compact 32-value activation blocks by packed matrix columns."""
+
+        import torch
+
+        with self._lock:
+            entry, mapped = self._mapping(name)
+            if not isinstance(block_values, torch.Tensor):
+                block_values = torch.as_tensor(block_values)
+            if not isinstance(block_ids, torch.Tensor):
+                block_ids = torch.as_tensor(block_ids)
+            if (
+                block_values.ndim != 3
+                or block_values.shape[2] != Q4_BLOCK_SIZE
+                or block_values.shape[:2] != block_ids.shape
+                or block_ids.ndim != 2
+                or block_values.shape[0] < 1
+                or block_values.shape[1] < 1
+            ):
+                raise ValueError("Q4 selected blocks differ from their block IDs")
+            if block_values.device.type != "cpu" or block_ids.device.type != "cpu":
+                raise Q4BankError("Q4 execution is currently CPU-only")
+            ids = block_ids.detach().to(dtype=torch.int64).contiguous()
+            total_blocks = entry.shape[1] // Q4_BLOCK_SIZE
+            if bool((ids < 0).any()) or bool((ids >= total_blocks).any()):
+                raise ValueError("Q4 selected block ID is outside the matrix")
+            if any(len(set(row)) != len(row) for row in ids.tolist()):
+                raise ValueError("Q4 selected block IDs must be unique per row")
+            compute = block_values.detach().to(dtype=torch.float32).contiguous()
+            input_rows, selected_blocks, _ = compute.shape
+            output = torch.empty((input_rows, entry.shape[0]), dtype=torch.float32)
+            code = self.native.library.immer_q4_linear_selected_blocks_f32(
+                self.native._pointer(compute),
+                input_rows,
+                selected_blocks,
+                self.native._pointer(ids),
+                entry.shape[1],
+                self.native._pointer(mapped.bytes),
+                _FORMAT_CODES[entry.format],
+                entry.shape[0],
+                self.native._pointer(output),
+                self.threads,
+            )
+            if code:
+                raise Q4BankError(
+                    f"native Q4 selected-block linear failed with code {code}"
+                )
+            dtype = block_values.dtype if output_dtype is None else output_dtype
+            result = output.to(dtype=dtype)
+            block_bytes = _FORMAT_BLOCK_BYTES[entry.format]
+            self._stats.linear_calls += 1
+            self._stats.sparse_block_calls += 1
+            self._stats.input_quantizations += input_rows * selected_blocks
+            self._stats.linear_input_rows += input_rows
+            self._stats.selected_input_blocks += input_rows * selected_blocks
+            self._stats.logical_weight_bytes += (
+                input_rows * selected_blocks * entry.shape[0] * block_bytes
+            )
+            self._stats.output_bytes += result.numel() * result.element_size()
+            return result
+
+    def linear_routed(
+        self,
+        full_block_values: Any,
+        full_block_ids: Any,
+        sparse_values: Any,
+        sparse_coords: Any,
+        name: str,
+        *,
+        output_dtype: Any | None = None,
+    ) -> Any:
+        """Run dense selected Q4 blocks plus scattered packed coordinates."""
+
+        import torch
+
+        with self._lock:
+            entry, mapped = self._mapping(name)
+            tensors = []
+            for value in (
+                full_block_values,
+                full_block_ids,
+                sparse_values,
+                sparse_coords,
+            ):
+                tensors.append(value if isinstance(value, torch.Tensor) else torch.as_tensor(value))
+            full_value, full_ids, sparse_value, sparse_ids = tensors
+            if (
+                full_value.ndim != 3
+                or full_value.shape[2] != Q4_BLOCK_SIZE
+                or full_ids.ndim != 2
+                or full_value.shape[:2] != full_ids.shape
+                or sparse_value.ndim != 2
+                or sparse_ids.ndim != 2
+                or sparse_value.shape != sparse_ids.shape
+                or full_value.shape[0] != sparse_value.shape[0]
+                or full_value.shape[0] < 1
+                or full_value.shape[1] < 1
+                or sparse_value.shape[1] < 1
+            ):
+                raise ValueError("Q4 routed blocks and coordinates are misaligned")
+            if any(value.device.type != "cpu" for value in tensors):
+                raise Q4BankError("Q4 execution is currently CPU-only")
+            full_ids = full_ids.detach().to(dtype=torch.int64).contiguous()
+            sparse_ids = sparse_ids.detach().to(dtype=torch.int64).contiguous()
+            total_blocks = entry.shape[1] // Q4_BLOCK_SIZE
+            if (
+                bool((full_ids < 0).any())
+                or bool((full_ids >= total_blocks).any())
+                or bool((sparse_ids < 0).any())
+                or bool((sparse_ids >= entry.shape[1]).any())
+            ):
+                raise ValueError("Q4 routed coordinate is outside the matrix")
+            full_rows = full_ids.tolist()
+            sparse_rows = sparse_ids.tolist()
+            for blocks, coordinates in zip(full_rows, sparse_rows, strict=True):
+                if (
+                    len(set(blocks)) != len(blocks)
+                    or len(set(coordinates)) != len(coordinates)
+                    or {coordinate // Q4_BLOCK_SIZE for coordinate in coordinates}
+                    & set(blocks)
+                ):
+                    raise ValueError("Q4 routed coordinates overlap or repeat")
+            full_compute = full_value.detach().to(dtype=torch.float32).contiguous()
+            sparse_compute = sparse_value.detach().to(dtype=torch.float32).contiguous()
+            input_rows, full_blocks, _ = full_compute.shape
+            sparse_count = sparse_compute.shape[1]
+            output = torch.empty((input_rows, entry.shape[0]), dtype=torch.float32)
+            code = self.native.library.immer_q4_linear_routed_f32(
+                self.native._pointer(full_compute),
+                input_rows,
+                full_blocks,
+                self.native._pointer(full_ids),
+                self.native._pointer(sparse_compute),
+                self.native._pointer(sparse_ids),
+                sparse_count,
+                entry.shape[1],
+                self.native._pointer(mapped.bytes),
+                _FORMAT_CODES[entry.format],
+                entry.shape[0],
+                self.native._pointer(output),
+                self.threads,
+            )
+            if code:
+                raise Q4BankError(f"native Q4 routed linear failed with code {code}")
+            dtype = full_value.dtype if output_dtype is None else output_dtype
+            result = output.to(dtype=dtype)
+            block_bytes = _FORMAT_BLOCK_BYTES[entry.format]
+            sparse_touched_blocks = sum(
+                len({coordinate // Q4_BLOCK_SIZE for coordinate in row})
+                for row in sparse_rows
+            )
+            self._stats.linear_calls += 1
+            self._stats.sparse_coordinate_calls += 1
+            self._stats.input_quantizations += input_rows * full_blocks
+            self._stats.linear_input_rows += input_rows
+            self._stats.selected_input_blocks += input_rows * full_blocks
+            self._stats.selected_input_coordinates += input_rows * sparse_count
+            self._stats.logical_weight_bytes += (
+                (input_rows * full_blocks + sparse_touched_blocks)
+                * entry.shape[0]
+                * block_bytes
+            )
+            self._stats.output_bytes += result.numel() * result.element_size()
+            return result
+
+    def sparse_mlp(
+        self,
+        values: Any,
+        names: tuple[str, str, str],
+        *,
+        pilot_ids: Any,
+        coefficients: Any,
+        block_size: int,
+        selected_block_count: int,
+        affine_scale: Any,
+        affine_bias: Any,
+        output_dtype: Any | None = None,
+    ) -> tuple[Any, Any]:
+        """Execute routing, selected SwiGLU, and selected Down in one kernel."""
+
+        import torch
+
+        with self._lock:
+            if len(names) != 3 or len(set(names)) != 3:
+                raise ValueError("Q4 fused MLP requires Gate, Up, and Down names")
+            gate, up, down = (self._mapping(name) for name in names)
+            gate_entry, gate_map = gate
+            up_entry, up_map = up
+            down_entry, down_map = down
+            if (
+                gate_entry.shape != up_entry.shape
+                or down_entry.shape[1] != gate_entry.shape[0]
+            ):
+                raise Q4BankError("Q4 fused MLP tensor shapes disagree")
+            if not isinstance(values, torch.Tensor):
+                values = torch.as_tensor(values)
+            if (
+                values.ndim < 1
+                or values.shape[-1] != gate_entry.shape[1]
+                or values.device.type != "cpu"
+            ):
+                raise ValueError("Q4 fused MLP input differs from Gate/Up")
+            if (
+                isinstance(block_size, bool)
+                or not isinstance(block_size, int)
+                or block_size <= 0
+                or gate_entry.shape[0] % block_size
+                or isinstance(selected_block_count, bool)
+                or not isinstance(selected_block_count, int)
+                or not 0 < selected_block_count < gate_entry.shape[0] // block_size
+            ):
+                raise ValueError("Q4 fused MLP block topology is invalid")
+            ids = (
+                pilot_ids
+                if isinstance(pilot_ids, torch.Tensor)
+                else torch.tensor(pilot_ids)
+            ).detach().to(dtype=torch.int64).contiguous()
+            coeff = (
+                coefficients
+                if isinstance(coefficients, torch.Tensor)
+                else torch.tensor(coefficients)
+            ).detach().to(dtype=torch.float64).contiguous()
+            block_count = gate_entry.shape[0] // block_size
+            if (
+                ids.ndim != 2
+                or ids.shape[0] != block_count
+                or ids.shape[1] < 1
+                or coeff.shape != (block_count, ids.shape[1] + 1)
+            ):
+                raise ValueError("Q4 fused MLP pilots and coefficients disagree")
+            scale = (
+                affine_scale
+                if isinstance(affine_scale, torch.Tensor)
+                else torch.tensor(affine_scale)
+            ).detach().to(dtype=torch.float32).contiguous()
+            bias = (
+                affine_bias
+                if isinstance(affine_bias, torch.Tensor)
+                else torch.tensor(affine_bias)
+            ).detach().to(dtype=torch.float32).contiguous()
+            if scale.shape != (down_entry.shape[0],) or bias.shape != scale.shape:
+                raise ValueError("Q4 fused MLP affine vectors disagree with Down")
+            leading = tuple(values.shape[:-1])
+            input_rows = values.numel() // values.shape[-1]
+            compute = values.detach().to(dtype=torch.float32).reshape(
+                input_rows, values.shape[-1]
+            ).contiguous()
+            output = torch.empty((input_rows, down_entry.shape[0]), dtype=torch.float32)
+            selected = torch.empty(
+                (input_rows, selected_block_count), dtype=torch.int64
+            )
+            code = self.native.library.immer_q4_sparse_mlp_f32(
+                self.native._pointer(compute),
+                input_rows,
+                gate_entry.shape[1],
+                self.native._pointer(gate_map.bytes),
+                _FORMAT_CODES[gate_entry.format],
+                self.native._pointer(up_map.bytes),
+                _FORMAT_CODES[up_entry.format],
+                self.native._pointer(down_map.bytes),
+                _FORMAT_CODES[down_entry.format],
+                gate_entry.shape[0],
+                down_entry.shape[0],
+                self.native._pointer(ids),
+                block_count,
+                block_size,
+                ids.shape[1],
+                self.native._pointer(coeff),
+                selected_block_count,
+                self.native._pointer(scale),
+                self.native._pointer(bias),
+                self.native._pointer(output),
+                self.native._pointer(selected),
+                self.threads,
+            )
+            if code:
+                raise Q4BankError(f"native Q4 fused MLP failed with code {code}")
+            dtype = values.dtype if output_dtype is None else output_dtype
+            result = output.to(dtype=dtype).reshape(*leading, down_entry.shape[0])
+            pilot_count = ids.numel()
+            selected_neurons = selected_block_count * block_size
+            down_blocks = selected_neurons // Q4_BLOCK_SIZE
+            actual = input_rows * (
+                (pilot_count + selected_neurons)
+                * (gate_entry.row_bytes + up_entry.row_bytes)
+                + down_blocks
+                * down_entry.shape[0]
+                * _FORMAT_BLOCK_BYTES[down_entry.format]
+            )
+            self._stats.linear_calls += 3
+            self._stats.input_quantizations += input_rows * (1 + down_blocks)
+            self._stats.linear_input_rows += input_rows * 3
+            self._stats.selected_input_blocks += input_rows * down_blocks
+            self._stats.selected_output_rows += input_rows * 2 * (
+                pilot_count + selected_neurons
+            )
+            self._stats.logical_weight_bytes += actual
+            self._stats.output_bytes += result.numel() * result.element_size()
+            self._stats.fused_mlp_calls += 1
+            self._stats.fused_mlp_rows += input_rows
+            return result, selected
 
     def rows(self, name: str, row_ids: tuple[int, ...], *, dtype: Any) -> Any:
         import torch

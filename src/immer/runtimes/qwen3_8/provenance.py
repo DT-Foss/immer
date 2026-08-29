@@ -21,6 +21,7 @@ _QWEN_RUNTIME_FILES = (
     "pager.py",
     "provenance.py",
     "q4.py",
+    "q4_fast_mlp.py",
     "q4_native.c",
     "snapshot.py",
 )

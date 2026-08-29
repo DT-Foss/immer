@@ -53,6 +53,10 @@ from .markov_draft import (
 )
 from .pager import Qwen38WeightPager
 from .q4 import Q4Bank
+from .q4_fast_mlp import (
+    Qwen38PackedFastMlpMount,
+    open_qwen38_packed_fast_mlp,
+)
 from .speculative import Qwen38K4SpeculativeDecoder
 from .semantic_state_cache import (
     AnchorReceipt,
@@ -579,7 +583,7 @@ class _OwnedRuntime:
         tokenizer_sha256: str,
         bundle_receipt: Mapping[str, Any],
         preflight_receipt: Mapping[str, Any],
-        fast_mlp_mount: Qwen38FastMlpMount | None = None,
+        fast_mlp_mount: Qwen38FastMlpMount | Qwen38PackedFastMlpMount | None = None,
         exact_head_index: ExactHeadIndex | None = None,
         range_prefetcher: MarkovRangePrefetcher | None = None,
         q4_bank: Q4Bank | None = None,
@@ -669,6 +673,7 @@ def _open_local_runtime(
     fast_mlp_source_budget_mb: float | None = None,
     fast_mlp_max_resident_bytes: int | None = None,
     fast_mlp_active_layers: Sequence[int] | None = None,
+    fast_mlp_selected_block_count: int | None = None,
     fast_mlp_online_state_path: Path | None = None,
     exact_head_root: Path | None = None,
     exact_head_block_rows: int | None = None,
@@ -692,7 +697,7 @@ def _open_local_runtime(
     mount: CausalWeightMount | None = None
     pager: Qwen38WeightPager | None = None
     model: StreamedQwen38 | None = None
-    fast_mlp_mount: Qwen38FastMlpMount | None = None
+    fast_mlp_mount: Qwen38FastMlpMount | Qwen38PackedFastMlpMount | None = None
     exact_head_index: ExactHeadIndex | None = None
     range_prefetcher: MarkovRangePrefetcher | None = None
     q4_bank: Q4Bank | None = None
@@ -759,24 +764,36 @@ def _open_local_runtime(
             else:
                 pager.attach_exact_head_index(exact_head_index)
         if fast_mlp_paths is not None:
-            fast_mlp_mount = open_qwen38_fast_mlp(
-                paths=fast_mlp_paths,
-                target_mount=mount,
-                target_pager=pager,
-                config=config,
-                source_budget_mb=(
-                    source_budget_mb
-                    if fast_mlp_source_budget_mb is None
-                    else fast_mlp_source_budget_mb
-                ),
-                max_resident_bytes=(
-                    max_resident_bytes
-                    if fast_mlp_max_resident_bytes is None
-                    else fast_mlp_max_resident_bytes
-                ),
-                active_layers=fast_mlp_active_layers,
-                online_state_path=fast_mlp_online_state_path,
-            )
+            if q4_bank is None:
+                fast_mlp_mount = open_qwen38_fast_mlp(
+                    paths=fast_mlp_paths,
+                    target_mount=mount,
+                    target_pager=pager,
+                    config=config,
+                    source_budget_mb=(
+                        source_budget_mb
+                        if fast_mlp_source_budget_mb is None
+                        else fast_mlp_source_budget_mb
+                    ),
+                    max_resident_bytes=(
+                        max_resident_bytes
+                        if fast_mlp_max_resident_bytes is None
+                        else fast_mlp_max_resident_bytes
+                    ),
+                    active_layers=fast_mlp_active_layers,
+                    online_state_path=fast_mlp_online_state_path,
+                )
+            else:
+                fast_mlp_mount = open_qwen38_packed_fast_mlp(
+                    paths=fast_mlp_paths,
+                    bank=q4_bank,
+                    config=config,
+                    weights_root=mount.weights_root,
+                    active_layers=fast_mlp_active_layers,
+                    output_dtype=pager.compute_dtype,
+                    selected_block_count=fast_mlp_selected_block_count,
+                    markov_state_path=fast_mlp_online_state_path,
+                )
         model = StreamedQwen38(
             config,
             pager,
@@ -881,6 +898,7 @@ def _open_official_runtime(
     fast_mlp_source_budget_mb: float | None = None,
     fast_mlp_max_resident_bytes: int | None = None,
     fast_mlp_active_layers: Sequence[int] | None = None,
+    fast_mlp_selected_block_count: int | None = None,
     fast_mlp_online_state_path: Path | None = None,
     exact_head_root: Path | None = None,
     exact_head_block_rows: int | None = None,
@@ -909,6 +927,7 @@ def _open_official_runtime(
         fast_mlp_source_budget_mb=fast_mlp_source_budget_mb,
         fast_mlp_max_resident_bytes=fast_mlp_max_resident_bytes,
         fast_mlp_active_layers=fast_mlp_active_layers,
+        fast_mlp_selected_block_count=fast_mlp_selected_block_count,
         fast_mlp_online_state_path=fast_mlp_online_state_path,
         exact_head_root=exact_head_root,
         exact_head_block_rows=exact_head_block_rows,
@@ -960,6 +979,7 @@ class Qwen38CausalChat:
         fast_mlp_source_budget_mb: float | None = None,
         fast_mlp_max_resident_bytes: int | None = None,
         fast_mlp_active_layers: Sequence[int] | None = None,
+        fast_mlp_selected_block_count: int | None = None,
         fast_mlp_online_state_path: str | Path | None = None,
         range_markov_state_path: str | Path | None = None,
         range_prefetch_max_bytes: int = 64 * 1024**2,
@@ -1009,6 +1029,11 @@ class Qwen38CausalChat:
         if fast_mlp_max_resident_bytes is not None:
             fast_mlp_max_resident_bytes = _positive_int(
                 fast_mlp_max_resident_bytes, "fast_mlp_max_resident_bytes"
+            )
+        if fast_mlp_selected_block_count is not None:
+            fast_mlp_selected_block_count = _positive_int(
+                fast_mlp_selected_block_count,
+                "fast_mlp_selected_block_count",
             )
         max_prompt_tokens = _positive_int(max_prompt_tokens, "max_prompt_tokens")
         max_new_tokens = _positive_int(max_new_tokens, "max_new_tokens")
@@ -1134,18 +1159,21 @@ class Qwen38CausalChat:
                 fast_mlp_source_budget_mb,
                 fast_mlp_max_resident_bytes,
                 fast_mlp_active_layers,
+                fast_mlp_selected_block_count,
                 fast_mlp_online_state_path,
             )
         ):
             raise ValueError("fast-MLP options require fast_mlp_root")
         if fast_mlp_root is not None and fast_mlp_max_resident_bytes is None:
             fast_mlp_max_resident_bytes = 64 * 1024**2
+        if fast_mlp_selected_block_count is not None and q4_root is None:
+            raise ValueError("fast_mlp_selected_block_count requires Q4 execution")
         if q4_root is not None and any(
             value is not None
-            for value in (fast_mlp_root, exact_head_root, range_markov_state_path)
+            for value in (exact_head_root, range_markov_state_path)
         ):
             raise ValueError(
-                "Q4 execution replaces Fast-MLP, exact-head, and BF16 range prefetch"
+                "Q4 execution replaces exact-head and BF16 range prefetch"
             )
         if result_cell_code_revision is not None and (
             not isinstance(result_cell_code_revision, str)
@@ -1214,6 +1242,7 @@ class Qwen38CausalChat:
         self._fast_mlp_source_budget_mb = fast_mlp_source_budget_mb
         self._fast_mlp_max_resident_bytes = fast_mlp_max_resident_bytes
         self._fast_mlp_active_layers = fast_mlp_active_layers
+        self._fast_mlp_selected_block_count = fast_mlp_selected_block_count
         self._fast_mlp_online_state_path = (
             None
             if fast_mlp_online_state_path is None
@@ -1403,6 +1432,7 @@ class Qwen38CausalChat:
                 ),
                 "enabled": True,
                 "online_state": self._fast_mlp_online_state_path is not None,
+                "selected_block_count": self._fast_mlp_selected_block_count,
             }
             runtime = self._runtime
             receipt = (
@@ -1415,12 +1445,20 @@ class Qwen38CausalChat:
                     key: receipt[key]
                     for key in (
                         "affine_fit_sha256",
+                        "auxiliary_payload_bytes",
+                        "execution",
                         "model_pin_sha256",
+                        "markov_state_persistent",
+                        "markov_width_actions",
                         "pilot_manifest_body_sha256",
+                        "q4_manifest_sha256",
                         "router_fit_sha256",
+                        "schema",
+                        "selected_block_count",
                         "transpose_manifest_sha256",
                         "weights_index_sha256",
                     )
+                    if key in receipt
                 }
                 for key in (
                     "adaptive_width_policy_sha256",
@@ -1584,6 +1622,7 @@ class Qwen38CausalChat:
             fast_mlp_source_budget_mb=self._fast_mlp_source_budget_mb,
             fast_mlp_max_resident_bytes=self._fast_mlp_max_resident_bytes,
             fast_mlp_active_layers=self._fast_mlp_active_layers,
+            fast_mlp_selected_block_count=self._fast_mlp_selected_block_count,
             fast_mlp_online_state_path=self._fast_mlp_online_state_path,
             exact_head_root=self._exact_head_root,
             exact_head_block_rows=self._head_block_rows,
@@ -2049,9 +2088,17 @@ class Qwen38CausalChat:
             "online_sparse_waves",
             "online_surprises",
             "online_width_updates",
+            "full_equivalent_logical_weight_bytes",
+            "packed_sparse_calls",
+            "packed_sparse_rows",
+            "q4_weight_bytes_saved",
+            "selected_blocks",
         ):
             if field in delta:
                 request[field] = delta[field]
+        for field, value in delta.items():
+            if field.startswith("markov_"):
+                request[field] = value
         self._last_fast_mlp_evidence = request
         return request
 
@@ -2327,14 +2374,22 @@ class Qwen38CausalChat:
                 "candidate_rows",
                 "embedding_rows",
                 "head_calls",
+                "fused_mlp_calls",
+                "fused_mlp_rows",
                 "input_quantizations",
                 "linear_calls",
                 "linear_group_calls",
                 "linear_input_rows",
+                "linear_row_calls",
                 "logical_weight_bytes",
                 "mapped_payload_bytes",
                 "mapped_tensors",
                 "output_bytes",
+                "selected_input_blocks",
+                "selected_input_coordinates",
+                "selected_output_rows",
+                "sparse_block_calls",
+                "sparse_coordinate_calls",
             )
             q4_request = {
                 field: int(q4_after.get(field, 0)) - int(q4_before.get(field, 0))
