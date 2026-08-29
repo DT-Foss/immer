@@ -12,7 +12,7 @@ from .draft_protocol import RollingDraftProposal
 from .mtp_draft import Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v3"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v4"
 MARKOV_MTP_WINDOW_WORK_COSTS = {
     1: 1.0,
     2: 1.6,
@@ -77,7 +77,9 @@ class Qwen38MarkovMtpDraftMetrics:
     mtp_selections: int
     markov_rounds: int
     mtp_rounds: int
+    markov_external_feedback_rounds: int
     provider_switches: int
+    mtp_init_failures: int
     hidden_history_rows: int
     hidden_history_bytes: int
     switch_available: bool
@@ -125,6 +127,7 @@ class Qwen38MarkovMtpDraftProvider:
             "propose_round",
             "discard_pending_proposal",
             "advance_confirmed_prefix",
+            "reconcile_external_prefix",
             "reconcile_prefix",
             "observe_final",
             "close",
@@ -152,7 +155,9 @@ class Qwen38MarkovMtpDraftProvider:
         self._mtp_selections = 0
         self._markov_rounds = 0
         self._mtp_rounds = 0
+        self._markov_external_feedback_rounds = 0
         self._provider_switches = 0
+        self._mtp_init_failures = 0
         self._pending_provider: Literal["markov", "mtp"] | None = None
 
     @property
@@ -259,6 +264,17 @@ class Qwen38MarkovMtpDraftProvider:
         )
         return policy.chosen_window > 1
 
+    def _commit_markov_selection(
+        self,
+        proposal: RollingDraftProposal,
+    ) -> RollingDraftProposal:
+        if self._selected_provider not in {None, "markov"}:
+            self._provider_switches += 1
+        self._selected_provider = "markov"
+        self._markov_selections += 1
+        self._markov_rounds += 1
+        return proposal
+
     def _load_mtp(self) -> object:
         if self._mtp_provider is not None:
             return self._mtp_provider
@@ -302,12 +318,7 @@ class Qwen38MarkovMtpDraftProvider:
             )
         self._selection_calls += 1
         if self._select_markov(proposal) or not self._switch_available:
-            if self._selected_provider not in {None, "markov"}:
-                self._provider_switches += 1
-            self._selected_provider = "markov"
-            self._markov_selections += 1
-            self._markov_rounds += 1
-            return proposal
+            return self._commit_markov_selection(proposal)
 
         hidden_history = self._hidden_history
         request_history = self._request_history
@@ -320,16 +331,33 @@ class Qwen38MarkovMtpDraftProvider:
             # pending K1 proposal so the decoder can reconcile the direct row.
             self._switch_available = False
             self._hidden_history = None
-            self._selected_provider = "markov"
-            self._markov_selections += 1
-            self._markov_rounds += 1
-            return proposal
+            return self._commit_markov_selection(proposal)
 
-        self.markov_provider.discard_pending_proposal()
-        mtp = self._load_mtp()
-        if hidden_history is not None:
-            mtp.begin_request_state(history, hidden_history.detach().clone())
+        try:
+            mtp = self._load_mtp()
+        except Qwen38MarkovMtpDraftError:
+            raise
+        except Exception:
+            self._mtp_init_failures += 1
+            self._switch_available = False
             self._hidden_history = None
+            return self._commit_markov_selection(proposal)
+        try:
+            if hidden_history is not None:
+                mtp.begin_request_state(history, hidden_history.detach().clone())
+                self._hidden_history = None
+        except Exception:
+            failed = self._mtp_provider
+            self._mtp_provider = None
+            if failed is not None:
+                try:
+                    failed.close()
+                except Exception:
+                    pass
+            self._mtp_init_failures += 1
+            self._switch_available = False
+            self._hidden_history = None
+            return self._commit_markov_selection(proposal)
         if self._selected_provider not in {None, "mtp"}:
             self._provider_switches += 1
         self._selected_provider = "mtp"
@@ -452,7 +480,8 @@ class Qwen38MarkovMtpDraftProvider:
             raise Qwen38MarkovMtpDraftError("hybrid provider was not selected")
         owner.reconcile_prefix(history)
         if pending == "mtp":
-            self.markov_provider.advance_confirmed_prefix(history)
+            self.markov_provider.reconcile_external_prefix(history)
+            self._markov_external_feedback_rounds += 1
         self._request_history = history
         self._pending_provider = None
         self._round_target_hidden = None
@@ -484,7 +513,8 @@ class Qwen38MarkovMtpDraftProvider:
             raise Qwen38MarkovMtpDraftError("hybrid provider was not selected")
         owner.reconcile_prefix(history)
         if pending == "mtp":
-            self.markov_provider.advance_confirmed_prefix(history)
+            self.markov_provider.reconcile_external_prefix(history)
+            self._markov_external_feedback_rounds += 1
         elif self._mtp_provider is not None:
             if round_hidden is None:
                 raise Qwen38MarkovMtpDraftError(
@@ -532,9 +562,9 @@ class Qwen38MarkovMtpDraftProvider:
                 self._mtp_provider.observe_final(history)
             except Exception as exc:
                 mtp_failure = exc
-            # The MTP branch executes the request, while Markov receives only
-            # the final target-confirmed episode and therefore learns without
-            # treating its discarded speculative tokens as observations.
+            # MTP executes novelty rounds.  Markov has already reconciled each
+            # of its shadow predictions against the same target-confirmed
+            # prefixes and now commits that feedback with the complete episode.
             self.markov_provider.observe_final(history)
         else:
             mtp_failure = None
@@ -557,7 +587,9 @@ class Qwen38MarkovMtpDraftProvider:
             mtp_selections=self._mtp_selections,
             markov_rounds=self._markov_rounds,
             mtp_rounds=self._mtp_rounds,
+            markov_external_feedback_rounds=self._markov_external_feedback_rounds,
             provider_switches=self._provider_switches,
+            mtp_init_failures=self._mtp_init_failures,
             hidden_history_rows=self._hidden_history_rows,
             hidden_history_bytes=self._hidden_history_bytes,
             switch_available=self._switch_available,

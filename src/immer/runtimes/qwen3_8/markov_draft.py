@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v10"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v11"
 V5_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
 V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
@@ -823,6 +823,8 @@ class MarkovDraftMetrics:
     state_bytes: int
     council_predictions: int
     council_feedback: int
+    external_reconcile_calls: int
+    external_feedback_tokens: int
     leader_changes: int
     expert_weights: tuple[tuple[str, float], ...]
     expert_accuracy: tuple[tuple[str, float], ...]
@@ -1009,6 +1011,8 @@ class FingerprintRollingK4DraftProvider:
         self._predictions = 0
         self._council_predictions = 0
         self._council_feedback = 0
+        self._external_reconcile_calls = 0
+        self._external_feedback_tokens = 0
         self._last_confidence = 0.0
         self._last_disagreement = 0.0
         self._adaptive_proposal_calls = 0
@@ -2070,6 +2074,63 @@ class FingerprintRollingK4DraftProvider:
         self._pending_composition_program = None
         self._reconcile_calls += 1
 
+    def reconcile_external_prefix(self, history: tuple[int, ...], /) -> None:
+        """Train one unused Council proposal from another verified provider.
+
+        Feedback remains valid through the first mismatch: later Council rows
+        were conditioned on its rejected token rather than the actual target
+        prefix.  A fully matching observed prefix retains the next-token carry;
+        a mismatch drops that counterfactual tail and the next round rebuilds
+        directly from the confirmed history.
+        """
+
+        if self._closed:
+            raise MarkovDraftError("Markov draft provider is closed")
+        if not self._request_started or self._request_completed:
+            raise MarkovDraftError("Markov request is not active")
+        committed = self._token_tuple(
+            history,
+            label="externally reconciled Markov history",
+        )
+        base = self._pending_base
+        proposal = self._pending_proposal
+        if base is None or proposal is None:
+            raise MarkovDraftError(
+                "reconcile_external_prefix requires a pending proposal"
+            )
+        if len(self._pending_feedback) != self.proposal_width + 1:
+            raise MarkovDraftError("Markov council proposal feedback is missing")
+        if committed[: len(base)] != base:
+            raise MarkovDraftError(
+                "external Markov reconciliation changed its known base"
+            )
+        delta = committed[len(base) :]
+        if len(delta) > self.proposal_width:
+            raise MarkovDraftError(
+                "external Markov reconciliation exceeds the proposal width"
+            )
+        assert self._last_confirmed_length is not None
+        verified = 0
+        prefix_matches = True
+        for index, token in enumerate(delta):
+            self._episode_feedback.append((self._pending_feedback[index], token))
+            verified += 1
+            if token != proposal[index]:
+                prefix_matches = False
+                break
+        self._carry_feedback = (
+            self._pending_feedback[len(delta)] if prefix_matches else None
+        )
+        self._last_confirmed_length = len(committed)
+        self._pending_base = None
+        self._pending_proposal = None
+        self._pending_feedback = ()
+        self._pending_phrase_option = None
+        self._pending_composition_program = None
+        self._reconcile_calls += 1
+        self._external_reconcile_calls += 1
+        self._external_feedback_tokens += verified
+
     def discard_pending_proposal(self) -> None:
         """Drop one unused proposal while retaining request-level learning.
 
@@ -2251,6 +2312,8 @@ class FingerprintRollingK4DraftProvider:
             state_bytes=len(self._state.to_bytes()),
             council_predictions=self._council_predictions,
             council_feedback=self._council_feedback,
+            external_reconcile_calls=self._external_reconcile_calls,
+            external_feedback_tokens=self._external_feedback_tokens,
             leader_changes=self._state.leader_changes,
             expert_weights=tuple(zip(self._state.expert_names, weights, strict=True)),
             expert_accuracy=tuple(zip(self._state.expert_names, accuracy, strict=True)),

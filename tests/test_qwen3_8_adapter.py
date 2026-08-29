@@ -906,18 +906,46 @@ class Qwen38CausalChatTests(unittest.TestCase):
         hybrid = policy["hybrid_draft"]
         self.assertEqual(
             hybrid["selection"],
-            "round-wise-markov-first-mtp-fallback/v3",
+            "round-wise-markov-first-mtp-fallback/v4",
         )
         self.assertFalse(hybrid["request_provider_lock"])
         self.assertFalse(hybrid["one_way_handoff"])
         self.assertTrue(hybrid["round_reselection"])
         self.assertTrue(hybrid["cross_provider_target_state_sync"])
+        self.assertTrue(hybrid["cross_provider_target_feedback"])
         self.assertTrue(hybrid["committed_hidden_handoff"])
         self.assertTrue(hybrid["markov_persistent"])
         self.assertTrue(hybrid["mtp_persistent_calibration"])
         self.assertEqual(
             hybrid["round_window_selector"],
             "markov-prefix-utility/v2",
+        )
+        chat.close()
+
+    def test_hybrid_runtime_identity_names_the_round_wise_feedback_policy(
+        self,
+    ) -> None:
+        runtime = _Runtime()
+        chat = _chat(
+            runtime,
+            draft_mode="hybrid",
+            q4_root="/models/q4-mtp",
+            markov_draft_state_path="/state/markov.bin",
+            mtp_draft_state_path="/state/mtp.json",
+            max_new_tokens=8,
+        )
+        chat._runtime = runtime
+        chat._bundle_receipt = _BUNDLE_RECEIPT
+        chat._tokenizer_sha256 = _DIGEST
+        with patch(
+            "immer.runtimes.qwen3_8.adapter._digest",
+            side_effect=lambda value: value,
+        ):
+            identity = chat._draft_window_runtime_identity()
+
+        self.assertEqual(
+            identity["provider"]["selection"],
+            "round-wise-markov-first-mtp-fallback/v4",
         )
         chat.close()
 

@@ -910,6 +910,111 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         provider.close()
 
+    def test_external_provider_mismatch_trains_only_the_valid_council_row(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        proposal = provider.propose_round(prompt, 2)
+        first_predictions = {
+            prediction for _distribution, prediction in provider._pending_feedback[0]
+        }
+        external = next(
+            token
+            for token in range(provider.vocab_size)
+            if token not in first_predictions and token != proposal.token_ids[0]
+        )
+        before = provider._state
+
+        provider.reconcile_external_prefix((*prompt, 2, external, 17))
+
+        interim = provider.metrics()
+        self.assertEqual(interim.external_reconcile_calls, 1)
+        self.assertEqual(interim.external_feedback_tokens, 1)
+        self.assertEqual(interim.council_feedback, 0)
+        self.assertEqual(interim.phrase_accepted_tokens, 0)
+        provider.observe_final((*prompt, 2, external, 17))
+        after = provider.metrics()
+        self.assertEqual(after.council_feedback, 1)
+        self.assertEqual(
+            provider._state.expert_observations,
+            tuple(value + 1 for value in before.expert_observations),
+        )
+        self.assertEqual(provider._state.expert_hits, before.expert_hits)
+        provider.close()
+
+    def test_external_k1_reconciliation_carries_feedback_to_next_known_token(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        provider.propose_round(prompt, 2)
+
+        history = (*prompt, 2)
+        provider.reconcile_external_prefix(history)
+
+        self.assertIsNotNone(provider._carry_feedback)
+        self.assertEqual(provider.metrics().external_feedback_tokens, 0)
+        provider.propose_round(history, 7)
+        self.assertEqual(len(provider._episode_feedback), 1)
+        provider.discard_pending_proposal()
+        provider.observe_final((*history, 7))
+        self.assertEqual(provider.metrics().council_feedback, 1)
+        provider.close()
+
+    def test_external_matching_prefix_scores_each_conditionally_valid_row(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        proposal = provider.propose_round(prompt, 2)
+        matched = proposal.token_ids[:2]
+
+        provider.reconcile_external_prefix((*prompt, 2, *matched))
+
+        self.assertEqual(provider.metrics().external_feedback_tokens, 2)
+        self.assertIsNotNone(provider._carry_feedback)
+        provider.observe_final((*prompt, 2, *matched, 9))
+        self.assertEqual(provider.metrics().council_feedback, 3)
+        self.assertEqual(provider.metrics().phrase_accepted_tokens, 0)
+        provider.close()
+
+    def test_external_reconciliation_rejects_missing_or_noncontiguous_state(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        with self.assertRaisesRegex(MarkovDraftError, "pending proposal"):
+            provider.reconcile_external_prefix((*prompt, 2))
+        provider.propose_round(prompt, 2)
+        with self.assertRaisesRegex(MarkovDraftError, "known base"):
+            provider.reconcile_external_prefix((20, 1, 3))
+        with self.assertRaisesRegex(MarkovDraftError, "proposal width"):
+            provider.reconcile_external_prefix((*prompt, 2, 3, 4, 5, 6))
+        provider.discard_pending_proposal()
+        provider.observe_final((*prompt, 2))
+        provider.close()
+
     def test_phrase_agent_uses_longest_prefix_with_repeated_support(self) -> None:
         episodes = (
             (1, 2, 3, 4, 5, 6, 7, 8),
