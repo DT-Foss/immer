@@ -105,6 +105,13 @@ is flushed as one JSON line. Model continuation state is cleared between
 requests while immutable packed mappings, tokenizer, graph, and kernel remain
 resident.
 
+Gated DeltaNet's convolution is a fixed causal depthwise kernel, not a general
+Conv1d workload. For K<=8 and S<=256, the runtime forms causal sliding windows,
+multiplies each channel by its own kernel, accumulates BF16/FP16 inputs in
+FP32, and updates the existing raw-input cache directly. Larger shapes retain
+the generic fallback. Qwen's K=4 path is BF16-bit-identical and avoids 48
+expensive grouped-Conv dispatches per target forward.
+
 Rolling generation stages one target-known token followed by up to 15
 untrusted drafts. The target executes the K=2–16 rows in one layer-major
 weight pass and commits only the accepted prefix. DeltaNet update operands

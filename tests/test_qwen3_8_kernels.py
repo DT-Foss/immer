@@ -765,6 +765,38 @@ class Qwen38KernelTests(unittest.TestCase):
         torch.testing.assert_close(torch.cat((first, second), dim=1), actual)
         torch.testing.assert_close(second_state, state)
 
+    def test_small_bf16_depthwise_kernel_is_bit_exact_to_grouped_conv(self) -> None:
+        from immer.runtimes.qwen3_8.kernels import causal_depthwise_conv
+
+        torch.manual_seed(31)
+        projected = torch.randn(2, 7, 17, dtype=torch.bfloat16)
+        weight = torch.randn(17, 1, 4, dtype=torch.bfloat16)
+        bias = torch.randn(17, dtype=torch.bfloat16)
+        actual, state = causal_depthwise_conv(projected, weight, bias=bias)
+        reference = F.conv1d(
+            projected.transpose(1, 2),
+            weight,
+            bias,
+            padding=3,
+            groups=17,
+        )[..., : projected.shape[1]]
+        reference = F.silu(reference).transpose(1, 2).contiguous()
+
+        self.assertTrue(torch.equal(actual, reference))
+        first, first_state = causal_depthwise_conv(
+            projected[:, :3],
+            weight,
+            bias=bias,
+        )
+        second, second_state = causal_depthwise_conv(
+            projected[:, 3:],
+            weight,
+            bias=bias,
+            conv_state=first_state,
+        )
+        self.assertTrue(torch.equal(torch.cat((first, second), dim=1), actual))
+        self.assertTrue(torch.equal(second_state, state))
+
     @staticmethod
     def _recurrent_delta_reference(query, key, value, g, beta, initial_state=None):
         q = query * torch.rsqrt((query * query).sum(-1, keepdim=True) + 1e-6)

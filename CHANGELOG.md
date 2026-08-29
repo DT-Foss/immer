@@ -49,6 +49,13 @@ All notable changes to IMMER are recorded here.
   The real two-request process generated first tokens in 15.01 and 16.90
   seconds; request two opened zero new tensors. `--max-requests` exits directly
   after the configured line count.
+- Replaced PyTorch's generic 10,240-group `conv1d` in the fixed Qwen DeltaNet
+  kernel with a direct causal small-kernel implementation. K=4 windows are
+  expressed as shifted channelwise products with FP32 accumulation; raw Conv
+  state and BF16 outputs remain bit-identical. On Beast, S=1 improved 162.8x
+  and S=18 improved 47.5x. The same arbitrary eight-token request fell from
+  79.05 to 23.01 seconds generation, TTFT from 25.05 to 13.65 seconds, and
+  preserved the exact token trace.
 
 - Generalized correction-first rolling verification from fixed K=4 to a
   configurable K=2–16 target window; `immer chat` defaults to K=8. All target

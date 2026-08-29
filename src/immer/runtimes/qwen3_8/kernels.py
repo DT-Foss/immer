@@ -1024,15 +1024,9 @@ def causal_depthwise_conv(
             raise ValueError("bias and projected_qkv must be on the same device")
 
     channels_first = projected.transpose(1, 2)
+    direct_small_kernel = kernel_size <= 8 and sequence_length <= 256
     if conv_state is None:
-        convolution_input = channels_first.to(dtype=kernel.dtype)
-        convolved = F.conv1d(
-            convolution_input,
-            kernel.unsqueeze(1),
-            None if conv_bias is None else conv_bias.to(kernel.dtype),
-            padding=kernel_size - 1,
-            groups=channels,
-        )[..., :sequence_length]
+        convolution_source = F.pad(channels_first, (kernel_size - 1, 0))
         if sequence_length >= kernel_size:
             next_state = channels_first[..., -kernel_size:]
         else:
@@ -1046,14 +1040,44 @@ def causal_depthwise_conv(
             )
         _same_device_dtype(channels_first, previous, "conv_state")
         combined = torch.cat((previous, channels_first), dim=-1)
+        convolution_source = combined
+        next_state = combined[..., -kernel_size:]
+
+    if direct_small_kernel:
+        windows = convolution_source.unfold(-1, kernel_size, 1)[
+            ..., -sequence_length:, :
+        ]
+        accumulation_dtype = (
+            torch.float32
+            if kernel.dtype in {torch.bfloat16, torch.float16}
+            else kernel.dtype
+        )
+        convolved = (
+            windows.to(dtype=accumulation_dtype)
+            * kernel.to(dtype=accumulation_dtype)[None, :, None, :]
+        ).sum(dim=-1, dtype=accumulation_dtype)
+        if conv_bias is not None:
+            convolved = convolved + conv_bias.to(dtype=accumulation_dtype)[
+                None, :, None
+            ]
+        convolved = convolved.to(dtype=kernel.dtype)
+    elif conv_state is None:
+        convolution_input = channels_first.to(dtype=kernel.dtype)
         convolved = F.conv1d(
-            combined.to(dtype=kernel.dtype),
+            convolution_input,
+            kernel.unsqueeze(1),
+            None if conv_bias is None else conv_bias.to(kernel.dtype),
+            padding=kernel_size - 1,
+            groups=channels,
+        )[..., :sequence_length]
+    else:
+        convolved = F.conv1d(
+            convolution_source.to(dtype=kernel.dtype),
             kernel.unsqueeze(1),
             None if conv_bias is None else conv_bias.to(kernel.dtype),
             padding=0,
             groups=channels,
         )[..., -sequence_length:]
-        next_state = combined[..., -kernel_size:]
 
     activated = F.silu(convolved).to(dtype=projected.dtype)
     return activated.transpose(1, 2).contiguous(), next_state.contiguous()
