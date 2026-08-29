@@ -76,7 +76,9 @@ class MarkovExpertSpec:
             raise TypeError("local_only must be boolean")
 
 
-def _expert_specs(max_order: int, max_history_tokens: int) -> tuple[MarkovExpertSpec, ...]:
+def _expert_specs(
+    max_order: int, max_history_tokens: int
+) -> tuple[MarkovExpertSpec, ...]:
     rows = (
         ("local-o0-w128", 0, min(128, max_history_tokens), True),
         ("global-o0-w4096", 0, max_history_tokens, False),
@@ -158,8 +160,7 @@ class _TransitionFingerprint:
             for token in self.vocabulary
         }
         known = tuple(
-            token if token in self.vocabulary else _UNKNOWN_TOKEN
-            for token in context
+            token if token in self.vocabulary else _UNKNOWN_TOKEN for token in context
         )
         for order in range(1, min(self.max_order, len(known)) + 1):
             counter = self.counts.get(known[-order:])
@@ -171,9 +172,9 @@ class _TransitionFingerprint:
             weight = total / (total + self.backoff_strength)
             for token in self.vocabulary:
                 empirical = counter.get(token, 0) / total
-                probabilities[token] = (
-                    (1.0 - weight) * probabilities[token] + weight * empirical
-                )
+                probabilities[token] = (1.0 - weight) * probabilities[
+                    token
+                ] + weight * empirical
         return probabilities
 
 
@@ -197,7 +198,10 @@ def _read_state_bytes(path: Path) -> bytes:
             | int(getattr(os, "O_NOFOLLOW", 0)),
         )
         before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= _MAX_STATE_BYTES:
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not 0 < before.st_size <= _MAX_STATE_BYTES
+        ):
             raise MarkovDraftError("Markov draft state size is invalid")
         chunks = []
         remaining = before.st_size
@@ -279,9 +283,7 @@ class MarkovDialectState:
             or len({len(rapidities), len(observations), len(hits)}) != 1
             or any(not math.isfinite(value) for value in rapidities)
             or any(
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
                 for value in (*observations, *hits)
             )
             or any(hit > seen for hit, seen in zip(hits, observations, strict=True))
@@ -321,9 +323,7 @@ class MarkovDialectState:
                 signature=tuple(int(item, 16) for item in value["signature"]),
                 visits=value["visits"],
                 last_seen=value["last_seen"],
-                rapidities=tuple(
-                    float.fromhex(item) for item in value["rapidities"]
-                ),
+                rapidities=tuple(float.fromhex(item) for item in value["rapidities"]),
                 observations=tuple(value["observations"]),
                 hits=tuple(value["hits"]),
             )
@@ -349,9 +349,7 @@ class MarkovPhraseOption:
         if (
             not 2 <= len(self.token_ids) <= 15
             or any(
-                isinstance(token, bool)
-                or not isinstance(token, int)
-                or token < 0
+                isinstance(token, bool) or not isinstance(token, int) or token < 0
                 for token in self.token_ids
             )
             or self.context_order < 1
@@ -406,30 +404,25 @@ class MarkovDraftState:
         episode_lengths = tuple(self.episode_lengths)
         if self.token_ids and not episode_lengths:
             episode_lengths = (len(self.token_ids),)
-        if (
-            any(
-                isinstance(length, bool)
-                or not isinstance(length, int)
-                or length <= 0
-                for length in episode_lengths
-            )
-            or sum(episode_lengths) != len(self.token_ids)
-        ):
+        if any(
+            isinstance(length, bool) or not isinstance(length, int) or length <= 0
+            for length in episode_lengths
+        ) or sum(episode_lengths) != len(self.token_ids):
             raise ValueError("Markov episode boundaries are invalid")
         episode_dialects = tuple(self.episode_dialects)
         if episode_lengths and not episode_dialects:
             episode_dialects = (None,) * len(episode_lengths)
         if len(episode_dialects) != len(episode_lengths) or any(
             value is not None
-            and (
-                not isinstance(value, str)
-                or len(value) != 64
-                or set(value) - _HEX
-            )
+            and (not isinstance(value, str) or len(value) != 64 or set(value) - _HEX)
             for value in episode_dialects
         ):
             raise ValueError("Markov episode dialect bindings are invalid")
-        if isinstance(self.updates, bool) or not isinstance(self.updates, int) or self.updates < 0:
+        if (
+            isinstance(self.updates, bool)
+            or not isinstance(self.updates, int)
+            or self.updates < 0
+        ):
             raise ValueError("updates must be a non-negative integer")
         names = tuple(self.expert_names)
         log_weights = tuple(float(value) for value in self.expert_log_weights)
@@ -443,9 +436,7 @@ class MarkovDraftState:
                 or any(not isinstance(name, str) or not name for name in names)
                 or any(not math.isfinite(value) for value in log_weights)
                 or any(
-                    isinstance(value, bool)
-                    or not isinstance(value, int)
-                    or value < 0
+                    isinstance(value, bool) or not isinstance(value, int) or value < 0
                     for value in (*observations, *hits)
                 )
                 or any(hit > seen for hit, seen in zip(hits, observations, strict=True))
@@ -474,16 +465,18 @@ class MarkovDraftState:
         ):
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{label} must be finite and non-negative")
-        if isinstance(self.clock, bool) or not isinstance(self.clock, int) or self.clock < 0:
+        if (
+            isinstance(self.clock, bool)
+            or not isinstance(self.clock, int)
+            or self.clock < 0
+        ):
             raise ValueError("clock must be a non-negative integer")
         imported = tuple(self.imported_episode_sha256s)
         if (
             len(imported) > _MAX_IMPORTED_EPISODE_DIGESTS
             or imported != tuple(sorted(set(imported)))
             or any(
-                not isinstance(value, str)
-                or len(value) != 64
-                or set(value) - _HEX
+                not isinstance(value, str) or len(value) != 64 or set(value) - _HEX
                 for value in imported
             )
         ):
@@ -514,7 +507,9 @@ class MarkovDraftState:
             {
                 "max_history_tokens": self.max_history_tokens,
                 "expert_hits": list(self.expert_hits),
-                "expert_log_weights": [value.hex() for value in self.expert_log_weights],
+                "expert_log_weights": [
+                    value.hex() for value in self.expert_log_weights
+                ],
                 "expert_names": list(self.expert_names),
                 "expert_observations": list(self.expert_observations),
                 "leader_changes": self.leader_changes,
@@ -718,8 +713,7 @@ class MarkovDraftState:
                 updates=value["updates"],
                 expert_names=tuple(value.get("expert_names", ())),
                 expert_log_weights=tuple(
-                    float.fromhex(item)
-                    for item in value.get("expert_log_weights", ())
+                    float.fromhex(item) for item in value.get("expert_log_weights", ())
                 ),
                 expert_observations=tuple(value.get("expert_observations", ())),
                 expert_hits=tuple(value.get("expert_hits", ())),
@@ -734,9 +728,7 @@ class MarkovDraftState:
                 surprise_deviation=float.fromhex(
                     value.get("surprise_deviation", "0x1.0p+0")
                 ),
-                surprise_cusum=float.fromhex(
-                    value.get("surprise_cusum", "0x0.0p+0")
-                ),
+                surprise_cusum=float.fromhex(value.get("surprise_cusum", "0x0.0p+0")),
                 regime_generation=value.get("regime_generation", 0),
                 clock=value.get("clock", 0),
                 dialects=tuple(
@@ -833,15 +825,27 @@ class FingerprintRollingK4DraftProvider:
         max_history_tokens: int = 4096,
         proposal_width: int = 3,
     ) -> None:
-        if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size <= 1:
+        if (
+            isinstance(vocab_size, bool)
+            or not isinstance(vocab_size, int)
+            or vocab_size <= 1
+        ):
             raise ValueError("vocab_size must be greater than one")
-        if isinstance(max_order, bool) or not isinstance(max_order, int) or max_order < 0:
+        if (
+            isinstance(max_order, bool)
+            or not isinstance(max_order, int)
+            or max_order < 0
+        ):
             raise ValueError("max_order must be a non-negative integer")
         if not math.isfinite(alpha) or alpha <= 0:
             raise ValueError("alpha must be finite and positive")
         if not math.isfinite(backoff_strength) or backoff_strength <= 0:
             raise ValueError("backoff_strength must be finite and positive")
-        if isinstance(min_count, bool) or not isinstance(min_count, int) or min_count < 1:
+        if (
+            isinstance(min_count, bool)
+            or not isinstance(min_count, int)
+            or min_count < 1
+        ):
             raise ValueError("min_count must be a positive integer")
         if (
             isinstance(max_history_tokens, bool)
@@ -1021,9 +1025,7 @@ class FingerprintRollingK4DraftProvider:
         return tuple(sorted(features)[: self.DIALECT_SKETCH_SIZE])
 
     @staticmethod
-    def _dialect_similarity(
-        left: Sequence[int], right: Sequence[int]
-    ) -> float:
+    def _dialect_similarity(left: Sequence[int], right: Sequence[int]) -> float:
         first = set(left)
         second = set(right)
         union = first | second
@@ -1069,26 +1071,20 @@ class FingerprintRollingK4DraftProvider:
         if self._active_dialect is not None:
             rapidities = tuple(
                 global_value
-                + self.DIALECT_STRENGTH
-                * self._active_dialect_similarity
-                * local_value
+                + self.DIALECT_STRENGTH * self._active_dialect_similarity * local_value
                 for global_value, local_value in zip(
                     rapidities,
                     self._active_dialect.rapidities,
                     strict=True,
                 )
             )
-        scaled = tuple(
-            value / self.EXPERT_TEMPERATURE
-            for value in rapidities
-        )
+        scaled = tuple(value / self.EXPERT_TEMPERATURE for value in rapidities)
         maximum = max(scaled)
         raw = tuple(math.exp(value - maximum) for value in scaled)
         total = sum(raw)
         count = len(raw)
         return tuple(
-            (1.0 - self.FIXED_SHARE) * value / total
-            + self.FIXED_SHARE / count
+            (1.0 - self.FIXED_SHARE) * value / total + self.FIXED_SHARE / count
             for value in raw
         )
 
@@ -1137,11 +1133,7 @@ class FingerprintRollingK4DraftProvider:
 
     @staticmethod
     def _import_digest(value: object) -> str:
-        if (
-            not isinstance(value, str)
-            or len(value) != 64
-            or set(value) - _HEX
-        ):
+        if not isinstance(value, str) or len(value) != 64 or set(value) - _HEX:
             raise ValueError("import digest must be a SHA-256 value")
         return value
 
@@ -1152,9 +1144,7 @@ class FingerprintRollingK4DraftProvider:
             raise MarkovDraftError("Markov draft provider is closed")
         return self._state.imported_episode_sha256s
 
-    def register_imported_episode_sha256s(
-        self, values: Sequence[str], /
-    ) -> int:
+    def register_imported_episode_sha256s(self, values: Sequence[str], /) -> int:
         """Atomically migrate legacy import identities into provider state."""
 
         if self._closed:
@@ -1257,11 +1247,7 @@ class FingerprintRollingK4DraftProvider:
         self,
         option: MarkovPhraseOption,
     ) -> tuple[float, int, int, int, tuple[int, ...], str]:
-        scope = (
-            self._active_dialect_similarity
-            if option.source == "dialect"
-            else 1.0
-        )
+        scope = self._active_dialect_similarity if option.source == "dialect" else 1.0
         quality = (
             option.confidence
             * math.log1p(option.support)
@@ -1371,9 +1357,7 @@ class FingerprintRollingK4DraftProvider:
             mixture = {
                 symbol: sum(
                     weight * distribution.get(symbol, 0.0)
-                    for weight, distribution in zip(
-                        weights, distributions, strict=True
-                    )
+                    for weight, distribution in zip(weights, distributions, strict=True)
                 )
                 for symbol in numeric_symbols
             }
@@ -1386,13 +1370,13 @@ class FingerprintRollingK4DraftProvider:
                 )[2]
             )
             proposal.append(token)
-            universe = set().union(*(distribution.keys() for distribution in distributions))
+            universe = set().union(
+                *(distribution.keys() for distribution in distributions)
+            )
             pooled = {
                 symbol: sum(
                     weight * distribution.get(symbol, 0.0)
-                    for weight, distribution in zip(
-                        weights, distributions, strict=True
-                    )
+                    for weight, distribution in zip(weights, distributions, strict=True)
                 )
                 for symbol in universe
             }
@@ -1410,9 +1394,7 @@ class FingerprintRollingK4DraftProvider:
                 entropy(pooled)
                 - sum(
                     weight * entropy(distribution)
-                    for weight, distribution in zip(
-                        weights, distributions, strict=True
-                    )
+                    for weight, distribution in zip(weights, distributions, strict=True)
                 ),
             )
             confidences.append(self._last_confidence)
@@ -1466,13 +1448,11 @@ class FingerprintRollingK4DraftProvider:
                 probabilities.append(distribution[symbol])
                 continue
             seen = sum(
-                candidate.isdecimal()
-                and 0 <= int(candidate) < self.vocab_size
+                candidate.isdecimal() and 0 <= int(candidate) < self.vocab_size
                 for candidate in distribution
             )
             probabilities.append(
-                distribution.get(_UNKNOWN_TOKEN, 1e-12)
-                / max(1, self.vocab_size - seen)
+                distribution.get(_UNKNOWN_TOKEN, 1e-12) / max(1, self.vocab_size - seen)
             )
         mixture_probability = sum(
             weight * probability
@@ -1484,22 +1464,16 @@ class FingerprintRollingK4DraftProvider:
         if self._state.feedback_count == 0:
             z_score = 0.0
         else:
-            z_score = (surprise - previous_mean) / max(
-                previous_deviation, 1e-6
-            )
+            z_score = (surprise - previous_mean) / max(previous_deviation, 1e-6)
         next_mean = (
-            (1.0 - self.SURPRISE_RATE) * previous_mean
-            + self.SURPRISE_RATE * surprise
-        )
+            1.0 - self.SURPRISE_RATE
+        ) * previous_mean + self.SURPRISE_RATE * surprise
         next_deviation = (
-            (1.0 - self.SURPRISE_RATE) * previous_deviation
-            + self.SURPRISE_RATE * abs(surprise - previous_mean)
-        )
+            1.0 - self.SURPRISE_RATE
+        ) * previous_deviation + self.SURPRISE_RATE * abs(surprise - previous_mean)
         next_cusum = max(
             0.0,
-            self.CUSUM_DECAY * self._state.surprise_cusum
-            + z_score
-            - self.CUSUM_DRIFT,
+            self.CUSUM_DECAY * self._state.surprise_cusum + z_score - self.CUSUM_DRIFT,
         )
         for index, (distribution, prediction) in enumerate(feedback):
             probability = probabilities[index]
@@ -1561,9 +1535,7 @@ class FingerprintRollingK4DraftProvider:
             surprise_mean=next_mean,
             surprise_deviation=next_deviation,
             surprise_cusum=next_cusum,
-            regime_generation=(
-                self._state.regime_generation + int(regime_change)
-            ),
+            regime_generation=(self._state.regime_generation + int(regime_change)),
         )
         self._council_feedback += 1
 
@@ -1590,7 +1562,11 @@ class FingerprintRollingK4DraftProvider:
         if self._request_completed:
             raise MarkovDraftError("Markov provider request is complete")
         committed = self._token_tuple(history, label="rolling Markov history")
-        if isinstance(known_token, bool) or not isinstance(known_token, int) or not 0 <= known_token < self.vocab_size:
+        if (
+            isinstance(known_token, bool)
+            or not isinstance(known_token, int)
+            or not 0 <= known_token < self.vocab_size
+        ):
             raise ValueError("known token is outside the Qwen vocabulary")
         if self._pending_base is not None:
             raise MarkovDraftError("previous Markov proposal was not reconciled")
@@ -1639,8 +1615,8 @@ class FingerprintRollingK4DraftProvider:
         known_token: int,
         /,
     ) -> tuple[int, ...]:
-        proposal, _confidence, _disagreement, _option = (
-            self._prepare_rolling_proposal(history, known_token)
+        proposal, _confidence, _disagreement, _option = self._prepare_rolling_proposal(
+            history, known_token
         )
         return proposal
 
@@ -1654,8 +1630,8 @@ class FingerprintRollingK4DraftProvider:
             raise MarkovDraftError(
                 "adaptive Markov proposal requires a K4/K8/K16 ceiling"
             )
-        proposal, confidences, disagreements, option = (
-            self._prepare_rolling_proposal(history, known_token)
+        proposal, confidences, disagreements, option = self._prepare_rolling_proposal(
+            history, known_token
         )
         result = RollingDraftProposal.build(
             proposal,
@@ -1676,9 +1652,7 @@ class FingerprintRollingK4DraftProvider:
                 )
             ),
             phrase_width=(
-                0
-                if option is None
-                else min(len(option.token_ids), self.proposal_width)
+                0 if option is None else min(len(option.token_ids), self.proposal_width)
             ),
         )
         self._adaptive_proposal_calls += 1
@@ -1728,7 +1702,9 @@ class FingerprintRollingK4DraftProvider:
         committed = replace(
             dialect,
             signature=signature,
-            visits=dialect.visits if self._active_dialect_is_new else dialect.visits + 1,
+            visits=dialect.visits
+            if self._active_dialect_is_new
+            else dialect.visits + 1,
             last_seen=clock,
         )
         profiles = {row.dialect_id: row for row in self._state.dialects}
@@ -1743,9 +1719,7 @@ class FingerprintRollingK4DraftProvider:
                 candidates,
                 key=lambda row: (
                     row.visits
-                    * math.exp(
-                        -self.RICCI_AGE_ALPHA * (clock - row.last_seen)
-                    ),
+                    * math.exp(-self.RICCI_AGE_ALPHA * (clock - row.last_seen)),
                     row.last_seen,
                     row.dialect_id,
                 ),
@@ -1787,6 +1761,26 @@ class FingerprintRollingK4DraftProvider:
         self._pending_phrase_option = None
         self._reconcile_calls += 1
 
+    def discard_pending_proposal(self) -> None:
+        """Drop one unused proposal while retaining request-level learning.
+
+        A provider cascade may ask the council whether it already owns a
+        useful continuation, then delegate the request to another drafter.
+        The council's speculative feedback is unavailable in that case, but
+        the final target-confirmed episode is still valuable and remains
+        learnable through :meth:`observe_final`.
+        """
+
+        if self._closed:
+            raise MarkovDraftError("Markov draft provider is closed")
+        if self._pending_base is None or self._pending_proposal is None:
+            raise MarkovDraftError("no pending Markov proposal to discard")
+        self._pending_base = None
+        self._pending_proposal = None
+        self._pending_feedback = ()
+        self._pending_phrase_option = None
+        self._last_round_proposal = None
+
     def observe_final(self, history: tuple[int, ...], /) -> None:
         committed = self._token_tuple(history, label="final Markov history")
         if self._request_completed:
@@ -1803,9 +1797,10 @@ class FingerprintRollingK4DraftProvider:
         original_confirmed_length = self._last_confirmed_length
         original_evictions = self._dialect_evictions
         try:
-            if self._last_confirmed_length is not None and len(
-                committed
-            ) < self._last_confirmed_length:
+            if (
+                self._last_confirmed_length is not None
+                and len(committed) < self._last_confirmed_length
+            ):
                 raise MarkovDraftError("final Markov history moved backwards")
             if (
                 self._carry_feedback is not None
@@ -1907,20 +1902,14 @@ class FingerprintRollingK4DraftProvider:
             predictions=self._predictions,
             learned_tokens=len(self._state.token_ids),
             episode_count=len(self._state.episode_lengths),
-            imported_episode_count=len(
-                self._state.imported_episode_sha256s
-            ),
+            imported_episode_count=len(self._state.imported_episode_sha256s),
             updates=self._state.updates,
             state_bytes=len(self._state.to_bytes()),
             council_predictions=self._council_predictions,
             council_feedback=self._council_feedback,
             leader_changes=self._state.leader_changes,
-            expert_weights=tuple(
-                zip(self._state.expert_names, weights, strict=True)
-            ),
-            expert_accuracy=tuple(
-                zip(self._state.expert_names, accuracy, strict=True)
-            ),
+            expert_weights=tuple(zip(self._state.expert_names, weights, strict=True)),
+            expert_accuracy=tuple(zip(self._state.expert_names, accuracy, strict=True)),
             effective_experts=1.0 / sum(value * value for value in weights),
             last_confidence=self._last_confidence,
             last_disagreement=self._last_disagreement,

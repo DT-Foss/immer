@@ -52,8 +52,13 @@ from .markov_draft import (
     FingerprintRollingK4DraftProvider,
 )
 from .mtp_draft import (
+    MTP_MATRIX_NAMES,
     QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
     Qwen35MtpDraftProvider,
+)
+from .hybrid_draft import (
+    QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
+    Qwen38MarkovMtpDraftProvider,
 )
 from .pager import Qwen38WeightPager
 from .q4 import Q4Bank
@@ -1019,6 +1024,7 @@ class Qwen38CausalChat:
         draft_source_budget_mb: float = 1_048_576,
         draft_max_resident_bytes: int | None = None,
         markov_draft_state_path: str | Path | None = None,
+        mtp_draft_state_path: str | Path | None = None,
         draft_window_state_path: str | Path | None = None,
         fast_mlp_root: str | Path | None = None,
         fast_mlp_source_budget_mb: float | None = None,
@@ -1137,8 +1143,13 @@ class Qwen38CausalChat:
             draft_bundle_path, (str, Path)
         ):
             raise TypeError("draft_bundle_path must be a local path or None")
-        if draft_mode is not None and draft_mode not in {"qwen35", "markov", "mtp"}:
-            raise ValueError("draft_mode must be qwen35, markov, mtp, or None")
+        if draft_mode is not None and draft_mode not in {
+            "hybrid",
+            "markov",
+            "mtp",
+            "qwen35",
+        }:
+            raise ValueError("draft_mode must be qwen35, markov, mtp, hybrid, or None")
         if (
             isinstance(draft_window, bool)
             or not isinstance(draft_window, int)
@@ -1149,6 +1160,10 @@ class Qwen38CausalChat:
             markov_draft_state_path, (str, Path)
         ):
             raise TypeError("markov_draft_state_path must be a local path or None")
+        if mtp_draft_state_path is not None and not isinstance(
+            mtp_draft_state_path, (str, Path)
+        ):
+            raise TypeError("mtp_draft_state_path must be a local path or None")
         if draft_window_state_path is not None and not isinstance(
             draft_window_state_path, (str, Path)
         ):
@@ -1156,6 +1171,12 @@ class Qwen38CausalChat:
         if draft_mode is None:
             if draft_bundle_path is not None:
                 draft_mode = "qwen35"
+            elif (
+                markov_draft_state_path is not None and mtp_draft_state_path is not None
+            ):
+                draft_mode = "hybrid"
+            elif mtp_draft_state_path is not None:
+                draft_mode = "mtp"
             elif markov_draft_state_path is not None:
                 draft_mode = "markov"
         if draft_mode == "qwen35" and draft_bundle_path is None:
@@ -1164,12 +1185,23 @@ class Qwen38CausalChat:
             raise ValueError("markov draft mode does not use a draft bundle")
         if draft_mode == "mtp" and draft_bundle_path is not None:
             raise ValueError("MTP draft mode uses the target checkpoint branch")
+        if draft_mode == "hybrid" and draft_bundle_path is not None:
+            raise ValueError("hybrid draft mode uses Markov plus target MTP")
         if draft_mode == "mtp" and q4_root is None:
             raise ValueError("MTP draft mode requires the local Q4 bank")
-        if draft_mode not in {"markov", "mtp"} and markov_draft_state_path is not None:
+        if draft_mode == "hybrid" and q4_root is None:
+            raise ValueError("hybrid draft mode requires the local MTP Q4 bank")
+        if (
+            draft_mode not in {"hybrid", "markov", "mtp"}
+            and markov_draft_state_path is not None
+        ):
             raise ValueError(
-                "markov_draft_state_path requires markov or MTP draft mode"
+                "markov_draft_state_path requires markov, MTP, or hybrid draft mode"
             )
+        if draft_mode not in {"hybrid", "mtp"} and mtp_draft_state_path is not None:
+            raise ValueError("mtp_draft_state_path requires MTP or hybrid draft mode")
+        if draft_mode == "mtp" and mtp_draft_state_path is None:
+            mtp_draft_state_path = markov_draft_state_path
         if draft_window_state_path is not None and draft_mode is None:
             raise ValueError("draft_window_state_path requires a rolling draft mode")
         if draft_window_state_path is not None and draft_window < min(
@@ -1278,6 +1310,11 @@ class Qwen38CausalChat:
             None
             if markov_draft_state_path is None
             else Path(markov_draft_state_path).expanduser().absolute()
+        )
+        self._mtp_draft_state_path = (
+            None
+            if mtp_draft_state_path is None
+            else Path(mtp_draft_state_path).expanduser().absolute()
         )
         self._draft_window_state_path = (
             None
@@ -1411,7 +1448,7 @@ class Qwen38CausalChat:
                     ],
                     "round_window_selector": (
                         "markov-prefix-utility/v2"
-                        if self._draft_mode in {"markov", "mtp"}
+                        if self._draft_mode in {"hybrid", "markov", "mtp"}
                         else "fixed-request-window"
                     ),
                     "short_window_fallback": short_fixed_eligible,
@@ -1444,15 +1481,29 @@ class Qwen38CausalChat:
                     "round_window_selector": "markov-prefix-utility/v2",
                     "persistent": self._markov_draft_state_path is not None,
                 }
-            else:
+            elif self._draft_mode == "mtp":
                 policy["mtp_draft"] = {
                     "provider_abi": QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
                     "layers": 1,
                     "shared_embedding": True,
                     "shared_lm_head": True,
                     "target_hidden_conditioning": True,
-                    "persistent_calibration": self._markov_draft_state_path is not None,
+                    "persistent_calibration": self._mtp_draft_state_path is not None,
                     "round_window_selector": "markov-prefix-utility/v2",
+                }
+            else:
+                policy["hybrid_draft"] = {
+                    "provider_abi": QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
+                    "selection": "markov-council-first-then-embedded-mtp/v1",
+                    "request_provider_lock": True,
+                    "markov_provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
+                    "markov_persistent": self._markov_draft_state_path is not None,
+                    "mtp_provider_abi": QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
+                    "mtp_persistent_calibration": (
+                        self._mtp_draft_state_path is not None
+                    ),
+                    "round_window_selector": "markov-prefix-utility/v2",
+                    "target_hidden_conditioning": True,
                 }
         elif self._draft_mode is not None:
             policy["draft_fallback"] = {
@@ -1611,9 +1662,32 @@ class Qwen38CausalChat:
                 ).get("manifest_sha256"),
                 "state_path": (
                     None
+                    if self._mtp_draft_state_path is None
+                    else str(self._mtp_draft_state_path)
+                ),
+            }
+        elif self._draft_mode == "hybrid":
+            provider = {
+                "abi": QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
+                "kind": "markov-mtp-hybrid",
+                "markov_abi": MARKOV_DRAFT_PROVIDER_ABI,
+                "markov_state_path": (
+                    None
                     if self._markov_draft_state_path is None
                     else str(self._markov_draft_state_path)
                 ),
+                "mtp_abi": QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
+                "mtp_state_path": (
+                    None
+                    if self._mtp_draft_state_path is None
+                    else str(self._mtp_draft_state_path)
+                ),
+                "q4_manifest_sha256": getattr(
+                    getattr(self._runtime, "q4_bank", None),
+                    "identity",
+                    {},
+                ).get("manifest_sha256"),
+                "selection": "markov-council-first-then-embedded-mtp/v1",
             }
         else:
             raise Qwen38ChatError("draft-window identity lacks a draft provider")
@@ -1859,6 +1933,8 @@ class Qwen38CausalChat:
             if adaptive_selection is not None
             else min(self._draft_window, self._max_new_tokens)
         )
+        rolling_started = time.perf_counter()
+        rolling_source_start = _runtime_source_body_bytes(runtime)
         if self._draft_mode == "qwen35":
             draft = self._load_draft_locked(runtime)
             provider: Any = Qwen35K4DraftProvider(
@@ -1873,20 +1949,40 @@ class Qwen38CausalChat:
                 state_path=self._markov_draft_state_path,
                 proposal_width=draft_window - 1,
             )
-        else:
+        elif self._draft_mode == "mtp":
             provider = Qwen35MtpDraftProvider(
                 runtime.model.config,
                 runtime.model.pager,
                 eos_token_ids=eos,
                 head_block_rows=self._head_block_rows,
                 proposal_width=draft_window - 1,
-                state_path=self._markov_draft_state_path,
+                state_path=self._mtp_draft_state_path,
             )
-        rolling_started = time.perf_counter()
-        rolling_source_start = _runtime_source_body_bytes(runtime)
+        else:
+            markov_provider = FingerprintRollingK4DraftProvider(
+                vocab_size=runtime.model.config.vocab_size,
+                state_path=self._markov_draft_state_path,
+                proposal_width=draft_window - 1,
+            )
+
+            def mtp_factory() -> Qwen35MtpDraftProvider:
+                return Qwen35MtpDraftProvider(
+                    runtime.model.config,
+                    runtime.model.pager,
+                    eos_token_ids=eos,
+                    head_block_rows=self._head_block_rows,
+                    proposal_width=draft_window - 1,
+                    state_path=self._mtp_draft_state_path,
+                )
+
+            provider = Qwen38MarkovMtpDraftProvider(
+                markov_provider,
+                mtp_factory,
+            )
         adaptive_rounds = (
             self._draft_mode
             in {
+                "hybrid",
                 "markov",
                 "mtp",
             }
@@ -1929,7 +2025,7 @@ class Qwen38CausalChat:
                 raise Qwen38ChatError(
                     "rolling execution window differs from its Markov selection"
                 )
-            mapped_evidence = {
+            fallback_mapped_evidence = {
                 "prompt_token_ids": evidence.prompt_token_ids,
                 "generated_token_ids": evidence.generated_token_ids,
                 "context_mode": "stateful_autoregressive",
@@ -1944,21 +2040,71 @@ class Qwen38CausalChat:
                 "stopped_on_eos": evidence.stopped_on_eos,
                 "final_state_committed": evidence.final_state_committed,
             }
+            # Preserve the realized target receipt before optional provider
+            # accounting.  A successful metrics read below replaces this with
+            # the exact target/provider split; a metrics failure still teaches
+            # the controller the combined work once instead of losing the
+            # completed Qwen outcome.
             self._stage_draft_window_feedback(
                 prompt_ids=prompt_ids,
                 generated_ids=tuple(generated.token_ids),
-                generation_evidence=mapped_evidence,
+                generation_evidence=fallback_mapped_evidence,
                 accepted_draft_tokens=evidence.accepted_draft_tokens,
                 draft_source_body_bytes=0,
                 aux_source_body_bytes=0,
                 nested_horizons=_nested_draft_horizons(evidence),
             )
             provider_metrics = provider.metrics()
+            provider_source_body_bytes = int(provider_metrics.source_body_bytes)
+            provider_linear_calls = int(provider_metrics.linear_calls)
+            shared_target_pager = self._draft_mode in {"hybrid", "mtp"}
+            if shared_target_pager:
+                combined_source_body_bytes = max(
+                    int(evidence.source_body_bytes),
+                    max(
+                        0,
+                        _runtime_source_body_bytes(runtime) - rolling_source_start,
+                    ),
+                )
+                combined_linear_calls = int(evidence.linear_calls)
+                if (
+                    provider_source_body_bytes > combined_source_body_bytes
+                    or provider_linear_calls > combined_linear_calls
+                ):
+                    raise Qwen38ChatError(
+                        "shared-pager draft accounting exceeds combined execution"
+                    )
+                target_source_body_bytes = (
+                    combined_source_body_bytes - provider_source_body_bytes
+                )
+                target_linear_calls = combined_linear_calls - provider_linear_calls
+            else:
+                target_source_body_bytes = int(evidence.source_body_bytes)
+                target_linear_calls = int(evidence.linear_calls)
+                combined_source_body_bytes = (
+                    target_source_body_bytes + provider_source_body_bytes
+                )
+                combined_linear_calls = target_linear_calls + provider_linear_calls
+            mapped_evidence = {
+                "prompt_token_ids": evidence.prompt_token_ids,
+                "generated_token_ids": evidence.generated_token_ids,
+                "context_mode": "stateful_autoregressive",
+                "stateful_cache": True,
+                "general_generation": True,
+                "prefill_mode": "batched",
+                "forward_passes": evidence.forward_passes,
+                "source_body_bytes": target_source_body_bytes,
+                "linear_calls": target_linear_calls,
+                "seconds": evidence.seconds,
+                "state_bytes": runtime.model.state_bytes,
+                "stopped_on_eos": evidence.stopped_on_eos,
+                "final_state_committed": evidence.final_state_committed,
+            }
             fast_request = self._record_fast_mlp_request(
                 runtime,
                 fast_before,
-                target_source_body_bytes=evidence.source_body_bytes,
-                draft_source_body_bytes=provider_metrics.source_body_bytes,
+                target_source_body_bytes=target_source_body_bytes,
+                draft_source_body_bytes=provider_source_body_bytes,
             )
             self._record_delta_head_request(runtime, delta_before)
             aux_source_body_bytes = (
@@ -1969,19 +2115,15 @@ class Qwen38CausalChat:
             self._last_draft_evidence = {
                 "accepted_draft_tokens": evidence.accepted_draft_tokens,
                 "mode": self._draft_mode,
-                "draft_source_body_bytes": provider_metrics.source_body_bytes,
+                "draft_source_body_bytes": provider_source_body_bytes,
                 "aux_source_body_bytes": aux_source_body_bytes,
-                "draft_linear_calls": provider_metrics.linear_calls,
-                "target_source_body_bytes": evidence.source_body_bytes,
-                "target_linear_calls": evidence.linear_calls,
+                "draft_linear_calls": provider_linear_calls,
+                "target_source_body_bytes": target_source_body_bytes,
+                "target_linear_calls": target_linear_calls,
                 "total_source_body_bytes": (
-                    evidence.source_body_bytes
-                    + provider_metrics.source_body_bytes
-                    + aux_source_body_bytes
+                    combined_source_body_bytes + aux_source_body_bytes
                 ),
-                "total_linear_calls": (
-                    evidence.linear_calls + provider_metrics.linear_calls
-                ),
+                "total_linear_calls": combined_linear_calls,
                 "final_state_committed": evidence.final_state_committed,
                 "rounds": len(evidence.rounds),
                 "round_window_policies": [
@@ -2022,6 +2164,10 @@ class Qwen38CausalChat:
                 prompt_ids=prompt_ids,
                 generated_ids=tuple(generated.token_ids),
                 generation_evidence=mapped_evidence,
+                accepted_draft_tokens=evidence.accepted_draft_tokens,
+                draft_source_body_bytes=provider_source_body_bytes,
+                aux_source_body_bytes=aux_source_body_bytes,
+                nested_horizons=_nested_draft_horizons(evidence),
                 council_confidence=getattr(
                     provider_metrics,
                     "last_confidence",
@@ -2061,15 +2207,25 @@ class Qwen38CausalChat:
                 and self._pending_draft_window_feedback is None
             ):
                 elapsed = time.perf_counter() - rolling_started
-                source_bytes = max(
+                combined_source_bytes = max(
                     0,
                     _runtime_source_body_bytes(runtime) - rolling_source_start,
                 )
+                timeout_provider_metrics = provider.metrics()
+                draft_source_bytes = int(timeout_provider_metrics.source_body_bytes)
+                if self._draft_mode in {"hybrid", "mtp"}:
+                    if draft_source_bytes > combined_source_bytes:
+                        raise Qwen38ChatError(
+                            "shared-pager timeout accounting exceeds execution"
+                        )
+                    target_source_bytes = combined_source_bytes - draft_source_bytes
+                else:
+                    target_source_bytes = combined_source_bytes
                 timeout_receipt = {
                     "elapsed_seconds": elapsed,
                     "schema": "immer.qwen3.8-draft-window-timeout/v1",
                     "selection_id": adaptive_selection.selection_id,
-                    "target_source_body_bytes": source_bytes,
+                    "target_source_body_bytes": target_source_bytes,
                 }
                 self._pending_draft_window_feedback = {
                     "_terminal_outcome": "timeout",
@@ -2077,7 +2233,7 @@ class Qwen38CausalChat:
                     "aux_source_body_bytes": 0,
                     "council_confidence": None,
                     "council_disagreement": None,
-                    "draft_source_body_bytes": 0,
+                    "draft_source_body_bytes": draft_source_bytes,
                     "effective_experts": None,
                     "emitted_tokens": 0,
                     "nested_horizons": (),
@@ -2088,7 +2244,7 @@ class Qwen38CausalChat:
                     "seconds": elapsed,
                     "target_forwards": 1,
                     "target_receipt_sha256": _digest(timeout_receipt),
-                    "target_source_body_bytes": source_bytes,
+                    "target_source_body_bytes": target_source_bytes,
                 }
             raise
         finally:
@@ -2368,6 +2524,17 @@ class Qwen38CausalChat:
                 raise Qwen38ChatError(
                     "runtime model context is smaller than the facade contract"
                 )
+            if self._draft_mode in {"hybrid", "mtp"}:
+                q4_bank = getattr(runtime, "q4_bank", None)
+                if q4_bank is None:
+                    q4_bank = getattr(getattr(model, "pager", None), "q4_bank", None)
+                has_tensor = getattr(q4_bank, "has", None)
+                if not callable(has_tensor) or any(
+                    not bool(has_tensor(name)) for name in MTP_MATRIX_NAMES
+                ):
+                    raise Qwen38ChatError(
+                        "runtime Q4 bank lacks the embedded MTP matrices"
+                    )
         except Exception as exc:
             self._load_error = f"{type(exc).__name__}: {exc}"
             close = getattr(runtime, "close", None)

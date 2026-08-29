@@ -165,11 +165,16 @@ def _resolve_qwen38_chat_paths(
         "IMMER_QWEN38_Q4",
     )
     if q4 is None and root is not None:
-        candidates = (
-            (root / "causal" / "q4-base-v3-mtp", root / "causal" / "q4-base-v2")
-            if getattr(args, "draft_mode", None) == "mtp"
-            else (root / "causal" / "q4-base-v2",)
-        )
+        draft_mode = getattr(args, "draft_mode", None)
+        if draft_mode in {"hybrid", "mtp"}:
+            candidates = (root / "causal" / "q4-base-v3-mtp",)
+        elif draft_mode is None:
+            candidates = (
+                root / "causal" / "q4-base-v3-mtp",
+                root / "causal" / "q4-base-v2",
+            )
+        else:
+            candidates = (root / "causal" / "q4-base-v2",)
         q4 = next((candidate for candidate in candidates if candidate.is_dir()), None)
 
     disable_fast_mlp = bool(getattr(args, "no_fast_mlp", False))
@@ -213,16 +218,43 @@ def _resolve_qwen38_markov_draft(
     args: argparse.Namespace,
     bundle_path: Path,
     q4_root: Path | None,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
     draft_mode = getattr(args, "draft_mode", None)
     markov_state = getattr(args, "markov_draft_state", None)
+    mtp_state = getattr(args, "mtp_draft_state", None)
+    anchor_active = getattr(args, "qwen38_anchor_cache", None) is not None and not bool(
+        getattr(args, "no_anchor_cache", False)
+    )
     disabled = bool(getattr(args, "no_markov_draft", False))
     if disabled:
-        if draft_mode == "markov" or markov_state is not None:
+        if draft_mode in {"hybrid", "markov"} or markov_state is not None:
             raise ValueError(
                 "Markov draft options and --no-markov-draft are mutually exclusive"
             )
-        return draft_mode, markov_state
+        if draft_mode is None and mtp_state is not None:
+            draft_mode = "mtp"
+        return draft_mode, markov_state, mtp_state
+    if draft_mode is None and getattr(args, "draft_bundle", None) is None:
+        if markov_state is not None and mtp_state is not None:
+            draft_mode = "hybrid"
+        elif mtp_state is not None:
+            draft_mode = "mtp"
+    if (
+        draft_mode is None
+        and getattr(args, "draft_bundle", None) is None
+        and markov_state is None
+        and mtp_state is None
+        and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+        and q4_root is not None
+        and q4_root.name == "q4-base-v3-mtp"
+        and not anchor_active
+        and _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE.is_file()
+    ):
+        return (
+            "hybrid",
+            str(_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE),
+            str(_QWEN38_DEPLOYMENT_MTP_STATE),
+        )
     if (
         draft_mode is None
         and getattr(args, "draft_bundle", None) is None
@@ -231,15 +263,22 @@ def _resolve_qwen38_markov_draft(
         and q4_root is not None
         and _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE.is_file()
     ):
-        return "markov", str(_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE)
+        return "markov", str(_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE), mtp_state
     if (
         draft_mode == "mtp"
-        and markov_state is None
+        and mtp_state is None
         and bundle_path == _QWEN38_DEPLOYMENT_ROOT
         and q4_root is not None
     ):
-        return "mtp", str(_QWEN38_DEPLOYMENT_MTP_STATE)
-    return draft_mode, markov_state
+        mtp_state = markov_state or str(_QWEN38_DEPLOYMENT_MTP_STATE)
+    if (
+        draft_mode == "hybrid"
+        and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+        and q4_root is not None
+    ):
+        markov_state = markov_state or str(_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE)
+        mtp_state = mtp_state or str(_QWEN38_DEPLOYMENT_MTP_STATE)
+    return draft_mode, markov_state, mtp_state
 
 
 def _qwen38_growing_warm_profile(
@@ -267,7 +306,11 @@ def _qwen38_growing_warm_profile(
         "draft_window": args.draft_window,
         "head_block_rows": args.head_block_rows,
         "markov_provider_abi": (
-            "immer.qwen3.8-markov-draft-provider/v8" if draft_mode == "markov" else None
+            "immer.qwen3.8-markov-mtp-hybrid-provider/v1"
+            if draft_mode == "hybrid"
+            else "immer.qwen3.8-markov-draft-provider/v8"
+            if draft_mode == "markov"
+            else None
         ),
         "max_context_tokens": args.max_context_tokens,
         "max_new_tokens": args.max_new_tokens,
@@ -525,7 +568,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         bundle_path, tokenizer_path, q4_root, fast_mlp_root = (
             _resolve_qwen38_chat_paths(args)
         )
-        draft_mode, markov_draft_state = _resolve_qwen38_markov_draft(
+        draft_mode, markov_draft_state, mtp_draft_state = _resolve_qwen38_markov_draft(
             args,
             bundle_path,
             q4_root,
@@ -653,6 +696,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 else int(args.draft_max_resident_mb * 1024**2)
             ),
             markov_draft_state_path=markov_draft_state,
+            mtp_draft_state_path=mtp_draft_state,
             draft_window_state_path=args.draft_window_state,
             range_markov_state_path=args.range_markov_state,
             range_prefetch_max_bytes=int(args.range_prefetch_max_mb * 1024**2),
@@ -1473,7 +1517,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chat.add_argument(
         "--draft-mode",
-        choices=("qwen35", "markov", "mtp"),
+        choices=("qwen35", "markov", "mtp", "hybrid"),
         help="rolling draft provider; inferred as qwen35 when --draft-bundle is set",
     )
     chat.add_argument(
@@ -1487,6 +1531,10 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--markov-draft-state",
         help="persistent sparse Qwen-token Markov memory",
+    )
+    chat.add_argument(
+        "--mtp-draft-state",
+        help="persistent embedded-MTP reliability state",
     )
     chat.add_argument(
         "--no-markov-draft",

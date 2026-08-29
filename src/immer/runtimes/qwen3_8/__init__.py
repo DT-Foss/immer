@@ -125,6 +125,13 @@ from .draft_protocol import (
     RollingDraftProposal,
     RoundWindowPolicy,
 )
+from .hybrid_draft import (
+    MARKOV_MTP_WINDOW_WORK_COSTS,
+    QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
+    Qwen38MarkovMtpDraftError,
+    Qwen38MarkovMtpDraftMetrics,
+    Qwen38MarkovMtpDraftProvider,
+)
 from .markov_draft import (
     LEGACY_MARKOV_DRAFT_STATE_SCHEMA,
     V2_MARKOV_DRAFT_STATE_SCHEMA,
@@ -414,6 +421,7 @@ __all__ = [
     "MARKOV_DRAFT_METRICS_SCHEMA",
     "MARKOV_DRAFT_PROVIDER_ABI",
     "MARKOV_DRAFT_STATE_SCHEMA",
+    "MARKOV_MTP_WINDOW_WORK_COSTS",
     "MODEL_PIN_SCHEMA",
     "MeasurementReceipt",
     "FingerprintRollingK4DraftProvider",
@@ -496,6 +504,10 @@ __all__ = [
     "Qwen38RuntimeError",
     "Qwen38K2SpeculativeDecoder",
     "Qwen38K4SpeculativeDecoder",
+    "QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA",
+    "Qwen38MarkovMtpDraftError",
+    "Qwen38MarkovMtpDraftMetrics",
+    "Qwen38MarkovMtpDraftProvider",
     "Qwen38SnapshotError",
     "Qwen38SpeculativeError",
     "Qwen38StableCrsaGraft",

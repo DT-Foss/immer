@@ -37,9 +37,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.config = _tiny_config()
         save_file(_tiny_weights(self.config), self.root / "model.safetensors")
-        self.source = Streamer.from_local(
-            self.root, budget_mb=1000, use_cache=False
-        )
+        self.source = Streamer.from_local(self.root, budget_mb=1000, use_cache=False)
         self.pagers: list[Qwen38WeightPager] = []
 
     def tearDown(self) -> None:
@@ -225,9 +223,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             state_path=state_path,
             max_history_tokens=64,
         )
-        self.assertTrue(
-            provider.import_confirmed_episode(first_episode, first_digest)
-        )
+        self.assertTrue(provider.import_confirmed_episode(first_episode, first_digest))
         provider.close()
 
         provider = FingerprintRollingK4DraftProvider(
@@ -235,9 +231,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             state_path=state_path,
             max_history_tokens=64,
         )
-        self.assertFalse(
-            provider.import_confirmed_episode(first_episode, first_digest)
-        )
+        self.assertFalse(provider.import_confirmed_episode(first_episode, first_digest))
         self.assertTrue(
             provider.import_confirmed_episode(second_episode, second_digest)
         )
@@ -317,16 +311,16 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         target = self._model()
 
-        result = Qwen38K4SpeculativeDecoder(
-            target, provider
-        ).generate_rolling(
+        result = Qwen38K4SpeculativeDecoder(target, provider).generate_rolling(
             [prompt],
             max_new_tokens=8,
             head_block_rows=7,
         )
 
         self.assertEqual(result.token_ids, expected)
-        self.assertLess(result.evidence.forward_passes, baseline_evidence.forward_passes)
+        self.assertLess(
+            result.evidence.forward_passes, baseline_evidence.forward_passes
+        )
         self.assertGreater(result.evidence.accepted_draft_tokens, 0)
         _assert_layer_states_equal(self, target._layer_states, baseline._layer_states)
         metrics = provider.metrics()
@@ -383,7 +377,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
 
         self.assertEqual(result.token_ids, expected)
-        _assert_layer_states_equal(self, candidate._layer_states, reference._layer_states)
+        _assert_layer_states_equal(
+            self, candidate._layer_states, reference._layer_states
+        )
         self.assertEqual(result.evidence.used_window_sizes, (8,))
         self.assertEqual(result.evidence.rounds[0].round_policy.chosen_window, 8)
         self.assertEqual(len(result.evidence.rounds[0].provider_proposed_token_ids), 7)
@@ -400,9 +396,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         target = self._model()
 
-        result = Qwen38K4SpeculativeDecoder(
-            target, provider
-        ).generate_rolling(
+        result = Qwen38K4SpeculativeDecoder(target, provider).generate_rolling(
             [[1, 4]],
             max_new_tokens=1,
             head_block_rows=7,
@@ -417,8 +411,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
     def test_council_reweights_and_recovers_after_regime_flip(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         history = tuple((1, 2, 1, 3) * 20) + (2, 1)
-        proposal, feedback, _confidence, _disagreement = (
-            provider._predict_council(history, 1)
+        proposal, feedback, _confidence, _disagreement = provider._predict_council(
+            history, 1
         )
         self.assertEqual(proposal, (3,))
 
@@ -556,7 +550,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                     max_history_tokens=64,
                 )
 
-    def test_similar_context_reuses_dialect_and_distinct_context_creates_one(self) -> None:
+    def test_similar_context_reuses_dialect_and_distinct_context_creates_one(
+        self,
+    ) -> None:
         state_path = self.root / "dialects.bin"
         first_context = tuple((1, 2, 3, 4) * 20)
         similar_context = (*first_context[:-1], 5)
@@ -739,7 +735,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider.metrics().phrase_accepted_tokens, 2)
         provider.close()
 
-    def test_phrase_agent_fills_a_seven_token_window_from_repeated_episode(self) -> None:
+    def test_phrase_agent_fills_a_seven_token_window_from_repeated_episode(
+        self,
+    ) -> None:
         episode = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
         state_path = self.root / "wide-global-phrases.bin"
         state_path.write_bytes(
@@ -804,6 +802,28 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(metrics.last_recommended_window, 8)
         provider.close()
 
+    def test_discarded_proposal_still_learns_the_confirmed_request(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=7,
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        provider.propose_round(prompt, 2)
+
+        provider.discard_pending_proposal()
+        provider.observe_final((*prompt, 2, 7, 11))
+
+        metrics = provider.metrics()
+        self.assertEqual(metrics.episode_count, 1)
+        self.assertEqual(metrics.updates, 1)
+        self.assertEqual(
+            provider.confirmed_episodes(),
+            ((*prompt, 2, 7, 11),),
+        )
+        provider.close()
+
     def test_phrase_agent_uses_longest_prefix_with_repeated_support(self) -> None:
         episodes = (
             (1, 2, 3, 4, 5, 6, 7, 8),
@@ -832,7 +852,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((20, 1, 2, *proposal[:4]))
         provider.close()
 
-    def test_dialect_phrase_agent_activates_before_global_support_threshold(self) -> None:
+    def test_dialect_phrase_agent_activates_before_global_support_threshold(
+        self,
+    ) -> None:
         state_path = self.root / "dialect-phrases.bin"
         prompt = tuple((1, 2) * 20)
         episode = (*prompt, 3, 4, 5, 6)
