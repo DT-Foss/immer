@@ -87,8 +87,8 @@ manifest binds all 498 text matrices to the original model identity, inventory
 fingerprint, bundle manifest, layout fingerprint, and causal graph revision.
 Each 32-value Q4_0 block stores one FP16 scale plus 16 packed nibbles; Q8_0
 stores one scale plus 32 signed bytes. Gate/Up and full-attention matrices use
-Q4_0. Recurrent Linear-Attention projections, MLP Down, embeddings, and the LM
-head use Q8_0. Files are opened lazily and retained as read-only mmaps, so the
+Q4_0. Recurrent Linear-Attention projections, embeddings, and the LM head use
+Q8_0. Files are opened lazily and retained as read-only mmaps, so the
 native kernel operates on the causal-addressed payload without reconstructing
 a full floating matrix. Unsupported or uncovered tensors continue through the
 original BF16 pager.

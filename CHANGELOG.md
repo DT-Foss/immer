@@ -56,6 +56,13 @@ All notable changes to IMMER are recorded here.
   and S=18 improved 47.5x. The same arbitrary eight-token request fell from
   79.05 to 23.01 seconds generation, TTFT from 25.05 to 13.65 seconds, and
   preserved the exact token trace.
+- Promoted the recurrent precision bank as the local default. MLP Down moves
+  from Q8 to Q4 while recurrent Linear-Attention, embedding, and head remain
+  Q8. The derived plane falls from 22.03 to 19.18 GB and real peak RSS from
+  21.65 to 18.79 GB. After warm pages, the same trace completes in 20.50
+  seconds with 12.10-second TTFT. The superseded Balanced directory was removed
+  only after 434 shared hardlink inodes were verified; original BF16 weights
+  remain unchanged.
 
 - Generalized correction-first rolling verification from fixed K=4 to a
   configurable K=2–16 target window; `immer chat` defaults to K=8. All target

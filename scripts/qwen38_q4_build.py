@@ -19,6 +19,7 @@ from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
 from immer.runtimes.qwen3_8.q4 import (
     Q4_BASE_POLICY,
     Q4_BALANCED_POLICY,
+    Q4_RECURRENT_POLICY,
     Q4BankBuilder,
     Q4BankError,
 )
@@ -39,9 +40,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--threads", type=int)
     parser.add_argument(
         "--policy",
-        choices=("base", "balanced"),
+        choices=("base", "balanced", "recurrent"),
         default="base",
-        help="balanced keeps recurrent Attention and residual Down matrices at Q8",
+        help=(
+            "balanced keeps recurrent Attention and Down at Q8; recurrent keeps "
+            "only recurrent Attention plus embedding/head at Q8"
+        ),
     )
     parser.add_argument(
         "--reuse-bank",
@@ -92,9 +96,11 @@ def run(args: argparse.Namespace) -> int:
             bundle_receipt=receipt,
             row_chunk=args.row_chunk,
             threads=args.threads,
-            format_policy=(
-                Q4_BASE_POLICY if args.policy == "base" else Q4_BALANCED_POLICY
-            ),
+            format_policy={
+                "base": Q4_BASE_POLICY,
+                "balanced": Q4_BALANCED_POLICY,
+                "recurrent": Q4_RECURRENT_POLICY,
+            }[args.policy],
             reuse_root=args.reuse_bank,
         )
         plan = builder.plan()

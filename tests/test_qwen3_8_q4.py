@@ -16,6 +16,7 @@ from immer.runtimes.qwen3_8.q4 import (
     Q8_0,
     Q4_BANK_SCHEMA,
     Q4_BALANCED_POLICY,
+    Q4_RECURRENT_POLICY,
     Q4Bank,
     Q4BankBuilder,
     Q4BankError,
@@ -387,6 +388,30 @@ class Q4BankTests(unittest.TestCase):
             self.assertNotEqual(
                 (base / "weights" / base_rows[linear]["file"]).stat().st_ino,
                 (balanced / "weights" / rows[linear]["file"]).stat().st_ino,
+            )
+
+            recurrent = Path(temporary) / "recurrent"
+            recurrent_manifest = Q4BankBuilder(
+                recurrent,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=2,
+                threads=2,
+                format_policy=Q4_RECURRENT_POLICY,
+                reuse_root=balanced,
+            ).build()
+            recurrent_rows = {
+                row["name"]: row for row in recurrent_manifest["body"]["tensors"]
+            }
+            self.assertEqual(recurrent_rows[linear]["format"], Q8_0)
+            self.assertEqual(recurrent_rows[down]["format"], Q4_0)
+            self.assertEqual(
+                (balanced / "weights" / rows[linear]["file"]).stat().st_ino,
+                (recurrent / "weights" / recurrent_rows[linear]["file"]).stat().st_ino,
+            )
+            self.assertNotEqual(
+                (balanced / "weights" / rows[down]["file"]).stat().st_ino,
+                (recurrent / "weights" / recurrent_rows[down]["file"]).stat().st_ino,
             )
 
     def test_mount_rejects_foreign_bundle(self) -> None:

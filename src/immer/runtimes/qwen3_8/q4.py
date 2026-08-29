@@ -51,7 +51,12 @@ Q4_BASE_POLICY = "q4_0-text-matrices+q8_0-embedding-head/v1"
 Q4_BALANCED_POLICY = (
     "q4_0-gate-up-full-attn+q8_0-linear-attn-down-embedding-head/v1"
 )
-Q4_FORMAT_POLICIES = frozenset((Q4_BASE_POLICY, Q4_BALANCED_POLICY))
+Q4_RECURRENT_POLICY = (
+    "q4_0-mlp-full-attn+q8_0-linear-attn-embedding-head/v1"
+)
+Q4_FORMAT_POLICIES = frozenset(
+    (Q4_BASE_POLICY, Q4_BALANCED_POLICY, Q4_RECURRENT_POLICY)
+)
 _FORMAT_CODES = {Q4_0: 4, Q8_0: 8}
 _FORMAT_BLOCK_BYTES = {Q4_0: Q4_BLOCK_BYTES, Q8_0: Q8_BLOCK_BYTES}
 
@@ -818,8 +823,12 @@ class Q4BankBuilder:
     def _format_for_name(self, name: str) -> str:
         if name in Q4_HEAD_TENSORS:
             return Q8_0
-        if self.format_policy == Q4_BALANCED_POLICY and (
-            ".linear_attn." in name or ".mlp.down_proj.weight" in name
+        if self.format_policy in {Q4_BALANCED_POLICY, Q4_RECURRENT_POLICY} and (
+            ".linear_attn." in name
+            or (
+                self.format_policy == Q4_BALANCED_POLICY
+                and ".mlp.down_proj.weight" in name
+            )
         ):
             return Q8_0
         return Q4_0
@@ -1191,6 +1200,7 @@ __all__ = [
     "Q4_BASE_POLICY",
     "Q4_BALANCED_POLICY",
     "Q4_FORMAT_POLICIES",
+    "Q4_RECURRENT_POLICY",
     "Q4Bank",
     "Q4BankBuilder",
     "Q4BankError",

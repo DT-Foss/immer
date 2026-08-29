@@ -22,11 +22,11 @@ release surface.
   ranges fill Torch-owned weight storage directly through `preadv`.
 - **Native packed execution.** A source-bound derived weight plane maps the
   original causal graph onto row-addressable Q4_0/Q8_0 files without changing
-  the BF16 bundle. Gate/Up and full-attention matrices execute as Q4; recurrent
-  Linear-Attention projections, residual Down, embeddings, and the LM head use
-  Q8. The C kernel consumes mmap pages directly with AVX2 and retains the
+  the BF16 bundle. MLP Gate/Up/Down and full-attention matrices execute as Q4;
+  recurrent Linear-Attention projections, embeddings, and the LM head use Q8.
+  The C kernel consumes mmap pages directly with AVX2 and retains the
   existing Qwen Attention, DeltaNet, Sinkhorn, state, tokenizer, and FERTIG
-  paths. The complete text plane is 22.03 GB instead of 53.79 GB.
+  paths. The complete text plane is 19.18 GB instead of 53.79 GB.
 - **Predictive weight transport.** A persistent two-agent operation Markov
   model learns the exact tensor/range sequence already emitted by the
   Streamer. Order-1/2 Fixed Share, surprise regimes, and Ricci retention
@@ -156,9 +156,9 @@ release surface.
 | Trial | Result | Scope |
 |---|---:|---|
 | Local causal bundle reopen | 77.77 → 1.20 s; 64.90x | complete 55.6 GB Qwen3.8 bundle; first full-content verification followed by unchanged next-process stat+digest reuse; no model forward |
-| Native causal Q4/Q8 chat | readable arbitrary German output; TTFT 22.58 s; 8 tokens in 73.21 s | real 27B CPU run on 16 AVX2 cores; 498 text matrices; 21.65 GB peak RSS; 22.03 GB derived payload; original BF16 graph remains authoritative |
+| Native causal Q4/Q8 chat | readable arbitrary German output; TTFT 12.10 s; 8 tokens in 20.50 s | real 27B CPU run on 16 AVX2 cores; 498 text matrices; 18.79 GB peak RSS; 19.18 GB derived payload; original BF16 graph remains authoritative |
 | Cost-aware Markov abstention | 74.58 s vs 79.05 s direct; identical token trace | seven K1 waves on an unseen German request; zero draft bytes/linears; confirmed episode still updates Council state |
-| Persistent JSONL chat | second request opens 0 tensors | one process retains the verified 22.03 GB mmap plane; observed one-token generation 15.01 s then 16.90 s |
+| Persistent JSONL chat | second request opens 0 tensors | one process retains the verified mmap plane; observed one-token generation 15.01 s then 16.90 s |
 | Native DeltaNet K=4 convolution | 79.05 → 23.01 s generation; 3.44x | direct causal channelwise kernel replaces generic 10,240-group Conv1d; identical output/token trace; TTFT 25.05 → 13.65 s |
 | Rolling K=2–16 continuation | accepted prefixes commit with zero weight reads | one target-known token plus up to 15 drafts; DeltaNet Conv/recurrent state, next-token continuation, Graft, and native Prefix-Sinkhorn state remain bit-exact |
 | Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed variable phrase options up to 15 tokens |
