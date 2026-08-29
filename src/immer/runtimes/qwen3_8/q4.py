@@ -196,6 +196,7 @@ class Q4NativeKernel:
         if self.library.immer_q4_abi() != Q4_NATIVE_ABI:
             raise Q4BankError("native Q4 ABI differs from the Python runtime")
         self.avx2 = bool(self.library.immer_q4_has_avx2())
+        self.silu_bf16_table = self._build_silu_bf16_table()
 
     @classmethod
     def load(cls) -> "Q4NativeKernel":
@@ -439,6 +440,23 @@ class Q4NativeKernel:
             integer,
         )
         self.library.immer_q4_linear_group_f32.restype = integer
+        self.library.immer_q4_mlp_bf16_f32.argtypes = (
+            void,
+            i64,
+            i64,
+            void,
+            integer,
+            void,
+            integer,
+            void,
+            integer,
+            i64,
+            i64,
+            void,
+            void,
+            integer,
+        )
+        self.library.immer_q4_mlp_bf16_f32.restype = integer
 
     @staticmethod
     def _pointer(value: Any) -> ctypes.c_void_p:
@@ -449,6 +467,15 @@ class Q4NativeKernel:
         if interface is None:
             raise TypeError("native Q4 value has no stable data pointer")
         return ctypes.c_void_p(int(interface.data))
+
+    @staticmethod
+    def _build_silu_bf16_table() -> np.ndarray:
+        import torch
+
+        bits = np.arange(65_536, dtype=np.uint16)
+        values = torch.from_numpy(bits.copy()).view(torch.bfloat16)
+        outputs = torch.nn.functional.silu(values).contiguous()
+        return np.asarray(outputs.view(torch.uint16).numpy(), dtype=np.uint16).copy()
 
     def row_bytes(self, fmt: str, cols: int) -> int:
         if fmt not in _FORMAT_CODES:
@@ -691,6 +718,8 @@ class Q4BankMetrics:
     native_topk_calls: int = 0
     native_topk_rows: int = 0
     native_topk_discard_bytes: int = 0
+    full_mlp_calls: int = 0
+    full_mlp_rows: int = 0
     linear_calls: int = 0
     linear_group_calls: int = 0
     linear_row_calls: int = 0
@@ -1060,6 +1089,82 @@ class Q4Bank:
                 result.numel() * result.element_size() for result in results
             )
             return results
+
+    def mlp(
+        self,
+        values: Any,
+        names: tuple[str, str, str],
+        *,
+        output_dtype: Any,
+    ) -> Any:
+        """Execute the complete BF16-rounded SwiGLU MLP in one native team."""
+
+        import torch
+
+        with self._lock:
+            if len(names) != 3 or len(set(names)) != 3:
+                raise ValueError("Q4 full MLP requires Gate, Up, and Down names")
+            gate, up, down = (self._mapping(name) for name in names)
+            gate_entry, gate_map = gate
+            up_entry, up_map = up
+            down_entry, down_map = down
+            if (
+                gate_entry.shape != up_entry.shape
+                or down_entry.shape[1] != gate_entry.shape[0]
+                or output_dtype != torch.bfloat16
+            ):
+                raise Q4BankError("Q4 full MLP shapes or BF16 ABI disagree")
+            if not isinstance(values, torch.Tensor):
+                values = torch.as_tensor(values)
+            if (
+                values.ndim < 1
+                or values.shape[-1] != gate_entry.shape[1]
+                or values.device.type != "cpu"
+            ):
+                raise ValueError("Q4 full MLP input differs from Gate/Up")
+            leading = tuple(values.shape[:-1])
+            input_rows = values.numel() // values.shape[-1]
+            compute = (
+                values.detach()
+                .to(dtype=torch.float32)
+                .reshape(input_rows, values.shape[-1])
+                .contiguous()
+            )
+            output = torch.empty((input_rows, down_entry.shape[0]), dtype=torch.float32)
+            code = self.native.library.immer_q4_mlp_bf16_f32(
+                self.native._pointer(compute),
+                input_rows,
+                gate_entry.shape[1],
+                self.native._pointer(gate_map.bytes),
+                _FORMAT_CODES[gate_entry.format],
+                self.native._pointer(up_map.bytes),
+                _FORMAT_CODES[up_entry.format],
+                self.native._pointer(down_map.bytes),
+                _FORMAT_CODES[down_entry.format],
+                gate_entry.shape[0],
+                down_entry.shape[0],
+                self.native._pointer(self.native.silu_bf16_table),
+                self.native._pointer(output),
+                self.threads,
+            )
+            if code == 2:
+                raise ValueError("native Q4 full MLP values are non-finite")
+            if code:
+                raise Q4BankError(f"native Q4 full MLP failed with code {code}")
+            result = output.to(dtype=output_dtype).reshape(
+                *leading,
+                down_entry.shape[0],
+            )
+            self._stats.linear_calls += 3
+            self._stats.input_quantizations += input_rows * 2
+            self._stats.linear_input_rows += input_rows * 3
+            self._stats.logical_weight_bytes += sum(
+                entry.payload_bytes for entry in (gate_entry, up_entry, down_entry)
+            )
+            self._stats.output_bytes += result.numel() * result.element_size()
+            self._stats.full_mlp_calls += 1
+            self._stats.full_mlp_rows += input_rows
+            return result
 
     def linear_rows(
         self,

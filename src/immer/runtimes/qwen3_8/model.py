@@ -197,7 +197,9 @@ class _ContinuationPrefixTrace:
             0 if row is None else row.numel() * row.element_size()
             for row in self.graft_histories
         )
-        operator_bytes = sum(row.operators.nbytes for row in self.native_operator_blocks)
+        operator_bytes = sum(
+            row.operators.nbytes for row in self.native_operator_blocks
+        )
         return layer_bytes + graft_bytes + operator_bytes
 
 
@@ -369,7 +371,12 @@ class StreamedQwen38:
             ):
                 raise ValueError("mlp_sparse_executor identity is invalid")
         if delta_head_router is not None:
-            required = ("project", "project_many", "snapshot_identity", "supports_layer")
+            required = (
+                "project",
+                "project_many",
+                "snapshot_identity",
+                "supports_layer",
+            )
             if any(
                 not callable(getattr(delta_head_router, name, None))
                 for name in required
@@ -1376,11 +1383,9 @@ class StreamedQwen38:
         native_head_crsa_tokenwise_usage: bool = False,
     ) -> tuple[torch.Tensor, AttentionState]:
         base = f"model.language_model.layers.{layer}.self_attn"
-        projected_query_gate, projected_key, projected_value = (
-            self.pager.linear_group(
-                hidden,
-                (f"{base}.q_proj", f"{base}.k_proj", f"{base}.v_proj"),
-            )
+        projected_query_gate, projected_key, projected_value = self.pager.linear_group(
+            hidden,
+            (f"{base}.q_proj", f"{base}.k_proj", f"{base}.v_proj"),
         )
         q_norm_weight = self._control(f"{base}.q_norm.weight")
         k_norm_weight = self._control(f"{base}.k_norm.weight")
@@ -1659,6 +1664,24 @@ class StreamedQwen38:
                 return output
         self.mlp_sparse_last_trace = None
         base = f"model.language_model.layers.{layer}.mlp"
+        q4_bank = getattr(self.pager, "q4_bank", None)
+        fused_names = (
+            f"{base}.gate_proj.weight",
+            f"{base}.up_proj.weight",
+            f"{base}.down_proj.weight",
+        )
+        if (
+            q4_bank is not None
+            and callable(getattr(q4_bank, "mlp", None))
+            and self.pager.compute_dtype == torch.bfloat16
+            and all(q4_bank.has(name) for name in fused_names)
+            and self.mlp_sparse_executor is None
+            and self.layer_boundary_observer is None
+        ):
+            return self.pager.mlp(
+                hidden,
+                fused_names,
+            )
         gate, up = self.pager.linear_group(
             hidden,
             (f"{base}.gate_proj", f"{base}.up_proj"),
@@ -1670,8 +1693,9 @@ class StreamedQwen38:
 
         observe_full = self._full_mlp_observer(layer)
         observe_down = None
-        q4_active = getattr(self.pager, "q4_bank", None) is not None
+        q4_active = q4_bank is not None
         if observe_full is not None and not q4_active:
+
             def observe_down(weight: Any, result: Any) -> None:
                 self._observe_exact_mlp(
                     layer=layer,
@@ -1710,6 +1734,7 @@ class StreamedQwen38:
         if len(hidden) == 1:
             observed = None
             if weight_observer is not None:
+
                 def observed(weight: Any, result: Any) -> None:
                     weight_observer(weight, (result,))
 
@@ -1834,8 +1859,10 @@ class StreamedQwen38:
         if not isinstance(next_state, AttentionState):  # pragma: no cover - kernel.
             raise Qwen38RuntimeError("continuation full attention returned no state")
         projected = self._linear_token_rows(tuple(mixed_rows), f"{base}.o_proj")
-        return projected, next_state, _LayerPrefixTrace(
-            attention_log_usage=tuple(prefix_usage)
+        return (
+            projected,
+            next_state,
+            _LayerPrefixTrace(attention_log_usage=tuple(prefix_usage)),
         )
 
     def _full_attention_k2_pair(
@@ -1932,9 +1959,7 @@ class StreamedQwen38:
                 )
                 mixed_rows.append(mixed)
                 if not isinstance(next_state, DeltaNetState):
-                    raise Qwen38RuntimeError(
-                        "continuation DeltaNet returned no state"
-                    )
+                    raise Qwen38RuntimeError("continuation DeltaNet returned no state")
                 conv_inputs.append(next_state.conv[..., -1:].detach().clone())
         finally:
             del projected_qkv, projected_z, projected_b, projected_a
@@ -1949,13 +1974,15 @@ class StreamedQwen38:
                 layer=layer,
             )
         else:
-            projected = self._linear_token_rows(
-                tuple(mixed_rows), f"{base}.out_proj"
-            )
+            projected = self._linear_token_rows(tuple(mixed_rows), f"{base}.out_proj")
         kernel_size = int(next_state.conv.shape[-1])
-        return projected, next_state, _LayerPrefixTrace(
-            delta_updates=tuple(updates),
-            delta_conv_prefix=tuple(conv_inputs[:-kernel_size]),
+        return (
+            projected,
+            next_state,
+            _LayerPrefixTrace(
+                delta_updates=tuple(updates),
+                delta_conv_prefix=tuple(conv_inputs[:-kernel_size]),
+            ),
         )
 
     def _linear_attention_k2_pair(
@@ -2013,6 +2040,7 @@ class StreamedQwen38:
         observe_down = None
         q4_active = getattr(self.pager, "q4_bank", None) is not None
         if observe_full is not None and not q4_active:
+
             def observe_down(weight: Any, result: tuple[Any, ...]) -> None:
                 self._observe_exact_mlp(
                     layer=layer,
@@ -2101,10 +2129,7 @@ class StreamedQwen38:
         )
         mlp = self._mlp_token_rows(mlp_input, layer=layer)
         return (
-            tuple(
-                after_attention[index] + mlp[index]
-                for index in range(len(hidden))
-            ),
+            tuple(after_attention[index] + mlp[index] for index in range(len(hidden))),
             next_state,
             prefix_trace,
         )
@@ -2757,9 +2782,7 @@ class StreamedQwen38:
         staged = list(states)
         staged_history = graft_history
         staged_native_evidence: list[NativeHeadCrsaEvidence] = []
-        staged_layer_traces = [
-            _LayerPrefixTrace() for _ in range(self.config.n_layers)
-        ]
+        staged_layer_traces = [_LayerPrefixTrace() for _ in range(self.config.n_layers)]
         graft_prefix_histories: list[torch.Tensor | None] = [None] * len(rows)
         staged_operator_blocks: list[NativePrefixSinkhornOperatorBlock] = []
         public_operator_observer = self.native_prefix_sinkhorn_operator_observer
@@ -2920,9 +2943,7 @@ class StreamedQwen38:
                 kernel_size = int(left_state.conv.shape[-1])
                 expected = max(0, left.width + 1 - kernel_size)
                 if len(conv_prefix) < expected:
-                    conv_prefix += (
-                        left_state.conv[..., :1].detach().clone(),
-                    )
+                    conv_prefix += (left_state.conv[..., :1].detach().clone(),)
             rows.append(
                 _LayerPrefixTrace(
                     attention_log_usage=(
@@ -3169,7 +3190,9 @@ class StreamedQwen38:
                 progress=progress,
             )
             if staged.prefix_trace is None:
-                raise Qwen38RuntimeError("continuation extension lacks its prefix trace")
+                raise Qwen38RuntimeError(
+                    "continuation extension lacks its prefix trace"
+                )
             prefix_trace = self._merge_prefix_traces(
                 pending.prefix_trace,
                 staged.prefix_trace,
@@ -3315,9 +3338,7 @@ class StreamedQwen38:
             staged_suffix = final.conv[..., -min(kernel_size, stage_width) :]
             pieces = (*stored, staged_suffix[..., :suffix_count])
             appended = (
-                staged_suffix[..., :0]
-                if not pieces
-                else torch.cat(pieces, dim=-1)
+                staged_suffix[..., :0] if not pieces else torch.cat(pieces, dim=-1)
             )
             conv = torch.cat((base.conv, appended), dim=-1)[
                 ..., -kernel_size:
@@ -3332,7 +3353,10 @@ class StreamedQwen38:
                 )
             candidate[layer] = DeltaNetState(conv=conv, recurrent=recurrent)
         graft_history = trace.graft_histories[width - 1]
-        if any(not isinstance(state, (AttentionState, DeltaNetState)) for state in candidate):
+        if any(
+            not isinstance(state, (AttentionState, DeltaNetState))
+            for state in candidate
+        ):
             raise Qwen38RuntimeError("continuation prefix reconstruction is incomplete")
         return tuple(candidate), graft_history  # type: ignore[arg-type]
 

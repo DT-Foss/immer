@@ -519,6 +519,42 @@ class Qwen38WeightPager:
         )
         return planned
 
+    def _preflight_q4_mlp(
+        self,
+        layouts: tuple[_TensorLayout, _TensorLayout, _TensorLayout],
+        *,
+        input_rows: int,
+    ) -> int:
+        gate, up, down = layouts
+        if (
+            input_rows <= 0
+            or gate.shape != up.shape
+            or len(gate.shape) != 2
+            or len(down.shape) != 2
+            or down.shape[1] != gate.shape[0]
+        ):
+            raise Qwen38PagerError("Q4 full MLP preflight shape is invalid")
+        hidden = gate.shape[1]
+        intermediate = gate.shape[0]
+        output = down.shape[0]
+        planned = input_rows * (
+            hidden * 4
+            + (hidden // 32) * 34
+            + intermediate * 4
+            + (intermediate // 32) * 34
+            + output * (4 + self._dtype_bytes(self.compute_dtype))
+        )
+        if planned > self.max_resident_bytes:
+            raise Qwen38PagerError(
+                f"Q4 full MLP needs {planned} transient bytes, limit is "
+                f"{self.max_resident_bytes}"
+            )
+        self._stats.peak_planned_resident_bytes = max(
+            self._stats.peak_planned_resident_bytes,
+            planned,
+        )
+        return planned
+
     def _layout(self, name: str) -> _TensorLayout:
         if self.causal_tensor_reader is not None:
             plan = self.causal_tensor_reader.resolve_tensor_plan(name)
@@ -1069,6 +1105,41 @@ class Qwen38WeightPager:
             self._stats.grouped_linear_calls += 1
             self._stats.grouped_linear_matrices += len(weight_names)
             return results
+
+    def mlp(self, x: Any, names: Iterable[str]) -> Any:
+        """Execute a complete packed BF16 SwiGLU MLP in one native call."""
+
+        with self._lock:
+            self._ensure_open()
+            prefixes = tuple(names)
+            if len(prefixes) != 3:
+                raise ValueError("MLP requires Gate, Up, and Down names")
+            weight_names = tuple(self._weight_name(name) for name in prefixes)
+            q4_bank = self.q4_bank
+            if (
+                q4_bank is None
+                or not callable(getattr(q4_bank, "mlp", None))
+                or not all(q4_bank.has(name) for name in weight_names)
+                or self.compute_dtype != self.torch.bfloat16
+            ):
+                raise Qwen38PagerError("native Q4 full MLP is unavailable")
+            if not isinstance(x, self.torch.Tensor):
+                x = self.torch.as_tensor(x)
+            compute = x.to(device=self.device, dtype=self.compute_dtype)
+            layouts = tuple(self._layout(name) for name in weight_names)
+            self._preflight_q4_mlp(
+                layouts,  # type: ignore[arg-type]
+                input_rows=compute.numel() // compute.shape[-1],
+            )
+            result = q4_bank.mlp(
+                compute,
+                weight_names,
+                output_dtype=self.compute_dtype,
+            )
+            self._stats.linear_calls += 3
+            self._stats.grouped_linear_calls += 1
+            self._stats.grouped_linear_matrices += 3
+            return result
 
     def linear_many(
         self,

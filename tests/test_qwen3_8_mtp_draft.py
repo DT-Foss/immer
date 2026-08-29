@@ -114,6 +114,13 @@ class _Pager(Qwen38WeightPager):
     def linear_group(self, x, names, *, output_dtype=None):
         return tuple(self.linear(x, name, output_dtype=output_dtype) for name in names)
 
+    def mlp(self, x, names):
+        gate, up = self.linear_group(x, names[:2])
+        return self.linear(
+            torch.nn.functional.silu(gate) * up,
+            names[2],
+        )
+
     def topk_logits(self, hidden, *, k=1, name="lm_head.weight", **_kwargs):
         logits = self.linear(hidden, name, output_dtype=torch.bfloat16)
         ids = torch.arange(logits.shape[-1], dtype=torch.long).expand_as(logits)

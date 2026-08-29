@@ -307,6 +307,14 @@ class Q4NativeKernelTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.kernel = Q4NativeKernel.load()
 
+    def test_bf16_silu_table_covers_the_complete_torch_domain(self) -> None:
+        bits = np.arange(65_536, dtype=np.uint16)
+        values = torch.from_numpy(bits.copy()).view(torch.bfloat16)
+        expected = (
+            torch.nn.functional.silu(values).contiguous().view(torch.uint16).numpy()
+        )
+        self.assertTrue(np.array_equal(self.kernel.silu_bf16_table, expected))
+
     def test_wire_sizes_and_row_roundtrip(self) -> None:
         values = torch.linspace(-4.0, 3.0, 128).reshape(2, 64)
         for fmt, row_bytes in ((Q4_0, 36), (Q8_0, 68)):
@@ -831,6 +839,65 @@ class Q4BankTests(unittest.TestCase):
                 metrics = bank.metrics()
                 self.assertEqual(metrics["fused_mlp_calls"], 1)
                 self.assertEqual(metrics["fused_mlp_rows"], 2)
+            finally:
+                bank.close()
+
+    def test_fused_full_mlp_matches_composed_q4_bit_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-full-mlp"
+            generator = torch.Generator().manual_seed(4404)
+            base = "model.language_model.layers.0.mlp"
+            tensors = {
+                f"{base}.gate_proj.weight": torch.randn((96, 64), generator=generator),
+                f"{base}.up_proj.weight": torch.randn((96, 64), generator=generator),
+                f"{base}.down_proj.weight": torch.randn((64, 96), generator=generator),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=32,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                values = torch.randn((3, 64), generator=generator).to(torch.bfloat16)
+                gate, up = bank.linear_group(
+                    values,
+                    (
+                        f"{base}.gate_proj.weight",
+                        f"{base}.up_proj.weight",
+                    ),
+                    output_dtype=torch.bfloat16,
+                )
+                expected = bank.linear(
+                    torch.nn.functional.silu(gate) * up,
+                    f"{base}.down_proj.weight",
+                    output_dtype=torch.bfloat16,
+                )
+                bank.release_touched()
+
+                actual = bank.mlp(
+                    values,
+                    (
+                        f"{base}.gate_proj.weight",
+                        f"{base}.up_proj.weight",
+                        f"{base}.down_proj.weight",
+                    ),
+                    output_dtype=torch.bfloat16,
+                )
+
+                self.assertTrue(torch.equal(actual, expected))
+                metrics = bank.metrics()
+                self.assertEqual(metrics["full_mlp_calls"], 1)
+                self.assertEqual(metrics["full_mlp_rows"], 3)
             finally:
                 bank.close()
 

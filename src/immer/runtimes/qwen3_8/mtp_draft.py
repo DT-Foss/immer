@@ -16,7 +16,7 @@ import torch
 
 from .config import Qwen38Config
 from .draft_protocol import RollingDraftProposal
-from .kernels import AttentionState, full_attention_core, rms_norm, swiglu
+from .kernels import AttentionState, full_attention_core, rms_norm
 from .pager import Qwen38WeightPager
 
 
@@ -420,13 +420,13 @@ class Qwen35MtpDraftProvider:
                 "mtp.layers.0.post_attention_layernorm.weight",
             )
             mlp = "mtp.layers.0.mlp"
-            gate, up = self.pager.linear_group(
+            hidden = residual + self.pager.mlp(
                 normalized,
-                (f"{mlp}.gate_proj", f"{mlp}.up_proj"),
-            )
-            hidden = residual + self.pager.linear(
-                swiglu(gate, up),
-                f"{mlp}.down_proj",
+                (
+                    f"{mlp}.gate_proj",
+                    f"{mlp}.up_proj",
+                    f"{mlp}.down_proj",
+                ),
             )
             hidden = self._norm(hidden, "mtp.norm.weight")
             self._draft_steps += rows
