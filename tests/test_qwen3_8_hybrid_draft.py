@@ -347,7 +347,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(proposal.token_ids, (7, 8, 9))
         self.assertEqual(
             proposal.provider_abi,
-            "immer.qwen3.8-markov-mtp-hybrid-provider/v12",
+            "immer.qwen3.8-markov-mtp-hybrid-provider/v13",
         )
         self.assertTrue(
             all(abs(value - 0.7625) < 1e-12 for value in proposal.token_confidences)
@@ -416,6 +416,22 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         provider.observe_verification(0, 1)
         provider.reconcile_prefix((*prompt, 4))
         provider.observe_final((*prompt, 4, 10))
+        provider.close()
+
+    def test_consensus_gain_is_monotone_at_confidence_cap(self) -> None:
+        provider = Qwen38MarkovMtpDraftProvider(_Markov(0.55), _Mtp)
+        provider._shadow_markov_proposal = _proposal(
+            confidence=0.55,
+            tokens=(7, 8, 9),
+        )
+        mtp = _proposal(confidence=0.999, tokens=(7, 8, 9))
+
+        fused = provider._fuse_mtp_consensus(mtp)
+
+        self.assertIs(fused, mtp)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.consensus_confidence_gain, 0.0)
+        self.assertEqual(metrics.last_consensus_confidence_gain, 0.0)
         provider.close()
 
     def test_mtp_initialization_failure_keeps_the_pending_markov_fallback(
@@ -574,7 +590,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(mtp.advance_calls[0][2], final_hidden))
 
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v12")
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v13")
         self.assertEqual(metrics.selected_provider, "markov")
         self.assertEqual(metrics.selection_calls, 4)
         self.assertEqual(metrics.markov_rounds, 3)

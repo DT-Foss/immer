@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v19"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v20"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
 V5_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
@@ -42,7 +42,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v16"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v17"
 _STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
 _V6_STATE_PREFIX = b"IMMD\x06"
@@ -1023,6 +1023,11 @@ class MarkovDraftMetrics:
     dialect_specialist_predictions: int
     max_position_maturity: float
     max_dialect_skill_maturity: float
+    lookahead_calls: int
+    lookahead_candidates: int
+    lookahead_token_changes: int
+    last_lookahead_gain: float
+    max_lookahead_gain: float
     regime_generation: int
     surprise_mean: float
     surprise_cusum: float
@@ -1092,6 +1097,9 @@ class FingerprintRollingK4DraftProvider:
     COMPOSITION_BOUNDS = CompositionBounds()
     EMPIRICAL_EVIDENCE_SATURATION = 8.0
     POSITION_WEIGHT_SATURATION = 8.0
+    LOOKAHEAD_CANDIDATES = 4
+    LOOKAHEAD_DISCOUNT = 0.5
+    LOOKAHEAD_MIN_LOG_GAIN = 0.05
 
     def __init__(
         self,
@@ -1265,6 +1273,11 @@ class FingerprintRollingK4DraftProvider:
         self._dialect_specialist_predictions = 0
         self._max_position_maturity = 0.0
         self._max_dialect_skill_maturity = 0.0
+        self._lookahead_calls = 0
+        self._lookahead_candidates = 0
+        self._lookahead_token_changes = 0
+        self._last_lookahead_gain = 0.0
+        self._max_lookahead_gain = 0.0
         self._adaptive_proposal_calls = 0
         self._recommended_window_counts = {1: 0, 4: 0, 8: 0, 16: 0}
         self._last_round_proposal: RollingDraftProposal | None = None
@@ -2122,6 +2135,72 @@ class FingerprintRollingK4DraftProvider:
         calibrated = 1.0 - (1.0 - raw) * (1.0 - evidence)
         return max(raw, min(0.999, calibrated)), evidence
 
+    def _lookahead_choice(
+        self,
+        experts: Sequence[tuple[_TransitionFingerprint, list[str]]],
+        mixture: Mapping[str, float],
+        numeric_symbols: Sequence[str],
+        base_weights: Sequence[float],
+        position: int,
+    ) -> tuple[int, float, int]:
+        """Choose one token by discounted current+next Markov log probability."""
+
+        greedy = max(
+            (probability, -int(symbol), int(symbol))
+            for symbol, probability in mixture.items()
+        )[2]
+        if (
+            position + 1 >= _MAX_PROPOSAL_POSITIONS
+            or len(numeric_symbols) < 2
+        ):
+            return greedy, 0.0, 0
+        candidates = sorted(
+            numeric_symbols,
+            key=lambda symbol: (mixture.get(symbol, 0.0), -int(symbol)),
+            reverse=True,
+        )[: self.LOOKAHEAD_CANDIDATES]
+        next_weights = self._position_weighting(position + 1, base_weights)[0]
+        rows = []
+        for symbol in candidates:
+            next_distributions = tuple(
+                model.distribution((*context, symbol)) for model, context in experts
+            )
+            next_symbols = {
+                candidate
+                for distribution in next_distributions
+                for candidate in distribution
+                if candidate != _UNKNOWN_TOKEN
+                and candidate.isdecimal()
+                and 0 <= int(candidate) < self.vocab_size
+            }
+            next_probability = max(
+                (
+                    sum(
+                        weight * distribution.get(candidate, 0.0)
+                        for weight, distribution in zip(
+                            next_weights,
+                            next_distributions,
+                            strict=True,
+                        )
+                    )
+                    for candidate in next_symbols
+                ),
+                default=1e-12,
+            )
+            current_probability = max(1e-12, float(mixture.get(symbol, 0.0)))
+            score = math.log(current_probability) + self.LOOKAHEAD_DISCOUNT * math.log(
+                max(1e-12, next_probability)
+            )
+            rows.append((score, current_probability, -int(symbol), int(symbol)))
+        best = max(rows)
+        greedy_row = next(row for row in rows if row[3] == greedy)
+        if best[3] != greedy and best[0] < (
+            greedy_row[0] + self.LOOKAHEAD_MIN_LOG_GAIN
+        ):
+            return greedy, 0.0, len(candidates)
+        gain = max(0.0, best[0] - greedy_row[0])
+        return best[3], gain, len(candidates)
+
     def _predict_council(
         self,
         history: tuple[int, ...],
@@ -2160,8 +2239,8 @@ class FingerprintRollingK4DraftProvider:
             horizon_position = position_offset + position
             weights, position_maturity, dialect_skill_maturity = (
                 self._position_weighting(
-                horizon_position,
-                base_weights,
+                    horizon_position,
+                    base_weights,
                 )
             )
             distributions = tuple(
@@ -2186,14 +2265,33 @@ class FingerprintRollingK4DraftProvider:
                 )
                 for symbol in numeric_symbols
             }
-            token = (
-                forced[position]
-                if position < len(forced)
-                else max(
-                    (probability, -int(symbol), int(symbol))
-                    for symbol, probability in mixture.items()
-                )[2]
-            )
+            if position < len(forced):
+                token = forced[position]
+                lookahead_gain = 0.0
+                evaluated_candidates = 0
+            else:
+                token, lookahead_gain, evaluated_candidates = (
+                    self._lookahead_choice(
+                        experts,
+                        mixture,
+                        numeric_symbols,
+                        base_weights,
+                        horizon_position,
+                    )
+                )
+                if evaluated_candidates:
+                    greedy = max(
+                        (probability, -int(symbol), int(symbol))
+                        for symbol, probability in mixture.items()
+                    )[2]
+                    self._lookahead_calls += 1
+                    self._lookahead_candidates += evaluated_candidates
+                    self._lookahead_token_changes += int(token != greedy)
+                    self._max_lookahead_gain = max(
+                        self._max_lookahead_gain,
+                        lookahead_gain,
+                    )
+            self._last_lookahead_gain = lookahead_gain
             proposal.append(token)
             universe = set().union(
                 *(distribution.keys() for distribution in distributions)
@@ -2301,6 +2399,11 @@ class FingerprintRollingK4DraftProvider:
             self._dialect_specialist_predictions,
             self._max_position_maturity,
             self._max_dialect_skill_maturity,
+            self._lookahead_calls,
+            self._lookahead_candidates,
+            self._lookahead_token_changes,
+            self._last_lookahead_gain,
+            self._max_lookahead_gain,
         )
         try:
             tokens, feedback, _confidence, _disagreement = self._predict_council(
@@ -2325,6 +2428,11 @@ class FingerprintRollingK4DraftProvider:
                 self._dialect_specialist_predictions,
                 self._max_position_maturity,
                 self._max_dialect_skill_maturity,
+                self._lookahead_calls,
+                self._lookahead_candidates,
+                self._lookahead_token_changes,
+                self._last_lookahead_gain,
+                self._max_lookahead_gain,
             ) = snapshot
 
     def _apply_council_feedback(
@@ -3083,6 +3191,11 @@ class FingerprintRollingK4DraftProvider:
             dialect_specialist_predictions=self._dialect_specialist_predictions,
             max_position_maturity=self._max_position_maturity,
             max_dialect_skill_maturity=self._max_dialect_skill_maturity,
+            lookahead_calls=self._lookahead_calls,
+            lookahead_candidates=self._lookahead_candidates,
+            lookahead_token_changes=self._lookahead_token_changes,
+            last_lookahead_gain=self._last_lookahead_gain,
+            max_lookahead_gain=self._max_lookahead_gain,
             regime_generation=self._state.regime_generation,
             surprise_mean=self._state.surprise_mean,
             surprise_cusum=self._state.surprise_cusum,

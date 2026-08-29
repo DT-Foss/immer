@@ -12,7 +12,7 @@ from .draft_protocol import RollingDraftProposal
 from .mtp_draft import Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v12"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v13"
 MARKOV_MTP_WINDOW_WORK_COSTS = {
     1: 1.0,
     2: 1.6,
@@ -414,11 +414,14 @@ class Qwen38MarkovMtpDraftProvider:
             surplus = max(0.0, 2.0 * markov_confidence - 1.0)
             agreement_evidence = 0.5 * surplus * (1.0 - markov_disagreement)
             previous = fused[index]
-            fused[index] = min(
-                0.999,
-                1.0 - (1.0 - previous) * (1.0 - agreement_evidence),
+            fused[index] = max(
+                previous,
+                min(
+                    0.999,
+                    1.0 - (1.0 - previous) * (1.0 - agreement_evidence),
+                ),
             )
-            gain += fused[index] - previous
+            gain += max(0.0, fused[index] - previous)
         self._last_consensus_agreement_tokens = agreements
         self._last_consensus_confidence_gain = gain
         if agreements:

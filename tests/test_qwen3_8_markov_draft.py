@@ -929,6 +929,43 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertIn("b" * 64, metrics.dialect_neighbor_ids)
         provider.close()
 
+    def test_one_step_lookahead_can_choose_a_better_markov_sequence(self) -> None:
+        calls = []
+
+        class PlanningExpert:
+            @staticmethod
+            def distribution(context):
+                calls.append(tuple(context))
+                if not context:
+                    return {"07": 0.55, "08": 0.45}
+                if context[-1] == "07":
+                    return {"09": 0.51, "10": 0.49}
+                return {"09": 0.99, "10": 0.01}
+
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        provider._expert_models = lambda _history: tuple(
+            (PlanningExpert(), []) for _ in provider._experts
+        )
+
+        planned = provider._predict_council((1,), 1)[0]
+        planned_metrics = provider.metrics()
+        planned_call_count = len(calls)
+        forced = provider._predict_council((1,), 1, forced_prefix=(7,))[0]
+        terminal = provider._predict_council((1,), 1, position_offset=15)[0]
+
+        self.assertEqual(planned, (8,))
+        self.assertEqual(planned_metrics.lookahead_calls, 1)
+        self.assertEqual(planned_metrics.lookahead_candidates, 2)
+        self.assertEqual(planned_metrics.lookahead_token_changes, 1)
+        self.assertGreater(planned_metrics.last_lookahead_gain, 0.05)
+        self.assertEqual(planned_call_count, len(provider._experts) * 3)
+        self.assertEqual(forced, (7,))
+        self.assertEqual(terminal, (7,))
+        self.assertEqual(provider.metrics().lookahead_calls, 1)
+        self.assertEqual(provider.metrics().last_lookahead_gain, 0.0)
+        self.assertEqual(len(calls), len(provider._experts) * 5)
+        provider.close()
+
     def test_below_threshold_prompt_starts_global_without_neighbor_leakage(
         self,
     ) -> None:

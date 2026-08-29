@@ -1479,7 +1479,7 @@ class Qwen38CausalChat:
                     ),
                     "provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
                     "confidence": (
-                        "dialect-council-position-specialist-beta/v7"
+                        "dialect-council-one-step-lookahead/v8"
                     ),
                     "empirical_evidence_saturation": 8.0,
                     "composition": {
@@ -1505,7 +1505,7 @@ class Qwen38CausalChat:
             else:
                 policy["hybrid_draft"] = {
                     "provider_abi": QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
-                    "selection": "round-wise-markov-first-mtp-fallback/v12",
+                    "selection": "round-wise-markov-first-mtp-fallback/v13",
                     "request_provider_lock": False,
                     "one_way_handoff": False,
                     "round_reselection": True,
@@ -1515,11 +1515,12 @@ class Qwen38CausalChat:
                     "committed_hidden_handoff": True,
                     "markov_provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
                     "markov_confidence": (
-                        "dialect-council-position-specialist-beta/v7"
+                        "dialect-council-one-step-lookahead/v8"
                     ),
                     "position_specialists": "beta-maturity-fixed-share/v1",
                     "dialect_specialists": "similarity-beta-maturity/v1",
                     "dialect_council": "similarity-visits-ricci-top4/v1",
+                    "planning": "top4-one-step-log-probability/v1",
                     "markov_persistent": self._markov_draft_state_path is not None,
                     "markov_composition": "literal+relative-prompt-copy/v1",
                     "mtp_provider_abi": QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
@@ -1711,7 +1712,7 @@ class Qwen38CausalChat:
                     "identity",
                     {},
                 ).get("manifest_sha256"),
-                "selection": "round-wise-markov-first-mtp-fallback/v12",
+                "selection": "round-wise-markov-first-mtp-fallback/v13",
             }
         else:
             raise Qwen38ChatError("draft-window identity lacks a draft provider")

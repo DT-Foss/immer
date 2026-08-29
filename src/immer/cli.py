@@ -106,8 +106,8 @@ _QWEN38_DEPLOYMENT_WARM_ROOT = Path(
 )
 _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE = Path("/root/immer-state/qwen-markov-q4-v1.bin")
 _QWEN38_DEPLOYMENT_MTP_STATE = Path("/root/immer-state/qwen-mtp-q4-v1.json")
-_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v19"
-_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v12"
+_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v20"
+_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v13"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v2"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
     b"immer:qwen3.8-growing-warm-runtime/v2"
