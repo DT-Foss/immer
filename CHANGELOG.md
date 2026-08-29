@@ -18,6 +18,10 @@ All notable changes to IMMER are recorded here.
   `13.1823` to `12.6874 s` and TTFT from `11.4121` to `10.8587 s`, with peak
   RSS unchanged near `1.176 GB`. The five-token `Fledermaus` trace completed in
   `18.7056 s`; 320 full MLP executions used the fused path.
+- Extended the same exact MLP kernel across independent speculative token rows.
+  Blind MTP-K2 retained its `2/3` accepted drafts and target trace while falling
+  from `21.6381` to `20.1531 s`. The calibrated controller still selects K1 at
+  this reliability because direct generation is `18.7056 s`.
 
 - Made explicit Qwen prefix batteries self-charging. On the first miss, the
   runtime derives the question-independent chat-template prefix, executes it
