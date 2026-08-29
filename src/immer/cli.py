@@ -119,13 +119,22 @@ def _resolve_qwen38_chat_paths(
         if candidate.is_dir():
             q4 = candidate
 
-    fast_mlp = _chat_path(
-        getattr(args, "fast_mlp", None),
-        "IMMER_QWEN38_FAST_MLP",
+    disable_fast_mlp = bool(getattr(args, "no_fast_mlp", False))
+    if disable_fast_mlp and getattr(args, "fast_mlp", None) is not None:
+        raise ValueError("--fast-mlp and --no-fast-mlp are mutually exclusive")
+    fast_mlp = (
+        None
+        if disable_fast_mlp
+        else _chat_path(
+            getattr(args, "fast_mlp", None),
+            "IMMER_QWEN38_FAST_MLP",
+        )
     )
     if (
-        fast_mlp is None
+        not disable_fast_mlp
+        and fast_mlp is None
         and q4 is not None
+        and root == _QWEN38_DEPLOYMENT_ROOT
         and _QWEN38_DEPLOYMENT_FAST_MLP.is_dir()
     ):
         fast_mlp = _QWEN38_DEPLOYMENT_FAST_MLP
@@ -1034,6 +1043,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--fast-mlp",
         metavar="ARTIFACT_ROOT",
         help="mount the existing row-routed sparse MLP banks for fast chat",
+    )
+    chat.add_argument(
+        "--no-fast-mlp",
+        action="store_true",
+        help="run the full Q4 MLP path instead of the deployed sparse plan",
     )
     chat.add_argument(
         "--fast-mlp-layers",

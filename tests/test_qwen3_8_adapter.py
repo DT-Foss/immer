@@ -1284,6 +1284,41 @@ class Qwen38CausalChatTests(unittest.TestCase):
             (0, 9),
         )
 
+    def test_cli_can_disable_the_deployed_sparse_mlp_plan(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
+            deployed_fast = Path(temporary) / "deployed-fast"
+            deployed_fast.mkdir()
+            with patch.dict("os.environ", {}, clear=True), patch(
+                "immer.cli._QWEN38_DEPLOYMENT_ROOT",
+                deployed,
+            ), patch(
+                "immer.cli._QWEN38_DEPLOYMENT_FAST_MLP",
+                deployed_fast,
+            ), patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ) as constructor, redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--no-fast-mlp",
+                        "--raw-qwen",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(
+            options["q4_root"],
+            str(deployed / "causal" / "q4-base-v2"),
+        )
+        self.assertIsNone(options["fast_mlp_root"])
+        self.assertIsNone(options["fast_mlp_active_layers"])
+
     def test_cli_jsonl_reuses_one_loaded_component_for_multiple_requests(self) -> None:
         qwen = _chat(_Runtime())
         output = io.StringIO()
