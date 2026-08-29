@@ -6,6 +6,28 @@ All notable changes to IMMER are recorded here.
 
 ### Arbitrary local Qwen runtime
 
+- Removed the second confidence penalty from target-confirmed dialect phrases.
+  Dialect similarity still chooses the applicable memory; once selected, an
+  exact suffix match uses its own empirical support instead of multiplying the
+  same similarity into probability again. Two confirmed copies of one fresh
+  request now open K2 with a seven-token exact option.
+- The third ordinary request for that context selected `hybrid → markov`, did
+  not construct MTP, accepted all seven proposed phrase tokens, and reduced
+  target forwards to `9` for 16 output tokens. The identical output completed
+  in `26.7907 s` at `1,341,214,720` bytes peak RSS, versus the first novel
+  MTP-backed request at `30.3833 s`, 12 forwards, and 1.49 GB.
+- Fused Q4 speculative-row input projections through the existing grouped
+  kernel. On each K2 target wave, Full Attention Q/K/V now use one input group
+  instead of three and DeltaNet QKV/Z/B/A one instead of four: 176 native
+  calls, 352 Q8 row quantizations, and 352 OpenMP team starts disappear across
+  the 64-layer stack. Real 27B matrix micro-runs are bit-identical and
+  `1.11–1.12x` faster for those projection groups.
+- Removed the experimental complete native DeltaNet seam after official-width
+  parity caught PyTorch SIMD `softplus` differing from scalar C by one Float32
+  ULP. Projection and Conv matched, but recurrent state did not; the product
+  continues through the exact composed recurrence. Tiny-topology parity is no
+  longer sufficient to activate a native numerical seam.
+
 - Promoted embedded MTP from an explicit mode into the normal deployed chat
   path through a request-locked Markov-first cascade. The zero-weight token
   Council proposes first; a useful K2/K4/K8 continuation keeps the complete

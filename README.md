@@ -38,6 +38,9 @@ release surface.
   from the installed Torch semantics, keeping the fused path bit-identical
   across host libm implementations. AVX2 hosts with F16C decode every packed
   FP16 block scale in hardware; other hosts retain the scalar IEEE reference.
+  Speculative Q/K/V and DeltaNet input projections also share one Q8 input and
+  native team across all staged token rows; K2 removes 176 redundant native
+  calls and 352 row quantizations per target wave.
 - **Predictive weight transport.** A persistent two-agent operation Markov
   model learns the exact tensor/range sequence already emitted by the
   Streamer. Order-1/2 Fixed Share, surprise regimes, and Ricci retention
@@ -78,7 +81,9 @@ release surface.
   chat now asks the zero-weight Markov Council first: a useful continuation
   locks the request to Markov, while Council K1 abstention lazily opens MTP.
   Novel MTP requests teach their complete target-confirmed episode back to the
-  Council.
+  Council. After two confirmed copies, the same context can execute from its
+  exact dialect phrase: a live third request used no MTP, accepted seven Markov
+  drafts, and completed 16 output tokens in nine target forwards.
 - **All-layer Fast MLP.** A prompt-free weight initializer derives p4/k32
   pilots for every Qwen MLP layer from exact Gate/Up Gaussian joint moments.
   Existing full-path tensors update bounded recursive-ridge route statistics;
@@ -244,7 +249,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Persistent JSONL chat | second request opens 0 tensors | one process retains the verified mmap plane; observed one-token generation 15.01 s then 16.90 s |
 | Native DeltaNet K=4 convolution | 79.05 → 23.01 s generation; 3.44x | direct causal channelwise kernel replaces generic 10,240-group Conv1d; identical output/token trace; TTFT 25.05 → 13.65 s |
 | Adaptive embedded MTP | 34.05 → 26.74 s generation; 16 → 9 target forwards | arbitrary 16-token counting request; identical target trace; eight accepted drafts; eight provider head scans; 1.58 GB peak RSS |
-| Automatic Markov→MTP cascade | 12 target forwards for 16 generated tokens | ordinary fresh CLI request; Council K1 abstention opened MTP lazily; five accepted drafts; 30.38 s generation; 1.49 GB peak RSS; confirmed episode persisted back into Council memory |
+| Automatic Markov→MTP→Markov learning | 30.38 → 26.79 s; 12 → 9 target forwards | first novel request opened MTP and taught Council memory; after two confirmations the third request stayed entirely on a seven-token dialect phrase, loaded no MTP, preserved identical output, and used 1.34 GB peak RSS |
 | Rolling K=2–16 continuation | accepted prefixes commit with zero weight reads | one target-known token plus up to 15 drafts; DeltaNet Conv/recurrent state, next-token continuation, Graft, and native Prefix-Sinkhorn state remain bit-exact |
 | Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed variable phrase options up to 15 tokens |
 | Persistent draft-window policy | request ceiling plus per-wave K4/K8/K16 | real Fixed-Share ceiling sampling after bootstrap; each Markov proposal supplies prefix-local expected acceptance/work utility and only the chosen prefix enters the target; full provider tails remain unauthoritative; model/tokenizer/provider-bound state; K2/K3 terminal fallback |
