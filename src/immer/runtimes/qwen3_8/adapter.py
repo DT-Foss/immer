@@ -59,6 +59,7 @@ from .markov_draft import (
 )
 from .markov_atlas import MarkovTokenAtlas
 from .mlp_page_markov import (
+    MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS,
     MLP_PAGE_MARKOV_POLICY,
     MLP_PAGE_MARKOV_SCHEMA,
     MlpPageMarkov,
@@ -1882,7 +1883,12 @@ class Qwen38CausalChat:
             }
         return _digest(policy)
 
-    def _draft_window_runtime_identity(self) -> str:
+    def _draft_window_runtime_identity(
+        self,
+        *,
+        mlp_page_schema: str = MLP_PAGE_MARKOV_SCHEMA,
+        mlp_page_policy: str = MLP_PAGE_MARKOV_POLICY,
+    ) -> str:
         bundle = self._bundle_receipt
         tokenizer_sha256 = self._tokenizer_sha256
         if bundle is None or not _is_sha256(tokenizer_sha256):
@@ -1985,12 +1991,12 @@ class Qwen38CausalChat:
             "mlp_page_policy": (
                 None
                 if self._mlp_page_state_path is None
-                else MLP_PAGE_MARKOV_POLICY
+                else mlp_page_policy
             ),
             "mlp_page_schema": (
                 None
                 if self._mlp_page_state_path is None
-                else MLP_PAGE_MARKOV_SCHEMA
+                else mlp_page_schema
             ),
             "o1_enabled": self._markov_o1_retention_path is not None,
             "policy": "o1+draft+page-savings-target-work/v1",
@@ -3149,8 +3155,16 @@ class Qwen38CausalChat:
         )
 
         if self._draft_window_controller is not None:
+            compatible_previous = tuple(
+                self._draft_window_runtime_identity(
+                    mlp_page_schema=schema,
+                    mlp_page_policy=policy,
+                )
+                for schema, policy in MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS
+            ) if self._mlp_page_state_path is not None else ()
             self._draft_window_controller.bind_policy_identity(
-                self._draft_window_runtime_identity()
+                self._draft_window_runtime_identity(),
+                compatible_previous=compatible_previous,
             )
             self._draft_window_selection = self._draft_window_controller.choose(
                 prompt_ids,
@@ -3439,6 +3453,7 @@ class Qwen38CausalChat:
                 "runtime": {
                     key: mlp_page_after[key]
                     for key in (
+                        "agent_weights",
                         "energy_coverage",
                         "last_width_mean",
                         "last_width_min",

@@ -1420,21 +1420,39 @@ class DraftWindowController:
         with self._locked_state():
             self._state = self._load_locked()
 
-    def bind_policy_identity(self, policy_identity_sha256: str) -> DraftWindowMetrics:
+    def bind_policy_identity(
+        self,
+        policy_identity_sha256: str,
+        *,
+        compatible_previous: Sequence[str] = (),
+    ) -> DraftWindowMetrics:
         """Bind this state file to one target/tokenizer/drafter runtime."""
 
         if not _is_sha256(policy_identity_sha256):
             raise ValueError("policy_identity_sha256 must be a SHA-256 digest")
+        previous = tuple(compatible_previous)
+        if (
+            len(set(previous)) != len(previous)
+            or policy_identity_sha256 in previous
+            or any(not _is_sha256(value) for value in previous)
+        ):
+            raise ValueError("compatible_previous must contain unique SHA-256 digests")
         with self._thread_lock, self._locked_state():
             state = self._load_locked()
             if (
                 state.policy_identity_sha256 is not None
                 and state.policy_identity_sha256 != policy_identity_sha256
             ):
-                raise DraftWindowError(
-                    "draft-window state belongs to a different runtime identity"
+                if state.policy_identity_sha256 not in previous:
+                    raise DraftWindowError(
+                        "draft-window state belongs to a different runtime identity"
+                    )
+                state = replace(
+                    state,
+                    policy_identity_sha256=policy_identity_sha256,
                 )
-            if state.policy_identity_sha256 is None:
+                _persist_state(self.state_path, state)
+            elif state.policy_identity_sha256 is None:
                 state = replace(
                     state,
                     policy_identity_sha256=policy_identity_sha256,

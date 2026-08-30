@@ -16,9 +16,16 @@ import threading
 from typing import Any
 
 
-MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v6"
+MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v7"
 MLP_PAGE_MARKOV_POLICY = (
+    "dynamic-page-transitions+coactivation+adaptive-width+terminal-route-advantage+fixed-share/v7"
+)
+_V6_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v6"
+_V6_MLP_PAGE_MARKOV_POLICY = (
     "dynamic-page-transitions+coactivation+adaptive-width+terminal-reward+fixed-share/v6"
+)
+MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS = (
+    (_V6_MLP_PAGE_MARKOV_SCHEMA, _V6_MLP_PAGE_MARKOV_POLICY),
 )
 _V5_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v5"
 _V5_MLP_PAGE_MARKOV_POLICY = (
@@ -54,6 +61,7 @@ _V6_METRICS = frozenset(
         "runtime_reward_updates",
     }
 )
+_V7_METRICS = frozenset({"runtime_reward_route_agent_feedback"})
 _MAX_STATE_BYTES = 16 * 1024 * 1024
 _CALL_PREFETCH = object()
 _MAX_REWARD_RECEIPTS = 64
@@ -257,7 +265,14 @@ class MlpPageMarkov:
         self._compiled: list[MlpPagePrediction | None] = [None] * n_layers
         self._reward_active = False
         self._reward_traces: list[
-            tuple[int, int, tuple[tuple[str, int | None], ...], int]
+            tuple[
+                int,
+                int,
+                tuple[tuple[str, int | None], ...],
+                int,
+                tuple[int, ...],
+                tuple[tuple[str, tuple[int | None, ...]], ...],
+            ]
         ] = []
         self._recent_reward_sha256s: tuple[str, ...] = ()
         self._runtime_reward_sum = 0.0
@@ -292,6 +307,7 @@ class MlpPageMarkov:
             "width_agent_feedback": 0,
             "runtime_reward_trace_rows": 0,
             "runtime_reward_updates": 0,
+            "runtime_reward_route_agent_feedback": 0,
         }
         self._load()
 
@@ -1235,6 +1251,8 @@ class MlpPageMarkov:
                         len(route),
                         () if pending is None else pending.agent_widths,
                         row_count,
+                        route,
+                        () if pending is None else pending.agent_page_ids,
                     )
                 )
             self._metrics["selected_advances"] += 1
@@ -1266,7 +1284,7 @@ class MlpPageMarkov:
         receipt_sha256: str,
         reward: float,
     ) -> dict[str, object]:
-        """Reweight causal width agents from one terminal request outcome."""
+        """Reweight causal width and page-route agents from one request outcome."""
 
         with self._lock:
             self._ensure_open()
@@ -1289,7 +1307,8 @@ class MlpPageMarkov:
                 self._reward_traces = []
                 self._reward_active = False
                 return self.metrics()
-            original_logs = [list(row) for row in self._width_agent_logs]
+            original_route_logs = [list(row) for row in self._agent_logs]
+            original_width_logs = [list(row) for row in self._width_agent_logs]
             original_recent = self._recent_reward_sha256s
             original_sum = self._runtime_reward_sum
             original_last = self._last_runtime_reward
@@ -1297,42 +1316,111 @@ class MlpPageMarkov:
             original_dirty = self._dirty
             traces = tuple(self._reward_traces)
             total_rows = sum(row[3] for row in traces)
+            reward_baseline = (
+                0.0
+                if self._metrics["runtime_reward_updates"] == 0
+                else self._runtime_reward_sum
+                / self._metrics["runtime_reward_updates"]
+            )
+            route_advantage = value - reward_baseline
             try:
-                touched = set()
-                for layer, selected, agent_rows, row_count in traces:
-                    predictions = dict(agent_rows)
-                    valid = tuple(
-                        (index, predictions.get(name))
-                        for index, name in enumerate(_WIDTH_AGENTS)
-                        if predictions.get(name) is not None
-                    )
-                    if len(valid) < 2 or total_rows <= 0:
+                touched_width = set()
+                touched_route = set()
+                for (
+                    layer,
+                    selected,
+                    width_agent_rows,
+                    row_count,
+                    selected_route,
+                    route_agent_rows,
+                ) in traces:
+                    if total_rows <= 0:
                         continue
-                    qualities = tuple(
-                        (
-                            index,
-                            1.0
-                            - abs(int(predicted) - selected)
-                            / self.route_width,
-                        )
-                        for index, predicted in valid
-                    )
-                    center = sum(row[1] for row in qualities) / len(qualities)
-                    scale = (
+                    width_scale = (
                         self.LEARNING_RATE
                         * math.tanh(value / 4.0)
                         * row_count
                         / total_rows
                     )
-                    for index, quality in qualities:
-                        self._width_agent_logs[layer][index] += scale * (
-                            quality - center
+                    predictions = dict(width_agent_rows)
+                    valid = tuple(
+                        (index, predictions.get(name))
+                        for index, name in enumerate(_WIDTH_AGENTS)
+                        if predictions.get(name) is not None
+                    )
+                    if len(valid) >= 2:
+                        qualities = tuple(
+                            (
+                                index,
+                                1.0
+                                - abs(int(predicted) - selected)
+                                / self.route_width,
+                            )
+                            for index, predicted in valid
                         )
-                    touched.add(layer)
-                for layer in touched:
+                        center = sum(row[1] for row in qualities) / len(qualities)
+                        for index, quality in qualities:
+                            self._width_agent_logs[layer][index] += (
+                                width_scale * (quality - center)
+                            )
+                        touched_width.add(layer)
+
+                    route_qualities = []
+                    selected_set = set(selected_route)
+                    route_predictions = dict(route_agent_rows)
+                    for index, name in enumerate(_AGENTS):
+                        proposed = route_predictions.get(name)
+                        if proposed is None or not any(
+                            page is not None for page in proposed
+                        ):
+                            continue
+                        proposed_prefix = proposed[:selected]
+                        position_accuracy = sum(
+                            page == expected
+                            for page, expected in zip(
+                                proposed_prefix,
+                                selected_route,
+                                strict=True,
+                            )
+                            if page is not None
+                        ) / selected
+                        proposed_set = {
+                            page for page in proposed_prefix if page is not None
+                        }
+                        overlap = len(proposed_set & selected_set) / selected
+                        route_qualities.append(
+                            (index, 0.5 * position_accuracy + 0.5 * overlap)
+                        )
+                    if len(route_qualities) >= 2 and total_rows > 0:
+                        route_center = sum(
+                            quality for _index, quality in route_qualities
+                        ) / len(route_qualities)
+                        route_scale = (
+                            self.LEARNING_RATE
+                            * math.tanh(route_advantage / 4.0)
+                            * row_count
+                            / total_rows
+                        )
+                        if route_scale:
+                            for index, quality in route_qualities:
+                                self._agent_logs[layer][index] += route_scale * (
+                                    quality - route_center
+                                )
+                            touched_route.add(layer)
+                        self._metrics[
+                            "runtime_reward_route_agent_feedback"
+                        ] += len(route_qualities) * row_count
+                for layer in touched_width:
                     logs = self._width_agent_logs[layer]
                     center = sum(logs) / len(logs)
                     self._width_agent_logs[layer] = [
+                        max(-20.0, min(20.0, item - center))
+                        for item in logs
+                    ]
+                for layer in touched_route:
+                    logs = self._agent_logs[layer]
+                    center = sum(logs) / len(logs)
+                    self._agent_logs[layer] = [
                         max(-20.0, min(20.0, item - center))
                         for item in logs
                     ]
@@ -1350,7 +1438,8 @@ class MlpPageMarkov:
                 self._dirty = True
                 self.flush()
             except Exception:
-                self._width_agent_logs = original_logs
+                self._agent_logs = original_route_logs
+                self._width_agent_logs = original_width_logs
                 self._recent_reward_sha256s = original_recent
                 self._runtime_reward_sum = original_sum
                 self._last_runtime_reward = original_last
@@ -1599,14 +1688,19 @@ class MlpPageMarkov:
             legacy_v3 = schema == _V3_MLP_PAGE_MARKOV_SCHEMA
             legacy_v4 = schema == _V4_MLP_PAGE_MARKOV_SCHEMA
             legacy_v5 = schema == _V5_MLP_PAGE_MARKOV_SCHEMA
-            adaptive_width = legacy_v5 or schema == MLP_PAGE_MARKOV_SCHEMA
-            terminal_reward = schema == MLP_PAGE_MARKOV_SCHEMA
+            legacy_v6 = schema == _V6_MLP_PAGE_MARKOV_SCHEMA
+            adaptive_width = (
+                legacy_v5 or legacy_v6 or schema == MLP_PAGE_MARKOV_SCHEMA
+            )
+            terminal_reward = legacy_v6 or schema == MLP_PAGE_MARKOV_SCHEMA
+            route_terminal_reward = schema == MLP_PAGE_MARKOV_SCHEMA
             if (
                 not isinstance(document, dict)
                 or set(document) != {"body", "schema", "sha256"}
                 or schema
                 not in {
                     MLP_PAGE_MARKOV_SCHEMA,
+                    _V6_MLP_PAGE_MARKOV_SCHEMA,
                     _V5_MLP_PAGE_MARKOV_SCHEMA,
                     _V4_MLP_PAGE_MARKOV_SCHEMA,
                     _V3_MLP_PAGE_MARKOV_SCHEMA,
@@ -1659,6 +1753,8 @@ class MlpPageMarkov:
                     if legacy_v4
                     else _V5_MLP_PAGE_MARKOV_POLICY
                     if legacy_v5
+                    else _V6_MLP_PAGE_MARKOV_POLICY
+                    if legacy_v6
                     else MLP_PAGE_MARKOV_POLICY
                 ),
                 adaptive_width=adaptive_width,
@@ -1841,6 +1937,8 @@ class MlpPageMarkov:
                 missing_metrics.update(_V5_METRICS)
             if not terminal_reward:
                 missing_metrics.update(_V6_METRICS)
+            if not route_terminal_reward:
+                missing_metrics.update(_V7_METRICS)
             expected_metrics = set(self._metrics) - missing_metrics
             if (
                 not isinstance(metrics, dict)
@@ -2007,6 +2105,7 @@ class MlpPageMarkov:
 
 
 __all__ = [
+    "MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS",
     "MLP_PAGE_MARKOV_POLICY",
     "MLP_PAGE_MARKOV_SCHEMA",
     "MlpPageMarkov",

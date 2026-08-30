@@ -608,6 +608,38 @@ class DraftWindowControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(DraftWindowError, "different runtime identity"):
             rebound.bind_policy_identity("b" * 64)
 
+    def test_known_runtime_identity_upgrade_preserves_learned_policy(self) -> None:
+        controller = DraftWindowController(self.state_path)
+        controller.bind_policy_identity("a" * 64)
+        selection = controller.choose((2, 4, 6), max_window=16, max_new_tokens=16)
+        before = controller.settle(selection, _feedback(selection))
+
+        upgraded = DraftWindowController(self.state_path)
+        after = upgraded.bind_policy_identity(
+            "b" * 64,
+            compatible_previous=("a" * 64,),
+        )
+
+        self.assertEqual(after.updates, before.updates)
+        self.assertEqual(after.agents, before.agents)
+        self.assertEqual(after.policy_weights, before.policy_weights)
+        self.assertEqual(after.policy_identity_sha256, "b" * 64)
+        persisted = DraftWindowState.from_bytes(self.state_path.read_bytes())
+        self.assertEqual(persisted.policy_identity_sha256, "b" * 64)
+        with self.assertRaisesRegex(DraftWindowError, "different runtime identity"):
+            DraftWindowController(self.state_path).bind_policy_identity(
+                "c" * 64,
+                compatible_previous=("d" * 64,),
+            )
+
+        for previous in (("b" * 64,), ("bad",), ("d" * 64, "d" * 64)):
+            with self.subTest(previous=previous):
+                with self.assertRaises(ValueError):
+                    upgraded.bind_policy_identity(
+                        "b" * 64,
+                        compatible_previous=previous,
+                    )
+
     def test_feedback_requires_a_target_receipt_and_matching_window(self) -> None:
         controller = DraftWindowController(self.state_path)
         selection = controller.choose((1, 2), max_window=16, max_new_tokens=16)
@@ -752,6 +784,73 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.assertEqual(nested[0]["accepted_draft_tokens"], 3)
         self.assertEqual(nested[0]["proposed_draft_tokens"], 3)
         self.assertEqual(result.evidence["draft"]["window_size"], 8)
+        chat.close()
+
+    def test_adapter_migrates_the_known_v6_page_runtime_identity(self) -> None:
+        runtime = _Runtime()
+        runtime.model.pager.q4_bank = SimpleNamespace(
+            metrics=lambda: {"page_mlp_selected_pages": 0}
+        )
+
+        class PageRouter:
+            page_count = 272
+            route_width = 192
+
+            @staticmethod
+            def abort_runtime_reward() -> None:
+                pass
+
+            @staticmethod
+            def begin_runtime_reward() -> None:
+                pass
+
+            @staticmethod
+            def flush() -> None:
+                pass
+
+            @staticmethod
+            def metrics():
+                return {
+                    "adaptive_width_pages_saved": 0,
+                    "runtime_reward_updates": 0,
+                }
+
+            @staticmethod
+            def settle_runtime_reward(_receipt: str, _reward: float):
+                return {"runtime_reward_updates": 1}
+
+        runtime.mlp_page_router = PageRouter()
+        chat = self._adaptive_chat(
+            runtime,
+            q4_root=self.root / "q4",
+            mlp_page_state_path=self.root / "pages.json",
+        )
+        chat._load_locked()
+        legacy_identity = chat._draft_window_runtime_identity(
+            mlp_page_schema="immer.qwen3.8-mlp-page-markov/v6",
+            mlp_page_policy=(
+                "dynamic-page-transitions+coactivation+adaptive-width+"
+                "terminal-reward+fixed-share/v6"
+            ),
+        )
+        current_identity = chat._draft_window_runtime_identity()
+        DraftWindowController(self.state_path).bind_policy_identity(
+            legacy_identity
+        )
+
+        decoder = SimpleNamespace(
+            generate_rolling=lambda *args, **kwargs: _rolling_result()
+        )
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+            return_value=decoder,
+        ):
+            result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        restored = DraftWindowState.from_bytes(self.state_path.read_bytes())
+        self.assertEqual(restored.policy_identity_sha256, current_identity)
+        self.assertEqual(restored.updates, 1)
         chat.close()
 
     def test_adapter_records_round_local_k1_abstention_under_k8_ceiling(self) -> None:

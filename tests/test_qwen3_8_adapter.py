@@ -484,9 +484,17 @@ class Qwen38CausalChatTests(unittest.TestCase):
         disabled_identity = disabled._draft_window_runtime_identity()
         width160_identity = width160._draft_window_runtime_identity()
         width192_identity = width192._draft_window_runtime_identity()
+        width192_v6_identity = width192._draft_window_runtime_identity(
+            mlp_page_schema="immer.qwen3.8-mlp-page-markov/v6",
+            mlp_page_policy=(
+                "dynamic-page-transitions+coactivation+adaptive-width+"
+                "terminal-reward+fixed-share/v6"
+            ),
+        )
 
         self.assertNotEqual(disabled_identity, width192_identity)
         self.assertNotEqual(width160_identity, width192_identity)
+        self.assertNotEqual(width192_v6_identity, width192_identity)
         with patch(
             "immer.runtimes.qwen3_8.adapter.DRAFT_WINDOW_FEEDBACK_SCHEMA",
             "immer.qwen3.8-draft-window-feedback/v999",
@@ -509,9 +517,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "mlp_page_enabled": True,
                 "mlp_page_policy": (
                     "dynamic-page-transitions+coactivation+adaptive-width+"
-                    "terminal-reward+fixed-share/v6"
+                    "terminal-route-advantage+fixed-share/v7"
                 ),
-                "mlp_page_schema": "immer.qwen3.8-mlp-page-markov/v6",
+                "mlp_page_schema": "immer.qwen3.8-mlp-page-markov/v7",
                 "o1_enabled": False,
                 "policy": "o1+draft+page-savings-target-work/v1",
                 "route_width": 192,
@@ -718,6 +726,12 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 before = self.metric_calls == 0
                 self.metric_calls += 1
                 return {
+                    "agent_weights": {
+                        "temporal": 0.4,
+                        "cross_layer": 0.3,
+                        "coactive": 0.2,
+                        "marginal": 0.1,
+                    },
                     "adaptive_width_pages_saved": 40 if before else 136,
                     "adaptive_width_predictions": 2 if before else 5,
                     "energy_coverage": 0.995,
@@ -764,6 +778,12 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(
             route["runtime"],
             {
+                "agent_weights": {
+                    "temporal": 0.4,
+                    "cross_layer": 0.3,
+                    "coactive": 0.2,
+                    "marginal": 0.1,
+                },
                 "energy_coverage": 0.995,
                 "last_runtime_reward": 2.5,
                 "last_width_mean": 128.0,

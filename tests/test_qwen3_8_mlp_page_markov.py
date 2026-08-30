@@ -40,6 +40,10 @@ class MlpPageMarkovTests(unittest.TestCase):
         controller._width_temporal[(0, 2)] = Counter({2: 7})
         controller._width_marginal[0] = Counter({4: 7})
         controller._width_agent_logs[0] = [8.0, -8.0, -8.0]
+        for source, target in enumerate((0, 1, 2, 3)):
+            controller._temporal[(0, source)] = Counter({target: 7})
+            controller._marginal[(0, source)] = Counter({target + 4: 7})
+        controller._agent_logs[0] = [16.0, -8.0, 0.0, -8.0]
         controller.compile_routes()
         return controller
 
@@ -211,10 +215,15 @@ class MlpPageMarkovTests(unittest.TestCase):
         committed = tuple(controller._reward_traces)
         self.assertTrue(controller._reward_active)
         self.assertEqual(len(committed), 1)
-        layer, selected, agents, row_count = committed[0]
+        layer, selected, agents, row_count, selected_route, route_agents = (
+            committed[0]
+        )
         self.assertEqual((layer, selected, row_count), (0, 2, 1))
         self.assertEqual(dict(agents)["temporal"], 2)
         self.assertEqual(dict(agents)["marginal"], 4)
+        self.assertEqual(selected_route, (0, 1))
+        self.assertEqual(dict(route_agents)["temporal"], (0, 1, 2, 3))
+        self.assertEqual(dict(route_agents)["marginal"], (4, 5, 6, 7))
 
         controller.begin_transaction()
         staged = controller.route(0, row_count=3)
@@ -224,15 +233,22 @@ class MlpPageMarkovTests(unittest.TestCase):
         self.assertTrue(controller._reward_active)
         self.assertEqual(tuple(controller._reward_traces), committed)
 
-        before = [list(row) for row in controller._width_agent_logs]
+        before_width = [list(row) for row in controller._width_agent_logs]
+        before_route = [list(row) for row in controller._agent_logs]
         metrics = controller.settle_runtime_reward("a" * 64, 4.0)
-        after = controller._width_agent_logs
+        after_width = controller._width_agent_logs
+        after_route = controller._agent_logs
         self.assertGreater(
-            after[0][0] - after[0][2],
-            before[0][0] - before[0][2],
+            after_width[0][0] - after_width[0][2],
+            before_width[0][0] - before_width[0][2],
+        )
+        self.assertGreater(
+            after_route[0][0] - after_route[0][3],
+            before_route[0][0] - before_route[0][3],
         )
         self.assertEqual(metrics["runtime_reward_updates"], 1)
         self.assertEqual(metrics["runtime_reward_trace_rows"], 1)
+        self.assertEqual(metrics["runtime_reward_route_agent_feedback"], 3)
         self.assertFalse(controller._reward_active)
         self.assertEqual(controller._reward_traces, [])
 
@@ -258,7 +274,8 @@ class MlpPageMarkovTests(unittest.TestCase):
                 route_width=4,
                 min_exact_rows=1,
             )
-            before_logs = [list(row) for row in restored._width_agent_logs]
+            before_width_logs = [list(row) for row in restored._width_agent_logs]
+            before_route_logs = [list(row) for row in restored._agent_logs]
             before = restored.metrics()
             self.assertEqual(restored._recent_reward_sha256s, ("b" * 64,))
             self.assertEqual(restored._runtime_reward_sum, 2.5)
@@ -274,9 +291,47 @@ class MlpPageMarkovTests(unittest.TestCase):
             self.assertEqual(duplicate["last_runtime_reward"], 2.5)
             self.assertEqual(duplicate["runtime_reward_mean"], 2.5)
             self.assertEqual(duplicate["runtime_reward_receipts"], 1)
-            self.assertEqual(restored._width_agent_logs, before_logs)
+            self.assertEqual(restored._width_agent_logs, before_width_logs)
+            self.assertEqual(restored._agent_logs, before_route_logs)
             restored.close()
             self.assertEqual(path.read_bytes(), persisted)
+
+    def test_negative_terminal_reward_reverses_route_agent_credit(self) -> None:
+        positive = self._runtime_reward_controller()
+        negative = self._runtime_reward_controller()
+        for controller in (positive, negative):
+            controller.begin_runtime_reward()
+            prediction = controller.route(0, row_count=1)
+            controller.advance_selected(0, prediction.page_ids)
+
+        positive_before = positive._agent_logs[0][0] - positive._agent_logs[0][3]
+        negative_before = negative._agent_logs[0][0] - negative._agent_logs[0][3]
+        positive.settle_runtime_reward("d" * 64, 4.0)
+        negative.settle_runtime_reward("e" * 64, -4.0)
+
+        self.assertGreater(
+            positive._agent_logs[0][0] - positive._agent_logs[0][3],
+            positive_before,
+        )
+        self.assertLess(
+            negative._agent_logs[0][0] - negative._agent_logs[0][3],
+            negative_before,
+        )
+
+    def test_equal_terminal_reward_has_zero_repeated_route_advantage(self) -> None:
+        controller = self._runtime_reward_controller()
+        controller.begin_runtime_reward()
+        first = controller.route(0, row_count=1)
+        controller.advance_selected(0, first.page_ids)
+        controller.settle_runtime_reward("1" * 64, 4.0)
+        after_first = [list(row) for row in controller._agent_logs]
+
+        controller.begin_runtime_reward()
+        second = controller.route(0, row_count=1)
+        controller.advance_selected(0, second.page_ids)
+        controller.settle_runtime_reward("2" * 64, 4.0)
+
+        self.assertEqual(controller._agent_logs, after_first)
 
     def test_terminal_reward_flush_failure_rolls_back_and_can_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -286,7 +341,8 @@ class MlpPageMarkovTests(unittest.TestCase):
             prediction = controller.route(0, row_count=3)
             controller.advance_selected(0, prediction.page_ids, row_count=3)
             traces = tuple(controller._reward_traces)
-            logs = [list(row) for row in controller._width_agent_logs]
+            width_logs = [list(row) for row in controller._width_agent_logs]
+            route_logs = [list(row) for row in controller._agent_logs]
             metrics = dict(controller._metrics)
 
             with mock.patch.object(
@@ -299,7 +355,8 @@ class MlpPageMarkovTests(unittest.TestCase):
 
             self.assertTrue(controller._reward_active)
             self.assertEqual(tuple(controller._reward_traces), traces)
-            self.assertEqual(controller._width_agent_logs, logs)
+            self.assertEqual(controller._width_agent_logs, width_logs)
+            self.assertEqual(controller._agent_logs, route_logs)
             self.assertEqual(controller._metrics, metrics)
             self.assertEqual(controller._recent_reward_sha256s, ())
             self.assertEqual(controller._runtime_reward_sum, 0.0)
@@ -550,15 +607,15 @@ class MlpPageMarkovTests(unittest.TestCase):
             self.assertEqual(reopened.metrics()["adaptive_width_predictions"], 1)
             reopened.close()
 
-    def test_v3_state_migrates_to_v6_without_losing_learned_state(self) -> None:
+    def test_v3_state_migrates_to_v7_without_losing_learned_state(self) -> None:
         self.assertEqual(
             MLP_PAGE_MARKOV_SCHEMA,
-            "immer.qwen3.8-mlp-page-markov/v6",
+            "immer.qwen3.8-mlp-page-markov/v7",
         )
         self.assertEqual(
             MLP_PAGE_MARKOV_POLICY,
             "dynamic-page-transitions+coactivation+adaptive-width+"
-            "terminal-reward+fixed-share/v6",
+            "terminal-route-advantage+fixed-share/v7",
         )
         legacy_metrics = {
             "agent_feedback": 18,
@@ -662,6 +719,7 @@ class MlpPageMarkovTests(unittest.TestCase):
                     "width_agent_feedback": 0,
                     "runtime_reward_trace_rows": 0,
                     "runtime_reward_updates": 0,
+                    "runtime_reward_route_agent_feedback": 0,
                 },
             )
             self.assertEqual(
@@ -718,6 +776,7 @@ class MlpPageMarkovTests(unittest.TestCase):
                     "width_agent_feedback": 0,
                     "runtime_reward_trace_rows": 0,
                     "runtime_reward_updates": 0,
+                    "runtime_reward_route_agent_feedback": 0,
                     "prediction_calls": legacy_metrics["prediction_calls"] + 1,
                     "predicted_pages": legacy_metrics["predicted_pages"] + 2,
                     "ready_predictions": legacy_metrics["ready_predictions"] + 1,
@@ -738,7 +797,7 @@ class MlpPageMarkovTests(unittest.TestCase):
             self.assertEqual(reopened._cross[(0, 3)], {4: 19})
             reopened.close()
 
-    def test_v4_state_migrates_to_v6_on_the_next_persistent_update(self) -> None:
+    def test_v4_state_migrates_to_v7_on_the_next_persistent_update(self) -> None:
         def canonical(value: object) -> bytes:
             return json.dumps(
                 value,
@@ -785,6 +844,7 @@ class MlpPageMarkovTests(unittest.TestCase):
             "width_agent_feedback",
             "runtime_reward_trace_rows",
             "runtime_reward_updates",
+            "runtime_reward_route_agent_feedback",
         ):
             body["metrics"].pop(key)
 
@@ -839,7 +899,7 @@ class MlpPageMarkovTests(unittest.TestCase):
             self.assertEqual(migrated["body"]["last_widths"], [2])
             self.assertEqual(migrated["body"]["width_marginal"], [])
 
-    def test_v5_state_load_is_read_only_until_a_v6_update(self) -> None:
+    def test_v5_state_load_is_read_only_until_a_v7_update(self) -> None:
         def canonical(value: object) -> bytes:
             return json.dumps(
                 value,
@@ -862,6 +922,7 @@ class MlpPageMarkovTests(unittest.TestCase):
         )
         body["metrics"].pop("runtime_reward_trace_rows")
         body["metrics"].pop("runtime_reward_updates")
+        body["metrics"].pop("runtime_reward_route_agent_feedback")
 
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "pages-v5.json"
@@ -913,6 +974,70 @@ class MlpPageMarkovTests(unittest.TestCase):
             self.assertEqual(
                 float.fromhex(migrated["body"]["last_runtime_reward"]),
                 0.0,
+            )
+
+    def test_v6_state_load_is_read_only_until_a_v7_route_reward(self) -> None:
+        def canonical(value: object) -> bytes:
+            return json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+
+        seed = self._runtime_reward_controller()
+        body = seed._body()
+        body["config"]["policy"] = (
+            "dynamic-page-transitions+coactivation+adaptive-width+"
+            "terminal-reward+fixed-share/v6"
+        )
+        body["metrics"].pop("runtime_reward_route_agent_feedback")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "pages-v6.json"
+            encoded = canonical(
+                {
+                    "body": body,
+                    "schema": "immer.qwen3.8-mlp-page-markov/v6",
+                    "sha256": hashlib.sha256(canonical(body)).hexdigest(),
+                }
+            )
+            path.write_bytes(encoded)
+
+            restored = MlpPageMarkov(
+                path,
+                n_layers=1,
+                page_count=8,
+                route_width=4,
+                min_exact_rows=1,
+            )
+            self.assertEqual(
+                restored.metrics()["runtime_reward_route_agent_feedback"],
+                0,
+            )
+            restored.close()
+            self.assertEqual(path.read_bytes(), encoded)
+
+            migrating = MlpPageMarkov(
+                path,
+                n_layers=1,
+                page_count=8,
+                route_width=4,
+                min_exact_rows=1,
+            )
+            migrating.begin_runtime_reward()
+            prediction = migrating.route(0, row_count=1)
+            migrating.advance_selected(0, prediction.page_ids)
+            migrating.settle_runtime_reward("f" * 64, 3.0)
+            migrating.close()
+
+            document = json.loads(path.read_text())
+            self.assertEqual(document["schema"], MLP_PAGE_MARKOV_SCHEMA)
+            self.assertGreater(
+                document["body"]["metrics"][
+                    "runtime_reward_route_agent_feedback"
+                ],
+                0,
             )
 
     def test_tamper_and_nested_state_corruption_are_rejected(self) -> None:
