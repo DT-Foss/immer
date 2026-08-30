@@ -27,10 +27,15 @@ import stat
 from typing import Any, Literal
 
 from immer.contracts import ExecutionStatus, Result
+from immer.runtimes.qwen3_8.output_semantics import (
+    QWEN_SEMANTIC_REPLAY_EVIDENCE_KEY,
+    QwenSemanticReplayKey,
+    parse_semantic_replay_receipt,
+)
 from immer.runtimes.qwen3_8.semantic_atlas import ModelPin
 
 from .chat import result_from_document, result_to_document
-from .controller import ActionExecution
+from .controller import ActionExecution, WarmAccountingReceipt
 from .crystal import (
     CrystalStore,
     CrystalStoreError,
@@ -43,6 +48,12 @@ from .qwen_bridge import QwenOoeFeatureReceipt
 RESULT_CELL_SCHEMA = "immer-ooe-result-cell/v1"
 RESULT_CELL_BINDING_SCHEMA = "immer-ooe-result-cell-binding/v1"
 RESULT_CELL_POINTER_SCHEMA = "immer-ooe-result-cell-pointer/v1"
+RESULT_CELL_SEMANTIC_POINTER_SCHEMA = (
+    "immer-ooe-result-cell-semantic-pointer/v1"
+)
+RESULT_CELL_SEMANTIC_ACCOUNTING_SCHEMA = (
+    "immer-ooe-result-cell-semantic-accounting/v1"
+)
 RESULT_CELL_PARITY_SCHEMA = "immer-ooe-result-cell-parity/v1"
 RESULT_CELL_BENCHMARK_SCHEMA = "immer-ooe-result-cell-benchmark/v1"
 RESULT_CELL_EXECUTOR_SCHEMA = "immer-ooe-result-cell-executor/v1"
@@ -62,6 +73,8 @@ COLD_QWEN_GENERATION_VERIFIER_SHA256 = hashlib.sha256(
         }
     )
 ).hexdigest()
+_SEMANTIC_POINTER_PREFIX = "qwen-result-semantic-v1-"
+_SEMANTIC_ACCOUNTING_PREFIX = "qwen-result-semantic-accounting-v1-"
 RESULT_CELL_EXECUTOR_SHA256 = hashlib.sha256(
     canonical_json_bytes(
         {
@@ -1180,6 +1193,99 @@ class ResultCellPublication:
     pointer_generation: int | None
     object_created: bool
     pointer_created: bool
+    semantic_key_sha256: str | None = None
+    semantic_pointer_created: bool = False
+    semantic_pointer_updated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticResultCellPointer:
+    key: QwenSemanticReplayKey
+    payload_sha256: str
+    producer_binding_sha256: str
+    output_sha256: str
+    token_trace_sha256: str
+    teacher_forward_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, QwenSemanticReplayKey):
+            raise TypeError("semantic pointer requires a replay key")
+        for field in (
+            "payload_sha256",
+            "producer_binding_sha256",
+            "output_sha256",
+            "token_trace_sha256",
+        ):
+            object.__setattr__(
+                self,
+                field,
+                require_sha256(getattr(self, field), field=field),
+            )
+        if (
+            isinstance(self.teacher_forward_count, bool)
+            or not isinstance(self.teacher_forward_count, int)
+            or self.teacher_forward_count <= 0
+        ):
+            raise ValueError("semantic pointer teacher forwards are invalid")
+
+    def to_bytes(self) -> bytes:
+        body = {
+            "key": self.key.to_document(),
+            "output_sha256": self.output_sha256,
+            "payload_sha256": self.payload_sha256,
+            "producer_binding_sha256": self.producer_binding_sha256,
+            "teacher_forward_count": self.teacher_forward_count,
+            "token_trace_sha256": self.token_trace_sha256,
+        }
+        return canonical_json_bytes(
+            {
+                "body": body,
+                "schema": RESULT_CELL_SEMANTIC_POINTER_SCHEMA,
+                "sha256": _digest(body),
+            }
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "SemanticResultCellPointer":
+        value = _strict_json(data, label="semantic result-cell pointer", maximum=16384)
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"body", "schema", "sha256"}
+            or value.get("schema") != RESULT_CELL_SEMANTIC_POINTER_SCHEMA
+            or not isinstance(value.get("body"), Mapping)
+            or value.get("sha256") != _digest(value["body"])
+        ):
+            raise ResultCellIntegrityError("semantic result-cell pointer is invalid")
+        body = value["body"]
+        if set(body) != {
+            "key",
+            "output_sha256",
+            "payload_sha256",
+            "producer_binding_sha256",
+            "teacher_forward_count",
+            "token_trace_sha256",
+        }:
+            raise ResultCellIntegrityError(
+                "semantic result-cell pointer body is invalid"
+            )
+        try:
+            result = cls(
+                key=QwenSemanticReplayKey.from_document(body["key"]),
+                payload_sha256=body["payload_sha256"],
+                producer_binding_sha256=body["producer_binding_sha256"],
+                output_sha256=body["output_sha256"],
+                token_trace_sha256=body["token_trace_sha256"],
+                teacher_forward_count=body["teacher_forward_count"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise ResultCellIntegrityError(
+                "semantic result-cell pointer values are invalid"
+            ) from exc
+        if result.to_bytes() != data:
+            raise ResultCellIntegrityError(
+                "semantic result-cell pointer failed reconstruction"
+            )
+        return result
 
 
 class ResultCellBank:
@@ -1204,6 +1310,81 @@ class ResultCellBank:
     def pointer_state_name(binding_sha256: str) -> str:
         digest = require_sha256(binding_sha256, field="binding_sha256")
         return f"{_POINTER_PREFIX}{digest}"
+
+    @staticmethod
+    def semantic_pointer_state_name(key_sha256: str) -> str:
+        digest = require_sha256(key_sha256, field="semantic key sha256")
+        return f"{_SEMANTIC_POINTER_PREFIX}{digest}"
+
+    @staticmethod
+    def semantic_accounting_state_name(key_sha256: str) -> str:
+        digest = require_sha256(key_sha256, field="semantic key sha256")
+        return f"{_SEMANTIC_ACCOUNTING_PREFIX}{digest}"
+
+    @staticmethod
+    def _semantic_pointer_for_cell(
+        cell: ResultCell,
+    ) -> SemanticResultCellPointer | None:
+        result = cell.cold_qwen_result
+        evidence = result.evidence
+        raw_receipt = evidence.get(QWEN_SEMANTIC_REPLAY_EVIDENCE_KEY)
+        if raw_receipt is None:
+            return None
+        try:
+            semantics, key = parse_semantic_replay_receipt(raw_receipt)
+        except (TypeError, ValueError) as exc:
+            raise ResultCellIntegrityError(
+                "cold Qwen semantic replay receipt is invalid"
+            ) from exc
+        binding = cell.binding
+        if (
+            semantics.repo_id != binding.model_pin.repo_id
+            or semantics.revision != binding.model_pin.revision
+            or semantics.tokenizer_sha256 != binding.tokenizer_sha256
+            or key.question_sha256 != binding.question_sha256
+            or key.rendered_prompt_sha256 != binding.rendered_prompt_sha256
+            or key.rendered_prompt_token_sha256
+            != binding.rendered_prompt_token_sha256
+            or key.system_prompt_sha256 != binding.system_prompt_sha256
+        ):
+            raise ResultCellIntegrityError(
+                "semantic replay receipt differs from its producer binding"
+            )
+        generation = evidence.get("generation")
+        output_sha256 = evidence.get("output_sha256")
+        if not isinstance(generation, Mapping):
+            raise ResultCellIntegrityError(
+                "semantic replay result lacks generation evidence"
+            )
+        try:
+            output_sha256 = require_sha256(
+                output_sha256,
+                field="semantic output_sha256",
+            )
+            token_trace_sha256 = require_sha256(
+                generation.get("token_trace_sha256"),
+                field="semantic token_trace_sha256",
+            )
+        except ValueError as exc:
+            raise ResultCellIntegrityError(
+                "semantic replay output evidence is invalid"
+            ) from exc
+        if (
+            not isinstance(result.output, str)
+            or hashlib.sha256(result.output.encode("utf-8")).hexdigest()
+            != output_sha256
+        ):
+            raise ResultCellIntegrityError(
+                "semantic replay output body differs from its digest"
+            )
+        return SemanticResultCellPointer(
+            key=key,
+            payload_sha256=cell.payload_sha256,
+            producer_binding_sha256=binding.sha256,
+            output_sha256=output_sha256,
+            token_trace_sha256=token_trace_sha256,
+            teacher_forward_count=cell.teacher_forward_count,
+        )
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
@@ -1309,6 +1490,40 @@ class ResultCellBank:
             raise ResultCellIntegrityError("result-cell pointer binding mismatch")
         return binding_sha256, payload_sha256
 
+    def _semantic_pointer_unlocked(
+        self,
+        key: QwenSemanticReplayKey,
+    ) -> SemanticResultCellPointer:
+        if not isinstance(key, QwenSemanticReplayKey):
+            raise TypeError("key must be QwenSemanticReplayKey")
+        try:
+            data = self._restore_state(
+                self.semantic_pointer_state_name(key.sha256)
+            )
+        except KeyError as exc:
+            raise ResultCellMissError(
+                "no result cell for the semantic replay key"
+            ) from exc
+        pointer = SemanticResultCellPointer.from_bytes(data)
+        if pointer.key != key:
+            raise ResultCellIntegrityError(
+                "semantic result-cell pointer key mismatch"
+            )
+        return pointer
+
+    def _restore_semantic_unlocked(
+        self,
+        key: QwenSemanticReplayKey,
+    ) -> tuple[SemanticResultCellPointer, ResultCell]:
+        pointer = self._semantic_pointer_unlocked(key)
+        cell = self._restore_payload_unlocked(pointer.payload_sha256)
+        expected = self._semantic_pointer_for_cell(cell)
+        if expected is None or expected != pointer:
+            raise ResultCellIntegrityError(
+                "semantic pointer and ResultCell authority disagree"
+            )
+        return pointer, cell
+
     def charge(
         self,
         cell: ResultCell,
@@ -1327,7 +1542,24 @@ class ResultCellBank:
                 field="expected_current_payload_sha256",
             )
         )
+        semantic = self._semantic_pointer_for_cell(cell)
         with self._locked():
+            existing_semantic = None
+            if semantic is not None:
+                try:
+                    existing_semantic, _existing_cell = (
+                        self._restore_semantic_unlocked(semantic.key)
+                    )
+                except ResultCellMissError:
+                    existing_semantic = None
+                if existing_semantic is not None and (
+                    existing_semantic.output_sha256 != semantic.output_sha256
+                    or existing_semantic.token_trace_sha256
+                    != semantic.token_trace_sha256
+                ):
+                    raise ResultCellConflictError(
+                        "one semantic replay key produced different Qwen output or token trace"
+                    )
             try:
                 _binding_sha256, current = self._pointer_unlocked(cell.binding)
             except ResultCellMissError:
@@ -1346,40 +1578,90 @@ class ResultCellBank:
                     raise ResultCellConflictError(
                         "an immutable result-cell binding cannot be rebound"
                     )
-                return ResultCellPublication(
-                    binding_sha256=cell.binding.sha256,
-                    payload_sha256=current,
-                    object_generation=None,
-                    pointer_generation=None,
-                    object_created=False,
-                    pointer_created=False,
-                )
-            if expected is not None:
-                raise ResultCellConflictError(
-                    "result-cell CAS expected an existing current payload"
-                )
-            try:
-                object_publication = self.store.publish_state(
-                    self.object_state_name(cell.payload_sha256),
-                    cell.to_bytes(),
-                )
-                pointer_publication = self.store.publish_state(
-                    self.pointer_state_name(cell.binding.sha256),
-                    self._pointer_bytes(cell),
-                )
-            except ManifestConflictError as exc:
-                raise ResultCellConflictError("result-cell CAS conflict") from exc
-            except CrystalStoreError as exc:
-                raise ResultCellIntegrityError(
-                    "result-cell publication failed integrity"
-                ) from exc
+                object_publication = None
+                pointer_publication = None
+            else:
+                if expected is not None:
+                    raise ResultCellConflictError(
+                        "result-cell CAS expected an existing current payload"
+                    )
+                try:
+                    object_publication = self.store.publish_state(
+                        self.object_state_name(cell.payload_sha256),
+                        cell.to_bytes(),
+                    )
+                    pointer_publication = self.store.publish_state(
+                        self.pointer_state_name(cell.binding.sha256),
+                        self._pointer_bytes(cell),
+                    )
+                except ManifestConflictError as exc:
+                    raise ResultCellConflictError("result-cell CAS conflict") from exc
+                except CrystalStoreError as exc:
+                    raise ResultCellIntegrityError(
+                        "result-cell publication failed integrity"
+                    ) from exc
+            semantic_publication = None
+            semantic_pointer_created = False
+            semantic_pointer_updated = False
+            if semantic is not None and existing_semantic != semantic:
+                try:
+                    semantic_publication = self.store.publish_state(
+                        self.semantic_pointer_state_name(semantic.key.sha256),
+                        semantic.to_bytes(),
+                        expected_sha256=(
+                            None
+                            if existing_semantic is None
+                            else hashlib.sha256(
+                                existing_semantic.to_bytes()
+                            ).hexdigest()
+                        ),
+                    )
+                except ManifestConflictError as exc:
+                    raise ResultCellConflictError(
+                        "semantic result-cell CAS conflict"
+                    ) from exc
+                except CrystalStoreError as exc:
+                    raise ResultCellIntegrityError(
+                        "semantic result-cell publication failed integrity"
+                    ) from exc
+                semantic_pointer_created = existing_semantic is None
+                semantic_pointer_updated = existing_semantic is not None
             return ResultCellPublication(
                 binding_sha256=cell.binding.sha256,
                 payload_sha256=cell.payload_sha256,
-                object_generation=object_publication.generation,
-                pointer_generation=pointer_publication.generation,
-                object_created=object_publication.changed,
-                pointer_created=pointer_publication.changed,
+                object_generation=(
+                    None
+                    if object_publication is None
+                    else object_publication.generation
+                ),
+                pointer_generation=(
+                    None
+                    if pointer_publication is None
+                    else pointer_publication.generation
+                ),
+                object_created=(
+                    False
+                    if object_publication is None
+                    else object_publication.changed
+                ),
+                pointer_created=(
+                    False
+                    if pointer_publication is None
+                    else pointer_publication.changed
+                ),
+                semantic_key_sha256=(
+                    None if semantic is None else semantic.key.sha256
+                ),
+                semantic_pointer_created=(
+                    semantic_pointer_created
+                    and semantic_publication is not None
+                    and semantic_publication.changed
+                ),
+                semantic_pointer_updated=(
+                    semantic_pointer_updated
+                    and semantic_publication is not None
+                    and semantic_publication.changed
+                ),
             )
 
     def restore(self, binding: ResultCellBinding) -> ResultCell:
@@ -1401,6 +1683,156 @@ class ResultCellBank:
     def restore_payload(self, payload_sha256: str) -> ResultCell:
         with self._locked():
             return self._restore_payload_unlocked(payload_sha256)
+
+    def restore_semantic(
+        self,
+        key: QwenSemanticReplayKey,
+    ) -> tuple[SemanticResultCellPointer, ResultCell]:
+        with self._locked():
+            return self._restore_semantic_unlocked(key)
+
+    def settle_semantic(
+        self,
+        key: QwenSemanticReplayKey,
+        *,
+        accept: bool,
+        expected_pointer_sha256: str | None = None,
+    ) -> WarmAccountingReceipt:
+        if not isinstance(key, QwenSemanticReplayKey):
+            raise TypeError("key must be QwenSemanticReplayKey")
+        if not isinstance(accept, bool):
+            raise TypeError("accept must be boolean")
+        expected_pointer = (
+            None
+            if expected_pointer_sha256 is None
+            else require_sha256(
+                expected_pointer_sha256,
+                field="expected_pointer_sha256",
+            )
+        )
+        with self._locked():
+            pointer, _cell = self._restore_semantic_unlocked(key)
+            if (
+                expected_pointer is not None
+                and hashlib.sha256(pointer.to_bytes()).hexdigest()
+                != expected_pointer
+            ):
+                raise ResultCellConflictError(
+                    "semantic result-cell pointer changed before settlement"
+                )
+            name = self.semantic_accounting_state_name(key.sha256)
+            try:
+                raw = self._restore_state(name)
+            except KeyError:
+                body = {
+                    "committed": 0,
+                    "next_transaction": 0,
+                    "rejected": 0,
+                    "saved_qwen_forwards": 0,
+                    "semantic_key_sha256": key.sha256,
+                }
+                expected_sha256 = None
+            else:
+                value = _strict_json(
+                    raw,
+                    label="semantic replay accounting",
+                    maximum=16384,
+                )
+                if (
+                    not isinstance(value, Mapping)
+                    or set(value) != {"body", "schema", "sha256"}
+                    or value.get("schema")
+                    != RESULT_CELL_SEMANTIC_ACCOUNTING_SCHEMA
+                    or not isinstance(value.get("body"), Mapping)
+                    or value.get("sha256") != _digest(value["body"])
+                ):
+                    raise ResultCellIntegrityError(
+                        "semantic replay accounting is invalid"
+                    )
+                body = dict(value["body"])
+                if (
+                    set(body)
+                    != {
+                        "committed",
+                        "next_transaction",
+                        "rejected",
+                        "saved_qwen_forwards",
+                        "semantic_key_sha256",
+                    }
+                    or body["semantic_key_sha256"] != key.sha256
+                    or any(
+                        isinstance(body[field], bool)
+                        or not isinstance(body[field], int)
+                        or body[field] < 0
+                        for field in (
+                            "committed",
+                            "next_transaction",
+                            "rejected",
+                            "saved_qwen_forwards",
+                        )
+                    )
+                ):
+                    raise ResultCellIntegrityError(
+                        "semantic replay accounting body is invalid"
+                    )
+                expected_sha256 = hashlib.sha256(raw).hexdigest()
+            ordinal = body["next_transaction"]
+            execution_sha256 = _digest(
+                {
+                    "output_sha256": pointer.output_sha256,
+                    "payload_sha256": pointer.payload_sha256,
+                    "semantic_key_sha256": key.sha256,
+                    "token_trace_sha256": pointer.token_trace_sha256,
+                }
+            )
+            decision_sha256 = _digest(
+                {
+                    "execution_sha256": execution_sha256,
+                    "semantic_key_sha256": key.sha256,
+                }
+            )
+            transaction_sha256 = _digest(
+                {
+                    "execution_sha256": execution_sha256,
+                    "ordinal": ordinal,
+                    "semantic_key_sha256": key.sha256,
+                }
+            )
+            receipt = WarmAccountingReceipt(
+                transaction_sha256=transaction_sha256,
+                decision_binding_sha256=decision_sha256,
+                execution_receipt_sha256=execution_sha256,
+                disposition="committed" if accept else "rejected",
+                saved_qwen_forwards=(
+                    pointer.teacher_forward_count if accept else 0
+                ),
+            )
+            body["next_transaction"] = ordinal + 1
+            body["committed" if accept else "rejected"] += 1
+            if accept:
+                body["saved_qwen_forwards"] += pointer.teacher_forward_count
+            data = canonical_json_bytes(
+                {
+                    "body": body,
+                    "schema": RESULT_CELL_SEMANTIC_ACCOUNTING_SCHEMA,
+                    "sha256": _digest(body),
+                }
+            )
+            try:
+                self.store.publish_state(
+                    name,
+                    data,
+                    expected_sha256=expected_sha256,
+                )
+            except ManifestConflictError as exc:
+                raise ResultCellConflictError(
+                    "semantic replay accounting CAS conflict"
+                ) from exc
+            except CrystalStoreError as exc:
+                raise ResultCellIntegrityError(
+                    "semantic replay accounting failed integrity"
+                ) from exc
+            return receipt
 
 
 BindingResolver = Callable[[QwenOoeFeatureReceipt], ResultCellBinding]
@@ -1801,6 +2233,8 @@ __all__ = [
     "RESULT_CELL_EXECUTOR_SHA256",
     "RESULT_CELL_PARITY_SCHEMA",
     "RESULT_CELL_POINTER_SCHEMA",
+    "RESULT_CELL_SEMANTIC_ACCOUNTING_SCHEMA",
+    "RESULT_CELL_SEMANTIC_POINTER_SCHEMA",
     "RESULT_CELL_SCHEMA",
     "ResultCell",
     "ResultCellBank",
@@ -1815,6 +2249,7 @@ __all__ = [
     "ResultCellParityVerifier",
     "ResultCellPublication",
     "ResultCellStaleError",
+    "SemanticResultCellPointer",
     "attach_cold_qwen_generation_receipt",
     "artifact_sha256",
     "extract_cold_qwen_generation_receipt",

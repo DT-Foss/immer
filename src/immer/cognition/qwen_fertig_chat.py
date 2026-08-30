@@ -716,6 +716,31 @@ class QwenFertigChat:
                     ooe_summary = {"warm": {"status": "error", **_failure(exc)}}
 
             if warm_result is not None:
+                release_bypassed = getattr(
+                    self._qwen,
+                    "release_warm_bypass_state",
+                    None,
+                )
+                if callable(release_bypassed):
+                    try:
+                        release_bypassed()
+                    except Exception as exc:
+                        return self._result(
+                            question=question,
+                            route="ooe_integrity_error",
+                            output=None,
+                            status=ExecutionStatus.ERROR,
+                            reason="warm OoE state release failed",
+                            candidate=None,
+                            qwen=None,
+                            fertig={"preflight": preflight, "status": "not_run"},
+                            ooe={
+                                "warm": {
+                                    "status": "integrity-error",
+                                    **_failure(exc),
+                                }
+                            },
+                        )
                 qwen_result = warm_result
                 candidate_origin = "ooe"
             else:

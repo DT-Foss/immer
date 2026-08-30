@@ -403,6 +403,55 @@ def _qwen38_growing_warm_profile(
     ).hexdigest()
 
 
+def _qwen38_output_semantics(
+    args: argparse.Namespace,
+    *,
+    tokenizer_path: Path,
+    q4_root: Path | None,
+    mlp_page_state_path: Path | None,
+):
+    if q4_root is None:
+        return None
+    q4_manifest = q4_root / "manifest.json"
+    if not q4_manifest.is_file() or not tokenizer_path.is_file():
+        return None
+    from .runtimes.qwen3_8.config import OFFICIAL_REPO_ID, OFFICIAL_REVISION
+    from .runtimes.qwen3_8.encoding import END_OF_TEXT_TOKEN_ID, IM_END_TOKEN_ID
+    from .runtimes.qwen3_8.mlp_page_markov import MlpPageMarkov
+    from .runtimes.qwen3_8.output_semantics import QwenOutputSemantics
+    from .runtimes.qwen3_8.q4 import Q4_BANK_CODEC_ABI, Q4_NATIVE_ABI
+
+    route_width = None
+    width_actions = ()
+    energy_coverage = None
+    if mlp_page_state_path is not None:
+        route_width = getattr(args, "mlp_page_width", None)
+        if (
+            isinstance(route_width, bool)
+            or not isinstance(route_width, int)
+            or route_width <= 0
+        ):
+            raise ValueError("MLP page width must be a positive integer")
+        width_actions = MlpPageMarkov.width_actions_for(route_width)
+        energy_coverage = MlpPageMarkov.ENERGY_COVERAGE
+    return QwenOutputSemantics(
+        repo_id=OFFICIAL_REPO_ID,
+        revision=OFFICIAL_REVISION,
+        q4_manifest_file_sha256=_path_sha256(q4_manifest),
+        q4_native_abi=Q4_NATIVE_ABI,
+        q4_bank_codec_abi=Q4_BANK_CODEC_ABI,
+        tokenizer_sha256=_path_sha256(tokenizer_path),
+        compute_dtype=args.compute_dtype,
+        max_context_tokens=args.max_context_tokens,
+        max_prompt_tokens=args.max_prompt_tokens,
+        max_new_tokens=args.max_new_tokens,
+        eos_token_ids=(IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID),
+        mlp_page_route_width=route_width,
+        mlp_page_width_actions=width_actions,
+        mlp_page_energy_coverage=energy_coverage,
+    )
+
+
 def _qwen38_runtime_code_paths() -> tuple[Path, ...]:
     package = Path(__file__).resolve().parent
     fixed = (
@@ -1171,8 +1220,22 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 runtime_code_revision=warm_runtime_code_revision,
             )
         )
+        output_semantics = (
+            None
+            if args.raw_qwen or warm_profile_sha256 is None
+            else _qwen38_output_semantics(
+                args,
+                tokenizer_path=tokenizer_path,
+                q4_root=q4_root,
+                mlp_page_state_path=mlp_page_state_path,
+            )
+        )
         prompt_tokenizer = None
-        if warm_profile_sha256 is not None or interactive:
+        if (
+            warm_profile_sha256 is not None
+            or output_semantics is not None
+            or interactive
+        ):
             from .runtimes.qwen3_8.encoding import Qwen38Tokenizer
 
             prompt_tokenizer = Qwen38Tokenizer(
@@ -1185,6 +1248,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             history: tuple[tuple[str, str], ...] = (),
             session_id: str | None = None,
         ) -> dict[str, object]:
+            text = text.strip()
             metadata: dict[str, object] = {}
             if history:
                 metadata[QWEN38_CHAT_HISTORY_METADATA] = history
@@ -1208,12 +1272,30 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 )
             )
             token_sha256 = prompt_token_sha256(prompt_tokenizer.encode(rendered))
+            semantic_key = None
+            if output_semantics is not None:
+                from .runtimes.qwen3_8.output_semantics import (
+                    QWEN_SEMANTIC_REPLAY_METADATA_KEY,
+                    semantic_replay_key_for_prompt,
+                )
+
+                semantic_key = semantic_replay_key_for_prompt(
+                    output_semantics,
+                    question=text.strip(),
+                    rendered_prompt=rendered,
+                    rendered_prompt_token_sha256=token_sha256,
+                    system_prompt=args.system_prompt.strip(),
+                )
             metadata.update(
                 {
                     "qwen_token_sha256": token_sha256,
                     "qwen_warm_runtime_profile_sha256": warm_profile_sha256,
                 }
             )
+            if semantic_key is not None:
+                metadata[QWEN_SEMANTIC_REPLAY_METADATA_KEY] = (
+                    semantic_key.to_document()
+                )
             return metadata
 
         def fit_interactive_history(
@@ -1246,6 +1328,43 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 claimed,
             )
 
+        def verify_semantic_key(
+            question: str,
+            claimed: object,
+            metadata: object,
+        ) -> bool:
+            if not isinstance(metadata, dict):
+                return False
+            raw_history = metadata.get(QWEN38_CHAT_HISTORY_METADATA, ())
+            if not isinstance(raw_history, tuple):
+                return False
+            try:
+                expected = request_metadata_for(
+                    question,
+                    history=raw_history,
+                ).get("qwen_semantic_replay_key")
+                left = hashlib.sha256(
+                    json.dumps(
+                        expected,
+                        allow_nan=False,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("ascii")
+                ).hexdigest()
+                right = hashlib.sha256(
+                    json.dumps(
+                        claimed,
+                        allow_nan=False,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("ascii")
+                ).hexdigest()
+            except (TypeError, ValueError):
+                return False
+            return hmac.compare_digest(left, right)
+
         warm_mount = None
         if not args.raw_qwen:
             warm_root = _resolve_qwen38_warm_root(args, bundle_path)
@@ -1263,6 +1382,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     ),
                     prompt_token_verifier=(
                         verify_prompt_token if warm_profile_sha256 is not None else None
+                    ),
+                    semantic_key_verifier=(
+                        verify_semantic_key
+                        if warm_profile_sha256 is not None
+                        else None
                     ),
                 )
         anchor_cache = (

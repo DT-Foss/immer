@@ -42,6 +42,12 @@ from immer.runtimes.qwen3_8.semantic_atlas import (
     ModelPin,
     ProbeIdentity,
 )
+from immer.runtimes.qwen3_8.output_semantics import (
+    QWEN_SEMANTIC_REPLAY_EVIDENCE_KEY,
+    QwenOutputSemantics,
+    QwenSemanticReplayKey,
+    semantic_replay_receipt,
+)
 
 
 def _sha(value: str) -> str:
@@ -81,6 +87,35 @@ def _binding(**changes: object) -> ResultCellBinding:
     }
     values.update(changes)
     return ResultCellBinding(**values)  # type: ignore[arg-type]
+
+
+def _semantic(
+    binding: ResultCellBinding,
+) -> tuple[QwenOutputSemantics, QwenSemanticReplayKey, dict[str, object]]:
+    semantics = QwenOutputSemantics(
+        repo_id=binding.model_pin.repo_id,
+        revision=binding.model_pin.revision,
+        q4_manifest_file_sha256=_sha("q4-manifest"),
+        q4_native_abi=5,
+        q4_bank_codec_abi=2,
+        tokenizer_sha256=binding.tokenizer_sha256,
+        compute_dtype="bfloat16",
+        max_context_tokens=2048,
+        max_prompt_tokens=1024,
+        max_new_tokens=64,
+        eos_token_ids=(1, 2),
+        mlp_page_route_width=192,
+        mlp_page_width_actions=(96, 128, 160, 192),
+        mlp_page_energy_coverage=0.995,
+    )
+    key = QwenSemanticReplayKey(
+        output_semantics_sha256=semantics.sha256,
+        question_sha256=binding.question_sha256,
+        rendered_prompt_sha256=binding.rendered_prompt_sha256,
+        rendered_prompt_token_sha256=binding.rendered_prompt_token_sha256,
+        system_prompt_sha256=binding.system_prompt_sha256,
+    )
+    return semantics, key, semantic_replay_receipt(semantics, key)
 
 
 def _feature(
@@ -125,6 +160,8 @@ def _raw_qwen_result(
     *,
     forward_passes: int = 3,
     binding: ResultCellBinding | None = None,
+    semantic_receipt: dict[str, object] | None = None,
+    token_trace_sha256: str | None = None,
 ) -> Result:
     exact_binding = binding or _binding()
     generation = {
@@ -140,25 +177,28 @@ def _raw_qwen_result(
         "state_bytes": 8192,
         "stateful_cache": True,
         "stopped_on_eos": True,
-        "token_trace_sha256": _sha(f"token-trace:{output}"),
+        "token_trace_sha256": token_trace_sha256 or _sha(f"token-trace:{output}"),
     }
+    evidence = {
+        "bundle": {
+            "layout_fingerprint": exact_binding.model_pin.bundle_fingerprint,
+            "manifest_sha256": (
+                exact_binding.model_pin.bundle_manifest_sha256
+            ),
+        },
+        "generation": generation,
+        "model": exact_binding.model_pin.repo_id,
+        "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
+        "revision": exact_binding.model_pin.revision,
+        "tokenizer_sha256": exact_binding.tokenizer_sha256,
+    }
+    if semantic_receipt is not None:
+        evidence[QWEN_SEMANTIC_REPLAY_EVIDENCE_KEY] = semantic_receipt
     return Result(
         ExecutionStatus.OK,
         "qwen3.8.causal",
         output=output,
-        evidence={
-            "bundle": {
-                "layout_fingerprint": exact_binding.model_pin.bundle_fingerprint,
-                "manifest_sha256": (
-                    exact_binding.model_pin.bundle_manifest_sha256
-                ),
-            },
-            "generation": generation,
-            "model": exact_binding.model_pin.repo_id,
-            "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
-            "revision": exact_binding.model_pin.revision,
-            "tokenizer_sha256": exact_binding.tokenizer_sha256,
-        },
+        evidence=evidence,
     )
 
 
@@ -167,6 +207,8 @@ def _qwen_result(
     *,
     forward_passes: int = 3,
     binding: ResultCellBinding | None = None,
+    semantic_receipt: dict[str, object] | None = None,
+    token_trace_sha256: str | None = None,
 ) -> Result:
     exact_binding = binding or _binding()
     return attach_cold_qwen_generation_receipt(
@@ -174,6 +216,8 @@ def _qwen_result(
             output,
             forward_passes=forward_passes,
             binding=exact_binding,
+            semantic_receipt=semantic_receipt,
+            token_trace_sha256=token_trace_sha256,
         ),
         binding=exact_binding,
     )
@@ -225,6 +269,9 @@ def _cell(
     output: str = "42",
     fertig_status: str = "verified",
     judgment: dict | None = None,
+    semantic_receipt: dict[str, object] | None = None,
+    token_trace_sha256: str | None = None,
+    forward_passes: int = 3,
 ) -> ResultCell:
     exact_binding = binding or _binding()
     fertig_judgment = judgment or _judgment(fertig_status)
@@ -235,7 +282,13 @@ def _cell(
     }[fertig_status]
     return ResultCell.from_cold(
         binding=exact_binding,
-        cold_qwen_result=_qwen_result(output, binding=exact_binding),
+        cold_qwen_result=_qwen_result(
+            output,
+            forward_passes=forward_passes,
+            binding=exact_binding,
+            semantic_receipt=semantic_receipt,
+            token_trace_sha256=token_trace_sha256,
+        ),
         cold_final_result=_final_result(output, route=final_route),
         cold_fertig_judgment=fertig_judgment,
         cold_fertig_status=fertig_status,
@@ -506,6 +559,215 @@ class ResultCellBankTests(unittest.TestCase):
             )
             self.assertNotIn(_RAW_QUESTION.encode(), state_bytes)
             self.assertNotIn(_RAW_RENDERED_PROMPT.encode(), state_bytes)
+
+    def test_semantic_replay_crosses_producer_profiles_and_conflicts_hard(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = ResultCellBank(Path(temporary) / "result-cells")
+            first_binding = _binding()
+            _semantics, key, receipt = _semantic(first_binding)
+            first = _cell(
+                binding=first_binding,
+                semantic_receipt=receipt,
+            )
+            published = bank.charge(first)
+            self.assertTrue(published.semantic_pointer_created)
+            self.assertEqual(published.semantic_key_sha256, key.sha256)
+            pointer, restored = bank.restore_semantic(key)
+            self.assertEqual(restored, first)
+            self.assertEqual(pointer.payload_sha256, first.payload_sha256)
+            first_pointer_sha256 = hashlib.sha256(pointer.to_bytes()).hexdigest()
+
+            second_binding = _binding(
+                model_pin=replace(_PIN, code_revision="d" * 40),
+                generation_policy_sha256=_sha("new-full-runtime-policy"),
+            )
+            _semantics2, key2, receipt2 = _semantic(second_binding)
+            self.assertEqual(key2, key)
+            second = _cell(
+                binding=second_binding,
+                semantic_receipt=receipt2,
+                forward_passes=9,
+            )
+            equivalent = bank.charge(second)
+            self.assertTrue(equivalent.pointer_created)
+            self.assertFalse(equivalent.semantic_pointer_created)
+            self.assertTrue(equivalent.semantic_pointer_updated)
+            self.assertEqual(bank.restore(second_binding), second)
+            second_pointer, semantic_cell = bank.restore_semantic(key)
+            self.assertEqual(semantic_cell, second)
+            self.assertEqual(second_pointer.teacher_forward_count, 9)
+            with self.assertRaisesRegex(
+                ResultCellConflictError,
+                "changed before settlement",
+            ):
+                bank.settle_semantic(
+                    key,
+                    accept=True,
+                    expected_pointer_sha256=first_pointer_sha256,
+                )
+
+            trace_binding = _binding(
+                model_pin=replace(_PIN, code_revision="e" * 40),
+                generation_policy_sha256=_sha("different-token-trace-policy"),
+            )
+            _trace_semantics, trace_key, trace_receipt = _semantic(trace_binding)
+            self.assertEqual(trace_key, key)
+            different_trace = _cell(
+                binding=trace_binding,
+                semantic_receipt=trace_receipt,
+                token_trace_sha256=_sha("different-generated-token-trace"),
+            )
+            with self.assertRaisesRegex(
+                ResultCellConflictError,
+                "output or token trace",
+            ):
+                bank.charge(different_trace)
+
+            conflicting_binding = _binding(
+                model_pin=replace(_PIN, code_revision="f" * 40),
+                generation_policy_sha256=_sha("conflicting-full-policy"),
+            )
+            _semantics3, key3, receipt3 = _semantic(conflicting_binding)
+            self.assertEqual(key3, key)
+            conflicting = _cell(
+                binding=conflicting_binding,
+                output="43",
+                semantic_receipt=receipt3,
+            )
+            with self.assertRaisesRegex(
+                ResultCellConflictError,
+                "output or token trace",
+            ):
+                bank.charge(conflicting)
+            with self.assertRaises(ResultCellError):
+                bank.restore(conflicting_binding)
+
+            committed = bank.settle_semantic(key, accept=True)
+            rejected = bank.settle_semantic(key, accept=False)
+            self.assertEqual(committed.saved_qwen_forwards, 9)
+            self.assertEqual(committed.disposition, "committed")
+            self.assertEqual(rejected.saved_qwen_forwards, 0)
+            self.assertEqual(rejected.disposition, "rejected")
+
+    def test_semantic_pointer_publication_recovers_after_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CrystalStore(Path(temporary) / "result-cells")
+            bank = ResultCellBank(store)
+            binding = _binding()
+            _semantics, key, receipt = _semantic(binding)
+            cell = _cell(binding=binding, semantic_receipt=receipt)
+            original = store.publish_state
+            failed = False
+
+            def fail_semantic_once(name: str, payload: bytes, **kwargs):
+                nonlocal failed
+                if (
+                    name == bank.semantic_pointer_state_name(key.sha256)
+                    and not failed
+                ):
+                    failed = True
+                    raise OSError("simulated semantic pointer crash")
+                return original(name, payload, **kwargs)
+
+            store.publish_state = fail_semantic_once  # type: ignore[method-assign]
+            with self.assertRaisesRegex(OSError, "semantic pointer crash"):
+                bank.charge(cell)
+            store.publish_state = original  # type: ignore[method-assign]
+
+            recovered = bank.charge(cell)
+            self.assertFalse(recovered.object_created)
+            self.assertFalse(recovered.pointer_created)
+            self.assertTrue(recovered.semantic_pointer_created)
+            self.assertEqual(bank.restore_semantic(key)[1], cell)
+
+    def test_semantic_direct_provider_returns_zero_forward_raw_qwen_result(
+        self,
+    ) -> None:
+        from immer.runtimes.ooe.chat import OoeChatIntegrityError
+        from immer.runtimes.ooe.qwen_warm_bank import (
+            QwenWarmBankError,
+            _semantic_replay_provider,
+            open_verified_qwen_warm_bank,
+        )
+        from immer.runtimes.qwen3_8.output_semantics import (
+            QWEN_SEMANTIC_REPLAY_METADATA_KEY,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                QwenWarmBankError,
+                "requires a growing warm profile",
+            ):
+                open_verified_qwen_warm_bank(
+                    Path(temporary) / "missing",
+                    semantic_key_verifier=lambda *_args: True,
+                )
+            bank = ResultCellBank(Path(temporary) / "result-cells")
+            binding = _binding()
+            _semantics, key, receipt = _semantic(binding)
+            cell = _cell(binding=binding, semantic_receipt=receipt)
+            bank.charge(cell)
+            provider = _semantic_replay_provider(
+                bank,
+                lambda _question, _key, _metadata: True,
+            )
+
+            miss = provider("another question", {})
+            self.assertIsNone(miss)
+            rejected_metadata = _semantic_replay_provider(
+                bank,
+                lambda _question, _key, _metadata: False,
+            )(
+                _RAW_QUESTION,
+                {QWEN_SEMANTIC_REPLAY_METADATA_KEY: key.to_document()},
+            )
+            self.assertIsNone(rejected_metadata)
+            attempt = provider(
+                _RAW_QUESTION,
+                {QWEN_SEMANTIC_REPLAY_METADATA_KEY: key.to_document()},
+            )
+            self.assertIsNotNone(attempt)
+            assert attempt is not None and attempt.result is not None
+            self.assertEqual(attempt.result.output, "42")
+            self.assertEqual(
+                attempt.result.evidence["generation"]["forward_passes"],
+                0,
+            )
+            self.assertEqual(
+                attempt.evidence["saved_qwen_forwards"],
+                3,
+            )
+            accounting = attempt._settler(True)
+            self.assertEqual(accounting.saved_qwen_forwards, 3)
+            with self.assertRaisesRegex(
+                QwenWarmBankError,
+                "already settled",
+            ):
+                attempt._settler(True)
+            with self.assertRaises(OoeChatIntegrityError):
+                provider(
+                    _RAW_QUESTION,
+                    {QWEN_SEMANTIC_REPLAY_METADATA_KEY: {"bad": True}},
+                )
+
+    def test_tampered_semantic_pointer_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CrystalStore(Path(temporary) / "result-cells")
+            bank = ResultCellBank(store)
+            binding = _binding()
+            _semantics, key, receipt = _semantic(binding)
+            bank.charge(_cell(binding=binding, semantic_receipt=receipt))
+            name = bank.semantic_pointer_state_name(key.sha256)
+            path = store.root / "state" / store._state_filename(name)
+            payload = bytearray(path.read_bytes())
+            payload[len(payload) // 2] ^= 1
+            path.chmod(0o600)
+            path.write_bytes(payload)
+
+            with self.assertRaises(ResultCellIntegrityError):
+                bank.restore_semantic(key)
 
     def test_object_first_publication_recovers_after_pointer_crash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -2067,6 +2067,60 @@ class Qwen38CausalChat:
         )
         return qwen_result_binding_evidence(binding)
 
+    def _result_cell_semantic_replay_receipt(
+        self,
+        *,
+        question: str,
+        rendered_prompt: str,
+        prompt_ids: tuple[int, ...],
+    ) -> dict[str, object] | None:
+        if self._result_cell_code_revision is None or self._q4_root is None:
+            return None
+        from .cartography_probe import prompt_token_sha256
+        from .output_semantics import (
+            QwenOutputSemantics,
+            semantic_replay_key_for_prompt,
+            semantic_replay_receipt,
+        )
+        from .q4 import Q4_BANK_CODEC_ABI, Q4_NATIVE_ABI
+
+        tokenizer_sha256 = self._tokenizer_sha256
+        if not _is_sha256(tokenizer_sha256):
+            raise Qwen38ChatError("runtime tokenizer receipt is invalid")
+        route_width = None
+        width_actions = ()
+        energy_coverage = None
+        if self._mlp_page_state_path is not None:
+            route_width = self._mlp_page_route_width
+            width_actions = MlpPageMarkov.width_actions_for(route_width)
+            energy_coverage = MlpPageMarkov.ENERGY_COVERAGE
+        semantics = QwenOutputSemantics(
+            repo_id=OFFICIAL_REPO_ID,
+            revision=OFFICIAL_REVISION,
+            q4_manifest_file_sha256=_file_sha256(
+                self._q4_root / "manifest.json"
+            ),
+            q4_native_abi=Q4_NATIVE_ABI,
+            q4_bank_codec_abi=Q4_BANK_CODEC_ABI,
+            tokenizer_sha256=tokenizer_sha256,
+            compute_dtype=self._compute_dtype,
+            max_context_tokens=self._max_context_tokens,
+            max_prompt_tokens=self._max_prompt_tokens,
+            max_new_tokens=self._max_new_tokens,
+            eos_token_ids=(IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID),
+            mlp_page_route_width=route_width,
+            mlp_page_width_actions=width_actions,
+            mlp_page_energy_coverage=energy_coverage,
+        )
+        key = semantic_replay_key_for_prompt(
+            semantics,
+            question=question,
+            rendered_prompt=rendered_prompt,
+            rendered_prompt_token_sha256=prompt_token_sha256(prompt_ids),
+            system_prompt=self._system_prompt,
+        )
+        return semantic_replay_receipt(semantics, key)
+
     @property
     def model_id(self) -> str:
         return OFFICIAL_REPO_ID
@@ -2084,6 +2138,39 @@ class Qwen38CausalChat:
     def closed(self) -> bool:
         with self._lock:
             return self._closed
+
+    def release_warm_bypass_state(self) -> None:
+        """Drop native conversation ownership before a zero-forward warm turn."""
+
+        with self._lock:
+            if self._closed:
+                raise Qwen38ChatError("Qwen3.8 chat component is closed")
+            runtime = self._runtime
+            self._clear_conversation_binding()
+            if runtime is None:
+                return
+            if self._pending_page_runtime_reward is not None:
+                router = getattr(runtime, "mlp_page_router", None)
+                abort = getattr(router, "abort_runtime_reward", None)
+                if callable(abort):
+                    try:
+                        abort()
+                    except Exception as exc:
+                        self._pending_page_runtime_reward = None
+                        self._page_reward_retry_failed = False
+                        cleanup = self._retire_runtime_locked(exc)
+                        raise Qwen38ChatError(
+                            f"warm bypass reward abort failed: {cleanup}"
+                        ) from exc
+                self._pending_page_runtime_reward = None
+                self._page_reward_retry_failed = False
+            try:
+                runtime.model.reset_state(release=True)
+            except Exception as exc:
+                cleanup = self._retire_runtime_locked(exc)
+                raise Qwen38ChatError(
+                    f"warm bypass state cleanup failed: {cleanup}"
+                ) from exc
 
     def _clear_conversation_binding(self) -> None:
         self._conversation_session_id = None
@@ -3601,6 +3688,15 @@ class Qwen38CausalChat:
         )
         if result_cell_binding is not None:
             evidence["result_cell_binding_receipt"] = result_cell_binding
+        semantic_replay = self._result_cell_semantic_replay_receipt(
+            question=text,
+            rendered_prompt=prompt,
+            prompt_ids=prompt_ids,
+        )
+        if semantic_replay is not None:
+            from .output_semantics import QWEN_SEMANTIC_REPLAY_EVIDENCE_KEY
+
+            evidence[QWEN_SEMANTIC_REPLAY_EVIDENCE_KEY] = semantic_replay
         if restored is not None:
             anchor_evidence = _anchor_hit_evidence(
                 restored,

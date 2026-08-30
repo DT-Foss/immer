@@ -20,6 +20,9 @@ MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v9"
 MLP_PAGE_MARKOV_POLICY = (
     "dynamic-page-transitions+coactivation+adaptive-width+terminal-route-advantage+consensus-budget-lookahead+fixed-share/v9"
 )
+MLP_PAGE_OUTPUT_ABI = (
+    "dynamic-page-route+adaptive-energy-width+fixed-share/v1"
+)
 _V8_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v8"
 _V8_MLP_PAGE_MARKOV_POLICY = (
     "dynamic-page-transitions+coactivation+adaptive-width+terminal-route-advantage+causal-lookahead-prefetch+fixed-share/v8"
@@ -2329,6 +2332,7 @@ __all__ = [
     "MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS",
     "MLP_PAGE_MARKOV_POLICY",
     "MLP_PAGE_MARKOV_SCHEMA",
+    "MLP_PAGE_OUTPUT_ABI",
     "MlpPageMarkov",
     "MlpPageMarkovError",
     "MlpPagePrediction",

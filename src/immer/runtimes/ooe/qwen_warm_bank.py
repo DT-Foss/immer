@@ -11,9 +11,19 @@ from pathlib import Path
 import stat
 from typing import Any
 
+from ...contracts import ExecutionStatus, Result
 from ...knowledge.livecausal import LiveGraph
+from ..qwen3_8.output_semantics import (
+    QWEN_SEMANTIC_REPLAY_METADATA_KEY,
+    QwenSemanticReplayKey,
+)
 from ..qwen3_8.semantic_atlas import ModelPin
-from .chat import ChainedOoeChatHook, OoeChatHook
+from .chat import (
+    ChainedOoeChatHook,
+    OoeChatAttempt,
+    OoeChatHook,
+    OoeChatIntegrityError,
+)
 from .controller import (
     ActionExecution,
     ControllerConfig,
@@ -25,7 +35,13 @@ from .crystal import CrystalStore
 from .identity import canonical_json_bytes, require_sha256
 from .qwen_bridge import QwenOoeFeatureReceipt
 from .qwen_warm_growth import GrowingQwenWarmBank, load_growing_index
-from .result_cells import ResultCellBank, ResultCellBinding, ResultCellExecutor
+from .result_cells import (
+    ResultCellBank,
+    ResultCellBinding,
+    ResultCellExecutor,
+    ResultCellIntegrityError,
+    ResultCellMissError,
+)
 
 
 COHORT_SCHEMA = "immer.qwen3.8-ooe-chat-cohort-manifest/v1"
@@ -94,6 +110,133 @@ def _directory(root: Path, *, prefix: str, fallback: str) -> Path:
     return candidates[0]
 
 
+def _semantic_replay_provider(
+    bank: ResultCellBank,
+    semantic_key_verifier: Any | None = None,
+):
+    def provide(
+        question: str,
+        metadata: Mapping[str, Any],
+    ) -> OoeChatAttempt | None:
+        raw_key = metadata.get(QWEN_SEMANTIC_REPLAY_METADATA_KEY)
+        if raw_key is None or semantic_key_verifier is None:
+            return None
+        try:
+            verified = bool(
+                semantic_key_verifier(question, raw_key, metadata)
+            )
+        except Exception as exc:
+            raise OoeChatIntegrityError(
+                "semantic replay metadata verification failed"
+            ) from exc
+        if not verified:
+            return None
+        try:
+            key = QwenSemanticReplayKey.from_document(raw_key)
+        except (TypeError, ValueError) as exc:
+            raise OoeChatIntegrityError(
+                "semantic replay metadata is invalid"
+            ) from exc
+        if hashlib.sha256(question.strip().encode("utf-8")).hexdigest() != (
+            key.question_sha256
+        ):
+            return None
+        try:
+            pointer, cell = bank.restore_semantic(key)
+        except ResultCellMissError:
+            return None
+        except ResultCellIntegrityError as exc:
+            raise OoeChatIntegrityError(
+                "semantic replay ResultCell failed integrity"
+            ) from exc
+        cold = cell.cold_qwen_result
+        if not cold.ok or not isinstance(cold.output, str) or not cold.output:
+            raise OoeChatIntegrityError(
+                "semantic replay ResultCell has no successful Qwen output"
+            )
+        evidence = dict(cold.evidence)
+        generation = evidence.get("generation")
+        if not isinstance(generation, Mapping):
+            raise OoeChatIntegrityError(
+                "semantic replay ResultCell lost generation evidence"
+            )
+        warm_generation = dict(generation)
+        for field, value in {
+            "forward_passes": 0,
+            "linear_calls": 0,
+            "seconds": 0.0,
+            "source_body_bytes": 0,
+            "state_bytes": 0,
+            "time_to_first_token_seconds": 0.0,
+            "output_tokens_per_second": 0.0,
+        }.items():
+            if field in warm_generation or field in {
+                "forward_passes",
+                "linear_calls",
+                "seconds",
+                "source_body_bytes",
+                "state_bytes",
+            }:
+                warm_generation[field] = value
+        evidence["generation"] = warm_generation
+        execution_sha256 = _digest(
+            {
+                "output_sha256": pointer.output_sha256,
+                "payload_sha256": pointer.payload_sha256,
+                "semantic_key_sha256": key.sha256,
+                "token_trace_sha256": pointer.token_trace_sha256,
+            }
+        )
+        evidence["semantic_replay"] = {
+            "execution_sha256": execution_sha256,
+            "payload_sha256": pointer.payload_sha256,
+            "producer_binding_sha256": pointer.producer_binding_sha256,
+            "saved_qwen_forwards": pointer.teacher_forward_count,
+            "semantic_key_sha256": key.sha256,
+        }
+        result = Result(
+            ExecutionStatus.OK,
+            cold.component,
+            output=cold.output,
+            evidence=evidence,
+        )
+        settled = False
+        pointer_sha256 = hashlib.sha256(pointer.to_bytes()).hexdigest()
+
+        def settle(accept: bool) -> WarmAccountingReceipt:
+            nonlocal settled
+            if settled:
+                raise QwenWarmBankError(
+                    "semantic replay attempt was already settled"
+                )
+            try:
+                receipt = bank.settle_semantic(
+                    key,
+                    accept=accept,
+                    expected_pointer_sha256=pointer_sha256,
+                )
+            except ResultCellIntegrityError as exc:
+                raise OoeChatIntegrityError(
+                    "semantic replay accounting failed integrity"
+                ) from exc
+            settled = True
+            return receipt
+
+        return OoeChatAttempt(
+            result,
+            {
+                "execution_sha256": execution_sha256,
+                "saved_qwen_forwards": pointer.teacher_forward_count,
+                "semantic_key_sha256": key.sha256,
+                "status": "semantic-hit",
+            },
+            _settler=settle,
+            _abstention_authorized=True,
+        )
+
+    return provide
+
+
 @dataclass(frozen=True, slots=True)
 class VerifiedQwenWarmMount:
     """A fully cross-bound warm hook and its compact product identity."""
@@ -139,6 +282,7 @@ def open_verified_qwen_warm_bank(
     runtime_code_revision: str | None = None,
     template_output_character_limit: int | None = None,
     prompt_token_verifier: Any | None = None,
+    semantic_key_verifier: Any | None = None,
 ) -> VerifiedQwenWarmMount:
     """Open one existing verified warm cell without running or probing Qwen."""
 
@@ -164,6 +308,12 @@ def open_verified_qwen_warm_bank(
         raise QwenWarmBankError("template output character limit must be positive")
     if prompt_token_verifier is not None and not callable(prompt_token_verifier):
         raise QwenWarmBankError("prompt_token_verifier must be callable or None")
+    if semantic_key_verifier is not None and not callable(semantic_key_verifier):
+        raise QwenWarmBankError("semantic_key_verifier must be callable or None")
+    if semantic_key_verifier is not None and runtime_profile is None:
+        raise QwenWarmBankError(
+            "semantic replay verifier requires a growing warm profile"
+        )
     if len(
         {
             runtime_profile is None,
@@ -439,6 +589,10 @@ def open_verified_qwen_warm_bank(
         controller=controller,
         feature_provider=feature_provider,
         quality_verifier=quality_verifier,
+        direct_provider=_semantic_replay_provider(
+            bank,
+            semantic_key_verifier,
+        ),
         snapshot_name=state_name,
         snapshot_restorer=restore_controller,
         commit_on_fertig_abstention=True,

@@ -14,6 +14,8 @@ from immer.cognition.fertig.adapter import (
 )
 from immer.cognition.qwen_fertig_chat import QwenFertigChat
 from immer.contracts import ExecutionStatus, Request, Result
+from immer.runtimes.ooe.chat import OoeChatAttempt, OoeChatHook
+from immer.runtimes.ooe.controller import WarmAccountingReceipt
 
 
 MATH_QUESTION = "What is 500?"
@@ -111,6 +113,7 @@ class _Qwen:
         self.requests: list[Request] = []
         self.loaded = False
         self.close_calls = 0
+        self.release_warm_calls = 0
 
     def handle(self, request: Request) -> Result:
         self.requests.append(request)
@@ -121,6 +124,9 @@ class _Qwen:
 
     def close(self) -> None:
         self.close_calls += 1
+
+    def release_warm_bypass_state(self) -> None:
+        self.release_warm_calls += 1
 
 
 def _qwen_ok(output: str) -> Result:
@@ -157,6 +163,49 @@ def _receipt(result: Result) -> dict:
 
 
 class QwenFertigChatTests(unittest.TestCase):
+    def test_semantic_warm_hit_releases_native_state_and_never_calls_qwen(
+        self,
+    ) -> None:
+        warm = _qwen_ok("500")
+        attempt = OoeChatAttempt(warm, {"status": "semantic-hit"})
+        accounting = WarmAccountingReceipt(
+            transaction_sha256="1" * 64,
+            decision_binding_sha256="2" * 64,
+            execution_receipt_sha256="3" * 64,
+            disposition="committed",
+            saved_qwen_forwards=3,
+        )
+        hook = object.__new__(OoeChatHook)
+        hook.try_warm = lambda _question, _metadata: attempt
+        hook.commit_warm = lambda _attempt: accounting
+        hook.reject_warm = lambda _attempt: accounting
+        hook.abstention_commit_authorized = lambda _attempt: True
+        hook.observe_cold = lambda *_args, **_kwargs: {}
+        qwen = _Qwen(RuntimeError("Qwen must not run on semantic replay"))
+        with _patched_solver(
+            None,
+            _verification(
+                CandidateVerificationStatus.VERIFIED,
+                candidate="500",
+                expected="500",
+            ),
+        ) as (fertig, _, verify):
+            result = QwenFertigChat(qwen, fertig, ooe_hook=hook).handle(
+                Request("chat", MATH_QUESTION)
+            )
+
+        self.assertEqual(result.output, "500")
+        self.assertEqual(qwen.requests, [])
+        self.assertFalse(qwen.loaded)
+        self.assertEqual(qwen.release_warm_calls, 1)
+        verify.assert_called_once_with(MATH_QUESTION, "500")
+        receipt = _receipt(result)
+        self.assertEqual(receipt["route"], "ooe_verified")
+        self.assertEqual(
+            receipt["ooe"]["accounting"]["saved_qwen_forwards"],
+            3,
+        )
+
     def test_qwen_receipt_keeps_compact_markov_atlas_runtime_progress(self) -> None:
         base = _qwen_ok("ordinary answer")
         qwen_result = Result(

@@ -18,6 +18,7 @@ from immer.cli import (
     _QWEN38_MARKOV_DRAFT_ABI,
     _QWEN38_MTP_DRAFT_ABI,
     _qwen38_growing_warm_profile,
+    _qwen38_output_semantics,
     _qwen38_runtime_code_paths,
     main,
 )
@@ -1562,6 +1563,43 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(runtime.model.calls, [])
         chat.close()
 
+    def test_zero_forward_warm_bypass_releases_only_existing_native_state(
+        self,
+    ) -> None:
+        cold_runtime = _Runtime()
+        cold = _chat(cold_runtime)
+        cold.release_warm_bypass_state()
+        self.assertFalse(cold.loaded)
+        self.assertEqual(cold_runtime.model.reset_calls, [])
+        cold.close()
+
+        runtime = _Runtime()
+        chat = _chat(runtime)
+        session = {QWEN38_CHAT_SESSION_METADATA: "semantic:warm"}
+        result = chat.handle(Request("chat", "hello", session))
+        self.assertTrue(result.ok, result.reason)
+        self.assertTrue(chat._conversation_prefix_token_ids)
+        self.assertEqual(runtime.model.reset_calls, [])
+
+        chat.release_warm_bypass_state()
+
+        self.assertEqual(runtime.model.reset_calls, [True])
+        self.assertEqual(chat._conversation_prefix_token_ids, ())
+        self.assertIsNone(chat._conversation_session_id)
+        self.assertIsNone(chat._conversation_mtp_carry)
+        chat.close()
+
+        broken_runtime = _Runtime(
+            model=_Model(cleanup_error=RuntimeError("cannot release warm state"))
+        )
+        broken = _chat(broken_runtime)
+        broken._load_locked()
+        with self.assertRaisesRegex(Qwen38ChatError, "warm bypass state cleanup"):
+            broken.release_warm_bypass_state()
+        self.assertIsNone(broken._runtime)
+        self.assertEqual(broken_runtime.close_calls, 1)
+        broken.close()
+
     def test_conversation_generation_failure_drops_retained_state(self) -> None:
         class FailureTokenizer(_Tokenizer):
             def encode(self, text: str):
@@ -2163,6 +2201,80 @@ class Qwen38CausalChatTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "full lowercase"):
             _chat(_Runtime(), result_cell_code_revision="short")
 
+    def test_cli_and_adapter_build_the_same_semantic_replay_authority(self) -> None:
+        from immer.runtimes.qwen3_8.output_semantics import (
+            QWEN_SEMANTIC_REPLAY_EVIDENCE_KEY,
+            QwenSemanticReplayKey,
+            parse_semantic_replay_receipt,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            q4 = root / "q4"
+            q4.mkdir()
+            manifest = q4 / "manifest.json"
+            manifest.write_bytes(b"q4-manifest")
+            tokenizer = root / "tokenizer.json"
+            tokenizer.write_bytes(b"tokenizer")
+            q4_sha = hashlib.sha256(b"q4-manifest").hexdigest()
+            runtime = _Runtime()
+            chat = _chat(
+                runtime,
+                system_prompt=" local system ",
+                q4_root=q4,
+                mlp_page_state_path=root / "pages.json",
+                mlp_page_route_width=192,
+                result_cell_code_revision="f" * 40,
+            )
+            with patch(
+                "immer.runtimes.qwen3_8.adapter._file_sha256",
+                return_value=q4_sha,
+            ):
+                result = chat.handle(Request("chat", "hello"))
+            semantic_document = result.evidence[
+                QWEN_SEMANTIC_REPLAY_EVIDENCE_KEY
+            ]
+            adapter_semantics, adapter_key = parse_semantic_replay_receipt(
+                semantic_document
+            )
+            args = SimpleNamespace(
+                compute_dtype="auto",
+                max_context_tokens=16,
+                max_new_tokens=3,
+                max_prompt_tokens=8,
+                mlp_page_width=192,
+            )
+            with patch(
+                "immer.cli._path_sha256",
+                side_effect=lambda path: (
+                    q4_sha if path == manifest else _DIGEST
+                ),
+            ):
+                cli_semantics = _qwen38_output_semantics(
+                    args,
+                    tokenizer_path=tokenizer,
+                    q4_root=q4,
+                    mlp_page_state_path=root / "another-pages.json",
+                )
+            assert cli_semantics is not None
+            rendered = Qwen38Tokenizer.render_no_thinking_prompt(
+                "local system",
+                "hello",
+            )
+            cli_key = QwenSemanticReplayKey(
+                output_semantics_sha256=cli_semantics.sha256,
+                question_sha256=hashlib.sha256(b"hello").hexdigest(),
+                rendered_prompt_sha256=hashlib.sha256(
+                    rendered.encode()
+                ).hexdigest(),
+                rendered_prompt_token_sha256=prompt_token_sha256((11, 12)),
+                system_prompt_sha256=hashlib.sha256(b"local system").hexdigest(),
+            )
+
+        self.assertEqual(adapter_semantics, cli_semantics)
+        self.assertEqual(adapter_key, cli_key)
+        chat.close()
+
     def test_authenticated_exact_anchor_bypasses_prefill_with_identical_output(
         self,
     ) -> None:
@@ -2699,6 +2811,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             runtime_code_revision=None,
             template_output_character_limit=None,
             prompt_token_verifier=None,
+            semantic_key_verifier=None,
         )
         self.assertIs(wrapper.call_args.kwargs["ooe_hook"], hook)
 
@@ -2769,6 +2882,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             64,
         )
         self.assertTrue(callable(opener.call_args.kwargs["prompt_token_verifier"]))
+        self.assertTrue(callable(opener.call_args.kwargs["semantic_key_verifier"]))
         self.assertEqual(
             constructor.call_args.kwargs["result_cell_code_revision"],
             code_revision,
@@ -2915,12 +3029,39 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     **common,
                     mlp_page_state_path=root / "pages-a.json",
                 )
+            semantics_a = _qwen38_output_semantics(
+                args,
+                tokenizer_path=tokenizer,
+                q4_root=q4,
+                mlp_page_state_path=root / "pages-a.json",
+            )
+            args.q4_threads = 7
+            semantics_threads = _qwen38_output_semantics(
+                args,
+                tokenizer_path=tokenizer,
+                q4_root=q4,
+                mlp_page_state_path=root / "pages-a.json",
+            )
+            args.q4_threads = None
+            changed_runtime_code = _qwen38_growing_warm_profile(
+                args,
+                tokenizer_path=tokenizer,
+                q4_root=q4,
+                fast_mlp_root=None,
+                mlp_page_state_path=root / "pages-a.json",
+                draft_mode="hybrid",
+                markov_atlas_path=None,
+                markov_o1_retention_path=None,
+                runtime_code_revision="b" * 64,
+            )
 
         self.assertIsNotNone(routed)
         self.assertNotEqual(disabled, routed)
         self.assertEqual(routed, same_policy_other_file)
         self.assertNotEqual(routed, changed_width)
         self.assertNotEqual(routed, changed_policy)
+        self.assertEqual(semantics_a, semantics_threads)
+        self.assertNotEqual(routed, changed_runtime_code)
 
     def test_cli_draft_abis_match_runtime_exports(self) -> None:
         self.assertEqual(_QWEN38_MARKOV_DRAFT_ABI, MARKOV_DRAFT_PROVIDER_ABI)
