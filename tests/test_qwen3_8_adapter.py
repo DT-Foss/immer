@@ -2139,7 +2139,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIn("adapter.py", names)
         self.assertIn("qwen_warm_growth.py", names)
 
-    def test_hybrid_warm_profile_changes_with_markov_confidence_abi(self) -> None:
+    def test_hybrid_warm_profile_binds_every_draft_provider_abi(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             q4 = root / "q4"
@@ -2183,8 +2183,38 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     markov_o1_retention_path=None,
                     runtime_code_revision="a" * 64,
                 )
+            with patch(
+                "immer.cli._QWEN38_MTP_DRAFT_ABI",
+                "immer.qwen3.5-mtp-draft-provider/v999",
+            ):
+                changed_mtp = _qwen38_growing_warm_profile(
+                    args,
+                    tokenizer_path=tokenizer,
+                    q4_root=q4,
+                    fast_mlp_root=None,
+                    draft_mode="hybrid",
+                    markov_atlas_path=None,
+                    markov_o1_retention_path=None,
+                    runtime_code_revision="a" * 64,
+                )
+            with patch(
+                "immer.cli._QWEN38_HYBRID_DRAFT_ABI",
+                "immer.qwen3.8-markov-mtp-hybrid-provider/v999",
+            ):
+                changed_hybrid = _qwen38_growing_warm_profile(
+                    args,
+                    tokenizer_path=tokenizer,
+                    q4_root=q4,
+                    fast_mlp_root=None,
+                    draft_mode="hybrid",
+                    markov_atlas_path=None,
+                    markov_o1_retention_path=None,
+                    runtime_code_revision="a" * 64,
+                )
 
         self.assertNotEqual(current, changed)
+        self.assertNotEqual(current, changed_mtp)
+        self.assertNotEqual(current, changed_hybrid)
 
     def test_cli_explicit_layout_does_not_inherit_deployed_q4(self) -> None:
         qwen = _chat(_Runtime())

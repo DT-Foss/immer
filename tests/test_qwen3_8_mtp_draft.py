@@ -192,7 +192,7 @@ def _tensors(config: Qwen38Config) -> dict[str, torch.Tensor]:
 
 
 class Qwen35MtpDraftTests(unittest.TestCase):
-    def test_v2_calibration_identity_migrates_to_v3_without_data_loss(
+    def test_v1_calibration_with_v2_provider_migrates_to_v4_without_data_loss(
         self,
     ) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -235,16 +235,27 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         )
 
         self.assertEqual(provider._previous_outcome, 1)
-        self.assertEqual(provider._reliability, {(2, 6, 1): [7, 3]})
+        self.assertEqual(provider._reliability, {(False, 2, 6, 1): [7, 3]})
         self.assertEqual(provider.metrics().calibration_updates, 8)
         provider.close()
         migrated = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(
             migrated["identity"]["provider"],
-            "immer.qwen3.5-mtp-draft-provider/v3",
+            "immer.qwen3.5-mtp-draft-provider/v4",
         )
-        self.assertEqual(migrated["previous_outcome"], 1)
+        self.assertEqual(
+            migrated["previous_outcomes"],
+            {"carried": -1, "cold": 1},
+        )
         self.assertEqual(migrated["updates"], 8)
+        self.assertEqual(
+            migrated["schema"],
+            "immer.qwen3.5-mtp-markov-calibration/v2",
+        )
+        self.assertEqual(
+            migrated["updates_by_context"],
+            {"carried": 0, "cold": 8},
+        )
         self.assertEqual(
             migrated["rows"],
             [
@@ -252,6 +263,7 @@ class Qwen35MtpDraftTests(unittest.TestCase):
                     "alpha": 7,
                     "beta": 3,
                     "bucket": 6,
+                    "carried": False,
                     "position": 2,
                     "previous": 1,
                 }
@@ -355,8 +367,8 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         target_hidden = torch.randn((1, len(history), config.dim)).to(torch.bfloat16)
         provider.begin_request_state(history, target_hidden)
         steps_before = provider.metrics().draft_steps
-        provider._reliability[(0, 6, -1)] = [9, 1]
-        provider._reliability[(0, 6, 1)] = [9, 1]
+        provider._reliability[(False, 0, 6, -1)] = [9, 1]
+        provider._reliability[(False, 0, 6, 1)] = [9, 1]
         head = (
             torch.tensor([[16.0, 0.0]], dtype=torch.bfloat16),
             torch.tensor([[5, 6]], dtype=torch.long),
@@ -443,10 +455,18 @@ class Qwen35MtpDraftTests(unittest.TestCase):
             hidden[:, -1:],
         )
         self.assertEqual(restored_proposal.token_ids, full_proposal.token_ids)
-        self.assertEqual(
-            restored_proposal.token_confidences,
-            full_proposal.token_confidences,
+        self.assertTrue(
+            all(
+                carried <= cold
+                for carried, cold in zip(
+                    restored_proposal.token_confidences,
+                    full_proposal.token_confidences,
+                    strict=True,
+                )
+            )
         )
+        self.assertTrue(restored.metrics().carried_context)
+        self.assertFalse(full.metrics().carried_context)
         full.close()
         restored.close()
 
@@ -476,6 +496,94 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(carry.last_target_hidden, hidden[:, -1:]))
         provider.close()
 
+    def test_carried_reliability_is_separate_and_starts_at_beta_prior(self) -> None:
+        config = _config()
+        tensors = _tensors(config)
+        prefix = (4, 7, 11)
+        hidden = torch.randn((1, len(prefix), config.dim)).to(torch.bfloat16)
+        source = Qwen35MtpDraftProvider(
+            config,
+            _Pager(tensors),
+            proposal_width=3,
+        )
+        source.begin_request_state(prefix, hidden)
+        carry = source.export_carry(prefix)
+        source.close()
+        pager = _Pager(tensors)
+        provider = Qwen35MtpDraftProvider(
+            config,
+            pager,
+            proposal_width=3,
+            initial_carry=carry,
+        )
+        provider._reliability[(False, 0, 6, -1)] = [99, 1]
+        head = (
+            torch.tensor([[16.0, 0.0]], dtype=torch.bfloat16),
+            torch.tensor([[5, 6]], dtype=torch.long),
+        )
+
+        with mock.patch.object(pager, "topk_logits", return_value=head):
+            _token, cold_start, bucket = provider._scan(
+                torch.zeros((1, 1, config.dim), dtype=torch.bfloat16),
+                proposal_index=0,
+            )
+            provider._reliability[(True, 0, bucket, -1)] = [4, 1]
+            _token, matured, _bucket = provider._scan(
+                torch.zeros((1, 1, config.dim), dtype=torch.bfloat16),
+                proposal_index=0,
+            )
+
+        self.assertAlmostEqual(cold_start, 0.5)
+        self.assertAlmostEqual(matured, 4 / 5)
+        metrics = provider.metrics()
+        self.assertTrue(metrics.carried_context)
+        self.assertEqual(metrics.cold_calibration_states, 1)
+        self.assertEqual(metrics.carried_calibration_states, 1)
+        provider.close()
+
+    def test_context_split_calibration_persists_across_carry_restart(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        state_path = Path(temporary.name) / "mtp.json"
+        config = _config()
+        tensors = _tensors(config)
+        prefix = (4, 7, 11)
+        hidden = torch.randn((1, len(prefix), config.dim)).to(torch.bfloat16)
+        source = Qwen35MtpDraftProvider(
+            config,
+            _Pager(tensors),
+            proposal_width=3,
+            state_path=state_path,
+        )
+        source.begin_request_state(prefix, hidden)
+        carry = source.export_carry(prefix)
+        source._reliability = {
+            (False, 0, 6, -1): [99, 1],
+            (True, 0, 6, -1): [4, 1],
+        }
+        source._previous_outcomes = {False: 1, True: 0}
+        source._calibration_updates = 12
+        source._calibration_updates_by_context = {False: 8, True: 4}
+        source.close()
+
+        restored = Qwen35MtpDraftProvider(
+            config,
+            _Pager(tensors),
+            proposal_width=3,
+            state_path=state_path,
+            initial_carry=carry,
+        )
+
+        self.assertEqual(restored._previous_outcome, 0)
+        self.assertEqual(restored._reliability[(False, 0, 6, -1)], [99, 1])
+        self.assertEqual(restored._reliability[(True, 0, 6, -1)], [4, 1])
+        metrics = restored.metrics()
+        self.assertEqual(metrics.cold_calibration_updates, 8)
+        self.assertEqual(metrics.carried_calibration_updates, 4)
+        self.assertEqual(metrics.cold_calibration_states, 1)
+        self.assertEqual(metrics.carried_calibration_states, 1)
+        restored.close()
+
     def test_adaptive_exact_deeper_posterior_stops_and_pads(self) -> None:
         config = _config()
         pager = _Pager(_tensors(config))
@@ -490,9 +598,9 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         target_hidden = torch.randn((1, len(history), config.dim)).to(torch.bfloat16)
         provider.begin_request_state(history, target_hidden)
         steps_before = provider.metrics().draft_steps
-        provider._reliability[(0, 6, -1)] = [9, 1]
-        provider._reliability[(0, 6, 1)] = [9, 1]
-        provider._reliability[(1, 6, 1)] = [1, 1]
+        provider._reliability[(False, 0, 6, -1)] = [9, 1]
+        provider._reliability[(False, 0, 6, 1)] = [9, 1]
+        provider._reliability[(False, 1, 6, 1)] = [1, 1]
         head = (
             torch.tensor([[16.0, 0.0]], dtype=torch.bfloat16),
             torch.tensor([[5, 6]], dtype=torch.long),
@@ -531,7 +639,7 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         target_hidden = torch.randn((1, len(history), config.dim)).to(torch.bfloat16)
         provider.begin_request_state(history, target_hidden)
         steps_before = provider.metrics().draft_steps
-        provider._reliability[(0, 6, -1)] = [9, 1]
+        provider._reliability[(False, 0, 6, -1)] = [9, 1]
         head = (
             torch.tensor([[16.0, 0.0]], dtype=torch.bfloat16),
             torch.tensor([[127, 6]], dtype=torch.long),
@@ -600,7 +708,7 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         self.assertEqual(provider._committed_history, (*history, *extension))
         self.assertEqual(provider._next_position, len(history) + len(extension) - 1)
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.5-mtp-draft-provider/v3")
+        self.assertEqual(metrics.schema, "immer.qwen3.5-mtp-draft-provider/v4")
         self.assertEqual(metrics.advance_calls, 1)
         self.assertEqual(metrics.advanced_tokens, len(extension))
         self.assertFalse(metrics.pending)

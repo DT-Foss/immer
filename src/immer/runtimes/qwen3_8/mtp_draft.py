@@ -20,12 +20,14 @@ from .kernels import AttentionState, full_attention_core, rms_norm
 from .pager import Qwen38WeightPager
 
 
-QWEN35_MTP_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v3"
+QWEN35_MTP_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v4"
+_QWEN35_MTP_DRAFT_PROVIDER_V3_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v3"
 _QWEN35_MTP_DRAFT_PROVIDER_V2_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v2"
 _QWEN35_MTP_DRAFT_PROVIDER_LEGACY_SCHEMA = (
     "immer.qwen3.5-mtp-draft-provider/v1"
 )
-QWEN35_MTP_CALIBRATION_SCHEMA = "immer.qwen3.5-mtp-markov-calibration/v1"
+QWEN35_MTP_CALIBRATION_SCHEMA = "immer.qwen3.5-mtp-markov-calibration/v2"
+_QWEN35_MTP_CALIBRATION_V1_SCHEMA = "immer.qwen3.5-mtp-markov-calibration/v1"
 QWEN35_MTP_CARRY_SCHEMA = "immer.qwen3.5-mtp-attention-carry/v1"
 MTP_MATRIX_NAMES = (
     "mtp.fc.weight",
@@ -131,6 +133,11 @@ class Qwen35MtpDraftMetrics:
     calibration_states: int
     calibration_updates: int
     calibration_persistent: bool
+    carried_context: bool
+    cold_calibration_states: int
+    carried_calibration_states: int
+    cold_calibration_updates: int
+    carried_calibration_updates: int
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -213,9 +220,11 @@ class Qwen35MtpDraftProvider:
         self._pending_states: tuple[AttentionState, ...] = ()
         self._last_confidences: tuple[float, ...] = ()
         self._pending_gap_buckets: tuple[int, ...] = ()
-        self._reliability: dict[tuple[int, int, int], list[int]] = {}
-        self._previous_outcome = -1
+        self._carried_context = initial_carry is not None
+        self._reliability: dict[tuple[bool, int, int, int], list[int]] = {}
+        self._previous_outcomes = {False: -1, True: -1}
         self._calibration_updates = 0
+        self._calibration_updates_by_context = {False: 0, True: 0}
         self._adaptive_round_call = False
         self._load_calibration()
         self._closed = False
@@ -250,6 +259,14 @@ class Qwen35MtpDraftProvider:
             "q4_manifest_sha256": self.pager.q4_bank.identity["manifest_sha256"],
             "vocab_size": self.config.vocab_size,
         }
+
+    @property
+    def _previous_outcome(self) -> int:
+        return self._previous_outcomes[self._carried_context]
+
+    @_previous_outcome.setter
+    def _previous_outcome(self, value: int) -> None:
+        self._previous_outcomes[self._carried_context] = value
 
     def _carry_identity(self) -> tuple[object, ...]:
         source_metrics_callback = getattr(self.pager.source, "metrics", None)
@@ -329,6 +346,10 @@ class Qwen35MtpDraftProvider:
         try:
             document = json.loads(path.read_bytes())
             identity = self._calibration_identity()
+            v3_identity = {
+                **identity,
+                "provider": _QWEN35_MTP_DRAFT_PROVIDER_V3_SCHEMA,
+            }
             legacy_identity = {
                 **identity,
                 "provider": _QWEN35_MTP_DRAFT_PROVIDER_LEGACY_SCHEMA,
@@ -339,25 +360,74 @@ class Qwen35MtpDraftProvider:
             }
             if (
                 not isinstance(document, dict)
-                or document.get("schema") != QWEN35_MTP_CALIBRATION_SCHEMA
+                or document.get("schema")
+                not in (
+                    QWEN35_MTP_CALIBRATION_SCHEMA,
+                    _QWEN35_MTP_CALIBRATION_V1_SCHEMA,
+                )
                 or document.get("identity")
-                not in (identity, v2_identity, legacy_identity)
+                not in (identity, v3_identity, v2_identity, legacy_identity)
                 or not isinstance(document.get("rows"), list)
                 or isinstance(document.get("updates"), bool)
                 or not isinstance(document.get("updates"), int)
                 or document["updates"] < 0
-                or document.get("previous_outcome") not in {-1, 0, 1}
             ):
                 return
-            restored: dict[tuple[int, int, int], list[int]] = {}
+            schema = document["schema"]
+            if schema == _QWEN35_MTP_CALIBRATION_V1_SCHEMA:
+                if document.get("previous_outcome") not in {-1, 0, 1}:
+                    return
+                previous_outcomes = {
+                    False: document["previous_outcome"],
+                    True: -1,
+                }
+                updates_by_context = {False: document["updates"], True: 0}
+            else:
+                raw_previous = document.get("previous_outcomes")
+                raw_updates = document.get("updates_by_context")
+                if (
+                    not isinstance(raw_previous, dict)
+                    or set(raw_previous) != {"carried", "cold"}
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value not in {-1, 0, 1}
+                        for value in raw_previous.values()
+                    )
+                    or not isinstance(raw_updates, dict)
+                    or set(raw_updates) != {"carried", "cold"}
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                        for value in raw_updates.values()
+                    )
+                    or sum(raw_updates.values()) != document["updates"]
+                ):
+                    return
+                previous_outcomes = {
+                    False: raw_previous["cold"],
+                    True: raw_previous["carried"],
+                }
+                updates_by_context = {
+                    False: raw_updates["cold"],
+                    True: raw_updates["carried"],
+                }
+            restored: dict[tuple[bool, int, int, int], list[int]] = {}
             for row in document["rows"]:
-                if not isinstance(row, dict) or set(row) != {
+                expected_keys = {
                     "alpha",
                     "beta",
                     "bucket",
                     "position",
                     "previous",
-                }:
+                }
+                if schema == QWEN35_MTP_CALIBRATION_SCHEMA:
+                    expected_keys.add("carried")
+                if not isinstance(row, dict) or set(row) != expected_keys:
+                    return
+                carried = row.get("carried", False)
+                if not isinstance(carried, bool):
                     return
                 values = tuple(
                     row[key]
@@ -383,10 +453,11 @@ class Qwen35MtpDraftProvider:
                     or beta < 1
                 ):
                     return
-                restored[(position, bucket, previous)] = [alpha, beta]
+                restored[(carried, position, bucket, previous)] = [alpha, beta]
             self._reliability = restored
-            self._previous_outcome = document["previous_outcome"]
+            self._previous_outcomes = previous_outcomes
             self._calibration_updates = document["updates"]
+            self._calibration_updates_by_context = updates_by_context
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
             return
 
@@ -396,19 +467,27 @@ class Qwen35MtpDraftProvider:
             return
         document = {
             "identity": self._calibration_identity(),
-            "previous_outcome": self._previous_outcome,
+            "previous_outcomes": {
+                "carried": self._previous_outcomes[True],
+                "cold": self._previous_outcomes[False],
+            },
             "rows": [
                 {
                     "alpha": counts[0],
                     "beta": counts[1],
-                    "bucket": key[1],
-                    "position": key[0],
-                    "previous": key[2],
+                    "bucket": key[2],
+                    "carried": key[0],
+                    "position": key[1],
+                    "previous": key[3],
                 }
                 for key, counts in sorted(self._reliability.items())
             ],
             "schema": QWEN35_MTP_CALIBRATION_SCHEMA,
             "updates": self._calibration_updates,
+            "updates_by_context": {
+                "carried": self._calibration_updates_by_context[True],
+                "cold": self._calibration_updates_by_context[False],
+            },
         }
         data = json.dumps(
             document,
@@ -620,9 +699,13 @@ class Qwen35MtpDraftProvider:
         raw_confidence = max(0.0, min(0.999, 1.0 - math.exp(-gap)))
         bucket = self._gap_bucket(gap)
         previous = self._previous_outcome if proposal_index == 0 else 1
-        exact = self._reliability.get((proposal_index, bucket, previous))
+        exact = self._reliability.get(
+            (self._carried_context, proposal_index, bucket, previous)
+        )
         if exact is None and proposal_index > 0:
-            exact = self._reliability.get((0, bucket, previous))
+            exact = self._reliability.get(
+                (self._carried_context, 0, bucket, previous)
+            )
         alpha, beta = [1, 1] if exact is None else exact
         confidence = min(raw_confidence, alpha / (alpha + beta))
         del values, selected
@@ -876,7 +959,7 @@ class Qwen35MtpDraftProvider:
         previous = self._previous_outcome
         for index in range(verified_proposals):
             outcome = index < accepted_prefix_length
-            key = (index, buckets[index], previous)
+            key = (self._carried_context, index, buckets[index], previous)
             alpha, beta = self._reliability.setdefault(key, [1, 1])
             if outcome:
                 alpha += 1
@@ -884,6 +967,7 @@ class Qwen35MtpDraftProvider:
                 beta += 1
             self._reliability[key] = [alpha, beta]
             self._calibration_updates += 1
+            self._calibration_updates_by_context[self._carried_context] += 1
             previous = int(outcome)
             if not outcome:
                 break
@@ -1046,6 +1130,15 @@ class Qwen35MtpDraftProvider:
             calibration_states=len(self._reliability),
             calibration_updates=self._calibration_updates,
             calibration_persistent=self.state_path is not None,
+            carried_context=self._carried_context,
+            cold_calibration_states=sum(
+                1 for key in self._reliability if key[0] is False
+            ),
+            carried_calibration_states=sum(
+                1 for key in self._reliability if key[0] is True
+            ),
+            cold_calibration_updates=self._calibration_updates_by_context[False],
+            carried_calibration_updates=self._calibration_updates_by_context[True],
         )
 
     def close(self) -> None:
