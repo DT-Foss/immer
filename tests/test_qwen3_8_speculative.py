@@ -12,6 +12,7 @@ import torch
 
 from immer.knowledge import Streamer
 from immer.runtimes.qwen3_8 import (
+    FingerprintRollingK4DraftProvider,
     QWEN38_K2_SPECULATIVE_SCHEMA,
     QWEN38_K4_SPECULATIVE_ROUND_SCHEMA,
     QWEN38_K4_SPECULATIVE_SCHEMA,
@@ -951,6 +952,54 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         self.assertEqual(result.token_ids, tokens)
         self._assert_state_equal(candidate, baseline)
 
+    def test_real_markov_continues_from_an_exact_anchor_seed(self) -> None:
+        prompt = (1, 4)
+        reference = self._model()
+        expected, _evidence = reference.generate_greedy(
+            [prompt], max_new_tokens=4, head_block_rows=7
+        )
+        candidate = self._model()
+        prompt_hidden, _ = candidate.prefill([prompt], reset=True)
+        restored_seed = prompt_hidden[:, -1:].detach().clone()
+
+        class ExactRestoredMarkov(FingerprintRollingK4DraftProvider):
+            def propose_round(self, history, known_token):
+                proposal = super().propose_round(history, known_token)
+                position = len(history) - len(prompt)
+                tokens = (expected[position + 1], *proposal.token_ids[1:])
+                self._pending_planner = "beam"
+                return RollingDraftProposal.build(
+                    tokens,
+                    (0.10,) * len(tokens),
+                    (0.0,) * len(tokens),
+                    request_window_ceiling=len(tokens) + 1,
+                    provider_abi=proposal.provider_abi,
+                )
+
+        provider = ExactRestoredMarkov(
+            vocab_size=self.config.vocab_size,
+            proposal_width=3,
+        )
+        result = Qwen38K4SpeculativeDecoder(
+            candidate,
+            provider,
+            window_size=4,
+            adaptive_round_windows=True,
+        ).generate_rolling(
+            [prompt],
+            max_new_tokens=4,
+            restored_prefix_length=len(prompt),
+            restored_seed_hidden=restored_seed,
+            head_block_rows=7,
+        )
+
+        self.assertEqual(result.token_ids, expected)
+        self.assertEqual(result.evidence.prefill_forward_passes, 0)
+        self.assertEqual(provider._beam_verified_tokens, 3)
+        self.assertEqual(provider._beam_accepted_tokens, 3)
+        self._assert_state_equal(candidate, reference)
+        provider.close()
+
     def test_rolling_state_provider_cannot_mutate_target_hidden(self) -> None:
         prompt = (1, 4)
         baseline = self._model()
@@ -1237,12 +1286,66 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         self.assertEqual(len(row.provider_proposed_token_ids), 7)
         self.assertEqual(row.round_policy.selector, "markov-prefix-utility/v2")
 
+    def test_real_markov_verification_matches_the_budget_committed_prefix(
+        self,
+    ) -> None:
+        prompt = (1, 4)
+        teacher = self._model()
+        teacher_tokens, _ = teacher.generate_greedy(
+            [prompt], max_new_tokens=4, head_block_rows=7
+        )
+        reference = self._model()
+        expected, baseline = reference.generate_greedy(
+            [prompt], max_new_tokens=3, head_block_rows=7
+        )
+
+        class ExactWideMarkov(FingerprintRollingK4DraftProvider):
+            def propose_round(self, history, known_token):
+                proposal = super().propose_round(history, known_token)
+                position = len(history) - len(prompt)
+                tokens = tuple(teacher_tokens[position + 1 : position + 4])
+                self._pending_proposal = tokens
+                self._pending_planner = "beam"
+                return RollingDraftProposal.build(
+                    tokens,
+                    (0.99,) * len(tokens),
+                    (0.0,) * len(tokens),
+                    request_window_ceiling=len(tokens) + 1,
+                    provider_abi=proposal.provider_abi,
+                )
+
+        provider = ExactWideMarkov(
+            vocab_size=self.config.vocab_size,
+            proposal_width=3,
+        )
+        candidate = self._model()
+
+        result = Qwen38K4SpeculativeDecoder(
+            candidate,
+            provider,
+            window_size=4,
+            adaptive_round_windows=True,
+        ).generate_rolling(
+            [prompt],
+            max_new_tokens=3,
+            head_block_rows=7,
+        )
+
+        self.assertEqual(result.token_ids, expected)
+        self.assertEqual(result.evidence.used_window_sizes, (4,))
+        self.assertEqual(result.evidence.rounds[0].accepted_prefix_length, 2)
+        self.assertEqual(provider._beam_verified_tokens, 2)
+        self.assertEqual(provider._beam_accepted_tokens, 2)
+        self.assertEqual(provider.metrics().reconcile_calls, 1)
+        self._assert_state_equal(candidate, reference)
+        provider.close()
+
     def test_zero_weight_markov_proposal_uses_target_only_window_costs(self) -> None:
         class MarkovAdaptive(_AdaptiveRollingFromTokens):
             def propose_round(self, history, known_token):
                 return replace(
                     super().propose_round(history, known_token),
-                    provider_abi="immer.qwen3.8-markov-draft-provider/v26",
+                    provider_abi="immer.qwen3.8-markov-draft-provider/v27",
                 )
 
         prompt = (1, 4)
@@ -1314,6 +1417,60 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         self.assertEqual(result.evidence.used_window_sizes, (1, 1, 1))
         self.assertEqual(result.evidence.forward_passes, baseline.forward_passes)
         self._assert_state_equal(candidate, reference)
+
+    def test_real_markov_k1_commits_a_correct_virtual_target_match(self) -> None:
+        prompt = (1, 4)
+        reference = self._model()
+        expected, baseline = reference.generate_greedy(
+            [prompt], max_new_tokens=4, head_block_rows=7
+        )
+
+        class ExactK1Markov(FingerprintRollingK4DraftProvider):
+            def propose_round(self, history, known_token):
+                proposal = super().propose_round(history, known_token)
+                position = len(history) - len(prompt)
+                tokens = (expected[position + 1], *proposal.token_ids[1:])
+                self._pending_planner = "beam"
+                return RollingDraftProposal.build(
+                    tokens,
+                    (0.10,) * len(tokens),
+                    (0.0,) * len(tokens),
+                    request_window_ceiling=len(tokens) + 1,
+                    provider_abi=proposal.provider_abi,
+                )
+
+        provider = ExactK1Markov(
+            vocab_size=self.config.vocab_size,
+            proposal_width=3,
+        )
+        candidate = self._model()
+
+        with mock.patch.object(
+            candidate,
+            "stage_continuation_block",
+            side_effect=AssertionError("real Markov K1 must not stage"),
+        ):
+            result = Qwen38K4SpeculativeDecoder(
+                candidate,
+                provider,
+                window_size=4,
+                adaptive_round_windows=True,
+            ).generate_rolling(
+                [prompt],
+                max_new_tokens=4,
+                head_block_rows=7,
+            )
+
+        self.assertEqual(result.token_ids, expected)
+        self.assertEqual(result.evidence.used_window_sizes, (1, 1, 1))
+        self.assertEqual(result.evidence.forward_passes, baseline.forward_passes)
+        self._assert_state_equal(candidate, reference)
+        self.assertEqual(provider._beam_verified_tokens, 3)
+        self.assertEqual(provider._beam_accepted_tokens, 3)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.reconcile_calls, 3)
+        self.assertEqual(metrics.updates, 1)
+        provider.close()
 
     def test_rolling_k16_full_acceptance_uses_one_target_wave(self) -> None:
         prompt = (1, 4)

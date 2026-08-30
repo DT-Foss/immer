@@ -1762,12 +1762,17 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         self,
         accepted_prefix_length: int,
         verified_proposals: int,
+        *,
+        virtual: bool = False,
     ) -> tuple[int, float]:
+        callback_name = (
+            "observe_virtual_verification" if virtual else "observe_verification"
+        )
         missing = object()
         if (
             inspect.getattr_static(
                 self.draft_provider,
-                "observe_verification",
+                callback_name,
                 missing,
             )
             is missing
@@ -1779,9 +1784,9 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         integrity_bytes = self.model.state_bytes
         failure: Exception | None = None
         try:
-            callback = getattr(self.draft_provider, "observe_verification")
+            callback = getattr(self.draft_provider, callback_name)
             if not callable(callback):
-                raise TypeError("draft provider observe_verification is not callable")
+                raise TypeError(f"draft provider {callback_name} is not callable")
             callback(accepted_prefix_length, verified_proposals)
         except Exception as exc:
             failure = exc
@@ -1795,12 +1800,12 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         if changed:
             self.model.reset_state(release=True)
             raise Qwen38SpeculativeError(
-                "rolling verification observer changed target model state"
+                f"rolling {callback_name} observer changed target model state"
             )
         if failure is not None:
             self.model.reset_state(release=True)
             raise Qwen38SpeculativeError(
-                "rolling verification observer failed: "
+                f"rolling {callback_name} observer failed: "
                 f"{type(failure).__name__}: {failure}"
             ) from failure
         return integrity_bytes, integrity_seconds
@@ -1884,21 +1889,43 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         )
         if len(prompt) + max_new_tokens > self.model.max_seq_len:
             raise ValueError("generation would exceed max_seq_len")
+        exact_restore = False
         if restored_prefix_length is None:
             if restored_seed_hidden is not None:
                 raise ValueError("restored_seed_hidden requires restored_prefix_length")
-        elif (
-            isinstance(restored_prefix_length, bool)
-            or not isinstance(restored_prefix_length, int)
-            or not 1 <= restored_prefix_length < len(prompt)
-            or restored_seed_hidden is not None
-            or self.model.next_position != restored_prefix_length
-            or self.model.state_batch_size != 1
-            or self.model.state_poisoned
-        ):
-            raise ValueError(
-                "rolling restore requires a committed strict prompt prefix"
-            )
+        else:
+            if (
+                isinstance(restored_prefix_length, bool)
+                or not isinstance(restored_prefix_length, int)
+                or not 1 <= restored_prefix_length <= len(prompt)
+                or self.model.next_position != restored_prefix_length
+                or self.model.state_batch_size != 1
+                or self.model.state_poisoned
+            ):
+                raise ValueError(
+                    "rolling restore requires a committed prompt prefix"
+                )
+            exact_restore = restored_prefix_length == len(prompt)
+            if exact_restore:
+                if not isinstance(restored_seed_hidden, torch.Tensor):
+                    raise TypeError(
+                        "an exact rolling restore requires a hidden-state tensor"
+                    )
+                if (
+                    not restored_seed_hidden.is_floating_point()
+                    or tuple(restored_seed_hidden.shape)
+                    != (1, 1, self.model.config.dim)
+                    or restored_seed_hidden.dtype != self.model.pager.compute_dtype
+                    or not self.model._on_pager_device(restored_seed_hidden)
+                    or not bool(torch.isfinite(restored_seed_hidden).all().item())
+                ):
+                    raise Qwen38SpeculativeError(
+                        "restored exact-prefix seed differs from rolling execution"
+                    )
+            elif restored_seed_hidden is not None:
+                raise ValueError(
+                    "a suffix rolling restore may not provide an exact-prefix seed"
+                )
         if isinstance(eos_token_ids, (str, bytes)):
             raise TypeError("eos_token_ids must be an iterable of integers")
         eos: set[int] = set()
@@ -1922,6 +1949,10 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             hidden, prefill_evidence = self.model.prefill(
                 [prompt], reset=True, tokenwise=False
             )
+        elif exact_restore:
+            assert restored_seed_hidden is not None
+            hidden = restored_seed_hidden.detach()
+            prefill_evidence = ()
         else:
             hidden, prefill_evidence = self.model.prefill(
                 [prompt[restored_prefix_length:]],
@@ -2054,6 +2085,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                     self._observe_rolling_verification_provider(
                         virtual_accepted,
                         int(bool(provider_proposal)),
+                        virtual=True,
                     )
                 )
                 guard_bytes += verification_bytes
@@ -2121,19 +2153,12 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                 accepted < active_window - 1 and proposal[accepted] == targets[accepted]
             ):
                 accepted += 1
-            verified_proposals = (
+            matched_prefix_length = accepted
+            target_verified_proposals = (
                 accepted
                 if accepted == len(proposal)
                 else min(len(proposal), accepted + 1)
             )
-            verification_bytes, verification_seconds = (
-                self._observe_rolling_verification_provider(
-                    accepted,
-                    verified_proposals,
-                )
-            )
-            guard_bytes += verification_bytes
-            guard_seconds += verification_seconds
             accepted = min(accepted, remaining - 1)
             eos_offset = next(
                 (
@@ -2145,6 +2170,19 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             )
             if eos_offset is not None:
                 accepted = eos_offset + 1
+            verified_proposals = (
+                accepted
+                if accepted < matched_prefix_length
+                else target_verified_proposals
+            )
+            verification_bytes, verification_seconds = (
+                self._observe_rolling_verification_provider(
+                    accepted,
+                    verified_proposals,
+                )
+            )
+            guard_bytes += verification_bytes
+            guard_seconds += verification_seconds
             emitted = (pending_token, *proposal[:accepted])
             stopped = eos_offset is not None
             terminal = stopped or len(emitted) == remaining

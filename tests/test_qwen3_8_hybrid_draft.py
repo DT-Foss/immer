@@ -69,6 +69,7 @@ class _Markov:
         self.propose_calls = []
         self.discard_calls = 0
         self.verification_calls = []
+        self.virtual_verification_calls = []
         self.reconcile_calls = []
         self.advance_calls = []
         self.external_reconcile_calls = []
@@ -138,6 +139,9 @@ class _Markov:
     def observe_verification(self, accepted, verified):
         self.verification_calls.append((accepted, verified))
 
+    def observe_virtual_verification(self, accepted, verified):
+        self.virtual_verification_calls.append((accepted, verified))
+
     def reconcile_prefix(self, history):
         if not self.pending:
             raise AssertionError("reconcile without proposal")
@@ -185,6 +189,7 @@ class _Mtp:
         self.begin_calls = []
         self.propose_calls = []
         self.verification_calls = []
+        self.virtual_verification_calls = []
         self.reconcile_calls = []
         self.advance_calls = []
         self.final_calls = []
@@ -210,6 +215,9 @@ class _Mtp:
 
     def observe_verification(self, accepted, verified):
         self.verification_calls.append((accepted, verified))
+
+    def observe_virtual_verification(self, accepted, verified):
+        self.virtual_verification_calls.append((accepted, verified))
 
     def reconcile_prefix(self, history):
         if not self.pending:
@@ -437,6 +445,23 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         provider.close()
         provider.close()
         self.assertEqual(close_order, ["mtp", "markov"])
+
+    def test_virtual_k1_verification_routes_only_to_the_selected_mtp(self) -> None:
+        markov = _Markov(0.01)
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        prompt = (1, 2, 3, 4)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        provider.propose_round_state(prompt, 5, hidden[:, -1:])
+        provider.observe_virtual_verification(1, 1)
+        provider.reconcile_prefix((*prompt, 5))
+
+        self.assertEqual(mtp.virtual_verification_calls, [(1, 1)])
+        self.assertEqual(markov.virtual_verification_calls, [])
+        provider.observe_final((*prompt, 5, 9))
+        provider.close()
         self.assertTrue(markov.closed)
         self.assertTrue(mtp.closed)
 

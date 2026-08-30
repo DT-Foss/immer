@@ -299,7 +299,7 @@ class Qwen35MtpDraftTests(unittest.TestCase):
             1,
         )
         self.assertTrue(provider.metrics().pending)
-        provider.observe_verification(0, 1)
+        provider.observe_virtual_verification(0, 1)
         provider.reconcile_prefix((*history, 23))
         self.assertEqual(provider._next_position, len(history))
         metrics = provider.metrics()

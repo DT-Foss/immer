@@ -114,7 +114,7 @@ _QWEN38_DEPLOYMENT_MARKOV_ATLAS = (
 _QWEN38_DEPLOYMENT_O1_RETENTION = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-markov-o1-retention-v1.json"
 )
-_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v26"
+_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v27"
 _QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v18"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v2"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
@@ -233,9 +233,6 @@ def _resolve_qwen38_markov_draft(
     draft_mode = getattr(args, "draft_mode", None)
     markov_state = getattr(args, "markov_draft_state", None)
     mtp_state = getattr(args, "mtp_draft_state", None)
-    anchor_active = getattr(args, "qwen38_anchor_cache", None) is not None and not bool(
-        getattr(args, "no_anchor_cache", False)
-    )
     disabled = bool(getattr(args, "no_markov_draft", False))
     if disabled:
         if draft_mode in {"hybrid", "markov"} or markov_state is not None:
@@ -250,22 +247,6 @@ def _resolve_qwen38_markov_draft(
             draft_mode = "hybrid"
         elif mtp_state is not None:
             draft_mode = "mtp"
-    if (
-        draft_mode is None
-        and getattr(args, "draft_bundle", None) is None
-        and markov_state is None
-        and mtp_state is None
-        and bundle_path == _QWEN38_DEPLOYMENT_ROOT
-        and q4_root is not None
-        and q4_root.name == "q4-base-v3-mtp"
-        and not anchor_active
-        and _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE.is_file()
-    ):
-        return (
-            "hybrid",
-            str(_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE),
-            str(_QWEN38_DEPLOYMENT_MTP_STATE),
-        )
     if (
         draft_mode is None
         and getattr(args, "draft_bundle", None) is None
@@ -1625,7 +1606,10 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--draft-mode",
         choices=("qwen35", "markov", "mtp", "hybrid"),
-        help="rolling draft provider; inferred as qwen35 when --draft-bundle is set",
+        help=(
+            "rolling draft provider; deployed chat defaults to zero-weight Markov, "
+            "while MTP and hybrid are explicit opt-ins"
+        ),
     )
     chat.add_argument(
         "--draft-window",

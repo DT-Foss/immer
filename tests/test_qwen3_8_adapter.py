@@ -2111,7 +2111,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(options["draft_mode"], "markov")
         self.assertEqual(options["markov_draft_state_path"], str(state))
 
-    def test_cli_deployment_cascades_markov_into_embedded_mtp(self) -> None:
+    def test_cli_deployment_uses_markov_without_reading_embedded_mtp(self) -> None:
         qwen = _chat(_Runtime())
         with tempfile.TemporaryDirectory() as temporary:
             deployed = Path(temporary) / "deployed"
@@ -2135,6 +2135,40 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 redirect_stdout(io.StringIO()),
             ):
                 code = main(["chat", "hello", "--raw-qwen"])
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["q4_root"], str(q4))
+        self.assertEqual(options["draft_mode"], "markov")
+        self.assertEqual(options["markov_draft_state_path"], str(markov_state))
+        self.assertIsNone(options["mtp_draft_state_path"])
+
+    def test_cli_deployment_keeps_hybrid_as_an_explicit_opt_in(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            q4 = deployed / "causal" / "q4-base-v3-mtp"
+            q4.mkdir(parents=True)
+            markov_state = Path(temporary) / "qwen-markov.bin"
+            markov_state.write_bytes(b"fixture")
+            mtp_state = Path(temporary) / "qwen-mtp.json"
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE",
+                    markov_state,
+                ),
+                patch("immer.cli._QWEN38_DEPLOYMENT_MTP_STATE", mtp_state),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
+                code = main(
+                    ["chat", "hello", "--raw-qwen", "--draft-mode", "hybrid"]
+                )
 
         self.assertEqual(code, 0)
         options = constructor.call_args.kwargs

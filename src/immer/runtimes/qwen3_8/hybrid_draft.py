@@ -671,6 +671,23 @@ class Qwen38MarkovMtpDraftProvider:
         if callable(callback):
             callback(accepted_prefix_length, verified_proposals)
 
+    def observe_virtual_verification(
+        self,
+        accepted_prefix_length: int,
+        verified_proposals: int,
+        /,
+    ) -> None:
+        self._require_open_request()
+        pending = self._pending_provider
+        if pending is None:
+            raise Qwen38MarkovMtpDraftError(
+                "virtual verification has no pending hybrid proposal"
+            )
+        owner = self.markov_provider if pending == "markov" else self._mtp_provider
+        callback = getattr(owner, "observe_virtual_verification", None)
+        if callable(callback):
+            callback(accepted_prefix_length, verified_proposals)
+
     def reconcile_prefix(self, history: tuple[int, ...], /) -> None:
         self._require_open_request()
         pending = self._pending_provider

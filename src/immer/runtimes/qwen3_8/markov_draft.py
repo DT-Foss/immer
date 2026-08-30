@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v26"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v27"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -1560,6 +1560,7 @@ class FingerprintRollingK4DraftProvider:
         self._beam_accepted_tokens = 0
         self._pending_accepted_prefix_length: int | None = None
         self._pending_verified_proposals: int | None = None
+        self._pending_verification_virtual = False
         self._pending_import_digest: str | None = None
         self._persistent_symbols_cache: tuple[str, ...] | None = None
         self._persistent_expert_models: dict[str, _TransitionFingerprint] = {}
@@ -3754,6 +3755,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_planner = None
         self._pending_accepted_prefix_length = None
         self._pending_verified_proposals = None
+        self._pending_verification_virtual = False
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._reconcile_calls += 1
@@ -3781,13 +3783,50 @@ class FingerprintRollingK4DraftProvider:
             raise MarkovDraftError("proposal verification was already observed")
         self._pending_accepted_prefix_length = accepted_prefix_length
         self._pending_verified_proposals = verified_proposals
+        self._pending_verification_virtual = False
+
+    def observe_virtual_verification(
+        self,
+        accepted_prefix_length: int,
+        verified_proposals: int,
+        /,
+    ) -> None:
+        """Record a target-checked K1 prediction that was not emitted yet."""
+
+        if self._pending_base is None or self._pending_proposal is None:
+            raise MarkovDraftError("virtual verification requires a pending proposal")
+        if (
+            isinstance(accepted_prefix_length, bool)
+            or not isinstance(accepted_prefix_length, int)
+            or accepted_prefix_length < 0
+            or isinstance(verified_proposals, bool)
+            or not isinstance(verified_proposals, int)
+            or verified_proposals < 0
+            or accepted_prefix_length > verified_proposals
+            or verified_proposals > 1
+        ):
+            raise ValueError("virtual verification prefix counts are invalid")
+        if self._pending_verified_proposals is not None:
+            raise MarkovDraftError("proposal verification was already observed")
+        self._pending_accepted_prefix_length = accepted_prefix_length
+        self._pending_verified_proposals = verified_proposals
+        self._pending_verification_virtual = True
 
     def _commit_pending_verification(self, accepted_prefix_length: int) -> None:
         observed = self._pending_accepted_prefix_length
         verified = self._pending_verified_proposals
         if observed is None and verified is None:
             return
-        if observed is None or verified is None or observed != accepted_prefix_length:
+        if observed is None or verified is None:
+            raise MarkovDraftError(
+                "verification acceptance differs from reconciled prefix"
+            )
+        if self._pending_verification_virtual:
+            if accepted_prefix_length != 0:
+                raise MarkovDraftError(
+                    "virtual verification requires an uncommitted proposal"
+                )
+        elif observed != accepted_prefix_length:
             raise MarkovDraftError(
                 "verification acceptance differs from reconciled prefix"
             )
@@ -3915,6 +3954,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_planner = None
         self._pending_accepted_prefix_length = None
         self._pending_verified_proposals = None
+        self._pending_verification_virtual = False
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._reconcile_calls += 1
@@ -3942,6 +3982,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_planner = None
         self._pending_accepted_prefix_length = None
         self._pending_verified_proposals = None
+        self._pending_verification_virtual = False
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._last_round_proposal = None
@@ -4331,6 +4372,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_planner = None
         self._pending_accepted_prefix_length = None
         self._pending_verified_proposals = None
+        self._pending_verification_virtual = False
         self._carry_feedback = None
         self._carry_feedback_position = None
         self._carry_feedback_teacher_forced = False

@@ -1383,6 +1383,28 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertIsNone(provider._pending_verified_proposals)
         provider.close()
 
+    def test_beam_virtual_k1_match_is_committed_without_emitting_the_draft(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        prompt = (1, 2)
+        provider.begin_request(prompt)
+        provider.propose_round(prompt, 3)
+        provider._pending_planner = "beam"
+
+        provider.observe_virtual_verification(1, 1)
+        provider.reconcile_prefix((*prompt, 3))
+
+        self.assertEqual(provider._beam_verified_tokens, 1)
+        self.assertEqual(provider._beam_accepted_tokens, 1)
+        self.assertIsNone(provider._pending_accepted_prefix_length)
+        self.assertIsNone(provider._pending_verified_proposals)
+        self.assertFalse(provider._pending_verification_virtual)
+        provider.close()
+
     def test_atlas_ranking_score_is_not_served_as_acceptance_probability(self) -> None:
         class Expert:
             @staticmethod

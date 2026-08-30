@@ -746,6 +746,18 @@ class Qwen35MtpDraftProvider:
         except OSError:
             pass
 
+    def observe_virtual_verification(
+        self,
+        accepted_prefix_length: int,
+        verified_proposals: int,
+        /,
+    ) -> None:
+        """Calibrate one target-checked K1 draft that remains uncommitted."""
+
+        if verified_proposals > 1:
+            raise ValueError("virtual MTP verification covers at most one proposal")
+        self.observe_verification(accepted_prefix_length, verified_proposals)
+
     def reconcile_prefix(self, history: tuple[int, ...], /) -> None:
         committed = self._history(history, label="MTP reconciled history")
         base = self._pending_base
