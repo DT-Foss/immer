@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v34"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v35"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -44,7 +44,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v25"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v26"
 _STATE_PREFIX = b"IMMD\x09"
 _V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
@@ -1300,6 +1300,9 @@ class MarkovDraftMetrics:
     request_position_updates: int
     max_request_position_maturity: float
     request_lookahead_updates: int
+    request_regime_changes: int
+    request_surprise_mean: float
+    request_surprise_cusum: float
     regime_generation: int
     surprise_mean: float
     surprise_cusum: float
@@ -1631,6 +1634,11 @@ class FingerprintRollingK4DraftProvider:
         self._request_lookahead_hits: list[int] | None = None
         self._request_lookahead_greedy_hits: list[int] | None = None
         self._request_lookahead_updates = 0
+        self._request_surprise_mean: float | None = None
+        self._request_surprise_deviation: float | None = None
+        self._request_surprise_cusum: float | None = None
+        self._request_feedback_count = 0
+        self._request_regime_changes = 0
         self._external_reconcile_calls = 0
         self._external_feedback_tokens = 0
         self._teacher_forced_predictions = 0
@@ -3450,6 +3458,40 @@ class FingerprintRollingK4DraftProvider:
             weight * probability
             for weight, probability in zip(weights, probabilities, strict=True)
         )
+        surprise = -math.log(max(mixture_probability, 1e-12))
+        previous_mean = (
+            self._state.surprise_mean
+            if self._request_surprise_mean is None
+            else self._request_surprise_mean
+        )
+        previous_deviation = (
+            self._state.surprise_deviation
+            if self._request_surprise_deviation is None
+            else self._request_surprise_deviation
+        )
+        previous_cusum = (
+            self._state.surprise_cusum
+            if self._request_surprise_cusum is None
+            else self._request_surprise_cusum
+        )
+        total_feedback = self._state.feedback_count + self._request_feedback_count
+        z_score = (
+            0.0
+            if total_feedback == 0
+            else (surprise - previous_mean) / max(previous_deviation, 1e-6)
+        )
+        next_mean = (
+            (1.0 - self.SURPRISE_RATE) * previous_mean
+            + self.SURPRISE_RATE * surprise
+        )
+        next_deviation = (
+            (1.0 - self.SURPRISE_RATE) * previous_deviation
+            + self.SURPRISE_RATE * abs(surprise - previous_mean)
+        )
+        next_cusum = max(
+            0.0,
+            self.CUSUM_DECAY * previous_cusum + z_score - self.CUSUM_DRIFT,
+        )
         logs = list(
             self._combined_rapidities()
             if self._request_expert_rapidities is None
@@ -3464,7 +3506,20 @@ class FingerprintRollingK4DraftProvider:
                 + self.EXPERT_LEARNING_RATE * advantage
             )
         center = sum(logs) / len(logs)
-        self._request_expert_rapidities = tuple(value - center for value in logs)
+        logs = [value - center for value in logs]
+        regime_change = (
+            total_feedback + 1 >= self.REGIME_WARMUP
+            and next_cusum > self.CUSUM_THRESHOLD
+        )
+        if regime_change:
+            logs = [self.REGIME_RAPIDITY_SHRINK * value for value in logs]
+            next_cusum = 0.0
+            self._request_regime_changes += 1
+        self._request_expert_rapidities = tuple(logs)
+        self._request_surprise_mean = next_mean
+        self._request_surprise_deviation = next_deviation
+        self._request_surprise_cusum = next_cusum
+        self._request_feedback_count += 1
         after = self._weights()
         shift = 0.5 * sum(
             abs(left - right) for left, right in zip(before, after, strict=True)
@@ -4528,6 +4583,11 @@ class FingerprintRollingK4DraftProvider:
             else list(self._request_lookahead_greedy_hits)
         )
         original_request_lookahead_updates = self._request_lookahead_updates
+        original_request_surprise_mean = self._request_surprise_mean
+        original_request_surprise_deviation = self._request_surprise_deviation
+        original_request_surprise_cusum = self._request_surprise_cusum
+        original_request_feedback_count = self._request_feedback_count
+        original_request_regime_changes = self._request_regime_changes
         try:
             if (
                 self._last_confirmed_length is not None
@@ -4552,6 +4612,10 @@ class FingerprintRollingK4DraftProvider:
             self._request_lookahead_observations = None
             self._request_lookahead_hits = None
             self._request_lookahead_greedy_hits = None
+            self._request_surprise_mean = None
+            self._request_surprise_deviation = None
+            self._request_surprise_cusum = None
+            self._request_feedback_count = 0
             for (
                 feedback,
                 token,
@@ -4649,6 +4713,11 @@ class FingerprintRollingK4DraftProvider:
                 original_request_lookahead_greedy_hits
             )
             self._request_lookahead_updates = original_request_lookahead_updates
+            self._request_surprise_mean = original_request_surprise_mean
+            self._request_surprise_deviation = original_request_surprise_deviation
+            self._request_surprise_cusum = original_request_surprise_cusum
+            self._request_feedback_count = original_request_feedback_count
+            self._request_regime_changes = original_request_regime_changes
             raise
 
     def _persist(self) -> None:
@@ -4784,6 +4853,17 @@ class FingerprintRollingK4DraftProvider:
             request_position_updates=self._request_position_updates,
             max_request_position_maturity=self._max_request_position_maturity,
             request_lookahead_updates=self._request_lookahead_updates,
+            request_regime_changes=self._request_regime_changes,
+            request_surprise_mean=(
+                self._state.surprise_mean
+                if self._request_surprise_mean is None
+                else self._request_surprise_mean
+            ),
+            request_surprise_cusum=(
+                self._state.surprise_cusum
+                if self._request_surprise_cusum is None
+                else self._request_surprise_cusum
+            ),
             regime_generation=self._state.regime_generation,
             surprise_mean=self._state.surprise_mean,
             surprise_cusum=self._state.surprise_cusum,
@@ -4907,6 +4987,10 @@ class FingerprintRollingK4DraftProvider:
         self._request_lookahead_observations = None
         self._request_lookahead_hits = None
         self._request_lookahead_greedy_hits = None
+        self._request_surprise_mean = None
+        self._request_surprise_deviation = None
+        self._request_surprise_cusum = None
+        self._request_feedback_count = 0
         self._request_local_cache_history = None
         self._request_local_cache = None
         self._episode_feedback.clear()

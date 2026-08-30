@@ -1777,6 +1777,94 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         actual.close()
         expected.close()
 
+    def test_request_surprise_resets_rapidities_on_an_abrupt_regime(self) -> None:
+        trigger = FingerprintRollingK4DraftProvider(vocab_size=32)
+        control = FingerprintRollingK4DraftProvider(vocab_size=32)
+        for provider in (trigger, control):
+            provider._state = replace(
+                provider._state,
+                feedback_count=16,
+                surprise_mean=0.0,
+                surprise_deviation=1.0,
+                surprise_cusum=7.9,
+            )
+            provider.begin_request((20, 21))
+        control.CUSUM_THRESHOLD = 1e9
+        correct = trigger._symbol(7)
+        other = trigger._symbol(8)
+        feedback = tuple(
+            (
+                ({correct: 0.99, other: 0.01}, 7)
+                if index == 0
+                else ({correct: 0.01, other: 0.99}, 8)
+            )
+            for index in range(len(trigger._experts))
+        )
+        state_before = trigger._state
+
+        trigger._record_confirmed_feedback(feedback, 7, 0, 7, 7, 0.0)
+        control._record_confirmed_feedback(feedback, 7, 0, 7, 7, 0.0)
+
+        trigger_peak = max(abs(value) for value in trigger._request_expert_rapidities)
+        control_peak = max(abs(value) for value in control._request_expert_rapidities)
+        self.assertEqual(trigger.metrics().request_regime_changes, 1)
+        self.assertEqual(control.metrics().request_regime_changes, 0)
+        self.assertEqual(trigger.metrics().request_surprise_cusum, 0.0)
+        self.assertGreater(control.metrics().request_surprise_cusum, 8.0)
+        self.assertAlmostEqual(
+            trigger_peak,
+            control_peak * trigger.REGIME_RAPIDITY_SHRINK,
+        )
+        self.assertIs(trigger._state, state_before)
+        self.assertEqual(trigger._state.regime_generation, 0)
+        trigger.close()
+        control.close()
+
+    def test_request_regime_is_persisted_exactly_once_at_finalization(self) -> None:
+        prompt = (20,)
+        actual = FingerprintRollingK4DraftProvider(vocab_size=32)
+        expected = FingerprintRollingK4DraftProvider(vocab_size=32)
+        for provider in (actual, expected):
+            provider._state = replace(
+                provider._state,
+                feedback_count=16,
+                surprise_mean=0.0,
+                surprise_deviation=1.0,
+                surprise_cusum=7.9,
+            )
+            provider.begin_request(prompt)
+        correct = actual._symbol(7)
+        other = actual._symbol(8)
+        feedback = tuple(
+            (
+                ({correct: 0.99, other: 0.01}, 7)
+                if index == 0
+                else ({correct: 0.01, other: 0.99}, 8)
+            )
+            for index in range(len(actual._experts))
+        )
+
+        expected._apply_council_feedback(feedback, 7, 0, 7, 7)
+        actual._record_confirmed_feedback(feedback, 7, 0, 7, 7, 0.0)
+        self.assertEqual(actual._state.regime_generation, 0)
+        self.assertEqual(actual.metrics().request_regime_changes, 1)
+        actual.observe_final((*prompt, 7))
+
+        self.assertEqual(
+            actual._state.expert_log_weights,
+            expected._state.expert_log_weights,
+        )
+        self.assertEqual(actual._state.surprise_mean, expected._state.surprise_mean)
+        self.assertEqual(
+            actual._state.surprise_deviation,
+            expected._state.surprise_deviation,
+        )
+        self.assertEqual(actual._state.surprise_cusum, expected._state.surprise_cusum)
+        self.assertEqual(actual._state.regime_generation, 1)
+        self.assertIsNone(actual._request_surprise_mean)
+        actual.close()
+        expected.close()
+
     def test_beam_proposal_keeps_feedback_reconciliation_exact(self) -> None:
         class PlanningExpert:
             @staticmethod
@@ -2882,6 +2970,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             if provider._request_lookahead_greedy_hits is None
             else list(provider._request_lookahead_greedy_hits)
         )
+        before_request_surprise_mean = provider._request_surprise_mean
+        before_request_surprise_deviation = provider._request_surprise_deviation
+        before_request_surprise_cusum = provider._request_surprise_cusum
 
         with (
             mock.patch.object(
@@ -2942,6 +3033,22 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(
             after_failure.request_lookahead_updates,
             before_metrics.request_lookahead_updates,
+        )
+        self.assertEqual(
+            provider._request_surprise_mean,
+            before_request_surprise_mean,
+        )
+        self.assertEqual(
+            provider._request_surprise_deviation,
+            before_request_surprise_deviation,
+        )
+        self.assertEqual(
+            provider._request_surprise_cusum,
+            before_request_surprise_cusum,
+        )
+        self.assertEqual(
+            after_failure.request_regime_changes,
+            before_metrics.request_regime_changes,
         )
         self.assertEqual(
             after_failure.council_feedback,
