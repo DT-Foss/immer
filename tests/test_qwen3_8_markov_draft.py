@@ -1300,6 +1300,139 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(cooled_round.recommended_window, 1)
         provider.close()
 
+    def test_request_local_agent_learns_repeated_context_inside_one_answer(
+        self,
+    ) -> None:
+        state_path = self.root / "request-local-agent.bin"
+        seed = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=256,
+            proposal_width=3,
+        )
+        seed.observe_final((8, 9, 10, 11, 12, 13, 14, 15))
+        seed.close()
+        persisted = state_path.read_bytes()
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=256,
+            proposal_width=3,
+        )
+        prompt = (30, 31)
+        confirmed = (
+            1,
+            2,
+            7,
+            4,
+            2,
+            3,
+            1,
+            2,
+            7,
+            5,
+            2,
+            3,
+            1,
+            2,
+            7,
+            6,
+            2,
+            3,
+            1,
+            2,
+        )
+        provider.begin_request(prompt)
+        state_before = provider._state
+
+        options = provider._request_local_options((*prompt, *confirmed), limit=8)
+        proposal = provider.propose_round(
+            (*prompt, *confirmed[:-1]),
+            confirmed[-1],
+        )
+        language = provider.language_evidence_for_pending(proposal.token_ids)
+
+        self.assertEqual(options[0][0], provider._symbol(7))
+        self.assertEqual(options[0][2:], (2, 2, 4))
+        self.assertGreater(options[0][1], 0.59)
+        self.assertEqual(proposal.token_ids[0], 7)
+        self.assertEqual(provider._pending_planner, "beam")
+        self.assertGreater(language[0].online_score, 0.59)
+        self.assertEqual(language[0].online_support, 2)
+        self.assertIs(provider._state, state_before)
+
+        provider.discard_pending_proposal()
+        provider.close()
+        self.assertEqual(state_path.read_bytes(), persisted)
+
+    def test_request_local_agent_never_trains_on_prompt_tokens(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        prompt = (1, 2, 7, 1, 2, 7, 1, 2)
+        provider.begin_request(prompt)
+
+        self.assertEqual(provider._request_local_options(prompt, limit=8), ())
+        self.assertIsNone(provider._request_local_fingerprint((*prompt, 3)))
+        provider.close()
+
+    def test_request_local_agent_uses_corrections_but_not_rejected_drafts(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        prompt = (30, 31)
+        provider.begin_request(prompt)
+
+        first = provider.propose_round(prompt, 1)
+        rejected_first = first.token_ids[0]
+        correction_first = next(
+            token for token in range(32) if token not in {*prompt, 1, rejected_first}
+        )
+        provider.observe_virtual_verification(0, 1)
+        provider.reconcile_prefix((*prompt, 1))
+
+        second_history = (*prompt, 1)
+        second = provider.propose_round(second_history, correction_first)
+        rejected_second = second.token_ids[0]
+        correction_second = next(
+            token
+            for token in range(32)
+            if token
+            not in {
+                *prompt,
+                1,
+                rejected_first,
+                correction_first,
+                rejected_second,
+            }
+        )
+        provider.observe_virtual_verification(0, 1)
+        provider.reconcile_prefix((*second_history, correction_first))
+
+        third_history = (*second_history, correction_first)
+        provider.propose_round(third_history, correction_second)
+        local = provider._request_local_fingerprint(
+            (*third_history, correction_second)
+        )
+
+        self.assertIsNotNone(local)
+        assert local is not None
+        vocabulary = set(local[0].vocabulary)
+        self.assertIn(provider._symbol(correction_first), vocabulary)
+        self.assertIn(provider._symbol(correction_second), vocabulary)
+        if rejected_first not in {1, correction_first, correction_second}:
+            self.assertNotIn(provider._symbol(rejected_first), vocabulary)
+        if rejected_second not in {1, correction_first, correction_second}:
+            self.assertNotIn(provider._symbol(rejected_second), vocabulary)
+
+        provider.discard_pending_proposal()
+        provider.close()
+
     def test_beam_proposal_keeps_feedback_reconciliation_exact(self) -> None:
         class PlanningExpert:
             @staticmethod

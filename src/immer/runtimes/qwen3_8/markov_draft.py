@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v29"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v30"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -224,6 +224,79 @@ class _TransitionFingerprint:
                 )
             )
         return max(candidates, default=(0.0, 0, 0, 0))
+
+    def contextual_confidence(
+        self,
+        context: Sequence[str],
+        token: str,
+        *,
+        min_order: int,
+        min_support: int,
+        support_scale: float,
+    ) -> tuple[float, int, int, int]:
+        known = tuple(
+            value if value in self.vocabulary else _UNKNOWN_TOKEN for value in context
+        )
+        for order in range(min(self.max_order, len(known)), min_order - 1, -1):
+            counter = self.counts.get(known[-order:])
+            if not counter:
+                continue
+            support = int(counter.get(token, 0))
+            total = sum(counter.values())
+            if support < min_support or total <= 0:
+                continue
+            probability = support / total
+            support_strength = 1.0 - math.exp(-support / support_scale)
+            order_strength = 0.75 + 0.25 * order / max(1, self.max_order)
+            return (
+                max(
+                    0.0,
+                    min(0.999, probability * support_strength * order_strength),
+                ),
+                support,
+                total,
+                order,
+            )
+        return 0.0, 0, 0, 0
+
+    def contextual_options(
+        self,
+        context: Sequence[str],
+        *,
+        min_order: int,
+        min_support: int,
+        support_scale: float,
+        limit: int,
+    ) -> tuple[tuple[str, float, int, int, int], ...]:
+        known = tuple(
+            token if token in self.vocabulary else _UNKNOWN_TOKEN for token in context
+        )
+        for order in range(min(self.max_order, len(known)), min_order - 1, -1):
+            counter = self.counts.get(known[-order:])
+            if not counter:
+                continue
+            total = sum(counter.values())
+            rows = []
+            for token, support in counter.items():
+                if support < min_support:
+                    continue
+                probability = support / total
+                support_strength = 1.0 - math.exp(-support / support_scale)
+                order_strength = 0.75 + 0.25 * order / max(1, self.max_order)
+                confidence = max(
+                    0.0,
+                    min(0.999, probability * support_strength * order_strength),
+                )
+                if confidence > 0.0:
+                    rows.append((token, confidence, support, total, order))
+            if rows:
+                return tuple(
+                    sorted(
+                        rows,
+                        key=lambda row: (-row[1], -row[2], row[0]),
+                    )[:limit]
+                )
+        return ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1321,6 +1394,9 @@ class FingerprintRollingK4DraftProvider:
     LOOKAHEAD_DISCOUNT = 0.5
     LOOKAHEAD_MIN_LOG_GAIN = 0.05
     LOOKAHEAD_EMPIRICAL_STRENGTH = 0.25
+    REQUEST_LOCAL_MIN_ORDER = 2
+    REQUEST_LOCAL_MIN_SUPPORT = 2
+    REQUEST_LOCAL_SUPPORT_SCALE = 1.5
     ATLAS_MIN_SUPPORT = 2
     ATLAS_MIN_CONFIDENCE = 0.70
 
@@ -1572,6 +1648,10 @@ class FingerprintRollingK4DraftProvider:
         self._pending_import_digest: str | None = None
         self._persistent_symbols_cache: tuple[str, ...] | None = None
         self._persistent_expert_models: dict[str, _TransitionFingerprint] = {}
+        self._request_local_cache_history: tuple[int, ...] | None = None
+        self._request_local_cache: (
+            tuple[_TransitionFingerprint, tuple[str, ...]] | None
+        ) = None
         self._closed = False
 
     def _acquire_state_lock(self) -> None:
@@ -1831,6 +1911,8 @@ class FingerprintRollingK4DraftProvider:
         self._activate_dialect(committed)
         self._request_prompt = committed
         self._request_prompt_length = len(committed)
+        self._request_local_cache_history = None
+        self._request_local_cache = None
         self._request_started = True
 
     def _persistent_symbols(self) -> tuple[str, ...]:
@@ -2277,6 +2359,62 @@ class FingerprintRollingK4DraftProvider:
             rows.append((model, list(current[-spec.window :])))
         return tuple(rows)
 
+    def _request_local_fingerprint(
+        self,
+        history: tuple[int, ...],
+    ) -> tuple[_TransitionFingerprint, tuple[str, ...]] | None:
+        if history == self._request_local_cache_history:
+            return self._request_local_cache
+        prompt = self._request_prompt
+        prompt_length = self._request_prompt_length
+        if (
+            prompt is None
+            or prompt_length is None
+            or history[:prompt_length] != prompt
+        ):
+            result = None
+            self._request_local_cache_history = history
+            self._request_local_cache = result
+            return result
+        generated = history[prompt_length:]
+        if len(generated) <= self.REQUEST_LOCAL_MIN_ORDER:
+            result = None
+            self._request_local_cache_history = history
+            self._request_local_cache = result
+            return result
+        symbols = tuple(self._symbol(token) for token in generated[-4096:])
+        result = (
+            _TransitionFingerprint.fit(
+                symbols,
+                max_order=min(self.max_order, len(symbols) - 1),
+                alpha=self.alpha,
+                backoff_strength=self.backoff_strength,
+                min_count=self.min_count,
+            ),
+            symbols,
+        )
+        self._request_local_cache_history = history
+        self._request_local_cache = result
+        return result
+
+    def _request_local_options(
+        self,
+        history: tuple[int, ...],
+        *,
+        limit: int,
+    ) -> tuple[tuple[str, float, int, int, int], ...]:
+        local = self._request_local_fingerprint(history)
+        if local is None:
+            return ()
+        model, context = local
+        return model.contextual_options(
+            context,
+            min_order=self.REQUEST_LOCAL_MIN_ORDER,
+            min_support=self.REQUEST_LOCAL_MIN_SUPPORT,
+            support_scale=self.REQUEST_LOCAL_SUPPORT_SCALE,
+            limit=limit,
+        )
+
     def _position_weighting(
         self,
         position: int,
@@ -2608,7 +2746,7 @@ class FingerprintRollingK4DraftProvider:
         tuple[float, ...],
         tuple[float, ...],
     ] | None:
-        """Compose Atlas alternatives with the live Council before verification."""
+        """Compose Atlas and same-request transitions with the live Council."""
 
         if (
             isinstance(position_offset, bool)
@@ -2618,6 +2756,7 @@ class FingerprintRollingK4DraftProvider:
         ):
             raise ValueError("beam position range is invalid")
         experts = self._expert_models(history)
+        request_local = self._request_local_fingerprint(history)
         base_weights = self._weights()
         beam = (_BeamPath(score=0.0, tokens=(), steps=()),)
         for position in range(count):
@@ -2667,9 +2806,27 @@ class FingerprintRollingK4DraftProvider:
                     )
                 )
                 atlas_by_token = {row.token_id: row for row in atlas_rows}
+                request_local_rows = (
+                    ()
+                    if request_local is None
+                    else request_local[0].contextual_options(
+                        (*request_local[1], *symbols),
+                        min_order=self.REQUEST_LOCAL_MIN_ORDER,
+                        min_support=self.REQUEST_LOCAL_MIN_SUPPORT,
+                        support_scale=self.REQUEST_LOCAL_SUPPORT_SCALE,
+                        limit=self.LOOKAHEAD_CANDIDATES * 2,
+                    )
+                )
+                request_local_by_token = {
+                    int(row[0]): row for row in request_local_rows
+                }
                 candidates = tuple(
                     sorted(
-                        {*(int(symbol) for symbol in online), *atlas_by_token},
+                        {
+                            *(int(symbol) for symbol in online),
+                            *atlas_by_token,
+                            *request_local_by_token,
+                        },
                     )
                 )
                 if not candidates:
@@ -2717,9 +2874,14 @@ class FingerprintRollingK4DraftProvider:
                         else atlas.probability
                         * (1.0 - math.exp(-float(atlas.support) / 1.5))
                     )
+                    local = request_local_by_token.get(token)
+                    local_confidence = 0.0 if local is None else local[1]
                     fused = min(
                         0.999,
-                        1.0 - (1.0 - calibrated) * (1.0 - atlas_confidence),
+                        1.0
+                        - (1.0 - calibrated)
+                        * (1.0 - atlas_confidence)
+                        * (1.0 - local_confidence),
                     )
                     candidate_rows.append((token, fused, raw, empirical))
                 retained_width = max(
@@ -3353,9 +3515,17 @@ class FingerprintRollingK4DraftProvider:
         base = (*committed, known_token)
         option = self._phrase_option(base)
         use_literal = option is not None and option.kind != "atlas"
+        has_request_local_transition = bool(
+            self._request_local_options(base, limit=1)
+        )
         predicted = (
             None
-            if use_literal or (self.atlas is None and not self._state.token_ids)
+            if use_literal
+            or (
+                self.atlas is None
+                and not self._state.token_ids
+                and not has_request_local_transition
+            )
             else self._predict_beam(base, self.proposal_width + 1)
         )
         if predicted is None:
@@ -3504,6 +3674,10 @@ class FingerprintRollingK4DraftProvider:
             raise MarkovDraftError("language Council proposal width changed")
         atlas_rows = self.atlas_evidence_for_pending(proposed)
         experts = self._expert_models(self._pending_base)
+        request_local = self._request_local_fingerprint(self._pending_base)
+        request_local_context = (
+            [] if request_local is None else list(request_local[1])
+        )
         base_weights = self._weights()
         rows = []
         for position, token_id in enumerate(proposed):
@@ -3538,10 +3712,30 @@ class FingerprintRollingK4DraftProvider:
                 online_score += float(weight) * score * reliability
                 online_support = max(online_support, support)
                 context.append(symbol)
+            request_local_score = 0.0
+            if request_local is not None:
+                (
+                    request_local_score,
+                    request_local_support,
+                    _request_local_total,
+                    _request_local_order,
+                ) = request_local[0].contextual_confidence(
+                    request_local_context,
+                    symbol,
+                    min_order=self.REQUEST_LOCAL_MIN_ORDER,
+                    min_support=self.REQUEST_LOCAL_MIN_SUPPORT,
+                    support_scale=self.REQUEST_LOCAL_SUPPORT_SCALE,
+                )
+                if request_local_score > 0.0:
+                    online_support = max(online_support, request_local_support)
+                request_local_context.append(symbol)
             atlas_row = None if not atlas_rows else atlas_rows[position]
             atlas_score = 0.0 if atlas_row is None else atlas_row.score
             atlas_support = 0 if atlas_row is None else atlas_row.support
             online_score = max(0.0, min(1.0, online_score))
+            online_score = 1.0 - (1.0 - online_score) * (
+                1.0 - request_local_score
+            )
             combined = 1.0 - (1.0 - atlas_score) * (1.0 - online_score)
             rows.append(
                 MarkovLanguageTokenEvidence(
@@ -4395,6 +4589,8 @@ class FingerprintRollingK4DraftProvider:
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._pending_import_digest = None
+        self._request_local_cache_history = None
+        self._request_local_cache = None
         self._episode_feedback.clear()
         try:
             self._persist_if_dirty()
