@@ -2683,6 +2683,172 @@ class Qwen38CausalChatTests(unittest.TestCase):
             Qwen38Tokenizer.render_no_thinking_prompt("", "again"),
         )
 
+    def test_cli_interactive_stats_exposes_live_markov_intelligence(self) -> None:
+        runtime = _Runtime()
+        qwen = Mock()
+        qwen.handle.return_value = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "generation": {
+                    "forward_passes": 3,
+                    "generated_tokens": 8,
+                    "seconds": 1.25,
+                },
+                "runtime_metrics": {
+                    "process_peak_rss_bytes": 2 * 1024**3,
+                },
+                "draft": {
+                    "accepted_draft_tokens": 5,
+                    "provider": {
+                        "markov": {
+                            "active_dialect_similarity": 0.75,
+                            "planner_beam_selections": 1,
+                            "planner_council_selections": 0,
+                            "planner_phrase_selections": 1,
+                            "planner_tournament_calls": 2,
+                            "planner_trace_feedback_tokens": 9,
+                            "recursive_trace_feedback_tokens": 4,
+                            "recursive_trace_max_position": 3,
+                        },
+                        "mtp": {"teacher_verifications": 2},
+                    },
+                },
+            },
+        )
+        output = io.StringIO()
+        stream = io.StringIO("hello\n/stats\n/quit\n")
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ),
+            patch(
+                "immer.runtimes.qwen3_8.encoding.Qwen38Tokenizer",
+                return_value=runtime.tokenizer,
+            ),
+            patch("sys.stdin", stream),
+            redirect_stdout(output),
+        ):
+            code = main(
+                [
+                    "chat",
+                    "--interactive",
+                    "--raw-qwen",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                "answer",
+                "[8 tokens · 3 Qwen forwards · 1.25 s · 2.00 GiB peak · "
+                "5 accepted draft tokens · Markov 2 tournaments B1/C0/P1, "
+                "9 counterfactual labels, 4 deep labels through p3, dialect 0.75 · "
+                "2 free MTP teacher labels]",
+            ],
+        )
+        qwen.close.assert_called_once()
+
+    def test_cli_interactive_stats_handles_flat_and_malformed_providers(self) -> None:
+        runtime = _Runtime()
+        qwen = Mock()
+        qwen.handle.side_effect = (
+            Result(
+                ExecutionStatus.OK,
+                "qwen3.8.causal-chat",
+                output="markov",
+                evidence={
+                    "generation": {"generated_tokens": 1},
+                    "draft": {
+                        "provider": {
+                            "planner_beam_selections": 0,
+                            "planner_council_selections": 1,
+                            "planner_phrase_selections": 0,
+                            "planner_tournament_calls": 1,
+                            "planner_trace_feedback_tokens": 2,
+                        }
+                    },
+                },
+            ),
+            Result(
+                ExecutionStatus.OK,
+                "qwen3.8.causal-chat",
+                output="mtp",
+                evidence={
+                    "generation": {"generated_tokens": 1},
+                    "draft": {"provider": {"teacher_verifications": 3}},
+                },
+            ),
+            Result(
+                ExecutionStatus.OK,
+                "qwen3.8.causal-chat",
+                output="malformed",
+                evidence={
+                    "generation": {"generated_tokens": 1},
+                    "draft": {
+                        "accepted_draft_tokens": True,
+                        "provider": {
+                            "active_dialect_similarity": True,
+                            "planner_beam_selections": "0",
+                            "planner_tournament_calls": True,
+                            "planner_trace_feedback_tokens": False,
+                            "recursive_trace_feedback_tokens": "4",
+                            "teacher_verifications": True,
+                        },
+                    },
+                },
+            ),
+        )
+        output = io.StringIO()
+        stream = io.StringIO(
+            "one\n/stats\ntwo\n/stats\nthree\n/stats\n/quit\n"
+        )
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ),
+            patch(
+                "immer.runtimes.qwen3_8.encoding.Qwen38Tokenizer",
+                return_value=runtime.tokenizer,
+            ),
+            patch("sys.stdin", stream),
+            redirect_stdout(output),
+        ):
+            code = main(
+                [
+                    "chat",
+                    "--interactive",
+                    "--raw-qwen",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                "markov",
+                "[1 tokens · Markov 1 tournaments B0/C1/P0, "
+                "2 counterfactual labels]",
+                "mtp",
+                "[1 tokens · 3 free MTP teacher labels]",
+                "malformed",
+                "[1 tokens]",
+            ],
+        )
+        qwen.close.assert_called_once()
+
     def test_cli_interactive_drops_only_oldest_complete_turns_at_token_limit(
         self,
     ) -> None:

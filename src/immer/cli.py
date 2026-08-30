@@ -653,6 +653,100 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             peak_rss = runtime_metrics.get("process_peak_rss_bytes")
             if isinstance(peak_rss, int) and not isinstance(peak_rss, bool):
                 parts.append(f"{peak_rss / 1024**3:.2f} GiB peak")
+        draft = evidence.get("draft")
+        if isinstance(draft, dict):
+            accepted = draft.get("accepted_draft_tokens")
+            if (
+                isinstance(accepted, int)
+                and not isinstance(accepted, bool)
+                and accepted > 0
+            ):
+                parts.append(f"{accepted} accepted draft tokens")
+            provider = draft.get("provider")
+            markov = None
+            mtp = None
+            if isinstance(provider, dict):
+                nested_markov = provider.get("markov")
+                nested_mtp = provider.get("mtp")
+                markov = (
+                    nested_markov
+                    if isinstance(nested_markov, dict)
+                    else provider
+                    if "planner_tournament_calls" in provider
+                    else None
+                )
+                mtp = (
+                    nested_mtp
+                    if isinstance(nested_mtp, dict)
+                    else provider
+                    if "teacher_verifications" in provider
+                    else None
+                )
+            if isinstance(markov, dict):
+                markov_parts = []
+                tournaments = markov.get("planner_tournament_calls")
+                if (
+                    isinstance(tournaments, int)
+                    and not isinstance(tournaments, bool)
+                    and tournaments > 0
+                ):
+                    selections = tuple(
+                        markov.get(name, 0)
+                        for name in (
+                            "planner_beam_selections",
+                            "planner_council_selections",
+                            "planner_phrase_selections",
+                        )
+                    )
+                    if all(
+                        isinstance(value, int) and not isinstance(value, bool)
+                        for value in selections
+                    ):
+                        markov_parts.append(
+                            f"{tournaments} tournaments "
+                            f"B{selections[0]}/C{selections[1]}/P{selections[2]}"
+                        )
+                counterfactual = markov.get("planner_trace_feedback_tokens")
+                if (
+                    isinstance(counterfactual, int)
+                    and not isinstance(counterfactual, bool)
+                    and counterfactual > 0
+                ):
+                    markov_parts.append(f"{counterfactual} counterfactual labels")
+                deep = markov.get("recursive_trace_feedback_tokens")
+                depth = markov.get("recursive_trace_max_position")
+                if (
+                    isinstance(deep, int)
+                    and not isinstance(deep, bool)
+                    and deep > 0
+                ):
+                    markov_parts.append(
+                        f"{deep} deep labels"
+                        + (
+                            f" through p{depth}"
+                            if isinstance(depth, int)
+                            and not isinstance(depth, bool)
+                            and depth > 0
+                            else ""
+                        )
+                    )
+                similarity = markov.get("active_dialect_similarity")
+                if (
+                    isinstance(similarity, (int, float))
+                    and not isinstance(similarity, bool)
+                    and float(similarity) > 0.0
+                ):
+                    markov_parts.append(f"dialect {float(similarity):.2f}")
+                if markov_parts:
+                    parts.append("Markov " + ", ".join(markov_parts))
+            if isinstance(mtp, dict):
+                teacher = mtp.get("teacher_verifications")
+                if (
+                    isinstance(teacher, int)
+                    and not isinstance(teacher, bool)
+                    and teacher > 0
+                ):
+                    parts.append(f"{teacher} free MTP teacher labels")
         return None if not parts else "[" + " · ".join(parts) + "]"
 
     try:
