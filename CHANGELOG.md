@@ -4,11 +4,24 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-30
 
-Runtime commits through `08f3b7b` are deployed on the canonical server.
+Runtime commits through `cbeffa9` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `cbeffa9` made physical Q4 lookahead a direct function of the terminal-trained
+  Markov ensemble. The selected route carries exact vote mass from the four
+  page agents; the chosen execution width carries vote mass from the three
+  width agents. Their geometric consensus allocates each layer a transport
+  fraction `5/8 + 3/8·sqrt(route_mass·width_mass)`, bounded to 62.5–100% of the
+  existing hard Q4 prefetch cap. Confirmed terminal advantage sharpens the
+  agents behind successful routes and therefore earns those contexts more
+  future I/O; disagreement reduces physical advice while leaving execution
+  width and model output unchanged. Page state v9 migrates v3-v8 read-only,
+  DraftWindow identities accept v6-v8 predecessors, partial speculative replay
+  preserves the exact accepted confidence/budget accounting without repeating
+  mmap advice, and stats expose route confidence, width confidence, and mean
+  physical budget.
 - `08f3b7b` turned the learned Q4 page route into physical predictive weight
   transport. While layer L executes, the controller derives the exact route
   that layer L+1 will subsequently choose and sends its ranked page prefix to
