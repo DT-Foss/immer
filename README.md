@@ -88,7 +88,12 @@ release surface.
   tokens or rejected drafts. A sibling phrase/copy agent promotes the common
   continuation of repeatedly confirmed spans into a verified multi-token
   option. Both agents use a bounded 4,096-token horizon, and durable request
-  state is written once at successful finalization. The eight-expert Council
+  state is written once at successful finalization. Persistent PPM experts use
+  O1 value inside that live horizon: a bounded whole-answer optimizer maximizes
+  `priority × exp(-0.001 × age)` and then restores chronological episode order.
+  Valuable older answers therefore influence Markov drafting and hybrid MTP
+  consensus directly, instead of surviving only in long-term retention. The
+  eight-expert Council
   also updates its combined Rapidity/Fixed-Share weights after every confirmed
   row, so the next decision already uses the experts that are winning inside
   the current answer. A request-local 16×8 Beta overlay simultaneously learns
@@ -403,8 +408,8 @@ per-profile store and are revalidated against their source ResultCells.
 | Same-request periodic template agent | unseen variable slots retain their invariant block phase | three aligned cycles, at least 75% lag agreement, and three unanimous phase witnesses induce a bounded continuation; exact phrases win conflicts, ambiguous periods abstain, and measured agreement calibrates phrase confidence |
 | Same-request periodic binding agent | variable future slots copy confirmed current-block values | three distinct historical slot witnesses must share one structural source phase; multiple source phases abstain even when their current token matches, global evidence still ranks pure vs bound periods, each option copies at most one slot, and absolute phase survives the bounded 4,096-token window |
 | Corpus-scale Markov atlas | 4,000,000 tokens → 500,000 contexts in 8.0 MB | flat-array v2 adds ~150 MiB RSS and loads in 1.77 s on the live server; on an arbitrary rainbow question it supported 7 MTP tokens across 6 rounds while the hybrid accepted 11 drafts and produced 24 tokens in 14 target forwards |
-| Live-answer Markov expert | 65,536 retained answer tokens; 4,096-token cached PPM windows | on an unseen German lightning paraphrase the online memory supported 64/98 MTP candidates and supplied 18 calibrated confidence gains across 12 rounds; 10 drafts accepted, 24 tokens in 15 target forwards |
-| O1-valued episode retention | 1.1 KB state + 130 KB neural sidecar after the first live answer | real O1 surprise and learning-progress assign persistent episode priority; Ricci-age eviction keeps valuable older answers over low-value newer ones, with atomic rollback and answer-only boundaries |
+| Live-answer Markov expert | 65,536 retained answer tokens; O1/Ricci-optimized 4,096-token PPM windows | bounded whole-answer optimization exposes valuable older continuations directly to Markov and hybrid MTP consensus while preserving chronological boundaries |
+| O1-valued episode retention | 1.1 KB state + 130 KB neural sidecar after the first live answer | real O1 surprise and learning-progress assign persistent episode priority; the same `priority × exp(-0.001 × age)` value controls long-term eviction and the live PPM working set, with atomic rollback and answer-only boundaries |
 | Persistent draft-window policy | request ceiling plus per-wave K4/K8/K16 | real Fixed-Share ceiling sampling after bootstrap; each Markov proposal supplies prefix-local expected acceptance/work utility and only the chosen prefix enters the target; full provider tails remain unauthoritative; model/tokenizer/provider-bound state; K2/K3 terminal fallback |
 | Consuming ordinary decode | one continuation cache plus one replacement layer | removes simultaneous ownership of complete old and new cache stacks; official static cache cut is `154,927,104 + 65,552 × prefix_tokens` bytes |
 | K4 Fast-MLP route reuse | repeated K2/K4 target and auxiliary bytes equal one route | Gate/Up rows are wave-unioned; one-route down cache uses maximum-overlap row ordering while preserving each reduction; identical K4 routes remove 180 MiB per active p4/k32 layer |

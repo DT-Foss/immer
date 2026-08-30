@@ -4,11 +4,19 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-30
 
-Runtime commits through `41fd5db` are deployed on the canonical server.
+Runtime commits through `2f06514` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `2f06514` connected O1 episode value directly to the live PPM corpus. Each
+  persistent expert now solves a bounded whole-answer selection under
+  `priority × exp(-0.001 × age)`, then restores chronological episode order
+  before fitting. This makes valuable older answers available to Markov drafts
+  and hybrid MTP consensus instead of limiting them to eviction survival.
+  Missing O1 keeps the former raw suffix byte-for-byte; transient priority
+  failures retry on the next expert round; failed final commits restore every
+  working-set, priority, PPM, symbol, and composition cache.
 - `41fd5db` moved the Q4 MLP page agents into the canonical local chat path.
   Every exact prefill row now trains bounded temporal, cross-layer,
   coactivation, and marginal routes; each decode token reruns those agents
