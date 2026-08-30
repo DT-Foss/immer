@@ -1594,6 +1594,113 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertIsNone(provider._request_phrase_option((*prompt, *generated)))
         provider.close()
 
+    def test_request_weight_overlay_adapts_immediately_without_persistence(
+        self,
+    ) -> None:
+        state_path = self.root / "request-weight-overlay.bin"
+        seed = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=256,
+        )
+        seed.observe_final((8, 9, 10, 11))
+        seed.close()
+        persisted = state_path.read_bytes()
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=256,
+        )
+        provider.begin_request((20, 21))
+        correct = provider._symbol(7)
+        other = provider._symbol(8)
+        feedback = tuple(
+            (
+                ({correct: 0.99, other: 0.01}, 7)
+                if index == 0
+                else ({correct: 0.01, other: 0.99}, 8)
+            )
+            for index in range(len(provider._experts))
+        )
+        class FixedExpert:
+            def __init__(self, distribution):
+                self._distribution = distribution
+
+            def distribution(self, _context):
+                return dict(self._distribution)
+
+        provider._expert_models = lambda _history: tuple(
+            (FixedExpert(distribution), [])
+            for distribution, _prediction in feedback
+        )
+        state_before = provider._state
+        weights_before = provider._weights()
+        predicted_before = provider._predict_council(
+            (20, 21),
+            1,
+            position_offset=15,
+        )[0][0]
+
+        provider._record_confirmed_feedback(feedback, 7, 0, 7, 7, 0.0)
+
+        weights_after = provider._weights()
+        predicted_after = provider._predict_council(
+            (20, 21),
+            1,
+            position_offset=15,
+        )[0][0]
+        metrics = provider.metrics()
+        self.assertEqual(predicted_before, 8)
+        self.assertEqual(predicted_after, 7)
+        self.assertGreater(weights_after[0], weights_before[0])
+        self.assertTrue(
+            all(
+                weights_after[0] > weight
+                for weight in weights_after[1:]
+            )
+        )
+        self.assertEqual(metrics.request_weight_updates, 1)
+        self.assertGreater(metrics.max_request_weight_shift, 0.0)
+        self.assertIs(provider._state, state_before)
+
+        provider.close()
+        self.assertEqual(state_path.read_bytes(), persisted)
+
+    def test_request_weight_overlay_is_persisted_exactly_once_at_finalization(
+        self,
+    ) -> None:
+        prompt = (20,)
+        actual = FingerprintRollingK4DraftProvider(vocab_size=32)
+        expected = FingerprintRollingK4DraftProvider(vocab_size=32)
+        actual.begin_request(prompt)
+        expected.begin_request(prompt)
+        correct = actual._symbol(7)
+        other = actual._symbol(8)
+        feedback = tuple(
+            (
+                ({correct: 0.99, other: 0.01}, 7)
+                if index == 0
+                else ({correct: 0.01, other: 0.99}, 8)
+            )
+            for index in range(len(actual._experts))
+        )
+
+        expected._apply_council_feedback(feedback, 7, 0, 7, 7)
+        actual._record_confirmed_feedback(feedback, 7, 0, 7, 7, 0.0)
+        actual.observe_final((*prompt, 7))
+
+        self.assertEqual(
+            actual._state.expert_log_weights,
+            expected._state.expert_log_weights,
+        )
+        self.assertEqual(actual._state.expert_observations, (1,) * 8)
+        self.assertEqual(actual._state.feedback_count, 1)
+        self.assertEqual(actual.metrics().request_weight_updates, 1)
+        self.assertIsNone(actual._request_expert_rapidities)
+        actual.close()
+        expected.close()
+
     def test_beam_proposal_keeps_feedback_reconciliation_exact(self) -> None:
         class PlanningExpert:
             @staticmethod
@@ -1642,10 +1749,12 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         proposal = provider.propose_round(prompt, 2)
         committed = (*prompt, 2, *proposal.token_ids[:2])
         provider.reconcile_prefix(committed)
+        self.assertEqual(provider.metrics().request_weight_updates, 2)
         provider.observe_final((*committed, 13))
 
         self.assertEqual(proposal.token_ids[:2], (8, 9))
         self.assertEqual(provider.metrics().council_feedback, 3)
+        self.assertEqual(provider.metrics().request_weight_updates, 3)
         self.assertEqual(provider._state.feedback_count, 3)
         provider.close()
 
@@ -1686,7 +1795,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         prompt = (1, 2)
         provider.begin_request(prompt)
-        provider.propose_round(prompt, 3)
+        proposal = provider.propose_round(prompt, 3)
         provider._pending_planner = "beam"
 
         provider.observe_virtual_verification(1, 1)
@@ -1697,6 +1806,10 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertIsNone(provider._pending_accepted_prefix_length)
         self.assertIsNone(provider._pending_verified_proposals)
         self.assertFalse(provider._pending_verification_virtual)
+        self.assertEqual(provider.metrics().request_weight_updates, 0)
+        provider.propose_round((*prompt, 3), proposal.token_ids[0])
+        self.assertEqual(provider.metrics().request_weight_updates, 1)
+        provider.discard_pending_proposal()
         provider.close()
 
     def test_atlas_ranking_score_is_not_served_as_acceptance_probability(self) -> None:
@@ -2469,6 +2582,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(interim.external_feedback_tokens, 2)
         self.assertEqual(interim.teacher_forced_predictions, 2)
         self.assertEqual(interim.teacher_forced_feedback_tokens, 1)
+        self.assertEqual(interim.request_weight_updates, 2)
+        self.assertEqual(provider._state.feedback_count, 0)
         self.assertEqual(interim.teacher_forced_failures, 0)
         self.assertTrue(provider._carry_feedback_teacher_forced)
         self.assertEqual(provider._carry_feedback_position, 2)
@@ -2486,6 +2601,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((*prompt, 2, external, 17))
         after = provider.metrics()
         self.assertEqual(after.council_feedback, 2)
+        self.assertEqual(after.request_weight_updates, 2)
         self.assertEqual(after.horizon_observations[:2], (1, 1))
         self.assertEqual(
             provider._state.expert_observations,
@@ -2520,10 +2636,12 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertTrue(provider._carry_feedback_teacher_forced)
         self.assertEqual(provider._carry_feedback_position, 1)
         self.assertEqual(provider.metrics().teacher_forced_predictions, 1)
+        self.assertEqual(provider.metrics().request_weight_updates, 1)
         provider.propose_round(history, 7)
         metrics = provider.metrics()
         self.assertEqual(metrics.teacher_forced_feedback_tokens, 1)
         self.assertEqual(metrics.external_feedback_tokens, 2)
+        self.assertEqual(metrics.request_weight_updates, 2)
         provider.discard_pending_proposal()
         provider.observe_final((*history, 7))
         metrics = provider.metrics()
@@ -2547,6 +2665,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         before_state = provider._state
         before_feedback = list(provider._episode_feedback)
         before_carry = provider._carry_feedback
+        before_request_rapidities = provider._request_expert_rapidities
 
         with (
             mock.patch.object(
@@ -2565,6 +2684,18 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._carry_feedback_position, 1)
         self.assertTrue(provider._carry_feedback_teacher_forced)
         self.assertEqual(
+            provider._request_expert_rapidities,
+            before_request_rapidities,
+        )
+        self.assertEqual(
+            after_failure.request_weight_updates,
+            before_metrics.request_weight_updates,
+        )
+        self.assertEqual(
+            after_failure.max_request_weight_shift,
+            before_metrics.max_request_weight_shift,
+        )
+        self.assertEqual(
             after_failure.council_feedback,
             before_metrics.council_feedback,
         )
@@ -2582,6 +2713,10 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(after_retry.council_feedback, 2)
         self.assertEqual(after_retry.external_feedback_tokens, 2)
         self.assertEqual(after_retry.teacher_forced_feedback_tokens, 1)
+        self.assertEqual(
+            after_retry.request_weight_updates,
+            before_metrics.request_weight_updates + 1,
+        )
         provider.close()
 
     def test_external_k1_reconciliation_carries_feedback_to_next_known_token(
@@ -2601,8 +2736,10 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertIsNotNone(provider._carry_feedback)
         self.assertEqual(provider.metrics().external_feedback_tokens, 0)
+        self.assertEqual(provider.metrics().request_weight_updates, 0)
         provider.propose_round(history, 7)
         self.assertEqual(len(provider._episode_feedback), 1)
+        self.assertEqual(provider.metrics().request_weight_updates, 1)
         provider.discard_pending_proposal()
         provider.observe_final((*history, 7))
         self.assertEqual(provider.metrics().council_feedback, 1)
@@ -2651,9 +2788,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.reconcile_external_prefix((*prompt, 2, *matched))
 
         self.assertEqual(provider.metrics().external_feedback_tokens, 2)
+        self.assertEqual(provider.metrics().request_weight_updates, 2)
         self.assertIsNotNone(provider._carry_feedback)
         provider.observe_final((*prompt, 2, *matched, 9))
         self.assertEqual(provider.metrics().council_feedback, 3)
+        self.assertEqual(provider.metrics().request_weight_updates, 3)
         self.assertEqual(provider.metrics().horizon_observations[:3], (1, 1, 1))
         self.assertEqual(provider.metrics().phrase_accepted_tokens, 0)
         provider.close()

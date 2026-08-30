@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v31"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v32"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -44,7 +44,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v22"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v23"
 _STATE_PREFIX = b"IMMD\x09"
 _V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
@@ -1295,6 +1295,8 @@ class MarkovDraftMetrics:
     lookahead_outcomes: tuple[int, ...]
     lookahead_hits: tuple[int, ...]
     lookahead_greedy_hits: tuple[int, ...]
+    request_weight_updates: int
+    max_request_weight_shift: float
     regime_generation: int
     surprise_mean: float
     surprise_cusum: float
@@ -1615,6 +1617,9 @@ class FingerprintRollingK4DraftProvider:
         self._predictions = 0
         self._council_predictions = 0
         self._council_feedback = 0
+        self._request_expert_rapidities: tuple[float, ...] | None = None
+        self._request_weight_updates = 0
+        self._max_request_weight_shift = 0.0
         self._external_reconcile_calls = 0
         self._external_feedback_tokens = 0
         self._teacher_forced_predictions = 0
@@ -1882,7 +1887,7 @@ class FingerprintRollingK4DraftProvider:
             )
         return ()
 
-    def _weights(self) -> tuple[float, ...]:
+    def _combined_rapidities(self) -> tuple[float, ...]:
         rapidities = self._state.expert_log_weights
         dialects = self._inference_dialects()
         if dialects:
@@ -1895,6 +1900,12 @@ class FingerprintRollingK4DraftProvider:
                 )
                 for index, global_value in enumerate(rapidities)
             )
+        return rapidities
+
+    def _weights(self) -> tuple[float, ...]:
+        rapidities = self._request_expert_rapidities
+        if rapidities is None:
+            rapidities = self._combined_rapidities()
         scaled = tuple(value / self.EXPERT_TEMPERATURE for value in rapidities)
         maximum = max(scaled)
         raw = tuple(math.exp(value - maximum) for value in scaled)
@@ -3351,6 +3362,90 @@ class FingerprintRollingK4DraftProvider:
                 self._last_plan_trace,
             ) = snapshot
 
+    def _feedback_probabilities(
+        self,
+        feedback: tuple[tuple[dict[str, float], int], ...],
+        token: int,
+    ) -> tuple[float, ...]:
+        if len(feedback) != len(self._experts):
+            raise MarkovDraftError("Markov council feedback width changed")
+        symbol = self._symbol(token)
+        probabilities = []
+        for distribution, _prediction in feedback:
+            if symbol in distribution:
+                probabilities.append(distribution[symbol])
+                continue
+            seen = sum(
+                candidate.isdecimal() and 0 <= int(candidate) < self.vocab_size
+                for candidate in distribution
+            )
+            probabilities.append(
+                distribution.get(_UNKNOWN_TOKEN, 1e-12)
+                / max(1, self.vocab_size - seen)
+            )
+        return tuple(probabilities)
+
+    def _update_request_weights(
+        self,
+        feedback: tuple[tuple[dict[str, float], int], ...],
+        token: int,
+        position: int,
+    ) -> None:
+        if not 0 <= position < _MAX_PROPOSAL_POSITIONS:
+            raise MarkovDraftError("Markov feedback position is invalid")
+        probabilities = self._feedback_probabilities(feedback, token)
+        before = self._weights()
+        weights = self._position_weighting(position, before)[0]
+        mixture_probability = sum(
+            weight * probability
+            for weight, probability in zip(weights, probabilities, strict=True)
+        )
+        logs = list(
+            self._combined_rapidities()
+            if self._request_expert_rapidities is None
+            else self._request_expert_rapidities
+        )
+        for index, probability in enumerate(probabilities):
+            advantage = math.log(max(probability, 1e-12)) - math.log(
+                max(mixture_probability, 1e-12)
+            )
+            logs[index] = (
+                self.RAPIDITY_DECAY * logs[index]
+                + self.EXPERT_LEARNING_RATE * advantage
+            )
+        center = sum(logs) / len(logs)
+        self._request_expert_rapidities = tuple(value - center for value in logs)
+        after = self._weights()
+        shift = 0.5 * sum(
+            abs(left - right) for left, right in zip(before, after, strict=True)
+        )
+        self._request_weight_updates += 1
+        self._max_request_weight_shift = max(
+            self._max_request_weight_shift,
+            shift,
+        )
+
+    def _record_confirmed_feedback(
+        self,
+        feedback: tuple[tuple[dict[str, float], int], ...],
+        token: int,
+        position: int,
+        planned_token: int,
+        greedy_token: int,
+        lookahead_gain: float,
+    ) -> None:
+        self._update_request_weights(feedback, token, position)
+        self._episode_feedback.append(
+            (
+                feedback,
+                token,
+                position,
+                planned_token,
+                greedy_token,
+                lookahead_gain,
+            )
+        )
+
     def _apply_council_feedback(
         self,
         feedback: tuple[tuple[dict[str, float], int], ...],
@@ -3359,11 +3454,8 @@ class FingerprintRollingK4DraftProvider:
         planned_token: int | None = None,
         greedy_token: int | None = None,
     ) -> None:
-        if len(feedback) != len(self._experts):
-            raise MarkovDraftError("Markov council feedback width changed")
         if not 0 <= position < _MAX_PROPOSAL_POSITIONS:
             raise MarkovDraftError("Markov feedback position is invalid")
-        symbol = self._symbol(token)
         before_leader = max(
             range(len(self._experts)),
             key=lambda index: self._state.expert_log_weights[index],
@@ -3382,18 +3474,7 @@ class FingerprintRollingK4DraftProvider:
             position,
             self._weights(),
         )
-        probabilities = []
-        for distribution, _prediction in feedback:
-            if symbol in distribution:
-                probabilities.append(distribution[symbol])
-                continue
-            seen = sum(
-                candidate.isdecimal() and 0 <= int(candidate) < self.vocab_size
-                for candidate in distribution
-            )
-            probabilities.append(
-                distribution.get(_UNKNOWN_TOKEN, 1e-12) / max(1, self.vocab_size - seen)
-            )
+        probabilities = self._feedback_probabilities(feedback, token)
         mixture_probability = sum(
             weight * probability
             for weight, probability in zip(weights, probabilities, strict=True)
@@ -3534,7 +3615,7 @@ class FingerprintRollingK4DraftProvider:
         plan = self._carry_plan
         if plan is None:
             raise MarkovDraftError("Markov carry planning trace is missing")
-        self._episode_feedback.append((feedback, token, position, *plan))
+        self._record_confirmed_feedback(feedback, token, position, *plan)
         if self._carry_feedback_teacher_forced:
             self._teacher_forced_feedback_tokens += 1
             self._external_feedback_tokens += 1
@@ -3987,13 +4068,11 @@ class FingerprintRollingK4DraftProvider:
         self._commit_pending_verification(len(delta))
         assert self._last_confirmed_length is not None
         for index, token in enumerate(delta):
-            self._episode_feedback.append(
-                (
-                    self._pending_feedback[index],
-                    token,
-                    index,
-                    *self._pending_plan_trace[index],
-                )
+            self._record_confirmed_feedback(
+                self._pending_feedback[index],
+                token,
+                index,
+                *self._pending_plan_trace[index],
             )
         if self._pending_phrase_option is not None:
             self._phrase_accepted_tokens += min(
@@ -4150,13 +4229,11 @@ class FingerprintRollingK4DraftProvider:
         mismatch_index: int | None = None
         teacher_failed = False
         for index, token in enumerate(delta):
-            self._episode_feedback.append(
-                (
-                    self._pending_feedback[index],
-                    token,
-                    index,
-                    *self._pending_plan_trace[index],
-                )
+            self._record_confirmed_feedback(
+                self._pending_feedback[index],
+                token,
+                index,
+                *self._pending_plan_trace[index],
             )
             verified += 1
             if token != proposal[index]:
@@ -4177,8 +4254,11 @@ class FingerprintRollingK4DraftProvider:
                     self._teacher_forced_failures += 1
                     teacher_failed = True
                     break
-                self._episode_feedback.append(
-                    (teacher_feedback, delta[index], index, *teacher_plan)
+                self._record_confirmed_feedback(
+                    teacher_feedback,
+                    delta[index],
+                    index,
+                    *teacher_plan,
                 )
                 verified += 1
                 self._teacher_forced_predictions += 1
@@ -4309,6 +4389,9 @@ class FingerprintRollingK4DraftProvider:
         original_retention_failures = self._retention_failures
         original_retention_evictions = self._retention_priority_evictions
         original_retention_priority = self._last_retention_priority
+        original_request_rapidities = self._request_expert_rapidities
+        original_request_weight_updates = self._request_weight_updates
+        original_max_request_weight_shift = self._max_request_weight_shift
         try:
             if (
                 self._last_confirmed_length is not None
@@ -4327,6 +4410,7 @@ class FingerprintRollingK4DraftProvider:
             self._carry_feedback_position = None
             self._carry_feedback_teacher_forced = False
             self._carry_plan = None
+            self._request_expert_rapidities = None
             for (
                 feedback,
                 token,
@@ -4405,6 +4489,9 @@ class FingerprintRollingK4DraftProvider:
             self._retention_failures = original_retention_failures
             self._retention_priority_evictions = original_retention_evictions
             self._last_retention_priority = original_retention_priority
+            self._request_expert_rapidities = original_request_rapidities
+            self._request_weight_updates = original_request_weight_updates
+            self._max_request_weight_shift = original_max_request_weight_shift
             raise
 
     def _persist(self) -> None:
@@ -4535,6 +4622,8 @@ class FingerprintRollingK4DraftProvider:
             lookahead_outcomes=self._state.lookahead_observations,
             lookahead_hits=self._state.lookahead_hits,
             lookahead_greedy_hits=self._state.lookahead_greedy_hits,
+            request_weight_updates=self._request_weight_updates,
+            max_request_weight_shift=self._max_request_weight_shift,
             regime_generation=self._state.regime_generation,
             surprise_mean=self._state.surprise_mean,
             surprise_cusum=self._state.surprise_cusum,
@@ -4652,6 +4741,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._pending_import_digest = None
+        self._request_expert_rapidities = None
         self._request_local_cache_history = None
         self._request_local_cache = None
         self._episode_feedback.clear()
