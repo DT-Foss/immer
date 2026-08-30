@@ -2150,6 +2150,69 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertIsNone(provider._request_lookahead_observations)
         provider.close()
 
+    def test_request_lookahead_terminal_carry_retries_exactly_once(self) -> None:
+        class PlanningExpert:
+            @staticmethod
+            def distribution(context):
+                if not context or context[-1] == "02":
+                    return {"07": 0.55, "08": 0.45}
+                if context[-1] == "07":
+                    return {"09": 0.51, "10": 0.49}
+                return {"09": 0.99, "10": 0.01}
+
+        state_path = self.root / "lookahead-retry.bin"
+        seed = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+        )
+        seed.observe_final((10, 11, 12))
+        seed.close()
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            proposal_width=3,
+        )
+        provider._expert_models = lambda _history: tuple(
+            (PlanningExpert(), []) for _ in provider._experts
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        proposal = provider.propose_round(prompt, 2)
+        self.assertEqual(proposal.token_ids[0], 8)
+        history = (*prompt, 2)
+        provider.reconcile_prefix(history)
+        state_before = provider._state
+        carry_before = provider._carry_feedback
+
+        with (
+            mock.patch.object(
+                provider,
+                "_persist",
+                side_effect=OSError("disk unavailable"),
+            ),
+            self.assertRaisesRegex(OSError, "disk unavailable"),
+        ):
+            provider.observe_final((*history, 7))
+
+        self.assertIs(provider._state, state_before)
+        self.assertIs(provider._carry_feedback, carry_before)
+        self.assertEqual(provider.metrics().request_lookahead_updates, 0)
+        self.assertIsNone(provider._request_lookahead_observations)
+        with mock.patch.object(
+            provider,
+            "_persist",
+            wraps=provider._persist,
+        ) as persist:
+            provider.observe_final((*history, 7))
+            provider.close()
+            self.assertEqual(persist.call_count, 1)
+
+        self.assertEqual(provider._state.lookahead_observations[0], 1)
+        self.assertEqual(provider._state.lookahead_hits[0], 0)
+        self.assertEqual(provider._state.lookahead_greedy_hits[0], 1)
+        self.assertEqual(provider.metrics().request_lookahead_updates, 1)
+        self.assertIsNone(provider._request_lookahead_observations)
+
     def test_below_threshold_prompt_starts_global_without_neighbor_leakage(
         self,
     ) -> None:
