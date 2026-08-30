@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v38"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v39"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -44,7 +44,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v28"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v29"
 _STATE_PREFIX = b"IMMD\x09"
 _V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
@@ -585,7 +585,13 @@ class MarkovPhraseOption:
     def __post_init__(self) -> None:
         if self.source not in {"atlas", "dialect", "global", "request"}:
             raise ValueError("phrase option source is invalid")
-        if self.kind not in {"atlas", "composition", "literal", "periodic"}:
+        if self.kind not in {
+            "atlas",
+            "binding",
+            "composition",
+            "literal",
+            "periodic",
+        }:
             raise ValueError("phrase option kind is invalid")
         if (
             not 1 <= len(self.token_ids) <= 15
@@ -1322,6 +1328,9 @@ class MarkovDraftMetrics:
     periodic_option_calls: int
     periodic_draft_tokens: int
     periodic_accepted_tokens: int
+    binding_option_calls: int
+    binding_draft_tokens: int
+    binding_accepted_tokens: int
     atlas_contexts: int
     atlas_corpus_tokens: int
     atlas_option_calls: int
@@ -1601,6 +1610,9 @@ class FingerprintRollingK4DraftProvider:
         self._periodic_option_calls = 0
         self._periodic_draft_tokens = 0
         self._periodic_accepted_tokens = 0
+        self._binding_option_calls = 0
+        self._binding_draft_tokens = 0
+        self._binding_accepted_tokens = 0
         self._atlas_option_calls = 0
         self._atlas_draft_tokens = 0
         self._atlas_accepted_tokens = 0
@@ -2341,6 +2353,44 @@ class FingerprintRollingK4DraftProvider:
             return None
         return max(candidates, key=self._phrase_option_score)
 
+    def _request_periodic_copy_value(
+        self,
+        generated: tuple[int, ...],
+        *,
+        period: int,
+        offset: int,
+    ) -> int | None:
+        target_indexes = tuple(
+            len(generated) + offset - copy * period for copy in range(1, 4)
+        )
+        if any(index < 0 or index >= len(generated) for index in target_indexes):
+            return None
+        target_values = tuple(generated[index] for index in target_indexes)
+        if len(set(target_values)) < 2:
+            return None
+        partial_width = len(generated) % period
+        current_block_start = len(generated) - partial_width
+        candidates = set()
+        for delta in range(-1, -period, -1):
+            current_source = len(generated) + offset + delta
+            if not current_block_start <= current_source < len(generated):
+                continue
+            source_indexes = tuple(index + delta for index in target_indexes)
+            if any(index < 0 or index >= len(generated) for index in source_indexes):
+                continue
+            if all(
+                generated[target] == generated[source]
+                for target, source in zip(
+                    target_indexes,
+                    source_indexes,
+                    strict=True,
+                )
+            ):
+                candidates.add(generated[current_source])
+        if len(candidates) != 1:
+            return None
+        return candidates.pop()
+
     def _request_periodic_option(
         self,
         history: tuple[int, ...],
@@ -2362,7 +2412,7 @@ class FingerprintRollingK4DraftProvider:
             self.REQUEST_PERIOD_MAX,
             len(generated) // 3,
         )
-        candidates: list[tuple[float, int, MarkovPhraseOption]] = []
+        candidates: list[tuple[float, int, int, MarkovPhraseOption]] = []
         for period in range(self.REQUEST_PERIOD_MIN, maximum_period + 1):
             comparison_start = max(period, len(generated) - 3 * period)
             comparisons = tuple(
@@ -2378,6 +2428,7 @@ class FingerprintRollingK4DraftProvider:
             ):
                 continue
             predicted = []
+            copied_phases = 0
             for offset in range(min(max_width, period)):
                 values = tuple(
                     generated[len(generated) + offset - copy * period]
@@ -2385,11 +2436,20 @@ class FingerprintRollingK4DraftProvider:
                     if 0 <= len(generated) + offset - copy * period < len(generated)
                 )
                 if (
-                    len(values) < self.REQUEST_PERIOD_MIN_SUPPORT
-                    or len(set(values)) != 1
+                    len(values) >= self.REQUEST_PERIOD_MIN_SUPPORT
+                    and len(set(values)) == 1
                 ):
+                    predicted.append(values[0])
+                    continue
+                copied = self._request_periodic_copy_value(
+                    generated,
+                    period=period,
+                    offset=offset,
+                )
+                if copied is None:
                     break
-                predicted.append(values[0])
+                predicted.append(copied)
+                copied_phases += 1
             if len(predicted) < 2:
                 continue
             support = sum(comparisons)
@@ -2399,24 +2459,25 @@ class FingerprintRollingK4DraftProvider:
                 context_order=self.REQUEST_PHRASE_MIN_CONTEXT,
                 support=support,
                 total=len(comparisons),
-                kind="periodic",
+                kind="binding" if copied_phases else "periodic",
             )
-            candidates.append((match_ratio, period, option))
+            candidates.append((match_ratio, period, copied_phases, option))
         if not candidates:
             return None
         best_ratio = max(row[0] for row in candidates)
         contenders = [row for row in candidates if row[0] == best_ratio]
-        if len({row[2].token_ids for row in contenders}) > 1:
+        if len({row[3].token_ids for row in contenders}) > 1:
             return None
         return max(
             contenders,
             key=lambda row: (
-                len(row[2].token_ids),
-                row[2].support,
+                len(row[3].token_ids),
+                row[3].support,
+                -row[2],
                 -row[1],
-                tuple(-token for token in row[2].token_ids),
+                tuple(-token for token in row[3].token_ids),
             ),
-        )[2]
+        )[3]
 
     def _phrase_option_score(
         self,
@@ -3996,6 +4057,12 @@ class FingerprintRollingK4DraftProvider:
                     len(option.token_ids),
                     self.proposal_width,
                 )
+            if option.kind == "binding":
+                self._binding_option_calls += 1
+                self._binding_draft_tokens += min(
+                    len(option.token_ids),
+                    self.proposal_width,
+                )
         self._draft_calls += 1
         return (
             proposal,
@@ -4381,6 +4448,11 @@ class FingerprintRollingK4DraftProvider:
                 )
             if self._pending_phrase_option.kind == "periodic":
                 self._periodic_accepted_tokens += min(
+                    len(delta),
+                    len(self._pending_phrase_option.token_ids),
+                )
+            if self._pending_phrase_option.kind == "binding":
+                self._binding_accepted_tokens += min(
                     len(delta),
                     len(self._pending_phrase_option.token_ids),
                 )
@@ -5043,6 +5115,9 @@ class FingerprintRollingK4DraftProvider:
             periodic_option_calls=self._periodic_option_calls,
             periodic_draft_tokens=self._periodic_draft_tokens,
             periodic_accepted_tokens=self._periodic_accepted_tokens,
+            binding_option_calls=self._binding_option_calls,
+            binding_draft_tokens=self._binding_draft_tokens,
+            binding_accepted_tokens=self._binding_accepted_tokens,
             atlas_contexts=0 if self.atlas is None else self.atlas.context_count,
             atlas_corpus_tokens=0 if self.atlas is None else self.atlas.token_count,
             atlas_option_calls=self._atlas_option_calls,

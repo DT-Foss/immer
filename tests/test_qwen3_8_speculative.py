@@ -1345,7 +1345,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
             def propose_round(self, history, known_token):
                 return replace(
                     super().propose_round(history, known_token),
-                    provider_abi="immer.qwen3.8-markov-draft-provider/v38",
+                    provider_abi="immer.qwen3.8-markov-draft-provider/v39",
                 )
 
         prompt = (1, 4)
