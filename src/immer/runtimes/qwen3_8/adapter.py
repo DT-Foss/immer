@@ -110,7 +110,9 @@ _GENERATION_RECEIPT_FIELDS = (
 )
 RESULT_CELL_GENERATION_POLICY_SCHEMA = "immer.qwen3.8-result-cell-generation-policy/v1"
 QWEN38_CHAT_HISTORY_METADATA = "qwen_chat_history"
+QWEN38_CHAT_SESSION_METADATA = "qwen_chat_session"
 _MAX_CHAT_HISTORY_MESSAGES = 128
+_MAX_CHAT_SESSION_LENGTH = 128
 _RESULT_CELL_CODE_REVISION_LENGTHS = frozenset((40, 64))
 
 
@@ -241,6 +243,22 @@ def _chat_history(metadata: object) -> tuple[tuple[str, str], ...]:
             raise ValueError("Qwen chat history content must be non-empty text")
         rows.append((expected, content.strip()))
     return tuple(rows)
+
+
+def _chat_session(metadata: object) -> str | None:
+    if not isinstance(metadata, Mapping):
+        raise TypeError("chat metadata must be a mapping")
+    value = metadata.get(QWEN38_CHAT_SESSION_METADATA)
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > _MAX_CHAT_SESSION_LENGTH
+    ):
+        raise ValueError("Qwen chat session ID must be 1-128 trimmed characters")
+    return value
 
 
 def _mapping(value: object, label: str) -> dict[str, Any]:
@@ -1518,6 +1536,10 @@ class Qwen38CausalChat:
         self._tokenizer_sha256: str | None = None
         self._markov_atlas: MarkovTokenAtlas | None = None
         self._markov_o1_retention: O1MarkovRetention | None = None
+        self._conversation_session_id: str | None = None
+        self._conversation_prefix_token_ids: tuple[int, ...] = ()
+        self._conversation_reuse_hits = 0
+        self._conversation_reuse_misses = 0
         self._load_error: str | None = None
         self._close_error: str | None = None
         self._closed = False
@@ -1979,6 +2001,32 @@ class Qwen38CausalChat:
         with self._lock:
             return self._closed
 
+    def _clear_conversation_binding(self) -> None:
+        self._conversation_session_id = None
+        self._conversation_prefix_token_ids = ()
+
+    def _owns_conversation_state(
+        self,
+        runtime: _OwnedRuntime,
+        session_id: str | None,
+    ) -> bool:
+        prefix = self._conversation_prefix_token_ids
+        if session_id is None or self._conversation_session_id != session_id or not prefix:
+            return False
+        next_position, poisoned, _state_bytes, batch_size = _anchor_model_state(
+            runtime.model
+        )
+        return not poisoned and batch_size == 1 and next_position == len(prefix)
+
+    def clear_conversation(self) -> None:
+        """Drop the one in-process chat prefix without closing the loaded runtime."""
+
+        with self._lock:
+            self._clear_conversation_binding()
+            runtime = self._runtime
+            if runtime is not None:
+                runtime.model.reset_state(release=True)
+
     def _open_runtime(self) -> _OwnedRuntime:
         return _open_official_runtime(
             bundle_path=self._bundle_path,
@@ -2096,6 +2144,19 @@ class Qwen38CausalChat:
 
         return emit
 
+    def _draft_mode_for_request(
+        self,
+        generation_options: Mapping[str, Any],
+    ) -> str | None:
+        mode = self._draft_mode
+        if generation_options.get("restored_prefix_length") is None:
+            return mode
+        if mode == "hybrid":
+            return "markov"
+        if mode == "mtp":
+            return None
+        return mode
+
     def _generate_locked(
         self,
         runtime: _OwnedRuntime,
@@ -2123,7 +2184,9 @@ class Qwen38CausalChat:
                 raise Qwen38ChatError("O1 retention episode did not decode to text")
             return retention.score(token_ids, decoded)
 
-        draft_enabled = self._draft_mode is not None and (
+        configured_draft_mode = self._draft_mode
+        effective_draft_mode = self._draft_mode_for_request(generation_options)
+        draft_enabled = effective_draft_mode is not None and (
             (self._draft_window_controller is None and self._max_new_tokens >= 2)
             or adaptive_selection is not None
             or (
@@ -2159,7 +2222,7 @@ class Qwen38CausalChat:
         )
         rolling_started = time.perf_counter()
         rolling_source_start = _runtime_source_body_bytes(runtime)
-        if self._draft_mode == "qwen35":
+        if effective_draft_mode == "qwen35":
             draft = self._load_draft_locked(runtime)
             provider: Any = Qwen35K4DraftProvider(
                 draft.model,
@@ -2167,7 +2230,7 @@ class Qwen38CausalChat:
                 head_block_rows=self._head_block_rows,
                 window_size=draft_window,
             )
-        elif self._draft_mode == "markov":
+        elif effective_draft_mode == "markov":
             provider = FingerprintRollingK4DraftProvider(
                 vocab_size=runtime.model.config.vocab_size,
                 state_path=self._markov_draft_state_path,
@@ -2177,7 +2240,7 @@ class Qwen38CausalChat:
                 episode_priority=None if retention is None else retention.priority,
                 episode_priority_store=None if retention is None else retention.remember,
             )
-        elif self._draft_mode == "mtp":
+        elif effective_draft_mode == "mtp":
             provider = Qwen35MtpDraftProvider(
                 runtime.model.config,
                 runtime.model.pager,
@@ -2212,7 +2275,7 @@ class Qwen38CausalChat:
                 mtp_factory,
             )
         adaptive_rounds = (
-            self._draft_mode
+            effective_draft_mode
             in {
                 "hybrid",
                 "markov",
@@ -2289,7 +2352,7 @@ class Qwen38CausalChat:
             provider_metrics = provider.metrics()
             provider_source_body_bytes = int(provider_metrics.source_body_bytes)
             provider_linear_calls = int(provider_metrics.linear_calls)
-            shared_target_pager = self._draft_mode in {"hybrid", "mtp"}
+            shared_target_pager = effective_draft_mode in {"hybrid", "mtp"}
             if shared_target_pager:
                 combined_source_body_bytes = max(
                     int(evidence.source_body_bytes),
@@ -2346,7 +2409,11 @@ class Qwen38CausalChat:
             )
             self._last_draft_evidence = {
                 "accepted_draft_tokens": evidence.accepted_draft_tokens,
-                "mode": self._draft_mode,
+                "configured_mode": configured_draft_mode,
+                "mode": effective_draft_mode,
+                "state_reuse_provider_downgrade": (
+                    effective_draft_mode != configured_draft_mode
+                ),
                 "draft_source_body_bytes": provider_source_body_bytes,
                 "aux_source_body_bytes": aux_source_body_bytes,
                 "draft_linear_calls": provider_linear_calls,
@@ -2445,7 +2512,7 @@ class Qwen38CausalChat:
                 )
                 timeout_provider_metrics = provider.metrics()
                 draft_source_bytes = int(timeout_provider_metrics.source_body_bytes)
-                if self._draft_mode in {"hybrid", "mtp"}:
+                if effective_draft_mode in {"hybrid", "mtp"}:
                     if draft_source_bytes > combined_source_bytes:
                         raise Qwen38ChatError(
                             "shared-pager timeout accounting exceeds execution"
@@ -2891,6 +2958,7 @@ class Qwen38CausalChat:
         text: str,
         *,
         history: tuple[tuple[str, str], ...] = (),
+        session_id: str | None = None,
     ) -> Result:
         prompt = Qwen38Tokenizer.render_no_thinking_messages(
             self._system_prompt,
@@ -2915,6 +2983,54 @@ class Qwen38CausalChat:
         )
         if any(token_id >= vocab_size for token_id in prompt_ids):
             raise _RequestRejected("prompt token is outside the checkpoint vocabulary")
+
+        reuse_status = "disabled" if session_id is None else "cold"
+        reused_prefix_tokens = 0
+        stored_session = self._conversation_session_id
+        stored_prefix = self._conversation_prefix_token_ids
+        next_position, poisoned, _state_bytes, batch_size = _anchor_model_state(
+            runtime.model
+        )
+        if session_id is None:
+            if (
+                stored_session is not None
+                or next_position
+                or poisoned
+                or batch_size is not None
+            ):
+                runtime.model.reset_state(release=True)
+                self._clear_conversation_binding()
+        elif stored_session is not None:
+            prefix_matches = (
+                stored_session == session_id
+                and bool(stored_prefix)
+                and len(prompt_ids) > len(stored_prefix)
+                and prompt_ids[: len(stored_prefix)] == stored_prefix
+            )
+            state_matches = (
+                not poisoned
+                and batch_size == 1
+                and next_position == len(stored_prefix)
+            )
+            if prefix_matches and state_matches:
+                reused_prefix_tokens = len(stored_prefix)
+                reuse_status = "hit"
+                self._conversation_reuse_hits += 1
+            else:
+                reuse_status = (
+                    "session-mismatch"
+                    if stored_session != session_id
+                    else "token-prefix-mismatch"
+                    if not prefix_matches
+                    else "state-mismatch"
+                )
+                self._conversation_reuse_misses += 1
+                runtime.model.reset_state(release=True)
+                self._clear_conversation_binding()
+        elif next_position or poisoned or batch_size is not None:
+            reuse_status = "unbound-state"
+            self._conversation_reuse_misses += 1
+            runtime.model.reset_state(release=True)
 
         if self._draft_window_controller is not None:
             self._draft_window_controller.bind_policy_identity(
@@ -2943,7 +3059,9 @@ class Qwen38CausalChat:
             "eos_token_ids": (IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID),
             "head_block_rows": self._head_block_rows,
         }
-        if self._anchor_cache is not None:
+        if reused_prefix_tokens:
+            generation_options["restored_prefix_length"] = reused_prefix_tokens
+        elif self._anchor_cache is not None:
             before_restore = _anchor_model_state(runtime.model)
             if before_restore != (0, False, 0, None):
                 raise Qwen38ChatError("anchor restore requires an empty released model")
@@ -3073,12 +3191,19 @@ class Qwen38CausalChat:
         if not isinstance(decoded, str):
             raise Qwen38ChatError("runtime tokenizer returned a non-text response")
         output = decoded.strip()
+        conversation_evidence = {
+            "history_messages": len(history),
+            "history_turns": len(history) // 2,
+            "prompt_suffix_tokens": len(prompt_ids) - reused_prefix_tokens,
+            "reuse_hits": self._conversation_reuse_hits,
+            "reuse_misses": self._conversation_reuse_misses,
+            "reuse_status": reuse_status,
+            "reused_prefix_tokens": reused_prefix_tokens,
+            "state_retained_tokens": 0,
+        }
         evidence = {
             **self._base_evidence(),
-            "conversation": {
-                "history_messages": len(history),
-                "history_turns": len(history) // 2,
-            },
+            "conversation": conversation_evidence,
             "generation": receipt,
             "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
             "runtime_metrics": {
@@ -3201,12 +3326,30 @@ class Qwen38CausalChat:
                 anchor_miss["charge"] = anchor_charge
             evidence["anchor_cache"] = anchor_miss
         if not output:
+            self._clear_conversation_binding()
             return Result(
                 ExecutionStatus.ABSTAINED,
                 self.name,
                 reason="Qwen3.8 decoded an empty response",
                 evidence=evidence,
             )
+        if session_id is not None:
+            combined = (*prompt_ids, *generated_ids)
+            cursor, state_poisoned, _state_bytes, state_batch = _anchor_model_state(
+                runtime.model
+            )
+            if (
+                len(prompt_ids) <= cursor <= len(combined)
+                and state_poisoned is False
+                and state_batch == 1
+                and getattr(runtime.model, "_pending_block_stage", None) is None
+            ):
+                retained = tuple(combined[:cursor])
+                self._conversation_session_id = session_id
+                self._conversation_prefix_token_ids = retained
+                conversation_evidence["state_retained_tokens"] = len(retained)
+            else:
+                self._clear_conversation_binding()
         return Result(
             ExecutionStatus.OK,
             self.name,
@@ -3216,6 +3359,7 @@ class Qwen38CausalChat:
 
     def _retire_runtime_locked(self, error: Exception) -> str:
         detail = f"{type(error).__name__}: {error}"
+        self._clear_conversation_binding()
         runtime = self._runtime
         draft_runtime = self._draft_runtime
         self._runtime = None
@@ -3322,6 +3466,7 @@ class Qwen38CausalChat:
             )
         try:
             history = _chat_history(request.metadata)
+            session_id = _chat_session(request.metadata)
         except (TypeError, ValueError) as exc:
             return Result(
                 ExecutionStatus.REJECTED,
@@ -3357,6 +3502,7 @@ class Qwen38CausalChat:
                     runtime,
                     request.payload.strip(),
                     history=history,
+                    session_id=session_id,
                 )
             except _RequestRejected as exc:
                 result = Result(
@@ -3385,7 +3531,15 @@ class Qwen38CausalChat:
                     evidence=self._base_evidence(),
                 )
             try:
-                runtime.model.reset_state(release=True)
+                retain_conversation = result.ok and self._owns_conversation_state(
+                    runtime,
+                    session_id,
+                )
+                if retain_conversation:
+                    runtime.model.pager.release(force_gc=True)
+                else:
+                    self._clear_conversation_binding()
+                    runtime.model.reset_state(release=True)
             except Exception as exc:
                 cleanup = self._retire_runtime_locked(exc)
                 failed = Result(
@@ -3408,6 +3562,21 @@ class Qwen38CausalChat:
                 result,
                 failure_outcome=failure_outcome,
             )
+            if retain_conversation and not finalized.ok:
+                try:
+                    self._clear_conversation_binding()
+                    runtime.model.reset_state(release=True)
+                except Exception as exc:
+                    cleanup = self._retire_runtime_locked(exc)
+                    finalized = Result(
+                        ExecutionStatus.ERROR,
+                        self.name,
+                        reason="Qwen3.8 state cleanup failed",
+                        evidence={
+                            **dict(finalized.evidence),
+                            "cleanup": {"status": "error", "detail": cleanup},
+                        },
+                    )
             if abort is not None:
                 raise abort
             return finalized
@@ -3422,6 +3591,7 @@ class Qwen38CausalChat:
             self._draft_runtime = None
             self._markov_atlas = None
             self._markov_o1_retention = None
+            self._clear_conversation_binding()
             self._closed = True
             if runtime is not None:
                 try:
@@ -3449,6 +3619,7 @@ Qwen38Chat = Qwen38CausalChat
 
 __all__ = [
     "QWEN38_CHAT_HISTORY_METADATA",
+    "QWEN38_CHAT_SESSION_METADATA",
     "RESULT_CELL_GENERATION_POLICY_SCHEMA",
     "Qwen38CausalChat",
     "Qwen38Chat",

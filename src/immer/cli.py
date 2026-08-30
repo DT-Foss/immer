@@ -536,6 +536,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
     )
     from .runtimes.qwen3_8.adapter import (
         QWEN38_CHAT_HISTORY_METADATA,
+        QWEN38_CHAT_SESSION_METADATA,
         Qwen38CausalChat,
     )
     from .runtimes.qwen3_8.draft_window import DraftWindowError
@@ -620,6 +621,17 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             history_turns = conversation.get("history_turns")
             if isinstance(history_turns, int) and not isinstance(history_turns, bool):
                 parts.append(f"{history_turns} prior turns")
+            reuse_status = conversation.get("reuse_status")
+            reused_prefix = conversation.get("reused_prefix_tokens")
+            if reuse_status == "hit" and isinstance(reused_prefix, int):
+                parts.append(f"{reused_prefix} cached prefix tokens")
+            retained_prefix = conversation.get("state_retained_tokens")
+            if (
+                reuse_status != "hit"
+                and isinstance(retained_prefix, int)
+                and retained_prefix > 0
+            ):
+                parts.append(f"{retained_prefix} prefix tokens cached")
         generated_tokens = generation.get("generated_tokens")
         if isinstance(generated_tokens, int) and not isinstance(generated_tokens, bool):
             parts.append(f"{generated_tokens} tokens")
@@ -769,10 +781,13 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         def request_metadata_for(
             text: str,
             history: tuple[tuple[str, str], ...] = (),
+            session_id: str | None = None,
         ) -> dict[str, object]:
             metadata: dict[str, object] = {}
             if history:
                 metadata[QWEN38_CHAT_HISTORY_METADATA] = history
+            if session_id is not None:
+                metadata[QWEN38_CHAT_SESSION_METADATA] = session_id
             if warm_profile_sha256 is None or prompt_tokenizer is None:
                 return metadata
             from .runtimes.qwen3_8.cartography_probe import (
@@ -1004,6 +1019,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             handled = 0
             last_summary = None
             history: tuple[tuple[str, str], ...] = ()
+            session_generation = 0
             terminal = sys.stdin.isatty() and sys.stdout.isatty()
             if terminal:
                 print(
@@ -1035,6 +1051,8 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 if line_message == "/clear":
                     history = ()
                     last_summary = None
+                    session_generation += 1
+                    qwen.clear_conversation()
                     if terminal:
                         print("Conversation context cleared.", flush=True)
                     continue
@@ -1057,7 +1075,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     Request(
                         "chat",
                         line_message,
-                        request_metadata_for(line_message, retained),
+                        request_metadata_for(
+                            line_message,
+                            retained,
+                            f"interactive:{session_generation}",
+                        ),
                     )
                 )
                 emit(result)

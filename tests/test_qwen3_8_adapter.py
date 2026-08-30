@@ -29,11 +29,12 @@ from immer.runtimes.ooe.result_cells import (
 )
 from immer.runtimes.qwen3_8.adapter import (
     QWEN38_CHAT_HISTORY_METADATA,
+    QWEN38_CHAT_SESSION_METADATA,
     Qwen38CausalChat,
     Qwen38ChatError,
 )
 from immer.runtimes.qwen3_8.cartography_probe import prompt_token_sha256
-from immer.runtimes.qwen3_8.encoding import Qwen38Tokenizer
+from immer.runtimes.qwen3_8.encoding import IM_END_TOKEN_ID, Qwen38Tokenizer
 from immer.runtimes.qwen3_8.markov_atlas import MarkovTokenAtlas
 from immer.runtimes.qwen3_8.semantic_atlas import ModelPin
 from immer.runtimes.qwen3_8.semantic_state_cache import (
@@ -130,6 +131,11 @@ class _Model:
         self.config = SimpleNamespace(vocab_size=300_000)
         self.generated = tuple(generated)
         self.state_bytes = 0
+        self.next_position = 0
+        self.state_poisoned = False
+        self.state_batch_size = None
+        self._pending_block_stage = None
+        self.pager = SimpleNamespace(release=Mock())
         self.generation_error = generation_error
         self.cleanup_error = cleanup_error
         self.calls: list[tuple[object, dict[str, object]]] = []
@@ -140,6 +146,13 @@ class _Model:
         if self.generation_error is not None:
             raise self.generation_error
         prompt_ids = tuple(prompt[0])
+        retained = len(self.generated) if kwargs.get("retain_final_state") else max(
+            0,
+            len(self.generated) - 1,
+        )
+        self.next_position = len(prompt_ids) + retained
+        self.state_batch_size = 1
+        self.state_bytes = 456
         return self.generated, {
             "prompt_token_ids": prompt_ids,
             "generated_token_ids": self.generated,
@@ -159,6 +172,10 @@ class _Model:
         self.reset_calls.append(release)
         if self.cleanup_error is not None:
             raise self.cleanup_error
+        self.next_position = 0
+        self.state_poisoned = False
+        self.state_batch_size = None
+        self.state_bytes = 0
 
 
 class _StreamingModel(_Model):
@@ -750,7 +767,16 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotIn("result_cell_binding_receipt", result.evidence)
         self.assertEqual(
             result.evidence["conversation"],
-            {"history_messages": 0, "history_turns": 0},
+            {
+                "history_messages": 0,
+                "history_turns": 0,
+                "prompt_suffix_tokens": 2,
+                "reuse_hits": 0,
+                "reuse_misses": 0,
+                "reuse_status": "disabled",
+                "reused_prefix_tokens": 0,
+                "state_retained_tokens": 0,
+            },
         )
 
     def test_chat_history_renders_exact_multi_turn_qwen_context(self) -> None:
@@ -781,8 +807,95 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         self.assertEqual(
             result.evidence["conversation"],
-            {"history_messages": 2, "history_turns": 1},
+            {
+                "history_messages": 2,
+                "history_turns": 1,
+                "prompt_suffix_tokens": 2,
+                "reuse_hits": 0,
+                "reuse_misses": 0,
+                "reuse_status": "disabled",
+                "reused_prefix_tokens": 0,
+                "state_retained_tokens": 0,
+            },
         )
+        chat.close()
+
+    def test_conversation_session_reuses_only_exact_committed_token_prefix(
+        self,
+    ) -> None:
+        class ConversationTokenizer(_Tokenizer):
+            def encode(self, text: str):
+                self.encoded.append(text)
+                if "Start over." in text:
+                    return (21, 22)
+                if "What was the word?" in text:
+                    return (11, 12, 7, IM_END_TOKEN_ID, 13, 14)
+                return (11, 12)
+
+            def decode(self, token_ids):
+                ids = tuple(token_ids)
+                self.decoded_ids.append(ids)
+                return "alpha" if ids[0] == 7 else "beta"
+
+        class ConversationModel(_Model):
+            def generate_greedy(self, prompt, **kwargs):
+                self.generated = (
+                    (7, IM_END_TOKEN_ID)
+                    if not self.calls
+                    else (8, IM_END_TOKEN_ID)
+                )
+                tokens, evidence = super().generate_greedy(prompt, **kwargs)
+                return tokens, {**evidence, "stopped_on_eos": True}
+
+        runtime = _Runtime(
+            model=ConversationModel(),
+            tokenizer=ConversationTokenizer(),
+        )
+        chat = _chat(runtime, max_prompt_tokens=8)
+        session = {QWEN38_CHAT_SESSION_METADATA: "conversation:test"}
+
+        first = chat.handle(Request("chat", "Remember alpha.", session))
+        second = chat.handle(
+            Request(
+                "chat",
+                "What was the word?",
+                {
+                    **session,
+                    QWEN38_CHAT_HISTORY_METADATA: (
+                        ("user", "Remember alpha."),
+                        ("assistant", "alpha"),
+                    ),
+                },
+            )
+        )
+
+        self.assertTrue(first.ok, first.reason)
+        self.assertTrue(second.ok, second.reason)
+        self.assertEqual(first.output, "alpha")
+        self.assertEqual(second.output, "beta")
+        self.assertEqual(runtime.model.reset_calls, [])
+        self.assertEqual(
+            runtime.model.calls[1][1]["restored_prefix_length"],
+            3,
+        )
+        self.assertEqual(second.evidence["conversation"]["reuse_status"], "hit")
+        self.assertEqual(second.evidence["conversation"]["reused_prefix_tokens"], 3)
+        self.assertEqual(second.evidence["conversation"]["prompt_suffix_tokens"], 3)
+        self.assertEqual(second.evidence["conversation"]["state_retained_tokens"], 7)
+        self.assertEqual(runtime.model.pager.release.call_count, 2)
+
+        restarted = chat.handle(Request("chat", "Start over.", session))
+        self.assertTrue(restarted.ok, restarted.reason)
+        self.assertEqual(
+            restarted.evidence["conversation"]["reuse_status"],
+            "token-prefix-mismatch",
+        )
+        self.assertNotIn("restored_prefix_length", runtime.model.calls[2][1])
+        self.assertEqual(runtime.model.reset_calls, [True])
+
+        chat.clear_conversation()
+        self.assertEqual(runtime.model.reset_calls, [True, True])
+        self.assertEqual(chat._conversation_prefix_token_ids, ())
         chat.close()
 
     def test_invalid_chat_history_is_rejected_before_runtime_load(self) -> None:
@@ -801,6 +914,51 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIn("completed turns", result.reason or "")
         self.assertFalse(chat.loaded)
         self.assertEqual(runtime.model.calls, [])
+        chat.close()
+
+    def test_conversation_generation_failure_drops_retained_state(self) -> None:
+        class FailureTokenizer(_Tokenizer):
+            def encode(self, text: str):
+                self.encoded.append(text)
+                if "Continue." in text:
+                    return (11, 12, 7, IM_END_TOKEN_ID, 13)
+                return (11, 12)
+
+            def decode(self, token_ids):
+                self.decoded_ids.append(tuple(token_ids))
+                return "alpha"
+
+        class FailureModel(_Model):
+            def generate_greedy(self, prompt, **kwargs):
+                tokens, evidence = super().generate_greedy(prompt, **kwargs)
+                return tokens, {**evidence, "stopped_on_eos": True}
+
+        model = FailureModel(generated=(7, IM_END_TOKEN_ID))
+        runtime = _Runtime(model=model, tokenizer=FailureTokenizer())
+        chat = _chat(runtime, max_prompt_tokens=8)
+        session = {QWEN38_CHAT_SESSION_METADATA: "conversation:failure"}
+        first = chat.handle(Request("chat", "Start.", session))
+        self.assertTrue(first.ok, first.reason)
+        self.assertTrue(chat._conversation_prefix_token_ids)
+
+        model.generation_error = RuntimeError("decode failed")
+        failed = chat.handle(
+            Request(
+                "chat",
+                "Continue.",
+                {
+                    **session,
+                    QWEN38_CHAT_HISTORY_METADATA: (
+                        ("user", "Start."),
+                        ("assistant", "alpha"),
+                    ),
+                },
+            )
+        )
+
+        self.assertIs(failed.status, ExecutionStatus.ERROR)
+        self.assertEqual(chat._conversation_prefix_token_ids, ())
+        self.assertEqual(model.reset_calls, [True])
         chat.close()
 
     def test_direct_generation_emits_cumulative_text_snapshots(self) -> None:
@@ -1133,6 +1291,23 @@ class Qwen38CausalChatTests(unittest.TestCase):
             "markov-prefix-utility/v2",
         )
         chat.close()
+
+    def test_restored_conversation_uses_only_state_independent_drafting(self) -> None:
+        runtime = _Runtime()
+        hybrid = _chat(runtime, draft_mode="hybrid", q4_root="/q4")
+        mtp = _chat(_Runtime(), draft_mode="mtp", q4_root="/q4")
+
+        self.assertEqual(hybrid._draft_mode_for_request({}), "hybrid")
+        self.assertEqual(
+            hybrid._draft_mode_for_request({"restored_prefix_length": 17}),
+            "markov",
+        )
+        self.assertIsNone(
+            mtp._draft_mode_for_request({"restored_prefix_length": 17})
+        )
+
+        hybrid.close()
+        mtp.close()
 
     def test_hybrid_runtime_identity_names_the_round_wise_feedback_policy(
         self,
