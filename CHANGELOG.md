@@ -4,11 +4,23 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-30
 
-Runtime commits through `85ee307` are deployed on the canonical server.
+Runtime commits through `1f9687b` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `1f9687b` separated exact output identity from transport/controller identity.
+  Every successful local Qwen result now carries a stable output-semantics
+  receipt over the complete rendered chat, token trace, model, Q4 math,
+  tokenizer, context bounds, EOS contract, and output-affecting MLP policy.
+  The shared ResultCell bank indexes that receipt independently of the full
+  warm profile, so transport-only source, thread, residency, prefetch, metric,
+  and controller changes no longer strand an exact answer. A semantic hit
+  restores the authenticated raw Qwen result before model load, clears stale
+  conversation/native state, reruns current FERTIG, and records zero target
+  forwards. Equivalent newer producers atomically replace the accounting
+  baseline; different output or generated-token trace under one semantic key
+  is a hard conflict.
 - `85ee307` re-enabled the growing zero-forward ResultCell path for canonical
   dynamic Q4 page execution. The previous warm-profile gate returned `None`
   whenever an MLP page-state path was configured, so current production chat

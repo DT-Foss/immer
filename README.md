@@ -308,10 +308,12 @@ release surface.
   prompt boundaries. Train, validation, and final holdout are separate,
   content-duplicate relabeling rejects, and the artifact is explicitly
   predictive-only.
-- **Exact result cells.** A `ResultCell` is the sealed special case for one
+- **Exact result cells.** A `ResultCell` is the content-addressed special case for one
   complete Qwen/FERTIG result binding. It is distinct from a generic
-  `ComputeCrystal` and executes only under exact prompt, model, provenance, and
-  final-parity contracts.
+  `ComputeCrystal`. Its shared semantic index binds the complete rendered chat,
+  prompt tokens, model, Q4 math, tokenizer, decoding contract, generated token
+  trace, and output. Transport and controller revisions remain producer
+  provenance instead of invalidating the reusable result.
 - **Transport intelligence.** Label-free route observations support held-out
   Markov and placebo studies while the model's official router remains
   authoritative.
@@ -351,7 +353,11 @@ full Q4. `--no-ooe-warm` disables this route, and `--ooe-warm-root` mounts an
 explicit bank outside the canonical deployment. Dynamic MLP-page execution is
 part of warm-profile v3: schema, policy, route width, energy coverage, and width
 actions are bound into the authority, while the state-file location remains a
-replaceable storage detail.
+replaceable storage detail. Exact results also have a shared output-semantics
+key. Thread count, mmap residency, prefetch budgets, metrics, and controller
+state can change without losing a confirmed answer; output-affecting changes
+produce a different key. Every hit reruns current FERTIG and clears stale live
+Qwen continuation state before returning.
 
 The canonical Q4 deployment mounts the MTP-capable v3 target bank and defaults
 to the round-wise Markov/MTP hybrid. Markov handles learned continuations;
@@ -400,10 +406,13 @@ Full-Q4/FERTIG path charges an exact ResultCell, derives a prompt-native Markov
 feature, teaches `qwen_fallback → mount_organ`, promotes the per-runtime
 controller, and persists the index. A repeated request with the same runtime
 profile, question and rendered-token identity then executes the stored cell
-without loading Qwen. FERTIG mismatches are never charged; profile, token,
-model, Q4, tokenizer and current runtime-code changes produce a cold miss.
-This growing path remains active with the canonical page-state v9 router; the
-former page-route gate that disabled ordinary ResultCell charging is removed.
+without loading Qwen. The shared semantic index additionally preserves that
+exact result across transport-only runtime profiles. FERTIG mismatches are
+never charged; question, rendered chat, prompt tokens, model, Q4 math,
+tokenizer, decoding bounds, system prompt, generated trace, or output changes
+cannot reuse the entry. This growing path remains active with the canonical
+page-state v9 router; the former page-route gate that disabled ordinary
+ResultCell charging is removed.
 
 The same cold stream induces parametric Markov programs when two distinct
 ResultCells prove the same deterministic span transformation. Copy and case
