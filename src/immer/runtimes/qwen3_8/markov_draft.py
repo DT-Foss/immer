@@ -34,8 +34,9 @@ try:
 except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
-MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v42"
+MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v10"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v43"
+V9_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -44,8 +45,9 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v31"
-_STATE_PREFIX = b"IMMD\x09"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v32"
+_STATE_PREFIX = b"IMMD\x0a"
+_V9_STATE_PREFIX = b"IMMD\x09"
 _V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
 _V6_STATE_PREFIX = b"IMMD\x06"
@@ -54,6 +56,18 @@ _V4_STATE_PREFIX = b"IMMD\x04"
 _V3_STATE_PREFIX = b"IMMD\x03"
 _V2_STATE_PREFIX = b"IMMD\x02"
 _LEGACY_STATE_PREFIX = b"IMMD\x01"
+_STATE_PREFIXES = (
+    _STATE_PREFIX,
+    _V9_STATE_PREFIX,
+    _V8_STATE_PREFIX,
+    _V7_STATE_PREFIX,
+    _V6_STATE_PREFIX,
+    _V5_STATE_PREFIX,
+    _V4_STATE_PREFIX,
+    _V3_STATE_PREFIX,
+    _V2_STATE_PREFIX,
+    _LEGACY_STATE_PREFIX,
+)
 _MAX_STATE_BYTES = 16 * 1024 * 1024
 _UNKNOWN_TOKEN = "<unknown>"
 _EPISODE_TOKEN = "<episode>"
@@ -627,6 +641,8 @@ class MarkovDraftState:
     expert_hits: tuple[int, ...] = ()
     horizon_expert_observations: tuple[tuple[int, ...], ...] = ()
     horizon_expert_hits: tuple[tuple[int, ...], ...] = ()
+    horizon_plan_observations: tuple[int, ...] = ()
+    horizon_plan_hits: tuple[int, ...] = ()
     lookahead_observations: tuple[int, ...] = ()
     lookahead_hits: tuple[int, ...] = ()
     lookahead_greedy_hits: tuple[int, ...] = ()
@@ -762,6 +778,30 @@ class MarkovDraftState:
             )
         ):
             raise ValueError("Markov horizon expert state is invalid")
+        plan_observations = tuple(self.horizon_plan_observations)
+        plan_hits = tuple(self.horizon_plan_hits)
+        if bool(plan_observations) != bool(plan_hits) or (
+            plan_observations
+            and (
+                len(plan_observations) != _MAX_PROPOSAL_POSITIONS
+                or len(plan_hits) != _MAX_PROPOSAL_POSITIONS
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    for value in (*plan_observations, *plan_hits)
+                )
+                or any(
+                    hit > observed
+                    for observed, hit in zip(
+                        plan_observations,
+                        plan_hits,
+                        strict=True,
+                    )
+                )
+            )
+        ):
+            raise ValueError("Markov horizon plan state is invalid")
         lookahead_observations = tuple(self.lookahead_observations)
         lookahead_hits = tuple(self.lookahead_hits)
         lookahead_greedy_hits = tuple(self.lookahead_greedy_hits)
@@ -859,6 +899,8 @@ class MarkovDraftState:
             horizon_observations,
         )
         object.__setattr__(self, "horizon_expert_hits", horizon_hits)
+        object.__setattr__(self, "horizon_plan_observations", plan_observations)
+        object.__setattr__(self, "horizon_plan_hits", plan_hits)
         object.__setattr__(self, "lookahead_observations", lookahead_observations)
         object.__setattr__(self, "lookahead_hits", lookahead_hits)
         object.__setattr__(self, "lookahead_greedy_hits", lookahead_greedy_hits)
@@ -888,6 +930,10 @@ class MarkovDraftState:
                 "horizon_expert_observations": [
                     list(row) for row in self.horizon_expert_observations
                 ],
+                "horizon_plan_hits": list(self.horizon_plan_hits),
+                "horizon_plan_observations": list(
+                    self.horizon_plan_observations
+                ),
                 "lookahead_greedy_hits": list(self.lookahead_greedy_hits),
                 "lookahead_hits": list(self.lookahead_hits),
                 "lookahead_observations": list(self.lookahead_observations),
@@ -919,55 +965,15 @@ class MarkovDraftState:
         if (
             not isinstance(data, bytes)
             or len(data) > _MAX_STATE_BYTES
-            or not data.startswith(
-                (
-                    _STATE_PREFIX,
-                    _V8_STATE_PREFIX,
-                    _V7_STATE_PREFIX,
-                    _V6_STATE_PREFIX,
-                    _V5_STATE_PREFIX,
-                    _V4_STATE_PREFIX,
-                    _V3_STATE_PREFIX,
-                    _V2_STATE_PREFIX,
-                    _LEGACY_STATE_PREFIX,
-                )
-            )
+            or not data.startswith(_STATE_PREFIXES)
         ):
             raise MarkovDraftError("Markov draft state envelope is invalid")
         try:
             decoder = zlib.decompressobj()
-            prefix = (
-                _STATE_PREFIX
-                if data.startswith(_STATE_PREFIX)
-                else (
-                    _V8_STATE_PREFIX
-                    if data.startswith(_V8_STATE_PREFIX)
-                    else (
-                        _V7_STATE_PREFIX
-                        if data.startswith(_V7_STATE_PREFIX)
-                        else (
-                            _V6_STATE_PREFIX
-                            if data.startswith(_V6_STATE_PREFIX)
-                            else (
-                                _V5_STATE_PREFIX
-                                if data.startswith(_V5_STATE_PREFIX)
-                                else (
-                                    _V4_STATE_PREFIX
-                                    if data.startswith(_V4_STATE_PREFIX)
-                                    else (
-                                        _V2_STATE_PREFIX
-                                        if data.startswith(_V2_STATE_PREFIX)
-                                        else (
-                                            _V3_STATE_PREFIX
-                                            if data.startswith(_V3_STATE_PREFIX)
-                                            else _LEGACY_STATE_PREFIX
-                                        )
-                                    )
-                                )
-                            )
-                        )
-                    )
-                )
+            prefix = next(
+                candidate
+                for candidate in _STATE_PREFIXES
+                if data.startswith(candidate)
             )
             raw = decoder.decompress(data[len(prefix) :], _MAX_STATE_BYTES + 1)
             if (
@@ -1011,6 +1017,10 @@ class MarkovDraftState:
             isinstance(value, dict)
             and value.get("schema") == V8_MARKOV_DRAFT_STATE_SCHEMA
         )
+        v9 = (
+            isinstance(value, dict)
+            and value.get("schema") == V9_MARKOV_DRAFT_STATE_SCHEMA
+        )
         v2_fields = {
             "expert_hits",
             "expert_log_weights",
@@ -1018,6 +1028,34 @@ class MarkovDraftState:
             "expert_observations",
             "leader_changes",
             "episode_lengths",
+            "feedback_count",
+            "max_history_tokens",
+            "regime_generation",
+            "schema",
+            "surprise_cusum",
+            "surprise_deviation",
+            "surprise_mean",
+            "token_ids",
+            "updates",
+            "vocab_size",
+        }
+        v9_fields = {
+            "expert_hits",
+            "expert_log_weights",
+            "expert_names",
+            "expert_observations",
+            "horizon_expert_hits",
+            "horizon_expert_observations",
+            "lookahead_greedy_hits",
+            "lookahead_hits",
+            "lookahead_observations",
+            "leader_changes",
+            "episode_lengths",
+            "episode_dialects",
+            "episode_prompt_lengths",
+            "imported_episode_sha256s",
+            "clock",
+            "dialects",
             "feedback_count",
             "max_history_tokens",
             "regime_generation",
@@ -1156,34 +1194,10 @@ class MarkovDraftState:
                 "vocab_size",
             }
             if v7 or v8
-            else {
-                "expert_hits",
-                "expert_log_weights",
-                "expert_names",
-                "expert_observations",
-                "horizon_expert_hits",
-                "horizon_expert_observations",
-                "lookahead_greedy_hits",
-                "lookahead_hits",
-                "lookahead_observations",
-                "leader_changes",
-                "episode_lengths",
-                "episode_dialects",
-                "episode_prompt_lengths",
-                "imported_episode_sha256s",
-                "clock",
-                "dialects",
-                "feedback_count",
-                "max_history_tokens",
-                "regime_generation",
-                "schema",
-                "surprise_cusum",
-                "surprise_deviation",
-                "surprise_mean",
-                "token_ids",
-                "updates",
-                "vocab_size",
-            }
+            else v9_fields
+            if v9
+            else v9_fields
+            | {"horizon_plan_hits", "horizon_plan_observations"}
         )
         if (
             not isinstance(value, dict)
@@ -1191,6 +1205,7 @@ class MarkovDraftState:
             or value.get("schema")
             not in {
                 MARKOV_DRAFT_STATE_SCHEMA,
+                V9_MARKOV_DRAFT_STATE_SCHEMA,
                 V8_MARKOV_DRAFT_STATE_SCHEMA,
                 V7_MARKOV_DRAFT_STATE_SCHEMA,
                 V6_MARKOV_DRAFT_STATE_SCHEMA,
@@ -1212,6 +1227,12 @@ class MarkovDraftState:
         lookahead_greedy_hits = tuple(
             value.get("lookahead_greedy_hits", planner_zeros)
         )
+        horizon_plan_observations = tuple(
+            value.get("horizon_plan_observations", planner_zeros)
+        )
+        horizon_plan_hits = tuple(
+            value.get("horizon_plan_hits", planner_zeros)
+        )
         try:
             return cls(
                 vocab_size=value["vocab_size"],
@@ -1231,6 +1252,8 @@ class MarkovDraftState:
                 horizon_expert_hits=tuple(
                     tuple(row) for row in value.get("horizon_expert_hits", ())
                 ),
+                horizon_plan_observations=horizon_plan_observations,
+                horizon_plan_hits=horizon_plan_hits,
                 lookahead_observations=lookahead_observations,
                 lookahead_hits=lookahead_hits,
                 lookahead_greedy_hits=lookahead_greedy_hits,
@@ -1255,6 +1278,7 @@ class MarkovDraftState:
                         legacy=value.get("schema")
                         not in {
                             MARKOV_DRAFT_STATE_SCHEMA,
+                            V9_MARKOV_DRAFT_STATE_SCHEMA,
                             V8_MARKOV_DRAFT_STATE_SCHEMA,
                         },
                     )
@@ -1294,6 +1318,9 @@ class MarkovDraftMetrics:
     last_disagreement: float
     horizon_observations: tuple[int, ...]
     horizon_weighted_accuracy: tuple[float, ...]
+    horizon_self_reliability: tuple[float, ...]
+    horizon_plan_observations: tuple[int, ...]
+    horizon_plan_hits: tuple[int, ...]
     last_position: int
     last_position_maturity: float
     last_dialect_skill_maturity: float
@@ -1569,6 +1596,12 @@ class FingerprintRollingK4DraftProvider:
                 lookahead_hits=(0,) * _MAX_PROPOSAL_POSITIONS,
                 lookahead_greedy_hits=(0,) * _MAX_PROPOSAL_POSITIONS,
             )
+        if not self._state.horizon_plan_observations:
+            self._state = replace(
+                self._state,
+                horizon_plan_observations=(0,) * _MAX_PROPOSAL_POSITIONS,
+                horizon_plan_hits=(0,) * _MAX_PROPOSAL_POSITIONS,
+            )
         if any(not row.horizon_observations for row in self._state.dialects):
             dialect_zeros = tuple(
                 (0,) * len(names) for _ in range(_MAX_PROPOSAL_POSITIONS)
@@ -1673,6 +1706,8 @@ class FingerprintRollingK4DraftProvider:
         self._max_request_weight_shift = 0.0
         self._request_horizon_observations: list[list[int]] | None = None
         self._request_horizon_hits: list[list[int]] | None = None
+        self._request_plan_observations: list[int] | None = None
+        self._request_plan_hits: list[int] | None = None
         self._request_position_updates = 0
         self._max_request_position_maturity = 0.0
         self._request_lookahead_observations: list[int] | None = None
@@ -2739,6 +2774,17 @@ class FingerprintRollingK4DraftProvider:
             ),
         )
 
+    def _plan_counts(self, position: int) -> tuple[int, int]:
+        observations = self._state.horizon_plan_observations[position]
+        hits = self._state.horizon_plan_hits[position]
+        if self._request_plan_observations is None:
+            return observations, hits
+        assert self._request_plan_hits is not None
+        return (
+            observations + self._request_plan_observations[position],
+            hits + self._request_plan_hits[position],
+        )
+
     def _position_weighting(
         self,
         position: int,
@@ -3040,9 +3086,20 @@ class FingerprintRollingK4DraftProvider:
 
     def _beam_position_reliability(self, position: int) -> float:
         verified = self._beam_position_verified[position]
-        if verified <= 0:
-            return 1.0
-        return (self._beam_position_hits[position] + 0.5) / (verified + 2.0)
+        direct = (
+            1.0
+            if verified <= 0
+            else (self._beam_position_hits[position] + 0.5) / (verified + 2.0)
+        )
+        observations, hits = self._plan_counts(position)
+        if observations <= 0:
+            return direct
+        posterior = (hits + 1.0) / (observations + 2.0)
+        maturity = observations / (
+            observations + self.POSITION_WEIGHT_SATURATION
+        )
+        learned = (1.0 - maturity) + maturity * posterior
+        return max(0.0, min(1.0, min(direct, learned)))
 
     @staticmethod
     def _distribution_disagreement(
@@ -3395,6 +3452,7 @@ class FingerprintRollingK4DraftProvider:
         confidences = []
         disagreements = []
         plan_trace = []
+        prefix_reliability = 1.0
         forced = tuple(forced_prefix)
         if (
             isinstance(position_offset, bool)
@@ -3522,6 +3580,11 @@ class FingerprintRollingK4DraftProvider:
                 horizon_position,
                 allow_empirical=position >= len(forced),
             )
+            prefix_reliability = min(
+                prefix_reliability,
+                self._beam_position_reliability(horizon_position),
+            )
+            self._last_confidence *= prefix_reliability
             self._last_position = horizon_position
             self._last_position_maturity = position_maturity
             self._last_dialect_skill_maturity = dialect_skill_maturity
@@ -3758,6 +3821,7 @@ class FingerprintRollingK4DraftProvider:
     ) -> None:
         self._update_request_weights(feedback, token, position)
         self._update_request_position_skill(feedback, token, position)
+        self._update_request_plan(planned_token, token, position)
         self._update_request_lookahead(
             planned_token,
             greedy_token,
@@ -3817,6 +3881,21 @@ class FingerprintRollingK4DraftProvider:
             maturity,
         )
 
+    def _update_request_plan(
+        self,
+        planned_token: int,
+        token: int,
+        position: int,
+    ) -> None:
+        if not 0 <= position < _MAX_PROPOSAL_POSITIONS:
+            raise MarkovDraftError("Markov plan position is invalid")
+        if self._request_plan_observations is None:
+            self._request_plan_observations = [0] * _MAX_PROPOSAL_POSITIONS
+            self._request_plan_hits = [0] * _MAX_PROPOSAL_POSITIONS
+        assert self._request_plan_hits is not None
+        self._request_plan_observations[position] += 1
+        self._request_plan_hits[position] += int(planned_token == token)
+
     def _update_request_lookahead(
         self,
         planned_token: int,
@@ -3860,6 +3939,8 @@ class FingerprintRollingK4DraftProvider:
             list(row) for row in self._state.horizon_expert_observations
         ]
         horizon_hits = [list(row) for row in self._state.horizon_expert_hits]
+        plan_observations = list(self._state.horizon_plan_observations)
+        plan_hits = list(self._state.horizon_plan_hits)
         lookahead_observations = list(self._state.lookahead_observations)
         lookahead_hits = list(self._state.lookahead_hits)
         lookahead_greedy_hits = list(self._state.lookahead_greedy_hits)
@@ -3962,6 +4043,8 @@ class FingerprintRollingK4DraftProvider:
             )
         planned = token if planned_token is None else planned_token
         greedy = planned if greedy_token is None else greedy_token
+        plan_observations[position] += 1
+        plan_hits[position] += int(planned == token)
         if planned != greedy:
             lookahead_observations[position] += 1
             lookahead_hits[position] += int(planned == token)
@@ -3976,6 +4059,8 @@ class FingerprintRollingK4DraftProvider:
                 tuple(row) for row in horizon_observations
             ),
             horizon_expert_hits=tuple(tuple(row) for row in horizon_hits),
+            horizon_plan_observations=tuple(plan_observations),
+            horizon_plan_hits=tuple(plan_hits),
             lookahead_observations=tuple(lookahead_observations),
             lookahead_hits=tuple(lookahead_hits),
             lookahead_greedy_hits=tuple(lookahead_greedy_hits),
@@ -4006,9 +4091,13 @@ class FingerprintRollingK4DraftProvider:
             list(row) for row in self._state.horizon_expert_observations
         ]
         hits = [list(row) for row in self._state.horizon_expert_hits]
+        plan_observations = list(self._state.horizon_plan_observations)
+        plan_hits = list(self._state.horizon_plan_hits)
         for index, prediction in enumerate(predictions):
             observations[position][index] += 1
             hits[position][index] += int(prediction == token)
+        plan_observations[position] += 1
+        plan_hits[position] += int(planned_token == token)
         lookahead_observations = list(self._state.lookahead_observations)
         lookahead_hits = list(self._state.lookahead_hits)
         lookahead_greedy_hits = list(self._state.lookahead_greedy_hits)
@@ -4038,6 +4127,8 @@ class FingerprintRollingK4DraftProvider:
                 tuple(row) for row in observations
             ),
             horizon_expert_hits=tuple(tuple(row) for row in hits),
+            horizon_plan_observations=tuple(plan_observations),
+            horizon_plan_hits=tuple(plan_hits),
             lookahead_observations=tuple(lookahead_observations),
             lookahead_hits=tuple(lookahead_hits),
             lookahead_greedy_hits=tuple(lookahead_greedy_hits),
@@ -4136,6 +4227,7 @@ class FingerprintRollingK4DraftProvider:
                     token,
                     position,
                 )
+                self._update_request_plan(planned_token, token, position)
                 self._update_request_lookahead(
                     planned_token,
                     greedy_token,
@@ -5022,6 +5114,16 @@ class FingerprintRollingK4DraftProvider:
             if self._request_horizon_hits is None
             else [list(row) for row in self._request_horizon_hits]
         )
+        original_request_plan_observations = (
+            None
+            if self._request_plan_observations is None
+            else list(self._request_plan_observations)
+        )
+        original_request_plan_hits = (
+            None
+            if self._request_plan_hits is None
+            else list(self._request_plan_hits)
+        )
         original_request_position_updates = self._request_position_updates
         original_max_request_position_maturity = (
             self._max_request_position_maturity
@@ -5065,6 +5167,8 @@ class FingerprintRollingK4DraftProvider:
             self._request_expert_rapidities = None
             self._request_horizon_observations = None
             self._request_horizon_hits = None
+            self._request_plan_observations = None
+            self._request_plan_hits = None
             self._request_lookahead_observations = None
             self._request_lookahead_hits = None
             self._request_lookahead_greedy_hits = None
@@ -5184,6 +5288,8 @@ class FingerprintRollingK4DraftProvider:
                 original_request_horizon_observations
             )
             self._request_horizon_hits = original_request_horizon_hits
+            self._request_plan_observations = original_request_plan_observations
+            self._request_plan_hits = original_request_plan_hits
             self._request_position_updates = original_request_position_updates
             self._max_request_position_maturity = (
                 original_max_request_position_maturity
@@ -5308,6 +5414,18 @@ class FingerprintRollingK4DraftProvider:
                         strict=True,
                     )
                 )
+            ),
+            horizon_self_reliability=tuple(
+                self._beam_position_reliability(position)
+                for position in range(_MAX_PROPOSAL_POSITIONS)
+            ),
+            horizon_plan_observations=tuple(
+                self._plan_counts(position)[0]
+                for position in range(_MAX_PROPOSAL_POSITIONS)
+            ),
+            horizon_plan_hits=tuple(
+                self._plan_counts(position)[1]
+                for position in range(_MAX_PROPOSAL_POSITIONS)
             ),
             last_position=self._last_position,
             last_position_maturity=self._last_position_maturity,
@@ -5486,6 +5604,8 @@ class FingerprintRollingK4DraftProvider:
         self._request_expert_rapidities = None
         self._request_horizon_observations = None
         self._request_horizon_hits = None
+        self._request_plan_observations = None
+        self._request_plan_hits = None
         self._request_lookahead_observations = None
         self._request_lookahead_hits = None
         self._request_lookahead_greedy_hits = None
@@ -5513,6 +5633,7 @@ __all__ = [
     "V6_MARKOV_DRAFT_STATE_SCHEMA",
     "V7_MARKOV_DRAFT_STATE_SCHEMA",
     "V8_MARKOV_DRAFT_STATE_SCHEMA",
+    "V9_MARKOV_DRAFT_STATE_SCHEMA",
     "MARKOV_DRAFT_METRICS_SCHEMA",
     "MARKOV_DRAFT_PROVIDER_ABI",
     "MARKOV_DRAFT_STATE_SCHEMA",

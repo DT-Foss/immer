@@ -354,7 +354,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(provider.metrics().expert_weights), 8)
         provider.close()
 
-    def test_v2_council_state_migrates_to_v9_planner_memory(self) -> None:
+    def test_v2_council_state_migrates_to_v10_planner_memory(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         state = seed._state
         seed.close()
@@ -394,11 +394,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((1, 2, 3, 4))
         provider.close()
 
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0a"))
         migrated = MarkovDraftState.from_bytes(path.read_bytes())
         self.assertEqual(len(migrated.dialects), 1)
 
-    def test_v3_dialect_state_migrates_episode_bindings_to_v9(self) -> None:
+    def test_v3_dialect_state_migrates_episode_bindings_to_v10(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -411,6 +411,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("imported_episode_sha256s")
         document.pop("horizon_expert_hits")
         document.pop("horizon_expert_observations")
+        document.pop("horizon_plan_hits")
+        document.pop("horizon_plan_observations")
         document.pop("lookahead_greedy_hits")
         document.pop("lookahead_hits")
         document.pop("lookahead_observations")
@@ -434,9 +436,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.episode_dialects, (None,))
         provider.observe_final((1, 2, 3, 4))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0a"))
 
-    def test_v4_state_migrates_empty_import_inventory_to_v9(self) -> None:
+    def test_v4_state_migrates_empty_import_inventory_to_v10(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -448,6 +450,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("episode_prompt_lengths")
         document.pop("horizon_expert_hits")
         document.pop("horizon_expert_observations")
+        document.pop("horizon_plan_hits")
+        document.pop("horizon_plan_observations")
         document.pop("lookahead_greedy_hits")
         document.pop("lookahead_hits")
         document.pop("lookahead_observations")
@@ -470,9 +474,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider.imported_episode_sha256s(), ())
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0a"))
 
-    def test_v5_state_migrates_unknown_prompt_boundaries_to_v9(self) -> None:
+    def test_v5_state_migrates_unknown_prompt_boundaries_to_v10(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -483,6 +487,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("episode_prompt_lengths")
         document.pop("horizon_expert_hits")
         document.pop("horizon_expert_observations")
+        document.pop("horizon_plan_hits")
+        document.pop("horizon_plan_observations")
         document.pop("lookahead_greedy_hits")
         document.pop("lookahead_hits")
         document.pop("lookahead_observations")
@@ -505,9 +511,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider._state.episode_prompt_lengths, (None,))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0a"))
 
-    def test_v6_state_migrates_zeroed_position_expert_memory_to_v9(self) -> None:
+    def test_v6_state_migrates_zeroed_position_expert_memory_to_v10(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -517,6 +523,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document = json.loads(zlib.decompress(encoded[5:]))
         document.pop("horizon_expert_hits")
         document.pop("horizon_expert_observations")
+        document.pop("horizon_plan_hits")
+        document.pop("horizon_plan_observations")
         document.pop("lookahead_greedy_hits")
         document.pop("lookahead_hits")
         document.pop("lookahead_observations")
@@ -542,9 +550,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             all(not any(row) for row in provider._state.horizon_expert_observations)
         )
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0a"))
 
-    def test_v7_state_migrates_dialect_position_memory_to_v9(self) -> None:
+    def test_v7_state_migrates_dialect_position_memory_to_v10(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         seed.observe_final((1, 2, 3))
         document = json.loads(zlib.decompress(seed._state.to_bytes()[5:]))
@@ -555,6 +563,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("lookahead_greedy_hits")
         document.pop("lookahead_hits")
         document.pop("lookahead_observations")
+        document.pop("horizon_plan_hits")
+        document.pop("horizon_plan_observations")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v7"
         raw = json.dumps(
             document,
@@ -576,15 +586,17 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(dialect.horizon_observations), 16)
         self.assertTrue(all(not any(row) for row in dialect.horizon_observations))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0a"))
 
-    def test_v8_state_migrates_zeroed_lookahead_outcomes_to_v9(self) -> None:
+    def test_v8_state_migrates_zeroed_lookahead_outcomes_to_v10(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
         provider.close()
         document.pop("lookahead_greedy_hits")
         document.pop("lookahead_hits")
         document.pop("lookahead_observations")
+        document.pop("horizon_plan_hits")
+        document.pop("horizon_plan_observations")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v8"
         raw = json.dumps(
             document,
@@ -614,7 +626,55 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.lookahead_hits, (0,) * 16)
         self.assertEqual(provider._state.lookahead_greedy_hits, (0,) * 16)
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0a"))
+
+    def test_v9_state_migrates_neutral_plan_reliability_to_v10(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
+        provider.close()
+        document.pop("horizon_plan_hits")
+        document.pop("horizon_plan_observations")
+        document["schema"] = "immer.qwen3.8-markov-draft-state/v9"
+        raw = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        path = self.root / "v9-state.bin"
+        path.write_bytes(b"IMMD\x09" + zlib.compress(raw, level=9))
+
+        migrated = MarkovDraftState.from_bytes(path.read_bytes())
+        self.assertEqual(migrated.horizon_plan_observations, (0,) * 16)
+        self.assertEqual(migrated.horizon_plan_hits, (0,) * 16)
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=path,
+        )
+        self.assertEqual(provider.metrics().horizon_self_reliability, (1.0,) * 16)
+        provider.close()
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0a"))
+
+    def test_v10_rejects_malformed_plan_reliability_shape(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
+        provider.close()
+        document["horizon_plan_observations"] = [0] * 15
+        raw = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+        with self.assertRaisesRegex(
+            MarkovDraftError,
+            "values are invalid",
+        ):
+            MarkovDraftState.from_bytes(b"IMMD\x0a" + zlib.compress(raw, level=9))
 
     def test_import_digest_survives_episode_eviction_and_prevents_replay(self) -> None:
         state_path = self.root / "imported-markov.bin"
@@ -1215,6 +1275,117 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider.metrics().lookahead_calls, 1)
         self.assertEqual(provider.metrics().last_lookahead_gain, 0.0)
         self.assertEqual(len(calls), len(provider._experts) * 5)
+        provider.close()
+
+    def test_plan_self_reliability_is_neutral_without_target_evidence(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+
+        metrics = provider.metrics()
+
+        self.assertEqual(
+            markov_module.MARKOV_DRAFT_PROVIDER_ABI,
+            "immer.qwen3.8-markov-draft-provider/v43",
+        )
+        self.assertEqual(
+            metrics.schema,
+            "immer.qwen3.8-markov-draft-metrics/v32",
+        )
+        self.assertEqual(metrics.horizon_self_reliability, (1.0,) * 16)
+        self.assertTrue(
+            all(
+                provider._beam_position_reliability(position) == 1.0
+                for position in range(16)
+            )
+        )
+        provider.close()
+
+    def test_persistent_deep_plan_misses_cap_confidence_and_window(self) -> None:
+        class DecisiveExpert:
+            @staticmethod
+            def distribution(_context):
+                return {"07": 0.99, "08": 0.01}
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=7,
+        )
+        provider._expert_models = lambda _history: tuple(
+            (DecisiveExpert(), []) for _ in provider._experts
+        )
+        tokens, _feedback, clean_confidence, disagreement = provider._predict_council(
+            (1,),
+            7,
+            forced_prefix=(7,) * 7,
+        )
+        clean = RollingDraftProposal.build(
+            tokens,
+            clean_confidence,
+            disagreement,
+            request_window_ceiling=8,
+            provider_abi=markov_module.MARKOV_DRAFT_PROVIDER_ABI,
+        )
+        observations = [0] * 16
+        hits = [0] * 16
+        observations[3] = 100
+        provider._state = replace(
+            provider._state,
+            horizon_plan_observations=tuple(observations),
+            horizon_plan_hits=tuple(hits),
+        )
+
+        miss_reliability = provider._beam_position_reliability(3)
+        miss_tokens, _feedback, miss_confidence, miss_disagreement = (
+            provider._predict_council(
+                (1,),
+                7,
+                forced_prefix=(7,) * 7,
+            )
+        )
+        capped = RollingDraftProposal.build(
+            miss_tokens,
+            miss_confidence,
+            miss_disagreement,
+            request_window_ceiling=8,
+            provider_abi=markov_module.MARKOV_DRAFT_PROVIDER_ABI,
+        )
+
+        expected = (1.0 - 100 / 108) + (100 / 108) * (1 / 102)
+        self.assertAlmostEqual(miss_reliability, expected)
+        self.assertEqual(miss_tokens, tokens)
+        self.assertEqual(miss_confidence[:3], clean_confidence[:3])
+        self.assertTrue(all(value <= miss_reliability for value in miss_confidence[3:]))
+        self.assertEqual(clean.recommended_window, 8)
+        self.assertEqual(capped.recommended_window, 4)
+        self.assertAlmostEqual(
+            provider.metrics().horizon_self_reliability[3],
+            expected,
+        )
+        provider.close()
+
+    def test_direct_beam_receipt_remains_the_minimum_reliability_cap(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        observations = [0] * 16
+        hits = [0] * 16
+        observations[5] = 100
+        hits[5] = 100
+        provider._state = replace(
+            provider._state,
+            horizon_plan_observations=tuple(observations),
+            horizon_plan_hits=tuple(hits),
+        )
+        learned = provider._beam_position_reliability(5)
+        provider._beam_position_verified[5] = 4
+        provider._beam_position_hits[5] = 0
+
+        capped = provider._beam_position_reliability(5)
+
+        direct = 0.5 / 6
+        self.assertGreater(learned, 0.98)
+        self.assertAlmostEqual(capped, direct)
+        self.assertAlmostEqual(
+            provider.metrics().horizon_self_reliability[5],
+            direct,
+        )
         provider.close()
 
     def test_atlas_online_beam_can_choose_non_top1_for_a_stronger_path(self) -> None:
@@ -3599,6 +3770,62 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         self.assertEqual(restored.metrics().horizon_observations[:8], (2,) * 8)
         restored.close()
+
+    def test_deep_recursive_plan_hits_persist_and_outweigh_misses(self) -> None:
+        def exercise(path: Path, *, hit: bool) -> tuple[float, float, float]:
+            provider = FingerprintRollingK4DraftProvider(
+                vocab_size=32,
+                state_path=path,
+                max_history_tokens=128,
+                proposal_width=7,
+            )
+            prompt = (20, 21)
+            provider.begin_request(prompt)
+            proposal = provider.propose_round(prompt, 22)
+            complete = provider._pending_complete
+            committed = (*prompt, 22, proposal.token_ids[0])
+            provider.reconcile_external_prefix(committed)
+            deep_token = complete[2] if hit else (complete[2] + 1) % provider.vocab_size
+            history = (*committed, complete[1], deep_token)
+
+            provider.advance_confirmed_prefix(history)
+
+            active = provider.metrics()
+            self.assertEqual(active.recursive_trace_feedback_tokens, 1)
+            self.assertEqual(active.recursive_trace_hits, int(hit))
+            self.assertEqual(active.recursive_trace_misses, int(not hit))
+            self.assertEqual(provider._state.horizon_plan_observations[2], 0)
+            active_reliability = active.horizon_self_reliability[2]
+            self.assertLess(active_reliability, 1.0)
+            provider.observe_final(history)
+            persisted = provider.metrics()
+            self.assertEqual(provider._state.horizon_plan_observations[2], 1)
+            self.assertEqual(provider._state.horizon_plan_hits[2], int(hit))
+            persisted_reliability = persisted.horizon_self_reliability[2]
+            provider.close()
+
+            restored = FingerprintRollingK4DraftProvider(
+                vocab_size=32,
+                state_path=path,
+                max_history_tokens=128,
+                proposal_width=7,
+            )
+            restored_reliability = restored.metrics().horizon_self_reliability[2]
+            restored.close()
+            return (
+                active_reliability,
+                persisted_reliability,
+                restored_reliability,
+            )
+
+        hit_reliability = exercise(self.root / "recursive-hit.bin", hit=True)
+        miss_reliability = exercise(self.root / "recursive-miss.bin", hit=False)
+
+        self.assertGreater(hit_reliability[0], miss_reliability[0])
+        self.assertEqual(hit_reliability[0], hit_reliability[1])
+        self.assertEqual(hit_reliability[1], hit_reliability[2])
+        self.assertEqual(miss_reliability[0], miss_reliability[1])
+        self.assertEqual(miss_reliability[1], miss_reliability[2])
 
     def test_recursive_trace_failure_rolls_back_and_close_clears_it(self) -> None:
         provider = FingerprintRollingK4DraftProvider(

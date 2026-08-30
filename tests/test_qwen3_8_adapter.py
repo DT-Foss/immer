@@ -13,6 +13,9 @@ from unittest.mock import Mock, patch
 import torch
 
 from immer.cli import (
+    _QWEN38_HYBRID_DRAFT_ABI,
+    _QWEN38_MARKOV_DRAFT_ABI,
+    _QWEN38_MTP_DRAFT_ABI,
     _qwen38_growing_warm_profile,
     _qwen38_runtime_code_paths,
     main,
@@ -36,7 +39,14 @@ from immer.runtimes.qwen3_8.adapter import (
 from immer.runtimes.qwen3_8.cartography_probe import prompt_token_sha256
 from immer.runtimes.qwen3_8.encoding import IM_END_TOKEN_ID, Qwen38Tokenizer
 from immer.runtimes.qwen3_8.markov_atlas import MarkovTokenAtlas
-from immer.runtimes.qwen3_8.mtp_draft import Qwen35MtpCarry
+from immer.runtimes.qwen3_8.hybrid_draft import (
+    QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
+)
+from immer.runtimes.qwen3_8.markov_draft import MARKOV_DRAFT_PROVIDER_ABI
+from immer.runtimes.qwen3_8.mtp_draft import (
+    QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
+    Qwen35MtpCarry,
+)
 from immer.runtimes.qwen3_8.semantic_atlas import ModelPin
 from immer.runtimes.qwen3_8.semantic_state_cache import (
     AnchorReceipt,
@@ -2215,6 +2225,17 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotEqual(current, changed)
         self.assertNotEqual(current, changed_mtp)
         self.assertNotEqual(current, changed_hybrid)
+
+    def test_cli_draft_abis_match_runtime_exports(self) -> None:
+        self.assertEqual(_QWEN38_MARKOV_DRAFT_ABI, MARKOV_DRAFT_PROVIDER_ABI)
+        self.assertEqual(
+            _QWEN38_HYBRID_DRAFT_ABI,
+            QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
+        )
+        self.assertEqual(
+            _QWEN38_MTP_DRAFT_ABI,
+            QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
+        )
 
     def test_cli_explicit_layout_does_not_inherit_deployed_q4(self) -> None:
         qwen = _chat(_Runtime())
