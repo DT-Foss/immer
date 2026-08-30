@@ -47,6 +47,10 @@ All notable changes to IMMER are recorded here.
   position weights, calibrated confidence, and language evidence before the
   next draft. `182fbf9` covers K1 carry, external mismatch, teacher carry,
   abort, retry, and exact-once persistence. Provider ABI is v33; metrics v24.
+- `2caa03f` added same-request lookahead regret. Planned-vs-greedy outcomes are
+  tracked per recursive position and can disable a harmful one-step override
+  before finalization. `3dff43a` proves terminal-carry persistence failure and
+  retry consume the outcome exactly once. Provider ABI is v34; metrics v25.
 
 ### Arbitrary local Qwen runtime
 
