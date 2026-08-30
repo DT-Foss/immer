@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v33"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v34"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -44,7 +44,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v24"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v25"
 _STATE_PREFIX = b"IMMD\x09"
 _V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
@@ -1299,6 +1299,7 @@ class MarkovDraftMetrics:
     max_request_weight_shift: float
     request_position_updates: int
     max_request_position_maturity: float
+    request_lookahead_updates: int
     regime_generation: int
     surprise_mean: float
     surprise_cusum: float
@@ -1626,6 +1627,10 @@ class FingerprintRollingK4DraftProvider:
         self._request_horizon_hits: list[list[int]] | None = None
         self._request_position_updates = 0
         self._max_request_position_maturity = 0.0
+        self._request_lookahead_observations: list[int] | None = None
+        self._request_lookahead_hits: list[int] | None = None
+        self._request_lookahead_greedy_hits: list[int] | None = None
+        self._request_lookahead_updates = 0
         self._external_reconcile_calls = 0
         self._external_feedback_tokens = 0
         self._teacher_forced_predictions = 0
@@ -2710,6 +2715,20 @@ class FingerprintRollingK4DraftProvider:
         calibrated = 1.0 - (1.0 - raw) * (1.0 - evidence)
         return max(raw, min(0.999, calibrated)), evidence
 
+    def _lookahead_counts(self, position: int) -> tuple[int, int, int]:
+        observations = self._state.lookahead_observations[position]
+        hits = self._state.lookahead_hits[position]
+        greedy_hits = self._state.lookahead_greedy_hits[position]
+        if self._request_lookahead_observations is None:
+            return observations, hits, greedy_hits
+        assert self._request_lookahead_hits is not None
+        assert self._request_lookahead_greedy_hits is not None
+        return (
+            observations + self._request_lookahead_observations[position],
+            hits + self._request_lookahead_hits[position],
+            greedy_hits + self._request_lookahead_greedy_hits[position],
+        )
+
     def _lookahead_choice(
         self,
         experts: Sequence[tuple[_TransitionFingerprint, list[str]]],
@@ -2771,18 +2790,14 @@ class FingerprintRollingK4DraftProvider:
         greedy_row = next(row for row in rows if row[3] == greedy)
         gain = max(0.0, best[0] - greedy_row[0])
         if best[3] != greedy:
-            observations = self._state.lookahead_observations[position]
+            observations, planned_hits, greedy_hits = self._lookahead_counts(position)
             empirical_advantage = 0.0
             if observations > 0:
                 maturity = observations / (
                     observations + self.EMPIRICAL_EVIDENCE_SATURATION
                 )
-                planned = (self._state.lookahead_hits[position] + 1.0) / (
-                    observations + 2.0
-                )
-                baseline = (
-                    self._state.lookahead_greedy_hits[position] + 1.0
-                ) / (observations + 2.0)
+                planned = (planned_hits + 1.0) / (observations + 2.0)
+                baseline = (greedy_hits + 1.0) / (observations + 2.0)
                 empirical_advantage = maturity * (
                     math.log(planned / max(1e-12, 1.0 - planned))
                     - math.log(baseline / max(1e-12, 1.0 - baseline))
@@ -3471,6 +3486,12 @@ class FingerprintRollingK4DraftProvider:
     ) -> None:
         self._update_request_weights(feedback, token, position)
         self._update_request_position_skill(feedback, token, position)
+        self._update_request_lookahead(
+            planned_token,
+            greedy_token,
+            token,
+            position,
+        )
         self._episode_feedback.append(
             (
                 feedback,
@@ -3509,6 +3530,28 @@ class FingerprintRollingK4DraftProvider:
             self._max_request_position_maturity,
             maturity,
         )
+
+    def _update_request_lookahead(
+        self,
+        planned_token: int,
+        greedy_token: int,
+        token: int,
+        position: int,
+    ) -> None:
+        if planned_token == greedy_token:
+            return
+        if not 0 <= position < _MAX_PROPOSAL_POSITIONS:
+            raise MarkovDraftError("Markov feedback position is invalid")
+        if self._request_lookahead_observations is None:
+            self._request_lookahead_observations = [0] * _MAX_PROPOSAL_POSITIONS
+            self._request_lookahead_hits = [0] * _MAX_PROPOSAL_POSITIONS
+            self._request_lookahead_greedy_hits = [0] * _MAX_PROPOSAL_POSITIONS
+        assert self._request_lookahead_hits is not None
+        assert self._request_lookahead_greedy_hits is not None
+        self._request_lookahead_observations[position] += 1
+        self._request_lookahead_hits[position] += int(planned_token == token)
+        self._request_lookahead_greedy_hits[position] += int(greedy_token == token)
+        self._request_lookahead_updates += 1
 
     def _apply_council_feedback(
         self,
@@ -4469,6 +4512,22 @@ class FingerprintRollingK4DraftProvider:
         original_max_request_position_maturity = (
             self._max_request_position_maturity
         )
+        original_request_lookahead_observations = (
+            None
+            if self._request_lookahead_observations is None
+            else list(self._request_lookahead_observations)
+        )
+        original_request_lookahead_hits = (
+            None
+            if self._request_lookahead_hits is None
+            else list(self._request_lookahead_hits)
+        )
+        original_request_lookahead_greedy_hits = (
+            None
+            if self._request_lookahead_greedy_hits is None
+            else list(self._request_lookahead_greedy_hits)
+        )
+        original_request_lookahead_updates = self._request_lookahead_updates
         try:
             if (
                 self._last_confirmed_length is not None
@@ -4490,6 +4549,9 @@ class FingerprintRollingK4DraftProvider:
             self._request_expert_rapidities = None
             self._request_horizon_observations = None
             self._request_horizon_hits = None
+            self._request_lookahead_observations = None
+            self._request_lookahead_hits = None
+            self._request_lookahead_greedy_hits = None
             for (
                 feedback,
                 token,
@@ -4579,6 +4641,14 @@ class FingerprintRollingK4DraftProvider:
             self._max_request_position_maturity = (
                 original_max_request_position_maturity
             )
+            self._request_lookahead_observations = (
+                original_request_lookahead_observations
+            )
+            self._request_lookahead_hits = original_request_lookahead_hits
+            self._request_lookahead_greedy_hits = (
+                original_request_lookahead_greedy_hits
+            )
+            self._request_lookahead_updates = original_request_lookahead_updates
             raise
 
     def _persist(self) -> None:
@@ -4713,6 +4783,7 @@ class FingerprintRollingK4DraftProvider:
             max_request_weight_shift=self._max_request_weight_shift,
             request_position_updates=self._request_position_updates,
             max_request_position_maturity=self._max_request_position_maturity,
+            request_lookahead_updates=self._request_lookahead_updates,
             regime_generation=self._state.regime_generation,
             surprise_mean=self._state.surprise_mean,
             surprise_cusum=self._state.surprise_cusum,
@@ -4833,6 +4904,9 @@ class FingerprintRollingK4DraftProvider:
         self._request_expert_rapidities = None
         self._request_horizon_observations = None
         self._request_horizon_hits = None
+        self._request_lookahead_observations = None
+        self._request_lookahead_hits = None
+        self._request_lookahead_greedy_hits = None
         self._request_local_cache_history = None
         self._request_local_cache = None
         self._episode_feedback.clear()

@@ -2066,6 +2066,52 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(restored.lookahead_greedy_hits[0], 16)
         provider.close()
 
+    def test_request_lookahead_regret_disables_a_harmful_override_immediately(
+        self,
+    ) -> None:
+        class PlanningExpert:
+            @staticmethod
+            def distribution(context):
+                if not context:
+                    return {"07": 0.55, "08": 0.45}
+                if context[-1] == "07":
+                    return {"09": 0.51, "10": 0.49}
+                return {"09": 0.99, "10": 0.01}
+
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        provider.begin_request((20,))
+        provider._expert_models = lambda _history: tuple(
+            (PlanningExpert(), []) for _ in provider._experts
+        )
+        planned, feedback, _confidence, _disagreement = provider._predict_council(
+            (1,), 1
+        )
+        state_before = provider._state
+        self.assertEqual(planned, (8,))
+
+        for _ in range(16):
+            provider._record_confirmed_feedback(
+                feedback[0],
+                7,
+                0,
+                8,
+                7,
+                0.1,
+            )
+        learned, _feedback, _confidence, _disagreement = provider._predict_council(
+            (1,), 1
+        )
+
+        self.assertEqual(learned, (7,))
+        self.assertEqual(provider._state.lookahead_observations[0], 0)
+        self.assertEqual(provider._request_lookahead_observations[0], 16)
+        self.assertEqual(provider._request_lookahead_hits[0], 0)
+        self.assertEqual(provider._request_lookahead_greedy_hits[0], 16)
+        self.assertEqual(provider.metrics().request_lookahead_updates, 16)
+        self.assertIs(provider._state, state_before)
+        provider.close()
+        self.assertIsNone(provider._request_lookahead_observations)
+
     def test_runtime_carry_records_greedy_winner_against_planned_token(self) -> None:
         class PlanningExpert:
             @staticmethod
@@ -2089,14 +2135,19 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(proposal.token_ids[0], 8)
         history = (*prompt, 2)
         provider.reconcile_prefix(history)
+        self.assertEqual(provider.metrics().request_lookahead_updates, 0)
 
         provider.propose_round(history, 7)
+        self.assertEqual(provider.metrics().request_lookahead_updates, 1)
+        self.assertEqual(provider._state.lookahead_observations[0], 0)
         provider.discard_pending_proposal()
         provider.observe_final((*history, 7))
 
         self.assertEqual(provider._state.lookahead_observations[0], 1)
         self.assertEqual(provider._state.lookahead_hits[0], 0)
         self.assertEqual(provider._state.lookahead_greedy_hits[0], 1)
+        self.assertEqual(provider.metrics().request_lookahead_updates, 1)
+        self.assertIsNone(provider._request_lookahead_observations)
         provider.close()
 
     def test_below_threshold_prompt_starts_global_without_neighbor_leakage(
@@ -2753,6 +2804,21 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         before_request_horizon_hits = [
             list(row) for row in provider._request_horizon_hits or []
         ]
+        before_request_lookahead_observations = (
+            None
+            if provider._request_lookahead_observations is None
+            else list(provider._request_lookahead_observations)
+        )
+        before_request_lookahead_hits = (
+            None
+            if provider._request_lookahead_hits is None
+            else list(provider._request_lookahead_hits)
+        )
+        before_request_lookahead_greedy_hits = (
+            None
+            if provider._request_lookahead_greedy_hits is None
+            else list(provider._request_lookahead_greedy_hits)
+        )
 
         with (
             mock.patch.object(
@@ -2797,6 +2863,22 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(
             after_failure.max_request_position_maturity,
             before_metrics.max_request_position_maturity,
+        )
+        self.assertEqual(
+            provider._request_lookahead_observations,
+            before_request_lookahead_observations,
+        )
+        self.assertEqual(
+            provider._request_lookahead_hits,
+            before_request_lookahead_hits,
+        )
+        self.assertEqual(
+            provider._request_lookahead_greedy_hits,
+            before_request_lookahead_greedy_hits,
+        )
+        self.assertEqual(
+            after_failure.request_lookahead_updates,
+            before_metrics.request_lookahead_updates,
         )
         self.assertEqual(
             after_failure.council_feedback,
