@@ -34,6 +34,13 @@ from .cartographer import (
     RunResult,
     build_probe_frontier,
 )
+from .markov_retention import (
+    O1_MARKOV_RETENTION_POLICY,
+    O1_MARKOV_RETENTION_SCHEMA,
+    O1MarkovRetention,
+    O1MarkovRetentionError,
+    O1RetentionScore,
+)
 
 __all__ = [
     "D_OPTIMAL_ACQUISITION_SCHEMA",
@@ -54,6 +61,11 @@ __all__ = [
     "Coverage",
     "DOptimalAcquisitionReceipt",
     "O1Cartographer",
+    "O1_MARKOV_RETENTION_POLICY",
+    "O1_MARKOV_RETENTION_SCHEMA",
+    "O1MarkovRetention",
+    "O1MarkovRetentionError",
+    "O1RetentionScore",
     "ProbeJob",
     "ProbeOutcome",
     "ProbeTarget",

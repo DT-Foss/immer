@@ -383,6 +383,10 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                         "online_vote_score_sum",
                         "online_vote_supported_tokens",
                         "online_vote_tokens",
+                        "last_retention_priority",
+                        "retention_failures",
+                        "retention_priority_evictions",
+                        "retention_scored_episodes",
                     )
                     if key in markov
                 }
@@ -405,6 +409,9 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
             }
         summary["draft"] = compact_draft
         summary["draft_sha256"] = _sha256(_canonical_json(draft))
+    retention = evidence.get("o1_markov_retention")
+    if isinstance(retention, dict):
+        summary["o1_markov_retention"] = retention
     return summary
 
 

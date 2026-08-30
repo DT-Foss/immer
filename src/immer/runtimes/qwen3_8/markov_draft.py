@@ -8,7 +8,7 @@ fixed-width Qwen token symbols, while the target remains the sole authority.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v24"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v25"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -44,7 +44,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v21"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v22"
 _STATE_PREFIX = b"IMMD\x09"
 _V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
@@ -1229,6 +1229,10 @@ class MarkovDraftMetrics:
     online_vote_supported_tokens: int
     online_vote_score_sum: float
     online_vote_max_score: float
+    retention_scored_episodes: int
+    retention_failures: int
+    retention_priority_evictions: int
+    last_retention_priority: float
     composition_programs: int
     composition_option_calls: int
     composition_draft_tokens: int
@@ -1303,6 +1307,11 @@ class FingerprintRollingK4DraftProvider:
         max_history_tokens: int = 65_536,
         proposal_width: int = 3,
         atlas: MarkovTokenAtlas | None = None,
+        episode_scorer: Callable[[tuple[int, ...]], float] | None = None,
+        episode_priority: Callable[[tuple[int, ...]], float] | None = None,
+        episode_priority_store: (
+            Callable[[tuple[int, ...], float], None] | None
+        ) = None,
     ) -> None:
         if (
             isinstance(vocab_size, bool)
@@ -1344,6 +1353,14 @@ class FingerprintRollingK4DraftProvider:
             raise TypeError("atlas must be a MarkovTokenAtlas or None")
         if atlas is not None and atlas.vocab_size != vocab_size:
             raise ValueError("Markov atlas vocabulary differs from the provider")
+        if episode_scorer is not None and not callable(episode_scorer):
+            raise TypeError("episode_scorer must be callable or None")
+        if episode_priority is not None and not callable(episode_priority):
+            raise TypeError("episode_priority must be callable or None")
+        if episode_priority_store is not None and not callable(
+            episode_priority_store
+        ):
+            raise TypeError("episode_priority_store must be callable or None")
         self.vocab_size = vocab_size
         self.width = len(str(vocab_size - 1))
         self.state_path = (
@@ -1356,6 +1373,9 @@ class FingerprintRollingK4DraftProvider:
         self.max_history_tokens = max_history_tokens
         self.proposal_width = proposal_width
         self.atlas = atlas
+        self.episode_scorer = episode_scorer
+        self.episode_priority = episode_priority
+        self.episode_priority_store = episode_priority_store
         self._experts = _expert_specs(max_order, max_history_tokens)
         self._state_lock_descriptor: int | None = None
         self._acquire_state_lock()
@@ -1464,6 +1484,10 @@ class FingerprintRollingK4DraftProvider:
         self._online_vote_supported_tokens = 0
         self._online_vote_score_sum = 0.0
         self._online_vote_max_score = 0.0
+        self._retention_scored_episodes = 0
+        self._retention_failures = 0
+        self._retention_priority_evictions = 0
+        self._last_retention_priority = 1.0
         self._last_phrase_option: MarkovPhraseOption | None = None
         self._composition_cache: dict[
             str | None,
@@ -3155,6 +3179,7 @@ class FingerprintRollingK4DraftProvider:
         tokens: Sequence[int],
         *,
         prompt_length: int | None,
+        priority: float = 1.0,
     ) -> None:
         episode = tuple(tokens)
         if not episode:
@@ -3167,24 +3192,78 @@ class FingerprintRollingK4DraftProvider:
             raise MarkovDraftError("confirmed episode prompt boundary is invalid")
         if self._active_dialect is None:
             raise MarkovDraftError("confirmed episode has no dialect binding")
+        if not math.isfinite(priority) or priority < 0.0:
+            raise MarkovDraftError("confirmed episode priority is invalid")
         episodes = []
+        priorities = []
         dialect_ids = list(self._state.episode_dialects)
         prompt_lengths = list(self._state.episode_prompt_lengths)
         offset = 0
         for length in self._state.episode_lengths:
-            episodes.append(self._state.token_ids[offset : offset + length])
+            retained = self._state.token_ids[offset : offset + length]
+            episodes.append(retained)
             offset += length
+        for retained, boundary in zip(
+            episodes,
+            prompt_lengths,
+            strict=True,
+        ):
+            generated = retained if boundary is None else retained[boundary:]
+            try:
+                retained_priority = (
+                    1.0
+                    if self.episode_priority is None
+                    else float(self.episode_priority(generated))
+                )
+            except Exception:
+                retained_priority = 1.0
+                self._retention_failures += 1
+            if not math.isfinite(retained_priority) or retained_priority < 0.0:
+                retained_priority = 1.0
+                self._retention_failures += 1
+            priorities.append(retained_priority)
         episodes.append(episode)
+        priorities.append(priority)
         dialect_ids.append(self._active_dialect.dialect_id)
         prompt_lengths.append(prompt_length)
         total = sum(len(row) for row in episodes)
         while len(episodes) > 1 and total > self.max_history_tokens:
-            total -= len(episodes.pop(0))
-            dialect_ids.pop(0)
-            prompt_lengths.pop(0)
+            latest = len(episodes) - 1
+            evicted = min(
+                range(len(episodes)),
+                key=lambda index: (
+                    priorities[index]
+                    * math.exp(
+                        -self.RICCI_AGE_ALPHA * max(0, latest - index)
+                    ),
+                    index,
+                ),
+            )
+            total -= len(episodes.pop(evicted))
+            priorities.pop(evicted)
+            dialect_ids.pop(evicted)
+            prompt_lengths.pop(evicted)
+            self._retention_priority_evictions += 1
         if total > self.max_history_tokens:
+            removed = len(episodes[0]) - self.max_history_tokens
             episodes[0] = episodes[0][-self.max_history_tokens :]
-            prompt_lengths[0] = None
+            boundary = prompt_lengths[0]
+            adjusted = None if boundary is None else boundary - removed
+            prompt_lengths[0] = (
+                adjusted
+                if adjusted is not None and 1 <= adjusted < len(episodes[0])
+                else None
+            )
+            retained_answer = (
+                episodes[0]
+                if prompt_lengths[0] is None
+                else episodes[0][prompt_lengths[0] :]
+            )
+            if self.episode_priority_store is not None and retained_answer:
+                try:
+                    self.episode_priority_store(retained_answer, priorities[0])
+                except Exception:
+                    self._retention_failures += 1
         combined = tuple(token for row in episodes for token in row)
         self._state = replace(
             self._state,
@@ -3484,6 +3563,10 @@ class FingerprintRollingK4DraftProvider:
         original_teacher_forced_feedback_tokens = (
             self._teacher_forced_feedback_tokens
         )
+        original_retention_scored = self._retention_scored_episodes
+        original_retention_failures = self._retention_failures
+        original_retention_evictions = self._retention_priority_evictions
+        original_retention_priority = self._last_retention_priority
         try:
             if (
                 self._last_confirmed_length is not None
@@ -3518,9 +3601,32 @@ class FingerprintRollingK4DraftProvider:
                     greedy_token,
                 )
             self._episode_feedback.clear()
+            generated = (
+                committed
+                if self._request_prompt_length is None
+                else committed[self._request_prompt_length :]
+            )
+            retention_priority = 1.0
+            if self.episode_scorer is not None and generated:
+                try:
+                    retention_priority = float(self.episode_scorer(generated))
+                except Exception:
+                    self._retention_failures += 1
+                    retention_priority = 1.0
+                else:
+                    if (
+                        not math.isfinite(retention_priority)
+                        or retention_priority < 0.0
+                    ):
+                        self._retention_failures += 1
+                        retention_priority = 1.0
+                    else:
+                        self._retention_scored_episodes += 1
+            self._last_retention_priority = retention_priority
             self._learn_episode(
                 committed,
                 prompt_length=self._request_prompt_length,
+                priority=retention_priority,
             )
             if self._pending_import_digest is not None:
                 self._state = replace(
@@ -3553,6 +3659,10 @@ class FingerprintRollingK4DraftProvider:
             self._teacher_forced_feedback_tokens = (
                 original_teacher_forced_feedback_tokens
             )
+            self._retention_scored_episodes = original_retention_scored
+            self._retention_failures = original_retention_failures
+            self._retention_priority_evictions = original_retention_evictions
+            self._last_retention_priority = original_retention_priority
             raise
 
     def _persist(self) -> None:
@@ -3718,6 +3828,10 @@ class FingerprintRollingK4DraftProvider:
             online_vote_supported_tokens=self._online_vote_supported_tokens,
             online_vote_score_sum=self._online_vote_score_sum,
             online_vote_max_score=self._online_vote_max_score,
+            retention_scored_episodes=self._retention_scored_episodes,
+            retention_failures=self._retention_failures,
+            retention_priority_evictions=self._retention_priority_evictions,
+            last_retention_priority=self._last_retention_priority,
             composition_programs=self._composition_program_count,
             composition_option_calls=self._composition_option_calls,
             composition_draft_tokens=self._composition_draft_tokens,

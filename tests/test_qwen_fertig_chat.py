@@ -203,6 +203,10 @@ class QwenFertigChatTests(unittest.TestCase):
                     },
                     "window_size": 8,
                 },
+                "o1_markov_retention": {
+                    "last_score": {"priority": 7.5},
+                    "sequence": 3,
+                },
             },
         )
         qwen = _Qwen(qwen_result)
@@ -227,6 +231,10 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertEqual(draft["atlas"]["atlas_vote_supported_tokens"], 3)
         self.assertEqual(draft["online_memory"]["history_capacity_tokens"], 65_536)
         self.assertEqual(draft["provider"]["online_consensus_tokens"], 1)
+        self.assertEqual(
+            _receipt(result)["qwen"]["o1_markov_retention"]["sequence"],
+            3,
+        )
 
     def test_real_formula_and_rref_certificates_short_circuit_without_qwen(
         self,

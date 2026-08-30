@@ -111,8 +111,11 @@ _QWEN38_DEPLOYMENT_MTP_STATE = _QWEN38_DEPLOYMENT_STATE / "qwen-mtp-q4-v1.json"
 _QWEN38_DEPLOYMENT_MARKOV_ATLAS = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-markov-atlas-v1.bin"
 )
-_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v24"
-_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v17"
+_QWEN38_DEPLOYMENT_O1_RETENTION = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen-markov-o1-retention-v1.json"
+)
+_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v25"
+_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v18"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v2"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
     b"immer:qwen3.8-growing-warm-runtime/v2"
@@ -297,6 +300,7 @@ def _qwen38_growing_warm_profile(
     fast_mlp_root: Path | None,
     draft_mode: str | None,
     markov_atlas_path: Path | None,
+    markov_o1_retention_path: Path | None,
     runtime_code_revision: str,
 ) -> str | None:
     """Bind reusable cold cells to the exact pre-load product runtime."""
@@ -333,6 +337,7 @@ def _qwen38_growing_warm_profile(
             if markov_atlas_path is None
             else _path_sha256(markov_atlas_path)
         ),
+        "markov_o1_retention": markov_o1_retention_path is not None,
         "mtp_provider_abi": (
             _QWEN38_MTP_DRAFT_ABI if draft_mode in {"hybrid", "mtp"} else None
         ),
@@ -601,9 +606,22 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             getattr(args, "markov_atlas", None),
             "IMMER_QWEN38_MARKOV_ATLAS",
         )
+        markov_o1_retention_path = _chat_path(
+            getattr(args, "markov_o1_retention", None),
+            "IMMER_QWEN38_MARKOV_O1_RETENTION",
+        )
         if bool(getattr(args, "no_markov_draft", False)) and markov_atlas_path is not None:
             raise ValueError("--markov-atlas and --no-markov-draft are mutually exclusive")
+        if (
+            bool(getattr(args, "no_markov_draft", False))
+            and markov_o1_retention_path is not None
+        ):
+            raise ValueError(
+                "--markov-o1-retention and --no-markov-draft are mutually exclusive"
+            )
         if draft_mode is None and markov_atlas_path is not None:
+            draft_mode = "markov"
+        if draft_mode is None and markov_o1_retention_path is not None:
             draft_mode = "markov"
         if (
             markov_atlas_path is None
@@ -615,6 +633,12 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             markov_atlas_path = _QWEN38_DEPLOYMENT_MARKOV_ATLAS
             if draft_mode is None:
                 draft_mode = "markov"
+        if (
+            markov_o1_retention_path is None
+            and draft_mode in {"hybrid", "markov"}
+            and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+        ):
+            markov_o1_retention_path = _QWEN38_DEPLOYMENT_O1_RETENTION
         if bool(getattr(args, "no_anchor_cache", False)):
             if args.qwen38_anchor_cache is not None:
                 raise ValueError(
@@ -637,6 +661,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 fast_mlp_root=fast_mlp_root,
                 draft_mode=draft_mode,
                 markov_atlas_path=markov_atlas_path,
+                markov_o1_retention_path=markov_o1_retention_path,
                 runtime_code_revision=warm_runtime_code_revision,
             )
         )
@@ -741,6 +766,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             markov_draft_state_path=markov_draft_state,
             markov_atlas_path=(
                 None if markov_atlas_path is None else str(markov_atlas_path)
+            ),
+            markov_o1_retention_path=(
+                None
+                if markov_o1_retention_path is None
+                else str(markov_o1_retention_path)
             ),
             mtp_draft_state_path=mtp_draft_state,
             draft_window_state_path=args.draft_window_state,
@@ -1581,6 +1611,10 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--markov-atlas",
         help="corpus-scale zero-model-byte Qwen-token Markov atlas",
+    )
+    chat.add_argument(
+        "--markov-o1-retention",
+        help="persistent O1 surprise scorer for confirmed Markov episodes",
     )
     chat.add_argument(
         "--mtp-draft-state",

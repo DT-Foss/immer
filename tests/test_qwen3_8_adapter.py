@@ -385,6 +385,32 @@ class Qwen38CausalChatTests(unittest.TestCase):
             self.assertNotEqual(bound_identity, unbound_identity)
             chat.close()
 
+    def test_o1_retention_loads_once_with_runtime_identity(self) -> None:
+        retention = Mock()
+        retention.metrics.return_value = {"sequence": 0}
+        chat = _chat(
+            _Runtime(),
+            draft_mode="markov",
+            markov_o1_retention_path="/state/o1-retention.json",
+        )
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.O1MarkovRetention",
+            return_value=retention,
+        ) as constructor:
+            chat._load_locked()
+
+        constructor.assert_called_once_with(
+            Path("/state/o1-retention.json"),
+            vocab_size=300_000,
+            tokenizer_sha256=_DIGEST,
+        )
+        self.assertIs(chat._markov_o1_retention, retention)
+        self.assertEqual(
+            chat._base_evidence()["o1_markov_retention"],
+            {"sequence": 0},
+        )
+        chat.close()
+
     def test_template_anchor_stops_before_user_specific_tokens(self) -> None:
         class Tokenizer:
             @staticmethod
@@ -940,7 +966,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         hybrid = policy["hybrid_draft"]
         self.assertEqual(
             hybrid["selection"],
-            "round-wise-markov-first-mtp-fallback/v17",
+            "round-wise-markov-first-mtp-fallback/v18",
         )
         self.assertFalse(hybrid["request_provider_lock"])
         self.assertFalse(hybrid["one_way_handoff"])
@@ -1003,7 +1029,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         self.assertEqual(
             identity["provider"]["selection"],
-            "round-wise-markov-first-mtp-fallback/v17",
+            "round-wise-markov-first-mtp-fallback/v18",
         )
         chat.close()
 
@@ -1809,6 +1835,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 fast_mlp_root=None,
                 draft_mode="hybrid",
                 markov_atlas_path=None,
+                markov_o1_retention_path=None,
                 runtime_code_revision="a" * 64,
             )
             with patch(
@@ -1822,6 +1849,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     fast_mlp_root=None,
                     draft_mode="hybrid",
                     markov_atlas_path=None,
+                    markov_o1_retention_path=None,
                     runtime_code_revision="a" * 64,
                 )
 
@@ -2213,6 +2241,34 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(
             options["markov_atlas_path"],
             "/state/qwen-markov-atlas.bin",
+        )
+
+    def test_cli_wires_o1_markov_retention(self) -> None:
+        qwen = _chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor:
+            with redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--markov-o1-retention",
+                        "/state/o1-retention.json",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["draft_mode"], "markov")
+        self.assertEqual(
+            options["markov_o1_retention_path"],
+            "/state/o1-retention.json",
         )
 
     def test_cli_wires_q4_bank_and_native_threads(self) -> None:

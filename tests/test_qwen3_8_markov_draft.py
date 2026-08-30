@@ -191,6 +191,86 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((*prompt, 2, 3))
         provider.close()
 
+    def test_episode_scorer_receives_only_the_confirmed_answer(self) -> None:
+        scored = []
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_history_tokens=128,
+            episode_scorer=lambda tokens: scored.append(tokens) or 7.5,
+            episode_priority=lambda _tokens: 7.5,
+        )
+        prompt = (20, 21, 22)
+        answer = (3, 4, 5)
+        provider.begin_request(prompt)
+
+        provider.observe_final((*prompt, *answer))
+
+        self.assertEqual(scored, [answer])
+        metrics = provider.metrics()
+        self.assertEqual(metrics.retention_scored_episodes, 1)
+        self.assertEqual(metrics.retention_failures, 0)
+        self.assertEqual(metrics.last_retention_priority, 7.5)
+        provider.close()
+
+    def test_o1_priority_retains_valuable_old_episode_over_low_value_newer_one(
+        self,
+    ) -> None:
+        valuable = (1, 1, 1, 1)
+        expendable = (2, 2, 2, 2)
+        incoming = (3, 3, 3, 3, 3, 3)
+        priorities = {valuable: 10.0, expendable: 0.1}
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_history_tokens=12,
+            max_order=8,
+            episode_priority=lambda tokens: priorities.get(tokens, 1.0),
+        )
+        provider._state = replace(
+            provider._state,
+            token_ids=(*valuable, *expendable),
+            episode_lengths=(4, 4),
+            episode_dialects=(None, None),
+            episode_prompt_lengths=(None, None),
+        )
+        provider._activate_dialect((20, 21))
+
+        provider._learn_episode(
+            incoming,
+            prompt_length=None,
+            priority=5.0,
+        )
+
+        self.assertEqual(provider.confirmed_episodes(), (valuable, incoming))
+        self.assertEqual(provider.metrics().retention_priority_evictions, 1)
+        provider.close()
+
+    def test_oversized_answer_suffix_keeps_its_o1_priority_alias(self) -> None:
+        aliases = {}
+
+        def remember(tokens, priority):
+            aliases[tokens] = priority
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_order=8,
+            max_history_tokens=12,
+            episode_priority_store=remember,
+        )
+        provider._activate_dialect((30, 31))
+        episode = tuple(range(1, 21))
+
+        provider._learn_episode(
+            episode,
+            prompt_length=5,
+            priority=9.0,
+        )
+
+        retained = episode[-12:]
+        self.assertEqual(provider.confirmed_episodes(), (retained,))
+        self.assertEqual(provider._state.episode_prompt_lengths, (None,))
+        self.assertEqual(aliases, {retained: 9.0})
+        provider.close()
+
     def test_confirmed_request_persists_its_prompt_boundary(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         prompt = (1, 4, 7)

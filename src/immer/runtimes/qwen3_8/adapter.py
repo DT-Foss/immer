@@ -20,6 +20,10 @@ from typing import Any
 import torch
 
 from ...knowledge.range_markov import MarkovRangePrefetcher
+from ..o1_state.markov_retention import (
+    O1_MARKOV_RETENTION_POLICY,
+    O1MarkovRetention,
+)
 from ...contracts import ExecutionStatus, Request, Result
 from ..deepseek_v4.causal_weights import CausalWeightMount, LogicalModelIdentity
 from .bundle import verify_qwen38_causal_mount
@@ -1026,6 +1030,7 @@ class Qwen38CausalChat:
         draft_max_resident_bytes: int | None = None,
         markov_draft_state_path: str | Path | None = None,
         markov_atlas_path: str | Path | None = None,
+        markov_o1_retention_path: str | Path | None = None,
         mtp_draft_state_path: str | Path | None = None,
         draft_window_state_path: str | Path | None = None,
         fast_mlp_root: str | Path | None = None,
@@ -1167,6 +1172,11 @@ class Qwen38CausalChat:
             (str, Path),
         ):
             raise TypeError("markov_atlas_path must be a local path or None")
+        if markov_o1_retention_path is not None and not isinstance(
+            markov_o1_retention_path,
+            (str, Path),
+        ):
+            raise TypeError("markov_o1_retention_path must be a local path or None")
         if mtp_draft_state_path is not None and not isinstance(
             mtp_draft_state_path, (str, Path)
         ):
@@ -1186,7 +1196,7 @@ class Qwen38CausalChat:
                 draft_mode = "mtp"
             elif markov_draft_state_path is not None:
                 draft_mode = "markov"
-            elif markov_atlas_path is not None:
+            elif markov_atlas_path is not None or markov_o1_retention_path is not None:
                 draft_mode = "markov"
         if draft_mode == "qwen35" and draft_bundle_path is None:
             raise ValueError("qwen35 draft mode requires draft_bundle_path")
@@ -1209,6 +1219,13 @@ class Qwen38CausalChat:
             )
         if draft_mode not in {"hybrid", "markov"} and markov_atlas_path is not None:
             raise ValueError("markov_atlas_path requires Markov or hybrid draft mode")
+        if (
+            draft_mode not in {"hybrid", "markov"}
+            and markov_o1_retention_path is not None
+        ):
+            raise ValueError(
+                "markov_o1_retention_path requires Markov or hybrid draft mode"
+            )
         if draft_mode not in {"hybrid", "mtp"} and mtp_draft_state_path is not None:
             raise ValueError("mtp_draft_state_path requires MTP or hybrid draft mode")
         if draft_mode == "mtp" and mtp_draft_state_path is None:
@@ -1327,6 +1344,11 @@ class Qwen38CausalChat:
             if markov_atlas_path is None
             else Path(markov_atlas_path).expanduser().absolute()
         )
+        self._markov_o1_retention_path = (
+            None
+            if markov_o1_retention_path is None
+            else Path(markov_o1_retention_path).expanduser().absolute()
+        )
         self._mtp_draft_state_path = (
             None
             if mtp_draft_state_path is None
@@ -1385,6 +1407,7 @@ class Qwen38CausalChat:
         self._bundle_receipt: dict[str, Any] | None = None
         self._tokenizer_sha256: str | None = None
         self._markov_atlas: MarkovTokenAtlas | None = None
+        self._markov_o1_retention: O1MarkovRetention | None = None
         self._load_error: str | None = None
         self._close_error: str | None = None
         self._closed = False
@@ -1522,7 +1545,7 @@ class Qwen38CausalChat:
             else:
                 policy["hybrid_draft"] = {
                     "provider_abi": QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
-                    "selection": "round-wise-markov-first-mtp-fallback/v17",
+                    "selection": "round-wise-markov-first-mtp-fallback/v18",
                     "request_provider_lock": False,
                     "one_way_handoff": False,
                     "round_reselection": True,
@@ -1559,6 +1582,12 @@ class Qwen38CausalChat:
                     "token_count": self._markov_atlas.token_count,
                     "tokenizer_sha256": self._markov_atlas.tokenizer_sha256,
                     "zero_model_bytes": True,
+                }
+            if self._markov_o1_retention_path is not None:
+                policy["o1_markov_retention"] = {
+                    "history_capacity_tokens": 65_536,
+                    "policy": O1_MARKOV_RETENTION_POLICY,
+                    "persistent": True,
                 }
         elif self._draft_mode is not None:
             policy["draft_fallback"] = {
@@ -1742,7 +1771,7 @@ class Qwen38CausalChat:
                     "identity",
                     {},
                 ).get("manifest_sha256"),
-                "selection": "round-wise-markov-first-mtp-fallback/v17",
+                "selection": "round-wise-markov-first-mtp-fallback/v18",
             }
         else:
             raise Qwen38ChatError("draft-window identity lacks a draft provider")
@@ -1755,6 +1784,14 @@ class Qwen38CausalChat:
                 "sha256": self._markov_atlas.sha256,
                 "token_count": self._markov_atlas.token_count,
                 "tokenizer_sha256": self._markov_atlas.tokenizer_sha256,
+            }
+        if (
+            self._draft_mode in {"hybrid", "markov"}
+            and self._markov_o1_retention_path is not None
+        ):
+            provider["o1_markov_retention"] = {
+                "policy": O1_MARKOV_RETENTION_POLICY,
+                "state_path": str(self._markov_o1_retention_path),
             }
         return _digest(
             {
@@ -1964,6 +2001,16 @@ class Qwen38CausalChat:
         exact_head = getattr(runtime, "exact_head_index", None)
         exact_before = None if exact_head is None else exact_head.metrics()
         adaptive_selection = self._draft_window_selection
+        retention = self._markov_o1_retention
+
+        def score_episode(token_ids: tuple[int, ...]) -> float:
+            if retention is None:
+                return 1.0
+            decoded = runtime.tokenizer.decode(token_ids)
+            if not isinstance(decoded, str) or not decoded:
+                raise Qwen38ChatError("O1 retention episode did not decode to text")
+            return retention.score(token_ids, decoded)
+
         draft_enabled = self._draft_mode is not None and (
             (self._draft_window_controller is None and self._max_new_tokens >= 2)
             or adaptive_selection is not None
@@ -2014,6 +2061,9 @@ class Qwen38CausalChat:
                 state_path=self._markov_draft_state_path,
                 proposal_width=draft_window - 1,
                 atlas=self._markov_atlas,
+                episode_scorer=None if retention is None else score_episode,
+                episode_priority=None if retention is None else retention.priority,
+                episode_priority_store=None if retention is None else retention.remember,
             )
         elif self._draft_mode == "mtp":
             provider = Qwen35MtpDraftProvider(
@@ -2030,6 +2080,9 @@ class Qwen38CausalChat:
                 state_path=self._markov_draft_state_path,
                 proposal_width=draft_window - 1,
                 atlas=self._markov_atlas,
+                episode_scorer=None if retention is None else score_episode,
+                episode_priority=None if retention is None else retention.priority,
+                episode_priority_store=None if retention is None else retention.remember,
             )
 
             def mtp_factory() -> Qwen35MtpDraftProvider:
@@ -2552,6 +2605,10 @@ class Qwen38CausalChat:
         )
         if range_prefetcher is not None:
             evidence["range_markov"] = range_prefetcher.metrics()
+        if self._markov_o1_retention is not None:
+            evidence["o1_markov_retention"] = (
+                self._markov_o1_retention.metrics()
+            )
         return evidence
 
     def _load_locked(self) -> Any:
@@ -2593,6 +2650,15 @@ class Qwen38CausalChat:
                     expected_tokenizer_sha256=str(tokenizer_sha256),
                 )
             )
+            markov_o1_retention = (
+                None
+                if self._markov_o1_retention_path is None
+                else O1MarkovRetention(
+                    self._markov_o1_retention_path,
+                    vocab_size=model.config.vocab_size,
+                    tokenizer_sha256=str(tokenizer_sha256),
+                )
+            )
             model_context = _positive_int(
                 getattr(model, "max_seq_len", None), "runtime model max_seq_len"
             )
@@ -2626,6 +2692,7 @@ class Qwen38CausalChat:
         self._bundle_receipt = bundle_receipt
         self._tokenizer_sha256 = str(tokenizer_sha256)
         self._markov_atlas = markov_atlas
+        self._markov_o1_retention = markov_o1_retention
         return runtime
 
     def _template_anchor_prefix(
@@ -3180,6 +3247,7 @@ class Qwen38CausalChat:
             self._runtime = None
             self._draft_runtime = None
             self._markov_atlas = None
+            self._markov_o1_retention = None
             self._closed = True
             if runtime is not None:
                 try:
