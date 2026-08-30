@@ -45,6 +45,11 @@ release surface.
   persistent 64-neuron page controller automatically. Temporal, cross-layer,
   coactivation, and marginal Markov agents learn from every exact prefill row
   and choose a fresh bounded route at each decode token and layer boundary.
+  Native Q4 also returns total activation energy across all 272 pages. Three
+  causal width agents learn whether the current layer/context needs
+  96, 128, 160, or 192 routed pages to retain at least 99.5% of that energy;
+  execution uses the selected prefix while the next decision retains the full
+  route context.
   Unready layers execute the full MLP; speculative continuation commits only
   accepted learning rows. `--mlp-page-width` controls the route and
   `--no-mlp-page-route` restores full-MLP execution.
@@ -416,7 +421,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Direct-to-Torch local ranges | one final tensor for sorted selected-row routes | inode-stable `preadv` fills caller-owned Torch storage; no intermediate Python body, no row-stack duplicate, exact cache/budget/causal-plan accounting |
 | Markov range prefetch | zero additional logical/source bytes | grouped operations; order-1/2 beam; probability×Ricci/reuse scoring; cross-operation dedupe; accepted-only cooldown; delayed exact-byte utility for d1–d8 agents; adaptive 12.5–100% reservoir budget; bounded local OS-page hints |
 | Weight-only all-layer Fast MLP | deterministic 64-layer p4/k32 plan; capture-only target use forbidden | no prompts or model forwards in the build; exact paths learn adaptive width plus prequential sparse-output cosine/L2 and scalar correction; non-beneficial or uncalibrated routes use the full MLP |
-| Direct Q4 MLP-page route | explicit 192-of-272 page bound by default | exact full-MLP traces train bounded temporal/cross-layer/marginal routes; unready predictions fall back to full Q4, selected routes execute native Q4 pages, and speculative learning commits only for accepted rows; no wall-time claim is attached |
+| Direct Q4 MLP-page route | learned 96/128/160/192-of-272 action per layer/context | exact total energy trains causal temporal/cross-layer/marginal width agents; four page agents select the route, native Q4 executes its learned prefix, and speculative learning commits only accepted rows |
 | Exact residual-PQ LM head | K=1–16 and k=1/3/7 parity; certified page + economic row pruning | deterministic weight-only build, best-first tree, actual row-code caps, K-query survivor union, contiguous-read cost gate, 64-leaf no-saving stop, outward residual/roundoff bounds, overflow/tie/subnormal guards, and exact full-leaf fallback; no model forward |
 | Arbitrary local Qwen chat | 23 → 11 target forwards on the same capped prompt | authenticated causal Qwen3.8 path; default Markov/embedded-MTP hybrid on the v3 bank and full Q4 MLP execution; Qwen remains the sole committer, while explicit Markov-only mode retains the same target bank |
 | Seed v3 native migration | exact parity on 8/8 inherited tensor outputs for Micro and 5M | SHA-first migration of shared trained GRU/CRSA/SwiGLU weights; new receipt, quotient, route-value, and expected-work heads added under a strict inference-only manifest |

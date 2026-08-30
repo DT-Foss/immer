@@ -4,11 +4,18 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-30
 
-Runtime commits through `2f06514` are deployed on the canonical server.
+Runtime commits through `bfcdbd7` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `bfcdbd7` made MLP execution width a learned Markov action. Native Q4 ABI 5
+  returns the exact total activation energy across all 272 pages alongside the
+  ranked trace. Per-layer temporal, cross-layer, and marginal width agents
+  learn the smallest `96/128/160/192` action that covers at least 99.5% of that
+  energy. Decode executes the learned prefix while retaining the complete
+  192-page causal route for the next decision. State v5 migrates v3/v4 in
+  memory, and speculative partial commits preserve exact energy/width feedback.
 - `2f06514` connected O1 episode value directly to the live PPM corpus. Each
   persistent expert now solves a bounded whole-answer selection under
   `priority × exp(-0.001 × age)`, then restores chronological episode order
