@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v32"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v33"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -44,7 +44,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v23"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v24"
 _STATE_PREFIX = b"IMMD\x09"
 _V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
@@ -1297,6 +1297,8 @@ class MarkovDraftMetrics:
     lookahead_greedy_hits: tuple[int, ...]
     request_weight_updates: int
     max_request_weight_shift: float
+    request_position_updates: int
+    max_request_position_maturity: float
     regime_generation: int
     surprise_mean: float
     surprise_cusum: float
@@ -1620,6 +1622,10 @@ class FingerprintRollingK4DraftProvider:
         self._request_expert_rapidities: tuple[float, ...] | None = None
         self._request_weight_updates = 0
         self._max_request_weight_shift = 0.0
+        self._request_horizon_observations: list[list[int]] | None = None
+        self._request_horizon_hits: list[list[int]] | None = None
+        self._request_position_updates = 0
+        self._max_request_position_maturity = 0.0
         self._external_reconcile_calls = 0
         self._external_feedback_tokens = 0
         self._teacher_forced_predictions = 0
@@ -2489,6 +2495,35 @@ class FingerprintRollingK4DraftProvider:
             limit=limit,
         )
 
+    def _position_counts(
+        self,
+        position: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        observations = self._state.horizon_expert_observations[position]
+        hits = self._state.horizon_expert_hits[position]
+        request_observations = self._request_horizon_observations
+        request_hits = self._request_horizon_hits
+        if request_observations is None or request_hits is None:
+            return observations, hits
+        return (
+            tuple(
+                durable + local
+                for durable, local in zip(
+                    observations,
+                    request_observations[position],
+                    strict=True,
+                )
+            ),
+            tuple(
+                durable + local
+                for durable, local in zip(
+                    hits,
+                    request_hits[position],
+                    strict=True,
+                )
+            ),
+        )
+
     def _position_weighting(
         self,
         position: int,
@@ -2501,8 +2536,7 @@ class FingerprintRollingK4DraftProvider:
             _MAX_PROPOSAL_POSITIONS
         ):
             raise MarkovDraftError("Markov position weighting shape is invalid")
-        observations = self._state.horizon_expert_observations[position]
-        hits = self._state.horizon_expert_hits[position]
+        observations, hits = self._position_counts(position)
         maximum_observations = max(observations, default=0)
         position_maturity = (
             0.0
@@ -2627,6 +2661,7 @@ class FingerprintRollingK4DraftProvider:
             raise MarkovDraftError("Markov confidence position is invalid")
         evidence = 0.0
         token_symbol = self._symbol(token)
+        position_observations, position_hits = self._position_counts(position)
         for index, ((_distribution, predicted), weight) in enumerate(
             zip(expert_row, weights, strict=True)
         ):
@@ -2658,8 +2693,8 @@ class FingerprintRollingK4DraftProvider:
             )
             if decisiveness <= 0.0:
                 continue
-            observations = self._state.horizon_expert_observations[position][index]
-            hits = self._state.horizon_expert_hits[position][index]
+            observations = position_observations[index]
+            hits = position_hits[index]
             if observations <= 0:
                 observations = self._state.expert_observations[index]
                 hits = self._state.expert_hits[index]
@@ -3435,6 +3470,7 @@ class FingerprintRollingK4DraftProvider:
         lookahead_gain: float,
     ) -> None:
         self._update_request_weights(feedback, token, position)
+        self._update_request_position_skill(feedback, token, position)
         self._episode_feedback.append(
             (
                 feedback,
@@ -3444,6 +3480,34 @@ class FingerprintRollingK4DraftProvider:
                 greedy_token,
                 lookahead_gain,
             )
+        )
+
+    def _update_request_position_skill(
+        self,
+        feedback: tuple[tuple[dict[str, float], int], ...],
+        token: int,
+        position: int,
+    ) -> None:
+        if len(feedback) != len(self._experts):
+            raise MarkovDraftError("Markov council feedback width changed")
+        if not 0 <= position < _MAX_PROPOSAL_POSITIONS:
+            raise MarkovDraftError("Markov feedback position is invalid")
+        if self._request_horizon_observations is None:
+            self._request_horizon_observations = [
+                [0] * len(self._experts) for _ in range(_MAX_PROPOSAL_POSITIONS)
+            ]
+            self._request_horizon_hits = [
+                [0] * len(self._experts) for _ in range(_MAX_PROPOSAL_POSITIONS)
+            ]
+        assert self._request_horizon_hits is not None
+        for index, (_distribution, prediction) in enumerate(feedback):
+            self._request_horizon_observations[position][index] += 1
+            self._request_horizon_hits[position][index] += int(prediction == token)
+        self._request_position_updates += 1
+        maturity = self._position_weighting(position, self._weights())[1]
+        self._max_request_position_maturity = max(
+            self._max_request_position_maturity,
+            maturity,
         )
 
     def _apply_council_feedback(
@@ -3826,6 +3890,7 @@ class FingerprintRollingK4DraftProvider:
         rows = []
         for position, token_id in enumerate(proposed):
             weights = self._position_weighting(position, base_weights)[0]
+            position_observations, position_hits = self._position_counts(position)
             symbol = self._symbol(token_id)
             online_score = 0.0
             online_support = 0
@@ -3839,10 +3904,8 @@ class FingerprintRollingK4DraftProvider:
                     context,
                     symbol,
                 )
-                observations = self._state.horizon_expert_observations[position][
-                    index
-                ]
-                hits = self._state.horizon_expert_hits[position][index]
+                observations = position_observations[index]
+                hits = position_hits[index]
                 if observations <= 0:
                     observations = self._state.expert_observations[index]
                     hits = self._state.expert_hits[index]
@@ -4392,6 +4455,20 @@ class FingerprintRollingK4DraftProvider:
         original_request_rapidities = self._request_expert_rapidities
         original_request_weight_updates = self._request_weight_updates
         original_max_request_weight_shift = self._max_request_weight_shift
+        original_request_horizon_observations = (
+            None
+            if self._request_horizon_observations is None
+            else [list(row) for row in self._request_horizon_observations]
+        )
+        original_request_horizon_hits = (
+            None
+            if self._request_horizon_hits is None
+            else [list(row) for row in self._request_horizon_hits]
+        )
+        original_request_position_updates = self._request_position_updates
+        original_max_request_position_maturity = (
+            self._max_request_position_maturity
+        )
         try:
             if (
                 self._last_confirmed_length is not None
@@ -4411,6 +4488,8 @@ class FingerprintRollingK4DraftProvider:
             self._carry_feedback_teacher_forced = False
             self._carry_plan = None
             self._request_expert_rapidities = None
+            self._request_horizon_observations = None
+            self._request_horizon_hits = None
             for (
                 feedback,
                 token,
@@ -4492,6 +4571,14 @@ class FingerprintRollingK4DraftProvider:
             self._request_expert_rapidities = original_request_rapidities
             self._request_weight_updates = original_request_weight_updates
             self._max_request_weight_shift = original_max_request_weight_shift
+            self._request_horizon_observations = (
+                original_request_horizon_observations
+            )
+            self._request_horizon_hits = original_request_horizon_hits
+            self._request_position_updates = original_request_position_updates
+            self._max_request_position_maturity = (
+                original_max_request_position_maturity
+            )
             raise
 
     def _persist(self) -> None:
@@ -4624,6 +4711,8 @@ class FingerprintRollingK4DraftProvider:
             lookahead_greedy_hits=self._state.lookahead_greedy_hits,
             request_weight_updates=self._request_weight_updates,
             max_request_weight_shift=self._max_request_weight_shift,
+            request_position_updates=self._request_position_updates,
+            max_request_position_maturity=self._max_request_position_maturity,
             regime_generation=self._state.regime_generation,
             surprise_mean=self._state.surprise_mean,
             surprise_cusum=self._state.surprise_cusum,
@@ -4742,6 +4831,8 @@ class FingerprintRollingK4DraftProvider:
         self._pending_composition_program = None
         self._pending_import_digest = None
         self._request_expert_rapidities = None
+        self._request_horizon_observations = None
+        self._request_horizon_hits = None
         self._request_local_cache_history = None
         self._request_local_cache = None
         self._episode_feedback.clear()

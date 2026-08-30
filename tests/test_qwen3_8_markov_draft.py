@@ -1662,10 +1662,80 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         self.assertEqual(metrics.request_weight_updates, 1)
         self.assertGreater(metrics.max_request_weight_shift, 0.0)
+        self.assertEqual(metrics.request_position_updates, 1)
+        self.assertGreater(metrics.max_request_position_maturity, 0.0)
+        self.assertEqual(
+            provider._state.horizon_expert_observations[0],
+            (0,) * 8,
+        )
         self.assertIs(provider._state, state_before)
 
         provider.close()
         self.assertEqual(state_path.read_bytes(), persisted)
+
+    def test_request_position_overlay_learns_different_recursive_winners(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        provider.begin_request((20, 21))
+        seven = provider._symbol(7)
+        eight = provider._symbol(8)
+        position_zero = tuple(
+            (
+                ({seven: 0.99, eight: 0.01}, 7)
+                if index == 0
+                else ({seven: 0.01, eight: 0.99}, 8)
+            )
+            for index in range(len(provider._experts))
+        )
+        position_one = tuple(
+            (
+                ({seven: 0.01, eight: 0.99}, 8)
+                if index == 1
+                else ({seven: 0.99, eight: 0.01}, 7)
+            )
+            for index in range(len(provider._experts))
+        )
+
+        for _ in range(8):
+            provider._update_request_position_skill(position_zero, 7, 0)
+            provider._update_request_position_skill(position_one, 8, 1)
+        base = provider._weights()
+        zero_weights = provider._position_weighting(0, base)[0]
+        one_weights = provider._position_weighting(1, base)[0]
+
+        class FixedExpert:
+            def __init__(self, distribution):
+                self._distribution = distribution
+
+            def distribution(self, _context):
+                return dict(self._distribution)
+
+        distributions = (
+            {seven: 0.99, eight: 0.01},
+            {seven: 0.01, eight: 0.99},
+            *({seven: 0.5, eight: 0.5} for _ in range(6)),
+        )
+        provider._expert_models = lambda _history: tuple(
+            (FixedExpert(distribution), []) for distribution in distributions
+        )
+        provider._predict_council((20, 21), 1, position_offset=0)
+        greedy_zero = provider._last_plan_trace[0][1]
+        provider._predict_council((20, 21), 1, position_offset=1)
+        greedy_one = provider._last_plan_trace[0][1]
+
+        self.assertGreater(zero_weights[0], zero_weights[1])
+        self.assertGreater(one_weights[1], one_weights[0])
+        self.assertEqual(greedy_zero, 7)
+        self.assertEqual(greedy_one, 8)
+        self.assertEqual(provider.metrics().request_position_updates, 16)
+        self.assertEqual(provider.metrics().request_weight_updates, 0)
+        self.assertGreater(provider.metrics().max_request_position_maturity, 0.0)
+        self.assertEqual(
+            provider._state.horizon_expert_observations[:2],
+            ((0,) * 8, (0,) * 8),
+        )
+        provider.close()
 
     def test_request_weight_overlay_is_persisted_exactly_once_at_finalization(
         self,
@@ -1697,7 +1767,13 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(actual._state.expert_observations, (1,) * 8)
         self.assertEqual(actual._state.feedback_count, 1)
         self.assertEqual(actual.metrics().request_weight_updates, 1)
+        self.assertEqual(actual.metrics().request_position_updates, 1)
+        self.assertEqual(
+            actual._state.horizon_expert_observations[0],
+            expected._state.horizon_expert_observations[0],
+        )
         self.assertIsNone(actual._request_expert_rapidities)
+        self.assertIsNone(actual._request_horizon_observations)
         actual.close()
         expected.close()
 
@@ -2666,6 +2742,12 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         before_feedback = list(provider._episode_feedback)
         before_carry = provider._carry_feedback
         before_request_rapidities = provider._request_expert_rapidities
+        before_request_horizon_observations = [
+            list(row) for row in provider._request_horizon_observations or []
+        ]
+        before_request_horizon_hits = [
+            list(row) for row in provider._request_horizon_hits or []
+        ]
 
         with (
             mock.patch.object(
@@ -2696,6 +2778,22 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             before_metrics.max_request_weight_shift,
         )
         self.assertEqual(
+            provider._request_horizon_observations,
+            before_request_horizon_observations,
+        )
+        self.assertEqual(
+            provider._request_horizon_hits,
+            before_request_horizon_hits,
+        )
+        self.assertEqual(
+            after_failure.request_position_updates,
+            before_metrics.request_position_updates,
+        )
+        self.assertEqual(
+            after_failure.max_request_position_maturity,
+            before_metrics.max_request_position_maturity,
+        )
+        self.assertEqual(
             after_failure.council_feedback,
             before_metrics.council_feedback,
         )
@@ -2716,6 +2814,10 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(
             after_retry.request_weight_updates,
             before_metrics.request_weight_updates + 1,
+        )
+        self.assertEqual(
+            after_retry.request_position_updates,
+            before_metrics.request_position_updates + 1,
         )
         provider.close()
 
