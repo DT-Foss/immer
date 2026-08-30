@@ -27,7 +27,11 @@ from immer.runtimes.ooe.result_cells import (
     attach_cold_qwen_generation_receipt,
     qwen_result_binding_evidence,
 )
-from immer.runtimes.qwen3_8.adapter import Qwen38CausalChat, Qwen38ChatError
+from immer.runtimes.qwen3_8.adapter import (
+    QWEN38_CHAT_HISTORY_METADATA,
+    Qwen38CausalChat,
+    Qwen38ChatError,
+)
 from immer.runtimes.qwen3_8.cartography_probe import prompt_token_sha256
 from immer.runtimes.qwen3_8.encoding import Qwen38Tokenizer
 from immer.runtimes.qwen3_8.markov_atlas import MarkovTokenAtlas
@@ -107,6 +111,10 @@ class _Tokenizer:
     def decode(self, token_ids):
         self.decoded_ids.append(tuple(token_ids))
         return self.decoded
+
+    render_no_thinking_messages = staticmethod(
+        Qwen38Tokenizer.render_no_thinking_messages
+    )
 
 
 class _Model:
@@ -740,6 +748,60 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotIn("prompt_token_ids", generation)
         self.assertNotIn("generated_token_ids", generation)
         self.assertNotIn("result_cell_binding_receipt", result.evidence)
+        self.assertEqual(
+            result.evidence["conversation"],
+            {"history_messages": 0, "history_turns": 0},
+        )
+
+    def test_chat_history_renders_exact_multi_turn_qwen_context(self) -> None:
+        runtime = _Runtime()
+        chat = _chat(runtime, system_prompt="stay concise")
+        history = (
+            ("user", "My code is ORBIT-7."),
+            ("assistant", "Understood."),
+        )
+
+        result = chat.handle(
+            Request(
+                "chat",
+                "What was my code?",
+                {QWEN38_CHAT_HISTORY_METADATA: history},
+            )
+        )
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(
+            runtime.tokenizer.encoded,
+            [
+                Qwen38Tokenizer.render_no_thinking_messages(
+                    "stay concise",
+                    (*history, ("user", "What was my code?")),
+                )
+            ],
+        )
+        self.assertEqual(
+            result.evidence["conversation"],
+            {"history_messages": 2, "history_turns": 1},
+        )
+        chat.close()
+
+    def test_invalid_chat_history_is_rejected_before_runtime_load(self) -> None:
+        runtime = _Runtime()
+        chat = _chat(runtime)
+
+        result = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {QWEN38_CHAT_HISTORY_METADATA: (("user", "unfinished"),)},
+            )
+        )
+
+        self.assertIs(result.status, ExecutionStatus.REJECTED)
+        self.assertIn("completed turns", result.reason or "")
+        self.assertFalse(chat.loaded)
+        self.assertEqual(runtime.model.calls, [])
+        chat.close()
 
     def test_direct_generation_emits_cumulative_text_snapshots(self) -> None:
         runtime = _Runtime()
@@ -2316,14 +2378,19 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual([row["output"] for row in rows], ["local answer"] * 2)
 
     def test_cli_interactive_reuses_one_loaded_component_for_free_prompts(self) -> None:
-        qwen = _chat(_Runtime())
+        runtime = _Runtime()
+        qwen = _chat(runtime)
         output = io.StringIO()
-        stream = io.StringIO("hello\nworld\n/quit\n")
+        stream = io.StringIO("hello\nworld\n/clear\nagain\n/quit\n")
         with (
             patch(
                 "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
                 return_value=qwen,
             ) as constructor,
+            patch(
+                "immer.runtimes.qwen3_8.encoding.Qwen38Tokenizer",
+                return_value=runtime.tokenizer,
+            ),
             patch("sys.stdin", stream),
             redirect_stdout(output),
         ):
@@ -2342,7 +2409,121 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(code, 0)
         constructor.assert_called_once()
         self.assertTrue(qwen.closed)
-        self.assertEqual(output.getvalue(), "local answer\nlocal answer\n")
+        self.assertEqual(
+            output.getvalue(),
+            "local answer\nlocal answer\nlocal answer\n",
+        )
+        self.assertIn(
+            Qwen38Tokenizer.render_no_thinking_messages(
+                "",
+                (
+                    ("user", "hello"),
+                    ("assistant", "local answer"),
+                    ("user", "world"),
+                ),
+            ),
+            runtime.tokenizer.encoded,
+        )
+        self.assertEqual(
+            runtime.tokenizer.encoded[-1],
+            Qwen38Tokenizer.render_no_thinking_prompt("", "again"),
+        )
+
+    def test_cli_interactive_drops_only_oldest_complete_turns_at_token_limit(
+        self,
+    ) -> None:
+        class SizedTokenizer(_Tokenizer):
+            def encode(self, text: str):
+                self.encoded.append(text)
+                return tuple(range(text.count("<|im_start|>") * 2))
+
+        runtime = _Runtime(tokenizer=SizedTokenizer())
+        qwen = _chat(runtime, max_prompt_tokens=8)
+        output = io.StringIO()
+        stream = io.StringIO("one\ntwo\nthree\n/quit\n")
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ),
+            patch(
+                "immer.runtimes.qwen3_8.encoding.Qwen38Tokenizer",
+                return_value=runtime.tokenizer,
+            ),
+            patch("sys.stdin", stream),
+            redirect_stdout(output),
+        ):
+            code = main(
+                [
+                    "chat",
+                    "--interactive",
+                    "--raw-qwen",
+                    "--max-prompt-tokens",
+                    "8",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue(), "local answer\n" * 3)
+        final_prompt = runtime.tokenizer.encoded[-1]
+        self.assertNotIn("\none<|im_end|>", final_prompt)
+        self.assertIn("\ntwo<|im_end|>", final_prompt)
+        self.assertIn("\nthree<|im_end|>", final_prompt)
+        self.assertEqual(final_prompt.count("<|im_start|>"), 4)
+
+    def test_context_eviction_never_reenables_single_turn_wrapper(self) -> None:
+        class SizedTokenizer(_Tokenizer):
+            def encode(self, text: str):
+                self.encoded.append(text)
+                return tuple(range(text.count("<|im_start|>") * 2))
+
+        runtime = _Runtime(tokenizer=SizedTokenizer())
+        qwen = _chat(runtime, max_prompt_tokens=5)
+        wrapper = Mock()
+        wrapper.handle.side_effect = qwen.handle
+        wrapper.close.side_effect = qwen.close
+        output = io.StringIO()
+        stream = io.StringIO("one\ntwo\n/quit\n")
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ),
+            patch(
+                "immer.cognition.qwen_fertig_chat.QwenFertigChat",
+                return_value=wrapper,
+            ),
+            patch(
+                "immer.runtimes.qwen3_8.encoding.Qwen38Tokenizer",
+                return_value=runtime.tokenizer,
+            ),
+            patch("sys.stdin", stream),
+            redirect_stdout(output),
+        ):
+            code = main(
+                [
+                    "chat",
+                    "--interactive",
+                    "--no-ooe-warm",
+                    "--max-prompt-tokens",
+                    "5",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(wrapper.handle.call_count, 1)
+        self.assertEqual(len(runtime.model.calls), 2)
+        self.assertEqual(output.getvalue(), "local answer\n" * 2)
+        self.assertNotIn("\none<|im_end|>", runtime.tokenizer.encoded[-1])
+        self.assertIn("\ntwo<|im_end|>", runtime.tokenizer.encoded[-1])
 
     def test_cli_wires_fast_mlp_root_and_layer_subset(self) -> None:
         qwen = _chat(_Runtime())

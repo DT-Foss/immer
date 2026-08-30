@@ -534,7 +534,10 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
     from .runtimes.ooe.qwen_warm_bank import (
         open_verified_qwen_warm_bank,
     )
-    from .runtimes.qwen3_8.adapter import Qwen38CausalChat
+    from .runtimes.qwen3_8.adapter import (
+        QWEN38_CHAT_HISTORY_METADATA,
+        Qwen38CausalChat,
+    )
     from .runtimes.qwen3_8.draft_window import DraftWindowError
     from .runtimes.qwen3_8.semantic_state_cache import SemanticStateAnchorCache
 
@@ -612,6 +615,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         if not isinstance(generation, dict):
             return None
         parts = []
+        conversation = evidence.get("conversation")
+        if isinstance(conversation, dict):
+            history_turns = conversation.get("history_turns")
+            if isinstance(history_turns, int) and not isinstance(history_turns, bool):
+                parts.append(f"{history_turns} prior turns")
         generated_tokens = generation.get("generated_tokens")
         if isinstance(generated_tokens, int) and not isinstance(generated_tokens, bool):
             parts.append(f"{generated_tokens} tokens")
@@ -749,36 +757,77 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 runtime_code_revision=warm_runtime_code_revision,
             )
         )
-        warm_prompt_tokenizer = None
-        if warm_profile_sha256 is not None:
+        prompt_tokenizer = None
+        if warm_profile_sha256 is not None or interactive:
             from .runtimes.qwen3_8.encoding import Qwen38Tokenizer
 
-            warm_prompt_tokenizer = Qwen38Tokenizer(
+            prompt_tokenizer = Qwen38Tokenizer(
                 tokenizer_path,
                 require_official=True,
             )
 
-        def request_metadata_for(text: str) -> dict[str, str]:
-            if warm_profile_sha256 is None or warm_prompt_tokenizer is None:
-                return {}
+        def request_metadata_for(
+            text: str,
+            history: tuple[tuple[str, str], ...] = (),
+        ) -> dict[str, object]:
+            metadata: dict[str, object] = {}
+            if history:
+                metadata[QWEN38_CHAT_HISTORY_METADATA] = history
+            if warm_profile_sha256 is None or prompt_tokenizer is None:
+                return metadata
             from .runtimes.qwen3_8.cartography_probe import (
                 prompt_token_sha256,
             )
 
-            rendered = warm_prompt_tokenizer.render_no_thinking_prompt(
-                args.system_prompt,
-                text,
+            rendered = (
+                prompt_tokenizer.render_no_thinking_messages(
+                    args.system_prompt,
+                    (*history, ("user", text)),
+                )
+                if history
+                else prompt_tokenizer.render_no_thinking_prompt(
+                    args.system_prompt,
+                    text,
+                )
             )
-            token_sha256 = prompt_token_sha256(warm_prompt_tokenizer.encode(rendered))
-            return {
-                "qwen_token_sha256": token_sha256,
-                "qwen_warm_runtime_profile_sha256": warm_profile_sha256,
-            }
+            token_sha256 = prompt_token_sha256(prompt_tokenizer.encode(rendered))
+            metadata.update(
+                {
+                    "qwen_token_sha256": token_sha256,
+                    "qwen_warm_runtime_profile_sha256": warm_profile_sha256,
+                }
+            )
+            return metadata
+
+        def fit_interactive_history(
+            text: str,
+            history: tuple[tuple[str, str], ...],
+        ) -> tuple[tuple[tuple[str, str], ...], int, int]:
+            if prompt_tokenizer is None:
+                raise RuntimeError("interactive tokenizer is unavailable")
+            retained = history
+            dropped = 0
+            while True:
+                rendered = prompt_tokenizer.render_no_thinking_messages(
+                    args.system_prompt,
+                    (*retained, ("user", text)),
+                )
+                token_count = len(prompt_tokenizer.encode(rendered))
+                if (
+                    token_count <= args.max_prompt_tokens
+                    and len(retained) <= 128
+                ) or not retained:
+                    return retained, dropped, token_count
+                retained = retained[2:]
+                dropped += 1
 
         def verify_prompt_token(question: str, claimed: str) -> bool:
             metadata = request_metadata_for(question)
             expected = metadata.get("qwen_token_sha256")
-            return expected is not None and hmac.compare_digest(expected, claimed)
+            return isinstance(expected, str) and hmac.compare_digest(
+                expected,
+                claimed,
+            )
 
         warm_mount = None
         if not args.raw_qwen:
@@ -954,9 +1003,13 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             failures = 0
             handled = 0
             last_summary = None
+            history: tuple[tuple[str, str], ...] = ()
             terminal = sys.stdin.isatty() and sys.stdout.isatty()
             if terminal:
-                print("IMMER local Qwen — /help, /stats, /quit", flush=True)
+                print(
+                    "IMMER local Qwen — /help, /stats, /clear, /quit",
+                    flush=True,
+                )
             while max_requests is None or handled < max_requests:
                 if terminal:
                     print("you> ", end="", flush=True)
@@ -971,25 +1024,50 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 if line_message == "/help":
                     print(
                         "Enter any prompt. /stats shows the last real runtime cost. "
-                        "/quit closes the loaded local runtime.",
+                        "/clear drops conversation context. /quit closes the loaded "
+                        "local runtime.",
                         flush=True,
                     )
                     continue
                 if line_message == "/stats":
                     print(last_summary or "No completed Qwen response yet.", flush=True)
                     continue
+                if line_message == "/clear":
+                    history = ()
+                    last_summary = None
+                    if terminal:
+                        print("Conversation context cleared.", flush=True)
+                    continue
                 handled += 1
+                retained, dropped_turns, prompt_tokens = fit_interactive_history(
+                    line_message,
+                    history,
+                )
                 if terminal:
+                    if dropped_turns:
+                        print(
+                            f"[context: dropped {dropped_turns} oldest turns; "
+                            f"{prompt_tokens} prompt tokens]",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     print("immer> ", end="", flush=True)
-                result = component.handle(
+                turn_component = qwen if history else component
+                result = turn_component.handle(
                     Request(
                         "chat",
                         line_message,
-                        request_metadata_for(line_message),
+                        request_metadata_for(line_message, retained),
                     )
                 )
                 emit(result)
                 failures += int(not result.ok)
+                if result.ok and isinstance(result.output, str):
+                    history = (
+                        *retained,
+                        ("user", line_message),
+                        ("assistant", result.output),
+                    )
                 last_summary = interactive_summary(result)
                 if terminal and last_summary is not None:
                     print(last_summary, file=sys.stderr, flush=True)

@@ -144,17 +144,64 @@ class Qwen38Tokenizer:
         ``str.strip`` for both message bodies.
         """
 
+        return Qwen38Tokenizer.render_no_thinking_messages(
+            system,
+            (("user", user),),
+        )
+
+    @staticmethod
+    def render_no_thinking_messages(
+        system: str,
+        messages: Sequence[tuple[str, str]],
+    ) -> str:
+        """Render exact text-only no-thinking chat with preserved empty history tags."""
+
         if not isinstance(system, str):
             raise TypeError("system must be a string")
-        if not isinstance(user, str):
-            raise TypeError("user must be a string")
+        if isinstance(messages, (str, bytes, bytearray)):
+            raise TypeError("messages must be a sequence of role/content pairs")
+        try:
+            rows = tuple(messages)
+        except TypeError as exc:
+            raise TypeError(
+                "messages must be a sequence of role/content pairs"
+            ) from exc
+        if not rows:
+            raise ValueError("messages must contain a user query")
+
+        expected_role = "user"
+        normalized: list[tuple[str, str]] = []
+        for row in rows:
+            if (
+                not isinstance(row, tuple)
+                or len(row) != 2
+                or not isinstance(row[0], str)
+                or not isinstance(row[1], str)
+            ):
+                raise TypeError("messages must contain role/content text pairs")
+            role, content = row
+            if role != expected_role:
+                raise ValueError(
+                    f"messages must alternate user/assistant; expected {expected_role}"
+                )
+            content = content.strip()
+            if not content:
+                raise ValueError("message content must be non-empty text")
+            normalized.append((role, content))
+            expected_role = "assistant" if role == "user" else "user"
+        if normalized[-1][0] != "user":
+            raise ValueError("the final message must be the active user query")
 
         system = system.strip()
-        user = user.strip()
         rendered = ""
         if system:
             rendered += f"{IM_START_TOKEN}system\n{system}{IM_END_TOKEN}\n"
-        rendered += f"{IM_START_TOKEN}user\n{user}{IM_END_TOKEN}\n"
+        for role, content in normalized:
+            rendered += f"{IM_START_TOKEN}{role}\n"
+            if role == "assistant":
+                rendered += f"<think>\n\n</think>\n\n{content}{IM_END_TOKEN}\n"
+            else:
+                rendered += f"{content}{IM_END_TOKEN}\n"
         rendered += f"{IM_START_TOKEN}assistant\n<think>\n\n</think>\n\n"
         return rendered
 

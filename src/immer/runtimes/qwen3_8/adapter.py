@@ -109,6 +109,8 @@ _GENERATION_RECEIPT_FIELDS = (
     "stopped_on_eos",
 )
 RESULT_CELL_GENERATION_POLICY_SCHEMA = "immer.qwen3.8-result-cell-generation-policy/v1"
+QWEN38_CHAT_HISTORY_METADATA = "qwen_chat_history"
+_MAX_CHAT_HISTORY_MESSAGES = 128
 _RESULT_CELL_CODE_REVISION_LENGTHS = frozenset((40, 64))
 
 
@@ -199,6 +201,46 @@ def _token_ids(value: object, label: str) -> tuple[int, ...]:
             raise ValueError(f"{label} contains a negative token ID")
         result.append(token_id)
     return tuple(result)
+
+
+def _chat_history(metadata: object) -> tuple[tuple[str, str], ...]:
+    if not isinstance(metadata, Mapping):
+        raise TypeError("chat metadata must be a mapping")
+    raw = metadata.get(QWEN38_CHAT_HISTORY_METADATA)
+    if raw is None:
+        return ()
+    if isinstance(raw, (str, bytes, bytearray)):
+        raise TypeError("Qwen chat history must be a sequence")
+    try:
+        items = tuple(raw)
+    except TypeError as exc:
+        raise TypeError("Qwen chat history must be a sequence") from exc
+    if len(items) > _MAX_CHAT_HISTORY_MESSAGES:
+        raise ValueError("Qwen chat history exceeds 64 completed turns")
+    if len(items) % 2:
+        raise ValueError("Qwen chat history must contain completed turns")
+
+    rows: list[tuple[str, str]] = []
+    for index, item in enumerate(items):
+        if isinstance(item, Mapping):
+            if set(item) != {"content", "role"}:
+                raise ValueError("Qwen chat history message schema is invalid")
+            role, content = item.get("role"), item.get("content")
+        elif (
+            isinstance(item, Sequence)
+            and not isinstance(item, (str, bytes, bytearray))
+            and len(item) == 2
+        ):
+            role, content = item
+        else:
+            raise TypeError("Qwen chat history messages must bind role and content")
+        expected = "user" if index % 2 == 0 else "assistant"
+        if role != expected:
+            raise ValueError(f"Qwen chat history expected role {expected} at {index}")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Qwen chat history content must be non-empty text")
+        rows.append((expected, content.strip()))
+    return tuple(rows)
 
 
 def _mapping(value: object, label: str) -> dict[str, Any]:
@@ -2843,10 +2885,16 @@ class Qwen38CausalChat:
         finally:
             runtime.model.reset_state(release=True)
 
-    def _execute_locked(self, runtime: Any, text: str) -> Result:
-        prompt = Qwen38Tokenizer.render_no_thinking_prompt(
+    def _execute_locked(
+        self,
+        runtime: Any,
+        text: str,
+        *,
+        history: tuple[tuple[str, str], ...] = (),
+    ) -> Result:
+        prompt = Qwen38Tokenizer.render_no_thinking_messages(
             self._system_prompt,
-            text,
+            (*history, ("user", text)),
         )
         raw_prompt = runtime.tokenizer.encode(prompt)
         prompt_ids = _token_ids(
@@ -3027,6 +3075,10 @@ class Qwen38CausalChat:
         output = decoded.strip()
         evidence = {
             **self._base_evidence(),
+            "conversation": {
+                "history_messages": len(history),
+                "history_turns": len(history) // 2,
+            },
             "generation": receipt,
             "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
             "runtime_metrics": {
@@ -3268,6 +3320,14 @@ class Qwen38CausalChat:
                 self.name,
                 reason="chat payload must be non-empty text",
             )
+        try:
+            history = _chat_history(request.metadata)
+        except (TypeError, ValueError) as exc:
+            return Result(
+                ExecutionStatus.REJECTED,
+                self.name,
+                reason=str(exc),
+            )
 
         with self._lock:
             self._draft_window_selection = None
@@ -3293,7 +3353,11 @@ class Qwen38CausalChat:
             failure_outcome: str | None = None
             abort: BaseException | None = None
             try:
-                result = self._execute_locked(runtime, request.payload.strip())
+                result = self._execute_locked(
+                    runtime,
+                    request.payload.strip(),
+                    history=history,
+                )
             except _RequestRejected as exc:
                 result = Result(
                     ExecutionStatus.REJECTED,
@@ -3384,6 +3448,7 @@ Qwen38Chat = Qwen38CausalChat
 
 
 __all__ = [
+    "QWEN38_CHAT_HISTORY_METADATA",
     "RESULT_CELL_GENERATION_POLICY_SCHEMA",
     "Qwen38CausalChat",
     "Qwen38Chat",

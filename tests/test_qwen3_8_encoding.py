@@ -170,6 +170,49 @@ class Qwen38EncodingTests(unittest.TestCase):
             "<think>\n\n</think>\n\n",
         )
 
+    def test_no_thinking_messages_match_official_multi_turn_template(self) -> None:
+        from immer.runtimes.qwen3_8.encoding import Qwen38Tokenizer
+
+        rendered = Qwen38Tokenizer.render_no_thinking_messages(
+            "  Stay concise. ",
+            (
+                ("user", "My code is ORBIT-7."),
+                ("assistant", "Understood."),
+                ("user", "What was my code?"),
+            ),
+        )
+
+        self.assertEqual(
+            rendered,
+            "<|im_start|>system\n"
+            "Stay concise.<|im_end|>\n"
+            "<|im_start|>user\n"
+            "My code is ORBIT-7.<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            "<think>\n\n</think>\n\n"
+            "Understood.<|im_end|>\n"
+            "<|im_start|>user\n"
+            "What was my code?<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            "<think>\n\n</think>\n\n",
+        )
+
+    def test_no_thinking_messages_reject_incomplete_or_misordered_turns(self) -> None:
+        from immer.runtimes.qwen3_8.encoding import Qwen38Tokenizer
+
+        with self.assertRaisesRegex(ValueError, "final message"):
+            Qwen38Tokenizer.render_no_thinking_messages(
+                "",
+                (("user", "hello"), ("assistant", "hi")),
+            )
+        with self.assertRaisesRegex(ValueError, "expected user"):
+            Qwen38Tokenizer.render_no_thinking_messages(
+                "",
+                (("assistant", "hi"),),
+            )
+        with self.assertRaisesRegex(ValueError, "non-empty"):
+            Qwen38Tokenizer.render_no_thinking_messages("", (("user", " "),))
+
     def test_invalid_paths_and_public_input_types_fail_closed(self) -> None:
         from immer.runtimes.qwen3_8.encoding import (
             Qwen38EncodingError,
