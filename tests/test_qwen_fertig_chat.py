@@ -170,6 +170,9 @@ class QwenFertigChatTests(unittest.TestCase):
                     "mode": "hybrid",
                     "rounds": 3,
                     "provider": {
+                        "atlas_consensus_confidence_gain": 0.125,
+                        "atlas_consensus_rounds": 1,
+                        "atlas_consensus_tokens": 2,
                         "markov_rounds": 2,
                         "markov_selections": 1,
                         "mtp_rounds": 1,
@@ -181,6 +184,11 @@ class QwenFertigChatTests(unittest.TestCase):
                             "atlas_corpus_tokens": 4_000_000,
                             "atlas_draft_tokens": 3,
                             "atlas_option_calls": 1,
+                            "atlas_vote_calls": 2,
+                            "atlas_vote_max_score": 0.8,
+                            "atlas_vote_score_sum": 1.1,
+                            "atlas_vote_supported_tokens": 3,
+                            "atlas_vote_tokens": 6,
                         },
                     },
                     "window_size": 8,
@@ -203,8 +211,10 @@ class QwenFertigChatTests(unittest.TestCase):
         draft = _receipt(result)["qwen"]["draft"]
         self.assertEqual(draft["accepted_draft_tokens"], 5)
         self.assertEqual(draft["provider"]["markov_selections"], 1)
+        self.assertEqual(draft["provider"]["atlas_consensus_tokens"], 2)
         self.assertEqual(draft["atlas"]["atlas_contexts"], 500_000)
         self.assertEqual(draft["atlas"]["atlas_accepted_tokens"], 2)
+        self.assertEqual(draft["atlas"]["atlas_vote_supported_tokens"], 3)
 
     def test_real_formula_and_rref_certificates_short_circuit_without_qwen(
         self,

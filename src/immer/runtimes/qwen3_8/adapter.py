@@ -1481,7 +1481,7 @@ class Qwen38CausalChat:
                 }
             elif self._draft_mode == "markov":
                 policy["markov_draft"] = {
-                    "max_history_tokens": 4096,
+                    "max_history_tokens": 65_536,
                     "max_order": 16,
                     "experts": 8,
                     "fixed_share": 0.05,
@@ -1522,13 +1522,14 @@ class Qwen38CausalChat:
             else:
                 policy["hybrid_draft"] = {
                     "provider_abi": QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
-                    "selection": "round-wise-markov-first-mtp-fallback/v15",
+                    "selection": "round-wise-markov-first-mtp-fallback/v16",
                     "request_provider_lock": False,
                     "one_way_handoff": False,
                     "round_reselection": True,
                     "cross_provider_target_state_sync": True,
                     "cross_provider_target_feedback": True,
-                    "consensus": "discounted-confidence-surplus/v1",
+                    "consensus": "markov-prefix+atlas-backoff/v2",
+                    "atlas_consensus_strength": 0.25,
                     "committed_hidden_handoff": True,
                     "markov_provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
                     "markov_confidence": (
@@ -1681,7 +1682,7 @@ class Qwen38CausalChat:
                 "experts": 8,
                 "fixed_share": 0.05,
                 "kind": "markov-council",
-                "max_history_tokens": 4096,
+                "max_history_tokens": 65_536,
                 "max_order": 16,
                 "min_count": 1,
                 "phrase_max_context": 8,
@@ -1740,7 +1741,7 @@ class Qwen38CausalChat:
                     "identity",
                     {},
                 ).get("manifest_sha256"),
-                "selection": "round-wise-markov-first-mtp-fallback/v15",
+                "selection": "round-wise-markov-first-mtp-fallback/v16",
             }
         else:
             raise Qwen38ChatError("draft-window identity lacks a draft provider")

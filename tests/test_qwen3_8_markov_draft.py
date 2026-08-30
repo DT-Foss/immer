@@ -78,6 +78,54 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         with self.assertRaises(MarkovDraftError):
             MarkovDraftState.from_bytes(bytes(damaged))
 
+    def test_default_provider_expands_online_history_without_expanding_ppm_window(
+        self,
+    ) -> None:
+        path = self.root / "growing-history.bin"
+        legacy = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=path,
+            max_history_tokens=4096,
+        )
+        legacy.observe_final((1, 2, 3, 4))
+        legacy.close()
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=path,
+        )
+
+        self.assertEqual(provider._state.max_history_tokens, 65_536)
+        self.assertEqual(provider.metrics().history_capacity_tokens, 65_536)
+        self.assertEqual(max(row.window for row in provider._experts), 4096)
+        provider.observe_final((5, 6, 7, 8))
+        provider.close()
+        self.assertEqual(
+            MarkovDraftState.from_bytes(path.read_bytes()).max_history_tokens,
+            65_536,
+        )
+
+    def test_persistent_ppm_models_are_reused_across_one_request(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_history_tokens=256,
+        )
+        provider.observe_final((1, 2, 3, 4, 1, 2, 3, 5))
+        first = provider._expert_models((9, 10, 11))
+        second = provider._expert_models((9, 10, 11, 12))
+
+        for spec, first_row, second_row in zip(
+            provider._experts,
+            first,
+            second,
+            strict=True,
+        ):
+            if spec.local_only:
+                self.assertIsNot(first_row[0], second_row[0])
+            else:
+                self.assertIs(first_row[0], second_row[0])
+        provider.close()
+
     def test_confirmed_request_persists_its_prompt_boundary(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         prompt = (1, 4, 7)

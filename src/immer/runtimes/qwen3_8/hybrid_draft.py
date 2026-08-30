@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
+import math
 from typing import Any, Literal
 
 import torch
@@ -12,7 +13,8 @@ from .draft_protocol import RollingDraftProposal
 from .mtp_draft import Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v15"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v16"
+ATLAS_MTP_CONSENSUS_STRENGTH = 0.25
 MARKOV_MTP_WINDOW_WORK_COSTS = {
     1: 1.0,
     2: 1.6,
@@ -85,6 +87,11 @@ class Qwen38MarkovMtpDraftMetrics:
     consensus_confidence_gain: float
     last_consensus_agreement_tokens: int
     last_consensus_confidence_gain: float
+    atlas_consensus_rounds: int
+    atlas_consensus_tokens: int
+    atlas_consensus_confidence_gain: float
+    last_atlas_consensus_tokens: int
+    last_atlas_consensus_confidence_gain: float
     hidden_history_rows: int
     hidden_history_bytes: int
     switch_available: bool
@@ -169,6 +176,11 @@ class Qwen38MarkovMtpDraftProvider:
         self._consensus_confidence_gain = 0.0
         self._last_consensus_agreement_tokens = 0
         self._last_consensus_confidence_gain = 0.0
+        self._atlas_consensus_rounds = 0
+        self._atlas_consensus_tokens = 0
+        self._atlas_consensus_confidence_gain = 0.0
+        self._last_atlas_consensus_tokens = 0
+        self._last_atlas_consensus_confidence_gain = 0.0
         self._shadow_markov_proposal: RollingDraftProposal | None = None
         self._pending_provider: Literal["markov", "mtp"] | None = None
 
@@ -326,6 +338,8 @@ class Qwen38MarkovMtpDraftProvider:
         self._shadow_markov_proposal = None
         self._last_consensus_agreement_tokens = 0
         self._last_consensus_confidence_gain = 0.0
+        self._last_atlas_consensus_tokens = 0
+        self._last_atlas_consensus_confidence_gain = 0.0
         proposal = self.markov_provider.propose_round(history, known_token)
         if not isinstance(proposal, RollingDraftProposal):
             raise Qwen38MarkovMtpDraftError(
@@ -390,46 +404,102 @@ class Qwen38MarkovMtpDraftProvider:
         self._shadow_markov_proposal = None
         self._last_consensus_agreement_tokens = 0
         self._last_consensus_confidence_gain = 0.0
+        self._last_atlas_consensus_tokens = 0
+        self._last_atlas_consensus_confidence_gain = 0.0
         if markov is None:
             return mtp
         if len(markov.token_ids) != len(mtp.token_ids):
             raise Qwen38MarkovMtpDraftError(
                 "Markov/MTP consensus proposal widths disagree"
             )
-        fused = list(mtp.token_confidences)
+        atlas_rows: tuple[object, ...] = ()
+        atlas_vote = getattr(
+            self.markov_provider,
+            "atlas_evidence_for_pending",
+            None,
+        )
+        if callable(atlas_vote):
+            raw_rows = atlas_vote(mtp.token_ids)
+            if not isinstance(raw_rows, tuple) or (
+                raw_rows and len(raw_rows) != len(mtp.token_ids)
+            ):
+                raise Qwen38MarkovMtpDraftError(
+                    "Atlas/MTP consensus evidence width changed"
+                )
+            atlas_rows = raw_rows
+
         agreements = 0
-        gain = 0.0
         for index, (markov_token, mtp_token) in enumerate(
             zip(markov.token_ids, mtp.token_ids, strict=True)
         ):
-            if markov_token != mtp_token:
-                break
-            if mtp.token_confidences[index] <= 0.0:
+            if markov_token != mtp_token or mtp.token_confidences[index] <= 0.0:
                 break
             agreements += 1
-            markov_confidence = float(markov.token_confidences[index])
-            markov_disagreement = min(
-                1.0,
-                max(0.0, float(markov.token_disagreements[index])),
+
+        fused = list(mtp.token_confidences)
+        agreement_gain = 0.0
+        atlas_gain = 0.0
+        atlas_tokens = 0
+        for index, previous in enumerate(mtp.token_confidences):
+            if previous <= 0.0:
+                continue
+            agreement_evidence = 0.0
+            if index < agreements:
+                markov_confidence = float(markov.token_confidences[index])
+                markov_disagreement = min(
+                    1.0,
+                    max(0.0, float(markov.token_disagreements[index])),
+                )
+                surplus = max(0.0, 2.0 * markov_confidence - 1.0)
+                agreement_evidence = 0.5 * surplus * (1.0 - markov_disagreement)
+            after_agreement = min(
+                0.999,
+                1.0 - (1.0 - previous) * (1.0 - agreement_evidence),
             )
-            surplus = max(0.0, 2.0 * markov_confidence - 1.0)
-            agreement_evidence = 0.5 * surplus * (1.0 - markov_disagreement)
-            previous = fused[index]
-            fused[index] = max(
-                previous,
-                min(
-                    0.999,
-                    1.0 - (1.0 - previous) * (1.0 - agreement_evidence),
-                ),
+            agreement_gain += max(0.0, after_agreement - previous)
+
+            atlas_evidence = 0.0
+            if atlas_rows:
+                raw_score = getattr(atlas_rows[index], "score", None)
+                raw_token = getattr(atlas_rows[index], "token_id", None)
+                raw_support = getattr(atlas_rows[index], "support", None)
+                if (
+                    isinstance(raw_score, bool)
+                    or not isinstance(raw_score, (int, float))
+                    or not math.isfinite(float(raw_score))
+                    or not 0.0 <= float(raw_score) <= 1.0
+                    or raw_token != mtp.token_ids[index]
+                    or isinstance(raw_support, bool)
+                    or not isinstance(raw_support, int)
+                    or raw_support < 0
+                ):
+                    raise Qwen38MarkovMtpDraftError(
+                        "Atlas/MTP consensus evidence is invalid"
+                    )
+                if raw_support > 0 and raw_score > 0.0:
+                    atlas_evidence = (
+                        ATLAS_MTP_CONSENSUS_STRENGTH * float(raw_score)
+                    )
+            fused[index] = min(
+                0.999,
+                1.0 - (1.0 - after_agreement) * (1.0 - atlas_evidence),
             )
-            gain += max(0.0, fused[index] - previous)
+            token_atlas_gain = max(0.0, fused[index] - after_agreement)
+            atlas_gain += token_atlas_gain
+            atlas_tokens += int(token_atlas_gain > 0.0)
         self._last_consensus_agreement_tokens = agreements
-        self._last_consensus_confidence_gain = gain
+        self._last_consensus_confidence_gain = agreement_gain
         if agreements:
             self._consensus_rounds += 1
             self._consensus_agreement_tokens += agreements
-            self._consensus_confidence_gain += gain
-        if gain <= 0.0:
+            self._consensus_confidence_gain += agreement_gain
+        self._last_atlas_consensus_tokens = atlas_tokens
+        self._last_atlas_consensus_confidence_gain = atlas_gain
+        if atlas_tokens:
+            self._atlas_consensus_rounds += 1
+            self._atlas_consensus_tokens += atlas_tokens
+            self._atlas_consensus_confidence_gain += atlas_gain
+        if agreement_gain + atlas_gain <= 0.0:
             return mtp
         return RollingDraftProposal.build(
             mtp.token_ids,
@@ -674,6 +744,15 @@ class Qwen38MarkovMtpDraftProvider:
                 self._last_consensus_agreement_tokens
             ),
             last_consensus_confidence_gain=self._last_consensus_confidence_gain,
+            atlas_consensus_rounds=self._atlas_consensus_rounds,
+            atlas_consensus_tokens=self._atlas_consensus_tokens,
+            atlas_consensus_confidence_gain=(
+                self._atlas_consensus_confidence_gain
+            ),
+            last_atlas_consensus_tokens=self._last_atlas_consensus_tokens,
+            last_atlas_consensus_confidence_gain=(
+                self._last_atlas_consensus_confidence_gain
+            ),
             hidden_history_rows=self._hidden_history_rows,
             hidden_history_bytes=self._hidden_history_bytes,
             switch_available=self._switch_available,
@@ -732,6 +811,7 @@ class Qwen38MarkovMtpDraftProvider:
 
 
 __all__ = [
+    "ATLAS_MTP_CONSENSUS_STRENGTH",
     "MARKOV_MTP_WINDOW_WORK_COSTS",
     "QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA",
     "Qwen38MarkovMtpDraftError",

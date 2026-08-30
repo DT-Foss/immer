@@ -365,12 +365,20 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                         "atlas_corpus_tokens",
                         "atlas_draft_tokens",
                         "atlas_option_calls",
+                        "atlas_vote_calls",
+                        "atlas_vote_max_score",
+                        "atlas_vote_score_sum",
+                        "atlas_vote_supported_tokens",
+                        "atlas_vote_tokens",
                     )
                     if key in markov
                 }
             compact_draft["provider"] = {
                 key: provider[key]
                 for key in (
+                    "atlas_consensus_confidence_gain",
+                    "atlas_consensus_rounds",
+                    "atlas_consensus_tokens",
                     "markov_rounds",
                     "markov_selections",
                     "mtp_rounds",

@@ -27,7 +27,7 @@ from .markov_composition import (
     MarkovCompositionProgram,
     derive_programs,
 )
-from .markov_atlas import MarkovTokenAtlas
+from .markov_atlas import AtlasTokenEvidence, MarkovTokenAtlas
 
 try:
     import fcntl
@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v22"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v23"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -44,7 +44,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v19"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v20"
 _STATE_PREFIX = b"IMMD\x09"
 _V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
@@ -95,11 +95,12 @@ class MarkovExpertSpec:
 def _expert_specs(
     max_order: int, max_history_tokens: int
 ) -> tuple[MarkovExpertSpec, ...]:
+    global_window = min(4096, max_history_tokens)
     rows = (
         ("local-o0-w128", 0, min(128, max_history_tokens), True),
-        ("global-o0-w4096", 0, max_history_tokens, False),
+        ("global-o0-w4096", 0, global_window, False),
         ("local-o1-w128", min(1, max_order), min(128, max_history_tokens), True),
-        ("global-o1-w4096", min(1, max_order), max_history_tokens, False),
+        ("global-o1-w4096", min(1, max_order), global_window, False),
         (
             "recent-o2-w256",
             min(2, max_order),
@@ -112,8 +113,8 @@ def _expert_specs(
             min(1024, max_history_tokens),
             False,
         ),
-        ("deep-o8-w4096", min(8, max_order), max_history_tokens, False),
-        (f"max-o{max_order}-w4096", max_order, max_history_tokens, False),
+        ("deep-o8-w4096", min(8, max_order), global_window, False),
+        (f"max-o{max_order}-w4096", max_order, global_window, False),
     )
     return tuple(
         MarkovExpertSpec(name, order, max(8, window), local)
@@ -1097,6 +1098,7 @@ class MarkovDraftMetrics:
     reconcile_calls: int
     predictions: int
     learned_tokens: int
+    history_capacity_tokens: int
     episode_count: int
     imported_episode_count: int
     updates: int
@@ -1153,6 +1155,11 @@ class MarkovDraftMetrics:
     atlas_option_calls: int
     atlas_draft_tokens: int
     atlas_accepted_tokens: int
+    atlas_vote_calls: int
+    atlas_vote_tokens: int
+    atlas_vote_supported_tokens: int
+    atlas_vote_score_sum: float
+    atlas_vote_max_score: float
     composition_programs: int
     composition_option_calls: int
     composition_draft_tokens: int
@@ -1224,7 +1231,7 @@ class FingerprintRollingK4DraftProvider:
         alpha: float = 0.5,
         backoff_strength: float = 3.0,
         min_count: int = 1,
-        max_history_tokens: int = 4096,
+        max_history_tokens: int = 65_536,
         proposal_width: int = 3,
         atlas: MarkovTokenAtlas | None = None,
     ) -> None:
@@ -1378,6 +1385,11 @@ class FingerprintRollingK4DraftProvider:
         self._atlas_option_calls = 0
         self._atlas_draft_tokens = 0
         self._atlas_accepted_tokens = 0
+        self._atlas_vote_calls = 0
+        self._atlas_vote_tokens = 0
+        self._atlas_vote_supported_tokens = 0
+        self._atlas_vote_score_sum = 0.0
+        self._atlas_vote_max_score = 0.0
         self._last_phrase_option: MarkovPhraseOption | None = None
         self._composition_cache: dict[
             str | None,
@@ -1422,6 +1434,8 @@ class FingerprintRollingK4DraftProvider:
         self._last_round_proposal: RollingDraftProposal | None = None
         self._last_plan_trace: tuple[tuple[int, int, float], ...] = ()
         self._pending_import_digest: str | None = None
+        self._persistent_symbols_cache: tuple[str, ...] | None = None
+        self._persistent_expert_models: dict[str, _TransitionFingerprint] = {}
         self._closed = False
 
     def _acquire_state_lock(self) -> None:
@@ -1470,11 +1484,15 @@ class FingerprintRollingK4DraftProvider:
             state = MarkovDraftState.from_bytes(_read_state_bytes(path))
         except OSError as exc:  # pragma: no cover - normalized by helper.
             raise MarkovDraftError("cannot read Markov draft state") from exc
-        if (
-            state.vocab_size != self.vocab_size
-            or state.max_history_tokens != self.max_history_tokens
-        ):
+        if state.vocab_size != self.vocab_size:
             raise MarkovDraftError("Markov draft state configuration changed")
+        if state.max_history_tokens > self.max_history_tokens:
+            raise MarkovDraftError("Markov draft history capacity cannot shrink")
+        if state.max_history_tokens < self.max_history_tokens:
+            state = replace(
+                state,
+                max_history_tokens=self.max_history_tokens,
+            )
         return state
 
     def _token_tuple(self, value: object, *, label: str) -> tuple[int, ...]:
@@ -1678,12 +1696,17 @@ class FingerprintRollingK4DraftProvider:
         self._request_started = True
 
     def _persistent_symbols(self) -> tuple[str, ...]:
+        cached = self._persistent_symbols_cache
+        if cached is not None:
+            return cached
         rows: list[str] = []
         for index, episode in enumerate(self._generation_episodes()):
             if index:
                 rows.append(_EPISODE_TOKEN)
             rows.extend(self._symbol(token) for token in episode)
-        return tuple(rows)
+        result = tuple(rows)
+        self._persistent_symbols_cache = result
+        return result
 
     def _episodes(self, dialect_id: str | None = None) -> tuple[tuple[int, ...], ...]:
         rows = []
@@ -2091,20 +2114,29 @@ class FingerprintRollingK4DraftProvider:
         persistent = self._persistent_symbols()
         current = tuple(self._symbol(token) for token in history)
         for spec in self._experts:
-            source = (
-                current
-                if spec.local_only or not persistent
-                else (*persistent, _EPISODE_TOKEN, *current)
-            )
-            selected = source[-spec.window :]
-            model = _TransitionFingerprint.fit(
-                selected,
-                max_order=min(spec.max_order, len(selected) - 1),
-                alpha=self.alpha,
-                backoff_strength=self.backoff_strength,
-                min_count=self.min_count,
-            )
-            rows.append((model, list(selected)))
+            if spec.local_only or not persistent:
+                selected = current[-spec.window :]
+                model = _TransitionFingerprint.fit(
+                    selected,
+                    max_order=min(spec.max_order, len(selected) - 1),
+                    alpha=self.alpha,
+                    backoff_strength=self.backoff_strength,
+                    min_count=self.min_count,
+                )
+                rows.append((model, list(selected)))
+                continue
+            model = self._persistent_expert_models.get(spec.name)
+            if model is None:
+                corpus = persistent[-spec.window :]
+                model = _TransitionFingerprint.fit(
+                    corpus,
+                    max_order=min(spec.max_order, len(corpus) - 1),
+                    alpha=self.alpha,
+                    backoff_strength=self.backoff_strength,
+                    min_count=self.min_count,
+                )
+                self._persistent_expert_models[spec.name] = model
+            rows.append((model, list(current[-spec.window :])))
         return tuple(rows)
 
     def _position_weighting(
@@ -2932,6 +2964,39 @@ class FingerprintRollingK4DraftProvider:
         self._last_round_proposal = result
         return result
 
+    def atlas_evidence_for_pending(
+        self,
+        token_ids: Sequence[int],
+        /,
+    ) -> tuple[AtlasTokenEvidence, ...]:
+        """Score another provider's exact proposal against the Atlas.
+
+        The pending Markov base already includes the target-known token for
+        this round.  Scoring is read-only: it cannot change the Markov proposal
+        or learn from unverified MTP tokens.
+        """
+
+        proposed = self._token_tuple(
+            token_ids,
+            label="Atlas Council proposal",
+        )
+        if self._pending_base is None or self._pending_proposal is None:
+            raise MarkovDraftError("Atlas Council vote requires a pending proposal")
+        if len(proposed) != len(self._pending_proposal):
+            raise MarkovDraftError("Atlas Council proposal width changed")
+        if self.atlas is None:
+            return ()
+        evidence = self.atlas.sequence_evidence(self._pending_base, proposed)
+        self._atlas_vote_calls += 1
+        self._atlas_vote_tokens += len(evidence)
+        self._atlas_vote_supported_tokens += sum(row.support > 0 for row in evidence)
+        self._atlas_vote_score_sum += sum(row.score for row in evidence)
+        self._atlas_vote_max_score = max(
+            self._atlas_vote_max_score,
+            *(row.score for row in evidence),
+        )
+        return evidence
+
     def _learn_episode(
         self,
         tokens: Sequence[int],
@@ -2976,6 +3041,8 @@ class FingerprintRollingK4DraftProvider:
             episode_prompt_lengths=tuple(prompt_lengths),
             updates=self._state.updates + 1,
         )
+        self._persistent_symbols_cache = None
+        self._persistent_expert_models.clear()
         self._composition_cache.clear()
 
     def _commit_active_dialect(self) -> None:
@@ -3394,6 +3461,7 @@ class FingerprintRollingK4DraftProvider:
             reconcile_calls=self._reconcile_calls,
             predictions=self._predictions,
             learned_tokens=len(self._state.token_ids),
+            history_capacity_tokens=self._state.max_history_tokens,
             episode_count=len(self._state.episode_lengths),
             imported_episode_count=len(self._state.imported_episode_sha256s),
             updates=self._state.updates,
@@ -3487,6 +3555,11 @@ class FingerprintRollingK4DraftProvider:
             atlas_option_calls=self._atlas_option_calls,
             atlas_draft_tokens=self._atlas_draft_tokens,
             atlas_accepted_tokens=self._atlas_accepted_tokens,
+            atlas_vote_calls=self._atlas_vote_calls,
+            atlas_vote_tokens=self._atlas_vote_tokens,
+            atlas_vote_supported_tokens=self._atlas_vote_supported_tokens,
+            atlas_vote_score_sum=self._atlas_vote_score_sum,
+            atlas_vote_max_score=self._atlas_vote_max_score,
             composition_programs=self._composition_program_count,
             composition_option_calls=self._composition_option_calls,
             composition_draft_tokens=self._composition_draft_tokens,

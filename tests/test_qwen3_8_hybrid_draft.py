@@ -16,6 +16,7 @@ from immer.runtimes.qwen3_8.hybrid_draft import (
 from immer.runtimes.qwen3_8.markov_draft import (
     FingerprintRollingK4DraftProvider,
 )
+from immer.runtimes.qwen3_8.markov_atlas import AtlasTokenEvidence
 
 
 def _proposal(*, confidence: float, tokens=(3, 4, 5)) -> RollingDraftProposal:
@@ -50,6 +51,7 @@ class _Markov:
         confidence: float | list[float],
         *,
         tokens: tuple[int, ...] = (3, 4, 5),
+        atlas_scores: tuple[float, ...] = (),
     ) -> None:
         self.confidences = (
             [float(confidence)]
@@ -58,6 +60,7 @@ class _Markov:
         )
         self.confidence = self.confidences[0]
         self.tokens = tokens
+        self.atlas_scores = atlas_scores
         self._proposal_index = 0
         self.begin_calls = []
         self.propose_calls = []
@@ -91,6 +94,21 @@ class _Markov:
             raise AssertionError("discard without proposal")
         self.pending = False
         self.discard_calls += 1
+
+    def atlas_evidence_for_pending(self, token_ids):
+        if not self.atlas_scores:
+            return ()
+        return tuple(
+            AtlasTokenEvidence(
+                token_id=token,
+                context_order=2 if score > 0.0 else 0,
+                support=8 if score > 0.0 else 0,
+                total=16 if score > 0.0 else 0,
+                probability=0.5 if score > 0.0 else 0.0,
+                score=score,
+            )
+            for token, score in zip(token_ids, self.atlas_scores, strict=True)
+        )
 
     def observe_verification(self, accepted, verified):
         self.verification_calls.append((accepted, verified))
@@ -347,7 +365,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(proposal.token_ids, (7, 8, 9))
         self.assertEqual(
             proposal.provider_abi,
-            "immer.qwen3.8-markov-mtp-hybrid-provider/v15",
+            "immer.qwen3.8-markov-mtp-hybrid-provider/v16",
         )
         self.assertTrue(
             all(abs(value - 0.7625) < 1e-12 for value in proposal.token_confidences)
@@ -359,6 +377,37 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertAlmostEqual(metrics.consensus_confidence_gain, 0.0375)
         self.assertAlmostEqual(metrics.last_consensus_confidence_gain, 0.0375)
         provider.observe_verification(1, 1)
+        provider.reconcile_prefix((*prompt, 4, 7))
+        provider.observe_final((*prompt, 4, 7, 10))
+        provider.close()
+
+    def test_atlas_votes_for_mtp_tokens_without_requiring_markov_top1(self) -> None:
+        markov = _Markov(
+            0.01,
+            tokens=(31, 32, 33),
+            atlas_scores=(0.8, 0.4, 0.0),
+        )
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        proposal = provider.propose_round_state(prompt, 4, hidden[:, -1:])
+
+        self.assertEqual(proposal.token_ids, (7, 8, 9))
+        self.assertEqual(proposal.token_confidences, (0.8, 0.775, 0.75))
+        metrics = provider.metrics()
+        self.assertEqual(metrics.consensus_agreement_tokens, 0)
+        self.assertEqual(metrics.atlas_consensus_rounds, 1)
+        self.assertEqual(metrics.atlas_consensus_tokens, 2)
+        self.assertAlmostEqual(metrics.atlas_consensus_confidence_gain, 0.075)
+        self.assertEqual(metrics.last_atlas_consensus_tokens, 2)
+        self.assertAlmostEqual(
+            metrics.last_atlas_consensus_confidence_gain,
+            0.075,
+        )
+        provider.observe_verification(1, 2)
         provider.reconcile_prefix((*prompt, 4, 7))
         provider.observe_final((*prompt, 4, 7, 10))
         provider.close()
@@ -432,6 +481,28 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         metrics = provider.metrics()
         self.assertEqual(metrics.consensus_confidence_gain, 0.0)
         self.assertEqual(metrics.last_consensus_confidence_gain, 0.0)
+        provider.close()
+
+    def test_saturated_mtp_confidence_is_not_counted_as_atlas_help(self) -> None:
+        markov = _Markov(
+            0.01,
+            tokens=(31, 32, 33),
+            atlas_scores=(0.8, 0.8, 0.8),
+        )
+        provider = Qwen38MarkovMtpDraftProvider(markov, _Mtp)
+        provider._shadow_markov_proposal = _proposal(
+            confidence=0.01,
+            tokens=(31, 32, 33),
+        )
+        mtp = _proposal(confidence=0.999, tokens=(7, 8, 9))
+
+        fused = provider._fuse_mtp_consensus(mtp)
+
+        self.assertIs(fused, mtp)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.atlas_consensus_rounds, 0)
+        self.assertEqual(metrics.atlas_consensus_tokens, 0)
+        self.assertEqual(metrics.atlas_consensus_confidence_gain, 0.0)
         provider.close()
 
     def test_mtp_initialization_failure_keeps_the_pending_markov_fallback(
@@ -590,7 +661,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(mtp.advance_calls[0][2], final_hidden))
 
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v15")
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v16")
         self.assertEqual(metrics.selected_provider, "markov")
         self.assertEqual(metrics.selection_calls, 4)
         self.assertEqual(metrics.markov_rounds, 3)

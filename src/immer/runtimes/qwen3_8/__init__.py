@@ -151,6 +151,9 @@ from .markov_draft import (
 )
 from .markov_atlas import (
     AtlasContinuation,
+    AtlasTokenEvidence,
+    LEGACY_MARKOV_ATLAS_PREFIX,
+    LEGACY_MARKOV_ATLAS_SCHEMA,
     MARKOV_ATLAS_PREFIX,
     MARKOV_ATLAS_SCHEMA,
     MarkovAtlasError,
@@ -445,6 +448,9 @@ __all__ = [
     "MARKOV_ATLAS_PREFIX",
     "MARKOV_ATLAS_SCHEMA",
     "AtlasContinuation",
+    "AtlasTokenEvidence",
+    "LEGACY_MARKOV_ATLAS_PREFIX",
+    "LEGACY_MARKOV_ATLAS_SCHEMA",
     "CompositionAtom",
     "CompositionBounds",
     "ConfirmedTokenEpisode",

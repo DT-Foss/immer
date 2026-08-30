@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
+import json
 import tempfile
 import unittest
+import zlib
 
 from immer.runtimes.qwen3_8.markov_atlas import (
+    LEGACY_MARKOV_ATLAS_PREFIX,
+    LEGACY_MARKOV_ATLAS_SCHEMA,
+    MARKOV_ATLAS_PREFIX,
     MarkovAtlasError,
     MarkovTokenAtlas,
 )
@@ -72,6 +78,31 @@ class Qwen38MarkovAtlasTests(unittest.TestCase):
         damaged[-1] ^= 1
         with self.assertRaises(MarkovAtlasError):
             MarkovTokenAtlas.from_bytes(bytes(damaged))
+        with self.assertRaises(MarkovAtlasError):
+            MarkovTokenAtlas.from_bytes(encoded + b"junk")
+
+    def test_external_candidate_receives_backoff_evidence_without_being_top1(
+        self,
+    ) -> None:
+        atlas = self._atlas()
+
+        evidence = atlas.token_evidence((31, 2, 3, 4, 5), 8)
+        sequence = atlas.sequence_evidence((31, 2), (3, 4, 5))
+
+        self.assertEqual(evidence.token_id, 8)
+        self.assertEqual(evidence.context_order, 4)
+        self.assertEqual(evidence.support, 1)
+        self.assertEqual(evidence.total, 4)
+        self.assertGreater(evidence.score, 0.0)
+        self.assertEqual(tuple(row.token_id for row in sequence), (3, 4, 5))
+        self.assertTrue(all(row.support == 4 for row in sequence))
+        absent = atlas.token_evidence((31, 2, 3, 4, 5), 30)
+        self.assertEqual(absent.support, 0)
+        self.assertEqual(absent.score, 0.0)
+        root = atlas.token_evidence((30,), 3)
+        self.assertEqual(root.context_order, 0)
+        self.assertEqual(root.support, 4)
+        self.assertGreater(root.score, 0.0)
 
     def test_atomic_file_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -86,6 +117,50 @@ class Qwen38MarkovAtlasTests(unittest.TestCase):
             )
 
         self.assertEqual(restored.sha256, atlas.sha256)
+
+    def test_legacy_json_atlas_migrates_to_compact_binary_codec(self) -> None:
+        body = {
+            "document_count": 2,
+            "max_branches": 2,
+            "max_order": 2,
+            "min_context_count": 2,
+            "rows": [
+                [[2], 2, [[3, 2]]],
+                [[2, 3], 2, [[4, 2]]],
+            ],
+            "token_count": 6,
+            "tokenizer_sha256": TOKENIZER_SHA,
+            "vocab_size": 32,
+        }
+        canonical_body = json.dumps(
+            body,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        document = {
+            "body": body,
+            "schema": LEGACY_MARKOV_ATLAS_SCHEMA,
+            "sha256": hashlib.sha256(canonical_body).hexdigest(),
+        }
+        raw = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+
+        atlas = MarkovTokenAtlas.from_bytes(
+            LEGACY_MARKOV_ATLAS_PREFIX + zlib.compress(raw)
+        )
+
+        continuation = atlas.continuation((9, 2), max_tokens=2)
+        self.assertIsNotNone(continuation)
+        assert continuation is not None
+        self.assertEqual(continuation.token_ids, (3, 4))
+        self.assertTrue(atlas.to_bytes().startswith(MARKOV_ATLAS_PREFIX))
 
     def test_provider_uses_atlas_phrase_and_records_target_acceptance(self) -> None:
         atlas = self._atlas()
@@ -140,6 +215,30 @@ class Qwen38MarkovAtlasTests(unittest.TestCase):
         provider.observe_final((*prompt, 2, 3))
         provider.close()
 
+    def test_pending_provider_scores_external_tokens_as_atlas_votes(self) -> None:
+        atlas = self._atlas()
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+            atlas=atlas,
+        )
+        prompt = (20, 21)
+        provider.begin_request(prompt)
+        provider.propose_round(prompt, 2)
+
+        rows = provider.atlas_evidence_for_pending((3, 4, 5))
+
+        self.assertEqual(tuple(row.token_id for row in rows), (3, 4, 5))
+        self.assertTrue(all(row.score > 0.0 for row in rows))
+        metrics = provider.metrics()
+        self.assertEqual(metrics.atlas_vote_calls, 1)
+        self.assertEqual(metrics.atlas_vote_tokens, 3)
+        self.assertEqual(metrics.atlas_vote_supported_tokens, 3)
+        self.assertGreater(metrics.atlas_vote_score_sum, 0.0)
+        provider.discard_pending_proposal()
+        provider.observe_final((*prompt, 2, 3))
+        provider.close()
+
     def test_context_cap_keeps_the_highest_support_rows(self) -> None:
         atlas = MarkovTokenAtlas.build(
             (
@@ -151,10 +250,10 @@ class Qwen38MarkovAtlasTests(unittest.TestCase):
             max_order=2,
             min_context_count=2,
             max_branches=2,
-            max_contexts=1,
+            max_contexts=2,
         )
 
-        self.assertEqual(atlas.context_count, 1)
+        self.assertEqual(atlas.context_count, 2)
         continuation = atlas.continuation((1,), max_tokens=1)
         self.assertIsNotNone(continuation)
         assert continuation is not None
