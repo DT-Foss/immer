@@ -30,6 +30,7 @@ from immer.runtimes.ooe.result_cells import (
 from immer.runtimes.qwen3_8.adapter import Qwen38CausalChat, Qwen38ChatError
 from immer.runtimes.qwen3_8.cartography_probe import prompt_token_sha256
 from immer.runtimes.qwen3_8.encoding import Qwen38Tokenizer
+from immer.runtimes.qwen3_8.markov_atlas import MarkovTokenAtlas
 from immer.runtimes.qwen3_8.semantic_atlas import ModelPin
 from immer.runtimes.qwen3_8.semantic_state_cache import (
     AnchorReceipt,
@@ -355,6 +356,35 @@ class _ExactBackend:
 
 
 class Qwen38CausalChatTests(unittest.TestCase):
+    def test_markov_atlas_loads_once_and_binds_runtime_tokenizer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "atlas.bin"
+            atlas = MarkovTokenAtlas.build(
+                ((1, 2, 3, 4), (5, 2, 3, 6)),
+                vocab_size=300_000,
+                tokenizer_sha256=_DIGEST,
+                max_order=3,
+            )
+            atlas.write(path)
+            chat = _chat(
+                _Runtime(),
+                draft_mode="markov",
+                markov_atlas_path=path,
+            )
+
+            runtime = chat._load_locked()
+            loaded = chat._markov_atlas
+            self.assertIs(runtime.model.config, chat._runtime.model.config)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.sha256, atlas.sha256)
+            bound_identity = chat._draft_window_runtime_identity()
+            chat._markov_atlas = None
+            unbound_identity = chat._draft_window_runtime_identity()
+            chat._markov_atlas = loaded
+            self.assertNotEqual(bound_identity, unbound_identity)
+            chat.close()
+
     def test_template_anchor_stops_before_user_specific_tokens(self) -> None:
         class Tokenizer:
             @staticmethod
@@ -910,7 +940,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         hybrid = policy["hybrid_draft"]
         self.assertEqual(
             hybrid["selection"],
-            "round-wise-markov-first-mtp-fallback/v13",
+            "round-wise-markov-first-mtp-fallback/v15",
         )
         self.assertFalse(hybrid["request_provider_lock"])
         self.assertFalse(hybrid["one_way_handoff"])
@@ -924,7 +954,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertTrue(hybrid["committed_hidden_handoff"])
         self.assertEqual(
             hybrid["markov_confidence"],
-            "dialect-council-one-step-lookahead/v8",
+            "self-calibrating-dialect-council-lookahead/v9",
         )
         self.assertEqual(
             hybrid["position_specialists"],
@@ -940,7 +970,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         self.assertEqual(
             hybrid["planning"],
-            "top4-one-step-log-probability/v1",
+            "target-calibrated-top4-one-step/v2",
         )
         self.assertTrue(hybrid["markov_persistent"])
         self.assertTrue(hybrid["mtp_persistent_calibration"])
@@ -973,7 +1003,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         self.assertEqual(
             identity["provider"]["selection"],
-            "round-wise-markov-first-mtp-fallback/v13",
+            "round-wise-markov-first-mtp-fallback/v15",
         )
         chat.close()
 
@@ -1778,6 +1808,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 q4_root=q4,
                 fast_mlp_root=None,
                 draft_mode="hybrid",
+                markov_atlas_path=None,
                 runtime_code_revision="a" * 64,
             )
             with patch(
@@ -1790,6 +1821,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     q4_root=q4,
                     fast_mlp_root=None,
                     draft_mode="hybrid",
+                    markov_atlas_path=None,
                     runtime_code_revision="a" * 64,
                 )
 
@@ -2153,6 +2185,34 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(
             options["fast_mlp_online_state_path"],
             "/state/qwen-fast.json",
+        )
+
+    def test_cli_wires_corpus_markov_atlas_without_a_state_file(self) -> None:
+        qwen = _chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor:
+            with redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--markov-atlas",
+                        "/state/qwen-markov-atlas.bin",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["draft_mode"], "markov")
+        self.assertEqual(
+            options["markov_atlas_path"],
+            "/state/qwen-markov-atlas.bin",
         )
 
     def test_cli_wires_q4_bank_and_native_threads(self) -> None:

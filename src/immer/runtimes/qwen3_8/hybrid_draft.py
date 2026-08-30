@@ -12,7 +12,7 @@ from .draft_protocol import RollingDraftProposal
 from .mtp_draft import Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v13"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v15"
 MARKOV_MTP_WINDOW_WORK_COSTS = {
     1: 1.0,
     2: 1.6,
@@ -129,6 +129,7 @@ class Qwen38MarkovMtpDraftProvider:
             raise TypeError("mtp_factory must be callable")
         required = (
             "begin_request",
+            "propose_after",
             "propose_round",
             "discard_pending_proposal",
             "advance_confirmed_prefix",

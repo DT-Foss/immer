@@ -160,7 +160,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(provider.metrics().expert_weights), 8)
         provider.close()
 
-    def test_v2_council_state_migrates_to_v8_dialect_horizon_memory(self) -> None:
+    def test_v2_council_state_migrates_to_v9_planner_memory(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         state = seed._state
         seed.close()
@@ -200,11 +200,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((1, 2, 3, 4))
         provider.close()
 
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x08"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
         migrated = MarkovDraftState.from_bytes(path.read_bytes())
         self.assertEqual(len(migrated.dialects), 1)
 
-    def test_v3_dialect_state_migrates_episode_bindings_to_v8(self) -> None:
+    def test_v3_dialect_state_migrates_episode_bindings_to_v9(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -217,6 +217,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("imported_episode_sha256s")
         document.pop("horizon_expert_hits")
         document.pop("horizon_expert_observations")
+        document.pop("lookahead_greedy_hits")
+        document.pop("lookahead_hits")
+        document.pop("lookahead_observations")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v3"
         raw = json.dumps(
             document,
@@ -237,9 +240,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.episode_dialects, (None,))
         provider.observe_final((1, 2, 3, 4))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x08"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
 
-    def test_v4_state_migrates_empty_import_inventory_to_v8(self) -> None:
+    def test_v4_state_migrates_empty_import_inventory_to_v9(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -251,6 +254,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("episode_prompt_lengths")
         document.pop("horizon_expert_hits")
         document.pop("horizon_expert_observations")
+        document.pop("lookahead_greedy_hits")
+        document.pop("lookahead_hits")
+        document.pop("lookahead_observations")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v4"
         raw = json.dumps(
             document,
@@ -270,9 +276,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider.imported_episode_sha256s(), ())
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x08"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
 
-    def test_v5_state_migrates_unknown_prompt_boundaries_to_v8(self) -> None:
+    def test_v5_state_migrates_unknown_prompt_boundaries_to_v9(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -283,6 +289,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("episode_prompt_lengths")
         document.pop("horizon_expert_hits")
         document.pop("horizon_expert_observations")
+        document.pop("lookahead_greedy_hits")
+        document.pop("lookahead_hits")
+        document.pop("lookahead_observations")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v5"
         raw = json.dumps(
             document,
@@ -302,9 +311,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider._state.episode_prompt_lengths, (None,))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x08"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
 
-    def test_v6_state_migrates_zeroed_position_expert_memory_to_v8(self) -> None:
+    def test_v6_state_migrates_zeroed_position_expert_memory_to_v9(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -314,6 +323,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document = json.loads(zlib.decompress(encoded[5:]))
         document.pop("horizon_expert_hits")
         document.pop("horizon_expert_observations")
+        document.pop("lookahead_greedy_hits")
+        document.pop("lookahead_hits")
+        document.pop("lookahead_observations")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v6"
         raw = json.dumps(
             document,
@@ -336,9 +348,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             all(not any(row) for row in provider._state.horizon_expert_observations)
         )
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x08"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
 
-    def test_v7_state_migrates_dialect_position_memory_to_v8(self) -> None:
+    def test_v7_state_migrates_dialect_position_memory_to_v9(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         seed.observe_final((1, 2, 3))
         document = json.loads(zlib.decompress(seed._state.to_bytes()[5:]))
@@ -346,6 +358,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         for dialect in document["dialects"]:
             dialect.pop("horizon_hits")
             dialect.pop("horizon_observations")
+        document.pop("lookahead_greedy_hits")
+        document.pop("lookahead_hits")
+        document.pop("lookahead_observations")
         document["schema"] = "immer.qwen3.8-markov-draft-state/v7"
         raw = json.dumps(
             document,
@@ -367,7 +382,45 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(dialect.horizon_observations), 16)
         self.assertTrue(all(not any(row) for row in dialect.horizon_observations))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x08"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
+
+    def test_v8_state_migrates_zeroed_lookahead_outcomes_to_v9(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
+        provider.close()
+        document.pop("lookahead_greedy_hits")
+        document.pop("lookahead_hits")
+        document.pop("lookahead_observations")
+        document["schema"] = "immer.qwen3.8-markov-draft-state/v8"
+        raw = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        path = self.root / "v8-state.bin"
+        path.write_bytes(b"IMMD\x08" + zlib.compress(raw, level=9))
+
+        migrated = MarkovDraftState.from_bytes(path.read_bytes())
+        self.assertEqual(migrated.lookahead_observations, (0,) * 16)
+        self.assertEqual(migrated.lookahead_hits, (0,) * 16)
+        self.assertEqual(migrated.lookahead_greedy_hits, (0,) * 16)
+        self.assertEqual(
+            MarkovDraftState.from_bytes(migrated.to_bytes()),
+            migrated,
+        )
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=path,
+        )
+
+        self.assertEqual(provider._state.lookahead_observations, (0,) * 16)
+        self.assertEqual(provider._state.lookahead_hits, (0,) * 16)
+        self.assertEqual(provider._state.lookahead_greedy_hits, (0,) * 16)
+        provider.close()
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x09"))
 
     def test_import_digest_survives_episode_eviction_and_prevents_replay(self) -> None:
         state_path = self.root / "imported-markov.bin"
@@ -964,6 +1017,80 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider.metrics().lookahead_calls, 1)
         self.assertEqual(provider.metrics().last_lookahead_gain, 0.0)
         self.assertEqual(len(calls), len(provider._experts) * 5)
+        provider.close()
+
+    def test_target_feedback_can_disable_a_harmful_lookahead_override(self) -> None:
+        class PlanningExpert:
+            @staticmethod
+            def distribution(context):
+                if not context:
+                    return {"07": 0.55, "08": 0.45}
+                if context[-1] == "07":
+                    return {"09": 0.51, "10": 0.49}
+                return {"09": 0.99, "10": 0.01}
+
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        provider._expert_models = lambda _history: tuple(
+            (PlanningExpert(), []) for _ in provider._experts
+        )
+        planned, feedback, _confidence, _disagreement = provider._predict_council(
+            (1,), 1
+        )
+        self.assertEqual(planned, (8,))
+        for _ in range(16):
+            provider._apply_council_feedback(
+                feedback[0],
+                7,
+                0,
+                8,
+                7,
+            )
+
+        learned, _feedback, _confidence, _disagreement = provider._predict_council(
+            (1,), 1
+        )
+
+        self.assertEqual(learned, (7,))
+        self.assertEqual(provider._state.lookahead_observations[0], 16)
+        self.assertEqual(provider._state.lookahead_hits[0], 0)
+        self.assertEqual(provider._state.lookahead_greedy_hits[0], 16)
+        restored = MarkovDraftState.from_bytes(provider._state.to_bytes())
+        self.assertEqual(restored.lookahead_observations[0], 16)
+        self.assertEqual(restored.lookahead_hits[0], 0)
+        self.assertEqual(restored.lookahead_greedy_hits[0], 16)
+        provider.close()
+
+    def test_runtime_carry_records_greedy_winner_against_planned_token(self) -> None:
+        class PlanningExpert:
+            @staticmethod
+            def distribution(context):
+                if not context or context[-1] == "02":
+                    return {"07": 0.55, "08": 0.45}
+                if context[-1] == "07":
+                    return {"09": 0.51, "10": 0.49}
+                return {"09": 0.99, "10": 0.01}
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        provider._expert_models = lambda _history: tuple(
+            (PlanningExpert(), []) for _ in provider._experts
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        proposal = provider.propose_round(prompt, 2)
+        self.assertEqual(proposal.token_ids[0], 8)
+        history = (*prompt, 2)
+        provider.reconcile_prefix(history)
+
+        provider.propose_round(history, 7)
+        provider.discard_pending_proposal()
+        provider.observe_final((*history, 7))
+
+        self.assertEqual(provider._state.lookahead_observations[0], 1)
+        self.assertEqual(provider._state.lookahead_hits[0], 0)
+        self.assertEqual(provider._state.lookahead_greedy_hits[0], 1)
         provider.close()
 
     def test_below_threshold_prompt_starts_global_without_neighbor_leakage(

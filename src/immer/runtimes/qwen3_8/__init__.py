@@ -149,6 +149,14 @@ from .markov_draft import (
     MarkovExpertSpec,
     MarkovPhraseOption,
 )
+from .markov_atlas import (
+    AtlasContinuation,
+    MARKOV_ATLAS_PREFIX,
+    MARKOV_ATLAS_SCHEMA,
+    MarkovAtlasError,
+    MarkovTokenAtlas,
+    tokenizer_file_sha256,
+)
 from .markov_composition import (
     CompositionAtom,
     CompositionBounds,
@@ -434,6 +442,9 @@ __all__ = [
     "MARKOV_DRAFT_METRICS_SCHEMA",
     "MARKOV_DRAFT_PROVIDER_ABI",
     "MARKOV_DRAFT_STATE_SCHEMA",
+    "MARKOV_ATLAS_PREFIX",
+    "MARKOV_ATLAS_SCHEMA",
+    "AtlasContinuation",
     "CompositionAtom",
     "CompositionBounds",
     "ConfirmedTokenEpisode",
@@ -453,6 +464,8 @@ __all__ = [
     "MarkovDraftState",
     "MarkovExpertSpec",
     "MarkovPhraseOption",
+    "MarkovAtlasError",
+    "MarkovTokenAtlas",
     "ModelPin",
     "NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA",
     "NATIVE_HEAD_CRSA_FREE_HEADS",
@@ -600,6 +613,7 @@ __all__ = [
     "semantic_label_sha256",
     "tensor_range_plan_from_source",
     "token_prefix_sha256",
+    "tokenizer_file_sha256",
     "open_qwen38_fast_mlp",
     "open_qwen38_packed_fast_mlp",
     "verify_probe_document",

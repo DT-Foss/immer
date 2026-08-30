@@ -106,8 +106,9 @@ _QWEN38_DEPLOYMENT_WARM_ROOT = Path(
 )
 _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE = Path("/root/immer-state/qwen-markov-q4-v1.bin")
 _QWEN38_DEPLOYMENT_MTP_STATE = Path("/root/immer-state/qwen-mtp-q4-v1.json")
-_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v20"
-_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v13"
+_QWEN38_DEPLOYMENT_MARKOV_ATLAS = Path("/root/immer-state/qwen-markov-atlas-v1.bin")
+_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v22"
+_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v15"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v2"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
     b"immer:qwen3.8-growing-warm-runtime/v2"
@@ -291,6 +292,7 @@ def _qwen38_growing_warm_profile(
     q4_root: Path | None,
     fast_mlp_root: Path | None,
     draft_mode: str | None,
+    markov_atlas_path: Path | None,
     runtime_code_revision: str,
 ) -> str | None:
     """Bind reusable cold cells to the exact pre-load product runtime."""
@@ -321,6 +323,11 @@ def _qwen38_growing_warm_profile(
             _QWEN38_MARKOV_DRAFT_ABI
             if draft_mode in {"hybrid", "markov"}
             else None
+        ),
+        "markov_atlas_sha256": (
+            None
+            if markov_atlas_path is None
+            else _path_sha256(markov_atlas_path)
         ),
         "mtp_provider_abi": (
             _QWEN38_MTP_DRAFT_ABI if draft_mode in {"hybrid", "mtp"} else None
@@ -586,6 +593,24 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             bundle_path,
             q4_root,
         )
+        markov_atlas_path = _chat_path(
+            getattr(args, "markov_atlas", None),
+            "IMMER_QWEN38_MARKOV_ATLAS",
+        )
+        if bool(getattr(args, "no_markov_draft", False)) and markov_atlas_path is not None:
+            raise ValueError("--markov-atlas and --no-markov-draft are mutually exclusive")
+        if draft_mode is None and markov_atlas_path is not None:
+            draft_mode = "markov"
+        if (
+            markov_atlas_path is None
+            and draft_mode in {None, "hybrid", "markov"}
+            and not bool(getattr(args, "no_markov_draft", False))
+            and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+            and _QWEN38_DEPLOYMENT_MARKOV_ATLAS.is_file()
+        ):
+            markov_atlas_path = _QWEN38_DEPLOYMENT_MARKOV_ATLAS
+            if draft_mode is None:
+                draft_mode = "markov"
         if bool(getattr(args, "no_anchor_cache", False)):
             if args.qwen38_anchor_cache is not None:
                 raise ValueError(
@@ -607,6 +632,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 q4_root=q4_root,
                 fast_mlp_root=fast_mlp_root,
                 draft_mode=draft_mode,
+                markov_atlas_path=markov_atlas_path,
                 runtime_code_revision=warm_runtime_code_revision,
             )
         )
@@ -709,6 +735,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 else int(args.draft_max_resident_mb * 1024**2)
             ),
             markov_draft_state_path=markov_draft_state,
+            markov_atlas_path=(
+                None if markov_atlas_path is None else str(markov_atlas_path)
+            ),
             mtp_draft_state_path=mtp_draft_state,
             draft_window_state_path=args.draft_window_state,
             range_markov_state_path=args.range_markov_state,
@@ -1544,6 +1573,10 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--markov-draft-state",
         help="persistent sparse Qwen-token Markov memory",
+    )
+    chat.add_argument(
+        "--markov-atlas",
+        help="corpus-scale zero-model-byte Qwen-token Markov atlas",
     )
     chat.add_argument(
         "--mtp-draft-state",

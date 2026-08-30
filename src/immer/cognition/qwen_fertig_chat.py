@@ -335,6 +335,52 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
             if key in generation
         }
         summary["generation_sha256"] = _sha256(_canonical_json(generation))
+    draft = evidence.get("draft")
+    if isinstance(draft, dict):
+        compact_draft = {
+            key: draft[key]
+            for key in (
+                "accepted_draft_tokens",
+                "draft_source_body_bytes",
+                "mode",
+                "rounds",
+                "target_source_body_bytes",
+                "total_source_body_bytes",
+                "used_window_sizes",
+                "window_size",
+            )
+            if key in draft
+        }
+        provider = draft.get("provider")
+        if isinstance(provider, dict):
+            markov = provider.get("markov")
+            if not isinstance(markov, dict) and "atlas_contexts" in provider:
+                markov = provider
+            if isinstance(markov, dict):
+                compact_draft["atlas"] = {
+                    key: markov[key]
+                    for key in (
+                        "atlas_accepted_tokens",
+                        "atlas_contexts",
+                        "atlas_corpus_tokens",
+                        "atlas_draft_tokens",
+                        "atlas_option_calls",
+                    )
+                    if key in markov
+                }
+            compact_draft["provider"] = {
+                key: provider[key]
+                for key in (
+                    "markov_rounds",
+                    "markov_selections",
+                    "mtp_rounds",
+                    "mtp_selections",
+                    "provider_switches",
+                )
+                if key in provider
+            }
+        summary["draft"] = compact_draft
+        summary["draft_sha256"] = _sha256(_canonical_json(draft))
     return summary
 
 

@@ -27,14 +27,16 @@ from .markov_composition import (
     MarkovCompositionProgram,
     derive_programs,
 )
+from .markov_atlas import MarkovTokenAtlas
 
 try:
     import fcntl
 except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
-MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v20"
+MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v22"
+V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
 V5_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v5"
@@ -42,8 +44,9 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v17"
-_STATE_PREFIX = b"IMMD\x08"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v19"
+_STATE_PREFIX = b"IMMD\x09"
+_V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
 _V6_STATE_PREFIX = b"IMMD\x06"
 _V5_STATE_PREFIX = b"IMMD\x05"
@@ -420,9 +423,9 @@ class MarkovPhraseOption:
         return self.support / self.total
 
     def __post_init__(self) -> None:
-        if self.source not in {"dialect", "global"}:
+        if self.source not in {"atlas", "dialect", "global"}:
             raise ValueError("phrase option source is invalid")
-        if self.kind not in {"composition", "literal"}:
+        if self.kind not in {"atlas", "composition", "literal"}:
             raise ValueError("phrase option kind is invalid")
         if (
             not 1 <= len(self.token_ids) <= 15
@@ -449,6 +452,9 @@ class MarkovDraftState:
     expert_hits: tuple[int, ...] = ()
     horizon_expert_observations: tuple[tuple[int, ...], ...] = ()
     horizon_expert_hits: tuple[tuple[int, ...], ...] = ()
+    lookahead_observations: tuple[int, ...] = ()
+    lookahead_hits: tuple[int, ...] = ()
+    lookahead_greedy_hits: tuple[int, ...] = ()
     leader_changes: int = 0
     episode_lengths: tuple[int, ...] = ()
     feedback_count: int = 0
@@ -581,6 +587,43 @@ class MarkovDraftState:
             )
         ):
             raise ValueError("Markov horizon expert state is invalid")
+        lookahead_observations = tuple(self.lookahead_observations)
+        lookahead_hits = tuple(self.lookahead_hits)
+        lookahead_greedy_hits = tuple(self.lookahead_greedy_hits)
+        if len(
+            {
+                bool(lookahead_observations),
+                bool(lookahead_hits),
+                bool(lookahead_greedy_hits),
+            }
+        ) != 1 or (
+            lookahead_observations
+            and (
+                len(lookahead_observations) != _MAX_PROPOSAL_POSITIONS
+                or len(lookahead_hits) != _MAX_PROPOSAL_POSITIONS
+                or len(lookahead_greedy_hits) != _MAX_PROPOSAL_POSITIONS
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    for value in (
+                        *lookahead_observations,
+                        *lookahead_hits,
+                        *lookahead_greedy_hits,
+                    )
+                )
+                or any(
+                    planned > observed or greedy > observed
+                    for observed, planned, greedy in zip(
+                        lookahead_observations,
+                        lookahead_hits,
+                        lookahead_greedy_hits,
+                        strict=True,
+                    )
+                )
+            )
+        ):
+            raise ValueError("Markov lookahead state is invalid")
         if (
             isinstance(self.leader_changes, bool)
             or not isinstance(self.leader_changes, int)
@@ -641,6 +684,9 @@ class MarkovDraftState:
             horizon_observations,
         )
         object.__setattr__(self, "horizon_expert_hits", horizon_hits)
+        object.__setattr__(self, "lookahead_observations", lookahead_observations)
+        object.__setattr__(self, "lookahead_hits", lookahead_hits)
+        object.__setattr__(self, "lookahead_greedy_hits", lookahead_greedy_hits)
         object.__setattr__(self, "episode_lengths", episode_lengths)
         object.__setattr__(self, "dialects", dialects)
         object.__setattr__(self, "episode_dialects", episode_dialects)
@@ -667,6 +713,9 @@ class MarkovDraftState:
                 "horizon_expert_observations": [
                     list(row) for row in self.horizon_expert_observations
                 ],
+                "lookahead_greedy_hits": list(self.lookahead_greedy_hits),
+                "lookahead_hits": list(self.lookahead_hits),
+                "lookahead_observations": list(self.lookahead_observations),
                 "leader_changes": self.leader_changes,
                 "episode_lengths": list(self.episode_lengths),
                 "episode_dialects": list(self.episode_dialects),
@@ -698,6 +747,7 @@ class MarkovDraftState:
             or not data.startswith(
                 (
                     _STATE_PREFIX,
+                    _V8_STATE_PREFIX,
                     _V7_STATE_PREFIX,
                     _V6_STATE_PREFIX,
                     _V5_STATE_PREFIX,
@@ -715,24 +765,28 @@ class MarkovDraftState:
                 _STATE_PREFIX
                 if data.startswith(_STATE_PREFIX)
                 else (
-                    _V7_STATE_PREFIX
-                    if data.startswith(_V7_STATE_PREFIX)
+                    _V8_STATE_PREFIX
+                    if data.startswith(_V8_STATE_PREFIX)
                     else (
-                        _V6_STATE_PREFIX
-                        if data.startswith(_V6_STATE_PREFIX)
+                        _V7_STATE_PREFIX
+                        if data.startswith(_V7_STATE_PREFIX)
                         else (
-                            _V5_STATE_PREFIX
-                            if data.startswith(_V5_STATE_PREFIX)
+                            _V6_STATE_PREFIX
+                            if data.startswith(_V6_STATE_PREFIX)
                             else (
-                                _V4_STATE_PREFIX
-                                if data.startswith(_V4_STATE_PREFIX)
+                                _V5_STATE_PREFIX
+                                if data.startswith(_V5_STATE_PREFIX)
                                 else (
-                                    _V2_STATE_PREFIX
-                                    if data.startswith(_V2_STATE_PREFIX)
+                                    _V4_STATE_PREFIX
+                                    if data.startswith(_V4_STATE_PREFIX)
                                     else (
-                                        _V3_STATE_PREFIX
-                                        if data.startswith(_V3_STATE_PREFIX)
-                                        else _LEGACY_STATE_PREFIX
+                                        _V2_STATE_PREFIX
+                                        if data.startswith(_V2_STATE_PREFIX)
+                                        else (
+                                            _V3_STATE_PREFIX
+                                            if data.startswith(_V3_STATE_PREFIX)
+                                            else _LEGACY_STATE_PREFIX
+                                        )
                                     )
                                 )
                             )
@@ -777,6 +831,10 @@ class MarkovDraftState:
         v7 = (
             isinstance(value, dict)
             and value.get("schema") == V7_MARKOV_DRAFT_STATE_SCHEMA
+        )
+        v8 = (
+            isinstance(value, dict)
+            and value.get("schema") == V8_MARKOV_DRAFT_STATE_SCHEMA
         )
         v2_fields = {
             "expert_hits",
@@ -922,6 +980,35 @@ class MarkovDraftState:
                 "updates",
                 "vocab_size",
             }
+            if v7 or v8
+            else {
+                "expert_hits",
+                "expert_log_weights",
+                "expert_names",
+                "expert_observations",
+                "horizon_expert_hits",
+                "horizon_expert_observations",
+                "lookahead_greedy_hits",
+                "lookahead_hits",
+                "lookahead_observations",
+                "leader_changes",
+                "episode_lengths",
+                "episode_dialects",
+                "episode_prompt_lengths",
+                "imported_episode_sha256s",
+                "clock",
+                "dialects",
+                "feedback_count",
+                "max_history_tokens",
+                "regime_generation",
+                "schema",
+                "surprise_cusum",
+                "surprise_deviation",
+                "surprise_mean",
+                "token_ids",
+                "updates",
+                "vocab_size",
+            }
         )
         if (
             not isinstance(value, dict)
@@ -929,6 +1016,7 @@ class MarkovDraftState:
             or value.get("schema")
             not in {
                 MARKOV_DRAFT_STATE_SCHEMA,
+                V8_MARKOV_DRAFT_STATE_SCHEMA,
                 V7_MARKOV_DRAFT_STATE_SCHEMA,
                 V6_MARKOV_DRAFT_STATE_SCHEMA,
                 V5_MARKOV_DRAFT_STATE_SCHEMA,
@@ -941,6 +1029,14 @@ class MarkovDraftState:
             or _canonical(value) != raw
         ):
             raise MarkovDraftError("Markov draft state schema is invalid")
+        planner_zeros = (0,) * _MAX_PROPOSAL_POSITIONS
+        lookahead_observations = tuple(
+            value.get("lookahead_observations", planner_zeros)
+        )
+        lookahead_hits = tuple(value.get("lookahead_hits", planner_zeros))
+        lookahead_greedy_hits = tuple(
+            value.get("lookahead_greedy_hits", planner_zeros)
+        )
         try:
             return cls(
                 vocab_size=value["vocab_size"],
@@ -960,6 +1056,9 @@ class MarkovDraftState:
                 horizon_expert_hits=tuple(
                     tuple(row) for row in value.get("horizon_expert_hits", ())
                 ),
+                lookahead_observations=lookahead_observations,
+                lookahead_hits=lookahead_hits,
+                lookahead_greedy_hits=lookahead_greedy_hits,
                 leader_changes=value.get("leader_changes", 0),
                 episode_lengths=tuple(value.get("episode_lengths", ())),
                 episode_dialects=tuple(value.get("episode_dialects", ())),
@@ -978,7 +1077,11 @@ class MarkovDraftState:
                 dialects=tuple(
                     MarkovDialectState.from_record(
                         row,
-                        legacy=value.get("schema") != MARKOV_DRAFT_STATE_SCHEMA,
+                        legacy=value.get("schema")
+                        not in {
+                            MARKOV_DRAFT_STATE_SCHEMA,
+                            V8_MARKOV_DRAFT_STATE_SCHEMA,
+                        },
                     )
                     for row in value.get("dialects", ())
                 ),
@@ -1028,6 +1131,9 @@ class MarkovDraftMetrics:
     lookahead_token_changes: int
     last_lookahead_gain: float
     max_lookahead_gain: float
+    lookahead_outcomes: tuple[int, ...]
+    lookahead_hits: tuple[int, ...]
+    lookahead_greedy_hits: tuple[int, ...]
     regime_generation: int
     surprise_mean: float
     surprise_cusum: float
@@ -1042,6 +1148,11 @@ class MarkovDraftMetrics:
     phrase_option_calls: int
     phrase_draft_tokens: int
     phrase_accepted_tokens: int
+    atlas_contexts: int
+    atlas_corpus_tokens: int
+    atlas_option_calls: int
+    atlas_draft_tokens: int
+    atlas_accepted_tokens: int
     composition_programs: int
     composition_option_calls: int
     composition_draft_tokens: int
@@ -1100,6 +1211,9 @@ class FingerprintRollingK4DraftProvider:
     LOOKAHEAD_CANDIDATES = 4
     LOOKAHEAD_DISCOUNT = 0.5
     LOOKAHEAD_MIN_LOG_GAIN = 0.05
+    LOOKAHEAD_EMPIRICAL_STRENGTH = 0.25
+    ATLAS_MIN_SUPPORT = 2
+    ATLAS_MIN_CONFIDENCE = 0.70
 
     def __init__(
         self,
@@ -1112,6 +1226,7 @@ class FingerprintRollingK4DraftProvider:
         min_count: int = 1,
         max_history_tokens: int = 4096,
         proposal_width: int = 3,
+        atlas: MarkovTokenAtlas | None = None,
     ) -> None:
         if (
             isinstance(vocab_size, bool)
@@ -1149,6 +1264,10 @@ class FingerprintRollingK4DraftProvider:
             or not 1 <= proposal_width <= 15
         ):
             raise ValueError("proposal_width must lie in [1, 15]")
+        if atlas is not None and not isinstance(atlas, MarkovTokenAtlas):
+            raise TypeError("atlas must be a MarkovTokenAtlas or None")
+        if atlas is not None and atlas.vocab_size != vocab_size:
+            raise ValueError("Markov atlas vocabulary differs from the provider")
         self.vocab_size = vocab_size
         self.width = len(str(vocab_size - 1))
         self.state_path = (
@@ -1160,6 +1279,7 @@ class FingerprintRollingK4DraftProvider:
         self.min_count = min_count
         self.max_history_tokens = max_history_tokens
         self.proposal_width = proposal_width
+        self.atlas = atlas
         self._experts = _expert_specs(max_order, max_history_tokens)
         self._state_lock_descriptor: int | None = None
         self._acquire_state_lock()
@@ -1195,6 +1315,13 @@ class FingerprintRollingK4DraftProvider:
                 horizon_expert_observations=horizon_zeros,
                 horizon_expert_hits=horizon_zeros,
             )
+        if not self._state.lookahead_observations:
+            self._state = replace(
+                self._state,
+                lookahead_observations=(0,) * _MAX_PROPOSAL_POSITIONS,
+                lookahead_hits=(0,) * _MAX_PROPOSAL_POSITIONS,
+                lookahead_greedy_hits=(0,) * _MAX_PROPOSAL_POSITIONS,
+            )
         if any(not row.horizon_observations for row in self._state.dialects):
             dialect_zeros = tuple(
                 (0,) * len(names) for _ in range(_MAX_PROPOSAL_POSITIONS)
@@ -1217,11 +1344,20 @@ class FingerprintRollingK4DraftProvider:
         self._pending_feedback: tuple[
             tuple[tuple[dict[str, float], int], ...], ...
         ] = ()
+        self._pending_plan_trace: tuple[tuple[int, int, float], ...] = ()
         self._carry_feedback: tuple[tuple[dict[str, float], int], ...] | None = None
         self._carry_feedback_position: int | None = None
         self._carry_feedback_teacher_forced = False
+        self._carry_plan: tuple[int, int, float] | None = None
         self._episode_feedback: list[
-            tuple[tuple[tuple[dict[str, float], int], ...], int, int]
+            tuple[
+                tuple[tuple[dict[str, float], int], ...],
+                int,
+                int,
+                int,
+                int,
+                float,
+            ]
         ] = []
         self._active_dialect: MarkovDialectState | None = None
         self._dialect_neighbors: tuple[
@@ -1239,6 +1375,9 @@ class FingerprintRollingK4DraftProvider:
         self._phrase_option_calls = 0
         self._phrase_draft_tokens = 0
         self._phrase_accepted_tokens = 0
+        self._atlas_option_calls = 0
+        self._atlas_draft_tokens = 0
+        self._atlas_accepted_tokens = 0
         self._last_phrase_option: MarkovPhraseOption | None = None
         self._composition_cache: dict[
             str | None,
@@ -1281,6 +1420,7 @@ class FingerprintRollingK4DraftProvider:
         self._adaptive_proposal_calls = 0
         self._recommended_window_counts = {1: 0, 4: 0, 8: 0, 16: 0}
         self._last_round_proposal: RollingDraftProposal | None = None
+        self._last_plan_trace: tuple[tuple[int, int, float], ...] = ()
         self._pending_import_digest: str | None = None
         self._closed = False
 
@@ -1913,6 +2053,24 @@ class FingerprintRollingK4DraftProvider:
         )
         if global_composition is not None:
             composition_rows.append(global_composition)
+        if self.atlas is not None:
+            continuation = self.atlas.continuation(
+                history,
+                max_tokens=min(self.proposal_width, self.PHRASE_MAX_WIDTH),
+                min_support=self.ATLAS_MIN_SUPPORT,
+                min_confidence=self.ATLAS_MIN_CONFIDENCE,
+            )
+            if continuation is not None:
+                candidates.append(
+                    MarkovPhraseOption(
+                        token_ids=continuation.token_ids,
+                        source="atlas",
+                        context_order=continuation.context_order,
+                        support=continuation.support,
+                        total=continuation.total,
+                        kind="atlas",
+                    )
+                )
         composition_outputs = {row[0].token_ids for row in composition_rows}
         if len(composition_outputs) == 1:
             candidates.extend(row[0] for row in composition_rows)
@@ -2194,11 +2352,29 @@ class FingerprintRollingK4DraftProvider:
             rows.append((score, current_probability, -int(symbol), int(symbol)))
         best = max(rows)
         greedy_row = next(row for row in rows if row[3] == greedy)
-        if best[3] != greedy and best[0] < (
-            greedy_row[0] + self.LOOKAHEAD_MIN_LOG_GAIN
-        ):
-            return greedy, 0.0, len(candidates)
         gain = max(0.0, best[0] - greedy_row[0])
+        if best[3] != greedy:
+            observations = self._state.lookahead_observations[position]
+            empirical_advantage = 0.0
+            if observations > 0:
+                maturity = observations / (
+                    observations + self.EMPIRICAL_EVIDENCE_SATURATION
+                )
+                planned = (self._state.lookahead_hits[position] + 1.0) / (
+                    observations + 2.0
+                )
+                baseline = (
+                    self._state.lookahead_greedy_hits[position] + 1.0
+                ) / (observations + 2.0)
+                empirical_advantage = maturity * (
+                    math.log(planned / max(1e-12, 1.0 - planned))
+                    - math.log(baseline / max(1e-12, 1.0 - baseline))
+                )
+            adjusted_gain = gain + (
+                self.LOOKAHEAD_EMPIRICAL_STRENGTH * empirical_advantage
+            )
+            if adjusted_gain < self.LOOKAHEAD_MIN_LOG_GAIN:
+                return greedy, 0.0, len(candidates)
         return best[3], gain, len(candidates)
 
     def _predict_council(
@@ -2220,6 +2396,7 @@ class FingerprintRollingK4DraftProvider:
         feedback_rows = []
         confidences = []
         disagreements = []
+        plan_trace = []
         forced = tuple(forced_prefix)
         if (
             isinstance(position_offset, bool)
@@ -2267,9 +2444,14 @@ class FingerprintRollingK4DraftProvider:
             }
             if position < len(forced):
                 token = forced[position]
+                greedy = token
                 lookahead_gain = 0.0
                 evaluated_candidates = 0
             else:
+                greedy = max(
+                    (probability, -int(symbol), int(symbol))
+                    for symbol, probability in mixture.items()
+                )[2]
                 token, lookahead_gain, evaluated_candidates = (
                     self._lookahead_choice(
                         experts,
@@ -2280,10 +2462,6 @@ class FingerprintRollingK4DraftProvider:
                     )
                 )
                 if evaluated_candidates:
-                    greedy = max(
-                        (probability, -int(symbol), int(symbol))
-                        for symbol, probability in mixture.items()
-                    )[2]
                     self._lookahead_calls += 1
                     self._lookahead_candidates += evaluated_candidates
                     self._lookahead_token_changes += int(token != greedy)
@@ -2292,6 +2470,7 @@ class FingerprintRollingK4DraftProvider:
                         lookahead_gain,
                     )
             self._last_lookahead_gain = lookahead_gain
+            plan_trace.append((token, greedy, lookahead_gain))
             proposal.append(token)
             universe = set().union(
                 *(distribution.keys() for distribution in distributions)
@@ -2369,6 +2548,7 @@ class FingerprintRollingK4DraftProvider:
                 context.append(symbol)
         self._predictions += count
         self._council_predictions += count
+        self._last_plan_trace = tuple(plan_trace)
         return (
             tuple(proposal),
             tuple(feedback_rows),
@@ -2381,7 +2561,11 @@ class FingerprintRollingK4DraftProvider:
         history: tuple[int, ...],
         *,
         position: int,
-    ) -> tuple[tuple[tuple[dict[str, float], int], ...], int]:
+    ) -> tuple[
+        tuple[tuple[dict[str, float], int], ...],
+        int,
+        tuple[int, int, float],
+    ]:
         """Predict one retrospective row without changing served-draft metrics."""
 
         snapshot = (
@@ -2404,6 +2588,7 @@ class FingerprintRollingK4DraftProvider:
             self._lookahead_token_changes,
             self._last_lookahead_gain,
             self._max_lookahead_gain,
+            self._last_plan_trace,
         )
         try:
             tokens, feedback, _confidence, _disagreement = self._predict_council(
@@ -2411,7 +2596,7 @@ class FingerprintRollingK4DraftProvider:
                 1,
                 position_offset=position,
             )
-            return feedback[0], tokens[0]
+            return feedback[0], tokens[0], self._last_plan_trace[0]
         finally:
             (
                 self._predictions,
@@ -2433,6 +2618,7 @@ class FingerprintRollingK4DraftProvider:
                 self._lookahead_token_changes,
                 self._last_lookahead_gain,
                 self._max_lookahead_gain,
+                self._last_plan_trace,
             ) = snapshot
 
     def _apply_council_feedback(
@@ -2440,6 +2626,8 @@ class FingerprintRollingK4DraftProvider:
         feedback: tuple[tuple[dict[str, float], int], ...],
         token: int,
         position: int = 0,
+        planned_token: int | None = None,
+        greedy_token: int | None = None,
     ) -> None:
         if len(feedback) != len(self._experts):
             raise MarkovDraftError("Markov council feedback width changed")
@@ -2457,6 +2645,9 @@ class FingerprintRollingK4DraftProvider:
             list(row) for row in self._state.horizon_expert_observations
         ]
         horizon_hits = [list(row) for row in self._state.horizon_expert_hits]
+        lookahead_observations = list(self._state.lookahead_observations)
+        lookahead_hits = list(self._state.lookahead_hits)
+        lookahead_greedy_hits = list(self._state.lookahead_greedy_hits)
         weights, _position_maturity, _dialect_skill_maturity = self._position_weighting(
             position,
             self._weights(),
@@ -2565,6 +2756,12 @@ class FingerprintRollingK4DraftProvider:
                 ),
                 horizon_hits=tuple(tuple(row) for row in local_horizon_hits),
             )
+        planned = token if planned_token is None else planned_token
+        greedy = planned if greedy_token is None else greedy_token
+        if planned != greedy:
+            lookahead_observations[position] += 1
+            lookahead_hits[position] += int(planned == token)
+            lookahead_greedy_hits[position] += int(greedy == token)
         after_leader = max(range(len(logs)), key=logs.__getitem__)
         self._state = replace(
             self._state,
@@ -2575,6 +2772,9 @@ class FingerprintRollingK4DraftProvider:
                 tuple(row) for row in horizon_observations
             ),
             horizon_expert_hits=tuple(tuple(row) for row in horizon_hits),
+            lookahead_observations=tuple(lookahead_observations),
+            lookahead_hits=tuple(lookahead_hits),
+            lookahead_greedy_hits=tuple(lookahead_greedy_hits),
             leader_changes=(
                 self._state.leader_changes + int(before_leader != after_leader)
             ),
@@ -2601,13 +2801,17 @@ class FingerprintRollingK4DraftProvider:
         position = self._carry_feedback_position
         if position is None:
             raise MarkovDraftError("Markov carry feedback position is missing")
-        self._episode_feedback.append((feedback, token, position))
+        plan = self._carry_plan
+        if plan is None:
+            raise MarkovDraftError("Markov carry planning trace is missing")
+        self._episode_feedback.append((feedback, token, position, *plan))
         if self._carry_feedback_teacher_forced:
             self._teacher_forced_feedback_tokens += 1
             self._external_feedback_tokens += 1
         self._carry_feedback = None
         self._carry_feedback_position = None
         self._carry_feedback_teacher_forced = False
+        self._carry_plan = None
 
     def _prepare_rolling_proposal(
         self,
@@ -2651,9 +2855,12 @@ class FingerprintRollingK4DraftProvider:
             ),
         )
         proposal = complete[: self.proposal_width]
+        if len(self._last_plan_trace) != self.proposal_width + 1:
+            raise MarkovDraftError("Markov planning trace width is invalid")
         self._pending_base = base
         self._pending_proposal = proposal
         self._pending_feedback = feedback
+        self._pending_plan_trace = self._last_plan_trace
         self._pending_phrase_option = option
         if option is not None:
             self._phrase_option_calls += 1
@@ -2662,6 +2869,12 @@ class FingerprintRollingK4DraftProvider:
                 self.proposal_width,
             )
             self._last_phrase_option = option
+            if option.kind == "atlas":
+                self._atlas_option_calls += 1
+                self._atlas_draft_tokens += min(
+                    len(option.token_ids),
+                    self.proposal_width,
+                )
             if option.kind == "composition":
                 self._composition_option_calls += 1
                 self._composition_draft_tokens += min(
@@ -2816,6 +3029,8 @@ class FingerprintRollingK4DraftProvider:
             raise MarkovDraftError("reconcile_prefix requires a pending proposal")
         if len(self._pending_feedback) != self.proposal_width + 1:
             raise MarkovDraftError("Markov council proposal feedback is missing")
+        if len(self._pending_plan_trace) != self.proposal_width + 1:
+            raise MarkovDraftError("Markov planning trace is missing")
         if committed[: len(base)] != base:
             raise MarkovDraftError("Markov reconciliation changed its known base")
         delta = committed[len(base) :]
@@ -2824,13 +3039,23 @@ class FingerprintRollingK4DraftProvider:
         assert self._last_confirmed_length is not None
         for index, token in enumerate(delta):
             self._episode_feedback.append(
-                (self._pending_feedback[index], token, index)
+                (
+                    self._pending_feedback[index],
+                    token,
+                    index,
+                    *self._pending_plan_trace[index],
+                )
             )
         if self._pending_phrase_option is not None:
             self._phrase_accepted_tokens += min(
                 len(delta),
                 len(self._pending_phrase_option.token_ids),
             )
+            if self._pending_phrase_option.kind == "atlas":
+                self._atlas_accepted_tokens += min(
+                    len(delta),
+                    len(self._pending_phrase_option.token_ids),
+                )
             if self._pending_phrase_option.kind == "composition":
                 self._composition_accepted_tokens += min(
                     len(delta),
@@ -2839,10 +3064,12 @@ class FingerprintRollingK4DraftProvider:
         self._carry_feedback = self._pending_feedback[len(delta)]
         self._carry_feedback_position = len(delta)
         self._carry_feedback_teacher_forced = False
+        self._carry_plan = self._pending_plan_trace[len(delta)]
         self._last_confirmed_length = len(committed)
         self._pending_base = None
         self._pending_proposal = None
         self._pending_feedback = ()
+        self._pending_plan_trace = ()
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._reconcile_calls += 1
@@ -2873,6 +3100,8 @@ class FingerprintRollingK4DraftProvider:
             )
         if len(self._pending_feedback) != self.proposal_width + 1:
             raise MarkovDraftError("Markov council proposal feedback is missing")
+        if len(self._pending_plan_trace) != self.proposal_width + 1:
+            raise MarkovDraftError("Markov planning trace is missing")
         if committed[: len(base)] != base:
             raise MarkovDraftError(
                 "external Markov reconciliation changed its known base"
@@ -2889,7 +3118,12 @@ class FingerprintRollingK4DraftProvider:
         teacher_failed = False
         for index, token in enumerate(delta):
             self._episode_feedback.append(
-                (self._pending_feedback[index], token, index)
+                (
+                    self._pending_feedback[index],
+                    token,
+                    index,
+                    *self._pending_plan_trace[index],
+                )
             )
             verified += 1
             if token != proposal[index]:
@@ -2900,7 +3134,7 @@ class FingerprintRollingK4DraftProvider:
             for index in range(mismatch_index + 1, len(delta)):
                 actual_context = (*base, *delta[:index])
                 try:
-                    teacher_feedback, _teacher_token = (
+                    teacher_feedback, _teacher_token, teacher_plan = (
                         self._teacher_forced_prediction(
                             actual_context,
                             position=index,
@@ -2911,7 +3145,7 @@ class FingerprintRollingK4DraftProvider:
                     teacher_failed = True
                     break
                 self._episode_feedback.append(
-                    (teacher_feedback, delta[index], index)
+                    (teacher_feedback, delta[index], index, *teacher_plan)
                 )
                 verified += 1
                 self._teacher_forced_predictions += 1
@@ -2920,30 +3154,37 @@ class FingerprintRollingK4DraftProvider:
             self._carry_feedback = self._pending_feedback[len(delta)]
             self._carry_feedback_position = len(delta)
             self._carry_feedback_teacher_forced = False
+            self._carry_plan = self._pending_plan_trace[len(delta)]
         elif not teacher_failed and len(delta) < _MAX_PROPOSAL_POSITIONS:
             try:
-                teacher_carry, _teacher_token = self._teacher_forced_prediction(
-                    (*base, *delta),
-                    position=len(delta),
+                teacher_carry, _teacher_token, teacher_plan = (
+                    self._teacher_forced_prediction(
+                        (*base, *delta),
+                        position=len(delta),
+                    )
                 )
             except (MarkovDraftError, ValueError):
                 self._teacher_forced_failures += 1
                 self._carry_feedback = None
                 self._carry_feedback_position = None
                 self._carry_feedback_teacher_forced = False
+                self._carry_plan = None
             else:
                 self._carry_feedback = teacher_carry
                 self._carry_feedback_position = len(delta)
                 self._carry_feedback_teacher_forced = True
+                self._carry_plan = teacher_plan
                 self._teacher_forced_predictions += 1
         else:
             self._carry_feedback = None
             self._carry_feedback_position = None
             self._carry_feedback_teacher_forced = False
+            self._carry_plan = None
         self._last_confirmed_length = len(committed)
         self._pending_base = None
         self._pending_proposal = None
         self._pending_feedback = ()
+        self._pending_plan_trace = ()
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._reconcile_calls += 1
@@ -2967,6 +3208,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_base = None
         self._pending_proposal = None
         self._pending_feedback = ()
+        self._pending_plan_trace = ()
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._last_round_proposal = None
@@ -3013,6 +3255,7 @@ class FingerprintRollingK4DraftProvider:
         original_carry = self._carry_feedback
         original_carry_position = self._carry_feedback_position
         original_carry_teacher_forced = self._carry_feedback_teacher_forced
+        original_carry_plan = self._carry_plan
         original_feedback = list(self._episode_feedback)
         original_confirmed_length = self._last_confirmed_length
         original_evictions = self._dialect_evictions
@@ -3038,8 +3281,22 @@ class FingerprintRollingK4DraftProvider:
             self._carry_feedback = None
             self._carry_feedback_position = None
             self._carry_feedback_teacher_forced = False
-            for feedback, token, position in self._episode_feedback:
-                self._apply_council_feedback(feedback, token, position)
+            self._carry_plan = None
+            for (
+                feedback,
+                token,
+                position,
+                planned_token,
+                greedy_token,
+                _lookahead_gain,
+            ) in self._episode_feedback:
+                self._apply_council_feedback(
+                    feedback,
+                    token,
+                    position,
+                    planned_token,
+                    greedy_token,
+                )
             self._episode_feedback.clear()
             self._learn_episode(
                 committed,
@@ -3067,6 +3324,7 @@ class FingerprintRollingK4DraftProvider:
             self._carry_feedback = original_carry
             self._carry_feedback_position = original_carry_position
             self._carry_feedback_teacher_forced = original_carry_teacher_forced
+            self._carry_plan = original_carry_plan
             self._episode_feedback = original_feedback
             self._last_confirmed_length = original_confirmed_length
             self._dialect_evictions = original_evictions
@@ -3196,6 +3454,9 @@ class FingerprintRollingK4DraftProvider:
             lookahead_token_changes=self._lookahead_token_changes,
             last_lookahead_gain=self._last_lookahead_gain,
             max_lookahead_gain=self._max_lookahead_gain,
+            lookahead_outcomes=self._state.lookahead_observations,
+            lookahead_hits=self._state.lookahead_hits,
+            lookahead_greedy_hits=self._state.lookahead_greedy_hits,
             regime_generation=self._state.regime_generation,
             surprise_mean=self._state.surprise_mean,
             surprise_cusum=self._state.surprise_cusum,
@@ -3221,6 +3482,11 @@ class FingerprintRollingK4DraftProvider:
             phrase_option_calls=self._phrase_option_calls,
             phrase_draft_tokens=self._phrase_draft_tokens,
             phrase_accepted_tokens=self._phrase_accepted_tokens,
+            atlas_contexts=0 if self.atlas is None else self.atlas.context_count,
+            atlas_corpus_tokens=0 if self.atlas is None else self.atlas.token_count,
+            atlas_option_calls=self._atlas_option_calls,
+            atlas_draft_tokens=self._atlas_draft_tokens,
+            atlas_accepted_tokens=self._atlas_accepted_tokens,
             composition_programs=self._composition_program_count,
             composition_option_calls=self._composition_option_calls,
             composition_draft_tokens=self._composition_draft_tokens,
@@ -3282,9 +3548,11 @@ class FingerprintRollingK4DraftProvider:
         self._pending_base = None
         self._pending_proposal = None
         self._pending_feedback = ()
+        self._pending_plan_trace = ()
         self._carry_feedback = None
         self._carry_feedback_position = None
         self._carry_feedback_teacher_forced = False
+        self._carry_plan = None
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._pending_import_digest = None
@@ -3304,6 +3572,7 @@ __all__ = [
     "V5_MARKOV_DRAFT_STATE_SCHEMA",
     "V6_MARKOV_DRAFT_STATE_SCHEMA",
     "V7_MARKOV_DRAFT_STATE_SCHEMA",
+    "V8_MARKOV_DRAFT_STATE_SCHEMA",
     "MARKOV_DRAFT_METRICS_SCHEMA",
     "MARKOV_DRAFT_PROVIDER_ABI",
     "MARKOV_DRAFT_STATE_SCHEMA",

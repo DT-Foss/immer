@@ -157,6 +157,55 @@ def _receipt(result: Result) -> dict:
 
 
 class QwenFertigChatTests(unittest.TestCase):
+    def test_qwen_receipt_keeps_compact_markov_atlas_runtime_progress(self) -> None:
+        base = _qwen_ok("ordinary answer")
+        qwen_result = Result(
+            base.status,
+            base.component,
+            output=base.output,
+            evidence={
+                **dict(base.evidence),
+                "draft": {
+                    "accepted_draft_tokens": 5,
+                    "mode": "hybrid",
+                    "rounds": 3,
+                    "provider": {
+                        "markov_rounds": 2,
+                        "markov_selections": 1,
+                        "mtp_rounds": 1,
+                        "mtp_selections": 1,
+                        "provider_switches": 1,
+                        "markov": {
+                            "atlas_accepted_tokens": 2,
+                            "atlas_contexts": 500_000,
+                            "atlas_corpus_tokens": 4_000_000,
+                            "atlas_draft_tokens": 3,
+                            "atlas_option_calls": 1,
+                        },
+                    },
+                    "window_size": 8,
+                },
+            },
+        )
+        qwen = _Qwen(qwen_result)
+        with _patched_solver(
+            None,
+            _verification(
+                CandidateVerificationStatus.ABSTAINED,
+                candidate=None,
+                expected=None,
+            ),
+        ) as (fertig, _, _):
+            result = QwenFertigChat(qwen, fertig).handle(
+                Request("chat", MATH_QUESTION)
+            )
+
+        draft = _receipt(result)["qwen"]["draft"]
+        self.assertEqual(draft["accepted_draft_tokens"], 5)
+        self.assertEqual(draft["provider"]["markov_selections"], 1)
+        self.assertEqual(draft["atlas"]["atlas_contexts"], 500_000)
+        self.assertEqual(draft["atlas"]["atlas_accepted_tokens"], 2)
+
     def test_real_formula_and_rref_certificates_short_circuit_without_qwen(
         self,
     ) -> None:
