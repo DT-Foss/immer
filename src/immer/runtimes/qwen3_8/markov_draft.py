@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v37"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v38"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -1415,6 +1415,7 @@ class FingerprintRollingK4DraftProvider:
     REQUEST_PHRASE_MIN_SUPPORT = 2
     REQUEST_PERIOD_MIN = 2
     REQUEST_PERIOD_MAX = 64
+    REQUEST_PERIOD_MIN_SUPPORT = 3
     REQUEST_PERIOD_MATCH_THRESHOLD = 0.75
     ATLAS_MIN_SUPPORT = 2
     ATLAS_MIN_CONFIDENCE = 0.70
@@ -2371,38 +2372,45 @@ class FingerprintRollingK4DraftProvider:
             if not comparisons:
                 continue
             match_ratio = sum(comparisons) / len(comparisons)
-            if match_ratio < self.REQUEST_PERIOD_MATCH_THRESHOLD:
+            if (
+                match_ratio < self.REQUEST_PERIOD_MATCH_THRESHOLD
+                or match_ratio >= 1.0
+            ):
                 continue
             predicted = []
-            supports = []
             for offset in range(min(max_width, period)):
                 values = tuple(
                     generated[len(generated) + offset - copy * period]
                     for copy in range(1, 4)
                     if 0 <= len(generated) + offset - copy * period < len(generated)
                 )
-                if len(values) < self.REQUEST_PHRASE_MIN_SUPPORT or len(set(values)) != 1:
+                if (
+                    len(values) < self.REQUEST_PERIOD_MIN_SUPPORT
+                    or len(set(values)) != 1
+                ):
                     break
                 predicted.append(values[0])
-                supports.append(len(values))
             if len(predicted) < 2:
                 continue
-            support = min(supports)
+            support = sum(comparisons)
             option = MarkovPhraseOption(
                 token_ids=tuple(predicted),
                 source="request",
-                context_order=min(self.PHRASE_MAX_CONTEXT, period),
+                context_order=self.REQUEST_PHRASE_MIN_CONTEXT,
                 support=support,
-                total=support,
+                total=len(comparisons),
                 kind="periodic",
             )
             candidates.append((match_ratio, period, option))
         if not candidates:
             return None
+        best_ratio = max(row[0] for row in candidates)
+        contenders = [row for row in candidates if row[0] == best_ratio]
+        if len({row[2].token_ids for row in contenders}) > 1:
+            return None
         return max(
-            candidates,
+            contenders,
             key=lambda row: (
-                row[0],
                 len(row[2].token_ids),
                 row[2].support,
                 -row[1],
@@ -2438,9 +2446,10 @@ class FingerprintRollingK4DraftProvider:
         request_option = self._request_phrase_option(history)
         if request_option is not None:
             candidates.append(request_option)
-        periodic_option = self._request_periodic_option(history)
-        if periodic_option is not None:
-            candidates.append(periodic_option)
+        else:
+            periodic_option = self._request_periodic_option(history)
+            if periodic_option is not None:
+                candidates.append(periodic_option)
         if dialect is not None and not self._active_dialect_is_new:
             local = self._phrase_option_from(
                 history,

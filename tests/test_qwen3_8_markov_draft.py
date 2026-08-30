@@ -1513,6 +1513,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertIsNotNone(option)
         assert option is not None
         self.assertEqual(option.token_ids, (7, 8, 9))
+        self.assertEqual(option.kind, "literal")
         self.assertEqual(option.source, "request")
         self.assertEqual(option.context_order, 2)
         self.assertEqual(option.support, 3)
@@ -1669,10 +1670,13 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         assert option is not None
         self.assertEqual(option.token_ids, (3, 4, 5))
         self.assertEqual(option.kind, "periodic")
-        self.assertEqual(option.context_order, 6)
-        self.assertEqual(option.support, 3)
+        self.assertEqual(option.context_order, 2)
+        self.assertEqual(option.support, 12)
+        self.assertEqual(option.total, 15)
+        self.assertEqual(option.confidence, 0.8)
         self.assertEqual(proposal.token_ids, (3, 4, 5))
         self.assertEqual(proposal.phrase_source, "request")
+        self.assertEqual(proposal.phrase_confidence, 0.8)
         self.assertEqual(proposal.phrase_width, 3)
         self.assertEqual(proposal.recommended_window, 4)
         self.assertEqual(provider.metrics().periodic_option_calls, 1)
@@ -1735,6 +1739,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertIsNone(
             provider._request_periodic_option((*prompt, *tuple(range(1, 25))))
+        )
+        self.assertIsNone(
+            provider._request_periodic_option(
+                (*prompt, *((1, 2, 3, 4) * 3), 1, 2)
+            )
         )
         provider.close()
 
