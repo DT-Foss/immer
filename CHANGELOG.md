@@ -6,6 +6,31 @@ All notable changes to IMMER are recorded here.
 
 ### Deployed Markov/MTP product path
 
+- `c8c780a` added `Qwen35MtpCarry` v1 across interactive turns. A carry clones
+  the exact token history, shifted MTP AttentionState KV, cursor
+  `target_cursor - 1`, and last committed target hidden before provider close.
+  Its identity binds the relevant model configuration, Q4 manifest, BF16 source
+  repository/revision/fingerprint, device, and dtype; finite tensor and shape
+  contracts reject mismatches. Export trims terminal speculative overrun to the
+  committed Qwen boundary, and import computes only the official suffix.
+  Hybrid additionally requires its target-boundary hidden row to bit-match the
+  carry. The adapter validates and promotes the carry atomically with the same
+  Qwen token prefix; clear, mismatch, error, and close drop both states.
+  Markov-only turns materialize MTP lazily only when exporting the carry.
+  Calibration remains global and persistent, including v2-to-v3 migration.
+  Provider ABIs are MTP v3 and hybrid v19. On the live NIMBUS-60427 recall,
+  turn 1 returned `gespeichert`, retained 36 Qwen prefix tokens and a 150.0 KiB
+  MTP carry, and used four tokens, two forwards, 13.74 s, and 1.40 GiB peak RSS.
+  Turn 2 omitted the code, reused all 36 tokens, returned `NIMBUS-60427`,
+  exported a 322.0 KiB carry, and used ten tokens, seven forwards, 31.73 s, and
+  1.61 GiB peak RSS. The persistent state migrated to provider v3 with 342
+  updates. This is functional exact-carry proof, not a latency improvement: the
+  prompt was slower than the preceding Markov-only observation, so the next
+  work is carry-context-specific MTP reliability. The pre-review affected suite
+  passed 171 tests in 6.553 s; the latest post-fix core runs passed 144 tests;
+  nine focused remote tests passed before the live carry run. Final review
+  found no remaining P0–P2 issue after validated-pointer and boundary-hidden
+  fixes. These are separate runs, not one combined test total.
 - `06f7610` turned interactive Qwen context into an in-process compute battery.
   Each successful session retains exactly the committed token tuple represented
   by `model.next_position`; the next official prompt reuses it only when its

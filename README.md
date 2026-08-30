@@ -221,7 +221,10 @@ release surface.
   Interactive Qwen also keeps its committed KV/Delta continuation state in
   process between turns while releasing pager-held weights. Reuse requires an
   exact official-token prefix and an exact live model cursor; the next turn
-  computes only the still-uncommitted tail and new prompt suffix.
+  computes only the still-uncommitted tail and new prompt suffix. A matching
+  `Qwen35MtpCarry` now carries the embedded drafter's shifted attention KV,
+  target-boundary hidden row, and token cursor across the same boundary, so MTP
+  also computes only the official suffix.
 - **Stored compute.** `ComputeCrystal` programs materialize reusable numerical
   operators. The Markov operator graph charges verified routes, fuses compatible
   chains, applies the deepest charged prefix to previously unseen values, and
@@ -325,10 +328,11 @@ prefix, session, batch, cursor, and non-poisoned-state match. History eviction,
 prefix or session mismatch, errors, abstention, and `/clear` reset the state.
 The decoder deliberately leaves its terminal tail uncommitted, so that tail is
 part of the next suffix instead of requiring an extra closing forward. On a
-restored hybrid turn, Markov alone drafts from the carried target state. An
-explicitly configured restored MTP turn runs the direct target because a fresh
-MTP instance has no matching carried attention state. Qwen remains the sole
-committer.
+restored hybrid or explicit-MTP turn, embedded MTP reopens only when its carry
+matches the exact Qwen token prefix and target-boundary hidden row. Otherwise
+hybrid remains Markov-only and explicit MTP runs the direct target. Qwen remains
+the sole committer. MTP reliability calibration stays global and persistent;
+the in-process carry stores execution state, not a new per-session policy.
 
 Markov state v6 also retains prompt/output boundaries for composition. Two or
 more distinct target-confirmed bindings can induce literal/copy programs over a
@@ -357,7 +361,7 @@ per-profile store and are revalidated against their source ResultCells.
 
 | Trial | Result | Scope |
 |---|---:|---|
-| In-process Qwen compute battery | second turn returned `ZORPAX-731` from 35 cached official-prefix tokens although its prompt omitted the code | one loaded raw-Qwen hybrid process after deployment: turn 1 returned `gespeichert` in 4 tokens / 2 forwards / 14.65 s at 1.43 GiB peak and retained 35 tokens; turn 2 reported one prior turn and reused all 35 tokens, then returned the code in 9 tokens / 3 forwards / 18.99 s at 1.50 GiB peak. The prior code path observed 4 forwards / 29.87 s / 1.53 GiB on turn 2; this is a before/after product observation, not a controlled broad benchmark. 165 affected local tests passed in 6.621 s; eight focused deployment tests passed in 0.944 s |
+| Exact Qwen + MTP turn carry | second turn returned `NIMBUS-60427` although its prompt omitted the code | one loaded raw-Qwen hybrid process: turn 1 returned `gespeichert`, retained 36 Qwen tokens plus a 150.0 KiB MTP carry, and used 4 tokens / 2 forwards / 13.74 s / 1.40 GiB peak; turn 2 reused all 36 Qwen tokens, returned the code, exported a 322.0 KiB carry, and used 10 tokens / 7 forwards / 31.73 s / 1.61 GiB peak. This is functional exact-carry proof, not a latency improvement: this prompt was slower than the preceding Markov-only observation, so carry-context MTP reliability is the next target |
 | Deployed Markov/MTP hybrid | 23 → 11 Qwen forwards (-52.17%); 69.469500 → 49.448516 s (-28.82%, 1.405x) | same real prompt and identical target-confirmed prefix under a fixed 24-token cap against explicit Markov-only mode; accepted drafts rose 1 → 14; peak RSS changed 1,699,160,064 → 1,725,218,816 bytes (+1.53%); hybrid consumed 52,224 draft bytes and 58,201,088 target-source bytes (-52.17%) |
 | Local causal bundle reopen | 77.77 → 1.20 s; 64.90x | complete 55.6 GB Qwen3.8 bundle; first full-content verification followed by unchanged next-process stat+digest reuse; no model forward |
 | Native causal Q4/Q8 chat | readable arbitrary German output; TTFT 11.95 s; 8 tokens in 20.12 s | real 27B CPU run on 16 AVX2 cores; 498 text matrices; 16.02 GB peak RSS; 16.40 GB derived payload; two prior token traces preserved exactly |
