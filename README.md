@@ -89,7 +89,8 @@ release surface.
   state is written once at successful finalization. The eight-expert Council
   also updates its combined Rapidity/Fixed-Share weights after every confirmed
   row, so the next decision already uses the experts that are winning inside
-  the current answer.
+  the current answer. A request-local 16×8 Beta overlay simultaneously learns
+  which experts win at recursive proposal positions 0–15.
 - **Embedded MTP drafting.** The target checkpoint's own one-layer Qwen3.5 MTP
   branch now runs through the same causal Q4 bank, shared embedding, native
   bounded LM head, and exact rolling target verifier. Shifted token embeddings
@@ -343,6 +344,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Same-request high-order agent | repeated answer context becomes immediately eligible | order-2+ transitions learn from confirmed answer tokens and target corrections inside the active request; prompts and rejected drafts remain excluded, and the ephemeral agent adds no second persistence write |
 | Same-request phrase/copy agent | up to 15 tokens from repeated confirmed spans | two or more prior occurrences induce their deterministic longest common continuation prefix; the active proposal width caps the copy, Full Q4 verifies it, and both request-local agents stay inside a 4,096-token horizon |
 | Same-request Fixed-Share Council | expert winner changes before the next draft | every confirmed normal, K1-carry, external, and teacher-forced row updates an ephemeral Rapidity vector; abort discards it, while successful finalization replays each row exactly once into durable global/dialect state |
+| Same-request position specialists | independent winners at recursive positions 0–15 | a provider-only 16×8 Beta overlay updates position weights, calibrated confidence, and language evidence immediately; finalization clears it before exact-once replay into durable global and dialect matrices |
 | Corpus-scale Markov atlas | 4,000,000 tokens → 500,000 contexts in 8.0 MB | flat-array v2 adds ~150 MiB RSS and loads in 1.77 s on the live server; on an arbitrary rainbow question it supported 7 MTP tokens across 6 rounds while the hybrid accepted 11 drafts and produced 24 tokens in 14 target forwards |
 | Live-answer Markov expert | 65,536 retained answer tokens; 4,096-token cached PPM windows | on an unseen German lightning paraphrase the online memory supported 64/98 MTP candidates and supplied 18 calibrated confidence gains across 12 rounds; 10 drafts accepted, 24 tokens in 15 target forwards |
 | O1-valued episode retention | 1.1 KB state + 130 KB neural sidecar after the first live answer | real O1 surprise and learning-progress assign persistent episode priority; Ricci-age eviction keeps valuable older answers over low-value newer ones, with atomic rollback and answer-only boundaries |

@@ -42,6 +42,11 @@ All notable changes to IMMER are recorded here.
   Fixed Share applies the new weights to the next prediction. Finalization
   clears the overlay before replaying each row exactly once into durable
   global and dialect state. Provider ABI is v32 and metrics schema is v23.
+- `7ba5116` added request-local recursive-position specialists. A provider-only
+  16×8 Beta overlay separates expert skill at proposal positions 0–15 and feeds
+  position weights, calibrated confidence, and language evidence before the
+  next draft. `182fbf9` covers K1 carry, external mismatch, teacher carry,
+  abort, retry, and exact-once persistence. Provider ABI is v33; metrics v24.
 
 ### Arbitrary local Qwen runtime
 
