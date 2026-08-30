@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v28"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v29"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -1407,6 +1407,7 @@ class FingerprintRollingK4DraftProvider:
         self.episode_priority_store = episode_priority_store
         self._experts = _expert_specs(max_order, max_history_tokens)
         self._state_lock_descriptor: int | None = None
+        self._persisted_state: MarkovDraftState | None = None
         self._acquire_state_lock()
         try:
             self._state = self._load_state()
@@ -1616,13 +1617,15 @@ class FingerprintRollingK4DraftProvider:
         if path is None or (not path.exists() and not path.is_symlink()):
             return empty
         try:
-            state = MarkovDraftState.from_bytes(_read_state_bytes(path))
+            raw = _read_state_bytes(path)
+            state = MarkovDraftState.from_bytes(raw)
         except OSError as exc:  # pragma: no cover - normalized by helper.
             raise MarkovDraftError("cannot read Markov draft state") from exc
         if state.vocab_size != self.vocab_size:
             raise MarkovDraftError("Markov draft state configuration changed")
         if state.max_history_tokens > self.max_history_tokens:
             raise MarkovDraftError("Markov draft history capacity cannot shrink")
+        self._persisted_state = state if raw.startswith(_STATE_PREFIX) else None
         if state.max_history_tokens < self.max_history_tokens:
             state = replace(
                 state,
@@ -4188,6 +4191,11 @@ class FingerprintRollingK4DraftProvider:
             if descriptor is not None:
                 os.close(descriptor)
             temporary.unlink(missing_ok=True)
+        self._persisted_state = self._state
+
+    def _persist_if_dirty(self) -> None:
+        if self.state_path is not None and self._persisted_state is not self._state:
+            self._persist()
 
     def metrics(self) -> MarkovDraftMetrics:
         weights = self._weights()
@@ -4389,7 +4397,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_import_digest = None
         self._episode_feedback.clear()
         try:
-            self._persist()
+            self._persist_if_dirty()
         finally:
             self._closed = True
             self._release_state_lock()

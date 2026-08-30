@@ -1745,6 +1745,62 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         finally:
             os.close(descriptor)
 
+    def test_completed_request_is_not_persisted_again_during_close(self) -> None:
+        state_path = self.root / "single-write-state.bin"
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=64,
+        )
+        with mock.patch.object(
+            provider,
+            "_persist",
+            wraps=provider._persist,
+        ) as persist:
+            provider.observe_final((1, 2, 3, 4))
+            self.assertEqual(persist.call_count, 1)
+            provider.close()
+            self.assertEqual(persist.call_count, 1)
+
+        restored = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=64,
+        )
+        with mock.patch.object(
+            restored,
+            "_persist",
+            wraps=restored._persist,
+        ) as persist:
+            restored.close()
+            self.assertEqual(persist.call_count, 0)
+
+    def test_close_persists_an_unwritten_state_migration_once(self) -> None:
+        state_path = self.root / "migrated-on-close.bin"
+        state_path.write_bytes(
+            MarkovDraftState(
+                vocab_size=32,
+                max_history_tokens=64,
+                token_ids=(1, 2, 3),
+            ).to_bytes()
+        )
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=128,
+        )
+        with mock.patch.object(
+            provider,
+            "_persist",
+            wraps=provider._persist,
+        ) as persist:
+            provider.close()
+            self.assertEqual(persist.call_count, 1)
+        self.assertEqual(
+            MarkovDraftState.from_bytes(state_path.read_bytes()).max_history_tokens,
+            128,
+        )
+
     def test_aborted_half_episode_persists_no_feedback_or_tokens(self) -> None:
         state_path = self.root / "atomic-episode.bin"
         first = FingerprintRollingK4DraftProvider(
