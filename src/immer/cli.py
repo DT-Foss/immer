@@ -527,7 +527,7 @@ def _solve(
 
 
 def _chat_qwen38(args: argparse.Namespace) -> int:
-    """Run one turn or a persistent JSONL stream through local Qwen3.8."""
+    """Run one turn or a persistent JSONL/interactive local Qwen3.8 session."""
 
     from .cognition.fertig.adapter import FertigSolver
     from .cognition.qwen_fertig_chat import QwenFertigChat

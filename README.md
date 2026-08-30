@@ -59,10 +59,12 @@ release surface.
   and 100% of the hard maximum. Linux warms it via
   `POSIX_FADV_WILLNEED`: no payload copy, logical read, budget charge, or pager
   weight cache is introduced.
-- **Native local drafting.** Deployed chat uses the zero-weight Markov council;
-  causalized Qwen3.5-0.8B and embedded MTP providers remain explicit modes.
-  The provider proposes transactional continuations in a configurable K=2–16
-  target window, and Qwen3.8 alone verifies and commits them. The Council
+- **Native local drafting.** Deployed chat mounts the MTP-capable v3 Q4 bank
+  and runs the zero-weight Markov Council with the checkpoint's embedded MTP
+  branch as its novelty engine. The providers propose transactional
+  continuations in a configurable K=2–16 target window; Qwen3.8 alone verifies
+  and commits them. Explicit `--draft-mode markov` keeps the same v3 target
+  bank while disabling MTP. The Council
   combines live online distributions with retained Atlas branches in a
   bounded beam, so a stronger multi-token path can win without treating a
   ranking score as acceptance probability. Target-confirmed episodes become
@@ -272,6 +274,9 @@ PYTHONPATH=src python3 -m immer chat "<arbitrary text>"
 # Keep the mounted model alive for multiple raw-text or JSONL requests.
 PYTHONPATH=src python3 -m immer chat --jsonl
 
+# Keep one loaded runtime for an interactive local session.
+PYTHONPATH=src python3 -m immer chat --interactive
+
 # Emit one final machine-readable receipt instead of live text.
 PYTHONPATH=src python3 -m immer chat "<arbitrary text>" --output json
 ```
@@ -290,16 +295,22 @@ persists the Markov accounting; an unknown prompt falls directly through to
 full Q4. `--no-ooe-warm` disables this route, and `--ooe-warm-root` mounts an
 explicit bank outside the canonical deployment.
 
-The canonical Q4 deployment keeps the existing MTP-capable v3 target bank but
-uses its persistent token-level Markov Council directly. It does not load or
-run embedded MTP unless `--draft-mode mtp` or `--draft-mode hybrid` is supplied.
+The canonical Q4 deployment mounts the MTP-capable v3 target bank and defaults
+to the round-wise Markov/MTP hybrid. Markov handles learned continuations;
+embedded MTP covers novelty; the unchanged Qwen3.8 target remains the only
+component allowed to commit output. `--draft-mode markov` disables MTP without
+changing the v3 target bank. `--no-markov-draft` forces direct K1 decoding.
 Atlas and online agents expand a bounded beam, while a request-local high-order
 agent can reuse repeated context learned earlier in the same confirmed answer.
 A request-local phrase agent can copy the deterministic common prefix of two or
 more prior confirmed continuations directly into the same verified K window.
-Full Q4 still verifies every emitted token; `--no-markov-draft` forces direct
-K1 decoding. Direct Q4 MLP-page routing is also explicit-only through
-`--mlp-page-state` and is disabled in this default.
+Full Q4 still verifies every emitted token. Direct Q4 MLP-page routing is also
+explicit-only through `--mlp-page-state` and is disabled in this default.
+
+`immer chat --interactive` keeps that complete runtime loaded across arbitrary
+prompts. `/help` prints the local commands, `/stats` reports the last completed
+response's real token, Qwen-forward, wall-time, and peak-RSS totals, and `/quit`
+closes the session.
 
 Markov state v6 also retains prompt/output boundaries for composition. Two or
 more distinct target-confirmed bindings can induce literal/copy programs over a
@@ -328,6 +339,7 @@ per-profile store and are revalidated against their source ResultCells.
 
 | Trial | Result | Scope |
 |---|---:|---|
+| Deployed Markov/MTP hybrid | 23 → 11 Qwen forwards (-52.17%); 69.469500 → 49.448516 s (-28.82%, 1.405x) | same real prompt and identical target-confirmed prefix under a fixed 24-token cap against explicit Markov-only mode; accepted drafts rose 1 → 14; peak RSS changed 1,699,160,064 → 1,725,218,816 bytes (+1.53%); hybrid consumed 52,224 draft bytes and 58,201,088 target-source bytes (-52.17%) |
 | Local causal bundle reopen | 77.77 → 1.20 s; 64.90x | complete 55.6 GB Qwen3.8 bundle; first full-content verification followed by unchanged next-process stat+digest reuse; no model forward |
 | Native causal Q4/Q8 chat | readable arbitrary German output; TTFT 11.95 s; 8 tokens in 20.12 s | real 27B CPU run on 16 AVX2 cores; 498 text matrices; 16.02 GB peak RSS; 16.40 GB derived payload; two prior token traces preserved exactly |
 | Cost-aware Markov abstention | 74.58 s vs 79.05 s direct; identical token trace | seven K1 waves on an unseen German request; zero draft bytes/linears; confirmed episode still updates Council state |
@@ -371,7 +383,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Weight-only all-layer Fast MLP | deterministic 64-layer p4/k32 plan; capture-only target use forbidden | no prompts or model forwards in the build; exact paths learn adaptive width plus prequential sparse-output cosine/L2 and scalar correction; non-beneficial or uncalibrated routes use the full MLP |
 | Direct Q4 MLP-page route | explicit 192-of-272 page bound by default | exact full-MLP traces train bounded temporal/cross-layer/marginal routes; unready predictions fall back to full Q4, selected routes execute native Q4 pages, and speculative learning commits only for accepted rows; no wall-time claim is attached |
 | Exact residual-PQ LM head | K=1–16 and k=1/3/7 parity; certified page + economic row pruning | deterministic weight-only build, best-first tree, actual row-code caps, K-query survivor union, contiguous-read cost gate, 64-leaf no-saving stop, outward residual/roundoff bounds, overflow/tie/subnormal guards, and exact full-leaf fallback; no model forward |
-| Arbitrary local Qwen chat | one terminal 64-layer sweep removed per request | authenticated causal Qwen3.8 path; default zero-model-byte Markov drafting and full Q4 MLP execution, with auxiliary draft and MLP routes available explicitly; target, auxiliary, draft, and combined transport reported separately |
+| Arbitrary local Qwen chat | 23 → 11 target forwards on the same capped prompt | authenticated causal Qwen3.8 path; default Markov/embedded-MTP hybrid on the v3 bank and full Q4 MLP execution; Qwen remains the sole committer, while explicit Markov-only mode retains the same target bank |
 | Seed v3 native migration | exact parity on 8/8 inherited tensor outputs for Micro and 5M | SHA-first migration of shared trained GRU/CRSA/SwiGLU weights; new receipt, quotient, route-value, and expected-work heads added under a strict inference-only manifest |
 | Full Qwen MLP layer map | 640/640 cells; content promotion 0 | every layer repeats the same 146/549 template hits; 1,370/1,389 candidate admissions equal their matched random controls, closing the exhaustive exact-key line |
 | Qwen3.8 exact continuation | bit-identical K=1–16 state | exact transactional core with tokenwise hidden, KV, DeltaNet Conv/recurrent, and Prefix-Sinkhorn parity |

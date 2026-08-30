@@ -4,8 +4,22 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-30
 
-### Deployed Markov product path
+### Deployed Markov/MTP product path
 
+- `61cdbaa` restored novelty drafting to the deployed v3 Q4 product path.
+  Ordinary chat now runs the round-wise Markov/embedded-MTP hybrid: Markov
+  executes learned continuations, MTP covers novelty, and Qwen remains the sole
+  verifier and committer. Explicit `--draft-mode markov` disables MTP while
+  retaining the v3 target bank. `immer chat --interactive` keeps the runtime
+  loaded across arbitrary prompts and provides `/help`, real last-response
+  `/stats`, and `/quit`. On the same real prompt with a fixed 24-token cap,
+  both modes committed the same intentionally truncated prefix. Explicit
+  Markov-only used 23 target forwards, accepted one draft, ran in
+  69.469500 s, and peaked at 1,699,160,064 bytes RSS. The deployed hybrid used
+  11 forwards, accepted 14 drafts, ran in 49.448516 s, and peaked at
+  1,725,218,816 bytes RSS while consuming 52,224 draft bytes and 58,201,088
+  target-source bytes. That is 52.17% fewer target forwards and target-source
+  bytes, 28.82% less wall time (1.405x), and 1.53% more peak RSS.
 - `c204181` added direct native Q4 MLP-page execution behind the explicit
   `--mlp-page-state` option. Exact full-MLP activation traces train bounded
   temporal, cross-layer, and marginal Fixed-Share routes; unready layers retain
