@@ -4,11 +4,23 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-30
 
-Runtime commits through `cbeffa9` are deployed on the canonical server.
+Runtime commits through `85ee307` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `85ee307` re-enabled the growing zero-forward ResultCell path for canonical
+  dynamic Q4 page execution. The previous warm-profile gate returned `None`
+  whenever an MLP page-state path was configured, so current production chat
+  could mount only the fixed legacy warm cell and never charge ordinary cold
+  results. Warm-profile v3 now binds page schema v9, page policy, route width,
+  99.5% energy coverage, and the derived width-action inventory while treating
+  the state-file location as replaceable storage. The first target-confirmed
+  identical request publishes its authenticated raw Qwen Result and Markov
+  mount transition; later requests with the same runtime authority, complete
+  rendered prompt, token trace, model/Q4/tokenizer identity, and system prompt
+  execute with zero Qwen forwards and rerun the current FERTIG adjudicator.
+  Any identity difference falls through once to normal Q4.
 - `cbeffa9` made physical Q4 lookahead a direct function of the terminal-trained
   Markov ensemble. The selected route carries exact vote mass from the four
   page agents; the chosen execution width carries vote mass from the three

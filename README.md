@@ -348,7 +348,10 @@ When a verified local OoE warm bank is present, chat mounts it before opening
 Qwen. An authenticated ResultCell hit executes with zero Qwen forwards and
 persists the Markov accounting; an unknown prompt falls directly through to
 full Q4. `--no-ooe-warm` disables this route, and `--ooe-warm-root` mounts an
-explicit bank outside the canonical deployment.
+explicit bank outside the canonical deployment. Dynamic MLP-page execution is
+part of warm-profile v3: schema, policy, route width, energy coverage, and width
+actions are bound into the authority, while the state-file location remains a
+replaceable storage detail.
 
 The canonical Q4 deployment mounts the MTP-capable v3 target bank and defaults
 to the round-wise Markov/MTP hybrid. Markov handles learned continuations;
@@ -399,6 +402,8 @@ controller, and persists the index. A repeated request with the same runtime
 profile, question and rendered-token identity then executes the stored cell
 without loading Qwen. FERTIG mismatches are never charged; profile, token,
 model, Q4, tokenizer and current runtime-code changes produce a cold miss.
+This growing path remains active with the canonical page-state v9 router; the
+former page-route gate that disabled ordinary ResultCell charging is removed.
 
 The same cold stream induces parametric Markov programs when two distinct
 ResultCells prove the same deterministic span transformation. Copy and case
