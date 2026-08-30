@@ -92,7 +92,9 @@ release surface.
   the current answer. A request-local 16×8 Beta overlay simultaneously learns
   which experts win at recursive proposal positions 0–15. Per-position
   lookahead regret also compares every planned token with its greedy baseline,
-  allowing a harmful override to shut off before the answer ends.
+  allowing a harmful override to shut off before the answer ends. Surprise EMA
+  and CUSUM run on the same confirmed rows, so an abrupt regime shift can
+  release stale expert dominance inside the active answer.
 - **Embedded MTP drafting.** The target checkpoint's own one-layer Qwen3.5 MTP
   branch now runs through the same causal Q4 bank, shared embedding, native
   bounded LM head, and exact rolling target verifier. Shifted token embeddings
@@ -348,6 +350,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Same-request Fixed-Share Council | expert winner changes before the next draft | every confirmed normal, K1-carry, external, and teacher-forced row updates an ephemeral Rapidity vector; abort discards it, while successful finalization replays each row exactly once into durable global/dialect state |
 | Same-request position specialists | independent winners at recursive positions 0–15 | a provider-only 16×8 Beta overlay updates position weights, calibrated confidence, and language evidence immediately; finalization clears it before exact-once replay into durable global and dialect matrices |
 | Same-request lookahead regret | harmful non-greedy plans stop inside the active answer | planned-vs-greedy hits are tracked independently at positions 0–15; the existing empirical log-advantage gate consumes the ephemeral outcomes immediately, while finalization persists each outcome exactly once |
+| Same-request regime detector | abrupt answer-phase shifts release stale experts | the persistent Surprise EMA/deviation/CUSUM equations run ephemerally on confirmed rows; threshold crossings apply the canonical Rapidity shrink immediately and finalization replays the regime exactly once |
 | Corpus-scale Markov atlas | 4,000,000 tokens → 500,000 contexts in 8.0 MB | flat-array v2 adds ~150 MiB RSS and loads in 1.77 s on the live server; on an arbitrary rainbow question it supported 7 MTP tokens across 6 rounds while the hybrid accepted 11 drafts and produced 24 tokens in 14 target forwards |
 | Live-answer Markov expert | 65,536 retained answer tokens; 4,096-token cached PPM windows | on an unseen German lightning paraphrase the online memory supported 64/98 MTP candidates and supplied 18 calibrated confidence gains across 12 rounds; 10 drafts accepted, 24 tokens in 15 target forwards |
 | O1-valued episode retention | 1.1 KB state + 130 KB neural sidecar after the first live answer | real O1 surprise and learning-progress assign persistent episode priority; Ricci-age eviction keeps valuable older answers over low-value newer ones, with atomic rollback and answer-only boundaries |

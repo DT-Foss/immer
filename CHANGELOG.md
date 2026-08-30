@@ -51,6 +51,11 @@ All notable changes to IMMER are recorded here.
   tracked per recursive position and can disable a harmful one-step override
   before finalization. `3dff43a` proves terminal-carry persistence failure and
   retry consume the outcome exactly once. Provider ABI is v34; metrics v25.
+- `f50aff6` added same-request Surprise/CUSUM regime detection. Abrupt feedback
+  shifts update the existing EMA/deviation equations and immediately shrink
+  stale combined Rapidities by the canonical regime factor. Durable Surprise,
+  CUSUM and regime generation still replay exactly once at finalization.
+  Provider ABI is v35; metrics v26.
 
 ### Arbitrary local Qwen runtime
 
