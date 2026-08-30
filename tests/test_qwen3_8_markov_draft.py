@@ -1860,6 +1860,39 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(copied, 10)
         provider.close()
 
+    def test_request_binding_agent_rejects_a_future_block_source(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+
+        def block(phase_zero, phase_eight):
+            return (phase_zero, 1, 2, 3, 4, 5, 6, 7, phase_eight, 12)
+
+        generated = (
+            *block(7, 8),
+            *block(8, 9),
+            *block(9, 10),
+            10,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            11,
+        )
+
+        self.assertIsNone(
+            provider._request_periodic_copy_value(
+                generated,
+                period=10,
+                offset=1,
+            )
+        )
+        provider.close()
+
     def test_request_weight_overlay_adapts_immediately_without_persistence(
         self,
     ) -> None:
