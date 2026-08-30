@@ -1617,6 +1617,127 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertIsNone(provider._request_phrase_option((*prompt, *generated)))
         provider.close()
 
+    def test_request_periodic_agent_continues_an_unseen_variable_slot(self) -> None:
+        state_path = self.root / "request-periodic-agent.bin"
+        seed = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=256,
+            proposal_width=3,
+        )
+        seed.observe_final((11, 12, 13, 14))
+        seed.close()
+        persisted = state_path.read_bytes()
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=256,
+            proposal_width=3,
+        )
+        prompt = (30, 31)
+        confirmed = (
+            1,
+            2,
+            7,
+            3,
+            4,
+            5,
+            1,
+            2,
+            8,
+            3,
+            4,
+            5,
+            1,
+            2,
+            9,
+            3,
+            4,
+            5,
+            1,
+            2,
+            10,
+        )
+        provider.begin_request(prompt)
+        base = (*prompt, *confirmed)
+
+        self.assertIsNone(provider._request_phrase_option(base))
+        option = provider._request_periodic_option(base)
+        proposal = provider.propose_round(base[:-1], base[-1])
+
+        self.assertIsNotNone(option)
+        assert option is not None
+        self.assertEqual(option.token_ids, (3, 4, 5))
+        self.assertEqual(option.kind, "periodic")
+        self.assertEqual(option.context_order, 6)
+        self.assertEqual(option.support, 3)
+        self.assertEqual(proposal.token_ids, (3, 4, 5))
+        self.assertEqual(proposal.phrase_source, "request")
+        self.assertEqual(proposal.phrase_width, 3)
+        self.assertEqual(proposal.recommended_window, 4)
+        self.assertEqual(provider.metrics().periodic_option_calls, 1)
+        self.assertEqual(provider.metrics().periodic_draft_tokens, 3)
+        provider.observe_verification(3, 3)
+        provider.reconcile_prefix((*base, 3, 4, 5))
+        self.assertEqual(provider.metrics().phrase_accepted_tokens, 3)
+        self.assertEqual(provider.metrics().periodic_accepted_tokens, 3)
+        provider.close()
+        self.assertEqual(state_path.read_bytes(), persisted)
+
+    def test_request_periodic_agent_stops_before_the_next_variable_phase(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=7,
+        )
+        prompt = (30, 31)
+        confirmed = (
+            1,
+            2,
+            7,
+            3,
+            4,
+            5,
+            1,
+            2,
+            8,
+            3,
+            4,
+            5,
+            1,
+            2,
+            9,
+            3,
+            4,
+            5,
+            1,
+            2,
+            10,
+        )
+        provider.begin_request(prompt)
+
+        option = provider._request_periodic_option((*prompt, *confirmed))
+
+        self.assertIsNotNone(option)
+        assert option is not None
+        self.assertEqual(option.token_ids, (3, 4, 5, 1, 2))
+        self.assertEqual(option.kind, "periodic")
+        provider.close()
+
+    def test_request_periodic_agent_abstains_without_periodic_evidence(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        prompt = (30, 31)
+        provider.begin_request(prompt)
+
+        self.assertIsNone(
+            provider._request_periodic_option((*prompt, *tuple(range(1, 25))))
+        )
+        provider.close()
+
     def test_request_weight_overlay_adapts_immediately_without_persistence(
         self,
     ) -> None:

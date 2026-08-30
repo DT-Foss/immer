@@ -262,6 +262,28 @@ class Qwen38MarkovAtlasTests(unittest.TestCase):
         self.assertEqual(metrics.atlas_accepted_tokens, 3)
         provider.close()
 
+    def test_position_zero_beam_failure_also_gates_the_atlas_phrase_floor(
+        self,
+    ) -> None:
+        atlas = self._atlas()
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+            atlas=atlas,
+        )
+        prompt = (20, 21)
+        provider.begin_request(prompt)
+        provider._beam_position_verified[0] = 1
+        provider._beam_position_hits[0] = 0
+
+        proposal = provider.propose_round(prompt, 2)
+
+        self.assertEqual(proposal.phrase_source, "atlas")
+        self.assertLess(proposal.phrase_confidence, 0.17)
+        self.assertEqual(proposal.recommended_window, 1)
+        provider.discard_pending_proposal()
+        provider.close()
+
     def test_provider_leaves_low_confidence_atlas_routes_to_the_council(self) -> None:
         atlas = MarkovTokenAtlas.build(
             (
