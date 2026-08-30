@@ -2702,6 +2702,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "draft": {
                     "accepted_draft_tokens": 5,
                     "provider": {
+                        "provider_tournament_calls": 2,
+                        "provider_tournament_markov_selections": 1,
+                        "provider_tournament_mtp_selections": 1,
+                        "provider_trace_feedback_tokens": 6,
                         "markov": {
                             "active_dialect_similarity": 0.75,
                             "planner_beam_selections": 1,
@@ -2749,7 +2753,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
             [
                 "answer",
                 "[8 tokens · 3 Qwen forwards · 1.25 s · 2.00 GiB peak · "
-                "5 accepted draft tokens · Markov 2 tournaments B1/C0/P1, "
+                "5 accepted draft tokens · "
+                "Hybrid 2 provider tournaments Markov1/MTP1, "
+                "6 provider counterfactual labels · "
+                "Markov 2 tournaments B1/C0/P1, "
                 "9 counterfactual labels, 4 deep labels through p3, dialect 0.75 · "
                 "2 free MTP teacher labels]",
             ],

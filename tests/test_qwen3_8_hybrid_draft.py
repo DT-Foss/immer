@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 
@@ -55,6 +56,7 @@ class _Markov:
         tokens: tuple[int, ...] = (3, 4, 5),
         atlas_scores: tuple[float, ...] = (),
         online_scores: tuple[float, ...] = (),
+        provider_policy: dict[str, tuple[tuple[float, bool], ...]] | None = None,
     ) -> None:
         self.confidences = (
             [float(confidence)]
@@ -65,6 +67,16 @@ class _Markov:
         self.tokens = tokens
         self.atlas_scores = atlas_scores
         self.online_scores = online_scores
+        self.provider_policy = provider_policy or {}
+        self.provider_feedback = []
+        self._provider_observations = {
+            "markov": [0] * 16,
+            "mtp": [0] * 16,
+        }
+        self._provider_hits = {
+            "markov": [0] * 16,
+            "mtp": [0] * 16,
+        }
         self._proposal_index = 0
         self.begin_calls = []
         self.propose_calls = []
@@ -137,6 +149,20 @@ class _Markov:
             )
         )
 
+    def provider_policy_score(self, provider, position):
+        configured = self.provider_policy.get(provider, ())
+        if position < len(configured):
+            return configured[position]
+        observations = self._provider_observations[provider][position]
+        if observations == 0:
+            return 0.5, False
+        return self._provider_hits[provider][position] / observations, True
+
+    def observe_provider_policy_feedback(self, provider, position, hit):
+        self.provider_feedback.append((provider, position, hit))
+        self._provider_observations[provider][position] += 1
+        self._provider_hits[provider][position] += int(hit)
+
     def observe_verification(self, accepted, verified):
         self.verification_calls.append((accepted, verified))
 
@@ -193,6 +219,7 @@ class _Mtp:
         self.virtual_verification_calls = []
         self.teacher_verification_calls = []
         self.reconcile_calls = []
+        self.reconcile_state_calls = []
         self.advance_calls = []
         self.final_calls = []
         self.export_calls = []
@@ -230,6 +257,12 @@ class _Mtp:
             raise AssertionError("reconcile without MTP proposal")
         self.pending = False
         self.reconcile_calls.append(history)
+
+    def reconcile_prefix_state(self, history, hidden):
+        if not self.pending:
+            raise AssertionError("stateful reconcile without MTP proposal")
+        self.pending = False
+        self.reconcile_state_calls.append((history, hidden.detach().clone()))
 
     def advance_confirmed_prefix_state(
         self,
@@ -576,6 +609,9 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(metrics.source_body_bytes, 4096)
         self.assertEqual(metrics.linear_calls, 9)
         self.assertEqual(metrics.mtp_selections, 2)
+        self.assertEqual(metrics.provider_tournament_calls, 2)
+        self.assertEqual(metrics.provider_tournament_markov_selections, 0)
+        self.assertEqual(metrics.provider_tournament_mtp_selections, 2)
         self.assertEqual(metrics.consensus_rounds, 0)
         self.assertEqual(metrics.consensus_agreement_tokens, 0)
         self.assertEqual(metrics.consensus_confidence_gain, 0.0)
@@ -596,6 +632,336 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         provider.close()
         provider.close()
         self.assertEqual(close_order, ["mtp", "markov"])
+
+    def test_learned_markov_skill_beats_raw_mtp_confidence_and_reconciles_shadow(
+        self,
+    ) -> None:
+        learned = {
+            "markov": ((1.0, True),) * 3,
+            "mtp": ((0.05, True),) * 3,
+        }
+        markov = _Markov(
+            0.10,
+            tokens=(3, 4, 5),
+            provider_policy=learned,
+        )
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        provider._select_markov = lambda _proposal: False
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        proposal = provider.propose_round_state(prompt, 4, hidden[:, -1:])
+
+        self.assertEqual(proposal.token_ids, (3, 4, 5))
+        self.assertEqual(proposal.token_confidences, (0.10, 0.10, 0.10))
+        self.assertEqual(provider.selected_provider, "markov")
+        self.assertTrue(mtp.pending)
+        provider.observe_verification(1, 1)
+        committed = (*prompt, 4, 3)
+        committed_hidden = torch.arange(16, dtype=torch.float32).reshape(1, 2, 8)
+        provider.reconcile_prefix_state(committed, committed_hidden)
+
+        self.assertFalse(mtp.pending)
+        self.assertEqual(len(mtp.reconcile_state_calls), 1)
+        self.assertEqual(mtp.reconcile_state_calls[0][0], committed)
+        self.assertTrue(
+            torch.equal(mtp.reconcile_state_calls[0][1], committed_hidden)
+        )
+        metrics = provider.metrics()
+        self.assertEqual(metrics.provider_tournament_calls, 1)
+        self.assertEqual(metrics.provider_tournament_markov_selections, 1)
+        self.assertEqual(metrics.provider_tournament_mtp_selections, 0)
+        self.assertEqual(metrics.markov_rounds, 1)
+        self.assertEqual(metrics.mtp_rounds, 0)
+        provider.observe_final((*committed, 10))
+        provider.close()
+
+    def test_provider_candidates_stop_feedback_at_their_own_first_mismatch(
+        self,
+    ) -> None:
+        markov = _Markov(0.10, tokens=(7, 31, 9))
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        provider._select_markov = lambda _proposal: False
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        provider.propose_round_state(prompt, 4, hidden[:, -1:])
+        self.assertEqual(provider.selected_provider, "mtp")
+        provider.observe_verification(0, 1)
+        committed = (*prompt, 4, 7, 31)
+        provider.reconcile_prefix(committed)
+        provider.observe_final((*committed, 10))
+
+        self.assertEqual(
+            markov.provider_feedback,
+            [
+                ("markov", 0, True),
+                ("mtp", 0, True),
+                ("markov", 1, True),
+                ("mtp", 1, False),
+                ("markov", 2, False),
+            ],
+        )
+        metrics = provider.metrics()
+        self.assertEqual(metrics.provider_trace_created, 1)
+        self.assertEqual(metrics.provider_trace_active, 0)
+        self.assertEqual(metrics.provider_trace_feedback_tokens, 5)
+        provider.close()
+
+    def test_same_request_provider_feedback_switches_mtp_to_markov(self) -> None:
+        markov = _Markov(0.10, tokens=(3, 4, 5))
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        provider._select_markov = lambda _proposal: False
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        first = provider.propose_round_state(prompt, 4, hidden[:, -1:])
+        self.assertEqual(first.token_ids, (7, 8, 9))
+        self.assertEqual(provider.selected_provider, "mtp")
+        provider.observe_verification(0, 1)
+        first_history = (*prompt, 4, 3, 4, 5)
+        provider.reconcile_prefix(first_history)
+        self.assertEqual(markov.provider_policy_score("markov", 0), (1.0, True))
+        self.assertEqual(markov.provider_policy_score("mtp", 0), (0.0, True))
+
+        second = provider.propose_round_state(
+            first_history,
+            6,
+            torch.ones((1, 1, 8)),
+        )
+        self.assertEqual(second.token_ids, (3, 4, 5))
+        self.assertEqual(provider.selected_provider, "markov")
+        provider.observe_verification(1, 1)
+        second_history = (*first_history, 6, 3)
+        provider.reconcile_prefix(second_history)
+        self.assertEqual(mtp.reconcile_calls, [first_history, second_history])
+        provider.observe_final((*second_history, 10))
+
+        metrics = provider.metrics()
+        self.assertEqual(metrics.provider_tournament_calls, 2)
+        self.assertEqual(metrics.provider_tournament_mtp_selections, 1)
+        self.assertEqual(metrics.provider_tournament_markov_selections, 1)
+        self.assertEqual(metrics.provider_switches, 1)
+        provider.close()
+
+    def test_overlapping_provider_traces_persist_global_and_dialect_rows(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "provider-traces.bin"
+            markov = FingerprintRollingK4DraftProvider(
+                vocab_size=64,
+                state_path=state_path,
+                max_history_tokens=128,
+                proposal_width=3,
+            )
+            original_propose = markov.propose_round
+            candidates = (
+                (7, 8, 9, 10, 13, 14, 15),
+                (9, 10, 11, 12, 13, 14, 15),
+            )
+            markov_round = 0
+
+            def deterministic_propose(history, known_token):
+                nonlocal markov_round
+                original_propose(history, known_token)
+                tokens = candidates[min(markov_round, len(candidates) - 1)]
+                markov_round += 1
+                return _proposal(confidence=0.10, tokens=tokens)
+
+            class SequencedMtp(_Mtp):
+                def propose_round_state(self, history, known_token, hidden):
+                    self.propose_calls.append(
+                        (history, known_token, hidden.detach().clone(), "round")
+                    )
+                    self.pending = True
+                    index = min(len(self.propose_calls) - 1, len(candidates) - 1)
+                    return _proposal(confidence=0.75, tokens=candidates[index])
+
+            mtp = SequencedMtp()
+            provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+            provider._select_markov = lambda _proposal: False
+            prompt = (40, 41)
+            hidden = torch.zeros((1, len(prompt), 8), dtype=torch.bfloat16)
+            provider.begin_request_state(prompt, hidden)
+            with (
+                mock.patch.object(
+                    markov,
+                    "propose_round",
+                    side_effect=deterministic_propose,
+                ),
+                mock.patch.object(
+                    markov,
+                    "language_evidence_for_pending",
+                    return_value=(),
+                ),
+            ):
+                provider.propose_round_state(prompt, 42, hidden[:, -1:])
+                provider.observe_verification(1, 1)
+                first_history = (*prompt, 42, 7)
+                provider.reconcile_prefix(first_history)
+
+                provider.propose_round_state(
+                    first_history,
+                    8,
+                    torch.ones((1, 1, 8), dtype=torch.bfloat16),
+                )
+                provider.observe_verification(1, 1)
+                second_history = (*first_history, 8, 9)
+                provider.reconcile_prefix(second_history)
+
+            interim = provider.metrics()
+            self.assertEqual(interim.provider_trace_created, 2)
+            self.assertEqual(interim.provider_trace_active, 2)
+            self.assertEqual(interim.provider_trace_feedback_tokens, 8)
+
+            final_history = (*second_history, 10)
+            provider.observe_final(final_history)
+            final = provider.metrics()
+            self.assertEqual(final.provider_trace_active, 0)
+            self.assertEqual(final.provider_trace_feedback_tokens, 12)
+            expected_observations = (2, 2, 1)
+            expected_hits = (2, 2, 1)
+            self.assertEqual(
+                tuple(final.markov["planner_observations"][3][:3]),
+                expected_observations,
+            )
+            self.assertEqual(
+                tuple(final.markov["planner_hits"][3][:3]),
+                expected_hits,
+            )
+            self.assertEqual(
+                tuple(final.markov["planner_observations"][4][:3]),
+                expected_observations,
+            )
+            self.assertEqual(
+                tuple(final.markov["planner_hits"][4][:3]),
+                expected_hits,
+            )
+            self.assertEqual(
+                tuple(final.markov["active_dialect_planner_observations"][3][:3]),
+                expected_observations,
+            )
+            self.assertEqual(
+                tuple(final.markov["active_dialect_planner_hits"][3][:3]),
+                expected_hits,
+            )
+            self.assertEqual(
+                tuple(final.markov["active_dialect_planner_observations"][4][:3]),
+                expected_observations,
+            )
+            self.assertEqual(
+                tuple(final.markov["active_dialect_planner_hits"][4][:3]),
+                expected_hits,
+            )
+            provider.close()
+
+            restored = FingerprintRollingK4DraftProvider(
+                vocab_size=64,
+                state_path=state_path,
+                max_history_tokens=128,
+                proposal_width=3,
+            )
+            restored_metrics = restored.metrics()
+            self.assertEqual(
+                restored_metrics.planner_observations[3][:3],
+                expected_observations,
+            )
+            self.assertEqual(restored_metrics.planner_hits[3][:3], expected_hits)
+            self.assertEqual(
+                restored_metrics.planner_observations[4][:3],
+                expected_observations,
+            )
+            self.assertEqual(restored_metrics.planner_hits[4][:3], expected_hits)
+            restored._activate_dialect(prompt)
+            restored_metrics = restored.metrics()
+            self.assertEqual(
+                restored_metrics.active_dialect_planner_observations[3][:3],
+                expected_observations,
+            )
+            self.assertEqual(
+                restored_metrics.active_dialect_planner_hits[3][:3],
+                expected_hits,
+            )
+            self.assertEqual(
+                restored_metrics.active_dialect_planner_observations[4][:3],
+                expected_observations,
+            )
+            self.assertEqual(
+                restored_metrics.active_dialect_planner_hits[4][:3],
+                expected_hits,
+            )
+            restored.close()
+
+    def test_final_failure_rolls_back_provider_feedback_and_close_cleans_up(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "provider-final-failure.bin"
+            markov = FingerprintRollingK4DraftProvider(
+                vocab_size=64,
+                state_path=state_path,
+                max_history_tokens=128,
+                proposal_width=3,
+            )
+            original_propose = markov.propose_round
+
+            def deterministic_propose(history, known_token):
+                original_propose(history, known_token)
+                return _proposal(confidence=0.10, tokens=(7, 8, 9))
+
+            mtp = _Mtp()
+            provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+            provider._select_markov = lambda _proposal: False
+            prompt = (40, 41)
+            hidden = torch.zeros((1, len(prompt), 8), dtype=torch.bfloat16)
+            provider.begin_request_state(prompt, hidden)
+            with mock.patch.object(
+                markov,
+                "propose_round",
+                side_effect=deterministic_propose,
+            ):
+                provider.propose_round_state(prompt, 42, hidden[:, -1:])
+                provider.observe_verification(1, 1)
+                committed = (*prompt, 42, 7)
+                provider.reconcile_prefix(committed)
+
+            before_traces = list(provider._provider_traces)
+            before_feedback_tokens = provider.metrics().provider_trace_feedback_tokens
+            before_observations = [
+                list(row) for row in markov._request_planner_observations
+            ]
+            before_hits = [list(row) for row in markov._request_planner_hits]
+            before_feedback = list(markov._planner_feedback)
+            with (
+                mock.patch.object(markov, "_persist", side_effect=OSError("disk full")),
+                self.assertRaisesRegex(OSError, "disk full"),
+            ):
+                provider.observe_final((*committed, 8))
+
+            self.assertEqual(provider._provider_traces, before_traces)
+            self.assertEqual(
+                provider.metrics().provider_trace_feedback_tokens,
+                before_feedback_tokens,
+            )
+            self.assertEqual(markov._request_planner_observations, before_observations)
+            self.assertEqual(markov._request_planner_hits, before_hits)
+            self.assertEqual(markov._planner_feedback, before_feedback)
+
+            provider.close()
+            self.assertEqual(provider._provider_traces, [])
+            self.assertIsNone(provider._pending_provider_candidates)
+            self.assertIsNone(markov._request_planner_observations)
+            self.assertIsNone(markov._request_planner_hits)
+            self.assertEqual(provider.metrics().provider_trace_active, 0)
+            self.assertTrue(provider.metrics().closed)
+            self.assertTrue(markov._closed)
 
     def test_virtual_k1_verification_routes_only_to_the_selected_mtp(self) -> None:
         markov = _Markov(0.01)
@@ -637,7 +1003,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(proposal.token_ids, (7, 8, 9))
         self.assertEqual(
             proposal.provider_abi,
-            "immer.qwen3.8-markov-mtp-hybrid-provider/v25",
+            "immer.qwen3.8-markov-mtp-hybrid-provider/v26",
         )
         self.assertTrue(
             all(abs(value - 0.7625) < 1e-12 for value in proposal.token_confidences)
@@ -667,6 +1033,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
 
         proposal = provider.propose_round_state(prompt, 4, hidden[:, -1:])
 
+        self.assertEqual(provider.selected_provider, "mtp")
         self.assertEqual(proposal.token_ids, (7, 8, 9))
         self.assertEqual(proposal.token_confidences, (0.8, 0.775, 0.75))
         metrics = provider.metrics()
@@ -746,7 +1113,15 @@ class Qwen38HybridDraftTests(unittest.TestCase):
                     provider_abi="test-mtp-padded/v1",
                 )
 
-        markov = _Markov(0.55, tokens=(7, 8, 9))
+        equal_policy = {
+            "markov": ((0.8, True),) * 3,
+            "mtp": ((0.8, True),) * 3,
+        }
+        markov = _Markov(
+            0.55,
+            tokens=(7, 8, 9),
+            provider_policy=equal_policy,
+        )
         mtp = PaddedMtp()
         provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
         provider._select_markov = lambda _proposal: False
@@ -756,6 +1131,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
 
         proposal = provider.propose_round_state(prompt, 4, hidden[:, -1:])
 
+        self.assertEqual(provider.selected_provider, "mtp")
         self.assertAlmostEqual(proposal.token_confidences[0], 0.7625)
         self.assertEqual(proposal.token_confidences[1:], (0.0, 0.0))
         metrics = provider.metrics()
@@ -960,7 +1336,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(mtp.advance_calls[0][2], final_hidden))
 
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v25")
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v26")
         self.assertEqual(metrics.selected_provider, "markov")
         self.assertEqual(metrics.selection_calls, 4)
         self.assertEqual(metrics.markov_rounds, 3)

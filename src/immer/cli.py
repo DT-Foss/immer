@@ -114,8 +114,8 @@ _QWEN38_DEPLOYMENT_MARKOV_ATLAS = (
 _QWEN38_DEPLOYMENT_O1_RETENTION = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-markov-o1-retention-v1.json"
 )
-_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v45"
-_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v25"
+_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v46"
+_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v26"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v5"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
     b"immer:qwen3.8-growing-warm-runtime/v2"
@@ -666,6 +666,41 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             markov = None
             mtp = None
             if isinstance(provider, dict):
+                provider_parts = []
+                provider_tournaments = provider.get(
+                    "provider_tournament_calls"
+                )
+                if (
+                    isinstance(provider_tournaments, int)
+                    and not isinstance(provider_tournaments, bool)
+                    and provider_tournaments > 0
+                ):
+                    provider_selections = tuple(
+                        provider.get(name, 0)
+                        for name in (
+                            "provider_tournament_markov_selections",
+                            "provider_tournament_mtp_selections",
+                        )
+                    )
+                    if all(
+                        isinstance(value, int) and not isinstance(value, bool)
+                        for value in provider_selections
+                    ):
+                        provider_parts.append(
+                            f"{provider_tournaments} provider tournaments "
+                            f"Markov{provider_selections[0]}/MTP{provider_selections[1]}"
+                        )
+                provider_feedback = provider.get("provider_trace_feedback_tokens")
+                if (
+                    isinstance(provider_feedback, int)
+                    and not isinstance(provider_feedback, bool)
+                    and provider_feedback > 0
+                ):
+                    provider_parts.append(
+                        f"{provider_feedback} provider counterfactual labels"
+                    )
+                if provider_parts:
+                    parts.append("Hybrid " + ", ".join(provider_parts))
                 nested_markov = provider.get("markov")
                 nested_mtp = provider.get("mtp")
                 markov = (

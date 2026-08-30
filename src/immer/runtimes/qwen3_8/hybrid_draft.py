@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 import math
 from typing import Any, Literal
 
@@ -13,9 +13,10 @@ from .draft_protocol import RollingDraftProposal
 from .mtp_draft import Qwen35MtpCarry, Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v25"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v26"
 ATLAS_MTP_CONSENSUS_STRENGTH = 0.25
 ONLINE_MTP_CONSENSUS_STRENGTH = 0.25
+PROVIDER_TOURNAMENT_DISCOUNT = 0.85
 MARKOV_MTP_WINDOW_WORK_COSTS = {
     1: 1.0,
     2: 1.6,
@@ -27,6 +28,13 @@ MARKOV_MTP_WINDOW_WORK_COSTS = {
 
 class Qwen38MarkovMtpDraftError(RuntimeError):
     """The Markov/MTP council lost target-confirmed provider state."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderTournamentTrace:
+    candidates: tuple[tuple[int, ...], tuple[int, ...]]
+    alive: tuple[bool, bool]
+    next_position: int
 
 
 def _metrics_record(owner: object | None) -> dict[str, Any] | None:
@@ -82,6 +90,12 @@ class Qwen38MarkovMtpDraftMetrics:
     mtp_rounds: int
     markov_external_feedback_rounds: int
     provider_switches: int
+    provider_tournament_calls: int
+    provider_tournament_markov_selections: int
+    provider_tournament_mtp_selections: int
+    provider_trace_created: int
+    provider_trace_active: int
+    provider_trace_feedback_tokens: int
     mtp_init_failures: int
     consensus_rounds: int
     consensus_agreement_tokens: int
@@ -185,6 +199,11 @@ class Qwen38MarkovMtpDraftProvider:
         self._mtp_rounds = 0
         self._markov_external_feedback_rounds = 0
         self._provider_switches = 0
+        self._provider_tournament_calls = 0
+        self._provider_tournament_markov_selections = 0
+        self._provider_tournament_mtp_selections = 0
+        self._provider_trace_created = 0
+        self._provider_trace_feedback_tokens = 0
         self._mtp_init_failures = 0
         self._consensus_rounds = 0
         self._consensus_agreement_tokens = 0
@@ -202,6 +221,11 @@ class Qwen38MarkovMtpDraftProvider:
         self._last_online_consensus_tokens = 0
         self._last_online_consensus_confidence_gain = 0.0
         self._shadow_markov_proposal: RollingDraftProposal | None = None
+        self._pending_provider_candidates: (
+            tuple[tuple[int, ...], tuple[int, ...]] | None
+        ) = None
+        self._provider_traces: list[_ProviderTournamentTrace] = []
+        self._pending_mtp_shadow = False
         self._pending_provider: Literal["markov", "mtp"] | None = None
 
     @property
@@ -303,6 +327,21 @@ class Qwen38MarkovMtpDraftProvider:
             )
         return committed_hidden.detach().clone().contiguous()
 
+    def _round_proposal_tokens(
+        self,
+        history: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        current = self._request_history
+        if (
+            current is None
+            or len(history) <= len(current)
+            or history[: len(current)] != current
+        ):
+            raise Qwen38MarkovMtpDraftError(
+                "hybrid round history is not a strict extension"
+            )
+        return history[len(current) + 1 :]
+
     def __call__(self, _history: tuple[int, ...], /) -> tuple[int, ...]:
         raise Qwen38MarkovMtpDraftError(
             "hybrid drafting requires target-hidden rolling callbacks"
@@ -316,6 +355,161 @@ class Qwen38MarkovMtpDraftProvider:
             remaining_tokens=ceiling,
         )
         return policy.chosen_window > 1
+
+    def _provider_policy_score(
+        self,
+        provider: Literal["markov", "mtp"],
+        position: int,
+    ) -> tuple[float, bool]:
+        callback = getattr(self.markov_provider, "provider_policy_score", None)
+        if not callable(callback):
+            return 0.5, False
+        value = callback(provider, position)
+        if (
+            not isinstance(value, tuple)
+            or len(value) != 2
+            or isinstance(value[0], bool)
+            or not isinstance(value[0], (int, float))
+            or not math.isfinite(float(value[0]))
+            or not 0.0 <= float(value[0]) <= 1.0
+            or not isinstance(value[1], bool)
+        ):
+            raise Qwen38MarkovMtpDraftError(
+                "provider policy score is invalid"
+            )
+        return float(value[0]), value[1]
+
+    def _provider_utility(
+        self,
+        provider: Literal["markov", "mtp"],
+        proposal: RollingDraftProposal,
+        *,
+        width: int,
+    ) -> float:
+        prefix_reliability = 1.0
+        utility = 0.0
+        for position, confidence in enumerate(proposal.token_confidences[:width]):
+            reliability, _observed = self._provider_policy_score(
+                provider,
+                position,
+            )
+            prefix_reliability = min(prefix_reliability, reliability)
+            utility += PROVIDER_TOURNAMENT_DISCOUNT**position * math.log(
+                max(1e-12, float(confidence) * prefix_reliability)
+            )
+        return utility
+
+    @staticmethod
+    def _effective_mtp_width(proposal: RollingDraftProposal) -> int:
+        width = 0
+        for confidence in proposal.token_confidences:
+            if confidence <= 0.0:
+                break
+            width += 1
+        return max(1, width)
+
+    def _select_provider_tournament(
+        self,
+        markov: RollingDraftProposal,
+        mtp: RollingDraftProposal,
+    ) -> tuple[Literal["markov", "mtp"], RollingDraftProposal]:
+        if len(markov.token_ids) != len(mtp.token_ids):
+            raise Qwen38MarkovMtpDraftError(
+                "provider tournament proposal widths disagree"
+            )
+        providers: tuple[Literal["markov", "mtp"], ...] = ("markov", "mtp")
+        mtp_width = self._effective_mtp_width(mtp)
+        has_evidence = any(
+            self._provider_policy_score(provider, position)[1]
+            for provider in providers
+            for position in range(len(markov.token_ids))
+        )
+        selected: Literal["markov", "mtp"] = (
+            "mtp"
+            if not has_evidence
+            or self._provider_utility("mtp", mtp, width=mtp_width)
+            >= self._provider_utility("markov", markov, width=mtp_width)
+            else "markov"
+        )
+        self._provider_tournament_calls += 1
+        if selected == "markov":
+            self._provider_tournament_markov_selections += 1
+        else:
+            self._provider_tournament_mtp_selections += 1
+        self._pending_provider_candidates = (
+            markov.token_ids,
+            mtp.token_ids[:mtp_width],
+        )
+        return selected, markov if selected == "markov" else mtp
+
+    def _start_pending_provider_trace(self) -> None:
+        candidates = self._pending_provider_candidates
+        self._pending_provider_candidates = None
+        if candidates is None:
+            return
+        if not candidates[0] or not candidates[1]:
+            raise Qwen38MarkovMtpDraftError(
+                "pending provider tournament is invalid"
+            )
+        self._provider_traces.append(
+            _ProviderTournamentTrace(
+                candidates=candidates,
+                alive=(True, True),
+                next_position=0,
+            )
+        )
+        self._provider_trace_created += 1
+
+    def _advance_provider_traces(self, tokens: tuple[int, ...]) -> None:
+        for trace in self._provider_traces:
+            if (
+                trace.next_position < 0
+                or any(
+                    active and trace.next_position >= len(candidate)
+                    for candidate, active in zip(
+                        trace.candidates,
+                        trace.alive,
+                        strict=True,
+                    )
+                )
+            ):
+                raise Qwen38MarkovMtpDraftError(
+                    "provider tournament trace is invalid"
+                )
+        feedback = getattr(
+            self.markov_provider,
+            "observe_provider_policy_feedback",
+            None,
+        )
+        names: tuple[Literal["markov", "mtp"], ...] = ("markov", "mtp")
+        for token in tokens:
+            surviving = []
+            for trace in self._provider_traces:
+                position = trace.next_position
+                alive = []
+                for provider, candidate, active in zip(
+                    names,
+                    trace.candidates,
+                    trace.alive,
+                    strict=True,
+                ):
+                    if not active:
+                        alive.append(False)
+                        continue
+                    hit = candidate[position] == token
+                    if callable(feedback):
+                        feedback(provider, position, hit)
+                    self._provider_trace_feedback_tokens += 1
+                    alive.append(hit and position + 1 < len(candidate))
+                if any(alive):
+                    surviving.append(
+                        replace(
+                            trace,
+                            alive=tuple(alive),
+                            next_position=position + 1,
+                        )
+                    )
+            self._provider_traces = surviving
 
     def _commit_markov_selection(
         self,
@@ -338,6 +532,7 @@ class Qwen38MarkovMtpDraftProvider:
             "propose_after_state",
             "advance_confirmed_prefix_state",
             "reconcile_prefix",
+            "reconcile_prefix_state",
             "observe_final",
             "close",
         )
@@ -371,6 +566,7 @@ class Qwen38MarkovMtpDraftProvider:
         self._last_atlas_consensus_confidence_gain = 0.0
         self._last_online_consensus_tokens = 0
         self._last_online_consensus_confidence_gain = 0.0
+        self._advance_provider_traces((known_token,))
         proposal = self.markov_provider.propose_round(history, known_token)
         if not isinstance(proposal, RollingDraftProposal):
             raise Qwen38MarkovMtpDraftError(
@@ -423,10 +619,6 @@ class Qwen38MarkovMtpDraftProvider:
             self._switch_available = False
             self._hidden_history = None
             return self._commit_markov_selection(proposal)
-        if self._selected_provider not in {None, "mtp"}:
-            self._provider_switches += 1
-        self._selected_provider = "mtp"
-        self._mtp_selections += 1
         self._shadow_markov_proposal = proposal
         return None
 
@@ -437,7 +629,6 @@ class Qwen38MarkovMtpDraftProvider:
         """Discount exact Markov/MTP token agreement into MTP confidence."""
 
         markov = self._shadow_markov_proposal
-        self._shadow_markov_proposal = None
         self._last_consensus_agreement_tokens = 0
         self._last_consensus_confidence_gain = 0.0
         self._last_atlas_consensus_tokens = 0
@@ -622,23 +813,38 @@ class Qwen38MarkovMtpDraftProvider:
         if selected is not None:
             self._pending_provider = "markov"
             return selected
-        if self._selected_provider == "mtp":
-            assert self._mtp_provider is not None
-            proposal = self._mtp_provider.propose_round_state(
-                history,
-                known_token,
-                round_hidden.detach().clone(),
-            )
-            self._mtp_rounds += 1
-        else:  # pragma: no cover - guarded by the handoff transition.
-            raise Qwen38MarkovMtpDraftError("hybrid provider was not selected")
-        if not isinstance(proposal, RollingDraftProposal):
+        assert self._mtp_provider is not None
+        mtp_proposal = self._mtp_provider.propose_round_state(
+            history,
+            known_token,
+            round_hidden.detach().clone(),
+        )
+        if not isinstance(mtp_proposal, RollingDraftProposal):
             raise Qwen38MarkovMtpDraftError(
                 "selected provider returned no RollingDraftProposal"
             )
-        if self._selected_provider == "mtp":
-            proposal = self._fuse_mtp_consensus(proposal)
-        self._pending_provider = "mtp"
+        mtp_proposal = self._fuse_mtp_consensus(mtp_proposal)
+        markov_proposal = self._shadow_markov_proposal
+        self._shadow_markov_proposal = None
+        if markov_proposal is None:
+            raise Qwen38MarkovMtpDraftError(
+                "provider tournament lost the Markov proposal"
+            )
+        selected, proposal = self._select_provider_tournament(
+            markov_proposal,
+            mtp_proposal,
+        )
+        if self._selected_provider not in {None, selected}:
+            self._provider_switches += 1
+        self._selected_provider = selected
+        self._pending_provider = selected
+        self._pending_mtp_shadow = selected == "markov"
+        if selected == "markov":
+            self._markov_selections += 1
+            self._markov_rounds += 1
+        else:
+            self._mtp_selections += 1
+            self._mtp_rounds += 1
         return proposal
 
     def propose_after_state(
@@ -653,6 +859,7 @@ class Qwen38MarkovMtpDraftProvider:
             raise Qwen38MarkovMtpDraftError(
                 "previous hybrid proposal was not reconciled"
             )
+        self._advance_provider_traces((known_token,))
         # Fixed short windows do not expose the K4/K8/K16 horizon contract
         # required by ``propose_round``.  They are already the cheap path, so
         # lock directly to Markov and never materialize MTP for this request.
@@ -733,6 +940,7 @@ class Qwen38MarkovMtpDraftProvider:
                 "reconciliation has no pending hybrid proposal"
             )
         self._validate_history(history)
+        proposal_tokens = self._round_proposal_tokens(history)
         owner = self.markov_provider if pending == "markov" else self._mtp_provider
         if owner is None:  # pragma: no cover - selection invariant.
             raise Qwen38MarkovMtpDraftError("hybrid provider was not selected")
@@ -740,9 +948,19 @@ class Qwen38MarkovMtpDraftProvider:
         if pending == "mtp":
             self.markov_provider.reconcile_external_prefix(history)
             self._markov_external_feedback_rounds += 1
+        elif self._pending_mtp_shadow:
+            mtp = self._mtp_provider
+            if mtp is None:
+                raise Qwen38MarkovMtpDraftError(
+                    "provider tournament lost its pending MTP shadow"
+                )
+            mtp.reconcile_prefix(history)
+        self._start_pending_provider_trace()
+        self._advance_provider_traces(proposal_tokens)
         self._request_history = history
         self._pending_provider = None
         self._round_target_hidden = None
+        self._pending_mtp_shadow = False
         if pending == "markov":
             # A no-state caller cannot advance an already loaded MTP cache.
             # Keep serving the synchronized Markov expert for this request.
@@ -764,6 +982,7 @@ class Qwen38MarkovMtpDraftProvider:
             raise Qwen38MarkovMtpDraftError(
                 "reconciliation has no pending hybrid proposal"
             )
+        proposal_tokens = self._round_proposal_tokens(history)
         fragment = self._state_fragment(history, committed_hidden)
         caller_snapshot = committed_hidden.detach().clone()
         round_hidden = self._round_target_hidden
@@ -778,6 +997,17 @@ class Qwen38MarkovMtpDraftProvider:
         if pending == "mtp":
             self.markov_provider.reconcile_external_prefix(history)
             self._markov_external_feedback_rounds += 1
+        elif self._mtp_provider is not None and self._pending_mtp_shadow:
+            stateful_mtp_reconcile = getattr(
+                self._mtp_provider,
+                "reconcile_prefix_state",
+                None,
+            )
+            if not callable(stateful_mtp_reconcile):
+                raise Qwen38MarkovMtpDraftError(
+                    "pending MTP shadow lacks stateful reconciliation"
+                )
+            stateful_mtp_reconcile(history, fragment.detach().clone())
         elif self._mtp_provider is not None:
             if round_hidden is None:
                 raise Qwen38MarkovMtpDraftError(
@@ -809,6 +1039,8 @@ class Qwen38MarkovMtpDraftProvider:
                 self._hidden_history_bytes = (
                     self._hidden_history.numel() * self._hidden_history.element_size()
                 )
+        self._start_pending_provider_trace()
+        self._advance_provider_traces(proposal_tokens)
         self._request_history = history
         self._boundary_history = history
         self._boundary_target_hidden = (
@@ -816,6 +1048,7 @@ class Qwen38MarkovMtpDraftProvider:
         )
         self._pending_provider = None
         self._round_target_hidden = None
+        self._pending_mtp_shadow = False
 
     def observe_final(self, history: tuple[int, ...], /) -> None:
         self._require_open_request()
@@ -823,19 +1056,57 @@ class Qwen38MarkovMtpDraftProvider:
             raise Qwen38MarkovMtpDraftError(
                 "cannot finalize an unreconciled hybrid proposal"
             )
-        if self._mtp_provider is not None:
-            mtp_failure: Exception | None = None
-            try:
-                self._mtp_provider.observe_final(history)
-            except Exception as exc:
-                mtp_failure = exc
-            # MTP executes novelty rounds.  Markov has already reconciled each
-            # of its shadow predictions against the same target-confirmed
-            # prefixes and now commits that feedback with the complete episode.
-            self.markov_provider.observe_final(history)
-        else:
-            mtp_failure = None
-            self.markov_provider.observe_final(history)
+        current = self._request_history
+        if (
+            current is None
+            or len(history) < len(current)
+            or history[: len(current)] != current
+        ):
+            raise Qwen38MarkovMtpDraftError(
+                "final hybrid history changed its confirmed prefix"
+            )
+        original_traces = list(self._provider_traces)
+        original_feedback_tokens = self._provider_trace_feedback_tokens
+        policy_snapshot = None
+        snapshot_policy = getattr(
+            self.markov_provider,
+            "snapshot_provider_policy_feedback",
+            None,
+        )
+        restore_policy = getattr(
+            self.markov_provider,
+            "restore_provider_policy_feedback",
+            None,
+        )
+        if callable(snapshot_policy) and callable(restore_policy):
+            policy_snapshot = snapshot_policy()
+        try:
+            self._advance_provider_traces(history[len(current) :])
+            self._provider_traces.clear()
+            if self._mtp_provider is not None:
+                mtp_failure: Exception | None = None
+                try:
+                    self._mtp_provider.observe_final(history)
+                except Exception as exc:
+                    mtp_failure = exc
+                # MTP executes novelty rounds.  Markov has already reconciled each
+                # of its shadow predictions against the same target-confirmed
+                # prefixes and now commits that feedback with the complete episode.
+                self.markov_provider.observe_final(history)
+            else:
+                mtp_failure = None
+                self.markov_provider.observe_final(history)
+        except Exception:
+            self._provider_traces = original_traces
+            self._provider_trace_feedback_tokens = original_feedback_tokens
+            if policy_snapshot is not None:
+                try:
+                    restore_policy(policy_snapshot)
+                except Exception as restore_exc:
+                    raise Qwen38MarkovMtpDraftError(
+                        "provider policy feedback rollback failed"
+                    ) from restore_exc
+            raise
         self._request_completed = True
         self._switch_available = False
         self._round_target_hidden = None
@@ -891,6 +1162,16 @@ class Qwen38MarkovMtpDraftProvider:
             mtp_rounds=self._mtp_rounds,
             markov_external_feedback_rounds=self._markov_external_feedback_rounds,
             provider_switches=self._provider_switches,
+            provider_tournament_calls=self._provider_tournament_calls,
+            provider_tournament_markov_selections=(
+                self._provider_tournament_markov_selections
+            ),
+            provider_tournament_mtp_selections=(
+                self._provider_tournament_mtp_selections
+            ),
+            provider_trace_created=self._provider_trace_created,
+            provider_trace_active=len(self._provider_traces),
+            provider_trace_feedback_tokens=self._provider_trace_feedback_tokens,
             mtp_init_failures=self._mtp_init_failures,
             consensus_rounds=self._consensus_rounds,
             consensus_agreement_tokens=self._consensus_agreement_tokens,
@@ -970,6 +1251,9 @@ class Qwen38MarkovMtpDraftProvider:
         self._boundary_history = None
         self._boundary_target_hidden = None
         self._shadow_markov_proposal = None
+        self._pending_provider_candidates = None
+        self._provider_traces.clear()
+        self._pending_mtp_shadow = False
         self._switch_available = False
         self._closed = True
         if failure is not None:
@@ -979,6 +1263,7 @@ class Qwen38MarkovMtpDraftProvider:
 __all__ = [
     "ATLAS_MTP_CONSENSUS_STRENGTH",
     "ONLINE_MTP_CONSENSUS_STRENGTH",
+    "PROVIDER_TOURNAMENT_DISCOUNT",
     "MARKOV_MTP_WINDOW_WORK_COSTS",
     "QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA",
     "Qwen38MarkovMtpDraftError",

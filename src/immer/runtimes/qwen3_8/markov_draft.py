@@ -34,8 +34,9 @@ try:
 except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
-MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v12"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v45"
+MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v13"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v46"
+V12_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v12"
 V11_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v11"
 V10_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v10"
 V9_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
@@ -47,8 +48,9 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v34"
-_STATE_PREFIX = b"IMMD\x0c"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v35"
+_STATE_PREFIX = b"IMMD\x0d"
+_V12_STATE_PREFIX = b"IMMD\x0c"
 _V11_STATE_PREFIX = b"IMMD\x0b"
 _V10_STATE_PREFIX = b"IMMD\x0a"
 _V9_STATE_PREFIX = b"IMMD\x09"
@@ -62,6 +64,7 @@ _V2_STATE_PREFIX = b"IMMD\x02"
 _LEGACY_STATE_PREFIX = b"IMMD\x01"
 _STATE_PREFIXES = (
     _STATE_PREFIX,
+    _V12_STATE_PREFIX,
     _V11_STATE_PREFIX,
     _V10_STATE_PREFIX,
     _V9_STATE_PREFIX,
@@ -80,7 +83,9 @@ _EPISODE_TOKEN = "<episode>"
 _HEX = frozenset("0123456789abcdef")
 _MAX_IMPORTED_EPISODE_DIGESTS = 65_536
 _MAX_PROPOSAL_POSITIONS = 16
-_PLANNER_NAMES = ("beam", "council", "phrase")
+_PLANNER_NAMES = ("beam", "council", "phrase", "markov", "mtp")
+_INTERNAL_PLANNER_COUNT = 3
+_V12_PLANNER_COUNT = 3
 _PLANNING_DIAGNOSTIC_FIELDS = (
     "_predictions",
     "_council_predictions",
@@ -125,6 +130,13 @@ class _PlannerTournamentTrace:
     candidates: tuple[tuple[int, ...], ...]
     alive: tuple[bool, ...]
     next_position: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderPolicySnapshot:
+    observations: tuple[tuple[int, ...], ...] | None
+    hits: tuple[tuple[int, ...], ...] | None
+    feedback: tuple[tuple[int, int, bool], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -696,6 +708,7 @@ class MarkovDialectState:
         legacy: bool = False,
         plan_memory: bool = True,
         planner_memory: bool = True,
+        legacy_planner_count: int | None = None,
     ) -> "MarkovDialectState":
         expected = {
             "dialect_id",
@@ -724,6 +737,22 @@ class MarkovDialectState:
         ):
             raise ValueError("dialect planner memory is missing")
         try:
+            planner_observations = tuple(
+                tuple(row) for row in value.get("planner_observations", ())
+            )
+            planner_hits = tuple(
+                tuple(row) for row in value.get("planner_hits", ())
+            )
+            if legacy_planner_count is not None:
+                if (
+                    len(planner_observations) != legacy_planner_count
+                    or len(planner_hits) != legacy_planner_count
+                ):
+                    raise ValueError("legacy dialect planner width changed")
+                missing = len(_PLANNER_NAMES) - legacy_planner_count
+                zeros = (0,) * _MAX_PROPOSAL_POSITIONS
+                planner_observations = planner_observations + (zeros,) * missing
+                planner_hits = planner_hits + (zeros,) * missing
             return cls(
                 dialect_id=value["dialect_id"],
                 signature=tuple(int(item, 16) for item in value["signature"]),
@@ -740,12 +769,8 @@ class MarkovDialectState:
                 ),
                 plan_observations=tuple(value.get("plan_observations", ())),
                 plan_hits=tuple(value.get("plan_hits", ())),
-                planner_observations=tuple(
-                    tuple(row) for row in value.get("planner_observations", ())
-                ),
-                planner_hits=tuple(
-                    tuple(row) for row in value.get("planner_hits", ())
-                ),
+                planner_observations=planner_observations,
+                planner_hits=planner_hits,
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("dialect record values are invalid") from exc
@@ -1389,6 +1414,7 @@ class MarkovDraftState:
             or value.get("schema")
             not in {
                 MARKOV_DRAFT_STATE_SCHEMA,
+                V12_MARKOV_DRAFT_STATE_SCHEMA,
                 V11_MARKOV_DRAFT_STATE_SCHEMA,
                 V10_MARKOV_DRAFT_STATE_SCHEMA,
                 V9_MARKOV_DRAFT_STATE_SCHEMA,
@@ -1433,6 +1459,16 @@ class MarkovDraftState:
             )
         except TypeError as exc:
             raise MarkovDraftError("Markov draft state values are invalid") from exc
+        if schema == V12_MARKOV_DRAFT_STATE_SCHEMA:
+            if (
+                len(planner_observations) != _V12_PLANNER_COUNT
+                or len(planner_hits) != _V12_PLANNER_COUNT
+            ):
+                raise MarkovDraftError("Markov v12 planner width changed")
+            missing = len(_PLANNER_NAMES) - _V12_PLANNER_COUNT
+            zeros = (0,) * _MAX_PROPOSAL_POSITIONS
+            planner_observations = planner_observations + (zeros,) * missing
+            planner_hits = planner_hits + (zeros,) * missing
         if schema == MARKOV_DRAFT_STATE_SCHEMA and (
             not planner_observations or not planner_hits
         ):
@@ -1484,6 +1520,7 @@ class MarkovDraftState:
                         legacy=value.get("schema")
                         not in {
                             MARKOV_DRAFT_STATE_SCHEMA,
+                            V12_MARKOV_DRAFT_STATE_SCHEMA,
                             V11_MARKOV_DRAFT_STATE_SCHEMA,
                             V10_MARKOV_DRAFT_STATE_SCHEMA,
                             V9_MARKOV_DRAFT_STATE_SCHEMA,
@@ -1492,10 +1529,20 @@ class MarkovDraftState:
                         plan_memory=value.get("schema")
                         in {
                             MARKOV_DRAFT_STATE_SCHEMA,
+                            V12_MARKOV_DRAFT_STATE_SCHEMA,
                             V11_MARKOV_DRAFT_STATE_SCHEMA,
                         },
                         planner_memory=value.get("schema")
-                        == MARKOV_DRAFT_STATE_SCHEMA,
+                        in {
+                            MARKOV_DRAFT_STATE_SCHEMA,
+                            V12_MARKOV_DRAFT_STATE_SCHEMA,
+                        },
+                        legacy_planner_count=(
+                            _V12_PLANNER_COUNT
+                            if value.get("schema")
+                            == V12_MARKOV_DRAFT_STATE_SCHEMA
+                            else None
+                        ),
                     )
                     for row in value.get("dialects", ())
                 ),
@@ -3177,6 +3224,79 @@ class FingerprintRollingK4DraftProvider:
             )
         return utility
 
+    @staticmethod
+    def _provider_planner_index(provider: str) -> int:
+        if not isinstance(provider, str) or provider not in {"markov", "mtp"}:
+            raise MarkovDraftError("provider planner must be markov or mtp")
+        return _PLANNER_NAMES.index(provider)
+
+    def provider_policy_score(
+        self,
+        provider: str,
+        position: int,
+        /,
+    ) -> tuple[float, bool]:
+        if self._closed:
+            raise MarkovDraftError("Markov draft provider is closed")
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or not 0 <= position < _MAX_PROPOSAL_POSITIONS
+        ):
+            raise MarkovDraftError("provider policy position is invalid")
+        planner = self._provider_planner_index(provider)
+        observed = self._planner_has_evidence(planner, position)
+        return (
+            self._planner_reliability(planner, position) if observed else 0.5,
+            observed,
+        )
+
+    def observe_provider_policy_feedback(
+        self,
+        provider: str,
+        position: int,
+        hit: bool,
+        /,
+    ) -> None:
+        if self._closed or not self._request_started or self._request_completed:
+            raise MarkovDraftError("Markov request is not active")
+        planner = self._provider_planner_index(provider)
+        self._update_request_planner(planner, position, hit)
+
+    def snapshot_provider_policy_feedback(self, /) -> object:
+        if self._closed or not self._request_started or self._request_completed:
+            raise MarkovDraftError("Markov request is not active")
+        return _ProviderPolicySnapshot(
+            observations=(
+                None
+                if self._request_planner_observations is None
+                else tuple(
+                    tuple(row) for row in self._request_planner_observations
+                )
+            ),
+            hits=(
+                None
+                if self._request_planner_hits is None
+                else tuple(tuple(row) for row in self._request_planner_hits)
+            ),
+            feedback=tuple(self._planner_feedback),
+        )
+
+    def restore_provider_policy_feedback(self, snapshot: object, /) -> None:
+        if self._closed or not self._request_started or self._request_completed:
+            raise MarkovDraftError("Markov request is not active")
+        if not isinstance(snapshot, _ProviderPolicySnapshot):
+            raise MarkovDraftError("provider policy snapshot is invalid")
+        self._request_planner_observations = (
+            None
+            if snapshot.observations is None
+            else [list(row) for row in snapshot.observations]
+        )
+        self._request_planner_hits = (
+            None if snapshot.hits is None else [list(row) for row in snapshot.hits]
+        )
+        self._planner_feedback = list(snapshot.feedback)
+
     def _position_weighting(
         self,
         position: int,
@@ -4313,6 +4433,8 @@ class FingerprintRollingK4DraftProvider:
         if (
             isinstance(planner, bool)
             or not 0 <= planner < len(_PLANNER_NAMES)
+            or isinstance(position, bool)
+            or not isinstance(position, int)
             or not 0 <= position < _MAX_PROPOSAL_POSITIONS
             or not isinstance(hit, bool)
         ):
@@ -6354,6 +6476,7 @@ __all__ = [
     "V9_MARKOV_DRAFT_STATE_SCHEMA",
     "V10_MARKOV_DRAFT_STATE_SCHEMA",
     "V11_MARKOV_DRAFT_STATE_SCHEMA",
+    "V12_MARKOV_DRAFT_STATE_SCHEMA",
     "MARKOV_DRAFT_METRICS_SCHEMA",
     "MARKOV_DRAFT_PROVIDER_ABI",
     "MARKOV_DRAFT_STATE_SCHEMA",
