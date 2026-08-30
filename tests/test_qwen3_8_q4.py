@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mmap
 from pathlib import Path
 import tempfile
 import threading
@@ -681,6 +682,301 @@ class Q4BankTests(unittest.TestCase):
                     bank.metrics()["mapping_discard_calls"],
                     0,
                 )
+            finally:
+                bank.close()
+
+    def test_mlp_page_prefetch_lease_is_consumed_or_expires_boundedly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-prefetch"
+            generator = torch.Generator().manual_seed(8042)
+            base = "model.language_model.layers.0.mlp"
+            tensors = {
+                f"{base}.gate_proj.weight": torch.randn(
+                    (1024, 64), generator=generator
+                ),
+                f"{base}.up_proj.weight": torch.randn(
+                    (1024, 64), generator=generator
+                ),
+                f"{base}.down_proj.weight": torch.randn(
+                    (64, 1024), generator=generator
+                ),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=64,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                with (
+                    mock.patch(
+                        "immer.runtimes.qwen3_8.q4._MappedTensor.prefetch_supported",
+                        return_value=True,
+                    ),
+                    mock.patch(
+                        "immer.runtimes.qwen3_8.q4._MappedTensor.prefetch",
+                        autospec=True,
+                        return_value=True,
+                    ) as advise,
+                ):
+                    self.assertTrue(bank.prefetch_mlp_pages(0, (0, 2)))
+                    prefetched = bank.metrics()
+                    self.assertEqual(prefetched["page_mlp_prefetch_calls"], 1)
+                    self.assertEqual(prefetched["page_mlp_prefetch_pages"], 2)
+                    self.assertEqual(
+                        prefetched["page_mlp_prefetch_advice_calls"], 3
+                    )
+                    self.assertEqual(
+                        prefetched["page_mlp_prefetch_active_leases"], 3
+                    )
+                    self.assertEqual(advise.call_count, 3)
+
+                    bank.release_touched()
+                    self.assertEqual(
+                        bank.metrics()["page_mlp_prefetch_active_leases"], 3
+                    )
+                    hidden = torch.randn(
+                        (1, 64), generator=generator
+                    ).to(torch.bfloat16)
+                    first = bank.mlp_selected_pages(
+                        hidden,
+                        (
+                            f"{base}.gate_proj.weight",
+                            f"{base}.up_proj.weight",
+                            f"{base}.down_proj.weight",
+                        ),
+                        torch.tensor([[0, 2]]),
+                        output_dtype=torch.bfloat16,
+                    )
+                    consumed = bank.metrics()
+                    self.assertEqual(
+                        consumed["page_mlp_prefetch_consumed_leases"], 3
+                    )
+                    self.assertEqual(
+                        consumed["page_mlp_prefetch_active_leases"], 0
+                    )
+                    bank.release_touched()
+                    second = bank.mlp_selected_pages(
+                        hidden,
+                        (
+                            f"{base}.gate_proj.weight",
+                            f"{base}.up_proj.weight",
+                            f"{base}.down_proj.weight",
+                        ),
+                        torch.tensor([[0, 2]]),
+                        output_dtype=torch.bfloat16,
+                    )
+                    torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
+                    bank.release_touched()
+
+                    self.assertTrue(bank.prefetch_mlp_pages(0, (1,)))
+                    bank.release_touched()
+                    bank.release_touched()
+                    self.assertEqual(
+                        bank.metrics()["page_mlp_prefetch_active_leases"], 3
+                    )
+                    bank.mlp_selected_pages(
+                        hidden,
+                        (
+                            f"{base}.gate_proj.weight",
+                            f"{base}.up_proj.weight",
+                            f"{base}.down_proj.weight",
+                        ),
+                        torch.tensor([[1]]),
+                        output_dtype=torch.bfloat16,
+                    )
+                    self.assertEqual(
+                        bank.metrics()["page_mlp_prefetch_consumed_leases"], 6
+                    )
+                    bank.release_touched()
+
+                    self.assertTrue(bank.prefetch_mlp_pages(0, (2,)))
+                    bank.release_touched()
+                    bank.release_touched()
+                    bank.release_touched()
+                    expired = bank.metrics()
+                    self.assertEqual(
+                        expired["page_mlp_prefetch_active_leases"], 0
+                    )
+                    self.assertEqual(
+                        expired["page_mlp_prefetch_expired_leases"], 3
+                    )
+
+                    self.assertTrue(bank.prefetch_mlp_pages(0, (3,)))
+                    bank.release_touched(force_prefetch=True)
+                    forced = bank.metrics()
+                    self.assertEqual(
+                        forced["page_mlp_prefetch_active_leases"], 0
+                    )
+                    self.assertEqual(
+                        forced["page_mlp_prefetch_forced_releases"], 3
+                    )
+                    gate_entry = bank.entries[f"{base}.gate_proj.weight"]
+                    up_entry = bank.entries[f"{base}.up_proj.weight"]
+                    down_entry = bank.entries[f"{base}.down_proj.weight"]
+                    original_limit = bank.max_prefetch_bytes
+
+                    def aligned_run(entry, first_page: int, stop_page: int) -> int:
+                        offset = first_page * 64 * entry.row_bytes
+                        stop = min(entry.shape[0], stop_page * 64) * entry.row_bytes
+                        return min(
+                            entry.payload_bytes,
+                            ((stop + mmap.PAGESIZE - 1) // mmap.PAGESIZE)
+                            * mmap.PAGESIZE,
+                        ) - (offset // mmap.PAGESIZE * mmap.PAGESIZE)
+
+                    bank.max_prefetch_bytes = (
+                        down_entry.payload_bytes
+                        + aligned_run(gate_entry, 8, 9)
+                        + aligned_run(up_entry, 8, 9)
+                    )
+                    before_trim = bank.metrics()
+                    advice_before_trim = advise.call_count
+                    self.assertTrue(bank.prefetch_mlp_pages(0, (8, 0, 1)))
+                    trimmed = bank.metrics()
+                    self.assertEqual(
+                        trimmed["page_mlp_prefetch_requested_pages"]
+                        - before_trim["page_mlp_prefetch_requested_pages"],
+                        3,
+                    )
+                    self.assertEqual(
+                        trimmed["page_mlp_prefetch_pages"]
+                        - before_trim["page_mlp_prefetch_pages"],
+                        1,
+                    )
+                    self.assertEqual(
+                        trimmed["page_mlp_prefetch_trimmed_pages"]
+                        - before_trim["page_mlp_prefetch_trimmed_pages"],
+                        2,
+                    )
+                    self.assertEqual(
+                        trimmed["page_mlp_prefetch_budget_trims"]
+                        - before_trim["page_mlp_prefetch_budget_trims"],
+                        1,
+                    )
+                    trim_calls = advise.call_args_list[advice_before_trim:]
+                    self.assertEqual(len(trim_calls), 3)
+                    self.assertEqual(
+                        trim_calls[0].kwargs["offset"],
+                        (
+                            8
+                            * 64
+                            * gate_entry.row_bytes
+                            // mmap.PAGESIZE
+                            * mmap.PAGESIZE
+                        ),
+                    )
+                    self.assertEqual(
+                        trim_calls[1].kwargs["offset"],
+                        (
+                            8
+                            * 64
+                            * up_entry.row_bytes
+                            // mmap.PAGESIZE
+                            * mmap.PAGESIZE
+                        ),
+                    )
+                    self.assertEqual(trim_calls[2].kwargs["offset"], 0)
+                    bank.release_touched(force_prefetch=True)
+
+                    bank.max_prefetch_bytes = (
+                        down_entry.payload_bytes
+                        + aligned_run(gate_entry, 0, 3)
+                        + aligned_run(up_entry, 0, 3)
+                    )
+                    before_contiguous = bank.metrics()
+                    self.assertTrue(bank.prefetch_mlp_pages(0, (0, 1, 2)))
+                    contiguous = bank.metrics()
+                    self.assertEqual(
+                        contiguous["page_mlp_prefetch_requested_pages"]
+                        - before_contiguous["page_mlp_prefetch_requested_pages"],
+                        3,
+                    )
+                    self.assertEqual(
+                        contiguous["page_mlp_prefetch_pages"]
+                        - before_contiguous["page_mlp_prefetch_pages"],
+                        3,
+                    )
+                    self.assertEqual(
+                        contiguous["page_mlp_prefetch_trimmed_pages"]
+                        - before_contiguous["page_mlp_prefetch_trimmed_pages"],
+                        0,
+                    )
+                    bank.release_touched(force_prefetch=True)
+                    bank.max_prefetch_bytes = original_limit
+                supported = (
+                    isinstance(getattr(mmap, "MADV_WILLNEED", None), int)
+                    and hasattr(mmap.mmap, "madvise")
+                )
+                self.assertEqual(
+                    bank.prefetch_mlp_pages(0, (0, 2)),
+                    supported,
+                )
+                if supported:
+                    self.assertEqual(
+                        bank.metrics()["page_mlp_prefetch_active_leases"], 3
+                    )
+                bank.release_touched(force_prefetch=True)
+            finally:
+                bank.close()
+
+    def test_unsupported_mlp_page_prefetch_opens_no_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-prefetch-unsupported"
+            base = "model.language_model.layers.0.mlp"
+            tensors = {
+                f"{base}.gate_proj.weight": torch.zeros((64, 64)),
+                f"{base}.up_proj.weight": torch.zeros((64, 64)),
+                f"{base}.down_proj.weight": torch.zeros((64, 64)),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=64,
+                threads=1,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=1,
+            )
+            try:
+                with mock.patch(
+                    "immer.runtimes.qwen3_8.q4._MappedTensor.prefetch_supported",
+                    return_value=False,
+                ):
+                    self.assertFalse(bank.prefetch_mlp_pages(0, (0,)))
+                metrics = bank.metrics()
+                self.assertEqual(metrics["page_mlp_prefetch_unsupported"], 1)
+                self.assertEqual(metrics["page_mlp_prefetch_requested_pages"], 1)
+                self.assertEqual(metrics["page_mlp_prefetch_selected_pages"], 1)
+                self.assertEqual(metrics["page_mlp_prefetch_pages"], 0)
+                self.assertEqual(metrics["page_mlp_prefetch_advice_calls"], 0)
+                self.assertEqual(metrics["page_mlp_prefetch_bytes"], 0)
+                self.assertEqual(metrics["mapped_tensors"], 0)
+                self.assertEqual(metrics["page_mlp_prefetch_active_leases"], 0)
+                bank.max_prefetch_bytes = 1
+                with mock.patch(
+                    "immer.runtimes.qwen3_8.q4._MappedTensor.prefetch_supported",
+                    return_value=True,
+                ):
+                    self.assertFalse(bank.prefetch_mlp_pages(0, (0,)))
+                limited = bank.metrics()
+                self.assertEqual(limited["page_mlp_prefetch_budget_declines"], 1)
+                self.assertEqual(limited["mapped_tensors"], 0)
             finally:
                 bank.close()
 

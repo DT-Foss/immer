@@ -1017,6 +1017,36 @@ class Qwen38PagerTests(unittest.TestCase):
         self.assertEqual(metrics["gc_last_observed_rss_bytes"], 1_000)
         collect.assert_not_called()
 
+    def test_q4_forced_release_clears_prefetch_leases(self) -> None:
+        from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+
+        q4 = SimpleNamespace(
+            has=mock.Mock(return_value=True),
+            linear=mock.Mock(),
+            linear_group=mock.Mock(),
+            rows=mock.Mock(),
+            metrics=mock.Mock(return_value={}),
+            close=mock.Mock(),
+            release_touched=mock.Mock(),
+        )
+        pager = Qwen38WeightPager(
+            self._source(),
+            device="cpu",
+            q4_bank=q4,
+        )
+        with mock.patch(
+            "immer.runtimes.qwen3_8.pager.gc.collect",
+            return_value=0,
+        ):
+            pager.release()
+            pager.release(force_gc=True)
+
+        self.assertEqual(
+            q4.release_touched.call_args_list,
+            [mock.call(), mock.call(force_prefetch=True)],
+        )
+        pager.close()
+
     def test_darwin_default_limit_uses_current_not_historical_peak_rss(self) -> None:
         from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
 

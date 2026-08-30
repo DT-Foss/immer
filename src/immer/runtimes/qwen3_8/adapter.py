@@ -856,6 +856,7 @@ def _open_local_runtime(
                 revision=identity.revision,
                 inventory_fingerprint=fingerprint,
                 threads=q4_threads,
+                max_prefetch_bytes=max(1, max_resident_bytes // 2),
             )
         pager = Qwen38WeightPager(
             mount.source,
@@ -940,6 +941,7 @@ def _open_local_runtime(
                     "repo_id": identity.repo_id,
                     "revision": identity.revision,
                 },
+                lookahead_prefetch=q4_bank.prefetch_mlp_pages,
             )
         if (
             q4_bank is not None
@@ -3398,6 +3400,20 @@ class Qwen38CausalChat:
                 "page_mlp_calls",
                 "page_mlp_dense_down_calls",
                 "page_mlp_dense_down_rows",
+                "page_mlp_prefetch_advice_calls",
+                "page_mlp_prefetch_bytes",
+                "page_mlp_prefetch_budget_declines",
+                "page_mlp_prefetch_budget_trims",
+                "page_mlp_prefetch_calls",
+                "page_mlp_prefetch_consumed_leases",
+                "page_mlp_prefetch_expired_leases",
+                "page_mlp_prefetch_failures",
+                "page_mlp_prefetch_forced_releases",
+                "page_mlp_prefetch_pages",
+                "page_mlp_prefetch_requested_pages",
+                "page_mlp_prefetch_selected_pages",
+                "page_mlp_prefetch_trimmed_pages",
+                "page_mlp_prefetch_unsupported",
                 "page_mlp_rows",
                 "page_mlp_selected_pages",
                 "page_mlp_selected_neurons",
@@ -3434,6 +3450,11 @@ class Qwen38CausalChat:
             evidence["q4"] = {
                 **dict(evidence.get("q4", {})),
                 "request": q4_request,
+                "runtime": {
+                    key: q4_after[key]
+                    for key in ("page_mlp_prefetch_max_bytes",)
+                    if key in q4_after
+                },
             }
         mlp_page_request: dict[str, int] = {}
         if mlp_page_before is not None and mlp_page_after is not None:

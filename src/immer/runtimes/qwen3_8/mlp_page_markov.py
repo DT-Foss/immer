@@ -16,8 +16,12 @@ import threading
 from typing import Any
 
 
-MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v7"
+MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v8"
 MLP_PAGE_MARKOV_POLICY = (
+    "dynamic-page-transitions+coactivation+adaptive-width+terminal-route-advantage+causal-lookahead-prefetch+fixed-share/v8"
+)
+_V7_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v7"
+_V7_MLP_PAGE_MARKOV_POLICY = (
     "dynamic-page-transitions+coactivation+adaptive-width+terminal-route-advantage+fixed-share/v7"
 )
 _V6_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v6"
@@ -25,6 +29,7 @@ _V6_MLP_PAGE_MARKOV_POLICY = (
     "dynamic-page-transitions+coactivation+adaptive-width+terminal-reward+fixed-share/v6"
 )
 MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS = (
+    (_V7_MLP_PAGE_MARKOV_SCHEMA, _V7_MLP_PAGE_MARKOV_POLICY),
     (_V6_MLP_PAGE_MARKOV_SCHEMA, _V6_MLP_PAGE_MARKOV_POLICY),
 )
 _V5_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v5"
@@ -62,6 +67,13 @@ _V6_METRICS = frozenset(
     }
 )
 _V7_METRICS = frozenset({"runtime_reward_route_agent_feedback"})
+_V8_METRICS = frozenset(
+    {
+        "lookahead_prefetch_calls",
+        "lookahead_prefetch_pages",
+        "lookahead_prefetch_successes",
+    }
+)
 _MAX_STATE_BYTES = 16 * 1024 * 1024
 _CALL_PREFETCH = object()
 _MAX_REWARD_RECEIPTS = 64
@@ -206,6 +218,7 @@ class MlpPageMarkov:
         identity: Mapping[str, object] | None = None,
         min_exact_rows: int = 2,
         prefetch: Callable[[int, tuple[int, ...]], bool] | None = None,
+        lookahead_prefetch: Callable[[int, tuple[int, ...]], bool] | None = None,
     ) -> None:
         for value, label in (
             (n_layers, "n_layers"),
@@ -219,6 +232,8 @@ class MlpPageMarkov:
             raise ValueError("route_width exceeds page_count")
         if prefetch is not None and not callable(prefetch):
             raise TypeError("prefetch must be callable or None")
+        if lookahead_prefetch is not None and not callable(lookahead_prefetch):
+            raise TypeError("lookahead_prefetch must be callable or None")
         try:
             clean_identity = json.loads(
                 _canonical({} if identity is None else dict(identity)).decode("ascii")
@@ -235,6 +250,7 @@ class MlpPageMarkov:
         self.min_exact_rows = min_exact_rows
         self.identity = clean_identity
         self.prefetch = prefetch
+        self.lookahead_prefetch = lookahead_prefetch
         self._marginal: dict[tuple[int, int], Counter[int]] = {}
         self._temporal: dict[tuple[int, int], Counter[int]] = {}
         self._cross: dict[tuple[int, int], Counter[int]] = {}
@@ -261,6 +277,7 @@ class MlpPageMarkov:
         self._wave_widths: dict[int, tuple[int, ...]] = {}
         self._pending: dict[int, MlpPagePrediction] = {}
         self._pending_prefetch: dict[int, bool | None] = {}
+        self._pending_lookahead_prefetch: dict[int, bool | None] = {}
         self._pending_dynamic: dict[int, bool] = {}
         self._compiled: list[MlpPagePrediction | None] = [None] * n_layers
         self._reward_active = False
@@ -299,6 +316,9 @@ class MlpPageMarkov:
             "prefetch_calls": 0,
             "prefetch_pages": 0,
             "prefetch_successes": 0,
+            "lookahead_prefetch_calls": 0,
+            "lookahead_prefetch_pages": 0,
+            "lookahead_prefetch_successes": 0,
             "ready_predictions": 0,
             "route_jaccard_count": 0,
             "route_jaccard_sum_ppm": 0,
@@ -348,6 +368,9 @@ class MlpPageMarkov:
                 "metrics": dict(self._metrics),
                 "pending": dict(self._pending),
                 "pending_prefetch": dict(self._pending_prefetch),
+                "pending_lookahead_prefetch": dict(
+                    self._pending_lookahead_prefetch
+                ),
                 "pending_dynamic": dict(self._pending_dynamic),
                 "reward_active": self._reward_active,
                 "reward_traces": list(self._reward_traces),
@@ -407,7 +430,15 @@ class MlpPageMarkov:
             self.begin_transaction()
             replayed_exact = False
             try:
-                for kind, wave, layer, payload, scores, prefetch_result in events:
+                for (
+                    kind,
+                    wave,
+                    layer,
+                    payload,
+                    scores,
+                    prefetch_result,
+                    lookahead_prefetch_result,
+                ) in events:
                     keep = min(
                         wave_rows[wave],
                         max(0, accepted_rows - offsets[wave]),
@@ -430,12 +461,18 @@ class MlpPageMarkov:
                             layer,
                             row_count=keep,
                             replay_prefetch=prefetch_result,
+                            replay_lookahead_prefetch=(
+                                lookahead_prefetch_result
+                            ),
                         )
                         self.advance_selected(layer, payload, row_count=keep)
                     elif kind == "selected_prepare":
                         self._prepare(
                             layer,
                             replay_prefetch=prefetch_result,
+                            replay_lookahead_prefetch=(
+                                lookahead_prefetch_result
+                            ),
                         )
                         self.advance_selected(layer, payload, row_count=keep)
                     else:
@@ -482,6 +519,9 @@ class MlpPageMarkov:
             self._metrics = transaction["metrics"]
             self._pending = transaction["pending"]
             self._pending_prefetch = transaction["pending_prefetch"]
+            self._pending_lookahead_prefetch = transaction[
+                "pending_lookahead_prefetch"
+            ]
             self._pending_dynamic = transaction["pending_dynamic"]
             self._reward_active = transaction["reward_active"]
             self._reward_traces = transaction["reward_traces"]
@@ -633,16 +673,20 @@ class MlpPageMarkov:
             rows.append((agent, tuple(route)))
         return tuple(rows)
 
-    def _predict(self, layer: int) -> MlpPagePrediction:
-        cross_rows = self._wave_routes.get(layer - 1, ())
-        cross = cross_rows[-1] if cross_rows else None
-        agents = self._agent_routes(layer, self._last_routes[layer], cross)
+    def _prediction_from_context(
+        self,
+        layer: int,
+        *,
+        temporal_route: tuple[int, ...] | None,
+        cross_route: tuple[int, ...] | None,
+        temporal_width: int | None,
+        cross_width: int | None,
+    ) -> MlpPagePrediction:
+        agents = self._agent_routes(layer, temporal_route, cross_route)
         full_pages = self._combine(layer, agents)
-        cross_width_rows = self._wave_widths.get(layer - 1, ())
-        cross_width = cross_width_rows[-1] if cross_width_rows else None
         width_agents = self._agent_widths(
             layer,
-            self._last_widths[layer],
+            temporal_width,
             cross_width,
         )
         width = self._combine_width(layer, width_agents)
@@ -660,6 +704,38 @@ class MlpPageMarkov:
             full_page_ids=full_pages,
             width=width,
             agent_widths=width_agents,
+        )
+
+    def _predict(self, layer: int) -> MlpPagePrediction:
+        cross_rows = self._wave_routes.get(layer - 1, ())
+        cross_width_rows = self._wave_widths.get(layer - 1, ())
+        return self._prediction_from_context(
+            layer,
+            temporal_route=self._last_routes[layer],
+            cross_route=cross_rows[-1] if cross_rows else None,
+            temporal_width=self._last_widths[layer],
+            cross_width=cross_width_rows[-1] if cross_width_rows else None,
+        )
+
+    def _lookahead(self, prediction: MlpPagePrediction) -> MlpPagePrediction:
+        next_layer = (prediction.layer + 1) % self.n_layers
+        cross_route = None if next_layer == 0 else prediction.full_page_ids
+        cross_width = None if next_layer == 0 else prediction.width
+        same_layer = next_layer == prediction.layer
+        return self._prediction_from_context(
+            next_layer,
+            temporal_route=(
+                prediction.full_page_ids
+                if same_layer
+                else self._last_routes[next_layer]
+            ),
+            cross_route=cross_route,
+            temporal_width=(
+                prediction.width
+                if same_layer
+                else self._last_widths[next_layer]
+            ),
+            cross_width=cross_width,
         )
 
     def _combine(
@@ -700,6 +776,7 @@ class MlpPageMarkov:
         self._wave_widths = {}
         self._pending = {}
         self._pending_prefetch = {}
+        self._pending_lookahead_prefetch = {}
         self._pending_dynamic = {}
         if self._transaction is not None:
             self._transaction["current_wave"] += 1
@@ -725,12 +802,36 @@ class MlpPageMarkov:
                 compiled.append(self._predict(layer))
             self._compiled = compiled
 
+    def _run_lookahead_prefetch(
+        self,
+        prediction: MlpPagePrediction,
+        *,
+        replay: object,
+    ) -> bool | None:
+        if not prediction.ready or self.lookahead_prefetch is None:
+            return None
+        lookahead = self._lookahead(prediction)
+        if not lookahead.ready or (
+            replay is not _CALL_PREFETCH and replay is None
+        ):
+            return None
+        self._metrics["lookahead_prefetch_calls"] += 1
+        self._metrics["lookahead_prefetch_pages"] += len(lookahead.page_ids)
+        result = (
+            bool(self.lookahead_prefetch(lookahead.layer, lookahead.page_ids))
+            if replay is _CALL_PREFETCH
+            else bool(replay)
+        )
+        self._metrics["lookahead_prefetch_successes"] += int(result)
+        return result
+
     def _route(
         self,
         layer: int,
         *,
         row_count: int,
         replay_prefetch: object = _CALL_PREFETCH,
+        replay_lookahead_prefetch: object = _CALL_PREFETCH,
     ) -> MlpPagePrediction:
         self._ensure_open()
         self._validate_layer(layer)
@@ -774,6 +875,10 @@ class MlpPageMarkov:
             )
             self._metrics["prefetch_successes"] += int(prefetch_result)
         self._pending_prefetch[layer] = prefetch_result
+        self._pending_lookahead_prefetch[layer] = self._run_lookahead_prefetch(
+            prediction,
+            replay=replay_lookahead_prefetch,
+        )
         self._pending_dynamic[layer] = True
         return prediction
 
@@ -788,6 +893,7 @@ class MlpPageMarkov:
         layer: int,
         *,
         replay_prefetch: object = _CALL_PREFETCH,
+        replay_lookahead_prefetch: object = _CALL_PREFETCH,
     ) -> MlpPagePrediction:
         self._ensure_open()
         self._validate_layer(layer)
@@ -819,6 +925,10 @@ class MlpPageMarkov:
             )
             self._metrics["prefetch_successes"] += int(prefetch_result)
         self._pending_prefetch[layer] = prefetch_result
+        self._pending_lookahead_prefetch[layer] = self._run_lookahead_prefetch(
+            prediction,
+            replay=replay_lookahead_prefetch,
+        )
         self._pending_dynamic[layer] = False
         return prediction
 
@@ -1097,11 +1207,13 @@ class MlpPageMarkov:
                         if score_rows is None
                         else (score_rows, total_rows),
                         None,
+                        None,
                     )
                 )
 
             pending = self._pending.pop(layer, None)
             self._pending_prefetch.pop(layer, None)
+            self._pending_lookahead_prefetch.pop(layer, None)
             self._pending_dynamic.pop(layer, None)
             if pending is not None and routes:
                 predicted = set(pending.page_ids)
@@ -1209,6 +1321,9 @@ class MlpPageMarkov:
                 raise ValueError("row_count must be a positive integer")
             transaction = self._transaction
             pending_prefetch = self._pending_prefetch.get(layer)
+            pending_lookahead_prefetch = self._pending_lookahead_prefetch.get(
+                layer
+            )
             pending_dynamic = self._pending_dynamic.get(layer)
             if transaction is not None:
                 if pending_dynamic is None:
@@ -1235,10 +1350,12 @@ class MlpPageMarkov:
                         route,
                         None,
                         pending_prefetch,
+                        pending_lookahead_prefetch,
                     )
                 )
             self._pending.pop(layer, None)
             self._pending_prefetch.pop(layer, None)
+            self._pending_lookahead_prefetch.pop(layer, None)
             self._pending_dynamic.pop(layer, None)
             self._last_routes[layer] = full_route
             self._last_widths[layer] = len(route)
@@ -1463,6 +1580,7 @@ class MlpPageMarkov:
             self._wave_widths = {}
             self._pending = {}
             self._pending_prefetch = {}
+            self._pending_lookahead_prefetch = {}
             self._pending_dynamic = {}
             self._compiled = [None] * self.n_layers
             self._metrics["session_resets"] += 1
@@ -1689,17 +1807,25 @@ class MlpPageMarkov:
             legacy_v4 = schema == _V4_MLP_PAGE_MARKOV_SCHEMA
             legacy_v5 = schema == _V5_MLP_PAGE_MARKOV_SCHEMA
             legacy_v6 = schema == _V6_MLP_PAGE_MARKOV_SCHEMA
+            legacy_v7 = schema == _V7_MLP_PAGE_MARKOV_SCHEMA
             adaptive_width = (
-                legacy_v5 or legacy_v6 or schema == MLP_PAGE_MARKOV_SCHEMA
+                legacy_v5
+                or legacy_v6
+                or legacy_v7
+                or schema == MLP_PAGE_MARKOV_SCHEMA
             )
-            terminal_reward = legacy_v6 or schema == MLP_PAGE_MARKOV_SCHEMA
-            route_terminal_reward = schema == MLP_PAGE_MARKOV_SCHEMA
+            terminal_reward = (
+                legacy_v6 or legacy_v7 or schema == MLP_PAGE_MARKOV_SCHEMA
+            )
+            route_terminal_reward = legacy_v7 or schema == MLP_PAGE_MARKOV_SCHEMA
+            causal_lookahead = schema == MLP_PAGE_MARKOV_SCHEMA
             if (
                 not isinstance(document, dict)
                 or set(document) != {"body", "schema", "sha256"}
                 or schema
                 not in {
                     MLP_PAGE_MARKOV_SCHEMA,
+                    _V7_MLP_PAGE_MARKOV_SCHEMA,
                     _V6_MLP_PAGE_MARKOV_SCHEMA,
                     _V5_MLP_PAGE_MARKOV_SCHEMA,
                     _V4_MLP_PAGE_MARKOV_SCHEMA,
@@ -1755,6 +1881,8 @@ class MlpPageMarkov:
                     if legacy_v5
                     else _V6_MLP_PAGE_MARKOV_POLICY
                     if legacy_v6
+                    else _V7_MLP_PAGE_MARKOV_POLICY
+                    if legacy_v7
                     else MLP_PAGE_MARKOV_POLICY
                 ),
                 adaptive_width=adaptive_width,
@@ -1939,6 +2067,8 @@ class MlpPageMarkov:
                 missing_metrics.update(_V6_METRICS)
             if not route_terminal_reward:
                 missing_metrics.update(_V7_METRICS)
+            if not causal_lookahead:
+                missing_metrics.update(_V8_METRICS)
             expected_metrics = set(self._metrics) - missing_metrics
             if (
                 not isinstance(metrics, dict)

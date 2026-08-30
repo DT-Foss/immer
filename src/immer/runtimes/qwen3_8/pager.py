@@ -1977,6 +1977,10 @@ class Qwen38WeightPager:
     def _release_locked(self, *, force_gc: bool) -> None:
         self._stats.release_boundaries += 1
         if force_gc:
+            if self.q4_bank is not None:
+                release_touched = getattr(self.q4_bank, "release_touched", None)
+                if callable(release_touched):
+                    release_touched(force_prefetch=True)
             self._collect_locked("forced")
         elif self.q4_bank is not None:
             # Every model layer is already an execution boundary. Drop the

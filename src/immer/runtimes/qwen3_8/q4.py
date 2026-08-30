@@ -26,7 +26,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from functools import lru_cache
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -36,6 +36,7 @@ Q4_BUILD_STATE_SCHEMA = "immer.qwen3.8-causal-q4-build-state/v1"
 Q4_VERIFY_CACHE_SCHEMA = "immer.qwen3.8-causal-q4-verify-cache/v1"
 Q4_VERIFY_CACHE_NAME = ".verify-cache-v1.json"
 Q4_NATIVE_ABI = 5
+DEFAULT_Q4_PREFETCH_MAX_BYTES = 128 * 1024**2
 Q4_BANK_CODEC_ABI = 2
 Q4_0 = "q4_0"
 Q8_0 = "q8_0"
@@ -694,12 +695,22 @@ class _MappedTensor:
             os.close(descriptor)
         self.bytes = np.frombuffer(self.mapping, dtype=np.uint8)
 
-    def discard(self, *, offset: int = 0, length: int | None = None) -> bool:
-        """Drop resident read-only pages while keeping the stable mapping open."""
+    @staticmethod
+    def prefetch_supported() -> bool:
+        return isinstance(getattr(mmap, "MADV_WILLNEED", None), int) and hasattr(
+            mmap.mmap,
+            "madvise",
+        )
 
-        advice = getattr(mmap, "MADV_DONTNEED", None)
+    def _advise(
+        self,
+        advice: object,
+        *,
+        offset: int,
+        length: int | None,
+    ) -> bool:
         madvise = getattr(self.mapping, "madvise", None)
-        if advice is None or not callable(madvise):
+        if not isinstance(advice, int) or not callable(madvise):
             return False
         if (
             isinstance(offset, bool)
@@ -724,9 +735,27 @@ class _MappedTensor:
         stop_aligned = min(size, ((stop + page - 1) // page) * page)
         try:
             madvise(advice, start_aligned, stop_aligned - start_aligned)
-        except (OSError, ValueError):
+        except (NotImplementedError, OSError, ValueError):
             return False
         return True
+
+    def discard(self, *, offset: int = 0, length: int | None = None) -> bool:
+        """Drop resident read-only pages while keeping the stable mapping open."""
+
+        return self._advise(
+            getattr(mmap, "MADV_DONTNEED", None),
+            offset=offset,
+            length=length,
+        )
+
+    def prefetch(self, *, offset: int = 0, length: int | None = None) -> bool:
+        """Ask the kernel to fault a future read-only interval ahead of demand."""
+
+        return self._advise(
+            getattr(mmap, "MADV_WILLNEED", None),
+            offset=offset,
+            length=length,
+        )
 
     def close(self) -> None:
         self.bytes = np.empty(0, dtype=np.uint8)
@@ -758,6 +787,20 @@ class Q4BankMetrics:
     page_mlp_dense_down_calls: int = 0
     page_mlp_dense_down_rows: int = 0
     page_mlp_weight_bytes: int = 0
+    page_mlp_prefetch_calls: int = 0
+    page_mlp_prefetch_requested_pages: int = 0
+    page_mlp_prefetch_selected_pages: int = 0
+    page_mlp_prefetch_pages: int = 0
+    page_mlp_prefetch_advice_calls: int = 0
+    page_mlp_prefetch_bytes: int = 0
+    page_mlp_prefetch_failures: int = 0
+    page_mlp_prefetch_unsupported: int = 0
+    page_mlp_prefetch_budget_declines: int = 0
+    page_mlp_prefetch_budget_trims: int = 0
+    page_mlp_prefetch_trimmed_pages: int = 0
+    page_mlp_prefetch_consumed_leases: int = 0
+    page_mlp_prefetch_expired_leases: int = 0
+    page_mlp_prefetch_forced_releases: int = 0
     linear_calls: int = 0
     linear_group_calls: int = 0
     linear_row_calls: int = 0
@@ -789,15 +832,25 @@ class Q4Bank:
         manifest: Mapping[str, Any],
         entries: Mapping[str, Q4TensorEntry],
         threads: int,
+        max_prefetch_bytes: int = DEFAULT_Q4_PREFETCH_MAX_BYTES,
     ) -> None:
+        if (
+            isinstance(max_prefetch_bytes, bool)
+            or not isinstance(max_prefetch_bytes, int)
+            or max_prefetch_bytes <= 0
+        ):
+            raise ValueError("max_prefetch_bytes must be a positive integer")
         self.root = root
         self.manifest = dict(manifest)
         self.entries = dict(entries)
         self.threads = threads
+        self.max_prefetch_bytes = max_prefetch_bytes
         self.native = _native_library()
         self._mapped: dict[str, _MappedTensor] = {}
         self._mapped_once: set[str] = set()
         self._touched: set[str] = set()
+        self._prefetch_leases: dict[str, int] = {}
+        self._release_clock = 0
         self._stats = Q4BankMetrics()
         self._lock = threading.RLock()
         self._closed = False
@@ -812,6 +865,7 @@ class Q4Bank:
         revision: str,
         inventory_fingerprint: str,
         threads: int | None = None,
+        max_prefetch_bytes: int = DEFAULT_Q4_PREFETCH_MAX_BYTES,
     ) -> "Q4Bank":
         source = Path(root).expanduser().resolve()
         document = _strict_document(source / "manifest.json", schema=Q4_BANK_SCHEMA)
@@ -840,7 +894,13 @@ class Q4Bank:
             threads = min(16, os.cpu_count() or 1)
         if isinstance(threads, bool) or not isinstance(threads, int) or threads <= 0:
             raise ValueError("Q4 thread count must be a positive integer")
-        return cls(source, manifest=document, entries=entries, threads=threads)
+        return cls(
+            source,
+            manifest=document,
+            entries=entries,
+            threads=threads,
+            max_prefetch_bytes=max_prefetch_bytes,
+        )
 
     @property
     def identity(self) -> dict[str, Any]:
@@ -855,7 +915,12 @@ class Q4Bank:
     def has(self, name: str) -> bool:
         return name in self.entries
 
-    def _mapping(self, name: str) -> tuple[Q4TensorEntry, _MappedTensor]:
+    def _mapping(
+        self,
+        name: str,
+        *,
+        touch: bool = True,
+    ) -> tuple[Q4TensorEntry, _MappedTensor]:
         if self._closed:
             raise Q4BankError("Q4 bank is closed")
         try:
@@ -872,7 +937,10 @@ class Q4Bank:
                 self._stats.mapping_reopens += 1
             else:
                 self._mapped_once.add(name)
-        self._touched.add(name)
+        if touch:
+            if self._prefetch_leases.pop(name, None) is not None:
+                self._stats.page_mlp_prefetch_consumed_leases += 1
+            self._touched.add(name)
         return entry, mapped
 
     def discard_rows(self, name: str, start_row: int, row_count: int) -> None:
@@ -903,13 +971,197 @@ class Q4Bank:
                 self._stats.mapping_discard_calls += 1
                 self._stats.mapping_discard_bytes += length
 
-    def release_touched(self) -> None:
+    def prefetch_mlp_pages(
+        self,
+        layer: int,
+        page_ids: Sequence[int],
+    ) -> bool:
+        """Warm one predicted Q4 MLP layer without making it release-owned."""
+
+        with self._lock:
+            if self._closed:
+                raise Q4BankError("Q4 bank is closed")
+            if isinstance(layer, bool) or not isinstance(layer, int) or layer < 0:
+                raise ValueError("Q4 MLP prefetch layer is invalid")
+            pages = tuple(page_ids)
+            base = f"model.language_model.layers.{layer}.mlp"
+            names = tuple(
+                f"{base}.{role}_proj.weight"
+                for role in ("gate", "up", "down")
+            )
+            entries = tuple(self.entries.get(name) for name in names)
+            if any(entry is None for entry in entries):
+                raise KeyError(f"Q4 MLP layer {layer} is incomplete")
+            gate_entry, up_entry, down_entry = entries
+            assert gate_entry is not None
+            assert up_entry is not None
+            assert down_entry is not None
+            if (
+                gate_entry.shape != up_entry.shape
+                or down_entry.shape[1] != gate_entry.shape[0]
+            ):
+                raise Q4BankError("Q4 MLP prefetch tensor shapes disagree")
+            page_count = (gate_entry.shape[0] + 63) // 64
+            if (
+                not pages
+                or len(set(pages)) != len(pages)
+                or any(
+                    isinstance(page, bool)
+                    or not isinstance(page, int)
+                    or not 0 <= page < page_count
+                    for page in pages
+                )
+            ):
+                raise ValueError("Q4 MLP prefetch pages are invalid")
+            self._stats.page_mlp_prefetch_calls += 1
+            self._stats.page_mlp_prefetch_requested_pages += len(pages)
+            page_size = int(getattr(mmap, "PAGESIZE", 4096))
+
+            def page_interval(
+                entry: Q4TensorEntry,
+                page: int,
+            ) -> tuple[int, int]:
+                offset = page * 64 * entry.row_bytes
+                stop = min(entry.shape[0], (page + 1) * 64) * entry.row_bytes
+                return (
+                    offset // page_size * page_size,
+                    min(
+                        entry.payload_bytes,
+                        ((stop + page_size - 1) // page_size) * page_size,
+                    ),
+                )
+
+            def add_interval(
+                intervals: list[tuple[int, int]],
+                candidate: tuple[int, int],
+            ) -> list[tuple[int, int]]:
+                start, stop = candidate
+                merged = []
+                inserted = False
+                for left, right in intervals:
+                    if right < start:
+                        merged.append((left, right))
+                    elif stop < left:
+                        if not inserted:
+                            merged.append((start, stop))
+                            inserted = True
+                        merged.append((left, right))
+                    else:
+                        start = min(start, left)
+                        stop = max(stop, right)
+                if not inserted:
+                    merged.append((start, stop))
+                return merged
+
+            bounded_pages = []
+            intervals: list[list[tuple[int, int]]] = [[], []]
+            for page in pages:
+                candidate_intervals = [
+                    add_interval(rows, page_interval(entry, page))
+                    for rows, entry in zip(
+                        intervals,
+                        (gate_entry, up_entry),
+                        strict=True,
+                    )
+                ]
+                advised_bytes = down_entry.payload_bytes + sum(
+                    stop - start
+                    for rows in candidate_intervals
+                    for start, stop in rows
+                )
+                if advised_bytes > self.max_prefetch_bytes:
+                    break
+                bounded_pages.append(page)
+                intervals = candidate_intervals
+            if not bounded_pages:
+                self._stats.page_mlp_prefetch_budget_declines += 1
+                return False
+            if len(bounded_pages) != len(pages):
+                self._stats.page_mlp_prefetch_budget_trims += 1
+                self._stats.page_mlp_prefetch_trimmed_pages += (
+                    len(pages) - len(bounded_pages)
+                )
+            pages = tuple(bounded_pages)
+            self._stats.page_mlp_prefetch_selected_pages += len(pages)
+            if not _MappedTensor.prefetch_supported():
+                self._stats.page_mlp_prefetch_unsupported += 1
+                return False
+            try:
+                mapped_rows = tuple(
+                    self._mapping(name, touch=False)
+                    for name in names
+                )
+            except Q4BankError:
+                self._stats.page_mlp_prefetch_failures += 1
+                return False
+
+            requests: list[tuple[str, _MappedTensor, int, int]] = []
+            for entry_index, (name, (_entry, mapped)) in enumerate(
+                zip(names[:2], mapped_rows[:2], strict=True)
+            ):
+                for start, stop in intervals[entry_index]:
+                    requests.append(
+                        (
+                            name,
+                            mapped,
+                            start,
+                            stop - start,
+                        )
+                    )
+            down_map = mapped_rows[2][1]
+            requests.append(
+                (
+                    names[2],
+                    down_map,
+                    0,
+                    down_entry.payload_bytes,
+                )
+            )
+
+            accepted = True
+            leased_names = set()
+            for name, mapped, offset, length in requests:
+                if mapped.prefetch(offset=offset, length=length):
+                    self._stats.page_mlp_prefetch_advice_calls += 1
+                    self._stats.page_mlp_prefetch_bytes += length
+                    leased_names.add(name)
+                else:
+                    accepted = False
+                    self._stats.page_mlp_prefetch_failures += 1
+            # One ordinary next-layer prediction crosses one layer boundary.
+            # The final-layer wrap also crosses the stack-finally boundary
+            # before layer zero of the next token. Two boundaries retain both
+            # cases while stale or abandoned advice still expires promptly.
+            expiry = self._release_clock + 2
+            for name in leased_names:
+                self._prefetch_leases[name] = expiry
+            if accepted:
+                self._stats.page_mlp_prefetch_pages += len(pages)
+            return accepted
+
+    def release_touched(self, *, force_prefetch: bool = False) -> None:
         """Remove residency accumulated since the previous execution boundary."""
 
         with self._lock:
             if self._closed:
                 raise Q4BankError("Q4 bank is closed")
-            names = tuple(self._touched)
+            if not isinstance(force_prefetch, bool):
+                raise ValueError("force_prefetch must be a boolean")
+            self._release_clock += 1
+            if force_prefetch:
+                stale = set(self._prefetch_leases)
+                self._stats.page_mlp_prefetch_forced_releases += len(stale)
+            else:
+                stale = {
+                    name
+                    for name, expiry in self._prefetch_leases.items()
+                    if expiry < self._release_clock
+                }
+                self._stats.page_mlp_prefetch_expired_leases += len(stale)
+            for name in stale:
+                self._prefetch_leases.pop(name, None)
+            active_prefetch = set(self._prefetch_leases)
+            names = tuple((self._touched - active_prefetch) | stale)
             self._touched.clear()
             for name in names:
                 mapped = self._mapped.get(name)
@@ -2102,8 +2354,12 @@ class Q4Bank:
             return {
                 **asdict(self._stats),
                 **self.identity,
+                "page_mlp_prefetch_active_leases": len(
+                    self._prefetch_leases
+                ),
                 "tensor_count": len(self.entries),
                 "payload_bytes": sum(x.payload_bytes for x in self.entries.values()),
+                "page_mlp_prefetch_max_bytes": self.max_prefetch_bytes,
                 "threads": self.threads,
                 "native_library": str(self.native.path),
                 "native_build_seconds": self.native.build_seconds,
@@ -2118,6 +2374,7 @@ class Q4Bank:
                 mapped.close()
             self._mapped.clear()
             self._touched.clear()
+            self._prefetch_leases.clear()
             self._closed = True
 
 

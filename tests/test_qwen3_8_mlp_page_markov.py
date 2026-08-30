@@ -607,15 +607,15 @@ class MlpPageMarkovTests(unittest.TestCase):
             self.assertEqual(reopened.metrics()["adaptive_width_predictions"], 1)
             reopened.close()
 
-    def test_v3_state_migrates_to_v7_without_losing_learned_state(self) -> None:
+    def test_v3_state_migrates_to_v8_without_losing_learned_state(self) -> None:
         self.assertEqual(
             MLP_PAGE_MARKOV_SCHEMA,
-            "immer.qwen3.8-mlp-page-markov/v7",
+            "immer.qwen3.8-mlp-page-markov/v8",
         )
         self.assertEqual(
             MLP_PAGE_MARKOV_POLICY,
             "dynamic-page-transitions+coactivation+adaptive-width+"
-            "terminal-route-advantage+fixed-share/v7",
+            "terminal-route-advantage+causal-lookahead-prefetch+fixed-share/v8",
         )
         legacy_metrics = {
             "agent_feedback": 18,
@@ -720,6 +720,9 @@ class MlpPageMarkovTests(unittest.TestCase):
                     "runtime_reward_trace_rows": 0,
                     "runtime_reward_updates": 0,
                     "runtime_reward_route_agent_feedback": 0,
+                    "lookahead_prefetch_calls": 0,
+                    "lookahead_prefetch_pages": 0,
+                    "lookahead_prefetch_successes": 0,
                 },
             )
             self.assertEqual(
@@ -777,6 +780,9 @@ class MlpPageMarkovTests(unittest.TestCase):
                     "runtime_reward_trace_rows": 0,
                     "runtime_reward_updates": 0,
                     "runtime_reward_route_agent_feedback": 0,
+                    "lookahead_prefetch_calls": 0,
+                    "lookahead_prefetch_pages": 0,
+                    "lookahead_prefetch_successes": 0,
                     "prediction_calls": legacy_metrics["prediction_calls"] + 1,
                     "predicted_pages": legacy_metrics["predicted_pages"] + 2,
                     "ready_predictions": legacy_metrics["ready_predictions"] + 1,
@@ -797,7 +803,7 @@ class MlpPageMarkovTests(unittest.TestCase):
             self.assertEqual(reopened._cross[(0, 3)], {4: 19})
             reopened.close()
 
-    def test_v4_state_migrates_to_v7_on_the_next_persistent_update(self) -> None:
+    def test_v4_state_migrates_to_v8_on_the_next_persistent_update(self) -> None:
         def canonical(value: object) -> bytes:
             return json.dumps(
                 value,
@@ -845,6 +851,9 @@ class MlpPageMarkovTests(unittest.TestCase):
             "runtime_reward_trace_rows",
             "runtime_reward_updates",
             "runtime_reward_route_agent_feedback",
+            "lookahead_prefetch_calls",
+            "lookahead_prefetch_pages",
+            "lookahead_prefetch_successes",
         ):
             body["metrics"].pop(key)
 
@@ -899,7 +908,7 @@ class MlpPageMarkovTests(unittest.TestCase):
             self.assertEqual(migrated["body"]["last_widths"], [2])
             self.assertEqual(migrated["body"]["width_marginal"], [])
 
-    def test_v5_state_load_is_read_only_until_a_v7_update(self) -> None:
+    def test_v5_state_load_is_read_only_until_a_v8_update(self) -> None:
         def canonical(value: object) -> bytes:
             return json.dumps(
                 value,
@@ -923,6 +932,9 @@ class MlpPageMarkovTests(unittest.TestCase):
         body["metrics"].pop("runtime_reward_trace_rows")
         body["metrics"].pop("runtime_reward_updates")
         body["metrics"].pop("runtime_reward_route_agent_feedback")
+        body["metrics"].pop("lookahead_prefetch_calls")
+        body["metrics"].pop("lookahead_prefetch_pages")
+        body["metrics"].pop("lookahead_prefetch_successes")
 
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "pages-v5.json"
@@ -976,7 +988,7 @@ class MlpPageMarkovTests(unittest.TestCase):
                 0.0,
             )
 
-    def test_v6_state_load_is_read_only_until_a_v7_route_reward(self) -> None:
+    def test_v6_state_load_is_read_only_until_a_v8_route_reward(self) -> None:
         def canonical(value: object) -> bytes:
             return json.dumps(
                 value,
@@ -993,6 +1005,9 @@ class MlpPageMarkovTests(unittest.TestCase):
             "terminal-reward+fixed-share/v6"
         )
         body["metrics"].pop("runtime_reward_route_agent_feedback")
+        body["metrics"].pop("lookahead_prefetch_calls")
+        body["metrics"].pop("lookahead_prefetch_pages")
+        body["metrics"].pop("lookahead_prefetch_successes")
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "pages-v6.json"
             encoded = canonical(
@@ -1038,6 +1053,67 @@ class MlpPageMarkovTests(unittest.TestCase):
                     "runtime_reward_route_agent_feedback"
                 ],
                 0,
+            )
+
+    def test_v7_state_load_is_read_only_until_v8_lookahead_state(self) -> None:
+        def canonical(value: object) -> bytes:
+            return json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+
+        seed = self._runtime_reward_controller()
+        body = seed._body()
+        body["config"]["policy"] = (
+            "dynamic-page-transitions+coactivation+adaptive-width+"
+            "terminal-route-advantage+fixed-share/v7"
+        )
+        for key in (
+            "lookahead_prefetch_calls",
+            "lookahead_prefetch_pages",
+            "lookahead_prefetch_successes",
+        ):
+            body["metrics"].pop(key)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "pages-v7.json"
+            encoded = canonical(
+                {
+                    "body": body,
+                    "schema": "immer.qwen3.8-mlp-page-markov/v7",
+                    "sha256": hashlib.sha256(canonical(body)).hexdigest(),
+                }
+            )
+            path.write_bytes(encoded)
+
+            restored = MlpPageMarkov(
+                path,
+                n_layers=1,
+                page_count=8,
+                route_width=4,
+                min_exact_rows=1,
+            )
+            self.assertEqual(restored.metrics()["lookahead_prefetch_calls"], 0)
+            restored.close()
+            self.assertEqual(path.read_bytes(), encoded)
+
+            migrating = MlpPageMarkov(
+                path,
+                n_layers=1,
+                page_count=8,
+                route_width=4,
+                min_exact_rows=1,
+            )
+            prediction = migrating.prepare(0)
+            migrating.advance_selected(0, prediction.page_ids)
+            migrating.close()
+            document = json.loads(path.read_text())
+            self.assertEqual(document["schema"], MLP_PAGE_MARKOV_SCHEMA)
+            self.assertEqual(
+                document["body"]["config"]["policy"],
+                MLP_PAGE_MARKOV_POLICY,
             )
 
     def test_tamper_and_nested_state_corruption_are_rejected(self) -> None:
@@ -1126,6 +1202,60 @@ class MlpPageMarkovTests(unittest.TestCase):
         failing.observe_exact_batch(0, [1])
         with self.assertRaisesRegex(RuntimeError, "boom"):
             failing.prepare(0)
+
+    def test_causal_lookahead_prefetches_the_next_layer_route(self) -> None:
+        calls: list[tuple[int, tuple[int, ...]]] = []
+        controller = MlpPageMarkov(
+            None,
+            n_layers=2,
+            page_count=8,
+            route_width=2,
+            min_exact_rows=1,
+            lookahead_prefetch=lambda layer, pages: (
+                calls.append((layer, pages)) or True
+            ),
+        )
+        controller.prepare(0)
+        controller.observe_exact_batch(0, [0, 1])
+        controller.prepare(1)
+        controller.observe_exact_batch(1, [2, 3])
+        controller.compile_routes()
+
+        layer0 = controller.route(0, row_count=1)
+        self.assertTrue(layer0.ready)
+        self.assertEqual(calls[0][0], 1)
+        controller.advance_selected(0, layer0.page_ids)
+        layer1 = controller.route(1, row_count=1)
+        self.assertTrue(layer1.ready)
+        self.assertEqual(calls[1][0], 0)
+        self.assertEqual(calls[0][1], layer1.page_ids)
+        controller.advance_selected(1, layer1.page_ids)
+        next_layer0 = controller.route(0, row_count=1)
+        self.assertEqual(calls[1][1], next_layer0.page_ids)
+        controller.advance_selected(0, next_layer0.page_ids)
+
+        metrics = controller.metrics()
+        self.assertEqual(metrics["lookahead_prefetch_calls"], 3)
+        self.assertEqual(metrics["lookahead_prefetch_pages"], 6)
+        self.assertEqual(metrics["lookahead_prefetch_successes"], 3)
+        self.assertEqual(controller._pending_lookahead_prefetch, {})
+
+    def test_lookahead_prefetch_failure_is_explicit(self) -> None:
+        controller = MlpPageMarkov(
+            None,
+            n_layers=1,
+            page_count=4,
+            route_width=1,
+            min_exact_rows=1,
+            lookahead_prefetch=lambda _layer, _pages: (_ for _ in ()).throw(
+                RuntimeError("lookahead boom")
+            ),
+        )
+        controller.prepare(0)
+        controller.observe_exact_batch(0, [2])
+        controller.compile_routes()
+        with self.assertRaisesRegex(RuntimeError, "lookahead boom"):
+            controller.route(0, row_count=1)
 
     def test_invalid_routes_scores_and_closed_use_are_rejected(self) -> None:
         controller = MlpPageMarkov(
@@ -1314,6 +1444,7 @@ class MlpPageMarkovTests(unittest.TestCase):
         self,
     ) -> None:
         calls: list[tuple[int, tuple[int, ...]]] = []
+        lookahead_calls: list[tuple[int, tuple[int, ...]]] = []
 
         def prefetch(layer: int, pages: tuple[int, ...]) -> bool:
             calls.append((layer, pages))
@@ -1326,6 +1457,9 @@ class MlpPageMarkovTests(unittest.TestCase):
             route_width=1,
             min_exact_rows=1,
             prefetch=prefetch,
+            lookahead_prefetch=lambda layer, pages: (
+                lookahead_calls.append((layer, pages)) or True
+            ),
         )
         controller.prepare(0)
         controller.observe_exact_batch(0, [2])
@@ -1337,12 +1471,16 @@ class MlpPageMarkovTests(unittest.TestCase):
         second = controller.route(0, row_count=1)
         controller.advance_selected(0, second.page_ids)
         self.assertEqual(len(calls), 2)
+        self.assertEqual(len(lookahead_calls), 2)
 
         controller.commit_transaction(accepted_rows=1)
         self.assertEqual(len(calls), 2)
+        self.assertEqual(len(lookahead_calls), 2)
         metrics = controller.metrics()
         self.assertEqual(metrics["prefetch_calls"], 1)
         self.assertEqual(metrics["prefetch_successes"], 1)
+        self.assertEqual(metrics["lookahead_prefetch_calls"], 1)
+        self.assertEqual(metrics["lookahead_prefetch_successes"], 1)
         self.assertEqual(metrics["selected_advances"], 1)
 
         prepared = MlpPageMarkov(

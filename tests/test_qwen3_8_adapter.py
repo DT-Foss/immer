@@ -491,10 +491,18 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "terminal-reward+fixed-share/v6"
             ),
         )
+        width192_v7_identity = width192._draft_window_runtime_identity(
+            mlp_page_schema="immer.qwen3.8-mlp-page-markov/v7",
+            mlp_page_policy=(
+                "dynamic-page-transitions+coactivation+adaptive-width+"
+                "terminal-route-advantage+fixed-share/v7"
+            ),
+        )
 
         self.assertNotEqual(disabled_identity, width192_identity)
         self.assertNotEqual(width160_identity, width192_identity)
         self.assertNotEqual(width192_v6_identity, width192_identity)
+        self.assertNotEqual(width192_v7_identity, width192_identity)
         with patch(
             "immer.runtimes.qwen3_8.adapter.DRAFT_WINDOW_FEEDBACK_SCHEMA",
             "immer.qwen3.8-draft-window-feedback/v999",
@@ -517,9 +525,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "mlp_page_enabled": True,
                 "mlp_page_policy": (
                     "dynamic-page-transitions+coactivation+adaptive-width+"
-                    "terminal-route-advantage+fixed-share/v7"
+                    "terminal-route-advantage+causal-lookahead-prefetch+"
+                    "fixed-share/v8"
                 ),
-                "mlp_page_schema": "immer.qwen3.8-mlp-page-markov/v7",
+                "mlp_page_schema": "immer.qwen3.8-mlp-page-markov/v8",
                 "o1_enabled": False,
                 "policy": "o1+draft+page-savings-target-work/v1",
                 "route_width": 192,
@@ -663,6 +672,107 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 source.set_access_observer.call_args_list[-1].args,
                 (None,),
             )
+            mount.close.assert_called_once_with()
+
+    def test_runtime_wires_q4_page_lookahead_into_the_live_router(self) -> None:
+        from immer.runtimes.deepseek_v4.causal_weights import LogicalModelIdentity
+        from immer.runtimes.qwen3_8.adapter import _open_local_runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tokenizer_path = root / "tokenizer.json"
+            tokenizer_path.write_text("{}", encoding="utf-8")
+            source = SimpleNamespace(
+                repo_id="Qwen/test",
+                revision="a" * 40,
+                metrics=Mock(
+                    return_value={"inventory_source_fingerprint": "b" * 64}
+                ),
+            )
+            mount = SimpleNamespace(
+                source=source,
+                tensor_reader=object(),
+                weights_root=root,
+                close=Mock(),
+            )
+            q4 = SimpleNamespace(
+                identity={"manifest_sha256": "c" * 64},
+                prefetch_mlp_pages=Mock(return_value=True),
+                metrics=Mock(return_value={}),
+                close=Mock(),
+            )
+            pager = SimpleNamespace(
+                attach_exact_head_index=Mock(),
+                close=Mock(),
+            )
+            model = SimpleNamespace(
+                checkpoint_preflight=Mock(return_value={"ok": True}),
+                reset_state=Mock(),
+                mlp_sparse_executor=None,
+                mlp_page_router=None,
+                delta_head_router=None,
+            )
+            router = SimpleNamespace(close=Mock())
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.CausalWeightMount",
+                    return_value=mount,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.verify_qwen38_causal_mount",
+                    return_value=_BUNDLE_RECEIPT,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38Config.from_file",
+                    return_value=SimpleNamespace(n_layers=2, intermediate_size=128),
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Q4Bank.load",
+                    return_value=q4,
+                ) as q4_loader,
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38WeightPager",
+                    return_value=pager,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.StreamedQwen38",
+                    return_value=model,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.MlpPageMarkov",
+                    return_value=router,
+                ) as page_constructor,
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38Tokenizer",
+                    return_value=SimpleNamespace(),
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter._file_sha256",
+                    return_value=_DIGEST,
+                ),
+            ):
+                runtime = _open_local_runtime(
+                    bundle_path=root,
+                    tokenizer_path=tokenizer_path,
+                    identity=LogicalModelIdentity("Qwen/test", "a" * 40),
+                    require_official_config=False,
+                    device="cpu",
+                    compute_dtype="bfloat16",
+                    source_budget_mb=1,
+                    max_resident_bytes=1024,
+                    max_context_tokens=16,
+                    q4_root=root / "q4",
+                    mlp_page_state_path=root / "pages.json",
+                    mlp_page_route_width=2,
+                )
+
+            options = page_constructor.call_args.kwargs
+            self.assertEqual(q4_loader.call_args.kwargs["max_prefetch_bytes"], 512)
+            self.assertIs(options["lookahead_prefetch"], q4.prefetch_mlp_pages)
+            self.assertEqual(options["n_layers"], 2)
+            self.assertEqual(options["page_count"], 2)
+            self.assertEqual(options["route_width"], 2)
+            runtime.close()
             mount.close.assert_called_once_with()
 
     def test_range_markov_metrics_are_exposed_without_changing_generation(self) -> None:
@@ -3261,6 +3371,18 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         "last_width_min": 96,
                     },
                 },
+                "q4": {
+                    "request": {
+                        "page_mlp_prefetch_budget_declines": 1,
+                        "page_mlp_prefetch_bytes": 80 * 1024**2,
+                        "page_mlp_prefetch_calls": 63,
+                        "page_mlp_prefetch_consumed_leases": 186,
+                        "page_mlp_prefetch_failures": 0,
+                        "page_mlp_prefetch_pages": 8064,
+                        "page_mlp_prefetch_requested_pages": 9000,
+                        "page_mlp_prefetch_trimmed_pages": 936,
+                    }
+                },
                 "runtime_reward": {
                     "accepted_draft_tokens": 5,
                     "o1_priority": 9.0,
@@ -3333,6 +3455,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "MLP pages 64 dynamic routes, 7 changed, 12 exact rows learned, "
                 "24 coactive edges, 128 pages skipped, 12 energy labels, "
                 "width 96-128.5 · "
+                "Q4 lookahead 63 calls, 8064 pages fully advised, "
+                "80.0 MiB advised, "
+                "186 leases consumed, 9000 pages requested, "
+                "936 pages budget-trimmed, 1 budget declines · "
                 "joint reward 2.35 (draft 5, pages 128, O1 9.00) · "
                 "5 accepted draft tokens · "
                 "Hybrid 2 provider tournaments Markov1/MTP1, "

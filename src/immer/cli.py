@@ -724,6 +724,74 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                         )
                 if page_parts:
                     parts.append("MLP pages " + ", ".join(page_parts))
+        q4 = evidence.get("q4")
+        if isinstance(q4, dict):
+            q4_request = q4.get("request")
+            if isinstance(q4_request, dict):
+                prefetch_calls = q4_request.get("page_mlp_prefetch_calls")
+                prefetch_pages = q4_request.get("page_mlp_prefetch_pages")
+                requested_pages = q4_request.get(
+                    "page_mlp_prefetch_requested_pages"
+                )
+                selected_pages = q4_request.get(
+                    "page_mlp_prefetch_selected_pages"
+                )
+                prefetch_bytes = q4_request.get("page_mlp_prefetch_bytes")
+                consumed = q4_request.get(
+                    "page_mlp_prefetch_consumed_leases"
+                )
+                declines = q4_request.get(
+                    "page_mlp_prefetch_budget_declines"
+                )
+                trims = q4_request.get("page_mlp_prefetch_trimmed_pages")
+                failures = q4_request.get("page_mlp_prefetch_failures")
+                if (
+                    isinstance(prefetch_calls, int)
+                    and not isinstance(prefetch_calls, bool)
+                    and prefetch_calls > 0
+                    and isinstance(prefetch_pages, int)
+                    and not isinstance(prefetch_pages, bool)
+                    and isinstance(prefetch_bytes, int)
+                    and not isinstance(prefetch_bytes, bool)
+                ):
+                    detail = (
+                        f"Q4 lookahead {prefetch_calls} calls, "
+                        f"{prefetch_pages} pages fully advised, "
+                        f"{prefetch_bytes / 1024**2:.1f} MiB advised"
+                    )
+                    if isinstance(consumed, int) and not isinstance(consumed, bool):
+                        detail += f", {consumed} leases consumed"
+                    if (
+                        isinstance(selected_pages, int)
+                        and not isinstance(selected_pages, bool)
+                        and selected_pages > prefetch_pages
+                    ):
+                        detail += f", {selected_pages} pages budget-selected"
+                    if (
+                        isinstance(requested_pages, int)
+                        and not isinstance(requested_pages, bool)
+                        and requested_pages > prefetch_pages
+                    ):
+                        detail += f", {requested_pages} pages requested"
+                    if (
+                        isinstance(trims, int)
+                        and not isinstance(trims, bool)
+                        and trims > 0
+                    ):
+                        detail += f", {trims} pages budget-trimmed"
+                    if (
+                        isinstance(declines, int)
+                        and not isinstance(declines, bool)
+                        and declines > 0
+                    ):
+                        detail += f", {declines} budget declines"
+                    if (
+                        isinstance(failures, int)
+                        and not isinstance(failures, bool)
+                        and failures > 0
+                    ):
+                        detail += f", {failures} advice failures"
+                    parts.append(detail)
         runtime_reward = evidence.get("runtime_reward")
         if isinstance(runtime_reward, dict):
             reward = runtime_reward.get("reward")
