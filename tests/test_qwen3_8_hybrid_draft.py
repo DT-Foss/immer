@@ -15,6 +15,7 @@ from immer.runtimes.qwen3_8.hybrid_draft import (
 )
 from immer.runtimes.qwen3_8.markov_draft import (
     FingerprintRollingK4DraftProvider,
+    MarkovLanguageTokenEvidence,
 )
 from immer.runtimes.qwen3_8.markov_atlas import AtlasTokenEvidence
 
@@ -52,6 +53,7 @@ class _Markov:
         *,
         tokens: tuple[int, ...] = (3, 4, 5),
         atlas_scores: tuple[float, ...] = (),
+        online_scores: tuple[float, ...] = (),
     ) -> None:
         self.confidences = (
             [float(confidence)]
@@ -61,6 +63,7 @@ class _Markov:
         self.confidence = self.confidences[0]
         self.tokens = tokens
         self.atlas_scores = atlas_scores
+        self.online_scores = online_scores
         self._proposal_index = 0
         self.begin_calls = []
         self.propose_calls = []
@@ -108,6 +111,28 @@ class _Markov:
                 score=score,
             )
             for token, score in zip(token_ids, self.atlas_scores, strict=True)
+        )
+
+    def language_evidence_for_pending(self, token_ids):
+        if not self.atlas_scores and not self.online_scores:
+            return ()
+        atlas = self.atlas_scores or (0.0,) * len(token_ids)
+        online = self.online_scores or (0.0,) * len(token_ids)
+        return tuple(
+            MarkovLanguageTokenEvidence(
+                token_id=token,
+                atlas_score=atlas_score,
+                online_score=online_score,
+                score=1.0 - (1.0 - atlas_score) * (1.0 - online_score),
+                atlas_support=8 if atlas_score > 0.0 else 0,
+                online_support=8 if online_score > 0.0 else 0,
+            )
+            for token, atlas_score, online_score in zip(
+                token_ids,
+                atlas,
+                online,
+                strict=True,
+            )
         )
 
     def observe_verification(self, accepted, verified):
@@ -365,7 +390,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(proposal.token_ids, (7, 8, 9))
         self.assertEqual(
             proposal.provider_abi,
-            "immer.qwen3.8-markov-mtp-hybrid-provider/v16",
+            "immer.qwen3.8-markov-mtp-hybrid-provider/v17",
         )
         self.assertTrue(
             all(abs(value - 0.7625) < 1e-12 for value in proposal.token_confidences)
@@ -407,6 +432,31 @@ class Qwen38HybridDraftTests(unittest.TestCase):
             metrics.last_atlas_consensus_confidence_gain,
             0.075,
         )
+        provider.observe_verification(1, 2)
+        provider.reconcile_prefix((*prompt, 4, 7))
+        provider.observe_final((*prompt, 4, 7, 10))
+        provider.close()
+
+    def test_online_memory_votes_for_mtp_tokens_without_static_atlas(self) -> None:
+        markov = _Markov(
+            0.01,
+            tokens=(31, 32, 33),
+            online_scores=(0.6, 0.2, 0.0),
+        )
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        proposal = provider.propose_round_state(prompt, 4, hidden[:, -1:])
+
+        self.assertEqual(proposal.token_confidences, (0.7875, 0.7625, 0.75))
+        metrics = provider.metrics()
+        self.assertEqual(metrics.atlas_consensus_tokens, 0)
+        self.assertEqual(metrics.online_consensus_rounds, 1)
+        self.assertEqual(metrics.online_consensus_tokens, 2)
+        self.assertAlmostEqual(metrics.online_consensus_confidence_gain, 0.05)
         provider.observe_verification(1, 2)
         provider.reconcile_prefix((*prompt, 4, 7))
         provider.observe_final((*prompt, 4, 7, 10))
@@ -661,7 +711,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(mtp.advance_calls[0][2], final_hidden))
 
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v16")
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v17")
         self.assertEqual(metrics.selected_provider, "markov")
         self.assertEqual(metrics.selection_calls, 4)
         self.assertEqual(metrics.markov_rounds, 3)

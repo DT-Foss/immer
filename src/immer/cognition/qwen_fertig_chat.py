@@ -373,6 +373,19 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                     )
                     if key in markov
                 }
+                compact_draft["online_memory"] = {
+                    key: markov[key]
+                    for key in (
+                        "history_capacity_tokens",
+                        "learned_tokens",
+                        "online_vote_calls",
+                        "online_vote_max_score",
+                        "online_vote_score_sum",
+                        "online_vote_supported_tokens",
+                        "online_vote_tokens",
+                    )
+                    if key in markov
+                }
             compact_draft["provider"] = {
                 key: provider[key]
                 for key in (
@@ -383,6 +396,9 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                     "markov_selections",
                     "mtp_rounds",
                     "mtp_selections",
+                    "online_consensus_confidence_gain",
+                    "online_consensus_rounds",
+                    "online_consensus_tokens",
                     "provider_switches",
                 )
                 if key in provider

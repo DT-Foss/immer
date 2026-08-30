@@ -147,6 +147,7 @@ from .markov_draft import (
     MarkovDraftMetrics,
     MarkovDraftState,
     MarkovExpertSpec,
+    MarkovLanguageTokenEvidence,
     MarkovPhraseOption,
 )
 from .markov_atlas import (
@@ -469,6 +470,7 @@ __all__ = [
     "MarkovDraftMetrics",
     "MarkovDraftState",
     "MarkovExpertSpec",
+    "MarkovLanguageTokenEvidence",
     "MarkovPhraseOption",
     "MarkovAtlasError",
     "MarkovTokenAtlas",

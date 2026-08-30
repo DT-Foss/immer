@@ -126,6 +126,71 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                 self.assertIs(first_row[0], second_row[0])
         provider.close()
 
+    def test_live_answer_memory_scores_external_mtp_candidates(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_history_tokens=256,
+            proposal_width=3,
+        )
+        episodes = (
+            (2, 3, 4, 5),
+            (2, 3, 4, 6),
+            (2, 3, 4, 7),
+            (2, 3, 4, 8),
+        )
+        provider._state = replace(
+            provider._state,
+            token_ids=tuple(token for row in episodes for token in row),
+            episode_lengths=tuple(len(row) for row in episodes),
+            episode_dialects=(None,) * len(episodes),
+            episode_prompt_lengths=(None,) * len(episodes),
+            expert_observations=(16,) * len(provider._experts),
+            expert_hits=(12,) * len(provider._experts),
+        )
+        prompt = (20, 21)
+        provider.begin_request(prompt)
+        provider.propose_round(prompt, 2)
+
+        rows = provider.language_evidence_for_pending((3, 4, 5))
+
+        self.assertEqual(tuple(row.token_id for row in rows), (3, 4, 5))
+        self.assertTrue(all(row.atlas_score == 0.0 for row in rows))
+        self.assertGreater(rows[0].online_score, 0.0)
+        self.assertGreater(rows[1].online_score, 0.0)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.online_vote_calls, 1)
+        self.assertEqual(metrics.online_vote_tokens, 3)
+        self.assertGreaterEqual(metrics.online_vote_supported_tokens, 2)
+        provider.discard_pending_proposal()
+        provider.observe_final((*prompt, 2, 3))
+        provider.close()
+
+    def test_uncalibrated_live_memory_cannot_boost_mtp_confidence(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        episodes = ((2, 3, 4), (2, 3, 5), (2, 3, 6))
+        provider._state = replace(
+            provider._state,
+            token_ids=tuple(token for row in episodes for token in row),
+            episode_lengths=(3, 3, 3),
+            episode_dialects=(None, None, None),
+            episode_prompt_lengths=(None, None, None),
+        )
+        prompt = (20, 21)
+        provider.begin_request(prompt)
+        provider.propose_round(prompt, 2)
+
+        rows = provider.language_evidence_for_pending((3, 4, 5))
+
+        self.assertGreater(rows[0].online_support, 0)
+        self.assertTrue(all(row.online_score == 0.0 for row in rows))
+        provider.discard_pending_proposal()
+        provider.observe_final((*prompt, 2, 3))
+        provider.close()
+
     def test_confirmed_request_persists_its_prompt_boundary(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         prompt = (1, 4, 7)

@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v23"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v24"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -44,7 +44,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v20"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v21"
 _STATE_PREFIX = b"IMMD\x09"
 _V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
@@ -193,6 +193,70 @@ class _TransitionFingerprint:
                     token
                 ] + weight * empirical
         return probabilities
+
+    def token_evidence(
+        self,
+        context: Sequence[str],
+        token: str,
+    ) -> tuple[float, int, int, int]:
+        known = tuple(
+            value if value in self.vocabulary else _UNKNOWN_TOKEN for value in context
+        )
+        candidates = []
+        for order in range(min(self.max_order, len(known)) + 1):
+            key = () if order == 0 else known[-order:]
+            counter = self.counts.get(key)
+            if not counter:
+                continue
+            support = int(counter.get(token, 0))
+            total = sum(counter.values())
+            if support <= 0 or total < self.min_count:
+                continue
+            probability = support / total
+            support_strength = 1.0 - math.exp(-support / 4.0)
+            order_strength = 0.5 + 0.5 * order / max(1, self.max_order)
+            candidates.append(
+                (
+                    probability * support_strength * order_strength,
+                    support,
+                    total,
+                    order,
+                )
+            )
+        return max(candidates, default=(0.0, 0, 0, 0))
+
+
+@dataclass(frozen=True, slots=True)
+class MarkovLanguageTokenEvidence:
+    token_id: int
+    atlas_score: float
+    online_score: float
+    score: float
+    atlas_support: int
+    online_support: int
+
+    @property
+    def support(self) -> int:
+        return self.atlas_support + self.online_support
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.token_id, bool)
+            or not isinstance(self.token_id, int)
+            or self.token_id < 0
+            or any(
+                not math.isfinite(value) or not 0.0 <= value <= 1.0
+                for value in (self.atlas_score, self.online_score, self.score)
+            )
+            or isinstance(self.atlas_support, bool)
+            or not isinstance(self.atlas_support, int)
+            or self.atlas_support < 0
+            or isinstance(self.online_support, bool)
+            or not isinstance(self.online_support, int)
+            or self.online_support < 0
+            or self.score + 1e-15 < max(self.atlas_score, self.online_score)
+        ):
+            raise ValueError("Markov language evidence is invalid")
 
 
 def _canonical(value: object) -> bytes:
@@ -1160,6 +1224,11 @@ class MarkovDraftMetrics:
     atlas_vote_supported_tokens: int
     atlas_vote_score_sum: float
     atlas_vote_max_score: float
+    online_vote_calls: int
+    online_vote_tokens: int
+    online_vote_supported_tokens: int
+    online_vote_score_sum: float
+    online_vote_max_score: float
     composition_programs: int
     composition_option_calls: int
     composition_draft_tokens: int
@@ -1390,6 +1459,11 @@ class FingerprintRollingK4DraftProvider:
         self._atlas_vote_supported_tokens = 0
         self._atlas_vote_score_sum = 0.0
         self._atlas_vote_max_score = 0.0
+        self._online_vote_calls = 0
+        self._online_vote_tokens = 0
+        self._online_vote_supported_tokens = 0
+        self._online_vote_score_sum = 0.0
+        self._online_vote_max_score = 0.0
         self._last_phrase_option: MarkovPhraseOption | None = None
         self._composition_cache: dict[
             str | None,
@@ -2997,6 +3071,85 @@ class FingerprintRollingK4DraftProvider:
         )
         return evidence
 
+    def language_evidence_for_pending(
+        self,
+        token_ids: Sequence[int],
+        /,
+    ) -> tuple[MarkovLanguageTokenEvidence, ...]:
+        """Join static Atlas support with the live target-confirmed PPM overlay."""
+
+        proposed = self._token_tuple(
+            token_ids,
+            label="language Council proposal",
+        )
+        if self._pending_base is None or self._pending_proposal is None:
+            raise MarkovDraftError("language Council vote requires a pending proposal")
+        if len(proposed) != len(self._pending_proposal):
+            raise MarkovDraftError("language Council proposal width changed")
+        atlas_rows = self.atlas_evidence_for_pending(proposed)
+        experts = self._expert_models(self._pending_base)
+        base_weights = self._weights()
+        rows = []
+        for position, token_id in enumerate(proposed):
+            weights = self._position_weighting(position, base_weights)[0]
+            symbol = self._symbol(token_id)
+            online_score = 0.0
+            online_support = 0
+            for index, (spec, (model, context), weight) in enumerate(
+                zip(self._experts, experts, weights, strict=True)
+            ):
+                if spec.local_only:
+                    context.append(symbol)
+                    continue
+                score, support, _total, _order = model.token_evidence(
+                    context,
+                    symbol,
+                )
+                observations = self._state.horizon_expert_observations[position][
+                    index
+                ]
+                hits = self._state.horizon_expert_hits[position][index]
+                if observations <= 0:
+                    observations = self._state.expert_observations[index]
+                    hits = self._state.expert_hits[index]
+                reliability = 0.0
+                if observations > 0:
+                    maturity = observations / (
+                        observations + self.EMPIRICAL_EVIDENCE_SATURATION
+                    )
+                    posterior = (hits + 1.0) / (observations + 2.0)
+                    reliability = maturity * posterior
+                online_score += float(weight) * score * reliability
+                online_support = max(online_support, support)
+                context.append(symbol)
+            atlas_row = None if not atlas_rows else atlas_rows[position]
+            atlas_score = 0.0 if atlas_row is None else atlas_row.score
+            atlas_support = 0 if atlas_row is None else atlas_row.support
+            online_score = max(0.0, min(1.0, online_score))
+            combined = 1.0 - (1.0 - atlas_score) * (1.0 - online_score)
+            rows.append(
+                MarkovLanguageTokenEvidence(
+                    token_id=token_id,
+                    atlas_score=atlas_score,
+                    online_score=online_score,
+                    score=combined,
+                    atlas_support=atlas_support,
+                    online_support=online_support,
+                )
+            )
+        result = tuple(rows)
+        self._online_vote_calls += 1
+        self._online_vote_tokens += len(result)
+        self._online_vote_supported_tokens += sum(
+            row.online_support > 0 for row in result
+        )
+        self._online_vote_score_sum += sum(row.online_score for row in result)
+        self._online_vote_max_score = max(
+            self._online_vote_max_score,
+            *(row.online_score for row in result),
+        )
+        return result
+
     def _learn_episode(
         self,
         tokens: Sequence[int],
@@ -3560,6 +3713,11 @@ class FingerprintRollingK4DraftProvider:
             atlas_vote_supported_tokens=self._atlas_vote_supported_tokens,
             atlas_vote_score_sum=self._atlas_vote_score_sum,
             atlas_vote_max_score=self._atlas_vote_max_score,
+            online_vote_calls=self._online_vote_calls,
+            online_vote_tokens=self._online_vote_tokens,
+            online_vote_supported_tokens=self._online_vote_supported_tokens,
+            online_vote_score_sum=self._online_vote_score_sum,
+            online_vote_max_score=self._online_vote_max_score,
             composition_programs=self._composition_program_count,
             composition_option_calls=self._composition_option_calls,
             composition_draft_tokens=self._composition_draft_tokens,
@@ -3655,5 +3813,6 @@ __all__ = [
     "MarkovDraftMetrics",
     "MarkovDraftState",
     "MarkovExpertSpec",
+    "MarkovLanguageTokenEvidence",
     "MarkovPhraseOption",
 ]
