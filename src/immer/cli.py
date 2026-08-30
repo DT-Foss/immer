@@ -743,6 +743,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 declines = q4_request.get(
                     "page_mlp_prefetch_budget_declines"
                 )
+                budget_fraction_sum = q4_request.get(
+                    "page_mlp_prefetch_budget_fraction_sum_ppm"
+                )
                 trims = q4_request.get("page_mlp_prefetch_trimmed_pages")
                 failures = q4_request.get("page_mlp_prefetch_failures")
                 if (
@@ -759,6 +762,14 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                         f"{prefetch_pages} pages fully advised, "
                         f"{prefetch_bytes / 1024**2:.1f} MiB advised"
                     )
+                    if (
+                        isinstance(budget_fraction_sum, int)
+                        and not isinstance(budget_fraction_sum, bool)
+                    ):
+                        detail += (
+                            f", {budget_fraction_sum / prefetch_calls / 10_000:.1f}% "
+                            "mean budget"
+                        )
                     if isinstance(consumed, int) and not isinstance(consumed, bool):
                         detail += f", {consumed} leases consumed"
                     if (

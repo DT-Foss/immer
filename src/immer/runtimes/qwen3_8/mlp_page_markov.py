@@ -16,8 +16,12 @@ import threading
 from typing import Any
 
 
-MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v8"
+MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v9"
 MLP_PAGE_MARKOV_POLICY = (
+    "dynamic-page-transitions+coactivation+adaptive-width+terminal-route-advantage+consensus-budget-lookahead+fixed-share/v9"
+)
+_V8_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v8"
+_V8_MLP_PAGE_MARKOV_POLICY = (
     "dynamic-page-transitions+coactivation+adaptive-width+terminal-route-advantage+causal-lookahead-prefetch+fixed-share/v8"
 )
 _V7_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v7"
@@ -29,6 +33,7 @@ _V6_MLP_PAGE_MARKOV_POLICY = (
     "dynamic-page-transitions+coactivation+adaptive-width+terminal-reward+fixed-share/v6"
 )
 MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS = (
+    (_V8_MLP_PAGE_MARKOV_SCHEMA, _V8_MLP_PAGE_MARKOV_POLICY),
     (_V7_MLP_PAGE_MARKOV_SCHEMA, _V7_MLP_PAGE_MARKOV_POLICY),
     (_V6_MLP_PAGE_MARKOV_SCHEMA, _V6_MLP_PAGE_MARKOV_POLICY),
 )
@@ -72,6 +77,13 @@ _V8_METRICS = frozenset(
         "lookahead_prefetch_calls",
         "lookahead_prefetch_pages",
         "lookahead_prefetch_successes",
+    }
+)
+_V9_METRICS = frozenset(
+    {
+        "lookahead_budget_fraction_sum_ppm",
+        "lookahead_route_confidence_sum_ppm",
+        "lookahead_width_confidence_sum_ppm",
     }
 )
 _MAX_STATE_BYTES = 16 * 1024 * 1024
@@ -165,6 +177,9 @@ class MlpPagePrediction:
     full_page_ids: tuple[int, ...] = ()
     width: int = 0
     agent_widths: tuple[tuple[str, int | None], ...] = ()
+    route_confidence: float = 0.0
+    width_confidence: float = 0.0
+    prefetch_fraction: float = 0.625
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -177,6 +192,9 @@ class MlpPagePrediction:
             "full_page_ids": list(self.full_page_ids),
             "width": self.width,
             "agent_widths": dict(self.agent_widths),
+            "route_confidence": self.route_confidence,
+            "width_confidence": self.width_confidence,
+            "prefetch_fraction": self.prefetch_fraction,
         }
 
 
@@ -188,6 +206,7 @@ class MlpPageMarkov:
     MAX_TARGETS_PER_TRANSITION = 8
     COACTIVE_NEIGHBOR_SPAN = 4
     ENERGY_COVERAGE = 0.995
+    MIN_PREFETCH_FRACTION = 0.625
 
     @staticmethod
     def width_actions_for(route_width: int) -> tuple[int, ...]:
@@ -218,7 +237,9 @@ class MlpPageMarkov:
         identity: Mapping[str, object] | None = None,
         min_exact_rows: int = 2,
         prefetch: Callable[[int, tuple[int, ...]], bool] | None = None,
-        lookahead_prefetch: Callable[[int, tuple[int, ...]], bool] | None = None,
+        lookahead_prefetch: (
+            Callable[[int, tuple[int, ...], float], bool] | None
+        ) = None,
     ) -> None:
         for value, label in (
             (n_layers, "n_layers"),
@@ -319,6 +340,9 @@ class MlpPageMarkov:
             "lookahead_prefetch_calls": 0,
             "lookahead_prefetch_pages": 0,
             "lookahead_prefetch_successes": 0,
+            "lookahead_budget_fraction_sum_ppm": 0,
+            "lookahead_route_confidence_sum_ppm": 0,
+            "lookahead_width_confidence_sum_ppm": 0,
             "ready_predictions": 0,
             "route_jaccard_count": 0,
             "route_jaccard_sum_ppm": 0,
@@ -604,7 +628,7 @@ class MlpPageMarkov:
         self,
         layer: int,
         agents: tuple[tuple[str, int | None], ...],
-    ) -> int:
+    ) -> tuple[int, float]:
         votes: dict[int, float] = {}
         for weight, (_name, width) in zip(
             self._width_weights(layer), agents, strict=True
@@ -612,8 +636,9 @@ class MlpPageMarkov:
             if width is not None:
                 votes[width] = votes.get(width, 0.0) + weight
         if not votes:
-            return self.route_width
-        return max(votes, key=lambda width: (votes[width], width))
+            return self.route_width, 0.0
+        selected = max(votes, key=lambda width: (votes[width], width))
+        return selected, max(0.0, min(1.0, votes[selected]))
 
     def _coactive_route(self, layer: int) -> tuple[int | None, ...]:
         """Walk the learned within-route page graph from the strongest anchor."""
@@ -683,14 +708,23 @@ class MlpPageMarkov:
         cross_width: int | None,
     ) -> MlpPagePrediction:
         agents = self._agent_routes(layer, temporal_route, cross_route)
-        full_pages = self._combine(layer, agents)
+        full_pages, route_confidences = self._combine(layer, agents)
         width_agents = self._agent_widths(
             layer,
             temporal_width,
             cross_width,
         )
-        width = self._combine_width(layer, width_agents)
+        width, width_confidence = self._combine_width(layer, width_agents)
         pages = full_pages[:width]
+        route_confidence = (
+            0.0
+            if not pages
+            else sum(route_confidences[: len(pages)]) / len(pages)
+        )
+        consensus = math.sqrt(route_confidence * width_confidence)
+        prefetch_fraction = self.MIN_PREFETCH_FRACTION + (
+            1.0 - self.MIN_PREFETCH_FRACTION
+        ) * consensus
         ready = (
             len(full_pages) == self.route_width
             and len(pages) == width
@@ -704,6 +738,9 @@ class MlpPageMarkov:
             full_page_ids=full_pages,
             width=width,
             agent_widths=width_agents,
+            route_confidence=route_confidence,
+            width_confidence=width_confidence,
+            prefetch_fraction=prefetch_fraction,
         )
 
     def _predict(self, layer: int) -> MlpPagePrediction:
@@ -742,9 +779,10 @@ class MlpPageMarkov:
         self,
         layer: int,
         agents: tuple[tuple[str, tuple[int | None, ...]], ...],
-    ) -> tuple[int, ...]:
+    ) -> tuple[tuple[int, ...], tuple[float, ...]]:
         weights = self._weights(layer)
         selected: list[int] = []
+        confidences: list[float] = []
         for rank in range(self.route_width):
             votes: dict[int, float] = {}
             for weight, (_name, route) in zip(weights, agents, strict=True):
@@ -752,7 +790,9 @@ class MlpPageMarkov:
                 if page is not None and page not in selected:
                     votes[page] = votes.get(page, 0.0) + weight
             if votes:
-                selected.append(max(votes, key=lambda page: (votes[page], -page)))
+                winner = max(votes, key=lambda page: (votes[page], -page))
+                selected.append(winner)
+                confidences.append(max(0.0, min(1.0, votes[winner])))
         if len(selected) < self.route_width:
             totals: dict[int, float] = {}
             for rank in range(self.route_width):
@@ -765,9 +805,10 @@ class MlpPageMarkov:
             for page in sorted(totals, key=lambda value: (-totals[value], value)):
                 if page not in selected:
                     selected.append(page)
+                    confidences.append(0.0)
                     if len(selected) == self.route_width:
                         break
-        return tuple(selected)
+        return tuple(selected), tuple(confidences)
 
     def _begin_wave(self, layer: int, *, row_count: int | None) -> None:
         if layer != 0:
@@ -817,8 +858,23 @@ class MlpPageMarkov:
             return None
         self._metrics["lookahead_prefetch_calls"] += 1
         self._metrics["lookahead_prefetch_pages"] += len(lookahead.page_ids)
+        self._metrics["lookahead_route_confidence_sum_ppm"] += round(
+            lookahead.route_confidence * 1_000_000
+        )
+        self._metrics["lookahead_width_confidence_sum_ppm"] += round(
+            lookahead.width_confidence * 1_000_000
+        )
+        self._metrics["lookahead_budget_fraction_sum_ppm"] += round(
+            lookahead.prefetch_fraction * 1_000_000
+        )
         result = (
-            bool(self.lookahead_prefetch(lookahead.layer, lookahead.page_ids))
+            bool(
+                self.lookahead_prefetch(
+                    lookahead.layer,
+                    lookahead.page_ids,
+                    lookahead.prefetch_fraction,
+                )
+            )
             if replay is _CALL_PREFETCH
             else bool(replay)
         )
@@ -1808,23 +1864,32 @@ class MlpPageMarkov:
             legacy_v5 = schema == _V5_MLP_PAGE_MARKOV_SCHEMA
             legacy_v6 = schema == _V6_MLP_PAGE_MARKOV_SCHEMA
             legacy_v7 = schema == _V7_MLP_PAGE_MARKOV_SCHEMA
+            legacy_v8 = schema == _V8_MLP_PAGE_MARKOV_SCHEMA
             adaptive_width = (
                 legacy_v5
                 or legacy_v6
                 or legacy_v7
+                or legacy_v8
                 or schema == MLP_PAGE_MARKOV_SCHEMA
             )
             terminal_reward = (
-                legacy_v6 or legacy_v7 or schema == MLP_PAGE_MARKOV_SCHEMA
+                legacy_v6
+                or legacy_v7
+                or legacy_v8
+                or schema == MLP_PAGE_MARKOV_SCHEMA
             )
-            route_terminal_reward = legacy_v7 or schema == MLP_PAGE_MARKOV_SCHEMA
-            causal_lookahead = schema == MLP_PAGE_MARKOV_SCHEMA
+            route_terminal_reward = (
+                legacy_v7 or legacy_v8 or schema == MLP_PAGE_MARKOV_SCHEMA
+            )
+            causal_lookahead = legacy_v8 or schema == MLP_PAGE_MARKOV_SCHEMA
+            consensus_budget = schema == MLP_PAGE_MARKOV_SCHEMA
             if (
                 not isinstance(document, dict)
                 or set(document) != {"body", "schema", "sha256"}
                 or schema
                 not in {
                     MLP_PAGE_MARKOV_SCHEMA,
+                    _V8_MLP_PAGE_MARKOV_SCHEMA,
                     _V7_MLP_PAGE_MARKOV_SCHEMA,
                     _V6_MLP_PAGE_MARKOV_SCHEMA,
                     _V5_MLP_PAGE_MARKOV_SCHEMA,
@@ -1883,6 +1948,8 @@ class MlpPageMarkov:
                     if legacy_v6
                     else _V7_MLP_PAGE_MARKOV_POLICY
                     if legacy_v7
+                    else _V8_MLP_PAGE_MARKOV_POLICY
+                    if legacy_v8
                     else MLP_PAGE_MARKOV_POLICY
                 ),
                 adaptive_width=adaptive_width,
@@ -2069,6 +2136,8 @@ class MlpPageMarkov:
                 missing_metrics.update(_V7_METRICS)
             if not causal_lookahead:
                 missing_metrics.update(_V8_METRICS)
+            if not consensus_budget:
+                missing_metrics.update(_V9_METRICS)
             expected_metrics = set(self._metrics) - missing_metrics
             if (
                 not isinstance(metrics, dict)
@@ -2206,6 +2275,28 @@ class MlpPageMarkov:
                     else sum(active_widths) / len(active_widths)
                 ),
                 "energy_coverage": self.ENERGY_COVERAGE,
+                "minimum_prefetch_fraction": self.MIN_PREFETCH_FRACTION,
+                "lookahead_route_confidence_mean": (
+                    0.0
+                    if self._metrics["lookahead_prefetch_calls"] == 0
+                    else self._metrics["lookahead_route_confidence_sum_ppm"]
+                    / self._metrics["lookahead_prefetch_calls"]
+                    / 1_000_000
+                ),
+                "lookahead_width_confidence_mean": (
+                    0.0
+                    if self._metrics["lookahead_prefetch_calls"] == 0
+                    else self._metrics["lookahead_width_confidence_sum_ppm"]
+                    / self._metrics["lookahead_prefetch_calls"]
+                    / 1_000_000
+                ),
+                "lookahead_budget_fraction_mean": (
+                    self.MIN_PREFETCH_FRACTION
+                    if self._metrics["lookahead_prefetch_calls"] == 0
+                    else self._metrics["lookahead_budget_fraction_sum_ppm"]
+                    / self._metrics["lookahead_prefetch_calls"]
+                    / 1_000_000
+                ),
                 "last_runtime_reward": self._last_runtime_reward,
                 "runtime_reward_mean": (
                     0.0

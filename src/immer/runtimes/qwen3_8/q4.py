@@ -798,6 +798,7 @@ class Q4BankMetrics:
     page_mlp_prefetch_budget_declines: int = 0
     page_mlp_prefetch_budget_trims: int = 0
     page_mlp_prefetch_trimmed_pages: int = 0
+    page_mlp_prefetch_budget_fraction_sum_ppm: int = 0
     page_mlp_prefetch_consumed_leases: int = 0
     page_mlp_prefetch_expired_leases: int = 0
     page_mlp_prefetch_forced_releases: int = 0
@@ -975,6 +976,7 @@ class Q4Bank:
         self,
         layer: int,
         page_ids: Sequence[int],
+        budget_fraction: float = 1.0,
     ) -> bool:
         """Warm one predicted Q4 MLP layer without making it release-owned."""
 
@@ -983,6 +985,15 @@ class Q4Bank:
                 raise Q4BankError("Q4 bank is closed")
             if isinstance(layer, bool) or not isinstance(layer, int) or layer < 0:
                 raise ValueError("Q4 MLP prefetch layer is invalid")
+            if (
+                isinstance(budget_fraction, bool)
+                or not isinstance(budget_fraction, (int, float))
+                or not math.isfinite(float(budget_fraction))
+                or not 0.0 < float(budget_fraction) <= 1.0
+            ):
+                raise ValueError("Q4 MLP prefetch budget fraction is invalid")
+            fraction = float(budget_fraction)
+            effective_max_bytes = max(1, int(self.max_prefetch_bytes * fraction))
             pages = tuple(page_ids)
             base = f"model.language_model.layers.{layer}.mlp"
             names = tuple(
@@ -1015,6 +1026,9 @@ class Q4Bank:
                 raise ValueError("Q4 MLP prefetch pages are invalid")
             self._stats.page_mlp_prefetch_calls += 1
             self._stats.page_mlp_prefetch_requested_pages += len(pages)
+            self._stats.page_mlp_prefetch_budget_fraction_sum_ppm += round(
+                fraction * 1_000_000
+            )
             page_size = int(getattr(mmap, "PAGESIZE", 4096))
 
             def page_interval(
@@ -1069,7 +1083,7 @@ class Q4Bank:
                     for rows in candidate_intervals
                     for start, stop in rows
                 )
-                if advised_bytes > self.max_prefetch_bytes:
+                if advised_bytes > effective_max_bytes:
                     break
                 bounded_pages.append(page)
                 intervals = candidate_intervals

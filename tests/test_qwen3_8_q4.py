@@ -728,10 +728,16 @@ class Q4BankTests(unittest.TestCase):
                         return_value=True,
                     ) as advise,
                 ):
-                    self.assertTrue(bank.prefetch_mlp_pages(0, (0, 2)))
+                    self.assertTrue(bank.prefetch_mlp_pages(0, (0, 2), 0.75))
                     prefetched = bank.metrics()
                     self.assertEqual(prefetched["page_mlp_prefetch_calls"], 1)
                     self.assertEqual(prefetched["page_mlp_prefetch_pages"], 2)
+                    self.assertEqual(
+                        prefetched[
+                            "page_mlp_prefetch_budget_fraction_sum_ppm"
+                        ],
+                        750_000,
+                    )
                     self.assertEqual(
                         prefetched["page_mlp_prefetch_advice_calls"], 3
                     )
@@ -834,14 +840,17 @@ class Q4BankTests(unittest.TestCase):
                             * mmap.PAGESIZE,
                         ) - (offset // mmap.PAGESIZE * mmap.PAGESIZE)
 
-                    bank.max_prefetch_bytes = (
+                    one_page_budget = (
                         down_entry.payload_bytes
                         + aligned_run(gate_entry, 8, 9)
                         + aligned_run(up_entry, 8, 9)
                     )
+                    bank.max_prefetch_bytes = (one_page_budget * 4 + 2) // 3 + 1
                     before_trim = bank.metrics()
                     advice_before_trim = advise.call_count
-                    self.assertTrue(bank.prefetch_mlp_pages(0, (8, 0, 1)))
+                    self.assertTrue(
+                        bank.prefetch_mlp_pages(0, (8, 0, 1), 0.75)
+                    )
                     trimmed = bank.metrics()
                     self.assertEqual(
                         trimmed["page_mlp_prefetch_requested_pages"]
@@ -954,6 +963,10 @@ class Q4BankTests(unittest.TestCase):
                 threads=1,
             )
             try:
+                for fraction in (True, 0.0, -0.1, 1.1, float("nan")):
+                    with self.subTest(fraction=fraction):
+                        with self.assertRaises(ValueError):
+                            bank.prefetch_mlp_pages(0, (0,), fraction)
                 with mock.patch(
                     "immer.runtimes.qwen3_8.q4._MappedTensor.prefetch_supported",
                     return_value=False,

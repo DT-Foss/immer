@@ -498,11 +498,20 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "terminal-route-advantage+fixed-share/v7"
             ),
         )
+        width192_v8_identity = width192._draft_window_runtime_identity(
+            mlp_page_schema="immer.qwen3.8-mlp-page-markov/v8",
+            mlp_page_policy=(
+                "dynamic-page-transitions+coactivation+adaptive-width+"
+                "terminal-route-advantage+causal-lookahead-prefetch+"
+                "fixed-share/v8"
+            ),
+        )
 
         self.assertNotEqual(disabled_identity, width192_identity)
         self.assertNotEqual(width160_identity, width192_identity)
         self.assertNotEqual(width192_v6_identity, width192_identity)
         self.assertNotEqual(width192_v7_identity, width192_identity)
+        self.assertNotEqual(width192_v8_identity, width192_identity)
         with patch(
             "immer.runtimes.qwen3_8.adapter.DRAFT_WINDOW_FEEDBACK_SCHEMA",
             "immer.qwen3.8-draft-window-feedback/v999",
@@ -525,10 +534,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "mlp_page_enabled": True,
                 "mlp_page_policy": (
                     "dynamic-page-transitions+coactivation+adaptive-width+"
-                    "terminal-route-advantage+causal-lookahead-prefetch+"
-                    "fixed-share/v8"
+                    "terminal-route-advantage+consensus-budget-lookahead+"
+                    "fixed-share/v9"
                 ),
-                "mlp_page_schema": "immer.qwen3.8-mlp-page-markov/v8",
+                "mlp_page_schema": "immer.qwen3.8-mlp-page-markov/v9",
                 "o1_enabled": False,
                 "policy": "o1+draft+page-savings-target-work/v1",
                 "route_width": 192,
@@ -3374,6 +3383,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "q4": {
                     "request": {
                         "page_mlp_prefetch_budget_declines": 1,
+                        "page_mlp_prefetch_budget_fraction_sum_ppm": 50_400_000,
                         "page_mlp_prefetch_bytes": 80 * 1024**2,
                         "page_mlp_prefetch_calls": 63,
                         "page_mlp_prefetch_consumed_leases": 186,
@@ -3456,7 +3466,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "24 coactive edges, 128 pages skipped, 12 energy labels, "
                 "width 96-128.5 · "
                 "Q4 lookahead 63 calls, 8064 pages fully advised, "
-                "80.0 MiB advised, "
+                "80.0 MiB advised, 80.0% mean budget, "
                 "186 leases consumed, 9000 pages requested, "
                 "936 pages budget-trimmed, 1 budget declines · "
                 "joint reward 2.35 (draft 5, pages 128, O1 9.00) · "
