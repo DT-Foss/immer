@@ -67,6 +67,12 @@ All notable changes to IMMER are recorded here.
   phrases precedence, requires three phase witnesses, calibrates confidence by
   measured lag agreement, rejects conflicting periods, and gates Atlas phrase
   floors with causal Beam reliability. Provider ABI is v38; metrics v28.
+- `1aeef27` added request-local periodic slot binding. A varying future phase
+  can copy a confirmed earlier phase when the relation holds across three
+  cycles, then continue invariant phases. `b5ee3b8` requires three distinct
+  slot witnesses, rejects multiple structural sources even when their current
+  token matches, preserves absolute phase through the 4,096-token window, and
+  keeps future-block sources untrusted. Provider ABI is v40; metrics v30.
 
 ### Arbitrary local Qwen runtime
 
