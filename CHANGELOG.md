@@ -6,6 +6,38 @@ All notable changes to IMMER are recorded here.
 
 ### Deployed Markov/MTP product path
 
+- `1e2ba55` added a carried-only `bucket=-1` Beta aggregate. It reconstructs
+  algebraically from existing exact carried rows on load; an exact gap bucket
+  takes precedence after two observations, while sparse buckets back off to the
+  aggregate. Each verified receipt updates its exact and aggregate storage once
+  but increments calibration/update metrics only once. On the live SOLARA
+  recall, turn 1 used two forwards and 13.75 s. Turn 2 reused 35 Qwen tokens,
+  returned the omitted code in ten output tokens, exported a 318 KiB MTP carry,
+  and used seven forwards, 34.62 s, and 1.57 GiB peak RSS. Carried updates grew
+  `4→7`; the carried `previous=1` aggregate reached Beta(7,1), carried misses
+  stayed zero, and all 342 cold updates remained unchanged. This is one fewer
+  forward despite one additional output token than the preceding VELORA
+  observation. Wall time fluctuated, so no latency claim is attached. Next work
+  is higher-position/window learning from carried reliability, not another
+  prompt cohort.
+- `411744c` separated cold and carried MTP calibration under provider v4,
+  hybrid v20, and calibration JSON v2. Beta keys are now
+  `(carried, position, bucket, previous)` with independent previous outcomes,
+  update counts, and state counts. Legacy v1 rows migrate cold-only into the
+  same global persistent file; strict boolean and row-shape validation rejects
+  malformed state. A carried row starts at Beta(1,1), so it remains K1 at 0.5
+  until ordinary Qwen verification teaches it. With sufficient logit gap, two
+  first-ever consecutive hits can open K2; a miss moves carried `previous` to
+  zero and collapses the wider path. Warm runtime identities now bind MTP v4
+  and hybrid v20. The live VELORA recall retained 35 Qwen tokens and a 146 KiB
+  carry on turn 1, using two forwards, 15.13 s, and 1.43 GiB peak RSS. Turn 2
+  reused all 35 tokens, returned the omitted code in nine output tokens,
+  exported a 314 KiB carry, and used eight forwards, 35.02 s, and 1.59 GiB peak
+  RSS. State migrated to provider v4/schema v2: 342 cold updates were untouched,
+  carried updates reached four, and all three carried rows were hits.
+  Pre-aggregate verification passed 174 tests in 6.979 s; three focused remote
+  tests passed. Aggregate review reported no P0–P2. These runs are reported
+  separately, not combined into one total.
 - `c8c780a` added `Qwen35MtpCarry` v1 across interactive turns. A carry clones
   the exact token history, shifted MTP AttentionState KV, cursor
   `target_cursor - 1`, and last committed target hidden before provider close.
