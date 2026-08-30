@@ -16,10 +16,21 @@ import threading
 from typing import Any
 
 
-MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v3"
-MLP_PAGE_MARKOV_POLICY = "shared-page-transitions+fixed-share/v3"
-_AGENTS = ("temporal", "cross_layer", "marginal")
+MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v4"
+MLP_PAGE_MARKOV_POLICY = "dynamic-page-transitions+coactivation+fixed-share/v4"
+_V3_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v3"
+_V3_MLP_PAGE_MARKOV_POLICY = "shared-page-transitions+fixed-share/v3"
+_V3_AGENTS = ("temporal", "cross_layer", "marginal")
+_AGENTS = ("temporal", "cross_layer", "coactive", "marginal")
+_V4_METRICS = frozenset(
+    {
+        "coactive_updates",
+        "dynamic_route_calls",
+        "dynamic_route_changes",
+    }
+)
 _MAX_STATE_BYTES = 16 * 1024 * 1024
+_CALL_PREFETCH = object()
 
 
 class MlpPageMarkovError(RuntimeError):
@@ -122,6 +133,7 @@ class MlpPageMarkov:
     LEARNING_RATE = 0.5
     FIXED_SHARE = 0.05
     MAX_TARGETS_PER_TRANSITION = 8
+    COACTIVE_NEIGHBOR_SPAN = 4
 
     def __init__(
         self,
@@ -164,6 +176,7 @@ class MlpPageMarkov:
         self._marginal: dict[tuple[int, int], Counter[int]] = {}
         self._temporal: dict[tuple[int, int], Counter[int]] = {}
         self._cross: dict[tuple[int, int], Counter[int]] = {}
+        self._coactive: dict[tuple[int, int], Counter[int]] = {}
         self._agent_logs = [[0.0] * len(_AGENTS) for _ in range(n_layers)]
         self._agent_observations = [[0] * len(_AGENTS) for _ in range(n_layers)]
         self._agent_hits = [[0] * len(_AGENTS) for _ in range(n_layers)]
@@ -171,6 +184,8 @@ class MlpPageMarkov:
         self._last_routes: list[tuple[int, ...] | None] = [None] * n_layers
         self._wave_routes: dict[int, tuple[tuple[int, ...], ...]] = {}
         self._pending: dict[int, MlpPagePrediction] = {}
+        self._pending_prefetch: dict[int, bool | None] = {}
+        self._pending_dynamic: dict[int, bool] = {}
         self._compiled: list[MlpPagePrediction | None] = [None] * n_layers
         self._dirty = False
         self._closed = False
@@ -178,7 +193,10 @@ class MlpPageMarkov:
         self._lock = threading.RLock()
         self._metrics = {
             "agent_feedback": 0,
+            "coactive_updates": 0,
             "counter_evictions": 0,
+            "dynamic_route_calls": 0,
+            "dynamic_route_changes": 0,
             "exact_batches": 0,
             "exact_rows": 0,
             "fallback_predictions": 0,
@@ -222,6 +240,8 @@ class MlpPageMarkov:
                 "last_routes": list(self._last_routes),
                 "metrics": dict(self._metrics),
                 "pending": dict(self._pending),
+                "pending_prefetch": dict(self._pending_prefetch),
+                "pending_dynamic": dict(self._pending_dynamic),
                 "wave_routes": dict(self._wave_routes),
                 "wave_rows": [],
             }
@@ -234,6 +254,7 @@ class MlpPageMarkov:
             {key: Counter(value) for key, value in self._marginal.items()},
             {key: Counter(value) for key, value in self._temporal.items()},
             {key: Counter(value) for key, value in self._cross.items()},
+            {key: Counter(value) for key, value in self._coactive.items()},
         )
 
     def commit_transaction(self, *, accepted_rows: int | None = None) -> None:
@@ -273,7 +294,7 @@ class MlpPageMarkov:
             self.begin_transaction()
             replayed_exact = False
             try:
-                for kind, wave, layer, payload, scores in events:
+                for kind, wave, layer, payload, scores, prefetch_result in events:
                     keep = min(
                         wave_rows[wave],
                         max(0, accepted_rows - offsets[wave]),
@@ -288,9 +309,23 @@ class MlpPageMarkov:
                             payload[:keep],
                             None if scores is None else scores[:keep],
                         )
-                    else:
-                        self.route(layer, row_count=keep)
+                    elif kind == "selected_route":
+                        self._route(
+                            layer,
+                            row_count=keep,
+                            replay_prefetch=prefetch_result,
+                        )
                         self.advance_selected(layer, payload, row_count=keep)
+                    elif kind == "selected_prepare":
+                        self._prepare(
+                            layer,
+                            replay_prefetch=prefetch_result,
+                        )
+                        self.advance_selected(layer, payload, row_count=keep)
+                    else:
+                        raise MlpPageMarkovError(
+                            "MLP page transaction event is invalid"
+                        )
                 if replayed_exact:
                     self.compile_routes()
                 self._transaction = None
@@ -309,13 +344,20 @@ class MlpPageMarkov:
             self._agent_observations = transaction["agent_observations"]
             counters = transaction["counters"]
             if counters is not None:
-                self._marginal, self._temporal, self._cross = counters
+                (
+                    self._marginal,
+                    self._temporal,
+                    self._cross,
+                    self._coactive,
+                ) = counters
             self._dirty = transaction["dirty"]
             self._compiled = transaction["compiled"]
             self._exact_support = transaction["exact_support"]
             self._last_routes = transaction["last_routes"]
             self._metrics = transaction["metrics"]
             self._pending = transaction["pending"]
+            self._pending_prefetch = transaction["pending_prefetch"]
+            self._pending_dynamic = transaction["pending_dynamic"]
             self._wave_routes = transaction["wave_routes"]
             self._transaction = None
 
@@ -354,6 +396,39 @@ class MlpPageMarkov:
             for value in raw
         )
 
+    def _coactive_route(self, layer: int) -> tuple[int | None, ...]:
+        """Walk the learned within-route page graph from the strongest anchor."""
+
+        anchor = _winner(self._marginal.get((layer, 0)))
+        if anchor is None:
+            return (None,) * self.route_width
+        selected = [anchor]
+        selected_set = {anchor}
+        while len(selected) < self.route_width:
+            direct = self._coactive.get((layer, selected[-1]))
+            candidates = Counter(
+                {
+                    page: count
+                    for page, count in (() if direct is None else direct.items())
+                    if page not in selected_set
+                }
+            )
+            if not candidates:
+                for source in selected:
+                    counter = self._coactive.get((layer, source))
+                    if counter is None:
+                        continue
+                    scale = max(1, sum(counter.values()))
+                    for page, count in counter.items():
+                        if page not in selected_set:
+                            candidates[page] += count / scale
+            if not candidates:
+                break
+            winner = max(candidates, key=lambda page: (candidates[page], -page))
+            selected.append(winner)
+            selected_set.add(winner)
+        return tuple((*selected, *((None,) * (self.route_width - len(selected)))))
+
     def _agent_routes(
         self,
         layer: int,
@@ -362,6 +437,9 @@ class MlpPageMarkov:
     ) -> tuple[tuple[str, tuple[int | None, ...]], ...]:
         rows: list[tuple[str, tuple[int | None, ...]]] = []
         for agent in _AGENTS:
+            if agent == "coactive":
+                rows.append((agent, self._coactive_route(layer)))
+                continue
             route: list[int | None] = []
             for rank in range(self.route_width):
                 if agent == "temporal" and temporal_source is not None:
@@ -375,6 +453,17 @@ class MlpPageMarkov:
                 route.append(_winner(counter))
             rows.append((agent, tuple(route)))
         return tuple(rows)
+
+    def _predict(self, layer: int) -> MlpPagePrediction:
+        cross_rows = self._wave_routes.get(layer - 1, ())
+        cross = cross_rows[-1] if cross_rows else None
+        agents = self._agent_routes(layer, self._last_routes[layer], cross)
+        pages = self._combine(layer, agents)
+        ready = (
+            len(pages) == self.route_width
+            and self._exact_support[layer] >= self.min_exact_rows
+        )
+        return MlpPagePrediction(layer, pages, ready, agents)
 
     def _combine(
         self,
@@ -412,6 +501,8 @@ class MlpPageMarkov:
             return
         self._wave_routes = {}
         self._pending = {}
+        self._pending_prefetch = {}
+        self._pending_dynamic = {}
         if self._transaction is not None:
             self._transaction["current_wave"] += 1
             self._transaction["wave_rows"].append(row_count)
@@ -433,74 +524,109 @@ class MlpPageMarkov:
             self._ensure_open()
             compiled: list[MlpPagePrediction | None] = []
             for layer in range(self.n_layers):
-                cross_rows = self._wave_routes.get(layer - 1, ())
-                cross = cross_rows[-1] if cross_rows else None
-                agents = self._agent_routes(layer, self._last_routes[layer], cross)
-                pages = self._combine(layer, agents)
-                ready = (
-                    len(pages) == self.route_width
-                    and self._exact_support[layer] >= self.min_exact_rows
-                )
-                compiled.append(MlpPagePrediction(layer, pages, ready, agents))
+                compiled.append(self._predict(layer))
             self._compiled = compiled
 
+    def _route(
+        self,
+        layer: int,
+        *,
+        row_count: int,
+        replay_prefetch: object = _CALL_PREFETCH,
+    ) -> MlpPagePrediction:
+        self._ensure_open()
+        self._validate_layer(layer)
+        if (
+            isinstance(row_count, bool)
+            or not isinstance(row_count, int)
+            or row_count <= 0
+        ):
+            raise ValueError("row_count must be a positive integer")
+        self._begin_wave(layer, row_count=row_count)
+        prediction = self._predict(layer)
+        compiled = self._compiled[layer]
+        self._metrics["dynamic_route_calls"] += 1
+        self._metrics["dynamic_route_changes"] += int(
+            compiled is not None
+            and compiled.ready
+            and prediction.ready
+            and prediction.page_ids != compiled.page_ids
+        )
+        self._pending[layer] = prediction
+        self._metrics["prediction_calls"] += 1
+        self._metrics["predicted_pages"] += len(prediction.page_ids)
+        self._metrics[
+            "ready_predictions" if prediction.ready else "fallback_predictions"
+        ] += 1
+        prefetch_result = None
+        if (
+            prediction.ready
+            and self.prefetch is not None
+            and (
+                replay_prefetch is _CALL_PREFETCH
+                or replay_prefetch is not None
+            )
+        ):
+            self._metrics["prefetch_calls"] += 1
+            self._metrics["prefetch_pages"] += len(prediction.page_ids)
+            prefetch_result = (
+                bool(self.prefetch(layer, prediction.page_ids))
+                if replay_prefetch is _CALL_PREFETCH
+                else bool(replay_prefetch)
+            )
+            self._metrics["prefetch_successes"] += int(prefetch_result)
+        self._pending_prefetch[layer] = prefetch_result
+        self._pending_dynamic[layer] = True
+        return prediction
+
     def route(self, layer: int, *, row_count: int) -> MlpPagePrediction:
-        """Return the request-compiled action without rerunning the agents."""
+        """Run the cheap page agents against the latest causal route state."""
 
         with self._lock:
-            self._ensure_open()
-            self._validate_layer(layer)
-            if (
-                isinstance(row_count, bool)
-                or not isinstance(row_count, int)
-                or row_count <= 0
-            ):
-                raise ValueError("row_count must be a positive integer")
-            self._begin_wave(layer, row_count=row_count)
-            prediction = self._compiled[layer]
-            if prediction is None:
-                prediction = MlpPagePrediction(layer, (), False, ())
-            self._pending[layer] = prediction
-            self._metrics["prediction_calls"] += 1
-            self._metrics["predicted_pages"] += len(prediction.page_ids)
-            self._metrics[
-                "ready_predictions" if prediction.ready else "fallback_predictions"
-            ] += 1
-            if prediction.ready and self.prefetch is not None:
-                self._metrics["prefetch_calls"] += 1
-                self._metrics["prefetch_pages"] += len(prediction.page_ids)
-                self._metrics["prefetch_successes"] += int(
-                    bool(self.prefetch(layer, prediction.page_ids))
-                )
-            return prediction
+            return self._route(layer, row_count=row_count)
+
+    def _prepare(
+        self,
+        layer: int,
+        *,
+        replay_prefetch: object = _CALL_PREFETCH,
+    ) -> MlpPagePrediction:
+        self._ensure_open()
+        self._validate_layer(layer)
+        self._begin_wave(layer, row_count=None)
+        prediction = self._predict(layer)
+        pages = prediction.page_ids
+        ready = prediction.ready
+        self._pending[layer] = prediction
+        self._metrics["prediction_calls"] += 1
+        self._metrics["predicted_pages"] += len(pages)
+        self._metrics[
+            "ready_predictions" if ready else "fallback_predictions"
+        ] += 1
+        prefetch_result = None
+        if (
+            ready
+            and self.prefetch is not None
+            and (
+                replay_prefetch is _CALL_PREFETCH
+                or replay_prefetch is not None
+            )
+        ):
+            self._metrics["prefetch_calls"] += 1
+            self._metrics["prefetch_pages"] += len(pages)
+            prefetch_result = (
+                bool(self.prefetch(layer, pages))
+                if replay_prefetch is _CALL_PREFETCH
+                else bool(replay_prefetch)
+            )
+            self._metrics["prefetch_successes"] += int(prefetch_result)
+        self._pending_prefetch[layer] = prefetch_result
+        self._pending_dynamic[layer] = False
+        return prediction
 
     def prepare(self, layer: int) -> MlpPagePrediction:
         with self._lock:
-            self._ensure_open()
-            self._validate_layer(layer)
-            self._begin_wave(layer, row_count=None)
-            cross_rows = self._wave_routes.get(layer - 1, ())
-            cross = cross_rows[-1] if cross_rows else None
-            agents = self._agent_routes(layer, self._last_routes[layer], cross)
-            pages = self._combine(layer, agents)
-            ready = (
-                len(pages) == self.route_width
-                and self._exact_support[layer] >= self.min_exact_rows
-            )
-            prediction = MlpPagePrediction(layer, pages, ready, agents)
-            self._pending[layer] = prediction
-            self._metrics["prediction_calls"] += 1
-            self._metrics["predicted_pages"] += len(pages)
-            self._metrics[
-                "ready_predictions" if ready else "fallback_predictions"
-            ] += 1
-            if ready and self.prefetch is not None:
-                self._metrics["prefetch_calls"] += 1
-                self._metrics["prefetch_pages"] += len(pages)
-                self._metrics["prefetch_successes"] += int(
-                    bool(self.prefetch(layer, pages))
-                )
-            return prediction
+            return self._prepare(layer)
 
     @staticmethod
     def _nested_rows(value: Any, width: int) -> list[list[Any]]:
@@ -549,6 +675,53 @@ class MlpPageMarkov:
                 logs[index] -= self.LEARNING_RATE * (1.0 - correct / valid)
                 self._metrics["agent_feedback"] += valid
 
+    def _learn_exact_route(
+        self,
+        layer: int,
+        route: tuple[int, ...],
+        *,
+        temporal_source: tuple[int, ...] | None,
+        cross_source: tuple[int, ...] | None,
+    ) -> None:
+        agents = self._agent_routes(layer, temporal_source, cross_source)
+        self._feedback(layer, agents, route)
+        for rank, page in enumerate(route):
+            marginal = self._marginal.setdefault((layer, rank), Counter())
+            self._metrics["counter_evictions"] += _space_saving_increment(
+                marginal,
+                page,
+                limit=self.MAX_TARGETS_PER_TRANSITION,
+            )
+            if temporal_source is not None:
+                temporal = self._temporal.setdefault(
+                    (layer, temporal_source[rank]), Counter()
+                )
+                self._metrics["counter_evictions"] += _space_saving_increment(
+                    temporal,
+                    page,
+                    limit=self.MAX_TARGETS_PER_TRANSITION,
+                )
+            if cross_source is not None:
+                cross_counter = self._cross.setdefault(
+                    (layer, cross_source[rank]), Counter()
+                )
+                self._metrics["counter_evictions"] += _space_saving_increment(
+                    cross_counter,
+                    page,
+                    limit=self.MAX_TARGETS_PER_TRANSITION,
+                )
+        for source_index, source in enumerate(route):
+            for target in route[
+                source_index + 1 : source_index + 1 + self.COACTIVE_NEIGHBOR_SPAN
+            ]:
+                coactive = self._coactive.setdefault((layer, source), Counter())
+                self._metrics["counter_evictions"] += _space_saving_increment(
+                    coactive,
+                    target,
+                    limit=self.MAX_TARGETS_PER_TRANSITION,
+                )
+                self._metrics["coactive_updates"] += 1
+
     def observe_exact_batch(
         self,
         layer: int,
@@ -577,6 +750,13 @@ class MlpPageMarkov:
             else:
                 score_rows = None
 
+            previous = self._last_routes[layer]
+            cross_rows = self._wave_routes.get(layer - 1, ())
+            if len(cross_rows) not in {0, 1, len(routes)}:
+                raise MlpPageMarkovError(
+                    "cross-layer route rows differ from the current exact wave"
+                )
+
             transaction = self._transaction
             if transaction is not None:
                 wave = transaction["current_wave"]
@@ -592,12 +772,12 @@ class MlpPageMarkov:
                         "MLP page transaction rows changed between layers"
                     )
                 transaction["events"].append(
-                    ("exact", wave, layer, routes, score_rows)
+                    ("exact", wave, layer, routes, score_rows, None)
                 )
 
-            previous = self._last_routes[layer]
-            cross_rows = self._wave_routes.get(layer - 1, ())
             pending = self._pending.pop(layer, None)
+            self._pending_prefetch.pop(layer, None)
+            self._pending_dynamic.pop(layer, None)
             if pending is not None and routes:
                 predicted = set(pending.page_ids)
                 actual = set(routes[-1])
@@ -616,41 +796,23 @@ class MlpPageMarkov:
                     )
                 )
 
-            boundary_previous = routes[-2] if len(routes) > 1 else previous
-            feedback_cross = cross_rows[-1] if cross_rows else None
-            self._feedback(
-                layer,
-                self._agent_routes(layer, boundary_previous, feedback_cross),
-                routes[-1],
-            )
-            boundary = routes[-1]
-            for rank, page in enumerate(boundary):
-                marginal = self._marginal.setdefault((layer, rank), Counter())
-                self._metrics["counter_evictions"] += _space_saving_increment(
-                    marginal,
-                    page,
-                    limit=self.MAX_TARGETS_PER_TRANSITION,
+            for index, route in enumerate(routes):
+                temporal_source = previous if index == 0 else routes[index - 1]
+                cross_source = (
+                    None
+                    if not cross_rows
+                    else cross_rows[0]
+                    if len(cross_rows) == 1
+                    else cross_rows[index]
                 )
-                if boundary_previous is not None:
-                    temporal = self._temporal.setdefault(
-                        (layer, boundary_previous[rank]), Counter()
-                    )
-                    self._metrics["counter_evictions"] += _space_saving_increment(
-                        temporal,
-                        page,
-                        limit=self.MAX_TARGETS_PER_TRANSITION,
-                    )
-                if feedback_cross is not None:
-                    cross_counter = self._cross.setdefault(
-                        (layer, feedback_cross[rank]), Counter()
-                    )
-                    self._metrics["counter_evictions"] += _space_saving_increment(
-                        cross_counter,
-                        page,
-                        limit=self.MAX_TARGETS_PER_TRANSITION,
-                    )
-            self._last_routes[layer] = boundary
-            self._wave_routes[layer] = (boundary,)
+                self._learn_exact_route(
+                    layer,
+                    route,
+                    temporal_source=temporal_source,
+                    cross_source=cross_source,
+                )
+            self._last_routes[layer] = routes[-1]
+            self._wave_routes[layer] = routes
             self._exact_support[layer] += len(routes)
             self._metrics["exact_batches"] += 1
             self._metrics["exact_rows"] += len(routes)
@@ -687,7 +849,13 @@ class MlpPageMarkov:
             ):
                 raise ValueError("row_count must be a positive integer")
             transaction = self._transaction
+            pending_prefetch = self._pending_prefetch.get(layer)
+            pending_dynamic = self._pending_dynamic.get(layer)
             if transaction is not None:
+                if pending_dynamic is None:
+                    raise MlpPageMarkovError(
+                        "selected MLP pages have no pending route origin"
+                    )
                 wave = transaction["current_wave"]
                 if wave < 0:
                     raise MlpPageMarkovError(
@@ -701,9 +869,18 @@ class MlpPageMarkov:
                         "MLP page transaction rows changed between layers"
                     )
                 transaction["events"].append(
-                    ("selected", wave, layer, route, None)
+                    (
+                        "selected_route" if pending_dynamic else "selected_prepare",
+                        wave,
+                        layer,
+                        route,
+                        None,
+                        pending_prefetch,
+                    )
                 )
             self._pending.pop(layer, None)
+            self._pending_prefetch.pop(layer, None)
+            self._pending_dynamic.pop(layer, None)
             self._last_routes[layer] = route
             self._wave_routes[layer] = (route,)
             self._metrics["selected_advances"] += 1
@@ -719,6 +896,8 @@ class MlpPageMarkov:
             self._last_routes = [None] * self.n_layers
             self._wave_routes = {}
             self._pending = {}
+            self._pending_prefetch = {}
+            self._pending_dynamic = {}
             self._compiled = [None] * self.n_layers
             self._metrics["session_resets"] += 1
             self._dirty = True
@@ -796,13 +975,13 @@ class MlpPageMarkov:
             result[key] = counter
         return result
 
-    def _config(self) -> dict[str, object]:
+    def _config(self, *, policy: str = MLP_PAGE_MARKOV_POLICY) -> dict[str, object]:
         return {
             "identity": self.identity,
             "min_exact_rows": self.min_exact_rows,
             "n_layers": self.n_layers,
             "page_count": self.page_count,
-            "policy": MLP_PAGE_MARKOV_POLICY,
+            "policy": policy,
             "route_width": self.route_width,
         }
 
@@ -814,6 +993,7 @@ class MlpPageMarkov:
             ],
             "agent_observations": self._agent_observations,
             "config": self._config(),
+            "coactive": self._counter_rows(self._coactive),
             "cross": self._counter_rows(self._cross),
             "exact_support": self._exact_support,
             "last_routes": [
@@ -858,17 +1038,20 @@ class MlpPageMarkov:
         try:
             raw = _stable_read(self.path)
             document = json.loads(raw.decode("ascii"))
+            schema = document.get("schema") if isinstance(document, dict) else None
+            legacy = schema == _V3_MLP_PAGE_MARKOV_SCHEMA
             if (
                 not isinstance(document, dict)
                 or set(document) != {"body", "schema", "sha256"}
-                or document.get("schema") != MLP_PAGE_MARKOV_SCHEMA
+                or schema
+                not in {MLP_PAGE_MARKOV_SCHEMA, _V3_MLP_PAGE_MARKOV_SCHEMA}
                 or not isinstance(document.get("body"), dict)
                 or document.get("sha256") != _digest(document["body"])
                 or _canonical(document) != raw
             ):
                 raise ValueError("invalid state envelope")
             body = document["body"]
-            if set(body) != {
+            expected_body = {
                 "agent_hits",
                 "agent_logs",
                 "agent_observations",
@@ -879,7 +1062,17 @@ class MlpPageMarkov:
                 "marginal",
                 "metrics",
                 "temporal",
-            } or body["config"] != self._config():
+            }
+            if not legacy:
+                expected_body.add("coactive")
+            expected_config = self._config(
+                policy=(
+                    _V3_MLP_PAGE_MARKOV_POLICY
+                    if legacy
+                    else MLP_PAGE_MARKOV_POLICY
+                )
+            )
+            if set(body) != expected_body or body["config"] != expected_config:
                 raise ValueError("state configuration changed")
             raw_logs = body["agent_logs"]
             if not isinstance(raw_logs, list):
@@ -890,28 +1083,38 @@ class MlpPageMarkov:
             ]
             if any(not math.isfinite(value) for row in logs for value in row):
                 raise ValueError("agent logs are non-finite")
+            agent_count = len(_V3_AGENTS) if legacy else len(_AGENTS)
             observations = self._integer_matrix(
                 body["agent_observations"],
                 rows=self.n_layers,
-                columns=len(_AGENTS),
+                columns=agent_count,
                 label="agent observations",
             )
             hits = self._integer_matrix(
                 body["agent_hits"],
                 rows=self.n_layers,
-                columns=len(_AGENTS),
+                columns=agent_count,
                 label="agent hits",
             )
             if (
                 len(logs) != self.n_layers
-                or any(len(row) != len(_AGENTS) for row in logs)
+                or any(len(row) != agent_count for row in logs)
                 or any(
                     hits[layer][agent] > observations[layer][agent]
                     for layer in range(self.n_layers)
-                    for agent in range(len(_AGENTS))
+                    for agent in range(agent_count)
                 )
             ):
                 raise ValueError("agent state shape changed")
+            if legacy:
+                logs = [
+                    [row[0], row[1], sum(row) / len(row), row[2]]
+                    for row in logs
+                ]
+                observations = [
+                    [row[0], row[1], 0, row[2]] for row in observations
+                ]
+                hits = [[row[0], row[1], 0, row[2]] for row in hits]
             exact_support = body["exact_support"]
             if (
                 not isinstance(exact_support, list)
@@ -931,9 +1134,10 @@ class MlpPageMarkov:
                 None if row is None else self._validate_route(row) for row in last
             ]
             metrics = body["metrics"]
+            expected_metrics = set(self._metrics) - (_V4_METRICS if legacy else set())
             if (
                 not isinstance(metrics, dict)
-                or set(metrics) != set(self._metrics)
+                or set(metrics) != expected_metrics
                 or any(
                     isinstance(value, bool)
                     or not isinstance(value, int)
@@ -954,7 +1158,14 @@ class MlpPageMarkov:
                 body["temporal"], kind="temporal"
             )
             self._cross = self._restore_counters(body["cross"], kind="cross")
-            self._metrics = {key: int(value) for key, value in metrics.items()}
+            self._coactive = (
+                {}
+                if legacy
+                else self._restore_counters(body["coactive"], kind="coactive")
+            )
+            self._metrics.update(
+                {key: int(value) for key, value in metrics.items()}
+            )
         except MlpPageMarkovError:
             raise
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1021,6 +1232,7 @@ class MlpPageMarkov:
                     name: sum(row[index] for row in weights) / self.n_layers
                     for index, name in enumerate(_AGENTS)
                 },
+                "coactive_contexts": len(self._coactive),
                 "cross_contexts": len(self._cross),
                 "exact_supported_layers": sum(
                     support >= self.min_exact_rows

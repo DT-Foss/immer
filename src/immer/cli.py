@@ -114,6 +114,9 @@ _QWEN38_DEPLOYMENT_MARKOV_ATLAS = (
 _QWEN38_DEPLOYMENT_O1_RETENTION = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-markov-o1-retention-v1.json"
 )
+_QWEN38_DEPLOYMENT_MLP_PAGE_STATE = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen-mlp-page-markov-v1.json"
+)
 _QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v46"
 _QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v27"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
@@ -653,6 +656,44 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             peak_rss = runtime_metrics.get("process_peak_rss_bytes")
             if isinstance(peak_rss, int) and not isinstance(peak_rss, bool):
                 parts.append(f"{peak_rss / 1024**3:.2f} GiB peak")
+        page_route = evidence.get("mlp_page_route")
+        if isinstance(page_route, dict):
+            page_request = page_route.get("request")
+            if isinstance(page_request, dict):
+                dynamic_calls = page_request.get("dynamic_route_calls")
+                dynamic_changes = page_request.get("dynamic_route_changes")
+                exact_rows = page_request.get("exact_rows")
+                coactive_updates = page_request.get("coactive_updates")
+                page_parts = []
+                if (
+                    isinstance(dynamic_calls, int)
+                    and not isinstance(dynamic_calls, bool)
+                    and dynamic_calls > 0
+                ):
+                    page_parts.append(
+                        f"{dynamic_calls} dynamic routes"
+                        + (
+                            f", {dynamic_changes} changed"
+                            if isinstance(dynamic_changes, int)
+                            and not isinstance(dynamic_changes, bool)
+                            and dynamic_changes > 0
+                            else ""
+                        )
+                    )
+                if (
+                    isinstance(exact_rows, int)
+                    and not isinstance(exact_rows, bool)
+                    and exact_rows > 0
+                ):
+                    page_parts.append(f"{exact_rows} exact rows learned")
+                if (
+                    isinstance(coactive_updates, int)
+                    and not isinstance(coactive_updates, bool)
+                    and coactive_updates > 0
+                ):
+                    page_parts.append(f"{coactive_updates} coactive edges")
+                if page_parts:
+                    parts.append("MLP pages " + ", ".join(page_parts))
         draft = evidence.get("draft")
         if isinstance(draft, dict):
             accepted = draft.get("accepted_draft_tokens")
@@ -859,6 +900,14 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 "IMMER_QWEN38_MLP_PAGE_STATE",
             )
         )
+        if (
+            not disable_mlp_page_route
+            and mlp_page_state_path is None
+            and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+            and q4_root is not None
+            and q4_root.name == "q4-base-v3-mtp"
+        ):
+            mlp_page_state_path = _QWEN38_DEPLOYMENT_MLP_PAGE_STATE
         if mlp_page_state_path is not None:
             if q4_root is None:
                 raise ValueError("MLP page routing requires local Q4 execution")

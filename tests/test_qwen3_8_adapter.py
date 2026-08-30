@@ -2392,6 +2392,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         self.assertIsNone(options["fast_mlp_root"])
         self.assertIsNone(options["fast_mlp_active_layers"])
+        self.assertIsNone(options["mlp_page_state_path"])
         self.assertIsNone(options["draft_mode"])
         self.assertIsNone(options["markov_draft_state_path"])
 
@@ -2436,6 +2437,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             markov_state = Path(temporary) / "qwen-markov.bin"
             markov_state.write_bytes(b"fixture")
             mtp_state = Path(temporary) / "qwen-mtp.json"
+            page_state = Path(temporary) / "qwen-mlp-pages.json"
             with (
                 patch.dict("os.environ", {}, clear=True),
                 patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
@@ -2444,6 +2446,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     markov_state,
                 ),
                 patch("immer.cli._QWEN38_DEPLOYMENT_MTP_STATE", mtp_state),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_MLP_PAGE_STATE",
+                    page_state,
+                ),
                 patch(
                     "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
                     return_value=qwen,
@@ -2458,6 +2464,38 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(options["draft_mode"], "hybrid")
         self.assertEqual(options["markov_draft_state_path"], str(markov_state))
         self.assertEqual(options["mtp_draft_state_path"], str(mtp_state))
+        self.assertEqual(options["mlp_page_state_path"], page_state)
+        self.assertIsNone(options["fast_mlp_root"])
+
+    def test_cli_can_disable_the_deployed_dynamic_mlp_page_route(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            q4 = deployed / "causal" / "q4-base-v3-mtp"
+            q4.mkdir(parents=True)
+            markov_state = Path(temporary) / "qwen-markov.bin"
+            markov_state.write_bytes(b"fixture")
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE",
+                    markov_state,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
+                code = main(
+                    ["chat", "hello", "--raw-qwen", "--no-mlp-page-route"]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["q4_root"], str(q4))
+        self.assertIsNone(options["mlp_page_state_path"])
 
     def test_cli_deployment_keeps_markov_as_an_explicit_opt_out(self) -> None:
         qwen = _chat(_Runtime())
@@ -2699,6 +2737,14 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "runtime_metrics": {
                     "process_peak_rss_bytes": 2 * 1024**3,
                 },
+                "mlp_page_route": {
+                    "request": {
+                        "coactive_updates": 24,
+                        "dynamic_route_calls": 64,
+                        "dynamic_route_changes": 7,
+                        "exact_rows": 12,
+                    }
+                },
                 "draft": {
                     "accepted_draft_tokens": 5,
                     "provider": {
@@ -2757,6 +2803,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
             [
                 "answer",
                 "[8 tokens · 3 Qwen forwards · 1.25 s · 2.00 GiB peak · "
+                "MLP pages 64 dynamic routes, 7 changed, 12 exact rows learned, "
+                "24 coactive edges · "
                 "5 accepted draft tokens · "
                 "Hybrid 2 provider tournaments Markov1/MTP1, "
                 "6 provider counterfactual labels · "
