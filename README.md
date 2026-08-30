@@ -41,13 +41,13 @@ release surface.
   Speculative Q/K/V and DeltaNet input projections also share one Q8 input and
   native team across all staged token rows; K2 removes 176 redundant native
   calls and 352 row quantizations per target wave.
-- **Direct Q4 MLP-page execution (explicit).** An opt-in persistent controller
-  learns 64-neuron activation-page routes from exact full-Q4 MLP traces. Its
-  temporal, cross-layer, and marginal agents use Fixed Share to select a
-  bounded page set; unready layers execute the unchanged full MLP, and staged
-  continuation updates commit or roll back with the accepted target prefix.
-  Enable it explicitly with `--mlp-page-state` and bound it with
-  `--mlp-page-width`; the default chat command never enables this route.
+- **Dynamic Q4 MLP-page execution.** The canonical local Q4-v3 chat mounts a
+  persistent 64-neuron page controller automatically. Temporal, cross-layer,
+  coactivation, and marginal Markov agents learn from every exact prefill row
+  and choose a fresh bounded route at each decode token and layer boundary.
+  Unready layers execute the full MLP; speculative continuation commits only
+  accepted learning rows. `--mlp-page-width` controls the route and
+  `--no-mlp-page-route` restores full-MLP execution.
 - **Predictive weight transport.** A persistent two-agent operation Markov
   model learns the exact tensor/range sequence already emitted by the
   Streamer. Order-1/2 Fixed Share, surprise regimes, and Ricci retention
@@ -314,8 +314,9 @@ Atlas and online agents expand a bounded beam, while a request-local high-order
 agent can reuse repeated context learned earlier in the same confirmed answer.
 A request-local phrase agent can copy the deterministic common prefix of two or
 more prior confirmed continuations directly into the same verified K window.
-Full Q4 still verifies every emitted token. Direct Q4 MLP-page routing is also
-explicit-only through `--mlp-page-state` and is disabled in this default.
+The local Q4 target still commits every emitted token. Once a layer has enough
+exact route support, its MLP executes the dynamic bounded page action selected
+by the four Markov agents. `--no-mlp-page-route` restores the full MLP.
 
 `immer chat --interactive` keeps that complete runtime loaded across arbitrary
 prompts and renders every retained user/assistant pair through Qwen's official

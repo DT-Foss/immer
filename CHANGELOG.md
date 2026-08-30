@@ -4,11 +4,22 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-30
 
-Runtime commits through `be0fe4c` are deployed on the canonical server.
+Runtime commits through `41fd5db` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `41fd5db` moved the Q4 MLP page agents into the canonical local chat path.
+  Every exact prefill row now trains bounded temporal, cross-layer,
+  coactivation, and marginal routes; each decode token reruns those agents
+  against the latest causal page state instead of replaying one request-wide
+  route. Existing v3 state migrates to v4 without a read-only rewrite, partial
+  speculative commits preserve route origin and prefetch accounting, and
+  `--no-mlp-page-route` restores full-MLP execution.
+- `1a5e42c` turned every actual non-padded embedded-MTP tail into an
+  overlapping autonomous trace. Later normal chat tokens teach deeper exact
+  MTP horizons without another Qwen forward or MTP step; each trace stops
+  independently at its first mismatch.
 - `be0fe4c` expanded the persistent tournament to five agents: Beam, Council,
   structured Phrase, Markov, and MTP. Markov and MTP now learn from paired
   counterfactual traces, specialize globally and by dialect, switch within the
