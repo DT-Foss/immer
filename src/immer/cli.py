@@ -115,8 +115,8 @@ _QWEN38_DEPLOYMENT_O1_RETENTION = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-markov-o1-retention-v1.json"
 )
 _QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v41"
-_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v18"
-_QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v2"
+_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v19"
+_QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v3"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
     b"immer:qwen3.8-growing-warm-runtime/v2"
 ).hexdigest()
@@ -632,6 +632,14 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 and retained_prefix > 0
             ):
                 parts.append(f"{retained_prefix} prefix tokens cached")
+            mtp_carry_status = conversation.get("mtp_carry_status")
+            mtp_carry_bytes = conversation.get("mtp_carry_bytes")
+            if (
+                mtp_carry_status in {"stored", "reused+stored"}
+                and isinstance(mtp_carry_bytes, int)
+                and mtp_carry_bytes > 0
+            ):
+                parts.append(f"{mtp_carry_bytes / 1024:.1f} KiB MTP carry")
         generated_tokens = generation.get("generated_tokens")
         if isinstance(generated_tokens, int) and not isinstance(generated_tokens, bool):
             parts.append(f"{generated_tokens} tokens")

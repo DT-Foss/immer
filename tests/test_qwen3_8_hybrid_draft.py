@@ -18,6 +18,7 @@ from immer.runtimes.qwen3_8.markov_draft import (
     MarkovLanguageTokenEvidence,
 )
 from immer.runtimes.qwen3_8.markov_atlas import AtlasTokenEvidence
+from immer.runtimes.qwen3_8.mtp_draft import Qwen35MtpCarry
 
 
 def _proposal(*, confidence: float, tokens=(3, 4, 5)) -> RollingDraftProposal:
@@ -193,6 +194,7 @@ class _Mtp:
         self.reconcile_calls = []
         self.advance_calls = []
         self.final_calls = []
+        self.export_calls = []
         self.pending = False
         self.closed = False
 
@@ -244,6 +246,10 @@ class _Mtp:
     def observe_final(self, history):
         self.final_calls.append(history)
 
+    def export_carry(self, history):
+        self.export_calls.append(history)
+        return ("carry", history)
+
     def metrics(self):
         return _MtpMetrics(pending=self.pending, closed=self.closed)
 
@@ -252,6 +258,113 @@ class _Mtp:
 
 
 class Qwen38HybridDraftTests(unittest.TestCase):
+    def test_restored_hybrid_initializes_mtp_from_carried_prefix_suffix(self) -> None:
+        markov = _Markov(0.01)
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(
+            markov,
+            lambda: mtp,
+            restored_prefix_length=2,
+        )
+        prompt = (11, 12, 13, 14)
+        suffix_hidden = torch.randn((1, 2, 8), dtype=torch.bfloat16)
+
+        provider.begin_request_state(prompt, suffix_hidden)
+        proposal = provider.propose_round_state(
+            prompt,
+            15,
+            suffix_hidden[:, -1:],
+        )
+
+        self.assertEqual(proposal.token_ids, (7, 8, 9))
+        self.assertEqual(markov.begin_calls, [prompt])
+        self.assertEqual(mtp.begin_calls[0][0], prompt)
+        self.assertTrue(torch.equal(mtp.begin_calls[0][1], suffix_hidden))
+        provider.close()
+
+    def test_terminal_uncommitted_tail_exports_last_target_boundary(self) -> None:
+        markov = _Markov(0.01)
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        prompt = (11, 12)
+        hidden = torch.randn((1, 2, 8), dtype=torch.bfloat16)
+        provider.begin_request_state(prompt, hidden)
+        proposal = provider.propose_round_state(prompt, 13, hidden[:, -1:])
+        provider.observe_verification(1, 2)
+        emitted_history = (*prompt, 13, proposal.token_ids[0])
+        provider.reconcile_prefix(emitted_history)
+        provider.observe_final(emitted_history)
+
+        carry = provider.export_mtp_carry(prompt)
+
+        self.assertEqual(carry, ("carry", prompt))
+        self.assertEqual(mtp.export_calls, [prompt])
+        with self.assertRaisesRegex(
+            Qwen38MarkovMtpDraftError,
+            "target boundary",
+        ):
+            provider.export_mtp_carry(emitted_history)
+        provider.close()
+
+    def test_mtp_carry_export_rejects_wrong_target_boundary_hidden(self) -> None:
+        class WrongHiddenMtp(_Mtp):
+            def export_carry(self, history):
+                return Qwen35MtpCarry(
+                    schema="fixture",
+                    identity=(),
+                    history=history,
+                    next_position=len(history) - 1,
+                    state=None,
+                    last_target_hidden=torch.zeros((1, 1, 8)),
+                )
+
+        markov = _Markov(0.01)
+        mtp = WrongHiddenMtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        prompt = (11, 12)
+        hidden = torch.ones((1, 2, 8), dtype=torch.bfloat16)
+        provider.begin_request_state(prompt, hidden)
+        proposal = provider.propose_round_state(prompt, 13, hidden[:, -1:])
+        provider.observe_verification(1, 2)
+        emitted = (*prompt, 13, proposal.token_ids[0])
+        provider.reconcile_prefix(emitted)
+        provider.observe_final(emitted)
+
+        with self.assertRaisesRegex(
+            Qwen38MarkovMtpDraftError,
+            "target hidden differs",
+        ):
+            provider.export_mtp_carry(prompt)
+        provider.close()
+
+    def test_markov_only_request_materializes_mtp_carry_at_export(self) -> None:
+        markov = _Markov(0.99)
+        mtp = _Mtp()
+        factory_calls = []
+
+        def factory():
+            factory_calls.append(True)
+            return mtp
+
+        provider = Qwen38MarkovMtpDraftProvider(markov, factory)
+        prompt = (11, 12)
+        hidden = torch.randn((1, 2, 8), dtype=torch.bfloat16)
+        provider.begin_request_state(prompt, hidden)
+        provider.propose_round_state(prompt, 13, hidden[:, -1:])
+        provider.observe_verification(1, 2)
+        committed = (*prompt, 13, 3)
+        extension_hidden = torch.randn((1, 2, 8), dtype=torch.bfloat16)
+        provider.reconcile_prefix_state(committed, extension_hidden)
+        provider.observe_final(committed)
+
+        carry = provider.export_mtp_carry(committed)
+
+        self.assertEqual(carry, ("carry", committed))
+        self.assertEqual(factory_calls, [True])
+        self.assertEqual(mtp.begin_calls[0][0], committed)
+        self.assertEqual(tuple(mtp.begin_calls[0][1].shape), (1, 4, 8))
+        provider.close()
+
     def test_high_value_markov_proposal_locks_without_loading_mtp(self) -> None:
         markov = _Markov(0.99)
         factory_calls = []
@@ -486,7 +599,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(proposal.token_ids, (7, 8, 9))
         self.assertEqual(
             proposal.provider_abi,
-            "immer.qwen3.8-markov-mtp-hybrid-provider/v18",
+            "immer.qwen3.8-markov-mtp-hybrid-provider/v19",
         )
         self.assertTrue(
             all(abs(value - 0.7625) < 1e-12 for value in proposal.token_confidences)
@@ -809,7 +922,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(mtp.advance_calls[0][2], final_hidden))
 
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v18")
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v19")
         self.assertEqual(metrics.selected_provider, "markov")
         self.assertEqual(metrics.selection_calls, 4)
         self.assertEqual(metrics.markov_rounds, 3)

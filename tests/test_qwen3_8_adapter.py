@@ -36,6 +36,7 @@ from immer.runtimes.qwen3_8.adapter import (
 from immer.runtimes.qwen3_8.cartography_probe import prompt_token_sha256
 from immer.runtimes.qwen3_8.encoding import IM_END_TOKEN_ID, Qwen38Tokenizer
 from immer.runtimes.qwen3_8.markov_atlas import MarkovTokenAtlas
+from immer.runtimes.qwen3_8.mtp_draft import Qwen35MtpCarry
 from immer.runtimes.qwen3_8.semantic_atlas import ModelPin
 from immer.runtimes.qwen3_8.semantic_state_cache import (
     AnchorReceipt,
@@ -770,6 +771,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
             {
                 "history_messages": 0,
                 "history_turns": 0,
+                "mtp_carry_bytes": 0,
+                "mtp_carry_reused_tokens": 0,
+                "mtp_carry_status": "none",
                 "prompt_suffix_tokens": 2,
                 "reuse_hits": 0,
                 "reuse_misses": 0,
@@ -810,6 +814,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
             {
                 "history_messages": 2,
                 "history_turns": 1,
+                "mtp_carry_bytes": 0,
+                "mtp_carry_reused_tokens": 0,
+                "mtp_carry_status": "none",
                 "prompt_suffix_tokens": 2,
                 "reuse_hits": 0,
                 "reuse_misses": 0,
@@ -1304,6 +1311,27 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         self.assertIsNone(
             mtp._draft_mode_for_request({"restored_prefix_length": 17})
+        )
+
+        prefix = tuple(range(17))
+        carry = Qwen35MtpCarry(
+            schema="fixture",
+            identity=(),
+            history=prefix,
+            next_position=16,
+            state=None,
+            last_target_hidden=torch.zeros((1, 1, 1)),
+        )
+        hybrid._conversation_prefix_token_ids = prefix
+        hybrid._conversation_mtp_carry = carry
+        self.assertEqual(
+            hybrid._draft_mode_for_request({"restored_prefix_length": 17}),
+            "markov",
+        )
+        hybrid._validated_conversation_mtp_carry = carry
+        self.assertEqual(
+            hybrid._draft_mode_for_request({"restored_prefix_length": 17}),
+            "hybrid",
         )
 
         hybrid.close()

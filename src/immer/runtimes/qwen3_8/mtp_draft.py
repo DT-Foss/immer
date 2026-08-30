@@ -20,11 +20,13 @@ from .kernels import AttentionState, full_attention_core, rms_norm
 from .pager import Qwen38WeightPager
 
 
-QWEN35_MTP_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v2"
+QWEN35_MTP_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v3"
+_QWEN35_MTP_DRAFT_PROVIDER_V2_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v2"
 _QWEN35_MTP_DRAFT_PROVIDER_LEGACY_SCHEMA = (
     "immer.qwen3.5-mtp-draft-provider/v1"
 )
 QWEN35_MTP_CALIBRATION_SCHEMA = "immer.qwen3.5-mtp-markov-calibration/v1"
+QWEN35_MTP_CARRY_SCHEMA = "immer.qwen3.5-mtp-attention-carry/v1"
 MTP_MATRIX_NAMES = (
     "mtp.fc.weight",
     "mtp.layers.0.self_attn.q_proj.weight",
@@ -65,6 +67,39 @@ def _state_bytes(state: AttentionState | None) -> int:
         for value in (state.key, state.value, state.crsa_log_usage)
         if value is not None
     )
+
+
+def _clone_attention_state(state: AttentionState | None) -> AttentionState | None:
+    if state is None:
+        return None
+    return AttentionState(
+        key=state.key.detach().clone().contiguous(),
+        value=state.value.detach().clone().contiguous(),
+        crsa_log_usage=(
+            None
+            if state.crsa_log_usage is None
+            else state.crsa_log_usage.detach().clone().contiguous()
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Qwen35MtpCarry:
+    """One content-bound in-memory MTP cache aligned to a target token prefix."""
+
+    schema: str
+    identity: tuple[object, ...]
+    history: tuple[int, ...]
+    next_position: int
+    state: AttentionState | None
+    last_target_hidden: torch.Tensor
+
+    @property
+    def state_bytes(self) -> int:
+        return _state_bytes(self.state) + (
+            self.last_target_hidden.numel()
+            * self.last_target_hidden.element_size()
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +155,7 @@ class Qwen35MtpDraftProvider:
         eos_token_ids: Iterable[int] = (),
         head_block_rows: int = Qwen38WeightPager.DEFAULT_HEAD_BLOCK_ROWS,
         state_path: str | Path | None = None,
+        initial_carry: Qwen35MtpCarry | None = None,
     ) -> None:
         if not isinstance(config, Qwen38Config):
             raise TypeError("config must be Qwen38Config")
@@ -168,6 +204,9 @@ class Qwen35MtpDraftProvider:
         }
         self._committed_history: tuple[int, ...] | None = None
         self._committed_state: AttentionState | None = None
+        self._last_target_hidden: torch.Tensor | None = None
+        self._last_target_hidden_history_length = 0
+        self._carry_imported = False
         self._next_position = 0
         self._pending_base: tuple[int, ...] | None = None
         self._pending_proposal: tuple[int, ...] | None = None
@@ -201,6 +240,8 @@ class Qwen35MtpDraftProvider:
         )
         self._logical_weight_bytes = 0
         self._seconds = 0.0
+        if initial_carry is not None:
+            self._restore_carry(initial_carry)
 
     def _calibration_identity(self) -> dict[str, object]:
         return {
@@ -209,6 +250,77 @@ class Qwen35MtpDraftProvider:
             "q4_manifest_sha256": self.pager.q4_bank.identity["manifest_sha256"],
             "vocab_size": self.config.vocab_size,
         }
+
+    def _carry_identity(self) -> tuple[object, ...]:
+        source_metrics_callback = getattr(self.pager.source, "metrics", None)
+        source_metrics = (
+            dict(source_metrics_callback())
+            if callable(source_metrics_callback)
+            else {}
+        )
+        return (
+            QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
+            self.config.dim,
+            self.config.intermediate_size,
+            self.config.vocab_size,
+            self.config.n_heads,
+            self.config.n_kv_heads,
+            self.config.head_dim,
+            self.config.rotary_dim,
+            self.config.partial_rotary_factor,
+            self.config.rope_theta,
+            self.config.mrope_interleaved,
+            self.config.mrope_section,
+            self.config.rms_norm_eps,
+            self.config.hidden_act,
+            self.pager.q4_bank.identity["manifest_sha256"],
+            getattr(self.pager.source, "repo_id", None),
+            getattr(self.pager.source, "revision", None),
+            source_metrics.get("inventory_source_fingerprint"),
+            str(self.pager.device),
+            str(self.pager.compute_dtype),
+        )
+
+    def _restore_carry(self, carry: Qwen35MtpCarry) -> None:
+        if not isinstance(carry, Qwen35MtpCarry):
+            raise TypeError("initial_carry must be a Qwen35MtpCarry")
+        if (
+            carry.schema != QWEN35_MTP_CARRY_SCHEMA
+            or carry.identity != self._carry_identity()
+        ):
+            raise ValueError("MTP carry identity or cursor is invalid")
+        history = self._history(carry.history, label="MTP carry history")
+        if carry.next_position != len(history) - 1:
+            raise ValueError("MTP carry identity or cursor is invalid")
+        hidden = self._hidden(
+            carry.last_target_hidden,
+            rows=1,
+            label="MTP carry target hidden",
+        )
+        state = _clone_attention_state(carry.state)
+        if len(history) > 1 and state is None:
+            raise ValueError("MTP carry lacks its committed attention state")
+        if state is not None and (
+            tuple(state.key.shape)
+            != (
+                1,
+                self.config.n_kv_heads,
+                len(history) - 1,
+                self.config.head_dim,
+            )
+            or state.key.device != self.pager.device
+            or state.key.dtype != self.pager.compute_dtype
+            or state.crsa_log_usage is not None
+            or not bool(torch.isfinite(state.key).all().item())
+            or not bool(torch.isfinite(state.value).all().item())
+        ):
+            raise ValueError("MTP carry attention tensor contract is invalid")
+        self._committed_history = history
+        self._committed_state = state
+        self._last_target_hidden = hidden.detach().clone().contiguous()
+        self._last_target_hidden_history_length = len(history)
+        self._next_position = carry.next_position
+        self._carry_imported = True
 
     def _load_calibration(self) -> None:
         path = self.state_path
@@ -221,10 +333,15 @@ class Qwen35MtpDraftProvider:
                 **identity,
                 "provider": _QWEN35_MTP_DRAFT_PROVIDER_LEGACY_SCHEMA,
             }
+            v2_identity = {
+                **identity,
+                "provider": _QWEN35_MTP_DRAFT_PROVIDER_V2_SCHEMA,
+            }
             if (
                 not isinstance(document, dict)
                 or document.get("schema") != QWEN35_MTP_CALIBRATION_SCHEMA
-                or document.get("identity") not in (identity, legacy_identity)
+                or document.get("identity")
+                not in (identity, v2_identity, legacy_identity)
                 or not isinstance(document.get("rows"), list)
                 or isinstance(document.get("updates"), bool)
                 or not isinstance(document.get("updates"), int)
@@ -523,6 +640,32 @@ class Qwen35MtpDraftProvider:
         if self._closed:
             raise Qwen35MtpDraftError("MTP provider is closed")
         committed = self._history(history, label="MTP request history")
+        if self._carry_imported:
+            base = self._committed_history
+            previous = self._last_target_hidden
+            if (
+                base is None
+                or previous is None
+                or len(committed) <= len(base)
+                or committed[: len(base)] != base
+            ):
+                raise Qwen35MtpDraftError(
+                    "MTP carry history is not a strict request prefix"
+                )
+            added = len(committed) - len(base)
+            hidden = self._hidden(
+                target_hidden,
+                rows=added,
+                label="MTP restored request hidden",
+            )
+            self._carry_imported = False
+            self.advance_confirmed_prefix_state(
+                committed,
+                previous.detach().clone(),
+                hidden,
+            )
+            self._begin_calls += 1
+            return
         hidden = self._hidden(
             target_hidden,
             rows=len(committed),
@@ -539,6 +682,8 @@ class Qwen35MtpDraftProvider:
             )
             self._committed_state = state
         self._committed_history = committed
+        self._last_target_hidden = hidden[:, -1:].detach().clone().contiguous()
+        self._last_target_hidden_history_length = len(committed)
         self._next_position = len(committed) - 1
         self._begin_calls += 1
 
@@ -596,6 +741,8 @@ class Qwen35MtpDraftProvider:
         )
         self._committed_history = committed
         self._committed_state = state
+        self._last_target_hidden = fragment[:, -1:].detach().clone().contiguous()
+        self._last_target_hidden_history_length = len(committed)
         self._next_position = len(committed) - 1
         self._advance_calls += 1
         self._advanced_tokens += added
@@ -780,6 +927,87 @@ class Qwen35MtpDraftProvider:
         self._pending_gap_buckets = ()
         self._reconcile_calls += 1
 
+    def reconcile_prefix_state(
+        self,
+        history: tuple[int, ...],
+        committed_hidden: torch.Tensor,
+        /,
+    ) -> None:
+        base = self._committed_history
+        if base is None:
+            raise Qwen35MtpDraftError("MTP request state is not initialized")
+        committed = self._history(history, label="MTP reconciled history")
+        added = len(committed) - len(base)
+        fragment = self._hidden(
+            committed_hidden,
+            rows=added,
+            label="MTP reconciled target hidden",
+        )
+        self.reconcile_prefix(committed)
+        self._last_target_hidden = fragment[:, -1:].detach().clone().contiguous()
+        self._last_target_hidden_history_length = len(committed)
+
+    def export_carry(
+        self,
+        history: tuple[int, ...],
+        /,
+    ) -> Qwen35MtpCarry:
+        if self._closed:
+            raise Qwen35MtpDraftError("cannot export carry from a closed provider")
+        if (
+            self._pending_base is not None
+            or self._pending_proposal is not None
+            or self._pending_states
+            or self._pending_gap_buckets
+            or self._adaptive_round_call
+        ):
+            raise Qwen35MtpDraftError("cannot export carry with a pending proposal")
+        committed = self._committed_history
+        state = self._committed_state
+        last_target_hidden = self._last_target_hidden
+        expected = self._history(history, label="MTP carry history")
+        if (
+            committed is None
+            or len(expected) > len(committed)
+            or committed[: len(expected)] != expected
+            or last_target_hidden is None
+            or self._last_target_hidden_history_length != len(expected)
+        ):
+            raise Qwen35MtpDraftError(
+                "MTP carry history and target-hidden cursor are not aligned"
+            )
+        hidden = self._hidden(
+            last_target_hidden,
+            rows=1,
+            label="MTP carry target hidden",
+        )
+        state_length = len(expected) - 1
+        if state_length == 0:
+            exported_state = None
+        else:
+            if state is None or state.length < state_length:
+                raise Qwen35MtpDraftError("MTP carry attention state is too short")
+            exported_state = AttentionState(
+                key=state.key[:, :, :state_length].detach().clone().contiguous(),
+                value=state.value[:, :, :state_length].detach().clone().contiguous(),
+                crsa_log_usage=(
+                    None
+                    if state.crsa_log_usage is None
+                    else state.crsa_log_usage[:, :, :state_length]
+                    .detach()
+                    .clone()
+                    .contiguous()
+                ),
+            )
+        return Qwen35MtpCarry(
+            schema=QWEN35_MTP_CARRY_SCHEMA,
+            identity=self._carry_identity(),
+            history=expected,
+            next_position=len(expected) - 1,
+            state=exported_state,
+            last_target_hidden=hidden.detach().clone().contiguous(),
+        )
+
     def observe_final(self, _history: tuple[int, ...], /) -> None:
         return None
 
@@ -830,6 +1058,9 @@ class Qwen35MtpDraftProvider:
         self._controls.clear()
         self._committed_history = None
         self._committed_state = None
+        self._last_target_hidden = None
+        self._last_target_hidden_history_length = 0
+        self._carry_imported = False
         self._pending_base = None
         self._pending_proposal = None
         self._pending_states = ()
@@ -843,7 +1074,9 @@ class Qwen35MtpDraftProvider:
 __all__ = [
     "MTP_CONTROL_NAMES",
     "MTP_MATRIX_NAMES",
+    "QWEN35_MTP_CARRY_SCHEMA",
     "QWEN35_MTP_DRAFT_PROVIDER_SCHEMA",
+    "Qwen35MtpCarry",
     "Qwen35MtpDraftError",
     "Qwen35MtpDraftMetrics",
     "Qwen35MtpDraftProvider",

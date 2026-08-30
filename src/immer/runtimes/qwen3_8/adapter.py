@@ -60,6 +60,7 @@ from .mlp_page_markov import MlpPageMarkov
 from .mtp_draft import (
     MTP_MATRIX_NAMES,
     QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
+    Qwen35MtpCarry,
     Qwen35MtpDraftProvider,
 )
 from .hybrid_draft import (
@@ -1538,6 +1539,9 @@ class Qwen38CausalChat:
         self._markov_o1_retention: O1MarkovRetention | None = None
         self._conversation_session_id: str | None = None
         self._conversation_prefix_token_ids: tuple[int, ...] = ()
+        self._conversation_mtp_carry: Qwen35MtpCarry | None = None
+        self._validated_conversation_mtp_carry: Qwen35MtpCarry | None = None
+        self._pending_conversation_mtp_carry: Qwen35MtpCarry | None = None
         self._conversation_reuse_hits = 0
         self._conversation_reuse_misses = 0
         self._load_error: str | None = None
@@ -2004,6 +2008,9 @@ class Qwen38CausalChat:
     def _clear_conversation_binding(self) -> None:
         self._conversation_session_id = None
         self._conversation_prefix_token_ids = ()
+        self._conversation_mtp_carry = None
+        self._validated_conversation_mtp_carry = None
+        self._pending_conversation_mtp_carry = None
 
     def _owns_conversation_state(
         self,
@@ -2151,10 +2158,17 @@ class Qwen38CausalChat:
         mode = self._draft_mode
         if generation_options.get("restored_prefix_length") is None:
             return mode
+        carry = self._conversation_mtp_carry
+        carry_matches = (
+            isinstance(carry, Qwen35MtpCarry)
+            and carry is self._validated_conversation_mtp_carry
+            and carry.history == self._conversation_prefix_token_ids
+            and len(carry.history) == generation_options["restored_prefix_length"]
+        )
         if mode == "hybrid":
-            return "markov"
+            return "hybrid" if carry_matches else "markov"
         if mode == "mtp":
-            return None
+            return "mtp" if carry_matches else None
         return mode
 
     def _generate_locked(
@@ -2163,6 +2177,7 @@ class Qwen38CausalChat:
         prompt_ids: tuple[int, ...],
         generation_options: Mapping[str, Any],
     ) -> tuple[tuple[int, ...], Mapping[str, Any]]:
+        self._pending_conversation_mtp_carry = None
         self._last_draft_evidence = None
         self._last_fast_mlp_evidence = None
         self._last_delta_head_evidence = None
@@ -2222,6 +2237,13 @@ class Qwen38CausalChat:
         )
         rolling_started = time.perf_counter()
         rolling_source_start = _runtime_source_body_bytes(runtime)
+        restored_prefix_length = generation_options.get("restored_prefix_length")
+        initial_mtp_carry = (
+            self._conversation_mtp_carry
+            if restored_prefix_length is not None
+            and effective_draft_mode in {"hybrid", "mtp"}
+            else None
+        )
         if effective_draft_mode == "qwen35":
             draft = self._load_draft_locked(runtime)
             provider: Any = Qwen35K4DraftProvider(
@@ -2248,6 +2270,7 @@ class Qwen38CausalChat:
                 head_block_rows=self._head_block_rows,
                 proposal_width=draft_window - 1,
                 state_path=self._mtp_draft_state_path,
+                initial_carry=initial_mtp_carry,
             )
         else:
             markov_provider = FingerprintRollingK4DraftProvider(
@@ -2268,11 +2291,13 @@ class Qwen38CausalChat:
                     head_block_rows=self._head_block_rows,
                     proposal_width=draft_window - 1,
                     state_path=self._mtp_draft_state_path,
+                    initial_carry=initial_mtp_carry,
                 )
 
             provider = Qwen38MarkovMtpDraftProvider(
                 markov_provider,
                 mtp_factory,
+                restored_prefix_length=restored_prefix_length,
             )
         adaptive_rounds = (
             effective_draft_mode
@@ -2320,6 +2345,17 @@ class Qwen38CausalChat:
                 raise Qwen38ChatError(
                     "rolling execution window differs from its Markov selection"
                 )
+            export_carry = getattr(provider, "export_mtp_carry", None)
+            if callable(export_carry):
+                combined = (*prompt_ids, *generated.token_ids)
+                cursor = int(getattr(runtime.model, "next_position", 0))
+                if len(prompt_ids) <= cursor <= len(combined):
+                    try:
+                        candidate_carry = export_carry(tuple(combined[:cursor]))
+                    except (TypeError, ValueError, RuntimeError):
+                        candidate_carry = None
+                    if isinstance(candidate_carry, Qwen35MtpCarry):
+                        self._pending_conversation_mtp_carry = candidate_carry
             fallback_mapped_evidence = {
                 "prompt_token_ids": evidence.prompt_token_ids,
                 "generated_token_ids": evidence.generated_token_ids,
@@ -3031,6 +3067,14 @@ class Qwen38CausalChat:
             reuse_status = "unbound-state"
             self._conversation_reuse_misses += 1
             runtime.model.reset_state(release=True)
+        active_mtp_carry = self._conversation_mtp_carry
+        mtp_carry_reused_tokens = (
+            len(active_mtp_carry.history)
+            if reused_prefix_tokens
+            and isinstance(active_mtp_carry, Qwen35MtpCarry)
+            and active_mtp_carry.history == stored_prefix
+            else 0
+        )
 
         if self._draft_window_controller is not None:
             self._draft_window_controller.bind_policy_identity(
@@ -3194,6 +3238,9 @@ class Qwen38CausalChat:
         conversation_evidence = {
             "history_messages": len(history),
             "history_turns": len(history) // 2,
+            "mtp_carry_bytes": 0,
+            "mtp_carry_reused_tokens": mtp_carry_reused_tokens,
+            "mtp_carry_status": "reused" if mtp_carry_reused_tokens else "none",
             "prompt_suffix_tokens": len(prompt_ids) - reused_prefix_tokens,
             "reuse_hits": self._conversation_reuse_hits,
             "reuse_misses": self._conversation_reuse_misses,
@@ -3348,6 +3395,19 @@ class Qwen38CausalChat:
                 self._conversation_session_id = session_id
                 self._conversation_prefix_token_ids = retained
                 conversation_evidence["state_retained_tokens"] = len(retained)
+                carry = self._pending_conversation_mtp_carry
+                if isinstance(carry, Qwen35MtpCarry) and carry.history == retained:
+                    self._conversation_mtp_carry = carry
+                    self._validated_conversation_mtp_carry = carry
+                    conversation_evidence["mtp_carry_bytes"] = carry.state_bytes
+                    conversation_evidence["mtp_carry_status"] = (
+                        "reused+stored"
+                        if mtp_carry_reused_tokens
+                        else "stored"
+                    )
+                else:
+                    self._conversation_mtp_carry = None
+                    self._validated_conversation_mtp_carry = None
             else:
                 self._clear_conversation_binding()
         return Result(

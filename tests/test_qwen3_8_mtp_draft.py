@@ -192,7 +192,7 @@ def _tensors(config: Qwen38Config) -> dict[str, torch.Tensor]:
 
 
 class Qwen35MtpDraftTests(unittest.TestCase):
-    def test_v1_calibration_identity_migrates_to_v2_without_data_loss(
+    def test_v2_calibration_identity_migrates_to_v3_without_data_loss(
         self,
     ) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -204,7 +204,7 @@ class Qwen35MtpDraftTests(unittest.TestCase):
                 {
                     "identity": {
                         "dim": config.dim,
-                        "provider": "immer.qwen3.5-mtp-draft-provider/v1",
+                        "provider": "immer.qwen3.5-mtp-draft-provider/v2",
                         "q4_manifest_sha256": "a" * 64,
                         "vocab_size": config.vocab_size,
                     },
@@ -241,7 +241,7 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         migrated = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(
             migrated["identity"]["provider"],
-            "immer.qwen3.5-mtp-draft-provider/v2",
+            "immer.qwen3.5-mtp-draft-provider/v3",
         )
         self.assertEqual(migrated["previous_outcome"], 1)
         self.assertEqual(migrated["updates"], 8)
@@ -391,6 +391,91 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         self.assertEqual(metrics.rejected_tokens, 0)
         provider.close()
 
+    def test_mtp_carry_plus_suffix_matches_full_history_bootstrap(self) -> None:
+        config = _config()
+        tensors = _tensors(config)
+        history = (4, 7, 11, 19, 23)
+        prefix = history[:3]
+        hidden = torch.randn(
+            (1, len(history), config.dim),
+            generator=torch.Generator().manual_seed(77),
+        ).to(torch.bfloat16)
+
+        full = Qwen35MtpDraftProvider(
+            config,
+            _Pager(tensors),
+            proposal_width=3,
+        )
+        full.begin_request_state(history, hidden)
+
+        source = Qwen35MtpDraftProvider(
+            config,
+            _Pager(tensors),
+            proposal_width=3,
+        )
+        source.begin_request_state(prefix, hidden[:, : len(prefix)])
+        carry = source.export_carry(prefix)
+        source.close()
+
+        restored = Qwen35MtpDraftProvider(
+            config,
+            _Pager(tensors),
+            proposal_width=3,
+            initial_carry=carry,
+        )
+        restored.begin_request_state(history, hidden[:, len(prefix) :])
+
+        assert full._committed_state is not None
+        assert restored._committed_state is not None
+        self.assertTrue(
+            torch.equal(full._committed_state.key, restored._committed_state.key)
+        )
+        self.assertTrue(
+            torch.equal(full._committed_state.value, restored._committed_state.value)
+        )
+        self.assertTrue(
+            torch.equal(full._last_target_hidden, restored._last_target_hidden)
+        )
+        full_proposal = full.propose_round_state(history, 29, hidden[:, -1:])
+        restored_proposal = restored.propose_round_state(
+            history,
+            29,
+            hidden[:, -1:],
+        )
+        self.assertEqual(restored_proposal.token_ids, full_proposal.token_ids)
+        self.assertEqual(
+            restored_proposal.token_confidences,
+            full_proposal.token_confidences,
+        )
+        full.close()
+        restored.close()
+
+    def test_mtp_carry_trims_uncommitted_terminal_proposal_state(self) -> None:
+        config = _config()
+        provider = Qwen35MtpDraftProvider(
+            config,
+            _Pager(_tensors(config)),
+            proposal_width=3,
+        )
+        prefix = (4, 7, 11, 19)
+        hidden = torch.randn((1, len(prefix), config.dim)).to(torch.bfloat16)
+        provider.begin_request_state(prefix, hidden)
+        proposal = provider.propose_round_state(prefix, 23, hidden[:, -1:])
+
+        with self.assertRaisesRegex(Qwen35MtpDraftError, "pending proposal"):
+            provider.export_carry(prefix)
+
+        provider.observe_verification(1, 2)
+        provider.reconcile_prefix((*prefix, 23, proposal.token_ids[0]))
+        carry = provider.export_carry(prefix)
+
+        self.assertEqual(carry.history, prefix)
+        self.assertEqual(carry.next_position, len(prefix) - 1)
+        assert carry.state is not None
+        self.assertEqual(carry.state.length, len(prefix) - 1)
+        self.assertTrue(torch.equal(carry.last_target_hidden, hidden[:, -1:]))
+        provider.close()
+
     def test_adaptive_exact_deeper_posterior_stops_and_pads(self) -> None:
         config = _config()
         pager = _Pager(_tensors(config))
@@ -515,7 +600,7 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         self.assertEqual(provider._committed_history, (*history, *extension))
         self.assertEqual(provider._next_position, len(history) + len(extension) - 1)
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.5-mtp-draft-provider/v2")
+        self.assertEqual(metrics.schema, "immer.qwen3.5-mtp-draft-provider/v3")
         self.assertEqual(metrics.advance_calls, 1)
         self.assertEqual(metrics.advanced_tokens, len(extension))
         self.assertFalse(metrics.pending)

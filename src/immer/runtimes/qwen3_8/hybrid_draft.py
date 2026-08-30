@@ -10,10 +10,10 @@ from typing import Any, Literal
 import torch
 
 from .draft_protocol import RollingDraftProposal
-from .mtp_draft import Qwen35MtpDraftProvider
+from .mtp_draft import Qwen35MtpCarry, Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v18"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v19"
 ATLAS_MTP_CONSENSUS_STRENGTH = 0.25
 ONLINE_MTP_CONSENSUS_STRENGTH = 0.25
 MARKOV_MTP_WINDOW_WORK_COSTS = {
@@ -137,7 +137,13 @@ class Qwen38MarkovMtpDraftProvider:
 
     target_state_isolation = "hidden-argument+shared-pager-only/v1"
 
-    def __init__(self, markov_provider: object, mtp_factory: MtpFactory) -> None:
+    def __init__(
+        self,
+        markov_provider: object,
+        mtp_factory: MtpFactory,
+        *,
+        restored_prefix_length: int | None = None,
+    ) -> None:
         if not callable(mtp_factory):
             raise TypeError("mtp_factory must be callable")
         required = (
@@ -155,6 +161,7 @@ class Qwen38MarkovMtpDraftProvider:
             raise TypeError("markov_provider lacks the rolling council callbacks")
         self.markov_provider = markov_provider
         self._mtp_factory = mtp_factory
+        self._restored_prefix_length = restored_prefix_length
         self._mtp_provider: Qwen35MtpDraftProvider | object | None = None
         self._selected_provider: Literal["markov", "mtp"] | None = None
         self._request_history: tuple[int, ...] | None = None
@@ -166,6 +173,8 @@ class Qwen38MarkovMtpDraftProvider:
         self._hidden_history_bytes = 0
         self._switch_available = False
         self._round_target_hidden: torch.Tensor | None = None
+        self._boundary_history: tuple[int, ...] | None = None
+        self._boundary_target_hidden: torch.Tensor | None = None
         self._request_started = False
         self._request_completed = False
         self._closed = False
@@ -225,25 +234,35 @@ class Qwen38MarkovMtpDraftProvider:
             raise ValueError("hybrid request history must be a non-empty tuple")
         if not isinstance(target_hidden, torch.Tensor):
             raise TypeError("target_hidden must be a torch.Tensor")
+        restored = self._restored_prefix_length
+        expected_hidden_rows = (
+            len(history) if restored is None else len(history) - restored
+        )
         if (
             target_hidden.ndim != 3
             or target_hidden.shape[0] != 1
-            or target_hidden.shape[1] != len(history)
+            or target_hidden.shape[1] != expected_hidden_rows
             or target_hidden.shape[2] <= 0
             or not target_hidden.is_floating_point()
         ):
             raise ValueError("prompt hidden rows must match request history")
+        if restored is not None and not 1 <= restored < len(history):
+            raise ValueError("restored hybrid prefix must leave a prompt suffix")
         self.markov_provider.begin_request(history)
         self._request_history = history
         self._hidden_history = target_hidden.detach().clone().contiguous()
         self._hidden_device = target_hidden.device
         self._hidden_dtype = target_hidden.dtype
         self._hidden_width = int(target_hidden.shape[2])
-        self._hidden_history_rows = len(history)
+        self._hidden_history_rows = expected_hidden_rows
         self._hidden_history_bytes = (
             target_hidden.numel() * target_hidden.element_size()
         )
         self._switch_available = True
+        self._boundary_history = history
+        self._boundary_target_hidden = (
+            target_hidden[:, -1:].detach().clone().contiguous()
+        )
         self._request_started = True
 
     def _validate_history(self, history: tuple[int, ...]) -> None:
@@ -366,7 +385,12 @@ class Qwen38MarkovMtpDraftProvider:
         if self._mtp_provider is None and (
             hidden_history is None
             or request_history != history
-            or hidden_history.shape[1] != len(history)
+            or hidden_history.shape[1]
+            != (
+                len(history)
+                if self._restored_prefix_length is None
+                else len(history) - self._restored_prefix_length
+            )
         ):
             # Missing target state is a safe Markov-only fallback.  Keep its
             # pending K1 proposal so the decoder can reconcile the direct row.
@@ -710,7 +734,8 @@ class Qwen38MarkovMtpDraftProvider:
             # A no-state caller cannot advance an already loaded MTP cache.
             # Keep serving the synchronized Markov expert for this request.
             self._switch_available = False
-            self._hidden_history = None
+            if self._mtp_provider is not None:
+                self._hidden_history = None
 
     def reconcile_prefix_state(
         self,
@@ -732,7 +757,11 @@ class Qwen38MarkovMtpDraftProvider:
         owner = self.markov_provider if pending == "markov" else self._mtp_provider
         if owner is None:  # pragma: no cover - pending-provider invariant.
             raise Qwen38MarkovMtpDraftError("hybrid provider was not selected")
-        owner.reconcile_prefix(history)
+        stateful_reconcile = getattr(owner, "reconcile_prefix_state", None)
+        if pending == "mtp" and callable(stateful_reconcile):
+            stateful_reconcile(history, fragment.detach().clone())
+        else:
+            owner.reconcile_prefix(history)
         if pending == "mtp":
             self.markov_provider.reconcile_external_prefix(history)
             self._markov_external_feedback_rounds += 1
@@ -768,6 +797,10 @@ class Qwen38MarkovMtpDraftProvider:
                     self._hidden_history.numel() * self._hidden_history.element_size()
                 )
         self._request_history = history
+        self._boundary_history = history
+        self._boundary_target_hidden = (
+            fragment[:, -1:].detach().clone().contiguous()
+        )
         self._pending_provider = None
         self._round_target_hidden = None
 
@@ -792,10 +825,45 @@ class Qwen38MarkovMtpDraftProvider:
             self.markov_provider.observe_final(history)
         self._request_completed = True
         self._switch_available = False
-        self._hidden_history = None
         self._round_target_hidden = None
         if mtp_failure is not None:
             raise mtp_failure
+
+    def export_mtp_carry(
+        self,
+        history: tuple[int, ...],
+        /,
+    ) -> Qwen35MtpCarry | None:
+        if not self._request_completed or self._pending_provider is not None:
+            raise Qwen38MarkovMtpDraftError(
+                "hybrid request must complete before MTP carry export"
+            )
+        mtp = self._mtp_provider
+        boundary_history = self._boundary_history
+        boundary_hidden = self._boundary_target_hidden
+        if boundary_history != history or boundary_hidden is None:
+            raise Qwen38MarkovMtpDraftError(
+                "hybrid MTP carry differs from the target boundary"
+            )
+        if mtp is None:
+            hidden_history = self._hidden_history
+            if hidden_history is None:
+                return None
+            mtp = self._load_mtp()
+            mtp.begin_request_state(history, hidden_history.detach().clone())
+            self._hidden_history = None
+        export = getattr(mtp, "export_carry", None)
+        if not callable(export):
+            return None
+        carry = export(history)
+        if isinstance(carry, Qwen35MtpCarry) and not torch.equal(
+            carry.last_target_hidden,
+            boundary_hidden,
+        ):
+            raise Qwen38MarkovMtpDraftError(
+                "exported MTP carry target hidden differs from target boundary"
+            )
+        return carry
 
     def metrics(self) -> Qwen38MarkovMtpDraftMetrics:
         markov = _metrics_record(self.markov_provider)
@@ -886,6 +954,8 @@ class Qwen38MarkovMtpDraftProvider:
                 failure = exc
         self._hidden_history = None
         self._round_target_hidden = None
+        self._boundary_history = None
+        self._boundary_target_hidden = None
         self._shadow_markov_proposal = None
         self._switch_available = False
         self._closed = True
