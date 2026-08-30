@@ -2499,12 +2499,20 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         first.close()
         self.assertIsNone(first._request_horizon_observations)
         self.assertIsNone(first._request_horizon_hits)
+        self.assertIsNone(first._request_surprise_mean)
+        self.assertIsNone(first._request_surprise_deviation)
+        self.assertIsNone(first._request_surprise_cusum)
+        self.assertEqual(first._request_feedback_count, 0)
 
         aborted = MarkovDraftState.from_bytes(state_path.read_bytes())
         self.assertEqual(aborted.feedback_count, 0)
         self.assertEqual(aborted.updates, 0)
         self.assertEqual(aborted.token_ids, ())
         self.assertEqual(aborted.dialects, ())
+        self.assertEqual(aborted.surprise_mean, 0.0)
+        self.assertEqual(aborted.surprise_deviation, 1.0)
+        self.assertEqual(aborted.surprise_cusum, 0.0)
+        self.assertEqual(aborted.regime_generation, 0)
 
         replay = FingerprintRollingK4DraftProvider(
             vocab_size=32,
