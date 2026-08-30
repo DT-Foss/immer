@@ -6,6 +6,18 @@ All notable changes to IMMER are recorded here.
 
 ### Deployed Markov/MTP product path
 
+- `265d15d` made interactive chat a real multi-turn Qwen session. Every
+  successful user/assistant pair is retained and rendered by the official Qwen
+  chat template; prompt-bound trimming removes only the oldest complete turns,
+  and `/clear` resets the conversation. Contextual turns bypass single-turn
+  FERTIG and warm execution even when trimming evicts the complete prior
+  history. Single-request and JSONL paths are unchanged. In one loaded raw-Qwen
+  hybrid process, turn 1 stored `ZORPAX-731` and returned `gespeichert` in four
+  generated tokens, three Qwen forwards, 18.95 s, and 1.51 GiB peak RSS. Turn 2
+  omitted the code, reported one prior turn, and returned `ZORPAX-731` in nine
+  tokens, four forwards, 29.87 s, and 1.53 GiB peak RSS. This is a functional
+  two-turn proof, not a broad performance benchmark. The affected local suite
+  passed 161 tests in 6.532 s; six focused deployment tests passed remotely.
 - `61cdbaa` restored novelty drafting to the deployed v3 Q4 product path.
   Ordinary chat now runs the round-wise Markov/embedded-MTP hybrid: Markov
   executes learned continuations, MTP covers novelty, and Qwen remains the sole

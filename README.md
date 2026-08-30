@@ -308,8 +308,13 @@ Full Q4 still verifies every emitted token. Direct Q4 MLP-page routing is also
 explicit-only through `--mlp-page-state` and is disabled in this default.
 
 `immer chat --interactive` keeps that complete runtime loaded across arbitrary
-prompts. `/help` prints the local commands, `/stats` reports the last completed
-response's real token, Qwen-forward, wall-time, and peak-RSS totals, and `/quit`
+prompts and renders every retained user/assistant pair through Qwen's official
+multi-turn chat template. Context trimming removes only the oldest complete
+turns under the prompt-token bound. Once a session has context, its later turns
+stay on raw Qwen even if trimming evicts all earlier turns; single-turn and
+JSONL behavior remain unchanged. `/help` prints the local commands, `/stats`
+reports the last completed response's prior-turn, token, Qwen-forward,
+wall-time, and peak-RSS totals, `/clear` drops conversation context, and `/quit`
 closes the session.
 
 Markov state v6 also retains prompt/output boundaries for composition. Two or
@@ -339,6 +344,7 @@ per-profile store and are revalidated against their source ResultCells.
 
 | Trial | Result | Scope |
 |---|---:|---|
+| Loaded multi-turn Qwen recall | second turn returned `ZORPAX-731` although its prompt omitted the code | one raw-Qwen hybrid process; turn 1 returned `gespeichert` in 4 tokens / 3 forwards / 18.95 s at 1.51 GiB peak, then turn 2 reported one prior turn and returned the remembered word in 9 tokens / 4 forwards / 29.87 s at 1.53 GiB peak; functional two-turn proof, not a broad benchmark; 161 affected local tests passed in 6.532 s and six focused deployment tests passed remotely |
 | Deployed Markov/MTP hybrid | 23 → 11 Qwen forwards (-52.17%); 69.469500 → 49.448516 s (-28.82%, 1.405x) | same real prompt and identical target-confirmed prefix under a fixed 24-token cap against explicit Markov-only mode; accepted drafts rose 1 → 14; peak RSS changed 1,699,160,064 → 1,725,218,816 bytes (+1.53%); hybrid consumed 52,224 draft bytes and 58,201,088 target-source bytes (-52.17%) |
 | Local causal bundle reopen | 77.77 → 1.20 s; 64.90x | complete 55.6 GB Qwen3.8 bundle; first full-content verification followed by unchanged next-process stat+digest reuse; no model forward |
 | Native causal Q4/Q8 chat | readable arbitrary German output; TTFT 11.95 s; 8 tokens in 20.12 s | real 27B CPU run on 16 AVX2 cores; 498 text matrices; 16.02 GB peak RSS; 16.40 GB derived payload; two prior token traces preserved exactly |
