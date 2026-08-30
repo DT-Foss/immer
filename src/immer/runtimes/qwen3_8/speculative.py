@@ -1819,6 +1819,53 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             ) from failure
         return integrity_bytes, integrity_seconds
 
+    def _observe_rolling_teacher_provider(
+        self,
+        position: int,
+        outcome: bool,
+    ) -> tuple[int, float]:
+        missing = object()
+        if (
+            inspect.getattr_static(
+                self.draft_provider,
+                "observe_teacher_verification",
+                missing,
+            )
+            is missing
+        ):
+            return 0, 0.0
+        stamp_started = time.perf_counter()
+        before = self._provider_state_stamp()
+        integrity_seconds = time.perf_counter() - stamp_started
+        integrity_bytes = self._provider_guard_payload_bytes()
+        failure: Exception | None = None
+        try:
+            callback = getattr(self.draft_provider, "observe_teacher_verification")
+            if not callable(callback):
+                raise TypeError("draft provider teacher observer is not callable")
+            callback(position, outcome)
+        except Exception as exc:
+            failure = exc
+        stamp_started = time.perf_counter()
+        try:
+            changed = self._provider_state_stamp() != before
+        except Exception:
+            changed = True
+        integrity_seconds += time.perf_counter() - stamp_started
+        integrity_bytes += self._provider_guard_payload_bytes()
+        if changed:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError(
+                "rolling teacher observer changed target model state"
+            )
+        if failure is not None:
+            self.model.reset_state(release=True)
+            raise Qwen38SpeculativeError(
+                "rolling teacher observer failed: "
+                f"{type(failure).__name__}: {failure}"
+            ) from failure
+        return integrity_bytes, integrity_seconds
+
     def _observe_rolling_final_provider(
         self,
         history: tuple[int, ...],
@@ -2192,6 +2239,22 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
             )
             guard_bytes += verification_bytes
             guard_seconds += verification_seconds
+            if (
+                eos_offset is None
+                and matched_prefix_length == len(proposal)
+                and len(provider_proposal) > len(proposal)
+                and len(targets) > len(proposal)
+            ):
+                teacher_position = len(proposal)
+                teacher_bytes, teacher_seconds = (
+                    self._observe_rolling_teacher_provider(
+                        teacher_position,
+                        provider_proposal[teacher_position]
+                        == targets[teacher_position],
+                    )
+                )
+                guard_bytes += teacher_bytes
+                guard_seconds += teacher_seconds
             emitted = (pending_token, *proposal[:accepted])
             stopped = eos_offset is not None
             terminal = stopped or len(emitted) == remaining

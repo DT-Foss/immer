@@ -191,6 +191,7 @@ class _Mtp:
         self.propose_calls = []
         self.verification_calls = []
         self.virtual_verification_calls = []
+        self.teacher_verification_calls = []
         self.reconcile_calls = []
         self.advance_calls = []
         self.final_calls = []
@@ -220,6 +221,9 @@ class _Mtp:
 
     def observe_virtual_verification(self, accepted, verified):
         self.virtual_verification_calls.append((accepted, verified))
+
+    def observe_teacher_verification(self, position, outcome):
+        self.teacher_verification_calls.append((position, outcome))
 
     def reconcile_prefix(self, history):
         if not self.pending:
@@ -258,6 +262,40 @@ class _Mtp:
 
 
 class Qwen38HybridDraftTests(unittest.TestCase):
+    def test_teacher_verification_delegates_only_for_pending_mtp(self) -> None:
+        markov = _Markov([0.01, 0.99])
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        provider.observe_teacher_verification(1, False)
+        provider.propose_round_state(prompt, 4, hidden[:, -1:])
+        self.assertEqual(provider.selected_provider, "mtp")
+        provider.observe_teacher_verification(1, True)
+        self.assertEqual(mtp.teacher_verification_calls, [(1, True)])
+
+        provider.observe_verification(1, 1)
+        mtp_history = (*prompt, 4, 7)
+        provider.reconcile_prefix(mtp_history)
+        provider.observe_teacher_verification(2, False)
+
+        provider.propose_round_state(
+            mtp_history,
+            5,
+            torch.ones((1, 1, 8)),
+        )
+        self.assertEqual(provider.selected_provider, "markov")
+        provider.observe_teacher_verification(1, False)
+        self.assertEqual(mtp.teacher_verification_calls, [(1, True)])
+
+        provider.observe_verification(1, 1)
+        final_prefix = (*mtp_history, 5, 3)
+        provider.reconcile_prefix(final_prefix)
+        provider.observe_final((*final_prefix, 10))
+        provider.close()
+
     def test_restored_hybrid_initializes_mtp_from_carried_prefix_suffix(self) -> None:
         markov = _Markov(0.01)
         mtp = _Mtp()
@@ -599,7 +637,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(proposal.token_ids, (7, 8, 9))
         self.assertEqual(
             proposal.provider_abi,
-            "immer.qwen3.8-markov-mtp-hybrid-provider/v20",
+            "immer.qwen3.8-markov-mtp-hybrid-provider/v21",
         )
         self.assertTrue(
             all(abs(value - 0.7625) < 1e-12 for value in proposal.token_confidences)
@@ -922,7 +960,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(mtp.advance_calls[0][2], final_hidden))
 
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v20")
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v21")
         self.assertEqual(metrics.selected_provider, "markov")
         self.assertEqual(metrics.selection_calls, 4)
         self.assertEqual(metrics.markov_rounds, 3)

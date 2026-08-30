@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -204,6 +205,102 @@ class _MutatingQuad(Sequence[int]):
         if index == 2:
             self.model._layer_states[0].recurrent.data.zero_()
         return self.block[index]
+
+
+class Qwen38TeacherReuseUnitTests(unittest.TestCase):
+    def test_k2_reuses_one_scanned_teacher_token_only_after_a_clean_match(
+        self,
+    ) -> None:
+        proposal = RollingDraftProposal.build(
+            (11, 22, 33),
+            (0.9, 0.9, 0.9),
+            (0.0, 0.0, 0.0),
+            request_window_ceiling=4,
+            provider_abi="test-teacher-reuse/v1",
+        )
+        cases = (
+            ("clean", (11, 99), (), [mock.call(1, False)]),
+            ("mismatch", (12, 22), (), []),
+            ("eos", (11, 22), (11,), []),
+        )
+        for name, targets, eos, teacher_calls in cases:
+            with self.subTest(name=name):
+                model = mock.Mock()
+                model.config = SimpleNamespace(vocab_size=128)
+                model.max_seq_len = 16
+                model.pager.metrics.return_value = {}
+                model.pager.source.metrics.return_value = {}
+                model.next_position = 0
+                model.state_batch_size = 0
+                model.state_poisoned = False
+                model.state_bytes = 0
+                model._layer_states = []
+                model._graft_history = None
+                model._pending_block_stage = None
+                model._token_tensor.return_value = torch.tensor([[1, 4]])
+
+                def prefill(*_args, **_kwargs):
+                    model.next_position = 2
+                    model.state_batch_size = 1
+                    return torch.zeros((1, 2, 1)), (object(),)
+
+                def stage(token_ids):
+                    pending = SimpleNamespace(
+                        hidden=torch.zeros((1, len(token_ids[0]), 1))
+                    )
+                    model._pending_block_stage = pending
+                    return pending
+
+                def commit(pending, width=None):
+                    width = pending.hidden.shape[1] if width is None else width
+                    model.next_position += width
+                    model._pending_block_stage = None
+                    return pending.hidden[:, :width], ()
+
+                def decode(token_ids):
+                    model.next_position += len(token_ids[0])
+                    return torch.zeros((1, len(token_ids[0]), 1)), ()
+
+                model.prefill.side_effect = prefill
+                model.stage_continuation_block.side_effect = stage
+                model.commit_continuation_block.side_effect = commit
+                model.commit_continuation_prefix.side_effect = commit
+                model.decode.side_effect = decode
+                provider = mock.Mock(target_state_isolation="no-target-state-access/v1")
+                provider.propose_round = mock.Mock(return_value=proposal)
+                provider.observe_verification = mock.Mock()
+                provider.observe_teacher_verification = mock.Mock()
+                provider.reconcile_prefix = mock.Mock()
+                provider.observe_final = mock.Mock()
+                decoder = Qwen38K4SpeculativeDecoder.__new__(
+                    Qwen38K4SpeculativeDecoder
+                )
+                decoder.model = model
+                decoder.draft_provider = provider
+                decoder.window_size = 4
+                decoder.adaptive_round_windows = True
+                decoder.round_window_work_costs = {
+                    1: 1.0,
+                    2: 1.0,
+                    4: 100.0,
+                }
+                decoder._scan = mock.Mock(side_effect=[(7,), targets])
+
+                result = decoder.generate_rolling(
+                    [[1, 4]],
+                    max_new_tokens=2,
+                    eos_token_ids=eos,
+                )
+
+                row = result.evidence.rounds[0]
+                self.assertEqual(row.window_size, 2)
+                self.assertEqual(row.proposed_token_ids, (11,))
+                self.assertEqual(row.target_token_ids, targets)
+                self.assertEqual(
+                    provider.observe_teacher_verification.call_args_list,
+                    teacher_calls,
+                )
+                self.assertEqual(decoder._scan.call_count, 2)
 
 
 class Qwen38SpeculativeTests(unittest.TestCase):

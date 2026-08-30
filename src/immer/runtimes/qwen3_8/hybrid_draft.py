@@ -13,7 +13,7 @@ from .draft_protocol import RollingDraftProposal
 from .mtp_draft import Qwen35MtpCarry, Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v20"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v21"
 ATLAS_MTP_CONSENSUS_STRENGTH = 0.25
 ONLINE_MTP_CONSENSUS_STRENGTH = 0.25
 MARKOV_MTP_WINDOW_WORK_COSTS = {
@@ -711,6 +711,19 @@ class Qwen38MarkovMtpDraftProvider:
         callback = getattr(owner, "observe_virtual_verification", None)
         if callable(callback):
             callback(accepted_prefix_length, verified_proposals)
+
+    def observe_teacher_verification(
+        self,
+        position: int,
+        outcome: bool,
+        /,
+    ) -> None:
+        self._require_open_request()
+        if self._pending_provider != "mtp" or self._mtp_provider is None:
+            return
+        callback = getattr(self._mtp_provider, "observe_teacher_verification", None)
+        if callable(callback):
+            callback(position, outcome)
 
     def reconcile_prefix(self, history: tuple[int, ...], /) -> None:
         self._require_open_request()

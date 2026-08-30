@@ -20,7 +20,8 @@ from .kernels import AttentionState, full_attention_core, rms_norm
 from .pager import Qwen38WeightPager
 
 
-QWEN35_MTP_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v4"
+QWEN35_MTP_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v5"
+_QWEN35_MTP_DRAFT_PROVIDER_V4_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v4"
 _QWEN35_MTP_DRAFT_PROVIDER_V3_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v3"
 _QWEN35_MTP_DRAFT_PROVIDER_V2_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v2"
 _QWEN35_MTP_DRAFT_PROVIDER_LEGACY_SCHEMA = (
@@ -140,6 +141,10 @@ class Qwen35MtpDraftMetrics:
     carried_calibration_states: int
     cold_calibration_updates: int
     carried_calibration_updates: int
+    teacher_verifications: int
+    teacher_hits: int
+    teacher_misses: int
+    teacher_max_position: int
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -222,6 +227,8 @@ class Qwen35MtpDraftProvider:
         self._pending_states: tuple[AttentionState, ...] = ()
         self._last_confidences: tuple[float, ...] = ()
         self._pending_gap_buckets: tuple[int, ...] = ()
+        self._pending_computed_width = 0
+        self._pending_teacher_positions: set[int] = set()
         self._carried_context = initial_carry is not None
         self._reliability: dict[tuple[bool, int, int, int], list[int]] = {}
         self._previous_outcomes = {False: -1, True: -1}
@@ -243,6 +250,10 @@ class Qwen35MtpDraftProvider:
         self._verified_proposal_tokens = 0
         self._accepted_tokens = 0
         self._rejected_tokens = 0
+        self._teacher_verifications = 0
+        self._teacher_hits = 0
+        self._teacher_misses = 0
+        self._teacher_max_position = 0
         self._linear_calls = 0
         self._source_body_bytes = max(
             0,
@@ -401,6 +412,10 @@ class Qwen35MtpDraftProvider:
         try:
             document = json.loads(path.read_bytes())
             identity = self._calibration_identity()
+            v4_identity = {
+                **identity,
+                "provider": _QWEN35_MTP_DRAFT_PROVIDER_V4_SCHEMA,
+            }
             v3_identity = {
                 **identity,
                 "provider": _QWEN35_MTP_DRAFT_PROVIDER_V3_SCHEMA,
@@ -421,7 +436,13 @@ class Qwen35MtpDraftProvider:
                     _QWEN35_MTP_CALIBRATION_V1_SCHEMA,
                 )
                 or document.get("identity")
-                not in (identity, v3_identity, v2_identity, legacy_identity)
+                not in (
+                    identity,
+                    v4_identity,
+                    v3_identity,
+                    v2_identity,
+                    legacy_identity,
+                )
                 or not isinstance(document.get("rows"), list)
                 or isinstance(document.get("updates"), bool)
                 or not isinstance(document.get("updates"), int)
@@ -926,12 +947,14 @@ class Qwen35MtpDraftProvider:
         proposal: list[int] = []
         confidences: list[float] = []
         gap_buckets: list[int] = []
+        computed_width = 0
         for proposal_index in range(self.proposal_width):
             token, confidence, bucket = self._scan(
                 output,
                 proposal_index=proposal_index,
             )
             self._computed_proposal_tokens += 1
+            computed_width += 1
             proposal.append(token)
             confidences.append(confidence)
             gap_buckets.append(bucket)
@@ -969,6 +992,8 @@ class Qwen35MtpDraftProvider:
         self._pending_states = tuple(states)
         self._last_confidences = tuple(confidences)
         self._pending_gap_buckets = tuple(gap_buckets)
+        self._pending_computed_width = computed_width
+        self._pending_teacher_positions.clear()
         self._proposal_calls += 1
         self._proposed_tokens += len(result)
         return result
@@ -993,6 +1018,43 @@ class Qwen35MtpDraftProvider:
             provider_abi=QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
         )
 
+    def _update_calibration(
+        self,
+        *,
+        position: int,
+        bucket: int,
+        previous: int,
+        outcome: bool,
+    ) -> None:
+        key = (self._carried_context, position, bucket, previous)
+        alpha, beta = self._reliability.setdefault(key, [1, 1])
+        if outcome:
+            alpha += 1
+        else:
+            beta += 1
+        self._reliability[key] = [alpha, beta]
+        if self._carried_context:
+            aggregate_key = (
+                True,
+                position,
+                _AGGREGATE_GAP_BUCKET,
+                previous,
+            )
+            aggregate_alpha, aggregate_beta = self._reliability.setdefault(
+                aggregate_key,
+                [1, 1],
+            )
+            if outcome:
+                aggregate_alpha += 1
+            else:
+                aggregate_beta += 1
+            self._reliability[aggregate_key] = [
+                aggregate_alpha,
+                aggregate_beta,
+            ]
+        self._calibration_updates += 1
+        self._calibration_updates_by_context[self._carried_context] += 1
+
     def observe_verification(
         self,
         accepted_prefix_length: int,
@@ -1016,38 +1078,58 @@ class Qwen35MtpDraftProvider:
         previous = self._previous_outcome
         for index in range(verified_proposals):
             outcome = index < accepted_prefix_length
-            key = (self._carried_context, index, buckets[index], previous)
-            alpha, beta = self._reliability.setdefault(key, [1, 1])
-            if outcome:
-                alpha += 1
-            else:
-                beta += 1
-            self._reliability[key] = [alpha, beta]
-            if self._carried_context:
-                aggregate_key = (
-                    True,
-                    index,
-                    _AGGREGATE_GAP_BUCKET,
-                    previous,
-                )
-                aggregate_alpha, aggregate_beta = self._reliability.setdefault(
-                    aggregate_key,
-                    [1, 1],
-                )
-                if outcome:
-                    aggregate_alpha += 1
-                else:
-                    aggregate_beta += 1
-                self._reliability[aggregate_key] = [
-                    aggregate_alpha,
-                    aggregate_beta,
-                ]
-            self._calibration_updates += 1
-            self._calibration_updates_by_context[self._carried_context] += 1
+            self._update_calibration(
+                position=index,
+                bucket=buckets[index],
+                previous=previous,
+                outcome=outcome,
+            )
             previous = int(outcome)
             if not outcome:
                 break
         self._previous_outcome = previous
+        try:
+            self._save_calibration()
+        except OSError:
+            pass
+
+    def observe_teacher_verification(
+        self,
+        position: int,
+        outcome: bool,
+        /,
+    ) -> None:
+        if self._closed:
+            raise Qwen35MtpDraftError("MTP provider is closed")
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or position < 1
+            or not isinstance(outcome, bool)
+        ):
+            raise ValueError("MTP teacher verification is invalid")
+        if not self._pending_gap_buckets:
+            raise Qwen35MtpDraftError("MTP teacher verification has no proposal")
+        if position >= len(self._pending_gap_buckets):
+            raise ValueError("MTP teacher verification is invalid")
+        if position >= self._pending_computed_width:
+            return
+        if position in self._pending_teacher_positions:
+            raise Qwen35MtpDraftError(
+                "MTP teacher verification position was already observed"
+            )
+        self._update_calibration(
+            position=position,
+            bucket=self._pending_gap_buckets[position],
+            previous=1,
+            outcome=outcome,
+        )
+        self._teacher_verifications += 1
+        self._teacher_hits += int(outcome)
+        self._teacher_misses += int(not outcome)
+        self._teacher_max_position = max(self._teacher_max_position, position)
+        self._pending_teacher_positions.add(position)
+        self._previous_outcome = int(outcome)
         try:
             self._save_calibration()
         except OSError:
@@ -1085,6 +1167,8 @@ class Qwen35MtpDraftProvider:
         self._pending_proposal = None
         self._pending_states = ()
         self._pending_gap_buckets = ()
+        self._pending_computed_width = 0
+        self._pending_teacher_positions.clear()
         self._reconcile_calls += 1
 
     def reconcile_prefix_state(
@@ -1119,6 +1203,7 @@ class Qwen35MtpDraftProvider:
             or self._pending_proposal is not None
             or self._pending_states
             or self._pending_gap_buckets
+            or self._pending_teacher_positions
             or self._adaptive_round_call
         ):
             raise Qwen35MtpDraftError("cannot export carry with a pending proposal")
@@ -1215,6 +1300,10 @@ class Qwen35MtpDraftProvider:
             ),
             cold_calibration_updates=self._calibration_updates_by_context[False],
             carried_calibration_updates=self._calibration_updates_by_context[True],
+            teacher_verifications=self._teacher_verifications,
+            teacher_hits=self._teacher_hits,
+            teacher_misses=self._teacher_misses,
+            teacher_max_position=self._teacher_max_position,
         )
 
     def close(self) -> None:
@@ -1235,6 +1324,8 @@ class Qwen35MtpDraftProvider:
         self._pending_states = ()
         self._last_confidences = ()
         self._pending_gap_buckets = ()
+        self._pending_computed_width = 0
+        self._pending_teacher_positions.clear()
         self._reliability.clear()
         self._closed = True
         self.pager.release()

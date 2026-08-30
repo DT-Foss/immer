@@ -192,6 +192,43 @@ def _tensors(config: Qwen38Config) -> dict[str, torch.Tensor]:
 
 
 class Qwen35MtpDraftTests(unittest.TestCase):
+    def test_teacher_observation_updates_the_deeper_position_once(self) -> None:
+        config = _config()
+        provider = Qwen35MtpDraftProvider(
+            config,
+            _Pager(_tensors(config)),
+            proposal_width=3,
+        )
+        self.addCleanup(provider.close)
+        provider._pending_gap_buckets = (2, 5, 7)
+        provider._pending_computed_width = 2
+
+        with mock.patch.object(provider, "_save_calibration") as save:
+            provider.observe_teacher_verification(2, True)
+            self.assertEqual(provider._reliability, {})
+            self.assertEqual(save.call_count, 0)
+            provider._pending_computed_width = 3
+            provider.observe_teacher_verification(2, False)
+            with self.assertRaisesRegex(
+                Qwen35MtpDraftError,
+                "already observed",
+            ):
+                provider.observe_teacher_verification(2, True)
+
+        self.assertEqual(
+            provider._reliability,
+            {(False, 2, 7, 1): [1, 2]},
+        )
+        self.assertEqual(provider._previous_outcome, 0)
+        self.assertEqual(save.call_count, 1)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.calibration_updates, 1)
+        self.assertEqual(metrics.cold_calibration_updates, 1)
+        self.assertEqual(metrics.teacher_verifications, 1)
+        self.assertEqual(metrics.teacher_hits, 0)
+        self.assertEqual(metrics.teacher_misses, 1)
+        self.assertEqual(metrics.teacher_max_position, 2)
+
     def test_v1_calibration_with_v2_provider_migrates_to_v4_without_data_loss(
         self,
     ) -> None:
@@ -241,7 +278,7 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         migrated = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(
             migrated["identity"]["provider"],
-            "immer.qwen3.5-mtp-draft-provider/v4",
+            "immer.qwen3.5-mtp-draft-provider/v5",
         )
         self.assertEqual(
             migrated["previous_outcomes"],
@@ -721,7 +758,7 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         self.assertEqual(provider._committed_history, (*history, *extension))
         self.assertEqual(provider._next_position, len(history) + len(extension) - 1)
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.5-mtp-draft-provider/v4")
+        self.assertEqual(metrics.schema, "immer.qwen3.5-mtp-draft-provider/v5")
         self.assertEqual(metrics.advance_calls, 1)
         self.assertEqual(metrics.advanced_tokens, len(extension))
         self.assertFalse(metrics.pending)
