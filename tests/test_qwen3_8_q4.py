@@ -901,6 +901,623 @@ class Q4BankTests(unittest.TestCase):
             finally:
                 bank.close()
 
+    def test_full_mlp_activation_pages_match_exact_bf16_energy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-full-mlp-pages"
+            generator = torch.Generator().manual_seed(8128)
+            base = "model.language_model.layers.0.mlp"
+            intermediate = 160
+            names = (
+                f"{base}.gate_proj.weight",
+                f"{base}.up_proj.weight",
+                f"{base}.down_proj.weight",
+            )
+            tensors = {
+                names[0]: torch.randn((intermediate, 64), generator=generator),
+                names[1]: torch.randn((intermediate, 64), generator=generator),
+                names[2]: torch.randn((64, intermediate), generator=generator),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=32,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                values = torch.randn((1, 64), generator=generator).to(torch.bfloat16)
+                gate, up = bank.linear_group(
+                    values,
+                    names[:2],
+                    output_dtype=torch.bfloat16,
+                )
+                activation = torch.nn.functional.silu(gate) * up
+                expected_scores = [
+                    sum(
+                        float(value) * float(value)
+                        for value in activation[0, start : start + 64]
+                    )
+                    for start in range(0, intermediate, 64)
+                ]
+                expected_ids = sorted(
+                    range(len(expected_scores)),
+                    key=lambda page: (-expected_scores[page], page),
+                )
+                bank.release_touched()
+                baseline = bank.mlp(
+                    values,
+                    names,
+                    output_dtype=torch.bfloat16,
+                )
+
+                output, page_ids, page_scores = bank.mlp(
+                    values,
+                    names,
+                    output_dtype=torch.bfloat16,
+                    activation_page_topk=3,
+                )
+
+                self.assertEqual(tuple(output.shape), (1, 64))
+                self.assertTrue(torch.equal(output, baseline))
+                self.assertEqual(page_ids.tolist(), [expected_ids])
+                torch.testing.assert_close(
+                    page_scores,
+                    torch.tensor(
+                        [[expected_scores[page] for page in expected_ids]],
+                        dtype=torch.float64,
+                    ),
+                    rtol=0.0,
+                    atol=1e-9,
+                )
+                metrics = bank.metrics()
+                self.assertEqual(metrics["full_mlp_page_trace_calls"], 1)
+                self.assertEqual(metrics["full_mlp_page_trace_rows"], 1)
+                self.assertEqual(metrics["full_mlp_page_trace_candidates"], 3)
+                self.assertEqual(metrics["full_mlp_page_trace_selected"], 3)
+            finally:
+                bank.close()
+
+    def test_full_mlp_activation_page_ties_are_stable_at_zero_energy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-full-mlp-page-ties"
+            base = "model.language_model.layers.0.mlp"
+            names = (
+                f"{base}.gate_proj.weight",
+                f"{base}.up_proj.weight",
+                f"{base}.down_proj.weight",
+            )
+            tensors = {
+                names[0]: torch.zeros((96, 64)),
+                names[1]: torch.zeros((96, 64)),
+                names[2]: torch.zeros((64, 96)),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=32,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                values = torch.ones((1, 64), dtype=torch.bfloat16)
+                output, page_ids, page_scores = bank.mlp(
+                    values,
+                    names,
+                    output_dtype=torch.bfloat16,
+                    activation_page_topk=2,
+                )
+                self.assertEqual(page_ids.tolist(), [[0, 1]])
+                self.assertEqual(page_scores.tolist(), [[0.0, 0.0]])
+                self.assertEqual(int(torch.count_nonzero(output)), 0)
+                for invalid in (True, 0, -1, 3):
+                    with self.subTest(invalid=invalid):
+                        with self.assertRaises(ValueError):
+                            bank.mlp(
+                                values,
+                                names,
+                                output_dtype=torch.bfloat16,
+                                activation_page_topk=invalid,
+                            )
+            finally:
+                bank.close()
+
+    def test_full_mlp_activation_page_trace_preserves_multirow_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-full-mlp-page-multirow"
+            generator = torch.Generator().manual_seed(9901)
+            base = "model.language_model.layers.0.mlp"
+            names = (
+                f"{base}.gate_proj.weight",
+                f"{base}.up_proj.weight",
+                f"{base}.down_proj.weight",
+            )
+            tensors = {
+                names[0]: torch.randn((128, 64), generator=generator),
+                names[1]: torch.randn((128, 64), generator=generator),
+                names[2]: torch.randn((64, 128), generator=generator),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=32,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                values = torch.randn((2, 3, 64), generator=generator).to(
+                    torch.bfloat16
+                )
+                gate, up = bank.linear_group(
+                    values,
+                    names[:2],
+                    output_dtype=torch.bfloat16,
+                )
+                activation = (torch.nn.functional.silu(gate) * up).reshape(-1, 128)
+                expected_ids = []
+                expected_scores = []
+                for row in activation:
+                    energies = [
+                        sum(
+                            float(value) * float(value)
+                            for value in row[start : start + 64]
+                        )
+                        for start in (0, 64)
+                    ]
+                    order = sorted(range(2), key=lambda page: (-energies[page], page))
+                    expected_ids.append(order)
+                    expected_scores.append([energies[page] for page in order])
+                bank.release_touched()
+
+                output, page_ids, page_scores = bank.mlp(
+                    values,
+                    names,
+                    output_dtype=torch.bfloat16,
+                    activation_page_topk=2,
+                )
+
+                self.assertEqual(tuple(output.shape), (2, 3, 64))
+                self.assertEqual(tuple(page_ids.shape), (2, 3, 2))
+                self.assertEqual(tuple(page_scores.shape), (2, 3, 2))
+                self.assertEqual(page_ids.reshape(-1, 2).tolist(), expected_ids)
+                torch.testing.assert_close(
+                    page_scores.reshape(-1, 2),
+                    torch.tensor(expected_scores, dtype=torch.float64),
+                    rtol=0.0,
+                    atol=1e-9,
+                )
+            finally:
+                bank.close()
+
+    def test_full_mlp_page_trace_scales_to_official_page_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-full-mlp-official-pages"
+            base = "model.language_model.layers.0.mlp"
+            intermediate = 272 * 64
+            names = (
+                f"{base}.gate_proj.weight",
+                f"{base}.up_proj.weight",
+                f"{base}.down_proj.weight",
+            )
+            tensors = {
+                names[0]: torch.zeros((intermediate, 64)),
+                names[1]: torch.zeros((intermediate, 64)),
+                names[2]: torch.zeros((32, intermediate)),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=64,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                values = torch.ones((1, 64), dtype=torch.bfloat16)
+                baseline = bank.mlp(
+                    values,
+                    names,
+                    output_dtype=torch.bfloat16,
+                )
+                output, page_ids, page_scores = bank.mlp(
+                    values,
+                    names,
+                    output_dtype=torch.bfloat16,
+                    activation_page_topk=192,
+                )
+
+                self.assertTrue(torch.equal(output, baseline))
+                self.assertEqual(page_ids.tolist(), [list(range(192))])
+                self.assertEqual(page_scores.tolist(), [[0.0] * 192])
+                metrics = bank.metrics()
+                self.assertEqual(metrics["full_mlp_page_trace_calls"], 1)
+                self.assertEqual(metrics["full_mlp_page_trace_candidates"], 272)
+                self.assertEqual(metrics["full_mlp_page_trace_selected"], 192)
+            finally:
+                bank.close()
+
+    def test_selected_page_mlp_matches_zero_masked_dense_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-selected-page-mlp"
+            generator = torch.Generator().manual_seed(6421)
+            base = "model.language_model.layers.0.mlp"
+            intermediate = 160
+            names = (
+                f"{base}.gate_proj.weight",
+                f"{base}.up_proj.weight",
+                f"{base}.down_proj.weight",
+            )
+            tensors = {
+                names[0]: torch.randn((intermediate, 64), generator=generator),
+                names[1]: torch.randn((intermediate, 64), generator=generator),
+                names[2]: torch.randn((64, intermediate), generator=generator),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=32,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                values = torch.randn((2, 64), generator=generator).to(torch.bfloat16)
+                pages = torch.tensor(((2, 0), (1, 2)), dtype=torch.int64)
+                gate, up = bank.linear_group(
+                    values,
+                    names[:2],
+                    output_dtype=torch.bfloat16,
+                )
+                activation = torch.nn.functional.silu(gate) * up
+                selected = torch.zeros_like(activation)
+                for row, row_pages in enumerate(pages.tolist()):
+                    for page in row_pages:
+                        start = page * 64
+                        selected[row, start : start + 64] = activation[
+                            row, start : start + 64
+                        ]
+                expected = bank.linear(
+                    selected,
+                    names[2],
+                    output_dtype=torch.bfloat16,
+                )
+                bank.release_touched()
+
+                actual = bank.mlp_selected_pages(
+                    values,
+                    names,
+                    pages,
+                    output_dtype=torch.bfloat16,
+                )
+
+                self.assertTrue(torch.equal(actual, expected))
+                metrics = bank.metrics()
+                self.assertEqual(metrics["page_mlp_calls"], 1)
+                self.assertEqual(metrics["page_mlp_rows"], 2)
+                self.assertEqual(metrics["page_mlp_selected_pages"], 4)
+                self.assertEqual(metrics["page_mlp_selected_neurons"], 192)
+                self.assertEqual(metrics["page_mlp_selected_down_blocks"], 6)
+                self.assertEqual(metrics["page_mlp_dense_down_calls"], 1)
+                self.assertEqual(metrics["page_mlp_dense_down_rows"], 2)
+                expected_weight_bytes = 160 * (
+                    bank.entries[names[0]].row_bytes
+                    + bank.entries[names[1]].row_bytes
+                ) + 5 * 64 * 18
+                self.assertEqual(
+                    metrics["page_mlp_weight_bytes"],
+                    expected_weight_bytes,
+                )
+            finally:
+                bank.close()
+
+    def test_selected_page_mlp_is_order_independent_for_multirow_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-selected-page-order"
+            generator = torch.Generator().manual_seed(7731)
+            base = "model.language_model.layers.0.mlp"
+            names = (
+                f"{base}.gate_proj.weight",
+                f"{base}.up_proj.weight",
+                f"{base}.down_proj.weight",
+            )
+            tensors = {
+                names[0]: torch.randn((192, 64), generator=generator),
+                names[1]: torch.randn((192, 64), generator=generator),
+                names[2]: torch.randn((64, 192), generator=generator),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=32,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                distinct = torch.randn((2, 64), generator=generator).to(
+                    torch.bfloat16
+                )
+                values = torch.stack((distinct, distinct), dim=1)
+                pages = torch.tensor(
+                    (((0, 2), (2, 0)), ((1, 2), (2, 1))),
+                    dtype=torch.int64,
+                )
+                actual = bank.mlp_selected_pages(
+                    values,
+                    names,
+                    pages,
+                    output_dtype=torch.bfloat16,
+                )
+
+                self.assertEqual(tuple(actual.shape), (2, 2, 64))
+                self.assertTrue(torch.equal(actual[:, 0], actual[:, 1]))
+                metrics = bank.metrics()
+                self.assertEqual(metrics["page_mlp_dense_down_calls"], 1)
+                self.assertEqual(metrics["page_mlp_dense_down_rows"], 4)
+            finally:
+                bank.close()
+
+    def test_selected_page_mlp_adapts_down_density_bit_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-selected-page-density"
+            generator = torch.Generator().manual_seed(8077)
+            base = "model.language_model.layers.0.mlp"
+            intermediate = 256
+            names = (
+                f"{base}.gate_proj.weight",
+                f"{base}.up_proj.weight",
+                f"{base}.down_proj.weight",
+            )
+            tensors = {
+                names[0]: torch.randn((intermediate, 64), generator=generator),
+                names[1]: torch.randn((intermediate, 64), generator=generator),
+                names[2]: torch.randn((64, intermediate), generator=generator),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=32,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                values = torch.randn((2, 64), generator=generator).to(torch.bfloat16)
+                gate, up = bank.linear_group(
+                    values,
+                    names[:2],
+                    output_dtype=torch.bfloat16,
+                )
+                activation = torch.nn.functional.silu(gate) * up
+
+                def reference(pages: torch.Tensor) -> torch.Tensor:
+                    selected = torch.zeros_like(activation)
+                    for row, row_pages in enumerate(pages.tolist()):
+                        for page in row_pages:
+                            start = page * 64
+                            selected[row, start : start + 64] = activation[
+                                row, start : start + 64
+                            ]
+                    return bank.linear(
+                        selected,
+                        names[2],
+                        output_dtype=torch.bfloat16,
+                    )
+
+                sparse_pages = torch.tensor(((0,), (3,)), dtype=torch.int64)
+                sparse_expected = reference(sparse_pages)
+                sparse_actual = bank.mlp_selected_pages(
+                    values,
+                    names,
+                    sparse_pages,
+                    output_dtype=torch.bfloat16,
+                )
+                self.assertTrue(torch.equal(sparse_actual, sparse_expected))
+                sparse_metrics = bank.metrics()
+                self.assertEqual(sparse_metrics["page_mlp_dense_down_calls"], 0)
+                self.assertEqual(sparse_metrics["page_mlp_dense_down_rows"], 0)
+                sparse_bytes = 128 * (
+                    bank.entries[names[0]].row_bytes
+                    + bank.entries[names[1]].row_bytes
+                ) + 4 * 64 * 18
+                self.assertEqual(
+                    sparse_metrics["page_mlp_weight_bytes"],
+                    sparse_bytes,
+                )
+
+                dense_pages = torch.tensor(((0, 1), (1, 0)), dtype=torch.int64)
+                dense_expected = reference(dense_pages)
+                dense_actual = bank.mlp_selected_pages(
+                    values,
+                    names,
+                    dense_pages,
+                    output_dtype=torch.bfloat16,
+                )
+                self.assertTrue(torch.equal(dense_actual, dense_expected))
+                dense_metrics = bank.metrics()
+                self.assertEqual(dense_metrics["page_mlp_dense_down_calls"], 1)
+                self.assertEqual(dense_metrics["page_mlp_dense_down_rows"], 2)
+                dense_bytes = 128 * (
+                    bank.entries[names[0]].row_bytes
+                    + bank.entries[names[1]].row_bytes
+                ) + bank.entries[names[2]].payload_bytes
+                self.assertEqual(
+                    dense_metrics["page_mlp_weight_bytes"],
+                    sparse_bytes + dense_bytes,
+                )
+            finally:
+                bank.close()
+
+    def test_selected_page_mlp_mixes_dense_and_sparse_down_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-selected-page-mixed-density"
+            generator = torch.Generator().manual_seed(1703)
+            base = "model.language_model.layers.0.mlp"
+            names = (
+                f"{base}.gate_proj.weight",
+                f"{base}.up_proj.weight",
+                f"{base}.down_proj.weight",
+            )
+            tensors = {
+                names[0]: torch.randn((96, 64), generator=generator),
+                names[1]: torch.randn((96, 64), generator=generator),
+                names[2]: torch.randn((64, 96), generator=generator),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=32,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                values = torch.randn((2, 64), generator=generator).to(torch.bfloat16)
+                pages = torch.tensor(((0,), (1,)), dtype=torch.int64)
+                gate, up = bank.linear_group(
+                    values,
+                    names[:2],
+                    output_dtype=torch.bfloat16,
+                )
+                activation = torch.nn.functional.silu(gate) * up
+                selected = torch.zeros_like(activation)
+                selected[0, :64] = activation[0, :64]
+                selected[1, 64:] = activation[1, 64:]
+                expected = bank.linear(
+                    selected,
+                    names[2],
+                    output_dtype=torch.bfloat16,
+                )
+
+                actual = bank.mlp_selected_pages(
+                    values,
+                    names,
+                    pages,
+                    output_dtype=torch.bfloat16,
+                )
+
+                self.assertTrue(torch.equal(actual, expected))
+                metrics = bank.metrics()
+                self.assertEqual(metrics["page_mlp_dense_down_calls"], 1)
+                self.assertEqual(metrics["page_mlp_dense_down_rows"], 1)
+                self.assertEqual(metrics["page_mlp_selected_down_blocks"], 3)
+                expected_bytes = 96 * (
+                    bank.entries[names[0]].row_bytes
+                    + bank.entries[names[1]].row_bytes
+                ) + bank.entries[names[2]].payload_bytes
+                self.assertEqual(metrics["page_mlp_weight_bytes"], expected_bytes)
+            finally:
+                bank.close()
+
+    def test_selected_page_mlp_rejects_invalid_page_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-selected-page-invalid"
+            base = "model.language_model.layers.0.mlp"
+            names = (
+                f"{base}.gate_proj.weight",
+                f"{base}.up_proj.weight",
+                f"{base}.down_proj.weight",
+            )
+            tensors = {
+                names[0]: torch.zeros((128, 64)),
+                names[1]: torch.zeros((128, 64)),
+                names[2]: torch.zeros((64, 128)),
+            }
+            Q4BankBuilder(
+                root,
+                pager=_Pager(tensors),
+                bundle_receipt=_BUNDLE,
+                row_chunk=32,
+                threads=2,
+            ).build()
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+            )
+            try:
+                values = torch.ones((1, 64), dtype=torch.bfloat16)
+                invalid_routes = (
+                    torch.tensor(((-1,),), dtype=torch.int64),
+                    torch.tensor(((2,),), dtype=torch.int64),
+                    torch.tensor(((0, 0),), dtype=torch.int64),
+                    torch.tensor(((0.0,),), dtype=torch.float32),
+                    torch.tensor((0,), dtype=torch.int64),
+                    torch.empty((1, 0), dtype=torch.int64),
+                )
+                for pages in invalid_routes:
+                    with self.subTest(shape=tuple(pages.shape), dtype=pages.dtype):
+                        with self.assertRaises(ValueError):
+                            bank.mlp_selected_pages(
+                                values,
+                                names,
+                                pages,
+                                output_dtype=torch.bfloat16,
+                            )
+            finally:
+                bank.close()
+
     def test_fused_deltanet_step_matches_packed_projection_reference(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "q4-fused-deltanet"

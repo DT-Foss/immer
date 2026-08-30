@@ -35,7 +35,8 @@ Q4_BANK_SCHEMA = "immer.qwen3.8-causal-q4-bank/v1"
 Q4_BUILD_STATE_SCHEMA = "immer.qwen3.8-causal-q4-build-state/v1"
 Q4_VERIFY_CACHE_SCHEMA = "immer.qwen3.8-causal-q4-verify-cache/v1"
 Q4_VERIFY_CACHE_NAME = ".verify-cache-v1.json"
-Q4_NATIVE_ABI = 2
+Q4_NATIVE_ABI = 4
+Q4_BANK_CODEC_ABI = 2
 Q4_0 = "q4_0"
 Q8_0 = "q8_0"
 Q4_BLOCK_SIZE = 32
@@ -456,9 +457,31 @@ class Q4NativeKernel:
             i64,
             void,
             void,
+            i64,
+            void,
+            void,
             integer,
         )
         self.library.immer_q4_mlp_bf16_f32.restype = integer
+        self.library.immer_q4_mlp_pages_bf16_f32.argtypes = (
+            void,
+            i64,
+            i64,
+            void,
+            integer,
+            void,
+            integer,
+            void,
+            integer,
+            i64,
+            i64,
+            void,
+            void,
+            i64,
+            void,
+            integer,
+        )
+        self.library.immer_q4_mlp_pages_bf16_f32.restype = integer
 
     @staticmethod
     def _pointer(value: Any) -> ctypes.c_void_p:
@@ -722,6 +745,18 @@ class Q4BankMetrics:
     native_topk_discard_bytes: int = 0
     full_mlp_calls: int = 0
     full_mlp_rows: int = 0
+    full_mlp_page_trace_calls: int = 0
+    full_mlp_page_trace_rows: int = 0
+    full_mlp_page_trace_candidates: int = 0
+    full_mlp_page_trace_selected: int = 0
+    page_mlp_calls: int = 0
+    page_mlp_rows: int = 0
+    page_mlp_selected_pages: int = 0
+    page_mlp_selected_neurons: int = 0
+    page_mlp_selected_down_blocks: int = 0
+    page_mlp_dense_down_calls: int = 0
+    page_mlp_dense_down_rows: int = 0
+    page_mlp_weight_bytes: int = 0
     linear_calls: int = 0
     linear_group_calls: int = 0
     linear_row_calls: int = 0
@@ -781,7 +816,7 @@ class Q4Bank:
         document = _strict_document(source / "manifest.json", schema=Q4_BANK_SCHEMA)
         body = document["body"]
         if (
-            body.get("native_abi") != Q4_NATIVE_ABI
+            body.get("native_abi") != Q4_BANK_CODEC_ABI
             or body.get("format_policy") not in Q4_FORMAT_POLICIES
         ):
             raise Q4BankError("Q4 bank codec identity differs from this runtime")
@@ -812,6 +847,7 @@ class Q4Bank:
             "schema": Q4_BANK_SCHEMA,
             "manifest_sha256": self.manifest["sha256"],
             "native_abi": Q4_NATIVE_ABI,
+            "bank_codec_abi": Q4_BANK_CODEC_ABI,
             "native_avx2": self.native.avx2,
         }
 
@@ -1098,8 +1134,9 @@ class Q4Bank:
         names: tuple[str, str, str],
         *,
         output_dtype: Any,
+        activation_page_topk: int | None = None,
     ) -> Any:
-        """Execute the complete BF16-rounded SwiGLU MLP in one native team."""
+        """Run exact SwiGLU and optionally return its top 64-neuron pages."""
 
         import torch
 
@@ -1116,6 +1153,13 @@ class Q4Bank:
                 or output_dtype != torch.bfloat16
             ):
                 raise Q4BankError("Q4 full MLP shapes or BF16 ABI disagree")
+            page_count = (gate_entry.shape[0] + 63) // 64
+            if activation_page_topk is not None and (
+                isinstance(activation_page_topk, bool)
+                or not isinstance(activation_page_topk, int)
+                or not 1 <= activation_page_topk <= page_count
+            ):
+                raise ValueError("Q4 full MLP activation-page dimensions are invalid")
             if not isinstance(values, torch.Tensor):
                 values = torch.as_tensor(values)
             if (
@@ -1133,6 +1177,17 @@ class Q4Bank:
                 .contiguous()
             )
             output = torch.empty((input_rows, down_entry.shape[0]), dtype=torch.float32)
+            page_topk = 0 if activation_page_topk is None else activation_page_topk
+            if page_topk:
+                page_ids = torch.empty((input_rows, page_topk), dtype=torch.int64)
+                page_scores = torch.empty((input_rows, page_topk), dtype=torch.float64)
+                page_ids_pointer = self.native._pointer(page_ids)
+                page_scores_pointer = self.native._pointer(page_scores)
+            else:
+                page_ids = None
+                page_scores = None
+                page_ids_pointer = ctypes.c_void_p()
+                page_scores_pointer = ctypes.c_void_p()
             code = self.native.library.immer_q4_mlp_bf16_f32(
                 self.native._pointer(compute),
                 input_rows,
@@ -1147,6 +1202,9 @@ class Q4Bank:
                 down_entry.shape[0],
                 self.native._pointer(self.native.silu_bf16_table),
                 self.native._pointer(output),
+                page_topk,
+                page_ids_pointer,
+                page_scores_pointer,
                 self.threads,
             )
             if code == 2:
@@ -1166,6 +1224,170 @@ class Q4Bank:
             self._stats.output_bytes += result.numel() * result.element_size()
             self._stats.full_mlp_calls += 1
             self._stats.full_mlp_rows += input_rows
+            if page_topk:
+                self._stats.full_mlp_page_trace_calls += 1
+                self._stats.full_mlp_page_trace_rows += input_rows
+                self._stats.full_mlp_page_trace_candidates += input_rows * page_count
+                self._stats.full_mlp_page_trace_selected += input_rows * page_topk
+                if page_ids is None or page_scores is None:
+                    raise AssertionError("activation-page outputs were not allocated")
+                self._stats.output_bytes += (
+                    page_ids.numel() * page_ids.element_size()
+                    + page_scores.numel() * page_scores.element_size()
+                )
+                return (
+                    result,
+                    page_ids.reshape(*leading, page_topk),
+                    page_scores.reshape(*leading, page_topk),
+                )
+            return result
+
+    def mlp_selected_pages(
+        self,
+        values: Any,
+        names: tuple[str, str, str],
+        page_ids: Any,
+        *,
+        output_dtype: Any,
+    ) -> Any:
+        """Execute only explicit per-row 64-neuron SwiGLU pages."""
+
+        import torch
+
+        with self._lock:
+            if len(names) != 3 or len(set(names)) != 3:
+                raise ValueError("Q4 page MLP requires Gate, Up, and Down names")
+            gate, up, down = (self._mapping(name) for name in names)
+            gate_entry, gate_map = gate
+            up_entry, up_map = up
+            down_entry, down_map = down
+            if (
+                gate_entry.shape != up_entry.shape
+                or down_entry.shape[1] != gate_entry.shape[0]
+                or output_dtype != torch.bfloat16
+            ):
+                raise Q4BankError("Q4 page MLP shapes or BF16 ABI disagree")
+            if not isinstance(values, torch.Tensor):
+                values = torch.as_tensor(values)
+            if (
+                values.ndim < 1
+                or values.shape[-1] != gate_entry.shape[1]
+                or values.device.type != "cpu"
+            ):
+                raise ValueError("Q4 page MLP input differs from Gate/Up")
+            pages = torch.as_tensor(page_ids)
+            integer_dtypes = {
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+                torch.uint8,
+            }
+            page_count = (gate_entry.shape[0] + 63) // 64
+            leading = tuple(values.shape[:-1])
+            if (
+                pages.device.type != "cpu"
+                or pages.dtype not in integer_dtypes
+                or pages.ndim != values.ndim
+                or tuple(pages.shape[:-1]) != leading
+                or pages.shape[-1] < 1
+                or pages.shape[-1] > page_count
+            ):
+                raise ValueError("Q4 page MLP page dimensions are invalid")
+            input_rows = values.numel() // values.shape[-1]
+            selected_pages = pages.shape[-1]
+            compute_pages = pages.reshape(input_rows, selected_pages).to(
+                dtype=torch.int64
+            ).contiguous()
+            if bool(
+                torch.any(compute_pages < 0)
+                or torch.any(compute_pages >= page_count)
+            ):
+                raise ValueError("Q4 page MLP page IDs are out of range")
+            ordered = torch.sort(compute_pages, dim=1).values
+            if selected_pages > 1:
+                if bool(torch.any(ordered[:, 1:] == ordered[:, :-1])):
+                    raise ValueError("Q4 page MLP page IDs must be unique per row")
+            compute_pages = ordered.contiguous()
+            compute = (
+                values.detach()
+                .to(dtype=torch.float32)
+                .reshape(input_rows, values.shape[-1])
+                .contiguous()
+            )
+            output = torch.empty((input_rows, down_entry.shape[0]), dtype=torch.float32)
+            code = self.native.library.immer_q4_mlp_pages_bf16_f32(
+                self.native._pointer(compute),
+                input_rows,
+                gate_entry.shape[1],
+                self.native._pointer(gate_map.bytes),
+                _FORMAT_CODES[gate_entry.format],
+                self.native._pointer(up_map.bytes),
+                _FORMAT_CODES[up_entry.format],
+                self.native._pointer(down_map.bytes),
+                _FORMAT_CODES[down_entry.format],
+                gate_entry.shape[0],
+                down_entry.shape[0],
+                self.native._pointer(self.native.silu_bf16_table),
+                self.native._pointer(compute_pages),
+                selected_pages,
+                self.native._pointer(output),
+                self.threads,
+            )
+            if code == 2:
+                raise ValueError("native Q4 page MLP values are non-finite")
+            if code == 4:
+                raise ValueError("native Q4 page MLP page IDs are invalid")
+            if code:
+                raise Q4BankError(f"native Q4 page MLP failed with code {code}")
+            result = output.to(dtype=output_dtype).reshape(
+                *leading,
+                down_entry.shape[0],
+            )
+            page_neurons = torch.clamp(
+                gate_entry.shape[0] - compute_pages * 64,
+                min=0,
+                max=64,
+            )
+            selected_neurons = int(page_neurons.sum())
+            selected_down_blocks = selected_neurons // Q4_BLOCK_SIZE
+            row_down_blocks = (page_neurons // Q4_BLOCK_SIZE).sum(dim=1)
+            total_down_blocks = gate_entry.shape[0] // Q4_BLOCK_SIZE
+            dense_down_rows = int(
+                ((row_down_blocks * 2) >= total_down_blocks).sum()
+            )
+            unique_page_starts = torch.unique(compute_pages) * 64
+            unique_neurons = int(
+                torch.clamp(
+                    gate_entry.shape[0] - unique_page_starts,
+                    min=0,
+                    max=64,
+                ).sum()
+            )
+            unique_down_blocks = unique_neurons // Q4_BLOCK_SIZE
+            weight_bytes = unique_neurons * (
+                gate_entry.row_bytes + up_entry.row_bytes
+            ) + (
+                down_entry.payload_bytes
+                if dense_down_rows
+                else unique_down_blocks
+                * down_entry.shape[0]
+                * _FORMAT_BLOCK_BYTES[down_entry.format]
+            )
+            self._stats.linear_calls += 3
+            self._stats.input_quantizations += input_rows * 2
+            self._stats.linear_input_rows += input_rows * 3
+            self._stats.logical_weight_bytes += weight_bytes
+            self._stats.output_bytes += result.numel() * result.element_size()
+            self._stats.page_mlp_calls += 1
+            self._stats.page_mlp_rows += input_rows
+            self._stats.page_mlp_selected_pages += input_rows * selected_pages
+            self._stats.page_mlp_selected_neurons += selected_neurons
+            self._stats.page_mlp_selected_down_blocks += selected_down_blocks
+            if dense_down_rows:
+                self._stats.page_mlp_dense_down_calls += 1
+                self._stats.page_mlp_dense_down_rows += dense_down_rows
+            self._stats.page_mlp_weight_bytes += weight_bytes
             return result
 
     def linear_rows(
@@ -1985,7 +2207,7 @@ class Q4BankBuilder:
     def _initial_state(self, source: Mapping[str, Any]) -> dict[str, Any]:
         return {
             "source": dict(source),
-            "native_abi": Q4_NATIVE_ABI,
+            "native_abi": Q4_BANK_CODEC_ABI,
             "row_chunk": self.row_chunk,
             "format_policy": self.format_policy,
             "completed": [],
@@ -2030,7 +2252,7 @@ class Q4BankBuilder:
         body = _strict_document(path, schema=Q4_BUILD_STATE_SCHEMA)["body"]
         if (
             body.get("source") != dict(source)
-            or body.get("native_abi") != Q4_NATIVE_ABI
+            or body.get("native_abi") != Q4_BANK_CODEC_ABI
             or body.get("row_chunk") != self.row_chunk
             or body.get("format_policy") != self.format_policy
             or not isinstance(body.get("completed"), list)
@@ -2056,7 +2278,7 @@ class Q4BankBuilder:
         )
         if document["body"].get("source") != self._source_binding():
             raise Q4BankError("Q4 reuse bank belongs to another causal source")
-        if document["body"].get("native_abi") != Q4_NATIVE_ABI:
+        if document["body"].get("native_abi") != Q4_BANK_CODEC_ABI:
             raise Q4BankError("Q4 reuse bank has another codec ABI")
         return _verified_payload_entries(self.reuse_root, document)
 
@@ -2186,7 +2408,7 @@ class Q4BankBuilder:
             document = _strict_document(manifest_path, schema=Q4_BANK_SCHEMA)
             if (
                 document["body"].get("source") != self._source_binding()
-                or document["body"].get("native_abi") != Q4_NATIVE_ABI
+                or document["body"].get("native_abi") != Q4_BANK_CODEC_ABI
                 or document["body"].get("format_policy") != self.format_policy
             ):
                 raise Q4BankError("existing Q4 manifest belongs to another build")
@@ -2291,7 +2513,7 @@ class Q4BankBuilder:
         entries = [asdict(completed[key]) for key in sorted(completed)]
         body = {
             "source": source,
-            "native_abi": Q4_NATIVE_ABI,
+            "native_abi": Q4_BANK_CODEC_ABI,
             "format_policy": self.format_policy,
             "block_size": Q4_BLOCK_SIZE,
             "tensor_count": len(entries),

@@ -1200,8 +1200,14 @@ class Qwen38WeightPager:
                 outputs.append(tuple(rows))
             return tuple(outputs)
 
-    def mlp(self, x: Any, names: Iterable[str]) -> Any:
-        """Execute a complete packed BF16 SwiGLU MLP in one native call."""
+    def mlp(
+        self,
+        x: Any,
+        names: Iterable[str],
+        *,
+        activation_page_topk: int | None = None,
+    ) -> Any:
+        """Execute packed BF16 SwiGLU and optionally return exact page energy."""
 
         with self._lock:
             self._ensure_open()
@@ -1228,6 +1234,48 @@ class Qwen38WeightPager:
             result = q4_bank.mlp(
                 compute,
                 weight_names,
+                output_dtype=self.compute_dtype,
+                activation_page_topk=activation_page_topk,
+            )
+            self._stats.linear_calls += 3
+            self._stats.grouped_linear_calls += 1
+            self._stats.grouped_linear_matrices += 3
+            return result
+
+    def mlp_selected_pages(
+        self,
+        x: Any,
+        names: Iterable[str],
+        page_ids: Any,
+    ) -> Any:
+        """Execute only explicit 64-neuron pages of a packed BF16 SwiGLU MLP."""
+
+        with self._lock:
+            self._ensure_open()
+            prefixes = tuple(names)
+            if len(prefixes) != 3:
+                raise ValueError("MLP requires Gate, Up, and Down names")
+            weight_names = tuple(self._weight_name(name) for name in prefixes)
+            q4_bank = self.q4_bank
+            if (
+                q4_bank is None
+                or not callable(getattr(q4_bank, "mlp_selected_pages", None))
+                or not all(q4_bank.has(name) for name in weight_names)
+                or self.compute_dtype != self.torch.bfloat16
+            ):
+                raise Qwen38PagerError("native Q4 selected-page MLP is unavailable")
+            if not isinstance(x, self.torch.Tensor):
+                x = self.torch.as_tensor(x)
+            compute = x.to(device=self.device, dtype=self.compute_dtype)
+            layouts = tuple(self._layout(name) for name in weight_names)
+            self._preflight_q4_mlp(
+                layouts,  # type: ignore[arg-type]
+                input_rows=compute.numel() // compute.shape[-1],
+            )
+            result = q4_bank.mlp_selected_pages(
+                compute,
+                weight_names,
+                page_ids,
                 output_dtype=self.compute_dtype,
             )
             self._stats.linear_calls += 3

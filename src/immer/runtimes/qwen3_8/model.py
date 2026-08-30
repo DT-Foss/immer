@@ -255,6 +255,7 @@ class _PendingStatefulBlock:
     native_head_crsa_evidence: tuple[NativeHeadCrsaEvidence, ...]
     prefix_trace: _ContinuationPrefixTrace
     runtime_identity: str
+    mlp_page_transaction_owner: Any | None
 
 
 class StreamedQwen38:
@@ -293,6 +294,7 @@ class StreamedQwen38:
         layer_boundary_stages: Sequence[str] | None = None,
         layer_boundary_layers: Sequence[int] | None = None,
         mlp_sparse_executor: Any | None = None,
+        mlp_page_router: Any | None = None,
         delta_head_router: Any | None = None,
         native_deltanet_recurrence: bool = False,
         native_deltanet_fusion: bool = False,
@@ -370,6 +372,38 @@ class StreamedQwen38:
                 )
             ):
                 raise ValueError("mlp_sparse_executor identity is invalid")
+        if mlp_page_router is not None:
+            required = (
+                "advance_selected",
+                "begin_exact_wave",
+                "begin_transaction",
+                "compile_routes",
+                "commit_transaction",
+                "metrics",
+                "observe_exact_batch",
+                "prepare",
+                "reset_session",
+                "route",
+                "rollback_transaction",
+                "snapshot_identity",
+            )
+            if any(
+                not callable(getattr(mlp_page_router, name, None))
+                for name in required
+            ):
+                raise TypeError("mlp_page_router lacks the runtime contract")
+            route_width = getattr(mlp_page_router, "route_width", None)
+            page_count = (config.intermediate_size + 63) // 64
+            if (
+                isinstance(route_width, bool)
+                or not isinstance(route_width, int)
+                or not 0 < route_width <= page_count
+            ):
+                raise ValueError("mlp_page_router route width is invalid")
+            if mlp_sparse_executor is not None:
+                raise ValueError(
+                    "page-routed and pilot-routed sparse MLP are mutually exclusive"
+                )
         if delta_head_router is not None:
             required = (
                 "project",
@@ -480,6 +514,7 @@ class StreamedQwen38:
         self.layer_boundary_stages = tuple(selected_boundary_stages)
         self.layer_boundary_layers = selected_boundary_layers
         self.mlp_sparse_executor = mlp_sparse_executor
+        self.mlp_page_router = mlp_page_router
         self.delta_head_router = delta_head_router
         self.native_deltanet_recurrence = native_deltanet_recurrence
         self.native_deltanet_fusion = native_deltanet_fusion
@@ -655,6 +690,29 @@ class StreamedQwen38:
             ) from exc
         return {"kind": "pilot-sparse", "identity": canonical}
 
+    def _mlp_page_snapshot_identity(self) -> dict[str, Any]:
+        router = self.mlp_page_router
+        if router is None:
+            return {"kind": "none"}
+        identity = router.snapshot_identity()
+        if not isinstance(identity, dict):
+            raise Qwen38SnapshotError("MLP page route identity is not a mapping")
+        try:
+            canonical = json.loads(
+                json.dumps(
+                    identity,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise Qwen38SnapshotError(
+                "MLP page route identity is not canonical JSON"
+            ) from exc
+        return {"kind": "markov-page-route", "identity": canonical}
+
     def _delta_head_snapshot_identity(
         self, *, transport_neutral: bool = False
     ) -> dict[str, Any]:
@@ -754,6 +812,7 @@ class StreamedQwen38:
             "mlp_sparse_executor": self._mlp_sparse_snapshot_identity(
                 transport_neutral=transport_neutral
             ),
+            "mlp_page_router": self._mlp_page_snapshot_identity(),
             "native_head_crsa": self._native_head_crsa_snapshot_identity(),
         }
 
@@ -1269,6 +1328,7 @@ class StreamedQwen38:
         self._state_batch_size = batch
         self._state_poisoned = poisoned
         self._graft_history = history_device
+        self._reset_mlp_page_session()
         self._pending_block_stage = None
         return {
             **loaded.summary,
@@ -1678,10 +1738,61 @@ class StreamedQwen38:
             and self.mlp_sparse_executor is None
             and self.layer_boundary_observer is None
         ):
-            return self.pager.mlp(
-                hidden,
-                fused_names,
-            )
+            page_router = self.mlp_page_router
+            if page_router is not None:
+                prediction = (
+                    page_router.route(layer, row_count=row_count)
+                    if row_count == 1
+                    else None
+                )
+                page_ids = tuple(
+                    () if prediction is None else getattr(prediction, "page_ids", ())
+                )
+                if prediction is not None and bool(
+                    getattr(prediction, "ready", False)
+                ):
+                    route_shape = (*hidden.shape[:-1], len(page_ids))
+                    output = self.pager.mlp_selected_pages(
+                        hidden,
+                        fused_names,
+                        torch.tensor(
+                            page_ids,
+                            dtype=torch.int64,
+                            device="cpu",
+                        )
+                        .reshape(*((1,) * (hidden.ndim - 1)), len(page_ids))
+                        .expand(route_shape)
+                        .contiguous(),
+                    )
+                    page_router.advance_selected(
+                        layer,
+                        page_ids,
+                        row_count=row_count,
+                    )
+                    self._observe_layer_boundary(layer, "mlp.output", output)
+                    return output
+                if prediction is None:
+                    page_router.begin_exact_wave(layer)
+                traced = self.pager.mlp(
+                    hidden,
+                    fused_names,
+                    activation_page_topk=page_router.route_width,
+                )
+                if not isinstance(traced, tuple) or len(traced) != 3:
+                    raise Qwen38RuntimeError(
+                        "Q4 activation-page trace violated its runtime contract"
+                    )
+                output, exact_page_ids, exact_page_scores = traced
+                page_router.observe_exact_batch(
+                    layer,
+                    exact_page_ids,
+                    exact_page_scores,
+                )
+                if layer == self.config.n_layers - 1:
+                    page_router.compile_routes()
+                self._observe_layer_boundary(layer, "mlp.output", output)
+                return output
+            return self.pager.mlp(hidden, fused_names)
         gate, up = self.pager.linear_group(
             hidden,
             (f"{base}.gate_proj", f"{base}.up_proj"),
@@ -2079,7 +2190,46 @@ class StreamedQwen38:
                 [row.reshape(-1, row.shape[-1]) for row in hidden],
                 dim=0,
             )
-            fused = self.pager.mlp(combined, fused_names)
+            page_router = self.mlp_page_router
+            if page_router is None:
+                fused = self.pager.mlp(combined, fused_names)
+            else:
+                prediction = page_router.route(layer, row_count=row_count)
+                page_ids = tuple(getattr(prediction, "page_ids", ()))
+                if bool(getattr(prediction, "ready", False)):
+                    routes = torch.tensor(
+                        [page_ids],
+                        dtype=torch.int64,
+                        device="cpu",
+                    ).expand(row_count, -1).contiguous()
+                    fused = self.pager.mlp_selected_pages(
+                        combined,
+                        fused_names,
+                        routes,
+                    )
+                    page_router.advance_selected(
+                        layer,
+                        page_ids,
+                        row_count=row_count,
+                    )
+                else:
+                    traced = self.pager.mlp(
+                        combined,
+                        fused_names,
+                        activation_page_topk=page_router.route_width,
+                    )
+                    if not isinstance(traced, tuple) or len(traced) != 3:
+                        raise Qwen38RuntimeError(
+                            "Q4 activation-page trace violated its runtime contract"
+                        )
+                    fused, exact_page_ids, exact_page_scores = traced
+                    page_router.observe_exact_batch(
+                        layer,
+                        exact_page_ids,
+                        exact_page_scores,
+                    )
+                    if layer == self.config.n_layers - 1:
+                        page_router.compile_routes()
             outputs = []
             offset = 0
             for shape, count in zip(shapes, counts, strict=True):
@@ -2421,6 +2571,12 @@ class StreamedQwen38:
                 "graft": self._graft_snapshot_identity(),
                 "delta_head_router": self._delta_head_snapshot_identity(),
                 "mlp_sparse_executor": self._mlp_sparse_snapshot_identity(),
+                "mlp_page_router": self._mlp_page_snapshot_identity(),
+                "mlp_page_router_instance": (
+                    None
+                    if self.mlp_page_router is None
+                    else id(self.mlp_page_router)
+                ),
                 "native_head_crsa": native,
             }
         )
@@ -2650,7 +2806,19 @@ class StreamedQwen38:
         self._state_batch_size = None
         self._graft_history = None
         self._state_poisoned = True
+        self._reset_mlp_page_session()
         self._pending_block_stage = None
+
+    def _reset_mlp_page_session(self) -> None:
+        pending = self._pending_block_stage
+        owner = (
+            None if pending is None else pending.mlp_page_transaction_owner
+        )
+        current = self.mlp_page_router
+        if owner is not None and owner is not current:
+            owner.rollback_transaction()
+        if current is not None:
+            current.reset_session()
 
     def reset_state(self, *, release: bool = False) -> None:
         """Drop every committed KV/DeltaNet cache and clear the poison latch."""
@@ -2660,6 +2828,7 @@ class StreamedQwen38:
         self._state_batch_size = None
         self._state_poisoned = False
         self._graft_history = None
+        self._reset_mlp_page_session()
         self._pending_block_stage = None
         if release:
             # ``release=True`` is the public request teardown boundary.  Layer
@@ -3070,11 +3239,25 @@ class StreamedQwen38:
         )
         runtime_identity = self._continuation_block_runtime_identity()
 
+        page_router = self.mlp_page_router
+        previous_stage = self._pending_block_stage
+        if (
+            previous_stage is not None
+            and previous_stage.mlp_page_transaction_owner is not None
+        ):
+            previous_stage.mlp_page_transaction_owner.rollback_transaction()
         self._pending_block_stage = None
-        source = self.pager.source
-        start_bytes = self._metric(source, "network_or_source_body_bytes")
-        start_linears = self._metric(self.pager, "linear_calls")
-        started = time.perf_counter()
+        if page_router is not None:
+            page_router.begin_transaction()
+        try:
+            source = self.pager.source
+            start_bytes = self._metric(source, "network_or_source_body_bytes")
+            start_linears = self._metric(self.pager, "linear_calls")
+            started = time.perf_counter()
+        except Exception:
+            if page_router is not None:
+                page_router.rollback_transaction()
+            raise
         try:
             embedded = self.embed_batch(ids)
             if ids.shape[1] == 2:
@@ -3107,56 +3290,65 @@ class StreamedQwen38:
             hidden = torch.cat(final_rows, dim=1)
         except Exception:
             self._pending_block_stage = None
+            if page_router is not None:
+                page_router.rollback_transaction()
             self.pager.release()
             raise
         finally:
             self.pager.release()
 
-        input_ids = tuple(
-            tuple(int(value) for value in row)
-            for row in ids.detach().to("cpu").tolist()
-        )
-        evidence = StatefulBlockEvidence(
-            start_pos=start_pos,
-            end_pos=end_pos,
-            input_token_ids=input_ids,
-            layers_executed=self.config.n_layers,
-            checkpoint_layers=self.config.n_layers,
-            complete_layer_stack=True,
-            stateful_cache=True,
-            source_body_bytes=(
-                self._metric(source, "network_or_source_body_bytes") - start_bytes
-            ),
-            linear_calls=self._metric(self.pager, "linear_calls") - start_linears,
-            seconds=time.perf_counter() - started,
-            staged_state_bytes=self._continuation_bytes(
-                staged.layer_states, staged.graft_history
-            ),
-            graft_mode=self._graft_mode(),
-            graft_history_tokens=(
-                0
-                if staged.graft_history is None
-                else int(staged.graft_history.shape[1])
-            ),
-        )
-        stage = StatefulBlockStage(
-            hidden=hidden.detach().clone(),
-            evidence=replace(evidence),
-            _nonce=object(),
-        )
-        if staged.prefix_trace is None:
-            raise Qwen38RuntimeError("continuation stage lacks its prefix trace")
-        self._pending_block_stage = _PendingStatefulBlock(
-            handle=stage,
-            evidence=evidence,
-            hidden=hidden,
-            layer_states=staged.layer_states,
-            graft_history=staged.graft_history,
-            native_head_crsa_evidence=staged.native_head_crsa_evidence,
-            prefix_trace=staged.prefix_trace,
-            runtime_identity=runtime_identity,
-        )
-        return stage
+        try:
+            input_ids = tuple(
+                tuple(int(value) for value in row)
+                for row in ids.detach().to("cpu").tolist()
+            )
+            evidence = StatefulBlockEvidence(
+                start_pos=start_pos,
+                end_pos=end_pos,
+                input_token_ids=input_ids,
+                layers_executed=self.config.n_layers,
+                checkpoint_layers=self.config.n_layers,
+                complete_layer_stack=True,
+                stateful_cache=True,
+                source_body_bytes=(
+                    self._metric(source, "network_or_source_body_bytes") - start_bytes
+                ),
+                linear_calls=self._metric(self.pager, "linear_calls") - start_linears,
+                seconds=time.perf_counter() - started,
+                staged_state_bytes=self._continuation_bytes(
+                    staged.layer_states, staged.graft_history
+                ),
+                graft_mode=self._graft_mode(),
+                graft_history_tokens=(
+                    0
+                    if staged.graft_history is None
+                    else int(staged.graft_history.shape[1])
+                ),
+            )
+            stage = StatefulBlockStage(
+                hidden=hidden.detach().clone(),
+                evidence=replace(evidence),
+                _nonce=object(),
+            )
+            if staged.prefix_trace is None:
+                raise Qwen38RuntimeError("continuation stage lacks its prefix trace")
+            self._pending_block_stage = _PendingStatefulBlock(
+                handle=stage,
+                evidence=evidence,
+                hidden=hidden,
+                layer_states=staged.layer_states,
+                graft_history=staged.graft_history,
+                native_head_crsa_evidence=staged.native_head_crsa_evidence,
+                prefix_trace=staged.prefix_trace,
+                runtime_identity=runtime_identity,
+                mlp_page_transaction_owner=page_router,
+            )
+            return stage
+        except Exception:
+            self._pending_block_stage = None
+            if page_router is not None:
+                page_router.rollback_transaction()
+            raise
 
     def extend_continuation_block(
         self,
@@ -3177,6 +3369,7 @@ class StreamedQwen38:
         pending = self._pending_block_stage
         if pending is None or stage is not pending.handle:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
+        page_router = pending.mlp_page_transaction_owner
 
         # A matching handle is consumed exactly once.  No later validation or
         # compute failure may leave the old private transaction committable.
@@ -3304,10 +3497,13 @@ class StreamedQwen38:
                 ),
                 prefix_trace=prefix_trace,
                 runtime_identity=runtime_identity,
+                mlp_page_transaction_owner=page_router,
             )
             return next_stage
         except Exception:
             self._pending_block_stage = None
+            if page_router is not None:
+                page_router.rollback_transaction()
             raise
         finally:
             self.pager.release()
@@ -3321,6 +3517,9 @@ class StreamedQwen38:
         if pending is None or stage is not pending.handle:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
         self._pending_block_stage = None
+        page_router = pending.mlp_page_transaction_owner
+        if page_router is not None:
+            page_router.rollback_transaction()
         self.pager.release()
 
     def _reconstruct_continuation_prefix_states(
@@ -3428,6 +3627,13 @@ class StreamedQwen38:
         pending = self._pending_block_stage
         if pending is None or stage is not pending.handle:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
+        page_router = pending.mlp_page_transaction_owner
+
+        def rollback_page_route() -> None:
+            self._pending_block_stage = None
+            if page_router is not None:
+                page_router.rollback_transaction()
+
         row = pending.evidence
         stage_width = row.end_pos - row.start_pos
         if isinstance(width, bool) or not isinstance(width, int):
@@ -3437,40 +3643,44 @@ class StreamedQwen38:
         if width == stage_width:
             return self.commit_continuation_block(stage)
         if self._state_poisoned:
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError("decoder state is poisoned; call reset_state()")
         if self._next_position != row.start_pos:
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError("continuation block base state changed")
         if self._state_batch_size != len(row.input_token_ids):
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError("continuation block batch state changed")
         if len(row.input_token_ids) != 1 or row.end_pos > self.max_seq_len:
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError("continuation block exceeds runtime bounds")
         if self._continuation_block_runtime_identity() != pending.runtime_identity:
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError("continuation block runtime configuration changed")
         if tuple(pending.hidden.shape) != (1, stage_width, self.config.dim):
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError("continuation block hidden shape is invalid")
         if (
             not pending.hidden.is_floating_point()
             or not self._on_pager_device(pending.hidden)
             or pending.hidden.dtype != self.pager.compute_dtype
         ):
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError(
                 "continuation block hidden device/dtype is invalid"
             )
-        self._validate_stateful_range_states(
-            pending.layer_states,
-            batch_size=1,
-            sequence_length=0,
-            start_pos=row.end_pos,
-            start_layer=0,
-            graft_history=pending.graft_history,
-        )
+        try:
+            self._validate_stateful_range_states(
+                pending.layer_states,
+                batch_size=1,
+                sequence_length=0,
+                start_pos=row.end_pos,
+                start_layer=0,
+                graft_history=pending.graft_history,
+            )
+        except Exception:
+            rollback_page_route()
+            raise
 
         self._pending_block_stage = None
         started = time.perf_counter()
@@ -3479,14 +3689,21 @@ class StreamedQwen38:
         pending_native_evidence = pending.native_head_crsa_evidence
         prefix_trace = pending.prefix_trace
         del pending
-        states, graft_history = self._reconstruct_continuation_prefix_states(
-            row,
-            pending_states,
-            prefix_trace,
-            width=width,
-        )
+        try:
+            states, graft_history = self._reconstruct_continuation_prefix_states(
+                row,
+                pending_states,
+                prefix_trace,
+                width=width,
+            )
+        except Exception:
+            if page_router is not None:
+                page_router.rollback_transaction()
+            raise
         end_pos = row.start_pos + width
         hidden = pending_hidden[:, :width]
+        if page_router is not None:
+            page_router.commit_transaction(accepted_rows=width)
         self._layer_states = list(states)
         self._next_position = end_pos
         self._state_batch_size = 1
@@ -3531,40 +3748,47 @@ class StreamedQwen38:
         pending = self._pending_block_stage
         if pending is None or stage is not pending.handle:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
+        page_router = pending.mlp_page_transaction_owner
+
+        def rollback_page_route() -> None:
+            self._pending_block_stage = None
+            if page_router is not None:
+                page_router.rollback_transaction()
+
         row = pending.evidence
         if self._state_poisoned:
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError("decoder state is poisoned; call reset_state()")
         if self._next_position != row.start_pos:
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError("continuation block base state changed")
         if self._state_batch_size != len(row.input_token_ids):
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError("continuation block batch state changed")
         if (
             len(row.input_token_ids) > self.max_batch_size
             or row.end_pos > self.max_seq_len
         ):
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError(
                 "continuation block exceeds current runtime bounds"
             )
         if self._continuation_block_runtime_identity() != pending.runtime_identity:
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError("continuation block runtime configuration changed")
         if tuple(pending.hidden.shape) != (
             len(row.input_token_ids),
             row.end_pos - row.start_pos,
             self.config.dim,
         ):
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError("continuation block hidden shape is invalid")
         if (
             not pending.hidden.is_floating_point()
             or not self._on_pager_device(pending.hidden)
             or pending.hidden.dtype != self.pager.compute_dtype
         ):
-            self._pending_block_stage = None
+            rollback_page_route()
             raise Qwen38RuntimeError(
                 "continuation block hidden device/dtype is invalid"
             )
@@ -3578,11 +3802,13 @@ class StreamedQwen38:
                 graft_history=pending.graft_history,
             )
         except Exception:
-            self._pending_block_stage = None
+            rollback_page_route()
             raise
 
         committed_states = list(pending.layer_states)
         self._pending_block_stage = None
+        if page_router is not None:
+            page_router.commit_transaction()
         self._layer_states = committed_states
         self._next_position = row.end_pos
         self._state_batch_size = len(row.input_token_ids)
@@ -3675,7 +3901,14 @@ class StreamedQwen38:
             # boundary.  Any pending speculative stage is now stale regardless
             # of whether continuation compute commits or poisons, so release its
             # complete private cache before building replacement layer states.
+            pending = self._pending_block_stage
+            if (
+                pending is not None
+                and pending.mlp_page_transaction_owner is not None
+            ):
+                pending.mlp_page_transaction_owner.rollback_transaction()
             self._pending_block_stage = None
+            del pending
         staged: StatefulLayerRangeResult | None = None
         staged_native_evidence: tuple[NativeHeadCrsaEvidence, ...] = ()
         try:

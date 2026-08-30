@@ -565,6 +565,34 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(result.output, runtime.tokenizer.decoded.strip())
         chat.close()
 
+    def test_page_state_flush_failure_never_discards_generated_text(self) -> None:
+        runtime = _Runtime()
+
+        class PageRouter:
+            page_count = 272
+            route_width = 192
+
+            @staticmethod
+            def metrics():
+                return {"exact_rows": 4, "selected_advances": 3}
+
+            @staticmethod
+            def flush() -> None:
+                raise OSError("state disk full")
+
+        runtime.mlp_page_router = PageRouter()
+        chat = _chat(runtime)
+
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(result.output, runtime.tokenizer.decoded.strip())
+        self.assertIn(
+            "state disk full",
+            result.evidence["mlp_page_route"]["persistence_error"],
+        )
+        chat.close()
+
     def test_exact_head_non_cpu_configuration_is_lazy_nonapplicable(self) -> None:
         component = Qwen38CausalChat(
             "unused.causal",
@@ -625,6 +653,44 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     q4_root="/models/qwen-q4",
                     **options,
                 )
+
+    def test_direct_markov_page_route_requires_q4_and_replaces_legacy_sparse(self) -> None:
+        component = Qwen38CausalChat(
+            "unused.causal",
+            "unused-tokenizer.json",
+            q4_root="/models/qwen-q4",
+            mlp_page_state_path="/state/mlp-pages.json",
+            mlp_page_route_width=192,
+        )
+        self.assertEqual(
+            component._mlp_page_state_path,
+            Path("/state/mlp-pages.json"),
+        )
+        self.assertEqual(component._mlp_page_route_width, 192)
+        component.close()
+
+        with self.assertRaisesRegex(ValueError, "requires Q4"):
+            Qwen38CausalChat(
+                "unused.causal",
+                "unused-tokenizer.json",
+                mlp_page_state_path="/state/mlp-pages.json",
+            )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            Qwen38CausalChat(
+                "unused.causal",
+                "unused-tokenizer.json",
+                q4_root="/models/qwen-q4",
+                fast_mlp_root="/artifacts/fast",
+                mlp_page_state_path="/state/mlp-pages.json",
+            )
+        with self.assertRaisesRegex(ValueError, "leave at least one page"):
+            Qwen38CausalChat(
+                "unused.causal",
+                "unused-tokenizer.json",
+                q4_root="/models/qwen-q4",
+                mlp_page_state_path="/state/mlp-pages.json",
+                mlp_page_route_width=272,
+            )
 
     def test_success_is_lazy_uses_no_thinking_prompt_and_returns_compact_receipts(
         self,
@@ -1934,6 +2000,45 @@ class Qwen38CausalChatTests(unittest.TestCase):
             options["q4_root"],
             str(deployed / "causal" / "q4-base-v2"),
         )
+
+    def test_cli_mounts_direct_markov_page_execution_without_legacy_fast_mlp(self) -> None:
+        qwen = _chat(_Runtime())
+        with (
+            patch.dict(
+                "os.environ",
+                {"IMMER_QWEN38_FAST_MLP": "/state/legacy-fast"},
+                clear=True,
+            ),
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ) as constructor,
+            redirect_stdout(io.StringIO()),
+        ):
+            code = main(
+                [
+                    "chat",
+                    "hello",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                    "--qwen38-q4",
+                    "/models/q4",
+                    "--mlp-page-state",
+                    "/state/pages.json",
+                    "--mlp-page-width",
+                    "160",
+                    "--no-markov-draft",
+                    "--raw-qwen",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertIsNone(options["fast_mlp_root"])
+        self.assertEqual(options["mlp_page_state_path"], Path("/state/pages.json"))
+        self.assertEqual(options["mlp_page_route_width"], 160)
         self.assertIsNone(options["fast_mlp_root"])
         self.assertIsNone(options["fast_mlp_active_layers"])
 

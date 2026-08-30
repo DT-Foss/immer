@@ -18,6 +18,7 @@ _QWEN_RUNTIME_FILES = (
     "graft.py",
     "kernels.py",
     "model.py",
+    "mlp_page_markov.py",
     "native_crsa.py",
     "native_fork.py",
     "pager.py",

@@ -39,8 +39,9 @@
 #define IMMER_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define IMMER_Q4_ABI 2u
+#define IMMER_Q4_ABI 4u
 #define IMMER_QK 32
+#define IMMER_MLP_PAGE_NEURONS 64
 #define IMMER_FORMAT_Q4_0 4
 #define IMMER_FORMAT_Q8_0 8
 
@@ -158,25 +159,101 @@ static float immer_bf16_bits_to_float(uint16_t value) {
     return result;
 }
 
-static void immer_quantize_q8_row(const float *x, immer_block_q8_0 *out, int64_t cols) {
+static inline void immer_quantize_q8_block(
+    const float *values,
+    immer_block_q8_0 *out,
+    double *energy
+) {
+    float absolute_max = 0.0f;
+    for (int index = 0; index < IMMER_QK; ++index) {
+        const float value = values[index];
+        const float absolute = fabsf(value);
+        if (absolute > absolute_max) absolute_max = absolute;
+        if (energy) *energy += (double) value * (double) value;
+    }
+    const float scale = absolute_max / 127.0f;
+    const float inverse = scale > 0.0f ? 1.0f / scale : 0.0f;
+    out->d = immer_float_to_half(scale);
+    for (int index = 0; index < IMMER_QK; ++index) {
+        int quantized = (int) roundf(values[index] * inverse);
+        if (quantized < -127) quantized = -127;
+        if (quantized > 127) quantized = 127;
+        out->qs[index] = (int8_t) quantized;
+    }
+}
+
+static void immer_quantize_q8_row(
+    const float *x,
+    immer_block_q8_0 *out,
+    int64_t cols
+) {
     const int64_t blocks = cols / IMMER_QK;
     for (int64_t block = 0; block < blocks; ++block) {
-        const float *values = x + block * IMMER_QK;
-        float absolute_max = 0.0f;
-        for (int index = 0; index < IMMER_QK; ++index) {
-            const float absolute = fabsf(values[index]);
-            if (absolute > absolute_max) absolute_max = absolute;
-        }
-        const float scale = absolute_max / 127.0f;
-        const float inverse = scale > 0.0f ? 1.0f / scale : 0.0f;
-        out[block].d = immer_float_to_half(scale);
-        for (int index = 0; index < IMMER_QK; ++index) {
-            int quantized = (int) roundf(values[index] * inverse);
-            if (quantized < -127) quantized = -127;
-            if (quantized > 127) quantized = 127;
-            out[block].qs[index] = (int8_t) quantized;
-        }
+        immer_quantize_q8_block(
+            x + block * IMMER_QK,
+            out + block,
+            NULL
+        );
     }
+}
+
+typedef struct {
+    double score;
+    int64_t page;
+} immer_mlp_page_energy;
+
+static int immer_compare_mlp_page_energy(const void *left, const void *right) {
+    const immer_mlp_page_energy *a = (const immer_mlp_page_energy *) left;
+    const immer_mlp_page_energy *b = (const immer_mlp_page_energy *) right;
+    if (a->score > b->score) return -1;
+    if (a->score < b->score) return 1;
+    if (a->page < b->page) return -1;
+    if (a->page > b->page) return 1;
+    return 0;
+}
+
+static int immer_quantize_q8_row_with_page_topk(
+    const float *x,
+    immer_block_q8_0 *out,
+    int64_t cols,
+    int64_t k,
+    int64_t *top_page_ids,
+    double *top_page_scores,
+    immer_mlp_page_energy *energies
+) {
+    const int64_t blocks = cols / IMMER_QK;
+    const int64_t page_count =
+        (blocks - 1) / (IMMER_MLP_PAGE_NEURONS / IMMER_QK) + 1;
+    int64_t page = 0;
+    double page_energy = 0.0;
+    for (int64_t block = 0; block < blocks; ++block) {
+        immer_quantize_q8_block(
+            x + block * IMMER_QK,
+            out + block,
+            &page_energy
+        );
+        if (
+            (block + 1) % (IMMER_MLP_PAGE_NEURONS / IMMER_QK) != 0
+            && block + 1 != blocks
+        ) continue;
+        if (!isfinite(page_energy)) return 0;
+        energies[page].score = page_energy;
+        energies[page].page = page;
+        ++page;
+        page_energy = 0.0;
+    }
+    if (page != page_count) return 0;
+    qsort(
+        energies,
+        (size_t) page_count,
+        sizeof(immer_mlp_page_energy),
+        immer_compare_mlp_page_energy
+    );
+    for (int64_t index = 0; index < k; ++index) {
+        top_page_ids[index] = energies[index].page;
+        top_page_scores[index] = energies[index].score;
+    }
+    return 1;
 }
 
 static void immer_quantize_q4_row(const float *x, immer_block_q4_0 *out, int64_t cols) {
@@ -2520,6 +2597,9 @@ IMMER_EXPORT int immer_q4_mlp_bf16_f32(
     int64_t output_rows,
     const uint16_t *silu_bf16,
     float *output,
+    int64_t activation_page_topk,
+    int64_t *top_page_ids,
+    double *top_page_scores,
     int threads
 ) {
     int64_t hidden_blocks_gate;
@@ -2528,11 +2608,20 @@ IMMER_EXPORT int immer_q4_mlp_bf16_f32(
     size_t gate_row_bytes;
     size_t up_row_bytes;
     size_t down_row_bytes;
+    const int64_t activation_page_count = intermediate_cols > 0
+        ? (intermediate_cols - 1) / IMMER_MLP_PAGE_NEURONS + 1
+        : 0;
     if (
         !input || !gate_weights || !up_weights || !down_weights
         || !silu_bf16 || !output
         || input_rows <= 0 || hidden_cols <= 0 || intermediate_cols <= 0
         || output_rows <= 0 || threads <= 0
+        || activation_page_topk < 0
+        || activation_page_topk > activation_page_count
+        || (
+            activation_page_topk > 0
+            && (!top_page_ids || !top_page_scores)
+        )
         || input_rows > INT64_MAX / intermediate_cols
         || input_rows > INT64_MAX / output_rows
         || !immer_checked_row_layout(
@@ -2558,6 +2647,20 @@ IMMER_EXPORT int immer_q4_mlp_bf16_f32(
             input_rows, activation_blocks, sizeof(immer_block_q8_0)
         )
         || !immer_size_product_fits(input_rows, output_rows, sizeof(float))
+        || !immer_size_product_fits(
+            input_rows, activation_page_topk, sizeof(int64_t)
+        )
+        || !immer_size_product_fits(
+            input_rows, activation_page_topk, sizeof(double)
+        )
+        || (
+            activation_page_topk > 0
+            && !immer_size_product_fits(
+                input_rows,
+                activation_page_count,
+                sizeof(immer_mlp_page_energy)
+            )
+        )
     ) return 1;
     const size_t input_count = (size_t) input_rows * (size_t) hidden_cols;
     if (!immer_f32_values_are_finite(input, input_count)) return 2;
@@ -2575,10 +2678,21 @@ IMMER_EXPORT int immer_q4_mlp_bf16_f32(
         * (size_t) activation_blocks
         * sizeof(immer_block_q8_0)
     );
-    if (!quantized_hidden || !activation || !quantized_activation) {
+    immer_mlp_page_energy *page_energies = activation_page_topk > 0
+        ? (immer_mlp_page_energy *) malloc(
+            (size_t) input_rows
+            * (size_t) activation_page_count
+            * sizeof(immer_mlp_page_energy)
+        )
+        : NULL;
+    if (
+        !quantized_hidden || !activation || !quantized_activation
+        || (activation_page_topk > 0 && !page_energies)
+    ) {
         free(quantized_hidden);
         free(activation);
         free(quantized_activation);
+        free(page_energies);
         return 3;
     }
     int numeric_error = 0;
@@ -2644,11 +2758,26 @@ IMMER_EXPORT int immer_q4_mlp_bf16_f32(
         for (int64_t row = 0; row < input_rows; ++row) {
             immer_block_q8_0 *target = quantized_activation
                 + (size_t) row * (size_t) activation_blocks;
-            immer_quantize_q8_row(
-                activation + (size_t) row * (size_t) intermediate_cols,
-                target,
-                intermediate_cols
-            );
+            if (activation_page_topk > 0) {
+                if (!immer_quantize_q8_row_with_page_topk(
+                    activation + (size_t) row * (size_t) intermediate_cols,
+                    target,
+                    intermediate_cols,
+                    activation_page_topk,
+                    top_page_ids
+                        + (size_t) row * (size_t) activation_page_topk,
+                    top_page_scores
+                        + (size_t) row * (size_t) activation_page_topk,
+                    page_energies
+                        + (size_t) row * (size_t) activation_page_count
+                )) numeric_error = 1;
+            } else {
+                immer_quantize_q8_row(
+                    activation + (size_t) row * (size_t) intermediate_cols,
+                    target,
+                    intermediate_cols
+                );
+            }
             for (int64_t block = 0; block < activation_blocks; ++block) {
                 if (!isfinite(immer_half_to_float(target[block].d))) {
                     numeric_error = 1;
@@ -2677,5 +2806,282 @@ IMMER_EXPORT int immer_q4_mlp_bf16_f32(
     free(quantized_hidden);
     free(activation);
     free(quantized_activation);
+    free(page_energies);
+    return numeric_error ? 2 : 0;
+}
+
+IMMER_EXPORT int immer_q4_mlp_pages_bf16_f32(
+    const float *input,
+    int64_t input_rows,
+    int64_t hidden_cols,
+    const uint8_t *gate_weights,
+    int gate_format,
+    const uint8_t *up_weights,
+    int up_format,
+    const uint8_t *down_weights,
+    int down_format,
+    int64_t intermediate_cols,
+    int64_t output_rows,
+    const uint16_t *silu_bf16,
+    const int64_t *page_ids,
+    int64_t selected_pages,
+    float *output,
+    int threads
+) {
+    int64_t hidden_blocks_gate;
+    int64_t hidden_blocks_up;
+    int64_t activation_blocks;
+    size_t gate_row_bytes;
+    size_t up_row_bytes;
+    size_t down_row_bytes;
+    const int64_t page_count = intermediate_cols > 0
+        ? (intermediate_cols - 1) / IMMER_MLP_PAGE_NEURONS + 1
+        : 0;
+    if (
+        !input || !gate_weights || !up_weights || !down_weights
+        || !silu_bf16 || !page_ids || !output
+        || input_rows <= 0 || hidden_cols <= 0 || intermediate_cols <= 0
+        || output_rows <= 0 || selected_pages <= 0
+        || selected_pages > page_count || threads <= 0
+        || selected_pages > INT64_MAX / 2
+        || input_rows > INT64_MAX / selected_pages
+        || input_rows > INT64_MAX / output_rows
+        || !immer_checked_row_layout(
+            gate_format, hidden_cols, &hidden_blocks_gate, &gate_row_bytes
+        )
+        || !immer_checked_row_layout(
+            up_format, hidden_cols, &hidden_blocks_up, &up_row_bytes
+        )
+        || !immer_checked_row_layout(
+            down_format,
+            intermediate_cols,
+            &activation_blocks,
+            &down_row_bytes
+        )
+        || hidden_blocks_gate != hidden_blocks_up
+        || !immer_size_product_fits(
+            input_rows, hidden_blocks_gate, sizeof(immer_block_q8_0)
+        )
+        || !immer_size_product_fits(
+            input_rows, selected_pages, sizeof(int64_t)
+        )
+        || !immer_size_product_fits(
+            input_rows,
+            activation_blocks,
+            sizeof(immer_block_q8_0)
+        )
+        || !immer_size_product_fits(
+            input_rows, selected_pages * 2, sizeof(int64_t)
+        )
+        || !immer_size_product_fits(input_rows, output_rows, sizeof(float))
+    ) return 1;
+    const size_t input_count = (size_t) input_rows * (size_t) hidden_cols;
+    if (!immer_f32_values_are_finite(input, input_count)) return 2;
+
+    const int64_t selected_block_capacity = selected_pages * 2;
+    int64_t *sorted_pages = (int64_t *) malloc(
+        (size_t) input_rows * (size_t) selected_pages * sizeof(int64_t)
+    );
+    immer_block_q8_0 *quantized_hidden = (immer_block_q8_0 *) malloc(
+        (size_t) input_rows
+        * (size_t) hidden_blocks_gate
+        * sizeof(immer_block_q8_0)
+    );
+    immer_block_q8_0 *quantized_activation = (immer_block_q8_0 *) malloc(
+        (size_t) input_rows
+        * (size_t) activation_blocks
+        * sizeof(immer_block_q8_0)
+    );
+    int64_t *selected_block_ids = (int64_t *) malloc(
+        (size_t) input_rows
+        * (size_t) selected_block_capacity
+        * sizeof(int64_t)
+    );
+    int64_t *selected_block_counts = (int64_t *) malloc(
+        (size_t) input_rows * sizeof(int64_t)
+    );
+    if (
+        !sorted_pages || !quantized_hidden || !quantized_activation
+        || !selected_block_ids || !selected_block_counts
+    ) {
+        free(sorted_pages);
+        free(quantized_hidden);
+        free(quantized_activation);
+        free(selected_block_ids);
+        free(selected_block_counts);
+        return 3;
+    }
+
+    for (int64_t row = 0; row < input_rows; ++row) {
+        int64_t *target = sorted_pages
+            + (size_t) row * (size_t) selected_pages;
+        const int64_t *source = page_ids
+            + (size_t) row * (size_t) selected_pages;
+        for (int64_t selected = 0; selected < selected_pages; ++selected) {
+            const int64_t page = source[selected];
+            if (
+                page < 0 || page >= page_count
+                || (selected > 0 && source[selected - 1] >= page)
+            ) {
+                free(sorted_pages);
+                free(quantized_hidden);
+                free(quantized_activation);
+                free(selected_block_ids);
+                free(selected_block_counts);
+                return 4;
+            }
+            target[selected] = page;
+        }
+        int64_t block_count = 0;
+        int64_t *active_ids = selected_block_ids
+            + (size_t) row * (size_t) selected_block_capacity;
+        for (int64_t selected = 0; selected < selected_pages; ++selected) {
+            const int64_t first_block = target[selected]
+                * (IMMER_MLP_PAGE_NEURONS / IMMER_QK);
+            const int64_t remaining = activation_blocks - first_block;
+            const int64_t blocks = remaining < 2 ? remaining : 2;
+            for (int64_t local = 0; local < blocks; ++local) {
+                active_ids[block_count++] = first_block + local;
+            }
+        }
+        selected_block_counts[row] = block_count;
+    }
+
+    int numeric_error = 0;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(threads)
+#endif
+    {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+        for (int64_t row = 0; row < input_rows; ++row) {
+            immer_block_q8_0 *target = quantized_hidden
+                + (size_t) row * (size_t) hidden_blocks_gate;
+            immer_quantize_q8_row(
+                input + (size_t) row * (size_t) hidden_cols,
+                target,
+                hidden_cols
+            );
+            for (int64_t block = 0; block < hidden_blocks_gate; ++block) {
+                if (!isfinite(immer_half_to_float(target[block].d))) {
+                    numeric_error = 1;
+                }
+            }
+            if (selected_block_counts[row] * 2 >= activation_blocks) {
+                memset(
+                    quantized_activation
+                        + (size_t) row * (size_t) activation_blocks,
+                    0,
+                    (size_t) activation_blocks * sizeof(immer_block_q8_0)
+                );
+            }
+        }
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+        for (
+            int64_t task = 0;
+            task < input_rows * selected_pages;
+            ++task
+        ) {
+            const int64_t row = task / selected_pages;
+            const int64_t selected = task % selected_pages;
+            const int64_t page = sorted_pages[
+                (size_t) row * (size_t) selected_pages + selected
+            ];
+            const int64_t first_neuron = page * IMMER_MLP_PAGE_NEURONS;
+            const int64_t remaining = intermediate_cols - first_neuron;
+            const int64_t neuron_count = remaining < IMMER_MLP_PAGE_NEURONS
+                ? remaining
+                : IMMER_MLP_PAGE_NEURONS;
+            const immer_block_q8_0 *active_hidden = quantized_hidden
+                + (size_t) row * (size_t) hidden_blocks_gate;
+            float page_activation[IMMER_MLP_PAGE_NEURONS];
+            for (int64_t offset = 0; offset < neuron_count; ++offset) {
+                const int64_t neuron = first_neuron + offset;
+                float gate = immer_dot_packed_q8(
+                    gate_weights + (size_t) neuron * gate_row_bytes,
+                    gate_format,
+                    active_hidden,
+                    hidden_blocks_gate
+                );
+                float up = immer_dot_packed_q8(
+                    up_weights + (size_t) neuron * up_row_bytes,
+                    up_format,
+                    active_hidden,
+                    hidden_blocks_gate
+                );
+                gate = immer_round_bf16(gate);
+                up = immer_round_bf16(up);
+                uint32_t gate_bits;
+                memcpy(&gate_bits, &gate, sizeof(gate_bits));
+                const float silu = immer_bf16_bits_to_float(
+                    silu_bf16[gate_bits >> 16]
+                );
+                const float value = immer_round_bf16(silu * up);
+                if (!isfinite(value)) numeric_error = 1;
+                page_activation[offset] = value;
+            }
+            const int64_t page_blocks = neuron_count / IMMER_QK;
+            const int dense_down =
+                selected_block_counts[row] * 2 >= activation_blocks;
+            immer_block_q8_0 *target = quantized_activation
+                + (size_t) row * (size_t) activation_blocks
+                + (
+                    dense_down
+                    ? (size_t) page * (IMMER_MLP_PAGE_NEURONS / IMMER_QK)
+                    : (size_t) selected * 2
+                );
+            for (int64_t local = 0; local < page_blocks; ++local) {
+                immer_quantize_q8_block(
+                    page_activation + local * IMMER_QK,
+                    target + local,
+                    NULL
+                );
+                if (!isfinite(immer_half_to_float(target[local].d))) {
+                    numeric_error = 1;
+                }
+            }
+        }
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:numeric_error)
+#endif
+        for (int64_t output_row = 0; output_row < output_rows; ++output_row) {
+            const uint8_t *weight_row = down_weights
+                + (size_t) output_row * down_row_bytes;
+            for (int64_t input_row = 0; input_row < input_rows; ++input_row) {
+                const int dense_down =
+                    selected_block_counts[input_row] * 2 >= activation_blocks;
+                const immer_block_q8_0 *active = quantized_activation
+                    + (size_t) input_row * (size_t) activation_blocks;
+                const float value = dense_down
+                    ? immer_dot_packed_q8(
+                        weight_row,
+                        down_format,
+                        active,
+                        activation_blocks
+                    )
+                    : immer_dot_selected_packed_q8(
+                        weight_row,
+                        down_format,
+                        active,
+                        selected_block_ids
+                            + (size_t) input_row
+                            * (size_t) selected_block_capacity,
+                        selected_block_counts[input_row]
+                    );
+                if (!isfinite(value)) numeric_error = 1;
+                output[
+                    (size_t) input_row * (size_t) output_rows + output_row
+                ] = value;
+            }
+        }
+    }
+    free(sorted_pages);
+    free(quantized_hidden);
+    free(quantized_activation);
+    free(selected_block_ids);
+    free(selected_block_counts);
     return numeric_error ? 2 : 0;
 }

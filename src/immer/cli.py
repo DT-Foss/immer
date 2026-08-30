@@ -298,6 +298,7 @@ def _qwen38_growing_warm_profile(
     tokenizer_path: Path,
     q4_root: Path | None,
     fast_mlp_root: Path | None,
+    mlp_page_state_path: Path | None = None,
     draft_mode: str | None,
     markov_atlas_path: Path | None,
     markov_o1_retention_path: Path | None,
@@ -305,7 +306,11 @@ def _qwen38_growing_warm_profile(
 ) -> str | None:
     """Bind reusable cold cells to the exact pre-load product runtime."""
 
-    if q4_root is None or fast_mlp_root is not None:
+    if (
+        q4_root is None
+        or fast_mlp_root is not None
+        or mlp_page_state_path is not None
+    ):
         return None
     q4_manifest = q4_root / "manifest.json"
     if not q4_manifest.is_file() or not tokenizer_path.is_file():
@@ -610,6 +615,29 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             getattr(args, "markov_o1_retention", None),
             "IMMER_QWEN38_MARKOV_O1_RETENTION",
         )
+        disable_mlp_page_route = bool(
+            getattr(args, "no_mlp_page_route", False)
+        )
+        if disable_mlp_page_route and getattr(args, "mlp_page_state", None):
+            raise ValueError(
+                "--mlp-page-state and --no-mlp-page-route are mutually exclusive"
+            )
+        mlp_page_state_path = (
+            None
+            if disable_mlp_page_route
+            else _chat_path(
+                getattr(args, "mlp_page_state", None),
+                "IMMER_QWEN38_MLP_PAGE_STATE",
+            )
+        )
+        if mlp_page_state_path is not None:
+            if q4_root is None:
+                raise ValueError("MLP page routing requires local Q4 execution")
+            if getattr(args, "fast_mlp", None) is not None:
+                raise ValueError(
+                    "--mlp-page-state and --fast-mlp are mutually exclusive"
+                )
+            fast_mlp_root = None
         if bool(getattr(args, "no_markov_draft", False)) and markov_atlas_path is not None:
             raise ValueError("--markov-atlas and --no-markov-draft are mutually exclusive")
         if (
@@ -659,6 +687,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 tokenizer_path=tokenizer_path,
                 q4_root=q4_root,
                 fast_mlp_root=fast_mlp_root,
+                mlp_page_state_path=mlp_page_state_path,
                 draft_mode=draft_mode,
                 markov_atlas_path=markov_atlas_path,
                 markov_o1_retention_path=markov_o1_retention_path,
@@ -783,6 +812,8 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             range_prefetch_hint_cooldown=args.range_prefetch_hint_cooldown,
             fast_mlp_root=None if fast_mlp_root is None else str(fast_mlp_root),
             fast_mlp_online_state_path=args.fast_mlp_online_state,
+            mlp_page_state_path=mlp_page_state_path,
+            mlp_page_route_width=args.mlp_page_width,
             fast_mlp_source_budget_mb=args.fast_mlp_source_budget_mb,
             fast_mlp_max_resident_bytes=(
                 None
@@ -1705,6 +1736,23 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--fast-mlp-online-state",
         help="persistent target-confirmed state for a weight-only Fast-MLP bank",
+    )
+    chat.add_argument(
+        "--mlp-page-state",
+        help=(
+            "persistent Markov page routes that execute selected Q4 MLP pages"
+        ),
+    )
+    chat.add_argument(
+        "--mlp-page-width",
+        type=int,
+        default=192,
+        help="64-neuron Q4 MLP pages executed per layer (default: 192 of 272)",
+    )
+    chat.add_argument(
+        "--no-mlp-page-route",
+        action="store_true",
+        help="disable the deployed direct Markov MLP page route",
     )
     chat.add_argument(
         "--delta-head-online-state",

@@ -56,6 +56,7 @@ from .markov_draft import (
     FingerprintRollingK4DraftProvider,
 )
 from .markov_atlas import MarkovTokenAtlas
+from .mlp_page_markov import MlpPageMarkov
 from .mtp_draft import (
     MTP_MATRIX_NAMES,
     QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
@@ -596,6 +597,7 @@ class _OwnedRuntime:
         range_prefetcher: MarkovRangePrefetcher | None = None,
         q4_bank: Q4Bank | None = None,
         delta_head_router: PackedDeltaHeadRouter | None = None,
+        mlp_page_router: MlpPageMarkov | None = None,
     ) -> None:
         self.mount = mount
         self.pager = pager
@@ -609,6 +611,7 @@ class _OwnedRuntime:
         self.range_prefetcher = range_prefetcher
         self.q4_bank = q4_bank
         self.delta_head_router = delta_head_router
+        self.mlp_page_router = mlp_page_router
         self.q4_receipt = None if q4_bank is None else q4_bank.metrics()
         self.exact_head_receipt = (
             None if exact_head_index is None else exact_head_index.receipt.to_record()
@@ -632,6 +635,7 @@ class _OwnedRuntime:
         except Exception as exc:  # release the remaining owners regardless
             failures.append(exc)
         self.model.mlp_sparse_executor = None
+        self.model.mlp_page_router = None
         self.model.delta_head_router = None
         try:
             self.pager.attach_exact_head_index(None)
@@ -650,6 +654,11 @@ class _OwnedRuntime:
         if self.delta_head_router is not None:
             try:
                 self.delta_head_router.close()
+            except Exception as exc:
+                failures.append(exc)
+        if self.mlp_page_router is not None:
+            try:
+                self.mlp_page_router.close()
             except Exception as exc:
                 failures.append(exc)
         if self.range_prefetcher is not None:
@@ -694,6 +703,8 @@ def _open_local_runtime(
     fast_mlp_active_layers: Sequence[int] | None = None,
     fast_mlp_selected_block_count: int | None = None,
     fast_mlp_online_state_path: Path | None = None,
+    mlp_page_state_path: Path | None = None,
+    mlp_page_route_width: int = 192,
     delta_head_state_path: Path | None = None,
     exact_head_root: Path | None = None,
     exact_head_block_rows: int | None = None,
@@ -722,6 +733,7 @@ def _open_local_runtime(
     range_prefetcher: MarkovRangePrefetcher | None = None
     q4_bank: Q4Bank | None = None
     delta_head_router: PackedDeltaHeadRouter | None = None
+    mlp_page_router: MlpPageMarkov | None = None
     try:
         mount = CausalWeightMount(
             bundle_path,
@@ -815,6 +827,24 @@ def _open_local_runtime(
                     selected_block_count=fast_mlp_selected_block_count,
                     markov_state_path=fast_mlp_online_state_path,
                 )
+        if mlp_page_state_path is not None:
+            if q4_bank is None:
+                raise Qwen38ChatError("MLP page routing requires the Q4 bank")
+            if fast_mlp_mount is not None:
+                raise Qwen38ChatError(
+                    "MLP page routing and legacy Fast-MLP cannot run together"
+                )
+            mlp_page_router = MlpPageMarkov(
+                mlp_page_state_path,
+                n_layers=config.n_layers,
+                page_count=(config.intermediate_size + 63) // 64,
+                route_width=mlp_page_route_width,
+                identity={
+                    "q4_manifest_sha256": q4_bank.identity["manifest_sha256"],
+                    "repo_id": identity.repo_id,
+                    "revision": identity.revision,
+                },
+            )
         if (
             q4_bank is not None
             and delta_head_state_path is not None
@@ -845,6 +875,7 @@ def _open_local_runtime(
             mlp_sparse_executor=(
                 None if fast_mlp_mount is None else fast_mlp_mount.executor
             ),
+            mlp_page_router=mlp_page_router,
             delta_head_router=delta_head_router,
             native_deltanet_recurrence=q4_bank is not None,
             native_deltanet_fusion=q4_bank is not None,
@@ -888,6 +919,7 @@ def _open_local_runtime(
             range_prefetcher=range_prefetcher,
             q4_bank=q4_bank,
             delta_head_router=delta_head_router,
+            mlp_page_router=mlp_page_router,
         )
     except Exception:
         if model is not None:
@@ -896,6 +928,12 @@ def _open_local_runtime(
             except Exception:
                 pass
             model.delta_head_router = None
+            model.mlp_page_router = None
+        if mlp_page_router is not None:
+            try:
+                mlp_page_router.close()
+            except Exception:
+                pass
         if range_prefetcher is not None:
             try:
                 if mount is not None:
@@ -953,6 +991,8 @@ def _open_official_runtime(
     fast_mlp_active_layers: Sequence[int] | None = None,
     fast_mlp_selected_block_count: int | None = None,
     fast_mlp_online_state_path: Path | None = None,
+    mlp_page_state_path: Path | None = None,
+    mlp_page_route_width: int = 192,
     delta_head_state_path: Path | None = None,
     exact_head_root: Path | None = None,
     exact_head_block_rows: int | None = None,
@@ -983,6 +1023,8 @@ def _open_official_runtime(
         fast_mlp_active_layers=fast_mlp_active_layers,
         fast_mlp_selected_block_count=fast_mlp_selected_block_count,
         fast_mlp_online_state_path=fast_mlp_online_state_path,
+        mlp_page_state_path=mlp_page_state_path,
+        mlp_page_route_width=mlp_page_route_width,
         delta_head_state_path=delta_head_state_path,
         exact_head_root=exact_head_root,
         exact_head_block_rows=exact_head_block_rows,
@@ -1039,6 +1081,8 @@ class Qwen38CausalChat:
         fast_mlp_active_layers: Sequence[int] | None = None,
         fast_mlp_selected_block_count: int | None = None,
         fast_mlp_online_state_path: str | Path | None = None,
+        mlp_page_state_path: str | Path | None = None,
+        mlp_page_route_width: int = 192,
         delta_head_state_path: str | Path | None = None,
         range_markov_state_path: str | Path | None = None,
         range_prefetch_max_bytes: int = 64 * 1024**2,
@@ -1097,6 +1141,10 @@ class Qwen38CausalChat:
                 fast_mlp_selected_block_count,
                 "fast_mlp_selected_block_count",
             )
+        mlp_page_route_width = _positive_int(
+            mlp_page_route_width,
+            "mlp_page_route_width",
+        )
         max_prompt_tokens = _positive_int(max_prompt_tokens, "max_prompt_tokens")
         max_new_tokens = _positive_int(max_new_tokens, "max_new_tokens")
         max_context_tokens = _positive_int(max_context_tokens, "max_context_tokens")
@@ -1245,6 +1293,11 @@ class Qwen38CausalChat:
             (str, Path),
         ):
             raise TypeError("fast_mlp_online_state_path must be a local path or None")
+        if mlp_page_state_path is not None and not isinstance(
+            mlp_page_state_path,
+            (str, Path),
+        ):
+            raise TypeError("mlp_page_state_path must be a local path or None")
         if delta_head_state_path is not None and not isinstance(
             delta_head_state_path,
             (str, Path),
@@ -1286,6 +1339,15 @@ class Qwen38CausalChat:
             raise ValueError("fast_mlp_selected_block_count requires Q4 execution")
         if delta_head_state_path is not None and q4_root is None:
             raise ValueError("delta_head_state_path requires Q4 execution")
+        if mlp_page_state_path is not None:
+            if q4_root is None:
+                raise ValueError("mlp_page_state_path requires Q4 execution")
+            if fast_mlp_root is not None:
+                raise ValueError(
+                    "MLP page routing and legacy Fast-MLP are mutually exclusive"
+                )
+            if mlp_page_route_width >= 272:
+                raise ValueError("mlp_page_route_width must leave at least one page out")
         if q4_root is not None and any(
             value is not None for value in (exact_head_root, range_markov_state_path)
         ):
@@ -1378,6 +1440,12 @@ class Qwen38CausalChat:
             if fast_mlp_online_state_path is None
             else Path(fast_mlp_online_state_path).expanduser().absolute()
         )
+        self._mlp_page_state_path = (
+            None
+            if mlp_page_state_path is None
+            else Path(mlp_page_state_path).expanduser().absolute()
+        )
+        self._mlp_page_route_width = mlp_page_route_width
         self._delta_head_state_path = (
             None
             if delta_head_state_path is None
@@ -1884,6 +1952,8 @@ class Qwen38CausalChat:
             fast_mlp_active_layers=self._fast_mlp_active_layers,
             fast_mlp_selected_block_count=self._fast_mlp_selected_block_count,
             fast_mlp_online_state_path=self._fast_mlp_online_state_path,
+            mlp_page_state_path=self._mlp_page_state_path,
+            mlp_page_route_width=self._mlp_page_route_width,
             delta_head_state_path=self._delta_head_state_path,
             exact_head_root=self._exact_head_root,
             exact_head_block_rows=self._head_block_rows,
@@ -2900,6 +2970,10 @@ class Qwen38CausalChat:
                 )
 
         q4_before = _runtime_q4_metrics(runtime)
+        mlp_page_router = getattr(runtime, "mlp_page_router", None)
+        mlp_page_before = (
+            None if mlp_page_router is None else mlp_page_router.metrics()
+        )
         physical_read_before = _linux_process_read_bytes()
         request_started = time.perf_counter()
         raw_generated, raw_evidence = self._generate_locked(
@@ -2909,6 +2983,17 @@ class Qwen38CausalChat:
         )
         request_seconds = time.perf_counter() - request_started
         q4_after = _runtime_q4_metrics(runtime)
+        mlp_page_persistence_error = None
+        if mlp_page_router is not None:
+            try:
+                mlp_page_router.flush()
+            except Exception as exc:
+                mlp_page_persistence_error = (
+                    f"{type(exc).__module__}.{type(exc).__qualname__}: {exc}"
+                )
+        mlp_page_after = (
+            None if mlp_page_router is None else mlp_page_router.metrics()
+        )
         physical_read_after = _linux_process_read_bytes()
         generated_ids = _token_ids(raw_generated, "generated output")
         if len(generated_ids) > self._max_new_tokens:
@@ -2963,6 +3048,16 @@ class Qwen38CausalChat:
                 "fused_mlp_rows",
                 "full_mlp_calls",
                 "full_mlp_rows",
+                "full_mlp_page_trace_calls",
+                "full_mlp_page_trace_rows",
+                "page_mlp_calls",
+                "page_mlp_dense_down_calls",
+                "page_mlp_dense_down_rows",
+                "page_mlp_rows",
+                "page_mlp_selected_pages",
+                "page_mlp_selected_neurons",
+                "page_mlp_selected_down_blocks",
+                "page_mlp_weight_bytes",
                 "fused_deltanet_calls",
                 "fused_deltanet_rows",
                 "input_quantizations",
@@ -2994,6 +3089,21 @@ class Qwen38CausalChat:
             evidence["q4"] = {
                 **dict(evidence.get("q4", {})),
                 "request": q4_request,
+            }
+        if mlp_page_before is not None and mlp_page_after is not None:
+            counters = {
+                key: int(value) - int(mlp_page_before.get(key, 0))
+                for key, value in mlp_page_after.items()
+                if isinstance(value, int)
+                and not isinstance(value, bool)
+                and isinstance(mlp_page_before.get(key, 0), int)
+                and not isinstance(mlp_page_before.get(key, 0), bool)
+            }
+            evidence["mlp_page_route"] = {
+                "page_count": int(getattr(mlp_page_router, "page_count")),
+                "persistence_error": mlp_page_persistence_error,
+                "request": counters,
+                "route_width": int(getattr(mlp_page_router, "route_width")),
             }
         if self._last_draft_evidence is not None:
             evidence["draft"] = dict(self._last_draft_evidence)

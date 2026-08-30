@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import weakref
@@ -478,6 +479,257 @@ class Qwen38ModelTests(unittest.TestCase):
                 mlp_sparse_executor=object(),
                 max_seq_len=32,
             )
+
+    def test_markov_page_route_replaces_full_mlp_execution(self) -> None:
+        class Q4Stub:
+            @staticmethod
+            def has(_name: str) -> bool:
+                return True
+
+            @staticmethod
+            def mlp(*_args, **_kwargs):
+                raise AssertionError("pager mock owns full MLP execution")
+
+            @staticmethod
+            def mlp_selected_pages(*_args, **_kwargs):
+                raise AssertionError("pager mock owns selected MLP execution")
+
+        class PageRouter:
+            route_width = 1
+            page_count = 1
+
+            def __init__(self) -> None:
+                self.ready = False
+                self.prepared = []
+                self.routed = []
+                self.exact = []
+                self.advanced = []
+
+            def prepare(self, layer: int):
+                self.prepared.append(layer)
+                return SimpleNamespace(ready=self.ready, page_ids=(0,))
+
+            def observe_exact_batch(self, layer: int, ids, scores) -> None:
+                self.exact.append((layer, ids.clone(), scores.clone()))
+                self.ready = True
+
+            def advance_selected(self, layer: int, ids, *, row_count: int = 1) -> None:
+                self.advanced.append((layer, tuple(ids)))
+
+            def begin_transaction(self) -> None:
+                pass
+
+            @staticmethod
+            def begin_exact_wave(_layer: int) -> None:
+                pass
+
+            @staticmethod
+            def compile_routes() -> None:
+                pass
+
+            def commit_transaction(self) -> None:
+                pass
+
+            def rollback_transaction(self) -> None:
+                pass
+
+            def reset_session(self) -> None:
+                pass
+
+            def route(self, layer: int, *, row_count: int):
+                self.routed.append((layer, row_count))
+                return SimpleNamespace(ready=self.ready, page_ids=(0,))
+
+            @staticmethod
+            def snapshot_identity():
+                return {"schema": "test-page-router/v1"}
+
+            @staticmethod
+            def metrics():
+                return {}
+
+        router = PageRouter()
+        model = StreamedQwen38(
+            self.config,
+            self.pager,
+            mlp_page_router=router,
+            max_batch_size=3,
+            max_seq_len=32,
+        )
+        hidden = torch.ones(1, 3, self.config.dim)
+        full_output = torch.full_like(hidden, 0.5)
+        page_ids = torch.zeros((1, 3, 1), dtype=torch.int64)
+        page_scores = torch.ones((1, 3, 1), dtype=torch.float64)
+        selected_output = torch.full((1, 1, self.config.dim), 0.25)
+        original_q4 = self.pager.q4_bank
+        original_dtype = self.pager.compute_dtype
+        self.pager.q4_bank = Q4Stub()
+        self.pager.compute_dtype = torch.bfloat16
+        try:
+            with (
+                mock.patch.object(
+                    self.pager,
+                    "mlp",
+                    return_value=(full_output, page_ids, page_scores),
+                ) as full,
+                mock.patch.object(
+                    self.pager,
+                    "mlp_selected_pages",
+                    return_value=selected_output,
+                ) as selected,
+            ):
+                actual_full = model._mlp(hidden, layer=1)
+                self.assertTrue(torch.equal(actual_full, full_output))
+                self.assertEqual(len(router.exact), 1)
+                self.assertEqual(router.prepared, [])
+                full.assert_called_once()
+                selected.assert_not_called()
+
+                one = hidden[:, :1]
+                actual_selected = model._mlp(one, layer=1)
+                self.assertTrue(torch.equal(actual_selected, selected_output))
+                self.assertEqual(full.call_count, 1)
+                selected.assert_called_once()
+                self.assertEqual(
+                    tuple(selected.call_args.args[2].shape),
+                    (1, 1, 1),
+                )
+                self.assertEqual(router.advanced, [(1, (0,))])
+
+                rows = (one.clone(), one.clone())
+                selected.return_value = torch.full((2, self.config.dim), 0.75)
+                outputs = model._mlp_token_rows(rows, layer=1)
+                self.assertEqual(len(outputs), 2)
+                self.assertTrue(
+                    all(
+                        torch.equal(row, torch.full_like(row, 0.75))
+                        for row in outputs
+                    )
+                )
+                self.assertEqual(full.call_count, 1)
+                self.assertEqual(selected.call_count, 2)
+                self.assertEqual(router.routed, [(1, 1), (1, 2)])
+        finally:
+            self.pager.q4_bank = original_q4
+            self.pager.compute_dtype = original_dtype
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            StreamedQwen38(
+                self.config,
+                self.pager,
+                mlp_sparse_executor=mock.Mock(
+                    execute=mock.Mock(),
+                    execute_many=mock.Mock(),
+                    supports_layer=mock.Mock(return_value=True),
+                    snapshot_identity=mock.Mock(return_value={"layers": [0]}),
+                ),
+                mlp_page_router=router,
+                max_seq_len=32,
+            )
+
+    def test_continuation_stage_transactions_page_route_state(self) -> None:
+        class PageRouter:
+            route_width = 1
+
+            def __init__(self) -> None:
+                self.begins = 0
+                self.commits = 0
+                self.fail_commit = False
+                self.rollbacks = 0
+                self.resets = 0
+
+            @staticmethod
+            def advance_selected(
+                _layer: int,
+                _ids,
+                *,
+                row_count: int = 1,
+            ) -> None:
+                pass
+
+            def begin_transaction(self) -> None:
+                self.begins += 1
+
+            @staticmethod
+            def begin_exact_wave(_layer: int) -> None:
+                pass
+
+            @staticmethod
+            def compile_routes() -> None:
+                pass
+
+            def commit_transaction(self, *, accepted_rows: int | None = None) -> None:
+                if self.fail_commit:
+                    raise RuntimeError("page commit failed")
+                self.commits += 1
+
+            @staticmethod
+            def metrics():
+                return {}
+
+            @staticmethod
+            def observe_exact_batch(_layer: int, _ids, _scores) -> None:
+                pass
+
+            @staticmethod
+            def prepare(layer: int):
+                return SimpleNamespace(layer=layer, ready=False, page_ids=())
+
+            def reset_session(self) -> None:
+                self.resets += 1
+
+            def rollback_transaction(self) -> None:
+                self.rollbacks += 1
+
+            @staticmethod
+            def route(layer: int, *, row_count: int):
+                return SimpleNamespace(layer=layer, ready=False, page_ids=())
+
+            @staticmethod
+            def snapshot_identity():
+                return {"schema": "test-page-router/v1"}
+
+        router = PageRouter()
+        model = StreamedQwen38(
+            self.config,
+            self.pager,
+            mlp_page_router=router,
+            max_batch_size=1,
+            max_seq_len=32,
+        )
+        model.prefill([[1, 4]], reset=True)
+        stage = model.stage_continuation_block([[5, 6]])
+        self.assertEqual(router.begins, 1)
+        model.discard_continuation_block(stage)
+        self.assertEqual(router.rollbacks, 1)
+
+        stage = model.stage_continuation_block([[5]])
+        model.commit_continuation_block(stage)
+        self.assertEqual(router.begins, 2)
+        self.assertEqual(router.commits, 1)
+
+        stale = model.stage_continuation_block([[7]])
+        model.decode([[8]])
+        self.assertEqual(router.rollbacks, 2)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "stale"):
+            model.discard_continuation_block(stale)
+
+        stage = model.stage_continuation_block([[9, 10]])
+        cursor = model.next_position
+        router.fail_commit = True
+        with self.assertRaisesRegex(RuntimeError, "page commit failed"):
+            model.commit_continuation_prefix(stage, 1)
+        self.assertEqual(model.next_position, cursor)
+        router.fail_commit = False
+
+        stage = model.stage_continuation_block([[11]])
+        replacement = PageRouter()
+        model.mlp_page_router = replacement
+        model.reset_state()
+        self.assertEqual(router.rollbacks, 3)
+        self.assertEqual(replacement.resets, 1)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "stale"):
+            model.discard_continuation_block(stage)
 
     def test_exact_mlp_without_sparse_executor_requests_no_weight_observer(self) -> None:
         hidden = torch.ones(1, 1, self.config.dim)
