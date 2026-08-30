@@ -4,6 +4,32 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-30
 
+Runtime commits through `be0fe4c` are deployed on the canonical server.
+“Unreleased” denotes the absence of a tagged public release.
+
+### Self-improving Markov runtime
+
+- `be0fe4c` expanded the persistent tournament to five agents: Beam, Council,
+  structured Phrase, Markov, and MTP. Markov and MTP now learn from paired
+  counterfactual traces, specialize globally and by dialect, switch within the
+  same response, and preserve exact rollback semantics. State v13 migrates all
+  earlier state generations.
+- `c33f968` made Beam, Council, and Phrase compete on every eligible Markov
+  round. Only the selected plan affects served diagnostics; every candidate
+  continues as a causal shadow path and learns until its own first mismatch.
+- `a4a56bb` specialized horizon self-trust by dialect. Similar contexts transfer
+  skill by similarity, use, age, and maturity while novel contexts retain the
+  global fallback.
+- `e0cfbee` added exact chosen-plan self-trust for positions 0–15. Confirmed deep
+  misses reduce speculative width and confirmed hits restore it automatically.
+- `4fed4eb` retained overlapping autonomous Markov tails and trained their deep
+  positions from normal target-confirmed traffic without another Qwen forward.
+- `0470a92` reused the target scan already produced by speculative decoding to
+  train one additional embedded-MTP position with zero additional target work.
+- `f8c9287` exposed accepted drafts, planner and provider tournaments,
+  counterfactual/deep labels, dialect similarity, MTP teacher labels, target
+  forwards, time, and peak memory through interactive `/stats`.
+
 ### Deployed Markov/MTP product path
 
 - `1e2ba55` added a carried-only `bucket=-1` Beta aggregate. It reconstructs
