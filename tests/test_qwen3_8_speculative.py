@@ -1345,7 +1345,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
             def propose_round(self, history, known_token):
                 return replace(
                     super().propose_round(history, known_token),
-                    provider_abi="immer.qwen3.8-markov-draft-provider/v27",
+                    provider_abi="immer.qwen3.8-markov-draft-provider/v28",
                 )
 
         prompt = (1, 4)
@@ -1445,10 +1445,16 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         )
         candidate = self._model()
 
-        with mock.patch.object(
-            candidate,
-            "stage_continuation_block",
-            side_effect=AssertionError("real Markov K1 must not stage"),
+        with (
+            mock.patch.object(
+                candidate,
+                "stage_continuation_block",
+                side_effect=AssertionError("real Markov K1 must not stage"),
+            ),
+            mock.patch(
+                "immer.runtimes.qwen3_8.speculative._model_state_stamp",
+                side_effect=AssertionError("Markov must not hash target tensors"),
+            ),
         ):
             result = Qwen38K4SpeculativeDecoder(
                 candidate,
@@ -1464,12 +1470,54 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         self.assertEqual(result.token_ids, expected)
         self.assertEqual(result.evidence.used_window_sizes, (1, 1, 1))
         self.assertEqual(result.evidence.forward_passes, baseline.forward_passes)
+        self.assertEqual(result.evidence.provider_guard_bytes, 0)
+        self.assertGreater(result.evidence.provider_guard_seconds, 0.0)
         self._assert_state_equal(candidate, reference)
         self.assertEqual(provider._beam_verified_tokens, 3)
         self.assertEqual(provider._beam_accepted_tokens, 3)
         metrics = provider.metrics()
         self.assertEqual(metrics.reconcile_calls, 3)
         self.assertEqual(metrics.updates, 1)
+        provider.close()
+
+    def test_zero_weight_markov_version_guard_detects_target_mutation(self) -> None:
+        prompt = (1, 4)
+        candidate = self._model()
+
+        class MutatingMarkov(FingerprintRollingK4DraftProvider):
+            def propose_round(self, history, known_token):
+                state = candidate._layer_states[0]
+                assert state is not None
+                state.recurrent.add_(1.0)
+                return super().propose_round(history, known_token)
+
+        provider = MutatingMarkov(
+            vocab_size=self.config.vocab_size,
+            proposal_width=3,
+        )
+        with (
+            mock.patch(
+                "immer.runtimes.qwen3_8.speculative._model_state_stamp",
+                side_effect=AssertionError("Markov must not hash target tensors"),
+            ),
+            self.assertRaisesRegex(
+                Qwen38SpeculativeError,
+                "changed target model state",
+            ),
+        ):
+            Qwen38K4SpeculativeDecoder(
+                candidate,
+                provider,
+                window_size=4,
+                adaptive_round_windows=True,
+            ).generate_rolling(
+                [prompt],
+                max_new_tokens=4,
+                head_block_rows=7,
+            )
+
+        self.assertEqual(candidate.next_position, 0)
+        self.assertEqual(candidate.state_bytes, 0)
         provider.close()
 
     def test_rolling_k16_full_acceptance_uses_one_target_wave(self) -> None:

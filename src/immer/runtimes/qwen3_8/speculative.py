@@ -1456,12 +1456,21 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         self.adaptive_round_windows = adaptive_round_windows
 
     def _provider_state_stamp(self) -> tuple[object, ...]:
-        if (
-            getattr(self.draft_provider, "target_state_isolation", None)
-            == "hidden-argument+shared-pager-only/v1"
-        ):
+        isolation = getattr(self.draft_provider, "target_state_isolation", None)
+        if isolation in {
+            "hidden-argument+shared-pager-only/v1",
+            "no-target-state-access/v1",
+        }:
             return _model_state_version_stamp(self.model)
         return _model_state_stamp(self.model)
+
+    def _provider_guard_payload_bytes(self) -> int:
+        if (
+            getattr(self.draft_provider, "target_state_isolation", None)
+            == "no-target-state-access/v1"
+        ):
+            return 0
+        return self.model.state_bytes
 
     def _proposal_k4(
         self, history: tuple[int, ...]
@@ -1473,7 +1482,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         stamp_started = time.perf_counter()
         before = self._provider_state_stamp()
         integrity_seconds = time.perf_counter() - stamp_started
-        integrity_bytes = self.model.state_bytes
+        integrity_bytes = self._provider_guard_payload_bytes()
         failure: Exception | None = None
         proposal: tuple[int, ...] | None = None
         try:
@@ -1500,7 +1509,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         except Exception:
             changed = True
         integrity_seconds += time.perf_counter() - stamp_started
-        integrity_bytes += self.model.state_bytes
+        integrity_bytes += self._provider_guard_payload_bytes()
         if changed:
             self.model.reset_state(release=True)
             raise Qwen38SpeculativeError("draft provider changed target model state")
@@ -1559,7 +1568,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         stamp_started = time.perf_counter()
         before = self._provider_state_stamp()
         integrity_seconds = time.perf_counter() - stamp_started
-        integrity_bytes = self.model.state_bytes
+        integrity_bytes = self._provider_guard_payload_bytes()
         failure: Exception | None = None
         proposal: tuple[int, ...] | None = None
         proposal_evidence: RollingDraftProposal | None = None
@@ -1607,7 +1616,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         except Exception:
             changed = True
         integrity_seconds += time.perf_counter() - stamp_started
-        integrity_bytes += self.model.state_bytes
+        integrity_bytes += self._provider_guard_payload_bytes()
         if changed:
             self.model.reset_state(release=True)
             raise Qwen38SpeculativeError(
@@ -1644,7 +1653,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         stamp_started = time.perf_counter()
         before = self._provider_state_stamp()
         integrity_seconds = time.perf_counter() - stamp_started
-        integrity_bytes = self.model.state_bytes
+        integrity_bytes = self._provider_guard_payload_bytes()
         failure: Exception | None = None
         provider_hidden = target_hidden.detach().clone() if state_callback else None
         provider_hidden_stamp = (
@@ -1673,7 +1682,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         except Exception:
             changed = True
         integrity_seconds += time.perf_counter() - stamp_started
-        integrity_bytes += self.model.state_bytes
+        integrity_bytes += self._provider_guard_payload_bytes()
         if changed:
             self.model.reset_state(release=True)
             raise Qwen38SpeculativeError(
@@ -1714,7 +1723,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         stamp_started = time.perf_counter()
         before = self._provider_state_stamp()
         integrity_seconds = time.perf_counter() - stamp_started
-        integrity_bytes = self.model.state_bytes
+        integrity_bytes = self._provider_guard_payload_bytes()
         failure: Exception | None = None
         provider_hidden = (
             None if target_hidden is None else target_hidden.detach().clone()
@@ -1745,7 +1754,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         except Exception:
             changed = True
         integrity_seconds += time.perf_counter() - stamp_started
-        integrity_bytes += self.model.state_bytes
+        integrity_bytes += self._provider_guard_payload_bytes()
         if changed:
             self.model.reset_state(release=True)
             raise Qwen38SpeculativeError(
@@ -1781,7 +1790,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         stamp_started = time.perf_counter()
         before = self._provider_state_stamp()
         integrity_seconds = time.perf_counter() - stamp_started
-        integrity_bytes = self.model.state_bytes
+        integrity_bytes = self._provider_guard_payload_bytes()
         failure: Exception | None = None
         try:
             callback = getattr(self.draft_provider, callback_name)
@@ -1796,7 +1805,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         except Exception:
             changed = True
         integrity_seconds += time.perf_counter() - stamp_started
-        integrity_bytes += self.model.state_bytes
+        integrity_bytes += self._provider_guard_payload_bytes()
         if changed:
             self.model.reset_state(release=True)
             raise Qwen38SpeculativeError(
@@ -1823,7 +1832,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         stamp_started = time.perf_counter()
         before = self._provider_state_stamp()
         integrity_seconds = time.perf_counter() - stamp_started
-        integrity_bytes = self.model.state_bytes
+        integrity_bytes = self._provider_guard_payload_bytes()
         failure: Exception | None = None
         try:
             callback = getattr(self.draft_provider, "observe_final")
@@ -1838,7 +1847,7 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
         except Exception:
             changed = True
         integrity_seconds += time.perf_counter() - stamp_started
-        integrity_bytes += self.model.state_bytes
+        integrity_bytes += self._provider_guard_payload_bytes()
         if changed:
             self.model.reset_state(release=True)
             raise Qwen38SpeculativeError(

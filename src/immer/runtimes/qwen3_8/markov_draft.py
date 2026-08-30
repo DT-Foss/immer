@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v27"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v28"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -1284,7 +1284,14 @@ class MarkovDraftMetrics:
 
 
 class FingerprintRollingK4DraftProvider:
-    """Draft with sparse PPM counts and learn only target-confirmed tokens."""
+    """Draft from token IDs alone and learn only target-confirmed tokens.
+
+    The decoder never passes this provider target tensors, weights, a pager, or
+    a model handle, so callback guards inspect tensor versions without hashing
+    target payloads.
+    """
+
+    target_state_isolation = "no-target-state-access/v1"
 
     EXPERT_LEARNING_RATE = 0.5
     RAPIDITY_DECAY = 0.95
