@@ -34,8 +34,9 @@ try:
 except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
-MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v10"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v43"
+MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v11"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v44"
+V10_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v10"
 V9_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
@@ -45,8 +46,9 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v32"
-_STATE_PREFIX = b"IMMD\x0a"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v33"
+_STATE_PREFIX = b"IMMD\x0b"
+_V10_STATE_PREFIX = b"IMMD\x0a"
 _V9_STATE_PREFIX = b"IMMD\x09"
 _V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
@@ -58,6 +60,7 @@ _V2_STATE_PREFIX = b"IMMD\x02"
 _LEGACY_STATE_PREFIX = b"IMMD\x01"
 _STATE_PREFIXES = (
     _STATE_PREFIX,
+    _V10_STATE_PREFIX,
     _V9_STATE_PREFIX,
     _V8_STATE_PREFIX,
     _V7_STATE_PREFIX,
@@ -447,6 +450,8 @@ class MarkovDialectState:
     hits: tuple[int, ...]
     horizon_observations: tuple[tuple[int, ...], ...] = ()
     horizon_hits: tuple[tuple[int, ...], ...] = ()
+    plan_observations: tuple[int, ...] = ()
+    plan_hits: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -530,14 +535,50 @@ class MarkovDialectState:
             )
         ):
             raise ValueError("dialect horizon expert state is invalid")
+        plan_observations = tuple(self.plan_observations)
+        plan_hits = tuple(self.plan_hits)
+        if bool(plan_observations) != bool(plan_hits) or (
+            plan_observations
+            and (
+                len(plan_observations) != _MAX_PROPOSAL_POSITIONS
+                or len(plan_hits) != _MAX_PROPOSAL_POSITIONS
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    for value in (*plan_observations, *plan_hits)
+                )
+                or any(
+                    hit > observed
+                    for observed, hit in zip(
+                        plan_observations,
+                        plan_hits,
+                        strict=True,
+                    )
+                )
+            )
+        ):
+            raise ValueError("dialect horizon plan state is invalid")
         object.__setattr__(self, "signature", signature)
         object.__setattr__(self, "rapidities", rapidities)
         object.__setattr__(self, "observations", observations)
         object.__setattr__(self, "hits", hits)
         object.__setattr__(self, "horizon_observations", horizon_observations)
         object.__setattr__(self, "horizon_hits", horizon_hits)
+        object.__setattr__(self, "plan_observations", plan_observations)
+        object.__setattr__(self, "plan_hits", plan_hits)
 
     def to_record(self) -> dict[str, object]:
+        plan_observations = (
+            self.plan_observations
+            if self.plan_observations
+            else (0,) * _MAX_PROPOSAL_POSITIONS
+        )
+        plan_hits = (
+            self.plan_hits
+            if self.plan_hits
+            else (0,) * _MAX_PROPOSAL_POSITIONS
+        )
         return {
             "dialect_id": self.dialect_id,
             "hits": list(self.hits),
@@ -545,6 +586,8 @@ class MarkovDialectState:
             "horizon_observations": [
                 list(row) for row in self.horizon_observations
             ],
+            "plan_hits": list(plan_hits),
+            "plan_observations": list(plan_observations),
             "last_seen": self.last_seen,
             "observations": list(self.observations),
             "rapidities": [value.hex() for value in self.rapidities],
@@ -558,6 +601,7 @@ class MarkovDialectState:
         value: object,
         *,
         legacy: bool = False,
+        plan_memory: bool = True,
     ) -> "MarkovDialectState":
         expected = {
             "dialect_id",
@@ -570,8 +614,14 @@ class MarkovDialectState:
         }
         if not legacy:
             expected |= {"horizon_hits", "horizon_observations"}
+        if plan_memory:
+            expected |= {"plan_hits", "plan_observations"}
         if not isinstance(value, Mapping) or set(value) != expected:
             raise ValueError("dialect record is invalid")
+        if plan_memory and (
+            not value.get("plan_observations") or not value.get("plan_hits")
+        ):
+            raise ValueError("dialect plan memory is missing")
         try:
             return cls(
                 dialect_id=value["dialect_id"],
@@ -587,6 +637,8 @@ class MarkovDialectState:
                 horizon_hits=tuple(
                     tuple(row) for row in value.get("horizon_hits", ())
                 ),
+                plan_observations=tuple(value.get("plan_observations", ())),
+                plan_hits=tuple(value.get("plan_hits", ())),
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("dialect record values are invalid") from exc
@@ -1205,6 +1257,7 @@ class MarkovDraftState:
             or value.get("schema")
             not in {
                 MARKOV_DRAFT_STATE_SCHEMA,
+                V10_MARKOV_DRAFT_STATE_SCHEMA,
                 V9_MARKOV_DRAFT_STATE_SCHEMA,
                 V8_MARKOV_DRAFT_STATE_SCHEMA,
                 V7_MARKOV_DRAFT_STATE_SCHEMA,
@@ -1278,9 +1331,12 @@ class MarkovDraftState:
                         legacy=value.get("schema")
                         not in {
                             MARKOV_DRAFT_STATE_SCHEMA,
+                            V10_MARKOV_DRAFT_STATE_SCHEMA,
                             V9_MARKOV_DRAFT_STATE_SCHEMA,
                             V8_MARKOV_DRAFT_STATE_SCHEMA,
                         },
+                        plan_memory=value.get("schema")
+                        == MARKOV_DRAFT_STATE_SCHEMA,
                     )
                     for row in value.get("dialects", ())
                 ),
@@ -1357,6 +1413,8 @@ class MarkovDraftMetrics:
     dialect_neighbor_ids: tuple[str, ...]
     active_dialect_id: str | None
     active_dialect_similarity: float
+    active_dialect_plan_observations: tuple[int, ...]
+    active_dialect_plan_hits: tuple[int, ...]
     dialect_evictions: int
     phrase_option_calls: int
     phrase_draft_tokens: int
@@ -1615,6 +1673,21 @@ class FingerprintRollingK4DraftProvider:
                         row,
                         horizon_observations=dialect_zeros,
                         horizon_hits=dialect_zeros,
+                    )
+                    for row in self._state.dialects
+                ),
+            )
+        if any(not row.plan_observations for row in self._state.dialects):
+            plan_zeros = (0,) * _MAX_PROPOSAL_POSITIONS
+            self._state = replace(
+                self._state,
+                dialects=tuple(
+                    row
+                    if row.plan_observations
+                    else replace(
+                        row,
+                        plan_observations=plan_zeros,
+                        plan_hits=plan_zeros,
                     )
                     for row in self._state.dialects
                 ),
@@ -1975,6 +2048,8 @@ class FingerprintRollingK4DraftProvider:
                 (0,) * len(self._experts)
                 for _ in range(_MAX_PROPOSAL_POSITIONS)
             ),
+            plan_observations=(0,) * _MAX_PROPOSAL_POSITIONS,
+            plan_hits=(0,) * _MAX_PROPOSAL_POSITIONS,
         )
         self._active_dialect_similarity = 0.0
         self._active_dialect_is_new = True
@@ -1983,7 +2058,18 @@ class FingerprintRollingK4DraftProvider:
         self,
     ) -> tuple[tuple[float, float, MarkovDialectState], ...]:
         if self._dialect_neighbors:
-            return self._dialect_neighbors
+            active = self._active_dialect
+            return tuple(
+                (
+                    similarity,
+                    weight,
+                    active
+                    if active is not None
+                    and profile.dialect_id == active.dialect_id
+                    else profile,
+                )
+                for similarity, weight, profile in self._dialect_neighbors
+            )
         if self._active_dialect is not None and self._active_dialect_similarity > 0.0:
             return (
                 (
@@ -2785,6 +2871,15 @@ class FingerprintRollingK4DraftProvider:
             hits + self._request_plan_hits[position],
         )
 
+    @staticmethod
+    def _dialect_plan_counts(
+        dialect: MarkovDialectState,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        if dialect.plan_observations:
+            return dialect.plan_observations, dialect.plan_hits
+        zeros = (0,) * _MAX_PROPOSAL_POSITIONS
+        return zeros, zeros
+
     def _position_weighting(
         self,
         position: int,
@@ -3093,12 +3188,44 @@ class FingerprintRollingK4DraftProvider:
         )
         observations, hits = self._plan_counts(position)
         if observations <= 0:
-            return direct
-        posterior = (hits + 1.0) / (observations + 2.0)
-        maturity = observations / (
-            observations + self.POSITION_WEIGHT_SATURATION
-        )
-        learned = (1.0 - maturity) + maturity * posterior
+            learned = 1.0
+        else:
+            posterior = (hits + 1.0) / (observations + 2.0)
+            maturity = observations / (
+                observations + self.POSITION_WEIGHT_SATURATION
+            )
+            learned = (1.0 - maturity) + maturity * posterior
+        dialect_rows = []
+        for similarity, neighbor_weight, dialect in self._inference_dialects():
+            dialect_observation_rows, dialect_hit_rows = (
+                self._dialect_plan_counts(dialect)
+            )
+            dialect_observations = dialect_observation_rows[position]
+            if dialect_observations <= 0:
+                continue
+            dialect_hits = dialect_hit_rows[position]
+            dialect_maturity = dialect_observations / (
+                dialect_observations + self.POSITION_WEIGHT_SATURATION
+            )
+            dialect_posterior = (dialect_hits + 1.0) / (
+                dialect_observations + 2.0
+            )
+            dialect_reliability = (
+                (1.0 - dialect_maturity)
+                + dialect_maturity * dialect_posterior
+            )
+            influence = neighbor_weight * similarity * dialect_maturity
+            if influence > 0.0:
+                dialect_rows.append((influence, dialect_reliability))
+        if dialect_rows:
+            influence = min(1.0, sum(row[0] for row in dialect_rows))
+            dialect_reliability = sum(
+                weight * reliability for weight, reliability in dialect_rows
+            ) / sum(row[0] for row in dialect_rows)
+            learned = (
+                (1.0 - influence) * learned
+                + influence * dialect_reliability
+            )
         return max(0.0, min(1.0, min(direct, learned)))
 
     @staticmethod
@@ -3992,6 +4119,8 @@ class FingerprintRollingK4DraftProvider:
         if regime_change:
             logs = [self.REGIME_RAPIDITY_SHRINK * value for value in logs]
             next_cusum = 0.0
+        planned = token if planned_token is None else planned_token
+        greedy = planned if greedy_token is None else greedy_token
         dialect = self._active_dialect
         if dialect is not None:
             local_logs = list(dialect.rapidities)
@@ -4013,6 +4142,11 @@ class FingerprintRollingK4DraftProvider:
                     for _ in range(_MAX_PROPOSAL_POSITIONS)
                 ]
             )
+            local_plan_rows, local_plan_hit_rows = self._dialect_plan_counts(
+                dialect
+            )
+            local_plan_observations = list(local_plan_rows)
+            local_plan_hits = list(local_plan_hit_rows)
             for index, (_distribution, prediction) in enumerate(feedback):
                 advantage = math.log(max(probabilities[index], 1e-12)) - math.log(
                     max(mixture_probability, 1e-12)
@@ -4025,6 +4159,8 @@ class FingerprintRollingK4DraftProvider:
                 local_hits[index] += int(prediction == token)
                 local_horizon_observations[position][index] += 1
                 local_horizon_hits[position][index] += int(prediction == token)
+            local_plan_observations[position] += 1
+            local_plan_hits[position] += int(planned == token)
             local_center = sum(local_logs) / len(local_logs)
             local_logs = [value - local_center for value in local_logs]
             if regime_change:
@@ -4040,9 +4176,9 @@ class FingerprintRollingK4DraftProvider:
                     tuple(row) for row in local_horizon_observations
                 ),
                 horizon_hits=tuple(tuple(row) for row in local_horizon_hits),
+                plan_observations=tuple(local_plan_observations),
+                plan_hits=tuple(local_plan_hits),
             )
-        planned = token if planned_token is None else planned_token
-        greedy = planned if greedy_token is None else greedy_token
         plan_observations[position] += 1
         plan_hits[position] += int(planned == token)
         if planned != greedy:
@@ -4111,15 +4247,24 @@ class FingerprintRollingK4DraftProvider:
                 list(row) for row in dialect.horizon_observations
             ]
             dialect_hits = [list(row) for row in dialect.horizon_hits]
+            dialect_plan_rows, dialect_plan_hit_rows = (
+                self._dialect_plan_counts(dialect)
+            )
+            dialect_plan_observations = list(dialect_plan_rows)
+            dialect_plan_hits = list(dialect_plan_hit_rows)
             for index, prediction in enumerate(predictions):
                 dialect_observations[position][index] += 1
                 dialect_hits[position][index] += int(prediction == token)
+            dialect_plan_observations[position] += 1
+            dialect_plan_hits[position] += int(planned_token == token)
             self._active_dialect = replace(
                 dialect,
                 horizon_observations=tuple(
                     tuple(row) for row in dialect_observations
                 ),
                 horizon_hits=tuple(tuple(row) for row in dialect_hits),
+                plan_observations=tuple(dialect_plan_observations),
+                plan_hits=tuple(dialect_plan_hits),
             )
         self._state = replace(
             self._state,
@@ -5359,6 +5504,11 @@ class FingerprintRollingK4DraftProvider:
     def metrics(self) -> MarkovDraftMetrics:
         weights = self._weights()
         dialect_neighbors = self._inference_dialects()
+        active_plan_observations, active_plan_hits = (
+            ((0,) * _MAX_PROPOSAL_POSITIONS,) * 2
+            if self._active_dialect is None
+            else self._dialect_plan_counts(self._active_dialect)
+        )
         accuracy = tuple(
             0.0 if seen == 0 else hit / seen
             for hit, seen in zip(
@@ -5488,6 +5638,10 @@ class FingerprintRollingK4DraftProvider:
                 else self._active_dialect.dialect_id
             ),
             active_dialect_similarity=self._active_dialect_similarity,
+            active_dialect_plan_observations=(
+                active_plan_observations
+            ),
+            active_dialect_plan_hits=active_plan_hits,
             dialect_evictions=self._dialect_evictions,
             phrase_option_calls=self._phrase_option_calls,
             phrase_draft_tokens=self._phrase_draft_tokens,
@@ -5634,6 +5788,7 @@ __all__ = [
     "V7_MARKOV_DRAFT_STATE_SCHEMA",
     "V8_MARKOV_DRAFT_STATE_SCHEMA",
     "V9_MARKOV_DRAFT_STATE_SCHEMA",
+    "V10_MARKOV_DRAFT_STATE_SCHEMA",
     "MARKOV_DRAFT_METRICS_SCHEMA",
     "MARKOV_DRAFT_PROVIDER_ABI",
     "MARKOV_DRAFT_STATE_SCHEMA",
