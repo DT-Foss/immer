@@ -4,11 +4,22 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-30
 
-Runtime commits through `af92b49` are deployed on the canonical server.
+Runtime commits through `9d9f13d` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `9d9f13d` connected the terminal outcome to the concrete Q4 page routes.
+  Temporal, cross-layer, coactive, and marginal agents now receive online
+  action credit for the exact page prefix that executed. Credit uses reward
+  advantage against the persistent historical mean: better outcomes reinforce
+  the agents behind the action, worse outcomes shift mass to their alternatives,
+  and repeated equal-quality outcomes create zero route drift. Fixed Share keeps
+  every agent reachable. Page state v7 loads v3-v6 without rewriting a
+  read-only state; the first mutation persists v7. The matching DraftWindow
+  runtime identity upgrades atomically from the known v6 page identity while
+  retaining all learned K=4/8/16 policy state. Normal request evidence now
+  exposes the live route-agent weights.
 - `af92b49` closed the runtime learning loop across O1, drafting, and MLP
   execution. One terminal reward combines current O1 answer value, accepted
   draft tokens, skipped/selected pages, and target forwards. It updates the
