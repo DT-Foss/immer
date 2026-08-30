@@ -1767,7 +1767,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         prompt = (30, 31)
 
         def block(slot):
-            return (slot, 1, 2, slot, 3, 4, 5, 6, 20, 21)
+            return (slot, 1, 2, slot, 3, 4, 5, 6, 7, 8)
 
         confirmed = (*block(7), *block(8), *block(9), 10, 1, 2)
         provider.begin_request(prompt)
@@ -1835,7 +1835,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
 
         def block(slot):
-            return (slot, 1, 2, slot, 3, 4, 5, 6, 20, 21)
+            return (slot, 1, 2, slot, 3, 4, 5, 6, 7, 8)
 
         generated = (
             *((6,) * 4100),
