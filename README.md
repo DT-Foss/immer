@@ -61,6 +61,14 @@ release surface.
   alternatives, and equal repeated outcomes add no route drift. This couples
   semantic value, accepted drafts, page savings, and target cost into the next
   request's Q4 execution without another model call.
+  The same causal route now drives physical lookahead. While native Q4 computes
+  layer L, the controller predicts the exact action for layer L+1 and issues
+  page-aligned `MADV_WILLNEED` advice for its ranked Gate/Up prefix and Down
+  working set. The advice budget is half of the configured resident workspace;
+  wide routes keep their full execution width while transport takes the
+  highest-ranked prefix that fits. One bounded lease survives both ordinary
+  layer transitions and the final-layer wrap, then demand consumes it or
+  teardown releases it.
   Unready layers execute the full MLP; speculative continuation commits only
   accepted learning rows. `--mlp-page-width` controls the route and
   `--no-mlp-page-route` restores full-MLP execution.
@@ -73,8 +81,12 @@ release surface.
   actions: later exact demand supplies useful/hinted bytes to persistent
   distance agents, which reweight the beam and scale its budget between 12.5%
   and 100% of the hard maximum. Linux warms it via
-  `POSIX_FADV_WILLNEED`: no payload copy, logical read, budget charge, or pager
-  weight cache is introduced.
+  `POSIX_FADV_WILLNEED`: no payload copy, logical read, budget charge, or new
+  pager weight cache. Canonical Q4 adds a weight-native branch: its four page
+  agents predict the next layer's exact execution route, merge Gate/Up
+  intervals at OS-page granularity, warm the bounded ranked prefix directly
+  from local mmap, and retire every lease after demand, expiry, or request
+  cleanup.
 - **Native local drafting.** Deployed chat mounts the MTP-capable v3 Q4 bank
   and runs the zero-weight Markov Council with the checkpoint's embedded MTP
   branch as its novelty engine. The providers propose transactional
@@ -440,7 +452,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Direct-to-Torch local ranges | one final tensor for sorted selected-row routes | inode-stable `preadv` fills caller-owned Torch storage; no intermediate Python body, no row-stack duplicate, exact cache/budget/causal-plan accounting |
 | Markov range prefetch | zero additional logical/source bytes | grouped operations; order-1/2 beam; probability×Ricci/reuse scoring; cross-operation dedupe; accepted-only cooldown; delayed exact-byte utility for d1–d8 agents; adaptive 12.5–100% reservoir budget; bounded local OS-page hints |
 | Weight-only all-layer Fast MLP | deterministic 64-layer p4/k32 plan; capture-only target use forbidden | no prompts or model forwards in the build; exact paths learn adaptive width plus prequential sparse-output cosine/L2 and scalar correction; non-beneficial or uncalibrated routes use the full MLP |
-| Direct Q4 MLP-page route | learned 96/128/160/192-of-272 action per layer/context | exact total energy trains causal temporal/cross-layer/marginal width agents; four page agents select the route; terminal advantage trains the exact executed prefix; native Q4 executes the next learned action; speculative learning commits only accepted rows |
+| Direct Q4 MLP-page route | learned 96/128/160/192-of-272 action per layer/context | exact total energy trains causal temporal/cross-layer/marginal width agents; four page agents select the route; terminal advantage trains the exact executed prefix; layer L physically prefetches the page-aligned ranked prefix for L+1 under a half-workspace byte cap; two-boundary leases cover the final-layer wrap; speculative replay never repeats I/O advice |
 | Joint O1 runtime reward | one terminal receipt across semantic value, drafts, pages, and forwards | trains K=4/8/16 policy, execution width, and temporal/cross-layer/coactive/marginal route agents; repeated equal reward adds zero route drift; cleanup precedes settlement; disk retries remain idempotent; owner retirement aborts pending traces |
 | Exact residual-PQ LM head | K=1–16 and k=1/3/7 parity; certified page + economic row pruning | deterministic weight-only build, best-first tree, actual row-code caps, K-query survivor union, contiguous-read cost gate, 64-leaf no-saving stop, outward residual/roundoff bounds, overflow/tie/subnormal guards, and exact full-leaf fallback; no model forward |
 | Arbitrary local Qwen chat | 23 → 11 target forwards on the same capped prompt | authenticated causal Qwen3.8 path; default Markov/embedded-MTP hybrid on the v3 bank and full Q4 MLP execution; Qwen remains the sole committer, while explicit Markov-only mode retains the same target bank |

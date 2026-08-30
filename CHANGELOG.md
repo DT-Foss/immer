@@ -4,11 +4,25 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-30
 
-Runtime commits through `9d9f13d` are deployed on the canonical server.
+Runtime commits through `08f3b7b` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `08f3b7b` turned the learned Q4 page route into physical predictive weight
+  transport. While layer L executes, the controller derives the exact route
+  that layer L+1 will subsequently choose and sends its ranked page prefix to
+  the Q4 mmap bank. Gate/Up ranges merge at OS-page granularity; Down is warmed
+  as the row-spanning working set. The prefetch prefix consumes at most half of
+  the configured resident-workspace budget. Wider 160/192-page actions retain
+  their full compute route while the highest-ranked prefix fills the transport
+  budget. Two-boundary leases cover ordinary layer transitions and the
+  layer-63-to-layer-0 wrap, then consume on demand, expire when abandoned, or
+  clear immediately at request teardown. Speculative replay restores accepted
+  controller accounting without repeating physical advice. Page state v8
+  migrates v3-v7 read-only, DraftWindow identities migrate from v6/v7, and
+  interactive stats expose requested, budget-selected, fully advised, consumed,
+  expired, failed, and trimmed work.
 - `9d9f13d` connected the terminal outcome to the concrete Q4 page routes.
   Temporal, cross-layer, coactive, and marginal agents now receive online
   action credit for the exact page prefix that executed. Credit uses reward
