@@ -6,6 +6,27 @@ All notable changes to IMMER are recorded here.
 
 ### Deployed Markov/MTP product path
 
+- `06f7610` turned interactive Qwen context into an in-process compute battery.
+  Each successful session retains exactly the committed token tuple represented
+  by `model.next_position`; the next official prompt reuses it only when its
+  prefix, session ID, model cursor, batch size, and poison state all match.
+  Pager-held weights are released while KV/Delta continuation state remains.
+  `retain_final_state` stays false, so the uncommitted terminal tail is replayed
+  as part of the next suffix without an extra closing forward. Prefix mismatch,
+  history eviction, session change, error, abstention, and `/clear` reset the
+  binding. One-shot and JSONL execution are unchanged. A restored configured
+  hybrid uses Markov-only drafting; explicit restored MTP uses the direct Qwen
+  target because a fresh MTP instance has no carried attention state. Qwen is
+  still the sole committer. On the same deployed two-turn recall, turn 1
+  returned `gespeichert`, retained 35 prefix tokens, and used four generated
+  tokens, two forwards, 14.65 s, and 1.43 GiB peak RSS. Turn 2 reused all 35
+  tokens and returned `ZORPAX-731` with one prior turn, nine generated tokens,
+  three forwards, 18.99 s, and 1.50 GiB peak RSS. The old code path had observed
+  four forwards, 29.87 s, and 1.53 GiB on turn 2; this is a before/after product
+  observation, not a controlled broad benchmark. The affected local suite
+  passed 165 tests in 6.621 s; eight focused remote tests passed in 0.944 s.
+  Final review found no P0–P2 issue after the unsafe restored-suffix MTP path was
+  rolled back.
 - `265d15d` made interactive chat a real multi-turn Qwen session. Every
   successful user/assistant pair is retained and rendered by the official Qwen
   chat template; prompt-bound trimming removes only the oldest complete turns,
