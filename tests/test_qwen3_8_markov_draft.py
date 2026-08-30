@@ -1833,7 +1833,6 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             vocab_size=32,
             proposal_width=3,
         )
-        prompt = (30, 31)
 
         def block(slot):
             return (slot, 1, 2, slot, 3, 4, 5, 6, 20, 21)
@@ -1847,14 +1846,18 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             1,
             2,
         )
-        provider.begin_request(prompt)
+        window_start = len(generated) - provider.REQUEST_LOCAL_MAX_TOKENS
+        window = generated[window_start:]
 
-        option = provider._request_periodic_option((*prompt, *generated))
+        copied = provider._request_periodic_copy_value(
+            window,
+            period=10,
+            offset=0,
+            window_start=window_start,
+            total_length=len(generated),
+        )
 
-        self.assertIsNotNone(option)
-        assert option is not None
-        self.assertEqual(option.token_ids, (10, 3, 4))
-        self.assertEqual(option.kind, "binding")
+        self.assertEqual(copied, 10)
         provider.close()
 
     def test_request_weight_overlay_adapts_immediately_without_persistence(

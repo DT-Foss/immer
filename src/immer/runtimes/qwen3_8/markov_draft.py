@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v40"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v41"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -2415,16 +2415,16 @@ class FingerprintRollingK4DraftProvider:
             or max_width < 2
         ):
             return None
-        full_generated = history[prompt_length:]
-        window_start = max(0, len(full_generated) - self.REQUEST_LOCAL_MAX_TOKENS)
-        generated = full_generated[window_start:]
+        total_length = len(history) - prompt_length
+        window_start = max(0, total_length - self.REQUEST_LOCAL_MAX_TOKENS)
+        generated = history[prompt_length + window_start :]
         maximum_period = min(
             self.REQUEST_PERIOD_MAX,
             len(generated) // 3,
         )
         candidates: list[tuple[float, int, int, MarkovPhraseOption]] = []
         for period in range(self.REQUEST_PERIOD_MIN, maximum_period + 1):
-            current_block_start = len(full_generated) - len(full_generated) % period
+            current_block_start = total_length - total_length % period
             comparison_start_absolute = max(
                 window_start + period,
                 current_block_start - 2 * period,
@@ -2461,9 +2461,11 @@ class FingerprintRollingK4DraftProvider:
                     period=period,
                     offset=offset,
                     window_start=window_start,
-                    total_length=len(full_generated),
+                    total_length=total_length,
                 )
                 if copied is None:
+                    break
+                if copied_phases >= 1:
                     break
                 predicted.append(copied)
                 copied_phases += 1
@@ -2481,10 +2483,8 @@ class FingerprintRollingK4DraftProvider:
             candidates.append((match_ratio, period, copied_phases, option))
         if not candidates:
             return None
-        binding_candidates = [row for row in candidates if row[2] > 0]
-        candidate_class = binding_candidates or candidates
-        best_ratio = max(row[0] for row in candidate_class)
-        contenders = [row for row in candidate_class if row[0] == best_ratio]
+        best_ratio = max(row[0] for row in candidates)
+        contenders = [row for row in candidates if row[0] == best_ratio]
         if len({row[3].token_ids for row in contenders}) > 1:
             return None
         return max(
