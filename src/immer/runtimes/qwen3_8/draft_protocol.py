@@ -180,7 +180,13 @@ class RoundWindowPolicy:
             or not self.provider_abi
         ):
             raise ValueError("round policy provider identity is invalid")
-        if self.phrase_source not in {None, "atlas", "global", "dialect"}:
+        if self.phrase_source not in {
+            None,
+            "atlas",
+            "global",
+            "dialect",
+            "request",
+        }:
             raise ValueError("round policy phrase source is invalid")
         _uint(self.phrase_support, field="phrase_support")
         _finite(self.phrase_confidence, field="phrase_confidence", upper=1.0)
@@ -261,7 +267,13 @@ class RollingDraftProposal:
             raise ValueError("rolling proposal horizons are invalid")
         if not isinstance(self.provider_abi, str) or not self.provider_abi:
             raise ValueError("rolling proposal provider ABI is missing")
-        if self.phrase_source not in {None, "atlas", "global", "dialect"}:
+        if self.phrase_source not in {
+            None,
+            "atlas",
+            "global",
+            "dialect",
+            "request",
+        }:
             raise ValueError("rolling proposal phrase source is invalid")
         _uint(self.phrase_support, field="phrase_support")
         _finite(self.phrase_confidence, field="phrase_confidence", upper=1.0)

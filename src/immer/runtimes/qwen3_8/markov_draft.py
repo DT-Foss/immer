@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v30"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v31"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -583,7 +583,7 @@ class MarkovPhraseOption:
         return self.support / self.total
 
     def __post_init__(self) -> None:
-        if self.source not in {"atlas", "dialect", "global"}:
+        if self.source not in {"atlas", "dialect", "global", "request"}:
             raise ValueError("phrase option source is invalid")
         if self.kind not in {"atlas", "composition", "literal"}:
             raise ValueError("phrase option kind is invalid")
@@ -1397,6 +1397,8 @@ class FingerprintRollingK4DraftProvider:
     REQUEST_LOCAL_MIN_ORDER = 2
     REQUEST_LOCAL_MIN_SUPPORT = 2
     REQUEST_LOCAL_SUPPORT_SCALE = 1.5
+    REQUEST_PHRASE_MIN_CONTEXT = 2
+    REQUEST_PHRASE_MIN_SUPPORT = 2
     ATLAS_MIN_SUPPORT = 2
     ATLAS_MIN_CONFIDENCE = 0.70
 
@@ -2240,6 +2242,58 @@ class FingerprintRollingK4DraftProvider:
             return None
         return max(candidates, key=self._phrase_option_score)
 
+    def _request_phrase_option(
+        self,
+        history: tuple[int, ...],
+    ) -> MarkovPhraseOption | None:
+        prompt = self._request_prompt
+        prompt_length = self._request_prompt_length
+        max_width = min(self.proposal_width, self.PHRASE_MAX_WIDTH)
+        if (
+            prompt is None
+            or prompt_length is None
+            or history[:prompt_length] != prompt
+            or max_width < 2
+        ):
+            return None
+        generated = history[prompt_length:]
+        candidates = []
+        maximum_context = min(self.PHRASE_MAX_CONTEXT, len(generated))
+        for order in range(
+            maximum_context,
+            self.REQUEST_PHRASE_MIN_CONTEXT - 1,
+            -1,
+        ):
+            suffix = generated[-order:]
+            continuations = tuple(
+                generated[position : position + max_width]
+                for position in range(order, len(generated) - 1)
+                if generated[position - order : position] == suffix
+                and len(generated[position : position + max_width]) >= 2
+            )
+            if len(continuations) < self.REQUEST_PHRASE_MIN_SUPPORT:
+                continue
+            common_width = min(len(row) for row in continuations)
+            for index in range(common_width):
+                if len({row[index] for row in continuations}) != 1:
+                    common_width = index
+                    break
+            common_width = min(common_width, max_width)
+            if common_width < 2:
+                continue
+            candidates.append(
+                MarkovPhraseOption(
+                    token_ids=continuations[0][:common_width],
+                    source="request",
+                    context_order=order,
+                    support=len(continuations),
+                    total=len(continuations),
+                )
+            )
+        if not candidates:
+            return None
+        return max(candidates, key=self._phrase_option_score)
+
     def _phrase_option_score(
         self,
         option: MarkovPhraseOption,
@@ -2265,6 +2319,9 @@ class FingerprintRollingK4DraftProvider:
         dialect = self._active_dialect
         candidates: list[MarkovPhraseOption] = []
         composition_rows: list[tuple[MarkovPhraseOption, MarkovCompositionProgram]] = []
+        request_option = self._request_phrase_option(history)
+        if request_option is not None:
+            candidates.append(request_option)
         if dialect is not None and not self._active_dialect_is_new:
             local = self._phrase_option_from(
                 history,

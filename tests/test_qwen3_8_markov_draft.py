@@ -1433,6 +1433,147 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.discard_pending_proposal()
         provider.close()
 
+    def test_request_phrase_agent_copies_a_confirmed_repeated_span(self) -> None:
+        state_path = self.root / "request-phrase-agent.bin"
+        seed = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=256,
+            proposal_width=3,
+        )
+        seed.observe_final((8, 9, 10, 11, 12, 13, 14, 15))
+        seed.close()
+        persisted = state_path.read_bytes()
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=256,
+            proposal_width=3,
+        )
+        prompt = (30, 31)
+        confirmed = (
+            1,
+            2,
+            7,
+            8,
+            9,
+            10,
+            11,
+            3,
+            1,
+            2,
+            7,
+            8,
+            9,
+            10,
+            11,
+            4,
+            1,
+            2,
+            7,
+            8,
+            9,
+            10,
+            11,
+            5,
+            1,
+            2,
+        )
+        provider.begin_request(prompt)
+        state_before = provider._state
+        base = (*prompt, *confirmed)
+
+        option = provider._request_phrase_option(base)
+        proposal = provider.propose_round(base[:-1], base[-1])
+
+        self.assertIsNotNone(option)
+        assert option is not None
+        self.assertEqual(option.token_ids, (7, 8, 9))
+        self.assertEqual(option.source, "request")
+        self.assertEqual(option.context_order, 2)
+        self.assertEqual(option.support, 3)
+        self.assertEqual(option.confidence, 1.0)
+        self.assertEqual(proposal.token_ids, (7, 8, 9))
+        self.assertEqual(proposal.phrase_source, "request")
+        self.assertEqual(proposal.phrase_width, 3)
+        self.assertEqual(proposal.recommended_window, 4)
+        self.assertEqual(
+            proposal.select_window(
+                request_window_ceiling=4,
+                remaining_tokens=4,
+            ).phrase_source,
+            "request",
+        )
+        self.assertEqual(provider._pending_planner, "council")
+        self.assertIs(provider._state, state_before)
+
+        provider.observe_verification(3, 3)
+        provider.reconcile_prefix((*base, 7, 8, 9))
+        metrics = provider.metrics()
+        self.assertEqual(metrics.phrase_accepted_tokens, 3)
+        self.assertEqual(metrics.last_phrase_source, "request")
+        provider.close()
+        self.assertEqual(state_path.read_bytes(), persisted)
+
+    def test_request_phrase_agent_uses_deterministic_lcp_before_width_cap(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=7,
+        )
+        prompt = (30, 31)
+        confirmed = (
+            1,
+            2,
+            7,
+            8,
+            9,
+            10,
+            11,
+            3,
+            1,
+            2,
+            7,
+            8,
+            9,
+            10,
+            11,
+            4,
+            1,
+            2,
+            7,
+            8,
+            9,
+            10,
+            11,
+            5,
+            1,
+            2,
+        )
+        provider.begin_request(prompt)
+
+        option = provider._request_phrase_option((*prompt, *confirmed))
+
+        self.assertIsNotNone(option)
+        assert option is not None
+        self.assertEqual(option.token_ids, (7, 8, 9, 10, 11))
+        self.assertEqual(option.support, 3)
+        provider.close()
+
+    def test_request_phrase_agent_never_reads_repeated_prompt_text(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        prompt = (1, 2, 7, 8, 9, 1, 2, 7, 8, 9, 1, 2)
+        provider.begin_request(prompt)
+
+        self.assertIsNone(provider._request_phrase_option(prompt))
+        self.assertIsNone(provider._request_phrase_option((*prompt, 3)))
+        provider.close()
+
     def test_beam_proposal_keeps_feedback_reconciliation_exact(self) -> None:
         class PlanningExpert:
             @staticmethod

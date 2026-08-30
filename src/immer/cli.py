@@ -114,7 +114,7 @@ _QWEN38_DEPLOYMENT_MARKOV_ATLAS = (
 _QWEN38_DEPLOYMENT_O1_RETENTION = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-markov-o1-retention-v1.json"
 )
-_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v30"
+_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v31"
 _QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v18"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v2"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
