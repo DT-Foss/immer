@@ -1789,9 +1789,12 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(proposal.recommended_window, 4)
         self.assertEqual(provider.metrics().binding_option_calls, 1)
         self.assertEqual(provider.metrics().binding_draft_tokens, 3)
+        self.assertEqual(provider.metrics().periodic_option_calls, 1)
+        self.assertEqual(provider.metrics().periodic_draft_tokens, 3)
         provider.observe_verification(3, 3)
         provider.reconcile_prefix((*base, 10, 3, 4))
         self.assertEqual(provider.metrics().binding_accepted_tokens, 3)
+        self.assertEqual(provider.metrics().periodic_accepted_tokens, 3)
         provider.close()
         self.assertEqual(state_path.read_bytes(), persisted)
 
@@ -1804,7 +1807,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         def block(slot):
             return (slot, slot, 2, slot, 3, 4, 5, 6, 20, 21)
 
-        generated = (*block(7), *block(8), *block(9), 10, 11, 2)
+        generated = (*block(7), *block(8), *block(9), 10, 10, 2)
 
         self.assertIsNone(
             provider._request_periodic_copy_value(
@@ -1813,6 +1816,45 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                 offset=0,
             )
         )
+        repeated_witness = (*block(7), *block(7), *block(9), 10, 1, 2)
+        self.assertIsNone(
+            provider._request_periodic_copy_value(
+                repeated_witness,
+                period=10,
+                offset=0,
+            )
+        )
+        provider.close()
+
+    def test_request_binding_agent_keeps_absolute_phase_after_window_trim(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        prompt = (30, 31)
+
+        def block(slot):
+            return (slot, 1, 2, slot, 3, 4, 5, 6, 20, 21)
+
+        generated = (
+            *((6,) * 4100),
+            *block(7),
+            *block(8),
+            *block(9),
+            10,
+            1,
+            2,
+        )
+        provider.begin_request(prompt)
+
+        option = provider._request_periodic_option((*prompt, *generated))
+
+        self.assertIsNotNone(option)
+        assert option is not None
+        self.assertEqual(option.token_ids, (10, 3, 4))
+        self.assertEqual(option.kind, "binding")
         provider.close()
 
     def test_request_weight_overlay_adapts_immediately_without_persistence(
