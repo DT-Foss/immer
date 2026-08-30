@@ -1397,6 +1397,7 @@ class FingerprintRollingK4DraftProvider:
     REQUEST_LOCAL_MIN_ORDER = 2
     REQUEST_LOCAL_MIN_SUPPORT = 2
     REQUEST_LOCAL_SUPPORT_SCALE = 1.5
+    REQUEST_LOCAL_MAX_TOKENS = 4096
     REQUEST_PHRASE_MIN_CONTEXT = 2
     REQUEST_PHRASE_MIN_SUPPORT = 2
     ATLAS_MIN_SUPPORT = 2
@@ -2256,7 +2257,9 @@ class FingerprintRollingK4DraftProvider:
             or max_width < 2
         ):
             return None
-        generated = history[prompt_length:]
+        generated = history[prompt_length:][-
+            self.REQUEST_LOCAL_MAX_TOKENS :
+        ]
         candidates = []
         maximum_context = min(self.PHRASE_MAX_CONTEXT, len(generated))
         for order in range(
@@ -2439,7 +2442,10 @@ class FingerprintRollingK4DraftProvider:
             self._request_local_cache_history = history
             self._request_local_cache = result
             return result
-        symbols = tuple(self._symbol(token) for token in generated[-4096:])
+        symbols = tuple(
+            self._symbol(token)
+            for token in generated[-self.REQUEST_LOCAL_MAX_TOKENS :]
+        )
         result = (
             _TransitionFingerprint.fit(
                 symbols,

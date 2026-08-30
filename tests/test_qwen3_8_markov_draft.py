@@ -1574,6 +1574,26 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertIsNone(provider._request_phrase_option((*prompt, 3)))
         provider.close()
 
+    def test_request_phrase_agent_forgets_spans_outside_its_bounded_horizon(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        prompt = (30, 31)
+        old_spans = (1, 2, 7, 8, 9, 3, 1, 2, 7, 8, 9, 4)
+        generated = (
+            *old_spans,
+            *((6,) * provider.REQUEST_LOCAL_MAX_TOKENS),
+            1,
+            2,
+        )
+        provider.begin_request(prompt)
+
+        self.assertIsNone(provider._request_phrase_option((*prompt, *generated)))
+        provider.close()
+
     def test_beam_proposal_keeps_feedback_reconciliation_exact(self) -> None:
         class PlanningExpert:
             @staticmethod
