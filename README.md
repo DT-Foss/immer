@@ -83,8 +83,10 @@ release surface.
   the same episode, dialect, expert-rapidity, and phrase memory online.
   Within one request, an ephemeral high-order agent also learns repeated answer
   contexts from confirmed output and corrections. It never trains on prompt
-  tokens or rejected drafts, and durable request state is written once at
-  successful finalization.
+  tokens or rejected drafts. A sibling phrase/copy agent promotes the common
+  continuation of repeatedly confirmed spans into a verified multi-token
+  option. Both agents use a bounded 4,096-token horizon, and durable request
+  state is written once at successful finalization.
 - **Embedded MTP drafting.** The target checkpoint's own one-layer Qwen3.5 MTP
   branch now runs through the same causal Q4 bank, shared embedding, native
   bounded LM head, and exact rolling target verifier. Shifted token embeddings
@@ -279,6 +281,8 @@ uses its persistent token-level Markov Council directly. It does not load or
 run embedded MTP unless `--draft-mode mtp` or `--draft-mode hybrid` is supplied.
 Atlas and online agents expand a bounded beam, while a request-local high-order
 agent can reuse repeated context learned earlier in the same confirmed answer.
+A request-local phrase agent can copy the deterministic common prefix of two or
+more prior confirmed continuations directly into the same verified K window.
 Full Q4 still verifies every emitted token; `--no-markov-draft` forces direct
 K1 decoding. Direct Q4 MLP-page routing is also explicit-only through
 `--mlp-page-state` and is disabled in this default.
@@ -334,6 +338,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed variable phrase options up to 15 tokens |
 | Bounded Atlas + online beam | at most eight retained paths | Atlas and live Council alternatives are fused per token, deterministically pruned, and calibrated only from reconciled target prefixes; K1 virtual matches, request-budget truncation, and EOS truncation update only proposals actually verified |
 | Same-request high-order agent | repeated answer context becomes immediately eligible | order-2+ transitions learn from confirmed answer tokens and target corrections inside the active request; prompts and rejected drafts remain excluded, and the ephemeral agent adds no second persistence write |
+| Same-request phrase/copy agent | up to 15 tokens from repeated confirmed spans | two or more prior occurrences induce their deterministic longest common continuation prefix; the active proposal width caps the copy, Full Q4 verifies it, and both request-local agents stay inside a 4,096-token horizon |
 | Corpus-scale Markov atlas | 4,000,000 tokens → 500,000 contexts in 8.0 MB | flat-array v2 adds ~150 MiB RSS and loads in 1.77 s on the live server; on an arbitrary rainbow question it supported 7 MTP tokens across 6 rounds while the hybrid accepted 11 drafts and produced 24 tokens in 14 target forwards |
 | Live-answer Markov expert | 65,536 retained answer tokens; 4,096-token cached PPM windows | on an unseen German lightning paraphrase the online memory supported 64/98 MTP candidates and supplied 18 calibrated confidence gains across 12 rounds; 10 drafts accepted, 24 tokens in 15 target forwards |
 | O1-valued episode retention | 1.1 KB state + 130 KB neural sidecar after the first live answer | real O1 surprise and learning-progress assign persistent episode priority; Ricci-age eviction keeps valuable older answers over low-value newer ones, with atomic rollback and answer-only boundaries |

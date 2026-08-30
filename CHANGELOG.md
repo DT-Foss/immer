@@ -32,6 +32,11 @@ All notable changes to IMMER are recorded here.
   answer contexts become usable within the same response from confirmed output
   and target corrections; prompt tokens and rejected drafts never train it,
   and the ephemeral agent does not add another persistence write.
+- `b080bc0` added a request-local phrase/copy agent. Two or more prior confirmed
+  occurrences induce their deterministic longest common continuation prefix,
+  expose it through the existing phrase-window policy, and draft up to the
+  active K=2–16 ceiling. `0b272ad` bounds both request-local agents to the most
+  recent 4,096 confirmed output tokens.
 
 ### Arbitrary local Qwen runtime
 
