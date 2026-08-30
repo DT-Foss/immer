@@ -1297,6 +1297,14 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             strict=True,
         ):
             self.assertAlmostEqual(after, before * factor)
+        positioned_round = RollingDraftProposal.build(
+            positioned[0][:3],
+            positioned[2][:3],
+            positioned[3][:3],
+            request_window_ceiling=4,
+            provider_abi=markov_module.MARKOV_DRAFT_PROVIDER_ABI,
+        )
+        self.assertGreater(positioned_round.recommended_window, 1)
         provider._beam_position_verified[:] = [0] * 16
         provider._beam_position_hits[:] = [0] * 16
         provider._beam_position_verified[0] = 1
@@ -2086,6 +2094,16 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._beam_position_verified[0], 1)
         self.assertEqual(provider._beam_position_hits[0], 0)
         self.assertEqual(provider._beam_position_verified[1], 0)
+        self.assertEqual(provider._beam_verified_tokens, 1)
+        self.assertEqual(provider._beam_accepted_tokens, 0)
+        self.assertEqual(
+            sum(provider._beam_position_verified),
+            provider._beam_verified_tokens,
+        )
+        self.assertEqual(
+            sum(provider._beam_position_hits),
+            provider._beam_accepted_tokens,
+        )
         self.assertGreaterEqual(provider.metrics().teacher_forced_predictions, 2)
         provider.observe_final((*prompt, 2, mismatch, 9, 13))
         provider.close()
