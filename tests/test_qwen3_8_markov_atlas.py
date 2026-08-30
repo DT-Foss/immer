@@ -104,6 +104,81 @@ class Qwen38MarkovAtlasTests(unittest.TestCase):
         self.assertEqual(root.support, 4)
         self.assertGreater(root.score, 0.0)
 
+    def test_token_options_include_non_top1_retained_branches(self) -> None:
+        atlas = self._atlas()
+        history = (31, 2, 3, 4, 5)
+
+        options = atlas.token_options(history)
+
+        self.assertEqual(tuple(row.token_id for row in options), (6, 7, 8, 9))
+        external = next(row for row in options if row.token_id == 8)
+        self.assertEqual(external, atlas.token_evidence(history, 8))
+        continuation = atlas.continuation(
+            history,
+            max_tokens=1,
+            min_support=1,
+            min_confidence=0.0,
+        )
+        self.assertIsNotNone(continuation)
+        assert continuation is not None
+        self.assertEqual(continuation.token_ids, (6,))
+
+    def test_token_options_deduplicate_multi_order_evidence_to_strongest(self) -> None:
+        atlas = self._atlas()
+        history = (31, 2)
+
+        options = atlas.token_options(history)
+
+        self.assertEqual(tuple(row.token_id for row in options), (3, 2, 4, 5))
+        self.assertEqual(sum(row.token_id == 3 for row in options), 1)
+        strongest = options[0]
+        self.assertEqual(strongest, atlas.token_evidence(history, 3))
+        self.assertEqual(strongest.context_order, 1)
+        self.assertTrue(all(row.context_order == 0 for row in options[1:]))
+
+    def test_token_options_stably_order_ties_and_apply_limit(self) -> None:
+        atlas = self._atlas()
+        history = (31, 2, 3, 4, 5)
+
+        expected = atlas.token_options(history)
+
+        self.assertEqual(tuple(row.token_id for row in expected), (6, 7, 8, 9))
+        self.assertEqual(atlas.token_options(history), expected)
+        self.assertEqual(
+            tuple(row.token_id for row in atlas.token_options(history, limit=3)),
+            (6, 7, 8),
+        )
+        self.assertEqual(len(expected), atlas.max_branches)
+
+    def test_token_options_reject_invalid_history_and_limit(self) -> None:
+        atlas = self._atlas()
+
+        for history in ((), (-1,), (32,), (True,), (2, 1.0)):
+            with self.subTest(history=history):
+                with self.assertRaisesRegex(ValueError, "history"):
+                    atlas.token_options(history)
+        for history in ("2", b"2", bytearray(b"2")):
+            with self.subTest(history=history):
+                with self.assertRaisesRegex(TypeError, "history"):
+                    atlas.token_options(history)
+        for limit in (0, -1, True, 1.0, atlas.max_branches + 1):
+            with self.subTest(limit=limit):
+                with self.assertRaisesRegex(ValueError, "limit"):
+                    atlas.token_options((2,), limit=limit)
+
+    def test_token_options_match_after_compact_v2_reload(self) -> None:
+        atlas = self._atlas()
+        encoded = atlas.to_bytes()
+        restored = MarkovTokenAtlas.from_bytes(encoded)
+        history = (31, 2, 3, 4, 5)
+
+        expected = atlas.token_options(history)
+        actual = restored.token_options(history)
+
+        self.assertTrue(encoded.startswith(MARKOV_ATLAS_PREFIX))
+        self.assertEqual(actual, expected)
+        self.assertEqual(restored.to_bytes(), encoded)
+
     def test_atomic_file_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "atlas.bin"

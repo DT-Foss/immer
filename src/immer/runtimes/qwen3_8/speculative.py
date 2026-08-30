@@ -2015,10 +2015,17 @@ class Qwen38K4SpeculativeDecoder(Qwen38K2SpeculativeDecoder):
                     raise Qwen38SpeculativeError(
                         "adaptive rolling proposal evidence is missing"
                     )
+                round_costs = self.round_window_work_costs
+                if proposal_evidence.provider_abi.startswith(
+                    "immer.qwen3.8-markov-draft-provider/"
+                ):
+                    # Markov owns no model/head work.  Its proposal horizons
+                    # already price the target-only packed-row execution.
+                    round_costs = None
                 round_policy = proposal_evidence.select_window(
                     request_window_ceiling=self.window_size,
                     remaining_tokens=remaining,
-                    window_work_costs=self.round_window_work_costs,
+                    window_work_costs=round_costs,
                 )
                 active_window = round_policy.chosen_window
                 proposal = provider_proposal[: active_window - 1]

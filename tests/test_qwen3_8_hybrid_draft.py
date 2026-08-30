@@ -289,6 +289,76 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         provider.close()
         self.assertTrue(markov.closed)
 
+    def test_real_atlas_online_beam_locks_without_loading_mtp(self) -> None:
+        class PlanningExpert:
+            @staticmethod
+            def distribution(context):
+                if not context:
+                    return {"07": 0.55, "08": 0.45}
+                if context[-1] == "07":
+                    return {"09": 0.51, "10": 0.49}
+                if context[-1] == "08":
+                    return {"09": 0.99, "10": 0.01}
+                return {"11": 0.95, "12": 0.05}
+
+        class Atlas:
+            max_branches = 8
+            context_count = 2
+            token_count = 10
+
+            @staticmethod
+            def continuation(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def token_options(history, *, limit=None):
+                if history[-1] != 2:
+                    return ()
+                return (
+                    AtlasTokenEvidence(7, 1, 8, 10, 0.8, 0.6),
+                    AtlasTokenEvidence(8, 1, 6, 10, 0.6, 0.5),
+                )
+
+        markov = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        markov.atlas = Atlas()
+        markov._expert_models = lambda _history: tuple(
+            (PlanningExpert(), []) for _ in markov._experts
+        )
+        factory_calls = []
+        provider = Qwen38MarkovMtpDraftProvider(
+            markov,
+            lambda: factory_calls.append("mtp"),
+        )
+        prompt = (20, 21)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        proposal = provider.propose_round_state(prompt, 2, hidden[:, -1:])
+
+        self.assertEqual(proposal.token_ids[:2], (8, 9))
+        self.assertGreater(
+            proposal.select_window(
+                request_window_ceiling=4,
+                remaining_tokens=4,
+                window_work_costs=MARKOV_MTP_WINDOW_WORK_COSTS,
+            ).chosen_window,
+            1,
+        )
+        self.assertEqual(provider.selected_provider, "markov")
+        self.assertEqual(factory_calls, [])
+        provider.observe_verification(2, 3)
+        self.assertEqual(markov._beam_verified_tokens, 0)
+        self.assertEqual(markov._beam_accepted_tokens, 0)
+        committed = (*prompt, 2, *proposal.token_ids[:2])
+        provider.reconcile_prefix(committed)
+        self.assertEqual(markov._beam_verified_tokens, 3)
+        self.assertEqual(markov._beam_accepted_tokens, 2)
+        provider.observe_final((*committed, 13))
+        provider.close()
+
     def test_k1_lazily_loads_mtp_and_rechecks_markov_each_round(self) -> None:
         markov = _Markov(0.01)
         mtp = _Mtp()
@@ -376,6 +446,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         markov = _Markov(0.55, tokens=(7, 8, 9))
         mtp = _Mtp()
         provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        provider._select_markov = lambda _proposal: False
         prompt = (1, 2, 3)
         hidden = torch.zeros((1, len(prompt), 8))
         provider.begin_request_state(prompt, hidden)
@@ -466,6 +537,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         markov = _Markov(0.55, tokens=(7, 31, 9))
         mtp = _Mtp()
         provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        provider._select_markov = lambda _proposal: False
         prompt = (1, 2, 3)
         hidden = torch.zeros((1, len(prompt), 8))
         provider.begin_request_state(prompt, hidden)
@@ -501,6 +573,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         markov = _Markov(0.55, tokens=(7, 8, 9))
         mtp = PaddedMtp()
         provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        provider._select_markov = lambda _proposal: False
         prompt = (1, 2, 3)
         hidden = torch.zeros((1, len(prompt), 8))
         provider.begin_request_state(prompt, hidden)
@@ -818,6 +891,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
             )
             mtp = _Mtp()
             provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+            provider._select_markov = lambda _proposal: False
             prompt = (40, 41, 42)
             hidden = torch.zeros((1, len(prompt), 8), dtype=torch.bfloat16)
             provider.begin_request_state(prompt, hidden)

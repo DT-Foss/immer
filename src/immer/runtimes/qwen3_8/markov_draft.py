@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v25"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v26"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -257,6 +257,28 @@ class MarkovLanguageTokenEvidence:
             or self.score + 1e-15 < max(self.atlas_score, self.online_score)
         ):
             raise ValueError("Markov language evidence is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class _BeamStep:
+    token: int
+    greedy: int
+    gain: float
+    confidence: float
+    raw_confidence: float
+    empirical_evidence: float
+    disagreement: float
+    weights: tuple[float, ...]
+    position_maturity: float
+    dialect_maturity: float
+    evaluated_candidates: int
+
+
+@dataclass(frozen=True, slots=True)
+class _BeamPath:
+    score: float
+    tokens: tuple[int, ...]
+    steps: tuple[_BeamStep, ...]
 
 
 def _canonical(value: object) -> bytes:
@@ -1441,6 +1463,7 @@ class FingerprintRollingK4DraftProvider:
             tuple[tuple[dict[str, float], int], ...], ...
         ] = ()
         self._pending_plan_trace: tuple[tuple[int, int, float], ...] = ()
+        self._pending_planner: str | None = None
         self._carry_feedback: tuple[tuple[dict[str, float], int], ...] | None = None
         self._carry_feedback_position: int | None = None
         self._carry_feedback_teacher_forced = False
@@ -1531,6 +1554,12 @@ class FingerprintRollingK4DraftProvider:
         self._recommended_window_counts = {1: 0, 4: 0, 8: 0, 16: 0}
         self._last_round_proposal: RollingDraftProposal | None = None
         self._last_plan_trace: tuple[tuple[int, int, float], ...] = ()
+        self._last_beam_prefix_posteriors: tuple[float, ...] = ()
+        self._last_beam_path_count = 0
+        self._beam_verified_tokens = 0
+        self._beam_accepted_tokens = 0
+        self._pending_accepted_prefix_length: int | None = None
+        self._pending_verified_proposals: int | None = None
         self._pending_import_digest: str | None = None
         self._persistent_symbols_cache: tuple[str, ...] | None = None
         self._persistent_expert_models: dict[str, _TransitionFingerprint] = {}
@@ -2507,6 +2536,323 @@ class FingerprintRollingK4DraftProvider:
                 return greedy, 0.0, len(candidates)
         return best[3], gain, len(candidates)
 
+    def _beam_width(
+        self,
+        probabilities: Sequence[float],
+        disagreement: float,
+        maturity: float,
+    ) -> int:
+        ordered = sorted((float(value) for value in probabilities), reverse=True)
+        if len(ordered) < 2:
+            return 1
+        denominator = ordered[0] + ordered[1]
+        margin = 0.0 if denominator <= 0.0 else (ordered[0] - ordered[1]) / denominator
+        uncertainty = max(0.0, min(1.0, 1.0 - margin + 0.5 * disagreement))
+        adaptive = 1 + math.ceil(
+            (self.LOOKAHEAD_CANDIDATES * 2 - 1)
+            * uncertainty
+            * (1.0 - 0.5 * max(0.0, min(1.0, maturity)))
+        )
+        return max(1, min(self.LOOKAHEAD_CANDIDATES * 2, adaptive))
+
+    @staticmethod
+    def _distribution_disagreement(
+        distributions: Sequence[Mapping[str, float]],
+        weights: Sequence[float],
+    ) -> float:
+        universe = set().union(*(distribution.keys() for distribution in distributions))
+        pooled = {
+            symbol: sum(
+                weight * distribution.get(symbol, 0.0)
+                for weight, distribution in zip(weights, distributions, strict=True)
+            )
+            for symbol in universe
+        }
+
+        def entropy(probabilities: Mapping[str, float]) -> float:
+            return -sum(
+                value * math.log(max(value, 1e-12))
+                for value in probabilities.values()
+                if value > 0.0
+            )
+
+        return max(
+            0.0,
+            entropy(pooled)
+            - sum(
+                weight * entropy(distribution)
+                for weight, distribution in zip(weights, distributions, strict=True)
+            ),
+        )
+
+    def _predict_beam(
+        self,
+        history: tuple[int, ...],
+        count: int,
+        *,
+        position_offset: int = 0,
+    ) -> tuple[
+        tuple[int, ...],
+        tuple[tuple[tuple[dict[str, float], int], ...], ...],
+        tuple[float, ...],
+        tuple[float, ...],
+    ] | None:
+        """Compose Atlas alternatives with the live Council before verification."""
+
+        if (
+            isinstance(position_offset, bool)
+            or not isinstance(position_offset, int)
+            or position_offset < 0
+            or position_offset + count > _MAX_PROPOSAL_POSITIONS
+        ):
+            raise ValueError("beam position range is invalid")
+        experts = self._expert_models(history)
+        base_weights = self._weights()
+        beam = (_BeamPath(score=0.0, tokens=(), steps=()),)
+        for position in range(count):
+            horizon_position = position_offset + position
+            expansions: list[_BeamPath] = []
+            retained_width = 1
+            for path in beam:
+                weights, position_maturity, dialect_maturity = (
+                    self._position_weighting(horizon_position, base_weights)
+                )
+                symbols = tuple(self._symbol(token) for token in path.tokens)
+                distributions = tuple(
+                    model.distribution((*context, *symbols))
+                    for model, context in experts
+                )
+                numeric_symbols = {
+                    symbol
+                    for distribution in distributions
+                    for symbol in distribution
+                    if symbol != _UNKNOWN_TOKEN
+                    and symbol.isdecimal()
+                    and 0 <= int(symbol) < self.vocab_size
+                }
+                mixture = {
+                    symbol: sum(
+                        weight * distribution.get(symbol, 0.0)
+                        for weight, distribution in zip(
+                            weights, distributions, strict=True
+                        )
+                    )
+                    for symbol in numeric_symbols
+                }
+                online = sorted(
+                    numeric_symbols,
+                    key=lambda symbol: (mixture[symbol], -int(symbol)),
+                    reverse=True,
+                )[: self.LOOKAHEAD_CANDIDATES * 2]
+                atlas_rows = (
+                    ()
+                    if self.atlas is None
+                    else self.atlas.token_options(
+                        (*history, *path.tokens),
+                        limit=min(
+                            self.atlas.max_branches,
+                            self.LOOKAHEAD_CANDIDATES * 2,
+                        ),
+                    )
+                )
+                atlas_by_token = {row.token_id: row for row in atlas_rows}
+                candidates = tuple(
+                    sorted(
+                        {*(int(symbol) for symbol in online), *atlas_by_token},
+                    )
+                )
+                if not candidates:
+                    continue
+                greedy = max(
+                    (
+                        mixture.get(self._symbol(token), 0.0),
+                        -token,
+                        token,
+                    )
+                    for token in candidates
+                )[2]
+                disagreement = self._distribution_disagreement(
+                    distributions,
+                    weights,
+                )
+                expert_row = []
+                for distribution in distributions:
+                    predicted = max(
+                        (
+                            probability,
+                            -int(symbol),
+                            int(symbol),
+                        )
+                        for symbol, probability in distribution.items()
+                        if symbol != _UNKNOWN_TOKEN
+                        and symbol.isdecimal()
+                        and 0 <= int(symbol) < self.vocab_size
+                    )[2]
+                    expert_row.append((dict(distribution), predicted))
+                candidate_rows = []
+                for token in candidates:
+                    raw = mixture.get(self._symbol(token), 0.0)
+                    calibrated, empirical = self._calibrated_confidence(
+                        token,
+                        raw,
+                        expert_row,
+                        weights,
+                        horizon_position,
+                    )
+                    atlas = atlas_by_token.get(token)
+                    atlas_confidence = (
+                        0.0
+                        if atlas is None
+                        else atlas.probability
+                        * (1.0 - math.exp(-float(atlas.support) / 1.5))
+                    )
+                    fused = min(
+                        0.999,
+                        1.0 - (1.0 - calibrated) * (1.0 - atlas_confidence),
+                    )
+                    candidate_rows.append((token, fused, raw, empirical))
+                retained_width = max(
+                    retained_width,
+                    self._beam_width(
+                        [row[1] for row in candidate_rows],
+                        disagreement,
+                        max(position_maturity, dialect_maturity),
+                    ),
+                )
+                greedy_confidence = next(
+                    row[1] for row in candidate_rows if row[0] == greedy
+                )
+                for token, confidence, raw, empirical in candidate_rows:
+                    conflict = 0.0
+                    if token != greedy:
+                        denominator = confidence + greedy_confidence
+                        conflict = (
+                            0.0
+                            if denominator <= 0.0
+                            else max(
+                                0.0,
+                                min(
+                                    1.0,
+                                    (greedy_confidence - confidence) / denominator,
+                                ),
+                            )
+                        )
+                    token_disagreement = disagreement + conflict
+                    gain = max(
+                        0.0,
+                        math.log(max(confidence, 1e-12))
+                        - math.log(max(greedy_confidence, 1e-12)),
+                    )
+                    step = _BeamStep(
+                        token=token,
+                        greedy=greedy,
+                        gain=gain,
+                        confidence=confidence,
+                        raw_confidence=raw,
+                        empirical_evidence=empirical,
+                        disagreement=token_disagreement,
+                        weights=tuple(weights),
+                        position_maturity=position_maturity,
+                        dialect_maturity=dialect_maturity,
+                        evaluated_candidates=len(candidate_rows),
+                    )
+                    expansions.append(
+                        _BeamPath(
+                            score=path.score
+                            + self.LOOKAHEAD_DISCOUNT**position
+                            * math.log(max(confidence, 1e-12)),
+                            tokens=(*path.tokens, token),
+                            steps=(*path.steps, step),
+                        )
+                    )
+            if not expansions:
+                return None
+            beam = tuple(
+                sorted(
+                    expansions,
+                    key=lambda row: (-row.score, row.tokens),
+                )[:retained_width]
+            )
+
+        winner = beam[0]
+        if len(winner.steps) != count:
+            return None
+        path_logs = tuple(
+            sum(math.log(max(step.confidence, 1e-12)) for step in path.steps)
+            for path in beam
+        )
+
+        def logsumexp(indexes: Sequence[int]) -> float:
+            maximum = max(path_logs[index] for index in indexes)
+            return maximum + math.log(
+                sum(math.exp(path_logs[index] - maximum) for index in indexes)
+            )
+
+        posteriors = []
+        eligible = tuple(range(len(beam)))
+        for position, token in enumerate(winner.tokens):
+            matching = tuple(
+                index
+                for index in eligible
+                if beam[index].tokens[position] == token
+            )
+            posterior = math.exp(logsumexp(matching) - logsumexp(eligible))
+            posteriors.append(max(0.0, min(1.0, posterior)))
+            eligible = matching
+        self._last_beam_prefix_posteriors = tuple(posteriors)
+        self._last_beam_path_count = len(beam)
+        if self._beam_verified_tokens <= 0:
+            beam_reliability = 1.0
+        else:
+            beam_reliability = (self._beam_accepted_tokens + 0.5) / (
+                self._beam_verified_tokens + 2.0
+            )
+        feedback_rows = tuple(
+            self._teacher_forced_prediction(
+                (*history, *winner.tokens[:position]),
+                position=position_offset + position,
+                planner="council",
+            )[0]
+            for position in range(count)
+        )
+        for position, step in enumerate(winner.steps):
+            self._last_raw_confidence = step.raw_confidence
+            self._last_empirical_evidence = step.empirical_evidence
+            self._last_confidence = step.confidence
+            self._last_disagreement = step.disagreement
+            self._last_position = position
+            self._last_position_maturity = step.position_maturity
+            self._last_dialect_skill_maturity = step.dialect_maturity
+            self._last_position_weights = step.weights
+            self._lookahead_calls += int(step.evaluated_candidates > 1)
+            self._lookahead_candidates += step.evaluated_candidates
+            self._lookahead_token_changes += int(step.token != step.greedy)
+            self._max_lookahead_gain = max(self._max_lookahead_gain, step.gain)
+            if step.position_maturity > 0.0:
+                self._position_specialist_predictions += 1
+                self._max_position_maturity = max(
+                    self._max_position_maturity,
+                    step.position_maturity,
+                )
+            if step.dialect_maturity > 0.0:
+                self._dialect_specialist_predictions += 1
+                self._max_dialect_skill_maturity = max(
+                    self._max_dialect_skill_maturity,
+                    step.dialect_maturity,
+                )
+        self._last_lookahead_gain = winner.steps[-1].gain
+        self._last_plan_trace = tuple(
+            (step.token, step.greedy, step.gain) for step in winner.steps
+        )
+        self._predictions += count
+        self._council_predictions += count
+        return (
+            winner.tokens,
+            feedback_rows,
+            tuple(step.confidence * beam_reliability for step in winner.steps),
+            tuple(step.disagreement for step in winner.steps),
+        )
+
     def _predict_council(
         self,
         history: tuple[int, ...],
@@ -2691,6 +3037,7 @@ class FingerprintRollingK4DraftProvider:
         history: tuple[int, ...],
         *,
         position: int,
+        planner: str | None = None,
     ) -> tuple[
         tuple[tuple[dict[str, float], int], ...],
         int,
@@ -2721,11 +3068,28 @@ class FingerprintRollingK4DraftProvider:
             self._last_plan_trace,
         )
         try:
-            tokens, feedback, _confidence, _disagreement = self._predict_council(
-                history,
-                1,
-                position_offset=position,
+            selected = self._pending_planner if planner is None else planner
+            if selected not in {None, "beam", "council"}:
+                raise MarkovDraftError("teacher-forced planner is invalid")
+            predicted = (
+                self._predict_beam(
+                    history,
+                    1,
+                    position_offset=position,
+                )
+                if selected == "beam"
+                else None
             )
+            if predicted is None:
+                tokens, feedback, _confidence, _disagreement = (
+                    self._predict_council(
+                        history,
+                        1,
+                        position_offset=position,
+                    )
+                )
+            else:
+                tokens, feedback, _confidence, _disagreement = predicted
             return feedback[0], tokens[0], self._last_plan_trace[0]
         finally:
             (
@@ -2977,13 +3341,29 @@ class FingerprintRollingK4DraftProvider:
             self._consume_carry_feedback(known_token)
         base = (*committed, known_token)
         option = self._phrase_option(base)
-        complete, feedback, confidences, disagreements = self._predict_council(
-            base,
-            self.proposal_width + 1,
-            forced_prefix=(
-                () if option is None else option.token_ids[: self.proposal_width]
-            ),
+        use_literal = option is not None and option.kind != "atlas"
+        predicted = (
+            None
+            if use_literal or (self.atlas is None and not self._state.token_ids)
+            else self._predict_beam(base, self.proposal_width + 1)
         )
+        if predicted is None:
+            planner = "council"
+            complete, feedback, confidences, disagreements = self._predict_council(
+                base,
+                self.proposal_width + 1,
+                forced_prefix=(
+                    () if option is None else option.token_ids[: self.proposal_width]
+                ),
+            )
+        else:
+            planner = "beam"
+            complete, feedback, confidences, disagreements = predicted
+            if option is not None and complete[: len(option.token_ids)] != (
+                option.token_ids
+            ):
+                option = None
+                self._pending_composition_program = None
         proposal = complete[: self.proposal_width]
         if len(self._last_plan_trace) != self.proposal_width + 1:
             raise MarkovDraftError("Markov planning trace width is invalid")
@@ -2991,6 +3371,7 @@ class FingerprintRollingK4DraftProvider:
         self._pending_proposal = proposal
         self._pending_feedback = feedback
         self._pending_plan_trace = self._last_plan_trace
+        self._pending_planner = planner
         self._pending_phrase_option = option
         if option is not None:
             self._phrase_option_calls += 1
@@ -3335,6 +3716,7 @@ class FingerprintRollingK4DraftProvider:
         delta = committed[len(base) :]
         if len(delta) > self.proposal_width or delta != proposal[: len(delta)]:
             raise MarkovDraftError("Markov reconciliation is not a proposal prefix")
+        self._commit_pending_verification(len(delta))
         assert self._last_confirmed_length is not None
         for index, token in enumerate(delta):
             self._episode_feedback.append(
@@ -3369,9 +3751,49 @@ class FingerprintRollingK4DraftProvider:
         self._pending_proposal = None
         self._pending_feedback = ()
         self._pending_plan_trace = ()
+        self._pending_planner = None
+        self._pending_accepted_prefix_length = None
+        self._pending_verified_proposals = None
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._reconcile_calls += 1
+
+    def observe_verification(
+        self,
+        accepted_prefix_length: int,
+        verified_proposals: int,
+        /,
+    ) -> None:
+        if self._pending_base is None or self._pending_proposal is None:
+            raise MarkovDraftError("verification requires a pending proposal")
+        if (
+            isinstance(accepted_prefix_length, bool)
+            or not isinstance(accepted_prefix_length, int)
+            or accepted_prefix_length < 0
+            or isinstance(verified_proposals, bool)
+            or not isinstance(verified_proposals, int)
+            or verified_proposals < 0
+            or accepted_prefix_length > verified_proposals
+            or verified_proposals > self.proposal_width
+        ):
+            raise ValueError("verification prefix counts are invalid")
+        if self._pending_verified_proposals is not None:
+            raise MarkovDraftError("proposal verification was already observed")
+        self._pending_accepted_prefix_length = accepted_prefix_length
+        self._pending_verified_proposals = verified_proposals
+
+    def _commit_pending_verification(self, accepted_prefix_length: int) -> None:
+        observed = self._pending_accepted_prefix_length
+        verified = self._pending_verified_proposals
+        if observed is None and verified is None:
+            return
+        if observed is None or verified is None or observed != accepted_prefix_length:
+            raise MarkovDraftError(
+                "verification acceptance differs from reconciled prefix"
+            )
+        if self._pending_planner == "beam":
+            self._beam_verified_tokens += verified
+            self._beam_accepted_tokens += observed
 
     def reconcile_external_prefix(self, history: tuple[int, ...], /) -> None:
         """Train one unused Council proposal from another verified provider.
@@ -3410,6 +3832,12 @@ class FingerprintRollingK4DraftProvider:
             raise MarkovDraftError(
                 "external Markov reconciliation exceeds the proposal width"
             )
+        matching_prefix = 0
+        for actual, predicted in zip(delta, proposal, strict=False):
+            if actual != predicted:
+                break
+            matching_prefix += 1
+        self._commit_pending_verification(matching_prefix)
         assert self._last_confirmed_length is not None
         verified = 0
         prefix_matches = True
@@ -3484,6 +3912,9 @@ class FingerprintRollingK4DraftProvider:
         self._pending_proposal = None
         self._pending_feedback = ()
         self._pending_plan_trace = ()
+        self._pending_planner = None
+        self._pending_accepted_prefix_length = None
+        self._pending_verified_proposals = None
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._reconcile_calls += 1
@@ -3508,6 +3939,9 @@ class FingerprintRollingK4DraftProvider:
         self._pending_proposal = None
         self._pending_feedback = ()
         self._pending_plan_trace = ()
+        self._pending_planner = None
+        self._pending_accepted_prefix_length = None
+        self._pending_verified_proposals = None
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._last_round_proposal = None
@@ -3894,6 +4328,9 @@ class FingerprintRollingK4DraftProvider:
         self._pending_proposal = None
         self._pending_feedback = ()
         self._pending_plan_trace = ()
+        self._pending_planner = None
+        self._pending_accepted_prefix_length = None
+        self._pending_verified_proposals = None
         self._carry_feedback = None
         self._carry_feedback_position = None
         self._carry_feedback_teacher_forced = False

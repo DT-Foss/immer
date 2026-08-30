@@ -19,6 +19,7 @@ from immer.runtimes.qwen3_8.markov_draft import (
     MarkovDraftError,
     MarkovDraftState,
 )
+from immer.runtimes.qwen3_8.markov_atlas import AtlasTokenEvidence
 from immer.runtimes.qwen3_8.draft_protocol import RollingDraftProposal
 import immer.runtimes.qwen3_8.markov_draft as markov_module
 from immer.runtimes.qwen3_8.model import StreamedQwen38
@@ -1189,8 +1190,12 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                 return {"09": 0.99, "10": 0.01}
 
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
-        provider._expert_models = lambda _history: tuple(
-            (PlanningExpert(), []) for _ in provider._experts
+        provider._expert_models = lambda history: tuple(
+            (
+                PlanningExpert(),
+                [provider._symbol(token) for token in history if 7 <= token <= 12],
+            )
+            for _ in provider._experts
         )
 
         planned = provider._predict_council((1,), 1)[0]
@@ -1210,6 +1215,309 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider.metrics().lookahead_calls, 1)
         self.assertEqual(provider.metrics().last_lookahead_gain, 0.0)
         self.assertEqual(len(calls), len(provider._experts) * 5)
+        provider.close()
+
+    def test_atlas_online_beam_can_choose_non_top1_for_a_stronger_path(self) -> None:
+        class PlanningExpert:
+            @staticmethod
+            def distribution(context):
+                if not context:
+                    return {"07": 0.55, "08": 0.45}
+                if context[-1] == "07":
+                    return {"09": 0.51, "10": 0.49}
+                return {"09": 0.99, "10": 0.01}
+
+        class Atlas:
+            max_branches = 8
+            context_count = 2
+            token_count = 10
+
+            @staticmethod
+            def token_options(history, *, limit=None):
+                if len(history) > 1:
+                    return ()
+                return (
+                    AtlasTokenEvidence(7, 1, 8, 10, 0.8, 0.6),
+                    AtlasTokenEvidence(8, 1, 6, 10, 0.6, 0.5),
+                )
+
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        provider.atlas = Atlas()
+        provider._expert_models = lambda history: tuple(
+            (
+                PlanningExpert(),
+                [provider._symbol(token) for token in history if 7 <= token <= 12],
+            )
+            for _ in provider._experts
+        )
+
+        result = provider._predict_beam((1,), 2)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        tokens, feedback, confidences, disagreements = result
+        self.assertEqual(tokens, (8, 9))
+        self.assertEqual(len(feedback), 2)
+        self.assertTrue(all(row[0]["09"] == 0.99 for row in feedback[1]))
+        self.assertEqual(len(confidences), 2)
+        self.assertTrue(all(0.0 < value < 1.0 for value in confidences))
+        self.assertEqual(len(disagreements), 2)
+        self.assertEqual(provider._last_plan_trace[0][0], 8)
+        self.assertEqual(provider._last_plan_trace[0][1], 7)
+        provider._beam_verified_tokens = 3
+        provider._beam_accepted_tokens = 0
+        discounted = provider._predict_beam((1,), 2)
+        self.assertIsNotNone(discounted)
+        assert discounted is not None
+        reliability = 0.5 / 5
+        for before, after in zip(confidences, discounted[2], strict=True):
+            self.assertAlmostEqual(after, before * reliability)
+        provider._beam_verified_tokens = 0
+        provider._beam_accepted_tokens = 0
+        wide = provider._predict_beam((1,), 4)
+        self.assertIsNotNone(wide)
+        assert wide is not None
+        initial_round = RollingDraftProposal.build(
+            wide[0][:3],
+            wide[2][:3],
+            wide[3][:3],
+            request_window_ceiling=4,
+            provider_abi=markov_module.MARKOV_DRAFT_PROVIDER_ABI,
+        )
+        provider._beam_verified_tokens = 1
+        provider._beam_accepted_tokens = 0
+        cooled = provider._predict_beam((1,), 4)
+        self.assertIsNotNone(cooled)
+        assert cooled is not None
+        cooled_round = RollingDraftProposal.build(
+            cooled[0][:3],
+            cooled[2][:3],
+            cooled[3][:3],
+            request_window_ceiling=4,
+            provider_abi=markov_module.MARKOV_DRAFT_PROVIDER_ABI,
+        )
+        self.assertGreater(initial_round.recommended_window, 1)
+        self.assertEqual(cooled_round.recommended_window, 1)
+        provider.close()
+
+    def test_beam_proposal_keeps_feedback_reconciliation_exact(self) -> None:
+        class PlanningExpert:
+            @staticmethod
+            def distribution(context):
+                if not context:
+                    return {"07": 0.55, "08": 0.45}
+                if context[-1] == "07":
+                    return {"09": 0.51, "10": 0.49}
+                if context[-1] == "08":
+                    return {"09": 0.99, "10": 0.01}
+                return {"11": 0.95, "12": 0.05}
+
+        class Atlas:
+            max_branches = 8
+            context_count = 2
+            token_count = 10
+
+            @staticmethod
+            def continuation(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def token_options(history, *, limit=None):
+                if history[-1] != 2:
+                    return ()
+                return (
+                    AtlasTokenEvidence(7, 1, 8, 10, 0.8, 0.6),
+                    AtlasTokenEvidence(8, 1, 6, 10, 0.6, 0.5),
+                )
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        provider.atlas = Atlas()
+        provider._expert_models = lambda history: tuple(
+            (
+                PlanningExpert(),
+                [provider._symbol(token) for token in history if 7 <= token <= 12],
+            )
+            for _ in provider._experts
+        )
+        prompt = (20, 21)
+        provider.begin_request(prompt)
+
+        proposal = provider.propose_round(prompt, 2)
+        committed = (*prompt, 2, *proposal.token_ids[:2])
+        provider.reconcile_prefix(committed)
+        provider.observe_final((*committed, 13))
+
+        self.assertEqual(proposal.token_ids[:2], (8, 9))
+        self.assertEqual(provider.metrics().council_feedback, 3)
+        self.assertEqual(provider._state.feedback_count, 3)
+        provider.close()
+
+    def test_beam_verification_is_committed_only_for_the_reconciled_prefix(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        prompt = (1, 2)
+        provider.begin_request(prompt)
+        proposal = provider.propose_round(prompt, 3)
+        provider._pending_planner = "beam"
+
+        provider.observe_verification(3, 3)
+        self.assertEqual(provider._beam_verified_tokens, 0)
+        self.assertEqual(provider._beam_accepted_tokens, 0)
+        with self.assertRaisesRegex(
+            MarkovDraftError,
+            "verification acceptance differs from reconciled prefix",
+        ):
+            provider.reconcile_prefix((*prompt, 3, *proposal.token_ids[:2]))
+
+        self.assertEqual(provider._beam_verified_tokens, 0)
+        self.assertEqual(provider._beam_accepted_tokens, 0)
+        provider.discard_pending_proposal()
+        self.assertIsNone(provider._pending_accepted_prefix_length)
+        self.assertIsNone(provider._pending_verified_proposals)
+        provider.close()
+
+    def test_atlas_ranking_score_is_not_served_as_acceptance_probability(self) -> None:
+        class Expert:
+            @staticmethod
+            def distribution(_context):
+                return {"07": 0.55, "08": 0.45}
+
+        class Atlas:
+            max_branches = 8
+
+            @staticmethod
+            def token_options(_history, *, limit=None):
+                return (AtlasTokenEvidence(8, 6, 1, 100, 0.01, 0.99),)
+
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        provider.atlas = Atlas()
+        provider._expert_models = lambda history: tuple(
+            (
+                Expert(),
+                [provider._symbol(token) for token in history if 7 <= token <= 12],
+            )
+            for _ in provider._experts
+        )
+
+        result = provider._predict_beam((1,), 1)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        tokens, _feedback, confidences, _disagreements = result
+        self.assertEqual(tokens, (7,))
+        self.assertLess(confidences[0], 0.60)
+        provider.close()
+
+    def test_external_mismatch_replays_the_same_beam_planner(self) -> None:
+        class Expert:
+            @staticmethod
+            def distribution(context):
+                if not context:
+                    return {"07": 0.55, "08": 0.45}
+                return {"09": 0.9, "10": 0.1}
+
+        class Atlas:
+            max_branches = 8
+            context_count = 2
+            token_count = 10
+
+            @staticmethod
+            def continuation(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def token_options(history, *, limit=None):
+                if history[-1] != 2:
+                    return ()
+                return (
+                    AtlasTokenEvidence(7, 1, 8, 10, 0.8, 0.6),
+                    AtlasTokenEvidence(8, 1, 6, 10, 0.6, 0.5),
+                )
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        provider.atlas = Atlas()
+        provider._expert_models = lambda history: tuple(
+            (
+                Expert(),
+                [provider._symbol(token) for token in history if 7 <= token <= 12],
+            )
+            for _ in provider._experts
+        )
+        prompt = (20, 21)
+        provider.begin_request(prompt)
+        with mock.patch.object(
+            provider,
+            "_predict_beam",
+            wraps=provider._predict_beam,
+        ) as beam:
+            proposal = provider.propose_round(prompt, 2)
+            mismatch = 7 if proposal.token_ids[0] != 7 else 8
+            provider.reconcile_external_prefix((*prompt, 2, mismatch, 9))
+
+        self.assertGreaterEqual(beam.call_count, 3)
+        self.assertIsNone(provider._pending_planner)
+        self.assertGreaterEqual(provider.metrics().teacher_forced_predictions, 2)
+        provider.observe_final((*prompt, 2, mismatch, 9, 13))
+        provider.close()
+
+    def test_k16_beam_retains_only_compact_paths(self) -> None:
+        class WideExpert:
+            @staticmethod
+            def distribution(context):
+                offset = len(context) % 16
+                weights = {
+                    str(token): float(256 - ((token - offset) % 256))
+                    for token in range(256)
+                }
+                total = sum(weights.values())
+                return {token: value / total for token, value in weights.items()}
+
+        class Atlas:
+            max_branches = 8
+
+            @staticmethod
+            def token_options(_history, *, limit=None):
+                return tuple(
+                    AtlasTokenEvidence(
+                        token,
+                        1,
+                        4,
+                        16,
+                        0.25,
+                        0.10,
+                    )
+                    for token in range(8)
+                )
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=512,
+            proposal_width=15,
+        )
+        provider.atlas = Atlas()
+        provider._expert_models = lambda _history: tuple(
+            (WideExpert(), []) for _ in provider._experts
+        )
+
+        result = provider._predict_beam((511,), 16)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(len(result[0]), 16)
+        self.assertLessEqual(provider._last_beam_path_count, 8)
+        self.assertNotIn(
+            "feedback",
+            markov_module._BeamStep.__dataclass_fields__,
+        )
         provider.close()
 
     def test_target_feedback_can_disable_a_harmful_lookahead_override(self) -> None:

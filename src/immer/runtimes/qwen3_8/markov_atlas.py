@@ -372,15 +372,50 @@ class MarkovTokenAtlas:
             ),
         )
 
-    def _lookup(self, context: tuple[int, ...]) -> _AtlasRow | None:
+    def _lookup_index(self, context: tuple[int, ...]) -> int | None:
         candidates = self._hash_index.get(_context_hash(context))
         if candidates is None:
             return None
         indexes = (candidates,) if isinstance(candidates, int) else candidates
         for index in indexes:
             if self._context_matches(index, context):
-                return self._row_at(index)
+                return index
         return None
+
+    def _lookup(self, context: tuple[int, ...]) -> _AtlasRow | None:
+        index = self._lookup_index(context)
+        return None if index is None else self._row_at(index)
+
+    def _branch_evidence(
+        self,
+        *,
+        token_id: int,
+        context_order: int,
+        support: int,
+        total: int,
+    ) -> AtlasTokenEvidence:
+        probability = support / total
+        support_strength = 1.0 - math.exp(-support / 4.0)
+        order_strength = 0.5 + 0.5 * context_order / self.max_order
+        return AtlasTokenEvidence(
+            token_id=token_id,
+            context_order=context_order,
+            support=support,
+            total=total,
+            probability=probability,
+            score=probability * support_strength * order_strength,
+        )
+
+    @staticmethod
+    def _evidence_strength(
+        evidence: AtlasTokenEvidence,
+    ) -> tuple[float, int, int, int]:
+        return (
+            evidence.score,
+            evidence.context_order,
+            evidence.support,
+            -evidence.total,
+        )
 
     @property
     def context_count(self) -> int:
@@ -607,18 +642,12 @@ class MarkovTokenAtlas:
             )
             if count <= 0:
                 continue
-            probability = count / row.total
-            support_strength = 1.0 - math.exp(-count / 4.0)
-            order_strength = 0.5 + 0.5 * order / self.max_order
-            score = probability * support_strength * order_strength
             candidates.append(
-                AtlasTokenEvidence(
+                self._branch_evidence(
                     token_id=token_id,
                     context_order=order,
                     support=count,
                     total=row.total,
-                    probability=probability,
-                    score=score,
                 )
             )
         if not candidates:
@@ -630,15 +659,74 @@ class MarkovTokenAtlas:
                 probability=0.0,
                 score=0.0,
             )
-        return max(
-            candidates,
+        return max(candidates, key=self._evidence_strength)
+
+    def token_options(
+        self,
+        history: Sequence[int],
+        *,
+        limit: int | None = None,
+    ) -> tuple[AtlasTokenEvidence, ...]:
+        """Return the strongest retained evidence for each available token.
+
+        Every matching PPM order, including the order-zero corpus row, is
+        scanned directly in the flat branch arrays.  The result is bounded by
+        ``max_branches`` and ordered by descending evidence strength, with the
+        token ID providing a stable ascending tie-breaker.
+        """
+
+        if isinstance(history, (str, bytes, bytearray)):
+            raise TypeError("history must contain token IDs")
+        context = tuple(history)
+        if not context or any(
+            isinstance(token, bool)
+            or not isinstance(token, int)
+            or not 0 <= token < self.vocab_size
+            for token in context
+        ):
+            raise ValueError("history contains an invalid token")
+        option_limit = (
+            self.max_branches
+            if limit is None
+            else _positive_int(limit, label="limit")
+        )
+        if option_limit > self.max_branches:
+            raise ValueError("limit must not exceed max_branches")
+
+        strongest: dict[int, AtlasTokenEvidence] = {}
+        for order in range(min(self.max_order, len(context)) + 1):
+            key = () if order == 0 else context[-order:]
+            index = self._lookup_index(key)
+            if index is None:
+                continue
+            total = self._totals[index]
+            start = self._branch_offsets[index]
+            stop = self._branch_offsets[index + 1]
+            for offset in range(start, stop):
+                token_id = self._branch_tokens[offset]
+                evidence = self._branch_evidence(
+                    token_id=token_id,
+                    context_order=order,
+                    support=self._branch_counts[offset],
+                    total=total,
+                )
+                previous = strongest.get(token_id)
+                if previous is None or self._evidence_strength(
+                    evidence
+                ) > self._evidence_strength(previous):
+                    strongest[token_id] = evidence
+
+        ranked = sorted(
+            strongest.values(),
             key=lambda row: (
-                row.score,
-                row.context_order,
-                row.support,
-                -row.total,
+                -row.score,
+                -row.context_order,
+                -row.support,
+                -row.probability,
+                row.token_id,
             ),
         )
+        return tuple(ranked[:option_limit])
 
     def sequence_evidence(
         self,

@@ -295,7 +295,6 @@ class Qwen38MarkovMtpDraftProvider:
         policy = proposal.select_window(
             request_window_ceiling=ceiling,
             remaining_tokens=ceiling,
-            window_work_costs=MARKOV_MTP_WINDOW_WORK_COSTS,
         )
         return policy.chosen_window > 1
 

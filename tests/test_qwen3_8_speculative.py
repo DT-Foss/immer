@@ -1237,6 +1237,45 @@ class Qwen38SpeculativeTests(unittest.TestCase):
         self.assertEqual(len(row.provider_proposed_token_ids), 7)
         self.assertEqual(row.round_policy.selector, "markov-prefix-utility/v2")
 
+    def test_zero_weight_markov_proposal_uses_target_only_window_costs(self) -> None:
+        class MarkovAdaptive(_AdaptiveRollingFromTokens):
+            def propose_round(self, history, known_token):
+                return replace(
+                    super().propose_round(history, known_token),
+                    provider_abi="immer.qwen3.8-markov-draft-provider/v26",
+                )
+
+        prompt = (1, 4)
+        baseline = self._model()
+        expected, _evidence = baseline.generate_greedy(
+            [prompt], max_new_tokens=4, head_block_rows=7
+        )
+        provider = MarkovAdaptive(
+            prompt,
+            expected,
+            accepted_per_wave=3,
+            vocab_size=self.config.vocab_size,
+            proposal_width=3,
+            confidence=0.30,
+        )
+        candidate = self._model()
+
+        result = Qwen38K4SpeculativeDecoder(
+            candidate,
+            provider,
+            window_size=4,
+            adaptive_round_windows=True,
+            round_window_work_costs={1: 1.0, 2: 1.6, 4: 2.8},
+        ).generate_rolling(
+            [prompt],
+            max_new_tokens=4,
+            head_block_rows=7,
+        )
+
+        self.assertEqual(result.token_ids, expected)
+        self.assertEqual(result.evidence.used_window_sizes, (4,))
+        self._assert_state_equal(candidate, baseline)
+
     def test_low_confidence_k1_uses_direct_decode_without_transactional_stage(
         self,
     ) -> None:
