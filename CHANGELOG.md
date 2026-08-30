@@ -61,6 +61,12 @@ All notable changes to IMMER are recorded here.
   failed position cools itself and its causal tail, position-0 failure still
   forces K1, and external shadow verification trains through its first
   mismatch. Provider ABI is v36; metrics v27.
+- `a796f9f` added request-local periodic template inference across changing
+  slots. Three aligned cycles can continue invariant future phases even when
+  the current exact token context is unseen. `cef25eb` gives exact request
+  phrases precedence, requires three phase witnesses, calibrates confidence by
+  measured lag agreement, rejects conflicting periods, and gates Atlas phrase
+  floors with causal Beam reliability. Provider ABI is v38; metrics v28.
 
 ### Arbitrary local Qwen runtime
 

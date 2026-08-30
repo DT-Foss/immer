@@ -97,6 +97,8 @@ release surface.
   release stale expert dominance inside the active answer. Beam acceptance is
   calibrated separately at positions 0–15; a deep failure keeps an already
   reliable shallow prefix while cooling the failed position and its tail.
+  Periodic template inference continues invariant phases across confirmed
+  blocks whose slot tokens change, while exact request phrases retain priority.
 - **Embedded MTP drafting.** The target checkpoint's own one-layer Qwen3.5 MTP
   branch now runs through the same causal Q4 bank, shared embedding, native
   bounded LM head, and exact rolling target verifier. Shifted token embeddings
@@ -354,6 +356,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Same-request lookahead regret | harmful non-greedy plans stop inside the active answer | planned-vs-greedy hits are tracked independently at positions 0–15; the existing empirical log-advantage gate consumes the ephemeral outcomes immediately, while finalization persists each outcome exactly once |
 | Same-request regime detector | abrupt answer-phase shifts release stale experts | the persistent Surprise EMA/deviation/CUSUM equations run ephemerally on confirmed rows; threshold crossings apply the canonical Rapidity shrink immediately and finalization replays the regime exactly once |
 | Position-calibrated Markov beam | deep failures preserve reliable shallow prefixes | 16 Beta rows track verified/hit counts; confidence uses the cumulative weakest causal prefix, virtual K1 updates position 0, and external shadow verification scores through the first mismatch |
+| Same-request periodic template agent | unseen variable slots retain their invariant block phase | three aligned cycles, at least 75% lag agreement, and three unanimous phase witnesses induce a bounded continuation; exact phrases win conflicts, ambiguous periods abstain, and measured agreement calibrates phrase confidence |
 | Corpus-scale Markov atlas | 4,000,000 tokens → 500,000 contexts in 8.0 MB | flat-array v2 adds ~150 MiB RSS and loads in 1.77 s on the live server; on an arbitrary rainbow question it supported 7 MTP tokens across 6 rounds while the hybrid accepted 11 drafts and produced 24 tokens in 14 target forwards |
 | Live-answer Markov expert | 65,536 retained answer tokens; 4,096-token cached PPM windows | on an unseen German lightning paraphrase the online memory supported 64/98 MTP candidates and supplied 18 calibrated confidence gains across 12 rounds; 10 drafts accepted, 24 tokens in 15 target forwards |
 | O1-valued episode retention | 1.1 KB state + 130 KB neural sidecar after the first live answer | real O1 surprise and learning-progress assign persistent episode priority; Ricci-age eviction keeps valuable older answers over low-value newer ones, with atomic rollback and answer-only boundaries |
