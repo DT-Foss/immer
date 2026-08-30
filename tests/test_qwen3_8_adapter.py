@@ -2720,6 +2720,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             q4.mkdir(parents=True)
             (q4 / "manifest.json").write_bytes(b"q4-manifest")
             (root / "tokenizer.json").write_bytes(b"tokenizer")
+            page_state = root / "pages.json"
             prompt_tokenizer = SimpleNamespace(
                 encode=lambda _text: (11, 12),
                 render_no_thinking_prompt=(
@@ -2753,6 +2754,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         str(root),
                         "--ooe-warm-root",
                         "/state/qwen-warm",
+                        "--mlp-page-state",
+                        str(page_state),
                     ]
                 )
 
@@ -2854,6 +2857,70 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotEqual(current, changed)
         self.assertNotEqual(current, changed_mtp)
         self.assertNotEqual(current, changed_hybrid)
+
+    def test_growing_warm_profile_supports_dynamic_q4_page_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            q4 = root / "q4"
+            q4.mkdir()
+            (q4 / "manifest.json").write_bytes(b"manifest")
+            tokenizer = root / "tokenizer.json"
+            tokenizer.write_bytes(b"tokenizer")
+            args = SimpleNamespace(
+                compute_dtype="auto",
+                device="auto",
+                draft_window=8,
+                head_block_rows=2048,
+                max_context_tokens=2048,
+                max_new_tokens=64,
+                max_prompt_tokens=1024,
+                mlp_page_width=192,
+                q4_threads=None,
+                qwen38_anchor_cache=None,
+                system_prompt="",
+            )
+            common = {
+                "args": args,
+                "tokenizer_path": tokenizer,
+                "q4_root": q4,
+                "fast_mlp_root": None,
+                "draft_mode": "hybrid",
+                "markov_atlas_path": None,
+                "markov_o1_retention_path": None,
+                "runtime_code_revision": "a" * 64,
+            }
+            disabled = _qwen38_growing_warm_profile(
+                **common,
+                mlp_page_state_path=None,
+            )
+            routed = _qwen38_growing_warm_profile(
+                **common,
+                mlp_page_state_path=root / "pages-a.json",
+            )
+            same_policy_other_file = _qwen38_growing_warm_profile(
+                **common,
+                mlp_page_state_path=root / "pages-b.json",
+            )
+            args.mlp_page_width = 160
+            changed_width = _qwen38_growing_warm_profile(
+                **common,
+                mlp_page_state_path=root / "pages-a.json",
+            )
+            args.mlp_page_width = 192
+            with patch(
+                "immer.runtimes.qwen3_8.mlp_page_markov.MLP_PAGE_MARKOV_POLICY",
+                "different-page-policy/v999",
+            ):
+                changed_policy = _qwen38_growing_warm_profile(
+                    **common,
+                    mlp_page_state_path=root / "pages-a.json",
+                )
+
+        self.assertIsNotNone(routed)
+        self.assertNotEqual(disabled, routed)
+        self.assertEqual(routed, same_policy_other_file)
+        self.assertNotEqual(routed, changed_width)
+        self.assertNotEqual(routed, changed_policy)
 
     def test_cli_draft_abis_match_runtime_exports(self) -> None:
         self.assertEqual(_QWEN38_MARKOV_DRAFT_ABI, MARKOV_DRAFT_PROVIDER_ABI)

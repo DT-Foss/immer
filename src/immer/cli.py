@@ -124,7 +124,7 @@ _QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v47"
 _QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v28"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
-    b"immer:qwen3.8-growing-warm-runtime/v2"
+    b"immer:qwen3.8-growing-warm-runtime/v3"
 ).hexdigest()
 
 
@@ -320,15 +320,35 @@ def _qwen38_growing_warm_profile(
 ) -> str | None:
     """Bind reusable cold cells to the exact pre-load product runtime."""
 
-    if (
-        q4_root is None
-        or fast_mlp_root is not None
-        or mlp_page_state_path is not None
-    ):
+    if q4_root is None or fast_mlp_root is not None:
         return None
     q4_manifest = q4_root / "manifest.json"
     if not q4_manifest.is_file() or not tokenizer_path.is_file():
         return None
+    mlp_page_route = None
+    if mlp_page_state_path is not None:
+        from .runtimes.qwen3_8.mlp_page_markov import (
+            MLP_PAGE_MARKOV_POLICY,
+            MLP_PAGE_MARKOV_SCHEMA,
+            MlpPageMarkov,
+        )
+
+        route_width = getattr(args, "mlp_page_width", None)
+        if (
+            isinstance(route_width, bool)
+            or not isinstance(route_width, int)
+            or route_width <= 0
+        ):
+            raise ValueError("MLP page width must be a positive integer")
+        mlp_page_route = {
+            "energy_coverage": MlpPageMarkov.ENERGY_COVERAGE.hex(),
+            "policy": MLP_PAGE_MARKOV_POLICY,
+            "route_width": route_width,
+            "schema": MLP_PAGE_MARKOV_SCHEMA,
+            "width_actions": list(
+                MlpPageMarkov.width_actions_for(route_width)
+            ),
+        }
     profile = {
         "abi_sha256": _QWEN38_GROWING_WARM_ABI_SHA256,
         "anchor_cache": args.qwen38_anchor_cache is not None,
@@ -363,10 +383,11 @@ def _qwen38_growing_warm_profile(
         "max_context_tokens": args.max_context_tokens,
         "max_new_tokens": args.max_new_tokens,
         "max_prompt_tokens": args.max_prompt_tokens,
+        "mlp_page_route": mlp_page_route,
         "q4_manifest_file_sha256": _path_sha256(q4_manifest),
         "q4_threads": args.q4_threads or min(16, os.cpu_count() or 1),
         "runtime_code_revision": runtime_code_revision,
-        "schema": "immer.qwen3.8-growing-warm-runtime/v2",
+        "schema": "immer.qwen3.8-growing-warm-runtime/v3",
         "system_prompt_sha256": hashlib.sha256(
             args.system_prompt.strip().encode("utf-8")
         ).hexdigest(),
