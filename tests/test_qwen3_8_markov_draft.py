@@ -2293,7 +2293,10 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         proposal = first.propose_after((1, 2), 3)
         first.reconcile_prefix((1, 2, 3, proposal[0]))
+        self.assertEqual(first.metrics().request_position_updates, 1)
         first.close()
+        self.assertIsNone(first._request_horizon_observations)
+        self.assertIsNone(first._request_horizon_hits)
 
         aborted = MarkovDraftState.from_bytes(state_path.read_bytes())
         self.assertEqual(aborted.feedback_count, 0)
@@ -2659,6 +2662,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(interim.teacher_forced_predictions, 2)
         self.assertEqual(interim.teacher_forced_feedback_tokens, 1)
         self.assertEqual(interim.request_weight_updates, 2)
+        self.assertEqual(interim.request_position_updates, 2)
         self.assertEqual(provider._state.feedback_count, 0)
         self.assertEqual(interim.teacher_forced_failures, 0)
         self.assertTrue(provider._carry_feedback_teacher_forced)
@@ -2678,6 +2682,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         after = provider.metrics()
         self.assertEqual(after.council_feedback, 2)
         self.assertEqual(after.request_weight_updates, 2)
+        self.assertEqual(after.request_position_updates, 2)
         self.assertEqual(after.horizon_observations[:2], (1, 1))
         self.assertEqual(
             provider._state.expert_observations,
@@ -2819,6 +2824,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             after_retry.request_position_updates,
             before_metrics.request_position_updates + 1,
         )
+        self.assertEqual(after_retry.horizon_observations[:2], (1, 1))
+        self.assertIsNone(provider._request_horizon_observations)
+        self.assertIsNone(provider._request_horizon_hits)
         provider.close()
 
     def test_external_k1_reconciliation_carries_feedback_to_next_known_token(
@@ -2839,9 +2847,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertIsNotNone(provider._carry_feedback)
         self.assertEqual(provider.metrics().external_feedback_tokens, 0)
         self.assertEqual(provider.metrics().request_weight_updates, 0)
+        self.assertEqual(provider.metrics().request_position_updates, 0)
         provider.propose_round(history, 7)
         self.assertEqual(len(provider._episode_feedback), 1)
         self.assertEqual(provider.metrics().request_weight_updates, 1)
+        self.assertEqual(provider.metrics().request_position_updates, 1)
         provider.discard_pending_proposal()
         provider.observe_final((*history, 7))
         self.assertEqual(provider.metrics().council_feedback, 1)
