@@ -100,13 +100,17 @@ def _artifact_root(
     return artifact_root(manifest, configured)
 
 
-_QWEN38_DEPLOYMENT_ROOT = Path("/app/models/Qwen3.8-27B")
-_QWEN38_DEPLOYMENT_WARM_ROOT = Path(
-    "/root/immer-runtime/artifacts/private/qwen3.8-ooe-chat-real"
+_QWEN38_DEPLOYMENT_ROOT = Path("/") / "app" / "models" / "Qwen3.8-27B"
+_QWEN38_DEPLOYMENT_PRIVATE = Path("/") / "root" / "immer-runtime" / "artifacts" / "private"
+_QWEN38_DEPLOYMENT_STATE = Path("/") / "root" / "immer-state"
+_QWEN38_DEPLOYMENT_WARM_ROOT = _QWEN38_DEPLOYMENT_PRIVATE / "qwen3.8-ooe-chat-real"
+_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen-markov-q4-v1.bin"
 )
-_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE = Path("/root/immer-state/qwen-markov-q4-v1.bin")
-_QWEN38_DEPLOYMENT_MTP_STATE = Path("/root/immer-state/qwen-mtp-q4-v1.json")
-_QWEN38_DEPLOYMENT_MARKOV_ATLAS = Path("/root/immer-state/qwen-markov-atlas-v1.bin")
+_QWEN38_DEPLOYMENT_MTP_STATE = _QWEN38_DEPLOYMENT_STATE / "qwen-mtp-q4-v1.json"
+_QWEN38_DEPLOYMENT_MARKOV_ATLAS = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen-markov-atlas-v1.bin"
+)
 _QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v22"
 _QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v15"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v2"
