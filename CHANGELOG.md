@@ -4,11 +4,19 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-30
 
-Runtime commits through `bfcdbd7` are deployed on the canonical server.
+Runtime commits through `af92b49` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `af92b49` closed the runtime learning loop across O1, drafting, and MLP
+  execution. One terminal reward combines current O1 answer value, accepted
+  draft tokens, skipped/selected pages, and target forwards. It updates the
+  persistent K=4/8/16 controller and reweights the causal width agents that
+  produced the executed action. Settlement occurs only after generation and
+  cleanup succeed; Draft and Page persistence remain independently idempotent
+  and retryable, while owner retirement aborts its pending trace explicitly.
+  Canonical chat now mounts the K=8 controller automatically.
 - `bfcdbd7` made MLP execution width a learned Markov action. Native Q4 ABI 5
   returns the exact total activation energy across all 272 pages alongside the
   ranked trace. Per-layer temporal, cross-layer, and marginal width agents

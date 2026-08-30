@@ -50,6 +50,11 @@ release surface.
   96, 128, 160, or 192 routed pages to retain at least 99.5% of that energy;
   execution uses the selected prefix while the next decision retains the full
   route context.
+  After successful generation and cleanup, the width agents receive the same
+  terminal reward as the persistent draft-window controller:
+  `3·page_efficiency + 2·draft_efficiency + tanh(log1p(O1_value)/4) − target_work`.
+  This couples semantic value, accepted drafts, page savings, and target cost
+  into the next request's runtime actions.
   Unready layers execute the full MLP; speculative continuation commits only
   accepted learning rows. `--mlp-page-width` controls the route and
   `--no-mlp-page-route` restores full-MLP execution.
@@ -113,6 +118,13 @@ release surface.
   blocks whose slot tokens change, while exact request phrases retain priority.
   A bound-slot agent can also copy a varying future phase from an earlier
   confirmed phase when that relation holds across three distinct slot values.
+- **Joint O1 runtime reward.** Canonical chat mounts a persistent K=4/8/16
+  controller with K=8 as the cold action. O1 answer value, accepted drafts,
+  selected/skipped MLP pages, and target forwards produce one terminal reward
+  after cleanup. The same receipt trains draft-window policy and the causal
+  width agents responsible for the executed action. Repeated receipts are
+  idempotent; independent Draft/Page disk failures retain their pending work
+  until retry or explicit owner retirement.
 - **Embedded MTP drafting.** The target checkpoint's own one-layer Qwen3.5 MTP
   branch now runs through the same causal Q4 bank, shared embedding, native
   bounded LM head, and exact rolling target verifier. Shifted token embeddings
@@ -422,6 +434,7 @@ per-profile store and are revalidated against their source ResultCells.
 | Markov range prefetch | zero additional logical/source bytes | grouped operations; order-1/2 beam; probability×Ricci/reuse scoring; cross-operation dedupe; accepted-only cooldown; delayed exact-byte utility for d1–d8 agents; adaptive 12.5–100% reservoir budget; bounded local OS-page hints |
 | Weight-only all-layer Fast MLP | deterministic 64-layer p4/k32 plan; capture-only target use forbidden | no prompts or model forwards in the build; exact paths learn adaptive width plus prequential sparse-output cosine/L2 and scalar correction; non-beneficial or uncalibrated routes use the full MLP |
 | Direct Q4 MLP-page route | learned 96/128/160/192-of-272 action per layer/context | exact total energy trains causal temporal/cross-layer/marginal width agents; four page agents select the route, native Q4 executes its learned prefix, and speculative learning commits only accepted rows |
+| Joint O1 runtime reward | one terminal receipt across semantic value, drafts, pages, and forwards | trains K=4/8/16 policy and the width agents that caused the selected execution; cleanup precedes settlement, disk retries remain idempotent, owner retirement aborts pending traces |
 | Exact residual-PQ LM head | K=1–16 and k=1/3/7 parity; certified page + economic row pruning | deterministic weight-only build, best-first tree, actual row-code caps, K-query survivor union, contiguous-read cost gate, 64-leaf no-saving stop, outward residual/roundoff bounds, overflow/tie/subnormal guards, and exact full-leaf fallback; no model forward |
 | Arbitrary local Qwen chat | 23 → 11 target forwards on the same capped prompt | authenticated causal Qwen3.8 path; default Markov/embedded-MTP hybrid on the v3 bank and full Q4 MLP execution; Qwen remains the sole committer, while explicit Markov-only mode retains the same target bank |
 | Seed v3 native migration | exact parity on 8/8 inherited tensor outputs for Micro and 5M | SHA-first migration of shared trained GRU/CRSA/SwiGLU weights; new receipt, quotient, route-value, and expected-work heads added under a strict inference-only manifest |
