@@ -3490,6 +3490,184 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider.metrics().phrase_accepted_tokens, 0)
         provider.close()
 
+    def test_recursive_trace_trains_deep_tokens_and_dies_on_first_mismatch(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        proposal = provider.propose_round(prompt, 2)
+        complete = provider._pending_complete
+        committed = (*prompt, 2, proposal.token_ids[0])
+        provider.reconcile_external_prefix(committed)
+
+        self.assertEqual(provider.metrics().recursive_trace_created, 1)
+        self.assertEqual(provider.metrics().recursive_trace_active, 1)
+        mismatch = (complete[3] + 1) % provider.vocab_size
+        with mock.patch.object(
+            provider,
+            "_predict_council",
+            side_effect=AssertionError("exact tokens must not re-plan"),
+        ):
+            provider.advance_confirmed_prefix(
+                (*committed, complete[1], complete[2], mismatch)
+            )
+            provider.advance_confirmed_prefix(
+                (*committed, complete[1], complete[2], mismatch, 17)
+            )
+
+        metrics = provider.metrics()
+        self.assertEqual(metrics.recursive_trace_active, 0)
+        self.assertEqual(metrics.recursive_trace_feedback_tokens, 2)
+        self.assertEqual(metrics.recursive_trace_hits, 1)
+        self.assertEqual(metrics.recursive_trace_misses, 1)
+        self.assertEqual(metrics.recursive_trace_max_position, 3)
+        self.assertEqual(
+            tuple(row[2] for row in provider._episode_feedback),
+            (0, 1),
+        )
+        self.assertEqual(
+            tuple(row[2] for row in provider._recursive_feedback),
+            (2, 3),
+        )
+        provider.close()
+
+    def test_overlapping_recursive_traces_finalize_and_persist_every_horizon(
+        self,
+    ) -> None:
+        state_path = self.root / "recursive-traces.bin"
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=128,
+            proposal_width=7,
+        )
+        original_predict = provider._predict_council
+
+        def constant_prediction(
+            history,
+            count,
+            *,
+            forced_prefix=(),
+            position_offset=0,
+        ):
+            del forced_prefix
+            return original_predict(
+                history,
+                count,
+                forced_prefix=(7,) * count,
+                position_offset=position_offset,
+            )
+
+        prompt = (20, 21)
+        provider.begin_request(prompt)
+        with mock.patch.object(
+            provider,
+            "_predict_council",
+            side_effect=constant_prediction,
+        ):
+            first = provider.propose_round(prompt, 22)
+            first_committed = (*prompt, 22, first.token_ids[0])
+            provider.reconcile_external_prefix(first_committed)
+            second = provider.propose_round(first_committed, 7)
+            second_committed = (*first_committed, 7, second.token_ids[0])
+            provider.reconcile_external_prefix(second_committed)
+
+        interim = provider.metrics()
+        self.assertEqual(interim.recursive_trace_active, 2)
+        self.assertEqual(interim.recursive_trace_peak_active, 2)
+        self.assertEqual(interim.recursive_trace_feedback_tokens, 1)
+        provider.observe_final((*second_committed, 7, 7, 7, 7, 7, 7, 7))
+        final = provider.metrics()
+        self.assertEqual(final.recursive_trace_active, 0)
+        self.assertEqual(final.recursive_trace_feedback_tokens, 12)
+        self.assertEqual(final.recursive_trace_hits, 12)
+        self.assertEqual(final.recursive_trace_misses, 0)
+        self.assertEqual(final.recursive_trace_max_position, 7)
+        self.assertEqual(final.horizon_observations[:8], (2,) * 8)
+        provider.close()
+
+        restored = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=128,
+            proposal_width=7,
+        )
+        self.assertEqual(restored.metrics().horizon_observations[:8], (2,) * 8)
+        restored.close()
+
+    def test_recursive_trace_failure_rolls_back_and_close_clears_it(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        proposal = provider.propose_round(prompt, 2)
+        complete = provider._pending_complete
+        committed = (*prompt, 2, proposal.token_ids[0])
+        provider.reconcile_external_prefix(committed)
+        before_traces = list(provider._recursive_traces)
+        before_feedback = list(provider._recursive_feedback)
+        before_metrics = provider.metrics()
+
+        with (
+            mock.patch.object(provider, "_persist", side_effect=OSError("disk full")),
+            self.assertRaisesRegex(OSError, "disk full"),
+        ):
+            provider.observe_final((*committed, *complete[1:]))
+
+        self.assertEqual(provider._recursive_traces, before_traces)
+        self.assertEqual(provider._recursive_feedback, before_feedback)
+        self.assertEqual(
+            provider.metrics().recursive_trace_feedback_tokens,
+            before_metrics.recursive_trace_feedback_tokens,
+        )
+        provider.close()
+        self.assertEqual(provider._recursive_traces, [])
+        self.assertEqual(provider._recursive_feedback, [])
+        self.assertEqual(provider.metrics().recursive_trace_active, 0)
+
+    def test_failed_reconcile_does_not_advance_recursive_trace(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        prompt = (20, 1)
+        provider.begin_request(prompt)
+        first = provider.propose_round(prompt, 2)
+        complete = provider._pending_complete
+        committed = (*prompt, 2, first.token_ids[0])
+        provider.reconcile_external_prefix(committed)
+        second = provider.propose_round(committed, complete[1])
+        before_traces = list(provider._recursive_traces)
+        before_feedback = list(provider._recursive_feedback)
+        before_metrics = provider.metrics()
+
+        provider.observe_verification(0, 1)
+        with self.assertRaisesRegex(
+            MarkovDraftError,
+            "acceptance differs",
+        ):
+            provider.reconcile_prefix(
+                (*committed, complete[1], second.token_ids[0])
+            )
+
+        self.assertEqual(provider._recursive_traces, before_traces)
+        self.assertEqual(provider._recursive_feedback, before_feedback)
+        self.assertEqual(
+            provider.metrics().recursive_trace_feedback_tokens,
+            before_metrics.recursive_trace_feedback_tokens,
+        )
+        provider.discard_pending_proposal()
+        provider.close()
+
     def test_k16_external_prefix_trains_position_fifteen_carry(self) -> None:
         provider = FingerprintRollingK4DraftProvider(
             vocab_size=32,

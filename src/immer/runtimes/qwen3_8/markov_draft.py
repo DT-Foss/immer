@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v41"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v42"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -44,7 +44,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v30"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v31"
 _STATE_PREFIX = b"IMMD\x09"
 _V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
@@ -64,6 +64,15 @@ _MAX_PROPOSAL_POSITIONS = 16
 
 class MarkovDraftError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _RecursiveMarkovTrace:
+    token_ids: tuple[int, ...]
+    expert_predictions: tuple[tuple[int, ...], ...]
+    plan_trace: tuple[tuple[int, int, float], ...]
+    next_position: int
+    gate_pending: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1367,6 +1376,13 @@ class MarkovDraftMetrics:
     source_body_bytes: int = 0
     linear_calls: int = 0
     proposal_width: int = 3
+    recursive_trace_created: int = 0
+    recursive_trace_active: int = 0
+    recursive_trace_peak_active: int = 0
+    recursive_trace_feedback_tokens: int = 0
+    recursive_trace_hits: int = 0
+    recursive_trace_misses: int = 0
+    recursive_trace_max_position: int = 0
 
     def to_dict(self) -> dict[str, object]:
         value = asdict(self)
@@ -1572,6 +1588,7 @@ class FingerprintRollingK4DraftProvider:
             )
         self._pending_base: tuple[int, ...] | None = None
         self._pending_proposal: tuple[int, ...] | None = None
+        self._pending_complete: tuple[int, ...] = ()
         self._pending_feedback: tuple[
             tuple[tuple[dict[str, float], int], ...], ...
         ] = ()
@@ -1581,6 +1598,10 @@ class FingerprintRollingK4DraftProvider:
         self._carry_feedback_position: int | None = None
         self._carry_feedback_teacher_forced = False
         self._carry_plan: tuple[int, int, float] | None = None
+        self._recursive_traces: list[_RecursiveMarkovTrace] = []
+        self._recursive_feedback: list[
+            tuple[tuple[int, ...], int, int, int, int]
+        ] = []
         self._episode_feedback: list[
             tuple[
                 tuple[tuple[dict[str, float], int], ...],
@@ -1668,6 +1689,12 @@ class FingerprintRollingK4DraftProvider:
         self._teacher_forced_predictions = 0
         self._teacher_forced_feedback_tokens = 0
         self._teacher_forced_failures = 0
+        self._recursive_trace_created = 0
+        self._recursive_trace_peak_active = 0
+        self._recursive_trace_feedback_tokens = 0
+        self._recursive_trace_hits = 0
+        self._recursive_trace_misses = 0
+        self._recursive_trace_max_position = 0
         self._last_confidence = 0.0
         self._last_raw_confidence = 0.0
         self._last_empirical_evidence = 0.0
@@ -3756,6 +3783,20 @@ class FingerprintRollingK4DraftProvider:
     ) -> None:
         if len(feedback) != len(self._experts):
             raise MarkovDraftError("Markov council feedback width changed")
+        self._update_request_position_predictions(
+            tuple(prediction for _distribution, prediction in feedback),
+            token,
+            position,
+        )
+
+    def _update_request_position_predictions(
+        self,
+        predictions: tuple[int, ...],
+        token: int,
+        position: int,
+    ) -> None:
+        if len(predictions) != len(self._experts):
+            raise MarkovDraftError("Markov council prediction width changed")
         if not 0 <= position < _MAX_PROPOSAL_POSITIONS:
             raise MarkovDraftError("Markov feedback position is invalid")
         if self._request_horizon_observations is None:
@@ -3766,7 +3807,7 @@ class FingerprintRollingK4DraftProvider:
                 [0] * len(self._experts) for _ in range(_MAX_PROPOSAL_POSITIONS)
             ]
         assert self._request_horizon_hits is not None
-        for index, (_distribution, prediction) in enumerate(feedback):
+        for index, prediction in enumerate(predictions):
             self._request_horizon_observations[position][index] += 1
             self._request_horizon_hits[position][index] += int(prediction == token)
         self._request_position_updates += 1
@@ -3949,6 +3990,59 @@ class FingerprintRollingK4DraftProvider:
         )
         self._council_feedback += 1
 
+    def _apply_recursive_horizon_feedback(
+        self,
+        predictions: tuple[int, ...],
+        token: int,
+        position: int,
+        planned_token: int,
+        greedy_token: int,
+    ) -> None:
+        if len(predictions) != len(self._experts):
+            raise MarkovDraftError("recursive Markov prediction width changed")
+        if not 0 <= position < _MAX_PROPOSAL_POSITIONS:
+            raise MarkovDraftError("recursive Markov position is invalid")
+        observations = [
+            list(row) for row in self._state.horizon_expert_observations
+        ]
+        hits = [list(row) for row in self._state.horizon_expert_hits]
+        for index, prediction in enumerate(predictions):
+            observations[position][index] += 1
+            hits[position][index] += int(prediction == token)
+        lookahead_observations = list(self._state.lookahead_observations)
+        lookahead_hits = list(self._state.lookahead_hits)
+        lookahead_greedy_hits = list(self._state.lookahead_greedy_hits)
+        if planned_token != greedy_token:
+            lookahead_observations[position] += 1
+            lookahead_hits[position] += int(planned_token == token)
+            lookahead_greedy_hits[position] += int(greedy_token == token)
+        dialect = self._active_dialect
+        if dialect is not None:
+            dialect_observations = [
+                list(row) for row in dialect.horizon_observations
+            ]
+            dialect_hits = [list(row) for row in dialect.horizon_hits]
+            for index, prediction in enumerate(predictions):
+                dialect_observations[position][index] += 1
+                dialect_hits[position][index] += int(prediction == token)
+            self._active_dialect = replace(
+                dialect,
+                horizon_observations=tuple(
+                    tuple(row) for row in dialect_observations
+                ),
+                horizon_hits=tuple(tuple(row) for row in dialect_hits),
+            )
+        self._state = replace(
+            self._state,
+            horizon_expert_observations=tuple(
+                tuple(row) for row in observations
+            ),
+            horizon_expert_hits=tuple(tuple(row) for row in hits),
+            lookahead_observations=tuple(lookahead_observations),
+            lookahead_hits=tuple(lookahead_hits),
+            lookahead_greedy_hits=tuple(lookahead_greedy_hits),
+        )
+
     def __call__(self, history: tuple[int, ...], /) -> tuple[int, int, int, int]:
         committed = self._token_tuple(history, label="Markov draft history")
         proposal, _feedback, _confidence, _disagreement = self._predict_council(
@@ -3975,6 +4069,106 @@ class FingerprintRollingK4DraftProvider:
         self._carry_feedback_position = None
         self._carry_feedback_teacher_forced = False
         self._carry_plan = None
+
+    def _arm_recursive_trace(self, position: int) -> None:
+        complete = self._pending_complete
+        feedback = self._pending_feedback
+        plan_trace = self._pending_plan_trace
+        if (
+            not 0 <= position < len(complete)
+            or len(feedback) != len(complete)
+            or len(plan_trace) != len(complete)
+        ):
+            raise MarkovDraftError("recursive Markov trace source is invalid")
+        if position + 1 >= len(complete):
+            return
+        self._recursive_traces.append(
+            _RecursiveMarkovTrace(
+                token_ids=complete,
+                expert_predictions=tuple(
+                    tuple(prediction for _distribution, prediction in row)
+                    for row in feedback
+                ),
+                plan_trace=plan_trace,
+                next_position=position,
+                gate_pending=True,
+            )
+        )
+        self._recursive_trace_created += 1
+        self._recursive_trace_peak_active = max(
+            self._recursive_trace_peak_active,
+            len(self._recursive_traces),
+        )
+
+    def _advance_recursive_traces(self, tokens: Sequence[int], /) -> None:
+        for trace in self._recursive_traces:
+            if (
+                len(trace.token_ids) != len(trace.expert_predictions)
+                or len(trace.token_ids) != len(trace.plan_trace)
+                or not 0 <= trace.next_position < len(trace.token_ids)
+                or any(
+                    len(predictions) != len(self._experts)
+                    for predictions in trace.expert_predictions
+                )
+            ):
+                raise MarkovDraftError("recursive Markov trace is invalid")
+        for token in tokens:
+            surviving: list[_RecursiveMarkovTrace] = []
+            for trace in self._recursive_traces:
+                position = trace.next_position
+                hit = trace.token_ids[position] == token
+                if trace.gate_pending:
+                    if hit and position + 1 < len(trace.token_ids):
+                        surviving.append(
+                            replace(
+                                trace,
+                                next_position=position + 1,
+                                gate_pending=False,
+                            )
+                        )
+                    continue
+                planned_token, greedy_token, _lookahead_gain = (
+                    trace.plan_trace[position]
+                )
+                predictions = trace.expert_predictions[position]
+                self._update_request_position_predictions(
+                    predictions,
+                    token,
+                    position,
+                )
+                self._update_request_lookahead(
+                    planned_token,
+                    greedy_token,
+                    token,
+                    position,
+                )
+                self._recursive_feedback.append(
+                    (
+                        predictions,
+                        token,
+                        position,
+                        planned_token,
+                        greedy_token,
+                    )
+                )
+                self._recursive_trace_feedback_tokens += 1
+                self._recursive_trace_hits += int(hit)
+                self._recursive_trace_misses += int(not hit)
+                self._recursive_trace_max_position = max(
+                    self._recursive_trace_max_position,
+                    position,
+                )
+                if hit and position + 1 < len(trace.token_ids):
+                    surviving.append(
+                        replace(trace, next_position=position + 1)
+                    )
+            self._recursive_traces = surviving
+
+    def _advance_confirmed_tokens(self, tokens: Sequence[int], /) -> None:
+        for index, token in enumerate(tokens):
+            self._advance_recursive_traces((token,))
+            if index == 0 and self._carry_feedback is not None:
+                self._consume_carry_feedback(token)
 
     def _prepare_rolling_proposal(
         self,
@@ -4006,8 +4200,7 @@ class FingerprintRollingK4DraftProvider:
             self._last_confirmed_length = len(committed)
         elif len(committed) != self._last_confirmed_length:
             raise MarkovDraftError("rolling Markov history length is discontinuous")
-        if self._carry_feedback is not None:
-            self._consume_carry_feedback(known_token)
+        self._advance_confirmed_tokens((known_token,))
         base = (*committed, known_token)
         option = self._phrase_option(base)
         use_literal = option is not None and option.kind != "atlas"
@@ -4046,6 +4239,7 @@ class FingerprintRollingK4DraftProvider:
             raise MarkovDraftError("Markov planning trace width is invalid")
         self._pending_base = base
         self._pending_proposal = proposal
+        self._pending_complete = complete
         self._pending_feedback = feedback
         self._pending_plan_trace = self._last_plan_trace
         self._pending_planner = planner
@@ -4484,13 +4678,16 @@ class FingerprintRollingK4DraftProvider:
                     len(delta),
                     len(self._pending_phrase_option.token_ids),
                 )
+        self._advance_recursive_traces(delta)
         self._carry_feedback = self._pending_feedback[len(delta)]
         self._carry_feedback_position = len(delta)
         self._carry_feedback_teacher_forced = False
         self._carry_plan = self._pending_plan_trace[len(delta)]
+        self._arm_recursive_trace(len(delta))
         self._last_confirmed_length = len(committed)
         self._pending_base = None
         self._pending_proposal = None
+        self._pending_complete = ()
         self._pending_feedback = ()
         self._pending_plan_trace = ()
         self._pending_planner = None
@@ -4673,11 +4870,13 @@ class FingerprintRollingK4DraftProvider:
                 verified += 1
                 self._teacher_forced_predictions += 1
                 self._teacher_forced_feedback_tokens += 1
+        self._advance_recursive_traces(delta)
         if prefix_matches:
             self._carry_feedback = self._pending_feedback[len(delta)]
             self._carry_feedback_position = len(delta)
             self._carry_feedback_teacher_forced = False
             self._carry_plan = self._pending_plan_trace[len(delta)]
+            self._arm_recursive_trace(len(delta))
         elif not teacher_failed and len(delta) < _MAX_PROPOSAL_POSITIONS:
             try:
                 teacher_carry, _teacher_token, teacher_plan = (
@@ -4706,6 +4905,7 @@ class FingerprintRollingK4DraftProvider:
         self._last_confirmed_length = len(committed)
         self._pending_base = None
         self._pending_proposal = None
+        self._pending_complete = ()
         self._pending_feedback = ()
         self._pending_plan_trace = ()
         self._pending_planner = None
@@ -4734,6 +4934,7 @@ class FingerprintRollingK4DraftProvider:
             raise MarkovDraftError("no pending Markov proposal to discard")
         self._pending_base = None
         self._pending_proposal = None
+        self._pending_complete = ()
         self._pending_feedback = ()
         self._pending_plan_trace = ()
         self._pending_planner = None
@@ -4768,8 +4969,7 @@ class FingerprintRollingK4DraftProvider:
             previous = len(prompt)
         if len(committed) < previous:
             raise MarkovDraftError("advanced Markov history moved backwards")
-        if self._carry_feedback is not None and len(committed) > previous:
-            self._consume_carry_feedback(committed[previous])
+        self._advance_confirmed_tokens(committed[previous:])
         self._last_confirmed_length = len(committed)
 
     def observe_final(self, history: tuple[int, ...], /) -> None:
@@ -4787,7 +4987,17 @@ class FingerprintRollingK4DraftProvider:
         original_carry_position = self._carry_feedback_position
         original_carry_teacher_forced = self._carry_feedback_teacher_forced
         original_carry_plan = self._carry_plan
+        original_recursive_traces = list(self._recursive_traces)
+        original_recursive_trace_created = self._recursive_trace_created
+        original_recursive_trace_peak_active = self._recursive_trace_peak_active
+        original_recursive_trace_feedback_tokens = (
+            self._recursive_trace_feedback_tokens
+        )
+        original_recursive_trace_hits = self._recursive_trace_hits
+        original_recursive_trace_misses = self._recursive_trace_misses
+        original_recursive_trace_max_position = self._recursive_trace_max_position
         original_feedback = list(self._episode_feedback)
+        original_recursive_feedback = list(self._recursive_feedback)
         original_confirmed_length = self._last_confirmed_length
         original_evictions = self._dialect_evictions
         original_council_feedback = self._council_feedback
@@ -4843,18 +5053,15 @@ class FingerprintRollingK4DraftProvider:
                 and len(committed) < self._last_confirmed_length
             ):
                 raise MarkovDraftError("final Markov history moved backwards")
-            if (
-                self._carry_feedback is not None
-                and self._last_confirmed_length is not None
-                and len(committed) > self._last_confirmed_length
-            ):
-                self._consume_carry_feedback(
-                    committed[self._last_confirmed_length]
+            if self._last_confirmed_length is not None:
+                self._advance_confirmed_tokens(
+                    committed[self._last_confirmed_length :]
                 )
             self._carry_feedback = None
             self._carry_feedback_position = None
             self._carry_feedback_teacher_forced = False
             self._carry_plan = None
+            self._recursive_traces.clear()
             self._request_expert_rapidities = None
             self._request_horizon_observations = None
             self._request_horizon_hits = None
@@ -4880,7 +5087,22 @@ class FingerprintRollingK4DraftProvider:
                     planned_token,
                     greedy_token,
                 )
+            for (
+                predictions,
+                token,
+                position,
+                planned_token,
+                greedy_token,
+            ) in self._recursive_feedback:
+                self._apply_recursive_horizon_feedback(
+                    predictions,
+                    token,
+                    position,
+                    planned_token,
+                    greedy_token,
+                )
             self._episode_feedback.clear()
+            self._recursive_feedback.clear()
             generated = (
                 committed
                 if self._request_prompt_length is None
@@ -4931,7 +5153,19 @@ class FingerprintRollingK4DraftProvider:
             self._carry_feedback_position = original_carry_position
             self._carry_feedback_teacher_forced = original_carry_teacher_forced
             self._carry_plan = original_carry_plan
+            self._recursive_traces = original_recursive_traces
+            self._recursive_trace_created = original_recursive_trace_created
+            self._recursive_trace_peak_active = original_recursive_trace_peak_active
+            self._recursive_trace_feedback_tokens = (
+                original_recursive_trace_feedback_tokens
+            )
+            self._recursive_trace_hits = original_recursive_trace_hits
+            self._recursive_trace_misses = original_recursive_trace_misses
+            self._recursive_trace_max_position = (
+                original_recursive_trace_max_position
+            )
             self._episode_feedback = original_feedback
+            self._recursive_feedback = original_recursive_feedback
             self._last_confirmed_length = original_confirmed_length
             self._dialect_evictions = original_evictions
             self._council_feedback = original_council_feedback
@@ -5218,6 +5452,15 @@ class FingerprintRollingK4DraftProvider:
                 )
             ),
             proposal_width=self.proposal_width,
+            recursive_trace_created=self._recursive_trace_created,
+            recursive_trace_active=len(self._recursive_traces),
+            recursive_trace_peak_active=self._recursive_trace_peak_active,
+            recursive_trace_feedback_tokens=(
+                self._recursive_trace_feedback_tokens
+            ),
+            recursive_trace_hits=self._recursive_trace_hits,
+            recursive_trace_misses=self._recursive_trace_misses,
+            recursive_trace_max_position=self._recursive_trace_max_position,
         )
 
     def close(self) -> None:
@@ -5225,6 +5468,7 @@ class FingerprintRollingK4DraftProvider:
             return
         self._pending_base = None
         self._pending_proposal = None
+        self._pending_complete = ()
         self._pending_feedback = ()
         self._pending_plan_trace = ()
         self._pending_planner = None
@@ -5235,6 +5479,7 @@ class FingerprintRollingK4DraftProvider:
         self._carry_feedback_position = None
         self._carry_feedback_teacher_forced = False
         self._carry_plan = None
+        self._recursive_traces.clear()
         self._pending_phrase_option = None
         self._pending_composition_program = None
         self._pending_import_digest = None
@@ -5251,6 +5496,7 @@ class FingerprintRollingK4DraftProvider:
         self._request_local_cache_history = None
         self._request_local_cache = None
         self._episode_feedback.clear()
+        self._recursive_feedback.clear()
         try:
             self._persist_if_dirty()
         finally:
