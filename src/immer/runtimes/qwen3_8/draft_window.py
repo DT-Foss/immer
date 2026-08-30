@@ -34,7 +34,7 @@ DRAFT_WINDOW_STATE_SCHEMA = "immer.qwen3.8-draft-window-state/v2"
 V1_DRAFT_WINDOW_STATE_SCHEMA = "immer.qwen3.8-draft-window-state/v1"
 LEGACY_DRAFT_WINDOW_STATE_SCHEMA = "immer.qwen3.8-draft-window-state/v0"
 DRAFT_WINDOW_SELECTION_SCHEMA = "immer.qwen3.8-draft-window-selection/v2"
-DRAFT_WINDOW_FEEDBACK_SCHEMA = "immer.qwen3.8-draft-window-feedback/v2"
+DRAFT_WINDOW_FEEDBACK_SCHEMA = "immer.qwen3.8-draft-window-feedback/v3"
 DRAFT_WINDOW_NESTED_HORIZON_SCHEMA = (
     "immer.qwen3.8-draft-window-nested-horizon/v1"
 )
@@ -1080,6 +1080,10 @@ class DraftWindowFeedback:
     phrase_confidence: float | None = None
     phrase_support: int = 0
     phrase_width: int = 0
+    page_actions: int = 0
+    page_actions_saved: int = 0
+    o1_priority: float = 0.0
+    runtime_reward: float | None = None
 
     def __post_init__(self) -> None:
         if self.proposed_window not in DRAFT_WINDOW_ACTIONS:
@@ -1125,6 +1129,16 @@ class DraftWindowFeedback:
             )
         _uint(self.phrase_support, field="phrase_support")
         _uint(self.phrase_width, field="phrase_width")
+        _uint(self.page_actions, field="page_actions")
+        _uint(self.page_actions_saved, field="page_actions_saved")
+        _finite(self.o1_priority, field="o1_priority", lower=0.0, upper=1.0e12)
+        if self.runtime_reward is not None:
+            _finite(
+                self.runtime_reward,
+                field="runtime_reward",
+                lower=-16.0,
+                upper=16.0,
+            )
         if self.phrase_width > 15:
             raise ValueError("phrase_width exceeds the Markov option bound")
         if self.phrase_width == 0 and self.phrase_support:
@@ -1151,6 +1165,8 @@ class DraftWindowFeedback:
     def reward(self) -> float:
         """Useful confirmed tokens per total work, with terminal penalties."""
 
+        if self.runtime_reward is not None:
+            return self.runtime_reward
         if self.outcome == "ok" and self.accepted_draft_tokens > 0:
             efficiency = self.accepted_draft_tokens / self.total_work
             coverage = self.accepted_draft_tokens / max(1, self.emitted_tokens)
@@ -1179,6 +1195,10 @@ class DraftWindowFeedback:
             "phrase_confidence": self.phrase_confidence,
             "phrase_support": self.phrase_support,
             "phrase_width": self.phrase_width,
+            "page_actions": self.page_actions,
+            "page_actions_saved": self.page_actions_saved,
+            "o1_priority": self.o1_priority,
+            "runtime_reward": self.runtime_reward,
             "nested_horizons": [row.to_dict() for row in self.nested_horizons],
             "proposed_window": self.proposed_window,
             "reward": self.reward,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import hashlib
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -458,6 +459,69 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         chat.close()
 
+    def test_draft_window_identity_binds_page_route_width_and_joint_policy(
+        self,
+    ) -> None:
+        def configured(
+            *,
+            page_state: str | None = None,
+            route_width: int = 192,
+        ) -> Qwen38CausalChat:
+            chat = _chat(
+                _Runtime(),
+                draft_mode="markov",
+                q4_root=None if page_state is None else "/models/q4",
+                mlp_page_state_path=page_state,
+                mlp_page_route_width=route_width,
+            )
+            chat._bundle_receipt = _BUNDLE_RECEIPT
+            chat._tokenizer_sha256 = _DIGEST
+            return chat
+
+        disabled = configured()
+        width160 = configured(page_state="/state/pages-160.json", route_width=160)
+        width192 = configured(page_state="/state/pages-192.json", route_width=192)
+        disabled_identity = disabled._draft_window_runtime_identity()
+        width160_identity = width160._draft_window_runtime_identity()
+        width192_identity = width192._draft_window_runtime_identity()
+
+        self.assertNotEqual(disabled_identity, width192_identity)
+        self.assertNotEqual(width160_identity, width192_identity)
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.DRAFT_WINDOW_FEEDBACK_SCHEMA",
+            "immer.qwen3.8-draft-window-feedback/v999",
+        ):
+            changed_joint_policy = width192._draft_window_runtime_identity()
+        self.assertNotEqual(changed_joint_policy, width192_identity)
+
+        with patch(
+            "immer.runtimes.qwen3_8.adapter._digest",
+            side_effect=lambda value: value,
+        ):
+            record = width192._draft_window_runtime_identity()
+        joint = record["provider"]["joint_runtime_reward"]
+        self.assertEqual(
+            joint,
+            {
+                "draft_feedback_schema": (
+                    "immer.qwen3.8-draft-window-feedback/v3"
+                ),
+                "mlp_page_enabled": True,
+                "mlp_page_policy": (
+                    "dynamic-page-transitions+coactivation+adaptive-width+"
+                    "terminal-reward+fixed-share/v6"
+                ),
+                "mlp_page_schema": "immer.qwen3.8-mlp-page-markov/v6",
+                "o1_enabled": False,
+                "policy": "o1+draft+page-savings-target-work/v1",
+                "route_width": 192,
+                "schema": "immer.qwen3.8-joint-runtime-reward/v1",
+            },
+        )
+        disabled.close()
+        width160.close()
+        width192.close()
+
     def test_template_anchor_stops_before_user_specific_tokens(self) -> None:
         class Tokenizer:
             @staticmethod
@@ -658,13 +722,16 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     "adaptive_width_predictions": 2 if before else 5,
                     "energy_coverage": 0.995,
                     "energy_feedback_rows": 7 if before else 11,
+                    "last_runtime_reward": 0.0 if before else 2.5,
                     "last_width_mean": 192.0 if before else 128.0,
                     "last_width_min": 192 if before else 96,
                     "policy": (
                         "dynamic-page-transitions+coactivation+"
-                        "adaptive-width+fixed-share/v5"
+                        "adaptive-width+terminal-reward+fixed-share/v6"
                     ),
-                    "schema": "immer.qwen3.8-mlp-page-markov/v5",
+                    "schema": "immer.qwen3.8-mlp-page-markov/v6",
+                    "runtime_reward_mean": 0.0 if before else 2.5,
+                    "runtime_reward_receipts": 0 if before else 1,
                     "width_actions": (96, 128, 160, 192),
                     "width_agent_weights": {
                         "temporal": 0.5,
@@ -693,17 +760,21 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(route["request"]["adaptive_width_pages_saved"], 96)
         self.assertEqual(route["request"]["adaptive_width_predictions"], 3)
         self.assertEqual(route["request"]["energy_feedback_rows"], 4)
+        self.assertEqual(route["request"]["runtime_reward_receipts"], 1)
         self.assertEqual(
             route["runtime"],
             {
                 "energy_coverage": 0.995,
+                "last_runtime_reward": 2.5,
                 "last_width_mean": 128.0,
                 "last_width_min": 96,
                 "policy": (
                     "dynamic-page-transitions+coactivation+"
-                    "adaptive-width+fixed-share/v5"
+                    "adaptive-width+terminal-reward+fixed-share/v6"
                 ),
-                "schema": "immer.qwen3.8-mlp-page-markov/v5",
+                "schema": "immer.qwen3.8-mlp-page-markov/v6",
+                "runtime_reward_mean": 2.5,
+                "runtime_reward_receipts": 1,
                 "width_actions": (96, 128, 160, 192),
                 "width_agent_weights": {
                     "temporal": 0.5,
@@ -717,6 +788,336 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         self.assertEqual(router.metric_calls, 2)
         chat.close()
+
+    def test_joint_runtime_reward_begins_settles_and_exposes_o1_evidence(
+        self,
+    ) -> None:
+        runtime = _Runtime()
+
+        class Q4Metrics:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def metrics(self):
+                selected = 20 if self.calls == 0 else 68
+                self.calls += 1
+                return {"page_mlp_selected_pages": selected}
+
+        class PageRouter:
+            page_count = 272
+            route_width = 192
+
+            def __init__(self) -> None:
+                self.events = []
+                self.metric_calls = 0
+
+            def begin_runtime_reward(self) -> None:
+                self.events.append(("begin",))
+
+            def flush(self) -> None:
+                self.events.append(("flush",))
+
+            def metrics(self):
+                saved = 10 if self.metric_calls == 0 else 42
+                self.metric_calls += 1
+                return {
+                    "adaptive_width_pages_saved": saved,
+                    "last_runtime_reward": 0.0,
+                    "runtime_reward_mean": 0.0,
+                    "runtime_reward_receipts": 0,
+                    "runtime_reward_updates": 0,
+                }
+
+            def settle_runtime_reward(self, receipt: str, reward: float):
+                self.events.append(("settle", receipt, reward))
+                return {
+                    "last_runtime_reward": reward,
+                    "runtime_reward_mean": reward,
+                    "runtime_reward_receipts": 1,
+                    "runtime_reward_updates": 1,
+                }
+
+        class Retention:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def metrics(self):
+                self.calls += 1
+                if not runtime.model.calls:
+                    return {"sequence": 7}
+                return {
+                    "last_score": {"priority": 9.0},
+                    "sequence": 8,
+                }
+
+        q4 = Q4Metrics()
+        router = PageRouter()
+        runtime.model.pager.q4_bank = q4
+        runtime.mlp_page_router = router
+        chat = _chat(runtime)
+        self.assertIs(chat._load_locked(), runtime)
+        retention = Retention()
+        chat._markov_o1_retention = retention
+
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        expected = (
+            3.0 * (32 / (48 + 32))
+            + math.tanh(math.log1p(9.0) / 4.0)
+            - math.log1p(3) / 2.0
+        )
+        reward = result.evidence["runtime_reward"]
+        self.assertEqual(reward["schema"], "immer.qwen3.8-joint-runtime-reward/v1")
+        self.assertEqual(reward["accepted_draft_tokens"], 0)
+        self.assertEqual(reward["page_actions"], 48)
+        self.assertEqual(reward["page_actions_saved"], 32)
+        self.assertEqual(reward["o1_priority"], 9.0)
+        self.assertAlmostEqual(reward["reward"], expected)
+        self.assertEqual(reward["router_updates"], 1)
+        self.assertTrue(reward["settled"])
+        self.assertEqual(len(reward["receipt_sha256"]), 64)
+        page_runtime = result.evidence["mlp_page_route"]["runtime"]
+        self.assertAlmostEqual(page_runtime["last_runtime_reward"], expected)
+        self.assertAlmostEqual(page_runtime["runtime_reward_mean"], expected)
+        self.assertEqual(page_runtime["runtime_reward_receipts"], 1)
+        self.assertEqual(router.events[0], ("begin",))
+        self.assertEqual(router.events[1], ("flush",))
+        self.assertEqual(router.events[2][0], "settle")
+        self.assertEqual(router.events[2][1], reward["receipt_sha256"])
+        self.assertAlmostEqual(router.events[2][2], expected)
+        self.assertEqual(q4.calls, 2)
+        self.assertGreaterEqual(retention.calls, 3)
+        chat.close()
+
+    def test_failed_generation_aborts_the_open_page_reward_trace(self) -> None:
+        runtime = _Runtime(model=_Model(generation_error=RuntimeError("boom")))
+
+        class PageRouter:
+            page_count = 272
+            route_width = 192
+
+            def __init__(self) -> None:
+                self.events = []
+
+            def abort_runtime_reward(self) -> None:
+                self.events.append("abort")
+
+            def begin_runtime_reward(self) -> None:
+                self.events.append("begin")
+
+            @staticmethod
+            def metrics():
+                return {"adaptive_width_pages_saved": 0}
+
+        router = PageRouter()
+        runtime.mlp_page_router = router
+        chat = _chat(runtime)
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertEqual(router.events, ["begin", "abort"])
+        self.assertNotIn("runtime_reward", result.evidence)
+        chat.close()
+
+    def test_page_reward_settlement_failure_is_retried_before_next_begin(
+        self,
+    ) -> None:
+        runtime = _Runtime()
+
+        class PageRouter:
+            page_count = 272
+            route_width = 192
+
+            def __init__(self) -> None:
+                self.active = False
+                self.events = []
+                self.last_reward = 0.0
+                self.receipts = []
+                self.reward_sum = 0.0
+                self.settle_calls = 0
+                self.updates = 0
+
+            def abort_runtime_reward(self) -> None:
+                self.events.append(("abort",))
+                self.active = False
+
+            def begin_runtime_reward(self) -> None:
+                if self.active:
+                    raise AssertionError("begin preceded pending retry")
+                self.events.append(("begin",))
+                self.active = True
+
+            @staticmethod
+            def flush() -> None:
+                pass
+
+            def metrics(self):
+                return {
+                    "adaptive_width_pages_saved": 0,
+                    "last_runtime_reward": self.last_reward,
+                    "runtime_reward_mean": (
+                        0.0 if not self.updates else self.reward_sum / self.updates
+                    ),
+                    "runtime_reward_receipts": len(self.receipts),
+                    "runtime_reward_updates": self.updates,
+                }
+
+            def settle_runtime_reward(self, receipt: str, reward: float):
+                self.settle_calls += 1
+                if self.settle_calls <= 2:
+                    self.events.append(("settle-failed", receipt, reward))
+                    raise OSError("disk full")
+                phase = "retry" if self.settle_calls == 3 else "settle"
+                self.events.append((phase, receipt, reward))
+                self.active = False
+                self.receipts.append(receipt)
+                self.last_reward = reward
+                self.reward_sum += reward
+                self.updates += 1
+                return self.metrics()
+
+        router = PageRouter()
+        runtime.mlp_page_router = router
+        chat = _chat(runtime)
+
+        first = chat.handle(Request("chat", "first"))
+
+        self.assertIs(first.status, ExecutionStatus.ERROR)
+        self.assertEqual(first.reason, "Qwen3.8 runtime reward settlement failed")
+        first_reward = first.evidence["runtime_reward"]
+        self.assertEqual(
+            first_reward["settlement"]["status"],
+            "retryable-error",
+        )
+        self.assertEqual(router.events[0], ("begin",))
+        self.assertEqual(router.events[1][0], "settle-failed")
+        self.assertNotIn(("abort",), router.events)
+        self.assertTrue(router.active)
+        self.assertEqual(
+            chat._pending_page_runtime_reward,
+            {
+                "receipt_sha256": first_reward["receipt_sha256"],
+                "reward": first_reward["reward"],
+            },
+        )
+
+        runtime.model.generated = (9,)
+        second = chat.handle(Request("chat", "second"))
+
+        self.assertIs(second.status, ExecutionStatus.ERROR)
+        self.assertEqual(router.events[2][0], "settle-failed")
+        self.assertEqual(router.events[2][1], first_reward["receipt_sha256"])
+        self.assertNotIn(("abort",), router.events)
+        self.assertTrue(router.active)
+        self.assertEqual(
+            chat._pending_page_runtime_reward["receipt_sha256"],
+            first_reward["receipt_sha256"],
+        )
+
+        runtime.model.generated = (10,)
+        third = chat.handle(Request("chat", "third"))
+
+        self.assertTrue(third.ok, third.reason)
+        self.assertEqual(router.events[3][0], "retry")
+        self.assertEqual(router.events[3][1], first_reward["receipt_sha256"])
+        self.assertEqual(router.events[4], ("begin",))
+        self.assertEqual(router.events[5][0], "settle")
+        self.assertNotEqual(router.events[5][1], first_reward["receipt_sha256"])
+        self.assertNotIn(("abort",), router.events)
+        self.assertFalse(router.active)
+        self.assertIsNone(chat._pending_page_runtime_reward)
+        self.assertTrue(third.evidence["runtime_reward"]["settled"])
+        self.assertEqual(third.evidence["runtime_reward"]["router_updates"], 2)
+        chat.close()
+
+    def test_reward_retry_is_discarded_when_secondary_reset_retires_owner(
+        self,
+    ) -> None:
+        runtime = _Runtime(model=_Model(cleanup_error=RuntimeError("reset failed")))
+
+        class PageRouter:
+            page_count = 272
+            route_width = 192
+
+            def __init__(self) -> None:
+                self.events = []
+
+            def abort_runtime_reward(self) -> None:
+                self.events.append("abort")
+
+            def begin_runtime_reward(self) -> None:
+                self.events.append("begin")
+
+            @staticmethod
+            def flush() -> None:
+                pass
+
+            @staticmethod
+            def metrics():
+                return {"adaptive_width_pages_saved": 0}
+
+            def settle_runtime_reward(self, _receipt: str, _reward: float):
+                self.events.append("settle-failed")
+                raise OSError("disk full")
+
+        router = PageRouter()
+        runtime.mlp_page_router = router
+        chat = _chat(runtime)
+        result = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                metadata={QWEN38_CHAT_SESSION_METADATA: "conversation:reward"},
+            )
+        )
+
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertEqual(result.reason, "Qwen3.8 state cleanup failed")
+        self.assertEqual(router.events, ["begin", "settle-failed", "abort"])
+        self.assertIsNone(chat._pending_page_runtime_reward)
+        self.assertIsNone(chat._runtime)
+        chat.close()
+
+    def test_close_aborts_pending_reward_before_owner_shutdown(self) -> None:
+        runtime = _Runtime()
+
+        class PageRouter:
+            page_count = 272
+            route_width = 192
+
+            def __init__(self) -> None:
+                self.events = []
+
+            def abort_runtime_reward(self) -> None:
+                self.events.append("abort")
+
+            def begin_runtime_reward(self) -> None:
+                self.events.append("begin")
+
+            @staticmethod
+            def flush() -> None:
+                pass
+
+            @staticmethod
+            def metrics():
+                return {"adaptive_width_pages_saved": 0}
+
+            def settle_runtime_reward(self, _receipt: str, _reward: float):
+                self.events.append("settle-failed")
+                raise OSError("disk full")
+
+        router = PageRouter()
+        runtime.mlp_page_router = router
+        chat = _chat(runtime)
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertIsNotNone(chat._pending_page_runtime_reward)
+        chat.close()
+        self.assertEqual(router.events, ["begin", "settle-failed", "abort"])
+        self.assertIsNone(chat._pending_page_runtime_reward)
+        self.assertTrue(chat.closed)
 
     def test_exact_head_non_cpu_configuration_is_lazy_nonapplicable(self) -> None:
         component = Qwen38CausalChat(
@@ -2840,6 +3241,12 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         "last_width_min": 96,
                     },
                 },
+                "runtime_reward": {
+                    "accepted_draft_tokens": 5,
+                    "o1_priority": 9.0,
+                    "page_actions_saved": 128,
+                    "reward": 2.345,
+                },
                 "draft": {
                     "accepted_draft_tokens": 5,
                     "provider": {
@@ -2906,6 +3313,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "MLP pages 64 dynamic routes, 7 changed, 12 exact rows learned, "
                 "24 coactive edges, 128 pages skipped, 12 energy labels, "
                 "width 96-128.5 · "
+                "joint reward 2.35 (draft 5, pages 128, O1 9.00) · "
                 "5 accepted draft tokens · "
                 "Hybrid 2 provider tournaments Markov1/MTP1, "
                 "6 provider counterfactual labels · "

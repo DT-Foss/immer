@@ -37,6 +37,7 @@ from .config import (
 from .encoding import END_OF_TEXT_TOKEN_ID, IM_END_TOKEN_ID, Qwen38Tokenizer
 from .draft_window import (
     DRAFT_WINDOW_ACTIONS,
+    DRAFT_WINDOW_FEEDBACK_SCHEMA,
     DraftWindowController,
     DraftWindowFeedback,
     DraftWindowNestedHorizon,
@@ -57,7 +58,11 @@ from .markov_draft import (
     FingerprintRollingK4DraftProvider,
 )
 from .markov_atlas import MarkovTokenAtlas
-from .mlp_page_markov import MlpPageMarkov
+from .mlp_page_markov import (
+    MLP_PAGE_MARKOV_POLICY,
+    MLP_PAGE_MARKOV_SCHEMA,
+    MlpPageMarkov,
+)
 from .mtp_draft import (
     MTP_MATRIX_NAMES,
     QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
@@ -463,6 +468,34 @@ def _runtime_q4_metrics(runtime: object) -> dict[str, Any]:
     except Exception:
         return {}
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _joint_runtime_reward(
+    *,
+    accepted_draft_tokens: int,
+    generated_tokens: int,
+    selected_pages: int,
+    saved_pages: int,
+    target_forwards: int,
+    o1_priority: float,
+    successful: bool,
+) -> float:
+    page_efficiency = saved_pages / max(1, selected_pages + saved_pages)
+    draft_efficiency = accepted_draft_tokens / max(1, generated_tokens)
+    semantic_value = math.tanh(math.log1p(max(0.0, o1_priority)) / 4.0)
+    work_penalty = min(2.0, math.log1p(max(0, target_forwards)) / 2.0)
+    if not successful:
+        return -8.0 - work_penalty
+    return max(
+        -16.0,
+        min(
+            16.0,
+            3.0 * page_efficiency
+            + 2.0 * draft_efficiency
+            + semantic_value
+            - work_penalty,
+        ),
+    )
 
 
 def _linux_process_read_bytes() -> int | None:
@@ -1534,6 +1567,8 @@ class Qwen38CausalChat:
         self._draft_window_selection: DraftWindowSelection | None = None
         self._draft_window_policy_metrics: dict[str, Any] | None = None
         self._pending_draft_window_feedback: dict[str, Any] | None = None
+        self._pending_page_runtime_reward: dict[str, Any] | None = None
+        self._page_reward_retry_failed = False
         self._bundle_receipt: dict[str, Any] | None = None
         self._tokenizer_sha256: str | None = None
         self._markov_atlas: MarkovTokenAtlas | None = None
@@ -1833,6 +1868,18 @@ class Qwen38CausalChat:
             receipt = None if runtime is None else getattr(runtime, "q4_receipt", None)
             if receipt is not None:
                 policy["q4"]["manifest_sha256"] = receipt["manifest_sha256"]
+        if self._mlp_page_state_path is not None:
+            route_width = self._mlp_page_route_width
+            policy["mlp_page_route"] = {
+                "energy_coverage": MlpPageMarkov.ENERGY_COVERAGE.hex(),
+                "policy": MLP_PAGE_MARKOV_POLICY,
+                "route_width": route_width,
+                "schema": MLP_PAGE_MARKOV_SCHEMA,
+                "terminal_reward": "o1+draft+page-savings-target-work/v1",
+                "width_actions": list(
+                    MlpPageMarkov.width_actions_for(route_width)
+                ),
+            }
         return _digest(policy)
 
     def _draft_window_runtime_identity(self) -> str:
@@ -1932,6 +1979,28 @@ class Qwen38CausalChat:
                 "ppm_working_set": MARKOV_RICCI_WORKING_SET_POLICY,
                 "state_path": str(self._markov_o1_retention_path),
             }
+        provider["joint_runtime_reward"] = {
+            "draft_feedback_schema": DRAFT_WINDOW_FEEDBACK_SCHEMA,
+            "mlp_page_enabled": self._mlp_page_state_path is not None,
+            "mlp_page_policy": (
+                None
+                if self._mlp_page_state_path is None
+                else MLP_PAGE_MARKOV_POLICY
+            ),
+            "mlp_page_schema": (
+                None
+                if self._mlp_page_state_path is None
+                else MLP_PAGE_MARKOV_SCHEMA
+            ),
+            "o1_enabled": self._markov_o1_retention_path is not None,
+            "policy": "o1+draft+page-savings-target-work/v1",
+            "route_width": (
+                None
+                if self._mlp_page_state_path is None
+                else self._mlp_page_route_width
+            ),
+            "schema": "immer.qwen3.8-joint-runtime-reward/v1",
+        }
         return _digest(
             {
                 "provider": provider,
@@ -3184,9 +3253,43 @@ class Qwen38CausalChat:
 
         q4_before = _runtime_q4_metrics(runtime)
         mlp_page_router = getattr(runtime, "mlp_page_router", None)
+        pending_page_reward = self._pending_page_runtime_reward
+        if pending_page_reward is not None:
+            retry_settle = getattr(
+                mlp_page_router,
+                "settle_runtime_reward",
+                None,
+            )
+            if not callable(retry_settle):
+                raise Qwen38ChatError(
+                    "pending page runtime reward lost its settlement controller"
+                )
+            try:
+                retry_settle(
+                    str(pending_page_reward["receipt_sha256"]),
+                    float(pending_page_reward["reward"]),
+                )
+            except Exception:
+                self._page_reward_retry_failed = True
+                raise
+            self._pending_page_runtime_reward = None
+            self._page_reward_retry_failed = False
         mlp_page_before = (
             None if mlp_page_router is None else mlp_page_router.metrics()
         )
+        page_reward_begin = getattr(
+            mlp_page_router,
+            "begin_runtime_reward",
+            None,
+        )
+        if callable(page_reward_begin):
+            page_reward_begin()
+        retention_before_sequence = 0
+        if self._markov_o1_retention is not None:
+            retention_before = self._markov_o1_retention.metrics()
+            sequence = retention_before.get("sequence", 0)
+            if isinstance(sequence, int) and not isinstance(sequence, bool):
+                retention_before_sequence = sequence
         physical_read_before = _linux_process_read_bytes()
         request_started = time.perf_counter()
         raw_generated, raw_evidence = self._generate_locked(
@@ -3266,6 +3369,7 @@ class Qwen38CausalChat:
                 "process_peak_rss_bytes": _process_peak_rss_bytes(),
             },
         }
+        q4_request: dict[str, int] = {}
         if q4_after:
             fields = (
                 "candidate_rows",
@@ -3317,8 +3421,9 @@ class Qwen38CausalChat:
                 **dict(evidence.get("q4", {})),
                 "request": q4_request,
             }
+        mlp_page_request: dict[str, int] = {}
         if mlp_page_before is not None and mlp_page_after is not None:
-            counters = {
+            mlp_page_request = {
                 key: int(value) - int(mlp_page_before.get(key, 0))
                 for key, value in mlp_page_after.items()
                 if isinstance(value, int)
@@ -3329,7 +3434,7 @@ class Qwen38CausalChat:
             evidence["mlp_page_route"] = {
                 "page_count": int(getattr(mlp_page_router, "page_count")),
                 "persistence_error": mlp_page_persistence_error,
-                "request": counters,
+                "request": mlp_page_request,
                 "route_width": int(getattr(mlp_page_router, "route_width")),
                 "runtime": {
                     key: mlp_page_after[key]
@@ -3337,7 +3442,10 @@ class Qwen38CausalChat:
                         "energy_coverage",
                         "last_width_mean",
                         "last_width_min",
+                        "last_runtime_reward",
                         "policy",
+                        "runtime_reward_mean",
+                        "runtime_reward_receipts",
                         "schema",
                         "width_actions",
                         "width_agent_weights",
@@ -3364,6 +3472,86 @@ class Qwen38CausalChat:
             evidence["exact_head"] = {
                 **dict(evidence["exact_head"]),
                 "request": dict(self._last_exact_head_evidence),
+            }
+        settle_page_reward = getattr(
+            mlp_page_router,
+            "settle_runtime_reward",
+            None,
+        )
+        if callable(settle_page_reward):
+            retention_sequence = retention_before_sequence
+            o1_priority = 0.0
+            if self._markov_o1_retention is not None:
+                retention_after = self._markov_o1_retention.metrics()
+                sequence = retention_after.get("sequence", retention_sequence)
+                if isinstance(sequence, int) and not isinstance(sequence, bool):
+                    retention_sequence = sequence
+                last_score = retention_after.get("last_score")
+                if (
+                    retention_sequence > retention_before_sequence
+                    and isinstance(last_score, Mapping)
+                    and isinstance(last_score.get("priority"), (int, float))
+                    and not isinstance(last_score.get("priority"), bool)
+                ):
+                    o1_priority = float(last_score["priority"])
+            accepted = (
+                0
+                if self._last_draft_evidence is None
+                else int(self._last_draft_evidence["accepted_draft_tokens"])
+            )
+            runtime_reward = _joint_runtime_reward(
+                accepted_draft_tokens=accepted,
+                generated_tokens=len(generated_ids),
+                selected_pages=q4_request.get("page_mlp_selected_pages", 0),
+                saved_pages=mlp_page_request.get(
+                    "adaptive_width_pages_saved",
+                    0,
+                ),
+                target_forwards=int(receipt["forward_passes"]),
+                o1_priority=o1_priority,
+                successful=bool(output),
+            )
+            if self._pending_draft_window_feedback is not None:
+                self._pending_draft_window_feedback.update(
+                    {
+                        "o1_priority": o1_priority,
+                        "page_actions": q4_request.get(
+                            "page_mlp_selected_pages",
+                            0,
+                        ),
+                        "page_actions_saved": mlp_page_request.get(
+                            "adaptive_width_pages_saved",
+                            0,
+                        ),
+                        "runtime_reward": runtime_reward,
+                    }
+                )
+            reward_receipt = _digest(
+                {
+                    "generation": receipt,
+                    "mlp_page_request": mlp_page_request,
+                    "o1_sequence": retention_sequence,
+                    "output_sha256": evidence["output_sha256"],
+                    "reward": runtime_reward.hex(),
+                    "schema": "immer.qwen3.8-joint-runtime-reward/v1",
+                }
+            )
+            self._pending_page_runtime_reward = {
+                "receipt_sha256": reward_receipt,
+                "reward": runtime_reward,
+            }
+            evidence["runtime_reward"] = {
+                "accepted_draft_tokens": accepted,
+                "o1_priority": o1_priority,
+                "page_actions": q4_request.get("page_mlp_selected_pages", 0),
+                "page_actions_saved": mlp_page_request.get(
+                    "adaptive_width_pages_saved",
+                    0,
+                ),
+                "receipt_sha256": reward_receipt,
+                "reward": runtime_reward,
+                "router_updates": None,
+                "schema": "immer.qwen3.8-joint-runtime-reward/v1",
             }
         result_cell_binding = self._result_cell_binding_receipt(
             question=text,
@@ -3461,6 +3649,7 @@ class Qwen38CausalChat:
         result: Result,
         *,
         failure_outcome: str | None = None,
+        invalidate_runtime_reward: bool = False,
     ) -> Result:
         selection = self._draft_window_selection
         controller = self._draft_window_controller
@@ -3490,6 +3679,11 @@ class Qwen38CausalChat:
         record["request_status"] = result.status.value
         if failure_outcome is not None:
             record["post_generation_outcome"] = failure_outcome
+            outcome = failure_outcome
+            feedback_values["runtime_reward"] = None
+        elif invalidate_runtime_reward:
+            outcome = "error" if failure_outcome is None else failure_outcome
+            feedback_values["runtime_reward"] = None
         try:
             feedback = DraftWindowFeedback(**feedback_values, outcome=outcome)
             metrics = controller.settle(selection, feedback)
@@ -3530,6 +3724,96 @@ class Qwen38CausalChat:
             evidence=evidence,
         )
 
+    def _finalize_page_runtime_reward_result(
+        self,
+        result: Result,
+        *,
+        failure_outcome: str | None = None,
+    ) -> Result:
+        pending = self._pending_page_runtime_reward
+        if pending is None:
+            return result
+        runtime = self._runtime
+        page_router = None if runtime is None else getattr(
+            runtime,
+            "mlp_page_router",
+            None,
+        )
+        if failure_outcome is not None:
+            if self._page_reward_retry_failed:
+                return result
+            abort = getattr(page_router, "abort_runtime_reward", None)
+            if callable(abort):
+                abort()
+            self._pending_page_runtime_reward = None
+            self._page_reward_retry_failed = False
+            return result
+        if not result.ok:
+            return result
+        settle = getattr(page_router, "settle_runtime_reward", None)
+        if not callable(settle):
+            return Result(
+                ExecutionStatus.ERROR,
+                self.name,
+                reason="Qwen3.8 runtime reward lost its page controller",
+                evidence=dict(result.evidence),
+            )
+        try:
+            metrics = settle(
+                str(pending["receipt_sha256"]),
+                float(pending["reward"]),
+            )
+        except Exception as exc:
+            evidence = dict(result.evidence)
+            reward = evidence.get("runtime_reward")
+            if isinstance(reward, Mapping):
+                evidence["runtime_reward"] = {
+                    **dict(reward),
+                    "settlement": {
+                        "detail": f"{type(exc).__name__}: {exc}",
+                        "status": "retryable-error",
+                    },
+                }
+            return Result(
+                ExecutionStatus.ERROR,
+                self.name,
+                reason="Qwen3.8 runtime reward settlement failed",
+                evidence=evidence,
+            )
+        if not isinstance(metrics, Mapping):
+            raise Qwen38ChatError("page runtime reward returned invalid metrics")
+        self._pending_page_runtime_reward = None
+        self._page_reward_retry_failed = False
+        evidence = dict(result.evidence)
+        reward = evidence.get("runtime_reward")
+        if isinstance(reward, Mapping):
+            evidence["runtime_reward"] = {
+                **dict(reward),
+                "router_updates": metrics.get("runtime_reward_updates"),
+                "settled": True,
+            }
+        page = evidence.get("mlp_page_route")
+        if isinstance(page, Mapping):
+            runtime_metrics = dict(page.get("runtime", {}))
+            for key in (
+                "last_runtime_reward",
+                "runtime_reward_mean",
+                "runtime_reward_receipts",
+            ):
+                if key in metrics:
+                    runtime_metrics[key] = metrics[key]
+            evidence["mlp_page_route"] = {
+                **dict(page),
+                "runtime": runtime_metrics,
+            }
+        return Result(
+            result.status,
+            result.component,
+            output=result.output,
+            reason=result.reason,
+            evidence=evidence,
+        )
+
     def handle(self, request: Request) -> Result:
         if request.capability not in self.capabilities:
             return Result(
@@ -3557,6 +3841,7 @@ class Qwen38CausalChat:
             self._draft_window_selection = None
             self._draft_window_policy_metrics = None
             self._pending_draft_window_feedback = None
+            self._page_reward_retry_failed = False
             if self._closed:
                 return Result(
                     ExecutionStatus.UNAVAILABLE,
@@ -3576,6 +3861,15 @@ class Qwen38CausalChat:
 
             failure_outcome: str | None = None
             abort: BaseException | None = None
+
+            def abort_page_reward() -> None:
+                if self._pending_page_runtime_reward is not None:
+                    return
+                page_router = getattr(runtime, "mlp_page_router", None)
+                callback = getattr(page_router, "abort_runtime_reward", None)
+                if callable(callback):
+                    callback()
+
             try:
                 result = self._execute_locked(
                     runtime,
@@ -3584,6 +3878,7 @@ class Qwen38CausalChat:
                     session_id=session_id,
                 )
             except _RequestRejected as exc:
+                abort_page_reward()
                 result = Result(
                     ExecutionStatus.REJECTED,
                     self.name,
@@ -3591,6 +3886,7 @@ class Qwen38CausalChat:
                     evidence=self._base_evidence(),
                 )
             except Exception as exc:
+                abort_page_reward()
                 failure_outcome = (
                     "timeout" if isinstance(exc, TimeoutError) else "error"
                 )
@@ -3601,6 +3897,7 @@ class Qwen38CausalChat:
                     evidence=self._base_evidence(),
                 )
             except BaseException as exc:
+                abort_page_reward()
                 abort = exc
                 failure_outcome = "aborted"
                 result = Result(
@@ -3620,6 +3917,16 @@ class Qwen38CausalChat:
                     self._clear_conversation_binding()
                     runtime.model.reset_state(release=True)
             except Exception as exc:
+                page_router = getattr(runtime, "mlp_page_router", None)
+                abort_reward = getattr(
+                    page_router,
+                    "abort_runtime_reward",
+                    None,
+                )
+                if callable(abort_reward):
+                    abort_reward()
+                self._pending_page_runtime_reward = None
+                self._page_reward_retry_failed = False
                 cleanup = self._retire_runtime_locked(exc)
                 failed = Result(
                     ExecutionStatus.ERROR,
@@ -3633,6 +3940,13 @@ class Qwen38CausalChat:
                 finalized = self._finalize_draft_window_result(
                     failed,
                     failure_outcome=("aborted" if abort is not None else "error"),
+                    invalidate_runtime_reward=True,
+                )
+                finalized = self._finalize_page_runtime_reward_result(
+                    finalized,
+                    failure_outcome=(
+                        "aborted" if abort is not None else "error"
+                    ),
                 )
                 if abort is not None:
                     raise abort
@@ -3641,11 +3955,25 @@ class Qwen38CausalChat:
                 result,
                 failure_outcome=failure_outcome,
             )
+            finalized = self._finalize_page_runtime_reward_result(
+                finalized,
+                failure_outcome=failure_outcome,
+            )
             if retain_conversation and not finalized.ok:
                 try:
                     self._clear_conversation_binding()
                     runtime.model.reset_state(release=True)
                 except Exception as exc:
+                    page_router = getattr(runtime, "mlp_page_router", None)
+                    abort_reward = getattr(
+                        page_router,
+                        "abort_runtime_reward",
+                        None,
+                    )
+                    if callable(abort_reward):
+                        abort_reward()
+                    self._pending_page_runtime_reward = None
+                    self._page_reward_retry_failed = False
                     cleanup = self._retire_runtime_locked(exc)
                     finalized = Result(
                         ExecutionStatus.ERROR,
@@ -3664,8 +3992,32 @@ class Qwen38CausalChat:
         with self._lock:
             if self._closed:
                 return
+
+            def record_close_error(detail: str) -> None:
+                self._close_error = (
+                    detail
+                    if self._close_error is None
+                    else f"{self._close_error}; {detail}"
+                )
+
             runtime = self._runtime
             draft_runtime = self._draft_runtime
+            if runtime is not None and self._pending_page_runtime_reward is not None:
+                page_router = getattr(runtime, "mlp_page_router", None)
+                abort_reward = getattr(
+                    page_router,
+                    "abort_runtime_reward",
+                    None,
+                )
+                if callable(abort_reward):
+                    try:
+                        abort_reward()
+                    except Exception as exc:
+                        record_close_error(
+                            f"runtime reward abort: {type(exc).__name__}: {exc}"
+                        )
+                self._pending_page_runtime_reward = None
+                self._page_reward_retry_failed = False
             self._runtime = None
             self._draft_runtime = None
             self._markov_atlas = None
@@ -3676,12 +4028,12 @@ class Qwen38CausalChat:
                 try:
                     runtime.close()
                 except Exception as exc:
-                    self._close_error = f"{type(exc).__name__}: {exc}"
+                    record_close_error(f"{type(exc).__name__}: {exc}")
             if draft_runtime is not None:
                 try:
                     draft_runtime.close()
                 except Exception as exc:
-                    self._close_error = f"{type(exc).__name__}: {exc}"
+                    record_close_error(f"{type(exc).__name__}: {exc}")
 
     def __enter__(self) -> "Qwen38CausalChat":
         with self._lock:

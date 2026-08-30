@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -17,6 +18,7 @@ from immer.cli import main
 from immer.contracts import ExecutionStatus, Request
 from immer.runtimes.qwen3_8.draft_window import (
     DRAFT_WINDOW_ACTIONS,
+    DRAFT_WINDOW_FEEDBACK_SCHEMA,
     DRAFT_WINDOW_STATE_SCHEMA,
     LEGACY_DRAFT_WINDOW_STATE_SCHEMA,
     V1_DRAFT_WINDOW_STATE_SCHEMA,
@@ -29,7 +31,7 @@ from immer.runtimes.qwen3_8.draft_window import (
 )
 from immer.runtimes.qwen3_8.draft_protocol import RollingDraftProposal
 
-from test_qwen3_8_adapter import _Runtime, _Tokenizer, _chat
+from test_qwen3_8_adapter import _Model, _Runtime, _Tokenizer, _chat
 
 
 def _feedback(
@@ -199,6 +201,72 @@ class DraftWindowControllerTests(unittest.TestCase):
             + useful.draft_source_body_bytes
             + useful.aux_source_body_bytes,
         )
+
+    def test_feedback_v3_uses_exact_joint_runtime_reward_and_page_context(
+        self,
+    ) -> None:
+        controller = DraftWindowController(self.state_path)
+        selection = controller.choose((1, 2), max_window=16, max_new_tokens=16)
+        feedback = replace(
+            _feedback(
+                selection,
+                accepted=0,
+                emitted=0,
+                outcome="timeout",
+            ),
+            o1_priority=12.5,
+            page_actions=96,
+            page_actions_saved=64,
+            runtime_reward=3.125,
+        )
+
+        self.assertEqual(
+            DRAFT_WINDOW_FEEDBACK_SCHEMA,
+            "immer.qwen3.8-draft-window-feedback/v3",
+        )
+        self.assertEqual(feedback.reward, 3.125)
+        record = feedback.to_dict()
+        self.assertEqual(
+            {
+                key: record[key]
+                for key in (
+                    "o1_priority",
+                    "page_actions",
+                    "page_actions_saved",
+                    "reward",
+                    "runtime_reward",
+                    "schema",
+                )
+            },
+            {
+                "o1_priority": 12.5,
+                "page_actions": 96,
+                "page_actions_saved": 64,
+                "reward": 3.125,
+                "runtime_reward": 3.125,
+                "schema": DRAFT_WINDOW_FEEDBACK_SCHEMA,
+            },
+        )
+        metrics = controller.settle(selection, feedback)
+        self.assertEqual(metrics.updates, 1)
+        state = DraftWindowState.from_bytes(self.state_path.read_bytes())
+        self.assertAlmostEqual(
+            state.agents[1].reward_sum,
+            3.125,
+        )
+
+        for changes in (
+            {"page_actions": -1},
+            {"page_actions_saved": True},
+            {"o1_priority": -0.1},
+            {"o1_priority": float("nan")},
+            {"runtime_reward": float("nan")},
+            {"runtime_reward": -16.01},
+            {"runtime_reward": 16.01},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    replace(feedback, **changes)
 
     def test_wider_wave_teaches_exact_shorter_prefix_reliability(self) -> None:
         controller = DraftWindowController(self.state_path)
@@ -576,6 +644,47 @@ class DraftWindowAdapterTests(unittest.TestCase):
 
     def test_adapter_uses_k8_then_settles_public_receipt_metrics(self) -> None:
         runtime = _Runtime()
+
+        class Q4Metrics:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def metrics(self):
+                selected = 10 if self.calls == 0 else 30
+                self.calls += 1
+                return {"page_mlp_selected_pages": selected}
+
+        class PageRouter:
+            page_count = 272
+            route_width = 192
+
+            def __init__(self) -> None:
+                self.events = []
+                self.metric_calls = 0
+
+            def begin_runtime_reward(self) -> None:
+                self.events.append(("begin",))
+
+            @staticmethod
+            def flush() -> None:
+                pass
+
+            def metrics(self):
+                saved = 5 if self.metric_calls == 0 else 17
+                self.metric_calls += 1
+                return {
+                    "adaptive_width_pages_saved": saved,
+                    "runtime_reward_updates": 0,
+                }
+
+            def settle_runtime_reward(self, receipt: str, reward: float):
+                self.events.append(("settle", receipt, reward))
+                return {"runtime_reward_updates": 1}
+
+        q4 = Q4Metrics()
+        router = PageRouter()
+        runtime.model.pager.q4_bank = q4
+        runtime.mlp_page_router = router
         chat = self._adaptive_chat(runtime)
         generated = _rolling_result()
         decoder = SimpleNamespace(generate_rolling=lambda *args, **kwargs: generated)
@@ -599,6 +708,40 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.assertEqual(receipt["feedback"]["aux_source_body_bytes"], 0)
         self.assertEqual(receipt["feedback"]["target_forwards"], 3)
         self.assertEqual(receipt["feedback"]["seconds"], 1.0)
+        self.assertEqual(receipt["feedback"]["page_actions"], 20)
+        self.assertEqual(receipt["feedback"]["page_actions_saved"], 12)
+        self.assertEqual(receipt["feedback"]["o1_priority"], 0.0)
+        self.assertEqual(
+            receipt["feedback"]["runtime_reward"],
+            result.evidence["runtime_reward"]["reward"],
+        )
+        expected_reward = (
+            3.0 * (12 / (20 + 12))
+            + 2.0 * (4 / 4)
+            - math.log1p(3) / 2.0
+        )
+        self.assertAlmostEqual(
+            receipt["feedback"]["runtime_reward"],
+            expected_reward,
+        )
+        self.assertEqual(
+            receipt["feedback"]["reward"],
+            result.evidence["runtime_reward"]["reward"],
+        )
+        self.assertEqual(
+            receipt["feedback"]["schema"],
+            DRAFT_WINDOW_FEEDBACK_SCHEMA,
+        )
+        self.assertEqual(result.evidence["runtime_reward"]["accepted_draft_tokens"], 4)
+        self.assertEqual(result.evidence["runtime_reward"]["page_actions"], 20)
+        self.assertEqual(result.evidence["runtime_reward"]["page_actions_saved"], 12)
+        self.assertEqual(result.evidence["runtime_reward"]["router_updates"], 1)
+        self.assertEqual(router.events[0], ("begin",))
+        self.assertEqual(router.events[1][0], "settle")
+        self.assertEqual(
+            router.events[1][1],
+            result.evidence["runtime_reward"]["receipt_sha256"],
+        )
         self.assertEqual(receipt["metrics"]["agents"]["8"]["observations"], 1)
         self.assertEqual(
             receipt["metrics"]["agents"]["4"]["nested_observations"],
@@ -683,7 +826,7 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.assertIn("different runtime identity", result.reason)
         second.close()
 
-    def test_post_generation_decode_error_keeps_realized_window_outcome(self) -> None:
+    def test_post_generation_decode_error_teaches_terminal_error_reward(self) -> None:
         class BrokenDecode(_Tokenizer):
             def decode(self, token_ids):
                 raise RuntimeError("decode failed")
@@ -702,15 +845,143 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.assertIs(result.status, ExecutionStatus.ERROR)
         receipt = result.evidence["draft_window"]
         self.assertTrue(receipt["settled"])
-        self.assertEqual(receipt["feedback"]["outcome"], "ok")
-        self.assertGreater(receipt["feedback"]["reward"], 0.0)
+        self.assertEqual(receipt["feedback"]["outcome"], "error")
+        self.assertIsNone(receipt["feedback"]["runtime_reward"])
+        self.assertLess(receipt["feedback"]["reward"], -9.0)
         self.assertEqual(receipt["post_generation_outcome"], "error")
         restored = DraftWindowState.from_bytes(self.state_path.read_bytes())
         self.assertEqual(restored.updates, 1)
-        self.assertEqual(restored.agents[1].ok, 1)
+        self.assertEqual(restored.agents[1].errors, 1)
+        self.assertLess(restored.agents[1].reward_sum, 0.0)
         chat.close()
 
-    def test_broken_auxiliary_metrics_keep_realized_target_receipt(
+    def test_successful_generation_cleanup_failure_aborts_page_reward_and_teaches_error(
+        self,
+    ) -> None:
+        runtime = _Runtime(
+            model=_Model(cleanup_error=RuntimeError("cannot reset")),
+        )
+
+        class PageRouter:
+            page_count = 272
+            route_width = 192
+
+            def __init__(self) -> None:
+                self.events = []
+
+            def abort_runtime_reward(self) -> None:
+                self.events.append("abort")
+
+            def begin_runtime_reward(self) -> None:
+                self.events.append("begin")
+
+            @staticmethod
+            def flush() -> None:
+                pass
+
+            @staticmethod
+            def metrics():
+                return {
+                    "adaptive_width_pages_saved": 0,
+                    "runtime_reward_updates": 0,
+                }
+
+            def settle_runtime_reward(self, _receipt: str, _reward: float):
+                self.events.append("settle")
+                return {"runtime_reward_updates": 1}
+
+        router = PageRouter()
+        runtime.mlp_page_router = router
+        chat = self._adaptive_chat(runtime)
+        decoder = SimpleNamespace(
+            generate_rolling=lambda *args, **kwargs: _rolling_result()
+        )
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+            return_value=decoder,
+        ):
+            result = chat.handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertEqual(result.reason, "Qwen3.8 state cleanup failed")
+        self.assertEqual(router.events, ["begin", "abort"])
+        self.assertIsNone(chat._pending_page_runtime_reward)
+        feedback = result.evidence["draft_window"]["feedback"]
+        self.assertEqual(feedback["outcome"], "error")
+        self.assertIsNone(feedback["runtime_reward"])
+        self.assertLess(feedback["reward"], -9.0)
+        restored = DraftWindowState.from_bytes(self.state_path.read_bytes())
+        self.assertEqual(restored.updates, 1)
+        self.assertEqual(restored.agents[1].errors, 1)
+        self.assertLess(restored.agents[1].reward_sum, 0.0)
+        self.assertEqual(runtime.close_calls, 1)
+        chat.close()
+
+    def test_draft_settlement_failure_preserves_independent_page_reward(
+        self,
+    ) -> None:
+        runtime = _Runtime()
+
+        class PageRouter:
+            page_count = 272
+            route_width = 192
+
+            def __init__(self) -> None:
+                self.active = False
+                self.events = []
+
+            def abort_runtime_reward(self) -> None:
+                self.events.append("abort")
+                self.active = False
+
+            def begin_runtime_reward(self) -> None:
+                self.events.append("begin")
+                self.active = True
+
+            @staticmethod
+            def flush() -> None:
+                pass
+
+            @staticmethod
+            def metrics():
+                return {
+                    "adaptive_width_pages_saved": 0,
+                    "runtime_reward_updates": 0,
+                }
+
+            def settle_runtime_reward(self, _receipt: str, _reward: float):
+                self.events.append("settle")
+                self.active = False
+                return {"runtime_reward_updates": 1}
+
+        router = PageRouter()
+        runtime.mlp_page_router = router
+        chat = self._adaptive_chat(runtime)
+        decoder = SimpleNamespace(
+            generate_rolling=lambda *args, **kwargs: _rolling_result()
+        )
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+                return_value=decoder,
+            ),
+            patch.object(
+                chat._draft_window_controller,
+                "settle",
+                side_effect=OSError("window disk full"),
+            ),
+        ):
+            result = chat.handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertEqual(result.reason, "Qwen3.8 draft-window settlement failed")
+        self.assertEqual(router.events, ["begin"])
+        self.assertTrue(router.active)
+        self.assertIsNotNone(chat._pending_page_runtime_reward)
+        self.assertNotIn("settlement", result.evidence["runtime_reward"])
+        chat.close()
+
+    def test_broken_auxiliary_metrics_teach_terminal_error_reward(
         self,
     ) -> None:
         runtime = _Runtime()
@@ -736,12 +1007,14 @@ class DraftWindowAdapterTests(unittest.TestCase):
 
         self.assertIs(result.status, ExecutionStatus.ERROR)
         feedback = result.evidence["draft_window"]["feedback"]
-        self.assertEqual(feedback["outcome"], "ok")
+        self.assertEqual(feedback["outcome"], "error")
+        self.assertIsNone(feedback["runtime_reward"])
+        self.assertLess(feedback["reward"], -9.0)
         self.assertEqual(feedback["target_source_body_bytes"], 100)
         self.assertEqual(feedback["draft_source_body_bytes"], 0)
         restored = DraftWindowState.from_bytes(self.state_path.read_bytes())
         self.assertEqual(restored.updates, 1)
-        self.assertEqual(restored.agents[1].ok, 1)
+        self.assertEqual(restored.agents[1].errors, 1)
         chat.close()
 
     def test_target_timeout_teaches_the_selected_window_once(self) -> None:
@@ -822,8 +1095,8 @@ class DraftWindowAdapterTests(unittest.TestCase):
 
         restored = DraftWindowState.from_bytes(self.state_path.read_bytes())
         self.assertEqual(restored.updates, 1)
-        self.assertEqual(restored.agents[1].ok, 1)
-        self.assertGreater(restored.agents[1].reward_sum, 0.0)
+        self.assertEqual(restored.agents[1].aborted, 1)
+        self.assertLess(restored.agents[1].reward_sum, 0.0)
         chat.close()
 
     def test_output_budget_below_k8_selects_k4(self) -> None:
@@ -972,6 +1245,102 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.assertEqual(options["range_prefetch_beam_horizon"], 4)
         self.assertEqual(options["range_prefetch_beam_width"], 6)
         self.assertEqual(options["range_prefetch_hint_cooldown"], 3)
+
+    def test_cli_canonical_deployment_auto_wires_draft_window_state(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
+            markov_state = Path(temporary) / "qwen-markov.bin"
+            markov_state.write_bytes(b"fixture")
+            draft_window_state = Path(temporary) / "qwen-draft-window.bin"
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE",
+                    markov_state,
+                ),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_DRAFT_WINDOW_STATE",
+                    draft_window_state,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
+                code = main(["chat", "hello", "--raw-qwen"])
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["draft_mode"], "markov")
+        self.assertEqual(options["draft_window"], 8)
+        self.assertEqual(
+            options["draft_window_state_path"],
+            str(draft_window_state),
+        )
+
+    def test_cli_can_opt_out_of_default_or_environment_draft_window_state(
+        self,
+    ) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
+            markov_state = Path(temporary) / "qwen-markov.bin"
+            markov_state.write_bytes(b"fixture")
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "IMMER_QWEN38_DRAFT_WINDOW_STATE": "/env/window.bin",
+                    },
+                    clear=True,
+                ),
+                patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE",
+                    markov_state,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--raw-qwen",
+                        "--no-draft-window-controller",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertIsNone(
+            constructor.call_args.kwargs["draft_window_state_path"]
+        )
+
+        error = io.StringIO()
+        with redirect_stderr(error):
+            conflict = main(
+                [
+                    "chat",
+                    "hello",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                    "--draft-window-state",
+                    "/state/window.bin",
+                    "--no-draft-window-controller",
+                ]
+            )
+        self.assertEqual(conflict, 2)
+        self.assertIn("mutually exclusive", error.getvalue())
 
     def test_no_state_keeps_the_existing_fixed_window_contract(self) -> None:
         runtime = _Runtime()

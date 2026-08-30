@@ -16,8 +16,12 @@ import threading
 from typing import Any
 
 
-MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v5"
+MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v6"
 MLP_PAGE_MARKOV_POLICY = (
+    "dynamic-page-transitions+coactivation+adaptive-width+terminal-reward+fixed-share/v6"
+)
+_V5_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v5"
+_V5_MLP_PAGE_MARKOV_POLICY = (
     "dynamic-page-transitions+coactivation+adaptive-width+fixed-share/v5"
 )
 _V4_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v4"
@@ -44,8 +48,16 @@ _V5_METRICS = frozenset(
         "width_agent_feedback",
     }
 )
+_V6_METRICS = frozenset(
+    {
+        "runtime_reward_trace_rows",
+        "runtime_reward_updates",
+    }
+)
 _MAX_STATE_BYTES = 16 * 1024 * 1024
 _CALL_PREFETCH = object()
+_MAX_REWARD_RECEIPTS = 64
+_HEX = frozenset("0123456789abcdef")
 
 
 class MlpPageMarkovError(RuntimeError):
@@ -157,6 +169,25 @@ class MlpPageMarkov:
     COACTIVE_NEIGHBOR_SPAN = 4
     ENERGY_COVERAGE = 0.995
 
+    @staticmethod
+    def width_actions_for(route_width: int) -> tuple[int, ...]:
+        if (
+            isinstance(route_width, bool)
+            or not isinstance(route_width, int)
+            or route_width <= 0
+        ):
+            raise ValueError("route_width must be a positive integer")
+        return tuple(
+            sorted(
+                {
+                    max(1, route_width // 2),
+                    max(1, (2 * route_width + 2) // 3),
+                    max(1, (5 * route_width + 5) // 6),
+                    route_width,
+                }
+            )
+        )
+
     def __init__(
         self,
         path: str | Path | None,
@@ -192,16 +223,7 @@ class MlpPageMarkov:
         self.n_layers = n_layers
         self.page_count = page_count
         self.route_width = route_width
-        self.width_actions = tuple(
-            sorted(
-                {
-                    max(1, route_width // 2),
-                    max(1, (2 * route_width + 2) // 3),
-                    max(1, (5 * route_width + 5) // 6),
-                    route_width,
-                }
-            )
-        )
+        self.width_actions = self.width_actions_for(route_width)
         self.min_exact_rows = min_exact_rows
         self.identity = clean_identity
         self.prefetch = prefetch
@@ -233,6 +255,13 @@ class MlpPageMarkov:
         self._pending_prefetch: dict[int, bool | None] = {}
         self._pending_dynamic: dict[int, bool] = {}
         self._compiled: list[MlpPagePrediction | None] = [None] * n_layers
+        self._reward_active = False
+        self._reward_traces: list[
+            tuple[int, int, tuple[tuple[str, int | None], ...], int]
+        ] = []
+        self._recent_reward_sha256s: tuple[str, ...] = ()
+        self._runtime_reward_sum = 0.0
+        self._last_runtime_reward = 0.0
         self._dirty = False
         self._closed = False
         self._transaction: dict[str, Any] | None = None
@@ -261,6 +290,8 @@ class MlpPageMarkov:
             "selected_advances": 0,
             "session_resets": 0,
             "width_agent_feedback": 0,
+            "runtime_reward_trace_rows": 0,
+            "runtime_reward_updates": 0,
         }
         self._load()
 
@@ -302,6 +333,8 @@ class MlpPageMarkov:
                 "pending": dict(self._pending),
                 "pending_prefetch": dict(self._pending_prefetch),
                 "pending_dynamic": dict(self._pending_dynamic),
+                "reward_active": self._reward_active,
+                "reward_traces": list(self._reward_traces),
                 "wave_routes": dict(self._wave_routes),
                 "wave_widths": dict(self._wave_widths),
                 "wave_rows": [],
@@ -434,6 +467,8 @@ class MlpPageMarkov:
             self._pending = transaction["pending"]
             self._pending_prefetch = transaction["pending_prefetch"]
             self._pending_dynamic = transaction["pending_dynamic"]
+            self._reward_active = transaction["reward_active"]
+            self._reward_traces = transaction["reward_traces"]
             self._wave_routes = transaction["wave_routes"]
             self._wave_widths = transaction["wave_widths"]
             self._transaction = None
@@ -1193,12 +1228,138 @@ class MlpPageMarkov:
             self._last_widths[layer] = len(route)
             self._wave_routes[layer] = (full_route,)
             self._wave_widths[layer] = (len(route),)
+            if self._reward_active:
+                self._reward_traces.append(
+                    (
+                        layer,
+                        len(route),
+                        () if pending is None else pending.agent_widths,
+                        row_count,
+                    )
+                )
             self._metrics["selected_advances"] += 1
             self._metrics["adaptive_width_predictions"] += 1
             self._metrics["adaptive_width_pages_saved"] += (
                 self.route_width - len(route)
             ) * row_count
             self._dirty = True
+
+    def begin_runtime_reward(self) -> None:
+        """Start one terminal reward trace for the next normal request."""
+
+        with self._lock:
+            self._ensure_open()
+            if self._transaction is not None:
+                raise MlpPageMarkovError(
+                    "cannot begin runtime reward during a page transaction"
+                )
+            self._reward_traces = []
+            self._reward_active = True
+
+    def abort_runtime_reward(self) -> None:
+        with self._lock:
+            self._reward_traces = []
+            self._reward_active = False
+
+    def settle_runtime_reward(
+        self,
+        receipt_sha256: str,
+        reward: float,
+    ) -> dict[str, object]:
+        """Reweight causal width agents from one terminal request outcome."""
+
+        with self._lock:
+            self._ensure_open()
+            if self._transaction is not None:
+                raise MlpPageMarkovError(
+                    "cannot settle runtime reward during a page transaction"
+                )
+            if (
+                not isinstance(receipt_sha256, str)
+                or len(receipt_sha256) != 64
+                or set(receipt_sha256) - _HEX
+            ):
+                raise ValueError("runtime reward receipt must be SHA-256")
+            value = float(reward)
+            if not math.isfinite(value) or not -16.0 <= value <= 16.0:
+                raise ValueError("runtime reward must be finite in [-16, 16]")
+            if not self._reward_active:
+                raise MlpPageMarkovError("runtime reward request is not active")
+            if receipt_sha256 in self._recent_reward_sha256s:
+                self._reward_traces = []
+                self._reward_active = False
+                return self.metrics()
+            original_logs = [list(row) for row in self._width_agent_logs]
+            original_recent = self._recent_reward_sha256s
+            original_sum = self._runtime_reward_sum
+            original_last = self._last_runtime_reward
+            original_metrics = dict(self._metrics)
+            original_dirty = self._dirty
+            traces = tuple(self._reward_traces)
+            total_rows = sum(row[3] for row in traces)
+            try:
+                touched = set()
+                for layer, selected, agent_rows, row_count in traces:
+                    predictions = dict(agent_rows)
+                    valid = tuple(
+                        (index, predictions.get(name))
+                        for index, name in enumerate(_WIDTH_AGENTS)
+                        if predictions.get(name) is not None
+                    )
+                    if len(valid) < 2 or total_rows <= 0:
+                        continue
+                    qualities = tuple(
+                        (
+                            index,
+                            1.0
+                            - abs(int(predicted) - selected)
+                            / self.route_width,
+                        )
+                        for index, predicted in valid
+                    )
+                    center = sum(row[1] for row in qualities) / len(qualities)
+                    scale = (
+                        self.LEARNING_RATE
+                        * math.tanh(value / 4.0)
+                        * row_count
+                        / total_rows
+                    )
+                    for index, quality in qualities:
+                        self._width_agent_logs[layer][index] += scale * (
+                            quality - center
+                        )
+                    touched.add(layer)
+                for layer in touched:
+                    logs = self._width_agent_logs[layer]
+                    center = sum(logs) / len(logs)
+                    self._width_agent_logs[layer] = [
+                        max(-20.0, min(20.0, item - center))
+                        for item in logs
+                    ]
+                recent = (*self._recent_reward_sha256s, receipt_sha256)
+                self._recent_reward_sha256s = recent[-_MAX_REWARD_RECEIPTS:]
+                self._runtime_reward_sum = max(
+                    -1.0e12,
+                    min(1.0e12, self._runtime_reward_sum + value),
+                )
+                self._last_runtime_reward = value
+                self._metrics["runtime_reward_updates"] += 1
+                self._metrics["runtime_reward_trace_rows"] += total_rows
+                self._reward_traces = []
+                self._reward_active = False
+                self._dirty = True
+                self.flush()
+            except Exception:
+                self._width_agent_logs = original_logs
+                self._recent_reward_sha256s = original_recent
+                self._runtime_reward_sum = original_sum
+                self._last_runtime_reward = original_last
+                self._metrics = original_metrics
+                self._dirty = original_dirty
+                self._reward_traces = list(traces)
+                self._reward_active = True
+                raise
+            return self.metrics()
 
     def reset_session(self) -> None:
         """Drop request-local route context while retaining learned transitions."""
@@ -1395,6 +1556,9 @@ class MlpPageMarkov:
             ),
             "width_temporal": self._counter_rows(self._width_temporal),
             "last_widths": self._last_widths,
+            "last_runtime_reward": self._last_runtime_reward.hex(),
+            "recent_reward_sha256s": list(self._recent_reward_sha256s),
+            "runtime_reward_sum": self._runtime_reward_sum.hex(),
         }
 
     @staticmethod
@@ -1434,13 +1598,16 @@ class MlpPageMarkov:
             schema = document.get("schema") if isinstance(document, dict) else None
             legacy_v3 = schema == _V3_MLP_PAGE_MARKOV_SCHEMA
             legacy_v4 = schema == _V4_MLP_PAGE_MARKOV_SCHEMA
-            adaptive_width = schema == MLP_PAGE_MARKOV_SCHEMA
+            legacy_v5 = schema == _V5_MLP_PAGE_MARKOV_SCHEMA
+            adaptive_width = legacy_v5 or schema == MLP_PAGE_MARKOV_SCHEMA
+            terminal_reward = schema == MLP_PAGE_MARKOV_SCHEMA
             if (
                 not isinstance(document, dict)
                 or set(document) != {"body", "schema", "sha256"}
                 or schema
                 not in {
                     MLP_PAGE_MARKOV_SCHEMA,
+                    _V5_MLP_PAGE_MARKOV_SCHEMA,
                     _V4_MLP_PAGE_MARKOV_SCHEMA,
                     _V3_MLP_PAGE_MARKOV_SCHEMA,
                 }
@@ -1476,12 +1643,22 @@ class MlpPageMarkov:
                         "width_temporal",
                     }
                 )
+            if terminal_reward:
+                expected_body.update(
+                    {
+                        "last_runtime_reward",
+                        "recent_reward_sha256s",
+                        "runtime_reward_sum",
+                    }
+                )
             expected_config = self._config(
                 policy=(
                     _V3_MLP_PAGE_MARKOV_POLICY
                     if legacy_v3
                     else _V4_MLP_PAGE_MARKOV_POLICY
                     if legacy_v4
+                    else _V5_MLP_PAGE_MARKOV_POLICY
+                    if legacy_v5
                     else MLP_PAGE_MARKOV_POLICY
                 ),
                 adaptive_width=adaptive_width,
@@ -1628,12 +1805,42 @@ class MlpPageMarkov:
                 width_marginal = {}
                 width_temporal = {}
                 width_cross = {}
+            if terminal_reward:
+                raw_recent = body["recent_reward_sha256s"]
+                if (
+                    not isinstance(raw_recent, list)
+                    or len(raw_recent) > _MAX_REWARD_RECEIPTS
+                    or len(set(raw_recent)) != len(raw_recent)
+                    or any(
+                        not isinstance(value, str)
+                        or len(value) != 64
+                        or set(value) - _HEX
+                        for value in raw_recent
+                    )
+                ):
+                    raise ValueError("runtime reward receipt state is invalid")
+                recent_reward_sha256s = tuple(raw_recent)
+                runtime_reward_sum = float.fromhex(body["runtime_reward_sum"])
+                last_runtime_reward = float.fromhex(body["last_runtime_reward"])
+                if (
+                    not math.isfinite(runtime_reward_sum)
+                    or not -1.0e12 <= runtime_reward_sum <= 1.0e12
+                    or not math.isfinite(last_runtime_reward)
+                    or not -16.0 <= last_runtime_reward <= 16.0
+                ):
+                    raise ValueError("runtime reward values are invalid")
+            else:
+                recent_reward_sha256s = ()
+                runtime_reward_sum = 0.0
+                last_runtime_reward = 0.0
             metrics = body["metrics"]
             missing_metrics = set()
             if legacy_v3:
                 missing_metrics.update(_V4_METRICS)
             if not adaptive_width:
                 missing_metrics.update(_V5_METRICS)
+            if not terminal_reward:
+                missing_metrics.update(_V6_METRICS)
             expected_metrics = set(self._metrics) - missing_metrics
             if (
                 not isinstance(metrics, dict)
@@ -1670,6 +1877,9 @@ class MlpPageMarkov:
             self._width_marginal = width_marginal
             self._width_temporal = width_temporal
             self._width_cross = width_cross
+            self._recent_reward_sha256s = recent_reward_sha256s
+            self._runtime_reward_sum = runtime_reward_sum
+            self._last_runtime_reward = last_runtime_reward
             self._metrics.update(
                 {key: int(value) for key, value in metrics.items()}
             )
@@ -1768,6 +1978,14 @@ class MlpPageMarkov:
                     else sum(active_widths) / len(active_widths)
                 ),
                 "energy_coverage": self.ENERGY_COVERAGE,
+                "last_runtime_reward": self._last_runtime_reward,
+                "runtime_reward_mean": (
+                    0.0
+                    if self._metrics["runtime_reward_updates"] == 0
+                    else self._runtime_reward_sum
+                    / self._metrics["runtime_reward_updates"]
+                ),
+                "runtime_reward_receipts": len(self._recent_reward_sha256s),
                 "policy": MLP_PAGE_MARKOV_POLICY,
                 "route_jaccard_mean": (
                     0.0

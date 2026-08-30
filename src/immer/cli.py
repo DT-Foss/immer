@@ -117,6 +117,9 @@ _QWEN38_DEPLOYMENT_O1_RETENTION = (
 _QWEN38_DEPLOYMENT_MLP_PAGE_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-mlp-page-markov-v1.json"
 )
+_QWEN38_DEPLOYMENT_DRAFT_WINDOW_STATE = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen-draft-window-v1.bin"
+)
 _QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v47"
 _QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v28"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
@@ -721,6 +724,27 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                         )
                 if page_parts:
                     parts.append("MLP pages " + ", ".join(page_parts))
+        runtime_reward = evidence.get("runtime_reward")
+        if isinstance(runtime_reward, dict):
+            reward = runtime_reward.get("reward")
+            accepted_reward = runtime_reward.get("accepted_draft_tokens")
+            saved_reward = runtime_reward.get("page_actions_saved")
+            o1_reward = runtime_reward.get("o1_priority")
+            if (
+                isinstance(reward, (int, float))
+                and not isinstance(reward, bool)
+                and isinstance(accepted_reward, int)
+                and not isinstance(accepted_reward, bool)
+                and isinstance(saved_reward, int)
+                and not isinstance(saved_reward, bool)
+                and isinstance(o1_reward, (int, float))
+                and not isinstance(o1_reward, bool)
+            ):
+                parts.append(
+                    f"joint reward {float(reward):.2f} "
+                    f"(draft {accepted_reward}, pages {saved_reward}, "
+                    f"O1 {float(o1_reward):.2f})"
+                )
         draft = evidence.get("draft")
         if isinstance(draft, dict):
             accepted = draft.get("accepted_draft_tokens")
@@ -998,6 +1022,28 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             and bundle_path == _QWEN38_DEPLOYMENT_ROOT
         ):
             markov_o1_retention_path = _QWEN38_DEPLOYMENT_O1_RETENTION
+        disable_draft_window = bool(
+            getattr(args, "no_draft_window_controller", False)
+        )
+        if disable_draft_window and getattr(args, "draft_window_state", None):
+            raise ValueError(
+                "--draft-window-state and --no-draft-window-controller are mutually exclusive"
+            )
+        draft_window_state_path = (
+            None
+            if disable_draft_window
+            else _chat_path(
+                getattr(args, "draft_window_state", None),
+                "IMMER_QWEN38_DRAFT_WINDOW_STATE",
+            )
+        )
+        if (
+            not disable_draft_window
+            and draft_window_state_path is None
+            and draft_mode in {"hybrid", "markov"}
+            and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+        ):
+            draft_window_state_path = _QWEN38_DEPLOYMENT_DRAFT_WINDOW_STATE
         if bool(getattr(args, "no_anchor_cache", False)):
             if args.qwen38_anchor_cache is not None:
                 raise ValueError(
@@ -1177,7 +1223,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 else str(markov_o1_retention_path)
             ),
             mtp_draft_state_path=mtp_draft_state,
-            draft_window_state_path=args.draft_window_state,
+            draft_window_state_path=(
+                None
+                if draft_window_state_path is None
+                else str(draft_window_state_path)
+            ),
             range_markov_state_path=args.range_markov_state,
             range_prefetch_max_bytes=int(args.range_prefetch_max_mb * 1024**2),
             range_prefetch_min_support=args.range_prefetch_min_support,
@@ -2127,6 +2177,11 @@ def build_parser() -> argparse.ArgumentParser:
             "persistent target-receipt controller for contextual K=4/8/16; "
             "--draft-window becomes its maximum ceiling"
         ),
+    )
+    chat.add_argument(
+        "--no-draft-window-controller",
+        action="store_true",
+        help="disable the deployed joint runtime-reward window controller",
     )
     chat.add_argument(
         "--range-markov-state",
