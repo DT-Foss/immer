@@ -56,6 +56,11 @@ All notable changes to IMMER are recorded here.
   stale combined Rapidities by the canonical regime factor. Durable Surprise,
   CUSUM and regime generation still replay exactly once at finalization.
   Provider ABI is v35; metrics v26.
+- `b8b051a` replaced pooled Beam reliability with 16 recursive-position Beta
+  rows. Verified prefixes preserve successful shallow positions, the first
+  failed position cools itself and its causal tail, position-0 failure still
+  forces K1, and external shadow verification trains through its first
+  mismatch. Provider ABI is v36; metrics v27.
 
 ### Arbitrary local Qwen runtime
 
