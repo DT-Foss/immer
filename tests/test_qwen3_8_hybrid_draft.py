@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+import math
 import tempfile
 import unittest
 from unittest import mock
@@ -1003,7 +1004,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(proposal.token_ids, (7, 8, 9))
         self.assertEqual(
             proposal.provider_abi,
-            "immer.qwen3.8-markov-mtp-hybrid-provider/v27",
+            "immer.qwen3.8-markov-mtp-hybrid-provider/v28",
         )
         self.assertTrue(
             all(abs(value - 0.7625) < 1e-12 for value in proposal.token_confidences)
@@ -1072,6 +1073,81 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(metrics.online_consensus_tokens, 2)
         self.assertAlmostEqual(metrics.online_consensus_confidence_gain, 0.05)
         provider.observe_verification(1, 2)
+        provider.reconcile_prefix((*prompt, 4, 7))
+        provider.observe_final((*prompt, 4, 7, 10))
+        provider.close()
+
+    def test_hybrid_language_evidence_uses_ranked_old_ricci_episode(self) -> None:
+        old = (50, 4, 7, 8, 9)
+        medium = (10, 11, 12, 13, 14, 15)
+        recent = (20, 21, 22, 23, 24, 25)
+        priorities = {
+            old[1:]: 100.0,
+            medium: 2.0,
+            recent: 0.01,
+        }
+        markov = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_order=4,
+            max_history_tokens=17,
+            proposal_width=3,
+            episode_priority=lambda answer: priorities[answer],
+        )
+        expert_count = len(markov._experts)
+        markov._state = replace(
+            markov._state,
+            token_ids=(*old, *medium, *recent),
+            episode_lengths=(len(old), len(medium), len(recent)),
+            episode_dialects=(None, None, None),
+            episode_prompt_lengths=(1, None, None),
+            expert_observations=(64,) * expert_count,
+            expert_hits=(64,) * expert_count,
+        )
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(markov, lambda: mtp)
+        provider._select_markov = lambda _proposal: False
+        provider._select_provider_tournament = (
+            lambda _markov, fused_mtp: ("mtp", fused_mtp)
+        )
+        prompt = (30, 31)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        proposal = provider.propose_round_state(prompt, 4, hidden[:, -1:])
+
+        self.assertEqual(proposal.token_ids, (7, 8, 9))
+        self.assertTrue(all(value > 0.75 for value in proposal.token_confidences))
+        self.assertNotIn("04", markov._persistent_symbols()[-17:])
+        self.assertEqual(
+            markov._ricci_working_symbols(17),
+            (
+                "04",
+                "07",
+                "08",
+                "09",
+                "<episode>",
+                "10",
+                "11",
+                "12",
+                "13",
+                "14",
+                "15",
+            ),
+        )
+        metrics = provider.metrics()
+        self.assertEqual(metrics.online_consensus_rounds, 1)
+        self.assertEqual(metrics.online_consensus_tokens, 3)
+        self.assertEqual(metrics.last_online_consensus_tokens, 3)
+        self.assertGreater(metrics.online_consensus_confidence_gain, 0.0)
+        self.assertEqual(metrics.markov["ricci_working_set_builds"], 1)
+        self.assertEqual(metrics.markov["ricci_working_set_selected_episodes"], 2)
+        self.assertEqual(metrics.markov["ricci_working_set_selected_tokens"], 10)
+        self.assertEqual(metrics.markov["ricci_working_set_oldest_age"], 2)
+        self.assertAlmostEqual(
+            metrics.to_dict()["markov"]["ricci_working_set_max_score"],
+            100.0 * math.exp(-2.0 * markov.RICCI_AGE_ALPHA),
+        )
+        provider.observe_verification(1, 1)
         provider.reconcile_prefix((*prompt, 4, 7))
         provider.observe_final((*prompt, 4, 7, 10))
         provider.close()
@@ -1336,7 +1412,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(mtp.advance_calls[0][2], final_hidden))
 
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v27")
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v28")
         self.assertEqual(metrics.selected_provider, "markov")
         self.assertEqual(metrics.selection_calls, 4)
         self.assertEqual(metrics.markov_rounds, 3)

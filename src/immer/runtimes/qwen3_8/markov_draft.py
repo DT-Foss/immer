@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v13"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v46"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v47"
 V12_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v12"
 V11_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v11"
 V10_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v10"
@@ -48,7 +48,8 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v35"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v36"
+MARKOV_RICCI_WORKING_SET_POLICY = "o1-priority+ricci-age-whole-answer/v1"
 _STATE_PREFIX = b"IMMD\x0d"
 _V12_STATE_PREFIX = b"IMMD\x0c"
 _V11_STATE_PREFIX = b"IMMD\x0b"
@@ -1663,6 +1664,11 @@ class MarkovDraftMetrics:
     retention_failures: int
     retention_priority_evictions: int
     last_retention_priority: float
+    ricci_working_set_builds: int
+    ricci_working_set_selected_episodes: int
+    ricci_working_set_selected_tokens: int
+    ricci_working_set_oldest_age: int
+    ricci_working_set_max_score: float
     composition_programs: int
     composition_option_calls: int
     composition_draft_tokens: int
@@ -2005,6 +2011,11 @@ class FingerprintRollingK4DraftProvider:
         self._retention_failures = 0
         self._retention_priority_evictions = 0
         self._last_retention_priority = 1.0
+        self._ricci_working_set_builds = 0
+        self._ricci_working_set_selected_episodes = 0
+        self._ricci_working_set_selected_tokens = 0
+        self._ricci_working_set_oldest_age = 0
+        self._ricci_working_set_max_score = 0.0
         self._last_phrase_option: MarkovPhraseOption | None = None
         self._composition_cache: dict[
             str | None,
@@ -2091,6 +2102,12 @@ class FingerprintRollingK4DraftProvider:
         self._pending_verification_virtual = False
         self._pending_import_digest: str | None = None
         self._persistent_symbols_cache: tuple[str, ...] | None = None
+        self._ricci_working_symbols_cache: dict[int, tuple[str, ...]] = {}
+        self._ricci_episode_cache: tuple[
+            tuple[int, tuple[int, ...], float], ...
+        ] | None = None
+        self._ricci_priority_degraded = False
+        self._episode_priority_cache: dict[tuple[int, ...], float] = {}
         self._persistent_expert_models: dict[str, _TransitionFingerprint] = {}
         self._request_local_cache_history: tuple[int, ...] | None = None
         self._request_local_cache: (
@@ -2395,6 +2412,184 @@ class FingerprintRollingK4DraftProvider:
             rows.extend(self._symbol(token) for token in episode)
         result = tuple(rows)
         self._persistent_symbols_cache = result
+        return result
+
+    def _retention_priority(self, generated: tuple[int, ...]) -> float:
+        """Read one bounded O1 priority with a deterministic neutral fallback."""
+
+        cached = self._episode_priority_cache.get(generated)
+        if cached is not None:
+            return cached
+        try:
+            priority = (
+                1.0
+                if self.episode_priority is None
+                else float(self.episode_priority(generated))
+            )
+        except Exception:
+            priority = 1.0
+            self._retention_failures += 1
+            return priority
+        if not math.isfinite(priority) or priority < 0.0:
+            priority = 1.0
+            self._retention_failures += 1
+            return priority
+        self._episode_priority_cache[generated] = priority
+        return priority
+
+    def _ricci_episodes(
+        self,
+    ) -> tuple[tuple[int, tuple[int, ...], float], ...]:
+        cached = self._ricci_episode_cache
+        if cached is not None:
+            return cached
+        episodes = self._generation_episodes()
+        latest = len(episodes) - 1
+        failures_before = self._retention_failures
+        rows = tuple(
+            (
+                index,
+                episode,
+                self._retention_priority(episode)
+                * math.exp(
+                    -self.RICCI_AGE_ALPHA * max(0, latest - index)
+                ),
+            )
+            for index, episode in enumerate(episodes)
+        )
+        self._ricci_priority_degraded = (
+            self._retention_failures > failures_before
+        )
+        self._ricci_episode_cache = rows
+        return rows
+
+    def _ricci_working_symbols(self, window: int) -> tuple[str, ...]:
+        """Project the highest-value whole answer episodes into one PPM window."""
+
+        if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+            raise MarkovDraftError("Ricci working-set window is invalid")
+        persistent = self._persistent_symbols()
+        if self.episode_priority is None or not persistent:
+            return persistent[-window:]
+        cached = self._ricci_working_symbols_cache.get(window)
+        if cached is not None:
+            return cached
+        episodes = self._ricci_episodes()
+        ranked = tuple(
+            sorted(
+                episodes,
+                key=lambda row: (-row[2], -row[0], row[1]),
+            )
+        )
+        capacity = window + 1
+        by_cost: dict[int, list[tuple[int, tuple[int, ...], float]]] = {}
+        for row in episodes:
+            cost = len(row[1]) + 1
+            if cost <= capacity:
+                by_cost.setdefault(cost, []).append(row)
+        candidates = []
+        for cost, rows in by_cost.items():
+            candidates.extend(
+                sorted(
+                    rows,
+                    key=lambda row: (-row[2], -row[0], row[1]),
+                )[: capacity // cost]
+            )
+        candidates.sort(key=lambda row: row[0])
+        scores = [-math.inf] * (capacity + 1)
+        recencies = [-1] * (capacity + 1)
+        counts = [-1] * (capacity + 1)
+        scores[0] = 0.0
+        recencies[0] = 0
+        counts[0] = 0
+        update_masks: list[bytes] = []
+        mask_bytes = (capacity + 8) // 8
+        for row in candidates:
+            cost = len(row[1]) + 1
+            updates = bytearray(mask_bytes)
+            for used in range(capacity, cost - 1, -1):
+                previous_score = scores[used - cost]
+                if previous_score == -math.inf:
+                    continue
+                candidate_score = previous_score + row[2]
+                candidate_recency = recencies[used - cost] + row[0]
+                candidate_count = counts[used - cost] + 1
+                if (
+                    candidate_score,
+                    candidate_recency,
+                    candidate_count,
+                ) > (
+                    scores[used],
+                    recencies[used],
+                    counts[used],
+                ):
+                    scores[used] = candidate_score
+                    recencies[used] = candidate_recency
+                    counts[used] = candidate_count
+                    updates[used >> 3] |= 1 << (used & 7)
+            update_masks.append(bytes(updates))
+        best_used = max(
+            (
+                used
+                for used in range(1, capacity + 1)
+                if scores[used] != -math.inf
+            ),
+            key=lambda used: (
+                scores[used],
+                used,
+                recencies[used],
+                counts[used],
+            ),
+            default=0,
+        )
+        selected = []
+        used = best_used
+        if scores[used] != -math.inf:
+            for candidate_index in range(len(candidates) - 1, -1, -1):
+                mask = update_masks[candidate_index]
+                if not (mask[used >> 3] & (1 << (used & 7))):
+                    continue
+                row = candidates[candidate_index]
+                selected.append(row)
+                used -= len(row[1]) + 1
+                if used == 0:
+                    break
+        if used != 0:
+            raise MarkovDraftError(
+                "Ricci working-set optimization lost its parent path"
+            )
+        if not selected and ranked:
+            index, episode, score = ranked[0]
+            selected = [(index, episode[-window:], score)]
+        selected.sort(key=lambda row: row[0])
+        symbols: list[str] = []
+        for _index, episode, _score in selected:
+            if symbols:
+                symbols.append(_EPISODE_TOKEN)
+            symbols.extend(self._symbol(token) for token in episode)
+        result = tuple(symbols)
+        if len(result) > window:
+            raise MarkovDraftError("Ricci working set exceeds its expert window")
+        latest = len(episodes) - 1
+        selected_tokens = sum(len(row[1]) for row in selected)
+        self._ricci_working_set_builds += 1
+        self._ricci_working_set_selected_episodes = max(
+            self._ricci_working_set_selected_episodes,
+            len(selected),
+        )
+        self._ricci_working_set_selected_tokens = max(
+            self._ricci_working_set_selected_tokens,
+            selected_tokens,
+        )
+        self._ricci_working_set_oldest_age = max(
+            self._ricci_working_set_oldest_age,
+            max((latest - row[0] for row in selected), default=0),
+        )
+        self._ricci_working_set_max_score = max(
+            self._ricci_working_set_max_score,
+            max((row[2] for row in selected), default=0.0),
+        )
+        self._ricci_working_symbols_cache[window] = result
         return result
 
     def _episodes(self, dialect_id: str | None = None) -> tuple[tuple[int, ...], ...]:
@@ -3005,6 +3200,11 @@ class FingerprintRollingK4DraftProvider:
     def _expert_models(
         self, history: tuple[int, ...]
     ) -> tuple[tuple[_TransitionFingerprint, list[str]], ...]:
+        if self._ricci_priority_degraded:
+            self._ricci_working_symbols_cache.clear()
+            self._ricci_episode_cache = None
+            self._persistent_expert_models.clear()
+            self._ricci_priority_degraded = False
         rows = []
         persistent = self._persistent_symbols()
         current = tuple(self._symbol(token) for token in history)
@@ -3022,7 +3222,7 @@ class FingerprintRollingK4DraftProvider:
                 continue
             model = self._persistent_expert_models.get(spec.name)
             if model is None:
-                corpus = persistent[-spec.window :]
+                corpus = self._ricci_working_symbols(spec.window)
                 model = _TransitionFingerprint.fit(
                     corpus,
                     max_order=min(spec.max_order, len(corpus) - 1),
@@ -5352,19 +5552,7 @@ class FingerprintRollingK4DraftProvider:
             strict=True,
         ):
             generated = retained if boundary is None else retained[boundary:]
-            try:
-                retained_priority = (
-                    1.0
-                    if self.episode_priority is None
-                    else float(self.episode_priority(generated))
-                )
-            except Exception:
-                retained_priority = 1.0
-                self._retention_failures += 1
-            if not math.isfinite(retained_priority) or retained_priority < 0.0:
-                retained_priority = 1.0
-                self._retention_failures += 1
-            priorities.append(retained_priority)
+            priorities.append(self._retention_priority(generated))
         episodes.append(episode)
         priorities.append(priority)
         dialect_ids.append(self._active_dialect.dialect_id)
@@ -5417,6 +5605,10 @@ class FingerprintRollingK4DraftProvider:
             updates=self._state.updates + 1,
         )
         self._persistent_symbols_cache = None
+        self._ricci_working_symbols_cache.clear()
+        self._ricci_episode_cache = None
+        self._ricci_priority_degraded = False
+        self._episode_priority_cache.clear()
         self._persistent_expert_models.clear()
         self._composition_cache.clear()
 
@@ -5863,6 +6055,18 @@ class FingerprintRollingK4DraftProvider:
         original_retention_failures = self._retention_failures
         original_retention_evictions = self._retention_priority_evictions
         original_retention_priority = self._last_retention_priority
+        original_persistent_symbols_cache = self._persistent_symbols_cache
+        original_ricci_working_symbols_cache = dict(
+            self._ricci_working_symbols_cache
+        )
+        original_ricci_episode_cache = self._ricci_episode_cache
+        original_ricci_priority_degraded = self._ricci_priority_degraded
+        original_episode_priority_cache = dict(self._episode_priority_cache)
+        original_persistent_expert_models = dict(
+            self._persistent_expert_models
+        )
+        original_composition_cache = dict(self._composition_cache)
+        original_composition_program_count = self._composition_program_count
         original_request_rapidities = self._request_expert_rapidities
         original_request_weight_updates = self._request_weight_updates
         original_max_request_weight_shift = self._max_request_weight_shift
@@ -6064,6 +6268,16 @@ class FingerprintRollingK4DraftProvider:
             self._retention_failures = original_retention_failures
             self._retention_priority_evictions = original_retention_evictions
             self._last_retention_priority = original_retention_priority
+            self._persistent_symbols_cache = original_persistent_symbols_cache
+            self._ricci_working_symbols_cache = (
+                original_ricci_working_symbols_cache
+            )
+            self._ricci_episode_cache = original_ricci_episode_cache
+            self._ricci_priority_degraded = original_ricci_priority_degraded
+            self._episode_priority_cache = original_episode_priority_cache
+            self._persistent_expert_models = original_persistent_expert_models
+            self._composition_cache = original_composition_cache
+            self._composition_program_count = original_composition_program_count
             self._request_expert_rapidities = original_request_rapidities
             self._request_weight_updates = original_request_weight_updates
             self._max_request_weight_shift = original_max_request_weight_shift
@@ -6352,6 +6566,15 @@ class FingerprintRollingK4DraftProvider:
             retention_failures=self._retention_failures,
             retention_priority_evictions=self._retention_priority_evictions,
             last_retention_priority=self._last_retention_priority,
+            ricci_working_set_builds=self._ricci_working_set_builds,
+            ricci_working_set_selected_episodes=(
+                self._ricci_working_set_selected_episodes
+            ),
+            ricci_working_set_selected_tokens=(
+                self._ricci_working_set_selected_tokens
+            ),
+            ricci_working_set_oldest_age=self._ricci_working_set_oldest_age,
+            ricci_working_set_max_score=self._ricci_working_set_max_score,
             composition_programs=self._composition_program_count,
             composition_option_calls=self._composition_option_calls,
             composition_draft_tokens=self._composition_draft_tokens,
@@ -6480,6 +6703,7 @@ __all__ = [
     "MARKOV_DRAFT_METRICS_SCHEMA",
     "MARKOV_DRAFT_PROVIDER_ABI",
     "MARKOV_DRAFT_STATE_SCHEMA",
+    "MARKOV_RICCI_WORKING_SET_POLICY",
     "FingerprintRollingK4DraftProvider",
     "MarkovDraftError",
     "MarkovDialectState",

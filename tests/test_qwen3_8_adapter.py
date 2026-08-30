@@ -445,6 +445,17 @@ class Qwen38CausalChatTests(unittest.TestCase):
             chat._base_evidence()["o1_markov_retention"],
             {"sequence": 0},
         )
+        with patch(
+            "immer.runtimes.qwen3_8.adapter._digest",
+            side_effect=lambda value: value,
+        ):
+            runtime_identity = chat._draft_window_runtime_identity()
+        self.assertEqual(
+            runtime_identity["provider"]["o1_markov_retention"][
+                "ppm_working_set"
+            ],
+            "o1-priority+ricci-age-whole-answer/v1",
+        )
         chat.close()
 
     def test_template_anchor_stops_before_user_specific_tokens(self) -> None:
@@ -2759,6 +2770,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
                             "planner_phrase_selections": 1,
                             "planner_tournament_calls": 2,
                             "planner_trace_feedback_tokens": 9,
+                            "ricci_working_set_builds": 3,
+                            "ricci_working_set_selected_episodes": 2,
+                            "ricci_working_set_selected_tokens": 61,
+                            "ricci_working_set_oldest_age": 7,
+                            "ricci_working_set_max_score": 9.5,
                             "recursive_trace_feedback_tokens": 4,
                             "recursive_trace_max_position": 3,
                         },
@@ -2809,7 +2825,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "Hybrid 2 provider tournaments Markov1/MTP1, "
                 "6 provider counterfactual labels · "
                 "Markov 2 tournaments B1/C0/P1, "
-                "9 counterfactual labels, 4 deep labels through p3, dialect 0.75 · "
+                "9 counterfactual labels, 4 deep labels through p3, dialect 0.75, "
+                "Ricci PPM 2 episodes/61 tokens, age 7 · "
                 "2 free MTP teacher labels · 5 recursive MTP labels through p4]",
             ],
         )
@@ -2858,6 +2875,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
                             "planner_beam_selections": "0",
                             "planner_tournament_calls": True,
                             "planner_trace_feedback_tokens": False,
+                            "ricci_working_set_builds": True,
+                            "ricci_working_set_selected_episodes": "2",
+                            "ricci_working_set_selected_tokens": False,
+                            "ricci_working_set_oldest_age": "7",
                             "recursive_trace_feedback_tokens": "4",
                             "teacher_verifications": True,
                         },

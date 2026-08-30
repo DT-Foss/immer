@@ -52,6 +52,7 @@ from .model import StreamedQwen38
 from .local_draft import Qwen35K4DraftProvider
 from .markov_draft import (
     MARKOV_DRAFT_PROVIDER_ABI,
+    MARKOV_RICCI_WORKING_SET_POLICY,
     MARKOV_DRAFT_STATE_SCHEMA,
     FingerprintRollingK4DraftProvider,
 )
@@ -1723,6 +1724,7 @@ class Qwen38CausalChat:
                 policy["o1_markov_retention"] = {
                     "history_capacity_tokens": 65_536,
                     "policy": O1_MARKOV_RETENTION_POLICY,
+                    "ppm_working_set": MARKOV_RICCI_WORKING_SET_POLICY,
                     "persistent": True,
                 }
         elif self._draft_mode is not None:
@@ -1927,6 +1929,7 @@ class Qwen38CausalChat:
         ):
             provider["o1_markov_retention"] = {
                 "policy": O1_MARKOV_RETENTION_POLICY,
+                "ppm_working_set": MARKOV_RICCI_WORKING_SET_POLICY,
                 "state_path": str(self._markov_o1_retention_path),
             }
         return _digest(

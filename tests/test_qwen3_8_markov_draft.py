@@ -354,6 +354,371 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         provider.close()
 
+    def test_ricci_working_set_prioritizes_old_answer_for_ppm_evidence(
+        self,
+    ) -> None:
+        old = (50, 4, 7, 8, 9)
+        medium = (10, 11, 12, 13, 14, 15)
+        recent = (20, 21, 22, 23, 24, 25)
+        priorities = {
+            old[1:]: 100.0,
+            medium: 2.0,
+            recent: 0.01,
+        }
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_order=4,
+            max_history_tokens=17,
+            episode_priority=lambda answer: priorities[answer],
+        )
+        expert_count = len(provider._experts)
+        provider._state = replace(
+            provider._state,
+            token_ids=(*old, *medium, *recent),
+            episode_lengths=(len(old), len(medium), len(recent)),
+            episode_dialects=(None, None, None),
+            episode_prompt_lengths=(1, None, None),
+            expert_observations=(64,) * expert_count,
+            expert_hits=(64,) * expert_count,
+        )
+
+        raw_suffix = provider._persistent_symbols()[-17:]
+        working = provider._ricci_working_symbols(17)
+
+        self.assertNotIn("04", raw_suffix)
+        self.assertEqual(
+            working,
+            (
+                "04",
+                "07",
+                "08",
+                "09",
+                "<episode>",
+                "10",
+                "11",
+                "12",
+                "13",
+                "14",
+                "15",
+            ),
+        )
+        self.assertNotIn("50", working)
+        self.assertNotIn("20", working)
+
+        evidence = tuple(
+            model.token_evidence(context, "07")
+            for spec, (model, context) in zip(
+                provider._experts,
+                provider._expert_models((4,)),
+                strict=True,
+            )
+            if not spec.local_only and spec.max_order >= 1
+        )
+        self.assertTrue(
+            any(support > 0 and order >= 1 for _score, support, _total, order in evidence)
+        )
+        metrics = provider.metrics()
+        self.assertEqual(metrics.ricci_working_set_builds, 1)
+        self.assertEqual(metrics.ricci_working_set_selected_episodes, 2)
+        self.assertEqual(metrics.ricci_working_set_selected_tokens, 10)
+        self.assertEqual(metrics.ricci_working_set_oldest_age, 2)
+        self.assertAlmostEqual(
+            metrics.ricci_working_set_max_score,
+            100.0 * math.exp(-2.0 * provider.RICCI_AGE_ALPHA),
+        )
+        provider.close()
+
+    def test_ricci_working_set_without_priority_is_exact_raw_suffix(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_order=4,
+            max_history_tokens=64,
+        )
+        episodes = ((1, 2, 3), (4, 5, 6, 7), (8, 9))
+        provider._state = replace(
+            provider._state,
+            token_ids=tuple(token for episode in episodes for token in episode),
+            episode_lengths=tuple(len(episode) for episode in episodes),
+            episode_dialects=(None,) * len(episodes),
+            episode_prompt_lengths=(None,) * len(episodes),
+        )
+        persistent = provider._persistent_symbols()
+
+        for window in (1, 4, 8, len(persistent), len(persistent) + 5):
+            with self.subTest(window=window):
+                self.assertEqual(
+                    provider._ricci_working_symbols(window),
+                    persistent[-window:],
+                )
+
+        self.assertEqual(provider.metrics().ricci_working_set_builds, 0)
+        provider.close()
+
+    def test_ricci_working_set_falls_back_to_top_episode_tail(self) -> None:
+        old = tuple(range(1, 11))
+        recent = tuple(range(20, 30))
+        priorities = {old: 100.0, recent: 1.0}
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_order=4,
+            max_history_tokens=64,
+            episode_priority=lambda answer: priorities[answer],
+        )
+        provider._state = replace(
+            provider._state,
+            token_ids=(*old, *recent),
+            episode_lengths=(len(old), len(recent)),
+            episode_dialects=(None, None),
+            episode_prompt_lengths=(None, None),
+        )
+
+        self.assertEqual(
+            provider._ricci_working_symbols(4),
+            tuple(provider._symbol(token) for token in old[-4:]),
+        )
+        metrics = provider.metrics()
+        self.assertEqual(metrics.ricci_working_set_selected_episodes, 1)
+        self.assertEqual(metrics.ricci_working_set_selected_tokens, 4)
+        self.assertEqual(metrics.ricci_working_set_oldest_age, 1)
+        provider.close()
+
+    def test_ricci_working_set_maximizes_value_under_the_symbol_budget(
+        self,
+    ) -> None:
+        large = tuple(range(1, 10))
+        first = (20, 21, 22, 23)
+        second = (30, 31, 32, 33)
+        priorities = {large: 10.0, first: 9.0, second: 9.0}
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_order=4,
+            max_history_tokens=32,
+            episode_priority=lambda answer: priorities[answer],
+        )
+        provider._state = replace(
+            provider._state,
+            token_ids=(*large, *first, *second),
+            episode_lengths=(9, 4, 4),
+            episode_dialects=(None, None, None),
+            episode_prompt_lengths=(None, None, None),
+        )
+
+        self.assertEqual(
+            provider._ricci_working_symbols(10),
+            (
+                "20",
+                "21",
+                "22",
+                "23",
+                "<episode>",
+                "30",
+                "31",
+                "32",
+                "33",
+            ),
+        )
+        self.assertEqual(provider.metrics().ricci_working_set_selected_episodes, 2)
+        provider.close()
+
+    def test_ricci_priority_failures_use_neutral_safe_fallback(self) -> None:
+        def fail(_answer):
+            raise RuntimeError("priority service unavailable")
+
+        callbacks = (
+            ("exception", fail),
+            ("invalid", lambda _answer: float("nan")),
+        )
+        for label, callback in callbacks:
+            with self.subTest(callback=label):
+                provider = FingerprintRollingK4DraftProvider(
+                    vocab_size=64,
+                    max_order=2,
+                    max_history_tokens=32,
+                    episode_priority=callback,
+                )
+                episodes = ((1, 2, 3), (7, 8, 9))
+                provider._state = replace(
+                    provider._state,
+                    token_ids=tuple(
+                        token for episode in episodes for token in episode
+                    ),
+                    episode_lengths=(3, 3),
+                    episode_dialects=(None, None),
+                    episode_prompt_lengths=(None, None),
+                )
+
+                self.assertEqual(
+                    provider._ricci_working_symbols(3),
+                    ("07", "08", "09"),
+                )
+                metrics = provider.metrics()
+                self.assertEqual(metrics.retention_failures, 2)
+                self.assertEqual(metrics.ricci_working_set_builds, 1)
+                self.assertEqual(metrics.ricci_working_set_max_score, 1.0)
+                provider.close()
+
+    def test_transient_ricci_priority_failure_retries_next_expert_round(
+        self,
+    ) -> None:
+        old = (1, 2, 3, 4)
+        recent = (5, 6, 7, 8)
+        old_calls = 0
+
+        def priority(answer):
+            nonlocal old_calls
+            if answer == old:
+                old_calls += 1
+                if old_calls == 1:
+                    raise RuntimeError("transient O1 read")
+                return 100.0
+            return 1.0
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_order=2,
+            max_history_tokens=8,
+            episode_priority=priority,
+        )
+        provider._experts = (
+            markov_module.MarkovExpertSpec("global-test", 2, 8, False),
+        )
+        provider._state = replace(
+            provider._state,
+            token_ids=(*old, *recent),
+            episode_lengths=(4, 4),
+            episode_dialects=(None, None),
+            episode_prompt_lengths=(None, None),
+            expert_names=("global-test",),
+            expert_log_weights=(0.0,),
+            expert_observations=(0,),
+            expert_hits=(0,),
+            horizon_expert_observations=((0,),) * 16,
+            horizon_expert_hits=((0,),) * 16,
+        )
+        provider._last_position_weights = (1.0,)
+
+        first_model = provider._expert_models((20,))[0][0]
+        self.assertNotIn("01", first_model.vocabulary)
+        self.assertIn("05", first_model.vocabulary)
+
+        second_model = provider._expert_models((20,))[0][0]
+        self.assertIsNot(first_model, second_model)
+        self.assertIn("01", second_model.vocabulary)
+        self.assertNotIn("05", second_model.vocabulary)
+        self.assertEqual(old_calls, 2)
+        self.assertEqual(provider.metrics().retention_failures, 1)
+        self.assertEqual(provider.metrics().ricci_working_set_builds, 2)
+        provider.close()
+
+    def test_ricci_working_set_cache_reuses_and_invalidates_on_learning(
+        self,
+    ) -> None:
+        old = (1, 2, 3)
+        recent = (7, 8, 9)
+        learned = (11, 12, 13)
+        priorities = {old: 10.0, recent: 1.0, learned: 20.0}
+        priority_calls = []
+
+        def priority(answer):
+            priority_calls.append(answer)
+            return priorities[answer]
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_order=2,
+            max_history_tokens=64,
+            episode_priority=priority,
+        )
+        provider._state = replace(
+            provider._state,
+            token_ids=(*old, *recent),
+            episode_lengths=(3, 3),
+            episode_dialects=(None, None),
+            episode_prompt_lengths=(None, None),
+        )
+
+        first = provider._ricci_working_symbols(4)
+        first_wide = provider._ricci_working_symbols(5)
+        calls_after_build = len(priority_calls)
+        second = provider._ricci_working_symbols(4)
+        second_wide = provider._ricci_working_symbols(5)
+
+        self.assertIs(first, second)
+        self.assertIs(first_wide, second_wide)
+        self.assertEqual(first, ("01", "02", "03"))
+        self.assertEqual(calls_after_build, 2)
+        self.assertEqual(len(priority_calls), calls_after_build)
+        self.assertEqual(provider.metrics().ricci_working_set_builds, 2)
+
+        provider._activate_dialect((30, 31))
+        provider._learn_episode(learned, prompt_length=None, priority=20.0)
+        rebuilt = provider._ricci_working_symbols(4)
+        rebuilt_wide = provider._ricci_working_symbols(5)
+
+        self.assertEqual(rebuilt, ("11", "12", "13"))
+        self.assertEqual(rebuilt_wide, ("11", "12", "13"))
+        self.assertGreater(len(priority_calls), calls_after_build)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.ricci_working_set_builds, 4)
+        self.assertEqual(metrics.ricci_working_set_max_score, 20.0)
+        provider.close()
+
+    def test_failed_final_commit_restores_ricci_and_ppm_caches_exactly(
+        self,
+    ) -> None:
+        episodes = ((1, 2, 3), (7, 8, 9))
+        priority_calls = []
+
+        def priority(answer):
+            priority_calls.append(answer)
+            return 10.0 if answer == episodes[0] else 1.0
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=64,
+            max_order=2,
+            max_history_tokens=32,
+            episode_priority=priority,
+        )
+        provider._state = replace(
+            provider._state,
+            token_ids=tuple(token for row in episodes for token in row),
+            episode_lengths=(3, 3),
+            episode_dialects=(None, None),
+            episode_prompt_lengths=(None, None),
+        )
+        prompt = (20, 21)
+        provider.begin_request(prompt)
+        models = provider._expert_models(prompt)
+        original_symbols = provider._persistent_symbols_cache
+        original_working = dict(provider._ricci_working_symbols_cache)
+        original_episodes = provider._ricci_episode_cache
+        original_priorities = dict(provider._episode_priority_cache)
+        original_models = dict(provider._persistent_expert_models)
+        calls_before = len(priority_calls)
+
+        with (
+            mock.patch.object(provider, "_persist", side_effect=OSError("disk full")),
+            self.assertRaisesRegex(OSError, "disk full"),
+        ):
+            provider.observe_final((*prompt, 30))
+
+        self.assertIs(provider._persistent_symbols_cache, original_symbols)
+        self.assertEqual(provider._ricci_working_symbols_cache, original_working)
+        self.assertIs(provider._ricci_episode_cache, original_episodes)
+        self.assertEqual(provider._episode_priority_cache, original_priorities)
+        self.assertEqual(provider._persistent_expert_models, original_models)
+        replayed = provider._expert_models(prompt)
+        self.assertEqual(len(priority_calls), calls_before)
+        for spec, first, second in zip(
+            provider._experts,
+            models,
+            replayed,
+            strict=True,
+        ):
+            if not spec.local_only:
+                self.assertIs(first[0], second[0])
+        provider.close()
+
     def test_council_can_resume_after_another_provider_commits_prefix(self) -> None:
         provider = FingerprintRollingK4DraftProvider(
             vocab_size=64,
@@ -1559,11 +1924,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(
             markov_module.MARKOV_DRAFT_PROVIDER_ABI,
-            "immer.qwen3.8-markov-draft-provider/v46",
+            "immer.qwen3.8-markov-draft-provider/v47",
         )
         self.assertEqual(
             metrics.schema,
-            "immer.qwen3.8-markov-draft-metrics/v35",
+            "immer.qwen3.8-markov-draft-metrics/v36",
         )
         self.assertEqual(metrics.horizon_self_reliability, (1.0,) * 16)
         self.assertTrue(

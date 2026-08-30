@@ -13,7 +13,7 @@ from .draft_protocol import RollingDraftProposal
 from .mtp_draft import Qwen35MtpCarry, Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v27"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v28"
 ATLAS_MTP_CONSENSUS_STRENGTH = 0.25
 ONLINE_MTP_CONSENSUS_STRENGTH = 0.25
 PROVIDER_TOURNAMENT_DISCOUNT = 0.85

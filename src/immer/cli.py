@@ -117,8 +117,8 @@ _QWEN38_DEPLOYMENT_O1_RETENTION = (
 _QWEN38_DEPLOYMENT_MLP_PAGE_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-mlp-page-markov-v1.json"
 )
-_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v46"
-_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v27"
+_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v47"
+_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v28"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
     b"immer:qwen3.8-growing-warm-runtime/v2"
@@ -813,6 +813,32 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     and float(similarity) > 0.0
                 ):
                     markov_parts.append(f"dialect {float(similarity):.2f}")
+                ricci_builds = markov.get("ricci_working_set_builds")
+                ricci_episodes = markov.get(
+                    "ricci_working_set_selected_episodes"
+                )
+                ricci_tokens = markov.get("ricci_working_set_selected_tokens")
+                ricci_age = markov.get("ricci_working_set_oldest_age")
+                if (
+                    isinstance(ricci_builds, int)
+                    and not isinstance(ricci_builds, bool)
+                    and ricci_builds > 0
+                    and isinstance(ricci_episodes, int)
+                    and not isinstance(ricci_episodes, bool)
+                    and isinstance(ricci_tokens, int)
+                    and not isinstance(ricci_tokens, bool)
+                ):
+                    markov_parts.append(
+                        f"Ricci PPM {ricci_episodes} episodes/"
+                        f"{ricci_tokens} tokens"
+                        + (
+                            f", age {ricci_age}"
+                            if isinstance(ricci_age, int)
+                            and not isinstance(ricci_age, bool)
+                            and ricci_age > 0
+                            else ""
+                        )
+                    )
                 if markov_parts:
                     parts.append("Markov " + ", ".join(markov_parts))
             if isinstance(mtp, dict):

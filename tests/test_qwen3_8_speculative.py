@@ -14,6 +14,7 @@ import torch
 from immer.knowledge import Streamer
 from immer.runtimes.qwen3_8 import (
     FingerprintRollingK4DraftProvider,
+    MARKOV_DRAFT_PROVIDER_ABI,
     QWEN38_K2_SPECULATIVE_SCHEMA,
     QWEN38_K4_SPECULATIVE_ROUND_SCHEMA,
     QWEN38_K4_SPECULATIVE_SCHEMA,
@@ -1473,7 +1474,7 @@ class Qwen38SpeculativeTests(unittest.TestCase):
             def propose_round(self, history, known_token):
                 return replace(
                     super().propose_round(history, known_token),
-                    provider_abi="immer.qwen3.8-markov-draft-provider/v46",
+                    provider_abi=MARKOV_DRAFT_PROVIDER_ABI,
                 )
 
         prompt = (1, 4)
