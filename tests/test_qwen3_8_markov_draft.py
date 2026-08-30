@@ -17,6 +17,7 @@ from immer.runtimes.qwen3_8.markov_draft import (
     FingerprintRollingK4DraftProvider,
     MarkovDialectState,
     MarkovDraftError,
+    MarkovPhraseOption,
     MarkovDraftState,
 )
 from immer.runtimes.qwen3_8.markov_atlas import AtlasTokenEvidence
@@ -61,6 +62,52 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             pager,
             max_batch_size=1,
             max_seq_len=32,
+        )
+
+    @staticmethod
+    def _remove_v12_planner_memory(document: dict[str, object]) -> None:
+        document.pop("planner_hits", None)
+        document.pop("planner_observations", None)
+        for dialect in document.get("dialects", []):
+            dialect.pop("planner_hits", None)
+            dialect.pop("planner_observations", None)
+
+    @staticmethod
+    def _fake_planner_result(
+        provider: FingerprintRollingK4DraftProvider,
+        token_ids: tuple[int, ...],
+        count: int,
+        *,
+        confidence: float,
+        diagnostic_calls: int,
+    ):
+        planned = token_ids[:count]
+        if len(planned) != count:
+            raise AssertionError("fake planner width is too short")
+        feedback = tuple(
+            tuple(({provider._symbol(token): 1.0}, token) for _ in provider._experts)
+            for token in planned
+        )
+        provider._predictions += count
+        provider._council_predictions += count
+        provider._lookahead_calls += diagnostic_calls
+        provider._lookahead_candidates += diagnostic_calls
+        provider._last_raw_confidence = confidence
+        provider._last_empirical_evidence = confidence
+        provider._last_confidence = confidence
+        provider._last_disagreement = 0.0
+        provider._last_position = count - 1
+        provider._last_lookahead_gain = float(diagnostic_calls)
+        provider._max_lookahead_gain = max(
+            provider._max_lookahead_gain,
+            provider._last_lookahead_gain,
+        )
+        provider._last_plan_trace = tuple((token, token, 0.0) for token in planned)
+        return (
+            planned,
+            feedback,
+            (confidence,) * count,
+            (0.0,) * count,
         )
 
     def test_state_roundtrip_and_corruption_rejection(self) -> None:
@@ -323,7 +370,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.discard_pending_proposal()
         provider.advance_confirmed_prefix((*external, 42))
         provider.observe_final((*external, 42, 43))
-        self.assertEqual(provider.confirmed_transitions(), ((prompt, (40, 41, 42, 43)),))
+        self.assertEqual(
+            provider.confirmed_transitions(), ((prompt, (40, 41, 42, 43)),)
+        )
         provider.close()
 
     def test_v1_state_migrates_into_one_episode_and_initializes_council(self) -> None:
@@ -354,7 +403,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(provider.metrics().expert_weights), 8)
         provider.close()
 
-    def test_v2_council_state_migrates_to_v11_planner_memory(self) -> None:
+    def test_v2_council_state_migrates_to_v12_planner_memory(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         state = seed._state
         seed.close()
@@ -394,11 +443,13 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((1, 2, 3, 4))
         provider.close()
 
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0b"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0c"))
         migrated = MarkovDraftState.from_bytes(path.read_bytes())
         self.assertEqual(len(migrated.dialects), 1)
+        self.assertEqual(migrated.planner_observations, ((0,) * 16,) * 3)
+        self.assertEqual(migrated.planner_hits, ((0,) * 16,) * 3)
 
-    def test_v3_dialect_state_migrates_episode_bindings_to_v11(self) -> None:
+    def test_v3_dialect_state_migrates_episode_bindings_to_v12(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -416,6 +467,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("lookahead_greedy_hits")
         document.pop("lookahead_hits")
         document.pop("lookahead_observations")
+        self._remove_v12_planner_memory(document)
         document["schema"] = "immer.qwen3.8-markov-draft-state/v3"
         raw = json.dumps(
             document,
@@ -436,9 +488,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.episode_dialects, (None,))
         provider.observe_final((1, 2, 3, 4))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0b"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0c"))
 
-    def test_v4_state_migrates_empty_import_inventory_to_v11(self) -> None:
+    def test_v4_state_migrates_empty_import_inventory_to_v12(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -455,6 +507,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("lookahead_greedy_hits")
         document.pop("lookahead_hits")
         document.pop("lookahead_observations")
+        self._remove_v12_planner_memory(document)
         document["schema"] = "immer.qwen3.8-markov-draft-state/v4"
         raw = json.dumps(
             document,
@@ -474,9 +527,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider.imported_episode_sha256s(), ())
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0b"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0c"))
 
-    def test_v5_state_migrates_unknown_prompt_boundaries_to_v11(self) -> None:
+    def test_v5_state_migrates_unknown_prompt_boundaries_to_v12(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -492,6 +545,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("lookahead_greedy_hits")
         document.pop("lookahead_hits")
         document.pop("lookahead_observations")
+        self._remove_v12_planner_memory(document)
         document["schema"] = "immer.qwen3.8-markov-draft-state/v5"
         raw = json.dumps(
             document,
@@ -511,9 +565,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider._state.episode_prompt_lengths, (None,))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0b"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0c"))
 
-    def test_v6_state_migrates_zeroed_position_expert_memory_to_v11(self) -> None:
+    def test_v6_state_migrates_zeroed_position_expert_memory_to_v12(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -528,6 +582,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("lookahead_greedy_hits")
         document.pop("lookahead_hits")
         document.pop("lookahead_observations")
+        self._remove_v12_planner_memory(document)
         document["schema"] = "immer.qwen3.8-markov-draft-state/v6"
         raw = json.dumps(
             document,
@@ -550,9 +605,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             all(not any(row) for row in provider._state.horizon_expert_observations)
         )
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0b"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0c"))
 
-    def test_v7_state_migrates_dialect_position_memory_to_v11(self) -> None:
+    def test_v7_state_migrates_dialect_position_memory_to_v12(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         seed.observe_final((1, 2, 3))
         document = json.loads(zlib.decompress(seed._state.to_bytes()[5:]))
@@ -567,6 +622,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("lookahead_observations")
         document.pop("horizon_plan_hits")
         document.pop("horizon_plan_observations")
+        self._remove_v12_planner_memory(document)
         document["schema"] = "immer.qwen3.8-markov-draft-state/v7"
         raw = json.dumps(
             document,
@@ -588,9 +644,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(dialect.horizon_observations), 16)
         self.assertTrue(all(not any(row) for row in dialect.horizon_observations))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0b"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0c"))
 
-    def test_v8_state_migrates_zeroed_lookahead_outcomes_to_v11(self) -> None:
+    def test_v8_state_migrates_zeroed_lookahead_outcomes_to_v12(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
         provider.close()
@@ -599,6 +655,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         document.pop("lookahead_observations")
         document.pop("horizon_plan_hits")
         document.pop("horizon_plan_observations")
+        self._remove_v12_planner_memory(document)
         document["schema"] = "immer.qwen3.8-markov-draft-state/v8"
         raw = json.dumps(
             document,
@@ -628,14 +685,15 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.lookahead_hits, (0,) * 16)
         self.assertEqual(provider._state.lookahead_greedy_hits, (0,) * 16)
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0b"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0c"))
 
-    def test_v9_state_migrates_neutral_plan_reliability_to_v11(self) -> None:
+    def test_v9_state_migrates_neutral_plan_reliability_to_v12(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
         provider.close()
         document.pop("horizon_plan_hits")
         document.pop("horizon_plan_observations")
+        self._remove_v12_planner_memory(document)
         document["schema"] = "immer.qwen3.8-markov-draft-state/v9"
         raw = json.dumps(
             document,
@@ -657,9 +715,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         self.assertEqual(provider.metrics().horizon_self_reliability, (1.0,) * 16)
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0b"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0c"))
 
-    def test_v10_state_migrates_neutral_dialect_plan_memory_to_v11(self) -> None:
+    def test_v10_state_migrates_neutral_dialect_plan_memory_to_v12(self) -> None:
         context = tuple((1, 2, 3, 4) * 8)
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         seed.observe_final(context)
@@ -669,6 +727,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         for dialect in document["dialects"]:
             dialect.pop("plan_hits")
             dialect.pop("plan_observations")
+        self._remove_v12_planner_memory(document)
         document["schema"] = "immer.qwen3.8-markov-draft-state/v10"
         raw = json.dumps(
             document,
@@ -690,12 +749,51 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider.metrics().active_dialect_similarity, 1.0)
         self.assertEqual(provider.metrics().horizon_self_reliability, (1.0,) * 16)
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0b"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0c"))
+
+    def test_v11_state_migrates_neutral_planner_skill_to_v12(self) -> None:
+        context = tuple((1, 2, 3, 4) * 8)
+        seed = FingerprintRollingK4DraftProvider(vocab_size=32)
+        seed.observe_final(context)
+        document = json.loads(zlib.decompress(seed._state.to_bytes()[5:]))
+        seed.close()
+        self._remove_v12_planner_memory(document)
+        document["schema"] = "immer.qwen3.8-markov-draft-state/v11"
+        raw = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        path = self.root / "v11-state.bin"
+        path.write_bytes(b"IMMD\x0b" + zlib.compress(raw, level=9))
+
+        migrated = MarkovDraftState.from_bytes(path.read_bytes())
+        neutral = ((0,) * 16,) * 3
+        self.assertEqual(migrated.planner_observations, neutral)
+        self.assertEqual(migrated.planner_hits, neutral)
+        self.assertEqual(migrated.dialects[0].planner_observations, neutral)
+        self.assertEqual(migrated.dialects[0].planner_hits, neutral)
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=path,
+        )
+        provider._activate_dialect(context)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.planner_names, ("beam", "council", "phrase"))
+        self.assertEqual(metrics.planner_reliability, ((1.0,) * 16,) * 3)
+        self.assertEqual(metrics.active_dialect_planner_observations, neutral)
+        provider.close()
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0c"))
 
     def test_v11_rejects_malformed_global_plan_reliability_shape(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
         provider.close()
+        self._remove_v12_planner_memory(document)
+        document["schema"] = "immer.qwen3.8-markov-draft-state/v11"
         document["horizon_plan_observations"] = [0] * 15
         raw = json.dumps(
             document,
@@ -716,6 +814,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final(tuple((1, 2, 3, 4) * 8))
         document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
         provider.close()
+        self._remove_v12_planner_memory(document)
+        document["schema"] = "immer.qwen3.8-markov-draft-state/v11"
         document["dialects"][0]["plan_observations"] = [0] * 15
         raw = json.dumps(
             document,
@@ -736,6 +836,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final(tuple((1, 2, 3, 4) * 8))
         document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
         provider.close()
+        self._remove_v12_planner_memory(document)
+        document["schema"] = "immer.qwen3.8-markov-draft-state/v11"
         document["dialects"][0]["plan_observations"] = []
         document["dialects"][0]["plan_hits"] = []
         raw = json.dumps(
@@ -748,6 +850,52 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         with self.assertRaisesRegex(MarkovDraftError, "values are invalid"):
             MarkovDraftState.from_bytes(b"IMMD\x0b" + zlib.compress(raw, level=9))
+
+    def test_v12_rejects_malformed_global_planner_matrix(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
+        provider.close()
+        malformed_rows = (
+            ("row-count", [[0] * 16]),
+            ("row-width", [[0] * 15, [0] * 16, [0] * 16]),
+            ("boolean", [[False] + [0] * 15, [0] * 16, [0] * 16]),
+            ("scalar-row", [0, [0] * 16, [0] * 16]),
+        )
+        for label, rows in malformed_rows:
+            with self.subTest(label=label):
+                candidate = dict(document)
+                candidate["planner_observations"] = rows
+                raw = json.dumps(
+                    candidate,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                with self.assertRaisesRegex(
+                    MarkovDraftError,
+                    "values are invalid",
+                ):
+                    MarkovDraftState.from_bytes(
+                        b"IMMD\x0c" + zlib.compress(raw, level=9)
+                    )
+
+    def test_v12_rejects_malformed_nested_dialect_planner_matrix(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(vocab_size=32)
+        provider.observe_final(tuple((1, 2, 3, 4) * 8))
+        document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
+        provider.close()
+        document["dialects"][0]["planner_hits"][0][0] = 1
+        raw = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+        with self.assertRaisesRegex(MarkovDraftError, "values are invalid"):
+            MarkovDraftState.from_bytes(b"IMMD\x0c" + zlib.compress(raw, level=9))
 
     def test_import_digest_survives_episode_eviction_and_prevents_replay(self) -> None:
         state_path = self.root / "imported-markov.bin"
@@ -1002,9 +1150,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         trained._expert_models = lambda _history: fixed_models(trained)
 
-        tokens, _feedback, confidence, disagreement = trained._predict_council(
-            (1,), 3
-        )
+        tokens, _feedback, confidence, disagreement = trained._predict_council((1,), 3)
         proposal = RollingDraftProposal.build(
             tokens,
             confidence,
@@ -1043,9 +1189,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         trained._expert_models = lambda _history: tuple(
             (NearTieExpert(), []) for _ in trained._experts
         )
-        _tokens, _feedback, near_tie, _disagreement = trained._predict_council(
-            (1,), 1
-        )
+        _tokens, _feedback, near_tie, _disagreement = trained._predict_council((1,), 1)
         self.assertLess(near_tie[0], 0.12)
 
         class UnknownDominantExpert:
@@ -1059,15 +1203,15 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         trained._expert_models = lambda _history: tuple(
             (UnknownDominantExpert(), []) for _ in trained._experts
         )
-        _tokens, _feedback, unknown_dominant, _disagreement = (
-            trained._predict_council((1,), 1)
+        _tokens, _feedback, unknown_dominant, _disagreement = trained._predict_council(
+            (1,), 1
         )
         self.assertAlmostEqual(unknown_dominant[0], 0.11)
         self.assertEqual(trained.metrics().last_empirical_evidence, 0.0)
 
         trained._expert_models = lambda _history: fixed_models(trained)
-        _tokens, _feedback, forced_confidence, _disagreement = (
-            trained._predict_council((1,), 1, forced_prefix=(7,))
+        _tokens, _feedback, forced_confidence, _disagreement = trained._predict_council(
+            (1,), 1, forced_prefix=(7,)
         )
         self.assertAlmostEqual(forced_confidence[0], 0.9)
         self.assertEqual(trained.metrics().last_empirical_evidence, 0.0)
@@ -1102,9 +1246,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             (DecisiveExpert(), []) for _ in provider._experts
         )
 
-        tokens, feedback, confidence, _disagreement = provider._predict_council(
-            (1,), 3
-        )
+        tokens, feedback, confidence, _disagreement = provider._predict_council((1,), 3)
 
         self.assertEqual(tokens, (7, 7, 7))
         self.assertGreater(confidence[0], confidence[2])
@@ -1146,8 +1288,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             horizon_expert_hits=tuple(tuple(row) for row in hits),
         )
         provider._expert_models = lambda _history: tuple(
-            (TokenExpert(8 if index >= 5 else 7), [])
-            for index in range(width)
+            (TokenExpert(8 if index >= 5 else 7), []) for index in range(width)
         )
         global_weights = provider._weights()
         position_weights, maturity, dialect_maturity = provider._position_weighting(
@@ -1194,8 +1335,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             expert_log_weights=(-2.0, -2.0, -2.0, -2.0, 4.0, -2.0, -2.0, -2.0),
         )
         provider._expert_models = lambda _history: tuple(
-            (TokenExpert(8 if index >= 5 else 7), [])
-            for index in range(width)
+            (TokenExpert(8 if index >= 5 else 7), []) for index in range(width)
         )
         global_token = provider._predict_council((1,), 1)[0]
         dialect_observations = [[0] * width for _ in range(16)]
@@ -1210,9 +1350,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             rapidities=(0.0,) * width,
             observations=(20,) * width,
             hits=(0, 0, 0, 0, 0, 20, 20, 20),
-            horizon_observations=tuple(
-                tuple(row) for row in dialect_observations
-            ),
+            horizon_observations=tuple(tuple(row) for row in dialect_observations),
             horizon_hits=tuple(tuple(row) for row in dialect_hits),
         )
         provider._active_dialect_similarity = 1.0
@@ -1245,9 +1383,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         signature = provider._context_signature(prompt)
         shared = signature[: max(1, len(signature) // 2)]
         extras = tuple(
-            value
-            for value in range(1_000, 2_000)
-            if value not in set(signature)
+            value for value in range(1_000, 2_000) if value not in set(signature)
         )[: len(signature) - len(shared)]
         partial_signature = tuple(sorted((*shared, *extras)))
         width = len(provider._experts)
@@ -1357,11 +1493,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(
             markov_module.MARKOV_DRAFT_PROVIDER_ABI,
-            "immer.qwen3.8-markov-draft-provider/v44",
+            "immer.qwen3.8-markov-draft-provider/v45",
         )
         self.assertEqual(
             metrics.schema,
-            "immer.qwen3.8-markov-draft-metrics/v33",
+            "immer.qwen3.8-markov-draft-metrics/v34",
         )
         self.assertEqual(metrics.horizon_self_reliability, (1.0,) * 16)
         self.assertTrue(
@@ -1371,6 +1507,243 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             )
         )
         provider.close()
+
+    def test_cold_tournament_keeps_beam_default_and_selected_diagnostics(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        provider.atlas = mock.Mock(context_count=0, token_count=0, max_branches=8)
+        prompt = (20, 21)
+        beam_tokens = (7, 8, 9, 10)
+        council_tokens = (11, 12, 13, 14)
+
+        def predict_beam(_history, count, **_kwargs):
+            return self._fake_planner_result(
+                provider,
+                beam_tokens,
+                count,
+                confidence=0.01,
+                diagnostic_calls=1,
+            )
+
+        def predict_council(_history, count, **_kwargs):
+            return self._fake_planner_result(
+                provider,
+                council_tokens,
+                count,
+                confidence=0.99,
+                diagnostic_calls=10,
+            )
+
+        provider.begin_request(prompt)
+        with (
+            mock.patch.object(provider, "_phrase_option", return_value=None),
+            mock.patch.object(provider, "_predict_beam", side_effect=predict_beam),
+            mock.patch.object(
+                provider,
+                "_predict_council",
+                side_effect=predict_council,
+            ),
+        ):
+            proposal = provider.propose_round(prompt, 22)
+
+        metrics = provider.metrics()
+        self.assertEqual(proposal.token_ids, beam_tokens[:3])
+        self.assertEqual(provider._pending_planner, "beam")
+        self.assertEqual(
+            provider._pending_planner_candidates,
+            (beam_tokens, council_tokens, ()),
+        )
+        self.assertEqual(metrics.planner_tournament_calls, 1)
+        self.assertEqual(metrics.planner_beam_selections, 1)
+        self.assertEqual(metrics.planner_council_selections, 0)
+        self.assertEqual(metrics.planner_phrase_selections, 0)
+        self.assertEqual(metrics.predictions, 4)
+        self.assertEqual(metrics.council_predictions, 4)
+        self.assertEqual(metrics.lookahead_calls, 1)
+        self.assertEqual(metrics.lookahead_candidates, 1)
+        self.assertEqual(metrics.last_confidence, 0.01)
+        self.assertEqual(provider._last_plan_trace[0][0], beam_tokens[0])
+        provider.discard_pending_proposal()
+        provider.close()
+
+    def test_learned_planner_skill_can_switch_selection_to_pure_council(
+        self,
+    ) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            proposal_width=3,
+        )
+        provider.atlas = mock.Mock(context_count=0, token_count=0, max_branches=8)
+        observed = (100,) * 4 + (0,) * 12
+        provider._state = replace(
+            provider._state,
+            planner_observations=((0,) * 16, observed, (0,) * 16),
+            planner_hits=((0,) * 16, observed, (0,) * 16),
+        )
+        prompt = (20, 21)
+        beam_tokens = (7, 8, 9, 10)
+        council_tokens = (11, 12, 13, 14)
+
+        def predict_beam(_history, count, **_kwargs):
+            return self._fake_planner_result(
+                provider,
+                beam_tokens,
+                count,
+                confidence=0.99,
+                diagnostic_calls=1,
+            )
+
+        def predict_council(_history, count, **_kwargs):
+            return self._fake_planner_result(
+                provider,
+                council_tokens,
+                count,
+                confidence=0.80,
+                diagnostic_calls=10,
+            )
+
+        provider.begin_request(prompt)
+        with (
+            mock.patch.object(provider, "_phrase_option", return_value=None),
+            mock.patch.object(provider, "_predict_beam", side_effect=predict_beam),
+            mock.patch.object(
+                provider,
+                "_predict_council",
+                side_effect=predict_council,
+            ),
+        ):
+            proposal = provider.propose_round(prompt, 22)
+
+        metrics = provider.metrics()
+        self.assertEqual(proposal.token_ids, council_tokens[:3])
+        self.assertEqual(provider._pending_planner, "council")
+        self.assertEqual(metrics.planner_beam_selections, 0)
+        self.assertEqual(metrics.planner_council_selections, 1)
+        self.assertEqual(metrics.planner_phrase_selections, 0)
+        self.assertFalse(provider._planner_has_evidence(0, 0))
+        self.assertTrue(provider._planner_has_evidence(1, 0))
+        self.assertEqual(metrics.planner_reliability[0][0], 1.0)
+        self.assertEqual(metrics.predictions, 4)
+        self.assertEqual(metrics.lookahead_calls, 10)
+        self.assertEqual(metrics.last_confidence, 0.80)
+        provider.discard_pending_proposal()
+        provider.close()
+
+    def test_phrase_planner_can_win_or_lose_independently_from_its_default(
+        self,
+    ) -> None:
+        observed = (100,) * 4 + (0,) * 12
+        beam_tokens = (7, 8, 9, 10)
+        council_tokens = (11, 12, 13, 14)
+        phrase_tokens = (15, 16, 17, 18)
+
+        def exercise(
+            *,
+            option: MarkovPhraseOption,
+            planner_hits: tuple[tuple[int, ...], ...],
+            expected: str,
+        ):
+            provider = FingerprintRollingK4DraftProvider(
+                vocab_size=32,
+                proposal_width=3,
+            )
+            provider.atlas = mock.Mock(
+                context_count=0,
+                token_count=0,
+                max_branches=8,
+            )
+            provider._state = replace(
+                provider._state,
+                planner_observations=(observed,) * 3,
+                planner_hits=planner_hits,
+            )
+
+            def predict_beam(_history, count, **_kwargs):
+                return self._fake_planner_result(
+                    provider,
+                    beam_tokens,
+                    count,
+                    confidence=0.80,
+                    diagnostic_calls=1,
+                )
+
+            def predict_council(_history, count, *, forced_prefix=(), **_kwargs):
+                return self._fake_planner_result(
+                    provider,
+                    phrase_tokens if forced_prefix else council_tokens,
+                    count,
+                    confidence=0.80,
+                    diagnostic_calls=100 if forced_prefix else 10,
+                )
+
+            prompt = (20, 21)
+            provider.begin_request(prompt)
+            with (
+                mock.patch.object(provider, "_phrase_option", return_value=option),
+                mock.patch.object(
+                    provider,
+                    "_predict_beam",
+                    side_effect=predict_beam,
+                ),
+                mock.patch.object(
+                    provider,
+                    "_predict_council",
+                    side_effect=predict_council,
+                ),
+            ):
+                proposal = provider.propose_round(prompt, 22)
+            metrics = provider.metrics()
+            expected_tokens = {
+                "beam": beam_tokens,
+                "council": council_tokens,
+                "phrase": phrase_tokens,
+            }[expected]
+            self.assertEqual(proposal.token_ids, expected_tokens[:3])
+            self.assertEqual(provider._pending_planner, expected)
+            self.assertEqual(
+                (
+                    metrics.planner_beam_selections,
+                    metrics.planner_council_selections,
+                    metrics.planner_phrase_selections,
+                ),
+                tuple(int(name == expected) for name in metrics.planner_names),
+            )
+            self.assertEqual(
+                metrics.lookahead_calls,
+                {"beam": 1, "council": 10, "phrase": 100}[expected],
+            )
+            provider.discard_pending_proposal()
+            provider.close()
+            return proposal
+
+        phrase_winner = exercise(
+            option=MarkovPhraseOption(
+                token_ids=phrase_tokens[:3],
+                source="atlas",
+                context_order=2,
+                support=3,
+                total=4,
+                kind="atlas",
+            ),
+            planner_hits=((0,) * 16, (0,) * 16, observed),
+            expected="phrase",
+        )
+        phrase_loser = exercise(
+            option=MarkovPhraseOption(
+                token_ids=phrase_tokens[:3],
+                source="request",
+                context_order=2,
+                support=3,
+                total=4,
+                kind="composition",
+            ),
+            planner_hits=((0,) * 16, observed, (0,) * 16),
+            expected="council",
+        )
+        self.assertEqual(phrase_winner.phrase_source, "atlas")
+        self.assertIsNone(phrase_loser.phrase_source)
 
     def test_persistent_deep_plan_misses_cap_confidence_and_window(self) -> None:
         class DecisiveExpert:
@@ -1506,12 +1879,10 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                 (DecisiveExpert(), []) for _ in provider._experts
             )
             provider._activate_dialect(context)
-            tokens, _feedback, confidence, disagreement = (
-                provider._predict_council(
-                    (1,),
-                    7,
-                    forced_prefix=(7,) * 7,
-                )
+            tokens, _feedback, confidence, disagreement = provider._predict_council(
+                (1,),
+                7,
+                forced_prefix=(7,) * 7,
             )
             proposal = RollingDraftProposal.build(
                 tokens,
@@ -1799,9 +2170,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         third_history = (*second_history, correction_first)
         provider.propose_round(third_history, correction_second)
-        local = provider._request_local_fingerprint(
-            (*third_history, correction_second)
-        )
+        local = provider._request_local_fingerprint((*third_history, correction_second))
 
         self.assertIsNotNone(local)
         assert local is not None
@@ -1889,7 +2258,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             ).phrase_source,
             "request",
         )
-        self.assertEqual(provider._pending_planner, "council")
+        self.assertEqual(provider._pending_planner, "phrase")
         self.assertIs(provider._state, state_before)
 
         provider.observe_verification(3, 3)
@@ -1897,6 +2266,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         metrics = provider.metrics()
         self.assertEqual(metrics.phrase_accepted_tokens, 3)
         self.assertEqual(metrics.last_phrase_source, "request")
+        self.assertEqual(metrics.planner_phrase_selections, 1)
         provider.close()
         self.assertEqual(state_path.read_bytes(), persisted)
 
@@ -2101,9 +2471,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             provider._request_periodic_option((*prompt, *tuple(range(1, 25))))
         )
         self.assertIsNone(
-            provider._request_periodic_option(
-                (*prompt, *((1, 2, 3, 4) * 3), 1, 2)
-            )
+            provider._request_periodic_option((*prompt, *((1, 2, 3, 4) * 3), 1, 2))
         )
         provider.close()
 
@@ -2282,6 +2650,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             )
             for index in range(len(provider._experts))
         )
+
         class FixedExpert:
             def __init__(self, distribution):
                 self._distribution = distribution
@@ -2290,8 +2659,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                 return dict(self._distribution)
 
         provider._expert_models = lambda _history: tuple(
-            (FixedExpert(distribution), [])
-            for distribution, _prediction in feedback
+            (FixedExpert(distribution), []) for distribution, _prediction in feedback
         )
         state_before = provider._state
         weights_before = provider._weights()
@@ -2313,12 +2681,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(predicted_before, 8)
         self.assertEqual(predicted_after, 7)
         self.assertGreater(weights_after[0], weights_before[0])
-        self.assertTrue(
-            all(
-                weights_after[0] > weight
-                for weight in weights_after[1:]
-            )
-        )
+        self.assertTrue(all(weights_after[0] > weight for weight in weights_after[1:]))
         self.assertEqual(metrics.request_weight_updates, 1)
         self.assertGreater(metrics.max_request_weight_shift, 0.0)
         self.assertEqual(metrics.request_position_updates, 1)
@@ -3850,6 +4213,289 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider.metrics().phrase_accepted_tokens, 0)
         provider.close()
 
+    def test_three_counterfactual_plans_stop_after_their_own_first_mismatch(
+        self,
+    ) -> None:
+        state_path = self.root / "planner-first-mismatch.bin"
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        provider.atlas = mock.Mock(context_count=0, token_count=0, max_branches=8)
+        beam_tokens = (7, 8, 9, 10)
+        council_tokens = (7, 6, 5, 4)
+        phrase_tokens = (7, 8, 3, 12)
+        option = MarkovPhraseOption(
+            token_ids=phrase_tokens[:3],
+            source="request",
+            context_order=2,
+            support=3,
+            total=3,
+            kind="composition",
+        )
+
+        def predict_beam(_history, count, **_kwargs):
+            return self._fake_planner_result(
+                provider,
+                beam_tokens,
+                count,
+                confidence=0.8,
+                diagnostic_calls=1,
+            )
+
+        def predict_council(_history, count, *, forced_prefix=(), **_kwargs):
+            return self._fake_planner_result(
+                provider,
+                phrase_tokens if forced_prefix else council_tokens,
+                count,
+                confidence=0.8,
+                diagnostic_calls=100 if forced_prefix else 10,
+            )
+
+        prompt = (20, 21)
+        provider.begin_request(prompt)
+        with (
+            mock.patch.object(provider, "_phrase_option", return_value=option),
+            mock.patch.object(provider, "_predict_beam", side_effect=predict_beam),
+            mock.patch.object(
+                provider,
+                "_predict_council",
+                side_effect=predict_council,
+            ),
+        ):
+            proposal = provider.propose_round(prompt, 22)
+            self.assertEqual(provider._pending_planner, "phrase")
+            self.assertEqual(proposal.token_ids, phrase_tokens[:3])
+            provider.observe_verification(3, 3)
+            committed = (*prompt, 22, *phrase_tokens[:3])
+            provider.reconcile_prefix(committed)
+            final = (*committed, 4)
+            provider.advance_confirmed_prefix(final)
+
+        zeros = (0,) * 16
+        expected_observations = (
+            (1, 1, 1, *zeros[3:]),
+            (1, 1, *zeros[2:]),
+            (1, 1, 1, 1, *zeros[4:]),
+        )
+        expected_hits = (
+            (1, 1, 0, *zeros[3:]),
+            (1, 0, *zeros[2:]),
+            (1, 1, 1, 0, *zeros[4:]),
+        )
+        live = provider.metrics()
+        self.assertEqual(live.planner_observations, expected_observations)
+        self.assertEqual(live.planner_hits, expected_hits)
+        self.assertEqual(live.planner_trace_created, 1)
+        self.assertEqual(live.planner_trace_active, 0)
+        self.assertEqual(live.planner_trace_feedback_tokens, 9)
+        self.assertEqual(
+            live.active_dialect_planner_observations,
+            (zeros,) * 3,
+        )
+
+        provider.observe_final(final)
+        persisted = provider.metrics()
+        self.assertEqual(persisted.planner_observations, expected_observations)
+        self.assertEqual(persisted.planner_hits, expected_hits)
+        self.assertEqual(
+            persisted.active_dialect_planner_observations,
+            expected_observations,
+        )
+        self.assertEqual(persisted.active_dialect_planner_hits, expected_hits)
+        provider.close()
+
+        restored = MarkovDraftState.from_bytes(state_path.read_bytes())
+        self.assertEqual(restored.planner_observations, expected_observations)
+        self.assertEqual(restored.planner_hits, expected_hits)
+        self.assertEqual(
+            restored.dialects[0].planner_observations,
+            expected_observations,
+        )
+        self.assertEqual(restored.dialects[0].planner_hits, expected_hits)
+
+    def test_overlapping_planner_traces_finalize_all_global_and_dialect_rows(
+        self,
+    ) -> None:
+        state_path = self.root / "overlapping-planner-traces.bin"
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=state_path,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        provider.atlas = mock.Mock(context_count=0, token_count=0, max_branches=8)
+        tokens = (7, 7, 7, 7)
+        option = MarkovPhraseOption(
+            token_ids=tokens[:3],
+            source="request",
+            context_order=2,
+            support=3,
+            total=3,
+            kind="composition",
+        )
+
+        def predict_beam(_history, count, **_kwargs):
+            return self._fake_planner_result(
+                provider,
+                tokens,
+                count,
+                confidence=0.8,
+                diagnostic_calls=1,
+            )
+
+        def predict_council(_history, count, *, forced_prefix=(), **_kwargs):
+            return self._fake_planner_result(
+                provider,
+                tokens,
+                count,
+                confidence=0.8,
+                diagnostic_calls=100 if forced_prefix else 10,
+            )
+
+        prompt = (20, 21)
+        provider.begin_request(prompt)
+        with (
+            mock.patch.object(provider, "_phrase_option", return_value=option),
+            mock.patch.object(provider, "_predict_beam", side_effect=predict_beam),
+            mock.patch.object(
+                provider,
+                "_predict_council",
+                side_effect=predict_council,
+            ),
+        ):
+            first = provider.propose_round(prompt, 22)
+            first_committed = (*prompt, 22, first.token_ids[0])
+            provider.reconcile_prefix(first_committed)
+            second = provider.propose_round(first_committed, 7)
+            second_committed = (*first_committed, 7, second.token_ids[0])
+            provider.reconcile_prefix(second_committed)
+
+        interim = provider.metrics()
+        self.assertEqual(interim.planner_trace_created, 2)
+        self.assertEqual(interim.planner_trace_active, 2)
+        self.assertEqual(interim.planner_trace_feedback_tokens, 12)
+        self.assertEqual(
+            tuple(row[:4] for row in interim.planner_observations),
+            ((2, 1, 1, 0),) * 3,
+        )
+
+        final_history = (*second_committed, 7, 7, 7)
+        provider.observe_final(final_history)
+        final = provider.metrics()
+        expected = ((2, 2, 2, 2),) * 3
+        self.assertEqual(final.planner_trace_active, 0)
+        self.assertEqual(final.planner_trace_feedback_tokens, 24)
+        self.assertEqual(
+            tuple(row[:4] for row in final.planner_observations),
+            expected,
+        )
+        self.assertEqual(tuple(row[:4] for row in final.planner_hits), expected)
+        self.assertEqual(
+            tuple(row[:4] for row in final.active_dialect_planner_observations),
+            expected,
+        )
+        self.assertEqual(
+            tuple(row[:4] for row in final.active_dialect_planner_hits),
+            expected,
+        )
+        provider.close()
+
+        restored = MarkovDraftState.from_bytes(state_path.read_bytes())
+        self.assertEqual(
+            tuple(row[:4] for row in restored.planner_observations),
+            expected,
+        )
+        self.assertEqual(
+            tuple(row[:4] for row in restored.dialects[0].planner_observations),
+            expected,
+        )
+
+    def test_planner_trace_failure_rolls_back_and_close_cleans_up(self) -> None:
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            max_history_tokens=128,
+            proposal_width=3,
+        )
+        provider.atlas = mock.Mock(context_count=0, token_count=0, max_branches=8)
+        tokens = (7, 7, 7, 7)
+        option = MarkovPhraseOption(
+            token_ids=tokens[:3],
+            source="request",
+            context_order=2,
+            support=3,
+            total=3,
+            kind="composition",
+        )
+
+        def predict_beam(_history, count, **_kwargs):
+            return self._fake_planner_result(
+                provider,
+                tokens,
+                count,
+                confidence=0.8,
+                diagnostic_calls=1,
+            )
+
+        def predict_council(_history, count, *, forced_prefix=(), **_kwargs):
+            return self._fake_planner_result(
+                provider,
+                tokens,
+                count,
+                confidence=0.8,
+                diagnostic_calls=100 if forced_prefix else 10,
+            )
+
+        prompt = (20, 21)
+        provider.begin_request(prompt)
+        with (
+            mock.patch.object(provider, "_phrase_option", return_value=option),
+            mock.patch.object(provider, "_predict_beam", side_effect=predict_beam),
+            mock.patch.object(
+                provider,
+                "_predict_council",
+                side_effect=predict_council,
+            ),
+        ):
+            proposal = provider.propose_round(prompt, 22)
+            committed = (*prompt, 22, proposal.token_ids[0])
+            provider.reconcile_prefix(committed)
+
+        before_state = provider._state
+        before_dialect = provider._active_dialect
+        before_traces = list(provider._planner_traces)
+        before_feedback = list(provider._planner_feedback)
+        before_observations = [
+            list(row) for row in provider._request_planner_observations
+        ]
+        before_hits = [list(row) for row in provider._request_planner_hits]
+        before_metrics = provider.metrics()
+        with (
+            mock.patch.object(provider, "_persist", side_effect=OSError("disk full")),
+            self.assertRaisesRegex(OSError, "disk full"),
+        ):
+            provider.observe_final((*committed, 7, 7, 7))
+
+        self.assertIs(provider._state, before_state)
+        self.assertEqual(provider._active_dialect, before_dialect)
+        self.assertEqual(provider._planner_traces, before_traces)
+        self.assertEqual(provider._planner_feedback, before_feedback)
+        self.assertEqual(provider._request_planner_observations, before_observations)
+        self.assertEqual(provider._request_planner_hits, before_hits)
+        self.assertEqual(
+            provider.metrics().planner_trace_feedback_tokens,
+            before_metrics.planner_trace_feedback_tokens,
+        )
+
+        provider.close()
+        self.assertEqual(provider._planner_traces, [])
+        self.assertEqual(provider._planner_feedback, [])
+        self.assertIsNone(provider._request_planner_observations)
+        self.assertIsNone(provider._request_planner_hits)
+        self.assertEqual(provider.metrics().planner_trace_active, 0)
+
     def test_recursive_trace_trains_deep_tokens_and_dies_on_first_mismatch(
         self,
     ) -> None:
@@ -4139,9 +4785,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             MarkovDraftError,
             "acceptance differs",
         ):
-            provider.reconcile_prefix(
-                (*committed, complete[1], second.token_ids[0])
-            )
+            provider.reconcile_prefix((*committed, complete[1], second.token_ids[0]))
 
         self.assertEqual(provider._recursive_traces, before_traces)
         self.assertEqual(provider._recursive_feedback, before_feedback)
