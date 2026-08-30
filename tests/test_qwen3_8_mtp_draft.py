@@ -577,12 +577,25 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         self.assertEqual(restored._previous_outcome, 0)
         self.assertEqual(restored._reliability[(False, 0, 6, -1)], [99, 1])
         self.assertEqual(restored._reliability[(True, 0, 6, -1)], [4, 1])
+        self.assertEqual(restored._reliability[(True, 0, -1, -1)], [4, 1])
         metrics = restored.metrics()
         self.assertEqual(metrics.cold_calibration_updates, 8)
         self.assertEqual(metrics.carried_calibration_updates, 4)
         self.assertEqual(metrics.cold_calibration_states, 1)
-        self.assertEqual(metrics.carried_calibration_states, 1)
+        self.assertEqual(metrics.carried_calibration_states, 2)
         restored.close()
+
+    def test_carried_bucket_aggregates_recover_existing_cross_bucket_hits(self) -> None:
+        rows = {
+            (True, 0, 4, -1): [2, 1],
+            (True, 0, 5, 1): [2, 1],
+            (True, 0, 6, 1): [3, 1],
+        }
+
+        Qwen35MtpDraftProvider._ensure_carried_aggregates(rows)
+
+        self.assertEqual(rows[(True, 0, -1, -1)], [2, 1])
+        self.assertEqual(rows[(True, 0, -1, 1)], [4, 1])
 
     def test_adaptive_exact_deeper_posterior_stops_and_pads(self) -> None:
         config = _config()

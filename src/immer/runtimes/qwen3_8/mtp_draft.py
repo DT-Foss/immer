@@ -29,6 +29,8 @@ _QWEN35_MTP_DRAFT_PROVIDER_LEGACY_SCHEMA = (
 QWEN35_MTP_CALIBRATION_SCHEMA = "immer.qwen3.5-mtp-markov-calibration/v2"
 _QWEN35_MTP_CALIBRATION_V1_SCHEMA = "immer.qwen3.5-mtp-markov-calibration/v1"
 QWEN35_MTP_CARRY_SCHEMA = "immer.qwen3.5-mtp-attention-carry/v1"
+_AGGREGATE_GAP_BUCKET = -1
+_MIN_EXACT_BUCKET_OBSERVATIONS = 2
 MTP_MATRIX_NAMES = (
     "mtp.fc.weight",
     "mtp.layers.0.self_attn.q_proj.weight",
@@ -268,6 +270,59 @@ class Qwen35MtpDraftProvider:
     def _previous_outcome(self, value: int) -> None:
         self._previous_outcomes[self._carried_context] = value
 
+    @staticmethod
+    def _ensure_carried_aggregates(
+        rows: dict[tuple[bool, int, int, int], list[int]],
+    ) -> None:
+        grouped: dict[tuple[int, int], list[int]] = {}
+        for (carried, position, bucket, previous), counts in rows.items():
+            if not carried or bucket == _AGGREGATE_GAP_BUCKET:
+                continue
+            aggregate = grouped.setdefault((position, previous), [1, 1])
+            aggregate[0] += counts[0] - 1
+            aggregate[1] += counts[1] - 1
+        for (position, previous), counts in grouped.items():
+            rows.setdefault(
+                (True, position, _AGGREGATE_GAP_BUCKET, previous),
+                counts,
+            )
+
+    def _reliability_counts(
+        self,
+        position: int,
+        bucket: int,
+        previous: int,
+    ) -> list[int] | None:
+        exact = self._reliability.get(
+            (self._carried_context, position, bucket, previous)
+        )
+        if not self._carried_context:
+            if exact is None and position > 0:
+                exact = self._reliability.get((False, 0, bucket, previous))
+            return exact
+        if exact is not None and sum(exact) - 2 >= _MIN_EXACT_BUCKET_OBSERVATIONS:
+            return exact
+        aggregate = self._reliability.get(
+            (True, position, _AGGREGATE_GAP_BUCKET, previous)
+        )
+        if aggregate is not None:
+            return aggregate
+        if position > 0:
+            base_exact = self._reliability.get((True, 0, bucket, previous))
+            if (
+                base_exact is not None
+                and sum(base_exact) - 2 >= _MIN_EXACT_BUCKET_OBSERVATIONS
+            ):
+                return base_exact
+            base_aggregate = self._reliability.get(
+                (True, 0, _AGGREGATE_GAP_BUCKET, previous)
+            )
+            if base_aggregate is not None:
+                return base_aggregate
+            if base_exact is not None:
+                return base_exact
+        return exact
+
     def _carry_identity(self) -> tuple[object, ...]:
         source_metrics_callback = getattr(self.pager.source, "metrics", None)
         source_metrics = (
@@ -447,13 +502,21 @@ class Qwen35MtpDraftProvider:
                 position, bucket, previous, alpha, beta = values
                 if (
                     not 0 <= position < 15
-                    or not 0 <= bucket <= 6
+                    or not (
+                        0 <= bucket <= 6
+                        or (
+                            schema == QWEN35_MTP_CALIBRATION_SCHEMA
+                            and carried
+                            and bucket == _AGGREGATE_GAP_BUCKET
+                        )
+                    )
                     or previous not in {-1, 0, 1}
                     or alpha < 1
                     or beta < 1
                 ):
                     return
                 restored[(carried, position, bucket, previous)] = [alpha, beta]
+            self._ensure_carried_aggregates(restored)
             self._reliability = restored
             self._previous_outcomes = previous_outcomes
             self._calibration_updates = document["updates"]
@@ -699,13 +762,7 @@ class Qwen35MtpDraftProvider:
         raw_confidence = max(0.0, min(0.999, 1.0 - math.exp(-gap)))
         bucket = self._gap_bucket(gap)
         previous = self._previous_outcome if proposal_index == 0 else 1
-        exact = self._reliability.get(
-            (self._carried_context, proposal_index, bucket, previous)
-        )
-        if exact is None and proposal_index > 0:
-            exact = self._reliability.get(
-                (self._carried_context, 0, bucket, previous)
-            )
+        exact = self._reliability_counts(proposal_index, bucket, previous)
         alpha, beta = [1, 1] if exact is None else exact
         confidence = min(raw_confidence, alpha / (alpha + beta))
         del values, selected
@@ -966,6 +1023,25 @@ class Qwen35MtpDraftProvider:
             else:
                 beta += 1
             self._reliability[key] = [alpha, beta]
+            if self._carried_context:
+                aggregate_key = (
+                    True,
+                    index,
+                    _AGGREGATE_GAP_BUCKET,
+                    previous,
+                )
+                aggregate_alpha, aggregate_beta = self._reliability.setdefault(
+                    aggregate_key,
+                    [1, 1],
+                )
+                if outcome:
+                    aggregate_alpha += 1
+                else:
+                    aggregate_beta += 1
+                self._reliability[aggregate_key] = [
+                    aggregate_alpha,
+                    aggregate_beta,
+                ]
             self._calibration_updates += 1
             self._calibration_updates_by_context[self._carried_context] += 1
             previous = int(outcome)
