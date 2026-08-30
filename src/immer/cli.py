@@ -664,6 +664,8 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 dynamic_changes = page_request.get("dynamic_route_changes")
                 exact_rows = page_request.get("exact_rows")
                 coactive_updates = page_request.get("coactive_updates")
+                width_saved = page_request.get("adaptive_width_pages_saved")
+                energy_rows = page_request.get("energy_feedback_rows")
                 page_parts = []
                 if (
                     isinstance(dynamic_calls, int)
@@ -692,6 +694,31 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     and coactive_updates > 0
                 ):
                     page_parts.append(f"{coactive_updates} coactive edges")
+                if (
+                    isinstance(width_saved, int)
+                    and not isinstance(width_saved, bool)
+                    and width_saved > 0
+                ):
+                    page_parts.append(f"{width_saved} pages skipped")
+                if (
+                    isinstance(energy_rows, int)
+                    and not isinstance(energy_rows, bool)
+                    and energy_rows > 0
+                ):
+                    page_parts.append(f"{energy_rows} energy labels")
+                page_runtime = page_route.get("runtime")
+                if isinstance(page_runtime, dict):
+                    width_min = page_runtime.get("last_width_min")
+                    width_mean = page_runtime.get("last_width_mean")
+                    if (
+                        isinstance(width_min, int)
+                        and not isinstance(width_min, bool)
+                        and isinstance(width_mean, (int, float))
+                        and not isinstance(width_mean, bool)
+                    ):
+                        page_parts.append(
+                            f"width {width_min}-{float(width_mean):.1f}"
+                        )
                 if page_parts:
                     parts.append("MLP pages " + ", ".join(page_parts))
         draft = evidence.get("draft")

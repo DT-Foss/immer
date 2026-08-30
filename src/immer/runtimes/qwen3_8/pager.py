@@ -1207,7 +1207,7 @@ class Qwen38WeightPager:
         *,
         activation_page_topk: int | None = None,
     ) -> Any:
-        """Execute packed BF16 SwiGLU and optionally return exact page energy."""
+        """Execute packed BF16 SwiGLU and optionally return ranked/total energy."""
 
         with self._lock:
             self._ensure_open()

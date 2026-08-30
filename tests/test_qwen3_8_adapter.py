@@ -640,6 +640,84 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         chat.close()
 
+    def test_adaptive_page_route_runtime_evidence_is_request_scoped(self) -> None:
+        runtime = _Runtime()
+
+        class PageRouter:
+            page_count = 272
+            route_width = 192
+
+            def __init__(self) -> None:
+                self.metric_calls = 0
+
+            def metrics(self):
+                before = self.metric_calls == 0
+                self.metric_calls += 1
+                return {
+                    "adaptive_width_pages_saved": 40 if before else 136,
+                    "adaptive_width_predictions": 2 if before else 5,
+                    "energy_coverage": 0.995,
+                    "energy_feedback_rows": 7 if before else 11,
+                    "last_width_mean": 192.0 if before else 128.0,
+                    "last_width_min": 192 if before else 96,
+                    "policy": (
+                        "dynamic-page-transitions+coactivation+"
+                        "adaptive-width+fixed-share/v5"
+                    ),
+                    "schema": "immer.qwen3.8-mlp-page-markov/v5",
+                    "width_actions": (96, 128, 160, 192),
+                    "width_agent_weights": {
+                        "temporal": 0.5,
+                        "cross_layer": 0.3,
+                        "marginal": 0.2,
+                    },
+                    "width_cross_contexts": 3,
+                    "width_marginal_contexts": 4,
+                    "width_temporal_contexts": 5,
+                }
+
+            @staticmethod
+            def flush() -> None:
+                pass
+
+        router = PageRouter()
+        runtime.mlp_page_router = router
+        chat = _chat(runtime)
+
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        route = result.evidence["mlp_page_route"]
+        self.assertEqual(route["page_count"], 272)
+        self.assertEqual(route["route_width"], 192)
+        self.assertEqual(route["request"]["adaptive_width_pages_saved"], 96)
+        self.assertEqual(route["request"]["adaptive_width_predictions"], 3)
+        self.assertEqual(route["request"]["energy_feedback_rows"], 4)
+        self.assertEqual(
+            route["runtime"],
+            {
+                "energy_coverage": 0.995,
+                "last_width_mean": 128.0,
+                "last_width_min": 96,
+                "policy": (
+                    "dynamic-page-transitions+coactivation+"
+                    "adaptive-width+fixed-share/v5"
+                ),
+                "schema": "immer.qwen3.8-mlp-page-markov/v5",
+                "width_actions": (96, 128, 160, 192),
+                "width_agent_weights": {
+                    "temporal": 0.5,
+                    "cross_layer": 0.3,
+                    "marginal": 0.2,
+                },
+                "width_cross_contexts": 3,
+                "width_marginal_contexts": 4,
+                "width_temporal_contexts": 5,
+            },
+        )
+        self.assertEqual(router.metric_calls, 2)
+        chat.close()
+
     def test_exact_head_non_cpu_configuration_is_lazy_nonapplicable(self) -> None:
         component = Qwen38CausalChat(
             "unused.causal",
@@ -2750,11 +2828,17 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 },
                 "mlp_page_route": {
                     "request": {
+                        "adaptive_width_pages_saved": 128,
                         "coactive_updates": 24,
                         "dynamic_route_calls": 64,
                         "dynamic_route_changes": 7,
+                        "energy_feedback_rows": 12,
                         "exact_rows": 12,
-                    }
+                    },
+                    "runtime": {
+                        "last_width_mean": 128.5,
+                        "last_width_min": 96,
+                    },
                 },
                 "draft": {
                     "accepted_draft_tokens": 5,
@@ -2820,7 +2904,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "answer",
                 "[8 tokens · 3 Qwen forwards · 1.25 s · 2.00 GiB peak · "
                 "MLP pages 64 dynamic routes, 7 changed, 12 exact rows learned, "
-                "24 coactive edges · "
+                "24 coactive edges, 128 pages skipped, 12 energy labels, "
+                "width 96-128.5 · "
                 "5 accepted draft tokens · "
                 "Hybrid 2 provider tournaments Markov1/MTP1, "
                 "6 provider counterfactual labels · "

@@ -39,7 +39,7 @@
 #define IMMER_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define IMMER_Q4_ABI 4u
+#define IMMER_Q4_ABI 5u
 #define IMMER_QK 32
 #define IMMER_MLP_PAGE_NEURONS 64
 #define IMMER_FORMAT_Q4_0 4
@@ -219,6 +219,7 @@ static int immer_quantize_q8_row_with_page_topk(
     int64_t k,
     int64_t *top_page_ids,
     double *top_page_scores,
+    double *total_page_score,
     immer_mlp_page_energy *energies
 ) {
     const int64_t blocks = cols / IMMER_QK;
@@ -243,6 +244,12 @@ static int immer_quantize_q8_row_with_page_topk(
         page_energy = 0.0;
     }
     if (page != page_count) return 0;
+    double total_energy = 0.0;
+    for (int64_t index = 0; index < page_count; ++index) {
+        total_energy += energies[index].score;
+    }
+    if (!isfinite(total_energy)) return 0;
+    *total_page_score = total_energy;
     qsort(
         energies,
         (size_t) page_count,
@@ -2600,6 +2607,7 @@ IMMER_EXPORT int immer_q4_mlp_bf16_f32(
     int64_t activation_page_topk,
     int64_t *top_page_ids,
     double *top_page_scores,
+    double *total_page_scores,
     int threads
 ) {
     int64_t hidden_blocks_gate;
@@ -2620,7 +2628,7 @@ IMMER_EXPORT int immer_q4_mlp_bf16_f32(
         || activation_page_topk > activation_page_count
         || (
             activation_page_topk > 0
-            && (!top_page_ids || !top_page_scores)
+            && (!top_page_ids || !top_page_scores || !total_page_scores)
         )
         || input_rows > INT64_MAX / intermediate_cols
         || input_rows > INT64_MAX / output_rows
@@ -2652,6 +2660,10 @@ IMMER_EXPORT int immer_q4_mlp_bf16_f32(
         )
         || !immer_size_product_fits(
             input_rows, activation_page_topk, sizeof(double)
+        )
+        || (
+            activation_page_topk > 0
+            && !immer_size_product_fits(input_rows, 1, sizeof(double))
         )
         || (
             activation_page_topk > 0
@@ -2768,6 +2780,7 @@ IMMER_EXPORT int immer_q4_mlp_bf16_f32(
                         + (size_t) row * (size_t) activation_page_topk,
                     top_page_scores
                         + (size_t) row * (size_t) activation_page_topk,
+                    total_page_scores + row,
                     page_energies
                         + (size_t) row * (size_t) activation_page_count
                 )) numeric_error = 1;

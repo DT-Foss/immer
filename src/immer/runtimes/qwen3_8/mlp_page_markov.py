@@ -16,17 +16,32 @@ import threading
 from typing import Any
 
 
-MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v4"
-MLP_PAGE_MARKOV_POLICY = "dynamic-page-transitions+coactivation+fixed-share/v4"
+MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v5"
+MLP_PAGE_MARKOV_POLICY = (
+    "dynamic-page-transitions+coactivation+adaptive-width+fixed-share/v5"
+)
+_V4_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v4"
+_V4_MLP_PAGE_MARKOV_POLICY = (
+    "dynamic-page-transitions+coactivation+fixed-share/v4"
+)
 _V3_MLP_PAGE_MARKOV_SCHEMA = "immer.qwen3.8-mlp-page-markov/v3"
 _V3_MLP_PAGE_MARKOV_POLICY = "shared-page-transitions+fixed-share/v3"
 _V3_AGENTS = ("temporal", "cross_layer", "marginal")
 _AGENTS = ("temporal", "cross_layer", "coactive", "marginal")
+_WIDTH_AGENTS = ("temporal", "cross_layer", "marginal")
 _V4_METRICS = frozenset(
     {
         "coactive_updates",
         "dynamic_route_calls",
         "dynamic_route_changes",
+    }
+)
+_V5_METRICS = frozenset(
+    {
+        "adaptive_width_pages_saved",
+        "adaptive_width_predictions",
+        "energy_feedback_rows",
+        "width_agent_feedback",
     }
 )
 _MAX_STATE_BYTES = 16 * 1024 * 1024
@@ -115,6 +130,9 @@ class MlpPagePrediction:
     page_ids: tuple[int, ...]
     ready: bool
     agent_page_ids: tuple[tuple[str, tuple[int | None, ...]], ...]
+    full_page_ids: tuple[int, ...] = ()
+    width: int = 0
+    agent_widths: tuple[tuple[str, int | None], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -124,6 +142,9 @@ class MlpPagePrediction:
             "layer": self.layer,
             "page_ids": list(self.page_ids),
             "ready": self.ready,
+            "full_page_ids": list(self.full_page_ids),
+            "width": self.width,
+            "agent_widths": dict(self.agent_widths),
         }
 
 
@@ -134,6 +155,7 @@ class MlpPageMarkov:
     FIXED_SHARE = 0.05
     MAX_TARGETS_PER_TRANSITION = 8
     COACTIVE_NEIGHBOR_SPAN = 4
+    ENERGY_COVERAGE = 0.995
 
     def __init__(
         self,
@@ -170,6 +192,16 @@ class MlpPageMarkov:
         self.n_layers = n_layers
         self.page_count = page_count
         self.route_width = route_width
+        self.width_actions = tuple(
+            sorted(
+                {
+                    max(1, route_width // 2),
+                    max(1, (2 * route_width + 2) // 3),
+                    max(1, (5 * route_width + 5) // 6),
+                    route_width,
+                }
+            )
+        )
         self.min_exact_rows = min_exact_rows
         self.identity = clean_identity
         self.prefetch = prefetch
@@ -177,12 +209,26 @@ class MlpPageMarkov:
         self._temporal: dict[tuple[int, int], Counter[int]] = {}
         self._cross: dict[tuple[int, int], Counter[int]] = {}
         self._coactive: dict[tuple[int, int], Counter[int]] = {}
+        self._width_marginal: dict[int, Counter[int]] = {}
+        self._width_temporal: dict[tuple[int, int], Counter[int]] = {}
+        self._width_cross: dict[tuple[int, int], Counter[int]] = {}
         self._agent_logs = [[0.0] * len(_AGENTS) for _ in range(n_layers)]
         self._agent_observations = [[0] * len(_AGENTS) for _ in range(n_layers)]
         self._agent_hits = [[0] * len(_AGENTS) for _ in range(n_layers)]
+        self._width_agent_logs = [
+            [0.0] * len(_WIDTH_AGENTS) for _ in range(n_layers)
+        ]
+        self._width_agent_observations = [
+            [0] * len(_WIDTH_AGENTS) for _ in range(n_layers)
+        ]
+        self._width_agent_hits = [
+            [0] * len(_WIDTH_AGENTS) for _ in range(n_layers)
+        ]
         self._exact_support = [0] * n_layers
         self._last_routes: list[tuple[int, ...] | None] = [None] * n_layers
+        self._last_widths: list[int | None] = [None] * n_layers
         self._wave_routes: dict[int, tuple[tuple[int, ...], ...]] = {}
+        self._wave_widths: dict[int, tuple[int, ...]] = {}
         self._pending: dict[int, MlpPagePrediction] = {}
         self._pending_prefetch: dict[int, bool | None] = {}
         self._pending_dynamic: dict[int, bool] = {}
@@ -193,10 +239,13 @@ class MlpPageMarkov:
         self._lock = threading.RLock()
         self._metrics = {
             "agent_feedback": 0,
+            "adaptive_width_pages_saved": 0,
+            "adaptive_width_predictions": 0,
             "coactive_updates": 0,
             "counter_evictions": 0,
             "dynamic_route_calls": 0,
             "dynamic_route_changes": 0,
+            "energy_feedback_rows": 0,
             "exact_batches": 0,
             "exact_rows": 0,
             "fallback_predictions": 0,
@@ -211,6 +260,7 @@ class MlpPageMarkov:
             "route_jaccard_sum_ppm": 0,
             "selected_advances": 0,
             "session_resets": 0,
+            "width_agent_feedback": 0,
         }
         self._load()
 
@@ -231,6 +281,15 @@ class MlpPageMarkov:
                 "agent_observations": [
                     list(row) for row in self._agent_observations
                 ],
+                "width_agent_hits": [
+                    list(row) for row in self._width_agent_hits
+                ],
+                "width_agent_logs": [
+                    list(row) for row in self._width_agent_logs
+                ],
+                "width_agent_observations": [
+                    list(row) for row in self._width_agent_observations
+                ],
                 "counters": None,
                 "compiled": list(self._compiled),
                 "current_wave": -1,
@@ -238,11 +297,13 @@ class MlpPageMarkov:
                 "events": [],
                 "exact_support": list(self._exact_support),
                 "last_routes": list(self._last_routes),
+                "last_widths": list(self._last_widths),
                 "metrics": dict(self._metrics),
                 "pending": dict(self._pending),
                 "pending_prefetch": dict(self._pending_prefetch),
                 "pending_dynamic": dict(self._pending_dynamic),
                 "wave_routes": dict(self._wave_routes),
+                "wave_widths": dict(self._wave_widths),
                 "wave_rows": [],
             }
 
@@ -255,6 +316,9 @@ class MlpPageMarkov:
             {key: Counter(value) for key, value in self._temporal.items()},
             {key: Counter(value) for key, value in self._cross.items()},
             {key: Counter(value) for key, value in self._coactive.items()},
+            {key: Counter(value) for key, value in self._width_marginal.items()},
+            {key: Counter(value) for key, value in self._width_temporal.items()},
+            {key: Counter(value) for key, value in self._width_cross.items()},
         )
 
     def commit_transaction(self, *, accepted_rows: int | None = None) -> None:
@@ -304,10 +368,13 @@ class MlpPageMarkov:
                     if kind == "exact":
                         replayed_exact = True
                         self.begin_exact_wave(layer)
+                        score_rows = None if scores is None else scores[0]
+                        total_rows = None if scores is None else scores[1]
                         self.observe_exact_batch(
                             layer,
                             payload[:keep],
-                            None if scores is None else scores[:keep],
+                            None if score_rows is None else score_rows[:keep],
+                            None if total_rows is None else total_rows[:keep],
                         )
                     elif kind == "selected_route":
                         self._route(
@@ -342,6 +409,11 @@ class MlpPageMarkov:
             self._agent_hits = transaction["agent_hits"]
             self._agent_logs = transaction["agent_logs"]
             self._agent_observations = transaction["agent_observations"]
+            self._width_agent_hits = transaction["width_agent_hits"]
+            self._width_agent_logs = transaction["width_agent_logs"]
+            self._width_agent_observations = transaction[
+                "width_agent_observations"
+            ]
             counters = transaction["counters"]
             if counters is not None:
                 (
@@ -349,16 +421,21 @@ class MlpPageMarkov:
                     self._temporal,
                     self._cross,
                     self._coactive,
+                    self._width_marginal,
+                    self._width_temporal,
+                    self._width_cross,
                 ) = counters
             self._dirty = transaction["dirty"]
             self._compiled = transaction["compiled"]
             self._exact_support = transaction["exact_support"]
             self._last_routes = transaction["last_routes"]
+            self._last_widths = transaction["last_widths"]
             self._metrics = transaction["metrics"]
             self._pending = transaction["pending"]
             self._pending_prefetch = transaction["pending_prefetch"]
             self._pending_dynamic = transaction["pending_dynamic"]
             self._wave_routes = transaction["wave_routes"]
+            self._wave_widths = transaction["wave_widths"]
             self._transaction = None
 
     def _validate_layer(self, layer: int) -> None:
@@ -369,10 +446,15 @@ class MlpPageMarkov:
         ):
             raise ValueError("layer is outside the page controller")
 
-    def _validate_route(self, values: Sequence[int]) -> tuple[int, ...]:
+    def _validate_route(
+        self,
+        values: Sequence[int],
+        *,
+        full: bool = True,
+    ) -> tuple[int, ...]:
         route = tuple(values)
         if (
-            len(route) != self.route_width
+            (len(route) != self.route_width if full else not 1 <= len(route) <= self.route_width)
             or len(set(route)) != len(route)
             or any(
                 isinstance(page, bool)
@@ -395,6 +477,52 @@ class MlpPageMarkov:
             + self.FIXED_SHARE / count
             for value in raw
         )
+
+    def _width_weights(self, layer: int) -> tuple[float, ...]:
+        logs = self._width_agent_logs[layer]
+        maximum = max(logs)
+        raw = tuple(math.exp(value - maximum) for value in logs)
+        total = sum(raw)
+        count = len(raw)
+        return tuple(
+            (1.0 - self.FIXED_SHARE) * value / total
+            + self.FIXED_SHARE / count
+            for value in raw
+        )
+
+    def _agent_widths(
+        self,
+        layer: int,
+        temporal_source: int | None,
+        cross_source: int | None,
+    ) -> tuple[tuple[str, int | None], ...]:
+        rows = []
+        for agent in _WIDTH_AGENTS:
+            if agent == "temporal" and temporal_source is not None:
+                counter = self._width_temporal.get((layer, temporal_source))
+            elif agent == "cross_layer" and cross_source is not None:
+                counter = self._width_cross.get((layer, cross_source))
+            elif agent == "marginal":
+                counter = self._width_marginal.get(layer)
+            else:
+                counter = None
+            rows.append((agent, _winner(counter)))
+        return tuple(rows)
+
+    def _combine_width(
+        self,
+        layer: int,
+        agents: tuple[tuple[str, int | None], ...],
+    ) -> int:
+        votes: dict[int, float] = {}
+        for weight, (_name, width) in zip(
+            self._width_weights(layer), agents, strict=True
+        ):
+            if width is not None:
+                votes[width] = votes.get(width, 0.0) + weight
+        if not votes:
+            return self.route_width
+        return max(votes, key=lambda width: (votes[width], width))
 
     def _coactive_route(self, layer: int) -> tuple[int | None, ...]:
         """Walk the learned within-route page graph from the strongest anchor."""
@@ -458,12 +586,30 @@ class MlpPageMarkov:
         cross_rows = self._wave_routes.get(layer - 1, ())
         cross = cross_rows[-1] if cross_rows else None
         agents = self._agent_routes(layer, self._last_routes[layer], cross)
-        pages = self._combine(layer, agents)
+        full_pages = self._combine(layer, agents)
+        cross_width_rows = self._wave_widths.get(layer - 1, ())
+        cross_width = cross_width_rows[-1] if cross_width_rows else None
+        width_agents = self._agent_widths(
+            layer,
+            self._last_widths[layer],
+            cross_width,
+        )
+        width = self._combine_width(layer, width_agents)
+        pages = full_pages[:width]
         ready = (
-            len(pages) == self.route_width
+            len(full_pages) == self.route_width
+            and len(pages) == width
             and self._exact_support[layer] >= self.min_exact_rows
         )
-        return MlpPagePrediction(layer, pages, ready, agents)
+        return MlpPagePrediction(
+            layer,
+            pages,
+            ready,
+            agents,
+            full_page_ids=full_pages,
+            width=width,
+            agent_widths=width_agents,
+        )
 
     def _combine(
         self,
@@ -500,6 +646,7 @@ class MlpPageMarkov:
         if layer != 0:
             return
         self._wave_routes = {}
+        self._wave_widths = {}
         self._pending = {}
         self._pending_prefetch = {}
         self._pending_dynamic = {}
@@ -653,6 +800,56 @@ class MlpPageMarkov:
             raise ValueError("MLP page rows are empty")
         return rows
 
+    @staticmethod
+    def _flat_scalars(value: Any) -> list[Any]:
+        if hasattr(value, "detach") and hasattr(value, "tolist"):
+            value = value.detach().to(device="cpu").tolist()
+        elif hasattr(value, "tolist"):
+            value = value.tolist()
+        result = []
+
+        def visit(node: Any) -> None:
+            if isinstance(node, (list, tuple)):
+                for item in node:
+                    visit(item)
+                return
+            result.append(node)
+
+        visit(value)
+        if not result:
+            raise ValueError("MLP page scalar rows are empty")
+        return result
+
+    def _required_width(
+        self,
+        scores: Sequence[float],
+        total_energy: float,
+    ) -> int:
+        values = tuple(float(value) for value in scores)
+        if len(values) != self.route_width:
+            raise ValueError("MLP page energy width changed")
+        tolerance = max(1e-12, total_energy * 1e-12)
+        if any(
+            values[index] + tolerance < values[index + 1]
+            for index in range(len(values) - 1)
+        ):
+            raise ValueError("MLP page energies are not descending")
+        if sum(values) > total_energy + tolerance:
+            raise ValueError("MLP page energies exceed total activation energy")
+        if total_energy <= tolerance:
+            return self.width_actions[0]
+        cumulative = 0.0
+        action_index = 0
+        for index, score in enumerate(values, start=1):
+            cumulative += score
+            if index != self.width_actions[action_index]:
+                continue
+            if cumulative / total_energy >= self.ENERGY_COVERAGE:
+                return index
+            if action_index + 1 < len(self.width_actions):
+                action_index += 1
+        return self.route_width
+
     def _feedback(
         self,
         layer: int,
@@ -675,6 +872,25 @@ class MlpPageMarkov:
                 logs[index] -= self.LEARNING_RATE * (1.0 - correct / valid)
                 self._metrics["agent_feedback"] += valid
 
+    def _width_feedback(
+        self,
+        layer: int,
+        agents: tuple[tuple[str, int | None], ...],
+        target: int,
+    ) -> None:
+        logs = self._width_agent_logs[layer]
+        observations = self._width_agent_observations[layer]
+        hits = self._width_agent_hits[layer]
+        for index, (_name, proposed) in enumerate(agents):
+            if proposed is None:
+                continue
+            observations[index] += 1
+            hits[index] += int(proposed == target)
+            logs[index] -= self.LEARNING_RATE * (
+                abs(proposed - target) / self.route_width
+            )
+            self._metrics["width_agent_feedback"] += 1
+
     def _learn_exact_route(
         self,
         layer: int,
@@ -682,9 +898,29 @@ class MlpPageMarkov:
         *,
         temporal_source: tuple[int, ...] | None,
         cross_source: tuple[int, ...] | None,
+        temporal_width: int | None,
+        cross_width: int | None,
+        target_width: int | None,
     ) -> None:
         agents = self._agent_routes(layer, temporal_source, cross_source)
         self._feedback(layer, agents, route)
+        if target_width is not None:
+            width_agents = self._agent_widths(
+                layer,
+                temporal_width,
+                cross_width,
+            )
+            self._width_feedback(layer, width_agents, target_width)
+            self._width_marginal.setdefault(layer, Counter())[target_width] += 1
+            if temporal_width is not None:
+                self._width_temporal.setdefault(
+                    (layer, temporal_width), Counter()
+                )[target_width] += 1
+            if cross_width is not None:
+                self._width_cross.setdefault(
+                    (layer, cross_width), Counter()
+                )[target_width] += 1
+            self._metrics["energy_feedback_rows"] += 1
         for rank, page in enumerate(route):
             marginal = self._marginal.setdefault((layer, rank), Counter())
             self._metrics["counter_evictions"] += _space_saving_increment(
@@ -727,6 +963,7 @@ class MlpPageMarkov:
         layer: int,
         page_ids: Any,
         page_scores: Any | None = None,
+        page_total_scores: Any | None = None,
     ) -> None:
         with self._lock:
             self._ensure_open()
@@ -749,12 +986,40 @@ class MlpPageMarkov:
                     raise ValueError("MLP page scores are invalid")
             else:
                 score_rows = None
+            if page_total_scores is not None:
+                total_rows = self._flat_scalars(page_total_scores)
+                if len(total_rows) != len(routes) or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or float(value) < 0.0
+                    for value in total_rows
+                ):
+                    raise ValueError("MLP total page energies are invalid")
+                total_rows = [float(value) for value in total_rows]
+            else:
+                total_rows = None
+            if score_rows is None and total_rows is not None:
+                raise ValueError(
+                    "MLP total page energies require ranked page energies"
+                )
+            required_widths = tuple(
+                self.route_width
+                if total_rows is None or score_rows is None
+                else self._required_width(score_rows[index], total_rows[index])
+                for index in range(len(routes))
+            )
 
             previous = self._last_routes[layer]
             cross_rows = self._wave_routes.get(layer - 1, ())
+            cross_width_rows = self._wave_widths.get(layer - 1, ())
             if len(cross_rows) not in {0, 1, len(routes)}:
                 raise MlpPageMarkovError(
                     "cross-layer route rows differ from the current exact wave"
+                )
+            if len(cross_width_rows) not in {0, 1, len(routes)}:
+                raise MlpPageMarkovError(
+                    "cross-layer width rows differ from the current exact wave"
                 )
 
             transaction = self._transaction
@@ -772,7 +1037,16 @@ class MlpPageMarkov:
                         "MLP page transaction rows changed between layers"
                     )
                 transaction["events"].append(
-                    ("exact", wave, layer, routes, score_rows, None)
+                    (
+                        "exact",
+                        wave,
+                        layer,
+                        routes,
+                        None
+                        if score_rows is None
+                        else (score_rows, total_rows),
+                        None,
+                    )
                 )
 
             pending = self._pending.pop(layer, None)
@@ -780,7 +1054,8 @@ class MlpPageMarkov:
             self._pending_dynamic.pop(layer, None)
             if pending is not None and routes:
                 predicted = set(pending.page_ids)
-                actual = set(routes[-1])
+                actual_route = routes[-1][: required_widths[-1]]
+                actual = set(actual_route)
                 union = predicted | actual
                 if union:
                     self._metrics["route_jaccard_sum_ppm"] += round(
@@ -791,13 +1066,18 @@ class MlpPageMarkov:
                     left == right
                     for left, right in zip(
                         pending.page_ids,
-                        routes[-1],
+                        actual_route,
                         strict=False,
                     )
                 )
 
             for index, route in enumerate(routes):
                 temporal_source = previous if index == 0 else routes[index - 1]
+                temporal_width = (
+                    self._last_widths[layer]
+                    if index == 0
+                    else required_widths[index - 1]
+                )
                 cross_source = (
                     None
                     if not cross_rows
@@ -805,14 +1085,28 @@ class MlpPageMarkov:
                     if len(cross_rows) == 1
                     else cross_rows[index]
                 )
+                cross_width = (
+                    None
+                    if not cross_width_rows
+                    else cross_width_rows[0]
+                    if len(cross_width_rows) == 1
+                    else cross_width_rows[index]
+                )
                 self._learn_exact_route(
                     layer,
                     route,
                     temporal_source=temporal_source,
                     cross_source=cross_source,
+                    temporal_width=temporal_width,
+                    cross_width=cross_width,
+                    target_width=(
+                        None if total_rows is None else required_widths[index]
+                    ),
                 )
             self._last_routes[layer] = routes[-1]
+            self._last_widths[layer] = required_widths[-1]
             self._wave_routes[layer] = routes
+            self._wave_widths[layer] = required_widths
             self._exact_support[layer] += len(routes)
             self._metrics["exact_batches"] += 1
             self._metrics["exact_rows"] += len(routes)
@@ -823,8 +1117,14 @@ class MlpPageMarkov:
         layer: int,
         page_ids: Sequence[int],
         page_scores: Sequence[float] | None = None,
+        page_total_scores: Sequence[float] | None = None,
     ) -> None:
-        self.observe_exact_batch(layer, page_ids, page_scores)
+        self.observe_exact_batch(
+            layer,
+            page_ids,
+            page_scores,
+            page_total_scores,
+        )
 
     def advance_selected(
         self,
@@ -836,12 +1136,20 @@ class MlpPageMarkov:
         with self._lock:
             self._ensure_open()
             self._validate_layer(layer)
-            compiled = self._compiled[layer]
-            route = (
-                compiled.page_ids
-                if compiled is not None and page_ids is compiled.page_ids
-                else self._validate_route(page_ids)
-            )
+            route = self._validate_route(page_ids, full=False)
+            pending = self._pending.get(layer)
+            if pending is not None and route == pending.page_ids:
+                full_route = pending.full_page_ids
+            elif len(route) == self.route_width:
+                full_route = route
+            else:
+                raise MlpPageMarkovError(
+                    "partial MLP page action differs from its pending prediction"
+                )
+            if len(full_route) != self.route_width:
+                raise MlpPageMarkovError(
+                    "selected MLP page action lost its full route context"
+                )
             if (
                 isinstance(row_count, bool)
                 or not isinstance(row_count, int)
@@ -881,9 +1189,15 @@ class MlpPageMarkov:
             self._pending.pop(layer, None)
             self._pending_prefetch.pop(layer, None)
             self._pending_dynamic.pop(layer, None)
-            self._last_routes[layer] = route
-            self._wave_routes[layer] = (route,)
+            self._last_routes[layer] = full_route
+            self._last_widths[layer] = len(route)
+            self._wave_routes[layer] = (full_route,)
+            self._wave_widths[layer] = (len(route),)
             self._metrics["selected_advances"] += 1
+            self._metrics["adaptive_width_predictions"] += 1
+            self._metrics["adaptive_width_pages_saved"] += (
+                self.route_width - len(route)
+            ) * row_count
             self._dirty = True
 
     def reset_session(self) -> None:
@@ -894,7 +1208,9 @@ class MlpPageMarkov:
             if self._transaction is not None:
                 self.rollback_transaction()
             self._last_routes = [None] * self.n_layers
+            self._last_widths = [None] * self.n_layers
             self._wave_routes = {}
+            self._wave_widths = {}
             self._pending = {}
             self._pending_prefetch = {}
             self._pending_dynamic = {}
@@ -915,6 +1231,8 @@ class MlpPageMarkov:
                 "policy": MLP_PAGE_MARKOV_POLICY,
                 "route_width": self.route_width,
                 "schema": MLP_PAGE_MARKOV_SCHEMA,
+                "width_actions": list(self.width_actions),
+                "energy_coverage": self.ENERGY_COVERAGE.hex(),
             }
 
     @staticmethod
@@ -975,8 +1293,60 @@ class MlpPageMarkov:
             result[key] = counter
         return result
 
-    def _config(self, *, policy: str = MLP_PAGE_MARKOV_POLICY) -> dict[str, object]:
-        return {
+    def _restore_width_counters(
+        self,
+        rows: object,
+        *,
+        key_width: int,
+    ) -> dict[tuple[int, ...], Counter[int]]:
+        if not isinstance(rows, list) or key_width not in {1, 2}:
+            raise ValueError("width counter rows are invalid")
+        result: dict[tuple[int, ...], Counter[int]] = {}
+        for row in rows:
+            if not isinstance(row, list) or len(row) != key_width + 1:
+                raise ValueError("width counter row shape is invalid")
+            key = tuple(row[:key_width])
+            pairs = row[-1]
+            if (
+                key in result
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in key
+                )
+                or not 0 <= key[0] < self.n_layers
+                or (
+                    key_width == 2
+                    and not 1 <= key[1] <= self.route_width
+                )
+                or not isinstance(pairs, list)
+                or not 0 < len(pairs) <= len(self.width_actions)
+            ):
+                raise ValueError("width counter key is invalid")
+            counter: Counter[int] = Counter()
+            for pair in pairs:
+                if (
+                    not isinstance(pair, list)
+                    or len(pair) != 2
+                    or isinstance(pair[0], bool)
+                    or not isinstance(pair[0], int)
+                    or pair[0] not in self.width_actions
+                    or pair[0] in counter
+                    or isinstance(pair[1], bool)
+                    or not isinstance(pair[1], int)
+                    or pair[1] <= 0
+                ):
+                    raise ValueError("width counter value is invalid")
+                counter[pair[0]] = pair[1]
+            result[key] = counter
+        return result
+
+    def _config(
+        self,
+        *,
+        policy: str = MLP_PAGE_MARKOV_POLICY,
+        adaptive_width: bool = True,
+    ) -> dict[str, object]:
+        result = {
             "identity": self.identity,
             "min_exact_rows": self.min_exact_rows,
             "n_layers": self.n_layers,
@@ -984,6 +1354,14 @@ class MlpPageMarkov:
             "policy": policy,
             "route_width": self.route_width,
         }
+        if adaptive_width:
+            result.update(
+                {
+                    "energy_coverage": self.ENERGY_COVERAGE.hex(),
+                    "width_actions": list(self.width_actions),
+                }
+            )
+        return result
 
     def _body(self) -> dict[str, object]:
         return {
@@ -1002,6 +1380,21 @@ class MlpPageMarkov:
             "marginal": self._counter_rows(self._marginal),
             "metrics": dict(self._metrics),
             "temporal": self._counter_rows(self._temporal),
+            "width_agent_hits": self._width_agent_hits,
+            "width_agent_logs": [
+                [value.hex() for value in row]
+                for row in self._width_agent_logs
+            ],
+            "width_agent_observations": self._width_agent_observations,
+            "width_cross": self._counter_rows(self._width_cross),
+            "width_marginal": self._counter_rows(
+                {
+                    (layer,): counter
+                    for layer, counter in self._width_marginal.items()
+                }
+            ),
+            "width_temporal": self._counter_rows(self._width_temporal),
+            "last_widths": self._last_widths,
         }
 
     @staticmethod
@@ -1039,12 +1432,18 @@ class MlpPageMarkov:
             raw = _stable_read(self.path)
             document = json.loads(raw.decode("ascii"))
             schema = document.get("schema") if isinstance(document, dict) else None
-            legacy = schema == _V3_MLP_PAGE_MARKOV_SCHEMA
+            legacy_v3 = schema == _V3_MLP_PAGE_MARKOV_SCHEMA
+            legacy_v4 = schema == _V4_MLP_PAGE_MARKOV_SCHEMA
+            adaptive_width = schema == MLP_PAGE_MARKOV_SCHEMA
             if (
                 not isinstance(document, dict)
                 or set(document) != {"body", "schema", "sha256"}
                 or schema
-                not in {MLP_PAGE_MARKOV_SCHEMA, _V3_MLP_PAGE_MARKOV_SCHEMA}
+                not in {
+                    MLP_PAGE_MARKOV_SCHEMA,
+                    _V4_MLP_PAGE_MARKOV_SCHEMA,
+                    _V3_MLP_PAGE_MARKOV_SCHEMA,
+                }
                 or not isinstance(document.get("body"), dict)
                 or document.get("sha256") != _digest(document["body"])
                 or _canonical(document) != raw
@@ -1063,14 +1462,29 @@ class MlpPageMarkov:
                 "metrics",
                 "temporal",
             }
-            if not legacy:
+            if not legacy_v3:
                 expected_body.add("coactive")
+            if adaptive_width:
+                expected_body.update(
+                    {
+                        "last_widths",
+                        "width_agent_hits",
+                        "width_agent_logs",
+                        "width_agent_observations",
+                        "width_cross",
+                        "width_marginal",
+                        "width_temporal",
+                    }
+                )
             expected_config = self._config(
                 policy=(
                     _V3_MLP_PAGE_MARKOV_POLICY
-                    if legacy
+                    if legacy_v3
+                    else _V4_MLP_PAGE_MARKOV_POLICY
+                    if legacy_v4
                     else MLP_PAGE_MARKOV_POLICY
-                )
+                ),
+                adaptive_width=adaptive_width,
             )
             if set(body) != expected_body or body["config"] != expected_config:
                 raise ValueError("state configuration changed")
@@ -1083,7 +1497,7 @@ class MlpPageMarkov:
             ]
             if any(not math.isfinite(value) for row in logs for value in row):
                 raise ValueError("agent logs are non-finite")
-            agent_count = len(_V3_AGENTS) if legacy else len(_AGENTS)
+            agent_count = len(_V3_AGENTS) if legacy_v3 else len(_AGENTS)
             observations = self._integer_matrix(
                 body["agent_observations"],
                 rows=self.n_layers,
@@ -1106,7 +1520,7 @@ class MlpPageMarkov:
                 )
             ):
                 raise ValueError("agent state shape changed")
-            if legacy:
+            if legacy_v3:
                 logs = [
                     [row[0], row[1], sum(row) / len(row), row[2]]
                     for row in logs
@@ -1133,8 +1547,94 @@ class MlpPageMarkov:
             last_routes = [
                 None if row is None else self._validate_route(row) for row in last
             ]
+            if adaptive_width:
+                raw_width_logs = body["width_agent_logs"]
+                if not isinstance(raw_width_logs, list):
+                    raise ValueError("width agent logs are invalid")
+                width_logs = [
+                    [float.fromhex(value) for value in row]
+                    for row in raw_width_logs
+                ]
+                if (
+                    len(width_logs) != self.n_layers
+                    or any(
+                        len(row) != len(_WIDTH_AGENTS)
+                        or any(not math.isfinite(value) for value in row)
+                        for row in width_logs
+                    )
+                ):
+                    raise ValueError("width agent logs are non-finite")
+                width_observations = self._integer_matrix(
+                    body["width_agent_observations"],
+                    rows=self.n_layers,
+                    columns=len(_WIDTH_AGENTS),
+                    label="width agent observations",
+                )
+                width_hits = self._integer_matrix(
+                    body["width_agent_hits"],
+                    rows=self.n_layers,
+                    columns=len(_WIDTH_AGENTS),
+                    label="width agent hits",
+                )
+                if any(
+                    width_hits[layer][agent]
+                    > width_observations[layer][agent]
+                    for layer in range(self.n_layers)
+                    for agent in range(len(_WIDTH_AGENTS))
+                ):
+                    raise ValueError("width agent hits exceed observations")
+                last_widths = body["last_widths"]
+                if (
+                    not isinstance(last_widths, list)
+                    or len(last_widths) != self.n_layers
+                    or any(
+                        value is not None
+                        and (
+                            isinstance(value, bool)
+                            or not isinstance(value, int)
+                            or not 1 <= value <= self.route_width
+                        )
+                        for value in last_widths
+                    )
+                ):
+                    raise ValueError("last width state is invalid")
+                width_marginal_rows = self._restore_width_counters(
+                    body["width_marginal"], key_width=1
+                )
+                width_marginal = {
+                    key[0]: counter
+                    for key, counter in width_marginal_rows.items()
+                }
+                width_temporal = self._restore_width_counters(
+                    body["width_temporal"], key_width=2
+                )
+                width_cross = self._restore_width_counters(
+                    body["width_cross"], key_width=2
+                )
+            else:
+                width_logs = [
+                    [0.0] * len(_WIDTH_AGENTS) for _ in range(self.n_layers)
+                ]
+                width_observations = [
+                    [0] * len(_WIDTH_AGENTS) for _ in range(self.n_layers)
+                ]
+                width_hits = [
+                    [0] * len(_WIDTH_AGENTS) for _ in range(self.n_layers)
+                ]
+                last_widths = [
+                    None if route is None else self.route_width
+                    for route in last_routes
+                ]
+                width_marginal = {}
+                width_temporal = {}
+                width_cross = {}
             metrics = body["metrics"]
-            expected_metrics = set(self._metrics) - (_V4_METRICS if legacy else set())
+            missing_metrics = set()
+            if legacy_v3:
+                missing_metrics.update(_V4_METRICS)
+            if not adaptive_width:
+                missing_metrics.update(_V5_METRICS)
+            expected_metrics = set(self._metrics) - missing_metrics
             if (
                 not isinstance(metrics, dict)
                 or set(metrics) != expected_metrics
@@ -1160,9 +1660,16 @@ class MlpPageMarkov:
             self._cross = self._restore_counters(body["cross"], kind="cross")
             self._coactive = (
                 {}
-                if legacy
+                if legacy_v3
                 else self._restore_counters(body["coactive"], kind="coactive")
             )
+            self._width_agent_logs = width_logs
+            self._width_agent_observations = width_observations
+            self._width_agent_hits = width_hits
+            self._last_widths = list(last_widths)
+            self._width_marginal = width_marginal
+            self._width_temporal = width_temporal
+            self._width_cross = width_cross
             self._metrics.update(
                 {key: int(value) for key, value in metrics.items()}
             )
@@ -1226,6 +1733,12 @@ class MlpPageMarkov:
         with self._lock:
             self._ensure_open()
             weights = [self._weights(layer) for layer in range(self.n_layers)]
+            width_weights = [
+                self._width_weights(layer) for layer in range(self.n_layers)
+            ]
+            active_widths = tuple(
+                width for width in self._last_widths if width is not None
+            )
             return {
                 **self._metrics,
                 "agent_weights": {
@@ -1239,6 +1752,22 @@ class MlpPageMarkov:
                     for support in self._exact_support
                 ),
                 "marginal_contexts": len(self._marginal),
+                "width_actions": self.width_actions,
+                "width_agent_weights": {
+                    name: sum(row[index] for row in width_weights)
+                    / self.n_layers
+                    for index, name in enumerate(_WIDTH_AGENTS)
+                },
+                "width_cross_contexts": len(self._width_cross),
+                "width_marginal_contexts": len(self._width_marginal),
+                "width_temporal_contexts": len(self._width_temporal),
+                "last_width_min": min(active_widths, default=self.route_width),
+                "last_width_mean": (
+                    float(self.route_width)
+                    if not active_widths
+                    else sum(active_widths) / len(active_widths)
+                ),
+                "energy_coverage": self.ENERGY_COVERAGE,
                 "policy": MLP_PAGE_MARKOV_POLICY,
                 "route_jaccard_mean": (
                     0.0

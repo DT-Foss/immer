@@ -1778,15 +1778,21 @@ class StreamedQwen38:
                     fused_names,
                     activation_page_topk=page_router.route_width,
                 )
-                if not isinstance(traced, tuple) or len(traced) != 3:
+                if not isinstance(traced, tuple) or len(traced) != 4:
                     raise Qwen38RuntimeError(
                         "Q4 activation-page trace violated its runtime contract"
                     )
-                output, exact_page_ids, exact_page_scores = traced
+                (
+                    output,
+                    exact_page_ids,
+                    exact_page_scores,
+                    exact_page_total_scores,
+                ) = traced
                 page_router.observe_exact_batch(
                     layer,
                     exact_page_ids,
                     exact_page_scores,
+                    exact_page_total_scores,
                 )
                 if layer == self.config.n_layers - 1:
                     page_router.compile_routes()
@@ -2218,15 +2224,21 @@ class StreamedQwen38:
                         fused_names,
                         activation_page_topk=page_router.route_width,
                     )
-                    if not isinstance(traced, tuple) or len(traced) != 3:
+                    if not isinstance(traced, tuple) or len(traced) != 4:
                         raise Qwen38RuntimeError(
                             "Q4 activation-page trace violated its runtime contract"
                         )
-                    fused, exact_page_ids, exact_page_scores = traced
+                    (
+                        fused,
+                        exact_page_ids,
+                        exact_page_scores,
+                        exact_page_total_scores,
+                    ) = traced
                     page_router.observe_exact_batch(
                         layer,
                         exact_page_ids,
                         exact_page_scores,
+                        exact_page_total_scores,
                     )
                     if layer == self.config.n_layers - 1:
                         page_router.compile_routes()

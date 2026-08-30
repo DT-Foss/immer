@@ -20,6 +20,7 @@ from immer.runtimes.qwen3_8.q4 import (
     Q8_0,
     Q4_BANK_SCHEMA,
     Q4_BALANCED_POLICY,
+    Q4_NATIVE_ABI,
     Q4_RECURRENT_POLICY,
     Q4Bank,
     Q4BankBuilder,
@@ -314,6 +315,10 @@ class Q4NativeKernelTests(unittest.TestCase):
             torch.nn.functional.silu(values).contiguous().view(torch.uint16).numpy()
         )
         self.assertTrue(np.array_equal(self.kernel.silu_bf16_table, expected))
+
+    def test_native_library_exposes_activation_total_energy_abi(self) -> None:
+        self.assertEqual(Q4_NATIVE_ABI, 5)
+        self.assertEqual(self.kernel.library.immer_q4_abi(), 5)
 
     def test_wire_sizes_and_row_roundtrip(self) -> None:
         values = torch.linspace(-4.0, 3.0, 128).reshape(2, 64)
@@ -958,30 +963,40 @@ class Q4BankTests(unittest.TestCase):
                     output_dtype=torch.bfloat16,
                 )
 
-                output, page_ids, page_scores = bank.mlp(
+                output, page_ids, page_scores, page_total_scores = bank.mlp(
                     values,
                     names,
                     output_dtype=torch.bfloat16,
-                    activation_page_topk=3,
+                    activation_page_topk=2,
                 )
 
                 self.assertEqual(tuple(output.shape), (1, 64))
                 self.assertTrue(torch.equal(output, baseline))
-                self.assertEqual(page_ids.tolist(), [expected_ids])
+                self.assertEqual(page_ids.tolist(), [expected_ids[:2]])
                 torch.testing.assert_close(
                     page_scores,
                     torch.tensor(
-                        [[expected_scores[page] for page in expected_ids]],
+                        [[expected_scores[page] for page in expected_ids[:2]]],
                         dtype=torch.float64,
                     ),
                     rtol=0.0,
                     atol=1e-9,
                 )
+                torch.testing.assert_close(
+                    page_total_scores,
+                    torch.tensor([sum(expected_scores)], dtype=torch.float64),
+                    rtol=0.0,
+                    atol=1e-9,
+                )
+                self.assertGreater(
+                    page_total_scores.item(),
+                    page_scores.sum().item(),
+                )
                 metrics = bank.metrics()
                 self.assertEqual(metrics["full_mlp_page_trace_calls"], 1)
                 self.assertEqual(metrics["full_mlp_page_trace_rows"], 1)
                 self.assertEqual(metrics["full_mlp_page_trace_candidates"], 3)
-                self.assertEqual(metrics["full_mlp_page_trace_selected"], 3)
+                self.assertEqual(metrics["full_mlp_page_trace_selected"], 2)
             finally:
                 bank.close()
 
@@ -1016,7 +1031,7 @@ class Q4BankTests(unittest.TestCase):
             )
             try:
                 values = torch.ones((1, 64), dtype=torch.bfloat16)
-                output, page_ids, page_scores = bank.mlp(
+                output, page_ids, page_scores, page_total_scores = bank.mlp(
                     values,
                     names,
                     output_dtype=torch.bfloat16,
@@ -1024,6 +1039,8 @@ class Q4BankTests(unittest.TestCase):
                 )
                 self.assertEqual(page_ids.tolist(), [[0, 1]])
                 self.assertEqual(page_scores.tolist(), [[0.0, 0.0]])
+                self.assertEqual(tuple(page_total_scores.shape), (1,))
+                self.assertEqual(page_total_scores.tolist(), [0.0])
                 self.assertEqual(int(torch.count_nonzero(output)), 0)
                 for invalid in (True, 0, -1, 3):
                     with self.subTest(invalid=invalid):
@@ -1079,6 +1096,7 @@ class Q4BankTests(unittest.TestCase):
                 activation = (torch.nn.functional.silu(gate) * up).reshape(-1, 128)
                 expected_ids = []
                 expected_scores = []
+                expected_totals = []
                 for row in activation:
                     energies = [
                         sum(
@@ -1090,9 +1108,10 @@ class Q4BankTests(unittest.TestCase):
                     order = sorted(range(2), key=lambda page: (-energies[page], page))
                     expected_ids.append(order)
                     expected_scores.append([energies[page] for page in order])
+                    expected_totals.append(sum(energies))
                 bank.release_touched()
 
-                output, page_ids, page_scores = bank.mlp(
+                output, page_ids, page_scores, page_total_scores = bank.mlp(
                     values,
                     names,
                     output_dtype=torch.bfloat16,
@@ -1102,10 +1121,17 @@ class Q4BankTests(unittest.TestCase):
                 self.assertEqual(tuple(output.shape), (2, 3, 64))
                 self.assertEqual(tuple(page_ids.shape), (2, 3, 2))
                 self.assertEqual(tuple(page_scores.shape), (2, 3, 2))
+                self.assertEqual(tuple(page_total_scores.shape), (2, 3))
                 self.assertEqual(page_ids.reshape(-1, 2).tolist(), expected_ids)
                 torch.testing.assert_close(
                     page_scores.reshape(-1, 2),
                     torch.tensor(expected_scores, dtype=torch.float64),
+                    rtol=0.0,
+                    atol=1e-9,
+                )
+                torch.testing.assert_close(
+                    page_total_scores,
+                    torch.tensor(expected_totals, dtype=torch.float64).reshape(2, 3),
                     rtol=0.0,
                     atol=1e-9,
                 )
@@ -1149,7 +1175,7 @@ class Q4BankTests(unittest.TestCase):
                     names,
                     output_dtype=torch.bfloat16,
                 )
-                output, page_ids, page_scores = bank.mlp(
+                output, page_ids, page_scores, page_total_scores = bank.mlp(
                     values,
                     names,
                     output_dtype=torch.bfloat16,
@@ -1159,6 +1185,8 @@ class Q4BankTests(unittest.TestCase):
                 self.assertTrue(torch.equal(output, baseline))
                 self.assertEqual(page_ids.tolist(), [list(range(192))])
                 self.assertEqual(page_scores.tolist(), [[0.0] * 192])
+                self.assertEqual(tuple(page_total_scores.shape), (1,))
+                self.assertEqual(page_total_scores.tolist(), [0.0])
                 metrics = bank.metrics()
                 self.assertEqual(metrics["full_mlp_page_trace_calls"], 1)
                 self.assertEqual(metrics["full_mlp_page_trace_candidates"], 272)

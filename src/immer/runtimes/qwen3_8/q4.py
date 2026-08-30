@@ -35,7 +35,7 @@ Q4_BANK_SCHEMA = "immer.qwen3.8-causal-q4-bank/v1"
 Q4_BUILD_STATE_SCHEMA = "immer.qwen3.8-causal-q4-build-state/v1"
 Q4_VERIFY_CACHE_SCHEMA = "immer.qwen3.8-causal-q4-verify-cache/v1"
 Q4_VERIFY_CACHE_NAME = ".verify-cache-v1.json"
-Q4_NATIVE_ABI = 4
+Q4_NATIVE_ABI = 5
 Q4_BANK_CODEC_ABI = 2
 Q4_0 = "q4_0"
 Q8_0 = "q8_0"
@@ -458,6 +458,7 @@ class Q4NativeKernel:
             void,
             void,
             i64,
+            void,
             void,
             void,
             integer,
@@ -1136,7 +1137,7 @@ class Q4Bank:
         output_dtype: Any,
         activation_page_topk: int | None = None,
     ) -> Any:
-        """Run exact SwiGLU and optionally return its top 64-neuron pages."""
+        """Run exact SwiGLU and optionally return top pages plus total energy."""
 
         import torch
 
@@ -1181,13 +1182,17 @@ class Q4Bank:
             if page_topk:
                 page_ids = torch.empty((input_rows, page_topk), dtype=torch.int64)
                 page_scores = torch.empty((input_rows, page_topk), dtype=torch.float64)
+                page_total_scores = torch.empty((input_rows,), dtype=torch.float64)
                 page_ids_pointer = self.native._pointer(page_ids)
                 page_scores_pointer = self.native._pointer(page_scores)
+                page_total_scores_pointer = self.native._pointer(page_total_scores)
             else:
                 page_ids = None
                 page_scores = None
+                page_total_scores = None
                 page_ids_pointer = ctypes.c_void_p()
                 page_scores_pointer = ctypes.c_void_p()
+                page_total_scores_pointer = ctypes.c_void_p()
             code = self.native.library.immer_q4_mlp_bf16_f32(
                 self.native._pointer(compute),
                 input_rows,
@@ -1205,6 +1210,7 @@ class Q4Bank:
                 page_topk,
                 page_ids_pointer,
                 page_scores_pointer,
+                page_total_scores_pointer,
                 self.threads,
             )
             if code == 2:
@@ -1229,16 +1235,23 @@ class Q4Bank:
                 self._stats.full_mlp_page_trace_rows += input_rows
                 self._stats.full_mlp_page_trace_candidates += input_rows * page_count
                 self._stats.full_mlp_page_trace_selected += input_rows * page_topk
-                if page_ids is None or page_scores is None:
+                if (
+                    page_ids is None
+                    or page_scores is None
+                    or page_total_scores is None
+                ):
                     raise AssertionError("activation-page outputs were not allocated")
                 self._stats.output_bytes += (
                     page_ids.numel() * page_ids.element_size()
                     + page_scores.numel() * page_scores.element_size()
+                    + page_total_scores.numel()
+                    * page_total_scores.element_size()
                 )
                 return (
                     result,
                     page_ids.reshape(*leading, page_topk),
                     page_scores.reshape(*leading, page_topk),
+                    page_total_scores.reshape(leading),
                 )
             return result
 

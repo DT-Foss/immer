@@ -495,8 +495,8 @@ class Qwen38ModelTests(unittest.TestCase):
                 raise AssertionError("pager mock owns selected MLP execution")
 
         class PageRouter:
-            route_width = 1
-            page_count = 1
+            route_width = 4
+            page_count = 4
 
             def __init__(self) -> None:
                 self.ready = False
@@ -507,14 +507,14 @@ class Qwen38ModelTests(unittest.TestCase):
 
             def prepare(self, layer: int):
                 self.prepared.append(layer)
-                return SimpleNamespace(ready=self.ready, page_ids=(0,))
+                return SimpleNamespace(ready=self.ready, page_ids=(3, 1))
 
-            def observe_exact_batch(self, layer: int, ids, scores) -> None:
-                self.exact.append((layer, ids.clone(), scores.clone()))
+            def observe_exact_batch(self, layer: int, ids, scores, totals) -> None:
+                self.exact.append((layer, ids.clone(), scores.clone(), totals.clone()))
                 self.ready = True
 
             def advance_selected(self, layer: int, ids, *, row_count: int = 1) -> None:
-                self.advanced.append((layer, tuple(ids)))
+                self.advanced.append((layer, tuple(ids), row_count))
 
             def begin_transaction(self) -> None:
                 pass
@@ -538,7 +538,8 @@ class Qwen38ModelTests(unittest.TestCase):
 
             def route(self, layer: int, *, row_count: int):
                 self.routed.append((layer, row_count))
-                return SimpleNamespace(ready=self.ready, page_ids=(0,))
+                page_ids = (3, 1) if row_count == 1 else (2, 0, 3)
+                return SimpleNamespace(ready=self.ready, page_ids=page_ids)
 
             @staticmethod
             def snapshot_identity():
@@ -549,8 +550,14 @@ class Qwen38ModelTests(unittest.TestCase):
                 return {}
 
         router = PageRouter()
+        route_config_mapping = _tiny_config_mapping()
+        route_config_mapping["intermediate_size"] = 256
+        route_config = Qwen38Config.from_mapping(
+            route_config_mapping,
+            require_official=False,
+        )
         model = StreamedQwen38(
-            self.config,
+            route_config,
             self.pager,
             mlp_page_router=router,
             max_batch_size=3,
@@ -558,8 +565,12 @@ class Qwen38ModelTests(unittest.TestCase):
         )
         hidden = torch.ones(1, 3, self.config.dim)
         full_output = torch.full_like(hidden, 0.5)
-        page_ids = torch.zeros((1, 3, 1), dtype=torch.int64)
-        page_scores = torch.ones((1, 3, 1), dtype=torch.float64)
+        page_ids = torch.arange(4, dtype=torch.int64).expand(1, 3, 4).clone()
+        page_scores = torch.tensor(
+            [[[8.0, 4.0, 2.0, 1.0]] * 3],
+            dtype=torch.float64,
+        )
+        page_total_scores = torch.full((1, 3), 16.0, dtype=torch.float64)
         selected_output = torch.full((1, 1, self.config.dim), 0.25)
         original_q4 = self.pager.q4_bank
         original_dtype = self.pager.compute_dtype
@@ -570,7 +581,12 @@ class Qwen38ModelTests(unittest.TestCase):
                 mock.patch.object(
                     self.pager,
                     "mlp",
-                    return_value=(full_output, page_ids, page_scores),
+                    return_value=(
+                        full_output,
+                        page_ids,
+                        page_scores,
+                        page_total_scores,
+                    ),
                 ) as full,
                 mock.patch.object(
                     self.pager,
@@ -581,8 +597,13 @@ class Qwen38ModelTests(unittest.TestCase):
                 actual_full = model._mlp(hidden, layer=1)
                 self.assertTrue(torch.equal(actual_full, full_output))
                 self.assertEqual(len(router.exact), 1)
+                self.assertTrue(torch.equal(router.exact[0][3], page_total_scores))
                 self.assertEqual(router.prepared, [])
                 full.assert_called_once()
+                self.assertEqual(
+                    full.call_args.kwargs["activation_page_topk"],
+                    router.route_width,
+                )
                 selected.assert_not_called()
 
                 one = hidden[:, :1]
@@ -592,9 +613,13 @@ class Qwen38ModelTests(unittest.TestCase):
                 selected.assert_called_once()
                 self.assertEqual(
                     tuple(selected.call_args.args[2].shape),
-                    (1, 1, 1),
+                    (1, 1, 2),
                 )
-                self.assertEqual(router.advanced, [(1, (0,))])
+                self.assertEqual(
+                    selected.call_args.args[2].tolist(),
+                    [[[3, 1]]],
+                )
+                self.assertEqual(router.advanced, [(1, (3, 1), 1)])
 
                 rows = (one.clone(), one.clone())
                 selected.return_value = torch.full((2, self.config.dim), 0.75)
@@ -609,13 +634,25 @@ class Qwen38ModelTests(unittest.TestCase):
                 self.assertEqual(full.call_count, 1)
                 self.assertEqual(selected.call_count, 2)
                 self.assertEqual(router.routed, [(1, 1), (1, 2)])
+                self.assertEqual(
+                    tuple(selected.call_args.args[2].shape),
+                    (2, 3),
+                )
+                self.assertEqual(
+                    selected.call_args.args[2].tolist(),
+                    [[2, 0, 3], [2, 0, 3]],
+                )
+                self.assertEqual(
+                    router.advanced,
+                    [(1, (3, 1), 1), (1, (2, 0, 3), 2)],
+                )
         finally:
             self.pager.q4_bank = original_q4
             self.pager.compute_dtype = original_dtype
 
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             StreamedQwen38(
-                self.config,
+                route_config,
                 self.pager,
                 mlp_sparse_executor=mock.Mock(
                     execute=mock.Mock(),
@@ -668,7 +705,7 @@ class Qwen38ModelTests(unittest.TestCase):
                 return {}
 
             @staticmethod
-            def observe_exact_batch(_layer: int, _ids, _scores) -> None:
+            def observe_exact_batch(_layer: int, _ids, _scores, _totals) -> None:
                 pass
 
             @staticmethod

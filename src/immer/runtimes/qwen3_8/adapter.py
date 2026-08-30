@@ -3331,6 +3331,22 @@ class Qwen38CausalChat:
                 "persistence_error": mlp_page_persistence_error,
                 "request": counters,
                 "route_width": int(getattr(mlp_page_router, "route_width")),
+                "runtime": {
+                    key: mlp_page_after[key]
+                    for key in (
+                        "energy_coverage",
+                        "last_width_mean",
+                        "last_width_min",
+                        "policy",
+                        "schema",
+                        "width_actions",
+                        "width_agent_weights",
+                        "width_cross_contexts",
+                        "width_marginal_contexts",
+                        "width_temporal_contexts",
+                    )
+                    if key in mlp_page_after
+                },
             }
         if self._last_draft_evidence is not None:
             evidence["draft"] = dict(self._last_draft_evidence)
