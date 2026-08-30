@@ -179,7 +179,7 @@ def _resolve_qwen38_chat_paths(
         draft_mode = getattr(args, "draft_mode", None)
         if draft_mode in {"hybrid", "mtp"}:
             candidates = (root / "causal" / "q4-base-v3-mtp",)
-        elif draft_mode is None:
+        elif draft_mode in {None, "markov"}:
             candidates = (
                 root / "causal" / "q4-base-v3-mtp",
                 root / "causal" / "q4-base-v2",
@@ -233,6 +233,9 @@ def _resolve_qwen38_markov_draft(
     draft_mode = getattr(args, "draft_mode", None)
     markov_state = getattr(args, "markov_draft_state", None)
     mtp_state = getattr(args, "mtp_draft_state", None)
+    anchor_active = getattr(args, "qwen38_anchor_cache", None) is not None and not bool(
+        getattr(args, "no_anchor_cache", False)
+    )
     disabled = bool(getattr(args, "no_markov_draft", False))
     if disabled:
         if draft_mode in {"hybrid", "markov"} or markov_state is not None:
@@ -251,11 +254,35 @@ def _resolve_qwen38_markov_draft(
         draft_mode is None
         and getattr(args, "draft_bundle", None) is None
         and markov_state is None
+        and mtp_state is None
+        and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+        and q4_root is not None
+        and q4_root.name == "q4-base-v3-mtp"
+        and not anchor_active
+        and _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE.is_file()
+    ):
+        return (
+            "hybrid",
+            str(_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE),
+            str(_QWEN38_DEPLOYMENT_MTP_STATE),
+        )
+    if (
+        draft_mode is None
+        and getattr(args, "draft_bundle", None) is None
+        and markov_state is None
         and bundle_path == _QWEN38_DEPLOYMENT_ROOT
         and q4_root is not None
         and _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE.is_file()
     ):
         return "markov", str(_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE), mtp_state
+    if (
+        draft_mode == "markov"
+        and markov_state is None
+        and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+        and q4_root is not None
+        and _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE.is_file()
+    ):
+        markov_state = str(_QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE)
     if (
         draft_mode == "mtp"
         and mtp_state is None
@@ -434,6 +461,15 @@ class _LiveTextWriter:
             self._stream.flush()
         self._finished = True
 
+    def reset(self) -> None:
+        """Start the next response while keeping the loaded chat runtime alive."""
+
+        if not self._finished:
+            raise RuntimeError("cannot reset an unfinished text stream")
+        self._snapshot = ""
+        self._wrote = False
+        self._finished = False
+
 
 class _LiveProgressWriter:
     """Show decode progress without exposing provisional routed text."""
@@ -504,6 +540,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
 
     component = None
     jsonl = bool(getattr(args, "jsonl", False))
+    interactive = bool(getattr(args, "interactive", False))
     message = getattr(args, "message", None)
     max_requests = getattr(args, "max_requests", None)
     output_mode = getattr(args, "output", None) or ("json" if jsonl else "text")
@@ -566,12 +603,49 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             value["id"] = request_id
         print(json.dumps(value, ensure_ascii=False, sort_keys=True), flush=True)
 
+    def interactive_summary(result) -> str | None:
+        evidence = result.evidence
+        if not isinstance(evidence, dict):
+            evidence = dict(evidence)
+        generation = evidence.get("generation")
+        runtime_metrics = evidence.get("runtime_metrics")
+        if not isinstance(generation, dict):
+            return None
+        parts = []
+        generated_tokens = generation.get("generated_tokens")
+        if isinstance(generated_tokens, int) and not isinstance(generated_tokens, bool):
+            parts.append(f"{generated_tokens} tokens")
+        forwards = generation.get("forward_passes")
+        if isinstance(forwards, int) and not isinstance(forwards, bool):
+            parts.append(f"{forwards} Qwen forwards")
+        seconds = generation.get("seconds")
+        if isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
+            parts.append(f"{float(seconds):.2f} s")
+        if isinstance(runtime_metrics, dict):
+            peak_rss = runtime_metrics.get("process_peak_rss_bytes")
+            if isinstance(peak_rss, int) and not isinstance(peak_rss, bool):
+                parts.append(f"{peak_rss / 1024**3:.2f} GiB peak")
+        return None if not parts else "[" + " · ".join(parts) + "]"
+
     try:
         if jsonl:
             if output_mode != "json":
                 raise ValueError("JSONL chat requires --output json")
             if message is not None:
                 raise ValueError("chat message and --jsonl are mutually exclusive")
+            if interactive:
+                raise ValueError("--jsonl and --interactive are mutually exclusive")
+            if max_requests is not None and (
+                isinstance(max_requests, bool)
+                or not isinstance(max_requests, int)
+                or max_requests <= 0
+            ):
+                raise ValueError("max_requests must be a positive integer")
+        elif interactive:
+            if message is not None:
+                raise ValueError("chat message and --interactive are mutually exclusive")
+            if output_mode != "text":
+                raise ValueError("interactive chat requires --output text")
             if max_requests is not None and (
                 isinstance(max_requests, bool)
                 or not isinstance(max_requests, int)
@@ -579,7 +653,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             ):
                 raise ValueError("max_requests must be a positive integer")
         elif not isinstance(message, str) or not message.strip():
-            raise ValueError("chat requires a message or --jsonl")
+            raise ValueError("chat requires a message, --jsonl, or --interactive")
         bundle_path, tokenizer_path, q4_root, fast_mlp_root = (
             _resolve_qwen38_chat_paths(args)
         )
@@ -875,6 +949,52 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     )
                 if max_requests is not None and handled >= max_requests:
                     break
+            return 0 if failures == 0 else 2
+        if interactive:
+            failures = 0
+            handled = 0
+            last_summary = None
+            terminal = sys.stdin.isatty() and sys.stdout.isatty()
+            if terminal:
+                print("IMMER local Qwen — /help, /stats, /quit", flush=True)
+            while max_requests is None or handled < max_requests:
+                if terminal:
+                    print("you> ", end="", flush=True)
+                raw = sys.stdin.readline()
+                if raw == "":
+                    break
+                line_message = raw.strip()
+                if not line_message:
+                    continue
+                if line_message in {"/exit", "/quit"}:
+                    break
+                if line_message == "/help":
+                    print(
+                        "Enter any prompt. /stats shows the last real runtime cost. "
+                        "/quit closes the loaded local runtime.",
+                        flush=True,
+                    )
+                    continue
+                if line_message == "/stats":
+                    print(last_summary or "No completed Qwen response yet.", flush=True)
+                    continue
+                handled += 1
+                if terminal:
+                    print("immer> ", end="", flush=True)
+                result = component.handle(
+                    Request(
+                        "chat",
+                        line_message,
+                        request_metadata_for(line_message),
+                    )
+                )
+                emit(result)
+                failures += int(not result.ok)
+                last_summary = interactive_summary(result)
+                if terminal and last_summary is not None:
+                    print(last_summary, file=sys.stderr, flush=True)
+                if live_writer is not None:
+                    live_writer.reset()
             return 0 if failures == 0 else 2
         result = component.handle(
             Request("chat", message, request_metadata_for(message))
@@ -1560,6 +1680,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="keep one loaded runtime and process stdin as raw-text or JSONL requests",
     )
     chat.add_argument(
+        "--interactive",
+        action="store_true",
+        help="keep one loaded runtime and accept arbitrary prompts until /quit",
+    )
+    chat.add_argument(
         "--output",
         choices=("text", "json"),
         help="single-request output (default: live text; JSONL always uses json)",
@@ -1607,8 +1732,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--draft-mode",
         choices=("qwen35", "markov", "mtp", "hybrid"),
         help=(
-            "rolling draft provider; deployed chat defaults to zero-weight Markov, "
-            "while MTP and hybrid are explicit opt-ins"
+            "rolling draft provider; the deployed MTP-capable bank defaults to the "
+            "Markov/MTP hybrid, while an explicit value overrides it"
         ),
     )
     chat.add_argument(

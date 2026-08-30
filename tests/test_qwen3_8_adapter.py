@@ -2111,7 +2111,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(options["draft_mode"], "markov")
         self.assertEqual(options["markov_draft_state_path"], str(state))
 
-    def test_cli_deployment_uses_markov_without_reading_embedded_mtp(self) -> None:
+    def test_cli_deployment_uses_hybrid_novelty_fallback(self) -> None:
         qwen = _chat(_Runtime())
         with tempfile.TemporaryDirectory() as temporary:
             deployed = Path(temporary) / "deployed"
@@ -2139,11 +2139,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(code, 0)
         options = constructor.call_args.kwargs
         self.assertEqual(options["q4_root"], str(q4))
-        self.assertEqual(options["draft_mode"], "markov")
+        self.assertEqual(options["draft_mode"], "hybrid")
         self.assertEqual(options["markov_draft_state_path"], str(markov_state))
-        self.assertIsNone(options["mtp_draft_state_path"])
+        self.assertEqual(options["mtp_draft_state_path"], str(mtp_state))
 
-    def test_cli_deployment_keeps_hybrid_as_an_explicit_opt_in(self) -> None:
+    def test_cli_deployment_keeps_markov_as_an_explicit_opt_out(self) -> None:
         qwen = _chat(_Runtime())
         with tempfile.TemporaryDirectory() as temporary:
             deployed = Path(temporary) / "deployed"
@@ -2167,15 +2167,15 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 redirect_stdout(io.StringIO()),
             ):
                 code = main(
-                    ["chat", "hello", "--raw-qwen", "--draft-mode", "hybrid"]
+                    ["chat", "hello", "--raw-qwen", "--draft-mode", "markov"]
                 )
 
         self.assertEqual(code, 0)
         options = constructor.call_args.kwargs
         self.assertEqual(options["q4_root"], str(q4))
-        self.assertEqual(options["draft_mode"], "hybrid")
+        self.assertEqual(options["draft_mode"], "markov")
         self.assertEqual(options["markov_draft_state_path"], str(markov_state))
-        self.assertEqual(options["mtp_draft_state_path"], str(mtp_state))
+        self.assertIsNone(options["mtp_draft_state_path"])
 
     def test_cli_anchor_keeps_the_compatible_markov_provider(self) -> None:
         qwen = _chat(_Runtime())
@@ -2314,6 +2314,35 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(rows[0]["id"], "first")
         self.assertNotIn("id", rows[1])
         self.assertEqual([row["output"] for row in rows], ["local answer"] * 2)
+
+    def test_cli_interactive_reuses_one_loaded_component_for_free_prompts(self) -> None:
+        qwen = _chat(_Runtime())
+        output = io.StringIO()
+        stream = io.StringIO("hello\nworld\n/quit\n")
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                return_value=qwen,
+            ) as constructor,
+            patch("sys.stdin", stream),
+            redirect_stdout(output),
+        ):
+            code = main(
+                [
+                    "chat",
+                    "--interactive",
+                    "--raw-qwen",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        constructor.assert_called_once()
+        self.assertTrue(qwen.closed)
+        self.assertEqual(output.getvalue(), "local answer\nlocal answer\n")
 
     def test_cli_wires_fast_mlp_root_and_layer_subset(self) -> None:
         qwen = _chat(_Runtime())
