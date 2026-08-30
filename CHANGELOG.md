@@ -72,7 +72,10 @@ All notable changes to IMMER are recorded here.
   cycles, then continue invariant phases. `b5ee3b8` requires three distinct
   slot witnesses, rejects multiple structural sources even when their current
   token matches, preserves absolute phase through the 4,096-token window, and
-  keeps future-block sources untrusted. Provider ABI is v40; metrics v30.
+  keeps future-block sources untrusted. `898af70` restores global evidence
+  ranking across pure/bound periods, permits one bound slot per option, and
+  preserves absolute phase without allocating the full answer. Provider ABI is
+  v41; metrics v30.
 
 ### Arbitrary local Qwen runtime
 
