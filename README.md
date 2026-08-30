@@ -41,6 +41,13 @@ release surface.
   Speculative Q/K/V and DeltaNet input projections also share one Q8 input and
   native team across all staged token rows; K2 removes 176 redundant native
   calls and 352 row quantizations per target wave.
+- **Direct Q4 MLP-page execution (explicit).** An opt-in persistent controller
+  learns 64-neuron activation-page routes from exact full-Q4 MLP traces. Its
+  temporal, cross-layer, and marginal agents use Fixed Share to select a
+  bounded page set; unready layers execute the unchanged full MLP, and staged
+  continuation updates commit or roll back with the accepted target prefix.
+  Enable it explicitly with `--mlp-page-state` and bound it with
+  `--mlp-page-width`; the default chat command never enables this route.
 - **Predictive weight transport.** A persistent two-agent operation Markov
   model learns the exact tensor/range sequence already emitted by the
   Streamer. Order-1/2 Fixed Share, surprise regimes, and Ricci retention
@@ -52,10 +59,14 @@ release surface.
   and 100% of the hard maximum. Linux warms it via
   `POSIX_FADV_WILLNEED`: no payload copy, logical read, budget charge, or pager
   weight cache is introduced.
-- **Native local drafting.** A causalized Qwen3.5-0.8B or a zero-weight Markov
-  council proposes transactional continuations in a configurable K=2–16
-  target window. Qwen3.8 alone verifies and commits them; K=8 is the product
-  default. Target-confirmed episodes become reusable variable options up to
+- **Native local drafting.** Deployed chat uses the zero-weight Markov council;
+  causalized Qwen3.5-0.8B and embedded MTP providers remain explicit modes.
+  The provider proposes transactional continuations in a configurable K=2–16
+  target window, and Qwen3.8 alone verifies and commits them. The Council
+  combines live online distributions with retained Atlas branches in a
+  bounded beam, so a stronger multi-token path can win without treating a
+  ranking score as acceptance probability. Target-confirmed episodes become
+  reusable variable options up to
   15 tokens;
   global and contextual-dialect agents compete by support, confidence, context
   depth, and dialect similarity. Under an adaptive request ceiling, the
@@ -70,6 +81,10 @@ release surface.
   without cloning transactional state. Existing target receipts can be
   imported atomically and idempotently; normal persistent traffic then grows
   the same episode, dialect, expert-rapidity, and phrase memory online.
+  Within one request, an ephemeral high-order agent also learns repeated answer
+  contexts from confirmed output and corrections. It never trains on prompt
+  tokens or rejected drafts, and durable request state is written once at
+  successful finalization.
 - **Embedded MTP drafting.** The target checkpoint's own one-layer Qwen3.5 MTP
   branch now runs through the same causal Q4 bank, shared embedding, native
   bounded LM head, and exact rolling target verifier. Shifted token embeddings
@@ -81,9 +96,9 @@ release surface.
   an uneconomic target wave. Adaptive execution computes only the proposal
   frontier selected by that policy. On an arbitrary 16-token counting request,
   K2 accepted eight drafts and reduced exact generation from 34.05 to 26.74
-  seconds while cutting complete target forwards from 16 to 9. Normal deployed
-  chat now runs a round-wise Markov/MTP Council. Markov gets first refusal on
-  every response round; MTP covers novelty, and the next round can return to
+  seconds while cutting complete target forwards from 16 to 9. In explicit
+  hybrid mode, chat runs a round-wise Markov/MTP Council. Markov gets first
+  refusal on every response round; MTP covers novelty, and the next round can return to
   Markov as soon as a learned answer continuation applies. Both providers
   consume every exact target-confirmed prefix, so switching requires neither
   target replay nor another prefill. When MTP owns a novelty round, the unused
@@ -259,13 +274,14 @@ persists the Markov accounting; an unknown prompt falls directly through to
 full Q4. `--no-ooe-warm` disables this route, and `--ooe-warm-root` mounts an
 explicit bank outside the canonical deployment.
 
-The canonical Q4 deployment mounts the MTP-capable local bank and its persistent
-token-level Markov council. Every response round starts with the zero-model-cost
-Council and falls through to embedded MTP only for that round when Markov has no
-useful continuation. Exact committed target-hidden rows advance the inactive
-provider, allowing later rounds to switch in either direction without replay.
-The Markov corpus learns only target-confirmed answer tokens, and Full Q4 still
-verifies every emitted token. `--no-markov-draft` forces direct K1 decoding.
+The canonical Q4 deployment keeps the existing MTP-capable v3 target bank but
+uses its persistent token-level Markov Council directly. It does not load or
+run embedded MTP unless `--draft-mode mtp` or `--draft-mode hybrid` is supplied.
+Atlas and online agents expand a bounded beam, while a request-local high-order
+agent can reuse repeated context learned earlier in the same confirmed answer.
+Full Q4 still verifies every emitted token; `--no-markov-draft` forces direct
+K1 decoding. Direct Q4 MLP-page routing is also explicit-only through
+`--mlp-page-state` and is disabled in this default.
 
 Markov state v6 also retains prompt/output boundaries for composition. Two or
 more distinct target-confirmed bindings can induce literal/copy programs over a
@@ -316,6 +332,8 @@ per-profile store and are revalidated against their source ResultCells.
 | Compositional unseen token slot | unseen `CODE_DD44` via Markov only | three distinct target-confirmed code bindings induced unanimous Literal+Copy programs; fourth slot loaded no MTP, returned the exact requested code in three target forwards, and remained fully Qwen-verified |
 | Rolling K=2–16 continuation | accepted prefixes commit with zero weight reads | one target-known token plus up to 15 drafts; DeltaNet Conv/recurrent state, next-token continuation, Graft, and native Prefix-Sinkhorn state remain bit-exact |
 | Native-token Markov council | zero draft-model bytes | eight sparse Qwen-ID experts across orders 0–16; target-only Rapidity/Fixed-Share weighting, regime detection, 64 context dialects, Ricci retention, atomic episode learning, and target-confirmed variable phrase options up to 15 tokens |
+| Bounded Atlas + online beam | at most eight retained paths | Atlas and live Council alternatives are fused per token, deterministically pruned, and calibrated only from reconciled target prefixes; K1 virtual matches, request-budget truncation, and EOS truncation update only proposals actually verified |
+| Same-request high-order agent | repeated answer context becomes immediately eligible | order-2+ transitions learn from confirmed answer tokens and target corrections inside the active request; prompts and rejected drafts remain excluded, and the ephemeral agent adds no second persistence write |
 | Corpus-scale Markov atlas | 4,000,000 tokens → 500,000 contexts in 8.0 MB | flat-array v2 adds ~150 MiB RSS and loads in 1.77 s on the live server; on an arbitrary rainbow question it supported 7 MTP tokens across 6 rounds while the hybrid accepted 11 drafts and produced 24 tokens in 14 target forwards |
 | Live-answer Markov expert | 65,536 retained answer tokens; 4,096-token cached PPM windows | on an unseen German lightning paraphrase the online memory supported 64/98 MTP candidates and supplied 18 calibrated confidence gains across 12 rounds; 10 drafts accepted, 24 tokens in 15 target forwards |
 | O1-valued episode retention | 1.1 KB state + 130 KB neural sidecar after the first live answer | real O1 surprise and learning-progress assign persistent episode priority; Ricci-age eviction keeps valuable older answers over low-value newer ones, with atomic rollback and answer-only boundaries |
@@ -325,8 +343,9 @@ per-profile store and are revalidated against their source ResultCells.
 | Direct-to-Torch local ranges | one final tensor for sorted selected-row routes | inode-stable `preadv` fills caller-owned Torch storage; no intermediate Python body, no row-stack duplicate, exact cache/budget/causal-plan accounting |
 | Markov range prefetch | zero additional logical/source bytes | grouped operations; order-1/2 beam; probability×Ricci/reuse scoring; cross-operation dedupe; accepted-only cooldown; delayed exact-byte utility for d1–d8 agents; adaptive 12.5–100% reservoir budget; bounded local OS-page hints |
 | Weight-only all-layer Fast MLP | deterministic 64-layer p4/k32 plan; capture-only target use forbidden | no prompts or model forwards in the build; exact paths learn adaptive width plus prequential sparse-output cosine/L2 and scalar correction; non-beneficial or uncalibrated routes use the full MLP |
+| Direct Q4 MLP-page route | explicit 192-of-272 page bound by default | exact full-MLP traces train bounded temporal/cross-layer/marginal routes; unready predictions fall back to full Q4, selected routes execute native Q4 pages, and speculative learning commits only for accepted rows; no wall-time claim is attached |
 | Exact residual-PQ LM head | K=1–16 and k=1/3/7 parity; certified page + economic row pruning | deterministic weight-only build, best-first tree, actual row-code caps, K-query survivor union, contiguous-read cost gate, 64-leaf no-saving stop, outward residual/roundoff bounds, overflow/tie/subnormal guards, and exact full-leaf fallback; no model forward |
-| Arbitrary local Qwen chat | one terminal 64-layer sweep removed per request | authenticated causal Qwen3.8 path; rolling local-Qwen or zero-model-byte Markov drafting plus row-routed fast MLP; target, auxiliary, draft, and combined transport reported separately |
+| Arbitrary local Qwen chat | one terminal 64-layer sweep removed per request | authenticated causal Qwen3.8 path; default zero-model-byte Markov drafting and full Q4 MLP execution, with auxiliary draft and MLP routes available explicitly; target, auxiliary, draft, and combined transport reported separately |
 | Seed v3 native migration | exact parity on 8/8 inherited tensor outputs for Micro and 5M | SHA-first migration of shared trained GRU/CRSA/SwiGLU weights; new receipt, quotient, route-value, and expected-work heads added under a strict inference-only manifest |
 | Full Qwen MLP layer map | 640/640 cells; content promotion 0 | every layer repeats the same 146/549 template hits; 1,370/1,389 candidate admissions equal their matched random controls, closing the exhaustive exact-key line |
 | Qwen3.8 exact continuation | bit-identical K=1–16 state | exact transactional core with tokenwise hidden, KV, DeltaNet Conv/recurrent, and Prefix-Sinkhorn parity |

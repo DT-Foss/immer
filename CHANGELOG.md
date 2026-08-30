@@ -2,7 +2,36 @@
 
 All notable changes to IMMER are recorded here.
 
-## [Unreleased] — 2026-08-29
+## [Unreleased] — 2026-08-30
+
+### Deployed Markov product path
+
+- `c204181` added direct native Q4 MLP-page execution behind the explicit
+  `--mlp-page-state` option. Exact full-MLP activation traces train bounded
+  temporal, cross-layer, and marginal Fixed-Share routes; unready layers retain
+  full-Q4 fallback, and continuation transactions commit route learning only
+  for accepted rows. Normal chat does not enable this mode, and no wall-time
+  result is claimed.
+- `6a783e9` replaced greedy Atlas/online continuation selection with a bounded
+  beam. Up to eight retained paths combine live Council, Atlas, and calibrated
+  prefix evidence; target-only window costs remain authoritative, and beam
+  reliability changes only after exact reconciliation.
+- `a31bb3d` made direct zero-weight Markov drafting the deployed default while
+  retaining the unchanged MTP-capable v3 target bank. Embedded MTP and the
+  round-wise hybrid provider now require explicit `--draft-mode mtp` or
+  `--draft-mode hybrid`. The same cut routes K1 virtual verification to the
+  selected provider, respects request-budget and EOS truncation in verification
+  accounting, and accepts authenticated exact-prefix anchor seeds.
+- `9f7bec7` replaced target-payload hashing in Markov callbacks with zero-payload
+  tensor-version and structural guards. Provider callbacks still fail closed
+  on target mutation without reading model-state contents.
+- `aeb5d04` made durable Markov state a single write per completed request.
+  `close()` skips an already persisted final state, while a loaded migration
+  that received no request is still written exactly once.
+- `27527a7` added a request-local high-order transition agent. Repeated order-2+
+  answer contexts become usable within the same response from confirmed output
+  and target corrections; prompt tokens and rejected drafts never train it,
+  and the ephemeral agent does not add another persistence write.
 
 ### Arbitrary local Qwen runtime
 
