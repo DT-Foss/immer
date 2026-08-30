@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 import numbers
@@ -20,7 +20,8 @@ from .kernels import AttentionState, full_attention_core, rms_norm
 from .pager import Qwen38WeightPager
 
 
-QWEN35_MTP_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v5"
+QWEN35_MTP_DRAFT_PROVIDER_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v6"
+_QWEN35_MTP_DRAFT_PROVIDER_V5_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v5"
 _QWEN35_MTP_DRAFT_PROVIDER_V4_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v4"
 _QWEN35_MTP_DRAFT_PROVIDER_V3_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v3"
 _QWEN35_MTP_DRAFT_PROVIDER_V2_SCHEMA = "immer.qwen3.5-mtp-draft-provider/v2"
@@ -55,6 +56,14 @@ MTP_CONTROL_NAMES = (
 
 class Qwen35MtpDraftError(RuntimeError):
     """The embedded MTP branch cannot produce a history-aligned proposal."""
+
+
+@dataclass(frozen=True, slots=True)
+class _MtpRecursiveTrace:
+    token_ids: tuple[int, ...]
+    gap_buckets: tuple[int, ...]
+    next_position: int
+    gate_pending: bool
 
 
 def _owner_metric(owner: object, name: str) -> int:
@@ -145,6 +154,13 @@ class Qwen35MtpDraftMetrics:
     teacher_hits: int
     teacher_misses: int
     teacher_max_position: int
+    recursive_trace_created: int
+    recursive_trace_active: int
+    recursive_trace_peak_active: int
+    recursive_trace_feedback_tokens: int
+    recursive_trace_hits: int
+    recursive_trace_misses: int
+    recursive_trace_max_position: int
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -229,6 +245,8 @@ class Qwen35MtpDraftProvider:
         self._pending_gap_buckets: tuple[int, ...] = ()
         self._pending_computed_width = 0
         self._pending_teacher_positions: set[int] = set()
+        self._pending_verification_outcomes: dict[int, bool] = {}
+        self._recursive_traces: list[_MtpRecursiveTrace] = []
         self._carried_context = initial_carry is not None
         self._reliability: dict[tuple[bool, int, int, int], list[int]] = {}
         self._previous_outcomes = {False: -1, True: -1}
@@ -254,6 +272,12 @@ class Qwen35MtpDraftProvider:
         self._teacher_hits = 0
         self._teacher_misses = 0
         self._teacher_max_position = 0
+        self._recursive_trace_created = 0
+        self._recursive_trace_peak_active = 0
+        self._recursive_trace_feedback_tokens = 0
+        self._recursive_trace_hits = 0
+        self._recursive_trace_misses = 0
+        self._recursive_trace_max_position = 0
         self._linear_calls = 0
         self._source_body_bytes = max(
             0,
@@ -412,6 +436,10 @@ class Qwen35MtpDraftProvider:
         try:
             document = json.loads(path.read_bytes())
             identity = self._calibration_identity()
+            v5_identity = {
+                **identity,
+                "provider": _QWEN35_MTP_DRAFT_PROVIDER_V5_SCHEMA,
+            }
             v4_identity = {
                 **identity,
                 "provider": _QWEN35_MTP_DRAFT_PROVIDER_V4_SCHEMA,
@@ -438,6 +466,7 @@ class Qwen35MtpDraftProvider:
                 or document.get("identity")
                 not in (
                     identity,
+                    v5_identity,
                     v4_identity,
                     v3_identity,
                     v2_identity,
@@ -877,6 +906,7 @@ class Qwen35MtpDraftProvider:
             raise Qwen35MtpDraftError(
                 "cannot advance MTP state with a pending proposal"
             )
+        self._validate_recursive_traces()
         committed = self._history(history, label="MTP confirmed history")
         if len(committed) <= len(base) or committed[: len(base)] != base:
             raise Qwen35MtpDraftError(
@@ -905,6 +935,7 @@ class Qwen35MtpDraftProvider:
         self._last_target_hidden = fragment[:, -1:].detach().clone().contiguous()
         self._last_target_hidden_history_length = len(committed)
         self._next_position = len(committed) - 1
+        self._advance_recursive_traces(committed[len(base) :])
         self._advance_calls += 1
         self._advanced_tokens += added
 
@@ -922,6 +953,7 @@ class Qwen35MtpDraftProvider:
             raise Qwen35MtpDraftError("MTP proposal history is not committed")
         if self._pending_base is not None:
             raise Qwen35MtpDraftError("previous MTP proposal was not reconciled")
+        self._validate_recursive_traces()
         if isinstance(known_token, bool) or not isinstance(
             known_token, numbers.Integral
         ):
@@ -994,8 +1026,10 @@ class Qwen35MtpDraftProvider:
         self._pending_gap_buckets = tuple(gap_buckets)
         self._pending_computed_width = computed_width
         self._pending_teacher_positions.clear()
+        self._pending_verification_outcomes.clear()
         self._proposal_calls += 1
         self._proposed_tokens += len(result)
+        self._advance_recursive_traces((known,))
         return result
 
     def propose_round_state(
@@ -1055,6 +1089,93 @@ class Qwen35MtpDraftProvider:
         self._calibration_updates += 1
         self._calibration_updates_by_context[self._carried_context] += 1
 
+    def _validate_recursive_traces(self) -> None:
+        for trace in self._recursive_traces:
+            if (
+                not trace.token_ids
+                or len(trace.token_ids) != len(trace.gap_buckets)
+                or not 0 <= trace.next_position < len(trace.token_ids)
+            ):
+                raise Qwen35MtpDraftError("MTP recursive trace is invalid")
+
+    def _advance_recursive_traces(self, tokens: Iterable[int], /) -> None:
+        self._validate_recursive_traces()
+        changed = False
+        for raw_token in tokens:
+            token = int(raw_token)
+            surviving = []
+            for trace in self._recursive_traces:
+                position = trace.next_position
+                hit = trace.token_ids[position] == token
+                if trace.gate_pending:
+                    if hit and position + 1 < len(trace.token_ids):
+                        surviving.append(
+                            replace(
+                                trace,
+                                next_position=position + 1,
+                                gate_pending=False,
+                            )
+                        )
+                    continue
+                self._update_calibration(
+                    position=position,
+                    bucket=trace.gap_buckets[position],
+                    previous=1,
+                    outcome=hit,
+                )
+                changed = True
+                self._recursive_trace_feedback_tokens += 1
+                self._recursive_trace_hits += int(hit)
+                self._recursive_trace_misses += int(not hit)
+                self._recursive_trace_max_position = max(
+                    self._recursive_trace_max_position,
+                    position,
+                )
+                if hit and position + 1 < len(trace.token_ids):
+                    surviving.append(
+                        replace(trace, next_position=position + 1)
+                    )
+            self._recursive_traces = surviving
+        if changed:
+            try:
+                self._save_calibration()
+            except OSError:
+                pass
+
+    def _arm_pending_recursive_trace(self, accepted: int) -> None:
+        computed = self._pending_computed_width
+        proposal = self._pending_proposal
+        buckets = self._pending_gap_buckets
+        if (
+            proposal is None
+            or computed <= 0
+            or computed > len(proposal)
+            or len(buckets) != len(proposal)
+            or not 0 <= accepted <= computed
+        ):
+            raise Qwen35MtpDraftError("MTP recursive trace source is invalid")
+        if accepted >= computed:
+            return
+        observed = self._pending_verification_outcomes.get(accepted)
+        if observed is False:
+            return
+        gate_pending = observed is True
+        if gate_pending and accepted + 1 >= computed:
+            return
+        self._recursive_traces.append(
+            _MtpRecursiveTrace(
+                token_ids=proposal[:computed],
+                gap_buckets=buckets[:computed],
+                next_position=accepted,
+                gate_pending=gate_pending,
+            )
+        )
+        self._recursive_trace_created += 1
+        self._recursive_trace_peak_active = max(
+            self._recursive_trace_peak_active,
+            len(self._recursive_traces),
+        )
+
     def observe_verification(
         self,
         accepted_prefix_length: int,
@@ -1078,6 +1199,7 @@ class Qwen35MtpDraftProvider:
         previous = self._previous_outcome
         for index in range(verified_proposals):
             outcome = index < accepted_prefix_length
+            self._pending_verification_outcomes[index] = outcome
             self._update_calibration(
                 position=index,
                 bucket=buckets[index],
@@ -1129,6 +1251,7 @@ class Qwen35MtpDraftProvider:
         self._teacher_misses += int(not outcome)
         self._teacher_max_position = max(self._teacher_max_position, position)
         self._pending_teacher_positions.add(position)
+        self._pending_verification_outcomes[position] = outcome
         self._previous_outcome = int(outcome)
         try:
             self._save_calibration()
@@ -1159,6 +1282,8 @@ class Qwen35MtpDraftProvider:
         if len(delta) > len(proposal) or delta != proposal[: len(delta)]:
             raise Qwen35MtpDraftError("MTP reconciliation is not a proposal prefix")
         accepted = len(delta)
+        self._advance_recursive_traces(delta)
+        self._arm_pending_recursive_trace(accepted)
         self._committed_history = committed
         self._committed_state = self._pending_states[accepted]
         self._next_position = len(committed) - 1
@@ -1169,6 +1294,7 @@ class Qwen35MtpDraftProvider:
         self._pending_gap_buckets = ()
         self._pending_computed_width = 0
         self._pending_teacher_positions.clear()
+        self._pending_verification_outcomes.clear()
         self._reconcile_calls += 1
 
     def reconcile_prefix_state(
@@ -1204,6 +1330,8 @@ class Qwen35MtpDraftProvider:
             or self._pending_states
             or self._pending_gap_buckets
             or self._pending_teacher_positions
+            or self._pending_verification_outcomes
+            or self._recursive_traces
             or self._adaptive_round_call
         ):
             raise Qwen35MtpDraftError("cannot export carry with a pending proposal")
@@ -1253,8 +1381,19 @@ class Qwen35MtpDraftProvider:
             last_target_hidden=hidden.detach().clone().contiguous(),
         )
 
-    def observe_final(self, _history: tuple[int, ...], /) -> None:
-        return None
+    def observe_final(self, history: tuple[int, ...], /) -> None:
+        committed = self._committed_history
+        final = self._history(history, label="final MTP history")
+        if (
+            committed is None
+            or len(final) < len(committed)
+            or final[: len(committed)] != committed
+        ):
+            raise Qwen35MtpDraftError(
+                "final MTP history changed its committed prefix"
+            )
+        self._advance_recursive_traces(final[len(committed) :])
+        self._recursive_traces.clear()
 
     def metrics(self) -> Qwen35MtpDraftMetrics:
         return Qwen35MtpDraftMetrics(
@@ -1304,6 +1443,15 @@ class Qwen35MtpDraftProvider:
             teacher_hits=self._teacher_hits,
             teacher_misses=self._teacher_misses,
             teacher_max_position=self._teacher_max_position,
+            recursive_trace_created=self._recursive_trace_created,
+            recursive_trace_active=len(self._recursive_traces),
+            recursive_trace_peak_active=self._recursive_trace_peak_active,
+            recursive_trace_feedback_tokens=(
+                self._recursive_trace_feedback_tokens
+            ),
+            recursive_trace_hits=self._recursive_trace_hits,
+            recursive_trace_misses=self._recursive_trace_misses,
+            recursive_trace_max_position=self._recursive_trace_max_position,
         )
 
     def close(self) -> None:
@@ -1326,6 +1474,8 @@ class Qwen35MtpDraftProvider:
         self._pending_gap_buckets = ()
         self._pending_computed_width = 0
         self._pending_teacher_positions.clear()
+        self._pending_verification_outcomes.clear()
+        self._recursive_traces.clear()
         self._reliability.clear()
         self._closed = True
         self.pager.release()

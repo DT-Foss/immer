@@ -2716,7 +2716,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
                             "recursive_trace_feedback_tokens": 4,
                             "recursive_trace_max_position": 3,
                         },
-                        "mtp": {"teacher_verifications": 2},
+                        "mtp": {
+                            "recursive_trace_feedback_tokens": 5,
+                            "recursive_trace_max_position": 4,
+                            "teacher_verifications": 2,
+                        },
                     },
                 },
             },
@@ -2758,7 +2762,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "6 provider counterfactual labels · "
                 "Markov 2 tournaments B1/C0/P1, "
                 "9 counterfactual labels, 4 deep labels through p3, dialect 0.75 · "
-                "2 free MTP teacher labels]",
+                "2 free MTP teacher labels · 5 recursive MTP labels through p4]",
             ],
         )
         qwen.close.assert_called_once()

@@ -13,7 +13,7 @@ from .draft_protocol import RollingDraftProposal
 from .mtp_draft import Qwen35MtpCarry, Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v26"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v27"
 ATLAS_MTP_CONSENSUS_STRENGTH = 0.25
 ONLINE_MTP_CONSENSUS_STRENGTH = 0.25
 PROVIDER_TOURNAMENT_DISCOUNT = 0.85
@@ -1080,23 +1080,22 @@ class Qwen38MarkovMtpDraftProvider:
         )
         if callable(snapshot_policy) and callable(restore_policy):
             policy_snapshot = snapshot_policy()
+        markov_completed = False
         try:
             self._advance_provider_traces(history[len(current) :])
             self._provider_traces.clear()
+            # Markov owns the shared persistent tournament transaction. MTP
+            # finalization runs only after that transaction commits.
+            self.markov_provider.observe_final(history)
+            markov_completed = True
             if self._mtp_provider is not None:
-                mtp_failure: Exception | None = None
-                try:
-                    self._mtp_provider.observe_final(history)
-                except Exception as exc:
-                    mtp_failure = exc
-                # MTP executes novelty rounds.  Markov has already reconciled each
-                # of its shadow predictions against the same target-confirmed
-                # prefixes and now commits that feedback with the complete episode.
-                self.markov_provider.observe_final(history)
-            else:
-                mtp_failure = None
-                self.markov_provider.observe_final(history)
+                self._mtp_provider.observe_final(history)
         except Exception:
+            if markov_completed:
+                self._request_completed = True
+                self._switch_available = False
+                self._round_target_hidden = None
+                raise
             self._provider_traces = original_traces
             self._provider_trace_feedback_tokens = original_feedback_tokens
             if policy_snapshot is not None:
@@ -1110,8 +1109,6 @@ class Qwen38MarkovMtpDraftProvider:
         self._request_completed = True
         self._switch_available = False
         self._round_target_hidden = None
-        if mtp_failure is not None:
-            raise mtp_failure
 
     def export_mtp_carry(
         self,

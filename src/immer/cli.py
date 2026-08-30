@@ -115,8 +115,8 @@ _QWEN38_DEPLOYMENT_O1_RETENTION = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-markov-o1-retention-v1.json"
 )
 _QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v46"
-_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v26"
-_QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v5"
+_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v27"
+_QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
     b"immer:qwen3.8-growing-warm-runtime/v2"
 ).hexdigest()
@@ -782,6 +782,23 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     and teacher > 0
                 ):
                     parts.append(f"{teacher} free MTP teacher labels")
+                recursive_mtp = mtp.get("recursive_trace_feedback_tokens")
+                recursive_mtp_depth = mtp.get("recursive_trace_max_position")
+                if (
+                    isinstance(recursive_mtp, int)
+                    and not isinstance(recursive_mtp, bool)
+                    and recursive_mtp > 0
+                ):
+                    parts.append(
+                        f"{recursive_mtp} recursive MTP labels"
+                        + (
+                            f" through p{recursive_mtp_depth}"
+                            if isinstance(recursive_mtp_depth, int)
+                            and not isinstance(recursive_mtp_depth, bool)
+                            and recursive_mtp_depth > 0
+                            else ""
+                        )
+                    )
         return None if not parts else "[" + " · ".join(parts) + "]"
 
     try:

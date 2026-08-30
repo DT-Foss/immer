@@ -8,6 +8,7 @@ from unittest import mock
 
 import torch
 
+import immer.runtimes.qwen3_8.mtp_draft as mtp_module
 from immer.runtimes.qwen3_8.config import Qwen38Config
 from immer.runtimes.qwen3_8.mtp_draft import (
     MTP_CONTROL_NAMES,
@@ -192,6 +193,140 @@ def _tensors(config: Qwen38Config) -> dict[str, torch.Tensor]:
 
 
 class Qwen35MtpDraftTests(unittest.TestCase):
+    def test_recursive_traces_train_deep_positions_and_stop_independently(
+        self,
+    ) -> None:
+        config = _config()
+        provider = Qwen35MtpDraftProvider(
+            config,
+            _Pager(_tensors(config)),
+            proposal_width=3,
+        )
+        self.addCleanup(provider.close)
+        provider._recursive_traces = [
+            mtp_module._MtpRecursiveTrace((10, 20, 30), (1, 2, 3), 1, False),
+            mtp_module._MtpRecursiveTrace((11, 20, 40), (1, 2, 4), 1, False),
+        ]
+        provider._recursive_trace_created = 2
+
+        provider._advance_recursive_traces((20,))
+        self.assertEqual(len(provider._recursive_traces), 2)
+        provider._advance_recursive_traces((30,))
+
+        self.assertEqual(provider._recursive_traces, [])
+        self.assertEqual(provider._previous_outcome, -1)
+        self.assertEqual(provider._reliability[(False, 1, 2, 1)], [3, 1])
+        self.assertEqual(provider._reliability[(False, 2, 3, 1)], [2, 1])
+        self.assertEqual(provider._reliability[(False, 2, 4, 1)], [1, 2])
+        metrics = provider.metrics()
+        self.assertEqual(metrics.recursive_trace_created, 2)
+        self.assertEqual(metrics.recursive_trace_active, 0)
+        self.assertEqual(metrics.recursive_trace_feedback_tokens, 4)
+        self.assertEqual(metrics.recursive_trace_hits, 3)
+        self.assertEqual(metrics.recursive_trace_misses, 1)
+        self.assertEqual(metrics.recursive_trace_max_position, 2)
+
+    def test_recursive_trace_gate_is_exact_once_and_padding_never_arms(self) -> None:
+        config = _config()
+        provider = Qwen35MtpDraftProvider(
+            config,
+            _Pager(_tensors(config)),
+            proposal_width=3,
+        )
+        self.addCleanup(provider.close)
+        provider._pending_proposal = (10, 20, 20)
+        provider._pending_gap_buckets = (1, 2, 2)
+        provider._pending_computed_width = 2
+        provider._pending_verification_outcomes = {1: True}
+        provider._arm_pending_recursive_trace(1)
+        self.assertEqual(provider._recursive_traces, [])
+
+        provider._pending_proposal = (10, 20, 30)
+        provider._pending_gap_buckets = (1, 2, 3)
+        provider._pending_computed_width = 3
+        provider._arm_pending_recursive_trace(1)
+        self.assertEqual(len(provider._recursive_traces), 1)
+        before = provider.metrics().calibration_updates
+        provider._advance_recursive_traces((20,))
+        self.assertEqual(provider.metrics().calibration_updates, before)
+        self.assertEqual(provider._recursive_traces[0].next_position, 2)
+        provider._advance_recursive_traces((30,))
+        self.assertEqual(provider.metrics().calibration_updates, before + 1)
+        self.assertEqual(provider._reliability[(False, 2, 3, 1)], [2, 1])
+
+        provider._pending_verification_outcomes.clear()
+        provider._arm_pending_recursive_trace(1)
+        self.assertFalse(provider._recursive_traces[0].gate_pending)
+        before = provider.metrics().calibration_updates
+        provider._advance_recursive_traces((20,))
+        self.assertEqual(provider.metrics().calibration_updates, before + 1)
+        self.assertEqual(provider._reliability[(False, 1, 2, 1)], [2, 1])
+
+    def test_final_suffix_persists_recursive_rows_and_clears_traces(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        state_path = Path(temporary.name) / "mtp-recursive.json"
+        config = _config()
+        provider = Qwen35MtpDraftProvider(
+            config,
+            _Pager(_tensors(config)),
+            proposal_width=3,
+            state_path=state_path,
+        )
+        self.addCleanup(provider.close)
+        provider._committed_history = (1, 2)
+        provider._recursive_traces = [
+            mtp_module._MtpRecursiveTrace((10, 20, 30), (1, 2, 3), 1, False)
+        ]
+        provider._recursive_trace_created = 1
+
+        provider.observe_final((1, 2, 20, 30))
+
+        self.assertEqual(provider._recursive_traces, [])
+        self.assertEqual(provider.metrics().recursive_trace_feedback_tokens, 2)
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+        positions = {row["position"] for row in persisted["rows"]}
+        self.assertTrue({1, 2}.issubset(positions))
+
+    def test_step_failure_does_not_consume_recursive_feedback(self) -> None:
+        config = _config()
+        provider = Qwen35MtpDraftProvider(
+            config,
+            _Pager(_tensors(config)),
+            proposal_width=3,
+        )
+        self.addCleanup(provider.close)
+        provider._committed_history = (1, 2)
+        provider._next_position = 1
+        trace = mtp_module._MtpRecursiveTrace(
+            (10, 20, 30),
+            (1, 2, 3),
+            1,
+            False,
+        )
+        provider._recursive_traces = [trace]
+        hidden = torch.zeros((1, 1, config.dim), dtype=torch.bfloat16)
+
+        with (
+            mock.patch.object(provider, "_step", side_effect=RuntimeError("step")),
+            self.assertRaisesRegex(RuntimeError, "step"),
+        ):
+            provider.propose_after_state((1, 2), 20, hidden)
+        self.assertEqual(provider._recursive_traces, [trace])
+        self.assertEqual(provider.metrics().recursive_trace_feedback_tokens, 0)
+
+        with (
+            mock.patch.object(provider, "_step", side_effect=RuntimeError("step")),
+            self.assertRaisesRegex(RuntimeError, "step"),
+        ):
+            provider.advance_confirmed_prefix_state(
+                (1, 2, 20),
+                hidden,
+                hidden,
+            )
+        self.assertEqual(provider._recursive_traces, [trace])
+        self.assertEqual(provider.metrics().recursive_trace_feedback_tokens, 0)
+
     def test_teacher_observation_updates_the_deeper_position_once(self) -> None:
         config = _config()
         provider = Qwen35MtpDraftProvider(
@@ -278,7 +413,7 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         migrated = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(
             migrated["identity"]["provider"],
-            "immer.qwen3.5-mtp-draft-provider/v5",
+            "immer.qwen3.5-mtp-draft-provider/v6",
         )
         self.assertEqual(
             migrated["previous_outcomes"],
@@ -758,7 +893,7 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         self.assertEqual(provider._committed_history, (*history, *extension))
         self.assertEqual(provider._next_position, len(history) + len(extension) - 1)
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.5-mtp-draft-provider/v5")
+        self.assertEqual(metrics.schema, "immer.qwen3.5-mtp-draft-provider/v6")
         self.assertEqual(metrics.advance_calls, 1)
         self.assertEqual(metrics.advanced_tokens, len(extension))
         self.assertFalse(metrics.pending)
