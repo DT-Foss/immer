@@ -37,6 +37,11 @@ All notable changes to IMMER are recorded here.
   expose it through the existing phrase-window policy, and draft up to the
   active K=2–16 ceiling. `0b272ad` bounds both request-local agents to the most
   recent 4,096 confirmed output tokens.
+- `1785723` added request-local Council adaptation. Every target-confirmed
+  feedback row immediately updates an ephemeral combined Rapidity vector;
+  Fixed Share applies the new weights to the next prediction. Finalization
+  clears the overlay before replaying each row exactly once into durable
+  global and dialect state. Provider ABI is v32 and metrics schema is v23.
 
 ### Arbitrary local Qwen runtime
 
