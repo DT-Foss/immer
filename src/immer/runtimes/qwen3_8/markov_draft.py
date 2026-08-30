@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v9"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v35"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v36"
 V8_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v8"
 V7_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v7"
 V6_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v6"
@@ -44,7 +44,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v26"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v27"
 _STATE_PREFIX = b"IMMD\x09"
 _V8_STATE_PREFIX = b"IMMD\x08"
 _V7_STATE_PREFIX = b"IMMD\x07"
@@ -1303,6 +1303,8 @@ class MarkovDraftMetrics:
     request_regime_changes: int
     request_surprise_mean: float
     request_surprise_cusum: float
+    beam_position_verified: tuple[int, ...]
+    beam_position_hits: tuple[int, ...]
     regime_generation: int
     surprise_mean: float
     surprise_cusum: float
@@ -1669,6 +1671,8 @@ class FingerprintRollingK4DraftProvider:
         self._last_beam_path_count = 0
         self._beam_verified_tokens = 0
         self._beam_accepted_tokens = 0
+        self._beam_position_verified = [0] * _MAX_PROPOSAL_POSITIONS
+        self._beam_position_hits = [0] * _MAX_PROPOSAL_POSITIONS
         self._pending_accepted_prefix_length: int | None = None
         self._pending_verified_proposals: int | None = None
         self._pending_verification_virtual = False
@@ -2836,6 +2840,12 @@ class FingerprintRollingK4DraftProvider:
         )
         return max(1, min(self.LOOKAHEAD_CANDIDATES * 2, adaptive))
 
+    def _beam_position_reliability(self, position: int) -> float:
+        verified = self._beam_position_verified[position]
+        if verified <= 0:
+            return 1.0
+        return (self._beam_position_hits[position] + 0.5) / (verified + 2.0)
+
     @staticmethod
     def _distribution_disagreement(
         distributions: Sequence[Mapping[str, float]],
@@ -3106,12 +3116,6 @@ class FingerprintRollingK4DraftProvider:
             eligible = matching
         self._last_beam_prefix_posteriors = tuple(posteriors)
         self._last_beam_path_count = len(beam)
-        if self._beam_verified_tokens <= 0:
-            beam_reliability = 1.0
-        else:
-            beam_reliability = (self._beam_accepted_tokens + 0.5) / (
-                self._beam_verified_tokens + 2.0
-            )
         feedback_rows = tuple(
             self._teacher_forced_prediction(
                 (*history, *winner.tokens[:position]),
@@ -3151,10 +3155,25 @@ class FingerprintRollingK4DraftProvider:
         )
         self._predictions += count
         self._council_predictions += count
+        prefix_reliabilities = []
+        prefix_reliability = 1.0
+        for position in range(count):
+            prefix_reliability = min(
+                prefix_reliability,
+                self._beam_position_reliability(position_offset + position),
+            )
+            prefix_reliabilities.append(prefix_reliability)
         return (
             winner.tokens,
             feedback_rows,
-            tuple(step.confidence * beam_reliability for step in winner.steps),
+            tuple(
+                step.confidence * reliability
+                for step, reliability in zip(
+                    winner.steps,
+                    prefix_reliabilities,
+                    strict=True,
+                )
+            ),
             tuple(step.disagreement for step in winner.steps),
         )
 
@@ -4338,8 +4357,14 @@ class FingerprintRollingK4DraftProvider:
                 "verification acceptance differs from reconciled prefix"
             )
         if self._pending_planner == "beam":
-            self._beam_verified_tokens += verified
-            self._beam_accepted_tokens += observed
+            self._record_beam_verification(observed, verified)
+
+    def _record_beam_verification(self, accepted: int, verified: int) -> None:
+        self._beam_verified_tokens += verified
+        self._beam_accepted_tokens += accepted
+        for position in range(verified):
+            self._beam_position_verified[position] += 1
+            self._beam_position_hits[position] += int(position < accepted)
 
     def reconcile_external_prefix(self, history: tuple[int, ...], /) -> None:
         """Train one unused Council proposal from another verified provider.
@@ -4384,6 +4409,15 @@ class FingerprintRollingK4DraftProvider:
                 break
             matching_prefix += 1
         self._commit_pending_verification(matching_prefix)
+        if (
+            self._pending_planner == "beam"
+            and self._pending_verified_proposals is None
+        ):
+            externally_verified = min(
+                len(delta),
+                matching_prefix + int(matching_prefix < len(delta)),
+            )
+            self._record_beam_verification(matching_prefix, externally_verified)
         assert self._last_confirmed_length is not None
         verified = 0
         prefix_matches = True
@@ -4864,6 +4898,8 @@ class FingerprintRollingK4DraftProvider:
                 if self._request_surprise_cusum is None
                 else self._request_surprise_cusum
             ),
+            beam_position_verified=tuple(self._beam_position_verified),
+            beam_position_hits=tuple(self._beam_position_hits),
             regime_generation=self._state.regime_generation,
             surprise_mean=self._state.surprise_mean,
             surprise_cusum=self._state.surprise_cusum,

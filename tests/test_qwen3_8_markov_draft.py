@@ -1264,16 +1264,16 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(disagreements), 2)
         self.assertEqual(provider._last_plan_trace[0][0], 8)
         self.assertEqual(provider._last_plan_trace[0][1], 7)
-        provider._beam_verified_tokens = 3
-        provider._beam_accepted_tokens = 0
+        provider._beam_position_verified[:3] = [1, 1, 1]
+        provider._beam_position_hits[:3] = [0, 0, 0]
         discounted = provider._predict_beam((1,), 2)
         self.assertIsNotNone(discounted)
         assert discounted is not None
-        reliability = 0.5 / 5
+        reliability = 0.5 / 3
         for before, after in zip(confidences, discounted[2], strict=True):
             self.assertAlmostEqual(after, before * reliability)
-        provider._beam_verified_tokens = 0
-        provider._beam_accepted_tokens = 0
+        provider._beam_position_verified[:] = [0] * 16
+        provider._beam_position_hits[:] = [0] * 16
         wide = provider._predict_beam((1,), 4)
         self.assertIsNotNone(wide)
         assert wide is not None
@@ -1284,8 +1284,23 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             request_window_ceiling=4,
             provider_abi=markov_module.MARKOV_DRAFT_PROVIDER_ABI,
         )
-        provider._beam_verified_tokens = 1
-        provider._beam_accepted_tokens = 0
+        provider._beam_position_verified[:3] = [1, 1, 1]
+        provider._beam_position_hits[:3] = [1, 1, 0]
+        positioned = provider._predict_beam((1,), 4)
+        self.assertIsNotNone(positioned)
+        assert positioned is not None
+        self.assertEqual(positioned[0], wide[0])
+        for before, after, factor in zip(
+            wide[2],
+            positioned[2],
+            (0.5, 0.5, 0.5 / 3.0, 0.5 / 3.0),
+            strict=True,
+        ):
+            self.assertAlmostEqual(after, before * factor)
+        provider._beam_position_verified[:] = [0] * 16
+        provider._beam_position_hits[:] = [0] * 16
+        provider._beam_position_verified[0] = 1
+        provider._beam_position_hits[0] = 0
         cooled = provider._predict_beam((1,), 4)
         self.assertIsNotNone(cooled)
         assert cooled is not None
@@ -1912,13 +1927,18 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         proposal = provider.propose_round(prompt, 2)
         committed = (*prompt, 2, *proposal.token_ids[:2])
+        provider.observe_verification(2, 3)
         provider.reconcile_prefix(committed)
         self.assertEqual(provider.metrics().request_weight_updates, 2)
+        self.assertEqual(provider._beam_position_verified[:3], [1, 1, 1])
+        self.assertEqual(provider._beam_position_hits[:3], [1, 1, 0])
         provider.observe_final((*committed, 13))
 
         self.assertEqual(proposal.token_ids[:2], (8, 9))
         self.assertEqual(provider.metrics().council_feedback, 3)
         self.assertEqual(provider.metrics().request_weight_updates, 3)
+        self.assertEqual(provider.metrics().beam_position_verified[:3], (1, 1, 1))
+        self.assertEqual(provider.metrics().beam_position_hits[:3], (1, 1, 0))
         self.assertEqual(provider._state.feedback_count, 3)
         provider.close()
 
@@ -1945,6 +1965,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider._beam_verified_tokens, 0)
         self.assertEqual(provider._beam_accepted_tokens, 0)
+        self.assertEqual(provider._beam_position_verified, [0] * 16)
+        self.assertEqual(provider._beam_position_hits, [0] * 16)
         provider.discard_pending_proposal()
         self.assertIsNone(provider._pending_accepted_prefix_length)
         self.assertIsNone(provider._pending_verified_proposals)
@@ -1967,6 +1989,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider._beam_verified_tokens, 1)
         self.assertEqual(provider._beam_accepted_tokens, 1)
+        self.assertEqual(provider._beam_position_verified[0], 1)
+        self.assertEqual(provider._beam_position_hits[0], 1)
         self.assertIsNone(provider._pending_accepted_prefix_length)
         self.assertIsNone(provider._pending_verified_proposals)
         self.assertFalse(provider._pending_verification_virtual)
@@ -2059,6 +2083,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertGreaterEqual(beam.call_count, 3)
         self.assertIsNone(provider._pending_planner)
+        self.assertEqual(provider._beam_position_verified[0], 1)
+        self.assertEqual(provider._beam_position_hits[0], 0)
+        self.assertEqual(provider._beam_position_verified[1], 0)
         self.assertGreaterEqual(provider.metrics().teacher_forced_predictions, 2)
         provider.observe_final((*prompt, 2, mismatch, 9, 13))
         provider.close()
