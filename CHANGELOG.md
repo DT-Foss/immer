@@ -19,7 +19,11 @@ Runtime commits through `74a9c1c` are deployed on the canonical server.
   drafts, so the corrected saved-forward value is 21 rather than zero. That
   request reached the former 64-token default before EOS and cut its second
   sentence. Normal chat now allows 128 output tokens by default; per-request
-  execution still stops immediately on EOS.
+  execution still stops immediately on EOS. The corrected live service then
+  reached EOS after 39 tokens in 29 target forwards: 24 drafts proposed, 11
+  accepted, 10 target forwards actually avoided, 129.47 seconds generation,
+  and 1,739,022,336-byte peak RSS. The production rollup records exactly those
+  29 executed and 10 saved forwards.
 - `8afadd1` made canonical Qwen inference a resident local service. One
   `Qwen38CausalChat`/`QwenFertigChat` mount now serves single, JSONL, and
   interactive clients through a hash-bound Unix-socket protocol with mode
