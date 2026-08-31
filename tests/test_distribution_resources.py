@@ -39,10 +39,11 @@ def _build_python() -> str | None:
             if candidate
         )
     )
-    probe = "import build, setuptools, wheel"
+    probe = "import build.__main__, setuptools, wheel"
     for candidate in candidates:
         result = subprocess.run(
             [candidate, "-c", probe],
+            cwd=tempfile.gettempdir(),
             check=False,
             capture_output=True,
             text=True,
@@ -53,9 +54,24 @@ def _build_python() -> str | None:
 
 
 def _copy_build_source(destination: Path) -> None:
-    for name in ("pyproject.toml", "setup.py", "MANIFEST.in", "README.md"):
+    for name in (
+        "CHANGELOG.md",
+        "CITATION.cff",
+        "MANIFEST.in",
+        "MODEL_CARD.md",
+        "NOTICE.md",
+        "README.md",
+        "SECURITY.md",
+        "pyproject.toml",
+        "setup.py",
+    ):
         shutil.copy2(ROOT / name, destination / name)
     shutil.copytree(ROOT / "src", destination / "src")
+    shutil.copytree(ROOT / "deploy", destination / "deploy")
+    docs = destination / "docs"
+    docs.mkdir()
+    for name in ("BENCHMARKS.md", "SERVICE.md", "research.md"):
+        shutil.copy2(ROOT / "docs" / name, docs / name)
     manifest_dir = destination / "manifests"
     manifest_dir.mkdir()
     for name in MANIFEST_NAMES:

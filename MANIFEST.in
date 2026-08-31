@@ -1,3 +1,25 @@
+include CHANGELOG.md
+include CITATION.cff
+include MODEL_CARD.md
+include NOTICE.md
+include README.md
+include SECURITY.md
 include manifests/s3_ship_v6.json
 include manifests/crsa_router_v1.json
 include src/immer/runtimes/qwen3_8/q4_native.c
+include src/immer/runtimes/qwen3_8/deltanet_native.c
+include docs/BENCHMARKS.md
+include docs/SERVICE.md
+include docs/research.md
+recursive-include deploy *.example *.plist *.service
+prune artifacts
+prune build
+prune dist
+prune evals
+prune hf-cache
+prune kandidaten
+prune research
+prune results
+prune scripts
+prune tests
+prune vendor

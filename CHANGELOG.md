@@ -2,13 +2,25 @@
 
 All notable changes to IMMER are recorded here.
 
-## [Unreleased] — 2026-08-31
+## [Unreleased]
+
+## [1.0.0] — 2026-08-31
 
 Runtime commits through `74a9c1c` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- The v1.0 release surface now builds a 2.1-MiB wheel and 2.1-MiB sdist. A
+  structural Doctor recognizes the pinned causal Qwen source and packed Q4/Q8
+  bank from authenticated metadata and exact file sizes without hashing model
+  payloads. The release preflight enforces archive allowlists and rejects model
+  weights, causal segments, private state, machine paths, credentials, traces,
+  and operational artifacts. A fresh Python 3.12 environment installs the
+  wheel with Torch, Safetensors, and Tokenizers and reports `immer 1.0.0`.
+  systemd and launchd templates start the resident local service from private
+  operator configuration. The runtime card records the exact v1 execution
+  boundary, measured product path, local-data contract, and paper lineage.
 - `74a9c1c` corrected the economics exposed by the first natural service
   request. Draft savings are now the exact difference between generated tokens
   and executed target forwards; authenticated zero-forward Warm/ResultCell

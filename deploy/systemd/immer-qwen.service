@@ -1,0 +1,16 @@
+[Unit]
+Description=IMMER resident local Qwen inference
+After=local-fs.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/immer/qwen.env
+ExecStart=/usr/bin/env immer chat --service
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

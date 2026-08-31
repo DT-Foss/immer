@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -47,6 +48,13 @@ def _write_safetensors_fixture(root: Path) -> np.ndarray:
 
 
 class CliTests(unittest.TestCase):
+    def test_version_reports_the_v1_package(self) -> None:
+        out = io.StringIO()
+        with self.assertRaises(SystemExit) as stopped, redirect_stdout(out):
+            main(["--version"])
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertEqual(out.getvalue(), "immer 1.0.0\n")
+
     def test_components_command_reports_integrated_code(self) -> None:
         out = io.StringIO()
         with redirect_stdout(out):
@@ -75,6 +83,35 @@ class CliTests(unittest.TestCase):
         with patch("builtins.__import__", side_effect=import_without_requests), redirect_stdout(out):
             main(["doctor"])
         self.assertIn("✓ WorldStream", out.getvalue())
+
+    def test_doctor_recognizes_an_explicit_local_qwen_bank(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tokenizer = root / "tokenizer.json"
+            q4 = root / "q4"
+            out = io.StringIO()
+            with (
+                patch(
+                    "immer.cli._resolve_qwen38_chat_paths",
+                    return_value=(root, tokenizer, q4, None),
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.local_install.inspect_local_qwen",
+                    return_value=SimpleNamespace(
+                        summary=lambda: "18 shards / 15.50 GiB packed"
+                    ),
+                ) as inspect,
+                redirect_stdout(out),
+            ):
+                main(["doctor", "--qwen38-root", str(root)])
+
+        inspect.assert_called_once_with(
+            root,
+            tokenizer_path=tokenizer,
+            q4_root=q4,
+        )
+        self.assertIn("✓ Qwen3.8", out.getvalue())
+        self.assertIn("18 shards / 15.50 GiB packed", out.getvalue())
 
     def test_organs_uses_the_bundled_manifest_by_default(self) -> None:
         out = io.StringIO()

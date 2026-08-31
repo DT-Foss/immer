@@ -12,6 +12,9 @@ tests, and selected public receipts. Model weights, learned graphs, private
 traces, capability-transfer material, and deployment state remain outside the
 release surface.
 
+Release: **1.0.0** · [Runtime card](MODEL_CARD.md) ·
+[Resident-service guide](docs/SERVICE.md) · [Benchmark ledger](docs/BENCHMARKS.md)
+
 ## Research focus
 
 - **Causalized local weights.** Immutable tensor payloads are paired with an
@@ -324,6 +327,10 @@ release surface.
 ## Local packed runtime
 
 ```bash
+# Inspect one explicitly configured local causal/Q4 bank without hashing its
+# 55 GB source or 16 GB packed payload.
+PYTHONPATH=src python3 -m immer doctor --qwen38-root /absolute/path/to/Qwen3.8-27B
+
 # On the IMMER server this auto-mounts local Qwen, full Q4/Q8, native
 # DeltaNet and FERTIG.
 PYTHONPATH=src python3 -m immer chat "<arbitrary text>"

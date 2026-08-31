@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dtfoss.immer-qwen</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/absolute/path/to/immer</string>
+    <string>chat</string>
+    <string>--service</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>IMMER_QWEN38_ROOT</key>
+    <string>/absolute/path/to/Qwen3.8-27B</string>
+    <key>IMMER_QWEN38_SOCKET</key>
+    <string>/absolute/path/to/private-state/qwen3.8-service.sock</string>
+    <key>IMMER_QWEN38_INFERENCE_ECONOMICS</key>
+    <string>/absolute/path/to/private-state/inference-economics</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>/absolute/path/to/private-state/service.err.log</string>
+  <key>StandardOutPath</key>
+  <string>/absolute/path/to/private-state/service.out.log</string>
+</dict>
+</plist>

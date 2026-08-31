@@ -2223,7 +2223,15 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
     return 0 if result.ok else 2
 
 
-def _doctor(*, deep: bool = False, artifact_root: str | Path | None = None) -> int:
+def _doctor(
+    *,
+    deep: bool = False,
+    artifact_root: str | Path | None = None,
+    qwen38_root: str | Path | None = None,
+    qwen38_causal_bundle: str | Path | None = None,
+    qwen38_tokenizer: str | Path | None = None,
+    qwen38_q4: str | Path | None = None,
+) -> int:
     from .runtimes.o1_state.adapter import is_available as o1state_available
 
     fertig_root = os.environ.get("IMMER_FERTIG_ROOT")
@@ -2256,6 +2264,47 @@ def _doctor(*, deep: bool = False, artifact_root: str | Path | None = None) -> i
         organ_detail = f"{len(bank.names())} SHA-geprüfte Organe"
     except (FileNotFoundError, KeyError, ValueError) as exc:
         organ_detail = f"{exc}; run 'immer artifacts import SOURCE'"
+    qwen_requested = bool(
+        qwen38_root
+        or qwen38_causal_bundle
+        or qwen38_tokenizer
+        or qwen38_q4
+        or os.environ.get("IMMER_QWEN38_ROOT")
+        or os.environ.get("IMMER_QWEN38_CAUSAL_BUNDLE")
+        or os.environ.get("IMMER_QWEN38_TOKENIZER")
+        or os.environ.get("IMMER_QWEN38_Q4")
+        or _QWEN38_DEPLOYMENT_ROOT.is_dir()
+    )
+    qwen_ready = False
+    qwen_detail = "optional; set --qwen38-root or IMMER_QWEN38_ROOT"
+    qwen_paths = argparse.Namespace(
+        draft_mode=None,
+        fast_mlp=None,
+        no_fast_mlp=False,
+        qwen38_causal_bundle=qwen38_causal_bundle,
+        qwen38_q4=qwen38_q4,
+        qwen38_root=qwen38_root,
+        qwen38_tokenizer=qwen38_tokenizer,
+    )
+    bundle_path = None
+    if qwen_requested:
+        try:
+            from .runtimes.qwen3_8.local_install import inspect_local_qwen
+
+            bundle_path, tokenizer_path, q4_root, _fast_mlp = (
+                _resolve_qwen38_chat_paths(qwen_paths)
+            )
+            if q4_root is None:
+                raise ValueError("configured Qwen runtime has no Q4/Q8 bank")
+            install = inspect_local_qwen(
+                bundle_path,
+                tokenizer_path=tokenizer_path,
+                q4_root=q4_root,
+            )
+            qwen_ready = True
+            qwen_detail = install.summary()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            qwen_detail = f"{type(exc).__name__}: {exc}"
     checks = [
         ("FERTIG-solv", solver_ready, "vendored; override via IMMER_FERTIG_ROOT", True),
         (
@@ -2266,6 +2315,7 @@ def _doctor(*, deep: bool = False, artifact_root: str | Path | None = None) -> i
             else "optional; set IMMER_FERTIG_GRAPH",
             False,
         ),
+        ("Qwen3.8", qwen_ready, qwen_detail, qwen_requested),
         (
             "Action-gates",
             True,
@@ -2290,6 +2340,26 @@ def _doctor(*, deep: bool = False, artifact_root: str | Path | None = None) -> i
     except ImportError:
         world_stream = False
     checks.append(("WorldStream", world_stream, "pip install -e .", True))
+    service_ready = False
+    service_detail = "optional; start 'immer chat --service'"
+    if qwen_ready and bundle_path is not None:
+        try:
+            from .runtimes.qwen3_8.service import UnixQwenServiceClient
+
+            socket_path = _resolve_qwen38_service_socket(qwen_paths, bundle_path)
+            client = UnixQwenServiceClient(socket_path, timeout=0.2)
+            try:
+                ping = client.request("ping")
+            finally:
+                client.close()
+            profile = ping.result.evidence.get("runtime_profile_sha256")
+            if not isinstance(profile, str) or len(profile) != 64:
+                raise RuntimeError("service returned no runtime profile")
+            service_ready = True
+            service_detail = f"resident profile {profile[:12]}"
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
+    checks.append(("Qwen-service", service_ready, service_detail, False))
     for name, ready, hint, _required in checks:
         print(f"{'✓' if ready else '·'} {name:12} {hint}")
     if deep and organ_ready and crsa:
@@ -2842,6 +2912,9 @@ def _answer_via_cascade(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="immer")
+    from . import __version__
+
+    parser.add_argument("--version", action="version", version=f"immer {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("components", help="show the system component map")
     doctor = sub.add_parser("doctor", help="inspect runtime integrations")
@@ -2849,6 +2922,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--deep", action="store_true", help="also run the cold 152-case SHIP eval"
     )
     doctor.add_argument("--artifact-root", help="external SHIP artifact directory")
+    doctor.add_argument(
+        "--qwen38-root",
+        help="local Qwen3.8 root containing bundle, tokenizer, causal graph and Q4/Q8",
+    )
+    doctor.add_argument("--qwen38-causal-bundle", help="override the causal bundle root")
+    doctor.add_argument("--qwen38-tokenizer", help="override tokenizer.json")
+    doctor.add_argument("--qwen38-q4", help="override the packed Q4/Q8 bank")
     solve = sub.add_parser("solve", help="run the guarded S3 + FERTIG exact cascade")
     solve.add_argument("question")
     solve.add_argument(
@@ -3248,7 +3328,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "components":
         return _components()
     if args.command == "doctor":
-        return _doctor(deep=args.deep, artifact_root=args.artifact_root)
+        return _doctor(
+            deep=args.deep,
+            artifact_root=args.artifact_root,
+            qwen38_root=args.qwen38_root,
+            qwen38_causal_bundle=args.qwen38_causal_bundle,
+            qwen38_tokenizer=args.qwen38_tokenizer,
+            qwen38_q4=args.qwen38_q4,
+        )
     if args.command == "solve":
         return _solve(args.question, args.manifest, args.artifact_root)
     if args.command == "chat":
