@@ -142,6 +142,17 @@ class InferenceActionBankTests(unittest.TestCase):
                     saved=4,
                 )
             )
+            program = bank.observe(
+                _economics(
+                    "program",
+                    warm=True,
+                    draft=False,
+                    pages=False,
+                    target=0,
+                    saved=2,
+                ),
+                executed_actions=("parametric_program",),
+            )
             snapshot = bank.snapshot()
             directive = bank.recommend(
                 question_sha256=_sha("question:warm"),
@@ -161,9 +172,10 @@ class InferenceActionBankTests(unittest.TestCase):
         self.assertFalse(first.duplicate)
         self.assertTrue(duplicate.duplicate)
         self.assertFalse(warm.duplicate)
+        self.assertFalse(program.duplicate)
         self.assertEqual(snapshot["schema"], INFERENCE_ACTION_BANK_SCHEMA)
-        self.assertEqual(snapshot["requests"], 2)
-        self.assertEqual(len(snapshot["signatures"]), 2)
+        self.assertEqual(snapshot["requests"], 3)
+        self.assertEqual(len(snapshot["signatures"]), 3)
         self.assertEqual(snapshot["signatures"][0]["actions"], ["stored_result"])
         self.assertEqual(snapshot["signatures"][0]["saved_qwen_forwards"], 4)
         self.assertEqual(snapshot["signatures"][0]["accepted_draft_tokens"], 0)
@@ -176,18 +188,23 @@ class InferenceActionBankTests(unittest.TestCase):
             ("qwen_target", "target_verified_draft"),
         )
         self.assertTrue(directive.draft_enabled)
-        self.assertEqual(directive.support, 2)
-        self.assertEqual(directive.saved_qwen_forwards, 5)
+        self.assertEqual(directive.support, 3)
+        self.assertEqual(directive.saved_qwen_forwards, 7)
         self.assertEqual(
             InferenceActionDirective.from_document(directive.to_document()),
             directive,
         )
         assert runtime_directive is not None
-        self.assertEqual(runtime_directive.primary_actions, directive.fallback_actions)
+        self.assertEqual(runtime_directive.primary_actions, ("parametric_program",))
+        self.assertEqual(runtime_directive.fallback_actions, directive.fallback_actions)
         self.assertTrue(runtime_directive.draft_enabled)
         assert transferred_directive is not None
         self.assertEqual(
             transferred_directive.primary_actions,
+            ("parametric_program",),
+        )
+        self.assertEqual(
+            transferred_directive.fallback_actions,
             directive.fallback_actions,
         )
         self.assertTrue(transferred_directive.draft_enabled)

@@ -618,6 +618,18 @@ class InferenceActionBank:
                 receipt.action_signature_sha256,
             )
         )
+        parametric = [
+            receipt
+            for receipt in receipts
+            if receipt.status == "ok"
+            and receipt.actions == ("parametric_program",)
+        ]
+        parametric.sort(
+            key=lambda receipt: (
+                -receipt.saved_qwen_forwards,
+                receipt.action_signature_sha256,
+            )
+        )
         exact_runtime = [
             receipt
             for receipt in receipts
@@ -644,16 +656,26 @@ class InferenceActionBank:
                 receipt.action_signature_sha256,
             )
         )
-        if not exact and not runtime:
+        if not exact and not parametric and not runtime:
             return None
         runtime_actions = ("qwen_target", "target_verified_draft")
-        primary = exact[0].actions if exact else runtime_actions
+        if exact:
+            primary = exact[0].actions
+        elif parametric:
+            primary = ("parametric_program",)
+        else:
+            primary = runtime_actions
         fallback = runtime_actions if runtime else ("qwen_target",)
+        sources_by_request = {
+            receipt.request_sha256: receipt
+            for receipt in (*exact, *parametric, *runtime)
+        }
+        sources_receipts = tuple(sources_by_request.values())
         sources = tuple(
             sorted(
                 {
                     receipt.action_signature_sha256
-                    for receipt in (*exact, *runtime)
+                    for receipt in sources_receipts
                 }
             )
         )
@@ -664,9 +686,9 @@ class InferenceActionBank:
             fallback_actions=fallback,
             draft_enabled=True if runtime else None,
             source_signature_sha256s=sources,
-            support=len(exact) + len(runtime),
+            support=len(sources_receipts),
             saved_qwen_forwards=sum(
-                receipt.saved_qwen_forwards for receipt in (*exact, *runtime)
+                receipt.saved_qwen_forwards for receipt in sources_receipts
             ),
         )
 
