@@ -584,8 +584,20 @@ class InferenceActionBank:
         self,
         receipts: Iterable[InferenceEconomicsReceipt],
     ) -> dict[str, Any]:
+        with self._lock:
+            existing = {
+                receipt.request_sha256 for receipt in self._receipts()
+            }
         for receipt in receipts:
+            if receipt.request_sha256 in existing:
+                continue
+            if receipt.warm_hit and receipt.target_forwards == 0:
+                # Economics proves zero-forward execution but cannot distinguish
+                # ResultCell from a parametric program after the full Result is
+                # gone. Never invent the lost subtype during reconciliation.
+                continue
             self.observe(receipt)
+            existing.add(receipt.request_sha256)
         return self.snapshot()
 
     def recommend(

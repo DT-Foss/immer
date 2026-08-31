@@ -154,6 +154,19 @@ class InferenceActionBankTests(unittest.TestCase):
                 executed_actions=("parametric_program",),
             )
             snapshot = bank.snapshot()
+            reconciled = bank.reconcile(
+                (
+                    _economics("cold"),
+                    _economics(
+                        "program",
+                        warm=True,
+                        draft=False,
+                        pages=False,
+                        target=0,
+                        saved=2,
+                    ),
+                )
+            )
             directive = bank.recommend(
                 question_sha256=_sha("question:warm"),
                 runtime_profile_sha256=_sha("profile"),
@@ -181,6 +194,7 @@ class InferenceActionBankTests(unittest.TestCase):
         self.assertEqual(snapshot["signatures"][0]["accepted_draft_tokens"], 0)
         self.assertEqual(snapshot["signatures"][0]["source_body_bytes"], 0)
         self.assertEqual(restarted_snapshot, snapshot)
+        self.assertEqual(reconciled, snapshot)
         assert directive is not None
         self.assertEqual(directive.primary_actions, ("stored_result",))
         self.assertEqual(
@@ -221,6 +235,23 @@ class InferenceActionBankTests(unittest.TestCase):
             event.write_bytes(payload)
             with self.assertRaises(InferenceActionBankError):
                 bank.snapshot()
+
+    def test_reconcile_never_invents_a_missing_warm_subtype(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = InferenceActionBank(Path(temporary) / "actions")
+            snapshot = bank.reconcile(
+                (
+                    _economics(
+                        "unknown-warm",
+                        warm=True,
+                        draft=False,
+                        pages=False,
+                        target=0,
+                        saved=4,
+                    ),
+                )
+            )
+        self.assertEqual(snapshot["requests"], 0)
 
 
 if __name__ == "__main__":
