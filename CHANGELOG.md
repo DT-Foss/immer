@@ -6,7 +6,7 @@ All notable changes to IMMER are recorded here.
 
 ## [1.0.0] — 2026-08-31
 
-Runtime commits through `74a9c1c` are deployed on the canonical server.
+Runtime commits through `6c9aaad` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
@@ -20,7 +20,16 @@ Runtime commits through `74a9c1c` are deployed on the canonical server.
   wheel with Torch, Safetensors, and Tokenizers and reports `immer 1.0.0`.
   systemd and launchd templates start the resident local service from private
   operator configuration. The runtime card records the exact v1 execution
-  boundary, measured product path, local-data contract, and paper lineage.
+  boundary, measured product path, local-data contract, and paper lineage. The
+  deployed Doctor completes in 3.49 seconds with exit zero and reports 18
+  source shards (51.75 GiB), 506 packed tensors (15.50 GiB), and the resident
+  service profile. `278a1bf` binds inspection to the bank's real `weights/`
+  layout; `6c9aaad` keeps unrelated legacy SHIP organs optional for the Qwen
+  product. Final archive SHA-256:
+  `e289ee32947220e474f2a3b4df4f74f935dd3166a4cc737c5efef37c655fec68`
+  (wheel) and
+  `6385271cd731d141cd2f1d0e7460b875df272a9f2f98050b418ad5fb1c226526`
+  (sdist).
 - `74a9c1c` corrected the economics exposed by the first natural service
   request. Draft savings are now the exact difference between generated tokens
   and executed target forwards; authenticated zero-forward Warm/ResultCell
