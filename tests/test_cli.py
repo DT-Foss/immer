@@ -103,7 +103,7 @@ class CliTests(unittest.TestCase):
                 ) as inspect,
                 redirect_stdout(out),
             ):
-                main(["doctor", "--qwen38-root", str(root)])
+                code = main(["doctor", "--qwen38-root", str(root)])
 
         inspect.assert_called_once_with(
             root,
@@ -112,6 +112,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertIn("✓ Qwen3.8", out.getvalue())
         self.assertIn("18 shards / 15.50 GiB packed", out.getvalue())
+        self.assertEqual(code, 0)
 
     def test_organs_uses_the_bundled_manifest_by_default(self) -> None:
         out = io.StringIO()

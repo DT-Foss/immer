@@ -2323,7 +2323,7 @@ def _doctor(
             True,
         ),
         ("o1-state", o1state_available(), "pip install -e '.[neural]'", True),
-        ("SHIP-v6", organ_ready, organ_detail, True),
+        ("SHIP-v6", organ_ready, organ_detail, False),
     ]
     try:
         import torch  # noqa: F401
