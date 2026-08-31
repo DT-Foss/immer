@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
@@ -23,11 +23,26 @@ from .chat import OoeChatAttempt, OoeChatIntegrityError
 from .controller import WarmAccountingReceipt
 from .crystal import CrystalStore
 from .identity import canonical_json_bytes, require_sha256
+from .qwen_warm_multislot import (
+    MAX_MULTISLOT_OBSERVATIONS,
+    MultiSlotObservation,
+    MultiSlotProgram,
+    MultiSlotWarmError,
+    derive_multislot_observations,
+    promote_multislot,
+)
 
 
-TEMPLATE_STATE_SCHEMA = "immer.qwen3.8-parametric-warm-state/v1"
+TEMPLATE_STATE_SCHEMA = "immer.qwen3.8-parametric-warm-state/v2"
+LEGACY_TEMPLATE_STATE_SCHEMA = "immer.qwen3.8-parametric-warm-state/v1"
+# The logical state name stays stable across schema upgrades. An older binary
+# therefore fails on the v2 payload instead of continuing to mutate stale v1
+# state under a second name.
 TEMPLATE_STATE_NAME = "qwen38-parametric-warm-state-v1"
+LEGACY_TEMPLATE_STATE_NAME = TEMPLATE_STATE_NAME
 MINIMUM_DISTINCT_SLOTS = 2
+MAX_PARAMETRIC_STATE_BYTES = 48 * 1024**2
+MAX_IMPORTED_TEMPLATE_CONTENTS = 1024
 _MODES = ("identity", "upper", "lower", "casefold")
 TemplateMode = Literal["identity", "upper", "lower", "casefold"]
 
@@ -216,6 +231,30 @@ def _state_bytes(body: Mapping[str, Any]) -> bytes:
     )
 
 
+def _validate_multislot_source_groups(
+    observations: Sequence[MultiSlotObservation],
+) -> None:
+    groups: dict[
+        tuple[str, str, str, int],
+        list[MultiSlotObservation],
+    ] = {}
+    for row in observations:
+        groups.setdefault(row.source_key, []).append(row)
+    for rows in groups.values():
+        representative = rows[0]
+        expected = derive_multislot_observations(
+            representative.question,
+            representative.output,
+            question_sha256=representative.question_sha256,
+            cell_payload_sha256=representative.cell_payload_sha256,
+            teacher_forward_count=representative.teacher_forward_count,
+        )
+        if {row.sha256 for row in rows} != {row.sha256 for row in expected}:
+            raise ParametricWarmError(
+                "multi-slot source lost its complete derived authority"
+            )
+
+
 @contextmanager
 def _template_lock(root: Path) -> Iterator[None]:
     descriptor = os.open(
@@ -247,7 +286,7 @@ class ParametricWarmBank:
         runtime_profile_sha256: str,
         *,
         output_character_limit: int,
-        observation_verifier: Callable[[TemplateObservation], bool] | None = None,
+        observation_verifier: Callable[[object], bool] | None = None,
         prompt_token_verifier: Callable[[str, str], bool] | None = None,
     ) -> None:
         self.store = store
@@ -272,8 +311,54 @@ class ParametricWarmBank:
         self._lock = threading.RLock()
         self._load()
 
+    @classmethod
+    def open_existing(
+        cls,
+        store: CrystalStore,
+        *,
+        observation_verifier: Callable[[object], bool] | None = None,
+    ) -> "ParametricWarmBank | None":
+        try:
+            raw = store.restore_state(TEMPLATE_STATE_NAME)
+        except KeyError:
+            return None
+        try:
+            value = json.loads(raw)
+            body = value["body"]
+            profile = require_sha256(
+                body["runtime_profile_sha256"],
+                field="runtime_profile_sha256",
+            )
+            output_character_limit = body["output_character_limit"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ParametricWarmError(
+                "existing template state identity is invalid"
+            ) from exc
+        return cls(
+            store,
+            profile,
+            output_character_limit=output_character_limit,
+            observation_verifier=observation_verifier,
+        )
+
     @staticmethod
     def _empty(profile: str, output_character_limit: int) -> dict[str, Any]:
+        return {
+            "committed_executions": 0,
+            "imported_content_sha256s": [],
+            "multislot_observations": [],
+            "next_transaction": 0,
+            "observations": [],
+            "output_character_limit": output_character_limit,
+            "privacy": "private-executable-template-descriptors/v1",
+            "rejected_executions": 0,
+            "runtime_profile_sha256": profile,
+            "saved_qwen_forwards": 0,
+            "schema": TEMPLATE_STATE_SCHEMA,
+        }
+
+    @staticmethod
+    def _legacy_empty(profile: str, output_character_limit: int) -> dict[str, Any]:
         return {
             "committed_executions": 0,
             "next_transaction": 0,
@@ -283,7 +368,7 @@ class ParametricWarmBank:
             "rejected_executions": 0,
             "runtime_profile_sha256": profile,
             "saved_qwen_forwards": 0,
-            "schema": TEMPLATE_STATE_SCHEMA,
+            "schema": LEGACY_TEMPLATE_STATE_SCHEMA,
         }
 
     def _load(self) -> None:
@@ -295,25 +380,43 @@ class ParametricWarmBank:
                 self.output_character_limit,
             )
             self.state_sha256 = None
+            self.legacy_state_sha256 = None
             return
+        raw_sha256 = hashlib.sha256(raw).hexdigest()
         try:
             value = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ParametricWarmError("template state is invalid JSON") from exc
+        envelope_schema = value.get("schema") if isinstance(value, Mapping) else None
+        if envelope_schema not in {
+            TEMPLATE_STATE_SCHEMA,
+            LEGACY_TEMPLATE_STATE_SCHEMA,
+        }:
+            raise ParametricWarmError("template state schema is invalid")
+        legacy = envelope_schema == LEGACY_TEMPLATE_STATE_SCHEMA
         body = value.get("body") if isinstance(value, Mapping) else None
+        expected_schema = (
+            LEGACY_TEMPLATE_STATE_SCHEMA if legacy else TEMPLATE_STATE_SCHEMA
+        )
+        expected_body = (
+            self._legacy_empty(
+                self.runtime_profile_sha256,
+                self.output_character_limit,
+            )
+            if legacy
+            else self._empty(
+                self.runtime_profile_sha256,
+                self.output_character_limit,
+            )
+        )
         if (
             canonical_json_bytes(value) != raw
             or not isinstance(value, Mapping)
             or set(value) != {"body", "schema", "sha256"}
-            or value.get("schema") != TEMPLATE_STATE_SCHEMA
+            or value.get("schema") != expected_schema
             or not isinstance(body, Mapping)
-            or set(body)
-            != set(
-                self._empty(
-                    self.runtime_profile_sha256,
-                    self.output_character_limit,
-                )
-            )
+            or set(body) != set(expected_body)
+            or body.get("schema") != expected_schema
             or body.get("runtime_profile_sha256") != self.runtime_profile_sha256
             or body.get("output_character_limit")
             != self.output_character_limit
@@ -321,21 +424,82 @@ class ParametricWarmBank:
             != "private-executable-template-descriptors/v1"
             or value.get("sha256") != _digest(body)
             or not isinstance(body.get("observations"), list)
+            or (
+                not legacy
+                and not isinstance(body.get("multislot_observations"), list)
+            )
         ):
             raise ParametricWarmError("template state envelope is invalid")
         observations = [
             TemplateObservation.from_dict(row) for row in body["observations"]
         ]
+        try:
+            multislot_observations = (
+                []
+                if legacy
+                else [
+                    MultiSlotObservation.from_dict(row)
+                    for row in body["multislot_observations"]
+                ]
+            )
+        except MultiSlotWarmError as exc:
+            raise ParametricWarmError(
+                "multi-slot observation failed validation"
+            ) from exc
         if len({row.sha256 for row in observations}) != len(observations):
             raise ParametricWarmError("template observation is duplicated")
+        if len({row.sha256 for row in multislot_observations}) != len(
+            multislot_observations
+        ):
+            raise ParametricWarmError("multi-slot observation is duplicated")
+        if len(multislot_observations) > MAX_MULTISLOT_OBSERVATIONS:
+            raise ParametricWarmError("multi-slot observation capacity is exceeded")
+        _validate_multislot_source_groups(multislot_observations)
         if self.observation_verifier is not None and any(
-            not bool(self.observation_verifier(row)) for row in observations
+            not bool(self.observation_verifier(row))
+            for row in (*observations, *multislot_observations)
         ):
             raise ParametricWarmError(
                 "template observation lost its exact ResultCell authority"
             )
-        normalized = dict(body)
+        normalized = self._empty(
+            self.runtime_profile_sha256,
+            self.output_character_limit,
+        )
+        for field in (
+            "committed_executions",
+            "next_transaction",
+            "rejected_executions",
+            "saved_qwen_forwards",
+        ):
+            normalized[field] = body[field]
         normalized["observations"] = [row.to_dict() for row in observations]
+        normalized["multislot_observations"] = [
+            row.to_dict() for row in multislot_observations
+        ]
+        imported_content_sha256s = (
+            [] if legacy else body["imported_content_sha256s"]
+        )
+        if (
+            not isinstance(imported_content_sha256s, list)
+            or len(imported_content_sha256s) > MAX_IMPORTED_TEMPLATE_CONTENTS
+        ):
+            raise ParametricWarmError("template import inventory is invalid")
+        try:
+            normalized["imported_content_sha256s"] = sorted(
+                {
+                    require_sha256(value, field="imported_content_sha256")
+                    for value in imported_content_sha256s
+                }
+            )
+        except (TypeError, ValueError) as exc:
+            raise ParametricWarmError(
+                "template import inventory failed validation"
+            ) from exc
+        if len(normalized["imported_content_sha256s"]) != len(
+            imported_content_sha256s
+        ):
+            raise ParametricWarmError("template import inventory is duplicated")
         for field in (
             "committed_executions",
             "next_transaction",
@@ -346,7 +510,8 @@ class ParametricWarmBank:
             if isinstance(number, bool) or not isinstance(number, int) or number < 0:
                 raise ParametricWarmError("template metrics are invalid")
         self.body = normalized
-        self.state_sha256 = hashlib.sha256(raw).hexdigest()
+        self.state_sha256 = raw_sha256
+        self.legacy_state_sha256 = raw_sha256 if legacy else None
 
     @property
     def observations(self) -> tuple[TemplateObservation, ...]:
@@ -355,7 +520,14 @@ class ParametricWarmBank:
         )
 
     @property
-    def promoted(self) -> tuple[PromotedTemplate, ...]:
+    def multislot_observations(self) -> tuple[MultiSlotObservation, ...]:
+        return tuple(
+            MultiSlotObservation.from_dict(row)
+            for row in self.body["multislot_observations"]
+        )
+
+    @property
+    def promoted(self) -> tuple[object, ...]:
         groups: dict[tuple[str, str, str], list[TemplateObservation]] = {}
         for row in self.observations:
             groups.setdefault(row.template_key, []).append(row)
@@ -376,15 +548,144 @@ class ParametricWarmBank:
                     ),
                 )
             )
-        return tuple(sorted(promoted, key=lambda row: row.sha256))
+        multislot = promote_multislot(
+            self.multislot_observations,
+            minimum_distinct_slots=MINIMUM_DISTINCT_SLOTS,
+        )
+        return tuple(
+            sorted((*promoted, *multislot), key=lambda row: row.sha256)
+        )
 
     def _publish(self) -> None:
+        payload = _state_bytes(self.body)
+        if len(payload) > MAX_PARAMETRIC_STATE_BYTES:
+            raise ParametricWarmError("template state exceeds its hard byte limit")
         publication = self.store.publish_state(
             TEMPLATE_STATE_NAME,
-            _state_bytes(self.body),
+            payload,
             expected_sha256=self.state_sha256,
         )
         self.state_sha256 = publication.payload_sha256
+        self.legacy_state_sha256 = None
+
+    def import_compatible(self, source: "ParametricWarmBank") -> dict[str, int]:
+        if not isinstance(source, ParametricWarmBank):
+            raise TypeError("source must be a ParametricWarmBank")
+        if source.root.resolve() == self.root.resolve():
+            return {
+                "capacity_rejected_source_states": 0,
+                "imported_multislot_observations": 0,
+                "imported_single_slot_observations": 0,
+                "source_states": 0,
+            }
+        source_single = tuple(
+            row
+            for row in source.observations
+            if len(row.output) <= self.output_character_limit
+        )
+        source_multislot = tuple(
+            row
+            for row in source.multislot_observations
+            if len(row.output) <= self.output_character_limit
+        )
+        if not source_single and not source_multislot:
+            return {
+                "capacity_rejected_source_states": 0,
+                "imported_multislot_observations": 0,
+                "imported_single_slot_observations": 0,
+                "source_states": 0,
+            }
+        source_content_sha256 = _digest(
+            {
+                "multislot_observations": [
+                    row.to_dict() for row in source_multislot
+                ],
+                "observations": [row.to_dict() for row in source_single],
+                "schema": "immer.qwen3.8-parametric-compatible-content/v1",
+            }
+        )
+        if self.observation_verifier is not None and any(
+            not bool(self.observation_verifier(row))
+            for row in (*source_single, *source_multislot)
+        ):
+            raise ParametricWarmError(
+                "imported template observation lost its ResultCell authority"
+            )
+        _validate_multislot_source_groups(source_multislot)
+        with self._lock, _template_lock(self.root):
+            self._load()
+            existing_single = {row.sha256: row for row in self.observations}
+            existing_multislot = {
+                row.sha256: row for row in self.multislot_observations
+            }
+            single_before = len(existing_single)
+            multislot_before = len(existing_multislot)
+            missing_single = tuple(
+                row
+                for row in source_single
+                if row.sha256 not in existing_single
+            )
+            missing_multislot = tuple(
+                row
+                for row in source_multislot
+                if row.sha256 not in existing_multislot
+            )
+            remaining = max(
+                0,
+                MAX_MULTISLOT_OBSERVATIONS - len(existing_multislot),
+            )
+            if len(missing_multislot) > remaining:
+                return {
+                    "capacity_rejected_source_states": 1,
+                    "imported_multislot_observations": 0,
+                    "imported_single_slot_observations": 0,
+                    "source_states": 0,
+                }
+            imported = set(self.body["imported_content_sha256s"])
+            imported_before = set(imported)
+            if (
+                source_content_sha256 not in imported
+                and len(imported) >= MAX_IMPORTED_TEMPLATE_CONTENTS
+            ):
+                return {
+                    "capacity_rejected_source_states": 1,
+                    "imported_multislot_observations": 0,
+                    "imported_single_slot_observations": 0,
+                    "source_states": 0,
+                }
+            for row in missing_single:
+                existing_single[row.sha256] = row
+            for row in missing_multislot:
+                existing_multislot[row.sha256] = row
+            _validate_multislot_source_groups(tuple(existing_multislot.values()))
+            imported.add(source_content_sha256)
+            proposed = dict(self.body)
+            proposed["imported_content_sha256s"] = sorted(imported)
+            proposed["observations"] = [
+                row.to_dict() for _sha, row in sorted(existing_single.items())
+            ]
+            proposed["multislot_observations"] = [
+                row.to_dict()
+                for _sha, row in sorted(existing_multislot.items())
+            ]
+            if len(_state_bytes(proposed)) > MAX_PARAMETRIC_STATE_BYTES:
+                return {
+                    "capacity_rejected_source_states": 1,
+                    "imported_multislot_observations": 0,
+                    "imported_single_slot_observations": 0,
+                    "source_states": 0,
+                }
+            single_added = len(existing_single) - single_before
+            multislot_added = len(existing_multislot) - multislot_before
+            if single_added or multislot_added or imported != imported_before:
+                self.body = proposed
+                self._publish()
+            return {
+                "capacity_rejected_source_states": 0,
+                "imported_multislot_observations": multislot_added,
+                "imported_single_slot_observations": single_added,
+                "source_states": 1,
+            }
 
     def observe(
         self,
@@ -395,6 +696,12 @@ class ParametricWarmBank:
         cell_payload_sha256: str,
         teacher_forward_count: int,
     ) -> dict[str, object]:
+        if (
+            not output.isascii()
+            or not output.isprintable()
+            or len(output) > self.output_character_limit
+        ):
+            return {"candidates": 0, "status": "output-outside-template-abi"}
         rows = _candidate_observations(
             question,
             output,
@@ -402,16 +709,18 @@ class ParametricWarmBank:
             cell_payload_sha256=cell_payload_sha256,
             teacher_forward_count=teacher_forward_count,
         )
-        if (
-            not output.isascii()
-            or not output.isprintable()
-            or len(output) > self.output_character_limit
-        ):
-            return {"candidates": 0, "status": "output-outside-template-abi"}
-        if not rows:
+        multislot_rows = derive_multislot_observations(
+            question,
+            output,
+            question_sha256=question_sha256,
+            cell_payload_sha256=cell_payload_sha256,
+            teacher_forward_count=teacher_forward_count,
+        )
+        if not rows and not multislot_rows:
             return {"candidates": 0, "status": "no-template"}
         if self.observation_verifier is not None and any(
-            not bool(self.observation_verifier(row)) for row in rows
+            not bool(self.observation_verifier(row))
+            for row in (*rows, *multislot_rows)
         ):
             raise ParametricWarmError(
                 "new template observation lacks ResultCell authority"
@@ -419,17 +728,47 @@ class ParametricWarmBank:
         with self._lock, _template_lock(self.root):
             self._load()
             existing = {row.sha256: row for row in self.observations}
+            existing_multislot = {
+                row.sha256: row for row in self.multislot_observations
+            }
             before = len(self.promoted)
             for row in rows:
                 existing.setdefault(row.sha256, row)
+            multislot_before = len(existing_multislot)
+            new_multislot_rows = tuple(
+                row
+                for row in multislot_rows
+                if row.sha256 not in existing_multislot
+            )
+            remaining_multislot = max(
+                0,
+                MAX_MULTISLOT_OBSERVATIONS - multislot_before,
+            )
+            if len(new_multislot_rows) <= remaining_multislot:
+                for row in new_multislot_rows:
+                    existing_multislot[row.sha256] = row
+                multislot_admitted = len(new_multislot_rows)
+                multislot_dropped = 0
+            else:
+                multislot_admitted = 0
+                multislot_dropped = len(new_multislot_rows)
             self.body["observations"] = [
                 row.to_dict() for _sha, row in sorted(existing.items())
+            ]
+            self.body["multislot_observations"] = [
+                row.to_dict()
+                for _sha, row in sorted(existing_multislot.items())
             ]
             self._publish()
             after = len(self.promoted)
             return {
-                "candidates": len(rows),
-                "observations": len(existing),
+                "candidates": len(rows) + len(multislot_rows),
+                "multislot_candidates": len(multislot_rows),
+                "multislot_admitted": multislot_admitted,
+                "multislot_capacity_dropped": multislot_dropped,
+                "multislot_observations": len(existing_multislot),
+                "observations": len(existing) + len(existing_multislot),
+                "single_slot_candidates": len(rows),
                 "promoted": after,
                 "promoted_delta": after - before,
                 "status": "observed",
@@ -475,6 +814,15 @@ class ParametricWarmBank:
         authorities = tuple(
             sorted(template.sha256 for template, value in matches if value == output)
         )
+        slot_arities = tuple(
+            sorted(
+                {
+                    2 if isinstance(template, MultiSlotProgram) else 1
+                    for template, value in matches
+                    if value == output
+                }
+            )
+        )
         saved = min(
             template.saved_qwen_forwards
             for template, value in matches
@@ -487,13 +835,15 @@ class ParametricWarmBank:
                     question.strip().encode("utf-8")
                 ).hexdigest(),
                 "runtime_profile_sha256": self.runtime_profile_sha256,
-                "schema": "immer.qwen3.8-parametric-warm-execution/v1",
+                "schema": "immer.qwen3.8-parametric-warm-execution/v2",
+                "slot_arities": list(slot_arities),
                 "template_sha256s": list(authorities),
             }
         )
         decision_sha256 = _digest(
             {
                 "execution_sha256": execution_sha256,
+                "slot_arities": list(slot_arities),
                 "template_sha256s": list(authorities),
             }
         )
@@ -538,6 +888,7 @@ class ParametricWarmBank:
                     "execution_sha256": execution_sha256,
                     "runtime_profile_sha256": self.runtime_profile_sha256,
                     "saved_qwen_forwards": saved,
+                    "slot_arities": list(slot_arities),
                     "template_sha256s": list(authorities),
                 }
             },
@@ -547,6 +898,7 @@ class ParametricWarmBank:
             {
                 "execution_sha256": execution_sha256,
                 "saved_qwen_forwards": saved,
+                "slot_arities": list(slot_arities),
                 "status": "parametric-hit",
                 "template_sha256s": list(authorities),
             },
@@ -557,6 +909,9 @@ class ParametricWarmBank:
 
 __all__ = [
     "MINIMUM_DISTINCT_SLOTS",
+    "MAX_PARAMETRIC_STATE_BYTES",
+    "LEGACY_TEMPLATE_STATE_NAME",
+    "LEGACY_TEMPLATE_STATE_SCHEMA",
     "ParametricWarmBank",
     "ParametricWarmError",
     "PromotedTemplate",

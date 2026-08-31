@@ -32,6 +32,7 @@ from immer.runtimes.ooe.qwen_warm_growth import (
     QwenWarmGrowthError,
     _fertig_judgment,
 )
+from immer.runtimes.ooe.qwen_warm_templates import TEMPLATE_STATE_NAME
 from immer.runtimes.qwen3_8.semantic_atlas import (
     GraphRevision,
     InterventionIdentity,
@@ -84,6 +85,41 @@ ANSWERS = ("81", "310", "110", "50", "2")
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _synthetic_cold_qwen_result(
+    *,
+    template_binding: ResultCellBinding,
+    model_pin: ModelPin,
+    base_evidence: dict[str, object],
+    question: str,
+    output: str,
+    tag: str,
+) -> tuple[Result, str]:
+    token_sha256 = _hash(f"tokens:{question}")
+    binding = ResultCellBinding(
+        model_pin=model_pin,
+        tokenizer_sha256=template_binding.tokenizer_sha256,
+        question_sha256=hashlib.sha256(question.encode()).hexdigest(),
+        rendered_prompt_sha256=_hash(f"rendered:{tag}"),
+        rendered_prompt_token_sha256=token_sha256,
+        system_prompt_sha256=template_binding.system_prompt_sha256,
+        generation_policy_sha256=template_binding.generation_policy_sha256,
+    )
+    evidence = {
+        **base_evidence,
+        "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
+        "result_cell_binding_receipt": qwen_result_binding_evidence(binding),
+    }
+    return (
+        Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output=output,
+            evidence=evidence,
+        ),
+        token_sha256,
+    )
 
 
 PIN = ModelPin(
@@ -921,6 +957,187 @@ class Qwen38OoeChatCohortTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(QwenWarmGrowthError, "mismatch"):
             _fertig_judgment(final)
+
+    def test_two_multislot_cold_chats_promote_unseen_composition(self) -> None:
+        manifest = self.fixture.prepare()
+        result = self.fixture.execute()
+        verification = cohort.verify(self.fixture.verify_args())
+        (self.fixture.root / "verification.json").write_bytes(
+            cohort._document_bytes(verification)
+        )
+        profile = _hash("multislot-runtime-profile")
+        runtime_code = _hash("multislot-runtime-code")
+        prompt_tokens: dict[str, str] = {}
+
+        def verify_prompt_token(question: str, claimed: str) -> bool:
+            return prompt_tokens.get(question) == claimed
+
+        mount = open_verified_qwen_warm_bank(
+            self.fixture.root,
+            runtime_profile_sha256=profile,
+            runtime_code_revision=runtime_code,
+            template_output_character_limit=32,
+            prompt_token_verifier=verify_prompt_token,
+        )
+        template_binding = ResultCellBinding.from_record(
+            manifest["body"]["items"][0]["binding"]
+        )
+        dynamic_pin = ModelPin(
+            repo_id=template_binding.model_pin.repo_id,
+            revision=template_binding.model_pin.revision,
+            bundle_fingerprint=template_binding.model_pin.bundle_fingerprint,
+            bundle_manifest_sha256=(
+                template_binding.model_pin.bundle_manifest_sha256
+            ),
+            code_revision=runtime_code,
+        )
+        template_cell = cohort.ResultCellBank(self.fixture.organ).restore_payload(
+            result["body"]["cold_rows"][0]["cell_payload_sha256"]
+        )
+        base_evidence = dict(template_cell.cold_qwen_result.evidence)
+        base_evidence.pop(COLD_QWEN_GENERATION_EVIDENCE_KEY)
+
+        def cold(question: str, output: str, tag: str) -> dict[str, object]:
+            qwen_result, token_sha256 = _synthetic_cold_qwen_result(
+                template_binding=template_binding,
+                model_pin=dynamic_pin,
+                base_evidence=base_evidence,
+                question=question,
+                output=output,
+                tag=tag,
+            )
+            prompt_tokens[question] = token_sha256
+            metadata = {
+                "qwen_token_sha256": token_sha256,
+                "qwen_warm_runtime_profile_sha256": profile,
+            }
+            qwen = _Qwen(qwen_result)
+            with _patched_solver(
+                None,
+                _verification(
+                    CandidateVerificationStatus.ABSTAINED,
+                    candidate=None,
+                    expected=None,
+                    question=question,
+                ),
+            ) as (solver, _certify, _verify):
+                answer = QwenFertigChat(
+                    qwen,
+                    solver,
+                    ooe_hook=mount.hook,
+                ).handle(Request("chat", question, metadata))
+            self.assertTrue(answer.ok)
+            self.assertEqual(answer.output, output)
+            self.assertEqual(len(qwen.requests), 1)
+            return answer.evidence["receipt"]["ooe"]["cold_observer"]
+
+        first = cold("join ALPHA and BETA", "ALPHA-BETA", "first")
+        second = cold("join GAMMA and DELTA", "GAMMA-DELTA", "second")
+        first_template = first["authorities"][0]["observation"]["template"]
+        second_template = second["authorities"][0]["observation"]["template"]
+        self.assertGreater(first_template["multislot_candidates"], 0)
+        self.assertGreater(second_template["multislot_candidates"], 0)
+        self.assertGreater(second_template["promoted"], first_template["promoted"])
+
+        restarted = open_verified_qwen_warm_bank(
+            self.fixture.root,
+            runtime_profile_sha256=profile,
+            runtime_code_revision=runtime_code,
+            template_output_character_limit=32,
+            prompt_token_verifier=verify_prompt_token,
+        )
+        question = "join EPSILON and ZETA"
+        token_sha256 = _hash(f"tokens:{question}")
+        prompt_tokens[question] = token_sha256
+        metadata = {
+            "qwen_token_sha256": token_sha256,
+            "qwen_warm_runtime_profile_sha256": profile,
+        }
+        qwen = _Qwen(RuntimeError("Qwen must not run for unseen slot composition"))
+        with _patched_solver(
+            None,
+            _verification(
+                CandidateVerificationStatus.ABSTAINED,
+                candidate=None,
+                expected=None,
+                question=question,
+            ),
+        ) as (solver, _certify, _verify):
+            answer = QwenFertigChat(
+                qwen,
+                solver,
+                ooe_hook=restarted.hook,
+            ).handle(Request("chat", question, metadata))
+
+        self.assertTrue(answer.ok)
+        self.assertEqual(answer.output, "EPSILON-ZETA")
+        self.assertEqual(qwen.requests, [])
+        warm = answer.evidence["receipt"]["ooe"]["warm"]
+        parametric = next(
+            row
+            for row in warm["attempts"]
+            if row.get("status") == "parametric-hit"
+        )
+        self.assertEqual(parametric["slot_arities"], [2])
+        accounting = answer.evidence["receipt"]["ooe"]["accounting"]
+        self.assertEqual(accounting["disposition"], "committed")
+        self.assertGreater(accounting["saved_qwen_forwards"], 0)
+
+        next_profile = _hash("multislot-next-runtime-profile")
+        next_runtime_code = _hash("multislot-next-runtime-code")
+        corrupt_sibling = CrystalStore(
+            self.fixture.root
+            / "growing-crystals"
+            / "corrupt-sibling-profile"
+            / "private-parametric-state"
+        )
+        corrupt_sibling.publish_state(TEMPLATE_STATE_NAME, b"{}")
+        migrated_mount = open_verified_qwen_warm_bank(
+            self.fixture.root,
+            runtime_profile_sha256=next_profile,
+            runtime_code_revision=next_runtime_code,
+            template_output_character_limit=32,
+            prompt_token_verifier=verify_prompt_token,
+        )
+        migrated_question = "join THETA and IOTA"
+        migrated_token_sha256 = _hash(f"tokens:{migrated_question}")
+        prompt_tokens[migrated_question] = migrated_token_sha256
+        migrated_qwen = _Qwen(
+            RuntimeError("Qwen must not run after a runtime-profile migration")
+        )
+        with _patched_solver(
+            None,
+            _verification(
+                CandidateVerificationStatus.ABSTAINED,
+                candidate=None,
+                expected=None,
+                question=migrated_question,
+            ),
+        ) as (solver, _certify, _verify):
+            migrated_answer = QwenFertigChat(
+                migrated_qwen,
+                solver,
+                ooe_hook=migrated_mount.hook,
+            ).handle(
+                Request(
+                    "chat",
+                    migrated_question,
+                    {
+                        "qwen_token_sha256": migrated_token_sha256,
+                        "qwen_warm_runtime_profile_sha256": next_profile,
+                    },
+                )
+            )
+        self.assertTrue(migrated_answer.ok)
+        self.assertEqual(migrated_answer.output, "THETA-IOTA")
+        self.assertEqual(migrated_qwen.requests, [])
+        migrated_warm = migrated_answer.evidence["receipt"]["ooe"]["warm"]
+        migrated_parametric = next(
+            row
+            for row in migrated_warm["attempts"]
+            if row.get("status") == "parametric-hit"
+        )
+        self.assertEqual(migrated_parametric["slot_arities"], [2])
 
     def test_two_cold_slots_promote_unseen_parametric_qwen_bypass(self) -> None:
         manifest = self.fixture.prepare()

@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover
 from ...contracts import Result
 from ..qwen3_8.semantic_atlas import ModelPin, ProbeIdentity
 from .controller import OoeController, VerifiedTeacherTransition
-from .crystal import CrystalStore
+from .crystal import CrystalStore, CrystalStoreError
 from .identity import canonical_json_bytes, require_sha256
 from .qwen_bridge import QwenOoeFeatureReceipt
 from .result_cells import (
@@ -35,7 +35,7 @@ from .result_cells import (
     attach_cold_qwen_generation_receipt,
     qwen_result_binding_evidence,
 )
-from .qwen_warm_templates import ParametricWarmBank
+from .qwen_warm_templates import ParametricWarmBank, ParametricWarmError
 
 
 GROWING_INDEX_SCHEMA = "immer.qwen3.8-growing-warm-index/v1"
@@ -378,10 +378,24 @@ class GrowingQwenWarmBank:
         def verify_template_observation(row: Any) -> bool:
             try:
                 cell = self.bank.restore_payload(row.cell_payload_sha256)
+                expected_output_sha256 = getattr(row, "output_sha256", None)
+                if expected_output_sha256 is None:
+                    expected_output = getattr(row, "output", None)
+                    if not isinstance(expected_output, str):
+                        return False
+                    expected_output_sha256 = hashlib.sha256(
+                        expected_output.encode("utf-8")
+                    ).hexdigest()
+                expected_output_sha256 = require_sha256(
+                    expected_output_sha256,
+                    field="template output sha256",
+                )
             except Exception:
                 return False
+            output = str(cell.cold_qwen_result.output)
             return (
-                str(cell.cold_qwen_result.output) == row.output
+                hashlib.sha256(output.encode("utf-8")).hexdigest()
+                == expected_output_sha256
                 and cell.teacher_forward_count == row.teacher_forward_count
                 and cell.binding.question_sha256 == row.question_sha256
             )
@@ -394,6 +408,49 @@ class GrowingQwenWarmBank:
             observation_verifier=verify_template_observation,
             prompt_token_verifier=prompt_token_verifier,
         )
+        import_totals = {
+            "capacity_rejected_source_states": 0,
+            "imported_multislot_observations": 0,
+            "imported_single_slot_observations": 0,
+            "skipped_source_states": 0,
+            "source_states": 0,
+        }
+        for sibling in sorted(root.parent.iterdir(), key=lambda path: path.name):
+            if sibling == root:
+                continue
+            try:
+                metadata = sibling.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(metadata.st_mode):
+                continue
+            source_path = sibling / "private-parametric-state"
+            try:
+                source_metadata = source_path.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(source_metadata.st_mode):
+                continue
+            try:
+                source = ParametricWarmBank.open_existing(
+                    CrystalStore(source_path),
+                    observation_verifier=verify_template_observation,
+                )
+                if source is None:
+                    continue
+                report = self.templates.import_compatible(source)
+            except (
+                CrystalStoreError,
+                OSError,
+                ParametricWarmError,
+                TypeError,
+                ValueError,
+            ):
+                import_totals["skipped_source_states"] += 1
+                continue
+            for field, value in report.items():
+                import_totals[field] += value
+        self.template_import = import_totals
         self.controller = restore_controller()
         self.hook: Any | None = None
         self._lock = threading.RLock()
