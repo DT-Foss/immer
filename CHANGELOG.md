@@ -4,11 +4,25 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-31
 
-Runtime commits through `ffaa1d5` are deployed on the canonical server.
+Runtime commits through `8afadd1` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `8afadd1` made canonical Qwen inference a resident local service. One
+  `Qwen38CausalChat`/`QwenFertigChat` mount now serves single, JSONL, and
+  interactive clients through a hash-bound Unix-socket protocol with mode
+  `0600`. Events separate target-confirmed candidate snapshots, progress,
+  inference-economics receipts, final product results, and errors. A complete
+  runtime-profile handshake runs before prompt dispatch; matching clients use
+  the resident runtime, while an absent or mismatched service takes the
+  unchanged direct path. Transport failure after dispatch never retries Qwen.
+  Stateless requests carry no context. Interactive histories remain isolated
+  in RAM, use FERTIG/OoE only on a context-free first turn, keep contextual
+  follow-ups on raw Qwen, and disappear on `/clear` or normal CLI exit. The
+  service accepts multiple local connections while serializing work through
+  the single native runtime. Twelve focused service tests and 93 existing Qwen
+  adapter tests pass without a model run.
 - `ffaa1d5` made inference economics a passive product output of every normal
   chat. Single-request, JSONL, and interactive modes now derive one bounded
   receipt from work the runtime already performed: target/saved forwards,

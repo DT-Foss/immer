@@ -328,6 +328,9 @@ release surface.
 # DeltaNet and FERTIG.
 PYTHONPATH=src python3 -m immer chat "<arbitrary text>"
 
+# Start one resident Qwen/FERTIG process. Later chat commands auto-connect.
+PYTHONPATH=src python3 -m immer chat --service
+
 # Keep the mounted model alive for multiple raw-text or JSONL requests.
 PYTHONPATH=src python3 -m immer chat --jsonl
 
@@ -336,6 +339,9 @@ PYTHONPATH=src python3 -m immer chat --interactive
 
 # Emit one final machine-readable receipt instead of live text.
 PYTHONPATH=src python3 -m immer chat "<arbitrary text>" --output json
+
+# Bypass a running service and mount the configured runtime in this process.
+PYTHONPATH=src python3 -m immer chat "<arbitrary text>" --direct
 ```
 
 Outside the canonical deployment, set `IMMER_QWEN38_ROOT` and optionally
@@ -345,6 +351,20 @@ the general-chat language intact. `--raw-qwen` bypasses the normal
 FERTIG-first route. Normal single-request chat shows live token progress while
 stdout remains exactly the final FERTIG-routed answer. `--raw-qwen` streams the
 actual decoder text, and `--no-stream` buffers either mode until completion.
+
+`immer chat --service` owns one canonical Qwen3.8/FERTIG runtime behind a
+local Unix socket with mode `0600`. Single, JSONL, and interactive clients send
+the same canonical request/event protocol and receive `started`, confirmed
+`candidate_delta`, `progress`, inference `receipt`, and `final` events. A
+profile handshake binds model paths, Q4/MLP/Draft configuration, tokenizer,
+system prompt, decoding bounds, and runtime code before any chat request is
+sent. A matching service avoids another model mount. An absent or mismatched
+service uses the existing direct path; a failure after request dispatch never
+retries the prompt and therefore cannot duplicate Qwen, Markov, O1, or ledger
+work. Single and JSONL requests remain stateless. Interactive histories stay
+in service RAM, retain the existing raw-Qwen rule for contextual turns, and
+are deleted by `/clear` or normal CLI exit. No transcript is written.
+`--socket` and `IMMER_QWEN38_SOCKET` select the endpoint.
 
 When a verified local OoE warm bank is present, chat mounts it before opening
 Qwen. An authenticated ResultCell hit executes with zero Qwen forwards and
