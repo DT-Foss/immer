@@ -121,7 +121,7 @@ class InferenceActionBankTests(unittest.TestCase):
                 question_sha256=_sha("new question"),
                 runtime_profile_sha256=_sha("profile"),
             )
-            no_directive = bank.recommend(
+            transferred_directive = bank.recommend(
                 question_sha256=_sha("new question"),
                 runtime_profile_sha256=_sha("other profile"),
             )
@@ -143,7 +143,7 @@ class InferenceActionBankTests(unittest.TestCase):
         self.assertEqual(directive.primary_actions, ("stored_result",))
         self.assertEqual(
             directive.fallback_actions,
-            ("dynamic_mlp_pages", "qwen_target", "target_verified_draft"),
+            ("qwen_target", "target_verified_draft"),
         )
         self.assertTrue(directive.draft_enabled)
         self.assertEqual(directive.support, 2)
@@ -155,7 +155,12 @@ class InferenceActionBankTests(unittest.TestCase):
         assert runtime_directive is not None
         self.assertEqual(runtime_directive.primary_actions, directive.fallback_actions)
         self.assertTrue(runtime_directive.draft_enabled)
-        self.assertIsNone(no_directive)
+        assert transferred_directive is not None
+        self.assertEqual(
+            transferred_directive.primary_actions,
+            directive.fallback_actions,
+        )
+        self.assertTrue(transferred_directive.draft_enabled)
 
     def test_reconcile_recovers_a_missed_derived_event_and_tamper_is_hard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -574,7 +574,7 @@ class InferenceActionBank:
                 receipt.action_signature_sha256,
             )
         )
-        runtime = [
+        exact_runtime = [
             receipt
             for receipt in receipts
             if receipt.runtime_profile_sha256 == profile
@@ -583,6 +583,15 @@ class InferenceActionBank:
             and "target_verified_draft" in receipt.actions
             and receipt.saved_qwen_forwards > 0
         ]
+        transferable_runtime = [
+            receipt
+            for receipt in receipts
+            if receipt.status == "ok"
+            and "qwen_target" in receipt.actions
+            and "target_verified_draft" in receipt.actions
+            and receipt.saved_qwen_forwards > 0
+        ]
+        runtime = exact_runtime or transferable_runtime
         runtime.sort(
             key=lambda receipt: (
                 -receipt.saved_qwen_forwards,
@@ -593,8 +602,9 @@ class InferenceActionBank:
         )
         if not exact and not runtime:
             return None
-        primary = exact[0].actions if exact else runtime[0].actions
-        fallback = runtime[0].actions if runtime else ("qwen_target",)
+        runtime_actions = ("qwen_target", "target_verified_draft")
+        primary = exact[0].actions if exact else runtime_actions
+        fallback = runtime_actions if runtime else ("qwen_target",)
         sources = tuple(
             sorted(
                 {
