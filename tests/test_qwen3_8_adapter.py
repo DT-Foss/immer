@@ -35,6 +35,7 @@ from immer.runtimes.ooe.result_cells import (
 from immer.runtimes.qwen3_8.adapter import (
     QWEN38_CHAT_HISTORY_METADATA,
     QWEN38_CHAT_SESSION_METADATA,
+    QWEN38_INFERENCE_ACTION_METADATA,
     Qwen38CausalChat,
     Qwen38ChatError,
 )
@@ -44,7 +45,10 @@ from immer.runtimes.qwen3_8.markov_atlas import MarkovTokenAtlas
 from immer.runtimes.qwen3_8.hybrid_draft import (
     QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
 )
-from immer.runtimes.qwen3_8.action_bank import InferenceActionBank
+from immer.runtimes.qwen3_8.action_bank import (
+    InferenceActionBank,
+    InferenceActionDirective,
+)
 from immer.runtimes.qwen3_8.inference_economics import (
     InferenceEconomicsLedger,
 )
@@ -1782,6 +1786,44 @@ class Qwen38CausalChatTests(unittest.TestCase):
             provider,
             window_size=4,
             adaptive_round_windows=False,
+        )
+        chat.close()
+
+    def test_action_bank_directive_can_select_verified_direct_fallback(self) -> None:
+        runtime = _Runtime()
+        chat = _chat(
+            runtime,
+            draft_bundle_path="draft.causal",
+            max_new_tokens=4,
+        )
+        directive = InferenceActionDirective(
+            question_sha256=hashlib.sha256(b"hello").hexdigest(),
+            runtime_profile_sha256="2" * 64,
+            primary_actions=("qwen_target",),
+            fallback_actions=("qwen_target",),
+            draft_enabled=False,
+            source_signature_sha256s=("3" * 64,),
+            support=1,
+            saved_qwen_forwards=0,
+        )
+
+        result = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {QWEN38_INFERENCE_ACTION_METADATA: directive.to_document()},
+            )
+        )
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertNotIn("draft", result.evidence)
+        self.assertEqual(
+            result.evidence["inference_action_directive"]["applied"],
+            {"draft_enabled": False},
+        )
+        self.assertEqual(
+            result.evidence["inference_action_directive"]["directive"],
+            directive.to_document(),
         )
         chat.close()
 

@@ -769,6 +769,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
     from .runtimes.qwen3_8.adapter import (
         QWEN38_CHAT_HISTORY_METADATA,
         QWEN38_CHAT_SESSION_METADATA,
+        QWEN38_INFERENCE_ACTION_METADATA,
         Qwen38CausalChat,
     )
     from .runtimes.qwen3_8.draft_window import DraftWindowError
@@ -1733,6 +1734,20 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 metadata[QWEN38_CHAT_HISTORY_METADATA] = history
             if session_id is not None:
                 metadata[QWEN38_CHAT_SESSION_METADATA] = session_id
+            if action_bank is not None and economics_runtime_profile is not None:
+                try:
+                    directive = action_bank.recommend(
+                        question_sha256=hashlib.sha256(
+                            text.encode("utf-8")
+                        ).hexdigest(),
+                        runtime_profile_sha256=economics_runtime_profile,
+                    )
+                except Exception:
+                    directive = None
+                if directive is not None:
+                    metadata[QWEN38_INFERENCE_ACTION_METADATA] = (
+                        directive.to_document()
+                    )
             if warm_profile_sha256 is None or prompt_tokenizer is None:
                 return metadata
             from .runtimes.qwen3_8.cartography_probe import (

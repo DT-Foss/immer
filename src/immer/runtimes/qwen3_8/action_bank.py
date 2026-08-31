@@ -20,6 +20,7 @@ from .inference_economics import InferenceEconomicsReceipt
 
 INFERENCE_ACTION_RECEIPT_SCHEMA = "immer.qwen3.8-inference-action-receipt/v1"
 INFERENCE_ACTION_BANK_SCHEMA = "immer.qwen3.8-inference-action-bank/v1"
+INFERENCE_ACTION_DIRECTIVE_SCHEMA = "immer.qwen3.8-inference-action-directive/v1"
 MAX_ACTION_RECEIPT_BYTES = 32 * 1024
 ACTION_CATALOG = (
     "compute_crystal",
@@ -253,6 +254,101 @@ class InferenceActionObservation:
     snapshot: Mapping[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class InferenceActionDirective:
+    question_sha256: str
+    runtime_profile_sha256: str
+    primary_actions: tuple[str, ...]
+    fallback_actions: tuple[str, ...]
+    draft_enabled: bool | None
+    source_signature_sha256s: tuple[str, ...]
+    support: int
+    saved_qwen_forwards: int
+
+    def __post_init__(self) -> None:
+        for name in ("question_sha256", "runtime_profile_sha256"):
+            object.__setattr__(
+                self,
+                name,
+                require_sha256(getattr(self, name), field=name),
+            )
+        for name in ("primary_actions", "fallback_actions"):
+            actions = getattr(self, name)
+            if (
+                not actions
+                or tuple(sorted(set(actions))) != actions
+                or any(action not in ACTION_CATALOG for action in actions)
+            ):
+                raise ValueError(f"{name} must be sorted known action classes")
+        if self.draft_enabled is not None and not isinstance(
+            self.draft_enabled,
+            bool,
+        ):
+            raise TypeError("draft_enabled must be boolean or null")
+        if (
+            tuple(sorted(set(self.source_signature_sha256s)))
+            != self.source_signature_sha256s
+            or any(
+                require_sha256(value, field="source signature") != value
+                for value in self.source_signature_sha256s
+            )
+        ):
+            raise ValueError("source signatures must be sorted unique SHA-256 values")
+        if self.support <= 0 or isinstance(self.support, bool):
+            raise ValueError("directive support must be positive")
+        _uint(self.saved_qwen_forwards, "saved_qwen_forwards")
+
+    @property
+    def sha256(self) -> str:
+        return _digest(self.body())
+
+    def body(self) -> dict[str, object]:
+        return {
+            "draft_enabled": self.draft_enabled,
+            "fallback_actions": list(self.fallback_actions),
+            "primary_actions": list(self.primary_actions),
+            "question_sha256": self.question_sha256,
+            "runtime_profile_sha256": self.runtime_profile_sha256,
+            "saved_qwen_forwards": self.saved_qwen_forwards,
+            "source_signature_sha256s": list(self.source_signature_sha256s),
+            "support": self.support,
+        }
+
+    def to_document(self) -> dict[str, object]:
+        body = self.body()
+        return {
+            "body": body,
+            "schema": INFERENCE_ACTION_DIRECTIVE_SCHEMA,
+            "sha256": _digest(body),
+        }
+
+    @classmethod
+    def from_document(cls, value: object) -> "InferenceActionDirective":
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"body", "schema", "sha256"}
+            or value.get("schema") != INFERENCE_ACTION_DIRECTIVE_SCHEMA
+            or not isinstance(value.get("body"), Mapping)
+            or value.get("sha256") != _digest(value["body"])
+        ):
+            raise InferenceActionBankError("action directive envelope is invalid")
+        body = dict(value["body"])
+        for name in (
+            "fallback_actions",
+            "primary_actions",
+            "source_signature_sha256s",
+        ):
+            if isinstance(body.get(name), list):
+                body[name] = tuple(body[name])
+        try:
+            directive = cls(**body)
+        except (TypeError, ValueError) as exc:
+            raise InferenceActionBankError("action directive is invalid") from exc
+        if directive.to_document() != dict(value):
+            raise InferenceActionBankError("action directive is not canonical")
+        return directive
+
+
 class InferenceActionBank:
     """Crash-safe passive action index derived from authoritative economics."""
 
@@ -448,13 +544,87 @@ class InferenceActionBank:
             self.observe(receipt)
         return self.snapshot()
 
+    def recommend(
+        self,
+        *,
+        question_sha256: str,
+        runtime_profile_sha256: str,
+    ) -> InferenceActionDirective | None:
+        question = require_sha256(question_sha256, field="question_sha256")
+        profile = require_sha256(
+            runtime_profile_sha256,
+            field="runtime_profile_sha256",
+        )
+        with self._lock:
+            receipts = self._receipts()
+        exact = [
+            receipt
+            for receipt in receipts
+            if receipt.question_sha256 == question
+            and receipt.status == "ok"
+            and any(
+                action in {"fertig_exact", "stored_result"}
+                for action in receipt.actions
+            )
+        ]
+        exact.sort(
+            key=lambda receipt: (
+                -receipt.saved_qwen_forwards,
+                receipt.target_forwards,
+                receipt.action_signature_sha256,
+            )
+        )
+        runtime = [
+            receipt
+            for receipt in receipts
+            if receipt.runtime_profile_sha256 == profile
+            and receipt.status == "ok"
+            and "qwen_target" in receipt.actions
+            and "target_verified_draft" in receipt.actions
+            and receipt.saved_qwen_forwards > 0
+        ]
+        runtime.sort(
+            key=lambda receipt: (
+                -receipt.saved_qwen_forwards,
+                receipt.target_forwards,
+                receipt.request_wall_seconds,
+                receipt.action_signature_sha256,
+            )
+        )
+        if not exact and not runtime:
+            return None
+        primary = exact[0].actions if exact else runtime[0].actions
+        fallback = runtime[0].actions if runtime else ("qwen_target",)
+        sources = tuple(
+            sorted(
+                {
+                    receipt.action_signature_sha256
+                    for receipt in (*exact, *runtime)
+                }
+            )
+        )
+        return InferenceActionDirective(
+            question_sha256=question,
+            runtime_profile_sha256=profile,
+            primary_actions=primary,
+            fallback_actions=fallback,
+            draft_enabled=True if runtime else None,
+            source_signature_sha256s=sources,
+            support=len(exact) + len(runtime),
+            saved_qwen_forwards=sum(
+                receipt.saved_qwen_forwards for receipt in (*exact, *runtime)
+            ),
+        )
+
 
 __all__ = [
     "ACTION_CATALOG",
     "INFERENCE_ACTION_BANK_SCHEMA",
+    "INFERENCE_ACTION_DIRECTIVE_SCHEMA",
     "INFERENCE_ACTION_RECEIPT_SCHEMA",
     "InferenceActionBank",
     "InferenceActionBankError",
+    "InferenceActionDirective",
     "InferenceActionObservation",
     "InferenceActionReceipt",
 ]

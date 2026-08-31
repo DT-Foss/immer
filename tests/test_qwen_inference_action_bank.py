@@ -10,6 +10,7 @@ from immer.runtimes.qwen3_8.action_bank import (
     INFERENCE_ACTION_BANK_SCHEMA,
     InferenceActionBank,
     InferenceActionBankError,
+    InferenceActionDirective,
     InferenceActionReceipt,
 )
 from immer.runtimes.qwen3_8.inference_economics import InferenceEconomicsReceipt
@@ -112,6 +113,18 @@ class InferenceActionBankTests(unittest.TestCase):
                 )
             )
             snapshot = bank.snapshot()
+            directive = bank.recommend(
+                question_sha256=_sha("question:warm"),
+                runtime_profile_sha256=_sha("profile"),
+            )
+            runtime_directive = bank.recommend(
+                question_sha256=_sha("new question"),
+                runtime_profile_sha256=_sha("profile"),
+            )
+            no_directive = bank.recommend(
+                question_sha256=_sha("new question"),
+                runtime_profile_sha256=_sha("other profile"),
+            )
             restarted = InferenceActionBank(root)
             restarted_snapshot = restarted.snapshot()
 
@@ -126,6 +139,23 @@ class InferenceActionBankTests(unittest.TestCase):
         self.assertEqual(snapshot["signatures"][0]["accepted_draft_tokens"], 0)
         self.assertEqual(snapshot["signatures"][0]["source_body_bytes"], 0)
         self.assertEqual(restarted_snapshot, snapshot)
+        assert directive is not None
+        self.assertEqual(directive.primary_actions, ("stored_result",))
+        self.assertEqual(
+            directive.fallback_actions,
+            ("dynamic_mlp_pages", "qwen_target", "target_verified_draft"),
+        )
+        self.assertTrue(directive.draft_enabled)
+        self.assertEqual(directive.support, 2)
+        self.assertEqual(directive.saved_qwen_forwards, 5)
+        self.assertEqual(
+            InferenceActionDirective.from_document(directive.to_document()),
+            directive,
+        )
+        assert runtime_directive is not None
+        self.assertEqual(runtime_directive.primary_actions, directive.fallback_actions)
+        self.assertTrue(runtime_directive.draft_enabled)
+        self.assertIsNone(no_directive)
 
     def test_reconcile_recovers_a_missed_derived_event_and_tamper_is_hard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

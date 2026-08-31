@@ -26,6 +26,7 @@ from ..o1_state.markov_retention import (
 )
 from ...contracts import ExecutionStatus, Request, Result
 from ..deepseek_v4.causal_weights import CausalWeightMount, LogicalModelIdentity
+from .action_bank import InferenceActionBankError, InferenceActionDirective
 from .bundle import verify_qwen38_causal_mount
 from .config import (
     OFFICIAL_REPO_ID,
@@ -119,6 +120,7 @@ _GENERATION_RECEIPT_FIELDS = (
 RESULT_CELL_GENERATION_POLICY_SCHEMA = "immer.qwen3.8-result-cell-generation-policy/v1"
 QWEN38_CHAT_HISTORY_METADATA = "qwen_chat_history"
 QWEN38_CHAT_SESSION_METADATA = "qwen_chat_session"
+QWEN38_INFERENCE_ACTION_METADATA = "qwen_inference_action_directive"
 _MAX_CHAT_HISTORY_MESSAGES = 128
 _MAX_CHAT_SESSION_LENGTH = 128
 _RESULT_CELL_CODE_REVISION_LENGTHS = frozenset((40, 64))
@@ -267,6 +269,18 @@ def _chat_session(metadata: object) -> str | None:
     ):
         raise ValueError("Qwen chat session ID must be 1-128 trimmed characters")
     return value
+
+
+def _inference_action_directive(metadata: object) -> InferenceActionDirective | None:
+    if not isinstance(metadata, Mapping):
+        raise TypeError("chat metadata must be a mapping")
+    raw = metadata.get(QWEN38_INFERENCE_ACTION_METADATA)
+    if raw is None:
+        return None
+    try:
+        return InferenceActionDirective.from_document(raw)
+    except (InferenceActionBankError, TypeError, ValueError) as exc:
+        raise ValueError("Qwen inference action directive is invalid") from exc
 
 
 def _mapping(value: object, label: str) -> dict[str, Any]:
@@ -2322,6 +2336,8 @@ class Qwen38CausalChat:
         self,
         generation_options: Mapping[str, Any],
     ) -> str | None:
+        if generation_options.get("draft_enabled") is False:
+            return None
         mode = self._draft_mode
         if generation_options.get("restored_prefix_length") is None:
             return mode
@@ -3166,6 +3182,7 @@ class Qwen38CausalChat:
         *,
         history: tuple[tuple[str, str], ...] = (),
         session_id: str | None = None,
+        action_directive: InferenceActionDirective | None = None,
     ) -> Result:
         prompt = Qwen38Tokenizer.render_no_thinking_messages(
             self._system_prompt,
@@ -3282,6 +3299,8 @@ class Qwen38CausalChat:
             "eos_token_ids": (IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID),
             "head_block_rows": self._head_block_rows,
         }
+        if action_directive is not None and action_directive.draft_enabled is not None:
+            generation_options["draft_enabled"] = action_directive.draft_enabled
         if reused_prefix_tokens:
             generation_options["restored_prefix_length"] = reused_prefix_tokens
         elif self._anchor_cache is not None:
@@ -3590,6 +3609,13 @@ class Qwen38CausalChat:
             }
         if self._last_draft_evidence is not None:
             evidence["draft"] = dict(self._last_draft_evidence)
+        if action_directive is not None:
+            evidence["inference_action_directive"] = {
+                "applied": {
+                    "draft_enabled": self._last_draft_evidence is not None,
+                },
+                "directive": action_directive.to_document(),
+            }
         if self._last_fast_mlp_evidence is not None:
             evidence["fast_mlp"] = {
                 **dict(evidence["fast_mlp"]),
@@ -3971,6 +3997,11 @@ class Qwen38CausalChat:
         try:
             history = _chat_history(request.metadata)
             session_id = _chat_session(request.metadata)
+            action_directive = _inference_action_directive(request.metadata)
+            if action_directive is not None and action_directive.question_sha256 != (
+                hashlib.sha256(request.payload.strip().encode("utf-8")).hexdigest()
+            ):
+                raise ValueError("Qwen inference action belongs to another question")
         except (TypeError, ValueError) as exc:
             return Result(
                 ExecutionStatus.REJECTED,
@@ -4017,6 +4048,7 @@ class Qwen38CausalChat:
                     request.payload.strip(),
                     history=history,
                     session_id=session_id,
+                    action_directive=action_directive,
                 )
             except _RequestRejected as exc:
                 abort_page_reward()
@@ -4192,6 +4224,7 @@ Qwen38Chat = Qwen38CausalChat
 __all__ = [
     "QWEN38_CHAT_HISTORY_METADATA",
     "QWEN38_CHAT_SESSION_METADATA",
+    "QWEN38_INFERENCE_ACTION_METADATA",
     "RESULT_CELL_GENERATION_POLICY_SCHEMA",
     "Qwen38CausalChat",
     "Qwen38Chat",

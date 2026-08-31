@@ -337,6 +337,9 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
             if key in generation
         }
         summary["generation_sha256"] = _sha256(_canonical_json(generation))
+    action_directive = evidence.get("inference_action_directive")
+    if isinstance(action_directive, dict):
+        summary["inference_action_directive"] = action_directive
     draft = evidence.get("draft")
     if isinstance(draft, dict):
         compact_draft = {
