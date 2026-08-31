@@ -742,7 +742,13 @@ class QwenFertigChat:
             if route == "fertig_exact_short_circuit":
                 actions.append("fertig_exact")
             elif isinstance(route, str) and route.startswith("ooe_"):
-                actions.append("stored_result")
+                qwen = body.get("qwen")
+                actions.append(
+                    "parametric_program"
+                    if isinstance(qwen, Mapping)
+                    and qwen.get("component") == "immer.markov-parametric-template"
+                    else "stored_result"
+                )
             else:
                 qwen = body.get("qwen")
                 if isinstance(qwen, Mapping):

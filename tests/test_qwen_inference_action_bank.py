@@ -6,12 +6,14 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from immer.contracts import ExecutionStatus, Result
 from immer.runtimes.qwen3_8.action_bank import (
     INFERENCE_ACTION_BANK_SCHEMA,
     InferenceActionBank,
     InferenceActionBankError,
     InferenceActionDirective,
     InferenceActionReceipt,
+    executed_actions_from_result,
 )
 from immer.runtimes.qwen3_8.inference_economics import InferenceEconomicsReceipt
 
@@ -95,6 +97,34 @@ class InferenceActionReceiptTests(unittest.TestCase):
         self.assertEqual(receipt.target_forwards, 3)
         self.assertEqual(receipt.accepted_draft_tokens, 1)
         self.assertEqual(receipt.source_body_bytes, 100)
+
+    def test_parametric_program_is_distinct_from_an_exact_result_cell(self) -> None:
+        economics = _economics(
+            "program",
+            warm=True,
+            draft=False,
+            pages=False,
+            target=0,
+            saved=4,
+        )
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.fertig-chat",
+            output="OMEGA",
+            evidence={
+                "receipt": {
+                    "qwen": {"component": "immer.markov-parametric-template"}
+                }
+            },
+        )
+        actions = executed_actions_from_result(result, economics)
+        self.assertEqual(actions, ("parametric_program",))
+        receipt = InferenceActionReceipt.from_economics(
+            economics,
+            executed_actions=actions,
+        )
+        self.assertEqual(receipt.actions, ("parametric_program",))
+        self.assertEqual(receipt.target_forwards, 0)
 
 
 class InferenceActionBankTests(unittest.TestCase):

@@ -14,6 +14,7 @@ import stat
 import threading
 from typing import Any
 
+from ...contracts import Result
 from ..ooe.identity import canonical_json_bytes, require_sha256
 from .inference_economics import InferenceEconomicsReceipt
 
@@ -82,6 +83,28 @@ def _actions(receipt: InferenceEconomicsReceipt) -> tuple[str, ...]:
     return tuple(sorted(actions))
 
 
+def executed_actions_from_result(
+    result: Result,
+    economics: InferenceEconomicsReceipt,
+) -> tuple[str, ...]:
+    """Recover the exact executed class while the full result is still present."""
+
+    if not isinstance(result, Result):
+        raise TypeError("result must be Result")
+    actions = _actions(economics)
+    if actions != ("stored_result",):
+        return actions
+    evidence = result.evidence if isinstance(result.evidence, Mapping) else {}
+    receipt = evidence.get("receipt")
+    body = receipt if isinstance(receipt, Mapping) else {}
+    qwen = body.get("qwen")
+    if isinstance(qwen, Mapping) and qwen.get("component") == (
+        "immer.markov-parametric-template"
+    ):
+        return ("parametric_program",)
+    return actions
+
+
 @dataclass(frozen=True, slots=True)
 class InferenceActionReceipt:
     request_sha256: str
@@ -143,10 +166,26 @@ class InferenceActionReceipt:
     def from_economics(
         cls,
         receipt: InferenceEconomicsReceipt,
+        *,
+        executed_actions: tuple[str, ...] | None = None,
     ) -> "InferenceActionReceipt":
         if not isinstance(receipt, InferenceEconomicsReceipt):
             raise TypeError("receipt must be InferenceEconomicsReceipt")
-        actions = _actions(receipt)
+        actions = _actions(receipt) if executed_actions is None else executed_actions
+        if (
+            not actions
+            or tuple(sorted(set(actions))) != actions
+            or any(action not in ACTION_CATALOG for action in actions)
+        ):
+            raise ValueError("executed actions are invalid")
+        if (
+            any(
+                action in {"fertig_exact", "parametric_program", "stored_result"}
+                for action in actions
+            )
+            and receipt.target_forwards != 0
+        ):
+            raise ValueError("zero-forward action executed target forwards")
         signature = _digest(
             {
                 "actions": actions,
@@ -514,8 +553,13 @@ class InferenceActionBank:
     def observe(
         self,
         economics: InferenceEconomicsReceipt,
+        *,
+        executed_actions: tuple[str, ...] | None = None,
     ) -> InferenceActionObservation:
-        receipt = InferenceActionReceipt.from_economics(economics)
+        receipt = InferenceActionReceipt.from_economics(
+            economics,
+            executed_actions=executed_actions,
+        )
         payload = canonical_json_bytes(receipt.to_document())
         destination = self.events / (
             f"{receipt.request_sha256}-{receipt.sha256}.json"
@@ -563,7 +607,7 @@ class InferenceActionBank:
             if receipt.question_sha256 == question
             and receipt.status == "ok"
             and any(
-                action in {"fertig_exact", "stored_result"}
+                action in {"fertig_exact", "parametric_program", "stored_result"}
                 for action in receipt.actions
             )
         ]
@@ -637,4 +681,5 @@ __all__ = [
     "InferenceActionDirective",
     "InferenceActionObservation",
     "InferenceActionReceipt",
+    "executed_actions_from_result",
 ]

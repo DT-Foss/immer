@@ -1652,7 +1652,10 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 )
 
                 economics_ledger = InferenceEconomicsLedger(economics_root)
-                from .runtimes.qwen3_8.action_bank import InferenceActionBank
+                from .runtimes.qwen3_8.action_bank import (
+                    InferenceActionBank,
+                    executed_actions_from_result,
+                )
 
                 action_bank = InferenceActionBank(
                     economics_root.parent / "qwen-inference-action-bank-v1"
@@ -1923,7 +1926,13 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                             action_bank_initialization_error
                             or "inference action bank is unavailable"
                         )
-                    action_observation = action_bank.observe(observation.receipt)
+                    action_observation = action_bank.observe(
+                        observation.receipt,
+                        executed_actions=executed_actions_from_result(
+                            result,
+                            observation.receipt,
+                        ),
+                    )
                     action_evidence = {
                         "duplicate": action_observation.duplicate,
                         "receipt": action_observation.receipt.to_document(),
