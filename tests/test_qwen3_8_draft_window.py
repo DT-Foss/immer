@@ -658,8 +658,14 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.state_path = self.root / "window.bin"
+        self.economics_state_patch = patch(
+            "immer.cli._QWEN38_DEPLOYMENT_STATE",
+            self.root / "no-deployment-state",
+        )
+        self.economics_state_patch.start()
 
     def tearDown(self) -> None:
+        self.economics_state_patch.stop()
         self.temporary.cleanup()
 
     def _adaptive_chat(self, runtime: _Runtime, **overrides):
