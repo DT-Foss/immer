@@ -42,6 +42,17 @@ All notable changes to IMMER are recorded here.
   `OMEGA` and the exact arithmetic request, the first request registered the
   action and the second received and executed that action as its bank-selected
   primary, with `qwen_target + target_verified_draft` retained as fallback.
+- `dcb9802` lets an observed parametric class probe a genuinely new question
+  before neural work because the program matcher safely abstains on a miss.
+  `b9469bc` preserves precise warm subtypes during Economics recovery: existing
+  action events are never reclassified, and a missing warm event is left
+  unclassified instead of being invented as a ResultCell. One conflicting
+  derived file was moved to a recovery directory; all genuine events remained.
+  On the live service, the previously unseen slot `TAU` received
+  `parametric_program` as Primary with target-verified draft/Qwen fallback,
+  returned `TAU`, executed zero target forwards, and saved three. The bank now
+  holds nine normal requests: two ResultCells, four parametric programs, two
+  FERTIG exact executions, and one cold draft/page/target vector.
 
 ## [1.0.0] — 2026-08-31
 
