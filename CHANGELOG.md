@@ -4,11 +4,27 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-31
 
-Runtime commits through `53fcde6` are deployed on the canonical server.
+Runtime commits through `ffaa1d5` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `ffaa1d5` made inference economics a passive product output of every normal
+  chat. Single-request, JSONL, and interactive modes now derive one bounded
+  receipt from work the runtime already performed: target/saved forwards,
+  generation and wall time, source/logical/physical bytes, RSS, draft yield,
+  Q4/MLP pages, O1 value, terminal reward, and zero-forward accounting. No raw
+  prompt enters the ledger. Immutable 64-KiB event segments form a contiguous
+  hash chain; a replaceable bounded rollup rebuilds from that chain after a
+  crash and exposes the largest cumulative avoidable byte-cost class.
+  Request IDs distinguish genuine repeats from retries and hard-conflict when
+  one identity claims two results. Ledger failure is fail-open for the answer.
+  The canonical server enables the ledger automatically; portable deployments
+  use `--inference-economics-state` or
+  `IMMER_QWEN38_INFERENCE_ECONOMICS`. `/stats` and JSON receipts expose current
+  and cumulative economics. `7e3c519` and `0a37bbe` isolate Adapter and
+  DraftWindow deployment tests from production state. The deployed ledger is
+  clean at zero requests before its first normal product call.
 - `53fcde6` extended consequence-grounded warm execution from one variable
   slot to two. Two independent ResultCells must vary both slot positions before
   a program can promote; learned delimiters, slot order, and

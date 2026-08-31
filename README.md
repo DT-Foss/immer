@@ -395,6 +395,17 @@ new carried row begins at Beta(1,1), holds K1 at 0.5 confidence, and learns only
 from normal Qwen verification. A gap-specific row takes over after two exact
 observations; until then, the carried aggregate supplies the backoff.
 
+Canonical chat also records passive inference economics without another model
+call or weight read. Each completed request contributes a prompt-free,
+content-addressed receipt over target/saved forwards, time, source and logical
+bytes, RSS, draft yield, MLP pages, O1 value, terminal reward, and warm savings.
+Immutable event segments form a hash chain; a bounded rollup reports cumulative
+work and the largest avoidable byte-cost class. `/stats` displays the current
+and cumulative result. JSON mode includes the receipt and rollup directly.
+Telemetry is fail-open for the answer. Portable deployments select the ledger
+with `--inference-economics-state` or
+`IMMER_QWEN38_INFERENCE_ECONOMICS`; `--no-inference-economics` disables it.
+
 Markov state v6 also retains prompt/output boundaries for composition. Two or
 more distinct target-confirmed bindings can induce literal/copy programs over a
 bounded 64-token prompt suffix. An unseen slot is materialized as ordinary
