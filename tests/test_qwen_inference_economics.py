@@ -117,6 +117,7 @@ class InferenceEconomicsReceiptTests(unittest.TestCase):
         )
         self.assertEqual(receipt.target_forwards, 3)
         self.assertEqual(receipt.saved_qwen_forwards, 1)
+        self.assertFalse(receipt.warm_hit)
         self.assertEqual(receipt.accepted_draft_tokens, 2)
         self.assertEqual(receipt.proposed_draft_tokens, 3)
         self.assertEqual(receipt.target_source_body_bytes, 500)

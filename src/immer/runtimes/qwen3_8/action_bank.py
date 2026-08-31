@@ -67,7 +67,7 @@ def _nonnegative_float(value: object, label: str) -> float:
 def _actions(receipt: InferenceEconomicsReceipt) -> tuple[str, ...]:
     if receipt.fertig_exact:
         return ("fertig_exact",)
-    if receipt.warm_hit:
+    if receipt.warm_hit and receipt.target_forwards == 0:
         return ("stored_result",)
     actions = []
     if receipt.draft_active:
@@ -161,7 +161,9 @@ class InferenceActionReceipt:
                 "schema": "immer.qwen3.8-action-input-contract/v1",
             }
         )
-        zero_forward_action = receipt.warm_hit or receipt.fertig_exact
+        zero_forward_action = (
+            receipt.warm_hit and receipt.target_forwards == 0
+        ) or receipt.fertig_exact
         return cls(
             request_sha256=receipt.request_sha256,
             economics_receipt_sha256=receipt.sha256,

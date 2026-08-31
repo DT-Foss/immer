@@ -82,6 +82,19 @@ class InferenceActionReceiptTests(unittest.TestCase):
         )
         self.assertNotIn("question:one", json.dumps(receipt.to_document()))
 
+    def test_legacy_draft_savings_flag_cannot_impersonate_a_zero_forward_hit(
+        self,
+    ) -> None:
+        economics = _economics("legacy-cold", warm=True, target=3, saved=1)
+        receipt = InferenceActionReceipt.from_economics(economics)
+        self.assertEqual(
+            receipt.actions,
+            ("dynamic_mlp_pages", "qwen_target", "target_verified_draft"),
+        )
+        self.assertEqual(receipt.target_forwards, 3)
+        self.assertEqual(receipt.accepted_draft_tokens, 1)
+        self.assertEqual(receipt.source_body_bytes, 100)
+
 
 class InferenceActionBankTests(unittest.TestCase):
     def test_observe_restart_duplicate_and_ranking(self) -> None:

@@ -131,6 +131,15 @@ def _saved_qwen_forwards(
     return max(0, generated - target)
 
 
+def _authenticated_warm_execution(result: Result, route: str) -> bool:
+    receipt = _mapping(_mapping(result.evidence).get("receipt"))
+    accounting = _mapping(_mapping(receipt.get("ooe")).get("accounting"))
+    return "saved_qwen_forwards" in accounting or (
+        route.startswith("ooe_")
+        and route not in {"ooe_failure", "ooe_integrity_error"}
+    )
+
+
 def _proposed_draft_tokens(draft: Mapping[str, Any]) -> int:
     direct = draft.get("proposed_draft_tokens")
     if isinstance(direct, int) and not isinstance(direct, bool) and direct >= 0:
@@ -373,11 +382,7 @@ def receipt_from_result(
             }
         )
     saved_forwards = _saved_qwen_forwards(result, generation)
-    warm_hit = saved_forwards > 0 or (
-        result.ok
-        and route.startswith("ooe_")
-        and route not in {"ooe_failure", "ooe_integrity_error"}
-    )
+    warm_hit = result.ok and _authenticated_warm_execution(result, route)
     receipt = InferenceEconomicsReceipt(
         request_sha256=(
             request_digest
@@ -488,7 +493,11 @@ def _accumulate(
     result["saved_pages"] += receipt.saved_pages
     result["total_generation_seconds"] += receipt.generation_seconds
     result["total_request_wall_seconds"] += receipt.request_wall_seconds
-    result["warm_hits"] += int(receipt.warm_hit)
+    result["warm_hits"] += int(
+        receipt.warm_hit
+        and receipt.target_forwards == 0
+        and receipt.status == "ok"
+    )
     result["draft_requests"] += int(receipt.draft_active)
     result["page_requests"] += int(receipt.page_active)
     work = dict(result["avoidable_work_bytes"])
