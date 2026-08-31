@@ -47,7 +47,9 @@ def _fixture(root: Path) -> tuple[Path, Path]:
     (causal / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
     packed = causal / "q4-base-v3-mtp"
     packed.mkdir()
-    (packed / "tensor.q4_0.bin").write_bytes(b"packed")
+    weights = packed / "weights"
+    weights.mkdir()
+    (weights / "tensor.q4_0.bin").write_bytes(b"packed")
     _write_document(
         root / "bundle.json",
         QWEN38_BUNDLE_SCHEMA,
@@ -130,7 +132,7 @@ class QwenLocalInstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             tokenizer, packed = _fixture(root)
-            (packed / "tensor.q4_0.bin").write_bytes(b"short")
+            (packed / "weights" / "tensor.q4_0.bin").write_bytes(b"short")
             with (
                 patch(
                     "immer.runtimes.qwen3_8.local_install.Qwen38Config.from_file"

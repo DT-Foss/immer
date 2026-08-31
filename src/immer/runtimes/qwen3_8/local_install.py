@@ -215,7 +215,11 @@ def inspect_local_qwen(
     for row in tensors:
         if not isinstance(row, Mapping):
             raise QwenLocalInstallError("Qwen Q4/Q8 tensor entry is invalid")
-        path = _safe_child(packed, row.get("file"), "Qwen Q4/Q8 tensor")
+        path = _safe_child(
+            packed / "weights",
+            row.get("file"),
+            "Qwen Q4/Q8 tensor",
+        )
         if path.name in tensor_files:
             raise QwenLocalInstallError("Qwen Q4/Q8 payload is listed twice")
         tensor_files.add(path.name)
