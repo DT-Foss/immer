@@ -450,6 +450,19 @@ entry records the real vector
 `dynamic_mlp_pages + target_verified_draft + qwen_target` with 29 target
 forwards and 10 saved forwards. No additional Qwen work created it.
 
+The bank now issues executable directives. A directive binds the question,
+current runtime, source action signatures, support, measured savings, primary
+action, and target-verified fallback. Qwen rejects a directive for another
+question. Stored actions can transfer across transport/code revisions because
+their own ResultCell/program verifier remains authoritative; positive draft
+economics can transfer because the current Qwen target still commits every
+token. The deployed bank has selected and executed three independent
+zero-forward classes: exact ResultCells, an unseen-slot parametric program, and
+FERTIG exact execution. Its seven-request state records two ResultCell hits
+(`58` forwards saved), two parametric `OMEGA` executions (`6` saved), two
+FERTIG exact executions (`0` target), and one cold target-verified draft vector
+(`10` forwards saved).
+
 Markov state v6 also retains prompt/output boundaries for composition. Two or
 more distinct target-confirmed bindings can induce literal/copy programs over a
 bounded 64-token prompt suffix. An unseen slot is materialized as ordinary
@@ -487,6 +500,7 @@ token work, and complete descriptor authority.
 
 | Trial | Result | Scope |
 |---|---:|---|
+| Active multi-class Action Bank | 7 requests; 3 independent zero-forward classes selected | question-bound directives selected two ResultCells (58 forwards saved), two unseen-slot parametric `OMEGA` programs (6 saved), and two FERTIG exact executions (0 target); one cold dynamic-page/target-verified-draft/Qwen vector saved 10 of 39 forwards; every primary retained a local Qwen target fallback |
 | Resident Qwen service | 39 generated tokens in 29 target forwards; 10 forwards saved (-25.64%) | one natural German one-sentence request through the auto-connected `0600` Unix socket; 24 draft tokens proposed, 11 accepted, EOS reached, 129.47 s generation, 1,739,022,336-byte peak RSS; one service PID owned the runtime and the corrected ledger recorded the request |
 | Carried-context MTP reliability | exact SOLARA recall with 35 reused Qwen tokens and a 318 KiB MTP carry | after carried-gap aggregation, turn 1 used 2 forwards / 13.75 s; turn 2 returned the omitted code in 10 tokens / 7 forwards / 34.62 s at 1.57 GiB peak. Carried updates grew 4→7, the `previous=1` aggregate reached Beta(7,1), carried misses stayed zero, and all 342 cold updates remained untouched. This used one fewer forward despite one more output token than the preceding VELORA observation; wall time fluctuated, so no latency claim is attached. Next work is higher-position/window learning from carried reliability, not another prompt cohort |
 | Deployed Markov/MTP hybrid | 23 → 11 Qwen forwards (-52.17%); 69.469500 → 49.448516 s (-28.82%, 1.405x) | same real prompt and identical target-confirmed prefix under a fixed 24-token cap against explicit Markov-only mode; accepted drafts rose 1 → 14; peak RSS changed 1,699,160,064 → 1,725,218,816 bytes (+1.53%); hybrid consumed 52,224 draft bytes and 58,201,088 target-source bytes (-52.17%) |

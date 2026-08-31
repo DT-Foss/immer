@@ -24,6 +24,24 @@ All notable changes to IMMER are recorded here.
   39 tokens, 29 target forwards, 10 saved, 24 proposed drafts, 11 accepted,
   129.48 seconds, and 1,739,022,336-byte peak RSS. Economics now reports zero
   warm hits for that request.
+- `1462c2f` turns the bank ranking into a question-bound runtime directive.
+  Exact stored actions become the primary route; profitable target-verified
+  drafting becomes the Qwen fallback. Qwen verifies the question hash and
+  treats the directive as an advisory execution choice, never as token
+  authority. `c891aab` carries the same directive through FERTIG and warm
+  zero-forward results. `1fe4ee4` transfers positive draft economics across
+  runtime-code revisions because the configured current target still verifies
+  every proposed token. A runtime without a compatible drafter simply keeps
+  its configured target path.
+- `3b4cc08` separates learned parametric programs from exact ResultCells in the
+  action identity. The live bank now contains seven normal requests and four
+  verified signatures: two ResultCell executions saved 58 target forwards;
+  two unseen-slot parametric executions returned `OMEGA` with zero target and
+  saved six; two FERTIG exact executions returned `6` with zero target; the
+  cold dynamic-page/draft/Qwen vector saved ten of 39 forwards. For both
+  `OMEGA` and the exact arithmetic request, the first request registered the
+  action and the second received and executed that action as its bank-selected
+  primary, with `qwen_target + target_verified_draft` retained as fallback.
 
 ## [1.0.0] — 2026-08-31
 
