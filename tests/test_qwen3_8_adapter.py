@@ -397,6 +397,16 @@ class _ExactBackend:
 
 
 class Qwen38CausalChatTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Beast has the real deployment tree. Unit tests must never let an
+        # auto-resolved CLI path write fixture receipts into production state.
+        deployment_state = patch(
+            "immer.cli._QWEN38_DEPLOYMENT_STATE",
+            Path("/__immer_test_no_deployment_state__"),
+        )
+        deployment_state.start()
+        self.addCleanup(deployment_state.stop)
+
     def test_markov_atlas_loads_once_and_binds_runtime_tokenizer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "atlas.bin"
