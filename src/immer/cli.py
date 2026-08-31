@@ -876,6 +876,20 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     if isinstance(largest, str) and largest:
                         summary += f" / next {largest}"
                     parts.append(summary)
+        action_bank = evidence.get("inference_action_bank")
+        if isinstance(action_bank, dict) and action_bank.get("status") in {
+            "recorded",
+            "duplicate",
+        }:
+            receipt = action_bank.get("receipt")
+            body = receipt.get("body") if isinstance(receipt, dict) else None
+            snapshot = action_bank.get("snapshot")
+            if isinstance(body, dict) and isinstance(body.get("actions"), list):
+                parts.append("actions " + "+".join(body["actions"]))
+            if isinstance(snapshot, dict):
+                requests = snapshot.get("requests")
+                if isinstance(requests, int) and not isinstance(requests, bool):
+                    parts.append(f"action bank {requests} requests")
         generation = evidence.get("generation")
         runtime_metrics = evidence.get("runtime_metrics")
         if not isinstance(generation, dict):
@@ -1628,6 +1642,8 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         )
         economics_ledger = None
         economics_initialization_error = None
+        action_bank = None
+        action_bank_initialization_error = None
         if economics_root is not None:
             try:
                 from .runtimes.qwen3_8.inference_economics import (
@@ -1635,10 +1651,18 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 )
 
                 economics_ledger = InferenceEconomicsLedger(economics_root)
-            except Exception as exc:
-                economics_initialization_error = (
-                    f"{type(exc).__module__}.{type(exc).__qualname__}"
+                from .runtimes.qwen3_8.action_bank import InferenceActionBank
+
+                action_bank = InferenceActionBank(
+                    economics_root.parent / "qwen-inference-action-bank-v1"
                 )
+                action_bank.reconcile(economics_ledger.receipts())
+            except Exception as exc:
+                error = f"{type(exc).__module__}.{type(exc).__qualname__}"
+                if economics_ledger is None:
+                    economics_initialization_error = error
+                else:
+                    action_bank_initialization_error = error
         economics_runtime_profile = (
             None
             if economics_root is None
@@ -1836,6 +1860,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             ).hexdigest()
             ordinal = economics_request_ordinal
             economics_request_ordinal += 1
+            action_evidence: dict[str, object] | None = None
             try:
                 request_identity = (
                     {
@@ -1877,6 +1902,26 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     "rollup": dict(observation.rollup),
                     "status": "duplicate" if observation.duplicate else "recorded",
                 }
+                try:
+                    if action_bank is None:
+                        raise RuntimeError(
+                            action_bank_initialization_error
+                            or "inference action bank is unavailable"
+                        )
+                    action_observation = action_bank.observe(observation.receipt)
+                    action_evidence = {
+                        "duplicate": action_observation.duplicate,
+                        "receipt": action_observation.receipt.to_document(),
+                        "snapshot": dict(action_observation.snapshot),
+                        "status": (
+                            "duplicate" if action_observation.duplicate else "recorded"
+                        ),
+                    }
+                except Exception as exc:
+                    action_evidence = {
+                        "error": f"{type(exc).__module__}.{type(exc).__qualname__}",
+                        "status": "error",
+                    }
             except Exception as exc:
                 economics_evidence = {
                     "error": f"{type(exc).__module__}.{type(exc).__qualname__}",
@@ -1884,6 +1929,8 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 }
             evidence = dict(result.evidence)
             evidence["inference_economics"] = economics_evidence
+            if action_evidence is not None:
+                evidence["inference_action_bank"] = action_evidence
             return Result(
                 result.status,
                 result.component,

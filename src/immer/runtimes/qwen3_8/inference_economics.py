@@ -702,6 +702,14 @@ class InferenceEconomicsLedger:
             self._write_rollup_unlocked(rollup)
             return dict(rollup)
 
+    def receipts(self) -> tuple[InferenceEconomicsReceipt, ...]:
+        """Return the immutable receipt sequence for derived local consumers."""
+
+        with self._thread_lock, self._locked():
+            events, rollup = self._restore_unlocked()
+            self._write_rollup_unlocked(rollup)
+            return tuple(receipt for _event_sha256, receipt in events)
+
     def observe(
         self,
         result: Result,

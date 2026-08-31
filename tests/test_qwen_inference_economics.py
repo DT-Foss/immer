@@ -194,6 +194,10 @@ class InferenceEconomicsLedgerTests(unittest.TestCase):
             )
             restarted = InferenceEconomicsLedger(root)
             self.assertEqual(restarted.snapshot(), snapshot)
+            self.assertEqual(
+                [receipt.request_sha256 for receipt in restarted.receipts()],
+                [first.receipt.request_sha256, second.receipt.request_sha256],
+            )
             state_bytes = b"".join(
                 path.read_bytes()
                 for path in sorted((root / "events").iterdir())

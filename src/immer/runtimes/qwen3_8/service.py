@@ -583,12 +583,18 @@ class UnixQwenServiceServer:
                 raise TypeError("service application returned a non-Result value")
             economics = result.evidence.get("inference_economics")
             if isinstance(economics, Mapping):
+                receipt_body: dict[str, object] = {
+                    "inference_economics": dict(economics)
+                }
+                action_bank = result.evidence.get("inference_action_bank")
+                if isinstance(action_bank, Mapping):
+                    receipt_body["inference_action_bank"] = dict(action_bank)
                 self._send_event(
                     connection,
                     request.request_id,
                     sequence,
                     "receipt",
-                    {"inference_economics": dict(economics)},
+                    receipt_body,
                 )
                 sequence += 1
             self._send_event(

@@ -44,6 +44,7 @@ from immer.runtimes.qwen3_8.markov_atlas import MarkovTokenAtlas
 from immer.runtimes.qwen3_8.hybrid_draft import (
     QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
 )
+from immer.runtimes.qwen3_8.action_bank import InferenceActionBank
 from immer.runtimes.qwen3_8.inference_economics import (
     InferenceEconomicsLedger,
 )
@@ -3591,7 +3592,13 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 single["evidence"]["inference_economics"]["status"],
                 "recorded",
             )
+            self.assertEqual(
+                single["evidence"]["inference_action_bank"]["status"],
+                "recorded",
+            )
             self.assertEqual(InferenceEconomicsLedger(economics).snapshot()["requests"], 1)
+            action_root = economics.parent / "qwen-inference-action-bank-v1"
+            self.assertEqual(InferenceActionBank(action_root).snapshot()["requests"], 1)
 
             jsonl_runtime = _Runtime()
             jsonl_qwen = _chat(jsonl_runtime)
@@ -3635,6 +3642,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 )
             )
             self.assertEqual(InferenceEconomicsLedger(economics).snapshot()["requests"], 3)
+            self.assertEqual(InferenceActionBank(action_root).snapshot()["requests"], 3)
 
             interactive_runtime = _Runtime()
             interactive_qwen = _chat(interactive_runtime)
@@ -3671,6 +3679,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 InferenceEconomicsLedger(economics).snapshot()["requests"],
                 4,
             )
+            self.assertEqual(InferenceActionBank(action_root).snapshot()["requests"], 4)
 
             blocked = Path(temporary) / "blocked-ledger"
             blocked.write_text("not a directory", encoding="utf-8")

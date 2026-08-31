@@ -39,7 +39,11 @@ class _Application:
                     "inference_economics": {
                         "status": "recorded",
                         "rollup": {"requests": len(self.requests)},
-                    }
+                    },
+                    "inference_action_bank": {
+                        "status": "recorded",
+                        "snapshot": {"requests": len(self.requests)},
+                    },
                 },
             )
         if request.operation == "clear":
@@ -268,6 +272,8 @@ class UnixQwenServiceTests(unittest.TestCase):
                 [event.event for event in first.events],
                 ["started", "candidate_delta", "progress", "receipt", "final"],
             )
+            receipt = next(event for event in first.events if event.event == "receipt")
+            self.assertIn("inference_action_bank", receipt.body)
             self.assertEqual(clear.result.output, "cleared")
             self.assertEqual(stats.result.output["requests"], 4)
             self.assertEqual(ping.result.output, "pong")
