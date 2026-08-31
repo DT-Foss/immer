@@ -418,10 +418,15 @@ The same cold stream induces parametric Markov programs when two distinct
 ResultCells prove the same deterministic span transformation. Copy and case
 operators are promoted from whole-result consequences, not predefined prompt
 phrases. A new slot under the learned static context can then execute without
-Qwen. Conflicting transforms, insufficient support, FERTIG mismatches, wrong
+Qwen. The same engine now learns two-slot programs: both positions must vary
+independently across distinct ResultCells before learned delimiters, slot order,
+and case transforms may execute an unseen pair. Conflicting transforms,
+insufficient support, partial candidate derivation, FERTIG mismatches, wrong
 prompt-token identity, non-ASCII output, or output beyond `max_new_tokens`
-abstain. Executable template descriptors live only in the explicitly private
-per-profile store and are revalidated against their source ResultCells.
+abstain. Executable descriptors remain private. A stable v1→v2 state migration
+preserves single-slot programs, and compatible observations cross later runtime
+profiles only after the shared ResultCell bank revalidates question, output,
+token work, and complete descriptor authority.
 
 ## Selected trial evidence
 

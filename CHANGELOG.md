@@ -2,13 +2,27 @@
 
 All notable changes to IMMER are recorded here.
 
-## [Unreleased] — 2026-08-30
+## [Unreleased] — 2026-08-31
 
-Runtime commits through `1f9687b` are deployed on the canonical server.
+Runtime commits through `53fcde6` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `53fcde6` extended consequence-grounded warm execution from one variable
+  slot to two. Two independent ResultCells must vary both slot positions before
+  a program can promote; learned delimiters, slot order, and
+  Identity/Upper/Lower/Casefold transforms then execute an unseen pair with
+  zero Qwen forwards. Every stored descriptor reconstructs its complete source
+  question and output, rederives the full bounded candidate set on restore,
+  and rejects ambiguity, partial derivation, validly rehashed descriptor
+  changes, repeated support, and partial capacity admission. The stable state
+  name migrates v1 payloads to v2 on first mutation without splitting old and
+  new writers. New runtime profiles import compatible v1/v2 observations from
+  sibling roots only after revalidating their ResultCells; corrupt or stale
+  siblings cannot block the current mount. Existing accounting remains local
+  to its producer profile. The cut passes 178 focused local and 178 focused
+  server tests plus 55 subtests without a model run.
 - `1f9687b` separated exact output identity from transport/controller identity.
   Every successful local Qwen result now carries a stable output-semantics
   receipt over the complete rendered chat, token trace, model, Q4 math,
