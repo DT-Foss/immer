@@ -1744,7 +1744,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             prompt_token_ids=(11, 12),
             generated_token_ids=(7, 8, 9, 10),
             forward_passes=2,
-            rounds=(object(),),
+            rounds=(SimpleNamespace(proposed_token_ids=(7, 8, 9, 10)),),
             schema="immer.qwen3.8-rolling-k4-speculative-generation/v1",
             final_state_committed=False,
         )
@@ -1766,6 +1766,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(result.evidence["generation"]["forward_passes"], 2)
         self.assertEqual(result.evidence["generation"]["source_body_bytes"], 100)
         self.assertEqual(result.evidence["draft"]["accepted_draft_tokens"], 4)
+        self.assertEqual(result.evidence["draft"]["proposed_draft_tokens"], 4)
         self.assertEqual(result.evidence["draft"]["draft_linear_calls"], 3)
         self.assertEqual(result.evidence["draft"]["target_source_body_bytes"], 100)
         self.assertEqual(result.evidence["draft"]["total_source_body_bytes"], 132)
@@ -2892,7 +2893,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(len(code_revision), 64)
         self.assertEqual(
             opener.call_args.kwargs["template_output_character_limit"],
-            64,
+            128,
         )
         self.assertTrue(callable(opener.call_args.kwargs["prompt_token_verifier"]))
         self.assertTrue(callable(opener.call_args.kwargs["semantic_key_verifier"]))

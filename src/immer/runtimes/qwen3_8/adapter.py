@@ -2612,6 +2612,10 @@ class Qwen38CausalChat:
             )
             self._last_draft_evidence = {
                 "accepted_draft_tokens": evidence.accepted_draft_tokens,
+                "proposed_draft_tokens": sum(
+                    len(getattr(row, "proposed_token_ids", ()))
+                    for row in evidence.rounds
+                ),
                 "configured_mode": configured_draft_mode,
                 "mode": effective_draft_mode,
                 "state_reuse_provider_downgrade": (

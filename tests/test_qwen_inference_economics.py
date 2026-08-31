@@ -82,7 +82,7 @@ def _wrapped_warm_result() -> Result:
         "question_sha256": _sha("question"),
         "qwen": {
             "draft": {
-                "accepted_draft_tokens": 0,
+                "accepted_draft_tokens": 2,
                 "draft_source_body_bytes": 0,
                 "target_source_body_bytes": 0,
             },
@@ -116,6 +116,7 @@ class InferenceEconomicsReceiptTests(unittest.TestCase):
             runtime_profile_sha256=_sha("profile"),
         )
         self.assertEqual(receipt.target_forwards, 3)
+        self.assertEqual(receipt.saved_qwen_forwards, 1)
         self.assertEqual(receipt.accepted_draft_tokens, 2)
         self.assertEqual(receipt.proposed_draft_tokens, 3)
         self.assertEqual(receipt.target_source_body_bytes, 500)
@@ -139,6 +140,8 @@ class InferenceEconomicsReceiptTests(unittest.TestCase):
         self.assertTrue(receipt.warm_hit)
         self.assertEqual(receipt.target_forwards, 0)
         self.assertEqual(receipt.saved_qwen_forwards, 4)
+        self.assertEqual(receipt.accepted_draft_tokens, 2)
+        self.assertEqual(receipt.proposed_draft_tokens, 2)
         self.assertEqual(receipt.route, "ooe_verification_abstained")
         forged = _wrapped_warm_result()
         forged_receipt = dict(forged.evidence["receipt"])
@@ -184,7 +187,7 @@ class InferenceEconomicsLedgerTests(unittest.TestCase):
             snapshot = ledger.snapshot()
             self.assertEqual(snapshot["requests"], 2)
             self.assertEqual(snapshot["target_forwards"], 3)
-            self.assertEqual(snapshot["saved_qwen_forwards"], 4)
+            self.assertEqual(snapshot["saved_qwen_forwards"], 5)
             self.assertEqual(
                 snapshot["largest_avoidable_cost_class"],
                 "target_fallback",

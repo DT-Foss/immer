@@ -345,6 +345,7 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                 "accepted_draft_tokens",
                 "draft_source_body_bytes",
                 "mode",
+                "proposed_draft_tokens",
                 "rounds",
                 "target_source_body_bytes",
                 "total_source_body_bytes",

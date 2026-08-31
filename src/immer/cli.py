@@ -3124,7 +3124,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--draft-max-resident-mb", type=int, default=64)
     chat.add_argument("--fast-mlp-max-resident-mb", type=int)
     chat.add_argument("--max-prompt-tokens", type=int, default=1024)
-    chat.add_argument("--max-new-tokens", type=int, default=64)
+    chat.add_argument("--max-new-tokens", type=int, default=128)
     chat.add_argument("--max-context-tokens", type=int, default=2048)
     chat.add_argument("--head-block-rows", type=int, default=2048)
     chat.add_argument(

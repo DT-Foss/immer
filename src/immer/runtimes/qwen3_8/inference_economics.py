@@ -118,10 +118,17 @@ def _generation_and_context(
     )
 
 
-def _saved_qwen_forwards(result: Result) -> int:
+def _saved_qwen_forwards(
+    result: Result,
+    generation: Mapping[str, Any],
+) -> int:
     receipt = _mapping(_mapping(result.evidence).get("receipt"))
     accounting = _mapping(_mapping(receipt.get("ooe")).get("accounting"))
-    return _uint(accounting.get("saved_qwen_forwards"))
+    if "saved_qwen_forwards" in accounting:
+        return _uint(accounting.get("saved_qwen_forwards"))
+    generated = _uint(generation.get("generated_tokens"))
+    target = _uint(generation.get("forward_passes"))
+    return max(0, generated - target)
 
 
 def _proposed_draft_tokens(draft: Mapping[str, Any]) -> int:
@@ -321,7 +328,7 @@ def receipt_from_result(
     q4_request = _mapping(q4.get("request"))
     page_request = _mapping(page.get("request"))
     accepted = _uint(draft.get("accepted_draft_tokens"))
-    proposed = _proposed_draft_tokens(draft)
+    proposed = max(accepted, _proposed_draft_tokens(draft))
     target_bytes = _uint(draft.get("target_source_body_bytes"))
     draft_bytes = _uint(draft.get("draft_source_body_bytes"))
     source_bytes = _uint(generation.get("source_body_bytes"))
@@ -365,7 +372,7 @@ def receipt_from_result(
                 "status": result.status.value,
             }
         )
-    saved_forwards = _saved_qwen_forwards(result)
+    saved_forwards = _saved_qwen_forwards(result, generation)
     warm_hit = saved_forwards > 0 or (
         result.ok
         and route.startswith("ooe_")
