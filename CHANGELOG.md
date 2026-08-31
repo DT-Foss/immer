@@ -4,11 +4,22 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased] — 2026-08-31
 
-Runtime commits through `8afadd1` are deployed on the canonical server.
+Runtime commits through `74a9c1c` are deployed on the canonical server.
 “Unreleased” denotes the absence of a tagged public release.
 
 ### Self-improving Markov runtime
 
+- `74a9c1c` corrected the economics exposed by the first natural service
+  request. Draft savings are now the exact difference between generated tokens
+  and executed target forwards; authenticated zero-forward Warm/ResultCell
+  accounting remains authoritative and cannot double-count the stored cold
+  draft trace. The adapter also exports the actual staged proposal count
+  instead of forcing Economics to infer it from a compact round total. The
+  live request generated 64 tokens in 43 target forwards with 21 accepted
+  drafts, so the corrected saved-forward value is 21 rather than zero. That
+  request reached the former 64-token default before EOS and cut its second
+  sentence. Normal chat now allows 128 output tokens by default; per-request
+  execution still stops immediately on EOS.
 - `8afadd1` made canonical Qwen inference a resident local service. One
   `Qwen38CausalChat`/`QwenFertigChat` mount now serves single, JSONL, and
   interactive clients through a hash-bound Unix-socket protocol with mode

@@ -351,6 +351,8 @@ the general-chat language intact. `--raw-qwen` bypasses the normal
 FERTIG-first route. Normal single-request chat shows live token progress while
 stdout remains exactly the final FERTIG-routed answer. `--raw-qwen` streams the
 actual decoder text, and `--no-stream` buffers either mode until completion.
+Normal chat allows up to 128 generated tokens and stops earlier on the model's
+EOS token; `--max-new-tokens` changes that ceiling.
 
 `immer chat --service` owns one canonical Qwen3.8/FERTIG runtime behind a
 local Unix socket with mode `0600`. Single, JSONL, and interactive clients send
@@ -419,6 +421,9 @@ Canonical chat also records passive inference economics without another model
 call or weight read. Each completed request contributes a prompt-free,
 content-addressed receipt over target/saved forwards, time, source and logical
 bytes, RSS, draft yield, MLP pages, O1 value, terminal reward, and warm savings.
+Draft savings equal generated tokens minus executed target forwards. A
+Warm/ResultCell receipt supplies its authenticated saved-forward count instead,
+so replay never double-counts the cold run's original drafts.
 Immutable event segments form a hash chain; a bounded rollup reports cumulative
 work and the largest avoidable byte-cost class. `/stats` displays the current
 and cumulative result. JSON mode includes the receipt and rollup directly.
