@@ -17,6 +17,7 @@ from immer.contracts import ExecutionStatus, Request, Result
 from immer.runtimes.ooe.chat import OoeChatAttempt, OoeChatHook
 from immer.runtimes.ooe.controller import WarmAccountingReceipt
 from immer.runtimes.qwen3_8.inference_economics import receipt_from_result
+from immer.runtimes.qwen3_8.action_bank import InferenceActionDirective
 
 
 MATH_QUESTION = "What is 500?"
@@ -183,6 +184,16 @@ class QwenFertigChatTests(unittest.TestCase):
         hook.abstention_commit_authorized = lambda _attempt: True
         hook.observe_cold = lambda *_args, **_kwargs: {}
         qwen = _Qwen(RuntimeError("Qwen must not run on semantic replay"))
+        directive = InferenceActionDirective(
+            question_sha256=hashlib.sha256(MATH_QUESTION.encode("utf-8")).hexdigest(),
+            runtime_profile_sha256="4" * 64,
+            primary_actions=("stored_result",),
+            fallback_actions=("qwen_target",),
+            draft_enabled=None,
+            source_signature_sha256s=("5" * 64,),
+            support=1,
+            saved_qwen_forwards=3,
+        )
         with _patched_solver(
             None,
             _verification(
@@ -192,7 +203,11 @@ class QwenFertigChatTests(unittest.TestCase):
             ),
         ) as (fertig, _, verify):
             result = QwenFertigChat(qwen, fertig, ooe_hook=hook).handle(
-                Request("chat", MATH_QUESTION)
+                Request(
+                    "chat",
+                    MATH_QUESTION,
+                    {"qwen_inference_action_directive": directive.to_document()},
+                )
             )
 
         self.assertEqual(result.output, "500")
@@ -205,6 +220,10 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertEqual(
             receipt["ooe"]["accounting"]["saved_qwen_forwards"],
             3,
+        )
+        self.assertEqual(
+            result.evidence["inference_action_directive"]["applied"],
+            {"actions": ["stored_result"], "route": "ooe_verified"},
         )
 
     def test_qwen_receipt_keeps_compact_markov_atlas_runtime_progress(self) -> None:

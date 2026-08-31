@@ -705,6 +705,71 @@ class QwenFertigChat:
                 reason="chat payload must be non-empty text",
             )
         question = request.payload.strip()
+        action_directive = None
+        raw_action_directive = (
+            request.metadata.get("qwen_inference_action_directive")
+            if isinstance(request.metadata, Mapping)
+            else None
+        )
+        if raw_action_directive is not None:
+            try:
+                from ..runtimes.qwen3_8.action_bank import InferenceActionDirective
+
+                action_directive = InferenceActionDirective.from_document(
+                    raw_action_directive
+                )
+            except (RuntimeError, TypeError, ValueError) as exc:
+                return Result(
+                    ExecutionStatus.REJECTED,
+                    self.name,
+                    reason=f"invalid inference action directive: {exc}",
+                )
+            if action_directive.question_sha256 != _text_sha256(question):
+                return Result(
+                    ExecutionStatus.REJECTED,
+                    self.name,
+                    reason="inference action directive belongs to another question",
+                )
+
+        def attach_action_directive(result: Result) -> Result:
+            if action_directive is None:
+                return result
+            evidence = dict(result.evidence)
+            receipt = evidence.get("receipt")
+            body = receipt if isinstance(receipt, Mapping) else {}
+            route = body.get("route")
+            actions = []
+            if route == "fertig_exact_short_circuit":
+                actions.append("fertig_exact")
+            elif isinstance(route, str) and route.startswith("ooe_"):
+                actions.append("stored_result")
+            else:
+                qwen = body.get("qwen")
+                if isinstance(qwen, Mapping):
+                    if isinstance(qwen.get("mlp_page_route"), Mapping):
+                        actions.append("dynamic_mlp_pages")
+                    if isinstance(qwen.get("draft"), Mapping):
+                        actions.append("target_verified_draft")
+                    generation = qwen.get("generation")
+                    if isinstance(generation, Mapping) and isinstance(
+                        generation.get("forward_passes"),
+                        int,
+                    ) and generation.get("forward_passes", 0) > 0:
+                        actions.append("qwen_target")
+            evidence["inference_action_directive"] = {
+                "applied": {
+                    "actions": sorted(actions),
+                    "route": route,
+                },
+                "directive": action_directive.to_document(),
+            }
+            return Result(
+                result.status,
+                result.component,
+                output=result.output,
+                reason=result.reason,
+                evidence=evidence,
+            )
 
         with self._lock:
             if self._closed:
@@ -728,15 +793,17 @@ class QwenFertigChat:
                 preflight = {"status": "error", **_failure(exc)}
             if certificate is not None:
                 certified = _certified_payload(certificate)
-                return self._result(
-                    question=question,
-                    route="fertig_exact_short_circuit",
-                    output=certificate.answer,
-                    status=ExecutionStatus.OK,
-                    reason=None,
-                    candidate=None,
-                    qwen=None,
-                    fertig={"certificate": certified, "status": "certified"},
+                return attach_action_directive(
+                    self._result(
+                        question=question,
+                        route="fertig_exact_short_circuit",
+                        output=certificate.answer,
+                        status=ExecutionStatus.OK,
+                        reason=None,
+                        candidate=None,
+                        qwen=None,
+                        fertig={"certificate": certified, "status": "certified"},
+                    )
                 )
 
             qwen_called = False
@@ -838,12 +905,14 @@ class QwenFertigChat:
                 }
 
             def finish(result: Result) -> Result:
-                return self._attach_cold_observation(
-                    result,
-                    question=question,
-                    metadata=request.metadata,
-                    qwen_result=qwen_result,
-                    qwen_called=qwen_called,
+                return attach_action_directive(
+                    self._attach_cold_observation(
+                        result,
+                        question=question,
+                        metadata=request.metadata,
+                        qwen_result=qwen_result,
+                        qwen_called=qwen_called,
+                    )
                 )
 
             def settle_warm(*, accept: bool) -> Result | None:
