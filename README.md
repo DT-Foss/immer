@@ -438,6 +438,18 @@ Telemetry is fail-open for the answer. Portable deployments select the ledger
 with `--inference-economics-state` or
 `IMMER_QWEN38_INFERENCE_ECONOMICS`; `--no-inference-economics` disables it.
 
+The v2 Action Bank consumes that same immutable receipt sequence. Every normal
+request becomes a content-addressed action contract over the runtime profile,
+question hash, verified result, executed action vector, target/saved forwards,
+bytes, wall time, and RSS. The catalog covers stored results, parametric
+programs, ComputeCrystals, batteries, Prefix-Sinkhorn, MLP/head coordinates,
+drafting, suffix execution, and the full Qwen target. Unexecuted classes remain
+at zero evidence. Atomic per-request events rebuild from Economics after a
+crash; Action Bank failure remains fail-open for the answer. The first deployed
+entry records the real vector
+`dynamic_mlp_pages + target_verified_draft + qwen_target` with 29 target
+forwards and 10 saved forwards. No additional Qwen work created it.
+
 Markov state v6 also retains prompt/output boundaries for composition. Two or
 more distinct target-confirmed bindings can induce literal/copy programs over a
 bounded 64-token prompt suffix. An unseen slot is materialized as ordinary

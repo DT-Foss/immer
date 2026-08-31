@@ -4,6 +4,27 @@ All notable changes to IMMER are recorded here.
 
 ## [Unreleased]
 
+### Stored-compute v2
+
+- `55c9983` derives a passive content-addressed Action Bank from every normal
+  Inference Economics receipt. Each request produces an input-contract hash,
+  runtime-bound action signature, result/quality authority, actual target and
+  saved forwards, draft proposal/acceptance counts, bytes, wall time, and RSS.
+  The catalog spans ResultCells, parametric programs, ComputeCrystals,
+  continuation batteries, Prefix-Sinkhorn, MLP/head coordinates, embedded and
+  external drafting, Qwen suffixes, and the full target; only classes actually
+  executed by a request gain evidence. Events are atomic, idempotent, and
+  reconstructible from the authoritative Economics chain after a crash. The
+  service receipt stream and `/stats` expose the current action vector and
+  bank size without another model call or weight read.
+- `e1099d1` separates speculative savings from zero-forward execution. A cold
+  request with saved draft forwards cannot identify as a ResultCell; Warm/OoE
+  requires zero target forwards. The deployed bank reconstructed its existing
+  product request as `dynamic_mlp_pages + target_verified_draft + qwen_target`:
+  39 tokens, 29 target forwards, 10 saved, 24 proposed drafts, 11 accepted,
+  129.48 seconds, and 1,739,022,336-byte peak RSS. Economics now reports zero
+  warm hits for that request.
+
 ## [1.0.0] — 2026-08-31
 
 Runtime commits through `6c9aaad` are deployed on the canonical server.
