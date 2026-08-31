@@ -124,6 +124,9 @@ _QWEN38_DEPLOYMENT_DRAFT_WINDOW_STATE = (
 _QWEN38_DEPLOYMENT_INFERENCE_ECONOMICS = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-inference-economics-v1"
 )
+_QWEN38_DEPLOYMENT_SERVICE_SOCKET = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen3.8-service.sock"
+)
 _QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v47"
 _QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v28"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
@@ -247,6 +250,8 @@ def _resolve_qwen38_inference_economics(
             "are mutually exclusive"
         )
     if disabled:
+        if bool(getattr(args, "service", False)):
+            raise ValueError("the Qwen service requires inference economics")
         return None
     configured = _chat_path(
         configured_value,
@@ -259,7 +264,126 @@ def _resolve_qwen38_inference_economics(
         and _QWEN38_DEPLOYMENT_STATE.is_dir()
     ):
         return _QWEN38_DEPLOYMENT_INFERENCE_ECONOMICS
+    if bool(getattr(args, "service", False)):
+        service_socket = getattr(args, "service_socket", None)
+        if service_socket is None:
+            raise ValueError("the Qwen service socket is unresolved")
+        return Path(service_socket).parent / "qwen-inference-economics-v1"
     return None
+
+
+def _resolve_qwen38_service_socket(
+    args: argparse.Namespace,
+    bundle_path: Path,
+) -> Path:
+    configured = _chat_path(
+        getattr(args, "service_socket", None),
+        "IMMER_QWEN38_SOCKET",
+    )
+    if configured is not None:
+        return configured
+    if (
+        bundle_path == _QWEN38_DEPLOYMENT_ROOT
+        and _QWEN38_DEPLOYMENT_STATE.is_dir()
+    ):
+        return _QWEN38_DEPLOYMENT_SERVICE_SOCKET
+    return (Path.home() / ".immer" / "qwen3.8-service.sock").absolute()
+
+
+def _qwen38_service_profile(
+    args: argparse.Namespace,
+    *,
+    bundle_path: Path,
+    tokenizer_path: Path,
+    q4_root: Path | None,
+    fast_mlp_root: Path | None,
+    warm_root: Path | None,
+    draft_mode: str | None,
+    markov_draft_state: str | None,
+    mtp_draft_state: str | None,
+    markov_atlas_path: Path | None,
+    markov_o1_retention_path: Path | None,
+    mlp_page_state_path: Path | None,
+    draft_window_state_path: Path | None,
+    runtime_code_revision: str,
+) -> str:
+    """Bind socket clients to the exact output-affecting runtime configuration."""
+
+    argument_names = (
+        "compute_dtype",
+        "delta_head_online_state",
+        "device",
+        "draft_bundle",
+        "draft_max_resident_mb",
+        "draft_source_budget_mb",
+        "draft_window",
+        "exact_head",
+        "exact_head_max_mb",
+        "fast_mlp_blocks",
+        "fast_mlp_layers",
+        "fast_mlp_max_resident_mb",
+        "fast_mlp_online_state",
+        "fast_mlp_policy",
+        "fast_mlp_source_budget_mb",
+        "head_block_rows",
+        "inference_economics_state",
+        "max_context_tokens",
+        "max_new_tokens",
+        "max_prompt_tokens",
+        "max_resident_mb",
+        "mlp_page_width",
+        "no_inference_economics",
+        "q4_threads",
+        "qwen38_anchor_cache",
+        "range_markov_state",
+        "range_prefetch_beam_horizon",
+        "range_prefetch_beam_width",
+        "range_prefetch_hint_cooldown",
+        "range_prefetch_max_mb",
+        "range_prefetch_min_confidence",
+        "range_prefetch_min_support",
+        "raw_qwen",
+        "source_budget_mb",
+        "system_prompt",
+    )
+
+    def normalized(value: object) -> object:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, tuple):
+            return list(value)
+        return value
+
+    profile = {
+        "arguments": {
+            name: normalized(getattr(args, name, None)) for name in argument_names
+        },
+        "paths": {
+            "bundle": str(bundle_path),
+            "draft_window_state": normalized(draft_window_state_path),
+            "fast_mlp": normalized(fast_mlp_root),
+            "markov_atlas": normalized(markov_atlas_path),
+            "markov_draft_state": markov_draft_state,
+            "markov_o1_retention": normalized(markov_o1_retention_path),
+            "mlp_page_state": normalized(mlp_page_state_path),
+            "mtp_draft_state": mtp_draft_state,
+            "q4": normalized(q4_root),
+            "tokenizer": str(tokenizer_path),
+            "warm_root": normalized(warm_root),
+        },
+        "draft_mode": draft_mode,
+        "runtime_code_revision": runtime_code_revision,
+        "schema": "immer.qwen3.8-service-profile/v1",
+    }
+    return hashlib.sha256(
+        json.dumps(
+            profile,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
 
 
 def _resolve_qwen38_markov_draft(
@@ -597,6 +721,7 @@ class _LiveProgressWriter:
             self._stream.write("\r\x1b[2K")
             self._stream.flush()
         self._active = False
+        self._tokens = 0
 
 
 def _components() -> int:
@@ -648,15 +773,25 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
     )
     from .runtimes.qwen3_8.draft_window import DraftWindowError
     from .runtimes.qwen3_8.semantic_state_cache import SemanticStateAnchorCache
+    from .runtimes.qwen3_8.service import (
+        QwenChatServiceApplication,
+        QwenServiceError,
+        SnapshotEventBridge,
+        UnixQwenServiceClient,
+        UnixQwenServiceServer,
+    )
 
     component = None
     jsonl = bool(getattr(args, "jsonl", False))
     interactive = bool(getattr(args, "interactive", False))
+    service = bool(getattr(args, "service", False))
+    direct = bool(getattr(args, "direct", False))
     message = getattr(args, "message", None)
     max_requests = getattr(args, "max_requests", None)
     output_mode = getattr(args, "output", None) or ("json" if jsonl else "text")
     stream_enabled = (
-        not jsonl
+        not service
+        and not jsonl
         and output_mode == "text"
         and not bool(getattr(args, "no_stream", False))
     )
@@ -1121,8 +1256,167 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     )
         return None if not parts else "[" + " · ".join(parts) + "]"
 
-    try:
+    def service_event_sink(event) -> None:
+        if event.event != "candidate_delta":
+            return
+        snapshot = event.body.get("snapshot")
+        if not isinstance(snapshot, str):
+            raise QwenServiceError("service candidate snapshot is invalid")
+        if live_writer is not None:
+            live_writer.update(snapshot)
+        elif progress_writer is not None:
+            progress_writer.update(snapshot)
+
+    def run_socket_frontend(client: UnixQwenServiceClient) -> int:
         if jsonl:
+            failures = 0
+            handled = 0
+            for raw in sys.stdin:
+                line = raw.strip()
+                if not line:
+                    continue
+                if max_requests is not None and handled >= max_requests:
+                    break
+                handled += 1
+                request_id = None
+                include_id = False
+                try:
+                    if line.startswith("{"):
+                        document = json.loads(line)
+                        if not isinstance(document, dict) or set(document) - {
+                            "id",
+                            "message",
+                        }:
+                            raise ValueError(
+                                "JSONL request must contain only id/message"
+                            )
+                        include_id = "id" in document
+                        request_id = document.get("id")
+                        line_message = document.get("message")
+                    else:
+                        line_message = line
+                    if not isinstance(line_message, str) or not line_message.strip():
+                        raise ValueError("JSONL request message must be non-empty text")
+                    internal_request_id = (
+                        hashlib.sha256(
+                            json.dumps(
+                                {
+                                    "external_id": request_id,
+                                    "message_sha256": hashlib.sha256(
+                                        line_message.strip().encode("utf-8")
+                                    ).hexdigest(),
+                                },
+                                allow_nan=False,
+                                ensure_ascii=True,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ).encode("ascii")
+                        ).hexdigest()
+                        if include_id
+                        else secrets.token_hex(16)
+                    )
+                    response = client.request(
+                        "chat",
+                        session_id=None,
+                        message=line_message,
+                        request_id=internal_request_id,
+                        event_sink=service_event_sink,
+                    )
+                    emit(
+                        response.result,
+                        request_id=request_id,
+                        include_id=include_id,
+                    )
+                    failures += int(not response.result.ok)
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    failures += 1
+                    emit_line_error(
+                        f"{type(exc).__name__}: {exc}",
+                        request_id=request_id,
+                        include_id=include_id,
+                    )
+                if max_requests is not None and handled >= max_requests:
+                    break
+            return 0 if failures == 0 else 2
+
+        if interactive:
+            failures = 0
+            handled = 0
+            terminal = sys.stdin.isatty() and sys.stdout.isatty()
+            session_id = f"interactive:{secrets.token_hex(16)}"
+            if terminal:
+                print(
+                    "IMMER local Qwen service — /help, /stats, /clear, /quit",
+                    flush=True,
+                )
+            while max_requests is None or handled < max_requests:
+                if terminal:
+                    print("you> ", end="", flush=True)
+                raw = sys.stdin.readline()
+                if raw == "":
+                    break
+                line_message = raw.strip()
+                if not line_message:
+                    continue
+                if line_message in {"/exit", "/quit"}:
+                    break
+                if line_message == "/help":
+                    print(
+                        "Enter any prompt. /stats shows the last real runtime cost. "
+                        "/clear drops conversation context. /quit disconnects while "
+                        "the local Qwen service stays loaded.",
+                        flush=True,
+                    )
+                    continue
+                if line_message == "/stats":
+                    response = client.request("stats", session_id=session_id)
+                    print(response.result.output, flush=True)
+                    continue
+                if line_message == "/clear":
+                    client.request("clear", session_id=session_id)
+                    if terminal:
+                        print("Conversation context cleared.", flush=True)
+                    continue
+                handled += 1
+                if terminal:
+                    print("immer> ", end="", flush=True)
+                response = client.request(
+                    "chat",
+                    session_id=session_id,
+                    message=line_message,
+                    event_sink=service_event_sink,
+                )
+                emit(response.result)
+                failures += int(not response.result.ok)
+                summary = interactive_summary(response.result)
+                if terminal and summary is not None:
+                    print(summary, file=sys.stderr, flush=True)
+                if live_writer is not None:
+                    live_writer.reset()
+            client.request("clear", session_id=session_id)
+            return 0 if failures == 0 else 2
+
+        response = client.request(
+            "chat",
+            session_id=None,
+            message=message,
+            event_sink=service_event_sink,
+        )
+        emit(response.result)
+        return 0 if response.result.ok else 2
+
+    try:
+        if service:
+            if direct:
+                raise ValueError("--service and --direct are mutually exclusive")
+            if message is not None or jsonl or interactive:
+                raise ValueError(
+                    "--service is mutually exclusive with a message, --jsonl, "
+                    "and --interactive"
+                )
+            if max_requests is not None:
+                raise ValueError("--max-requests does not apply to --service")
+        elif jsonl:
             if output_mode != "json":
                 raise ValueError("JSONL chat requires --output json")
             if message is not None:
@@ -1151,6 +1445,8 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         bundle_path, tokenizer_path, q4_root, fast_mlp_root = (
             _resolve_qwen38_chat_paths(args)
         )
+        service_socket = _resolve_qwen38_service_socket(args, bundle_path)
+        args.service_socket = service_socket
         draft_mode, markov_draft_state, mtp_draft_state = _resolve_qwen38_markov_draft(
             args,
             bundle_path,
@@ -1255,8 +1551,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         else:
             anchor_cache_path = args.qwen38_anchor_cache
         args.qwen38_anchor_cache = anchor_cache_path
+        runtime_code_revision = _qwen38_runtime_code_revision()
         warm_runtime_code_revision = (
-            None if args.raw_qwen else _qwen38_runtime_code_revision()
+            None if args.raw_qwen else runtime_code_revision
         )
         warm_profile_sha256 = (
             None
@@ -1273,6 +1570,48 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 runtime_code_revision=warm_runtime_code_revision,
             )
         )
+        warm_root = (
+            None
+            if args.raw_qwen
+            else _resolve_qwen38_warm_root(args, bundle_path)
+        )
+        service_profile_sha256 = _qwen38_service_profile(
+            args,
+            bundle_path=bundle_path,
+            tokenizer_path=tokenizer_path,
+            q4_root=q4_root,
+            fast_mlp_root=fast_mlp_root,
+            warm_root=warm_root,
+            draft_mode=draft_mode,
+            markov_draft_state=markov_draft_state,
+            mtp_draft_state=mtp_draft_state,
+            markov_atlas_path=markov_atlas_path,
+            markov_o1_retention_path=markov_o1_retention_path,
+            mlp_page_state_path=mlp_page_state_path,
+            draft_window_state_path=draft_window_state_path,
+            runtime_code_revision=runtime_code_revision,
+        )
+        if not service and not direct:
+            service_client = UnixQwenServiceClient(service_socket)
+            try:
+                service_client.connect()
+                ping = service_client.request(
+                    "ping",
+                    session_id=None,
+                    request_id=secrets.token_hex(16),
+                )
+                remote_profile = ping.result.evidence.get(
+                    "runtime_profile_sha256"
+                )
+            except (OSError, QwenServiceError):
+                service_client.close()
+            else:
+                if remote_profile == service_profile_sha256:
+                    try:
+                        return run_socket_frontend(service_client)
+                    finally:
+                        service_client.close()
+                service_client.close()
         output_semantics = (
             None
             if args.raw_qwen or warm_profile_sha256 is None
@@ -1324,7 +1663,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                             else _path_sha256(q4_root / "manifest.json")
                         ),
                         "raw_qwen": bool(args.raw_qwen),
-                        "runtime_code_revision": _qwen38_runtime_code_revision(),
+                        "runtime_code_revision": runtime_code_revision,
                         "schema": "immer.qwen3.8-economics-runtime-profile/v1",
                         "tokenizer_path_sha256": hashlib.sha256(
                             str(tokenizer_path).encode("utf-8")
@@ -1350,6 +1689,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             warm_profile_sha256 is not None
             or output_semantics is not None
             or interactive
+            or service
         ):
             from .runtimes.qwen3_8.encoding import Qwen38Tokenizer
 
@@ -1554,7 +1894,6 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
 
         warm_mount = None
         if not args.raw_qwen:
-            warm_root = _resolve_qwen38_warm_root(args, bundle_path)
             if warm_root is not None:
                 warm_mount = open_verified_qwen_warm_bank(
                     warm_root,
@@ -1598,6 +1937,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             fast_mlp_layers = (*range(18), *range(55, 64))
             if fast_mlp_blocks is None:
                 fast_mlp_blocks = 64 if args.fast_mlp_online_state else 32
+        snapshot_bridge = SnapshotEventBridge() if service else None
         qwen = Qwen38CausalChat(
             str(bundle_path),
             str(tokenizer_path),
@@ -1665,7 +2005,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 else warm_mount.result_cell_code_revision
             ),
             text_snapshot_sink=(
-                live_writer.update
+                snapshot_bridge
+                if snapshot_bridge is not None
+                else live_writer.update
                 if live_writer is not None
                 else progress_writer.update
                 if progress_writer is not None
@@ -1679,6 +2021,26 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 FertigSolver(),
                 ooe_hook=None if warm_mount is None else warm_mount.hook,
             )
+        if service:
+            assert snapshot_bridge is not None
+            application = QwenChatServiceApplication(
+                qwen=qwen,
+                component=component,
+                snapshot_bridge=snapshot_bridge,
+                request_metadata_for=request_metadata_for,
+                fit_history=fit_interactive_history,
+                attach_inference_economics=attach_inference_economics,
+                result_summary=interactive_summary,
+                runtime_profile_sha256=service_profile_sha256,
+            )
+            server = UnixQwenServiceServer(service_socket, application)
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                server.close()
+            return 0
         if jsonl:
             failures = 0
             handled = 0
@@ -2507,6 +2869,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--interactive",
         action="store_true",
         help="keep one loaded runtime and accept arbitrary prompts until /quit",
+    )
+    chat.add_argument(
+        "--service",
+        action="store_true",
+        help="keep the canonical Qwen/FERTIG runtime behind a local Unix socket",
+    )
+    chat.add_argument(
+        "--socket",
+        "--service-socket",
+        dest="service_socket",
+        help=(
+            "local Qwen service socket; default: IMMER_QWEN38_SOCKET, the "
+            "deployment state directory, or ~/.immer/qwen3.8-service.sock"
+        ),
+    )
+    chat.add_argument(
+        "--direct",
+        action="store_true",
+        help="bypass an available local Qwen service and mount the runtime here",
     )
     chat.add_argument(
         "--output",
