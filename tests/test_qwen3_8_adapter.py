@@ -44,6 +44,9 @@ from immer.runtimes.qwen3_8.markov_atlas import MarkovTokenAtlas
 from immer.runtimes.qwen3_8.hybrid_draft import (
     QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
 )
+from immer.runtimes.qwen3_8.inference_economics import (
+    InferenceEconomicsLedger,
+)
 from immer.runtimes.qwen3_8.markov_draft import MARKOV_DRAFT_PROVIDER_ABI
 from immer.runtimes.qwen3_8.mtp_draft import (
     QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
@@ -3233,6 +3236,41 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIsNone(options["draft_mode"])
         self.assertIsNone(options["markov_draft_state_path"])
 
+    def test_cli_deployment_enables_passive_economics_by_default(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
+            state = Path(temporary) / "state"
+            state.mkdir()
+            economics = state / "qwen-inference-economics-v1"
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
+                patch("immer.cli._QWEN38_DEPLOYMENT_STATE", state),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_INFERENCE_ECONOMICS",
+                    economics,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            snapshot = InferenceEconomicsLedger(economics).snapshot()
+            self.assertEqual(snapshot["requests"], 1)
+            self.assertEqual(snapshot["target_forwards"], 3)
+
     def test_cli_deployment_mounts_the_persistent_markov_token_council(
         self,
     ) -> None:
@@ -3505,6 +3543,156 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(rows[0]["id"], "first")
         self.assertNotIn("id", rows[1])
         self.assertEqual([row["output"] for row in rows], ["local answer"] * 2)
+
+    def test_cli_economics_covers_single_jsonl_and_interactive_fail_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            economics = Path(temporary) / "economics"
+
+            single_runtime = _Runtime()
+            single_qwen = _chat(single_runtime)
+            single_output = io.StringIO()
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=single_qwen,
+                ),
+                redirect_stdout(single_output),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--raw-qwen",
+                        "--output",
+                        "json",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--inference-economics-state",
+                        str(economics),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(len(single_runtime.model.calls), 1)
+            single = json.loads(single_output.getvalue())
+            self.assertEqual(
+                single["evidence"]["inference_economics"]["status"],
+                "recorded",
+            )
+            self.assertEqual(InferenceEconomicsLedger(economics).snapshot()["requests"], 1)
+
+            jsonl_runtime = _Runtime()
+            jsonl_qwen = _chat(jsonl_runtime)
+            jsonl_output = io.StringIO()
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=jsonl_qwen,
+                ),
+                patch(
+                    "sys.stdin",
+                    io.StringIO(
+                        '{"id":"first","message":"hello"}\n'
+                        '{"id":"second","message":"hello"}\n'
+                    ),
+                ),
+                redirect_stdout(jsonl_output),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "--jsonl",
+                        "--raw-qwen",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--inference-economics-state",
+                        str(economics),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(len(jsonl_runtime.model.calls), 2)
+            rows = [json.loads(line) for line in jsonl_output.getvalue().splitlines()]
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(
+                all(
+                    row["evidence"]["inference_economics"]["status"]
+                    == "recorded"
+                    for row in rows
+                )
+            )
+            self.assertEqual(InferenceEconomicsLedger(economics).snapshot()["requests"], 3)
+
+            interactive_runtime = _Runtime()
+            interactive_qwen = _chat(interactive_runtime)
+            interactive_output = io.StringIO()
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=interactive_qwen,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.encoding.Qwen38Tokenizer",
+                    return_value=interactive_runtime.tokenizer,
+                ),
+                patch("sys.stdin", io.StringIO("hello\n/stats\n/quit\n")),
+                redirect_stdout(interactive_output),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "--interactive",
+                        "--raw-qwen",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--inference-economics-state",
+                        str(economics),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(len(interactive_runtime.model.calls), 1)
+            self.assertIn("ledger 4 requests", interactive_output.getvalue())
+            self.assertEqual(
+                InferenceEconomicsLedger(economics).snapshot()["requests"],
+                4,
+            )
+
+            blocked = Path(temporary) / "blocked-ledger"
+            blocked.write_text("not a directory", encoding="utf-8")
+            failed_qwen = _chat(_Runtime())
+            failed_output = io.StringIO()
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=failed_qwen,
+                ),
+                redirect_stdout(failed_output),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--raw-qwen",
+                        "--output",
+                        "json",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--inference-economics-state",
+                        str(blocked),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            failed = json.loads(failed_output.getvalue())
+            self.assertEqual(
+                failed["evidence"]["inference_economics"]["status"],
+                "error",
+            )
 
     def test_cli_interactive_reuses_one_loaded_component_for_free_prompts(self) -> None:
         runtime = _Runtime()

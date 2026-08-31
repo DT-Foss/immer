@@ -16,6 +16,7 @@ from immer.cognition.qwen_fertig_chat import QwenFertigChat
 from immer.contracts import ExecutionStatus, Request, Result
 from immer.runtimes.ooe.chat import OoeChatAttempt, OoeChatHook
 from immer.runtimes.ooe.controller import WarmAccountingReceipt
+from immer.runtimes.qwen3_8.inference_economics import receipt_from_result
 
 
 MATH_QUESTION = "What is 500?"
@@ -214,6 +215,13 @@ class QwenFertigChatTests(unittest.TestCase):
             output=base.output,
             evidence={
                 **dict(base.evidence),
+                "generation": {
+                    **dict(base.evidence["generation"]),
+                    "linear_calls": 90,
+                    "seconds": 2.5,
+                    "source_body_bytes": 300,
+                    "time_to_first_token_seconds": 1.25,
+                },
                 "draft": {
                     "accepted_draft_tokens": 5,
                     "mode": "hybrid",
@@ -256,6 +264,34 @@ class QwenFertigChatTests(unittest.TestCase):
                     "last_score": {"priority": 7.5},
                     "sequence": 3,
                 },
+                "mlp_page_route": {
+                    "request": {
+                        "adaptive_width_pages_saved": 11,
+                        "dynamic_route_calls": 64,
+                    },
+                },
+                "q4": {
+                    "request": {
+                        "logical_weight_bytes": 400,
+                        "page_mlp_prefetch_bytes": 50,
+                        "page_mlp_selected_pages": 17,
+                        "page_mlp_weight_bytes": 200,
+                    },
+                },
+                "runtime_metrics": {
+                    "generation_wall_seconds": 2.75,
+                    "physical_read_bytes": 123,
+                    "process_peak_rss_bytes": 1024,
+                },
+                "runtime_reward": {
+                    "accepted_draft_tokens": 5,
+                    "o1_priority": 4.5,
+                    "page_actions": 17,
+                    "page_actions_saved": 11,
+                    "receipt_sha256": "d" * 64,
+                    "reward": 1.75,
+                    "schema": "immer.qwen3.8-joint-runtime-reward/v1",
+                },
             },
         )
         qwen = _Qwen(qwen_result)
@@ -284,6 +320,35 @@ class QwenFertigChatTests(unittest.TestCase):
             _receipt(result)["qwen"]["o1_markov_retention"]["sequence"],
             3,
         )
+        qwen_receipt = _receipt(result)["qwen"]
+        self.assertEqual(qwen_receipt["generation"]["seconds"], 2.5)
+        self.assertEqual(
+            qwen_receipt["runtime_metrics"]["process_peak_rss_bytes"],
+            1024,
+        )
+        self.assertEqual(
+            qwen_receipt["q4"]["request"]["page_mlp_weight_bytes"],
+            200,
+        )
+        self.assertEqual(
+            qwen_receipt["mlp_page_route"]["request"][
+                "adaptive_width_pages_saved"
+            ],
+            11,
+        )
+        self.assertEqual(qwen_receipt["runtime_reward"]["o1_priority"], 4.5)
+        economics = receipt_from_result(
+            result,
+            question_sha256=hashlib.sha256(
+                MATH_QUESTION.encode("utf-8")
+            ).hexdigest(),
+            runtime_profile_sha256="e" * 64,
+        )
+        self.assertEqual(economics.target_forwards, 3)
+        self.assertEqual(economics.logical_weight_bytes, 400)
+        self.assertEqual(economics.page_mlp_weight_bytes, 200)
+        self.assertEqual(economics.saved_pages, 11)
+        self.assertEqual(economics.process_peak_rss_bytes, 1024)
 
     def test_real_formula_and_rref_certificates_short_circuit_without_qwen(
         self,

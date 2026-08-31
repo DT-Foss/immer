@@ -5,11 +5,12 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import sys
 from pathlib import Path
 from typing import TextIO
 
-from .contracts import Request
+from .contracts import Request, Result
 from .resource_paths import s3_ship_manifest
 from .substrate import LifeDaemon
 
@@ -120,6 +121,9 @@ _QWEN38_DEPLOYMENT_MLP_PAGE_STATE = (
 _QWEN38_DEPLOYMENT_DRAFT_WINDOW_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-draft-window-v1.bin"
 )
+_QWEN38_DEPLOYMENT_INFERENCE_ECONOMICS = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen-inference-economics-v1"
+)
 _QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v47"
 _QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v28"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
@@ -228,6 +232,33 @@ def _resolve_qwen38_warm_root(
         return configured
     if bundle_path == _QWEN38_DEPLOYMENT_ROOT and _QWEN38_DEPLOYMENT_WARM_ROOT.is_dir():
         return _QWEN38_DEPLOYMENT_WARM_ROOT
+    return None
+
+
+def _resolve_qwen38_inference_economics(
+    args: argparse.Namespace,
+    bundle_path: Path,
+) -> Path | None:
+    disabled = bool(getattr(args, "no_inference_economics", False))
+    configured_value = getattr(args, "inference_economics_state", None)
+    if disabled and configured_value is not None:
+        raise ValueError(
+            "--inference-economics-state and --no-inference-economics "
+            "are mutually exclusive"
+        )
+    if disabled:
+        return None
+    configured = _chat_path(
+        configured_value,
+        "IMMER_QWEN38_INFERENCE_ECONOMICS",
+    )
+    if configured is not None:
+        return configured
+    if (
+        bundle_path == _QWEN38_DEPLOYMENT_ROOT
+        and _QWEN38_DEPLOYMENT_STATE.is_dir()
+    ):
+        return _QWEN38_DEPLOYMENT_INFERENCE_ECONOMICS
     return None
 
 
@@ -687,11 +718,33 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         evidence = result.evidence
         if not isinstance(evidence, dict):
             evidence = dict(evidence)
+        parts = []
+        economics = evidence.get("inference_economics")
+        if isinstance(economics, dict) and economics.get("status") in {
+            "recorded",
+            "duplicate",
+        }:
+            receipt = economics.get("receipt")
+            body = receipt.get("body") if isinstance(receipt, dict) else None
+            rollup = economics.get("rollup")
+            if isinstance(body, dict):
+                target = body.get("target_forwards")
+                saved = body.get("saved_qwen_forwards")
+                if isinstance(target, int) and isinstance(saved, int):
+                    parts.append(f"economics {target} target / {saved} saved")
+            if isinstance(rollup, dict):
+                requests = rollup.get("requests")
+                saved = rollup.get("saved_qwen_forwards")
+                largest = rollup.get("largest_avoidable_cost_class")
+                if isinstance(requests, int) and isinstance(saved, int):
+                    summary = f"ledger {requests} requests / {saved} saved"
+                    if isinstance(largest, str) and largest:
+                        summary += f" / next {largest}"
+                    parts.append(summary)
         generation = evidence.get("generation")
         runtime_metrics = evidence.get("runtime_metrics")
         if not isinstance(generation, dict):
-            return None
-        parts = []
+            return "; ".join(parts) or None
         conversation = evidence.get("conversation")
         if isinstance(conversation, dict):
             history_turns = conversation.get("history_turns")
@@ -1230,6 +1283,68 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 mlp_page_state_path=mlp_page_state_path,
             )
         )
+        economics_root = _resolve_qwen38_inference_economics(
+            args,
+            bundle_path,
+        )
+        economics_ledger = None
+        economics_initialization_error = None
+        if economics_root is not None:
+            try:
+                from .runtimes.qwen3_8.inference_economics import (
+                    InferenceEconomicsLedger,
+                )
+
+                economics_ledger = InferenceEconomicsLedger(economics_root)
+            except Exception as exc:
+                economics_initialization_error = (
+                    f"{type(exc).__module__}.{type(exc).__qualname__}"
+                )
+        economics_runtime_profile = (
+            None
+            if economics_root is None
+            else warm_profile_sha256
+            or hashlib.sha256(
+                json.dumps(
+                    {
+                        "bundle_path_sha256": hashlib.sha256(
+                            str(bundle_path).encode("utf-8")
+                        ).hexdigest(),
+                        "q4_path_sha256": (
+                            None
+                            if q4_root is None
+                            else hashlib.sha256(
+                                str(q4_root).encode("utf-8")
+                            ).hexdigest()
+                        ),
+                        "q4_manifest_file_sha256": (
+                            None
+                            if q4_root is None
+                            or not (q4_root / "manifest.json").is_file()
+                            else _path_sha256(q4_root / "manifest.json")
+                        ),
+                        "raw_qwen": bool(args.raw_qwen),
+                        "runtime_code_revision": _qwen38_runtime_code_revision(),
+                        "schema": "immer.qwen3.8-economics-runtime-profile/v1",
+                        "tokenizer_path_sha256": hashlib.sha256(
+                            str(tokenizer_path).encode("utf-8")
+                        ).hexdigest(),
+                        "tokenizer_file_sha256": (
+                            _path_sha256(tokenizer_path)
+                            if tokenizer_path.is_file()
+                            else None
+                        ),
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("ascii")
+            ).hexdigest()
+        )
+        economics_session_nonce = (
+            None if economics_root is None else secrets.token_hex(16)
+        )
+        economics_request_ordinal = 0
         prompt_tokenizer = None
         if (
             warm_profile_sha256 is not None
@@ -1364,6 +1479,78 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             except (TypeError, ValueError):
                 return False
             return hmac.compare_digest(left, right)
+
+        def attach_inference_economics(
+            question: str,
+            result: Result,
+            *,
+            request_id: object | None = None,
+        ) -> Result:
+            nonlocal economics_request_ordinal
+            if economics_root is None:
+                return result
+            assert economics_runtime_profile is not None
+            assert economics_session_nonce is not None
+            question_sha256 = hashlib.sha256(
+                question.strip().encode("utf-8")
+            ).hexdigest()
+            ordinal = economics_request_ordinal
+            economics_request_ordinal += 1
+            try:
+                request_identity = (
+                    {
+                        "external_id": request_id,
+                        "question_sha256": question_sha256,
+                        "runtime_profile_sha256": economics_runtime_profile,
+                    }
+                    if request_id is not None
+                    else {
+                        "ordinal": ordinal,
+                        "question_sha256": question_sha256,
+                        "runtime_profile_sha256": economics_runtime_profile,
+                        "session_nonce": economics_session_nonce,
+                    }
+                )
+                request_sha256 = hashlib.sha256(
+                    json.dumps(
+                        request_identity,
+                        allow_nan=False,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("ascii")
+                ).hexdigest()
+                if economics_ledger is None:
+                    raise RuntimeError(
+                        economics_initialization_error
+                        or "inference economics is unavailable"
+                    )
+                observation = economics_ledger.observe(
+                    result,
+                    question_sha256=question_sha256,
+                    runtime_profile_sha256=economics_runtime_profile,
+                    request_sha256=request_sha256,
+                )
+                economics_evidence: dict[str, object] = {
+                    "duplicate": observation.duplicate,
+                    "receipt": observation.receipt.to_document(),
+                    "rollup": dict(observation.rollup),
+                    "status": "duplicate" if observation.duplicate else "recorded",
+                }
+            except Exception as exc:
+                economics_evidence = {
+                    "error": f"{type(exc).__module__}.{type(exc).__qualname__}",
+                    "status": "error",
+                }
+            evidence = dict(result.evidence)
+            evidence["inference_economics"] = economics_evidence
+            return Result(
+                result.status,
+                result.component,
+                output=result.output,
+                reason=result.reason,
+                evidence=evidence,
+            )
 
         warm_mount = None
         if not args.raw_qwen:
@@ -1528,6 +1715,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                             request_metadata_for(line_message),
                         )
                     )
+                    result = attach_inference_economics(
+                        line_message,
+                        result,
+                        request_id=request_id if include_id else None,
+                    )
                     emit(
                         result,
                         request_id=request_id,
@@ -1612,6 +1804,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                         ),
                     )
                 )
+                result = attach_inference_economics(line_message, result)
                 emit(result)
                 failures += int(not result.ok)
                 if result.ok and isinstance(result.output, str):
@@ -1629,6 +1822,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         result = component.handle(
             Request("chat", message, request_metadata_for(message))
         )
+        result = attach_inference_economics(message, result)
     except (
         DraftWindowError,
         OSError,
@@ -2515,6 +2709,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-ooe-warm",
         action="store_true",
         help="disable the deployed zero-Qwen-forward warm path",
+    )
+    chat.add_argument(
+        "--inference-economics-state",
+        help="append-only local inference-economics ledger directory",
+    )
+    chat.add_argument(
+        "--no-inference-economics",
+        action="store_true",
+        help="disable passive inference-economics receipts",
     )
     chat.add_argument(
         "--qwen38-anchor-cache",

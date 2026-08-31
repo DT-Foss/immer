@@ -328,8 +328,10 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                 "generated_tokens",
                 "linear_calls",
                 "prompt_tokens",
+                "seconds",
                 "source_body_bytes",
                 "stopped_on_eos",
+                "time_to_first_token_seconds",
                 "token_trace_sha256",
             )
             if key in generation
@@ -412,6 +414,64 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
     retention = evidence.get("o1_markov_retention")
     if isinstance(retention, dict):
         summary["o1_markov_retention"] = retention
+    runtime_metrics = evidence.get("runtime_metrics")
+    if isinstance(runtime_metrics, dict):
+        summary["runtime_metrics"] = {
+            key: runtime_metrics[key]
+            for key in (
+                "generation_wall_seconds",
+                "physical_read_bytes",
+                "process_peak_rss_bytes",
+            )
+            if key in runtime_metrics
+        }
+    q4 = evidence.get("q4")
+    if isinstance(q4, dict):
+        request = q4.get("request")
+        if isinstance(request, dict):
+            summary["q4"] = {
+                "request": {
+                    key: request[key]
+                    for key in (
+                        "logical_weight_bytes",
+                        "page_mlp_prefetch_bytes",
+                        "page_mlp_selected_pages",
+                        "page_mlp_weight_bytes",
+                    )
+                    if key in request
+                }
+            }
+    mlp_page = evidence.get("mlp_page_route")
+    if isinstance(mlp_page, dict):
+        request = mlp_page.get("request")
+        if isinstance(request, dict):
+            summary["mlp_page_route"] = {
+                "request": {
+                    key: request[key]
+                    for key in (
+                        "adaptive_width_pages_saved",
+                        "dynamic_route_calls",
+                        "dynamic_route_changes",
+                        "exact_rows",
+                    )
+                    if key in request
+                }
+            }
+    runtime_reward = evidence.get("runtime_reward")
+    if isinstance(runtime_reward, dict):
+        summary["runtime_reward"] = {
+            key: runtime_reward[key]
+            for key in (
+                "accepted_draft_tokens",
+                "o1_priority",
+                "page_actions",
+                "page_actions_saved",
+                "receipt_sha256",
+                "reward",
+                "schema",
+            )
+            if key in runtime_reward
+        }
     return summary
 
 
