@@ -893,6 +893,118 @@ def _nested_draft_horizons(value: object) -> tuple[DraftWindowNestedHorizon, ...
     return tuple(horizons)
 
 
+def _draft_provider_record(value: object) -> dict[str, Any]:
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _mapping(to_dict(), "draft provider metrics")
+    if isinstance(value, Mapping) or (
+        is_dataclass(value) and not isinstance(value, type)
+    ):
+        return _mapping(value, "draft provider metrics")
+    fields = (
+        "draft_calls",
+        "external_linear_calls",
+        "external_source_body_bytes",
+        "linear_calls",
+        "markov",
+        "mtp_shared_linear_calls",
+        "mtp_shared_source_body_bytes",
+        "source_body_bytes",
+    )
+    record = {field: getattr(value, field) for field in fields if hasattr(value, field)}
+    if "source_body_bytes" not in record or "linear_calls" not in record:
+        raise TypeError("draft provider metrics are not serializable")
+    return record
+
+
+def _draft_provider_cost_split(
+    value: object,
+    *,
+    mode: str | None,
+) -> dict[str, int]:
+    """Separate zero-weight, external-model and shared-target draft work."""
+
+    record = _draft_provider_record(value)
+
+    def amount(source: Mapping[str, Any], key: str) -> int:
+        item = source.get(key, 0)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise Qwen38ChatError(f"draft provider metric {key} is invalid")
+        return item
+
+    total_bytes = amount(record, "source_body_bytes")
+    total_linears = amount(record, "linear_calls")
+    if mode == "hybrid" and all(
+        key in record
+        for key in (
+            "external_source_body_bytes",
+            "external_linear_calls",
+            "mtp_shared_source_body_bytes",
+            "mtp_shared_linear_calls",
+        )
+    ):
+        markov = record.get("markov")
+        markov_record = markov if isinstance(markov, Mapping) else {}
+        markov_bytes = amount(markov_record, "source_body_bytes")
+        markov_linears = amount(markov_record, "linear_calls")
+        external_bytes = amount(record, "external_source_body_bytes")
+        external_linears = amount(record, "external_linear_calls")
+        shared_bytes = amount(record, "mtp_shared_source_body_bytes")
+        shared_linears = amount(record, "mtp_shared_linear_calls")
+    elif mode == "mtp":
+        markov_bytes = markov_linears = external_bytes = external_linears = 0
+        shared_bytes, shared_linears = total_bytes, total_linears
+    elif mode == "qwen35":
+        markov_bytes = markov_linears = shared_bytes = shared_linears = 0
+        external_bytes, external_linears = total_bytes, total_linears
+    else:
+        external_bytes = external_linears = shared_bytes = shared_linears = 0
+        markov_bytes, markov_linears = total_bytes, total_linears
+    if (
+        markov_bytes + external_bytes + shared_bytes != total_bytes
+        or markov_linears + external_linears + shared_linears != total_linears
+    ):
+        raise Qwen38ChatError(
+            "draft provider cost split differs from its total work"
+        )
+    return {
+        "external_linear_calls": external_linears,
+        "external_source_body_bytes": external_bytes,
+        "markov_linear_calls": markov_linears,
+        "markov_source_body_bytes": markov_bytes,
+        "shared_linear_calls": shared_linears,
+        "shared_source_body_bytes": shared_bytes,
+        "total_linear_calls": total_linears,
+        "total_source_body_bytes": total_bytes,
+    }
+
+
+def _draft_provider_evidence(value: object, *, mode: str | None) -> dict[str, Any]:
+    """Normalize standalone Qwen3.5 into the hybrid provider receipt shape."""
+
+    record = _draft_provider_record(value)
+    if mode != "qwen35":
+        return record
+    calls = record.get("draft_calls", 0)
+    if isinstance(calls, bool) or not isinstance(calls, int) or calls < 0:
+        raise Qwen38ChatError("standalone Qwen3.5 draft calls are invalid")
+    source_bytes = record.get("source_body_bytes", 0)
+    linears = record.get("linear_calls", 0)
+    if any(
+        isinstance(item, bool) or not isinstance(item, int) or item < 0
+        for item in (source_bytes, linears)
+    ):
+        raise Qwen38ChatError("standalone Qwen3.5 work metrics are invalid")
+    return {
+        "external_linear_calls": linears,
+        "external_source_body_bytes": source_bytes,
+        "qwen35": record,
+        "qwen35_rounds": calls,
+        "qwen35_selections": calls,
+        "selected_provider": "qwen35" if calls else None,
+    }
+
+
 def _runtime_source_body_bytes(runtime: object) -> int:
     model = getattr(runtime, "model", None)
     pager = getattr(model, "pager", None)
@@ -4632,61 +4744,28 @@ class Qwen38CausalChat:
                 nested_horizons=_nested_draft_horizons(evidence),
             )
             provider_metrics = provider.metrics()
-            provider_source_body_bytes = int(provider_metrics.source_body_bytes)
-            provider_linear_calls = int(provider_metrics.linear_calls)
-            split_provider_accounting = all(
-                hasattr(provider_metrics, field)
-                for field in (
-                    "external_source_body_bytes",
-                    "external_linear_calls",
-                    "mtp_shared_source_body_bytes",
-                    "mtp_shared_linear_calls",
-                )
+            provider_costs = _draft_provider_cost_split(
+                provider_metrics,
+                mode=effective_draft_mode,
             )
-            if split_provider_accounting:
-                external_provider_source_body_bytes = int(
-                    provider_metrics.external_source_body_bytes
-                )
-                external_provider_linear_calls = int(
-                    provider_metrics.external_linear_calls
-                )
-                shared_provider_source_body_bytes = int(
-                    provider_metrics.mtp_shared_source_body_bytes
-                )
-                shared_provider_linear_calls = int(
-                    provider_metrics.mtp_shared_linear_calls
-                )
-            else:
-                external_provider_source_body_bytes = (
-                    provider_source_body_bytes
-                    if effective_draft_mode == "qwen35"
-                    else 0
-                )
-                external_provider_linear_calls = (
-                    provider_linear_calls
-                    if effective_draft_mode == "qwen35"
-                    else 0
-                )
-                shared_provider_source_body_bytes = (
-                    provider_source_body_bytes
-                    if effective_draft_mode in {"hybrid", "mtp"}
-                    else 0
-                )
-                shared_provider_linear_calls = (
-                    provider_linear_calls
-                    if effective_draft_mode in {"hybrid", "mtp"}
-                    else 0
-                )
-            if (
-                external_provider_source_body_bytes
-                + shared_provider_source_body_bytes
-                != provider_source_body_bytes
-                or external_provider_linear_calls + shared_provider_linear_calls
-                != provider_linear_calls
-            ):
-                raise Qwen38ChatError(
-                    "draft provider cost split differs from its total work"
-                )
+            provider_source_body_bytes = provider_costs[
+                "total_source_body_bytes"
+            ]
+            provider_linear_calls = provider_costs["total_linear_calls"]
+            markov_provider_source_body_bytes = provider_costs[
+                "markov_source_body_bytes"
+            ]
+            markov_provider_linear_calls = provider_costs["markov_linear_calls"]
+            external_provider_source_body_bytes = provider_costs[
+                "external_source_body_bytes"
+            ]
+            external_provider_linear_calls = provider_costs[
+                "external_linear_calls"
+            ]
+            shared_provider_source_body_bytes = provider_costs[
+                "shared_source_body_bytes"
+            ]
+            shared_provider_linear_calls = provider_costs["shared_linear_calls"]
             shared_target_pager = effective_draft_mode in {"hybrid", "mtp"}
             if shared_target_pager:
                 target_pager_source_body_bytes = max(
@@ -4715,18 +4794,25 @@ class Qwen38CausalChat:
                 combined_source_body_bytes = (
                     target_pager_source_body_bytes
                     + external_provider_source_body_bytes
+                    + markov_provider_source_body_bytes
                 )
                 combined_linear_calls = (
-                    target_pager_linear_calls + external_provider_linear_calls
+                    target_pager_linear_calls
+                    + external_provider_linear_calls
+                    + markov_provider_linear_calls
                 )
             else:
                 target_source_body_bytes = int(evidence.source_body_bytes)
                 target_linear_calls = int(evidence.linear_calls)
                 combined_source_body_bytes = (
-                    target_source_body_bytes + external_provider_source_body_bytes
+                    target_source_body_bytes
+                    + external_provider_source_body_bytes
+                    + markov_provider_source_body_bytes
                 )
                 combined_linear_calls = (
-                    target_linear_calls + external_provider_linear_calls
+                    target_linear_calls
+                    + external_provider_linear_calls
+                    + markov_provider_linear_calls
                 )
             mapped_evidence = {
                 "prompt_token_ids": evidence.prompt_token_ids,
@@ -4769,10 +4855,12 @@ class Qwen38CausalChat:
                 ),
                 "draft_source_body_bytes": provider_source_body_bytes,
                 "external_source_body_bytes": external_provider_source_body_bytes,
+                "markov_source_body_bytes": markov_provider_source_body_bytes,
                 "shared_source_body_bytes": shared_provider_source_body_bytes,
                 "aux_source_body_bytes": aux_source_body_bytes,
                 "draft_linear_calls": provider_linear_calls,
                 "external_linear_calls": external_provider_linear_calls,
+                "markov_linear_calls": markov_provider_linear_calls,
                 "shared_linear_calls": shared_provider_linear_calls,
                 "target_source_body_bytes": target_source_body_bytes,
                 "target_linear_calls": target_linear_calls,
@@ -4823,7 +4911,12 @@ class Qwen38CausalChat:
                 )
             provider_record = getattr(provider_metrics, "to_dict", None)
             if callable(provider_record):
-                self._last_draft_evidence["provider"] = provider_record()
+                self._last_draft_evidence["provider"] = (
+                    _draft_provider_evidence(
+                        provider_record(),
+                        mode=effective_draft_mode,
+                    )
+                )
             self._stage_draft_window_feedback(
                 prompt_ids=prompt_ids,
                 generated_ids=tuple(generated.token_ids),
@@ -4876,13 +4969,22 @@ class Qwen38CausalChat:
                     _runtime_source_body_bytes(runtime) - rolling_source_start,
                 )
                 timeout_provider_metrics = provider.metrics()
-                draft_source_bytes = int(timeout_provider_metrics.source_body_bytes)
+                timeout_provider_costs = _draft_provider_cost_split(
+                    timeout_provider_metrics,
+                    mode=effective_draft_mode,
+                )
+                draft_source_bytes = timeout_provider_costs[
+                    "total_source_body_bytes"
+                ]
                 if effective_draft_mode in {"hybrid", "mtp"}:
-                    if draft_source_bytes > combined_source_bytes:
+                    shared_draft_bytes = timeout_provider_costs[
+                        "shared_source_body_bytes"
+                    ]
+                    if shared_draft_bytes > combined_source_bytes:
                         raise Qwen38ChatError(
                             "shared-pager timeout accounting exceeds execution"
                         )
-                    target_source_bytes = combined_source_bytes - draft_source_bytes
+                    target_source_bytes = combined_source_bytes - shared_draft_bytes
                 else:
                     target_source_bytes = combined_source_bytes
                 timeout_receipt = {

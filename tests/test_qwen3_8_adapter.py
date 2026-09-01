@@ -4883,11 +4883,17 @@ class Qwen38CausalChatTests(unittest.TestCase):
             bundle_receipt=_BUNDLE_RECEIPT,
             close=lambda: None,
         )
+        provider_metrics = SimpleNamespace(
+            source_body_bytes=12,
+            linear_calls=3,
+            to_dict=lambda: {
+                "draft_calls": 1,
+                "linear_calls": 3,
+                "source_body_bytes": 12,
+            },
+        )
         provider = SimpleNamespace(
-            metrics=lambda: SimpleNamespace(
-                source_body_bytes=12,
-                linear_calls=3,
-            ),
+            metrics=lambda: provider_metrics,
             close=lambda: None,
         )
         evidence = SimpleNamespace(
@@ -4928,6 +4934,16 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(result.evidence["draft"]["total_source_body_bytes"], 132)
         self.assertEqual(result.evidence["draft"]["target_linear_calls"], 10)
         self.assertEqual(result.evidence["draft"]["total_linear_calls"], 13)
+        self.assertEqual(
+            result.evidence["draft"]["provider"]["qwen35_rounds"],
+            1,
+        )
+        self.assertEqual(
+            result.evidence["draft"]["provider"]["qwen35"][
+                "source_body_bytes"
+            ],
+            12,
+        )
         self.assertEqual(result.evidence["generation"]["linear_calls"], 10)
         self.assertEqual(
             result.evidence["fast_mlp"]["request"]["aux_source_body_bytes"], 20
@@ -5364,7 +5380,17 @@ class Qwen38CausalChatTests(unittest.TestCase):
     def test_shared_mtp_pager_work_is_split_without_double_counting(self) -> None:
         target = _Runtime()
         target.q4_bank = SimpleNamespace(has=lambda _name: True)
-        target.model.pager = SimpleNamespace(q4_bank=target.q4_bank)
+        source_calls = 0
+
+        def source_metrics():
+            nonlocal source_calls
+            source_calls += 1
+            return {"network_or_source_body_bytes": 0 if source_calls == 1 else 100}
+
+        target.model.pager = SimpleNamespace(
+            q4_bank=target.q4_bank,
+            source=SimpleNamespace(metrics=source_metrics),
+        )
         chat = _chat(
             target,
             draft_mode="mtp",
@@ -5449,12 +5475,13 @@ class Qwen38CausalChatTests(unittest.TestCase):
         generated = SimpleNamespace(token_ids=(7, 8, 9, 10), evidence=evidence)
         decoder = SimpleNamespace(generate_rolling=lambda *args, **kwargs: generated)
         metrics = SimpleNamespace(
-            source_body_bytes=35,
-            linear_calls=5,
+            source_body_bytes=40,
+            linear_calls=6,
             external_source_body_bytes=15,
             external_linear_calls=2,
             mtp_shared_source_body_bytes=20,
             mtp_shared_linear_calls=3,
+            markov={"source_body_bytes": 5, "linear_calls": 1},
             last_confidence=0.7,
             last_disagreement=0.0,
             last_phrase_confidence=0.0,
@@ -5481,17 +5508,75 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(draft["target_source_body_bytes"], 80)
         self.assertEqual(draft["shared_source_body_bytes"], 20)
         self.assertEqual(draft["external_source_body_bytes"], 15)
-        self.assertEqual(draft["draft_source_body_bytes"], 35)
-        self.assertEqual(draft["total_source_body_bytes"], 115)
+        self.assertEqual(draft["markov_source_body_bytes"], 5)
+        self.assertEqual(draft["draft_source_body_bytes"], 40)
+        self.assertEqual(draft["total_source_body_bytes"], 120)
         self.assertEqual(draft["target_linear_calls"], 7)
         self.assertEqual(draft["shared_linear_calls"], 3)
         self.assertEqual(draft["external_linear_calls"], 2)
-        self.assertEqual(draft["total_linear_calls"], 12)
+        self.assertEqual(draft["markov_linear_calls"], 1)
+        self.assertEqual(draft["total_linear_calls"], 13)
         self.assertTrue(
             callable(hybrid_constructor.call_args.kwargs["qwen35_factory"])
         )
         self.assertEqual(hybrid_constructor.call_args.kwargs["max_new_tokens"], 4)
         chat.close()
+
+    def test_hybrid_timeout_subtracts_only_shared_mtp_work(self) -> None:
+        target = _Runtime()
+        target.q4_bank = SimpleNamespace(has=lambda _name: True)
+        source_calls = 0
+
+        def source_metrics():
+            nonlocal source_calls
+            source_calls += 1
+            return {"network_or_source_body_bytes": 0 if source_calls == 1 else 100}
+
+        target.model.pager = SimpleNamespace(
+            q4_bank=target.q4_bank,
+            source=SimpleNamespace(metrics=source_metrics),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            chat = _chat(
+                target,
+                draft_bundle_path="/models/Qwen3.5-0.8B",
+                draft_mode="hybrid",
+                draft_window=4,
+                draft_window_state_path=Path(temporary) / "window.bin",
+                q4_root="/models/q4-mtp",
+                max_new_tokens=4,
+            )
+            metrics = SimpleNamespace(
+                source_body_bytes=235,
+                linear_calls=12,
+                external_source_body_bytes=200,
+                external_linear_calls=8,
+                mtp_shared_source_body_bytes=30,
+                mtp_shared_linear_calls=3,
+                markov={"source_body_bytes": 5, "linear_calls": 1},
+            )
+            provider = SimpleNamespace(metrics=lambda: metrics, close=lambda: None)
+            decoder = SimpleNamespace(
+                generate_rolling=Mock(side_effect=TimeoutError("budget"))
+            )
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38MarkovMtpDraftProvider",
+                    return_value=provider,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+                    return_value=decoder,
+                ),
+            ):
+                result = chat.handle(Request("chat", "hello"))
+
+            self.assertIs(result.status, ExecutionStatus.ERROR)
+            self.assertIn("TimeoutError: budget", result.reason or "")
+            self.assertNotIn("shared-pager timeout accounting", result.reason or "")
+            assert chat._draft_window_controller is not None
+            self.assertEqual(chat._draft_window_controller.metrics().updates, 1)
+            chat.close()
 
     def test_mtp_generation_policy_matches_adaptive_round_execution(self) -> None:
         chat = _chat(

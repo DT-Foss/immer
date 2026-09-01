@@ -551,6 +551,27 @@ class InferenceActionReceiptTests(unittest.TestCase):
 
         self.assertIn("external_drafter", actions)
         self.assertIn("target_verified_draft", actions)
+        standalone = Result(
+            result.status,
+            result.component,
+            output=result.output,
+            evidence={
+                "draft": {
+                    "mode": "qwen35",
+                    "provider": {
+                        "external_linear_calls": 7,
+                        "external_source_body_bytes": 50_000,
+                        "qwen35_rounds": 1,
+                        "qwen35_selections": 1,
+                        "qwen35": qwen35,
+                    },
+                }
+            },
+        )
+        self.assertIn(
+            "external_drafter",
+            executed_actions_from_result(standalone, economics),
+        )
         receipt = InferenceActionReceipt.from_economics(
             economics,
             executed_actions=actions,

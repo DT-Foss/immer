@@ -479,6 +479,8 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                 "draft_source_body_bytes",
                 "external_linear_calls",
                 "external_source_body_bytes",
+                "markov_linear_calls",
+                "markov_source_body_bytes",
                 "mode",
                 "proposed_draft_tokens",
                 "rounds",

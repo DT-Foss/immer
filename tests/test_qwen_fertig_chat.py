@@ -246,9 +246,15 @@ class QwenFertigChatTests(unittest.TestCase):
                     "accepted_draft_tokens": 5,
                     "configured_mode": "hybrid",
                     "draft_linear_calls": 11,
+                    "external_linear_calls": 7,
+                    "external_source_body_bytes": 50_000,
+                    "markov_linear_calls": 1,
+                    "markov_source_body_bytes": 5,
                     "mode": "hybrid",
                     "rounds": 3,
                     "state_reuse_provider_downgrade": False,
+                    "shared_linear_calls": 4,
+                    "shared_source_body_bytes": 70,
                     "provider": {
                         "atlas_consensus_confidence_gain": 0.125,
                         "atlas_consensus_rounds": 1,
@@ -436,6 +442,7 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertEqual(draft["accepted_draft_tokens"], 5)
         self.assertEqual(draft["configured_mode"], "hybrid")
         self.assertEqual(draft["draft_linear_calls"], 11)
+        self.assertEqual(draft["markov_source_body_bytes"], 5)
         self.assertEqual(draft["target_linear_calls"], 90)
         self.assertFalse(draft["state_reuse_provider_downgrade"])
         self.assertEqual(draft["provider"]["markov_selections"], 1)
