@@ -474,10 +474,12 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
             key: draft[key]
             for key in (
                 "accepted_draft_tokens",
+                "configured_mode",
                 "draft_source_body_bytes",
                 "mode",
                 "proposed_draft_tokens",
                 "rounds",
+                "state_reuse_provider_downgrade",
                 "target_source_body_bytes",
                 "total_source_body_bytes",
                 "used_window_sizes",
@@ -583,12 +585,18 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
             )
             if key in runtime_metrics
         }
+        component_timings = runtime_metrics.get("component_timings")
+        if isinstance(component_timings, dict):
+            summary["runtime_metrics"]["component_timings"] = component_timings
     conversation = evidence.get("conversation")
     if isinstance(conversation, dict):
         summary["conversation"] = {
             key: conversation[key]
             for key in (
                 "history_turns",
+                "mtp_carry_bytes",
+                "mtp_carry_reused_tokens",
+                "mtp_carry_status",
                 "prompt_suffix_tokens",
                 "reuse_status",
                 "reused_prefix_tokens",
@@ -603,9 +611,12 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
             for key in (
                 "checkpoint_read_sweeps_saved",
                 "forward_passes_saved",
+                "mtp_carry_bytes",
+                "mtp_carry_status",
                 "prefix_tokens",
                 "prefill_weight_sweeps_saved",
                 "prompt_token_layer_evaluations_saved",
+                "snapshot_bytes_read",
                 "status",
             )
             if key in anchor_cache

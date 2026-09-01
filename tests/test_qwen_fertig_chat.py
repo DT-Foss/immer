@@ -244,8 +244,10 @@ class QwenFertigChatTests(unittest.TestCase):
                 },
                 "draft": {
                     "accepted_draft_tokens": 5,
+                    "configured_mode": "hybrid",
                     "mode": "hybrid",
                     "rounds": 3,
+                    "state_reuse_provider_downgrade": False,
                     "provider": {
                         "atlas_consensus_confidence_gain": 0.125,
                         "atlas_consensus_rounds": 1,
@@ -326,6 +328,19 @@ class QwenFertigChatTests(unittest.TestCase):
                     },
                 },
                 "runtime_metrics": {
+                    "component_timings": {
+                        "clock": "time.perf_counter_ns",
+                        "components": {
+                            "attention": {"calls": 64, "nanoseconds": 1200},
+                            "mlp": {"calls": 64, "nanoseconds": 1800},
+                        },
+                        "measured_nanoseconds": 3000,
+                        "schema": (
+                            "immer.qwen3.8-component-timing-request/v1"
+                        ),
+                        "status": "ok",
+                        "unit": "nanoseconds",
+                    },
                     "generation_wall_seconds": 2.75,
                     "major_page_faults": 3,
                     "minor_page_faults": 456,
@@ -361,6 +376,8 @@ class QwenFertigChatTests(unittest.TestCase):
 
         draft = _receipt(result)["qwen"]["draft"]
         self.assertEqual(draft["accepted_draft_tokens"], 5)
+        self.assertEqual(draft["configured_mode"], "hybrid")
+        self.assertFalse(draft["state_reuse_provider_downgrade"])
         self.assertEqual(draft["provider"]["markov_selections"], 1)
         self.assertEqual(draft["provider"]["atlas_consensus_tokens"], 2)
         self.assertEqual(draft["atlas"]["atlas_contexts"], 500_000)
@@ -393,6 +410,12 @@ class QwenFertigChatTests(unittest.TestCase):
             0.75,
         )
         self.assertEqual(
+            qwen_receipt["runtime_metrics"]["component_timings"][
+                "measured_nanoseconds"
+            ],
+            3000,
+        )
+        self.assertEqual(
             qwen_receipt["q4"]["request"]["page_mlp_weight_bytes"],
             200,
         )
@@ -420,6 +443,61 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertEqual(economics.page_mlp_weight_bytes, 200)
         self.assertEqual(economics.saved_pages, 11)
         self.assertEqual(economics.process_peak_rss_bytes, 1024)
+
+    def test_qwen_receipt_keeps_mtp_anchor_reuse_evidence(self) -> None:
+        base = _qwen_ok("ordinary answer")
+        qwen_result = Result(
+            base.status,
+            base.component,
+            output=base.output,
+            evidence={
+                **dict(base.evidence),
+                "conversation": {
+                    "history_turns": 0,
+                    "mtp_carry_bytes": 20_093,
+                    "mtp_carry_reused_tokens": 3,
+                    "mtp_carry_status": "restored-anchor",
+                    "prompt_suffix_tokens": 8,
+                    "reuse_status": "anchor-prefix",
+                    "reused_prefix_tokens": 3,
+                    "state_retained_tokens": 0,
+                },
+                "anchor_cache": {
+                    "checkpoint_read_sweeps_saved": 0,
+                    "forward_passes_saved": 0,
+                    "mtp_carry_bytes": 20_093,
+                    "mtp_carry_status": "restored",
+                    "prefix_tokens": 3,
+                    "prefill_weight_sweeps_saved": 0,
+                    "prompt_token_layer_evaluations_saved": 192,
+                    "snapshot_bytes_read": 40_186,
+                    "status": "hit",
+                },
+            },
+        )
+        with _patched_solver(
+            None,
+            _verification(
+                CandidateVerificationStatus.ABSTAINED,
+                candidate=None,
+                expected=None,
+            ),
+        ) as (fertig, _, _):
+            result = QwenFertigChat(_Qwen(qwen_result), fertig).handle(
+                Request("chat", MATH_QUESTION)
+            )
+
+        qwen_receipt = _receipt(result)["qwen"]
+        self.assertEqual(qwen_receipt["conversation"]["mtp_carry_bytes"], 20_093)
+        self.assertEqual(
+            qwen_receipt["conversation"]["mtp_carry_status"],
+            "restored-anchor",
+        )
+        self.assertEqual(qwen_receipt["anchor_cache"]["mtp_carry_bytes"], 20_093)
+        self.assertEqual(
+            qwen_receipt["anchor_cache"]["mtp_carry_status"],
+            "restored",
+        )
 
     def test_qwen_receipt_keeps_selected_layer_context_work(self) -> None:
         base = _qwen_ok("ordinary answer")
