@@ -152,8 +152,7 @@ def _layer_mlp_crystal_registry_evidence() -> dict[str, object]:
     }
     layer = {
         "action_abi": (
-            "immer.qwen3.8/"
-            "layer-mlp-residual-rademacher-centered-ridge-bf16/v2"
+            "immer.qwen3.8/layer-mlp-residual-rademacher-centered-ridge-bf16/v2"
         ),
         "enabled": True,
         "identity_sha256": _sha("layer-18-mlp-identity"),
@@ -499,7 +498,7 @@ class InferenceActionReceiptTests(unittest.TestCase):
             executed_actions_from_result(result, economics),
         )
 
-    def test_physical_mtp_round_is_recorded_as_external_drafter(self) -> None:
+    def test_embedded_mtp_is_only_target_verified_drafting(self) -> None:
         economics = _economics("physical-mtp", saved=1)
         result = Result(
             ExecutionStatus.OK,
@@ -509,7 +508,41 @@ class InferenceActionReceiptTests(unittest.TestCase):
                 "draft": {
                     "draft_source_body_bytes": 50_000,
                     "mode": "hybrid",
-                    "provider": {"mtp_rounds": 1},
+                    "provider": {
+                        "mtp_rounds": 1,
+                        "mtp_selections": 1,
+                        "mtp": {"source_body_bytes": 50_000},
+                    },
+                }
+            },
+        )
+
+        actions = executed_actions_from_result(result, economics)
+
+        self.assertIn("target_verified_draft", actions)
+        self.assertNotIn("external_drafter", actions)
+
+    def test_physical_qwen35_is_external_and_runtime_profile_exact(self) -> None:
+        economics = _economics("physical-qwen35", saved=1)
+        qwen35 = {
+            "draft_calls": 2,
+            "linear_calls": 7,
+            "source_body_bytes": 50_000,
+        }
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "draft": {
+                    "mode": "hybrid",
+                    "provider": {
+                        "external_linear_calls": 7,
+                        "external_source_body_bytes": 50_000,
+                        "qwen35_rounds": 1,
+                        "qwen35_selections": 1,
+                        "qwen35": qwen35,
+                    },
                 }
             },
         )
@@ -517,6 +550,7 @@ class InferenceActionReceiptTests(unittest.TestCase):
         actions = executed_actions_from_result(result, economics)
 
         self.assertIn("external_drafter", actions)
+        self.assertIn("target_verified_draft", actions)
         receipt = InferenceActionReceipt.from_economics(
             economics,
             executed_actions=actions,
@@ -525,29 +559,58 @@ class InferenceActionReceiptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             bank = InferenceActionBank(Path(temporary) / "actions")
             bank.observe(economics, executed_actions=actions)
-            directive = bank.recommend(
-                question_sha256=_sha("new MTP question"),
+            same_profile = bank.recommend(
+                question_sha256=_sha("new Qwen3.5 question"),
                 runtime_profile_sha256=_sha("profile"),
             )
-        assert directive is not None
-        self.assertIn("external_drafter", directive.primary_actions)
-        self.assertTrue(directive.draft_enabled)
+            other_profile = bank.recommend(
+                question_sha256=_sha("other Qwen3.5 question"),
+                runtime_profile_sha256=_sha("other-profile"),
+            )
+        assert same_profile is not None
+        assert other_profile is not None
+        self.assertIn("external_drafter", same_profile.primary_actions)
+        self.assertTrue(same_profile.draft_enabled)
+        self.assertNotIn("external_drafter", other_profile.primary_actions)
+        self.assertNotIn("external_drafter", other_profile.fallback_actions)
+        self.assertIn("target_verified_draft", other_profile.primary_actions)
 
-        no_weight_work = Result(
-            result.status,
-            result.component,
-            output=result.output,
-            evidence={
-                "draft": {
-                    "draft_source_body_bytes": 0,
-                    "mode": "hybrid",
-                    "provider": {"mtp_rounds": 1},
+        invalid_cases = (
+            {"qwen35_rounds": 0},
+            {"qwen35_selections": 0},
+            {"external_source_body_bytes": 0},
+            {"qwen35": {**qwen35, "source_body_bytes": 0}},
+            {"qwen35": {}},
+        )
+        for update in invalid_cases:
+            with self.subTest(update=update):
+                provider = {
+                    "external_linear_calls": 7,
+                    "external_source_body_bytes": 50_000,
+                    "qwen35_rounds": 1,
+                    "qwen35_selections": 1,
+                    "qwen35": qwen35,
+                    **update,
                 }
-            },
+                unphysical = Result(
+                    result.status,
+                    result.component,
+                    output=result.output,
+                    evidence={"draft": {"mode": "hybrid", "provider": provider}},
+                )
+                self.assertNotIn(
+                    "external_drafter",
+                    executed_actions_from_result(unphysical, economics),
+                )
+
+        not_target_verified = _economics(
+            "qwen35-unverified",
+            draft=False,
+            saved=0,
         )
         self.assertNotIn(
             "external_drafter",
-            executed_actions_from_result(no_weight_work, economics),
+            executed_actions_from_result(result, not_target_verified),
         )
 
     def test_exact_attention_output_crystal_records_physical_replay(self) -> None:

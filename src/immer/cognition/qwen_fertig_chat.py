@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..contracts import Component, ExecutionStatus, Request, Result
 from ..runtimes.qwen3_8.action_bank import (
+    physical_external_drafter_executed,
     physical_lm_head_coordinate_executed,
     physical_prefix_sinkhorn_executed,
 )
@@ -368,9 +369,7 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
             )
             if key in contextual_continuation
         }
-    layer_contextual_continuation = evidence.get(
-        "layer_contextual_continuation"
-    )
+    layer_contextual_continuation = evidence.get("layer_contextual_continuation")
     if isinstance(layer_contextual_continuation, dict):
         compact_layer_context = {
             key: layer_contextual_continuation[key]
@@ -474,15 +473,22 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
             key: draft[key]
             for key in (
                 "accepted_draft_tokens",
+                "aux_source_body_bytes",
                 "configured_mode",
                 "draft_linear_calls",
                 "draft_source_body_bytes",
+                "external_linear_calls",
+                "external_source_body_bytes",
                 "mode",
                 "proposed_draft_tokens",
                 "rounds",
+                "shared_linear_calls",
+                "shared_source_body_bytes",
                 "state_reuse_provider_downgrade",
+                "target_forward_passes",
                 "target_source_body_bytes",
                 "target_linear_calls",
+                "total_linear_calls",
                 "total_source_body_bytes",
                 "used_window_sizes",
                 "window_size",
@@ -555,8 +561,13 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                     "atlas_consensus_confidence_gain",
                     "atlas_consensus_rounds",
                     "atlas_consensus_tokens",
+                    "external_linear_calls",
+                    "external_source_body_bytes",
+                    "last_qwen35_complete_wave_probability",
                     "markov_rounds",
                     "markov_selections",
+                    "mtp_shared_linear_calls",
+                    "mtp_shared_source_body_bytes",
                     "mtp_wave_gate_checks",
                     "mtp_wave_gate_passes",
                     "mtp_wave_gate_rejections",
@@ -568,9 +579,51 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                     "online_consensus_rounds",
                     "online_consensus_tokens",
                     "provider_switches",
+                    "provider_tournament_qwen35_selections",
+                    "qwen35_accepted_tokens",
+                    "qwen35_init_failures",
+                    "qwen35_proposed_tokens",
+                    "qwen35_rounds",
+                    "qwen35_selections",
+                    "qwen35_wave_gate_checks",
+                    "qwen35_wave_gate_passes",
+                    "qwen35_wave_gate_rejections",
+                    "qwen35_wave_gate_unknown",
+                    "selected_provider",
+                    "shared_linear_calls",
+                    "shared_source_body_bytes",
+                    "target_linear_calls",
+                    "target_source_body_bytes",
                 )
                 if key in provider
             }
+            qwen35 = provider.get("qwen35")
+            if isinstance(qwen35, dict):
+                compact_draft["provider"]["qwen35"] = {
+                    key: qwen35[key]
+                    for key in (
+                        "accepted_prefix_0",
+                        "accepted_prefix_1",
+                        "accepted_prefix_2",
+                        "accepted_prefix_3",
+                        "accepted_prefix_4",
+                        "accepted_prefix_counts",
+                        "committed_tokens",
+                        "draft_calls",
+                        "extension_calls",
+                        "linear_calls",
+                        "pending",
+                        "poisoned",
+                        "prefill_calls",
+                        "reconcile_calls",
+                        "restaged_blocks",
+                        "schema",
+                        "source_body_bytes",
+                        "state_bytes",
+                        "window_size",
+                    )
+                    if key in qwen35
+                }
             mtp = provider.get("mtp")
             if isinstance(mtp, dict):
                 compact_draft["provider"]["mtp"] = {
@@ -719,7 +772,7 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                         "physical_pages_saved",
                     )
                     if key in request
-                }
+                },
             }
     runtime_reward = evidence.get("runtime_reward")
     if isinstance(runtime_reward, dict):
@@ -1017,18 +1070,27 @@ class QwenFertigChat:
                     prefix_sinkhorn = qwen.get("prefix_sinkhorn")
                     if physical_prefix_sinkhorn_executed(prefix_sinkhorn):
                         actions.append("prefix_sinkhorn")
-                    if physical_lm_head_coordinate_executed(
-                        qwen.get("exact_head")
-                    ):
+                    if physical_lm_head_coordinate_executed(qwen.get("exact_head")):
                         actions.append("lm_head_coordinate")
-                    if isinstance(qwen.get("draft"), Mapping):
+                    draft = qwen.get("draft")
+                    if isinstance(draft, Mapping):
                         actions.append("target_verified_draft")
                     generation = qwen.get("generation")
-                    if isinstance(generation, Mapping) and isinstance(
-                        generation.get("forward_passes"),
-                        int,
-                    ) and generation.get("forward_passes", 0) > 0:
+                    if (
+                        isinstance(generation, Mapping)
+                        and isinstance(
+                            generation.get("forward_passes"),
+                            int,
+                        )
+                        and generation.get("forward_passes", 0) > 0
+                    ):
                         actions.append("qwen_target")
+                    if (
+                        "qwen_target" in actions
+                        and "target_verified_draft" in actions
+                        and physical_external_drafter_executed(draft)
+                    ):
+                        actions.append("external_drafter")
             evidence["inference_action_directive"] = {
                 "applied": {
                     "actions": sorted(actions),
@@ -1213,8 +1275,7 @@ class QwenFertigChat:
                         ooe={
                             "warm": {
                                 "error": (
-                                    f"{type(exc).__module__}."
-                                    f"{type(exc).__qualname__}"
+                                    f"{type(exc).__module__}.{type(exc).__qualname__}"
                                 ),
                                 "status": "integrity-error",
                             }

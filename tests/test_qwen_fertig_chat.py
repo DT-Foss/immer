@@ -253,6 +253,8 @@ class QwenFertigChatTests(unittest.TestCase):
                         "atlas_consensus_confidence_gain": 0.125,
                         "atlas_consensus_rounds": 1,
                         "atlas_consensus_tokens": 2,
+                        "external_linear_calls": 7,
+                        "external_source_body_bytes": 50_000,
                         "markov_rounds": 2,
                         "markov_selections": 1,
                         "last_mtp_complete_wave_probability": 0.93,
@@ -262,6 +264,8 @@ class QwenFertigChatTests(unittest.TestCase):
                         "mtp_wave_gate_unknown": 0,
                         "mtp_rounds": 1,
                         "mtp_selections": 1,
+                        "mtp_shared_linear_calls": 4,
+                        "mtp_shared_source_body_bytes": 70,
                         "mtp": {
                             "accepted_tokens": 2,
                             "draft_steps": 3,
@@ -275,6 +279,39 @@ class QwenFertigChatTests(unittest.TestCase):
                         "online_consensus_rounds": 1,
                         "online_consensus_tokens": 1,
                         "provider_switches": 1,
+                        "provider_tournament_qwen35_selections": 1,
+                        "qwen35_accepted_tokens": 2,
+                        "qwen35_init_failures": 0,
+                        "qwen35_proposed_tokens": 3,
+                        "qwen35_rounds": 1,
+                        "qwen35_selections": 1,
+                        "qwen35_wave_gate_checks": 2,
+                        "qwen35_wave_gate_passes": 1,
+                        "qwen35_wave_gate_rejections": 1,
+                        "qwen35_wave_gate_unknown": 0,
+                        "last_qwen35_complete_wave_probability": 0.88,
+                        "selected_provider": "qwen35",
+                        "qwen35": {
+                            "accepted_prefix_0": 0,
+                            "accepted_prefix_1": 1,
+                            "accepted_prefix_2": 1,
+                            "accepted_prefix_3": 0,
+                            "accepted_prefix_4": 0,
+                            "accepted_prefix_counts": [0, 1, 1, 0, 0],
+                            "committed_tokens": 2,
+                            "draft_calls": 1,
+                            "extension_calls": 3,
+                            "linear_calls": 7,
+                            "pending": False,
+                            "poisoned": False,
+                            "prefill_calls": 1,
+                            "reconcile_calls": 1,
+                            "restaged_blocks": 0,
+                            "schema": "immer.qwen35-k4-metrics/v1",
+                            "source_body_bytes": 50_000,
+                            "state_bytes": 4096,
+                            "window_size": 4,
+                        },
                         "markov": {
                             "atlas_accepted_tokens": 2,
                             "atlas_contexts": 500_000,
@@ -360,9 +397,7 @@ class QwenFertigChatTests(unittest.TestCase):
                             "mlp": {"calls": 64, "nanoseconds": 1800},
                         },
                         "measured_nanoseconds": 3000,
-                        "schema": (
-                            "immer.qwen3.8-component-timing-request/v1"
-                        ),
+                        "schema": ("immer.qwen3.8-component-timing-request/v1"),
                         "status": "ok",
                         "unit": "nanoseconds",
                     },
@@ -395,9 +430,7 @@ class QwenFertigChatTests(unittest.TestCase):
                 expected=None,
             ),
         ) as (fertig, _, _):
-            result = QwenFertigChat(qwen, fertig).handle(
-                Request("chat", MATH_QUESTION)
-            )
+            result = QwenFertigChat(qwen, fertig).handle(Request("chat", MATH_QUESTION))
 
         draft = _receipt(result)["qwen"]["draft"]
         self.assertEqual(draft["accepted_draft_tokens"], 5)
@@ -414,6 +447,19 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertEqual(draft["provider"]["online_consensus_tokens"], 1)
         self.assertEqual(draft["provider"]["mtp_wave_gate_rejections"], 1)
         self.assertEqual(draft["provider"]["mtp"]["draft_steps"], 3)
+        self.assertEqual(draft["provider"]["qwen35_rounds"], 1)
+        self.assertEqual(draft["provider"]["qwen35_selections"], 1)
+        self.assertEqual(draft["provider"]["qwen35_accepted_tokens"], 2)
+        self.assertEqual(draft["provider"]["qwen35_wave_gate_rejections"], 1)
+        self.assertEqual(draft["provider"]["external_source_body_bytes"], 50_000)
+        self.assertEqual(draft["provider"]["external_linear_calls"], 7)
+        self.assertEqual(draft["provider"]["mtp_shared_source_body_bytes"], 70)
+        self.assertEqual(draft["provider"]["mtp_shared_linear_calls"], 4)
+        self.assertEqual(draft["provider"]["qwen35"]["draft_calls"], 1)
+        self.assertEqual(
+            draft["provider"]["qwen35"]["source_body_bytes"],
+            50_000,
+        )
         self.assertEqual(draft["context_crystal"]["crystal_accepted_tokens"], 5)
         self.assertEqual(draft["context_crystal"]["crystal_bank_cells"], 12)
         self.assertEqual(
@@ -457,13 +503,9 @@ class QwenFertigChatTests(unittest.TestCase):
             qwen_receipt["q4"]["request"]["release_touched_nanoseconds"],
             123_456,
         )
-        self.assertTrue(
-            qwen_receipt["q4"]["runtime"]["resident_head_fully_protected"]
-        )
+        self.assertTrue(qwen_receipt["q4"]["runtime"]["resident_head_fully_protected"])
         self.assertEqual(
-            qwen_receipt["mlp_page_route"]["request"][
-                "adaptive_width_pages_saved"
-            ],
+            qwen_receipt["mlp_page_route"]["request"]["adaptive_width_pages_saved"],
             11,
         )
         self.assertEqual(qwen_receipt["runtime_reward"]["o1_priority"], 4.5)
@@ -473,9 +515,7 @@ class QwenFertigChatTests(unittest.TestCase):
         )
         economics = receipt_from_result(
             result,
-            question_sha256=hashlib.sha256(
-                MATH_QUESTION.encode("utf-8")
-            ).hexdigest(),
+            question_sha256=hashlib.sha256(MATH_QUESTION.encode("utf-8")).hexdigest(),
             runtime_profile_sha256="e" * 64,
         )
         self.assertEqual(economics.target_forwards, 3)
@@ -483,6 +523,89 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertEqual(economics.page_mlp_weight_bytes, 200)
         self.assertEqual(economics.saved_pages, 11)
         self.assertEqual(economics.process_peak_rss_bytes, 1024)
+
+    def test_qwen35_compaction_requires_explicit_acceptance_evidence(self) -> None:
+        base = _qwen_ok("ordinary answer")
+        qwen_result = Result(
+            base.status,
+            base.component,
+            output=base.output,
+            evidence={
+                **dict(base.evidence),
+                "draft": {
+                    "accepted_draft_tokens": 3,
+                    "draft_linear_calls": 12,
+                    "draft_source_body_bytes": 60_000,
+                    "mode": "hybrid",
+                    "provider": {
+                        "external_linear_calls": 7,
+                        "external_source_body_bytes": 50_000,
+                        "mtp_shared_linear_calls": 5,
+                        "mtp_shared_source_body_bytes": 10_000,
+                        "qwen35_rounds": 1,
+                        "qwen35_selections": 1,
+                        "qwen35_proposed_tokens": 4,
+                        "qwen35_wave_gate_checks": 1,
+                        "qwen35_wave_gate_passes": 1,
+                        "selected_provider": "qwen35",
+                        "qwen35": {
+                            "draft_calls": 1,
+                            "linear_calls": 7,
+                            "source_body_bytes": 50_000,
+                        },
+                    },
+                    "target_linear_calls": 90,
+                    "target_source_body_bytes": 300,
+                    "total_linear_calls": 102,
+                    "total_source_body_bytes": 60_300,
+                },
+            },
+        )
+        directive = InferenceActionDirective(
+            question_sha256=hashlib.sha256(MATH_QUESTION.encode("utf-8")).hexdigest(),
+            runtime_profile_sha256="4" * 64,
+            primary_actions=(
+                "external_drafter",
+                "qwen_target",
+                "target_verified_draft",
+            ),
+            fallback_actions=("qwen_target",),
+            draft_enabled=True,
+            source_signature_sha256s=("5" * 64,),
+            support=1,
+            saved_qwen_forwards=1,
+        )
+        with _patched_solver(
+            None,
+            _verification(
+                CandidateVerificationStatus.ABSTAINED,
+                candidate=None,
+                expected=None,
+            ),
+        ) as (fertig, _, _):
+            result = QwenFertigChat(_Qwen(qwen_result), fertig).handle(
+                Request(
+                    "chat",
+                    MATH_QUESTION,
+                    {"qwen_inference_action_directive": directive.to_document()},
+                )
+            )
+
+        draft = _receipt(result)["qwen"]["draft"]
+        provider = draft["provider"]
+        self.assertNotIn("qwen35_accepted_tokens", provider)
+        self.assertNotIn("accepted_tokens", provider["qwen35"])
+        self.assertEqual(provider["qwen35_proposed_tokens"], 4)
+        self.assertEqual(provider["external_source_body_bytes"], 50_000)
+        self.assertEqual(provider["mtp_shared_source_body_bytes"], 10_000)
+        self.assertEqual(draft["target_source_body_bytes"], 300)
+        self.assertEqual(draft["target_linear_calls"], 90)
+        self.assertEqual(draft["total_source_body_bytes"], 60_300)
+        self.assertEqual(draft["total_linear_calls"], 102)
+        self.assertEqual(
+            result.evidence["inference_action_directive"]["applied"]["actions"],
+            ["external_drafter", "qwen_target", "target_verified_draft"],
+        )
 
     def test_qwen_receipt_keeps_mtp_anchor_reuse_evidence(self) -> None:
         base = _qwen_ok("ordinary answer")
@@ -652,9 +775,7 @@ class QwenFertigChatTests(unittest.TestCase):
                 expected=None,
             ),
         ) as (fertig, _, _):
-            result = QwenFertigChat(qwen, fertig).handle(
-                Request("chat", MATH_QUESTION)
-            )
+            result = QwenFertigChat(qwen, fertig).handle(Request("chat", MATH_QUESTION))
 
         compact = _receipt(result)["qwen"]["delta_head_router"]
         self.assertEqual(compact["layers"], [0, 1])
@@ -945,9 +1066,7 @@ class QwenFertigChatTests(unittest.TestCase):
                             "base_softmax_head_rows_skipped": 12,
                             "base_softmax_probability_elements_skipped": 144,
                         },
-                        "schema": (
-                            "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
-                        ),
+                        "schema": ("immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"),
                     },
                 },
             )

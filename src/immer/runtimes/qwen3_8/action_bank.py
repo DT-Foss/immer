@@ -115,6 +115,40 @@ def physical_lm_head_coordinate_executed(value: object) -> bool:
     )
 
 
+def physical_external_drafter_executed(value: object) -> bool:
+    """Accept only physical external-Qwen3.5 provider work.
+
+    Embedded MTP shares the target runtime and therefore remains ordinary
+    target-verified drafting.  Merely selecting Qwen3.5 is also insufficient:
+    the request must report both a realized round and positive external source
+    bytes from the nested Qwen3.5 provider receipt.
+    """
+
+    if not isinstance(value, Mapping) or value.get("mode") not in {
+        "hybrid",
+        "qwen35",
+    }:
+        return False
+    provider = value.get("provider")
+    if not isinstance(provider, Mapping):
+        return False
+    qwen35 = provider.get("qwen35")
+    if not isinstance(qwen35, Mapping):
+        return False
+    external_bytes = provider.get("external_source_body_bytes")
+    qwen35_bytes = qwen35.get("source_body_bytes")
+    counters = (
+        provider.get("qwen35_rounds"),
+        provider.get("qwen35_selections"),
+        external_bytes,
+        qwen35_bytes,
+    )
+    return external_bytes == qwen35_bytes and all(
+        isinstance(counter, int) and not isinstance(counter, bool) and counter > 0
+        for counter in counters
+    )
+
+
 def physical_layer_transition_crystal_executed(value: object) -> bool:
     """Accept only physically executed layer transitions with pinned identity."""
 
@@ -319,8 +353,7 @@ def _physical_layer_mlp_crystal_registry_executed(
         not isinstance(installed, list)
         or not installed
         or any(
-            isinstance(layer, bool) or not isinstance(layer, int)
-            for layer in installed
+            isinstance(layer, bool) or not isinstance(layer, int) for layer in installed
         )
         or installed != sorted(set(installed))
         or not isinstance(enabled_layer, int)
@@ -358,14 +391,8 @@ def _physical_layer_mlp_crystal_registry_executed(
         not _is_sha256(identity_sha256)
         or action_abi
         not in {
-            (
-                "immer.qwen3.8/"
-                "layer63-mlp-residual-rademacher-centered-ridge-bf16/v1"
-            ),
-            (
-                "immer.qwen3.8/"
-                "layer-mlp-residual-rademacher-centered-ridge-bf16/v2"
-            ),
+            ("immer.qwen3.8/layer63-mlp-residual-rademacher-centered-ridge-bf16/v1"),
+            ("immer.qwen3.8/layer-mlp-residual-rademacher-centered-ridge-bf16/v2"),
         }
         or selected.get("installed") is not True
         or selected.get("enabled") is not True
@@ -382,8 +409,7 @@ def _physical_layer_mlp_crystal_registry_executed(
         or request.get("max_error_radius") != radius
         or selected_request.get("identity_sha256") != identity_sha256
         or selected_request.get("action_abi") != action_abi
-        or selected_request.get("packed_weight_bytes_per_transition")
-        != per_transition
+        or selected_request.get("packed_weight_bytes_per_transition") != per_transition
         or selected_request.get("max_error_radius") != radius
     ):
         return False
@@ -413,8 +439,7 @@ def _physical_layer_mlp_crystal_registry_executed(
     avoided = request["packed_weight_bytes_avoided"]
     counter_fields = (*positive, "fallbacks")
     if any(
-        selected_request.get(field) != request.get(field)
-        for field in counter_fields
+        selected_request.get(field) != request.get(field) for field in counter_fields
     ):
         return False
     for layer, counters in request_layers.items():
@@ -567,16 +592,10 @@ def executed_actions_from_result(
         ):
             actions = tuple(sorted({*actions, "mlp_page_coordinate"}))
     if isinstance(draft, Mapping):
-        provider = draft.get("provider")
         if (
-            isinstance(provider, Mapping)
-            and draft.get("mode") in {"hybrid", "mtp"}
-            and isinstance(provider.get("mtp_rounds"), int)
-            and not isinstance(provider.get("mtp_rounds"), bool)
-            and provider.get("mtp_rounds", 0) > 0
-            and isinstance(draft.get("draft_source_body_bytes"), int)
-            and not isinstance(draft.get("draft_source_body_bytes"), bool)
-            and draft.get("draft_source_body_bytes", 0) > 0
+            "qwen_target" in actions
+            and "target_verified_draft" in actions
+            and physical_external_drafter_executed(draft)
         ):
             actions = tuple(sorted({*actions, "external_drafter"}))
         crystal = draft.get("context_crystal")
@@ -668,9 +687,7 @@ class InferenceActionReceipt:
             or "target_verified_draft" not in self.actions
             or self.target_forwards <= 0
         ):
-            raise ValueError(
-                "external drafter requires target-verified Qwen work"
-            )
+            raise ValueError("external drafter requires target-verified Qwen work")
 
     @classmethod
     def from_economics(
@@ -1237,10 +1254,6 @@ class InferenceActionBank:
                 or "lm_head_coordinate" in receipt.actions
                 or "mlp_page_coordinate" in receipt.actions
                 or (
-                    "external_drafter" in receipt.actions
-                    and receipt.saved_qwen_forwards > 0
-                )
-                or (
                     "target_verified_draft" in receipt.actions
                     and receipt.saved_qwen_forwards > 0
                 )
@@ -1276,6 +1289,7 @@ class InferenceActionBank:
                     "qwen_target",
                     "target_verified_draft",
                 }
+                and (action != "external_drafter" or bool(exact_runtime))
             }
             if runtime
             else {"qwen_target"}
@@ -1290,6 +1304,12 @@ class InferenceActionBank:
             runtime_action_set.update({"mlp_page_coordinate", "qwen_target"})
         if any("lm_head_coordinate" in receipt.actions for receipt in runtime):
             runtime_action_set.update({"lm_head_coordinate", "qwen_target"})
+        if exact_runtime and any(
+            "external_drafter" in receipt.actions for receipt in exact_runtime
+        ):
+            runtime_action_set.update(
+                {"external_drafter", "qwen_target", "target_verified_draft"}
+            )
         if exact_runtime and any(
             "layer_transition_crystal" in receipt.actions for receipt in exact_runtime
         ):
@@ -1350,6 +1370,7 @@ __all__ = [
     "InferenceActionObservation",
     "InferenceActionReceipt",
     "executed_actions_from_result",
+    "physical_external_drafter_executed",
     "physical_lm_head_coordinate_executed",
     "physical_prefix_sinkhorn_executed",
 ]
