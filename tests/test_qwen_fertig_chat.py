@@ -703,6 +703,70 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertEqual(receipt["fertig"]["status"], "abstained")
         self.assertNotIn("exact_math", json.dumps(result.evidence, sort_keys=True))
 
+    def test_outer_action_receipt_keeps_executed_physical_prefix_sinkhorn(
+        self,
+    ) -> None:
+        question = "Explain causal graphs."
+        base = _qwen_ok("They index causal structure.")
+        qwen = _Qwen(
+            Result(
+                base.status,
+                base.component,
+                output=base.output,
+                evidence={
+                    **dict(base.evidence),
+                    "prefix_sinkhorn": {
+                        "action_identity_sha256": "a" * 64,
+                        "active": True,
+                        "available": True,
+                        "configuration": {
+                            "alpha": 1.0,
+                            "replace_base_softmax": True,
+                        },
+                        "request": {
+                            "base_softmax_head_rows_skipped": 12,
+                            "base_softmax_probability_elements_skipped": 144,
+                        },
+                        "schema": (
+                            "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
+                        ),
+                    },
+                },
+            )
+        )
+        directive = InferenceActionDirective(
+            question_sha256=hashlib.sha256(question.encode("utf-8")).hexdigest(),
+            runtime_profile_sha256="4" * 64,
+            primary_actions=("prefix_sinkhorn", "qwen_target"),
+            fallback_actions=("qwen_target",),
+            draft_enabled=None,
+            source_signature_sha256s=("5" * 64,),
+            support=1,
+            saved_qwen_forwards=0,
+        )
+        with _patched_solver(
+            None,
+            _verification(
+                CandidateVerificationStatus.ABSTAINED,
+                candidate=None,
+                expected=None,
+                question=question,
+            ),
+        ) as (fertig, _, _):
+            result = QwenFertigChat(qwen, fertig).handle(
+                Request(
+                    "chat",
+                    question,
+                    {"qwen_inference_action_directive": directive.to_document()},
+                )
+            )
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(
+            result.evidence["inference_action_directive"]["applied"]["actions"],
+            ["prefix_sinkhorn", "qwen_target"],
+        )
+
     def test_failures_are_contained_and_never_trigger_a_second_qwen_call(self) -> None:
         cases = (
             (

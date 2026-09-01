@@ -3726,9 +3726,74 @@ class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
         self.assertEqual(self.model._metric(self.pager, "linear_calls"), linears_before)
         self.assertEqual(self.observed, [])
 
+    def test_prefix_sinkhorn_action_switches_only_on_empty_state_and_counts_work(
+        self,
+    ) -> None:
+        from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
+        enabled_identity = self.model._native_head_crsa_snapshot_identity()
+        self.assertNotEqual(enabled_identity, {"kind": "none"})
+        action_identity = self.model.prefix_sinkhorn_action_identity_sha256()
+
+        self.model.set_native_head_crsa_enabled(False)
+        self.assertEqual(
+            self.model._native_head_crsa_snapshot_identity(),
+            {"kind": "none"},
+        )
+        self.model.prefill([[1, 4]])
+        disabled_state = self.model._layer_states[27]
+        self.assertIsInstance(disabled_state, AttentionState)
+        self.assertIsNone(disabled_state.crsa_log_usage)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "empty model state"):
+            self.model.set_native_head_crsa_enabled(True)
+        self.model.reset_state()
+        self.model.set_native_head_crsa_enabled(True)
+        self.assertEqual(
+            self.model.prefix_sinkhorn_action_identity_sha256(),
+            action_identity,
+        )
+
+        physical = StreamedQwen38(
+            self.config,
+            self.pager,
+            native_head_crsa=Qwen38NativeHeadCrsa(
+                alpha=1.0,
+                replace_base_softmax=True,
+            ),
+            max_batch_size=1,
+            max_seq_len=16,
+        )
+        physical.prefill([[1, 4]])
+        metrics = physical.native_prefix_sinkhorn_metrics()
+        self.assertEqual(metrics["base_softmax_head_rows_skipped"], 8)
+        self.assertEqual(
+            metrics["base_softmax_probability_elements_skipped"],
+            16,
+        )
+        self.assertTrue(metrics["physical_replacement"])
+        self.assertNotEqual(
+            metrics["action_identity_sha256"],
+            action_identity,
+        )
+        before_discarded_stage = dict(metrics)
+        discarded = physical.stage_continuation_block([[9, 7]])
+        after_discarded_stage = physical.native_prefix_sinkhorn_metrics()
+        self.assertGreater(
+            after_discarded_stage["base_softmax_head_rows_skipped"],
+            before_discarded_stage["base_softmax_head_rows_skipped"],
+        )
+        physical.discard_continuation_block(discarded)
+        self.assertEqual(
+            physical.native_prefix_sinkhorn_metrics(),
+            after_discarded_stage,
+        )
+        physical.reset_state(release=True)
+
     def test_attention_output_crystal_replays_prefix_sinkhorn_state_exactly(
         self,
     ) -> None:
+        from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
         pager = Qwen38WeightPager(
             self.source,
             device="cpu",
@@ -3739,7 +3804,10 @@ class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
         model = StreamedQwen38(
             self.config,
             pager,
-            native_head_crsa=self.intervention,
+            native_head_crsa=Qwen38NativeHeadCrsa(
+                alpha=1.0,
+                replace_base_softmax=True,
+            ),
             native_head_crsa_observer=observed.append,
             max_batch_size=1,
             max_seq_len=16,
@@ -3766,6 +3834,7 @@ class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
 
             model.reset_state()
             model.prefill([[1, 4]])
+            physical_before_replay = model.native_prefix_sinkhorn_metrics()
             observed.clear()
             replay = model.stage_continuation_block([[9, 7]])
             self.assertEqual(observed, [])
@@ -3782,6 +3851,10 @@ class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
             metrics = bank.metrics()
             self.assertEqual(metrics.hit_count, 14)
             self.assertEqual(metrics.skipped_projection_calls_saved, 28)
+            self.assertEqual(
+                model.native_prefix_sinkhorn_metrics(),
+                physical_before_replay,
+            )
         finally:
             model.reset_state(release=True)
             pager.close()

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, replace
 import math
 import unittest
+from unittest.mock import patch
 
 try:
     import torch
@@ -438,6 +439,93 @@ class Qwen38KernelTests(unittest.TestCase):
         )
         self.assertTrue(torch.isneginf(padded_state.crsa_log_usage[1, :, -1]).all())
         self.assertEqual(padded_rows[0].future_weight_max_abs, 0.0)
+
+    def test_physical_prefix_sinkhorn_skips_selected_head_base_softmax(self) -> None:
+        from immer.runtimes.qwen3_8 import kernels
+        from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
+        torch.manual_seed(191)
+        batch, sequence, heads, kv_heads, width = 2, 6, 24, 4, 4
+        query_gate = torch.randn(batch, sequence, 2 * heads * width)
+        key = torch.randn(batch, sequence, kv_heads * width)
+        value = torch.randn(batch, sequence, kv_heads * width)
+        common = dict(
+            q_norm_weight=torch.randn(width) * 0.05,
+            k_norm_weight=torch.randn(width) * 0.05,
+            num_attention_heads=heads,
+            num_key_value_heads=kv_heads,
+            head_dim=width,
+            rotary_dim=2,
+            rope_theta=1_000.0,
+        )
+        intervention = Qwen38NativeHeadCrsa(
+            alpha=1.0,
+            replace_base_softmax=True,
+        )
+        observed = []
+        with patch.object(
+            kernels.F,
+            "softmax",
+            wraps=kernels.F.softmax,
+        ) as base_softmax:
+            whole, whole_state = kernels.full_attention_core(
+                query_gate,
+                key,
+                value,
+                native_head_crsa=intervention,
+                native_head_crsa_observer=observed.append,
+                **common,
+            )
+
+        self.assertEqual(len(base_softmax.call_args_list), 1)
+        self.assertEqual(
+            tuple(base_softmax.call_args.args[0].shape),
+            (batch, 20, sequence, sequence),
+        )
+        evidence = observed[0]
+        self.assertEqual(evidence.execution_mode, "replace_base_softmax")
+        self.assertEqual(evidence.batch_size, batch)
+        self.assertEqual(
+            evidence.base_softmax_head_rows_skipped,
+            batch * 4 * sequence,
+        )
+        self.assertEqual(
+            evidence.base_softmax_probability_elements_skipped,
+            batch * 4 * sequence * sequence,
+        )
+        self.assertEqual(evidence.alpha_per_head, (1.0, 1.0, 1.0, 1.0))
+        self.assertEqual(evidence.future_weight_max_abs, 0.0)
+
+        prefix, prefix_state = kernels.full_attention_core(
+            query_gate[:, :3],
+            key[:, :3],
+            value[:, :3],
+            native_head_crsa=intervention,
+            **common,
+        )
+        suffix, split_state = kernels.full_attention_core(
+            query_gate[:, 3:],
+            key[:, 3:],
+            value[:, 3:],
+            state=prefix_state,
+            native_head_crsa=intervention,
+            **common,
+        )
+        torch.testing.assert_close(
+            torch.cat((prefix, suffix), dim=1),
+            whole,
+            rtol=2e-6,
+            atol=2e-6,
+        )
+        torch.testing.assert_close(
+            split_state.crsa_log_usage,
+            whole_state.crsa_log_usage,
+            rtol=2e-6,
+            atol=2e-6,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires alpha=1"):
+            Qwen38NativeHeadCrsa(alpha=0.5, replace_base_softmax=True)
 
     def test_full_attention_fork_prefill_is_bit_exact_and_shares_only_kv(
         self,

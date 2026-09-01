@@ -21,6 +21,10 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 from ...contracts import Result
+from ..qwen3_8.action_bank import (
+    InferenceActionBankError,
+    InferenceActionDirective,
+)
 from ..qwen3_8.semantic_atlas import ModelPin, ProbeIdentity
 from .controller import OoeController, VerifiedTeacherTransition
 from .crystal import CrystalStore, CrystalStoreError
@@ -64,6 +68,19 @@ def _question_sha256(question: str) -> str:
 def _profile(metadata: Mapping[str, Any]) -> str | None:
     value = metadata.get("qwen_warm_runtime_profile_sha256")
     return None if value is None else require_sha256(value, field="warm profile")
+
+
+def prefix_sinkhorn_warm_allowed(metadata: Mapping[str, Any]) -> bool:
+    """Reject warm replay only when a request explicitly disables Prefix-Sinkhorn."""
+
+    raw = metadata.get("qwen_inference_action_directive")
+    if raw is None:
+        return True
+    try:
+        directive = InferenceActionDirective.from_document(raw)
+    except (InferenceActionBankError, TypeError, ValueError):
+        return False
+    return "prefix_sinkhorn" not in directive.disabled_actions
 
 
 def _prompt_sketch(question: str, dimensions: int) -> tuple[float, ...]:
@@ -466,6 +483,8 @@ class GrowingQwenWarmBank:
         question: str,
         metadata: Mapping[str, Any],
     ) -> QwenOoeFeatureReceipt | None:
+        if not prefix_sinkhorn_warm_allowed(metadata):
+            return None
         profile = _profile(metadata)
         if profile is None:
             return None
@@ -499,6 +518,8 @@ class GrowingQwenWarmBank:
         question: str,
         metadata: Mapping[str, Any],
     ) -> Any:
+        if not prefix_sinkhorn_warm_allowed(metadata):
+            return None
         return self.templates.try_warm(question, metadata)
 
     @staticmethod
@@ -681,6 +702,8 @@ class GrowingQwenWarmBank:
         qwen_result: Result,
         final_result: Result,
     ) -> dict[str, Any]:
+        if not prefix_sinkhorn_warm_allowed(metadata):
+            return {"status": "prefix-policy-miss"}
         profile = _profile(metadata)
         if profile != self.runtime_profile_sha256:
             return {"status": "profile-miss"}

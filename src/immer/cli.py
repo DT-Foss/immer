@@ -1890,11 +1890,12 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                             None
                             if q4_root is None
                             or not (q4_root / "manifest.json").is_file()
-                            else _path_sha256(q4_root / "manifest.json")
+                                else _path_sha256(q4_root / "manifest.json")
                         ),
+                        "prefix_sinkhorn": bool(args.prefix_sinkhorn),
                         "raw_qwen": bool(args.raw_qwen),
                         "runtime_code_revision": runtime_code_revision,
-                        "schema": "immer.qwen3.8-economics-runtime-profile/v1",
+                        "schema": "immer.qwen3.8-economics-runtime-profile/v2",
                         "tokenizer_path_sha256": hashlib.sha256(
                             str(tokenizer_path).encode("utf-8")
                         ).hexdigest(),
@@ -2214,7 +2215,10 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         if bool(getattr(args, "prefix_sinkhorn", False)):
             from .runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
 
-            native_head_crsa = Qwen38NativeHeadCrsa()
+            native_head_crsa = Qwen38NativeHeadCrsa(
+                alpha=1.0,
+                replace_base_softmax=True,
+            )
         snapshot_bridge = SnapshotEventBridge() if service else None
         qwen = Qwen38CausalChat(
             str(bundle_path),
@@ -3498,7 +3502,10 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--prefix-sinkhorn",
         action="store_true",
-        help="run the native layer-27 Prefix-Sinkhorn attention intervention",
+        help=(
+            "replace base softmax with native Prefix-Sinkhorn on the routed "
+            "layer-27 heads"
+        ),
     )
     chat.add_argument(
         "--raw-qwen",

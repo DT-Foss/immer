@@ -34,7 +34,11 @@ from .controller import (
 from .crystal import CrystalStore
 from .identity import canonical_json_bytes, require_sha256
 from .qwen_bridge import QwenOoeFeatureReceipt
-from .qwen_warm_growth import GrowingQwenWarmBank, load_growing_index
+from .qwen_warm_growth import (
+    GrowingQwenWarmBank,
+    load_growing_index,
+    prefix_sinkhorn_warm_allowed,
+)
 from .result_cells import (
     ResultCellBank,
     ResultCellBinding,
@@ -563,6 +567,8 @@ def open_verified_qwen_warm_bank(
         question: str,
         metadata: Mapping[str, Any],
     ) -> QwenOoeFeatureReceipt | None:
+        if not prefix_sinkhorn_warm_allowed(metadata):
+            return None
         if hashlib.sha256(question.encode("utf-8")).hexdigest() == question_sha256:
             raw_token = metadata.get("qwen_token_sha256")
             if raw_token is not None and require_sha256(
@@ -585,14 +591,24 @@ def open_verified_qwen_warm_bank(
             )
         return False
 
+    semantic_replay_provider = _semantic_replay_provider(
+        bank,
+        semantic_key_verifier,
+    )
+
+    def direct_provider(
+        question: str,
+        metadata: Mapping[str, Any],
+    ) -> OoeChatAttempt | None:
+        if not prefix_sinkhorn_warm_allowed(metadata):
+            return None
+        return semantic_replay_provider(question, metadata)
+
     base_hook = OoeChatHook(
         controller=controller,
         feature_provider=feature_provider,
         quality_verifier=quality_verifier,
-        direct_provider=_semantic_replay_provider(
-            bank,
-            semantic_key_verifier,
-        ),
+        direct_provider=direct_provider,
         snapshot_name=state_name,
         snapshot_restorer=restore_controller,
         commit_on_fertig_abstention=True,

@@ -2667,6 +2667,10 @@ def _native_evidence_from_mapping(
     required = {
         "alpha_per_head",
         "argmax_changed_queries_per_head",
+        "base_softmax_head_rows_skipped",
+        "base_softmax_probability_elements_skipped",
+        "batch_size",
+        "execution_mode",
         "free_head_max_abs_error",
         "free_heads",
         "future_weight_max_abs",

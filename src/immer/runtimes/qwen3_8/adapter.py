@@ -1847,6 +1847,7 @@ class Qwen38CausalChat:
         self._last_fast_mlp_evidence: dict[str, Any] | None = None
         self._last_delta_head_evidence: dict[str, Any] | None = None
         self._last_exact_head_evidence: dict[str, Any] | None = None
+        self._last_prefix_sinkhorn_evidence: dict[str, int] | None = None
         self._last_attention_output_crystal_evidence: dict[str, int] | None = None
         self._last_mlp_page_coordinate_evidence: dict[str, int] | None = None
         self._draft_window_selection: DraftWindowSelection | None = None
@@ -1874,7 +1875,16 @@ class Qwen38CausalChat:
         self._closed = False
         self._lock = threading.RLock()
 
-    def _result_cell_generation_policy_sha256(self) -> str:
+    def _result_cell_generation_policy_sha256(
+        self,
+        *,
+        prefix_sinkhorn_applied: bool | None = None,
+    ) -> str:
+        if prefix_sinkhorn_applied is not None and not isinstance(
+            prefix_sinkhorn_applied,
+            bool,
+        ):
+            raise TypeError("prefix_sinkhorn_applied must be boolean or null")
         policy: dict[str, Any] = {
             "anchor_cache_enabled": self._anchor_cache is not None,
             "compute_dtype": self._compute_dtype,
@@ -2187,10 +2197,35 @@ class Qwen38CausalChat:
             if receipt is not None:
                 policy["exact_head"]["artifact"] = dict(receipt)
         if self._native_head_crsa is not None:
+            runtime = self._runtime
+            identity = (
+                None
+                if runtime is None
+                else getattr(
+                    runtime.model,
+                    "prefix_sinkhorn_action_identity_sha256",
+                    lambda: None,
+                )()
+            )
             policy["prefix_sinkhorn"] = {
-                "active": self._native_head_crsa.active,
+                "action_identity_sha256": identity,
+                "available": self._native_head_crsa.active,
                 "configuration": asdict(self._native_head_crsa),
-                "schema": self._native_head_crsa.evidence_schema,
+                "operator_evidence_schema": self._native_head_crsa.evidence_schema,
+                "request_applied": (
+                    bool(
+                        getattr(
+                            None if runtime is None else runtime.model,
+                            "native_head_crsa_enabled",
+                            self._native_head_crsa.active,
+                        )
+                    )
+                    if prefix_sinkhorn_applied is None
+                    else prefix_sinkhorn_applied
+                ),
+                "schema": (
+                    "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
+                ),
             }
         if self._attention_output_crystal_state_path is not None:
             bank = self._attention_output_crystal_bank
@@ -2402,6 +2437,7 @@ class Qwen38CausalChat:
         question: str,
         rendered_prompt: str,
         prompt_ids: tuple[int, ...],
+        prefix_sinkhorn_applied: bool,
     ) -> dict[str, Any] | None:
         code_revision = self._result_cell_code_revision
         if code_revision is None:
@@ -2439,7 +2475,11 @@ class Qwen38CausalChat:
             system_prompt_sha256=hashlib.sha256(
                 self._system_prompt.encode("utf-8")
             ).hexdigest(),
-            generation_policy_sha256=(self._result_cell_generation_policy_sha256()),
+            generation_policy_sha256=(
+                self._result_cell_generation_policy_sha256(
+                    prefix_sinkhorn_applied=prefix_sinkhorn_applied,
+                )
+            ),
         )
         return qwen_result_binding_evidence(binding)
 
@@ -2734,6 +2774,7 @@ class Qwen38CausalChat:
         self._last_fast_mlp_evidence = None
         self._last_delta_head_evidence = None
         self._last_exact_head_evidence = None
+        self._last_prefix_sinkhorn_evidence = None
         self._last_attention_output_crystal_evidence = None
         self._last_mlp_page_coordinate_evidence = None
         fast_mount = getattr(runtime, "fast_mlp_mount", None)
@@ -3431,6 +3472,70 @@ class Qwen38CausalChat:
         self._last_delta_head_evidence = request
         return request
 
+    def _prefix_sinkhorn_metrics(
+        self,
+        runtime: _OwnedRuntime,
+    ) -> dict[str, int] | None:
+        if self._native_head_crsa is None:
+            return None
+        metrics = getattr(runtime.model, "native_prefix_sinkhorn_metrics", None)
+        identity = getattr(
+            runtime.model,
+            "prefix_sinkhorn_action_identity_sha256",
+            None,
+        )
+        if not callable(metrics) or not callable(identity):
+            raise Qwen38ChatError(
+                "runtime model lacks Prefix-Sinkhorn action metrics"
+            )
+        record = metrics()
+        if (
+            not isinstance(record, Mapping)
+            or record.get("schema")
+            != "immer.qwen3.8-prefix-sinkhorn-action-metrics/v1"
+            or record.get("action_identity_sha256") != identity()
+            or record.get("physical_replacement")
+            is not self._native_head_crsa.physical_replacement
+        ):
+            raise Qwen38ChatError("Prefix-Sinkhorn action metrics are invalid")
+        counters: dict[str, int] = {}
+        for field in (
+            "base_softmax_head_rows_skipped",
+            "base_softmax_probability_elements_skipped",
+        ):
+            value = record.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise Qwen38ChatError(
+                    f"Prefix-Sinkhorn action {field} is invalid"
+                )
+            counters[field] = value
+        return counters
+
+    def _record_prefix_sinkhorn_request(
+        self,
+        before: Mapping[str, int] | None,
+        after: Mapping[str, int] | None,
+    ) -> dict[str, int] | None:
+        if before is None or after is None:
+            return None
+        request = {
+            field: int(after[field]) - int(before[field])
+            for field in (
+                "base_softmax_head_rows_skipped",
+                "base_softmax_probability_elements_skipped",
+            )
+        }
+        if any(value < 0 for value in request.values()):
+            raise Qwen38ChatError(
+                "Prefix-Sinkhorn request counters moved backwards"
+            )
+        self._last_prefix_sinkhorn_evidence = request
+        return request
+
     def _attention_output_crystal_metrics(self) -> dict[str, int] | None:
         bank = self._attention_output_crystal_bank
         if bank is None:
@@ -3568,10 +3673,31 @@ class Qwen38CausalChat:
         if self._tokenizer_sha256 is not None:
             evidence["tokenizer_sha256"] = self._tokenizer_sha256
         if self._native_head_crsa is not None:
+            runtime = self._runtime
+            identity = (
+                None
+                if runtime is None
+                else getattr(
+                    runtime.model,
+                    "prefix_sinkhorn_action_identity_sha256",
+                    lambda: None,
+                )()
+            )
             evidence["prefix_sinkhorn"] = {
-                "active": self._native_head_crsa.active,
+                "action_identity_sha256": identity,
+                "active": (
+                    self._native_head_crsa.active
+                    if runtime is None
+                    else bool(
+                        getattr(runtime.model, "native_head_crsa_enabled", False)
+                    )
+                ),
+                "available": self._native_head_crsa.active,
                 "configuration": asdict(self._native_head_crsa),
-                "schema": self._native_head_crsa.evidence_schema,
+                "operator_evidence_schema": self._native_head_crsa.evidence_schema,
+                "schema": (
+                    "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
+                ),
             }
         if self._draft_runtime is not None:
             evidence["draft_bundle"] = dict(self._draft_runtime.bundle_receipt)
@@ -4051,6 +4177,64 @@ class Qwen38CausalChat:
         if delta_head_router is not None:
             assert callable(set_delta_head_router)
             set_delta_head_router(None)
+
+        prefix_sinkhorn_configured = self._native_head_crsa is not None
+        prefix_sinkhorn_directive_selected = (
+            "prefix_sinkhorn" in effective_qwen_actions
+        )
+        prefix_sinkhorn_explicitly_disabled = (
+            action_directive is not None
+            and "prefix_sinkhorn" in action_directive.disabled_actions
+        )
+        prefix_sinkhorn_applied = (
+            prefix_sinkhorn_configured and not prefix_sinkhorn_explicitly_disabled
+        )
+        if prefix_sinkhorn_configured:
+            set_prefix_sinkhorn_enabled = getattr(
+                runtime.model,
+                "set_native_head_crsa_enabled",
+                None,
+            )
+            if not callable(set_prefix_sinkhorn_enabled):
+                raise Qwen38ChatError(
+                    "runtime model cannot select Prefix-Sinkhorn actions"
+                )
+            current_prefix_sinkhorn = bool(
+                getattr(runtime.model, "native_head_crsa_enabled", False)
+            )
+            if current_prefix_sinkhorn != prefix_sinkhorn_applied:
+                if self._attention_output_crystal_bank is not None:
+                    disable_crystal = getattr(
+                        runtime.model,
+                        "set_attention_output_crystal_enabled",
+                        None,
+                    )
+                    if not callable(disable_crystal):
+                        raise Qwen38ChatError(
+                            "runtime model cannot bind Prefix-Sinkhorn Crystals"
+                        )
+                    disable_crystal(False)
+                if self._mlp_page_coordinate_bank is not None:
+                    disable_coordinate = getattr(
+                        runtime.model,
+                        "set_mlp_page_coordinate_enabled",
+                        None,
+                    )
+                    if not callable(disable_coordinate):
+                        raise Qwen38ChatError(
+                            "runtime model cannot bind Prefix-Sinkhorn coordinates"
+                        )
+                    disable_coordinate(False)
+                current_state = _anchor_model_state(runtime.model)
+                if self._conversation_session_id is not None or current_state != (
+                    0,
+                    False,
+                    0,
+                    None,
+                ):
+                    runtime.model.reset_state(release=True)
+                    self._clear_conversation_binding()
+                set_prefix_sinkhorn_enabled(prefix_sinkhorn_applied)
         if delta_head_applied:
             current_state = _anchor_model_state(runtime.model)
             if self._conversation_session_id is not None or current_state != (
@@ -4064,13 +4248,17 @@ class Qwen38CausalChat:
 
         attention_output_crystal_applied = False
         attention_output_crystal_directive_selected = False
+        attention_output_crystal_explicitly_disabled = (
+            action_directive is not None
+            and "attention_output_crystal" in action_directive.disabled_actions
+        )
         set_attention_output_crystal_enabled = None
         if self._attention_output_crystal_bank is not None:
-            attention_output_crystal_applied = not delta_head_applied
+            attention_output_crystal_applied = not delta_head_applied and (
+                not prefix_sinkhorn_configured or prefix_sinkhorn_applied
+            ) and not attention_output_crystal_explicitly_disabled
             attention_output_crystal_directive_selected = (
-                action_directive is not None
-                and "attention_output_crystal"
-                in action_directive.primary_actions
+                "attention_output_crystal" in effective_qwen_actions
             )
             set_attention_output_crystal_enabled = getattr(
                 runtime.model,
@@ -4086,8 +4274,14 @@ class Qwen38CausalChat:
             )
         mlp_page_coordinate_applied = False
         mlp_page_coordinate_directive_selected = False
+        mlp_page_coordinate_explicitly_disabled = (
+            action_directive is not None
+            and "mlp_page_coordinate" in action_directive.disabled_actions
+        )
         if self._mlp_page_coordinate_bank is not None:
-            mlp_page_coordinate_applied = not delta_head_applied
+            mlp_page_coordinate_applied = not delta_head_applied and (
+                not prefix_sinkhorn_configured or prefix_sinkhorn_applied
+            ) and not mlp_page_coordinate_explicitly_disabled
             mlp_page_coordinate_directive_selected = (
                 "mlp_page_coordinate" in effective_qwen_actions
             )
@@ -4364,6 +4558,7 @@ class Qwen38CausalChat:
             if isinstance(sequence, int) and not isinstance(sequence, bool):
                 retention_before_sequence = sequence
         physical_read_before = _linux_process_read_bytes()
+        prefix_sinkhorn_before = self._prefix_sinkhorn_metrics(runtime)
         attention_output_crystal_before = (
             self._attention_output_crystal_metrics()
         )
@@ -4380,7 +4575,16 @@ class Qwen38CausalChat:
             runtime.model.reset_state(release=True)
             self._clear_conversation_binding()
             set_delta_head_router(None)
-            if self._attention_output_crystal_bank is not None:
+            prefix_banks_compatible = (
+                self._native_head_crsa is None
+                or bool(
+                    getattr(runtime.model, "native_head_crsa_enabled", False)
+                )
+            )
+            if (
+                self._attention_output_crystal_bank is not None
+                and prefix_banks_compatible
+            ):
                 set_attention_output_crystal_enabled = getattr(
                     runtime.model,
                     "set_attention_output_crystal_enabled",
@@ -4391,7 +4595,10 @@ class Qwen38CausalChat:
                         "runtime model lost attention-output Crystal selection"
                     )
                 set_attention_output_crystal_enabled(True)
-            if self._mlp_page_coordinate_bank is not None:
+            if (
+                self._mlp_page_coordinate_bank is not None
+                and prefix_banks_compatible
+            ):
                 set_mlp_page_coordinate_enabled = getattr(
                     runtime.model,
                     "set_mlp_page_coordinate_enabled",
@@ -4405,6 +4612,10 @@ class Qwen38CausalChat:
         self._record_attention_output_crystal_request(
             attention_output_crystal_before,
             self._attention_output_crystal_metrics(),
+        )
+        self._record_prefix_sinkhorn_request(
+            prefix_sinkhorn_before,
+            self._prefix_sinkhorn_metrics(runtime),
         )
         self._record_mlp_page_coordinate_request(
             mlp_page_coordinate_before,
@@ -4614,6 +4825,9 @@ class Qwen38CausalChat:
                     "attention_output_crystal_directive_selected": (
                         attention_output_crystal_directive_selected
                     ),
+                    "attention_output_crystal_explicitly_disabled": (
+                        attention_output_crystal_explicitly_disabled
+                    ),
                     "mlp_head_coordinate": delta_head_applied,
                     "mlp_head_coordinate_directive_selected": (
                         delta_head_directive_selected
@@ -4621,6 +4835,16 @@ class Qwen38CausalChat:
                     "mlp_page_coordinate": mlp_page_coordinate_applied,
                     "mlp_page_coordinate_directive_selected": (
                         mlp_page_coordinate_directive_selected
+                    ),
+                    "mlp_page_coordinate_explicitly_disabled": (
+                        mlp_page_coordinate_explicitly_disabled
+                    ),
+                    "prefix_sinkhorn": prefix_sinkhorn_applied,
+                    "prefix_sinkhorn_directive_selected": (
+                        prefix_sinkhorn_directive_selected
+                    ),
+                    "prefix_sinkhorn_explicitly_disabled": (
+                        prefix_sinkhorn_explicitly_disabled
                     ),
                     "draft_enabled": self._last_draft_evidence is not None,
                     "draft_window_ceiling": (
@@ -4647,6 +4871,12 @@ class Qwen38CausalChat:
             evidence["exact_head"] = {
                 **dict(evidence["exact_head"]),
                 "request": dict(self._last_exact_head_evidence),
+            }
+        if self._last_prefix_sinkhorn_evidence is not None:
+            evidence["prefix_sinkhorn"] = {
+                **dict(evidence["prefix_sinkhorn"]),
+                "active": prefix_sinkhorn_applied,
+                "request": dict(self._last_prefix_sinkhorn_evidence),
             }
         if self._last_attention_output_crystal_evidence is not None:
             evidence["attention_output_crystal"] = {
@@ -4739,6 +4969,7 @@ class Qwen38CausalChat:
             question=text,
             rendered_prompt=prompt,
             prompt_ids=prompt_ids,
+            prefix_sinkhorn_applied=prefix_sinkhorn_applied,
         )
         if result_cell_binding is not None:
             evidence["result_cell_binding_receipt"] = result_cell_binding
@@ -5076,7 +5307,20 @@ class Qwen38CausalChat:
                         "runtime model lost Delta head coordinate selection"
                     )
                 setter(None)
-                if self._attention_output_crystal_bank is not None:
+                prefix_banks_compatible = (
+                    self._native_head_crsa is None
+                    or bool(
+                        getattr(
+                            runtime.model,
+                            "native_head_crsa_enabled",
+                            False,
+                        )
+                    )
+                )
+                if (
+                    self._attention_output_crystal_bank is not None
+                    and prefix_banks_compatible
+                ):
                     crystal_setter = getattr(
                         runtime.model,
                         "set_attention_output_crystal_enabled",
@@ -5087,7 +5331,10 @@ class Qwen38CausalChat:
                             "runtime model lost attention-output Crystal selection"
                         )
                     crystal_setter(True)
-                if self._mlp_page_coordinate_bank is not None:
+                if (
+                    self._mlp_page_coordinate_bank is not None
+                    and prefix_banks_compatible
+                ):
                     coordinate_setter = getattr(
                         runtime.model,
                         "set_mlp_page_coordinate_enabled",

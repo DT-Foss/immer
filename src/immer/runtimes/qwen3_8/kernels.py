@@ -535,6 +535,7 @@ def _full_attention_work(
     attention_mask: torch.Tensor | None = None,
     require_crsa_usage: bool,
     native_support: bool,
+    base_softmax_excluded_heads: Sequence[int] = (),
     rope_theta: float = 10_000_000.0,
     rotary_dim: int | None = None,
     partial_rotary_factor: float = 0.25,
@@ -690,7 +691,39 @@ def _full_attention_work(
                 allowed = allowed & ~torch.isneginf(mask)
                 scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
 
-    base_probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    excluded_heads = tuple(base_softmax_excluded_heads)
+    if (
+        len(set(excluded_heads)) != len(excluded_heads)
+        or any(
+            isinstance(head, bool)
+            or not isinstance(head, int)
+            or not 0 <= head < heads
+            for head in excluded_heads
+        )
+    ):
+        raise ValueError("base-softmax excluded heads are invalid or duplicated")
+    if excluded_heads:
+        excluded = set(excluded_heads)
+        free_heads = tuple(head for head in range(heads) if head not in excluded)
+        if not free_heads:
+            base_probabilities = torch.zeros_like(scores)
+        else:
+            free = torch.tensor(free_heads, dtype=torch.long, device=scores.device)
+            free_probabilities = F.softmax(
+                scores.index_select(1, free),
+                dim=-1,
+                dtype=torch.float32,
+            ).to(query.dtype)
+            base_probabilities = torch.index_copy(
+                torch.zeros_like(scores),
+                1,
+                free,
+                free_probabilities,
+            )
+    else:
+        base_probabilities = F.softmax(
+            scores, dim=-1, dtype=torch.float32
+        ).to(query.dtype)
     return _FullAttentionWork(
         gate=gate,
         key=key,
@@ -834,6 +867,11 @@ def full_attention_core(
         attention_mask=attention_mask,
         require_crsa_usage=intervention is not None and intervention.active,
         native_support=intervention is not None,
+        base_softmax_excluded_heads=(
+            intervention.head_indices
+            if intervention is not None and intervention.physical_replacement
+            else ()
+        ),
         rope_theta=rope_theta,
         rotary_dim=rotary_dim,
         partial_rotary_factor=partial_rotary_factor,
@@ -909,6 +947,10 @@ def full_attention_fork_core(
         required=True,
     )
     assert intervention is not None
+    if intervention.physical_replacement:
+        raise ValueError(
+            "base-softmax replacement cannot fork an ordinary attention arm"
+        )
     if (off_state is None) != (native_state is None):
         raise ValueError("off_state and native_state must both be present or both None")
     if off_state is not None:
@@ -947,6 +989,7 @@ def full_attention_fork_core(
         attention_mask=attention_mask,
         require_crsa_usage=False,
         native_support=True,
+        base_softmax_excluded_heads=(),
         rope_theta=rope_theta,
         rotary_dim=rotary_dim,
         partial_rotary_factor=partial_rotary_factor,

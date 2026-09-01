@@ -153,14 +153,28 @@ class InferenceActionReceiptTests(unittest.TestCase):
 
     def test_native_prefix_sinkhorn_is_recorded_as_executed_attention(self) -> None:
         economics = _economics("prefix-sinkhorn")
+        action_identity = _sha("physical prefix action")
         result = Result(
             ExecutionStatus.OK,
             "qwen3.8.causal-chat",
             output="answer",
             evidence={
                 "prefix_sinkhorn": {
+                    "action_identity_sha256": action_identity,
                     "active": True,
-                    "configuration": {"layer": 27},
+                    "available": True,
+                    "configuration": {
+                        "alpha": 1.0,
+                        "layer": 27,
+                        "replace_base_softmax": True,
+                    },
+                    "request": {
+                        "base_softmax_head_rows_skipped": 12,
+                        "base_softmax_probability_elements_skipped": 144,
+                    },
+                    "schema": (
+                        "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
+                    ),
                 }
             },
         )
@@ -173,6 +187,30 @@ class InferenceActionReceiptTests(unittest.TestCase):
                 "qwen_target",
                 "target_verified_draft",
             ),
+        )
+
+        static_only = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "prefix_sinkhorn": {
+                    "action_identity_sha256": action_identity,
+                    "active": True,
+                    "available": True,
+                    "configuration": {
+                        "alpha": 1.0,
+                        "replace_base_softmax": True,
+                    },
+                    "schema": (
+                        "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
+                    ),
+                }
+            },
+        )
+        self.assertNotIn(
+            "prefix_sinkhorn",
+            executed_actions_from_result(static_only, economics),
         )
 
     def test_executed_delta_head_work_is_recorded_as_coordinate_action(self) -> None:
@@ -437,6 +475,45 @@ class InferenceActionReceiptTests(unittest.TestCase):
 
 
 class InferenceActionBankTests(unittest.TestCase):
+    def test_explicit_prefix_disable_blocks_warm_replay_but_omission_does_not(
+        self,
+    ) -> None:
+        from immer.runtimes.ooe.qwen_warm_growth import (
+            prefix_sinkhorn_warm_allowed,
+        )
+
+        base = dict(
+            question_sha256=_sha("warm prefix policy"),
+            runtime_profile_sha256=_sha("profile"),
+            primary_actions=("qwen_target",),
+            fallback_actions=("qwen_target",),
+            draft_enabled=None,
+            source_signature_sha256s=("6" * 64,),
+            support=1,
+            saved_qwen_forwards=0,
+        )
+        omitted = InferenceActionDirective(**base)
+        disabled = InferenceActionDirective(
+            **base,
+            disabled_actions=("prefix_sinkhorn",),
+        )
+        self.assertTrue(prefix_sinkhorn_warm_allowed({}))
+        self.assertTrue(
+            prefix_sinkhorn_warm_allowed(
+                {"qwen_inference_action_directive": omitted.to_document()}
+            )
+        )
+        self.assertFalse(
+            prefix_sinkhorn_warm_allowed(
+                {"qwen_inference_action_directive": disabled.to_document()}
+            )
+        )
+        self.assertFalse(
+            prefix_sinkhorn_warm_allowed(
+                {"qwen_inference_action_directive": {"tampered": True}}
+            )
+        )
+
     def test_observe_restart_duplicate_and_ranking(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "actions"
@@ -648,6 +725,33 @@ class InferenceActionBankTests(unittest.TestCase):
                 support=1,
                 saved_qwen_forwards=0,
             )
+        disabled = InferenceActionDirective(
+            question_sha256=_sha("explicit prefix disable"),
+            runtime_profile_sha256=_sha("profile"),
+            primary_actions=("qwen_target",),
+            fallback_actions=("qwen_target",),
+            draft_enabled=None,
+            source_signature_sha256s=("4" * 64,),
+            support=1,
+            saved_qwen_forwards=0,
+            disabled_actions=("prefix_sinkhorn",),
+        )
+        self.assertEqual(
+            InferenceActionDirective.from_document(disabled.to_document()),
+            disabled,
+        )
+        with self.assertRaisesRegex(ValueError, "conflict"):
+            InferenceActionDirective(
+                question_sha256=_sha("conflicting prefix disable"),
+                runtime_profile_sha256=_sha("profile"),
+                primary_actions=("prefix_sinkhorn", "qwen_target"),
+                fallback_actions=("qwen_target",),
+                draft_enabled=None,
+                source_signature_sha256s=("5" * 64,),
+                support=1,
+                saved_qwen_forwards=0,
+                disabled_actions=("prefix_sinkhorn",),
+            )
 
     def test_attention_replay_stays_additive_to_higher_ranked_drafting(self) -> None:
         attention = _economics(
@@ -704,6 +808,44 @@ class InferenceActionBankTests(unittest.TestCase):
                 question_sha256=_sha("invalid coordinate"),
                 runtime_profile_sha256=_sha("profile"),
                 primary_actions=("mlp_head_coordinate",),
+                fallback_actions=("qwen_target",),
+                draft_enabled=None,
+                source_signature_sha256s=("3" * 64,),
+                support=1,
+                saved_qwen_forwards=0,
+            )
+
+    def test_physical_prefix_sinkhorn_is_recommended_only_for_same_runtime(
+        self,
+    ) -> None:
+        economics = _economics(
+            "physical-prefix-runtime",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        actions = ("prefix_sinkhorn", "qwen_target")
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = InferenceActionBank(Path(temporary) / "actions")
+            bank.observe(economics, executed_actions=actions)
+            same = bank.recommend(
+                question_sha256=_sha("same-prefix-runtime"),
+                runtime_profile_sha256=_sha("profile"),
+            )
+            other = bank.recommend(
+                question_sha256=_sha("other-prefix-runtime"),
+                runtime_profile_sha256=_sha("other profile"),
+            )
+
+        assert same is not None
+        self.assertEqual(same.primary_actions, actions)
+        self.assertEqual(same.fallback_actions, actions)
+        self.assertIsNone(other)
+        with self.assertRaises(ValueError):
+            InferenceActionDirective(
+                question_sha256=_sha("invalid prefix action"),
+                runtime_profile_sha256=_sha("profile"),
+                primary_actions=("prefix_sinkhorn",),
                 fallback_actions=("qwen_target",),
                 draft_enabled=None,
                 source_signature_sha256s=("3" * 64,),

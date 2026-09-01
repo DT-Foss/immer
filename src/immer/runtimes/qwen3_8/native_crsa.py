@@ -248,6 +248,10 @@ class NativeHeadCrsaEvidence:
     history_length_before: int
     history_length_after: int
     identity: bool
+    execution_mode: str = "blend"
+    batch_size: int = 1
+    base_softmax_head_rows_skipped: int = 0
+    base_softmax_probability_elements_skipped: int = 0
 
     def __post_init__(self) -> None:
         if self.schema != NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA:
@@ -296,6 +300,17 @@ class NativeHeadCrsaEvidence:
         history_after = _integer(self.history_length_after, "history_length_after")
         if not isinstance(self.identity, bool):
             raise TypeError("identity must be boolean")
+        if self.execution_mode not in {"blend", "replace_base_softmax"}:
+            raise ValueError("native Head-CRSA execution mode is invalid")
+        batch_size = _integer(self.batch_size, "batch_size", positive=True)
+        skipped_rows = _integer(
+            self.base_softmax_head_rows_skipped,
+            "base_softmax_head_rows_skipped",
+        )
+        skipped_elements = _integer(
+            self.base_softmax_probability_elements_skipped,
+            "base_softmax_probability_elements_skipped",
+        )
         if free_error != 0.0:
             raise ValueError("free native attention heads must be bit-exact")
         if future != 0.0:
@@ -311,6 +326,29 @@ class NativeHeadCrsaEvidence:
                 raise ValueError("identity evidence cannot retain CRSA usage history")
         elif history_before != query_start or history_after != key_length:
             raise ValueError("native Head-CRSA usage-history evidence is inconsistent")
+        if self.execution_mode == "blend":
+            if skipped_rows or skipped_elements:
+                raise ValueError("blended Head-CRSA cannot report skipped base softmax")
+        else:
+            if self.identity or any(alpha != 1.0 for alpha in alphas):
+                raise ValueError(
+                    "base-softmax replacement requires active alpha=1 Head-CRSA"
+                )
+            if any(self.argmax_changed_queries_per_head) or any(
+                self.mean_l1_probability_delta_per_head
+            ):
+                raise ValueError(
+                    "base-softmax replacement has no computed base reference"
+                )
+            expected_rows = batch_size * count * query_length
+            expected_elements = expected_rows * key_length
+            if (skipped_rows, skipped_elements) != (
+                expected_rows,
+                expected_elements,
+            ):
+                raise ValueError(
+                    "base-softmax replacement savings do not match the tensor shape"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -328,12 +366,14 @@ class NativeHeadCrsaEvidence:
 
 @dataclass(frozen=True, slots=True)
 class Qwen38NativeHeadCrsa:
-    """Blend Prefix-Sinkhorn into one real query head per Qwen GQA group.
+    """Route one real query head per Qwen GQA group through Prefix-Sinkhorn.
 
     The other 20 query heads remain the original causal-softmax tensors.  The
-    blended probability matrix is consumed by the checkpoint's single native
-    ``P @ V`` / output-gate / ``o_proj`` path; no second attention forward or
-    hidden-state graft is involved.
+    default experimental mode blends the routed probabilities.  Physical
+    replacement with ``alpha=1`` omits base-softmax work for the four routed
+    heads.  Both modes feed the checkpoint's single native ``P @ V`` /
+    output-gate / ``o_proj`` path; no second attention forward or hidden-state
+    graft is involved.
     """
 
     layer: int = NATIVE_HEAD_CRSA_LAYER
@@ -341,6 +381,7 @@ class Qwen38NativeHeadCrsa:
     head_indices: tuple[int, ...] = NATIVE_HEAD_CRSA_QUERY_HEADS
     balance_alpha: float = 1.0
     diagonal_debit: float = 3.0
+    replace_base_softmax: bool = False
 
     evidence_schema: ClassVar[str] = NATIVE_HEAD_CRSA_EVIDENCE_SCHEMA
 
@@ -364,10 +405,18 @@ class Qwen38NativeHeadCrsa:
         object.__setattr__(
             self, "diagonal_debit", _real(self.diagonal_debit, "diagonal_debit")
         )
+        if not isinstance(self.replace_base_softmax, bool):
+            raise TypeError("replace_base_softmax must be boolean")
+        if self.replace_base_softmax and self.alpha != 1.0:
+            raise ValueError("base-softmax replacement requires alpha=1")
 
     @property
     def active(self) -> bool:
         return self.alpha != 0.0
+
+    @property
+    def physical_replacement(self) -> bool:
+        return self.active and self.replace_base_softmax
 
     @property
     def selected_kv_heads(self) -> tuple[int, ...]:
@@ -449,11 +498,29 @@ class Qwen38NativeHeadCrsa:
             raise ValueError("allowed must broadcast to the logits shape") from exc
         if bool((~support.any(dim=-1)).any().item()):
             raise ValueError("every native attention row must allow at least one key")
-        if bool((~torch.isfinite(base_probabilities)).any().item()):
+        selected = torch.tensor(
+            self.head_indices, dtype=torch.long, device=logits.device
+        )
+        free = torch.tensor(
+            NATIVE_HEAD_CRSA_FREE_HEADS,
+            dtype=torch.long,
+            device=logits.device,
+        )
+        checked_base = base_probabilities
+        checked_support = support
+        if self.physical_replacement:
+            selected_base = base_probabilities.index_select(1, selected)
+            if bool((selected_base != 0).any().item()):
+                raise ValueError(
+                    "base-softmax replacement requires zero selected-head base tensors"
+                )
+            checked_base = base_probabilities.index_select(1, free)
+            checked_support = support.index_select(1, free)
+        if bool((~torch.isfinite(checked_base)).any().item()):
             raise ValueError("base probabilities must be finite")
-        if bool((base_probabilities < 0).any().item()):
+        if bool((checked_base < 0).any().item()):
             raise ValueError("base probabilities must be non-negative")
-        if _outside_support_max_abs(base_probabilities, support) != 0.0:
+        if _outside_support_max_abs(checked_base, checked_support) != 0.0:
             raise ValueError("base probabilities must be exactly zero outside support")
 
         alpha_per_head = (self.alpha,) * len(self.head_indices)
@@ -482,6 +549,7 @@ class Qwen38NativeHeadCrsa:
                 history_length_before=0,
                 history_length_after=0,
                 identity=True,
+                batch_size=batch,
             )
             # This return deliberately precedes every clone and dtype cast.
             return base_probabilities, None, evidence
@@ -547,12 +615,25 @@ class Qwen38NativeHeadCrsa:
                 history_length_before=query_start,
                 history_length_after=int(usage.shape[-1]),
                 identity=False,
+                execution_mode=(
+                    "replace_base_softmax"
+                    if self.physical_replacement
+                    else "blend"
+                ),
+                batch_size=batch,
+                base_softmax_head_rows_skipped=(
+                    batch * len(self.head_indices) * query_length
+                    if self.physical_replacement
+                    else 0
+                ),
+                base_softmax_probability_elements_skipped=(
+                    batch * len(self.head_indices) * query_length * key_length
+                    if self.physical_replacement
+                    else 0
+                ),
             )
             return probabilities, usage, evidence
 
-        selected = torch.tensor(
-            self.head_indices, dtype=torch.long, device=logits.device
-        )
         work_dtype = self._work_dtype(logits.dtype)
         selected_logits = logits.index_select(1, selected).to(dtype=work_dtype)
         selected_base_native = base_probabilities.index_select(1, selected)
@@ -584,7 +665,11 @@ class Qwen38NativeHeadCrsa:
             prior_log_usage=prior_log_usage,
             allowed=selected_support,
         )
-        mixed_selected = selected_base + self.alpha * (routed - selected_base)
+        mixed_selected = (
+            routed
+            if self.physical_replacement
+            else selected_base + self.alpha * (routed - selected_base)
+        )
         mixed_selected = mixed_selected.to(dtype=base_probabilities.dtype)
         if (
             routed_operator_observer is not None
@@ -599,23 +684,37 @@ class Qwen38NativeHeadCrsa:
                     {
                         "schema": "immer.qwen3.8-prefix-sinkhorn-spec/v1",
                         "attention_spec": asdict(self.spec),
-                        "stage": "streaming_prefix_log.routed-before-native-blend",
+                        "stage": (
+                            "streaming_prefix_log.routed-before-native-replacement"
+                            if self.physical_replacement
+                            else "streaming_prefix_log.routed-before-native-blend"
+                        ),
                     }
                 ),
             )
         probabilities = base_probabilities.clone()
         probabilities[:, self.head_indices] = mixed_selected
 
-        free = NATIVE_HEAD_CRSA_FREE_HEADS
-        for head in free:
+        free_heads = NATIVE_HEAD_CRSA_FREE_HEADS
+        for head in free_heads:
             if not torch.equal(probabilities[:, head], base_probabilities[:, head]):
                 raise RuntimeError("native Head-CRSA modified a free attention head")
-        detached_delta = (mixed_selected - selected_base_native).detach()
-        argmax_changed = (
-            mixed_selected.detach().argmax(-1)
-            != selected_base_native.detach().argmax(-1)
-        ).sum(dim=(0, 2))
-        mean_l1 = detached_delta.abs().sum(-1).to(torch.float64).mean(dim=(0, 2))
+        if self.physical_replacement:
+            argmax_changed = torch.zeros(
+                len(self.head_indices), dtype=torch.long, device=logits.device
+            )
+            mean_l1 = torch.zeros(
+                len(self.head_indices), dtype=torch.float64, device=logits.device
+            )
+        else:
+            detached_delta = (mixed_selected - selected_base_native).detach()
+            argmax_changed = (
+                mixed_selected.detach().argmax(-1)
+                != selected_base_native.detach().argmax(-1)
+            ).sum(dim=(0, 2))
+            mean_l1 = (
+                detached_delta.abs().sum(-1).to(torch.float64).mean(dim=(0, 2))
+            )
         future_max = _outside_support_max_abs(mixed_selected, selected_support)
         evidence = NativeHeadCrsaEvidence(
             schema=self.evidence_schema,
@@ -632,7 +731,7 @@ class Qwen38NativeHeadCrsa:
             mean_l1_probability_delta_per_head=tuple(
                 float(value) for value in mean_l1.to(device="cpu").tolist()
             ),
-            free_heads=free,
+            free_heads=free_heads,
             free_head_max_abs_error=0.0,
             future_weight_max_abs=future_max,
             row_sum_max_error=float(
@@ -643,6 +742,20 @@ class Qwen38NativeHeadCrsa:
             history_length_before=query_start,
             history_length_after=int(next_log_usage.shape[-1]),
             identity=False,
+            execution_mode=(
+                "replace_base_softmax" if self.physical_replacement else "blend"
+            ),
+            batch_size=batch,
+            base_softmax_head_rows_skipped=(
+                batch * len(self.head_indices) * query_length
+                if self.physical_replacement
+                else 0
+            ),
+            base_softmax_probability_elements_skipped=(
+                batch * len(self.head_indices) * query_length * key_length
+                if self.physical_replacement
+                else 0
+            ),
         )
         return probabilities, next_log_usage, evidence
 

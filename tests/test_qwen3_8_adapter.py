@@ -230,6 +230,40 @@ class _StreamingModel(_Model):
         return super().generate_greedy(prompt, **kwargs)
 
 
+class _PrefixSinkhornModel(_Model):
+    def __init__(self) -> None:
+        super().__init__()
+        self.native_head_crsa_enabled = True
+        self.prefix_activation_calls: list[bool] = []
+        self.prefix_head_rows = 0
+        self.prefix_elements = 0
+
+    def set_native_head_crsa_enabled(self, enabled: bool) -> None:
+        self.native_head_crsa_enabled = enabled
+        self.prefix_activation_calls.append(enabled)
+
+    @staticmethod
+    def prefix_sinkhorn_action_identity_sha256() -> str:
+        return "a" * 64
+
+    def native_prefix_sinkhorn_metrics(self):
+        return {
+            "action_identity_sha256": self.prefix_sinkhorn_action_identity_sha256(),
+            "base_softmax_head_rows_skipped": self.prefix_head_rows,
+            "base_softmax_probability_elements_skipped": self.prefix_elements,
+            "enabled": self.native_head_crsa_enabled,
+            "physical_replacement": True,
+            "schema": "immer.qwen3.8-prefix-sinkhorn-action-metrics/v1",
+        }
+
+    def generate_greedy(self, prompt, **kwargs):
+        generated, evidence = super().generate_greedy(prompt, **kwargs)
+        if self.native_head_crsa_enabled:
+            self.prefix_head_rows += 12
+            self.prefix_elements += 144
+        return generated, evidence
+
+
 class _StreamingTokenizer(_Tokenizer):
     def decode(self, token_ids):
         ids = tuple(token_ids)
@@ -2477,18 +2511,140 @@ class Qwen38CausalChatTests(unittest.TestCase):
             {
                 "attention_output_crystal": False,
                 "attention_output_crystal_directive_selected": False,
+                "attention_output_crystal_explicitly_disabled": False,
                 "draft_enabled": False,
                 "draft_window_ceiling": None,
                 "mlp_head_coordinate": False,
                 "mlp_head_coordinate_directive_selected": False,
                 "mlp_page_coordinate": False,
                 "mlp_page_coordinate_directive_selected": False,
+                "mlp_page_coordinate_explicitly_disabled": False,
+                "prefix_sinkhorn": False,
+                "prefix_sinkhorn_directive_selected": False,
+                "prefix_sinkhorn_explicitly_disabled": False,
             },
         )
         self.assertEqual(
             result.evidence["inference_action_directive"]["directive"],
             directive.to_document(),
         )
+        chat.close()
+
+    def test_physical_prefix_sinkhorn_is_request_local_and_reports_saved_rows(
+        self,
+    ) -> None:
+        model = _PrefixSinkhornModel()
+        chat = _chat(
+            _Runtime(model=model),
+            native_head_crsa=Qwen38NativeHeadCrsa(
+                alpha=1.0,
+                replace_base_softmax=True,
+            ),
+        )
+        discovery = chat.handle(Request("chat", "hello", {}))
+        self.assertTrue(discovery.ok, discovery.reason)
+        self.assertEqual(
+            discovery.evidence["prefix_sinkhorn"]["request"],
+            {
+                "base_softmax_head_rows_skipped": 12,
+                "base_softmax_probability_elements_skipped": 144,
+            },
+        )
+        self.assertEqual(
+            discovery.evidence["prefix_sinkhorn"]["action_identity_sha256"],
+            "a" * 64,
+        )
+
+        unspecified = InferenceActionDirective(
+            question_sha256=hashlib.sha256(b"hello").hexdigest(),
+            runtime_profile_sha256="2" * 64,
+            primary_actions=("qwen_target",),
+            fallback_actions=("qwen_target",),
+            draft_enabled=None,
+            source_signature_sha256s=("2" * 64,),
+            support=1,
+            saved_qwen_forwards=0,
+        )
+        discovery_with_transferable_directive = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {
+                    QWEN38_INFERENCE_ACTION_METADATA: (
+                        unspecified.to_document()
+                    )
+                },
+            )
+        )
+        self.assertTrue(
+            discovery_with_transferable_directive.evidence["prefix_sinkhorn"][
+                "active"
+            ]
+        )
+        self.assertEqual(model.prefix_activation_calls, [])
+
+        off = InferenceActionDirective(
+            question_sha256=hashlib.sha256(b"hello").hexdigest(),
+            runtime_profile_sha256="2" * 64,
+            primary_actions=("qwen_target",),
+            fallback_actions=("qwen_target",),
+            draft_enabled=None,
+            source_signature_sha256s=("3" * 64,),
+            support=1,
+            saved_qwen_forwards=0,
+            disabled_actions=("prefix_sinkhorn",),
+        )
+        disabled = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {QWEN38_INFERENCE_ACTION_METADATA: off.to_document()},
+            )
+        )
+        self.assertTrue(disabled.ok, disabled.reason)
+        self.assertFalse(disabled.evidence["prefix_sinkhorn"]["active"])
+        self.assertEqual(
+            disabled.evidence["prefix_sinkhorn"]["request"],
+            {
+                "base_softmax_head_rows_skipped": 0,
+                "base_softmax_probability_elements_skipped": 0,
+            },
+        )
+
+        on = InferenceActionDirective(
+            question_sha256=hashlib.sha256(b"hello").hexdigest(),
+            runtime_profile_sha256="2" * 64,
+            primary_actions=("prefix_sinkhorn", "qwen_target"),
+            fallback_actions=("qwen_target",),
+            draft_enabled=None,
+            source_signature_sha256s=("4" * 64,),
+            support=1,
+            saved_qwen_forwards=0,
+        )
+        enabled = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {QWEN38_INFERENCE_ACTION_METADATA: on.to_document()},
+            )
+        )
+        self.assertTrue(enabled.ok, enabled.reason)
+        self.assertTrue(enabled.evidence["prefix_sinkhorn"]["active"])
+        self.assertEqual(
+            enabled.evidence["inference_action_directive"]["applied"][
+                "prefix_sinkhorn"
+            ],
+            True,
+        )
+        self.assertNotEqual(
+            chat._result_cell_generation_policy_sha256(
+                prefix_sinkhorn_applied=False
+            ),
+            chat._result_cell_generation_policy_sha256(
+                prefix_sinkhorn_applied=True
+            ),
+        )
+        self.assertEqual(model.prefix_activation_calls, [False, True])
         chat.close()
 
     def test_delta_coordinate_action_is_request_local_and_uses_qwen_fallback(
@@ -5589,7 +5745,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIsInstance(intervention, Qwen38NativeHeadCrsa)
         self.assertEqual(intervention.layer, 27)
         self.assertEqual(intervention.head_indices, (2, 8, 14, 20))
-        self.assertEqual(intervention.alpha, 0.01)
+        self.assertEqual(intervention.alpha, 1.0)
+        self.assertTrue(intervention.replace_base_softmax)
 
     def test_cli_wires_exact_head_index_root(self) -> None:
         qwen = _chat(_Runtime())

@@ -21,7 +21,7 @@ from .inference_economics import InferenceEconomicsReceipt
 
 INFERENCE_ACTION_RECEIPT_SCHEMA = "immer.qwen3.8-inference-action-receipt/v1"
 INFERENCE_ACTION_BANK_SCHEMA = "immer.qwen3.8-inference-action-bank/v1"
-INFERENCE_ACTION_DIRECTIVE_SCHEMA = "immer.qwen3.8-inference-action-directive/v2"
+INFERENCE_ACTION_DIRECTIVE_SCHEMA = "immer.qwen3.8-inference-action-directive/v3"
 MAX_ACTION_RECEIPT_BYTES = 32 * 1024
 ACTION_CATALOG = (
     "attention_output_crystal",
@@ -48,6 +48,44 @@ class InferenceActionBankError(RuntimeError):
 
 def _digest(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    try:
+        return require_sha256(value, field="SHA-256") == value
+    except (TypeError, ValueError):
+        return False
+
+
+def physical_prefix_sinkhorn_executed(value: object) -> bool:
+    """Accept only request evidence that proves omitted base-softmax work."""
+
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema")
+        != "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
+        or value.get("active") is not True
+        or value.get("available") is not True
+        or not _is_sha256(value.get("action_identity_sha256"))
+    ):
+        return False
+    configuration = value.get("configuration")
+    request = value.get("request")
+    return (
+        isinstance(configuration, Mapping)
+        and configuration.get("replace_base_softmax") is True
+        and configuration.get("alpha") == 1.0
+        and isinstance(request, Mapping)
+        and all(
+            isinstance(request.get(field), int)
+            and not isinstance(request.get(field), bool)
+            and request.get(field, 0) > 0
+            for field in (
+                "base_softmax_head_rows_skipped",
+                "base_softmax_probability_elements_skipped",
+            )
+        )
+    )
 
 
 def _uint(value: object, label: str) -> int:
@@ -123,7 +161,9 @@ def executed_actions_from_result(
     )
     if battery_hit:
         actions = tuple(sorted({*actions, "continuation_battery"}))
-    if isinstance(prefix_sinkhorn, Mapping) and prefix_sinkhorn.get("active") is True:
+    if "qwen_target" in actions and physical_prefix_sinkhorn_executed(
+        prefix_sinkhorn
+    ):
         actions = tuple(sorted({*actions, "prefix_sinkhorn"}))
     if isinstance(delta_head_router, Mapping):
         request = delta_head_router.get("request")
@@ -244,6 +284,7 @@ class InferenceActionReceipt:
                 "attention_output_crystal",
                 "mlp_head_coordinate",
                 "mlp_page_coordinate",
+                "prefix_sinkhorn",
             )
         ) and ("qwen_target" not in self.actions or self.target_forwards <= 0):
             raise ValueError(
@@ -392,6 +433,7 @@ class InferenceActionDirective:
     support: int
     saved_qwen_forwards: int
     draft_window_ceiling: int | None = None
+    disabled_actions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("question_sha256", "runtime_profile_sha256"):
@@ -423,11 +465,23 @@ class InferenceActionDirective:
                 raise ValueError(
                     f"{name} mlp_page_coordinate requires qwen_target"
                 )
+            if "prefix_sinkhorn" in actions and "qwen_target" not in actions:
+                raise ValueError(f"{name} prefix_sinkhorn requires qwen_target")
         if self.draft_enabled is not None and not isinstance(
             self.draft_enabled,
             bool,
         ):
             raise TypeError("draft_enabled must be boolean or null")
+        if (
+            tuple(sorted(set(self.disabled_actions))) != self.disabled_actions
+            or any(action not in ACTION_CATALOG for action in self.disabled_actions)
+        ):
+            raise ValueError("disabled_actions must be sorted known action classes")
+        if set(self.disabled_actions) & {
+            *self.primary_actions,
+            *self.fallback_actions,
+        }:
+            raise ValueError("disabled actions conflict with executable actions")
         if self.draft_window_ceiling is not None and (
             isinstance(self.draft_window_ceiling, bool)
             or not isinstance(self.draft_window_ceiling, int)
@@ -462,6 +516,7 @@ class InferenceActionDirective:
 
     def body(self) -> dict[str, object]:
         return {
+            "disabled_actions": list(self.disabled_actions),
             "draft_enabled": self.draft_enabled,
             "draft_window_ceiling": self.draft_window_ceiling,
             "fallback_actions": list(self.fallback_actions),
@@ -493,6 +548,7 @@ class InferenceActionDirective:
             raise InferenceActionBankError("action directive envelope is invalid")
         body = dict(value["body"])
         for name in (
+            "disabled_actions",
             "fallback_actions",
             "primary_actions",
             "source_signature_sha256s",
@@ -772,6 +828,7 @@ class InferenceActionBank:
                 "attention_output_crystal" in receipt.actions
                 or "mlp_head_coordinate" in receipt.actions
                 or "mlp_page_coordinate" in receipt.actions
+                or "prefix_sinkhorn" in receipt.actions
                 or (
                     "target_verified_draft" in receipt.actions
                     and receipt.saved_qwen_forwards > 0
@@ -814,6 +871,7 @@ class InferenceActionBank:
                     "continuation_battery",
                     "dynamic_mlp_pages",
                     "mlp_page_coordinate",
+                    "prefix_sinkhorn",
                     "qwen_target",
                     "target_verified_draft",
                 }
@@ -835,6 +893,10 @@ class InferenceActionBank:
             "mlp_head_coordinate" in receipt.actions for receipt in exact_runtime
         ):
             runtime_action_set.update({"mlp_head_coordinate", "qwen_target"})
+        if exact_runtime and any(
+            "prefix_sinkhorn" in receipt.actions for receipt in exact_runtime
+        ):
+            runtime_action_set.update({"prefix_sinkhorn", "qwen_target"})
         runtime_actions = tuple(sorted(runtime_action_set))
         if exact:
             primary = exact[0].actions
@@ -888,4 +950,5 @@ __all__ = [
     "InferenceActionObservation",
     "InferenceActionReceipt",
     "executed_actions_from_result",
+    "physical_prefix_sinkhorn_executed",
 ]

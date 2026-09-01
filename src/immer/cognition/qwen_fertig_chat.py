@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from ..contracts import Component, ExecutionStatus, Request, Result
+from ..runtimes.qwen3_8.action_bank import physical_prefix_sinkhorn_executed
 from .fertig.adapter import (
     CandidateVerification,
     CandidateVerificationStatus,
@@ -876,6 +877,9 @@ class QwenFertigChat:
                 if isinstance(qwen, Mapping):
                     if isinstance(qwen.get("mlp_page_route"), Mapping):
                         actions.append("dynamic_mlp_pages")
+                    prefix_sinkhorn = qwen.get("prefix_sinkhorn")
+                    if physical_prefix_sinkhorn_executed(prefix_sinkhorn):
+                        actions.append("prefix_sinkhorn")
                     if isinstance(qwen.get("draft"), Mapping):
                         actions.append("target_verified_draft")
                     generation = qwen.get("generation")

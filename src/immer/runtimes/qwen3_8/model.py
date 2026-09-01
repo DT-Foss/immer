@@ -530,6 +530,11 @@ class StreamedQwen38:
         self.graft_layer = graft_layer
         self.delta_probe = delta_probe
         self.native_head_crsa = native_head_crsa
+        self._native_head_crsa_configured = native_head_crsa
+        self.native_head_crsa_enabled = native_head_crsa is not None
+        self._native_prefix_sinkhorn_head_rows_skipped = 0
+        self._native_prefix_sinkhorn_probability_elements_skipped = 0
+        self._prefix_sinkhorn_action_identity_cache: str | None = None
         self.native_head_crsa_observer = native_head_crsa_observer
         self.native_prefix_sinkhorn_operator_observer = (
             native_prefix_sinkhorn_operator_observer
@@ -606,13 +611,99 @@ class StreamedQwen38:
         return self._snapshot_digest(
             {
                 "runtime": self._snapshot_identity(transport_neutral=True),
-                "schema": "immer.qwen3.8-attention-output-runtime-math/v2",
+                "schema": "immer.qwen3.8-attention-output-runtime-math/v3",
                 "transition": (
                     "exact-bf16-attention-input+prior-kv-crsa-to-"
-                    "post-o-proj+appended-kv-crsa/v1"
+                    "post-o-proj+appended-kv-crsa+physical-prefix-mode/v2"
                 ),
             }
         )
+
+    def prefix_sinkhorn_action_identity_sha256(self) -> str:
+        """Bind one request-local Prefix-Sinkhorn action to target math."""
+
+        intervention = self._native_head_crsa_configured
+        if intervention is None:
+            raise Qwen38RuntimeError(
+                "Prefix-Sinkhorn action identity requires a configured operator"
+            )
+        cached = self._prefix_sinkhorn_action_identity_cache
+        if cached is not None:
+            return cached
+        runtime = self._snapshot_identity(transport_neutral=True)
+        runtime["delta_head_router"] = {"kind": "none"}
+        runtime["native_head_crsa"] = {
+            "kind": (
+                f"{type(intervention).__module__}.{type(intervention).__qualname__}"
+            ),
+            **asdict(intervention),
+        }
+        identity = self._snapshot_digest(
+            {
+                "runtime": runtime,
+                "schema": "immer.qwen3.8-prefix-sinkhorn-action/v1",
+            }
+        )
+        self._prefix_sinkhorn_action_identity_cache = identity
+        return identity
+
+    def native_prefix_sinkhorn_metrics(self) -> dict[str, object]:
+        """Report physically skipped base work, including rejected draft rows."""
+
+        intervention = self._native_head_crsa_configured
+        return {
+            "action_identity_sha256": (
+                None
+                if intervention is None
+                else self.prefix_sinkhorn_action_identity_sha256()
+            ),
+            "base_softmax_head_rows_skipped": (
+                self._native_prefix_sinkhorn_head_rows_skipped
+            ),
+            "base_softmax_probability_elements_skipped": (
+                self._native_prefix_sinkhorn_probability_elements_skipped
+            ),
+            "enabled": self.native_head_crsa_enabled,
+            "physical_replacement": (
+                False if intervention is None else intervention.physical_replacement
+            ),
+            "schema": "immer.qwen3.8-prefix-sinkhorn-action-metrics/v1",
+        }
+
+    def set_native_head_crsa_enabled(self, enabled: bool) -> None:
+        """Select the configured Prefix-Sinkhorn action for one idle request."""
+
+        if not isinstance(enabled, bool):
+            raise TypeError("native Head-CRSA activation must be boolean")
+        if enabled and self._native_head_crsa_configured is None:
+            raise Qwen38RuntimeError(
+                "native Head-CRSA activation requires a configured operator"
+            )
+        if self.native_head_crsa_enabled == enabled:
+            return
+        if (
+            self._pending_block_stage is not None
+            or self._active_attention_output_crystal_transaction is not None
+            or self._active_mlp_page_coordinate_transaction is not None
+        ):
+            raise Qwen38RuntimeError(
+                "native Head-CRSA activation cannot change during a stage"
+            )
+        if (
+            self._next_position
+            or self._state_batch_size is not None
+            or any(state is not None for state in self._layer_states)
+            or self._graft_history is not None
+        ):
+            raise Qwen38RuntimeError(
+                "native Head-CRSA activation requires an empty model state"
+            )
+        if self.attention_output_crystal_enabled or self.mlp_page_coordinate_enabled:
+            raise Qwen38RuntimeError(
+                "native Head-CRSA activation requires action-bound exact banks"
+            )
+        self.native_head_crsa_enabled = enabled
+        self._attention_state_digest_cache.clear()
 
     def attach_attention_output_crystal_bank(
         self,
@@ -656,6 +747,14 @@ class StreamedQwen38:
         if enabled and self.attention_output_crystal_bank is None:
             raise Qwen38RuntimeError(
                 "attention-output Crystal activation requires an attached bank"
+            )
+        if (
+            enabled
+            and self._native_head_crsa_configured is not None
+            and not self.native_head_crsa_enabled
+        ):
+            raise Qwen38RuntimeError(
+                "attention-output Crystal activation requires its Prefix-Sinkhorn mode"
             )
         if (
             self._pending_block_stage is not None
@@ -736,6 +835,14 @@ class StreamedQwen38:
         if enabled and self.mlp_page_coordinate_bank is None:
             raise Qwen38RuntimeError(
                 "MLP page coordinate activation requires an attached bank"
+            )
+        if (
+            enabled
+            and self._native_head_crsa_configured is not None
+            and not self.native_head_crsa_enabled
+        ):
+            raise Qwen38RuntimeError(
+                "MLP page coordinate activation requires its Prefix-Sinkhorn mode"
             )
         if (
             self._pending_block_stage is not None
@@ -929,10 +1036,11 @@ class StreamedQwen38:
             key = torch.cat((state.key, hit.appended_rope_key), dim=2).contiguous()
             value = torch.cat((state.value, hit.appended_value), dim=2).contiguous()
 
+        configured_intervention = self._active_native_head_crsa()
         intervention = (
-            self.native_head_crsa
-            if self.native_head_crsa is not None
-            and layer == self.native_head_crsa.layer
+            configured_intervention
+            if configured_intervention is not None
+            and layer == configured_intervention.layer
             else None
         )
         usage = hit.next_crsa_usage
@@ -956,6 +1064,20 @@ class StreamedQwen38:
             raise Qwen38RuntimeError(
                 "attention-output Crystal native evidence contract is invalid"
             )
+        if evidence is not None and intervention is not None:
+            expected_mode = (
+                "replace_base_softmax"
+                if intervention.physical_replacement
+                else "blend"
+            )
+            if (
+                evidence.execution_mode != expected_mode
+                or evidence.alpha_per_head
+                != (intervention.alpha,) * len(intervention.head_indices)
+            ):
+                raise Qwen38RuntimeError(
+                    "attention-output Crystal Prefix-Sinkhorn action changed"
+                )
         return (
             hit.post_o_proj,
             AttentionState(key=key, value=value, crsa_log_usage=usage),
@@ -1042,8 +1164,12 @@ class StreamedQwen38:
             ) from exc
         return hashlib.sha256(encoded).hexdigest()
 
+    def _active_native_head_crsa(self) -> Qwen38NativeHeadCrsa | None:
+        intervention = self._native_head_crsa_configured
+        return intervention if self.native_head_crsa_enabled else None
+
     def _native_head_crsa_snapshot_identity(self) -> dict[str, Any]:
-        intervention = self.native_head_crsa
+        intervention = self._active_native_head_crsa()
         if intervention is None or not intervention.active:
             return {"kind": "none"}
         return {
@@ -1054,7 +1180,7 @@ class StreamedQwen38:
         }
 
     def _native_head_crsa_usage_required(self, layer: int) -> bool:
-        intervention = self.native_head_crsa
+        intervention = self._active_native_head_crsa()
         return (
             intervention is not None
             and intervention.active
@@ -1959,15 +2085,17 @@ class StreamedQwen38:
         captured_native_evidence: list[NativeHeadCrsaEvidence] = []
 
         def observe_native(evidence: NativeHeadCrsaEvidence) -> None:
+            self._record_native_prefix_sinkhorn_compute(evidence)
             captured_native_evidence.append(evidence)
             if native_head_crsa_observer is not None:
                 native_head_crsa_observer(evidence)
 
         try:
+            configured_intervention = self._active_native_head_crsa()
             native_head_crsa = (
-                self.native_head_crsa
-                if self.native_head_crsa is not None
-                and layer == self.native_head_crsa.layer
+                configured_intervention
+                if configured_intervention is not None
+                and layer == configured_intervention.layer
                 else None
             )
             mixed, next_state = full_attention_core(
@@ -2629,10 +2757,11 @@ class StreamedQwen38:
         """Run or exactly replay one-token attention transitions layer-major."""
 
         base = f"model.language_model.layers.{layer}.self_attn"
+        configured_intervention = self._active_native_head_crsa()
         intervention = (
-            self.native_head_crsa
-            if self.native_head_crsa is not None
-            and layer == self.native_head_crsa.layer
+            configured_intervention
+            if configured_intervention is not None
+            and layer == configured_intervention.layer
             else None
         )
         bank = (
@@ -2743,6 +2872,7 @@ class StreamedQwen38:
                 row_native_evidence: list[NativeHeadCrsaEvidence] = []
 
                 def observe_native(evidence: NativeHeadCrsaEvidence) -> None:
+                    self._record_native_prefix_sinkhorn_compute(evidence)
                     row_native_evidence.append(evidence)
                     native_head_crsa_observer(evidence)
 
@@ -3395,9 +3525,8 @@ class StreamedQwen38:
     def _continuation_block_runtime_identity(self) -> str:
         """Bind a staged block to every mutable math/runtime attachment."""
 
-        native = (
-            None if self.native_head_crsa is None else asdict(self.native_head_crsa)
-        )
+        active_native = self._active_native_head_crsa()
+        native = None if active_native is None else asdict(active_native)
         source_metrics = self.pager.source.metrics()
         return self._snapshot_digest(
             {
@@ -3538,6 +3667,19 @@ class StreamedQwen38:
             except Exception:
                 pass
 
+    def _record_native_prefix_sinkhorn_compute(
+        self,
+        evidence: NativeHeadCrsaEvidence,
+    ) -> None:
+        if not isinstance(evidence, NativeHeadCrsaEvidence):
+            raise TypeError("native Head-CRSA compute evidence is invalid")
+        self._native_prefix_sinkhorn_head_rows_skipped += (
+            evidence.base_softmax_head_rows_skipped
+        )
+        self._native_prefix_sinkhorn_probability_elements_skipped += (
+            evidence.base_softmax_probability_elements_skipped
+        )
+
     def _emit_native_head_crsa_evidence(
         self, rows: Iterable[NativeHeadCrsaEvidence]
     ) -> None:
@@ -3677,10 +3819,11 @@ class StreamedQwen38:
                     raise Qwen38RuntimeError(
                         f"full-attention layer {layer} state device/dtype is invalid"
                     )
+                active_native = self._active_native_head_crsa()
                 expects_usage = (
-                    self.native_head_crsa is not None
-                    and self.native_head_crsa.active
-                    and layer == self.native_head_crsa.layer
+                    active_native is not None
+                    and active_native.active
+                    and layer == active_native.layer
                 )
                 if expects_usage != (state.crsa_log_usage is not None):
                     raise Qwen38RuntimeError(
