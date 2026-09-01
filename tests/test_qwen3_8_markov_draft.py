@@ -1924,11 +1924,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(
             markov_module.MARKOV_DRAFT_PROVIDER_ABI,
-            "immer.qwen3.8-markov-draft-provider/v47",
+            "immer.qwen3.8-markov-draft-provider/v48",
         )
         self.assertEqual(
             metrics.schema,
-            "immer.qwen3.8-markov-draft-metrics/v36",
+            "immer.qwen3.8-markov-draft-metrics/v37",
         )
         self.assertEqual(metrics.horizon_self_reliability, (1.0,) * 16)
         self.assertTrue(

@@ -233,6 +233,50 @@ class InferenceActionReceiptTests(unittest.TestCase):
                     executed_actions_from_result(result, economics),
                 )
 
+    def test_accepted_context_crystal_is_recorded_as_compute_crystal(self) -> None:
+        economics = _economics("context-crystal")
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "draft": {
+                    "context_crystal": {
+                        "crystal_accepted_tokens": 7,
+                        "crystal_proposed_tokens": 15,
+                    }
+                }
+            },
+        )
+
+        actions = executed_actions_from_result(result, economics)
+
+        self.assertIn("compute_crystal", actions)
+        self.assertIn("target_verified_draft", actions)
+
+    def test_unaccepted_context_crystal_is_not_an_executed_compute_action(
+        self,
+    ) -> None:
+        economics = _economics("context-crystal-miss")
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "draft": {
+                    "context_crystal": {
+                        "crystal_accepted_tokens": 0,
+                        "crystal_proposed_tokens": 15,
+                    }
+                }
+            },
+        )
+
+        self.assertNotIn(
+            "compute_crystal",
+            executed_actions_from_result(result, economics),
+        )
+
 
 class InferenceActionBankTests(unittest.TestCase):
     def test_observe_restart_duplicate_and_ranking(self) -> None:

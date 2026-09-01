@@ -343,6 +343,23 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
     prefix_sinkhorn = evidence.get("prefix_sinkhorn")
     if isinstance(prefix_sinkhorn, dict):
         summary["prefix_sinkhorn"] = prefix_sinkhorn
+    contextual_continuation = evidence.get("contextual_continuation")
+    if isinstance(contextual_continuation, dict):
+        summary["contextual_continuation"] = {
+            key: contextual_continuation[key]
+            for key in (
+                "capture_count",
+                "cell_count",
+                "feedback_count",
+                "hit_positions",
+                "identity_sha256",
+                "settlements",
+                "state_sha256",
+                "support",
+                "verified_positions",
+            )
+            if key in contextual_continuation
+        }
     delta_head_router = evidence.get("delta_head_router")
     if isinstance(delta_head_router, dict):
         compact_delta_head = {
@@ -430,6 +447,27 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                         "retention_failures",
                         "retention_priority_evictions",
                         "retention_scored_episodes",
+                    )
+                    if key in markov
+                }
+                compact_draft["context_crystal"] = {
+                    key: markov[key]
+                    for key in (
+                        "crystal_accepted_tokens",
+                        "crystal_bank_cells",
+                        "crystal_bank_support",
+                        "crystal_captures",
+                        "crystal_enabled",
+                        "crystal_failures",
+                        "crystal_last_cell_sha256",
+                        "crystal_last_cosine",
+                        "crystal_last_margin",
+                        "crystal_mismatches",
+                        "crystal_option_calls",
+                        "crystal_proposed_tokens",
+                        "crystal_queries",
+                        "crystal_query_hits",
+                        "crystal_verified_tokens",
                     )
                     if key in markov
                 }

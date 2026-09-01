@@ -107,6 +107,7 @@ def executed_actions_from_result(
     conversation = execution.get("conversation")
     prefix_sinkhorn = execution.get("prefix_sinkhorn")
     delta_head_router = execution.get("delta_head_router")
+    draft = execution.get("draft")
     battery_hit = (
         isinstance(anchor, Mapping) and anchor.get("status") == "hit"
     ) or (
@@ -129,6 +130,15 @@ def executed_actions_from_result(
             for field in ("calls", "rows", "logical_bytes_saved")
         ):
             actions = tuple(sorted({*actions, "mlp_head_coordinate"}))
+    if isinstance(draft, Mapping):
+        crystal = draft.get("context_crystal")
+        accepted = (
+            None
+            if not isinstance(crystal, Mapping)
+            else crystal.get("crystal_accepted_tokens")
+        )
+        if isinstance(accepted, int) and not isinstance(accepted, bool) and accepted > 0:
+            actions = tuple(sorted({*actions, "compute_crystal"}))
     return actions
 
 
@@ -703,6 +713,8 @@ class InferenceActionBank:
                 for action in runtime[0].actions
                 if action
                 in {
+                    "compute_crystal",
+                    "continuation_battery",
                     "dynamic_mlp_pages",
                     "qwen_target",
                     "target_verified_draft",

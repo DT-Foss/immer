@@ -1004,7 +1004,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(proposal.token_ids, (7, 8, 9))
         self.assertEqual(
             proposal.provider_abi,
-            "immer.qwen3.8-markov-mtp-hybrid-provider/v28",
+            "immer.qwen3.8-markov-mtp-hybrid-provider/v29",
         )
         self.assertTrue(
             all(abs(value - 0.7625) < 1e-12 for value in proposal.token_confidences)
@@ -1412,7 +1412,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(mtp.advance_calls[0][2], final_hidden))
 
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v28")
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v29")
         self.assertEqual(metrics.selected_provider, "markov")
         self.assertEqual(metrics.selection_calls, 4)
         self.assertEqual(metrics.markov_rounds, 3)

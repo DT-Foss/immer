@@ -1381,7 +1381,7 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.assertEqual(code, 0)
         options = constructor.call_args.kwargs
         self.assertEqual(options["draft_mode"], "markov")
-        self.assertEqual(options["draft_window"], 8)
+        self.assertEqual(options["draft_window"], 16)
         self.assertEqual(
             options["draft_window_state_path"],
             str(draft_window_state),

@@ -275,6 +275,21 @@ class QwenFertigChatTests(unittest.TestCase):
                             "online_vote_score_sum": 0.9,
                             "online_vote_supported_tokens": 2,
                             "online_vote_tokens": 6,
+                            "crystal_accepted_tokens": 5,
+                            "crystal_bank_cells": 12,
+                            "crystal_bank_support": 19,
+                            "crystal_captures": 8,
+                            "crystal_enabled": True,
+                            "crystal_failures": 0,
+                            "crystal_last_cell_sha256": "e" * 64,
+                            "crystal_last_cosine": 0.98,
+                            "crystal_last_margin": 0.31,
+                            "crystal_mismatches": 1,
+                            "crystal_option_calls": 2,
+                            "crystal_proposed_tokens": 9,
+                            "crystal_queries": 4,
+                            "crystal_query_hits": 2,
+                            "crystal_verified_tokens": 6,
                         },
                     },
                     "window_size": 8,
@@ -282,6 +297,17 @@ class QwenFertigChatTests(unittest.TestCase):
                 "o1_markov_retention": {
                     "last_score": {"priority": 7.5},
                     "sequence": 3,
+                },
+                "contextual_continuation": {
+                    "capture_count": 8,
+                    "cell_count": 12,
+                    "feedback_count": 2,
+                    "hit_positions": 5,
+                    "identity_sha256": "f" * 64,
+                    "settlements": 2,
+                    "state_sha256": "1" * 64,
+                    "support": 19,
+                    "verified_positions": 6,
                 },
                 "mlp_page_route": {
                     "request": {
@@ -336,6 +362,8 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertEqual(draft["atlas"]["atlas_vote_supported_tokens"], 3)
         self.assertEqual(draft["online_memory"]["history_capacity_tokens"], 65_536)
         self.assertEqual(draft["provider"]["online_consensus_tokens"], 1)
+        self.assertEqual(draft["context_crystal"]["crystal_accepted_tokens"], 5)
+        self.assertEqual(draft["context_crystal"]["crystal_bank_cells"], 12)
         self.assertEqual(
             _receipt(result)["qwen"]["o1_markov_retention"]["sequence"],
             3,
@@ -358,6 +386,10 @@ class QwenFertigChatTests(unittest.TestCase):
             11,
         )
         self.assertEqual(qwen_receipt["runtime_reward"]["o1_priority"], 4.5)
+        self.assertEqual(
+            qwen_receipt["contextual_continuation"]["cell_count"],
+            12,
+        )
         economics = receipt_from_result(
             result,
             question_sha256=hashlib.sha256(

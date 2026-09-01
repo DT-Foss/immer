@@ -130,8 +130,11 @@ _QWEN38_DEPLOYMENT_SERVICE_SOCKET = (
 _QWEN38_DEPLOYMENT_ANCHOR_CACHE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-chat-prefix-anchors"
 )
-_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v47"
-_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v28"
+_QWEN38_DEPLOYMENT_CONTEXT_CRYSTAL_STATE = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen-contextual-continuation-v1.json"
+)
+_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v48"
+_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
     b"immer:qwen3.8-growing-warm-runtime/v3"
@@ -314,6 +317,7 @@ def _qwen38_service_profile(
 
     argument_names = (
         "compute_dtype",
+        "context_crystal_state",
         "delta_head_layers",
         "delta_head_online_state",
         "device",
@@ -337,6 +341,7 @@ def _qwen38_service_profile(
         "max_resident_mb",
         "mlp_page_width",
         "no_inference_economics",
+        "no_context_crystal",
         "prefix_sinkhorn",
         "q4_threads",
         "qwen38_anchor_cache",
@@ -538,6 +543,16 @@ def _qwen38_growing_warm_profile(
                 "max_selected_heads": 40,
                 "policy": "mean-square+sinkhorn-first-order/v1",
                 "width_actions": [24, 32, 40],
+            }
+        ),
+        "contextual_continuation_crystal": (
+            None
+            if getattr(args, "context_crystal_state", None) is None
+            else {
+                "key_abi": "known-token+normalized-rademacher-q8-256/v1",
+                "markov_provider_abi": _QWEN38_MARKOV_DRAFT_ABI,
+                "maximum_tail_tokens": 15,
+                "target_verified": True,
             }
         ),
         "markov_provider_abi": (
@@ -1555,6 +1570,44 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             and bundle_path == _QWEN38_DEPLOYMENT_ROOT
         ):
             markov_o1_retention_path = _QWEN38_DEPLOYMENT_O1_RETENTION
+        disable_context_crystal = bool(
+            getattr(args, "no_context_crystal", False)
+        )
+        if disable_context_crystal and getattr(
+            args,
+            "context_crystal_state",
+            None,
+        ) is not None:
+            raise ValueError(
+                "--context-crystal-state and --no-context-crystal are "
+                "mutually exclusive"
+            )
+        context_crystal_state_path = (
+            None
+            if disable_context_crystal
+            else _chat_path(
+                getattr(args, "context_crystal_state", None),
+                "IMMER_QWEN38_CONTEXT_CRYSTAL_STATE",
+            )
+        )
+        if (
+            not disable_context_crystal
+            and context_crystal_state_path is None
+            and draft_mode in {"hybrid", "markov"}
+            and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+            and q4_root is not None
+        ):
+            context_crystal_state_path = (
+                _QWEN38_DEPLOYMENT_CONTEXT_CRYSTAL_STATE
+            )
+        if context_crystal_state_path is not None and (
+            draft_mode not in {"hybrid", "markov"} or q4_root is None
+        ):
+            raise ValueError(
+                "contextual continuation Crystals require Q4 Markov or "
+                "hybrid drafting"
+            )
+        args.context_crystal_state = context_crystal_state_path
         disable_draft_window = bool(
             getattr(args, "no_draft_window_controller", False)
         )
@@ -2077,6 +2130,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 None
                 if markov_o1_retention_path is None
                 else str(markov_o1_retention_path)
+            ),
+            contextual_continuation_state_path=(
+                None
+                if context_crystal_state_path is None
+                else str(context_crystal_state_path)
             ),
             mtp_draft_state_path=mtp_draft_state,
             draft_window_state_path=(
@@ -3132,9 +3190,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--draft-window",
         type=int,
         choices=range(2, 17),
-        default=8,
+        default=16,
         metavar="K",
-        help="target-verified tokens per weight pass (2-16; default: 8)",
+        help="target-verified tokens per weight pass (2-16; default: 16)",
     )
     chat.add_argument(
         "--markov-draft-state",
@@ -3147,6 +3205,18 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--markov-o1-retention",
         help="persistent O1 surprise scorer for confirmed Markov episodes",
+    )
+    chat.add_argument(
+        "--context-crystal-state",
+        help=(
+            "persistent target-hidden continuation Crystals for verified "
+            "K1-K16 drafting"
+        ),
+    )
+    chat.add_argument(
+        "--no-context-crystal",
+        action="store_true",
+        help="disable the deployed target-hidden continuation Crystal bank",
     )
     chat.add_argument(
         "--mtp-draft-state",

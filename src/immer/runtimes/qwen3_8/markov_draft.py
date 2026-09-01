@@ -20,6 +20,16 @@ import stat
 from typing import Sequence
 import zlib
 
+import torch
+
+from .contextual_continuation import (
+    ContextualCandidate,
+    ContextualCandidateFeedback,
+    ContextualCapture,
+    ContextualContinuationBank,
+    ContextualKey,
+    MAX_CONTINUATION_TOKENS,
+)
 from .draft_protocol import RollingDraftProposal
 from .markov_composition import (
     CompositionBounds,
@@ -35,7 +45,7 @@ except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
 MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v13"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v47"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v48"
 V12_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v12"
 V11_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v11"
 V10_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v10"
@@ -48,7 +58,7 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v36"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v37"
 MARKOV_RICCI_WORKING_SET_POLICY = "o1-priority+ricci-age-whole-answer/v1"
 _STATE_PREFIX = b"IMMD\x0d"
 _V12_STATE_PREFIX = b"IMMD\x0c"
@@ -785,18 +795,33 @@ class MarkovPhraseOption:
     support: int
     total: int
     kind: str = "literal"
+    confidence_override: float | None = None
+    token_confidences: tuple[float, ...] = ()
+    token_disagreements: tuple[float, ...] = ()
+    cell_sha256: str | None = None
 
     @property
     def confidence(self) -> float:
-        return self.support / self.total
+        return (
+            self.support / self.total
+            if self.confidence_override is None
+            else self.confidence_override
+        )
 
     def __post_init__(self) -> None:
-        if self.source not in {"atlas", "dialect", "global", "request"}:
+        if self.source not in {
+            "atlas",
+            "crystal",
+            "dialect",
+            "global",
+            "request",
+        }:
             raise ValueError("phrase option source is invalid")
         if self.kind not in {
             "atlas",
             "binding",
             "composition",
+            "crystal",
             "literal",
             "periodic",
         }:
@@ -812,6 +837,42 @@ class MarkovPhraseOption:
             or self.total < self.support
         ):
             raise ValueError("phrase option evidence is invalid")
+        if self.kind == "crystal":
+            confidence = self.confidence_override
+            if (
+                self.source != "crystal"
+                or isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not math.isfinite(float(confidence))
+                or not 0.0 <= float(confidence) <= 1.0
+                or len(self.token_confidences) != len(self.token_ids)
+                or len(self.token_disagreements) != len(self.token_ids)
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or not 0.0 <= float(value) <= 1.0
+                    for value in self.token_confidences
+                )
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or float(value) < 0.0
+                    for value in self.token_disagreements
+                )
+                or not isinstance(self.cell_sha256, str)
+                or len(self.cell_sha256) != 64
+                or bool(set(self.cell_sha256) - _HEX)
+            ):
+                raise ValueError("crystal phrase evidence is invalid")
+        elif (
+            self.confidence_override is not None
+            or self.token_confidences
+            or self.token_disagreements
+            or self.cell_sha256 is not None
+        ):
+            raise ValueError("non-crystal phrase carries crystal evidence")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1693,6 +1754,21 @@ class MarkovDraftMetrics:
     recursive_trace_hits: int = 0
     recursive_trace_misses: int = 0
     recursive_trace_max_position: int = 0
+    crystal_enabled: bool = False
+    crystal_queries: int = 0
+    crystal_query_hits: int = 0
+    crystal_option_calls: int = 0
+    crystal_proposed_tokens: int = 0
+    crystal_verified_tokens: int = 0
+    crystal_accepted_tokens: int = 0
+    crystal_mismatches: int = 0
+    crystal_captures: int = 0
+    crystal_failures: int = 0
+    crystal_bank_cells: int = 0
+    crystal_bank_support: int = 0
+    crystal_last_cosine: float = 0.0
+    crystal_last_margin: float = 0.0
+    crystal_last_cell_sha256: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         value = asdict(self)
@@ -1772,6 +1848,7 @@ class FingerprintRollingK4DraftProvider:
         episode_priority_store: (
             Callable[[tuple[int, ...], float], None] | None
         ) = None,
+        contextual_continuation_bank: ContextualContinuationBank | None = None,
     ) -> None:
         if (
             isinstance(vocab_size, bool)
@@ -1821,6 +1898,14 @@ class FingerprintRollingK4DraftProvider:
             episode_priority_store
         ):
             raise TypeError("episode_priority_store must be callable or None")
+        if contextual_continuation_bank is not None and not isinstance(
+            contextual_continuation_bank,
+            ContextualContinuationBank,
+        ):
+            raise TypeError(
+                "contextual_continuation_bank must be a "
+                "ContextualContinuationBank or None"
+            )
         self.vocab_size = vocab_size
         self.width = len(str(vocab_size - 1))
         self.state_path = (
@@ -1836,6 +1921,7 @@ class FingerprintRollingK4DraftProvider:
         self.episode_scorer = episode_scorer
         self.episode_priority = episode_priority
         self.episode_priority_store = episode_priority_store
+        self.contextual_continuation_bank = contextual_continuation_bank
         self._experts = _expert_specs(max_order, max_history_tokens)
         self._state_lock_descriptor: int | None = None
         self._persisted_state: MarkovDraftState | None = None
@@ -1985,6 +2071,22 @@ class FingerprintRollingK4DraftProvider:
         self._request_prompt: tuple[int, ...] | None = None
         self._request_prompt_length: int | None = None
         self._pending_phrase_option: MarkovPhraseOption | None = None
+        self._context_crystal_key: ContextualKey | None = None
+        self._context_crystal_candidates: tuple[ContextualCandidate, ...] = ()
+        self._context_crystal_captures: list[tuple[ContextualKey, int]] = []
+        self._context_crystal_feedback: list[ContextualCandidateFeedback] = []
+        self._crystal_queries = 0
+        self._crystal_query_hits = 0
+        self._crystal_option_calls = 0
+        self._crystal_proposed_tokens = 0
+        self._crystal_verified_tokens = 0
+        self._crystal_accepted_tokens = 0
+        self._crystal_mismatches = 0
+        self._crystal_captures = 0
+        self._crystal_failures = 0
+        self._crystal_last_cosine = 0.0
+        self._crystal_last_margin = 0.0
+        self._crystal_last_cell_sha256: str | None = None
         self._phrase_option_calls = 0
         self._phrase_draft_tokens = 0
         self._phrase_accepted_tokens = 0
@@ -2399,7 +2501,98 @@ class FingerprintRollingK4DraftProvider:
         self._request_prompt_length = len(committed)
         self._request_local_cache_history = None
         self._request_local_cache = None
+        self._context_crystal_key = None
+        self._context_crystal_candidates = ()
+        self._context_crystal_captures.clear()
+        self._context_crystal_feedback.clear()
         self._request_started = True
+
+    def _load_context_crystal_boundary(
+        self,
+        history: tuple[int, ...],
+        known_token: int,
+        target_hidden: torch.Tensor,
+    ) -> None:
+        self._context_crystal_key = None
+        self._context_crystal_candidates = ()
+        bank = self.contextual_continuation_bank
+        if bank is None:
+            return
+        self._crystal_queries += 1
+        try:
+            key = bank.project(target_hidden, known_token)
+            candidates = bank.query_key(key, limit=8)
+        except Exception:
+            self._crystal_failures += 1
+            return
+        self._context_crystal_key = key
+        self._context_crystal_candidates = candidates
+        self._context_crystal_captures.append((key, len(history)))
+        if candidates:
+            self._crystal_query_hits += 1
+            self._crystal_last_cosine = float(candidates[0].cosine)
+            self._crystal_last_margin = float(candidates[0].margin or 0.0)
+            self._crystal_last_cell_sha256 = candidates[0].cell_sha256
+
+    @staticmethod
+    def _context_crystal_probabilities(
+        candidate: ContextualCandidate,
+        width: int,
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        semantic = max(0.0, min(0.999, (float(candidate.cosine) + 1.0) / 2.0))
+        separation = (
+            1.0
+            if candidate.margin is None
+            else max(0.0, min(1.0, float(candidate.margin) / 0.15))
+        )
+        prior = min(0.999, semantic * (0.8 + 0.2 * separation))
+        confidences = []
+        disagreements = []
+        for position in range(width):
+            verified = candidate.position_verified[position]
+            hits = candidate.position_hits[position]
+            maturity = verified / (verified + 4.0)
+            posterior = (hits + 1.0) / (verified + 2.0)
+            confidence = (1.0 - maturity) * prior + maturity * posterior
+            confidences.append(max(0.0, min(0.999, confidence)))
+            disagreements.append(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        (1.0 - separation) * (1.0 - maturity)
+                        + maturity * (1.0 - posterior),
+                    ),
+                )
+            )
+        return tuple(confidences), tuple(disagreements)
+
+    def _context_crystal_option(
+        self,
+        history: tuple[int, ...],
+    ) -> MarkovPhraseOption | None:
+        if self._context_crystal_key is None or not self._context_crystal_candidates:
+            return None
+        candidate = self._context_crystal_candidates[0]
+        width = min(len(candidate.target_tail), self.proposal_width)
+        if width < 1:
+            return None
+        confidences, disagreements = self._context_crystal_probabilities(
+            candidate,
+            width,
+        )
+        return MarkovPhraseOption(
+            token_ids=candidate.target_tail[:width],
+            source="crystal",
+            context_order=max(1, min(self.PHRASE_MAX_CONTEXT, len(history))),
+            support=max(1, candidate.support),
+            total=max(1, candidate.support),
+            kind="crystal",
+            confidence_override=min(confidences),
+            token_confidences=confidences,
+            token_disagreements=disagreements,
+            cell_sha256=candidate.cell_sha256,
+        )
 
     def _persistent_symbols(self) -> tuple[str, ...]:
         cached = self._persistent_symbols_cache
@@ -3128,6 +3321,9 @@ class FingerprintRollingK4DraftProvider:
         dialect = self._active_dialect
         candidates: list[MarkovPhraseOption] = []
         composition_rows: list[tuple[MarkovPhraseOption, MarkovCompositionProgram]] = []
+        crystal_option = self._context_crystal_option(history)
+        if crystal_option is not None:
+            candidates.append(crystal_option)
         request_option = self._request_phrase_option(history)
         if request_option is not None:
             candidates.append(request_option)
@@ -5265,13 +5461,23 @@ class FingerprintRollingK4DraftProvider:
         retain_option = selected_planner == 2 or (
             selected_planner == 0
             and option is not None
-            and option.kind == "atlas"
+            and option.kind in {"atlas", "crystal"}
             and complete[: len(option.token_ids)] == option.token_ids
         )
         if option is not None and not retain_option:
             option = None
             self._pending_composition_program = None
         proposal = complete[: self.proposal_width]
+        if option is not None and option.kind == "crystal":
+            calibrated_confidences = list(confidences)
+            calibrated_disagreements = list(disagreements)
+            for index, value in enumerate(
+                option.token_confidences[: self.proposal_width]
+            ):
+                calibrated_confidences[index] = value
+                calibrated_disagreements[index] = option.token_disagreements[index]
+            confidences = tuple(calibrated_confidences)
+            disagreements = tuple(calibrated_disagreements)
         if len(self._last_plan_trace) != self.proposal_width + 1:
             raise MarkovDraftError("Markov planning trace width is invalid")
         self._pending_base = base
@@ -5319,6 +5525,12 @@ class FingerprintRollingK4DraftProvider:
                     len(option.token_ids),
                     self.proposal_width,
                 )
+            if option.kind == "crystal":
+                self._crystal_option_calls += 1
+                self._crystal_proposed_tokens += min(
+                    len(option.token_ids),
+                    self.proposal_width,
+                )
         self._draft_calls += 1
         return (
             proposal,
@@ -5337,6 +5549,22 @@ class FingerprintRollingK4DraftProvider:
             history, known_token
         )
         return proposal
+
+    def propose_after_state(
+        self,
+        history: tuple[int, ...],
+        known_token: int,
+        target_hidden: torch.Tensor,
+        /,
+    ) -> tuple[int, ...]:
+        """Use one immutable target boundary to query continuation Crystals."""
+
+        self._load_context_crystal_boundary(history, known_token, target_hidden)
+        try:
+            return self.propose_after(history, known_token)
+        finally:
+            self._context_crystal_key = None
+            self._context_crystal_candidates = ()
 
     def propose_round(
         self,
@@ -5381,6 +5609,22 @@ class FingerprintRollingK4DraftProvider:
         self._recommended_window_counts[result.recommended_window] += 1
         self._last_round_proposal = result
         return result
+
+    def propose_round_state(
+        self,
+        history: tuple[int, ...],
+        known_token: int,
+        target_hidden: torch.Tensor,
+        /,
+    ) -> RollingDraftProposal:
+        """Rank a hidden-state Crystal inside the existing phrase planner."""
+
+        self._load_context_crystal_boundary(history, known_token, target_hidden)
+        try:
+            return self.propose_round(history, known_token)
+        finally:
+            self._context_crystal_key = None
+            self._context_crystal_candidates = ()
 
     def atlas_evidence_for_pending(
         self,
@@ -5733,6 +5977,30 @@ class FingerprintRollingK4DraftProvider:
         self._pending_composition_program = None
         self._reconcile_calls += 1
 
+    def _record_context_crystal_verification(
+        self,
+        accepted_prefix_length: int,
+        verified_proposals: int,
+    ) -> None:
+        option = self._pending_phrase_option
+        if option is None or option.kind != "crystal":
+            return
+        width = min(verified_proposals, len(option.token_ids))
+        if width <= 0:
+            return
+        accepted = min(accepted_prefix_length, width)
+        assert option.cell_sha256 is not None
+        self._context_crystal_feedback.append(
+            ContextualCandidateFeedback(
+                option.cell_sha256,
+                accepted,
+                width,
+            )
+        )
+        self._crystal_verified_tokens += width
+        self._crystal_accepted_tokens += accepted
+        self._crystal_mismatches += int(accepted < width)
+
     def observe_verification(
         self,
         accepted_prefix_length: int,
@@ -5757,6 +6025,10 @@ class FingerprintRollingK4DraftProvider:
         self._pending_accepted_prefix_length = accepted_prefix_length
         self._pending_verified_proposals = verified_proposals
         self._pending_verification_virtual = False
+        self._record_context_crystal_verification(
+            accepted_prefix_length,
+            verified_proposals,
+        )
 
     def observe_virtual_verification(
         self,
@@ -5784,6 +6056,10 @@ class FingerprintRollingK4DraftProvider:
         self._pending_accepted_prefix_length = accepted_prefix_length
         self._pending_verified_proposals = verified_proposals
         self._pending_verification_virtual = True
+        self._record_context_crystal_verification(
+            accepted_prefix_length,
+            verified_proposals,
+        )
 
     def _commit_pending_verification(self, accepted_prefix_length: int) -> None:
         observed = self._pending_accepted_prefix_length
@@ -6013,6 +6289,47 @@ class FingerprintRollingK4DraftProvider:
         self._advance_confirmed_tokens(committed[previous:])
         self._last_confirmed_length = len(committed)
 
+    def _settle_context_crystals(self, committed: tuple[int, ...]) -> None:
+        bank = self.contextual_continuation_bank
+        if bank is None:
+            self._context_crystal_captures.clear()
+            self._context_crystal_feedback.clear()
+            return
+        captures: list[ContextualCapture] = []
+        try:
+            for key, boundary_index in self._context_crystal_captures:
+                if (
+                    boundary_index >= len(committed)
+                    or committed[boundary_index] != key.known_token
+                ):
+                    raise MarkovDraftError(
+                        "context Crystal boundary differs from target history"
+                    )
+                tail = committed[
+                    boundary_index + 1 : boundary_index
+                    + 1
+                    + MAX_CONTINUATION_TOKENS
+                ]
+                if not tail:
+                    continue
+                captures.append(
+                    ContextualCapture(
+                        key=key,
+                        target_tail=tail,
+                        boundary_index=boundary_index,
+                    )
+                )
+            bank.settle(
+                captures=tuple(captures),
+                feedback=tuple(self._context_crystal_feedback),
+            )
+            self._crystal_captures += len(captures)
+        except Exception:
+            self._crystal_failures += 1
+        finally:
+            self._context_crystal_captures.clear()
+            self._context_crystal_feedback.clear()
+
     def observe_final(self, history: tuple[int, ...], /) -> None:
         committed = self._token_tuple(history, label="final Markov history")
         if self._request_completed:
@@ -6231,6 +6548,7 @@ class FingerprintRollingK4DraftProvider:
             self._commit_active_dialect()
             self._last_confirmed_length = len(committed)
             self._persist()
+            self._settle_context_crystals(committed)
             self._request_completed = True
         except Exception:
             self._state = original_state
@@ -6359,6 +6677,12 @@ class FingerprintRollingK4DraftProvider:
 
     def metrics(self) -> MarkovDraftMetrics:
         weights = self._weights()
+        crystal_metrics = None
+        if self.contextual_continuation_bank is not None:
+            try:
+                crystal_metrics = self.contextual_continuation_bank.metrics()
+            except Exception:
+                self._crystal_failures += 1
         dialect_neighbors = self._inference_dialects()
         active_plan_observations, active_plan_hits = (
             ((0,) * _MAX_PROPOSAL_POSITIONS,) * 2
@@ -6637,6 +6961,25 @@ class FingerprintRollingK4DraftProvider:
             recursive_trace_hits=self._recursive_trace_hits,
             recursive_trace_misses=self._recursive_trace_misses,
             recursive_trace_max_position=self._recursive_trace_max_position,
+            crystal_enabled=self.contextual_continuation_bank is not None,
+            crystal_queries=self._crystal_queries,
+            crystal_query_hits=self._crystal_query_hits,
+            crystal_option_calls=self._crystal_option_calls,
+            crystal_proposed_tokens=self._crystal_proposed_tokens,
+            crystal_verified_tokens=self._crystal_verified_tokens,
+            crystal_accepted_tokens=self._crystal_accepted_tokens,
+            crystal_mismatches=self._crystal_mismatches,
+            crystal_captures=self._crystal_captures,
+            crystal_failures=self._crystal_failures,
+            crystal_bank_cells=(
+                0 if crystal_metrics is None else crystal_metrics.cell_count
+            ),
+            crystal_bank_support=(
+                0 if crystal_metrics is None else crystal_metrics.support
+            ),
+            crystal_last_cosine=self._crystal_last_cosine,
+            crystal_last_margin=self._crystal_last_margin,
+            crystal_last_cell_sha256=self._crystal_last_cell_sha256,
         )
 
     def close(self) -> None:
@@ -6659,6 +7002,10 @@ class FingerprintRollingK4DraftProvider:
         self._recursive_traces.clear()
         self._planner_traces.clear()
         self._pending_phrase_option = None
+        self._context_crystal_key = None
+        self._context_crystal_candidates = ()
+        self._context_crystal_captures.clear()
+        self._context_crystal_feedback.clear()
         self._pending_composition_program = None
         self._pending_import_digest = None
         self._request_expert_rapidities = None

@@ -18,6 +18,24 @@ from .config import (
     Qwen38ConfigError,
 )
 from .bundle import Qwen38BundleError, verify_qwen38_causal_mount
+from .contextual_continuation import (
+    CONTEXTUAL_CONTINUATION_ENVELOPE_SCHEMA,
+    CONTEXTUAL_CONTINUATION_IDENTITY_SCHEMA,
+    CONTEXTUAL_CONTINUATION_KEY_SCHEMA,
+    CONTEXTUAL_CONTINUATION_STATE_SCHEMA,
+    CONTEXTUAL_KEY_DIMENSIONS,
+    CONTEXTUAL_PROJECTION_ABI,
+    ContextualCandidate,
+    ContextualCandidateFeedback,
+    ContextualCapture,
+    ContextualContinuationBank,
+    ContextualContinuationError,
+    ContextualContinuationIdentity,
+    ContextualContinuationIdentityError,
+    ContextualContinuationIntegrityError,
+    ContextualContinuationMetrics,
+    ContextualKey,
+)
 from .cartography_probe import (
     CARTOGRAPHY_BUNDLE_VIEW_SCHEMA,
     CARTOGRAPHY_EVIDENCE_SCHEMA,
@@ -343,6 +361,22 @@ from .speculative import (
 )
 
 __all__ = [
+    "CONTEXTUAL_CONTINUATION_ENVELOPE_SCHEMA",
+    "CONTEXTUAL_CONTINUATION_IDENTITY_SCHEMA",
+    "CONTEXTUAL_CONTINUATION_KEY_SCHEMA",
+    "CONTEXTUAL_CONTINUATION_STATE_SCHEMA",
+    "CONTEXTUAL_KEY_DIMENSIONS",
+    "CONTEXTUAL_PROJECTION_ABI",
+    "ContextualCandidate",
+    "ContextualCandidateFeedback",
+    "ContextualCapture",
+    "ContextualContinuationBank",
+    "ContextualContinuationError",
+    "ContextualContinuationIdentity",
+    "ContextualContinuationIdentityError",
+    "ContextualContinuationIntegrityError",
+    "ContextualContinuationMetrics",
+    "ContextualKey",
     "ANCHOR_BATTERY_STATE_SCHEMA",
     "AnchorBatteryController",
     "AnchorBatteryError",

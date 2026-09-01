@@ -13,7 +13,7 @@ from .draft_protocol import RollingDraftProposal
 from .mtp_draft import Qwen35MtpCarry, Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v28"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
 ATLAS_MTP_CONSENSUS_STRENGTH = 0.25
 ONLINE_MTP_CONSENSUS_STRENGTH = 0.25
 PROVIDER_TOURNAMENT_DISCOUNT = 0.85
@@ -557,6 +557,7 @@ class Qwen38MarkovMtpDraftProvider:
         self,
         history: tuple[int, ...],
         known_token: int,
+        target_hidden: torch.Tensor | None = None,
     ) -> RollingDraftProposal | None:
         self._validate_history(history)
         self._shadow_markov_proposal = None
@@ -567,7 +568,20 @@ class Qwen38MarkovMtpDraftProvider:
         self._last_online_consensus_tokens = 0
         self._last_online_consensus_confidence_gain = 0.0
         self._advance_provider_traces((known_token,))
-        proposal = self.markov_provider.propose_round(history, known_token)
+        stateful_proposal = getattr(
+            self.markov_provider,
+            "propose_round_state",
+            None,
+        )
+        proposal = (
+            stateful_proposal(
+                history,
+                known_token,
+                target_hidden.detach().clone(),
+            )
+            if target_hidden is not None and callable(stateful_proposal)
+            else self.markov_provider.propose_round(history, known_token)
+        )
         if not isinstance(proposal, RollingDraftProposal):
             raise Qwen38MarkovMtpDraftError(
                 "Markov council returned no RollingDraftProposal"
@@ -809,7 +823,11 @@ class Qwen38MarkovMtpDraftProvider:
             )
         round_hidden = self._mtp_hidden(target_hidden)
         self._round_target_hidden = round_hidden
-        selected = self._markov_round_or_handoff(history, known_token)
+        selected = self._markov_round_or_handoff(
+            history,
+            known_token,
+            round_hidden,
+        )
         if selected is not None:
             self._pending_provider = "markov"
             return selected
@@ -870,7 +888,20 @@ class Qwen38MarkovMtpDraftProvider:
             self._switch_available = False
             self._hidden_history = None
         if self._selected_provider == "markov":
-            proposal = self.markov_provider.propose_after(history, known_token)
+            stateful_proposal = getattr(
+                self.markov_provider,
+                "propose_after_state",
+                None,
+            )
+            proposal = (
+                stateful_proposal(
+                    history,
+                    known_token,
+                    target_hidden.detach().clone(),
+                )
+                if callable(stateful_proposal)
+                else self.markov_provider.propose_after(history, known_token)
+            )
             self._markov_rounds += 1
         elif self._selected_provider == "mtp":
             assert self._mtp_provider is not None
@@ -990,7 +1021,7 @@ class Qwen38MarkovMtpDraftProvider:
         if owner is None:  # pragma: no cover - pending-provider invariant.
             raise Qwen38MarkovMtpDraftError("hybrid provider was not selected")
         stateful_reconcile = getattr(owner, "reconcile_prefix_state", None)
-        if pending == "mtp" and callable(stateful_reconcile):
+        if callable(stateful_reconcile):
             stateful_reconcile(history, fragment.detach().clone())
         else:
             owner.reconcile_prefix(history)

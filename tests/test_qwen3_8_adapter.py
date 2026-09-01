@@ -479,6 +479,53 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         chat.close()
 
+    def test_contextual_continuation_bank_mounts_with_runtime_identity(self) -> None:
+        runtime = _Runtime()
+        runtime.model.config.dim = 8
+        runtime.q4_bank = SimpleNamespace(
+            identity={"manifest_sha256": "f" * 64},
+        )
+        runtime.mlp_page_router = None
+        runtime.delta_head_receipt = None
+        with tempfile.TemporaryDirectory() as temporary:
+            configured = Path(temporary) / "context.json"
+
+            def open_bank(path, identity):
+                return SimpleNamespace(
+                    state_path=path,
+                    identity=identity,
+                    metrics=Mock(
+                        return_value=SimpleNamespace(to_dict=lambda: {})
+                    ),
+                )
+
+            chat = _chat(
+                runtime,
+                draft_mode="markov",
+                q4_root="/q4",
+                contextual_continuation_state_path=configured,
+            )
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.asdict",
+                    return_value={"dim": 8},
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.ContextualContinuationBank",
+                    side_effect=open_bank,
+                ) as constructor,
+            ):
+                chat._load_locked()
+
+        state_path, identity = constructor.call_args.args
+        self.assertEqual(identity.hidden_width, 8)
+        self.assertEqual(identity.q4_sha256, "f" * 64)
+        self.assertEqual(identity.tokenizer_sha256, _DIGEST)
+        self.assertIn(".context-", state_path.name)
+        self.assertEqual(state_path.suffix, ".json")
+        self.assertIs(chat._contextual_continuation_bank.identity, identity)
+        chat.close()
+
     def test_draft_window_identity_binds_page_route_width_and_joint_policy(
         self,
     ) -> None:
@@ -1345,6 +1392,27 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIsNone(component._fast_mlp_paths)
         self.assertEqual(component._delta_head_active_layers, (0, 2, 4))
         component.close()
+
+        component = Qwen38CausalChat(
+            "unused.causal",
+            "unused-tokenizer.json",
+            q4_root="/models/qwen-q4",
+            draft_mode="markov",
+            contextual_continuation_state_path="/state/context.json",
+        )
+        self.assertEqual(
+            component._contextual_continuation_state_path,
+            Path("/state/context.json"),
+        )
+        component.close()
+
+        with self.assertRaisesRegex(ValueError, "require Q4"):
+            Qwen38CausalChat(
+                "unused.causal",
+                "unused-tokenizer.json",
+                draft_mode="markov",
+                contextual_continuation_state_path="/state/context.json",
+            )
 
         with self.assertRaisesRegex(
             ValueError,
@@ -3517,6 +3585,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             markov_state.write_bytes(b"fixture")
             mtp_state = Path(temporary) / "qwen-mtp.json"
             page_state = Path(temporary) / "qwen-mlp-pages.json"
+            context_state = Path(temporary) / "qwen-context.json"
             with (
                 patch.dict("os.environ", {}, clear=True),
                 patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
@@ -3528,6 +3597,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 patch(
                     "immer.cli._QWEN38_DEPLOYMENT_MLP_PAGE_STATE",
                     page_state,
+                ),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_CONTEXT_CRYSTAL_STATE",
+                    context_state,
                 ),
                 patch(
                     "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
@@ -3544,6 +3617,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(options["markov_draft_state_path"], str(markov_state))
         self.assertEqual(options["mtp_draft_state_path"], str(mtp_state))
         self.assertEqual(options["mlp_page_state_path"], page_state)
+        self.assertEqual(
+            options["contextual_continuation_state_path"],
+            str(context_state),
+        )
+        self.assertEqual(options["draft_window"], 16)
         self.assertIsNone(options["fast_mlp_root"])
 
     def test_cli_can_disable_the_deployed_dynamic_mlp_page_route(self) -> None:
@@ -3568,13 +3646,20 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 redirect_stdout(io.StringIO()),
             ):
                 code = main(
-                    ["chat", "hello", "--raw-qwen", "--no-mlp-page-route"]
+                    [
+                        "chat",
+                        "hello",
+                        "--raw-qwen",
+                        "--no-mlp-page-route",
+                        "--no-context-crystal",
+                    ]
                 )
 
         self.assertEqual(code, 0)
         options = constructor.call_args.kwargs
         self.assertEqual(options["q4_root"], str(q4))
         self.assertIsNone(options["mlp_page_state_path"])
+        self.assertIsNone(options["contextual_continuation_state_path"])
 
     def test_cli_deployment_keeps_markov_as_an_explicit_opt_out(self) -> None:
         qwen = _chat(_Runtime())

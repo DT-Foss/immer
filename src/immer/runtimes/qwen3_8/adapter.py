@@ -35,6 +35,10 @@ from .config import (
     QWEN35_DRAFTER_REVISION,
     Qwen38Config,
 )
+from .contextual_continuation import (
+    ContextualContinuationBank,
+    ContextualContinuationIdentity,
+)
 from .encoding import END_OF_TEXT_TOKEN_ID, IM_END_TOKEN_ID, Qwen38Tokenizer
 from .draft_window import (
     DRAFT_WINDOW_ACTIONS,
@@ -1220,6 +1224,7 @@ class Qwen38CausalChat:
         markov_draft_state_path: str | Path | None = None,
         markov_atlas_path: str | Path | None = None,
         markov_o1_retention_path: str | Path | None = None,
+        contextual_continuation_state_path: str | Path | None = None,
         mtp_draft_state_path: str | Path | None = None,
         draft_window_state_path: str | Path | None = None,
         fast_mlp_root: str | Path | None = None,
@@ -1379,6 +1384,13 @@ class Qwen38CausalChat:
             (str, Path),
         ):
             raise TypeError("markov_o1_retention_path must be a local path or None")
+        if contextual_continuation_state_path is not None and not isinstance(
+            contextual_continuation_state_path,
+            (str, Path),
+        ):
+            raise TypeError(
+                "contextual_continuation_state_path must be a local path or None"
+            )
         if mtp_draft_state_path is not None and not isinstance(
             mtp_draft_state_path, (str, Path)
         ):
@@ -1398,7 +1410,11 @@ class Qwen38CausalChat:
                 draft_mode = "mtp"
             elif markov_draft_state_path is not None:
                 draft_mode = "markov"
-            elif markov_atlas_path is not None or markov_o1_retention_path is not None:
+            elif (
+                markov_atlas_path is not None
+                or markov_o1_retention_path is not None
+                or contextual_continuation_state_path is not None
+            ):
                 draft_mode = "markov"
         if draft_mode == "qwen35" and draft_bundle_path is None:
             raise ValueError("qwen35 draft mode requires draft_bundle_path")
@@ -1428,6 +1444,15 @@ class Qwen38CausalChat:
             raise ValueError(
                 "markov_o1_retention_path requires Markov or hybrid draft mode"
             )
+        if (
+            draft_mode not in {"hybrid", "markov"}
+            and contextual_continuation_state_path is not None
+        ):
+            raise ValueError(
+                "contextual continuation Crystals require Markov or hybrid drafting"
+            )
+        if contextual_continuation_state_path is not None and q4_root is None:
+            raise ValueError("contextual continuation Crystals require Q4 execution")
         if draft_mode not in {"hybrid", "mtp"} and mtp_draft_state_path is not None:
             raise ValueError("mtp_draft_state_path requires MTP or hybrid draft mode")
         if draft_mode == "mtp" and mtp_draft_state_path is None:
@@ -1593,6 +1618,11 @@ class Qwen38CausalChat:
             if markov_o1_retention_path is None
             else Path(markov_o1_retention_path).expanduser().absolute()
         )
+        self._contextual_continuation_state_path = (
+            None
+            if contextual_continuation_state_path is None
+            else Path(contextual_continuation_state_path).expanduser().absolute()
+        )
         self._mtp_draft_state_path = (
             None
             if mtp_draft_state_path is None
@@ -1661,6 +1691,7 @@ class Qwen38CausalChat:
         self._tokenizer_sha256: str | None = None
         self._markov_atlas: MarkovTokenAtlas | None = None
         self._markov_o1_retention: O1MarkovRetention | None = None
+        self._contextual_continuation_bank: ContextualContinuationBank | None = None
         self._conversation_session_id: str | None = None
         self._conversation_prefix_token_ids: tuple[int, ...] = ()
         self._conversation_mtp_carry: Qwen35MtpCarry | None = None
@@ -1850,6 +1881,17 @@ class Qwen38CausalChat:
                     "ppm_working_set": MARKOV_RICCI_WORKING_SET_POLICY,
                     "persistent": True,
                 }
+            if self._contextual_continuation_state_path is not None:
+                bank = self._contextual_continuation_bank
+                policy["contextual_continuation_crystal"] = {
+                    "enabled": True,
+                    "identity_sha256": (
+                        None if bank is None else bank.identity.identity_sha256
+                    ),
+                    "key": "known-token+normalized-rademacher-q8-256/v1",
+                    "maximum_tail_tokens": 15,
+                    "target_verifier": "qwen-k1-k4-k8-k16",
+                }
         elif self._draft_mode is not None:
             policy["draft_fallback"] = {
                 "configured_mode": self._draft_mode,
@@ -1999,6 +2041,9 @@ class Qwen38CausalChat:
         *,
         mlp_page_schema: str = MLP_PAGE_MARKOV_SCHEMA,
         mlp_page_policy: str = MLP_PAGE_MARKOV_POLICY,
+        markov_provider_abi: str | None = None,
+        hybrid_provider_abi: str | None = None,
+        contextual_continuation_enabled: bool | None = None,
     ) -> str:
         bundle = self._bundle_receipt
         tokenizer_sha256 = self._tokenizer_sha256
@@ -2006,9 +2051,13 @@ class Qwen38CausalChat:
             raise Qwen38ChatError(
                 "draft-window identity requires a loaded target runtime"
             )
+        if markov_provider_abi is None:
+            markov_provider_abi = MARKOV_DRAFT_PROVIDER_ABI
+        if hybrid_provider_abi is None:
+            hybrid_provider_abi = QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA
         if self._draft_mode == "markov":
             provider: dict[str, Any] = {
-                "abi": MARKOV_DRAFT_PROVIDER_ABI,
+                "abi": markov_provider_abi,
                 "alpha": 0.5,
                 "backoff_strength": 3.0,
                 "experts": 8,
@@ -2054,9 +2103,9 @@ class Qwen38CausalChat:
             }
         elif self._draft_mode == "hybrid":
             provider = {
-                "abi": QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
+                "abi": hybrid_provider_abi,
                 "kind": "markov-mtp-hybrid",
-                "markov_abi": MARKOV_DRAFT_PROVIDER_ABI,
+                "markov_abi": markov_provider_abi,
                 "markov_state_path": (
                     None
                     if self._markov_draft_state_path is None
@@ -2095,6 +2144,23 @@ class Qwen38CausalChat:
                 "policy": O1_MARKOV_RETENTION_POLICY,
                 "ppm_working_set": MARKOV_RICCI_WORKING_SET_POLICY,
                 "state_path": str(self._markov_o1_retention_path),
+            }
+        context_enabled = (
+            self._contextual_continuation_state_path is not None
+            if contextual_continuation_enabled is None
+            else contextual_continuation_enabled
+        )
+        if (
+            self._draft_mode in {"hybrid", "markov"}
+            and context_enabled
+        ):
+            bank = self._contextual_continuation_bank
+            provider["contextual_continuation_crystal"] = {
+                "identity_sha256": (
+                    None if bank is None else bank.identity.identity_sha256
+                ),
+                "key_abi": "known-token+normalized-rademacher-q8-256/v1",
+                "maximum_tail_tokens": 15,
             }
         provider["joint_runtime_reward"] = {
             "draft_feedback_schema": DRAFT_WINDOW_FEEDBACK_SCHEMA,
@@ -2545,6 +2611,7 @@ class Qwen38CausalChat:
                 episode_scorer=None if retention is None else score_episode,
                 episode_priority=None if retention is None else retention.priority,
                 episode_priority_store=None if retention is None else retention.remember,
+                contextual_continuation_bank=self._contextual_continuation_bank,
             )
         elif effective_draft_mode == "mtp":
             provider = Qwen35MtpDraftProvider(
@@ -2565,6 +2632,7 @@ class Qwen38CausalChat:
                 episode_scorer=None if retention is None else score_episode,
                 episode_priority=None if retention is None else retention.priority,
                 episode_priority_store=None if retention is None else retention.remember,
+                contextual_continuation_bank=self._contextual_continuation_bank,
             )
 
             def mtp_factory() -> Qwen35MtpDraftProvider:
@@ -3118,6 +3186,10 @@ class Qwen38CausalChat:
             evidence["o1_markov_retention"] = (
                 self._markov_o1_retention.metrics()
             )
+        if self._contextual_continuation_bank is not None:
+            evidence["contextual_continuation"] = (
+                self._contextual_continuation_bank.metrics().to_dict()
+            )
         return evidence
 
     def _load_locked(self) -> Any:
@@ -3168,6 +3240,80 @@ class Qwen38CausalChat:
                     tokenizer_sha256=str(tokenizer_sha256),
                 )
             )
+            contextual_continuation_bank = None
+            if self._contextual_continuation_state_path is not None:
+                q4_bank = getattr(runtime, "q4_bank", None)
+                if q4_bank is None:
+                    q4_bank = getattr(getattr(model, "pager", None), "q4_bank", None)
+                q4_identity = getattr(q4_bank, "identity", None)
+                q4_manifest_sha256 = (
+                    None
+                    if not isinstance(q4_identity, Mapping)
+                    else q4_identity.get("manifest_sha256")
+                )
+                if not _is_sha256(q4_manifest_sha256):
+                    raise Qwen38ChatError(
+                        "contextual continuation bank lacks a Q4 model pin"
+                    )
+                mlp_page_router = getattr(runtime, "mlp_page_router", None)
+                mlp_page_identity = (
+                    {"kind": "none"}
+                    if mlp_page_router is None
+                    else mlp_page_router.snapshot_identity()
+                )
+                delta_head_identity = getattr(
+                    runtime,
+                    "delta_head_receipt",
+                    None,
+                )
+                contextual_identity = ContextualContinuationIdentity(
+                    runtime_sha256=_digest(
+                        {
+                            "delta_head": delta_head_identity,
+                            "hidden_boundary": (
+                                "final-normalized-target-hidden-before-known/v1"
+                            ),
+                            "hybrid_provider": (
+                                QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA
+                            ),
+                            "markov_provider": MARKOV_DRAFT_PROVIDER_ABI,
+                            "mlp_page": mlp_page_identity,
+                            "native_head_crsa": (
+                                None
+                                if self._native_head_crsa is None
+                                else asdict(self._native_head_crsa)
+                            ),
+                            "schema": (
+                                "immer.qwen3.8-contextual-runtime-identity/v1"
+                            ),
+                        }
+                    ),
+                    model_sha256=_digest(
+                        {
+                            "bundle": bundle_receipt,
+                            "config": asdict(model.config),
+                            "repo_id": OFFICIAL_REPO_ID,
+                            "revision": OFFICIAL_REVISION,
+                            "schema": "immer.qwen3.8-contextual-model-pin/v1",
+                        }
+                    ),
+                    q4_sha256=str(q4_manifest_sha256),
+                    tokenizer_sha256=str(tokenizer_sha256),
+                    hidden_width=_positive_int(
+                        getattr(model.config, "dim", None),
+                        "contextual continuation hidden width",
+                    ),
+                )
+                configured = self._contextual_continuation_state_path
+                suffix = configured.suffix or ".json"
+                state_path = configured.with_name(
+                    f"{configured.stem}.context-"
+                    f"{contextual_identity.identity_sha256[:16]}{suffix}"
+                )
+                contextual_continuation_bank = ContextualContinuationBank(
+                    state_path,
+                    contextual_identity,
+                )
             model_context = _positive_int(
                 getattr(model, "max_seq_len", None), "runtime model max_seq_len"
             )
@@ -3202,6 +3348,7 @@ class Qwen38CausalChat:
         self._tokenizer_sha256 = str(tokenizer_sha256)
         self._markov_atlas = markov_atlas
         self._markov_o1_retention = markov_o1_retention
+        self._contextual_continuation_bank = contextual_continuation_bank
         return runtime
 
     def _template_anchor_prefix(
@@ -3372,13 +3519,56 @@ class Qwen38CausalChat:
         )
 
         if self._draft_window_controller is not None:
-            compatible_previous = tuple(
-                self._draft_window_runtime_identity(
-                    mlp_page_schema=schema,
-                    mlp_page_policy=policy,
+            if self._draft_mode in {"hybrid", "markov"}:
+                previous_page_identities = (
+                    (
+                        (MLP_PAGE_MARKOV_SCHEMA, MLP_PAGE_MARKOV_POLICY),
+                        *MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS,
+                    )
+                    if self._mlp_page_state_path is not None
+                    else ((MLP_PAGE_MARKOV_SCHEMA, MLP_PAGE_MARKOV_POLICY),)
                 )
-                for schema, policy in MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS
-            ) if self._mlp_page_state_path is not None else ()
+                compatible_previous = tuple(
+                    sorted(
+                        {
+                            self._draft_window_runtime_identity(
+                                mlp_page_schema=schema,
+                                mlp_page_policy=policy,
+                                markov_provider_abi=(
+                                    "immer.qwen3.8-markov-draft-provider/v47"
+                                ),
+                                hybrid_provider_abi=(
+                                    "immer.qwen3.8-markov-mtp-hybrid-provider/v28"
+                                ),
+                                contextual_continuation_enabled=False,
+                            )
+                            for schema, policy in previous_page_identities
+                        }
+                        | {
+                            self._draft_window_runtime_identity(
+                                mlp_page_schema=schema,
+                                mlp_page_policy=policy,
+                            )
+                            for schema, policy in (
+                                MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS
+                                if self._mlp_page_state_path is not None
+                                else ()
+                            )
+                        }
+                    )
+                )
+            else:
+                compatible_previous = (
+                    tuple(
+                        self._draft_window_runtime_identity(
+                            mlp_page_schema=schema,
+                            mlp_page_policy=policy,
+                        )
+                        for schema, policy in MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS
+                    )
+                    if self._mlp_page_state_path is not None
+                    else ()
+                )
             self._draft_window_controller.bind_policy_identity(
                 self._draft_window_runtime_identity(),
                 compatible_previous=compatible_previous,
@@ -4307,6 +4497,7 @@ class Qwen38CausalChat:
             self._draft_runtime = None
             self._markov_atlas = None
             self._markov_o1_retention = None
+            self._contextual_continuation_bank = None
             self._clear_conversation_binding()
             self._closed = True
             if runtime is not None:

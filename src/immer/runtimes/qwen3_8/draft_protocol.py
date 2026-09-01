@@ -183,6 +183,7 @@ class RoundWindowPolicy:
         if self.phrase_source not in {
             None,
             "atlas",
+            "crystal",
             "global",
             "dialect",
             "request",
@@ -270,6 +271,7 @@ class RollingDraftProposal:
         if self.phrase_source not in {
             None,
             "atlas",
+            "crystal",
             "global",
             "dialect",
             "request",
