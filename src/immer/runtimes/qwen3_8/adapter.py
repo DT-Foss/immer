@@ -1407,8 +1407,10 @@ class Qwen38CausalChat:
             DRAFT_WINDOW_ACTIONS
         ):
             raise ValueError("adaptive draft-window ceiling must admit at least K=4")
-        if draft_mode not in {None, "markov"} and anchor_cache is not None:
-            raise ValueError("only Markov rolling drafting can share anchor restore")
+        if draft_mode not in {None, "hybrid", "markov"} and anchor_cache is not None:
+            raise ValueError(
+                "anchor restore requires direct, Markov, or hybrid drafting"
+            )
         if fast_mlp_root is not None and not isinstance(fast_mlp_root, (str, Path)):
             raise TypeError("fast_mlp_root must be a local path or None")
         if fast_mlp_online_state_path is not None and not isinstance(

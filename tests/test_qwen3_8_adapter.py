@@ -2072,6 +2072,22 @@ class Qwen38CausalChatTests(unittest.TestCase):
         hybrid.close()
         mtp.close()
 
+    def test_hybrid_accepts_anchor_restore_and_downgrades_without_mtp_carry(
+        self,
+    ) -> None:
+        hybrid = _chat(
+            _Runtime(),
+            draft_mode="hybrid",
+            q4_root="/q4",
+            anchor_cache=_anchor_cache(),
+        )
+
+        self.assertEqual(
+            hybrid._draft_mode_for_request({"restored_prefix_length": 17}),
+            "markov",
+        )
+        hybrid.close()
+
     def test_hybrid_runtime_identity_names_the_round_wise_feedback_policy(
         self,
     ) -> None:
