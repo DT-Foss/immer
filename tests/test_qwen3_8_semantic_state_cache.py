@@ -516,6 +516,228 @@ class Qwen38SemanticStateCacheTests(unittest.TestCase):
         )
         self.assertEqual(target.next_position, 1)
 
+        direct_target = self._model()
+        direct = reopened.restore_deepest(
+            direct_target,
+            [1, 9],
+            restore_mtp_carry=False,
+        )
+        self.assertIsNotNone(direct)
+        assert direct is not None
+        self.assertIsNone(direct.mtp_carry)
+        self.assertEqual(direct.mtp_carry_bytes, 0)
+        self.assertTrue(direct.mtp_carry_ignored)
+        self.assertEqual(direct_target.next_position, 1)
+
+        sidecar.write_bytes(b"broken optional sidecar")
+        ignored_corruption_target = self._model()
+        ignored_corruption = reopened.restore_deepest(
+            ignored_corruption_target,
+            [1, 10],
+            restore_mtp_carry=False,
+        )
+        self.assertIsNotNone(ignored_corruption)
+        assert ignored_corruption is not None
+        self.assertTrue(ignored_corruption.mtp_carry_ignored)
+        self.assertEqual(ignored_corruption_target.next_position, 1)
+
+    def test_upgrade_mtp_carry_reseals_v1_without_rewriting_native_state(
+        self,
+    ) -> None:
+        cache = SemanticStateAnchorCache(self.root / "cache")
+        source, carry, hidden = self._one_token_carry(1)
+        legacy = cache.store(
+            source,
+            [1],
+            boundary_kind="turn",
+            seed_hidden=hidden[:, -1:],
+        )
+        self.assertEqual(
+            legacy.to_document()["schema"],
+            "immer.qwen3.8-semantic-anchor/v1",
+        )
+        manifest = cache.snapshots / legacy.snapshot_manifest_name
+        payload = cache.snapshots / legacy.snapshot_payload_name
+        assert legacy.seed_hidden_name is not None
+        seed = cache.snapshots / legacy.seed_hidden_name
+        native_before = {
+            path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in (manifest, payload, seed)
+        }
+        with cache._locked():
+            state_before = cache._read_index()
+
+        upgraded = cache.upgrade_mtp_carry(
+            [1],
+            mtp_carry=carry,
+            tokenizer_sha256=self._TOKENIZER_SHA256,
+            seed_hidden=hidden[:, -1:],
+        )
+        self.assertEqual(upgraded.to_document()["schema"], SEMANTIC_ANCHOR_RECEIPT_SCHEMA)
+        self.assertIsNotNone(upgraded.mtp_carry)
+        self.assertEqual(upgraded.created_sequence, legacy.created_sequence)
+        self.assertEqual(
+            upgraded.last_access_sequence,
+            state_before.logical_clock + 1,
+        )
+        self.assertEqual(upgraded.hit_count, legacy.hit_count + 1)
+        for path in (manifest, payload, seed):
+            self.assertEqual(
+                (path.read_bytes(), path.stat().st_mtime_ns),
+                native_before[path.name],
+            )
+        with cache._locked():
+            state_after = cache._read_index()
+        self.assertEqual(state_after.anchors, (upgraded,))
+        self.assertEqual(state_after.generation, state_before.generation + 1)
+        self.assertEqual(state_after.logical_clock, state_before.logical_clock + 1)
+
+        index_before_retry = cache.index_path.read_bytes()
+        sidecars_before_retry = tuple(
+            sorted(path.name for path in cache.snapshots.glob("*.qwen35-mtp-carry"))
+        )
+        retried = cache.upgrade_mtp_carry(
+            [1],
+            mtp_carry=carry,
+            tokenizer_sha256=self._TOKENIZER_SHA256,
+            seed_hidden=hidden[:, -1:],
+        )
+        self.assertEqual(retried, upgraded)
+        self.assertEqual(cache.index_path.read_bytes(), index_before_retry)
+        self.assertEqual(
+            tuple(
+                sorted(
+                    path.name
+                    for path in cache.snapshots.glob("*.qwen35-mtp-carry")
+                )
+            ),
+            sidecars_before_retry,
+        )
+
+    def test_upgrade_mtp_carry_mismatches_never_mutate_index(self) -> None:
+        cache = SemanticStateAnchorCache(self.root / "cache")
+        source, carry, hidden = self._one_token_carry(1)
+        cache.store(
+            source,
+            [1],
+            boundary_kind="turn",
+            seed_hidden=hidden[:, -1:],
+        )
+        legacy_index = cache.index_path.read_bytes()
+        with self.assertRaisesRegex(SemanticStateCacheConflict, "seed hidden"):
+            cache.upgrade_mtp_carry(
+                [1],
+                mtp_carry=carry,
+                tokenizer_sha256=self._TOKENIZER_SHA256,
+                seed_hidden=hidden[:, -1:] + 1.0,
+            )
+        self.assertEqual(cache.index_path.read_bytes(), legacy_index)
+        self.assertEqual(
+            tuple(cache.snapshots.glob("*.qwen35-mtp-carry")),
+            (),
+        )
+        with self.assertRaisesRegex(SemanticStateCacheConflict, "no exact"):
+            cache.upgrade_mtp_carry(
+                [2],
+                mtp_carry=replace(carry, history=(2,)),
+                tokenizer_sha256=self._TOKENIZER_SHA256,
+            )
+        self.assertEqual(cache.index_path.read_bytes(), legacy_index)
+
+        upgraded = cache.upgrade_mtp_carry(
+            [1],
+            mtp_carry=carry,
+            tokenizer_sha256=self._TOKENIZER_SHA256,
+        )
+        upgraded_index = cache.index_path.read_bytes()
+        with self.assertRaisesRegex(SemanticStateCacheConflict, "foreign"):
+            cache.upgrade_mtp_carry(
+                [1],
+                mtp_carry=carry,
+                tokenizer_sha256="b" * 64,
+            )
+        self.assertEqual(cache.index_path.read_bytes(), upgraded_index)
+        different = replace(
+            carry,
+            last_target_hidden=carry.last_target_hidden + 1.0,
+        )
+        with self.assertRaisesRegex(SemanticStateCacheConflict, "different"):
+            cache.upgrade_mtp_carry(
+                [1],
+                mtp_carry=different,
+                tokenizer_sha256=self._TOKENIZER_SHA256,
+            )
+        self.assertEqual(cache.index_path.read_bytes(), upgraded_index)
+        self.assertEqual(cache.receipts(), (upgraded,))
+
+    def test_upgrade_mtp_carry_uses_deduplicated_physical_budget(self) -> None:
+        cache = SemanticStateAnchorCache(self.root / "shared-upgrade")
+        first_source, carry, first_hidden = self._one_token_carry(1)
+        cache.store(
+            first_source,
+            [1],
+            boundary_kind="turn",
+            seed_hidden=first_hidden[:, -1:],
+        )
+        second = self._charged(cache, [2])
+        descriptor = write_qwen35_mtp_carry_sidecar(
+            cache.snapshots,
+            carry,
+            tokenizer_sha256=self._TOKENIZER_SHA256,
+            prefix_sha256=token_prefix_sha256([1]),
+        )
+        shared_second = self._with_mtp_descriptor(second, descriptor)
+        with cache._locked():
+            state = cache._read_index()
+            shared_state = replace(
+                state,
+                anchors=tuple(
+                    shared_second
+                    if row.prefix_sha256 == second.prefix_sha256
+                    else row
+                    for row in state.anchors
+                ),
+                generation=state.generation + 1,
+            )
+            cache._write_index(shared_state)
+            physical_before = cache._physical_cache_bytes(shared_state.anchors)
+            cache.max_bytes = physical_before
+
+        upgraded = cache.upgrade_mtp_carry(
+            [1],
+            mtp_carry=carry,
+            tokenizer_sha256=self._TOKENIZER_SHA256,
+            seed_hidden=first_hidden[:, -1:],
+        )
+        self.assertEqual(upgraded.mtp_carry, descriptor)
+        self.assertEqual(len(cache.receipts()), 2)
+        self.assertEqual(cache.total_bytes, physical_before)
+        self.assertGreater(
+            sum(row.cache_bytes for row in cache.receipts()),
+            cache.total_bytes,
+        )
+
+        eviction = SemanticStateAnchorCache(self.root / "upgrade-eviction")
+        older = self._charged(eviction, [2])
+        protected_source, protected_carry, protected_hidden = self._one_token_carry(1)
+        protected = eviction.store(
+            protected_source,
+            [1],
+            boundary_kind="turn",
+            seed_hidden=protected_hidden[:, -1:],
+        )
+        eviction.max_bytes = protected.cache_bytes + descriptor.bytes
+        upgraded_protected = eviction.upgrade_mtp_carry(
+            [1],
+            mtp_carry=protected_carry,
+            tokenizer_sha256=self._TOKENIZER_SHA256,
+        )
+        self.assertEqual(eviction.receipts(), (upgraded_protected,))
+        self.assertFalse(
+            (eviction.snapshots / older.snapshot_manifest_name).exists()
+        )
+        self.assertLessEqual(eviction.total_bytes, eviction.max_bytes)
+
     def test_mtp_sidecar_missing_or_tampered_fails_before_model_load(self) -> None:
         missing_cache = SemanticStateAnchorCache(self.root / "missing-cache")
         source, carry, hidden = self._one_token_carry(1)
