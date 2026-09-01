@@ -341,6 +341,13 @@ class QwenFertigChatTests(unittest.TestCase):
                         "page_mlp_rows": 1,
                         "page_mlp_selected_pages": 17,
                         "page_mlp_weight_bytes": 200,
+                        "resident_page_misses": 19,
+                        "resident_unprotected_discard_bytes": 4096,
+                    },
+                    "runtime": {
+                        "resident_budget_bytes": 17_179_869_184,
+                        "resident_head_fully_protected": True,
+                        "resident_protected_bytes": 16_637_788_160,
                     },
                 },
                 "runtime_metrics": {
@@ -440,6 +447,13 @@ class QwenFertigChatTests(unittest.TestCase):
             200,
         )
         self.assertEqual(qwen_receipt["q4"]["request"]["page_mlp_rows"], 1)
+        self.assertEqual(
+            qwen_receipt["q4"]["request"]["resident_page_misses"],
+            19,
+        )
+        self.assertTrue(
+            qwen_receipt["q4"]["runtime"]["resident_head_fully_protected"]
+        )
         self.assertEqual(
             qwen_receipt["mlp_page_route"]["request"][
                 "adaptive_width_pages_saved"

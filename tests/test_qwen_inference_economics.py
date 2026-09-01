@@ -68,6 +68,7 @@ def _raw_result(output: str = "answer") -> Result:
                     "page_mlp_rows": 2,
                     "page_mlp_selected_pages": 384,
                     "page_mlp_weight_bytes": 200,
+                    "resident_unprotected_discard_bytes": 12_345,
                 },
             },
             "runtime_metrics": {
@@ -160,6 +161,7 @@ class InferenceEconomicsReceiptTests(unittest.TestCase):
         self.assertEqual(receipt.proposed_draft_tokens, 3)
         self.assertEqual(receipt.target_source_body_bytes, 500)
         self.assertEqual(receipt.avoidable_work_bytes["draft_miss"], 33)
+        self.assertEqual(receipt.avoidable_work_bytes["q4_discard"], 12_345)
         self.assertEqual(receipt.avoidable_work_bytes["target_fallback"], 500)
         self.assertEqual(receipt.selected_pages, 384)
         self.assertEqual(receipt.saved_pages, 160)
@@ -270,7 +272,7 @@ class InferenceEconomicsLedgerTests(unittest.TestCase):
             )
             self.assertEqual(
                 snapshot["largest_avoidable_cost_class"],
-                "target_fallback",
+                "q4_discard",
             )
             restarted = InferenceEconomicsLedger(root)
             self.assertEqual(restarted.snapshot(), snapshot)

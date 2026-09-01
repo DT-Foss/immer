@@ -487,6 +487,7 @@ def receipt_from_result(
     work = {
         "draft_miss": draft_waste,
         "mlp_target": page_bytes,
+        "q4_discard": _uint(q4_request.get("resident_unprotected_discard_bytes")),
         "target_fallback": target_work,
     }
     evidence_safe = _json_safe(dict(result.evidence))
@@ -619,6 +620,7 @@ def _empty_rollup() -> dict[str, Any]:
         "avoidable_work_bytes": {
             "draft_miss": 0,
             "mlp_target": 0,
+            "q4_discard": 0,
             "target_fallback": 0,
         },
         "component_timings": {

@@ -143,6 +143,9 @@ _QWEN_GENERATION_FIELDS = frozenset(
         "token_trace_sha256",
     )
 )
+_QWEN_GENERATION_OPTIONAL_FIELDS = frozenset(
+    ("output_tokens_per_second", "time_to_first_token_seconds")
+)
 
 
 class ResultCellError(RuntimeError):
@@ -528,7 +531,13 @@ def _authenticated_qwen_generation_evidence(
     if bundle.get("manifest_sha256") != model_pin.bundle_manifest_sha256:
         raise ResultCellStaleError("cold Qwen bundle manifest mismatch")
     generation = evidence.get("generation")
-    if not isinstance(generation, Mapping) or set(generation) != _QWEN_GENERATION_FIELDS:
+    if (
+        not isinstance(generation, Mapping)
+        or not _QWEN_GENERATION_FIELDS.issubset(generation)
+        or set(generation)
+        - _QWEN_GENERATION_FIELDS
+        - _QWEN_GENERATION_OPTIONAL_FIELDS
+    ):
         raise ResultCellIntegrityError("cold Qwen generation schema is invalid")
     for field_name in (
         "forward_passes",
@@ -548,6 +557,17 @@ def _authenticated_qwen_generation_evidence(
         field="generation.forward_passes",
         positive=True,
     )
+    for field_name in _QWEN_GENERATION_OPTIONAL_FIELDS & generation.keys():
+        value = generation[field_name]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise ResultCellIntegrityError(
+                f"cold Qwen generation {field_name} is invalid"
+            )
     for field_name in ("stateful_cache", "general_generation", "stopped_on_eos"):
         if not isinstance(generation[field_name], bool):
             raise ResultCellIntegrityError(

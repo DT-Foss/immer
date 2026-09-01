@@ -4462,6 +4462,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         generation = result.evidence["generation"]
         self.assertEqual(generation["prompt_tokens"], 2)
         self.assertEqual(generation["generated_tokens"], 2)
+        self.assertEqual(generation["output_tokens_per_second"], 1.6)
         self.assertEqual(len(generation["token_trace_sha256"]), 64)
         self.assertNotIn("prompt_token_ids", generation)
         self.assertNotIn("generated_token_ids", generation)
@@ -8023,7 +8024,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(options["q4_root"], str(q4))
         self.assertEqual(
             options["q4_resident_budget_bytes"],
-            13_312 * 1024**2,
+            16_384 * 1024**2,
         )
         self.assertEqual(options["draft_mode"], "hybrid")
         self.assertEqual(options["markov_draft_state_path"], str(markov_state))

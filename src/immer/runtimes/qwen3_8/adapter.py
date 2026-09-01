@@ -732,6 +732,21 @@ def _compact_generation_receipt(
             "generation evidence is incomplete: " + ", ".join(missing)
         )
     compact = {key: evidence[key] for key in _GENERATION_RECEIPT_FIELDS}
+    if "output_tokens_per_second" not in evidence:
+        seconds = compact["seconds"]
+        generated_tokens = len(generated_ids)
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not math.isfinite(float(seconds))
+            or float(seconds) < 0.0
+        ):
+            raise Qwen38ChatError(
+                "generation evidence cannot derive output throughput"
+            )
+        compact["output_tokens_per_second"] = (
+            generated_tokens / float(seconds) if seconds else 0.0
+        )
     for key in ("time_to_first_token_seconds", "output_tokens_per_second"):
         if key in evidence:
             item = evidence[key]

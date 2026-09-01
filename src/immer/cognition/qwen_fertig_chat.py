@@ -669,9 +669,33 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                         "page_mlp_rows",
                         "page_mlp_selected_pages",
                         "page_mlp_weight_bytes",
+                        "mapping_discard_bytes",
+                        "mapping_discard_calls",
+                        "resident_page_admissions",
+                        "resident_page_bypasses",
+                        "resident_page_hits",
+                        "resident_page_misses",
+                        "resident_unprotected_discard_bytes",
+                        "resident_unprotected_discard_calls",
+                        "resident_unprotected_discard_pages",
                     )
                     if key in request
                 }
+            }
+        runtime = q4.get("runtime")
+        if isinstance(runtime, dict):
+            summary.setdefault("q4", {})["runtime"] = {
+                key: runtime[key]
+                for key in (
+                    "resident_budget_bytes",
+                    "resident_budget_overage_bytes",
+                    "resident_head_fully_protected",
+                    "resident_page_size",
+                    "resident_peak_payload_bytes",
+                    "resident_protected_bytes",
+                    "resident_protected_pages",
+                )
+                if key in runtime
             }
     mlp_page = evidence.get("mlp_page_route")
     if isinstance(mlp_page, dict):

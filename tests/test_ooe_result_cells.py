@@ -478,6 +478,19 @@ class ResultCellPayloadTests(unittest.TestCase):
 
     def test_raw_generation_model_revision_bundle_and_schema_are_authenticated(self) -> None:
         raw = _raw_qwen_result()
+        timed_evidence = dict(raw.evidence)
+        timed_evidence["generation"] = {
+            **timed_evidence["generation"],
+            "output_tokens_per_second": 8.0,
+        }
+        timed = attach_cold_qwen_generation_receipt(
+            replace(raw, evidence=timed_evidence),
+            binding=_binding(),
+        )
+        self.assertEqual(
+            timed.evidence["generation"]["output_tokens_per_second"],
+            8.0,
+        )
         cases = []
         for field, value in (
             ("model", "Other/Model"),
@@ -496,6 +509,12 @@ class ResultCellPayloadTests(unittest.TestCase):
             cases.append(replace(raw, evidence=evidence))
         evidence = dict(raw.evidence)
         evidence["generation"] = {**evidence["generation"], "extra": 1}
+        cases.append(replace(raw, evidence=evidence))
+        evidence = dict(raw.evidence)
+        evidence["generation"] = {
+            **evidence["generation"],
+            "output_tokens_per_second": -1.0,
+        }
         cases.append(replace(raw, evidence=evidence))
 
         for changed in cases:
