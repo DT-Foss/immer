@@ -108,6 +108,7 @@ QWEN38_COMPONENT_TIMING_COMPONENTS = (
     "full_attention_core",
     "deltanet_core",
     "mlp_core",
+    "lm_head_core",
     "layer_transition_crystal",
     "layer_mlp_crystal",
 )
@@ -716,6 +717,7 @@ class StreamedQwen38:
             component: 0 for component in QWEN38_COMPONENT_TIMING_COMPONENTS
         }
         self._component_timing_accounting_failures = 0
+        self._install_component_timing_head_observer()
         self._attention_state_digest_cache: dict[
             tuple[object, ...],
             tuple[
@@ -1184,6 +1186,33 @@ class StreamedQwen38:
             "schema": QWEN38_COMPONENT_TIMING_COUNTER_SCHEMA,
             "unit": "nanoseconds",
         }
+
+    def _install_component_timing_head_observer(self) -> None:
+        """Time every physical target-head scan through the shared pager."""
+
+        observer_name = "_immer_qwen_component_timing_head_observers"
+        observers = getattr(self.pager, observer_name, None)
+        if observers is None:
+            observers = weakref.WeakSet()
+            setattr(self.pager, observer_name, observers)
+            pager_reference = weakref.ref(self.pager)
+
+            def timed_topk_logits(*args: Any, **kwargs: Any) -> Any:
+                pager = pager_reference()
+                if pager is None:  # pragma: no cover - bound call retains pager.
+                    raise Qwen38RuntimeError("LM-head pager was released")
+                active = tuple(getattr(pager, observer_name, ()))
+                started = tuple(
+                    (model, model._component_timing_start()) for model in active
+                )
+                try:
+                    return type(pager).topk_logits(pager, *args, **kwargs)
+                finally:
+                    for model, timestamp in started:
+                        model._component_timing_finish("lm_head_core", timestamp)
+
+            self.pager.topk_logits = timed_topk_logits
+        observers.add(self)
 
     def _component_timing_start(self) -> int | None:
         """Read the monotonic clock without making accounting correctness-critical."""

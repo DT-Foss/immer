@@ -572,12 +572,41 @@ class Qwen38ModelTests(unittest.TestCase):
                 "full_attention_core": {"calls": 1, "nanoseconds": 70},
                 "deltanet_core": {"calls": 1, "nanoseconds": 50},
                 "mlp_core": {"calls": 2, "nanoseconds": 170},
+                "lm_head_core": {"calls": 0, "nanoseconds": 0},
                 "layer_transition_crystal": {
                     "calls": 2,
                     "nanoseconds": 21,
                 },
                 "layer_mlp_crystal": {"calls": 2, "nanoseconds": 16},
             },
+        )
+
+    def test_component_timing_covers_direct_and_speculative_head_scans(self) -> None:
+        hidden = torch.randn((1, self.config.dim))
+        clock = iter((100, 140, 200, 260))
+
+        with mock.patch.object(
+            qwen_model_module.time,
+            "perf_counter_ns",
+            side_effect=lambda: next(clock),
+        ):
+            direct = self.model.pager.topk_logits(hidden, k=1)
+            speculative = self.model.pager.topk_logits(hidden, k=2)
+
+        self.assertEqual(tuple(direct[0].shape), (1, 1))
+        self.assertEqual(tuple(speculative[0].shape), (1, 2))
+        metrics = self.model.component_timing_metrics()
+        self.assertEqual(
+            metrics["components"]["lm_head_core"],
+            {"calls": 2, "nanoseconds": 100},
+        )
+        self.assertEqual(
+            sum(
+                row["calls"]
+                for component, row in metrics["components"].items()
+                if component != "lm_head_core"
+            ),
+            0,
         )
 
     def test_component_clock_failure_cannot_change_forward_execution(self) -> None:
