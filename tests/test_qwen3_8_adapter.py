@@ -75,6 +75,7 @@ from immer.runtimes.qwen3_8.layer_transition_crystal import (
 )
 from immer.runtimes.qwen3_8.layer_mlp_crystal import (
     LAYER_MLP_RESIDUAL_ACTION_ABI,
+    LAYER_MLP_RESIDUAL_GENERIC_ACTION_ABI,
     Layer63MlpResidualCrystalIdentity,
     LayerMlpResidualCrystalIdentity,
 )
@@ -85,6 +86,9 @@ from immer.runtimes.qwen3_8.layer_mlp_o1 import (
 from immer.runtimes.qwen3_8.layer_mlp_o1_runtime import (
     Layer63MlpO1AsyncWorker,
     LayerMlpO1AsyncPool,
+)
+from immer.runtimes.qwen3_8.layer_mlp_registry import (
+    publish_layer_mlp_o1_registry,
 )
 from immer.runtimes.qwen3_8.markov_draft import MARKOV_DRAFT_PROVIDER_ABI
 from immer.runtimes.qwen3_8.mlp_page_coordinate import (
@@ -170,6 +174,62 @@ def _generic_layer_mlp_identity(
     )
 
 
+def _fake_layer_mlp_mount_registry(*layers: int):
+    projection = LayerTransitionProjectionIdentity(
+        hidden_dim=8,
+        sketch_dim=3,
+        seed_sha256="1" * 64,
+    )
+    pins = SimpleNamespace(
+        atlas_revision_sha256="5" * 64,
+        graph_revision_sha256="4" * 64,
+        model_sha256="2" * 64,
+        projection=projection,
+        q4_sha256="3" * 64,
+    )
+    entries = tuple(
+        SimpleNamespace(
+            action_abi=(
+                LAYER_MLP_RESIDUAL_ACTION_ABI
+                if layer == 63
+                else LAYER_MLP_RESIDUAL_GENERIC_ACTION_ABI
+            ),
+            bank_file=f"layer-{layer}.json",
+            bank_file_sha256=hashlib.sha256(
+                f"bank-file-{layer}".encode()
+            ).hexdigest(),
+            bank_identity_sha256=hashlib.sha256(
+                f"bank-identity-{layer}".encode()
+            ).hexdigest(),
+            crystal_sha256=hashlib.sha256(f"crystal-{layer}".encode()).hexdigest(),
+            error_radius=0.0,
+            feature_radius=0.0,
+            layer_index=layer,
+            max_error_radius=0.0 if layer == 18 else 0.25,
+            packed_weight_bytes_avoided=8_192 + layer,
+            source_o1_generation=1,
+            source_o1_state_sha256=hashlib.sha256(
+                f"o1-state-{layer}".encode()
+            ).hexdigest(),
+        )
+        for layer in layers
+    )
+    mounts = tuple(
+        SimpleNamespace(entry=entry, bank=SimpleNamespace(identity=None))
+        for entry in entries
+    )
+    return SimpleNamespace(
+        configured_layers=tuple(layers),
+        entries=entries,
+        manifest_file_sha256="6" * 64,
+        mounted_layers=tuple(layers),
+        mounts=mounts,
+        pending=(),
+        pins=pins,
+        registry_sha256="7" * 64,
+    )
+
+
 def _semantic_atlas_authority(root: Path) -> str:
     atlas = LiveGraph(root)
     atlas.append_segment(
@@ -205,6 +265,51 @@ def _compute_graph_authority(root: Path) -> str:
     ancestor, _changed = graph.append_edge(edge("h63", "h64", 1))
     graph.append_edge(edge("h64", "h65", 2))
     return ancestor.sha256
+
+
+def _publish_mixed_layer_mlp_registry(root: Path) -> tuple[Path, Path, Path]:
+    atlas = root / "atlas"
+    compute = root / "compute"
+    atlas_revision = _semantic_atlas_authority(atlas)
+    graph_revision = _compute_graph_authority(compute)
+    legacy_path = root / "layer63-o1.json"
+    legacy = Layer63MlpO1Accumulator(
+        legacy_path,
+        _layer_mlp_identity(
+            atlas=atlas_revision,
+            graph=graph_revision,
+        ),
+        packed_weight_bytes_avoided=8_255,
+    )
+    generic = LayerMlpO1Accumulator(
+        _layer_mlp_o1_state_path_for_layer(
+            legacy_path,
+            layer_index=18,
+            sketch_dim=3,
+        ),
+        _generic_layer_mlp_identity(
+            18,
+            atlas=atlas_revision,
+            graph=graph_revision,
+        ),
+        packed_weight_bytes_avoided=8_210,
+    )
+    for accumulator, seed in ((legacy, 31), (generic, 37)):
+        generator = torch.Generator().manual_seed(seed)
+        base = torch.randn(10, 8, generator=generator).to(torch.bfloat16)
+        feature = torch.randn(10, 8, generator=generator).to(torch.bfloat16)
+        mixing = torch.randn(8, 8, generator=generator) * 0.04
+        target = (base.float() + feature.float() @ mixing + 0.125).to(
+            torch.bfloat16
+        )
+        accumulator.observe(base, feature, target)
+    summary = publish_layer_mlp_o1_registry(
+        legacy_path,
+        root / "published",
+        layers=(18, 63),
+        max_error_radius=0.25,
+    )
+    return summary.manifest_path, atlas, compute
 
 
 _BUNDLE_RECEIPT = {
@@ -479,6 +584,106 @@ class _LayerMlpO1Model(_Model):
             self.o1_rows_by_layer[layer_index] = (
                 self.o1_rows_by_layer.get(layer_index, 0) + 1
             )
+        return generated, evidence
+
+
+class _LayerMlpCrystalRegistryModel(_Model):
+    def __init__(self, registry, *, fallback_only: bool = False) -> None:
+        super().__init__()
+        self.config.dim = 8
+        self.config.n_layers = 64
+        self.registry = registry
+        self.fallback_only = fallback_only
+        self.layer_mlp_crystal_registry_enabled_layers = frozenset({18})
+        self.layer_mlp_crystal_enabled = False
+        self.registry_enable_calls: list[tuple[int, ...]] = []
+        self.legacy_enable_calls: list[bool] = []
+        self.counters = {
+            entry.layer_index: {
+                "attempts": 0,
+                "fallbacks": 0,
+                "packed_weight_bytes_avoided": 0,
+                "physical_transitions": 0,
+                "replacements": 0,
+                "skipped_q4_matrix_calls": 0,
+                "transition_rows": 0,
+            }
+            for entry in registry.entries
+        }
+
+    def set_layer_mlp_crystal_registry_enabled(self, layers) -> None:
+        selected = tuple(layers)
+        self.registry_enable_calls.append(selected)
+        self.layer_mlp_crystal_registry_enabled_layers = frozenset(selected)
+
+    def set_layer_mlp_crystal_enabled(self, enabled: bool) -> None:
+        self.legacy_enable_calls.append(enabled)
+        self.layer_mlp_crystal_enabled = enabled
+
+    def layer_mlp_crystal_registry_metrics(self):
+        enabled = set(self.layer_mlp_crystal_registry_enabled_layers)
+        if self.layer_mlp_crystal_enabled:
+            enabled.add(63)
+        entries = {entry.layer_index: entry for entry in self.registry.entries}
+        layers = {
+            str(layer): {
+                "action_abi": entry.action_abi,
+                "atlas_revision_sha256": self.registry.pins.atlas_revision_sha256,
+                "bank_generation": "layer63-v1" if layer == 63 else "v2",
+                "enabled": layer in enabled,
+                "graph_revision_sha256": self.registry.pins.graph_revision_sha256,
+                "identity_sha256": entry.bank_identity_sha256,
+                "installed": True,
+                "max_error_radius": entry.max_error_radius,
+                "model_sha256": self.registry.pins.model_sha256,
+                "q4_sha256": self.registry.pins.q4_sha256,
+                "request_enabled": layer in enabled,
+                **self.counters[layer],
+            }
+            for layer, entry in entries.items()
+        }
+        fields = tuple(next(iter(self.counters.values())))
+        installed = list(self.registry.mounted_layers)
+        enabled_layers = sorted(enabled)
+        return {
+            **{
+                field: sum(row[field] for row in self.counters.values())
+                for field in fields
+            },
+            "enabled_layers": enabled_layers,
+            "installed_layers": installed,
+            "layers": layers,
+            "registered_layers": installed,
+            "request_enabled_layers": enabled_layers,
+            "schema": (
+                "immer.qwen3.8-layer-mlp-residual-crystal-registry-metrics/v2"
+            ),
+        }
+
+    def generate_greedy(self, prompt, **kwargs):
+        generated, evidence = super().generate_greedy(prompt, **kwargs)
+        enabled = set(self.layer_mlp_crystal_registry_enabled_layers)
+        if self.layer_mlp_crystal_enabled:
+            enabled.add(63)
+        if enabled:
+            if len(enabled) != 1:
+                raise AssertionError("request enabled more than one MLP Crystal layer")
+            layer = next(iter(enabled))
+            counters = self.counters[layer]
+            counters["attempts"] += 1
+            if self.fallback_only:
+                counters["fallbacks"] += 1
+            else:
+                entry = next(
+                    item for item in self.registry.entries if item.layer_index == layer
+                )
+                counters["packed_weight_bytes_avoided"] += (
+                    entry.packed_weight_bytes_avoided
+                )
+                counters["physical_transitions"] += 1
+                counters["replacements"] += 1
+                counters["skipped_q4_matrix_calls"] += 3
+                counters["transition_rows"] += 1
         return generated, evidence
 
 
@@ -1960,6 +2165,51 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIsNotNone(chat._layer_mlp_crystal_compute_graph)
         chat.close()
 
+    def test_multi_layer_mlp_registry_split_mounts_generic_and_legacy_banks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest, atlas, compute = _publish_mixed_layer_mlp_registry(root)
+            runtime = _Runtime()
+            runtime.model.config.dim = 8
+            runtime.model.layer_mlp_crystal_model_sha256 = Mock(
+                return_value="2" * 64
+            )
+            runtime.model.layer_mlp_crystal_q4_sha256 = Mock(
+                return_value="3" * 64
+            )
+            runtime.model._layer_mlp_crystal_avoided_q4_bytes = Mock(
+                side_effect={18: 8_210, 63: 8_255}.__getitem__
+            )
+            runtime.model.set_layer_mlp_crystal_registry = Mock()
+            runtime.model.attach_layer_mlp_crystal_bank = Mock()
+            runtime.model.clear_layer_mlp_crystal_registry = Mock()
+            chat = _chat(
+                runtime,
+                q4_root="/q4",
+                layer_mlp_crystal_registry_path=manifest,
+                layer_mlp_crystal_atlas_path=atlas,
+                layer_mlp_crystal_compute_root=compute,
+            )
+
+            registry, legacy, opened_atlas, opened_compute = (
+                chat._open_layer_mlp_crystal_mount_registry(runtime)
+            )
+
+        self.assertEqual(registry.mounted_layers, (18, 63))
+        self.assertIsNotNone(legacy)
+        self.assertIsNotNone(opened_atlas)
+        self.assertIsNotNone(opened_compute)
+        generic_call = runtime.model.set_layer_mlp_crystal_registry.call_args
+        self.assertEqual(tuple(generic_call.args[0]), (18,))
+        self.assertEqual(generic_call.kwargs["max_error_radii"], {18: 0.25})
+        runtime.model.attach_layer_mlp_crystal_bank.assert_called_once()
+        legacy_call = runtime.model.attach_layer_mlp_crystal_bank.call_args
+        self.assertIs(legacy_call.args[0], legacy)
+        self.assertEqual(legacy_call.kwargs["max_error_radius"], 0.25)
+        chat.close()
+
     def test_layer_mlp_crystal_evidence_and_directive_are_request_local(self) -> None:
         runtime = _Runtime()
         runtime.model.set_layer_mlp_crystal_enabled = Mock()
@@ -2091,6 +2341,105 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         self.assertFalse(policy["layer_mlp_crystal"]["request_applied"])
         self.assertNotIn("/state/", json.dumps(policy, sort_keys=True))
+        chat.close()
+
+    def test_multi_layer_mlp_crystal_runs_deepest_only_and_restores_state(
+        self,
+    ) -> None:
+        registry = _fake_layer_mlp_mount_registry(18, 63)
+        model = _LayerMlpCrystalRegistryModel(registry)
+        runtime = _Runtime(model=model)
+        chat = _chat(runtime)
+        chat._load_locked()
+        chat._layer_mlp_crystal_mount_registry = registry
+        chat._layer_mlp_crystal_bank = SimpleNamespace()
+
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        evidence = result.evidence["layer_mlp_crystal"]
+        self.assertEqual(
+            evidence["schema"],
+            "immer.qwen3.8-layer-mlp-residual-crystal-evidence/v2",
+        )
+        self.assertEqual(evidence["enabled_layer"], 63)
+        self.assertEqual(evidence["request"]["enabled_layer"], 63)
+        self.assertEqual(evidence["request"]["executed_layer"], 63)
+        self.assertEqual(evidence["request"]["physical_transitions"], 1)
+        self.assertEqual(evidence["request"]["replacements"], 1)
+        self.assertEqual(evidence["request"]["skipped_q4_matrix_calls"], 3)
+        self.assertEqual(
+            evidence["request"]["packed_weight_bytes_avoided"],
+            next(
+                entry.packed_weight_bytes_avoided
+                for entry in registry.entries
+                if entry.layer_index == 63
+            ),
+        )
+        self.assertEqual(
+            model.layer_mlp_crystal_registry_enabled_layers,
+            frozenset({18}),
+        )
+        self.assertFalse(model.layer_mlp_crystal_enabled)
+        self.assertEqual(model.counters[18]["attempts"], 0)
+        self.assertEqual(model.counters[63]["attempts"], 1)
+        self.assertIn((), model.registry_enable_calls)
+        self.assertIn((18,), model.registry_enable_calls)
+        chat.close()
+
+    def test_multi_layer_mlp_crystal_radius_zero_fallback_is_not_execution(
+        self,
+    ) -> None:
+        registry = _fake_layer_mlp_mount_registry(18)
+        model = _LayerMlpCrystalRegistryModel(registry, fallback_only=True)
+        runtime = _Runtime(model=model)
+        chat = _chat(runtime)
+        chat._load_locked()
+        chat._layer_mlp_crystal_mount_registry = registry
+
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        evidence = result.evidence["layer_mlp_crystal"]
+        self.assertFalse(evidence["request_applied"])
+        self.assertEqual(evidence["request"]["attempts"], 1)
+        self.assertEqual(evidence["request"]["fallbacks"], 1)
+        self.assertEqual(evidence["request"]["physical_transitions"], 0)
+        self.assertIsNone(evidence["request"]["executed_layer"])
+        self.assertEqual(
+            model.layer_mlp_crystal_registry_enabled_layers,
+            frozenset({18}),
+        )
+        chat.close()
+
+    def test_multi_layer_mlp_crystal_rejects_manifest_drift_before_execution(
+        self,
+    ) -> None:
+        registry = _fake_layer_mlp_mount_registry(18)
+        changed = SimpleNamespace(
+            **{
+                **vars(registry),
+                "manifest_file_sha256": "8" * 64,
+                "registry_sha256": "9" * 64,
+            }
+        )
+        model = _LayerMlpCrystalRegistryModel(registry)
+        runtime = _Runtime(model=model)
+        chat = _chat(runtime)
+        chat._load_locked()
+        chat._layer_mlp_crystal_registry_path = Path("/registry.json")
+        chat._layer_mlp_crystal_mount_registry = registry
+
+        with patch(
+            "immer.runtimes.qwen3_8.adapter."
+            "read_layer_mlp_o1_registry_manifest",
+            return_value=changed,
+        ):
+            result = chat.handle(Request("chat", "hello"))
+
+        self.assertFalse(result.ok)
+        self.assertIn("registry changed", result.reason)
+        self.assertEqual(model.calls, [])
         chat.close()
 
     def test_layer_mlp_crystal_rejects_empty_bank_before_attachment(self) -> None:
@@ -5936,6 +6285,72 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(enabled_a, enabled_b)
         self.assertNotEqual(enabled_a, disabled)
 
+    def test_service_profile_uses_path_free_registry_descriptor_and_pins_drift(
+        self,
+    ) -> None:
+        registry = _fake_layer_mlp_mount_registry(18, 63)
+        server_args = SimpleNamespace(
+            layer_mlp_crystal_atlas=Path("/server/atlas"),
+            layer_mlp_crystal_compute_root=Path("/server/compute"),
+            layer_mlp_crystal_max_error_radius=0.0,
+            layer_mlp_crystal_registry=Path("/server/registry.json"),
+            layer_mlp_crystal_state=None,
+        )
+        client_args = SimpleNamespace(
+            layer_mlp_crystal_atlas=Path("/client/atlas"),
+            layer_mlp_crystal_compute_root=Path("/client/compute"),
+            layer_mlp_crystal_max_error_radius=0.0,
+            layer_mlp_crystal_registry=Path("/client/registry.json"),
+            layer_mlp_crystal_state=None,
+        )
+        common = {
+            "bundle_path": Path("/models/qwen"),
+            "tokenizer_path": Path("/models/qwen/tokenizer.json"),
+            "q4_root": Path("/models/qwen/q4"),
+            "fast_mlp_root": None,
+            "warm_root": None,
+            "draft_mode": None,
+            "markov_draft_state": None,
+            "mtp_draft_state": None,
+            "markov_atlas_path": None,
+            "markov_o1_retention_path": None,
+            "mlp_page_state_path": None,
+            "draft_window_state_path": None,
+            "runtime_code_revision": "a" * 64,
+        }
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.layer_mlp_registry."
+                "read_layer_mlp_o1_registry_manifest",
+                return_value=registry,
+            ),
+            patch("immer.cli._authenticate_layer_transition_crystal_atlas"),
+            patch("immer.cli._authenticate_layer_transition_crystal_compute_graph"),
+            patch(
+                "immer.runtimes.qwen3_8.layer_mlp_registry."
+                "LayerMlpO1MountRegistry.load",
+                side_effect=AssertionError("profile must not deserialize banks"),
+            ),
+        ):
+            server = _qwen38_service_profile(args=server_args, **common)
+            client = _qwen38_service_profile(args=client_args, **common)
+            changed = SimpleNamespace(
+                **{
+                    **vars(registry),
+                    "manifest_file_sha256": "8" * 64,
+                    "registry_sha256": "9" * 64,
+                }
+            )
+            with patch(
+                "immer.runtimes.qwen3_8.layer_mlp_registry."
+                "read_layer_mlp_o1_registry_manifest",
+                return_value=changed,
+            ):
+                drifted = _qwen38_service_profile(args=client_args, **common)
+
+        self.assertEqual(server, client)
+        self.assertNotEqual(client, drifted)
+
     def test_canonical_prefix_sinkhorn_default_is_shared_by_service_and_client(
         self,
     ) -> None:
@@ -6539,6 +6954,76 @@ class Qwen38CausalChatTests(unittest.TestCase):
             options["attention_output_crystal_state_path"],
             str(attention_state),
         )
+
+    def test_cli_canonical_missing_or_empty_mlp_registry_is_not_mounted(
+        self,
+    ) -> None:
+        from immer.runtimes.qwen3_8.layer_mlp_registry import (
+            LayerMlpO1RegistryNotMountableError,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            deployed = root / "deployed"
+            (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
+            missing = root / "missing" / "layer-mlp-o1-registry.json"
+            empty = root / "empty" / "layer-mlp-o1-registry.json"
+            empty.parent.mkdir()
+            empty.write_text("sealed-empty-fixture", encoding="ascii")
+            unavailable = root / "unavailable"
+
+            for manifest, side_effect in (
+                (missing, AssertionError("missing manifest must not be read")),
+                (
+                    empty,
+                    LayerMlpO1RegistryNotMountableError(
+                        "valid registry has no ready banks"
+                    ),
+                ),
+            ):
+                qwen = _chat(_Runtime())
+                with (
+                    patch.dict("os.environ", {}, clear=True),
+                    patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
+                    patch(
+                        "immer.cli._QWEN38_DEPLOYMENT_LAYER_MLP_CRYSTAL_REGISTRY",
+                        manifest,
+                    ),
+                    patch(
+                        "immer.cli._QWEN38_DEPLOYMENT_LAYER_MLP_O1_ATLAS",
+                        unavailable,
+                    ),
+                    patch(
+                        "immer.cli._QWEN38_DEPLOYMENT_LAYER_MLP_O1_COMPUTE",
+                        unavailable,
+                    ),
+                    patch(
+                        "immer.runtimes.qwen3_8.layer_mlp_registry."
+                        "read_layer_mlp_o1_registry_manifest",
+                        side_effect=side_effect,
+                    ) as reader,
+                    patch(
+                        "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                        return_value=qwen,
+                    ) as constructor,
+                    redirect_stdout(io.StringIO()),
+                ):
+                    code = main(
+                        [
+                            "chat",
+                            "hello",
+                            "--raw-qwen",
+                            "--no-markov-draft",
+                        ]
+                    )
+
+                self.assertEqual(code, 0)
+                self.assertIsNone(
+                    constructor.call_args.kwargs[
+                        "layer_mlp_crystal_registry_path"
+                    ]
+                )
+                self.assertEqual(reader.call_count, int(manifest.is_file()))
 
     def test_cli_deployment_mounts_existing_continuation_battery(self) -> None:
         qwen = _chat(_Runtime())

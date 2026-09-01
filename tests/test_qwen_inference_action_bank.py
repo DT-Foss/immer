@@ -140,6 +140,76 @@ def _layer_mlp_crystal_evidence() -> dict[str, object]:
     }
 
 
+def _layer_mlp_crystal_registry_evidence() -> dict[str, object]:
+    pins = {
+        "manifest_file_sha256": _sha("layer-mlp-manifest"),
+        "registry_sha256": _sha("layer-mlp-registry"),
+        "model_sha256": _sha("layer-mlp-model"),
+        "q4_sha256": _sha("layer-mlp-q4"),
+        "graph_revision_sha256": _sha("layer-mlp-graph"),
+        "atlas_revision_sha256": _sha("layer-mlp-atlas"),
+        "projection_sha256": _sha("layer-mlp-projection"),
+    }
+    layer = {
+        "action_abi": (
+            "immer.qwen3.8/"
+            "layer-mlp-residual-rademacher-centered-ridge-bf16/v2"
+        ),
+        "enabled": True,
+        "identity_sha256": _sha("layer-18-mlp-identity"),
+        "installed": True,
+        "layer_index": 18,
+        "max_error_radius": 0.25,
+        "packed_weight_bytes_per_transition": 8192,
+    }
+    request_layer = {
+        "action_abi": layer["action_abi"],
+        "attempts": 3,
+        "fallbacks": 1,
+        "identity_sha256": layer["identity_sha256"],
+        "max_error_radius": 0.25,
+        "packed_weight_bytes_avoided": 16_384,
+        "packed_weight_bytes_per_transition": 8192,
+        "physical_transitions": 2,
+        "replacements": 2,
+        "skipped_q4_matrix_calls": 6,
+        "transition_rows": 2,
+    }
+    request = {
+        **pins,
+        **{
+            field: request_layer[field]
+            for field in (
+                "attempts",
+                "fallbacks",
+                "packed_weight_bytes_avoided",
+                "physical_transitions",
+                "replacements",
+                "skipped_q4_matrix_calls",
+                "transition_rows",
+            )
+        },
+        "enabled_layer": 18,
+        "enabled_layers": [18],
+        "executed_layer": 18,
+        "executed_layers": [18],
+        "identity_sha256": layer["identity_sha256"],
+        "installed_layers": [18],
+        "layers": {"18": request_layer},
+        "max_error_radius": 0.25,
+        "packed_weight_bytes_per_transition": 8192,
+    }
+    return {
+        **pins,
+        "enabled_layer": 18,
+        "enabled_layers": [18],
+        "installed_layers": [18],
+        "layers": {"18": layer},
+        "request": request,
+        "schema": "immer.qwen3.8-layer-mlp-residual-crystal-evidence/v2",
+    }
+
+
 class InferenceActionReceiptTests(unittest.TestCase):
     def test_normal_cold_request_becomes_one_content_addressed_action_vector(
         self,
@@ -501,6 +571,66 @@ class InferenceActionReceiptTests(unittest.TestCase):
             ),
             ("qwen_target",),
         )
+
+    def test_multi_layer_mlp_crystal_requires_one_exact_pinned_execution(
+        self,
+    ) -> None:
+        economics = _economics(
+            "multi-layer-mlp-crystal",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        evidence = _layer_mlp_crystal_registry_evidence()
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={"layer_mlp_crystal": evidence},
+        )
+        self.assertEqual(
+            executed_actions_from_result(result, economics),
+            ("layer_mlp_crystal", "qwen_target"),
+        )
+
+        tampered = _layer_mlp_crystal_registry_evidence()
+        tampered["request"] = {
+            **tampered["request"],
+            "registry_sha256": _sha("other-registry"),
+        }
+        fallback = _layer_mlp_crystal_registry_evidence()
+        fallback_request = dict(fallback["request"])
+        fallback_layer = dict(fallback_request["layers"]["18"])
+        for field in (
+            "packed_weight_bytes_avoided",
+            "physical_transitions",
+            "replacements",
+            "skipped_q4_matrix_calls",
+            "transition_rows",
+        ):
+            fallback_request[field] = 0
+            fallback_layer[field] = 0
+        fallback_request["attempts"] = 1
+        fallback_request["fallbacks"] = 1
+        fallback_request["executed_layer"] = None
+        fallback_request["executed_layers"] = []
+        fallback_layer["attempts"] = 1
+        fallback_layer["fallbacks"] = 1
+        fallback_request["layers"] = {"18": fallback_layer}
+        fallback["request"] = fallback_request
+        for invalid in (tampered, fallback):
+            self.assertEqual(
+                executed_actions_from_result(
+                    Result(
+                        ExecutionStatus.OK,
+                        "qwen3.8.causal-chat",
+                        output="answer",
+                        evidence={"layer_mlp_crystal": invalid},
+                    ),
+                    economics,
+                ),
+                ("qwen_target",),
+            )
 
     def test_attention_output_crystal_requires_exact_positive_physical_work(
         self,

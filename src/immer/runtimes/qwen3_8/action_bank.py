@@ -211,6 +211,13 @@ def physical_layer_mlp_crystal_executed(value: object) -> bool:
     """Accept only physical layer-63 Gate/Up/Down replacement evidence."""
 
     if (
+        isinstance(value, Mapping)
+        and value.get("schema")
+        == "immer.qwen3.8-layer-mlp-residual-crystal-evidence/v2"
+    ):
+        return _physical_layer_mlp_crystal_registry_executed(value)
+
+    if (
         not isinstance(value, Mapping)
         or value.get("schema") != "immer.qwen3.8-layer-mlp-residual-crystal-evidence/v1"
         or value.get("action_abi")
@@ -278,6 +285,150 @@ def physical_layer_mlp_crystal_executed(value: object) -> bool:
         and float(radius) == float(radius)
         and request.get("max_error_radius") == radius
         and attempts == replacements + fallbacks
+        and replacements == transitions == rows
+        and skipped == transitions * 3
+        and avoided == transitions * per_transition
+    )
+
+
+def _physical_layer_mlp_crystal_registry_executed(
+    value: Mapping[object, object],
+) -> bool:
+    """Accept one pinned, physically executed layer from a mounted registry."""
+
+    pin_fields = (
+        "manifest_file_sha256",
+        "registry_sha256",
+        "model_sha256",
+        "q4_sha256",
+        "graph_revision_sha256",
+        "atlas_revision_sha256",
+        "projection_sha256",
+    )
+    if not all(_is_sha256(value.get(field)) for field in pin_fields):
+        return False
+    request = value.get("request")
+    if not isinstance(request, Mapping) or any(
+        request.get(field) != value.get(field) for field in pin_fields
+    ):
+        return False
+    installed = value.get("installed_layers")
+    enabled = value.get("enabled_layers")
+    enabled_layer = value.get("enabled_layer")
+    if (
+        not isinstance(installed, list)
+        or not installed
+        or any(
+            isinstance(layer, bool) or not isinstance(layer, int)
+            for layer in installed
+        )
+        or installed != sorted(set(installed))
+        or not isinstance(enabled_layer, int)
+        or isinstance(enabled_layer, bool)
+        or enabled_layer not in installed
+        or enabled != [enabled_layer]
+        or request.get("installed_layers") != installed
+        or request.get("enabled_layer") != enabled_layer
+        or request.get("enabled_layers") != [enabled_layer]
+        or request.get("executed_layer") != enabled_layer
+        or request.get("executed_layers") != [enabled_layer]
+    ):
+        return False
+    layers = value.get("layers")
+    request_layers = request.get("layers")
+    if (
+        not isinstance(layers, Mapping)
+        or not isinstance(request_layers, Mapping)
+        or set(layers) != {str(layer) for layer in installed}
+        or set(request_layers) != set(layers)
+    ):
+        return False
+    selected = layers.get(str(enabled_layer))
+    selected_request = request_layers.get(str(enabled_layer))
+    if not isinstance(selected, Mapping) or not isinstance(
+        selected_request,
+        Mapping,
+    ):
+        return False
+    identity_sha256 = selected.get("identity_sha256")
+    per_transition = selected.get("packed_weight_bytes_per_transition")
+    radius = selected.get("max_error_radius")
+    action_abi = selected.get("action_abi")
+    if (
+        not _is_sha256(identity_sha256)
+        or action_abi
+        not in {
+            (
+                "immer.qwen3.8/"
+                "layer63-mlp-residual-rademacher-centered-ridge-bf16/v1"
+            ),
+            (
+                "immer.qwen3.8/"
+                "layer-mlp-residual-rademacher-centered-ridge-bf16/v2"
+            ),
+        }
+        or selected.get("installed") is not True
+        or selected.get("enabled") is not True
+        or isinstance(per_transition, bool)
+        or not isinstance(per_transition, int)
+        or per_transition <= 0
+        or isinstance(radius, bool)
+        or not isinstance(radius, (int, float))
+        or not float(radius) >= 0.0
+        or float(radius) != float(radius)
+        or float(radius) in {float("inf"), float("-inf")}
+        or request.get("identity_sha256") != identity_sha256
+        or request.get("packed_weight_bytes_per_transition") != per_transition
+        or request.get("max_error_radius") != radius
+        or selected_request.get("identity_sha256") != identity_sha256
+        or selected_request.get("action_abi") != action_abi
+        or selected_request.get("packed_weight_bytes_per_transition")
+        != per_transition
+        or selected_request.get("max_error_radius") != radius
+    ):
+        return False
+    positive = (
+        "attempts",
+        "replacements",
+        "physical_transitions",
+        "transition_rows",
+        "skipped_q4_matrix_calls",
+        "packed_weight_bytes_avoided",
+    )
+    if any(
+        isinstance(request.get(field), bool)
+        or not isinstance(request.get(field), int)
+        or request.get(field, 0) <= 0
+        for field in positive
+    ):
+        return False
+    fallbacks = request.get("fallbacks")
+    if isinstance(fallbacks, bool) or not isinstance(fallbacks, int) or fallbacks < 0:
+        return False
+    attempts = request["attempts"]
+    replacements = request["replacements"]
+    transitions = request["physical_transitions"]
+    rows = request["transition_rows"]
+    skipped = request["skipped_q4_matrix_calls"]
+    avoided = request["packed_weight_bytes_avoided"]
+    counter_fields = (*positive, "fallbacks")
+    if any(
+        selected_request.get(field) != request.get(field)
+        for field in counter_fields
+    ):
+        return False
+    for layer, counters in request_layers.items():
+        if layer == str(enabled_layer):
+            continue
+        if not isinstance(counters, Mapping) or any(
+            isinstance(counters.get(field), bool)
+            or not isinstance(counters.get(field), int)
+            or counters.get(field) != 0
+            for field in counter_fields
+        ):
+            return False
+    return (
+        attempts == replacements + fallbacks
         and replacements == transitions == rows
         and skipped == transitions * 3
         and avoided == transitions * per_transition

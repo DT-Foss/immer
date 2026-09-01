@@ -84,12 +84,17 @@ from .layer_mlp_crystal import (
     LAYER_MLP_RESIDUAL_ACTION_ABI,
     Layer63MlpResidualCrystalBank,
     Layer63MlpResidualCrystalIdentity,
+    LayerMlpResidualCrystalBank,
     LayerMlpResidualCrystalIdentity,
 )
 from .layer_mlp_o1 import Layer63MlpO1Accumulator, LayerMlpO1Accumulator
 from .layer_mlp_o1_runtime import (
     Layer63MlpO1AsyncWorker,
     LayerMlpO1AsyncPool,
+)
+from .layer_mlp_registry import (
+    LayerMlpO1MountRegistry,
+    read_layer_mlp_o1_registry_manifest,
 )
 from .layer_transition_crystal import LayerTransitionProjectionIdentity
 from .mlp_page_markov import (
@@ -164,6 +169,9 @@ LAYER_TRANSITION_CRYSTAL_EVIDENCE_SCHEMA = (
 LAYER_MLP_CRYSTAL_EVIDENCE_SCHEMA = (
     "immer.qwen3.8-layer-mlp-residual-crystal-evidence/v1"
 )
+LAYER_MLP_CRYSTAL_REGISTRY_EVIDENCE_SCHEMA = (
+    "immer.qwen3.8-layer-mlp-residual-crystal-evidence/v2"
+)
 LAYER_MLP_O1_COLLECTION_EVIDENCE_SCHEMA = (
     "immer.qwen3.8-layer63-mlp-o1-collection-evidence/v1"
 )
@@ -181,6 +189,43 @@ _QWEN38_COMPONENT_TIMING_BOUNDARIES = {
 DEFAULT_LAYER_MLP_O1_PROJECTION_SEED = (
     "2b188a99b4b36f51bd910866e6d9a007fd02ec7256d6596fc87eb76f0444eccf"
 )
+
+
+def _layer_mlp_mount_entry_records(
+    registry: LayerMlpO1MountRegistry,
+    *,
+    hex_floats: bool,
+) -> list[dict[str, object]]:
+    """Return immutable, path-free registry descriptors for public records."""
+
+    records: list[dict[str, object]] = []
+    for entry in registry.entries:
+        records.append(
+            {
+                "action_abi": entry.action_abi,
+                "bank_file_sha256": entry.bank_file_sha256,
+                "bank_identity_sha256": entry.bank_identity_sha256,
+                "crystal_sha256": entry.crystal_sha256,
+                "error_radius": (
+                    entry.error_radius.hex() if hex_floats else entry.error_radius
+                ),
+                "feature_radius": (
+                    entry.feature_radius.hex() if hex_floats else entry.feature_radius
+                ),
+                "layer_index": entry.layer_index,
+                "max_error_radius": (
+                    entry.max_error_radius.hex()
+                    if hex_floats
+                    else entry.max_error_radius
+                ),
+                "packed_weight_bytes_avoided": (
+                    entry.packed_weight_bytes_avoided
+                ),
+                "source_o1_generation": entry.source_o1_generation,
+                "source_o1_state_sha256": entry.source_o1_state_sha256,
+            }
+        )
+    return records
 
 
 def _layer_mlp_o1_state_path_for_layer(
@@ -1334,6 +1379,16 @@ class _OwnedRuntime:
             "attach_layer_mlp_crystal_bank",
             None,
         )
+        detach_layer_mlp_crystal_registry = getattr(
+            self.model,
+            "clear_layer_mlp_crystal_registry",
+            None,
+        )
+        if callable(detach_layer_mlp_crystal_registry):
+            try:
+                detach_layer_mlp_crystal_registry()
+            except Exception as exc:
+                failures.append(exc)
         if callable(detach_layer_mlp_crystal):
             try:
                 detach_layer_mlp_crystal(None)
@@ -1827,6 +1882,7 @@ class Qwen38CausalChat:
         layer_transition_crystal_compute_root: str | Path | None = None,
         layer_transition_crystal_max_error_radius: float = 0.0,
         layer_mlp_crystal_state_path: str | Path | None = None,
+        layer_mlp_crystal_registry_path: str | Path | None = None,
         layer_mlp_crystal_atlas_path: str | Path | None = None,
         layer_mlp_crystal_compute_root: str | Path | None = None,
         layer_mlp_crystal_max_error_radius: float = 0.0,
@@ -2062,6 +2118,10 @@ class Qwen38CausalChat:
         )
         for value, label in (
             (layer_mlp_crystal_state_path, "layer_mlp_crystal_state_path"),
+            (
+                layer_mlp_crystal_registry_path,
+                "layer_mlp_crystal_registry_path",
+            ),
             (layer_mlp_crystal_atlas_path, "layer_mlp_crystal_atlas_path"),
             (layer_mlp_crystal_compute_root, "layer_mlp_crystal_compute_root"),
         ):
@@ -2103,6 +2163,14 @@ class Qwen38CausalChat:
                 "layer_mlp_crystal_max_error_radius must be finite and non-negative"
             )
         layer_mlp_crystal_max_error_radius = float(layer_mlp_crystal_max_error_radius)
+        if (
+            layer_mlp_crystal_state_path is not None
+            and layer_mlp_crystal_registry_path is not None
+        ):
+            raise ValueError(
+                "layer_mlp_crystal_state_path and layer_mlp_crystal_registry_path "
+                "are mutually exclusive"
+            )
         for value, label in (
             (layer_mlp_o1_state_path, "layer_mlp_o1_state_path"),
             (layer_mlp_o1_atlas_path, "layer_mlp_o1_atlas_path"),
@@ -2265,9 +2333,13 @@ class Qwen38CausalChat:
                 Path(layer_transition_crystal_compute_root).expanduser().absolute(),
                 "layer_transition_crystal_compute_root",
             )
-        if layer_mlp_crystal_state_path is not None and q4_root is None:
+        layer_mlp_crystal_configured = (
+            layer_mlp_crystal_state_path is not None
+            or layer_mlp_crystal_registry_path is not None
+        )
+        if layer_mlp_crystal_configured and q4_root is None:
             raise ValueError("layer-MLP Crystals require Q4 execution")
-        if layer_mlp_crystal_state_path is not None and compute_dtype not in {
+        if layer_mlp_crystal_configured and compute_dtype not in {
             "auto",
             "bfloat16",
         }:
@@ -2281,28 +2353,30 @@ class Qwen38CausalChat:
                 "layer_mlp_crystal_state_path"
             )
         if (
-            layer_mlp_crystal_state_path is not None
+            layer_mlp_crystal_configured
             and layer_mlp_crystal_atlas_path is None
         ):
             raise ValueError(
-                "layer_mlp_crystal_state_path requires layer_mlp_crystal_atlas_path"
+                "layer-MLP Crystal configuration requires "
+                "layer_mlp_crystal_atlas_path"
             )
         if (
-            layer_mlp_crystal_state_path is not None
+            layer_mlp_crystal_configured
             and layer_mlp_crystal_compute_root is None
         ):
             raise ValueError(
-                "layer_mlp_crystal_state_path requires layer_mlp_crystal_compute_root"
+                "layer-MLP Crystal configuration requires "
+                "layer_mlp_crystal_compute_root"
             )
         if (
-            layer_mlp_crystal_state_path is None
+            not layer_mlp_crystal_configured
             and layer_mlp_crystal_atlas_path is not None
         ):
             raise ValueError(
                 "layer_mlp_crystal_atlas_path requires layer_mlp_crystal_state_path"
             )
         if (
-            layer_mlp_crystal_state_path is None
+            not layer_mlp_crystal_configured
             and layer_mlp_crystal_compute_root is not None
         ):
             raise ValueError(
@@ -2559,6 +2633,11 @@ class Qwen38CausalChat:
             if layer_mlp_crystal_state_path is None
             else Path(layer_mlp_crystal_state_path).expanduser().absolute()
         )
+        self._layer_mlp_crystal_registry_path = (
+            None
+            if layer_mlp_crystal_registry_path is None
+            else Path(layer_mlp_crystal_registry_path).expanduser().absolute()
+        )
         self._layer_mlp_crystal_atlas_path = (
             None
             if layer_mlp_crystal_atlas_path is None
@@ -2678,6 +2757,7 @@ class Qwen38CausalChat:
         self._layer_transition_crystal_atlas: LiveGraph | None = None
         self._layer_transition_crystal_compute_graph: ComputeOperatorGraph | None = None
         self._layer_mlp_crystal_bank: Layer63MlpResidualCrystalBank | None = None
+        self._layer_mlp_crystal_mount_registry: LayerMlpO1MountRegistry | None = None
         self._layer_mlp_crystal_atlas: LiveGraph | None = None
         self._layer_mlp_crystal_compute_graph: ComputeOperatorGraph | None = None
         self._layer_mlp_o1_worker: Layer63MlpO1AsyncWorker | None = None
@@ -3107,7 +3187,79 @@ class Qwen38CausalChat:
                 "request_applied": layer_transition_crystal_applied,
                 "scope": "private-layer-63-k1/v1",
             }
-        if self._layer_mlp_crystal_state_path is not None:
+        if self._layer_mlp_crystal_registry_path is not None:
+            registry = self._layer_mlp_crystal_mount_registry
+            if layer_mlp_crystal_applied is None:
+                runtime = self._runtime
+                enabled_layers = (
+                    ()
+                    if runtime is None
+                    else tuple(
+                        sorted(
+                            getattr(
+                                runtime.model,
+                                "layer_mlp_crystal_registry_enabled_layers",
+                                (),
+                            )
+                        )
+                    )
+                )
+                legacy_enabled = bool(
+                    runtime is not None
+                    and self._layer_mlp_crystal_bank is not None
+                    and getattr(runtime.model, "layer_mlp_crystal_enabled", False)
+                )
+                layer_mlp_crystal_applied = bool(enabled_layers or legacy_enabled)
+            selected_layer = (
+                None
+                if not layer_mlp_crystal_applied or registry is None
+                else max(registry.mounted_layers)
+            )
+            policy["layer_mlp_crystal"] = {
+                "atlas_revision_sha256": (
+                    None
+                    if registry is None
+                    else registry.pins.atlas_revision_sha256
+                ),
+                "enabled_layer": selected_layer,
+                "entries": (
+                    None
+                    if registry is None
+                    else _layer_mlp_mount_entry_records(
+                        registry,
+                        hex_floats=True,
+                    )
+                ),
+                "evidence_schema": LAYER_MLP_CRYSTAL_REGISTRY_EVIDENCE_SCHEMA,
+                "graph_revision_sha256": (
+                    None
+                    if registry is None
+                    else registry.pins.graph_revision_sha256
+                ),
+                "installed_layers": (
+                    None if registry is None else list(registry.mounted_layers)
+                ),
+                "manifest_file_sha256": (
+                    None if registry is None else registry.manifest_file_sha256
+                ),
+                "model_sha256": (
+                    None if registry is None else registry.pins.model_sha256
+                ),
+                "projection_sha256": (
+                    None
+                    if registry is None
+                    else registry.pins.projection.projection_sha256
+                ),
+                "q4_sha256": (
+                    None if registry is None else registry.pins.q4_sha256
+                ),
+                "registry_sha256": (
+                    None if registry is None else registry.registry_sha256
+                ),
+                "request_applied": layer_mlp_crystal_applied,
+                "scope": "private-multi-layer-mlp-k1/v2",
+            }
+        elif self._layer_mlp_crystal_state_path is not None:
             bank = self._layer_mlp_crystal_bank
             identity = None if bank is None else bank.identity
             if layer_mlp_crystal_applied is None:
@@ -3495,6 +3647,7 @@ class Qwen38CausalChat:
             or self._native_head_crsa is not None
             or self._layer_transition_crystal_state_path is not None
             or self._layer_mlp_crystal_state_path is not None
+            or self._layer_mlp_crystal_registry_path is not None
         ):
             return None
         from .cartography_probe import prompt_token_sha256
@@ -4704,16 +4857,168 @@ class Qwen38CausalChat:
     def _layer_mlp_crystal_metrics(
         self,
         runtime: Any,
-    ) -> dict[str, int] | None:
+    ) -> dict[str, Any] | None:
         bank = self._layer_mlp_crystal_bank
-        if bank is None:
+        registry = self._layer_mlp_crystal_mount_registry
+        if bank is None and registry is None:
             return None
-        metrics = getattr(runtime.model, "layer_mlp_crystal_metrics", None)
+        metrics = getattr(
+            runtime.model,
+            (
+                "layer_mlp_crystal_registry_metrics"
+                if registry is not None
+                else "layer_mlp_crystal_metrics"
+            ),
+            None,
+        )
         if not callable(metrics):
             raise Qwen38ChatError("runtime model lacks layer-MLP Crystal metrics")
         record = metrics()
         if not isinstance(record, Mapping):
             raise Qwen38ChatError("layer-MLP Crystal metrics are not a mapping")
+        counter_fields = (
+            "attempts",
+            "fallbacks",
+            "packed_weight_bytes_avoided",
+            "physical_transitions",
+            "replacements",
+            "skipped_q4_matrix_calls",
+            "transition_rows",
+        )
+        if registry is not None:
+            if record.get("schema") != (
+                "immer.qwen3.8-layer-mlp-residual-crystal-registry-metrics/v2"
+            ):
+                raise Qwen38ChatError(
+                    "multi-layer MLP Crystal metrics schema is invalid"
+                )
+
+            def layer_list(field: str) -> tuple[int, ...]:
+                value = record.get(field)
+                if not isinstance(value, list) or any(
+                    isinstance(layer, bool) or not isinstance(layer, int)
+                    for layer in value
+                ):
+                    raise Qwen38ChatError(
+                        f"multi-layer MLP Crystal {field} metric is invalid"
+                    )
+                result = tuple(value)
+                if result != tuple(sorted(set(result))):
+                    raise Qwen38ChatError(
+                        f"multi-layer MLP Crystal {field} metric is not sorted unique"
+                    )
+                return result
+
+            installed_layers = layer_list("installed_layers")
+            enabled_layers = layer_list("enabled_layers")
+            if installed_layers != registry.mounted_layers:
+                raise Qwen38ChatError(
+                    "multi-layer MLP Crystal installed layers changed"
+                )
+            if len(enabled_layers) > 1 or not set(enabled_layers) <= set(
+                installed_layers
+            ):
+                raise Qwen38ChatError(
+                    "multi-layer MLP Crystal request enabled multiple layers"
+                )
+            for alias, expected in (
+                ("registered_layers", installed_layers),
+                ("request_enabled_layers", enabled_layers),
+            ):
+                if tuple(record.get(alias, ())) != expected:
+                    raise Qwen38ChatError(
+                        f"multi-layer MLP Crystal {alias} metric changed"
+                    )
+            raw_layers = record.get("layers")
+            if not isinstance(raw_layers, Mapping) or set(raw_layers) != {
+                str(layer) for layer in installed_layers
+            }:
+                raise Qwen38ChatError(
+                    "multi-layer MLP Crystal per-layer metrics changed"
+                )
+            entries = {entry.layer_index: entry for entry in registry.entries}
+            normalized_layers: dict[str, dict[str, Any]] = {}
+            for layer in installed_layers:
+                raw_layer = raw_layers.get(str(layer))
+                if not isinstance(raw_layer, Mapping):
+                    raise Qwen38ChatError(
+                        f"layer-{layer} MLP Crystal metrics are invalid"
+                    )
+                entry = entries[layer]
+                expected_generation = "layer63-v1" if layer == 63 else "v2"
+                expected_pins = {
+                    "action_abi": entry.action_abi,
+                    "atlas_revision_sha256": registry.pins.atlas_revision_sha256,
+                    "bank_generation": expected_generation,
+                    "graph_revision_sha256": registry.pins.graph_revision_sha256,
+                    "identity_sha256": entry.bank_identity_sha256,
+                    "model_sha256": registry.pins.model_sha256,
+                    "q4_sha256": registry.pins.q4_sha256,
+                }
+                if any(
+                    raw_layer.get(field) != expected
+                    for field, expected in expected_pins.items()
+                ):
+                    raise Qwen38ChatError(
+                        f"layer-{layer} MLP Crystal metrics changed identity"
+                    )
+                radius = raw_layer.get("max_error_radius")
+                if (
+                    isinstance(radius, bool)
+                    or not isinstance(radius, (int, float))
+                    or not math.isfinite(float(radius))
+                    or float(radius) != entry.max_error_radius
+                ):
+                    raise Qwen38ChatError(
+                        f"layer-{layer} MLP Crystal metrics changed error budget"
+                    )
+                expected_enabled = layer in enabled_layers
+                if (
+                    raw_layer.get("installed") is not True
+                    or raw_layer.get("enabled") is not expected_enabled
+                    or raw_layer.get("request_enabled") is not expected_enabled
+                ):
+                    raise Qwen38ChatError(
+                        f"layer-{layer} MLP Crystal enablement metrics changed"
+                    )
+                counters: dict[str, int] = {}
+                for field in counter_fields:
+                    value = raw_layer.get(field)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                    ):
+                        raise Qwen38ChatError(
+                            f"layer-{layer} MLP Crystal {field} is invalid"
+                        )
+                    counters[field] = value
+                normalized_layers[str(layer)] = counters
+            aggregates: dict[str, int] = {}
+            for field in counter_fields:
+                value = record.get(field)
+                expected = sum(
+                    layer[field] for layer in normalized_layers.values()
+                )
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    or value != expected
+                ):
+                    raise Qwen38ChatError(
+                        f"multi-layer MLP Crystal aggregate {field} is invalid"
+                    )
+                aggregates[field] = value
+            return {
+                **aggregates,
+                "enabled_layers": enabled_layers,
+                "installed_layers": installed_layers,
+                "layers": normalized_layers,
+                "schema": record["schema"],
+            }
+
+        assert bank is not None
         if record.get("schema") != (
             "immer.qwen3.8-layer-mlp-residual-crystal-metrics/v1"
         ):
@@ -4739,15 +5044,7 @@ class Qwen38CausalChat:
         if not isinstance(record.get("enabled"), bool):
             raise Qwen38ChatError("layer-MLP Crystal enabled metric is invalid")
         counters: dict[str, int] = {}
-        for field in (
-            "attempts",
-            "fallbacks",
-            "packed_weight_bytes_avoided",
-            "physical_transitions",
-            "replacements",
-            "skipped_q4_matrix_calls",
-            "transition_rows",
-        ):
+        for field in counter_fields:
             value = record.get(field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise Qwen38ChatError(f"layer-MLP Crystal {field} is invalid")
@@ -4771,23 +5068,159 @@ class Qwen38CausalChat:
 
     def _record_layer_mlp_crystal_request(
         self,
-        before: Mapping[str, int] | None,
-        after: Mapping[str, int] | None,
+        before: Mapping[str, Any] | None,
+        after: Mapping[str, Any] | None,
     ) -> dict[str, Any] | None:
         bank = self._layer_mlp_crystal_bank
-        if before is None or after is None or bank is None:
+        registry = self._layer_mlp_crystal_mount_registry
+        if before is None or after is None or (bank is None and registry is None):
             return None
+        fields = (
+            "attempts",
+            "fallbacks",
+            "packed_weight_bytes_avoided",
+            "physical_transitions",
+            "replacements",
+            "skipped_q4_matrix_calls",
+            "transition_rows",
+        )
+        if registry is not None:
+            if (
+                before.get("schema")
+                != "immer.qwen3.8-layer-mlp-residual-crystal-registry-metrics/v2"
+                or after.get("schema") != before.get("schema")
+                or tuple(before.get("installed_layers", ()))
+                != registry.mounted_layers
+                or tuple(after.get("installed_layers", ()))
+                != registry.mounted_layers
+            ):
+                raise Qwen38ChatError(
+                    "multi-layer MLP Crystal request metrics changed topology"
+                )
+            before_layers = before.get("layers")
+            after_layers = after.get("layers")
+            if not isinstance(before_layers, Mapping) or not isinstance(
+                after_layers,
+                Mapping,
+            ):
+                raise Qwen38ChatError(
+                    "multi-layer MLP Crystal request metrics lack layers"
+                )
+            entries = {entry.layer_index: entry for entry in registry.entries}
+            request_layers: dict[str, dict[str, Any]] = {}
+            for layer in registry.mounted_layers:
+                previous = before_layers.get(str(layer))
+                current = after_layers.get(str(layer))
+                if not isinstance(previous, Mapping) or not isinstance(
+                    current,
+                    Mapping,
+                ):
+                    raise Qwen38ChatError(
+                        f"layer-{layer} MLP Crystal request counters are invalid"
+                    )
+                deltas = {
+                    field: int(current[field]) - int(previous[field])
+                    for field in fields
+                }
+                if any(value < 0 for value in deltas.values()):
+                    raise Qwen38ChatError(
+                        f"layer-{layer} MLP Crystal counters moved backwards"
+                    )
+                entry = entries[layer]
+                request_layers[str(layer)] = {
+                    **deltas,
+                    "action_abi": entry.action_abi,
+                    "identity_sha256": entry.bank_identity_sha256,
+                    "max_error_radius": entry.max_error_radius,
+                    "packed_weight_bytes_per_transition": (
+                        entry.packed_weight_bytes_avoided
+                    ),
+                }
+            request: dict[str, Any] = {
+                field: int(after[field]) - int(before[field]) for field in fields
+            }
+            if any(value < 0 for value in request.values()):
+                raise Qwen38ChatError(
+                    "multi-layer MLP Crystal aggregate counters moved backwards"
+                )
+            if any(
+                request[field]
+                != sum(layer[field] for layer in request_layers.values())
+                for field in fields
+            ):
+                raise Qwen38ChatError(
+                    "multi-layer MLP Crystal request aggregate is not exact"
+                )
+            enabled_layers = tuple(after.get("enabled_layers", ()))
+            if len(enabled_layers) > 1:
+                raise Qwen38ChatError(
+                    "multi-layer MLP Crystal request enabled multiple layers"
+                )
+            enabled_layer = enabled_layers[0] if enabled_layers else None
+            for layer_text, counters in request_layers.items():
+                if int(layer_text) == enabled_layer:
+                    continue
+                if any(counters[field] != 0 for field in fields):
+                    raise Qwen38ChatError(
+                        "disabled layer-MLP Crystal counters changed during request"
+                    )
+            executed_layers = tuple(
+                int(layer)
+                for layer, counters in request_layers.items()
+                if counters["physical_transitions"] > 0
+                or counters["replacements"] > 0
+            )
+            if len(executed_layers) > 1 or (
+                executed_layers and executed_layers[0] != enabled_layer
+            ):
+                raise Qwen38ChatError(
+                    "multi-layer MLP Crystal execution crossed layer boundaries"
+                )
+            executed_layer = executed_layers[0] if executed_layers else None
+            selected = None if enabled_layer is None else entries[enabled_layer]
+            request.update(
+                {
+                    "atlas_revision_sha256": (
+                        registry.pins.atlas_revision_sha256
+                    ),
+                    "enabled_layer": enabled_layer,
+                    "enabled_layers": list(enabled_layers),
+                    "executed_layer": executed_layer,
+                    "executed_layers": (
+                        [] if executed_layer is None else [executed_layer]
+                    ),
+                    "graph_revision_sha256": (
+                        registry.pins.graph_revision_sha256
+                    ),
+                    "identity_sha256": (
+                        None if selected is None else selected.bank_identity_sha256
+                    ),
+                    "installed_layers": list(registry.mounted_layers),
+                    "layers": request_layers,
+                    "manifest_file_sha256": registry.manifest_file_sha256,
+                    "max_error_radius": (
+                        None if selected is None else selected.max_error_radius
+                    ),
+                    "model_sha256": registry.pins.model_sha256,
+                    "packed_weight_bytes_per_transition": (
+                        None
+                        if selected is None
+                        else selected.packed_weight_bytes_avoided
+                    ),
+                    "projection_sha256": (
+                        registry.pins.projection.projection_sha256
+                    ),
+                    "q4_sha256": registry.pins.q4_sha256,
+                    "registry_sha256": registry.registry_sha256,
+                }
+            )
+            self._last_layer_mlp_crystal_evidence = request
+            return request
+
+        assert bank is not None
         request: dict[str, Any] = {
             field: int(after[field]) - int(before[field])
-            for field in (
-                "attempts",
-                "fallbacks",
-                "packed_weight_bytes_avoided",
-                "physical_transitions",
-                "replacements",
-                "skipped_q4_matrix_calls",
-                "transition_rows",
-            )
+            for field in fields
         }
         if any(value < 0 for value in request.values()):
             raise Qwen38ChatError("layer-MLP Crystal request counters moved backwards")
@@ -4858,6 +5291,174 @@ class Qwen38CausalChat:
             )
         self._last_mlp_page_coordinate_evidence = request
         return request
+
+    def _open_layer_mlp_crystal_mount_registry(
+        self,
+        runtime: _OwnedRuntime,
+    ) -> tuple[
+        LayerMlpO1MountRegistry,
+        Layer63MlpResidualCrystalBank | None,
+        LiveGraph,
+        ComputeOperatorGraph,
+    ]:
+        """Authenticate and atomically split-mount one offline registry."""
+
+        manifest_path = self._layer_mlp_crystal_registry_path
+        atlas_path = self._layer_mlp_crystal_atlas_path
+        compute_root = self._layer_mlp_crystal_compute_root
+        if manifest_path is None or atlas_path is None or compute_root is None:
+            raise Qwen38ChatError(
+                "layer-MLP Crystal registry is incompletely configured"
+            )
+        registry = LayerMlpO1MountRegistry.load(
+            manifest_path,
+            require_mountable=True,
+        )
+        pins = registry.pins
+        model = runtime.model
+        model_pin = getattr(model, "layer_mlp_crystal_model_sha256", None)
+        q4_pin = getattr(model, "layer_mlp_crystal_q4_sha256", None)
+        packed_bytes = getattr(model, "_layer_mlp_crystal_avoided_q4_bytes", None)
+        if not all(callable(value) for value in (model_pin, q4_pin, packed_bytes)):
+            raise Qwen38ChatError(
+                "runtime model lacks multi-layer MLP Crystal identity pins"
+            )
+        live_model_sha256 = model_pin()
+        live_q4_sha256 = q4_pin()
+        if not _is_sha256(live_model_sha256) or not _is_sha256(live_q4_sha256):
+            raise Qwen38ChatError(
+                "runtime model returned invalid multi-layer MLP Crystal pins"
+            )
+        if pins.model_sha256 != live_model_sha256:
+            raise Qwen38ChatError(
+                "layer-MLP Crystal registry model pin differs from target"
+            )
+        if pins.q4_sha256 != live_q4_sha256:
+            raise Qwen38ChatError(
+                "layer-MLP Crystal registry Q4 pin differs from target"
+            )
+        config = getattr(model, "config", None)
+        hidden_dim = getattr(config, "dim", None)
+        if (
+            isinstance(hidden_dim, bool)
+            or not isinstance(hidden_dim, int)
+            or hidden_dim <= 0
+            or pins.projection.hidden_dim != hidden_dim
+        ):
+            raise Qwen38ChatError(
+                "layer-MLP Crystal registry projection differs from target"
+            )
+        atlas = _open_layer_mlp_crystal_atlas(
+            atlas_path,
+            atlas_revision_sha256=pins.atlas_revision_sha256,
+        )
+        compute_graph, _compute_state = _open_layer_mlp_crystal_compute_graph(
+            compute_root,
+            graph_revision_sha256=pins.graph_revision_sha256,
+        )
+
+        generic_banks: dict[int, LayerMlpResidualCrystalBank] = {}
+        generic_radii: dict[int, float] = {}
+        legacy_bank: Layer63MlpResidualCrystalBank | None = None
+        for mount in registry.mounts:
+            entry = mount.entry
+            identity = mount.bank.identity
+            if identity.projection != pins.projection:
+                raise Qwen38ChatError(
+                    f"layer-{entry.layer_index} MLP Crystal projection changed"
+                )
+            live_bytes = packed_bytes(entry.layer_index)
+            if (
+                isinstance(live_bytes, bool)
+                or not isinstance(live_bytes, int)
+                or live_bytes <= 0
+                or live_bytes != entry.packed_weight_bytes_avoided
+            ):
+                raise Qwen38ChatError(
+                    f"layer-{entry.layer_index} MLP Crystal byte pin differs from Q4"
+                )
+            if entry.layer_index == 63:
+                if not isinstance(mount.bank, Layer63MlpResidualCrystalBank):
+                    raise Qwen38ChatError(
+                        "layer-63 registry entry is not the legacy v1 bank"
+                    )
+                legacy_bank = mount.bank
+            else:
+                if not isinstance(mount.bank, LayerMlpResidualCrystalBank):
+                    raise Qwen38ChatError(
+                        f"layer-{entry.layer_index} registry entry is not a v2 bank"
+                    )
+                generic_banks[entry.layer_index] = mount.bank
+                generic_radii[entry.layer_index] = entry.max_error_radius
+
+        attach_registry = getattr(
+            model,
+            "set_layer_mlp_crystal_registry",
+            None,
+        )
+        attach_legacy = getattr(model, "attach_layer_mlp_crystal_bank", None)
+        clear_registry = getattr(model, "clear_layer_mlp_crystal_registry", None)
+        if generic_banks and not callable(attach_registry):
+            raise TypeError(
+                "runtime model must attach multi-layer MLP Crystal registries"
+            )
+        if legacy_bank is not None and not callable(attach_legacy):
+            raise TypeError("runtime model must attach layer-63 MLP Crystal banks")
+        try:
+            if generic_banks:
+                assert callable(attach_registry)
+                attach_registry(generic_banks, max_error_radii=generic_radii)
+            if legacy_bank is not None:
+                assert callable(attach_legacy)
+                identity = legacy_bank.identity
+                entry = next(
+                    item for item in registry.entries if item.layer_index == 63
+                )
+                attach_legacy(
+                    legacy_bank,
+                    max_error_radius=entry.max_error_radius,
+                    graph_revision_sha256=identity.graph_revision_sha256,
+                    atlas_revision_sha256=identity.atlas_revision_sha256,
+                )
+        except Exception:
+            if callable(attach_legacy):
+                try:
+                    attach_legacy(None)
+                except Exception:
+                    pass
+            if callable(clear_registry):
+                try:
+                    clear_registry()
+                except Exception:
+                    pass
+            raise
+        return registry, legacy_bank, atlas, compute_graph
+
+    def _require_layer_mlp_crystal_registry_unchanged(self) -> None:
+        """Fail closed if the live manifest or any immutable bank drifted."""
+
+        expected = self._layer_mlp_crystal_mount_registry
+        path = self._layer_mlp_crystal_registry_path
+        if expected is None or path is None:
+            return
+        try:
+            current = read_layer_mlp_o1_registry_manifest(
+                path,
+                require_mountable=True,
+            )
+        except Exception as exc:
+            raise Qwen38ChatError(
+                "layer-MLP Crystal registry changed after runtime start"
+            ) from exc
+        if (
+            current.manifest_file_sha256 != expected.manifest_file_sha256
+            or current.registry_sha256 != expected.registry_sha256
+            or current.pins != expected.pins
+            or current.entries != expected.entries
+        ):
+            raise Qwen38ChatError(
+                "layer-MLP Crystal registry changed after runtime start"
+            )
 
     def _open_layer_mlp_o1_runtime(
         self,
@@ -5151,7 +5752,50 @@ class Qwen38CausalChat:
                 "q4_sha256": identity.q4_sha256,
                 "schema": LAYER_TRANSITION_CRYSTAL_EVIDENCE_SCHEMA,
             }
-        if self._layer_mlp_crystal_bank is not None:
+        if self._layer_mlp_crystal_mount_registry is not None:
+            registry = self._layer_mlp_crystal_mount_registry
+            enabled_layer = (
+                None
+                if self._last_layer_mlp_crystal_evidence is None
+                else self._last_layer_mlp_crystal_evidence.get("enabled_layer")
+            )
+            evidence["layer_mlp_crystal"] = {
+                "atlas_revision_sha256": registry.pins.atlas_revision_sha256,
+                "enabled_layer": enabled_layer,
+                "enabled_layers": (
+                    [] if enabled_layer is None else [enabled_layer]
+                ),
+                "entries": _layer_mlp_mount_entry_records(
+                    registry,
+                    hex_floats=False,
+                ),
+                "graph_revision_sha256": registry.pins.graph_revision_sha256,
+                "installed_layers": list(registry.mounted_layers),
+                "layers": {
+                    str(mount.entry.layer_index): {
+                        "action_abi": mount.entry.action_abi,
+                        "bank_file_sha256": mount.entry.bank_file_sha256,
+                        "identity_sha256": mount.entry.bank_identity_sha256,
+                        "installed": True,
+                        "enabled": mount.entry.layer_index == enabled_layer,
+                        "layer_index": mount.entry.layer_index,
+                        "max_error_radius": mount.entry.max_error_radius,
+                        "packed_weight_bytes_per_transition": (
+                            mount.entry.packed_weight_bytes_avoided
+                        ),
+                    }
+                    for mount in registry.mounts
+                },
+                "manifest_file_sha256": registry.manifest_file_sha256,
+                "model_sha256": registry.pins.model_sha256,
+                "projection_sha256": (
+                    registry.pins.projection.projection_sha256
+                ),
+                "q4_sha256": registry.pins.q4_sha256,
+                "registry_sha256": registry.registry_sha256,
+                "schema": LAYER_MLP_CRYSTAL_REGISTRY_EVIDENCE_SCHEMA,
+            }
+        elif self._layer_mlp_crystal_bank is not None:
             identity = self._layer_mlp_crystal_bank.identity
             evidence["layer_mlp_crystal"] = {
                 "action_abi": identity.action_abi,
@@ -5500,9 +6144,17 @@ class Qwen38CausalChat:
                     atlas_revision_sha256=identity.atlas_revision_sha256,
                 )
             layer_mlp_crystal_bank = None
+            layer_mlp_crystal_mount_registry = None
             layer_mlp_crystal_atlas = None
             layer_mlp_crystal_compute_graph = None
-            if self._layer_mlp_crystal_state_path is not None:
+            if self._layer_mlp_crystal_registry_path is not None:
+                (
+                    layer_mlp_crystal_mount_registry,
+                    layer_mlp_crystal_bank,
+                    layer_mlp_crystal_atlas,
+                    layer_mlp_crystal_compute_graph,
+                ) = self._open_layer_mlp_crystal_mount_registry(runtime)
+            elif self._layer_mlp_crystal_state_path is not None:
                 layer_mlp_crystal_bank = Layer63MlpResidualCrystalBank.load(
                     self._layer_mlp_crystal_state_path
                 )
@@ -5703,6 +6355,9 @@ class Qwen38CausalChat:
             layer_transition_crystal_compute_graph
         )
         self._layer_mlp_crystal_bank = layer_mlp_crystal_bank
+        self._layer_mlp_crystal_mount_registry = (
+            layer_mlp_crystal_mount_registry
+        )
         self._layer_mlp_crystal_atlas = layer_mlp_crystal_atlas
         self._layer_mlp_crystal_compute_graph = layer_mlp_crystal_compute_graph
         self._layer_mlp_o1_worker = layer_mlp_o1_worker
@@ -5800,6 +6455,7 @@ class Qwen38CausalChat:
         session_id: str | None = None,
         action_directive: InferenceActionDirective | None = None,
     ) -> Result:
+        self._require_layer_mlp_crystal_registry_unchanged()
         prompt = Qwen38Tokenizer.render_no_thinking_messages(
             self._system_prompt,
             (*history, ("user", text)),
@@ -6012,11 +6668,81 @@ class Qwen38CausalChat:
             action_directive is not None
             and "layer_mlp_crystal" in action_directive.disabled_actions
         )
-        layer_mlp_crystal_applied = (
-            self._layer_mlp_crystal_bank is not None
-            and not layer_mlp_crystal_explicitly_disabled
-        )
-        if self._layer_mlp_crystal_bank is not None:
+        mount_registry = self._layer_mlp_crystal_mount_registry
+        layer_mlp_registry_setter = None
+        layer_mlp_legacy_setter = None
+        previous_layer_mlp_registry_enabled: tuple[int, ...] = ()
+        previous_layer_mlp_legacy_enabled = False
+        restore_layer_mlp_registry = False
+        if mount_registry is not None:
+            selected_layer = (
+                None
+                if layer_mlp_crystal_explicitly_disabled
+                else max(mount_registry.mounted_layers)
+            )
+            layer_mlp_crystal_applied = selected_layer is not None
+            generic_layers = tuple(
+                layer for layer in mount_registry.mounted_layers if layer != 63
+            )
+            layer_mlp_registry_setter = getattr(
+                runtime.model,
+                "set_layer_mlp_crystal_registry_enabled",
+                None,
+            )
+            layer_mlp_legacy_setter = getattr(
+                runtime.model,
+                "set_layer_mlp_crystal_enabled",
+                None,
+            )
+            if generic_layers and not callable(layer_mlp_registry_setter):
+                raise Qwen38ChatError(
+                    "runtime model cannot select multi-layer MLP Crystals"
+                )
+            if self._layer_mlp_crystal_bank is not None and not callable(
+                layer_mlp_legacy_setter
+            ):
+                raise Qwen38ChatError(
+                    "runtime model cannot select layer-63 MLP Crystals"
+                )
+            previous_layer_mlp_registry_enabled = tuple(
+                sorted(
+                    getattr(
+                        runtime.model,
+                        "layer_mlp_crystal_registry_enabled_layers",
+                        (),
+                    )
+                )
+            )
+            previous_layer_mlp_legacy_enabled = bool(
+                self._layer_mlp_crystal_bank is not None
+                and getattr(runtime.model, "layer_mlp_crystal_enabled", False)
+            )
+            try:
+                if callable(layer_mlp_legacy_setter):
+                    layer_mlp_legacy_setter(False)
+                if callable(layer_mlp_registry_setter):
+                    layer_mlp_registry_setter(())
+                if selected_layer == 63:
+                    assert callable(layer_mlp_legacy_setter)
+                    layer_mlp_legacy_setter(True)
+                elif selected_layer is not None:
+                    assert callable(layer_mlp_registry_setter)
+                    layer_mlp_registry_setter((selected_layer,))
+            except Exception:
+                if callable(layer_mlp_registry_setter):
+                    layer_mlp_registry_setter(
+                        previous_layer_mlp_registry_enabled
+                    )
+                if callable(layer_mlp_legacy_setter):
+                    layer_mlp_legacy_setter(previous_layer_mlp_legacy_enabled)
+                raise
+            restore_layer_mlp_registry = True
+        else:
+            layer_mlp_crystal_applied = (
+                self._layer_mlp_crystal_bank is not None
+                and not layer_mlp_crystal_explicitly_disabled
+            )
+        if mount_registry is None and self._layer_mlp_crystal_bank is not None:
             set_layer_mlp_crystal_enabled = getattr(
                 runtime.model,
                 "set_layer_mlp_crystal_enabled",
@@ -6314,6 +7040,7 @@ class Qwen38CausalChat:
                     )
                 assert layer_mlp_o1_layer is not None
                 layer_mlp_o1_registry_setter({layer_mlp_o1_layer: layer_mlp_o1_buffer})
+        layer_mlp_crystal_after: Mapping[str, Any] | None = None
         request_started = time.perf_counter()
         try:
             try:
@@ -6323,16 +7050,35 @@ class Qwen38CausalChat:
                     generation_options,
                 )
             finally:
-                if layer_mlp_o1_buffer is not None:
-                    if layer_mlp_o1_pool is None:
-                        assert callable(layer_mlp_o1_single_setter)
-                        layer_mlp_o1_single_setter(previous_layer_mlp_o1_observer)
-                    else:
-                        assert callable(layer_mlp_o1_registry_setter)
-                        assert isinstance(previous_layer_mlp_o1_observers, Mapping)
-                        layer_mlp_o1_registry_setter(
-                            dict(previous_layer_mlp_o1_observers)
-                        )
+                try:
+                    if layer_mlp_o1_buffer is not None:
+                        if layer_mlp_o1_pool is None:
+                            assert callable(layer_mlp_o1_single_setter)
+                            layer_mlp_o1_single_setter(previous_layer_mlp_o1_observer)
+                        else:
+                            assert callable(layer_mlp_o1_registry_setter)
+                            assert isinstance(previous_layer_mlp_o1_observers, Mapping)
+                            layer_mlp_o1_registry_setter(
+                                dict(previous_layer_mlp_o1_observers)
+                            )
+                finally:
+                    if restore_layer_mlp_registry:
+                        try:
+                            layer_mlp_crystal_after = (
+                                self._layer_mlp_crystal_metrics(runtime)
+                            )
+                        finally:
+                            if callable(layer_mlp_legacy_setter):
+                                layer_mlp_legacy_setter(False)
+                            if callable(layer_mlp_registry_setter):
+                                layer_mlp_registry_setter(())
+                                layer_mlp_registry_setter(
+                                    previous_layer_mlp_registry_enabled
+                                )
+                            if callable(layer_mlp_legacy_setter):
+                                layer_mlp_legacy_setter(
+                                    previous_layer_mlp_legacy_enabled
+                                )
         finally:
             if restore_lm_head_index is not None:
                 restore_lm_head_index(lm_head_index)
@@ -6381,7 +7127,11 @@ class Qwen38CausalChat:
         )
         self._record_layer_mlp_crystal_request(
             layer_mlp_crystal_before,
-            self._layer_mlp_crystal_metrics(runtime),
+            (
+                layer_mlp_crystal_after
+                if restore_layer_mlp_registry
+                else self._layer_mlp_crystal_metrics(runtime)
+            ),
         )
         layer_mlp_crystal_executed = bool(
             self._last_layer_mlp_crystal_evidence is not None
@@ -7478,6 +8228,7 @@ class Qwen38CausalChat:
             self._layer_transition_crystal_atlas = None
             self._layer_transition_crystal_compute_graph = None
             self._layer_mlp_crystal_bank = None
+            self._layer_mlp_crystal_mount_registry = None
             self._layer_mlp_crystal_atlas = None
             self._layer_mlp_crystal_compute_graph = None
             self._layer_mlp_o1_worker = None

@@ -166,6 +166,11 @@ _QWEN38_DEPLOYMENT_LAYER_MLP_O1_COMPUTE = (
     / "ooe"
     / "operator-compute"
 )
+_QWEN38_DEPLOYMENT_LAYER_MLP_CRYSTAL_REGISTRY = (
+    _QWEN38_DEPLOYMENT_STATE
+    / "qwen-layer-mlp-crystals-v2"
+    / "layer-mlp-o1-registry.json"
+)
 _QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v48"
 _QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
@@ -373,9 +378,10 @@ def _qwen38_layer_mlp_crystal_policy(
     *,
     request_applied: bool | None = None,
 ) -> dict[str, object] | None:
-    """Return a path-free policy for one configured layer-63 MLP bank."""
+    """Return a path-free policy for a legacy bank or immutable registry."""
 
     configured = getattr(args, "layer_mlp_crystal_state", None)
+    configured_registry = getattr(args, "layer_mlp_crystal_registry", None)
     configured_atlas = getattr(args, "layer_mlp_crystal_atlas", None)
     configured_compute_root = getattr(args, "layer_mlp_crystal_compute_root", None)
     radius = getattr(args, "layer_mlp_crystal_max_error_radius", 0.0)
@@ -385,14 +391,19 @@ def _qwen38_layer_mlp_crystal_policy(
         raise ValueError(
             "layer-MLP Crystal max-error radius must be finite and non-negative"
         ) from exc
-    if configured is None:
+    if configured is not None and configured_registry is not None:
+        raise ValueError(
+            "--layer-mlp-crystal-state and --layer-mlp-crystal-registry are "
+            "mutually exclusive"
+        )
+    if configured is None and configured_registry is None:
         if configured_atlas is not None:
             raise ValueError(
-                "--layer-mlp-crystal-atlas requires --layer-mlp-crystal-state"
+                "--layer-mlp-crystal-atlas requires a layer-MLP Crystal bank"
             )
         if configured_compute_root is not None:
             raise ValueError(
-                "--layer-mlp-crystal-compute-root requires --layer-mlp-crystal-state"
+                "--layer-mlp-crystal-compute-root requires a layer-MLP Crystal bank"
             )
         if radius != 0.0:
             raise ValueError(
@@ -401,13 +412,77 @@ def _qwen38_layer_mlp_crystal_policy(
             )
         return None
     if configured_atlas is None:
-        raise ValueError("--layer-mlp-crystal-state requires --layer-mlp-crystal-atlas")
+        raise ValueError("layer-MLP Crystals require --layer-mlp-crystal-atlas")
     if configured_compute_root is None:
         raise ValueError(
-            "--layer-mlp-crystal-state requires --layer-mlp-crystal-compute-root"
+            "layer-MLP Crystals require --layer-mlp-crystal-compute-root"
         )
     if request_applied is not None and not isinstance(request_applied, bool):
         raise TypeError("request_applied must be boolean or null")
+    if configured_registry is not None:
+        if radius != 0.0:
+            raise ValueError(
+                "--layer-mlp-crystal-max-error-radius applies only to the legacy "
+                "--layer-mlp-crystal-state"
+            )
+        from .runtimes.qwen3_8.layer_mlp_registry import (
+            read_layer_mlp_o1_registry_manifest,
+        )
+
+        registry = read_layer_mlp_o1_registry_manifest(
+            Path(configured_registry).expanduser().absolute(),
+            require_mountable=True,
+        )
+        pins = registry.pins
+        atlas_path = Path(configured_atlas).expanduser().absolute()
+        _authenticate_layer_transition_crystal_atlas(
+            atlas_path,
+            atlas_revision_sha256=pins.atlas_revision_sha256,
+            option="--layer-mlp-crystal-atlas",
+            subject="layer-MLP Crystal registry",
+        )
+        compute_root = Path(configured_compute_root).expanduser().absolute()
+        _authenticate_layer_transition_crystal_compute_graph(
+            compute_root,
+            graph_revision_sha256=pins.graph_revision_sha256,
+            option="--layer-mlp-crystal-compute-root",
+            subject="layer-MLP Crystal registry",
+        )
+        applied = True if request_applied is None else request_applied
+        return {
+            "atlas_revision_sha256": pins.atlas_revision_sha256,
+            "enabled": True,
+            "enabled_layer": max(registry.mounted_layers) if applied else None,
+            "entries": [
+                {
+                    "action_abi": entry.action_abi,
+                    "bank_file_sha256": entry.bank_file_sha256,
+                    "bank_identity_sha256": entry.bank_identity_sha256,
+                    "crystal_sha256": entry.crystal_sha256,
+                    "error_radius": entry.error_radius.hex(),
+                    "feature_radius": entry.feature_radius.hex(),
+                    "layer_index": entry.layer_index,
+                    "max_error_radius": entry.max_error_radius.hex(),
+                    "packed_weight_bytes_avoided": (
+                        entry.packed_weight_bytes_avoided
+                    ),
+                    "source_o1_generation": entry.source_o1_generation,
+                    "source_o1_state_sha256": entry.source_o1_state_sha256,
+                }
+                for entry in registry.entries
+            ],
+            "graph_revision_sha256": pins.graph_revision_sha256,
+            "installed_layers": list(registry.mounted_layers),
+            "manifest_file_sha256": registry.manifest_file_sha256,
+            "model_sha256": pins.model_sha256,
+            "projection_sha256": pins.projection.projection_sha256,
+            "q4_sha256": pins.q4_sha256,
+            "registry_sha256": registry.registry_sha256,
+            "request_applied": applied,
+            "schema": "immer.qwen3.8-layer-mlp-residual-crystal-policy/v2",
+        }
+
+    assert configured is not None
     path = Path(configured).expanduser().absolute()
     if not path.is_file():
         raise ValueError("--layer-mlp-crystal-state must name an existing sealed file")
@@ -2331,6 +2406,18 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             getattr(args, "layer_mlp_crystal_state", None),
             "IMMER_QWEN38_LAYER_MLP_CRYSTAL_STATE",
         )
+        layer_mlp_crystal_registry_path = _chat_path(
+            getattr(args, "layer_mlp_crystal_registry", None),
+            "IMMER_QWEN38_LAYER_MLP_CRYSTAL_REGISTRY",
+        )
+        if (
+            layer_mlp_crystal_state_path is not None
+            and layer_mlp_crystal_registry_path is not None
+        ):
+            raise ValueError(
+                "--layer-mlp-crystal-state and --layer-mlp-crystal-registry "
+                "are mutually exclusive"
+            )
         layer_mlp_crystal_atlas_path = _chat_path(
             getattr(args, "layer_mlp_crystal_atlas", None),
             "IMMER_QWEN38_LAYER_MLP_ATLAS",
@@ -2342,7 +2429,42 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         layer_mlp_crystal_max_error_radius = _finite_non_negative_float(
             getattr(args, "layer_mlp_crystal_max_error_radius", 0.0)
         )
-        if layer_mlp_crystal_state_path is not None and q4_root is None:
+        from .runtimes.qwen3_8.layer_mlp_registry import (
+            LayerMlpO1RegistryNotMountableError,
+            read_layer_mlp_o1_registry_manifest,
+        )
+
+        if (
+            layer_mlp_crystal_state_path is None
+            and layer_mlp_crystal_registry_path is None
+            and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+            and q4_root is not None
+            and _QWEN38_DEPLOYMENT_LAYER_MLP_CRYSTAL_REGISTRY.is_file()
+        ):
+            try:
+                read_layer_mlp_o1_registry_manifest(
+                    _QWEN38_DEPLOYMENT_LAYER_MLP_CRYSTAL_REGISTRY,
+                    require_mountable=True,
+                )
+            except LayerMlpO1RegistryNotMountableError:
+                pass
+            else:
+                layer_mlp_crystal_registry_path = (
+                    _QWEN38_DEPLOYMENT_LAYER_MLP_CRYSTAL_REGISTRY
+                )
+                if layer_mlp_crystal_atlas_path is None:
+                    layer_mlp_crystal_atlas_path = (
+                        _QWEN38_DEPLOYMENT_LAYER_MLP_O1_ATLAS
+                    )
+                if layer_mlp_crystal_compute_root is None:
+                    layer_mlp_crystal_compute_root = (
+                        _QWEN38_DEPLOYMENT_LAYER_MLP_O1_COMPUTE
+                    )
+        layer_mlp_crystal_configured = (
+            layer_mlp_crystal_state_path is not None
+            or layer_mlp_crystal_registry_path is not None
+        )
+        if layer_mlp_crystal_configured and q4_root is None:
             raise ValueError("layer-MLP Crystals require local Q4 execution")
         if (
             layer_mlp_crystal_state_path is not None
@@ -2351,33 +2473,42 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             raise ValueError(
                 "--layer-mlp-crystal-state must name an existing sealed file"
             )
+        if layer_mlp_crystal_registry_path is not None:
+            if not layer_mlp_crystal_registry_path.is_file():
+                raise ValueError(
+                    "--layer-mlp-crystal-registry must name an existing manifest"
+                )
+            read_layer_mlp_o1_registry_manifest(
+                layer_mlp_crystal_registry_path,
+                require_mountable=True,
+            )
         if (
-            layer_mlp_crystal_state_path is not None
+            layer_mlp_crystal_configured
             and layer_mlp_crystal_atlas_path is None
         ):
             raise ValueError(
-                "--layer-mlp-crystal-state requires --layer-mlp-crystal-atlas"
+                "layer-MLP Crystals require --layer-mlp-crystal-atlas"
             )
         if (
-            layer_mlp_crystal_state_path is not None
+            layer_mlp_crystal_configured
             and layer_mlp_crystal_compute_root is None
         ):
             raise ValueError(
-                "--layer-mlp-crystal-state requires --layer-mlp-crystal-compute-root"
+                "layer-MLP Crystals require --layer-mlp-crystal-compute-root"
             )
         if (
-            layer_mlp_crystal_state_path is None
+            not layer_mlp_crystal_configured
             and layer_mlp_crystal_atlas_path is not None
         ):
             raise ValueError(
-                "--layer-mlp-crystal-atlas requires --layer-mlp-crystal-state"
+                "--layer-mlp-crystal-atlas requires a layer-MLP Crystal bank"
             )
         if (
-            layer_mlp_crystal_state_path is None
+            not layer_mlp_crystal_configured
             and layer_mlp_crystal_compute_root is not None
         ):
             raise ValueError(
-                "--layer-mlp-crystal-compute-root requires --layer-mlp-crystal-state"
+                "--layer-mlp-crystal-compute-root requires a layer-MLP Crystal bank"
             )
         if layer_mlp_crystal_atlas_path is not None:
             _require_existing_real_directory(
@@ -2389,7 +2520,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 layer_mlp_crystal_compute_root,
                 "--layer-mlp-crystal-compute-root",
             )
-        if layer_mlp_crystal_state_path is not None and args.compute_dtype not in {
+        if layer_mlp_crystal_configured and args.compute_dtype not in {
             "auto",
             "bfloat16",
         }:
@@ -2403,6 +2534,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 "--layer-mlp-crystal-state"
             )
         args.layer_mlp_crystal_state = layer_mlp_crystal_state_path
+        args.layer_mlp_crystal_registry = layer_mlp_crystal_registry_path
         args.layer_mlp_crystal_atlas = layer_mlp_crystal_atlas_path
         args.layer_mlp_crystal_compute_root = layer_mlp_crystal_compute_root
         args.layer_mlp_crystal_max_error_radius = layer_mlp_crystal_max_error_radius
@@ -3045,6 +3177,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 None
                 if layer_mlp_crystal_state_path is None
                 else str(layer_mlp_crystal_state_path)
+            ),
+            layer_mlp_crystal_registry_path=(
+                None
+                if layer_mlp_crystal_registry_path is None
+                else str(layer_mlp_crystal_registry_path)
             ),
             layer_mlp_crystal_atlas_path=(
                 None
@@ -4227,6 +4364,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "existing sealed private layer-63 MLP residual Crystal bank; "
             "no bank is mounted by default"
+        ),
+    )
+    chat.add_argument(
+        "--layer-mlp-crystal-registry",
+        help=(
+            "existing sealed offline multi-layer MLP Crystal registry; "
+            "mutually exclusive with the legacy layer-63 state"
         ),
     )
     chat.add_argument(
