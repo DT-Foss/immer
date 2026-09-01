@@ -6494,6 +6494,48 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotIn("id", rows[1])
         self.assertEqual([row["output"] for row in rows], ["local answer"] * 2)
 
+    def test_cli_deployment_enables_passive_decode_o1_by_default(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            deployed = root / "deployed"
+            (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
+            atlas = root / "atlas"
+            compute = root / "compute"
+            _semantic_atlas_authority(atlas)
+            _compute_graph_authority(compute)
+            state = root / "decode-o1.json"
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
+                patch("immer.cli._QWEN38_DEPLOYMENT_LAYER_MLP_O1_STATE", state),
+                patch("immer.cli._QWEN38_DEPLOYMENT_LAYER_MLP_O1_ATLAS", atlas),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_LAYER_MLP_O1_COMPUTE",
+                    compute,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["layer_mlp_o1_state_path"], str(state))
+        self.assertEqual(options["layer_mlp_o1_atlas_path"], str(atlas))
+        self.assertEqual(options["layer_mlp_o1_compute_root"], str(compute))
+        self.assertEqual(options["layer_mlp_o1_sketch_dim"], 128)
+
     def test_cli_economics_covers_single_jsonl_and_interactive_fail_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             economics = Path(temporary) / "economics"

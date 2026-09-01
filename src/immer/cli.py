@@ -150,6 +150,22 @@ _QWEN38_DEPLOYMENT_CONTEXT_CRYSTAL_STATE = (
 _QWEN38_DEPLOYMENT_ATTENTION_OUTPUT_CRYSTAL_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-attention-output-crystal-v1.json"
 )
+_QWEN38_DEPLOYMENT_LAYER_MLP_O1_STATE = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen-layer63-mlp-o1-decode-r128-v1.json"
+)
+_QWEN38_DEPLOYMENT_LAYER_MLP_O1_ATLAS = (
+    _QWEN38_DEPLOYMENT_PRIVATE
+    / "qwen3.8-o1-cartography"
+    / "promptgrid-bcf3d28"
+    / "atlas"
+)
+_QWEN38_DEPLOYMENT_LAYER_MLP_O1_COMPUTE = (
+    _QWEN38_DEPLOYMENT_PRIVATE
+    / "qwen3.8-o1-cartography"
+    / "promptgrid-bcf3d28"
+    / "ooe"
+    / "operator-compute"
+)
 _QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v48"
 _QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
@@ -2300,6 +2316,16 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             getattr(args, "layer_mlp_o1_compute_root", None),
             "IMMER_QWEN38_LAYER_MLP_O1_COMPUTE_ROOT",
         )
+        if (
+            layer_mlp_o1_state_path is None
+            and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+            and q4_root is not None
+            and _QWEN38_DEPLOYMENT_LAYER_MLP_O1_ATLAS.is_dir()
+            and _QWEN38_DEPLOYMENT_LAYER_MLP_O1_COMPUTE.is_dir()
+        ):
+            layer_mlp_o1_state_path = _QWEN38_DEPLOYMENT_LAYER_MLP_O1_STATE
+            layer_mlp_o1_atlas_path = _QWEN38_DEPLOYMENT_LAYER_MLP_O1_ATLAS
+            layer_mlp_o1_compute_root = _QWEN38_DEPLOYMENT_LAYER_MLP_O1_COMPUTE
         if layer_mlp_o1_state_path is not None:
             if q4_root is None:
                 raise ValueError("layer-MLP O1 collection requires local Q4 execution")
