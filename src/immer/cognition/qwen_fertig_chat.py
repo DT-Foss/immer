@@ -368,6 +368,72 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
             )
             if key in contextual_continuation
         }
+    layer_contextual_continuation = evidence.get(
+        "layer_contextual_continuation"
+    )
+    if isinstance(layer_contextual_continuation, dict):
+        compact_layer_context = {
+            key: layer_contextual_continuation[key]
+            for key in (
+                "accounting_error",
+                "identity_sha256",
+                "schema",
+                "status",
+            )
+            if key in layer_contextual_continuation
+        }
+        request = layer_contextual_continuation.get("request")
+        if isinstance(request, dict):
+            compact_layer_context["request"] = {
+                key: request[key]
+                for key in (
+                    "accounting_error",
+                    "crystal_accepted_tokens",
+                    "crystal_mismatches",
+                    "crystal_proposed_tokens",
+                    "crystal_verified_tokens",
+                    "layers",
+                    "schema",
+                    "selected",
+                    "status",
+                )
+                if key in request
+            }
+            bank_work = request.get("bank_work")
+            if isinstance(bank_work, dict):
+                compact_layer_context["request"]["bank_work"] = {
+                    key: bank_work[key]
+                    for key in (
+                        "crystal_captures",
+                        "crystal_failures",
+                        "crystal_option_calls",
+                        "crystal_queries",
+                        "crystal_query_hits",
+                        "layers",
+                        "status",
+                    )
+                    if key in bank_work
+                }
+        metrics = layer_contextual_continuation.get("metrics")
+        if isinstance(metrics, dict):
+            compact_layer_context["metrics"] = {
+                key: metrics[key]
+                for key in (
+                    "crystal_accepted_tokens",
+                    "crystal_bank_cells",
+                    "crystal_bank_support",
+                    "crystal_captures",
+                    "crystal_failures",
+                    "crystal_queries",
+                    "crystal_query_hits",
+                    "layers",
+                    "receipt_count",
+                    "settlements",
+                    "state_sha256",
+                )
+                if key in metrics
+            }
+        summary["layer_contextual_continuation"] = compact_layer_context
     delta_head_router = evidence.get("delta_head_router")
     if isinstance(delta_head_router, dict):
         compact_delta_head = {

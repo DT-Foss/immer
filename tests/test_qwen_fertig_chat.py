@@ -421,6 +421,75 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertEqual(economics.saved_pages, 11)
         self.assertEqual(economics.process_peak_rss_bytes, 1024)
 
+    def test_qwen_receipt_keeps_selected_layer_context_work(self) -> None:
+        base = _qwen_ok("ordinary answer")
+        qwen_result = Result(
+            base.status,
+            base.component,
+            output=base.output,
+            evidence={
+                **dict(base.evidence),
+                "layer_contextual_continuation": {
+                    "accounting_error": None,
+                    "identity_sha256": "1" * 64,
+                    "metrics": {
+                        "crystal_bank_cells": 20,
+                        "crystal_bank_support": 20,
+                        "crystal_captures": 20,
+                        "layers": {"18": {"crystal_bank_cells": 4}},
+                        "receipt_count": 4,
+                        "settlements": 4,
+                        "state_sha256": "2" * 64,
+                    },
+                    "request": {
+                        "accounting_error": None,
+                        "bank_work": {
+                            "crystal_captures": 5,
+                            "crystal_queries": 5,
+                            "layers": {"18": {"crystal_queries": 1}},
+                            "status": "ok",
+                        },
+                        "crystal_accepted_tokens": 2,
+                        "crystal_mismatches": 0,
+                        "crystal_proposed_tokens": 2,
+                        "crystal_verified_tokens": 2,
+                        "layers": {
+                            "18": {
+                                "crystal_accepted_tokens": 2,
+                                "selected": True,
+                            }
+                        },
+                        "schema": (
+                            "immer.qwen3.8-layer-contextual-continuation-request/v2"
+                        ),
+                        "selected": {"layer": 18, "proposed_tokens": 2},
+                        "status": "ok",
+                    },
+                    "schema": (
+                        "immer.qwen3.8-layer-contextual-continuation-evidence/v2"
+                    ),
+                    "status": "ok",
+                },
+            },
+        )
+        with _patched_solver(
+            None,
+            _verification(
+                CandidateVerificationStatus.ABSTAINED,
+                candidate=None,
+                expected=None,
+            ),
+        ) as (fertig, _, _):
+            result = QwenFertigChat(_Qwen(qwen_result), fertig).handle(
+                Request("chat", MATH_QUESTION)
+            )
+
+        layer = _receipt(result)["qwen"]["layer_contextual_continuation"]
+        self.assertEqual(layer["request"]["crystal_accepted_tokens"], 2)
+        self.assertEqual(layer["request"]["selected"]["layer"], 18)
+        self.assertEqual(layer["request"]["bank_work"]["crystal_queries"], 5)
+        self.assertEqual(layer["metrics"]["crystal_bank_cells"], 20)
+
     def test_qwen_receipt_keeps_compact_delta_head_execution(self) -> None:
         base = _qwen_ok("ordinary answer")
         qwen_result = Result(
