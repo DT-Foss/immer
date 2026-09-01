@@ -84,9 +84,13 @@ from .layer_mlp_crystal import (
     LAYER_MLP_RESIDUAL_ACTION_ABI,
     Layer63MlpResidualCrystalBank,
     Layer63MlpResidualCrystalIdentity,
+    LayerMlpResidualCrystalIdentity,
 )
-from .layer_mlp_o1 import Layer63MlpO1Accumulator
-from .layer_mlp_o1_runtime import Layer63MlpO1AsyncWorker
+from .layer_mlp_o1 import Layer63MlpO1Accumulator, LayerMlpO1Accumulator
+from .layer_mlp_o1_runtime import (
+    Layer63MlpO1AsyncWorker,
+    LayerMlpO1AsyncPool,
+)
 from .layer_transition_crystal import LayerTransitionProjectionIdentity
 from .mlp_page_markov import (
     MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS,
@@ -163,21 +167,38 @@ LAYER_MLP_CRYSTAL_EVIDENCE_SCHEMA = (
 LAYER_MLP_O1_COLLECTION_EVIDENCE_SCHEMA = (
     "immer.qwen3.8-layer63-mlp-o1-collection-evidence/v1"
 )
-QWEN38_COMPONENT_TIMING_REQUEST_SCHEMA = (
-    "immer.qwen3.8-component-timing-request/v1"
+LAYER_MLP_O1_POOL_COLLECTION_EVIDENCE_SCHEMA = (
+    "immer.qwen3.8-layer-mlp-o1-collection-evidence/v2"
 )
+QWEN38_COMPONENT_TIMING_REQUEST_SCHEMA = "immer.qwen3.8-component-timing-request/v1"
 _QWEN38_COMPONENT_TIMING_BOUNDARIES = {
     "full_attention_core": "StreamedQwen38._full_attention",
     "deltanet_core": "StreamedQwen38._linear_attention",
     "mlp_core": "StreamedQwen38._mlp",
-    "layer_transition_crystal": (
-        "StreamedQwen38._layer_transition_crystal_forward"
-    ),
+    "layer_transition_crystal": ("StreamedQwen38._layer_transition_crystal_forward"),
     "layer_mlp_crystal": "StreamedQwen38._layer_mlp_crystal_forward",
 }
 DEFAULT_LAYER_MLP_O1_PROJECTION_SEED = (
     "2b188a99b4b36f51bd910866e6d9a007fd02ec7256d6596fc87eb76f0444eccf"
 )
+
+
+def _layer_mlp_o1_state_path_for_layer(
+    layer63_state_path: str | Path,
+    *,
+    layer_index: int,
+    sketch_dim: int,
+) -> Path:
+    """Return the stable private state filename for one passive MLP layer."""
+
+    path = Path(layer63_state_path).expanduser().absolute()
+    if layer_index == 63:
+        return path
+    return path.parent / (
+        f"qwen-layer{layer_index:02d}-mlp-o1-decode-r{sketch_dim}-v2.json"
+    )
+
+
 QWEN38_CHAT_HISTORY_METADATA = "qwen_chat_history"
 QWEN38_CHAT_SESSION_METADATA = "qwen_chat_session"
 QWEN38_INFERENCE_ACTION_METADATA = "qwen_inference_action_directive"
@@ -1225,6 +1246,7 @@ class _OwnedRuntime:
         self.delta_head_router = delta_head_router
         self.mlp_page_router = mlp_page_router
         self.layer_mlp_o1_worker: Layer63MlpO1AsyncWorker | None = None
+        self.layer_mlp_o1_pool: LayerMlpO1AsyncPool | None = None
         self.q4_receipt = None if q4_bank is None else q4_bank.metrics()
         self.exact_head_receipt = (
             None if exact_head_index is None else exact_head_index.receipt.to_record()
@@ -1243,12 +1265,22 @@ class _OwnedRuntime:
         if self._closed:
             return
         failures: list[Exception] = []
+        set_layer_mlp_o1_observers = getattr(
+            self.model,
+            "set_layer_mlp_o1_observers",
+            None,
+        )
         set_layer_mlp_o1_observer = getattr(
             self.model,
             "set_layer_mlp_o1_observer",
             None,
         )
-        if callable(set_layer_mlp_o1_observer):
+        if callable(set_layer_mlp_o1_observers):
+            try:
+                set_layer_mlp_o1_observers({})
+            except Exception as exc:
+                failures.append(exc)
+        elif callable(set_layer_mlp_o1_observer):
             try:
                 set_layer_mlp_o1_observer(None)
             except Exception as exc:
@@ -1256,6 +1288,11 @@ class _OwnedRuntime:
         if self.layer_mlp_o1_worker is not None:
             try:
                 self.layer_mlp_o1_worker.close()
+            except Exception as exc:
+                failures.append(exc)
+        if self.layer_mlp_o1_pool is not None:
+            try:
+                self.layer_mlp_o1_pool.close()
             except Exception as exc:
                 failures.append(exc)
         try:
@@ -1796,6 +1833,7 @@ class Qwen38CausalChat:
         layer_mlp_o1_state_path: str | Path | None = None,
         layer_mlp_o1_atlas_path: str | Path | None = None,
         layer_mlp_o1_compute_root: str | Path | None = None,
+        layer_mlp_o1_layers: Sequence[int] | None = None,
         layer_mlp_o1_sketch_dim: int = 128,
         layer_mlp_o1_projection_seed: str = DEFAULT_LAYER_MLP_O1_PROJECTION_SEED,
         layer_mlp_o1_ridge: float = 1e-8,
@@ -2029,6 +2067,32 @@ class Qwen38CausalChat:
         ):
             if value is not None and not isinstance(value, (str, Path)):
                 raise TypeError(f"{label} must be a local path or None")
+        if layer_mlp_o1_layers is None:
+            normalized_layer_mlp_o1_layers = (
+                None if layer_mlp_o1_state_path is None else (63,)
+            )
+        else:
+            if isinstance(layer_mlp_o1_layers, (str, bytes)) or not isinstance(
+                layer_mlp_o1_layers,
+                Sequence,
+            ):
+                raise TypeError("layer_mlp_o1_layers must be a sequence or None")
+            normalized_layer_mlp_o1_layers = tuple(layer_mlp_o1_layers)
+            if (
+                not normalized_layer_mlp_o1_layers
+                or any(
+                    isinstance(layer, bool) or not isinstance(layer, int)
+                    for layer in normalized_layer_mlp_o1_layers
+                )
+                or normalized_layer_mlp_o1_layers
+                != tuple(sorted(set(normalized_layer_mlp_o1_layers)))
+                or any(not 0 <= layer <= 63 for layer in normalized_layer_mlp_o1_layers)
+            ):
+                raise ValueError(
+                    "layer_mlp_o1_layers must be sorted unique integers in [0, 63]"
+                )
+            if layer_mlp_o1_state_path is None:
+                raise ValueError("layer_mlp_o1_layers requires layer_mlp_o1_state_path")
         if (
             isinstance(layer_mlp_crystal_max_error_radius, bool)
             or not isinstance(layer_mlp_crystal_max_error_radius, (int, float))
@@ -2521,6 +2585,7 @@ class Qwen38CausalChat:
             if layer_mlp_o1_compute_root is None
             else Path(layer_mlp_o1_compute_root).expanduser().absolute()
         )
+        self._layer_mlp_o1_layers = normalized_layer_mlp_o1_layers
         self._layer_mlp_o1_sketch_dim = layer_mlp_o1_sketch_dim
         self._layer_mlp_o1_projection_seed = layer_mlp_o1_projection_seed
         self._layer_mlp_o1_ridge = layer_mlp_o1_ridge
@@ -2616,6 +2681,11 @@ class Qwen38CausalChat:
         self._layer_mlp_crystal_atlas: LiveGraph | None = None
         self._layer_mlp_crystal_compute_graph: ComputeOperatorGraph | None = None
         self._layer_mlp_o1_worker: Layer63MlpO1AsyncWorker | None = None
+        self._layer_mlp_o1_pool: LayerMlpO1AsyncPool | None = None
+        self._layer_mlp_o1_registry: dict[
+            int,
+            Layer63MlpO1Accumulator | LayerMlpO1Accumulator,
+        ] = {}
         self._layer_mlp_o1_atlas: LiveGraph | None = None
         self._layer_mlp_o1_compute_graph: ComputeOperatorGraph | None = None
         self._mlp_page_coordinate_bank: MlpPageCoordinateBank | None = None
@@ -4789,16 +4859,28 @@ class Qwen38CausalChat:
         self._last_mlp_page_coordinate_evidence = request
         return request
 
-    def _open_layer_mlp_o1_worker(
+    def _open_layer_mlp_o1_runtime(
         self,
         runtime: _OwnedRuntime,
-    ) -> tuple[Layer63MlpO1AsyncWorker, LiveGraph, ComputeOperatorGraph]:
-        """Authenticate one passive O1 authority and start its bounded worker."""
+    ) -> tuple[
+        Layer63MlpO1AsyncWorker | None,
+        LayerMlpO1AsyncPool | None,
+        LiveGraph,
+        ComputeOperatorGraph,
+        dict[int, Layer63MlpO1Accumulator | LayerMlpO1Accumulator],
+    ]:
+        """Authenticate passive O1 states and start one bounded async runtime."""
 
         state_path = self._layer_mlp_o1_state_path
         atlas_path = self._layer_mlp_o1_atlas_path
         compute_root = self._layer_mlp_o1_compute_root
-        if state_path is None or atlas_path is None or compute_root is None:
+        layers = self._layer_mlp_o1_layers
+        if (
+            state_path is None
+            or atlas_path is None
+            or compute_root is None
+            or layers is None
+        ):
             raise Qwen38ChatError("layer-MLP O1 collection is incompletely configured")
         model = runtime.model
         model_pin = getattr(model, "layer_mlp_crystal_model_sha256", None)
@@ -4818,11 +4900,54 @@ class Qwen38CausalChat:
         ):
             raise Qwen38ChatError("runtime layer-MLP O1 byte scope is invalid")
 
-        try:
-            existing = Layer63MlpO1Accumulator.load(state_path)
-        except FileNotFoundError:
-            existing = None
-        if existing is None:
+        projection = LayerTransitionProjectionIdentity(
+            hidden_dim=model.config.dim,
+            sketch_dim=self._layer_mlp_o1_sketch_dim,
+            seed_sha256=self._layer_mlp_o1_projection_seed,
+        )
+        accumulators: dict[
+            int,
+            Layer63MlpO1Accumulator | LayerMlpO1Accumulator,
+        ] = {}
+        existing: dict[
+            int,
+            Layer63MlpO1Accumulator | LayerMlpO1Accumulator,
+        ] = {}
+        for layer_index in layers:
+            layer_state_path = _layer_mlp_o1_state_path_for_layer(
+                state_path,
+                layer_index=layer_index,
+                sketch_dim=self._layer_mlp_o1_sketch_dim,
+            )
+            try:
+                accumulator = (
+                    Layer63MlpO1Accumulator.load(layer_state_path)
+                    if layer_index == 63
+                    else LayerMlpO1Accumulator.load(layer_state_path)
+                )
+            except FileNotFoundError:
+                continue
+            identity = accumulator.identity
+            expected_identity_type = (
+                Layer63MlpResidualCrystalIdentity
+                if layer_index == 63
+                else LayerMlpResidualCrystalIdentity
+            )
+            if not isinstance(identity, expected_identity_type):
+                raise Qwen38ChatError(
+                    f"layer-{layer_index} MLP O1 state has another identity generation"
+                )
+            if identity.layer_index != layer_index:
+                raise Qwen38ChatError(
+                    f"layer-{layer_index} MLP O1 state has another layer identity"
+                )
+            existing[layer_index] = accumulator
+
+        authority_layer = 63 if 63 in existing else min(existing, default=None)
+        authority_identity = (
+            None if authority_layer is None else existing[authority_layer].identity
+        )
+        if authority_identity is None:
             try:
                 atlas = LiveGraph(atlas_path)
                 sequence, event_sha256 = atlas.store.revision()
@@ -4842,59 +4967,90 @@ class Qwen38CausalChat:
                 raise Qwen38ChatError(
                     "layer-MLP O1 Compute authority is unavailable or unauthenticated"
                 ) from exc
-            identity = Layer63MlpResidualCrystalIdentity(
-                model_sha256=live_model_sha256,
-                q4_sha256=live_q4_sha256,
-                graph_revision_sha256=graph_revision_sha256,
-                atlas_revision_sha256=atlas_revision_sha256,
-                projection=LayerTransitionProjectionIdentity(
-                    hidden_dim=model.config.dim,
-                    sketch_dim=self._layer_mlp_o1_sketch_dim,
-                    seed_sha256=self._layer_mlp_o1_projection_seed,
-                ),
+        else:
+            atlas = _open_layer_mlp_crystal_atlas(
+                atlas_path,
+                atlas_revision_sha256=authority_identity.atlas_revision_sha256,
             )
-            accumulator = Layer63MlpO1Accumulator(
-                state_path,
+            compute_graph, _compute_state = _open_layer_mlp_crystal_compute_graph(
+                compute_root,
+                graph_revision_sha256=authority_identity.graph_revision_sha256,
+            )
+            atlas_revision_sha256 = authority_identity.atlas_revision_sha256
+            graph_revision_sha256 = authority_identity.graph_revision_sha256
+
+        for layer_index in layers:
+            accumulator = existing.get(layer_index)
+            if accumulator is not None:
+                identity = accumulator.identity
+                if (
+                    identity.model_sha256 != live_model_sha256
+                    or identity.q4_sha256 != live_q4_sha256
+                    or identity.graph_revision_sha256 != graph_revision_sha256
+                    or identity.atlas_revision_sha256 != atlas_revision_sha256
+                    or identity.projection != projection
+                    or accumulator.packed_weight_bytes_avoided != live_packed_bytes
+                    or accumulator.ridge != self._layer_mlp_o1_ridge
+                    or accumulator.coverage_guard != self._layer_mlp_o1_coverage_guard
+                    or accumulator.error_guard != self._layer_mlp_o1_error_guard
+                ):
+                    raise Qwen38ChatError(
+                        f"layer-{layer_index} MLP O1 state differs from the "
+                        "configured runtime identity"
+                    )
+                accumulators[layer_index] = accumulator
+                continue
+            identity = (
+                Layer63MlpResidualCrystalIdentity(
+                    model_sha256=live_model_sha256,
+                    q4_sha256=live_q4_sha256,
+                    graph_revision_sha256=graph_revision_sha256,
+                    atlas_revision_sha256=atlas_revision_sha256,
+                    projection=projection,
+                )
+                if layer_index == 63
+                else LayerMlpResidualCrystalIdentity(
+                    model_sha256=live_model_sha256,
+                    q4_sha256=live_q4_sha256,
+                    graph_revision_sha256=graph_revision_sha256,
+                    atlas_revision_sha256=atlas_revision_sha256,
+                    projection=projection,
+                    layer_index=layer_index,
+                )
+            )
+            accumulator_type = (
+                Layer63MlpO1Accumulator if layer_index == 63 else LayerMlpO1Accumulator
+            )
+            accumulators[layer_index] = accumulator_type(
+                _layer_mlp_o1_state_path_for_layer(
+                    state_path,
+                    layer_index=layer_index,
+                    sketch_dim=self._layer_mlp_o1_sketch_dim,
+                ),
                 identity,
                 packed_weight_bytes_avoided=live_packed_bytes,
                 ridge=self._layer_mlp_o1_ridge,
                 coverage_guard=self._layer_mlp_o1_coverage_guard,
                 error_guard=self._layer_mlp_o1_error_guard,
             )
-        else:
-            identity = existing.identity
-            atlas = _open_layer_mlp_crystal_atlas(
-                atlas_path,
-                atlas_revision_sha256=identity.atlas_revision_sha256,
+
+        if layers == (63,):
+            accumulator = accumulators[63]
+            if not isinstance(accumulator, Layer63MlpO1Accumulator):
+                raise Qwen38ChatError("legacy layer-63 MLP O1 state is invalid")
+            worker = Layer63MlpO1AsyncWorker(
+                accumulator,
+                queue_capacity=self._layer_mlp_o1_queue_capacity,
             )
-            compute_graph, _compute_state = _open_layer_mlp_crystal_compute_graph(
-                compute_root,
-                graph_revision_sha256=identity.graph_revision_sha256,
-            )
-            expected_projection = LayerTransitionProjectionIdentity(
-                hidden_dim=model.config.dim,
-                sketch_dim=self._layer_mlp_o1_sketch_dim,
-                seed_sha256=self._layer_mlp_o1_projection_seed,
-            )
-            if (
-                identity.model_sha256 != live_model_sha256
-                or identity.q4_sha256 != live_q4_sha256
-                or identity.projection != expected_projection
-                or existing.packed_weight_bytes_avoided != live_packed_bytes
-                or existing.ridge != self._layer_mlp_o1_ridge
-                or existing.coverage_guard != self._layer_mlp_o1_coverage_guard
-                or existing.error_guard != self._layer_mlp_o1_error_guard
-            ):
-                raise Qwen38ChatError(
-                    "layer-MLP O1 state differs from the configured runtime identity"
-                )
-            accumulator = existing
-        worker = Layer63MlpO1AsyncWorker(
-            accumulator,
+            runtime.layer_mlp_o1_worker = worker
+            return worker, None, atlas, compute_graph, accumulators
+
+        pool = LayerMlpO1AsyncPool(
+            accumulators,
             queue_capacity=self._layer_mlp_o1_queue_capacity,
         )
-        runtime.layer_mlp_o1_worker = worker
-        return worker, atlas, compute_graph
+        runtime.layer_mlp_o1_pool = pool
+        return None, pool, atlas, compute_graph, accumulators
 
     def _base_evidence(self) -> dict[str, Any]:
         evidence: dict[str, Any] = {
@@ -5028,6 +5184,37 @@ class Qwen38CausalChat:
                 "ridge": accumulator.ridge,
                 "schema": LAYER_MLP_O1_COLLECTION_EVIDENCE_SCHEMA,
                 "sketch_dim": identity.sketch_dim,
+            }
+        elif self._layer_mlp_o1_pool is not None:
+            registry = self._layer_mlp_o1_registry
+            if not registry:
+                raise Qwen38ChatError("layer-MLP O1 pool lost its identity registry")
+            first = registry[min(registry)]
+            first_identity = first.identity
+            evidence["layer_mlp_o1_collection"] = {
+                "atlas_revision_sha256": first_identity.atlas_revision_sha256,
+                "coverage_guard": first.coverage_guard,
+                "error_guard": first.error_guard,
+                "graph_revision_sha256": first_identity.graph_revision_sha256,
+                "layers": list(registry),
+                "metrics": self._layer_mlp_o1_pool.metrics(),
+                "model_sha256": first_identity.model_sha256,
+                "projection_sha256": first_identity.projection.projection_sha256,
+                "q4_sha256": first_identity.q4_sha256,
+                "registry": {
+                    str(layer_index): {
+                        "action_abi": accumulator.identity.action_abi,
+                        "feature_stage": accumulator.identity.feature_stage,
+                        "identity_sha256": (accumulator.identity.identity_sha256),
+                        "layer_index": layer_index,
+                        "source_stage": accumulator.identity.source_stage,
+                        "target_stage": accumulator.identity.target_stage,
+                    }
+                    for layer_index, accumulator in registry.items()
+                },
+                "ridge": first.ridge,
+                "schema": LAYER_MLP_O1_POOL_COLLECTION_EVIDENCE_SCHEMA,
+                "sketch_dim": first_identity.sketch_dim,
             }
         if self._mlp_page_coordinate_bank is not None:
             identity = self._mlp_page_coordinate_bank.identity
@@ -5381,14 +5568,18 @@ class Qwen38CausalChat:
                     atlas_revision_sha256=identity.atlas_revision_sha256,
                 )
             layer_mlp_o1_worker = None
+            layer_mlp_o1_pool = None
+            layer_mlp_o1_registry = {}
             layer_mlp_o1_atlas = None
             layer_mlp_o1_compute_graph = None
             if self._layer_mlp_o1_state_path is not None:
                 (
                     layer_mlp_o1_worker,
+                    layer_mlp_o1_pool,
                     layer_mlp_o1_atlas,
                     layer_mlp_o1_compute_graph,
-                ) = self._open_layer_mlp_o1_worker(runtime)
+                    layer_mlp_o1_registry,
+                ) = self._open_layer_mlp_o1_runtime(runtime)
             mlp_page_coordinate_bank = None
             if self._mlp_page_coordinate_state_path is not None:
                 configured_delta_router = getattr(
@@ -5515,6 +5706,8 @@ class Qwen38CausalChat:
         self._layer_mlp_crystal_atlas = layer_mlp_crystal_atlas
         self._layer_mlp_crystal_compute_graph = layer_mlp_crystal_compute_graph
         self._layer_mlp_o1_worker = layer_mlp_o1_worker
+        self._layer_mlp_o1_pool = layer_mlp_o1_pool
+        self._layer_mlp_o1_registry = layer_mlp_o1_registry
         self._layer_mlp_o1_atlas = layer_mlp_o1_atlas
         self._layer_mlp_o1_compute_graph = layer_mlp_o1_compute_graph
         self._mlp_page_coordinate_bank = mlp_page_coordinate_bank
@@ -6055,14 +6248,34 @@ class Qwen38CausalChat:
         layer_mlp_crystal_before = self._layer_mlp_crystal_metrics(runtime)
         mlp_page_coordinate_before = self._mlp_page_coordinate_metrics()
         layer_mlp_o1_worker = self._layer_mlp_o1_worker
-        layer_mlp_o1_buffer = (
+        layer_mlp_o1_pool = self._layer_mlp_o1_pool
+        layer_mlp_o1_selected = (
             None
-            if layer_mlp_o1_worker is None
-            else layer_mlp_o1_worker.request_buffer()
+            if layer_mlp_o1_pool is None
+            else layer_mlp_o1_pool.select_request_buffer()
         )
-        layer_mlp_o1_setter = getattr(
+        layer_mlp_o1_layer = (
+            None
+            if layer_mlp_o1_worker is None and layer_mlp_o1_selected is None
+            else 63
+            if layer_mlp_o1_worker is not None
+            else layer_mlp_o1_selected.layer_index
+        )
+        layer_mlp_o1_buffer = (
+            layer_mlp_o1_worker.request_buffer()
+            if layer_mlp_o1_worker is not None
+            else None
+            if layer_mlp_o1_selected is None
+            else layer_mlp_o1_selected.buffer
+        )
+        layer_mlp_o1_single_setter = getattr(
             runtime.model,
             "set_layer_mlp_o1_observer",
+            None,
+        )
+        layer_mlp_o1_registry_setter = getattr(
+            runtime.model,
+            "set_layer_mlp_o1_observers",
             None,
         )
         layer_mlp_o1_model_metrics = getattr(
@@ -6075,14 +6288,32 @@ class Qwen38CausalChat:
             "layer_mlp_o1_observer",
             None,
         )
+        previous_layer_mlp_o1_observers = getattr(
+            runtime.model,
+            "layer_mlp_o1_observers",
+            None,
+        )
         layer_mlp_o1_observer_before = None
         if layer_mlp_o1_buffer is not None:
-            if not callable(layer_mlp_o1_setter) or not callable(
-                layer_mlp_o1_model_metrics
-            ):
+            if not callable(layer_mlp_o1_model_metrics):
                 raise Qwen38ChatError("runtime model lacks passive layer-MLP O1 hooks")
             layer_mlp_o1_observer_before = layer_mlp_o1_model_metrics()
-            layer_mlp_o1_setter(layer_mlp_o1_buffer)
+            if layer_mlp_o1_pool is None:
+                if not callable(layer_mlp_o1_single_setter):
+                    raise Qwen38ChatError(
+                        "runtime model lacks the legacy layer-MLP O1 hook"
+                    )
+                layer_mlp_o1_single_setter(layer_mlp_o1_buffer)
+            else:
+                if not callable(layer_mlp_o1_registry_setter) or not isinstance(
+                    previous_layer_mlp_o1_observers,
+                    Mapping,
+                ):
+                    raise Qwen38ChatError(
+                        "runtime model lacks multi-layer passive O1 hooks"
+                    )
+                assert layer_mlp_o1_layer is not None
+                layer_mlp_o1_registry_setter({layer_mlp_o1_layer: layer_mlp_o1_buffer})
         request_started = time.perf_counter()
         try:
             try:
@@ -6093,8 +6324,15 @@ class Qwen38CausalChat:
                 )
             finally:
                 if layer_mlp_o1_buffer is not None:
-                    assert callable(layer_mlp_o1_setter)
-                    layer_mlp_o1_setter(previous_layer_mlp_o1_observer)
+                    if layer_mlp_o1_pool is None:
+                        assert callable(layer_mlp_o1_single_setter)
+                        layer_mlp_o1_single_setter(previous_layer_mlp_o1_observer)
+                    else:
+                        assert callable(layer_mlp_o1_registry_setter)
+                        assert isinstance(previous_layer_mlp_o1_observers, Mapping)
+                        layer_mlp_o1_registry_setter(
+                            dict(previous_layer_mlp_o1_observers)
+                        )
         finally:
             if restore_lm_head_index is not None:
                 restore_lm_head_index(lm_head_index)
@@ -6205,7 +6443,7 @@ class Qwen38CausalChat:
         output = decoded.strip()
         layer_mlp_o1_request = None
         if layer_mlp_o1_buffer is not None:
-            assert layer_mlp_o1_worker is not None
+            assert layer_mlp_o1_layer is not None
             assert callable(layer_mlp_o1_model_metrics)
             try:
                 observer_after = layer_mlp_o1_model_metrics()
@@ -6214,17 +6452,78 @@ class Qwen38CausalChat:
                     Mapping,
                 ) or not isinstance(observer_after, Mapping):
                     raise ValueError("observer metrics are not mappings")
-                observer_rows = int(observer_after.get("rows", -1)) - int(
-                    layer_mlp_o1_observer_before.get("rows", -1)
+                legacy_observer_schema = "immer.qwen3.8-layer63-mlp-o1-observer/v1"
+                registry_observer_schema = (
+                    "immer.qwen3.8-layer-mlp-o1-observer-registry/v2"
                 )
-                observer_failures = int(observer_after.get("failures", -1)) - int(
-                    layer_mlp_o1_observer_before.get("failures", -1)
-                )
+                before_schema = layer_mlp_o1_observer_before.get("schema")
+                after_schema = observer_after.get("schema")
+                if layer_mlp_o1_pool is None:
+                    if (
+                        before_schema != legacy_observer_schema
+                        or after_schema != legacy_observer_schema
+                    ):
+                        raise ValueError("legacy observer metrics schema changed")
+                    observer_rows = int(observer_after.get("rows", -1)) - int(
+                        layer_mlp_o1_observer_before.get("rows", -1)
+                    )
+                    observer_failures = int(observer_after.get("failures", -1)) - int(
+                        layer_mlp_o1_observer_before.get("failures", -1)
+                    )
+                else:
+                    if before_schema not in {
+                        legacy_observer_schema,
+                        registry_observer_schema,
+                    } or after_schema not in {
+                        legacy_observer_schema,
+                        registry_observer_schema,
+                    }:
+                        raise ValueError("observer registry schema is invalid")
+
+                    def layer_counters(
+                        metrics: Mapping[str, object],
+                        schema: object,
+                    ) -> Mapping[str, object]:
+                        if schema == legacy_observer_schema:
+                            if layer_mlp_o1_layer != 63:
+                                return {"failures": 0, "rows": 0}
+                            return metrics
+                        layers = metrics.get("layers")
+                        if not isinstance(layers, Mapping):
+                            raise ValueError("observer layer metrics are not mappings")
+                        counters = layers.get(
+                            str(layer_mlp_o1_layer),
+                            {"failures": 0, "rows": 0},
+                        )
+                        if not isinstance(counters, Mapping):
+                            raise ValueError("observer layer counters are not mappings")
+                        return counters
+
+                    before_layer = layer_counters(
+                        layer_mlp_o1_observer_before,
+                        before_schema,
+                    )
+                    after_layer = layer_counters(observer_after, after_schema)
+                    if not isinstance(before_layer, Mapping) or not isinstance(
+                        after_layer,
+                        Mapping,
+                    ):
+                        raise ValueError("observer layer counters are not mappings")
+                    observer_rows = int(after_layer.get("rows", -1)) - int(
+                        before_layer.get("rows", -1)
+                    )
+                    observer_failures = int(after_layer.get("failures", -1)) - int(
+                        before_layer.get("failures", -1)
+                    )
                 if observer_rows < 0 or observer_failures < 0:
                     raise ValueError("observer counters moved backwards")
                 batch = layer_mlp_o1_buffer.batch()
                 captured_rows = 0 if batch is None else batch.rows
-                accepted = layer_mlp_o1_worker.submit(batch)
+                accepted = (
+                    layer_mlp_o1_worker.submit(batch)
+                    if layer_mlp_o1_worker is not None
+                    else layer_mlp_o1_pool.submit(layer_mlp_o1_layer, batch)
+                )
             except Exception as exc:
                 layer_mlp_o1_request = {
                     "accounting_error": (
@@ -6236,6 +6535,13 @@ class Qwen38CausalChat:
                     "schema": "immer.qwen3.8-layer63-mlp-o1-request/v1",
                     "status": "accounting-error",
                 }
+                if layer_mlp_o1_pool is not None:
+                    layer_mlp_o1_request.update(
+                        {
+                            "layer_index": layer_mlp_o1_layer,
+                            "schema": ("immer.qwen3.8-layer-mlp-o1-request/v2"),
+                        }
+                    )
             else:
                 layer_mlp_o1_request = {
                     "accounting_error": None,
@@ -6247,6 +6553,13 @@ class Qwen38CausalChat:
                     "schema": "immer.qwen3.8-layer63-mlp-o1-request/v1",
                     "status": "enqueued" if accepted else "empty-or-dropped",
                 }
+                if layer_mlp_o1_pool is not None:
+                    layer_mlp_o1_request.update(
+                        {
+                            "layer_index": layer_mlp_o1_layer,
+                            "schema": ("immer.qwen3.8-layer-mlp-o1-request/v2"),
+                        }
+                    )
         conversation_evidence = {
             "history_messages": len(history),
             "history_turns": len(history) // 2,
@@ -7168,6 +7481,8 @@ class Qwen38CausalChat:
             self._layer_mlp_crystal_atlas = None
             self._layer_mlp_crystal_compute_graph = None
             self._layer_mlp_o1_worker = None
+            self._layer_mlp_o1_pool = None
+            self._layer_mlp_o1_registry = {}
             self._layer_mlp_o1_atlas = None
             self._layer_mlp_o1_compute_graph = None
             self._mlp_page_coordinate_bank = None

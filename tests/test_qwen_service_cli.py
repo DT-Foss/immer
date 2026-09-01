@@ -186,7 +186,9 @@ class QwenServiceCliTests(unittest.TestCase):
                 patch("immer.cli._qwen38_service_profile", return_value="b" * 64),
                 patch(
                     "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
-                    side_effect=AssertionError("post-dispatch failure retried directly"),
+                    side_effect=AssertionError(
+                        "post-dispatch failure retried directly"
+                    ),
                 ) as constructor,
                 redirect_stdout(output),
             ):
@@ -288,8 +290,83 @@ class QwenServiceCliTests(unittest.TestCase):
         self.assertEqual(qwen.close_calls, 1)
         self.assertTrue(_InlineServer.instance.closed)
         self.assertTrue(
-            any(name == "candidate_delta" for name, _body in _InlineServer.instance.events)
+            any(
+                name == "candidate_delta"
+                for name, _body in _InlineServer.instance.events
+            )
         )
+
+    def test_service_forwards_the_multilayer_o1_registry_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            q4 = root / "q4"
+            atlas = root / "atlas"
+            compute = root / "compute"
+            q4.mkdir()
+            atlas.mkdir()
+            compute.mkdir()
+            state = root / "layer63.json"
+
+            def construct(*_args, **options):
+                return _ServiceQwen(options["text_snapshot_sink"])
+
+            policy = {
+                "authorities": {
+                    "atlas_revision_sha256": "a" * 64,
+                    "compute_revision_sha256": "b" * 64,
+                },
+                "enabled": True,
+                "layers": [0, 63],
+                "schema": "immer.qwen3.8-layer-mlp-o1-policy/v2",
+            }
+            with (
+                patch(
+                    "immer.cli._qwen38_layer_mlp_o1_policy",
+                    return_value=policy,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    side_effect=construct,
+                ) as constructor,
+                patch(
+                    "immer.runtimes.qwen3_8.encoding.Qwen38Tokenizer",
+                    return_value=_Tokenizer(),
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.service.UnixQwenServiceServer",
+                    _InlineServer,
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "--service",
+                        "--raw-qwen",
+                        "--qwen38-causal-bundle",
+                        str(root / "qwen.causal"),
+                        "--qwen38-tokenizer",
+                        str(root / "tokenizer.json"),
+                        "--qwen38-q4",
+                        str(q4),
+                        "--layer-mlp-o1-state",
+                        str(state),
+                        "--layer-mlp-o1-atlas",
+                        str(atlas),
+                        "--layer-mlp-o1-compute-root",
+                        str(compute),
+                        "--layer-mlp-o1-layers",
+                        "0,63",
+                        "--socket",
+                        str(root / "qwen.sock"),
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(options["layer_mlp_o1_layers"], (0, 63))
+        self.assertEqual(options["layer_mlp_o1_state_path"], str(state))
 
 
 if __name__ == "__main__":
