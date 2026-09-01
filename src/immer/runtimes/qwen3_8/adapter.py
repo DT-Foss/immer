@@ -8342,6 +8342,8 @@ class Qwen38CausalChat:
                 "resident_page_misses",
                 "resident_protection_drop_calls",
                 "resident_protection_drop_pages",
+                "release_touched_calls",
+                "release_touched_nanoseconds",
                 "resident_unprotected_discard_bytes",
                 "resident_unprotected_discard_calls",
                 "resident_unprotected_discard_pages",

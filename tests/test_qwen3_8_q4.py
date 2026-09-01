@@ -2522,6 +2522,8 @@ class Q4BankTests(unittest.TestCase):
                 torch.testing.assert_close(second, first, rtol=0.0, atol=0.0)
                 self.assertEqual(tuple(selected.shape), (1, 3))
                 metrics = bank.metrics()
+                self.assertEqual(metrics["release_touched_calls"], 3)
+                self.assertGreater(metrics["release_touched_nanoseconds"], 0)
                 self.assertEqual(metrics["resident_protected_pages"], 2)
                 self.assertEqual(metrics["resident_payload_bytes"], 2 * page_size)
                 self.assertEqual(metrics["resident_page_admissions"], 2)

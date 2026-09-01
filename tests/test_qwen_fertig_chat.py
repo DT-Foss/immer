@@ -342,6 +342,8 @@ class QwenFertigChatTests(unittest.TestCase):
                         "page_mlp_selected_pages": 17,
                         "page_mlp_weight_bytes": 200,
                         "resident_page_misses": 19,
+                        "release_touched_calls": 64,
+                        "release_touched_nanoseconds": 123_456,
                         "resident_unprotected_discard_bytes": 4096,
                     },
                     "runtime": {
@@ -450,6 +452,10 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertEqual(
             qwen_receipt["q4"]["request"]["resident_page_misses"],
             19,
+        )
+        self.assertEqual(
+            qwen_receipt["q4"]["request"]["release_touched_nanoseconds"],
+            123_456,
         )
         self.assertTrue(
             qwen_receipt["q4"]["runtime"]["resident_head_fully_protected"]

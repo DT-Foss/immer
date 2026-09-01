@@ -675,6 +675,8 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                         "resident_page_bypasses",
                         "resident_page_hits",
                         "resident_page_misses",
+                        "release_touched_calls",
+                        "release_touched_nanoseconds",
                         "resident_unprotected_discard_bytes",
                         "resident_unprotected_discard_calls",
                         "resident_unprotected_discard_pages",

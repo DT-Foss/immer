@@ -837,6 +837,8 @@ class Q4BankMetrics:
     resident_unprotected_discard_bytes: int = 0
     resident_protection_drop_calls: int = 0
     resident_protection_drop_pages: int = 0
+    release_touched_calls: int = 0
+    release_touched_nanoseconds: int = 0
 
 
 class Q4Bank:
@@ -1449,6 +1451,7 @@ class Q4Bank:
     def release_touched(self, *, force_prefetch: bool = False) -> None:
         """Discard only unprotected demand pages at an execution boundary."""
 
+        started = time.perf_counter_ns()
         with self._lock:
             if self._closed:
                 raise Q4BankError("Q4 bank is closed")
@@ -1496,6 +1499,10 @@ class Q4Bank:
                 if active is not None:
                     unprotected = self._subtract_page_runs(unprotected, active[1])
                 self._discard_page_runs(name, unprotected)
+        elapsed = time.perf_counter_ns() - started
+        with self._lock:
+            self._stats.release_touched_calls += 1
+            self._stats.release_touched_nanoseconds += max(0, elapsed)
 
     def linear(self, values: Any, name: str, *, output_dtype: Any | None = None) -> Any:
         import torch
