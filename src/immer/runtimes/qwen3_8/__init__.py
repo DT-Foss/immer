@@ -311,7 +311,11 @@ from .anchor_battery import (
     ProfitLedger,
     RadixDemandMiner,
 )
-from .snapshot import QWEN38_SNAPSHOT_SCHEMA, Qwen38SnapshotError
+from .snapshot import (
+    QWEN38_SNAPSHOT_SCHEMA,
+    Qwen38SnapshotError,
+    Qwen38SnapshotIdentityMismatch,
+)
 from .speculative import (
     DraftProvider,
     K4DraftProvider,
@@ -554,6 +558,7 @@ __all__ = [
     "Qwen38MarkovMtpDraftMetrics",
     "Qwen38MarkovMtpDraftProvider",
     "Qwen38SnapshotError",
+    "Qwen38SnapshotIdentityMismatch",
     "Qwen38SpeculativeError",
     "Qwen38StableCrsaGraft",
     "Qwen38Tokenizer",

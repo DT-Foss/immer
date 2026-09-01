@@ -27,7 +27,7 @@ from safetensors.torch import load as load_safetensors
 from safetensors.torch import save as save_safetensors
 import torch
 
-from .snapshot import QWEN38_SNAPSHOT_SCHEMA
+from .snapshot import QWEN38_SNAPSHOT_SCHEMA, Qwen38SnapshotIdentityMismatch
 
 
 TOKEN_PREFIX_SCHEMA = "immer.qwen3.8-token-prefix/v1"
@@ -1380,6 +1380,26 @@ class SemanticStateAnchorCache:
                     exact_prefix=exact,
                     seed_hidden=seed_hidden,
                 )
+            except Qwen38SnapshotIdentityMismatch:
+                current = state.by_prefix().get(anchor.prefix_sha256)
+                if current != anchor:
+                    raise SemanticStateCacheError(
+                        "anchor changed before incompatible eviction"
+                    )
+                retained = tuple(
+                    row
+                    for row in state.anchors
+                    if row.prefix_sha256 != anchor.prefix_sha256
+                )
+                self._write_index(
+                    _IndexState(
+                        anchors=retained,
+                        generation=state.generation + 1,
+                        logical_clock=state.logical_clock,
+                    )
+                )
+                self._delete_anchor_artifacts(anchor)
+                return None
             except Exception:
                 if loaded_completed:
                     try:

@@ -8,6 +8,7 @@ from typing import Any
 
 from ..deepseek_v4.snapshot import (
     DeepSeekV4SnapshotError,
+    DeepSeekV4SnapshotIdentityMismatch,
     LoadedSnapshot,
     SnapshotLimits,
     SnapshotTensor,
@@ -21,6 +22,10 @@ QWEN38_SNAPSHOT_SCHEMA = "immer.qwen3.8-continuation/v1"
 
 class Qwen38SnapshotError(ValueError):
     """A Qwen continuation is corrupt, unsafe, or runtime-incompatible."""
+
+
+class Qwen38SnapshotIdentityMismatch(Qwen38SnapshotError):
+    """The snapshot is valid but belongs to a different Qwen runtime."""
 
 
 def write_qwen38_snapshot(
@@ -61,6 +66,8 @@ def read_qwen38_snapshot(
             max_restore_peak_bytes=max_restore_peak_bytes,
             schema=QWEN38_SNAPSHOT_SCHEMA,
         )
+    except DeepSeekV4SnapshotIdentityMismatch as exc:
+        raise Qwen38SnapshotIdentityMismatch(str(exc)) from exc
     except DeepSeekV4SnapshotError as exc:
         raise Qwen38SnapshotError(str(exc)) from exc
 
@@ -69,6 +76,7 @@ __all__ = [
     "LoadedSnapshot",
     "QWEN38_SNAPSHOT_SCHEMA",
     "Qwen38SnapshotError",
+    "Qwen38SnapshotIdentityMismatch",
     "SnapshotLimits",
     "SnapshotTensor",
     "read_qwen38_snapshot",

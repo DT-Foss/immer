@@ -56,7 +56,11 @@ from .quantization import (
     quantize_fp8_e4m3_parts,
     unpack_fp4_e2m1,
 )
-from .snapshot import DeepSeekV4SnapshotError, SnapshotLimits
+from .snapshot import (
+    DeepSeekV4SnapshotError,
+    DeepSeekV4SnapshotIdentityMismatch,
+    SnapshotLimits,
+)
 from .semantic_state_cache import (
     AnchorReceipt,
     BOUNDARY_KINDS,
@@ -125,6 +129,7 @@ __all__ = [
     "CausalWeightReader",
     "DeepSeekV4Config",
     "DeepSeekV4SnapshotError",
+    "DeepSeekV4SnapshotIdentityMismatch",
     "DeepSeekRuntimeSource",
     "DeepSeekRuntimeSourceError",
     "DeepSeekWeightPager",

@@ -35,6 +35,10 @@ class DeepSeekV4SnapshotError(ValueError):
     """A continuation snapshot is unsafe, corrupt, or incompatible."""
 
 
+class DeepSeekV4SnapshotIdentityMismatch(DeepSeekV4SnapshotError):
+    """The snapshot is valid but belongs to a different runtime identity."""
+
+
 @dataclass(frozen=True, slots=True)
 class SnapshotLimits:
     """Hard admission bounds applied before tensor allocation."""
@@ -661,7 +665,9 @@ def read_snapshot(
     if not isinstance(identity, dict) or _canonical_json(identity) != _canonical_json(
         dict(expected_identity)
     ):
-        raise DeepSeekV4SnapshotError("snapshot model/source/runtime identity mismatch")
+        raise DeepSeekV4SnapshotIdentityMismatch(
+            "snapshot model/source/runtime identity mismatch"
+        )
     state = body.get("state")
     if not isinstance(state, dict):
         raise DeepSeekV4SnapshotError("snapshot state must be an object")
@@ -795,6 +801,7 @@ def read_snapshot(
 
 __all__ = [
     "DeepSeekV4SnapshotError",
+    "DeepSeekV4SnapshotIdentityMismatch",
     "LoadedSnapshot",
     "SNAPSHOT_SCHEMA",
     "SNAPSHOT_VERSION",

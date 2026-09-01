@@ -21,7 +21,6 @@ from immer.runtimes.qwen3_8.semantic_state_cache import (
     semantic_label_sha256,
     token_prefix_sha256,
 )
-from immer.runtimes.qwen3_8.snapshot import Qwen38SnapshotError
 
 from test_qwen3_8_model import _tiny_config, _tiny_weights
 
@@ -203,16 +202,17 @@ class Qwen38SemanticStateCacheTests(unittest.TestCase):
         self.assertEqual(target.next_position, 0)
         self.assertEqual(cache.index_path.read_bytes(), before)
 
-    def test_native_identity_mismatch_rejects_without_counting_a_hit(self) -> None:
+    def test_native_identity_mismatch_evicts_stale_anchor_as_a_miss(self) -> None:
         cache = SemanticStateAnchorCache(self.root / "cache")
         anchor = self._charged(cache, [1, 4, 9])
         incompatible = self._model(dtype="bfloat16")
-        with self.assertRaisesRegex(Qwen38SnapshotError, "identity mismatch"):
-            cache.restore_deepest(incompatible, [1, 4, 9, 7])
+        self.assertIsNone(cache.restore_deepest(incompatible, [1, 4, 9, 7]))
         self.assertEqual(incompatible.next_position, 0)
-        current = cache.receipts()[0]
-        self.assertEqual(current.receipt_sha256, anchor.receipt_sha256)
-        self.assertEqual(current.hit_count, 0)
+        self.assertEqual(cache.receipts(), ())
+        self.assertFalse(
+            (cache.snapshots / anchor.snapshot_manifest_name).exists()
+        )
+        self.assertFalse((cache.snapshots / anchor.snapshot_payload_name).exists())
 
     def test_manifest_payload_index_tamper_and_symlinks_fail_closed(self) -> None:
         cache = SemanticStateAnchorCache(self.root / "cache")
