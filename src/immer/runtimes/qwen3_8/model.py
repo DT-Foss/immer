@@ -652,6 +652,60 @@ class StreamedQwen38:
             )
         self.attention_output_crystal_enabled = enabled
 
+    def set_delta_head_router(self, router: Any | None) -> None:
+        """Select one output-changing DeltaNet coordinate action while idle."""
+
+        if router is not None:
+            required = (
+                "begin_transaction",
+                "commit_transaction",
+                "finalize_transaction",
+                "project",
+                "project_many",
+                "reset_session",
+                "revert_committed_transaction",
+                "rollback_transaction",
+                "snapshot_identity",
+                "supports_layer",
+            )
+            if any(not callable(getattr(router, name, None)) for name in required):
+                raise TypeError("delta_head_router lacks the runtime contract")
+            identity = router.snapshot_identity(transport_neutral=True)
+            if (
+                not isinstance(identity, dict)
+                or not isinstance(identity.get("layers"), list)
+                or any(
+                    isinstance(layer, bool)
+                    or not isinstance(layer, int)
+                    or not 0 <= layer < self.config.n_layers
+                    or self.config.is_full_attention(layer)
+                    for layer in identity["layers"]
+                )
+            ):
+                raise ValueError("delta_head_router identity is invalid")
+            if self.attention_output_crystal_enabled:
+                raise Qwen38RuntimeError(
+                    "Delta head coordinates require an action-bound attention bank"
+                )
+        if (
+            self._pending_block_stage is not None
+            or self._active_attention_output_crystal_transaction is not None
+        ):
+            raise Qwen38RuntimeError(
+                "Delta head coordinate action cannot change during a stage"
+            )
+        current = self.delta_head_router
+        if current is router:
+            if router is not None:
+                router.reset_session()
+            return
+        if current is not None:
+            current.reset_session()
+        if router is not None:
+            router.reset_session()
+        self.delta_head_router = router
+        self._attention_state_digest_cache.clear()
+
     @staticmethod
     def _attention_tensor_cache_stamp(tensor: torch.Tensor) -> tuple[object, ...]:
         return (
@@ -4937,6 +4991,8 @@ class StreamedQwen38:
         forward_count = len(forwards)
         first_token_seconds: float | None = None
         generation_crystal_transaction: AttentionOutputCrystalTransaction | None = None
+        generation_delta_router = self.delta_head_router
+        delta_transaction_active = False
         if (
             self.attention_output_crystal_enabled
             and self.attention_output_crystal_bank is not None
@@ -4952,6 +5008,9 @@ class StreamedQwen38:
             self._active_attention_output_crystal_transaction = (
                 generation_crystal_transaction
             )
+        if generation_delta_router is not None:
+            generation_delta_router.begin_transaction()
+            delta_transaction_active = True
         try:
             for step in range(max_new_tokens):
                 values, token_ids = self.pager.topk_logits(
@@ -4990,6 +5049,8 @@ class StreamedQwen38:
             self._rollback_attention_output_crystal_transaction(
                 generation_crystal_transaction
             )
+            if delta_transaction_active:
+                generation_delta_router.rollback_transaction()
             raise
         finally:
             if generation_crystal_transaction is not None:
@@ -4998,6 +5059,14 @@ class StreamedQwen38:
             generation_crystal_transaction,
             accepted_end_position=self._next_position,
         )
+        if delta_transaction_active:
+            try:
+                generation_delta_router.commit_transaction()
+                generation_delta_router.finalize_transaction()
+            except Exception:
+                generation_delta_router.rollback_transaction()
+                generation_delta_router.revert_committed_transaction()
+                raise
 
         prompt_ids = tuple(
             int(value) for value in prompt[0].detach().to("cpu").tolist()

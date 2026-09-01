@@ -218,11 +218,12 @@ class InferenceActionReceipt:
         ):
             _uint(getattr(self, name), name)
         _nonnegative_float(self.request_wall_seconds, "request_wall_seconds")
-        if "attention_output_crystal" in self.actions and (
-            "qwen_target" not in self.actions or self.target_forwards <= 0
-        ):
+        if any(
+            action in self.actions
+            for action in ("attention_output_crystal", "mlp_head_coordinate")
+        ) and ("qwen_target" not in self.actions or self.target_forwards <= 0):
             raise ValueError(
-                "attention_output_crystal requires executed target attention"
+                "coordinate actions require executed Qwen target work"
             )
 
     @classmethod
@@ -389,6 +390,10 @@ class InferenceActionDirective:
             ):
                 raise ValueError(
                     f"{name} attention_output_crystal requires qwen_target"
+                )
+            if "mlp_head_coordinate" in actions and "qwen_target" not in actions:
+                raise ValueError(
+                    f"{name} mlp_head_coordinate requires qwen_target"
                 )
         if self.draft_enabled is not None and not isinstance(
             self.draft_enabled,
@@ -737,6 +742,7 @@ class InferenceActionBank:
             and "qwen_target" in receipt.actions
             and (
                 "attention_output_crystal" in receipt.actions
+                or "mlp_head_coordinate" in receipt.actions
                 or (
                     "target_verified_draft" in receipt.actions
                     and receipt.saved_qwen_forwards > 0
@@ -792,6 +798,10 @@ class InferenceActionBank:
             runtime_action_set.update(
                 {"attention_output_crystal", "qwen_target"}
             )
+        if exact_runtime and any(
+            "mlp_head_coordinate" in receipt.actions for receipt in exact_runtime
+        ):
+            runtime_action_set.update({"mlp_head_coordinate", "qwen_target"})
         runtime_actions = tuple(sorted(runtime_action_set))
         if exact:
             primary = exact[0].actions

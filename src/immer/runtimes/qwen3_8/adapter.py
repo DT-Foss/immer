@@ -293,6 +293,20 @@ def _inference_action_directive(metadata: object) -> InferenceActionDirective | 
         raise ValueError("Qwen inference action directive is invalid") from exc
 
 
+def _effective_qwen_actions(
+    directive: InferenceActionDirective | None,
+) -> tuple[str, ...]:
+    """Return the primary or fallback vector that actually invokes Qwen."""
+
+    if directive is None:
+        return ()
+    if "qwen_target" in directive.primary_actions:
+        return directive.primary_actions
+    if "qwen_target" in directive.fallback_actions:
+        return directive.fallback_actions
+    return ()
+
+
 def _mapping(value: object, label: str) -> dict[str, Any]:
     if is_dataclass(value) and not isinstance(value, type):
         value = asdict(value)
@@ -1101,7 +1115,9 @@ def _open_local_runtime(
                 None if fast_mlp_mount is None else fast_mlp_mount.executor
             ),
             mlp_page_router=mlp_page_router,
-            delta_head_router=delta_head_router,
+            # Output-changing Delta coordinates are mounted by the runtime but
+            # selected only for an explicit request action after anchor restore.
+            delta_head_router=None,
             native_head_crsa=native_head_crsa,
             native_deltanet_recurrence=q4_bank is not None,
             native_deltanet_fusion=q4_bank is not None,
@@ -2658,7 +2674,7 @@ class Qwen38CausalChat:
         self._last_attention_output_crystal_evidence = None
         fast_mount = getattr(runtime, "fast_mlp_mount", None)
         fast_before = None if fast_mount is None else fast_mount.metrics()
-        delta_router = getattr(runtime, "delta_head_router", None)
+        delta_router = getattr(runtime.model, "delta_head_router", None)
         delta_before = None if delta_router is None else delta_router.metrics()
         exact_head = getattr(runtime, "exact_head_index", None)
         exact_before = None if exact_head is None else exact_head.metrics()
@@ -3336,7 +3352,7 @@ class Qwen38CausalChat:
         runtime: _OwnedRuntime,
         before: Mapping[str, int] | None,
     ) -> dict[str, Any] | None:
-        router = getattr(runtime, "delta_head_router", None)
+        router = getattr(runtime.model, "delta_head_router", None)
         if router is None or before is None:
             return None
         after = router.metrics()
@@ -3795,10 +3811,42 @@ class Qwen38CausalChat:
         if any(token_id >= vocab_size for token_id in prompt_ids):
             raise _RequestRejected("prompt token is outside the checkpoint vocabulary")
 
+        effective_qwen_actions = _effective_qwen_actions(action_directive)
+        delta_head_router = getattr(runtime, "delta_head_router", None)
+        delta_head_directive_selected = (
+            "mlp_head_coordinate" in effective_qwen_actions
+        )
+        delta_head_applied = (
+            delta_head_router is not None and delta_head_directive_selected
+        )
+        set_delta_head_router = getattr(
+            runtime.model,
+            "set_delta_head_router",
+            None,
+        )
+        if delta_head_router is not None and not callable(set_delta_head_router):
+            raise Qwen38ChatError(
+                "runtime model cannot select Delta head coordinate actions"
+            )
+        if delta_head_router is not None:
+            assert callable(set_delta_head_router)
+            set_delta_head_router(None)
+        if delta_head_applied:
+            current_state = _anchor_model_state(runtime.model)
+            if self._conversation_session_id is not None or current_state != (
+                0,
+                False,
+                0,
+                None,
+            ):
+                runtime.model.reset_state(release=True)
+                self._clear_conversation_binding()
+
         attention_output_crystal_applied = False
         attention_output_crystal_directive_selected = False
+        set_attention_output_crystal_enabled = None
         if self._attention_output_crystal_bank is not None:
-            attention_output_crystal_applied = True
+            attention_output_crystal_applied = not delta_head_applied
             attention_output_crystal_directive_selected = (
                 action_directive is not None
                 and "attention_output_crystal"
@@ -3813,7 +3861,12 @@ class Qwen38CausalChat:
                 raise Qwen38ChatError(
                     "runtime model cannot select attention-output Crystal execution"
                 )
-            set_attention_output_crystal_enabled(True)
+            set_attention_output_crystal_enabled(
+                attention_output_crystal_applied
+            )
+        if delta_head_applied:
+            assert callable(set_delta_head_router)
+            set_delta_head_router(delta_head_router)
 
         reuse_status = "disabled" if session_id is None else "cold"
         reused_prefix_tokens = 0
@@ -4084,6 +4137,22 @@ class Qwen38CausalChat:
             generation_options,
         )
         request_seconds = time.perf_counter() - request_started
+        if delta_head_applied:
+            assert callable(set_delta_head_router)
+            runtime.model.reset_state(release=True)
+            self._clear_conversation_binding()
+            set_delta_head_router(None)
+            if self._attention_output_crystal_bank is not None:
+                set_attention_output_crystal_enabled = getattr(
+                    runtime.model,
+                    "set_attention_output_crystal_enabled",
+                    None,
+                )
+                if not callable(set_attention_output_crystal_enabled):
+                    raise Qwen38ChatError(
+                        "runtime model lost attention-output Crystal selection"
+                    )
+                set_attention_output_crystal_enabled(True)
         self._record_attention_output_crystal_request(
             attention_output_crystal_before,
             self._attention_output_crystal_metrics(),
@@ -4291,6 +4360,10 @@ class Qwen38CausalChat:
                     ),
                     "attention_output_crystal_directive_selected": (
                         attention_output_crystal_directive_selected
+                    ),
+                    "mlp_head_coordinate": delta_head_applied,
+                    "mlp_head_coordinate_directive_selected": (
+                        delta_head_directive_selected
                     ),
                     "draft_enabled": self._last_draft_evidence is not None,
                     "draft_window_ceiling": (
@@ -4732,6 +4805,27 @@ class Qwen38CausalChat:
                 if callable(callback):
                     callback()
 
+            def detach_delta_action() -> None:
+                if getattr(runtime.model, "delta_head_router", None) is None:
+                    return
+                setter = getattr(runtime.model, "set_delta_head_router", None)
+                if not callable(setter):
+                    raise Qwen38ChatError(
+                        "runtime model lost Delta head coordinate selection"
+                    )
+                setter(None)
+                if self._attention_output_crystal_bank is not None:
+                    crystal_setter = getattr(
+                        runtime.model,
+                        "set_attention_output_crystal_enabled",
+                        None,
+                    )
+                    if not callable(crystal_setter):
+                        raise Qwen38ChatError(
+                            "runtime model lost attention-output Crystal selection"
+                        )
+                    crystal_setter(True)
+
             try:
                 result = self._execute_locked(
                     runtime,
@@ -4779,6 +4873,7 @@ class Qwen38CausalChat:
                 else:
                     self._clear_conversation_binding()
                     runtime.model.reset_state(release=True)
+                    detach_delta_action()
             except Exception as exc:
                 page_router = getattr(runtime, "mlp_page_router", None)
                 abort_reward = getattr(

@@ -648,6 +648,42 @@ class InferenceActionBankTests(unittest.TestCase):
         self.assertIn("target_verified_draft", directive.primary_actions)
         self.assertTrue(directive.draft_enabled)
 
+    def test_delta_coordinate_is_recommended_only_for_the_same_runtime(self) -> None:
+        economics = _economics(
+            "delta-coordinate",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        actions = ("mlp_head_coordinate", "qwen_target")
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = InferenceActionBank(Path(temporary) / "actions")
+            bank.observe(economics, executed_actions=actions)
+            same = bank.recommend(
+                question_sha256=_sha("same-runtime question"),
+                runtime_profile_sha256=_sha("profile"),
+            )
+            other = bank.recommend(
+                question_sha256=_sha("other-runtime question"),
+                runtime_profile_sha256=_sha("other profile"),
+            )
+
+        assert same is not None
+        self.assertEqual(same.primary_actions, actions)
+        self.assertEqual(same.fallback_actions, actions)
+        self.assertIsNone(other)
+        with self.assertRaises(ValueError):
+            InferenceActionDirective(
+                question_sha256=_sha("invalid coordinate"),
+                runtime_profile_sha256=_sha("profile"),
+                primary_actions=("mlp_head_coordinate",),
+                fallback_actions=("qwen_target",),
+                draft_enabled=None,
+                source_signature_sha256s=("3" * 64,),
+                support=1,
+                saved_qwen_forwards=0,
+            )
+
     def test_reconcile_recovers_a_missed_derived_event_and_tamper_is_hard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             bank = InferenceActionBank(Path(temporary) / "actions")

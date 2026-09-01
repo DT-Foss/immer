@@ -161,6 +161,8 @@ class _Model:
         self.state_poisoned = False
         self.state_batch_size = None
         self._pending_block_stage = None
+        self.delta_head_router = None
+        self.delta_head_router_calls: list[object | None] = []
         self.pager = SimpleNamespace(release=Mock())
         self.generation_error = generation_error
         self.cleanup_error = cleanup_error
@@ -202,6 +204,10 @@ class _Model:
         self.state_poisoned = False
         self.state_batch_size = None
         self.state_bytes = 0
+
+    def set_delta_head_router(self, router):
+        self.delta_head_router = router
+        self.delta_head_router_calls.append(router)
 
 
 class _StreamingModel(_Model):
@@ -1014,7 +1020,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 patch(
                     "immer.runtimes.qwen3_8.adapter.StreamedQwen38",
                     return_value=model,
-                ),
+                ) as model_constructor,
                 patch(
                     "immer.runtimes.qwen3_8.adapter.MlpPageMarkov",
                     return_value=router,
@@ -1058,7 +1064,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
             delta_options = delta_constructor.call_args.kwargs
             self.assertEqual(delta_options["active_layers"], (0,))
             self.assertEqual(delta_options["state_path"], root / "delta.json")
+            self.assertIsNone(
+                model_constructor.call_args.kwargs["delta_head_router"]
+            )
             self.assertIs(runtime.delta_head_router, delta_router)
+            self.assertIsNone(model.delta_head_router)
             runtime.close()
             mount.close.assert_called_once_with()
 
@@ -2137,11 +2147,171 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "attention_output_crystal_directive_selected": False,
                 "draft_enabled": False,
                 "draft_window_ceiling": None,
+                "mlp_head_coordinate": False,
+                "mlp_head_coordinate_directive_selected": False,
             },
         )
         self.assertEqual(
             result.evidence["inference_action_directive"]["directive"],
             directive.to_document(),
+        )
+        chat.close()
+
+    def test_delta_coordinate_action_is_request_local_and_uses_qwen_fallback(
+        self,
+    ) -> None:
+        coordinate = ("mlp_head_coordinate", "qwen_target")
+
+        def directive(primary, fallback):
+            return InferenceActionDirective(
+                question_sha256=hashlib.sha256(b"hello").hexdigest(),
+                runtime_profile_sha256="2" * 64,
+                primary_actions=primary,
+                fallback_actions=fallback,
+                draft_enabled=False,
+                source_signature_sha256s=("3" * 64,),
+                support=1,
+                saved_qwen_forwards=0,
+            )
+
+        for primary, fallback in (
+            (coordinate, coordinate),
+            (("parametric_program",), coordinate),
+        ):
+            with self.subTest(primary=primary):
+                runtime = _Runtime()
+                router = SimpleNamespace(
+                    metrics=Mock(
+                        side_effect=(
+                            {
+                                "calls": 10,
+                                "rows": 20,
+                                "logical_bytes_saved": 30,
+                            },
+                            {
+                                "calls": 12,
+                                "rows": 24,
+                                "logical_bytes_saved": 50,
+                            },
+                        )
+                    )
+                )
+                runtime.delta_head_router = router
+                runtime.delta_head_receipt = {
+                    "layers": [0],
+                    "schema": "fixture.delta-head/v2",
+                }
+                chat = _chat(
+                    runtime,
+                    q4_root="/q4",
+                    delta_head_state_path="/state/delta.json",
+                )
+
+                result = chat.handle(
+                    Request(
+                        "chat",
+                        "hello",
+                        {
+                            QWEN38_INFERENCE_ACTION_METADATA: directive(
+                                primary,
+                                fallback,
+                            ).to_document()
+                        },
+                    )
+                )
+
+                self.assertTrue(result.ok, result.reason)
+                self.assertEqual(
+                    runtime.model.delta_head_router_calls,
+                    [None, router, None],
+                )
+                self.assertIsNone(runtime.model.delta_head_router)
+                self.assertIn(True, runtime.model.reset_calls)
+                self.assertEqual(
+                    result.evidence["delta_head_router"]["request"],
+                    {
+                        "calls": 2,
+                        "logical_bytes_saved": 20,
+                        "rows": 4,
+                        "schema": "immer.qwen3.8-delta-head-request/v1",
+                    },
+                )
+                applied = result.evidence["inference_action_directive"]["applied"]
+                self.assertTrue(applied["mlp_head_coordinate"])
+                self.assertTrue(
+                    applied["mlp_head_coordinate_directive_selected"]
+                )
+                chat.close()
+
+        runtime = _Runtime()
+        router = SimpleNamespace(metrics=Mock())
+        runtime.delta_head_router = router
+        runtime.delta_head_receipt = {
+            "layers": [0],
+            "schema": "fixture.delta-head/v2",
+        }
+        chat = _chat(
+            runtime,
+            q4_root="/q4",
+            delta_head_state_path="/state/delta.json",
+        )
+        target_only = directive(("qwen_target",), ("qwen_target",))
+        result = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {QWEN38_INFERENCE_ACTION_METADATA: target_only.to_document()},
+            )
+        )
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(runtime.model.delta_head_router_calls, [None])
+        router.metrics.assert_not_called()
+        self.assertNotIn("request", result.evidence["delta_head_router"])
+        self.assertFalse(
+            result.evidence["inference_action_directive"]["applied"][
+                "mlp_head_coordinate"
+            ]
+        )
+        chat.close()
+
+        failing_model = _Model(generation_error=RuntimeError("delta boom"))
+        runtime = _Runtime(model=failing_model)
+        router = SimpleNamespace(
+            metrics=Mock(
+                return_value={
+                    "calls": 0,
+                    "rows": 0,
+                    "logical_bytes_saved": 0,
+                }
+            )
+        )
+        runtime.delta_head_router = router
+        runtime.delta_head_receipt = {
+            "layers": [0],
+            "schema": "fixture.delta-head/v2",
+        }
+        chat = _chat(
+            runtime,
+            q4_root="/q4",
+            delta_head_state_path="/state/delta.json",
+        )
+        failed = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {
+                    QWEN38_INFERENCE_ACTION_METADATA: directive(
+                        coordinate,
+                        coordinate,
+                    ).to_document()
+                },
+            )
+        )
+        self.assertEqual(failed.status, ExecutionStatus.ERROR)
+        self.assertIsNone(failing_model.delta_head_router)
+        self.assertEqual(
+            failing_model.delta_head_router_calls,
+            [None, router, None],
         )
         chat.close()
 

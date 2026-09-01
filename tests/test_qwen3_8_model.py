@@ -1072,10 +1072,13 @@ class Qwen38ModelTests(unittest.TestCase):
         model = StreamedQwen38(
             self.config,
             self.pager,
-            delta_head_router=router,
             max_batch_size=1,
             max_seq_len=16,
         )
+        self.assertIsNone(model.delta_head_router)
+        model.set_delta_head_router(router)
+        self.assertIs(model.delta_head_router, router)
+        self.assertEqual(router.events, [("reset",)])
         model.prefill([[1, 4]])
         self.assertEqual(router.single, [])
 
@@ -1109,6 +1112,18 @@ class Qwen38ModelTests(unittest.TestCase):
         )
         self.assertEqual(router.many[-1][2], 2)
         model.discard_continuation_block(stage)
+        generated, generation = model.generate_greedy(
+            [[1, 4]],
+            max_new_tokens=2,
+            retain_final_state=False,
+        )
+        self.assertEqual(len(generated), 2)
+        self.assertEqual(generation.forward_passes, 2)
+        self.assertIn(("commit", None), router.events)
+        self.assertIn(("finalize",), router.events)
+        model.set_delta_head_router(None)
+        self.assertIsNone(model.delta_head_router)
+        self.assertEqual(router.events[-1], ("reset",))
 
     def test_layer_boundary_observer_is_ordered_and_cannot_mutate_math(self) -> None:
         token_ids = torch.tensor([[1, 4, 9]])
