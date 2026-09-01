@@ -6,6 +6,26 @@ All notable changes to IMMER are recorded here.
 
 ### Stored-compute v2
 
+- `6b15c84` turns exact target hiddens from normal rolling generation into
+  persistent contextual continuation Crystals. The key is
+  `(runtime/model/Q4/tokenizer identity, known token, normalized Q8 Rademacher
+  sketch)` and the payload is 1–15 subsequent target-confirmed token IDs.
+  Retrieval joins the existing Markov phrase planner; Qwen remains the sole
+  committer through K1/K4/K8/K16. Target feedback calibrates each cell by
+  position. The bounded atomic bank stores neither prompt text nor prompt-token
+  sequences. Canonical chat mounts it automatically and raises the adaptive
+  ceiling from K8 to K16.
+- `5901ffd` separates Anchor-prefill accounting from replay-heavy speculative
+  decode. `9b697ba` restores an exact forward contract by carrying verified
+  prefill and rolling-round aggregates into the generation receipt; Anchor
+  savings remain exactly the missing prefill sweep.
+- The first cross-prompt Crystal execution is active in the deployed Action
+  Bank. One paraphrase generated 29 tokens in 25 target forwards and avoided
+  four complete target waves. A closer paraphrase accepted 11 Crystal tokens,
+  generated 40 tokens in 29 target forwards, and avoided 11 complete target
+  waves. Its Action vector is `compute_crystal + continuation_battery +
+  dynamic_mlp_pages + target_verified_draft + qwen_target`.
+
 - `544a27a` mounts the native continuation-state battery in canonical chat and
   carries authenticated anchor/conversation hits into Action Bank receipts.
   `361a6da` composes restored prefixes with the deployed hybrid Markov/MTP

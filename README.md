@@ -86,6 +86,17 @@ Release: **1.0.0** · [Runtime card](MODEL_CARD.md) ·
   identity, and runtime identity are authenticated before state enters the
   model. A valid snapshot from an older runtime is evicted and recharged as a
   cache miss; payload or receipt damage remains a hard error.
+- **Contextual continuation Crystals.** Every normal target-verified draft
+  round exposes the final-normalized 5,120-dimensional Qwen hidden state that
+  predicts its known token. IMMER projects that boundary through a deterministic
+  256-dimensional Rademacher kernel, L2-normalizes it, stores its Q8 key, and
+  binds it to up to 15 subsequent target-confirmed tokens. A later boundary
+  with the same model/runtime/Q4/tokenizer identity and known token retrieves
+  the nearest distinct tail. The tail enters the existing Markov phrase planner
+  and remains authority-free until Qwen verifies it inside K1/K4/K8/K16.
+  Verification outcomes update position-local confidence; wrong neighbors lose
+  width without changing output. The bank is bounded, atomically persistent,
+  content-addressed, and contains no prompt text or prompt-token sequence.
 - **Packed DeltaNet coordinate execution.** The Markov-Sinkhorn head router now
   runs directly beside Q4 and dynamic MLP pages, without the legacy Fast-MLP
   mount. It selects 24, 32, or 40 of 48 DeltaNet value heads and sends only
@@ -175,6 +186,15 @@ Release: **1.0.0** · [Runtime card](MODEL_CARD.md) ·
   complete target forwards, 386.34 seconds, and 1.63 GB peak RSS. Cold
   Attention/DeltaNet and whole target waves are now the dominant inference
   cost.
+- **Measured Crystal transfer.** The first natural request charged 38 hidden
+  boundaries without an additional Qwen pass. A differently worded request then ran
+  `compute_crystal + continuation_battery + dynamic_mlp_pages +
+  target_verified_draft + qwen_target`: 29 generated tokens, 25 target forwards,
+  five accepted drafts, four complete 64-layer target waves avoided, and
+  327,680 MLP page-row actions omitted. A closer third paraphrase accepted 11
+  Crystal tokens and 12 drafts overall; 40 generated tokens required 29 target
+  forwards, avoiding 11 complete target waves in 132.04 seconds. The persistent
+  bank reached 90 cells after three ordinary settlements.
 - **Embedded MTP drafting.** The target checkpoint's own one-layer Qwen3.5 MTP
   branch now runs through the same causal Q4 bank, shared embedding, native
   bounded LM head, and exact rolling target verifier. Shifted token embeddings
