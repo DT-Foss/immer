@@ -12,6 +12,7 @@ import torch
 from immer.runtimes.qwen3_8.draft_protocol import RollingDraftProposal
 from immer.runtimes.qwen3_8.hybrid_draft import (
     MARKOV_MTP_WINDOW_WORK_COSTS,
+    MTP_COMPLETE_WAVE_MIN_PROBABILITY,
     Qwen38MarkovMtpDraftError,
     Qwen38MarkovMtpDraftProvider,
 )
@@ -779,6 +780,87 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         provider.observe_final((*committed, 10))
         provider.close()
 
+    def test_complete_wave_gate_rejects_mtp_before_factory_weight_work(self) -> None:
+        markov = _Markov(0.10, tokens=(3, 4, 5))
+        markov.provider_prefix_probability = lambda provider, width: (
+            MTP_COMPLETE_WAVE_MIN_PROBABILITY - 0.01,
+            True,
+        )
+        factory = mock.Mock(return_value=_Mtp())
+        provider = Qwen38MarkovMtpDraftProvider(markov, factory)
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        proposal = provider.propose_round_state(prompt, 4, hidden[:, -1:])
+
+        self.assertEqual(proposal.token_ids, (3, 4, 5))
+        self.assertEqual(provider.selected_provider, "markov")
+        factory.assert_not_called()
+        metrics = provider.metrics()
+        self.assertEqual(metrics.mtp_wave_gate_checks, 1)
+        self.assertEqual(metrics.mtp_wave_gate_unknown, 0)
+        self.assertEqual(metrics.mtp_wave_gate_passes, 0)
+        self.assertEqual(metrics.mtp_wave_gate_rejections, 1)
+        self.assertAlmostEqual(
+            metrics.last_mtp_complete_wave_probability,
+            MTP_COMPLETE_WAVE_MIN_PROBABILITY - 0.01,
+        )
+        provider.observe_verification(0, 1)
+        committed = (*prompt, 4)
+        provider.reconcile_prefix_state(
+            committed,
+            torch.ones((1, 1, 8)),
+        )
+        provider.observe_final((*committed, 10))
+        provider.close()
+
+    def test_complete_wave_gate_keeps_unknown_and_profitable_mtp_exploration(
+        self,
+    ) -> None:
+        cases = (
+            ((0.0, False), 1, None),
+            ((MTP_COMPLETE_WAVE_MIN_PROBABILITY, True), 0, 0.90),
+        )
+        for policy, unknown, expected_probability in cases:
+            with self.subTest(policy=policy):
+                markov = _Markov(0.10, tokens=(3, 4, 5))
+                markov.provider_prefix_probability = (
+                    lambda provider, width, value=policy: value
+                )
+                mtp = _Mtp()
+                factory = mock.Mock(return_value=mtp)
+                provider = Qwen38MarkovMtpDraftProvider(markov, factory)
+                prompt = (1, 2, 3)
+                hidden = torch.zeros((1, len(prompt), 8))
+                provider.begin_request_state(prompt, hidden)
+
+                proposal = provider.propose_round_state(
+                    prompt,
+                    4,
+                    hidden[:, -1:],
+                )
+
+                self.assertEqual(proposal.token_ids, (7, 8, 9))
+                factory.assert_called_once_with()
+                metrics = provider.metrics()
+                self.assertEqual(metrics.mtp_wave_gate_checks, 1)
+                self.assertEqual(metrics.mtp_wave_gate_unknown, unknown)
+                self.assertEqual(metrics.mtp_wave_gate_passes, 1)
+                self.assertEqual(metrics.mtp_wave_gate_rejections, 0)
+                self.assertEqual(
+                    metrics.last_mtp_complete_wave_probability,
+                    expected_probability,
+                )
+                provider.observe_verification(0, 1)
+                committed = (*prompt, 4)
+                provider.reconcile_prefix_state(
+                    committed,
+                    torch.ones((1, 1, 8)),
+                )
+                provider.observe_final((*committed, 10))
+                provider.close()
+
     def test_provider_candidates_stop_feedback_at_their_own_first_mismatch(
         self,
     ) -> None:
@@ -1104,7 +1186,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(proposal.token_ids, (7, 8, 9))
         self.assertEqual(
             proposal.provider_abi,
-            "immer.qwen3.8-markov-mtp-hybrid-provider/v29",
+            "immer.qwen3.8-markov-mtp-hybrid-provider/v30",
         )
         self.assertTrue(
             all(abs(value - 0.7625) < 1e-12 for value in proposal.token_confidences)
@@ -1512,7 +1594,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(mtp.advance_calls[0][2], final_hidden))
 
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v29")
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v30")
         self.assertEqual(metrics.selected_provider, "markov")
         self.assertEqual(metrics.selection_calls, 4)
         self.assertEqual(metrics.markov_rounds, 3)

@@ -13,10 +13,12 @@ from .draft_protocol import RollingDraftProposal
 from .mtp_draft import Qwen35MtpCarry, Qwen35MtpDraftProvider
 
 
-QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
+QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA = "immer.qwen3.8-markov-mtp-hybrid-provider/v30"
 ATLAS_MTP_CONSENSUS_STRENGTH = 0.25
 ONLINE_MTP_CONSENSUS_STRENGTH = 0.25
 PROVIDER_TOURNAMENT_DISCOUNT = 0.85
+MTP_COMPLETE_WAVE_PREFIX_TOKENS = 2
+MTP_COMPLETE_WAVE_MIN_PROBABILITY = 0.90
 MARKOV_MTP_WINDOW_WORK_COSTS = {
     1: 1.0,
     2: 1.6,
@@ -96,6 +98,11 @@ class Qwen38MarkovMtpDraftMetrics:
     provider_trace_created: int
     provider_trace_active: int
     provider_trace_feedback_tokens: int
+    mtp_wave_gate_checks: int
+    mtp_wave_gate_unknown: int
+    mtp_wave_gate_passes: int
+    mtp_wave_gate_rejections: int
+    last_mtp_complete_wave_probability: float | None
     mtp_init_failures: int
     consensus_rounds: int
     consensus_agreement_tokens: int
@@ -205,6 +212,11 @@ class Qwen38MarkovMtpDraftProvider:
         self._provider_tournament_mtp_selections = 0
         self._provider_trace_created = 0
         self._provider_trace_feedback_tokens = 0
+        self._mtp_wave_gate_checks = 0
+        self._mtp_wave_gate_unknown = 0
+        self._mtp_wave_gate_passes = 0
+        self._mtp_wave_gate_rejections = 0
+        self._last_mtp_complete_wave_probability: float | None = None
         self._mtp_init_failures = 0
         self._consensus_rounds = 0
         self._consensus_agreement_tokens = 0
@@ -573,6 +585,47 @@ class Qwen38MarkovMtpDraftProvider:
         self._markov_rounds += 1
         return proposal
 
+    def _mtp_can_save_complete_wave(self) -> bool:
+        """Reject known sub-wave MTP work before materializing its weights."""
+
+        self._mtp_wave_gate_checks += 1
+        callback = getattr(
+            self.markov_provider,
+            "provider_prefix_probability",
+            None,
+        )
+        if not callable(callback):
+            self._mtp_wave_gate_unknown += 1
+            self._mtp_wave_gate_passes += 1
+            self._last_mtp_complete_wave_probability = None
+            return True
+        value = callback("mtp", MTP_COMPLETE_WAVE_PREFIX_TOKENS)
+        if (
+            not isinstance(value, tuple)
+            or len(value) != 2
+            or isinstance(value[0], bool)
+            or not isinstance(value[0], (int, float))
+            or not math.isfinite(float(value[0]))
+            or not 0.0 <= float(value[0]) <= 1.0
+            or not isinstance(value[1], bool)
+        ):
+            raise Qwen38MarkovMtpDraftError(
+                "provider prefix probability is invalid"
+            )
+        probability, observed = float(value[0]), value[1]
+        self._last_mtp_complete_wave_probability = (
+            probability if observed else None
+        )
+        if not observed:
+            self._mtp_wave_gate_unknown += 1
+            self._mtp_wave_gate_passes += 1
+            return True
+        if probability >= MTP_COMPLETE_WAVE_MIN_PROBABILITY:
+            self._mtp_wave_gate_passes += 1
+            return True
+        self._mtp_wave_gate_rejections += 1
+        return False
+
     def _load_mtp(self) -> object:
         if self._mtp_provider is not None:
             return self._mtp_provider
@@ -639,6 +692,11 @@ class Qwen38MarkovMtpDraftProvider:
             )
         self._selection_calls += 1
         if self._select_markov(proposal) or not self._switch_available:
+            return self._commit_markov_selection(proposal)
+
+        if not self._mtp_can_save_complete_wave():
+            self._switch_available = False
+            self._hidden_history = None
             return self._commit_markov_selection(proposal)
 
         hidden_history = self._hidden_history
@@ -1263,6 +1321,13 @@ class Qwen38MarkovMtpDraftProvider:
             provider_trace_created=self._provider_trace_created,
             provider_trace_active=len(self._provider_traces),
             provider_trace_feedback_tokens=self._provider_trace_feedback_tokens,
+            mtp_wave_gate_checks=self._mtp_wave_gate_checks,
+            mtp_wave_gate_unknown=self._mtp_wave_gate_unknown,
+            mtp_wave_gate_passes=self._mtp_wave_gate_passes,
+            mtp_wave_gate_rejections=self._mtp_wave_gate_rejections,
+            last_mtp_complete_wave_probability=(
+                self._last_mtp_complete_wave_probability
+            ),
             mtp_init_failures=self._mtp_init_failures,
             consensus_rounds=self._consensus_rounds,
             consensus_agreement_tokens=self._consensus_agreement_tokens,
@@ -1354,6 +1419,8 @@ class Qwen38MarkovMtpDraftProvider:
 __all__ = [
     "ATLAS_MTP_CONSENSUS_STRENGTH",
     "ONLINE_MTP_CONSENSUS_STRENGTH",
+    "MTP_COMPLETE_WAVE_MIN_PROBABILITY",
+    "MTP_COMPLETE_WAVE_PREFIX_TOKENS",
     "PROVIDER_TOURNAMENT_DISCOUNT",
     "MARKOV_MTP_WINDOW_WORK_COSTS",
     "QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA",

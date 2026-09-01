@@ -541,6 +541,7 @@ class _ComponentTimingModel(_Model):
         "full_attention_core",
         "deltanet_core",
         "mlp_core",
+        "lm_head_core",
         "layer_transition_crystal",
         "layer_mlp_crystal",
     )
@@ -574,6 +575,7 @@ class _ComponentTimingModel(_Model):
             "full_attention_core": (4, 400),
             "deltanet_core": (12, 1_200),
             "mlp_core": (16, 3_200),
+            "lm_head_core": (2, 600),
             "layer_transition_crystal": (16, 80),
             "layer_mlp_crystal": (16, 96),
         }
@@ -4484,7 +4486,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(timings["status"], "ok")
         self.assertIsNone(timings["accounting_error"])
         self.assertEqual(timings["accounting_failures"], 0)
-        self.assertEqual(timings["measured_nanoseconds"], 4_976)
+        self.assertEqual(timings["measured_nanoseconds"], 5_576)
         self.assertEqual(
             timings["components"],
             {
@@ -4502,6 +4504,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     "boundary": "StreamedQwen38._mlp",
                     "calls": 16,
                     "nanoseconds": 3_200,
+                },
+                "lm_head_core": {
+                    "boundary": "Qwen38WeightPager.topk_logits",
+                    "calls": 2,
+                    "nanoseconds": 600,
                 },
                 "layer_transition_crystal": {
                     "boundary": ("StreamedQwen38._layer_transition_crystal_forward"),
@@ -4911,6 +4918,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "attention_output_crystal_explicitly_disabled": False,
                 "draft_enabled": False,
                 "draft_window_ceiling": None,
+                "external_drafter": False,
+                "external_drafter_explicitly_disabled": False,
                 "layer_mlp_crystal": False,
                 "layer_mlp_crystal_configured": False,
                 "layer_mlp_crystal_directive_selected": False,
@@ -5439,6 +5448,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
         mtp = _chat(_Runtime(), draft_mode="mtp", q4_root="/q4")
 
         self.assertEqual(hybrid._draft_mode_for_request({}), "hybrid")
+        self.assertEqual(
+            hybrid._draft_mode_for_request({"mtp_enabled": False}),
+            "markov",
+        )
+        self.assertIsNone(mtp._draft_mode_for_request({"mtp_enabled": False}))
         self.assertEqual(
             hybrid._draft_mode_for_request({"restored_prefix_length": 17}),
             "markov",

@@ -567,6 +567,18 @@ def executed_actions_from_result(
         ):
             actions = tuple(sorted({*actions, "mlp_page_coordinate"}))
     if isinstance(draft, Mapping):
+        provider = draft.get("provider")
+        if (
+            isinstance(provider, Mapping)
+            and draft.get("mode") in {"hybrid", "mtp"}
+            and isinstance(provider.get("mtp_rounds"), int)
+            and not isinstance(provider.get("mtp_rounds"), bool)
+            and provider.get("mtp_rounds", 0) > 0
+            and isinstance(draft.get("draft_source_body_bytes"), int)
+            and not isinstance(draft.get("draft_source_body_bytes"), bool)
+            and draft.get("draft_source_body_bytes", 0) > 0
+        ):
+            actions = tuple(sorted({*actions, "external_drafter"}))
         crystal = draft.get("context_crystal")
         accepted = (
             None
@@ -651,6 +663,14 @@ class InferenceActionReceipt:
             )
         ) and ("qwen_target" not in self.actions or self.target_forwards <= 0):
             raise ValueError("coordinate actions require executed Qwen target work")
+        if "external_drafter" in self.actions and (
+            "qwen_target" not in self.actions
+            or "target_verified_draft" not in self.actions
+            or self.target_forwards <= 0
+        ):
+            raise ValueError(
+                "external drafter requires target-verified Qwen work"
+            )
 
     @classmethod
     def from_economics(
@@ -829,6 +849,13 @@ class InferenceActionDirective:
                 raise ValueError(f"{name} mlp_page_coordinate requires qwen_target")
             if "prefix_sinkhorn" in actions and "qwen_target" not in actions:
                 raise ValueError(f"{name} prefix_sinkhorn requires qwen_target")
+            if "external_drafter" in actions and not {
+                "qwen_target",
+                "target_verified_draft",
+            }.issubset(actions):
+                raise ValueError(
+                    f"{name} external_drafter requires target verification"
+                )
         if self.draft_enabled is not None and not isinstance(
             self.draft_enabled,
             bool,
@@ -1191,6 +1218,10 @@ class InferenceActionBank:
                 or "mlp_page_coordinate" in receipt.actions
                 or "prefix_sinkhorn" in receipt.actions
                 or (
+                    "external_drafter" in receipt.actions
+                    and receipt.saved_qwen_forwards > 0
+                )
+                or (
                     "target_verified_draft" in receipt.actions
                     and receipt.saved_qwen_forwards > 0
                 )
@@ -1205,6 +1236,10 @@ class InferenceActionBank:
                 "attention_output_crystal" in receipt.actions
                 or "lm_head_coordinate" in receipt.actions
                 or "mlp_page_coordinate" in receipt.actions
+                or (
+                    "external_drafter" in receipt.actions
+                    and receipt.saved_qwen_forwards > 0
+                )
                 or (
                     "target_verified_draft" in receipt.actions
                     and receipt.saved_qwen_forwards > 0
@@ -1232,6 +1267,7 @@ class InferenceActionBank:
                     "compute_crystal",
                     "continuation_battery",
                     "dynamic_mlp_pages",
+                    "external_drafter",
                     "layer_mlp_crystal",
                     "layer_transition_crystal",
                     "lm_head_coordinate",

@@ -193,6 +193,7 @@ _QWEN38_COMPONENT_TIMING_BOUNDARIES = {
     "full_attention_core": "StreamedQwen38._full_attention",
     "deltanet_core": "StreamedQwen38._linear_attention",
     "mlp_core": "StreamedQwen38._mlp",
+    "lm_head_core": "Qwen38WeightPager.topk_logits",
     "layer_transition_crystal": ("StreamedQwen38._layer_transition_crystal_forward"),
     "layer_mlp_crystal": "StreamedQwen38._layer_mlp_crystal_forward",
 }
@@ -4161,6 +4162,11 @@ class Qwen38CausalChat:
         if generation_options.get("draft_enabled") is False:
             return None
         mode = self._draft_mode
+        if generation_options.get("mtp_enabled") is False:
+            if mode == "hybrid":
+                mode = "markov"
+            elif mode == "mtp":
+                return None
         restored_prefix_length = generation_options.get("restored_prefix_length")
         if restored_prefix_length is None:
             return mode
@@ -4287,6 +4293,7 @@ class Qwen38CausalChat:
             direct_options = dict(generation_options)
             direct_options.pop("draft_enabled", None)
             direct_options.pop("draft_window_ceiling", None)
+            direct_options.pop("mtp_enabled", None)
             direct_options.pop("restored_mtp_carry", None)
             direct_options.pop("restored_mtp_carry_bytes", None)
             if direct_progress is not None:
@@ -7296,6 +7303,10 @@ class Qwen38CausalChat:
             raise _RequestRejected("prompt token is outside the checkpoint vocabulary")
 
         effective_qwen_actions = _effective_qwen_actions(action_directive)
+        external_drafter_explicitly_disabled = (
+            action_directive is not None
+            and "external_drafter" in action_directive.disabled_actions
+        )
         lm_head_index = getattr(runtime, "exact_head_index", None)
         lm_head_coordinate_directive_selected = (
             "lm_head_coordinate" in effective_qwen_actions
@@ -7665,6 +7676,8 @@ class Qwen38CausalChat:
         }
         if action_directive is not None and action_directive.draft_enabled is not None:
             generation_options["draft_enabled"] = action_directive.draft_enabled
+        if external_drafter_explicitly_disabled:
+            generation_options["mtp_enabled"] = False
         if (
             action_directive is not None
             and action_directive.draft_window_ceiling is not None
@@ -8405,6 +8418,19 @@ class Qwen38CausalChat:
         if self._last_draft_evidence is not None:
             evidence["draft"] = dict(self._last_draft_evidence)
         if action_directive is not None:
+            provider_evidence = (
+                {}
+                if self._last_draft_evidence is None
+                else _mapping(
+                    self._last_draft_evidence.get("provider"),
+                    "draft provider evidence",
+                )
+            )
+            external_drafter_applied = (
+                isinstance(provider_evidence.get("mtp_rounds"), int)
+                and not isinstance(provider_evidence.get("mtp_rounds"), bool)
+                and provider_evidence.get("mtp_rounds", 0) > 0
+            )
             evidence["inference_action_directive"] = {
                 "applied": {
                     "attention_output_crystal": (attention_output_crystal_applied),
@@ -8459,6 +8485,10 @@ class Qwen38CausalChat:
                         None
                         if self._last_draft_evidence is None
                         else self._last_draft_evidence.get("action_bank_window_ceiling")
+                    ),
+                    "external_drafter": external_drafter_applied,
+                    "external_drafter_explicitly_disabled": (
+                        external_drafter_explicitly_disabled
                     ),
                 },
                 "directive": action_directive.to_document(),

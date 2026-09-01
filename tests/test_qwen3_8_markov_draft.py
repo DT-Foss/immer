@@ -1949,6 +1949,10 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         self.assertEqual(provider.provider_policy_score("markov", 2), (0.5, False))
         self.assertEqual(provider.provider_policy_score("mtp", 2), (0.5, False))
+        self.assertEqual(
+            provider.provider_prefix_probability("mtp", 2),
+            (0.0, False),
+        )
         for invalid_provider in ("beam", ""):
             with (
                 self.subTest(callback="score", provider=invalid_provider),
@@ -1974,6 +1978,8 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                 provider.observe_provider_policy_feedback("markov", position, True)
         provider.observe_provider_policy_feedback("markov", 2, True)
         provider.observe_provider_policy_feedback("mtp", 2, False)
+        provider.observe_provider_policy_feedback("mtp", 0, True)
+        provider.observe_provider_policy_feedback("mtp", 1, False)
 
         markov_score = provider.provider_policy_score("markov", 2)
         mtp_score = provider.provider_policy_score("mtp", 2)
@@ -1982,6 +1988,15 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertAlmostEqual(markov_score[0], 26 / 27)
         self.assertAlmostEqual(mtp_score[0], 25 / 27)
         self.assertGreater(markov_score[0], mtp_score[0])
+        prefix_probability, prefix_observed = (
+            provider.provider_prefix_probability("mtp", 2)
+        )
+        self.assertTrue(prefix_observed)
+        self.assertAlmostEqual(
+            prefix_probability,
+            provider.provider_policy_score("mtp", 0)[0]
+            * provider.provider_policy_score("mtp", 1)[0],
+        )
         provider.observe_final((*prompt, 7))
 
         metrics = provider.metrics()

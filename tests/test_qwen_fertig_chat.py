@@ -245,6 +245,7 @@ class QwenFertigChatTests(unittest.TestCase):
                 "draft": {
                     "accepted_draft_tokens": 5,
                     "configured_mode": "hybrid",
+                    "draft_linear_calls": 11,
                     "mode": "hybrid",
                     "rounds": 3,
                     "state_reuse_provider_downgrade": False,
@@ -254,8 +255,22 @@ class QwenFertigChatTests(unittest.TestCase):
                         "atlas_consensus_tokens": 2,
                         "markov_rounds": 2,
                         "markov_selections": 1,
+                        "last_mtp_complete_wave_probability": 0.93,
+                        "mtp_wave_gate_checks": 2,
+                        "mtp_wave_gate_passes": 1,
+                        "mtp_wave_gate_rejections": 1,
+                        "mtp_wave_gate_unknown": 0,
                         "mtp_rounds": 1,
                         "mtp_selections": 1,
+                        "mtp": {
+                            "accepted_tokens": 2,
+                            "draft_steps": 3,
+                            "linear_calls": 11,
+                            "proposed_tokens": 4,
+                            "seconds": 0.75,
+                            "source_body_bytes": 120,
+                            "verified_proposal_tokens": 3,
+                        },
                         "online_consensus_confidence_gain": 0.05,
                         "online_consensus_rounds": 1,
                         "online_consensus_tokens": 1,
@@ -295,6 +310,7 @@ class QwenFertigChatTests(unittest.TestCase):
                             "crystal_verified_tokens": 6,
                         },
                     },
+                    "target_linear_calls": 90,
                     "window_size": 8,
                 },
                 "o1_markov_retention": {
@@ -377,6 +393,8 @@ class QwenFertigChatTests(unittest.TestCase):
         draft = _receipt(result)["qwen"]["draft"]
         self.assertEqual(draft["accepted_draft_tokens"], 5)
         self.assertEqual(draft["configured_mode"], "hybrid")
+        self.assertEqual(draft["draft_linear_calls"], 11)
+        self.assertEqual(draft["target_linear_calls"], 90)
         self.assertFalse(draft["state_reuse_provider_downgrade"])
         self.assertEqual(draft["provider"]["markov_selections"], 1)
         self.assertEqual(draft["provider"]["atlas_consensus_tokens"], 2)
@@ -385,6 +403,8 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertEqual(draft["atlas"]["atlas_vote_supported_tokens"], 3)
         self.assertEqual(draft["online_memory"]["history_capacity_tokens"], 65_536)
         self.assertEqual(draft["provider"]["online_consensus_tokens"], 1)
+        self.assertEqual(draft["provider"]["mtp_wave_gate_rejections"], 1)
+        self.assertEqual(draft["provider"]["mtp"]["draft_steps"], 3)
         self.assertEqual(draft["context_crystal"]["crystal_accepted_tokens"], 5)
         self.assertEqual(draft["context_crystal"]["crystal_bank_cells"], 12)
         self.assertEqual(

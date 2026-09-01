@@ -475,12 +475,14 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
             for key in (
                 "accepted_draft_tokens",
                 "configured_mode",
+                "draft_linear_calls",
                 "draft_source_body_bytes",
                 "mode",
                 "proposed_draft_tokens",
                 "rounds",
                 "state_reuse_provider_downgrade",
                 "target_source_body_bytes",
+                "target_linear_calls",
                 "total_source_body_bytes",
                 "used_window_sizes",
                 "window_size",
@@ -555,6 +557,11 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                     "atlas_consensus_tokens",
                     "markov_rounds",
                     "markov_selections",
+                    "mtp_wave_gate_checks",
+                    "mtp_wave_gate_passes",
+                    "mtp_wave_gate_rejections",
+                    "mtp_wave_gate_unknown",
+                    "last_mtp_complete_wave_probability",
                     "mtp_rounds",
                     "mtp_selections",
                     "online_consensus_confidence_gain",
@@ -564,6 +571,21 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                 )
                 if key in provider
             }
+            mtp = provider.get("mtp")
+            if isinstance(mtp, dict):
+                compact_draft["provider"]["mtp"] = {
+                    key: mtp[key]
+                    for key in (
+                        "accepted_tokens",
+                        "draft_steps",
+                        "linear_calls",
+                        "proposed_tokens",
+                        "seconds",
+                        "source_body_bytes",
+                        "verified_proposal_tokens",
+                    )
+                    if key in mtp
+                }
         summary["draft"] = compact_draft
         summary["draft_sha256"] = _sha256(_canonical_json(draft))
     retention = evidence.get("o1_markov_retention")

@@ -499,6 +499,57 @@ class InferenceActionReceiptTests(unittest.TestCase):
             executed_actions_from_result(result, economics),
         )
 
+    def test_physical_mtp_round_is_recorded_as_external_drafter(self) -> None:
+        economics = _economics("physical-mtp", saved=1)
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "draft": {
+                    "draft_source_body_bytes": 50_000,
+                    "mode": "hybrid",
+                    "provider": {"mtp_rounds": 1},
+                }
+            },
+        )
+
+        actions = executed_actions_from_result(result, economics)
+
+        self.assertIn("external_drafter", actions)
+        receipt = InferenceActionReceipt.from_economics(
+            economics,
+            executed_actions=actions,
+        )
+        self.assertEqual(receipt.saved_qwen_forwards, 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = InferenceActionBank(Path(temporary) / "actions")
+            bank.observe(economics, executed_actions=actions)
+            directive = bank.recommend(
+                question_sha256=_sha("new MTP question"),
+                runtime_profile_sha256=_sha("profile"),
+            )
+        assert directive is not None
+        self.assertIn("external_drafter", directive.primary_actions)
+        self.assertTrue(directive.draft_enabled)
+
+        no_weight_work = Result(
+            result.status,
+            result.component,
+            output=result.output,
+            evidence={
+                "draft": {
+                    "draft_source_body_bytes": 0,
+                    "mode": "hybrid",
+                    "provider": {"mtp_rounds": 1},
+                }
+            },
+        )
+        self.assertNotIn(
+            "external_drafter",
+            executed_actions_from_result(no_weight_work, economics),
+        )
+
     def test_exact_attention_output_crystal_records_physical_replay(self) -> None:
         economics = _economics(
             "attention-output-crystal",

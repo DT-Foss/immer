@@ -4044,6 +4044,36 @@ class FingerprintRollingK4DraftProvider:
             observed,
         )
 
+    def provider_prefix_probability(
+        self,
+        provider: str,
+        width: int,
+        /,
+    ) -> tuple[float, bool]:
+        """Return target-learned probability that one provider clears a prefix."""
+
+        if self._closed:
+            raise MarkovDraftError("Markov draft provider is closed")
+        if (
+            isinstance(width, bool)
+            or not isinstance(width, int)
+            or not 1 <= width <= _MAX_PROPOSAL_POSITIONS
+        ):
+            raise MarkovDraftError("provider policy width is invalid")
+        planner = self._provider_planner_index(provider)
+        if any(
+            not self._planner_has_evidence(planner, position)
+            for position in range(width)
+        ):
+            return 0.0, False
+        return (
+            math.prod(
+                self._planner_reliability(planner, position)
+                for position in range(width)
+            ),
+            True,
+        )
+
     def observe_provider_policy_feedback(
         self,
         provider: str,
