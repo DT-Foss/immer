@@ -340,6 +340,9 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
     action_directive = evidence.get("inference_action_directive")
     if isinstance(action_directive, dict):
         summary["inference_action_directive"] = action_directive
+    prefix_sinkhorn = evidence.get("prefix_sinkhorn")
+    if isinstance(prefix_sinkhorn, dict):
+        summary["prefix_sinkhorn"] = prefix_sinkhorn
     draft = evidence.get("draft")
     if isinstance(draft, dict):
         compact_draft = {

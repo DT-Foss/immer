@@ -151,6 +151,30 @@ class InferenceActionReceiptTests(unittest.TestCase):
             ),
         )
 
+    def test_native_prefix_sinkhorn_is_recorded_as_executed_attention(self) -> None:
+        economics = _economics("prefix-sinkhorn")
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "prefix_sinkhorn": {
+                    "active": True,
+                    "configuration": {"layer": 27},
+                }
+            },
+        )
+        actions = executed_actions_from_result(result, economics)
+        self.assertEqual(
+            actions,
+            (
+                "dynamic_mlp_pages",
+                "prefix_sinkhorn",
+                "qwen_target",
+                "target_verified_draft",
+            ),
+        )
+
 
 class InferenceActionBankTests(unittest.TestCase):
     def test_observe_restart_duplicate_and_ranking(self) -> None:

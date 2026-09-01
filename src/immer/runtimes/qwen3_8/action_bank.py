@@ -105,6 +105,7 @@ def executed_actions_from_result(
     execution = qwen if isinstance(qwen, Mapping) else evidence
     anchor = execution.get("anchor_cache")
     conversation = execution.get("conversation")
+    prefix_sinkhorn = execution.get("prefix_sinkhorn")
     battery_hit = (
         isinstance(anchor, Mapping) and anchor.get("status") == "hit"
     ) or (
@@ -116,6 +117,8 @@ def executed_actions_from_result(
     )
     if battery_hit:
         actions = tuple(sorted({*actions, "continuation_battery"}))
+    if isinstance(prefix_sinkhorn, Mapping) and prefix_sinkhorn.get("active") is True:
+        actions = tuple(sorted({*actions, "prefix_sinkhorn"}))
     return actions
 
 

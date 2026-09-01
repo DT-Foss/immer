@@ -336,6 +336,7 @@ def _qwen38_service_profile(
         "max_resident_mb",
         "mlp_page_width",
         "no_inference_economics",
+        "prefix_sinkhorn",
         "q4_threads",
         "qwen38_anchor_cache",
         "range_markov_state",
@@ -542,6 +543,7 @@ def _qwen38_growing_warm_profile(
         "max_new_tokens": args.max_new_tokens,
         "max_prompt_tokens": args.max_prompt_tokens,
         "mlp_page_route": mlp_page_route,
+        "prefix_sinkhorn": bool(getattr(args, "prefix_sinkhorn", False)),
         "q4_manifest_file_sha256": _path_sha256(q4_manifest),
         "q4_threads": args.q4_threads or min(16, os.cpu_count() or 1),
         "runtime_code_revision": runtime_code_revision,
@@ -1638,7 +1640,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 service_client.close()
         output_semantics = (
             None
-            if args.raw_qwen or warm_profile_sha256 is None
+            if args.raw_qwen
+            or warm_profile_sha256 is None
+            or bool(getattr(args, "prefix_sinkhorn", False))
             else _qwen38_output_semantics(
                 args,
                 tokenizer_path=tokenizer_path,
@@ -2017,6 +2021,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             fast_mlp_layers = (*range(18), *range(55, 64))
             if fast_mlp_blocks is None:
                 fast_mlp_blocks = 64 if args.fast_mlp_online_state else 32
+        native_head_crsa = None
+        if bool(getattr(args, "prefix_sinkhorn", False)):
+            from .runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
+
+            native_head_crsa = Qwen38NativeHeadCrsa()
         snapshot_bridge = SnapshotEventBridge() if service else None
         qwen = Qwen38CausalChat(
             str(bundle_path),
@@ -2084,6 +2093,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 if warm_mount is None or warm_profile_sha256 is None
                 else warm_mount.result_cell_code_revision
             ),
+            native_head_crsa=native_head_crsa,
             text_snapshot_sink=(
                 snapshot_bridge
                 if snapshot_bridge is not None
@@ -3236,6 +3246,11 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--delta-head-online-state",
         help="persistent Markov-Sinkhorn state for packed DeltaNet head routing",
+    )
+    chat.add_argument(
+        "--prefix-sinkhorn",
+        action="store_true",
+        help="run the native layer-27 Prefix-Sinkhorn attention intervention",
     )
     chat.add_argument(
         "--raw-qwen",

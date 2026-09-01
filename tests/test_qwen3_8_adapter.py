@@ -57,6 +57,7 @@ from immer.runtimes.qwen3_8.mtp_draft import (
     QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
     Qwen35MtpCarry,
 )
+from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
 from immer.runtimes.qwen3_8.semantic_atlas import ModelPin
 from immer.runtimes.qwen3_8.semantic_state_cache import (
     AnchorReceipt,
@@ -4300,6 +4301,36 @@ class Qwen38CausalChatTests(unittest.TestCase):
             options["delta_head_state_path"],
             "/state/qwen-delta-head.json",
         )
+
+    def test_cli_wires_native_prefix_sinkhorn_into_the_qwen_runtime(self) -> None:
+        qwen = _chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor:
+            with redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--qwen38-q4",
+                        "/models/qwen-q4",
+                        "--prefix-sinkhorn",
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        intervention = constructor.call_args.kwargs["native_head_crsa"]
+        self.assertIsInstance(intervention, Qwen38NativeHeadCrsa)
+        self.assertEqual(intervention.layer, 27)
+        self.assertEqual(intervention.head_indices, (2, 8, 14, 20))
+        self.assertEqual(intervention.alpha, 0.01)
 
     def test_cli_wires_exact_head_index_root(self) -> None:
         qwen = _chat(_Runtime())

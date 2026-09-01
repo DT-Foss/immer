@@ -71,6 +71,7 @@ from .mtp_draft import (
     Qwen35MtpCarry,
     Qwen35MtpDraftProvider,
 )
+from .native_crsa import Qwen38NativeHeadCrsa
 from .hybrid_draft import (
     QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
     Qwen38MarkovMtpDraftProvider,
@@ -828,6 +829,7 @@ def _open_local_runtime(
     range_prefetch_hint_cooldown: int = 2,
     q4_root: Path | None = None,
     q4_threads: int | None = None,
+    native_head_crsa: Qwen38NativeHeadCrsa | None = None,
 ) -> _OwnedRuntime:
     """Open one pinned local causal model; no remote source exists here."""
 
@@ -989,6 +991,7 @@ def _open_local_runtime(
             ),
             mlp_page_router=mlp_page_router,
             delta_head_router=delta_head_router,
+            native_head_crsa=native_head_crsa,
             native_deltanet_recurrence=q4_bank is not None,
             native_deltanet_fusion=q4_bank is not None,
             packed_continuation_gemm=fast_mlp_mount is not None,
@@ -1118,6 +1121,7 @@ def _open_official_runtime(
     range_prefetch_hint_cooldown: int = 2,
     q4_root: Path | None = None,
     q4_threads: int | None = None,
+    native_head_crsa: Qwen38NativeHeadCrsa | None = None,
 ) -> _OwnedRuntime:
     return _open_local_runtime(
         bundle_path=bundle_path,
@@ -1150,6 +1154,7 @@ def _open_official_runtime(
         range_prefetch_hint_cooldown=range_prefetch_hint_cooldown,
         q4_root=q4_root,
         q4_threads=q4_threads,
+        native_head_crsa=native_head_crsa,
     )
 
 
@@ -1205,6 +1210,7 @@ class Qwen38CausalChat:
         range_prefetch_hint_cooldown: int = 2,
         q4_root: str | Path | None = None,
         q4_threads: int | None = None,
+        native_head_crsa: Qwen38NativeHeadCrsa | None = None,
         text_snapshot_sink: Callable[[str], None] | None = None,
     ) -> None:
         if not isinstance(bundle_path, (str, Path)):
@@ -1225,6 +1231,11 @@ class Qwen38CausalChat:
             q4_threads = _positive_int(q4_threads, "q4_threads")
         if text_snapshot_sink is not None and not callable(text_snapshot_sink):
             raise TypeError("text_snapshot_sink must be callable or None")
+        if native_head_crsa is not None and not isinstance(
+            native_head_crsa,
+            Qwen38NativeHeadCrsa,
+        ):
+            raise TypeError("native_head_crsa must be Qwen38NativeHeadCrsa or None")
         if q4_root is not None:
             if device == "mps":
                 raise ValueError("Q4 execution requires the CPU device")
@@ -1498,6 +1509,7 @@ class Qwen38CausalChat:
         )
         self._q4_threads = q4_threads
         self._text_snapshot_sink = text_snapshot_sink
+        self._native_head_crsa = native_head_crsa
         self._anchor_cache = anchor_cache
         self._draft_bundle_path = (
             None
@@ -1879,6 +1891,12 @@ class Qwen38CausalChat:
             )
             if receipt is not None:
                 policy["exact_head"]["artifact"] = dict(receipt)
+        if self._native_head_crsa is not None:
+            policy["prefix_sinkhorn"] = {
+                "active": self._native_head_crsa.active,
+                "configuration": asdict(self._native_head_crsa),
+                "schema": self._native_head_crsa.evidence_schema,
+            }
         if self._q4_root is not None:
             policy["q4"] = {"enabled": True, "threads": self._q4_threads}
             runtime = self._runtime
@@ -2245,6 +2263,7 @@ class Qwen38CausalChat:
             range_prefetch_hint_cooldown=self._range_prefetch_hint_cooldown,
             q4_root=self._q4_root,
             q4_threads=self._q4_threads,
+            native_head_crsa=self._native_head_crsa,
         )
 
     def _open_draft_runtime(self) -> _OwnedRuntime:
@@ -2970,6 +2989,12 @@ class Qwen38CausalChat:
             evidence["bundle"] = dict(self._bundle_receipt)
         if self._tokenizer_sha256 is not None:
             evidence["tokenizer_sha256"] = self._tokenizer_sha256
+        if self._native_head_crsa is not None:
+            evidence["prefix_sinkhorn"] = {
+                "active": self._native_head_crsa.active,
+                "configuration": asdict(self._native_head_crsa),
+                "schema": self._native_head_crsa.evidence_schema,
+            }
         if self._draft_runtime is not None:
             evidence["draft_bundle"] = dict(self._draft_runtime.bundle_receipt)
         fast_mlp_receipt = (
