@@ -102,7 +102,7 @@ class PackedDeltaHeadRouterTests(unittest.TestCase):
         )
         state = router._states[2]
         state.previous = tuple(range(47, 31, -1))
-        state.overlap_ema = 0.9
+        state.overlap_ema = 0.38
         mixed = _head_values(batch=1, sequence=2)
         state.route_probe = router._route_probe(
             mixed[0, 0].reshape(48, 128)
