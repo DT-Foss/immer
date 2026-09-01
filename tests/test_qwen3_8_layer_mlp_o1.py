@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 import tempfile
 import threading
@@ -21,9 +22,17 @@ from immer.runtimes.qwen3_8.layer_mlp_crystal import (
     Layer63MlpResidualCrystal,
     Layer63MlpResidualCrystalBank,
     Layer63MlpResidualCrystalIdentity,
+    LayerMlpResidualCrystal,
+    LayerMlpResidualCrystalIdentity,
+    LayerMlpCrystalIdentityError,
     LayerMlpCrystalIntegrityError,
 )
-from immer.runtimes.qwen3_8.layer_mlp_o1 import Layer63MlpO1Accumulator
+from immer.runtimes.qwen3_8.layer_mlp_o1 import (
+    LAYER_MLP_GENERIC_O1_STATS_ENVELOPE_SCHEMA,
+    Layer63MlpO1Accumulator,
+    LayerMlpO1Accumulator,
+    LayerMlpO1Snapshot,
+)
 from immer.runtimes.qwen3_8.layer_transition_crystal import (
     LayerTransitionProjectionIdentity,
 )
@@ -47,6 +56,26 @@ def _identity(
     )
 
 
+def _generic_identity(
+    layer_index: int,
+    *,
+    hidden_dim: int = 8,
+    sketch_dim: int = 3,
+) -> LayerMlpResidualCrystalIdentity:
+    return LayerMlpResidualCrystalIdentity(
+        model_sha256="1" * 64,
+        q4_sha256="2" * 64,
+        graph_revision_sha256="3" * 64,
+        atlas_revision_sha256="4" * 64,
+        projection=LayerTransitionProjectionIdentity(
+            hidden_dim=hidden_dim,
+            sketch_dim=sketch_dim,
+            seed_sha256="5" * 64,
+        ),
+        layer_index=layer_index,
+    )
+
+
 def _triples(
     rows: int,
     hidden_dim: int = 8,
@@ -66,6 +95,63 @@ def _triples(
 
 
 class LayerMlpO1Tests(unittest.TestCase):
+    def test_generic_o1_accumulates_and_reopens_any_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for layer in (0, 18, 63):
+                identity = _generic_identity(layer)
+                path = root / f"layer-{layer}.json"
+                accumulator = LayerMlpO1Accumulator(
+                    path,
+                    identity,
+                    packed_weight_bytes_avoided=909 + layer,
+                )
+                snapshot = accumulator.observe(*_triples(12, seed=layer + 3))
+                self.assertIsInstance(snapshot, LayerMlpO1Snapshot)
+                self.assertTrue(snapshot.ready)
+                self.assertEqual(snapshot.layer_index, layer)
+                self.assertEqual(snapshot.source_stage, identity.source_stage)
+                self.assertEqual(snapshot.feature_stage, identity.feature_stage)
+                self.assertEqual(snapshot.target_stage, identity.target_stage)
+                self.assertEqual(
+                    json.loads(path.read_bytes())["schema"],
+                    LAYER_MLP_GENERIC_O1_STATS_ENVELOPE_SCHEMA,
+                )
+                reopened = LayerMlpO1Accumulator.load(path)
+                self.assertEqual(reopened.identity, identity)
+                self.assertIsInstance(
+                    reopened.current_crystal(),
+                    LayerMlpResidualCrystal,
+                )
+
+    def test_generic_o1_rejects_cross_layer_merge_and_legacy_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            left = LayerMlpO1Accumulator(
+                root / "left.json",
+                _generic_identity(7),
+                packed_weight_bytes_avoided=909,
+            )
+            right = LayerMlpO1Accumulator(
+                root / "right.json",
+                _generic_identity(8),
+                packed_weight_bytes_avoided=909,
+            )
+            left.observe(*_triples(12, seed=7))
+            right.observe(*_triples(12, seed=8))
+            with self.assertRaises(LayerMlpCrystalIdentityError):
+                left.merge_from(right)
+
+            legacy_path = root / "legacy.json"
+            legacy = Layer63MlpO1Accumulator(
+                legacy_path,
+                _identity(),
+                packed_weight_bytes_avoided=909,
+            )
+            legacy.observe(*_triples(12, seed=9))
+            with self.assertRaises(LayerMlpCrystalIdentityError):
+                LayerMlpO1Accumulator.load(legacy_path)
+
     def test_offline_relative_ridge_refit_preserves_source_and_provenance(
         self,
     ) -> None:

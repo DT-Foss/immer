@@ -9,7 +9,7 @@ path.  MTP can later draft tokens, but it must never alter base-model parity.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass, replace
 import hashlib
 import json
@@ -336,6 +336,7 @@ class StreamedQwen38:
         layer_boundary_stages: Sequence[str] | None = None,
         layer_boundary_layers: Sequence[int] | None = None,
         layer_mlp_o1_observer: LayerMlpO1Observer | None = None,
+        layer_mlp_o1_observers: Mapping[int, LayerMlpO1Observer] | None = None,
         mlp_sparse_executor: Any | None = None,
         mlp_page_router: Any | None = None,
         delta_head_router: Any | None = None,
@@ -403,6 +404,18 @@ class StreamedQwen38:
             raise ValueError("layer_boundary_layers require a layer_boundary_observer")
         if layer_mlp_o1_observer is not None and not callable(layer_mlp_o1_observer):
             raise TypeError("layer_mlp_o1_observer must be callable or None")
+        validated_layer_mlp_o1_observers = self._validated_layer_mlp_o1_observers(
+            layer_mlp_o1_observers,
+            n_layers=config.n_layers,
+        )
+        if (
+            layer_mlp_o1_observer is not None
+            and LAYER_MLP_TARGET_LAYER_INDEX in validated_layer_mlp_o1_observers
+        ):
+            raise ValueError(
+                "layer_mlp_o1_observer duplicates layer 63 in "
+                "layer_mlp_o1_observers"
+            )
         if mlp_sparse_executor is not None:
             required = (
                 "execute",
@@ -578,9 +591,21 @@ class StreamedQwen38:
         self.layer_boundary_observer = layer_boundary_observer
         self.layer_boundary_stages = tuple(selected_boundary_stages)
         self.layer_boundary_layers = selected_boundary_layers
-        self.layer_mlp_o1_observer = layer_mlp_o1_observer
+        if (
+            layer_mlp_o1_observer is not None
+            and LAYER_MLP_TARGET_LAYER_INDEX < config.n_layers
+        ):
+            validated_layer_mlp_o1_observers[LAYER_MLP_TARGET_LAYER_INDEX] = (
+                layer_mlp_o1_observer
+            )
+        self.layer_mlp_o1_observers = validated_layer_mlp_o1_observers
+        self.layer_mlp_o1_observer = self.layer_mlp_o1_observers.get(
+            LAYER_MLP_TARGET_LAYER_INDEX
+        )
         self._layer_mlp_o1_observer_rows = 0
         self._layer_mlp_o1_observer_failures = 0
+        self._layer_mlp_o1_observer_rows_by_layer: dict[int, int] = {}
+        self._layer_mlp_o1_observer_failures_by_layer: dict[int, int] = {}
         self.mlp_sparse_executor = mlp_sparse_executor
         self.mlp_page_router = mlp_page_router
         self.delta_head_router = delta_head_router
@@ -2594,17 +2619,78 @@ class StreamedQwen38:
         self,
         observer: LayerMlpO1Observer | None,
     ) -> None:
-        """Select one passive exact K1 MLP sink without changing runtime math."""
+        """Select the legacy layer-63 passive exact K1 MLP sink."""
 
         if observer is not None and not callable(observer):
             raise TypeError("layer_mlp_o1_observer must be callable or None")
+        observers = dict(self.layer_mlp_o1_observers)
+        if observer is None or LAYER_MLP_TARGET_LAYER_INDEX >= self.config.n_layers:
+            observers.pop(LAYER_MLP_TARGET_LAYER_INDEX, None)
+        else:
+            observers[LAYER_MLP_TARGET_LAYER_INDEX] = observer
+        self.layer_mlp_o1_observers = observers
         self.layer_mlp_o1_observer = observer
 
+    @staticmethod
+    def _validated_layer_mlp_o1_observers(
+        observers: Mapping[int, LayerMlpO1Observer] | None,
+        *,
+        n_layers: int,
+    ) -> dict[int, LayerMlpO1Observer]:
+        if observers is None:
+            return {}
+        if not isinstance(observers, Mapping):
+            raise TypeError("layer_mlp_o1_observers must be a mapping or None")
+        validated: dict[int, LayerMlpO1Observer] = {}
+        for layer, observer in observers.items():
+            if isinstance(layer, bool) or not isinstance(layer, int):
+                raise TypeError("layer_mlp_o1_observers keys must be integers")
+            if not 0 <= layer < n_layers:
+                raise ValueError("layer_mlp_o1_observers key outside decoder depth")
+            if not callable(observer):
+                raise TypeError("layer_mlp_o1_observers values must be callable")
+            validated[layer] = observer
+        return validated
+
+    def set_layer_mlp_o1_observers(
+        self,
+        observers: Mapping[int, LayerMlpO1Observer],
+    ) -> None:
+        """Atomically replace passive exact K1 MLP sinks by decoder layer."""
+
+        validated = self._validated_layer_mlp_o1_observers(
+            observers,
+            n_layers=self.config.n_layers,
+        )
+        self.layer_mlp_o1_observers = validated
+        self.layer_mlp_o1_observer = validated.get(LAYER_MLP_TARGET_LAYER_INDEX)
+
     def layer_mlp_o1_observer_metrics(self) -> dict[str, object]:
+        layers = sorted(
+            set(self.layer_mlp_o1_observers)
+            | set(self._layer_mlp_o1_observer_rows_by_layer)
+            | set(self._layer_mlp_o1_observer_failures_by_layer)
+        )
+        if all(layer == LAYER_MLP_TARGET_LAYER_INDEX for layer in layers):
+            return {
+                "failures": self._layer_mlp_o1_observer_failures,
+                "rows": self._layer_mlp_o1_observer_rows,
+                "schema": "immer.qwen3.8-layer63-mlp-o1-observer/v1",
+            }
         return {
             "failures": self._layer_mlp_o1_observer_failures,
+            "layers": {
+                str(layer): {
+                    "failures": self._layer_mlp_o1_observer_failures_by_layer.get(
+                        layer, 0
+                    ),
+                    "rows": self._layer_mlp_o1_observer_rows_by_layer.get(layer, 0),
+                }
+                for layer in layers
+            },
+            "registered_layers": sorted(self.layer_mlp_o1_observers),
             "rows": self._layer_mlp_o1_observer_rows,
-            "schema": "immer.qwen3.8-layer63-mlp-o1-observer/v1",
+            "schema": "immer.qwen3.8-layer-mlp-o1-observer-registry/v2",
         }
 
     def _observe_layer_mlp_o1(
@@ -2615,15 +2701,15 @@ class StreamedQwen38:
         *,
         layer: int,
         start_pos: int,
+        stateful: bool,
     ) -> None:
         """Copy one completed decode row into a passive sink after exact math."""
 
-        observer = self.layer_mlp_o1_observer
+        observer = self.layer_mlp_o1_observers.get(layer)
         if (
             observer is None
+            or not stateful
             or start_pos <= 0
-            or layer != LAYER_MLP_TARGET_LAYER_INDEX
-            or layer != self.config.n_layers - 1
             or any(
                 tuple(value.shape) != (1, 1, self.config.dim)
                 or value.dtype != torch.bfloat16
@@ -2642,9 +2728,12 @@ class StreamedQwen38:
             observer(*rows)
         except Exception as exc:
             self._layer_mlp_o1_observer_failures += 1
+            self._layer_mlp_o1_observer_failures_by_layer[layer] = (
+                self._layer_mlp_o1_observer_failures_by_layer.get(layer, 0) + 1
+            )
             try:
                 warnings.warn(
-                    "layer-63 MLP O1 observer failed after exact target math: "
+                    f"layer-{layer} MLP O1 observer failed after exact target math: "
                     f"{type(exc).__name__}: {exc}",
                     RuntimeWarning,
                     stacklevel=2,
@@ -2653,6 +2742,9 @@ class StreamedQwen38:
                 pass
         else:
             self._layer_mlp_o1_observer_rows += 1
+            self._layer_mlp_o1_observer_rows_by_layer[layer] = (
+                self._layer_mlp_o1_observer_rows_by_layer.get(layer, 0) + 1
+            )
 
     def _requires_unfused_mlp_boundaries(self, layer: int) -> bool:
         """Return whether this observer needs Gate/Up/activation/output tensors."""
@@ -4144,6 +4236,7 @@ class StreamedQwen38:
                 output[0],
                 layer=layer,
                 start_pos=start_pos,
+                stateful=True,
             )
         return (
             output,
@@ -4517,6 +4610,7 @@ class StreamedQwen38:
                     hidden,
                     layer=layer,
                     start_pos=start_pos,
+                    stateful=stateful,
                 )
         self._observe_layer_boundary(layer, "layer.output", hidden)
         return hidden, retained_state

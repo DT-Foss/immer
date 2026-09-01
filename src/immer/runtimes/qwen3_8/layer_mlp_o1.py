@@ -1,4 +1,4 @@
-"""Additive O1 sufficient statistics for the layer-63 MLP crystal.
+"""Additive O1 sufficient statistics for layer-parametric MLP crystals.
 
 Each observation is reduced immediately to float64 sufficient statistics.  The
 state therefore survives arbitrarily many ordinary Qwen requests without ever
@@ -23,9 +23,15 @@ from .layer_mlp_crystal import (
     Layer63MlpResidualCoverage,
     Layer63MlpResidualCrystal,
     Layer63MlpResidualCrystalIdentity,
+    LayerMlpResidualCoverage,
+    LayerMlpResidualCrystal,
+    LayerMlpResidualCrystalIdentity,
     LayerMlpCrystalIdentityError,
     LayerMlpCrystalIntegrityError,
+    _LayerMlpIdentity,
     _as_integrity,
+    _generic_identity,
+    _identity_from_record,
     _publish_bytes,
     _read_state,
     _state_lock,
@@ -51,6 +57,12 @@ LAYER_MLP_O1_STATS_SCHEMA = "immer.qwen3.8-layer63-mlp-o1-stats/v1"
 LAYER_MLP_O1_REFIT_STATS_SCHEMA = "immer.qwen3.8-layer63-mlp-o1-stats/v2"
 LAYER_MLP_O1_STATS_ENVELOPE_SCHEMA = "immer.qwen3.8-layer63-mlp-o1-stats-envelope/v1"
 LAYER_MLP_O1_SOLUTION_SCHEMA = "immer.qwen3.8-layer63-mlp-o1-solution/v1"
+LAYER_MLP_GENERIC_O1_STATS_SCHEMA = "immer.qwen3.8-layer-mlp-o1-stats/v2"
+LAYER_MLP_GENERIC_O1_REFIT_STATS_SCHEMA = "immer.qwen3.8-layer-mlp-o1-stats/v3"
+LAYER_MLP_GENERIC_O1_STATS_ENVELOPE_SCHEMA = (
+    "immer.qwen3.8-layer-mlp-o1-stats-envelope/v2"
+)
+LAYER_MLP_GENERIC_O1_SOLUTION_SCHEMA = "immer.qwen3.8-layer-mlp-o1-solution/v2"
 
 
 def _positive_finite(value: object, field: str) -> float:
@@ -123,7 +135,16 @@ class _O1Solution:
         object.__setattr__(self, "max_observed_error", observed)
         object.__setattr__(self, "error_radius", error)
 
-    def to_record(self) -> dict[str, object]:
+    def to_record(
+        self,
+        *,
+        schema: str = LAYER_MLP_O1_SOLUTION_SCHEMA,
+    ) -> dict[str, object]:
+        if schema not in (
+            LAYER_MLP_O1_SOLUTION_SCHEMA,
+            LAYER_MLP_GENERIC_O1_SOLUTION_SCHEMA,
+        ):
+            raise ValueError("MLP O1 solution schema is invalid")
         return {
             "error_radius": self.error_radius,
             "feature_mean": _tensor_record(
@@ -137,7 +158,7 @@ class _O1Solution:
                 self.residual_mean,
                 field="O1 residual_mean",
             ),
-            "schema": LAYER_MLP_O1_SOLUTION_SCHEMA,
+            "schema": schema,
         }
 
     @classmethod
@@ -147,6 +168,7 @@ class _O1Solution:
         *,
         sketch_dim: int,
         hidden_dim: int,
+        schema: str = LAYER_MLP_O1_SOLUTION_SCHEMA,
     ) -> "_O1Solution":
         fields = {
             "error_radius",
@@ -160,7 +182,7 @@ class _O1Solution:
         if (
             not isinstance(value, Mapping)
             or set(value) != fields
-            or value["schema"] != LAYER_MLP_O1_SOLUTION_SCHEMA
+            or value["schema"] != schema
         ):
             raise LayerMlpCrystalIntegrityError("MLP O1 solution fields are invalid")
         try:
@@ -198,7 +220,7 @@ class _O1Solution:
 
 @dataclass(frozen=True, slots=True)
 class _O1State:
-    identity: Layer63MlpResidualCrystalIdentity
+    identity: _LayerMlpIdentity
     packed_weight_bytes_avoided: int
     ridge: float
     coverage_guard: float
@@ -220,7 +242,10 @@ class _O1State:
     source_o1_generation: int | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.identity, Layer63MlpResidualCrystalIdentity):
+        if not isinstance(
+            self.identity,
+            (Layer63MlpResidualCrystalIdentity, LayerMlpResidualCrystalIdentity),
+        ):
             raise TypeError("O1 state identity is invalid")
         s = self.identity.sketch_dim
         h = self.identity.hidden_dim
@@ -291,6 +316,12 @@ class _O1State:
         return _sha256_document(self.to_record())
 
     def to_record(self) -> dict[str, object]:
+        generic = _generic_identity(self.identity)
+        solution_schema = (
+            LAYER_MLP_GENERIC_O1_SOLUTION_SCHEMA
+            if generic
+            else LAYER_MLP_O1_SOLUTION_SCHEMA
+        )
         record: dict[str, object] = {
             "coverage_guard": self.coverage_guard,
             "error_guard": self.error_guard,
@@ -305,8 +336,16 @@ class _O1State:
             "packed_weight_bytes_avoided": self.packed_weight_bytes_avoided,
             "ridge": self.ridge,
             "sample_count": self.sample_count,
-            "schema": LAYER_MLP_O1_STATS_SCHEMA,
-            "solution": None if self.solution is None else self.solution.to_record(),
+            "schema": (
+                LAYER_MLP_GENERIC_O1_STATS_SCHEMA
+                if generic
+                else LAYER_MLP_O1_STATS_SCHEMA
+            ),
+            "solution": (
+                None
+                if self.solution is None
+                else self.solution.to_record(schema=solution_schema)
+            ),
             "sum_d": _tensor_record(self.sum_d, field="O1 sum_d"),
             "sum_d2": self.sum_d2,
             "sum_f": _tensor_record(self.sum_f, field="O1 sum_f"),
@@ -316,7 +355,11 @@ class _O1State:
         if self.source_o1_state_sha256 is not None:
             record.update(
                 {
-                    "schema": LAYER_MLP_O1_REFIT_STATS_SCHEMA,
+                    "schema": (
+                        LAYER_MLP_GENERIC_O1_REFIT_STATS_SCHEMA
+                        if generic
+                        else LAYER_MLP_O1_REFIT_STATS_SCHEMA
+                    ),
                     "source_o1_generation": self.source_o1_generation,
                     "source_o1_state_sha256": self.source_o1_state_sha256,
                 }
@@ -324,16 +367,30 @@ class _O1State:
         return record
 
     def to_bytes(self) -> bytes:
-        return _sealed_document(self.to_record(), LAYER_MLP_O1_STATS_ENVELOPE_SCHEMA)
+        envelope_schema = (
+            LAYER_MLP_GENERIC_O1_STATS_ENVELOPE_SCHEMA
+            if _generic_identity(self.identity)
+            else LAYER_MLP_O1_STATS_ENVELOPE_SCHEMA
+        )
+        return _sealed_document(self.to_record(), envelope_schema)
 
     @classmethod
     def from_bytes(cls, value: bytes) -> "_O1State":
+        generic_envelope = False
         try:
-            body = _unseal_document(
-                value,
-                schema=LAYER_MLP_O1_STATS_ENVELOPE_SCHEMA,
-                kind="layer-63 MLP O1 state",
-            )
+            try:
+                body = _unseal_document(
+                    value,
+                    schema=LAYER_MLP_O1_STATS_ENVELOPE_SCHEMA,
+                    kind="layer-63 MLP O1 state",
+                )
+            except LayerTransitionCrystalIntegrityError:
+                generic_envelope = True
+                body = _unseal_document(
+                    value,
+                    schema=LAYER_MLP_GENERIC_O1_STATS_ENVELOPE_SCHEMA,
+                    kind="layer-parametric MLP O1 state",
+                )
         except Exception as exc:
             raise _as_integrity(exc) from exc
         legacy_fields = {
@@ -366,13 +423,29 @@ class _O1State:
         if actual_fields not in (legacy_fields, refit_fields):
             raise LayerMlpCrystalIntegrityError("MLP O1 state fields are invalid")
         is_refit = actual_fields == refit_fields
-        expected_schema = (
-            LAYER_MLP_O1_REFIT_STATS_SCHEMA if is_refit else LAYER_MLP_O1_STATS_SCHEMA
-        )
-        if body["schema"] != expected_schema:
+        schema = body["schema"]
+        if schema not in (
+            LAYER_MLP_O1_REFIT_STATS_SCHEMA if is_refit else LAYER_MLP_O1_STATS_SCHEMA,
+            (
+                LAYER_MLP_GENERIC_O1_REFIT_STATS_SCHEMA
+                if is_refit
+                else LAYER_MLP_GENERIC_O1_STATS_SCHEMA
+            ),
+        ):
             raise LayerMlpCrystalIntegrityError("MLP O1 state schema is invalid")
+        generic_schema = schema in (
+            LAYER_MLP_GENERIC_O1_STATS_SCHEMA,
+            LAYER_MLP_GENERIC_O1_REFIT_STATS_SCHEMA,
+        )
+        if generic_envelope != generic_schema:
+            raise LayerMlpCrystalIntegrityError(
+                "MLP O1 envelope and body generation differ"
+            )
         try:
-            identity = Layer63MlpResidualCrystalIdentity.from_record(body["identity"])
+            identity = _identity_from_record(body["identity"])
+            generic = _generic_identity(identity)
+            if generic != generic_schema:
+                raise ValueError("MLP O1 schema and identity generation differ")
             if body["identity_sha256"] != identity.identity_sha256:
                 raise ValueError("MLP O1 identity SHA-256 mismatch")
             solution = body["solution"]
@@ -401,6 +474,11 @@ class _O1State:
                         solution,
                         sketch_dim=identity.sketch_dim,
                         hidden_dim=identity.hidden_dim,
+                        schema=(
+                            LAYER_MLP_GENERIC_O1_SOLUTION_SCHEMA
+                            if generic
+                            else LAYER_MLP_O1_SOLUTION_SCHEMA
+                        ),
                     )
                 ),
                 source_o1_state_sha256=(
@@ -437,6 +515,16 @@ class Layer63MlpO1Snapshot:
     crystal_sha256: str | None
     source_o1_state_sha256: str | None
     source_o1_generation: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class LayerMlpO1Snapshot(Layer63MlpO1Snapshot):
+    """Snapshot carrying the fully qualified v2 layer boundary identity."""
+
+    layer_index: int
+    source_stage: str
+    feature_stage: str
+    target_stage: str
 
 
 def _fit_coefficients(
@@ -589,15 +677,18 @@ class Layer63MlpO1Accumulator:
     def __init__(
         self,
         state_path: str | os.PathLike[str],
-        identity: Layer63MlpResidualCrystalIdentity,
+        identity: _LayerMlpIdentity,
         *,
         packed_weight_bytes_avoided: int,
         ridge: float = 1e-8,
         coverage_guard: float = 0.0,
         error_guard: float = 0.0,
     ) -> None:
-        if not isinstance(identity, Layer63MlpResidualCrystalIdentity):
-            raise TypeError("identity must be a Layer63MlpResidualCrystalIdentity")
+        if not isinstance(
+            identity,
+            (Layer63MlpResidualCrystalIdentity, LayerMlpResidualCrystalIdentity),
+        ):
+            raise TypeError("identity must be an MLP residual crystal identity")
         self.state_path = Path(state_path)
         if not self.state_path.name:
             raise ValueError("state_path must name a file")
@@ -691,7 +782,17 @@ class Layer63MlpO1Accumulator:
     def _snapshot(self, state: _O1State) -> Layer63MlpO1Snapshot:
         crystal = self._crystal(state)
         solution = state.solution
-        return Layer63MlpO1Snapshot(
+        fields: dict[str, object] = {}
+        snapshot_cls: type[Layer63MlpO1Snapshot] = Layer63MlpO1Snapshot
+        if isinstance(self.identity, LayerMlpResidualCrystalIdentity):
+            snapshot_cls = LayerMlpO1Snapshot
+            fields = {
+                "layer_index": self.identity.layer_index,
+                "source_stage": self.identity.source_stage,
+                "feature_stage": self.identity.feature_stage,
+                "target_stage": self.identity.target_stage,
+            }
+        return snapshot_cls(
             identity_sha256=self.identity.identity_sha256,
             state_sha256=state.state_sha256,
             generation=state.generation,
@@ -708,18 +809,24 @@ class Layer63MlpO1Accumulator:
             crystal_sha256=None if crystal is None else crystal.crystal_sha256,
             source_o1_state_sha256=state.source_o1_state_sha256,
             source_o1_generation=state.source_o1_generation,
+            **fields,
         )
 
     def _crystal(self, state: _O1State) -> Layer63MlpResidualCrystal | None:
         solution = state.solution
         if solution is None:
             return None
-        return Layer63MlpResidualCrystal(
+        generic = _generic_identity(self.identity)
+        crystal_cls = LayerMlpResidualCrystal if generic else Layer63MlpResidualCrystal
+        coverage_cls = (
+            LayerMlpResidualCoverage if generic else Layer63MlpResidualCoverage
+        )
+        return crystal_cls(
             identity=self.identity,
             operator=solution.operator,
             feature_mean=solution.feature_mean,
             residual_mean=solution.residual_mean,
-            coverage=Layer63MlpResidualCoverage(
+            coverage=coverage_cls(
                 center=solution.feature_mean,
                 feature_radius=solution.feature_radius,
                 error_radius=solution.error_radius,
@@ -861,7 +968,7 @@ class Layer63MlpO1Accumulator:
         source = (
             other
             if isinstance(other, Layer63MlpO1Accumulator)
-            else Layer63MlpO1Accumulator.load(other)
+            else type(self).load(other)
         )
         if source.state_path.absolute() == self.state_path.absolute():
             raise ValueError("cannot merge an O1 state into itself")
@@ -1014,7 +1121,7 @@ class Layer63MlpO1Accumulator:
                 raise LayerMlpCrystalIntegrityError(
                     "MLP O1 ridge refit destination already exists"
                 )
-            destination = Layer63MlpO1Accumulator(
+            destination = type(self)(
                 destination_path,
                 self.identity,
                 packed_weight_bytes_avoided=self.packed_weight_bytes_avoided,
@@ -1045,10 +1152,50 @@ class Layer63MlpO1Accumulator:
             return self._crystal(self._state)
 
 
+class LayerMlpO1Accumulator(Layer63MlpO1Accumulator):
+    """Additive O1 state for a layer-parametric v2 MLP identity."""
+
+    def __init__(
+        self,
+        state_path: str | os.PathLike[str],
+        identity: LayerMlpResidualCrystalIdentity,
+        *,
+        packed_weight_bytes_avoided: int,
+        ridge: float = 1e-8,
+        coverage_guard: float = 0.0,
+        error_guard: float = 0.0,
+    ) -> None:
+        if not isinstance(identity, LayerMlpResidualCrystalIdentity):
+            raise TypeError("identity must be a LayerMlpResidualCrystalIdentity")
+        super().__init__(
+            state_path,
+            identity,
+            packed_weight_bytes_avoided=packed_weight_bytes_avoided,
+            ridge=ridge,
+            coverage_guard=coverage_guard,
+            error_guard=error_guard,
+        )
+
+    @classmethod
+    def load(cls, state_path: str | os.PathLike[str]) -> "LayerMlpO1Accumulator":
+        accumulator = super().load(state_path)
+        if not isinstance(accumulator.identity, LayerMlpResidualCrystalIdentity):
+            raise LayerMlpCrystalIdentityError(
+                "generic MLP O1 loader rejected a layer-63 v1 identity"
+            )
+        return accumulator
+
+
 __all__ = [
+    "LAYER_MLP_GENERIC_O1_REFIT_STATS_SCHEMA",
+    "LAYER_MLP_GENERIC_O1_SOLUTION_SCHEMA",
+    "LAYER_MLP_GENERIC_O1_STATS_ENVELOPE_SCHEMA",
+    "LAYER_MLP_GENERIC_O1_STATS_SCHEMA",
     "LAYER_MLP_O1_REFIT_STATS_SCHEMA",
     "LAYER_MLP_O1_STATS_ENVELOPE_SCHEMA",
     "LAYER_MLP_O1_STATS_SCHEMA",
     "Layer63MlpO1Accumulator",
     "Layer63MlpO1Snapshot",
+    "LayerMlpO1Accumulator",
+    "LayerMlpO1Snapshot",
 ]

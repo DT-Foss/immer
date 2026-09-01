@@ -4902,9 +4902,17 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
                         state=None,
                         start_pos=1,
                         stateful=True,
-                    )
+                )
                 self.assertTrue(torch.equal(isolated, expected))
-                self.assertEqual(model.layer_mlp_o1_observer_metrics()["failures"], 1)
+                legacy_metrics = model.layer_mlp_o1_observer_metrics()
+                self.assertEqual(
+                    legacy_metrics,
+                    {
+                        "failures": 1,
+                        "rows": 1,
+                        "schema": "immer.qwen3.8-layer63-mlp-o1-observer/v1",
+                    },
+                )
 
                 model.set_layer_mlp_o1_observer(observe)
                 replacement = SimpleNamespace(
@@ -4929,6 +4937,139 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
                         stateful=True,
                     )
                 self.assertEqual(len(captured), before)
+            finally:
+                pager.close()
+                source.close()
+
+    def test_passive_layer_mlp_o1_registry_dispatches_and_counts_by_layer(
+        self,
+    ) -> None:
+        config = _official_topology_tiny_config()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            save_file(_tiny_weights(config), root / "model.safetensors")
+            source = Streamer.from_local(root, budget_mb=20, use_cache=False)
+            pager = Qwen38WeightPager(
+                source,
+                device="cpu",
+                compute_dtype="bfloat16",
+                max_resident_bytes=2 * 1024**2,
+            )
+            model = StreamedQwen38(config, pager, max_batch_size=1, max_seq_len=8)
+            try:
+                hidden = torch.randn((1, 1, config.dim)).to(torch.bfloat16)
+                mask = torch.ones((1, 1), dtype=torch.bool)
+                captured: list[tuple[int, tuple[torch.Tensor, ...]]] = []
+
+                def observe_layer18(*rows: torch.Tensor) -> None:
+                    captured.append((18, rows))
+
+                def broken_layer27(*_rows: torch.Tensor) -> None:
+                    raise RuntimeError("layer 27 sink failed")
+
+                configured = {18: observe_layer18, 27: broken_layer27}
+                model.set_layer_mlp_o1_observers(configured)
+                configured.clear()
+
+                layer18_output, _ = model._forward_layer(
+                    hidden,
+                    layer=18,
+                    token_mask=mask,
+                    state=None,
+                    start_pos=1,
+                    stateful=True,
+                )
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    layer27_output, _ = model._forward_layer(
+                        hidden,
+                        layer=27,
+                        token_mask=mask,
+                        state=None,
+                        start_pos=1,
+                        stateful=True,
+                    )
+                self.assertEqual(tuple(layer18_output.shape), (1, 1, config.dim))
+                self.assertEqual(tuple(layer27_output.shape), (1, 1, config.dim))
+                self.assertEqual(len(captured), 1)
+                self.assertEqual(captured[0][0], 18)
+                self.assertTrue(
+                    all(
+                        tuple(row.shape) == (1, 1, config.dim)
+                        and row.dtype == torch.bfloat16
+                        and row.device.type == "cpu"
+                        for row in captured[0][1]
+                    )
+                )
+
+                metrics = model.layer_mlp_o1_observer_metrics()
+                self.assertEqual(
+                    metrics["schema"],
+                    "immer.qwen3.8-layer-mlp-o1-observer-registry/v2",
+                )
+                self.assertEqual(metrics["rows"], 1)
+                self.assertEqual(metrics["failures"], 1)
+                self.assertEqual(
+                    metrics["layers"],
+                    {
+                        "18": {"failures": 0, "rows": 1},
+                        "27": {"failures": 1, "rows": 0},
+                    },
+                )
+                self.assertEqual(metrics["registered_layers"], [18, 27])
+
+                # The same layer registry still rejects prompt position zero,
+                # prefill and K2 continuation waves.
+                model._forward_layer(
+                    hidden,
+                    layer=18,
+                    token_mask=mask,
+                    state=None,
+                    start_pos=0,
+                    stateful=True,
+                )
+                model._forward_layer(
+                    hidden,
+                    layer=18,
+                    token_mask=mask,
+                    state=None,
+                    start_pos=1,
+                    stateful=False,
+                )
+                model._forward_layer_token_rows(
+                    (hidden, hidden.clone()),
+                    layer=18,
+                    state=None,
+                    start_pos=1,
+                    native_head_crsa_observer=lambda _row: None,
+                )
+                self.assertEqual(len(captured), 1)
+
+                def legacy(*_rows: torch.Tensor) -> None:
+                    pass
+
+                model.set_layer_mlp_o1_observer(legacy)
+                self.assertIs(model.layer_mlp_o1_observer, legacy)
+                self.assertEqual(
+                    sorted(model.layer_mlp_o1_observers),
+                    [18, 27, 63],
+                )
+                model.set_layer_mlp_o1_observer(None)
+                self.assertEqual(sorted(model.layer_mlp_o1_observers), [18, 27])
+                model.set_layer_mlp_o1_observers({})
+                self.assertEqual(model.layer_mlp_o1_observers, {})
+                self.assertIsNone(model.layer_mlp_o1_observer)
+
+                with self.assertRaisesRegex(TypeError, "must be a mapping"):
+                    model.set_layer_mlp_o1_observers([])  # type: ignore[arg-type]
+                with self.assertRaisesRegex(TypeError, "keys must be integers"):
+                    model.set_layer_mlp_o1_observers({True: observe_layer18})
+                with self.assertRaisesRegex(ValueError, "decoder depth"):
+                    model.set_layer_mlp_o1_observers(
+                        {config.n_layers: observe_layer18}
+                    )
+                with self.assertRaisesRegex(TypeError, "values must be callable"):
+                    model.set_layer_mlp_o1_observers({18: None})  # type: ignore[dict-item]
             finally:
                 pager.close()
                 source.close()

@@ -13,12 +13,19 @@ import torch
 
 from immer.runtimes.qwen3_8.layer_mlp_crystal import (
     FEATURE_STAGE,
+    LAYER_MLP_RESIDUAL_GENERIC_BANK_ENVELOPE_SCHEMA,
+    LAYER_MLP_RESIDUAL_GENERIC_CRYSTAL_ENVELOPE_SCHEMA,
+    LAYER_MLP_RESIDUAL_GENERIC_IDENTITY_SCHEMA,
     SOURCE_STAGE,
     TARGET_STAGE,
     Layer63MlpResidualCoverage,
     Layer63MlpResidualCrystal,
     Layer63MlpResidualCrystalBank,
     Layer63MlpResidualCrystalIdentity,
+    LayerMlpResidualCoverage,
+    LayerMlpResidualCrystal,
+    LayerMlpResidualCrystalBank,
+    LayerMlpResidualCrystalIdentity,
     LayerMlpCrystalIdentityError,
     LayerMlpCrystalIntegrityError,
 )
@@ -86,6 +93,45 @@ def _crystal(
     )
 
 
+def _generic_identity(layer_index: int) -> LayerMlpResidualCrystalIdentity:
+    return LayerMlpResidualCrystalIdentity(
+        model_sha256=_sha("1"),
+        q4_sha256=_sha("2"),
+        graph_revision_sha256=_sha("3"),
+        atlas_revision_sha256=_sha("4"),
+        projection=LayerTransitionProjectionIdentity(
+            hidden_dim=8,
+            sketch_dim=3,
+            seed_sha256=_sha("5"),
+        ),
+        layer_index=layer_index,
+    )
+
+
+def _generic_crystal(
+    identity: LayerMlpResidualCrystalIdentity,
+) -> LayerMlpResidualCrystal:
+    center = torch.zeros(identity.sketch_dim, dtype=torch.float64)
+    return LayerMlpResidualCrystal(
+        identity=identity,
+        operator=torch.zeros(
+            (identity.sketch_dim, identity.hidden_dim),
+            dtype=torch.float64,
+        ),
+        feature_mean=center,
+        residual_mean=torch.full((identity.hidden_dim,), 0.25, dtype=torch.float64),
+        coverage=LayerMlpResidualCoverage(
+            center=center,
+            feature_radius=100.0,
+            error_radius=0.5,
+            sample_count=9,
+            max_observed_error=0.25,
+        ),
+        packed_weight_bytes_avoided=12288,
+        ridge=1e-8,
+    )
+
+
 def _canonical(value: object) -> bytes:
     return json.dumps(
         value,
@@ -97,6 +143,36 @@ def _canonical(value: object) -> bytes:
 
 
 class LayerMlpMathTests(unittest.TestCase):
+    def test_generic_identity_binds_every_layer_and_qualified_stage(self) -> None:
+        identities = tuple(_generic_identity(layer) for layer in range(64))
+        self.assertEqual(len({row.identity_sha256 for row in identities}), 64)
+        for layer, identity in enumerate(identities):
+            self.assertEqual(identity.layer_index, layer)
+            self.assertEqual(
+                identity.source_stage,
+                f"qwen.layer.{layer}.attention.residual",
+            )
+            self.assertEqual(identity.feature_stage, f"qwen.layer.{layer}.mlp.input")
+            self.assertEqual(identity.target_stage, f"qwen.layer.{layer}.layer.output")
+            self.assertEqual(
+                identity.to_record()["schema"],
+                LAYER_MLP_RESIDUAL_GENERIC_IDENTITY_SCHEMA,
+            )
+            self.assertEqual(
+                LayerMlpResidualCrystalIdentity.from_record(identity.to_record()),
+                identity,
+            )
+        self.assertNotEqual(identities[-1].identity_sha256, _identity().identity_sha256)
+        for invalid in (-1, 64, True):
+            with self.assertRaises(ValueError):
+                _generic_identity(invalid)
+
+    def test_generic_identity_rejects_stage_not_derived_from_layer(self) -> None:
+        record = _generic_identity(18).to_record()
+        record["source_stage"] = "qwen.layer.19.attention.residual"
+        with self.assertRaises(LayerMlpCrystalIntegrityError):
+            LayerMlpResidualCrystalIdentity.from_record(record)
+
     def test_centered_ridge_matches_closed_form_and_bf16_action(self) -> None:
         identity = _identity()
         base = torch.tensor(
@@ -235,6 +311,59 @@ class LayerMlpMathTests(unittest.TestCase):
 
 
 class LayerMlpStorageTests(unittest.TestCase):
+    def test_legacy_v1_hashes_remain_byte_identical(self) -> None:
+        identity = _identity()
+        crystal = _crystal(identity)
+        self.assertEqual(
+            identity.identity_sha256,
+            "0fb1a874254ff3e18cc44f23d5c58e7e718662bfd1f2b5df4917a535a1e97912",
+        )
+        self.assertEqual(
+            crystal.crystal_sha256,
+            "f74489e0a0dcb20c6ee5d781ee8e375190f5cd34926fa8bdc1bb26366a9315b1",
+        )
+        self.assertEqual(
+            hashlib.sha256(crystal.to_bytes()).hexdigest(),
+            "f82ec7abd82756642f7256606ec608e667f93ffcc8e523bcd813860a607e9e9e",
+        )
+
+    def test_generic_crystal_and_bank_roundtrip_without_legacy_relabeling(
+        self,
+    ) -> None:
+        identity = _generic_identity(18)
+        crystal = _generic_crystal(identity)
+        crystal_document = json.loads(crystal.to_bytes())
+        self.assertEqual(
+            crystal_document["schema"],
+            LAYER_MLP_RESIDUAL_GENERIC_CRYSTAL_ENVELOPE_SCHEMA,
+        )
+        restored = LayerMlpResidualCrystal.from_bytes(crystal.to_bytes())
+        self.assertIsInstance(restored.identity, LayerMlpResidualCrystalIdentity)
+        self.assertEqual(restored.to_bytes(), crystal.to_bytes())
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "layer18-mlp-v2.json"
+            bank = LayerMlpResidualCrystalBank(path, identity)
+            bank.publish(crystal)
+            bank_document = json.loads(path.read_bytes())
+            self.assertEqual(
+                bank_document["schema"],
+                LAYER_MLP_RESIDUAL_GENERIC_BANK_ENVELOPE_SCHEMA,
+            )
+            loaded = LayerMlpResidualCrystalBank.load(path)
+            self.assertEqual(loaded.identity, identity)
+            self.assertIsInstance(loaded.crystals[0], LayerMlpResidualCrystal)
+            with self.assertRaises(LayerMlpCrystalIdentityError):
+                LayerMlpResidualCrystalBank(path, _generic_identity(19))
+
+    def test_generic_loaders_reject_legacy_v1_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "layer63-v1.json"
+            identity = _identity()
+            legacy = Layer63MlpResidualCrystalBank(path, identity)
+            legacy.publish(_crystal(identity))
+            with self.assertRaises(LayerMlpCrystalIdentityError):
+                LayerMlpResidualCrystalBank.load(path)
+
     def test_crystal_roundtrip_is_hash_stable_and_has_no_raw_samples(self) -> None:
         crystal = _crystal()
         encoded = crystal.to_bytes()

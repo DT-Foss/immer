@@ -1,4 +1,4 @@
-"""Private layer-63 MLP residual crystals for the local Qwen3.8 runtime.
+"""Private layer-parametric MLP residual crystals for the local Qwen3.8 runtime.
 
 The crystal keeps the exact attention result ``x`` and replaces only the
 three packed MLP projections.  Given the exact normalised MLP input ``u`` it
@@ -56,6 +56,7 @@ from .layer_transition_crystal import (
 
 
 TARGET_LAYER_INDEX = 63
+MAX_LAYER_INDEX = 63
 SOURCE_STAGE = "attention.residual"
 FEATURE_STAGE = "mlp.input"
 TARGET_STAGE = "layer.output"
@@ -77,6 +78,32 @@ LAYER_MLP_RESIDUAL_CRYSTAL_ENVELOPE_SCHEMA = (
 LAYER_MLP_RESIDUAL_BANK_SCHEMA = "immer.qwen3.8-layer63-mlp-residual-bank/v1"
 LAYER_MLP_RESIDUAL_BANK_ENVELOPE_SCHEMA = (
     "immer.qwen3.8-layer63-mlp-residual-bank-envelope/v1"
+)
+
+# Layer-63 v1 artifacts are deployed private state.  The generic lane therefore
+# has its own ABI and schemas instead of silently assigning new semantics to
+# any existing digest.
+LAYER_MLP_RESIDUAL_GENERIC_ACTION_ABI = (
+    "immer.qwen3.8/layer-mlp-residual-rademacher-centered-ridge-bf16/v2"
+)
+LAYER_MLP_RESIDUAL_GENERIC_IDENTITY_SCHEMA = (
+    "immer.qwen3.8-layer-mlp-residual-crystal-identity/v2"
+)
+LAYER_MLP_RESIDUAL_GENERIC_COVERAGE_SCHEMA = (
+    "immer.qwen3.8-layer-mlp-residual-crystal-coverage/v2"
+)
+LAYER_MLP_RESIDUAL_GENERIC_CRYSTAL_SCHEMA = (
+    "immer.qwen3.8-layer-mlp-residual-crystal/v2"
+)
+LAYER_MLP_RESIDUAL_GENERIC_O1_CRYSTAL_SCHEMA = (
+    "immer.qwen3.8-layer-mlp-residual-crystal/v3"
+)
+LAYER_MLP_RESIDUAL_GENERIC_CRYSTAL_ENVELOPE_SCHEMA = (
+    "immer.qwen3.8-layer-mlp-residual-crystal-envelope/v2"
+)
+LAYER_MLP_RESIDUAL_GENERIC_BANK_SCHEMA = "immer.qwen3.8-layer-mlp-residual-bank/v2"
+LAYER_MLP_RESIDUAL_GENERIC_BANK_ENVELOPE_SCHEMA = (
+    "immer.qwen3.8-layer-mlp-residual-bank-envelope/v2"
 )
 
 _MAX_COUNTER = (1 << 63) - 1
@@ -127,6 +154,14 @@ def _publish_bytes(path: Path, data: bytes) -> None:
         _atomic_write(path, data)
     except LayerTransitionCrystalError as exc:
         raise _as_integrity(exc) from exc
+
+
+def _layer_index(value: object) -> int:
+    return _uint(value, field="layer_index", maximum=MAX_LAYER_INDEX)
+
+
+def _qualified_stage(layer_index: int, stage: str) -> str:
+    return f"qwen.layer.{_layer_index(layer_index)}.{stage}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +272,133 @@ class Layer63MlpResidualCrystalIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class LayerMlpResidualCrystalIdentity:
+    """Immutable v2 identity for one MLP action at any Qwen layer."""
+
+    model_sha256: str
+    q4_sha256: str
+    graph_revision_sha256: str
+    atlas_revision_sha256: str
+    projection: LayerTransitionProjectionIdentity
+    layer_index: int
+    action_abi: str = LAYER_MLP_RESIDUAL_GENERIC_ACTION_ABI
+
+    def __post_init__(self) -> None:
+        for field in (
+            "model_sha256",
+            "q4_sha256",
+            "graph_revision_sha256",
+            "atlas_revision_sha256",
+        ):
+            _digest(getattr(self, field), field)
+        if not isinstance(self.projection, LayerTransitionProjectionIdentity):
+            raise TypeError("projection must be a LayerTransitionProjectionIdentity")
+        _layer_index(self.layer_index)
+        if self.action_abi != LAYER_MLP_RESIDUAL_GENERIC_ACTION_ABI:
+            raise ValueError("generic MLP residual action ABI is not implemented")
+
+    @property
+    def source_stage(self) -> str:
+        return _qualified_stage(self.layer_index, SOURCE_STAGE)
+
+    @property
+    def feature_stage(self) -> str:
+        return _qualified_stage(self.layer_index, FEATURE_STAGE)
+
+    @property
+    def target_stage(self) -> str:
+        return _qualified_stage(self.layer_index, TARGET_STAGE)
+
+    @property
+    def hidden_dim(self) -> int:
+        return self.projection.hidden_dim
+
+    @property
+    def sketch_dim(self) -> int:
+        return self.projection.sketch_dim
+
+    @property
+    def identity_sha256(self) -> str:
+        return _sha256_document(self.to_record())
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "action_abi": self.action_abi,
+            "atlas_revision_sha256": self.atlas_revision_sha256,
+            "feature_stage": self.feature_stage,
+            "graph_revision_sha256": self.graph_revision_sha256,
+            "layer_index": self.layer_index,
+            "model_sha256": self.model_sha256,
+            "projection": self.projection.to_record(),
+            "q4_sha256": self.q4_sha256,
+            "schema": LAYER_MLP_RESIDUAL_GENERIC_IDENTITY_SCHEMA,
+            "source_stage": self.source_stage,
+            "target_stage": self.target_stage,
+        }
+
+    @classmethod
+    def from_record(cls, value: object) -> "LayerMlpResidualCrystalIdentity":
+        fields = {
+            "action_abi",
+            "atlas_revision_sha256",
+            "feature_stage",
+            "graph_revision_sha256",
+            "layer_index",
+            "model_sha256",
+            "projection",
+            "q4_sha256",
+            "schema",
+            "source_stage",
+            "target_stage",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise LayerMlpCrystalIntegrityError(
+                "generic MLP crystal identity fields are invalid"
+            )
+        if value["schema"] != LAYER_MLP_RESIDUAL_GENERIC_IDENTITY_SCHEMA:
+            raise LayerMlpCrystalIntegrityError(
+                "generic MLP crystal identity schema is invalid"
+            )
+        try:
+            result = cls(
+                model_sha256=value["model_sha256"],
+                q4_sha256=value["q4_sha256"],
+                graph_revision_sha256=value["graph_revision_sha256"],
+                atlas_revision_sha256=value["atlas_revision_sha256"],
+                projection=LayerTransitionProjectionIdentity.from_record(
+                    value["projection"]
+                ),
+                layer_index=value["layer_index"],
+                action_abi=value["action_abi"],
+            )
+            if (
+                value["source_stage"] != result.source_stage
+                or value["feature_stage"] != result.feature_stage
+                or value["target_stage"] != result.target_stage
+            ):
+                raise ValueError("generic MLP stages differ from layer_index")
+            return result
+        except (TypeError, ValueError, LayerTransitionCrystalIntegrityError) as exc:
+            raise LayerMlpCrystalIntegrityError(
+                "generic MLP crystal identity values are invalid"
+            ) from exc
+
+
+_LayerMlpIdentity = Layer63MlpResidualCrystalIdentity | LayerMlpResidualCrystalIdentity
+
+
+def _identity_from_record(value: object) -> _LayerMlpIdentity:
+    if not isinstance(value, Mapping):
+        raise LayerMlpCrystalIntegrityError("MLP crystal identity is invalid")
+    schema = value.get("schema")
+    if schema == LAYER_MLP_RESIDUAL_IDENTITY_SCHEMA:
+        return Layer63MlpResidualCrystalIdentity.from_record(value)
+    if schema == LAYER_MLP_RESIDUAL_GENERIC_IDENTITY_SCHEMA:
+        return LayerMlpResidualCrystalIdentity.from_record(value)
+    raise LayerMlpCrystalIntegrityError("MLP crystal identity schema is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class Layer63MlpResidualCoverage:
     """Finite feature-space coverage and observed BF16 error envelope."""
 
@@ -308,6 +470,60 @@ class Layer63MlpResidualCoverage:
             ) from exc
 
 
+class LayerMlpResidualCoverage(Layer63MlpResidualCoverage):
+    """Generic v2 coverage record shared by layer-parametric crystals."""
+
+    __slots__ = ()
+
+    def to_record(self) -> dict[str, object]:
+        record = super().to_record()
+        record["schema"] = LAYER_MLP_RESIDUAL_GENERIC_COVERAGE_SCHEMA
+        return record
+
+    @classmethod
+    def from_record(cls, value: object) -> "LayerMlpResidualCoverage":
+        fields = {
+            "center",
+            "error_radius",
+            "feature_radius",
+            "max_observed_error",
+            "sample_count",
+            "schema",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise LayerMlpCrystalIntegrityError(
+                "generic MLP coverage fields are invalid"
+            )
+        if value["schema"] != LAYER_MLP_RESIDUAL_GENERIC_COVERAGE_SCHEMA:
+            raise LayerMlpCrystalIntegrityError(
+                "generic MLP coverage schema is invalid"
+            )
+        try:
+            return cls(
+                center=_tensor_from_record(value["center"], field="coverage center"),
+                feature_radius=value["feature_radius"],
+                error_radius=value["error_radius"],
+                sample_count=value["sample_count"],
+                max_observed_error=value["max_observed_error"],
+            )
+        except (TypeError, ValueError, LayerTransitionCrystalIntegrityError) as exc:
+            raise LayerMlpCrystalIntegrityError(
+                "generic MLP coverage values are invalid"
+            ) from exc
+
+
+def _generic_identity(identity: _LayerMlpIdentity) -> bool:
+    return isinstance(identity, LayerMlpResidualCrystalIdentity)
+
+
+def _coverage_type(
+    identity: _LayerMlpIdentity,
+) -> type[Layer63MlpResidualCoverage]:
+    if _generic_identity(identity):
+        return LayerMlpResidualCoverage
+    return Layer63MlpResidualCoverage
+
+
 class Layer63MlpResidualCrystal:
     """One immutable centered-ridge MLP residual action."""
 
@@ -327,7 +543,7 @@ class Layer63MlpResidualCrystal:
     def __init__(
         self,
         *,
-        identity: Layer63MlpResidualCrystalIdentity,
+        identity: _LayerMlpIdentity,
         operator: torch.Tensor,
         feature_mean: torch.Tensor,
         residual_mean: torch.Tensor,
@@ -337,8 +553,11 @@ class Layer63MlpResidualCrystal:
         source_o1_state_sha256: str | None = None,
         source_o1_generation: int | None = None,
     ) -> None:
-        if not isinstance(identity, Layer63MlpResidualCrystalIdentity):
-            raise TypeError("identity must be a Layer63MlpResidualCrystalIdentity")
+        if not isinstance(
+            identity,
+            (Layer63MlpResidualCrystalIdentity, LayerMlpResidualCrystalIdentity),
+        ):
+            raise TypeError("identity must be an MLP residual crystal identity")
         if not isinstance(coverage, Layer63MlpResidualCoverage):
             raise TypeError("coverage must be a Layer63MlpResidualCoverage")
         weight = operator.detach().to(device="cpu", dtype=torch.float64).clone()
@@ -366,7 +585,7 @@ class Layer63MlpResidualCrystal:
         self._operator = weight.contiguous()
         self._feature_mean = feature.contiguous()
         self._residual_mean = residual.contiguous()
-        self._coverage = Layer63MlpResidualCoverage(
+        self._coverage = _coverage_type(identity)(
             center=coverage.center,
             feature_radius=coverage.feature_radius,
             error_radius=coverage.error_radius,
@@ -426,7 +645,7 @@ class Layer63MlpResidualCrystal:
 
     @property
     def coverage(self) -> Layer63MlpResidualCoverage:
-        return Layer63MlpResidualCoverage(
+        return _coverage_type(self.identity)(
             center=self._coverage.center,
             feature_radius=self._coverage.feature_radius,
             error_radius=self._coverage.error_radius,
@@ -447,12 +666,20 @@ class Layer63MlpResidualCrystal:
                 field="residual_mean",
             ),
             "ridge": self.ridge,
-            "schema": LAYER_MLP_RESIDUAL_CRYSTAL_SCHEMA,
+            "schema": (
+                LAYER_MLP_RESIDUAL_GENERIC_CRYSTAL_SCHEMA
+                if _generic_identity(self.identity)
+                else LAYER_MLP_RESIDUAL_CRYSTAL_SCHEMA
+            ),
         }
         if self.source_o1_state_sha256 is not None:
             record.update(
                 {
-                    "schema": LAYER_MLP_RESIDUAL_O1_CRYSTAL_SCHEMA,
+                    "schema": (
+                        LAYER_MLP_RESIDUAL_GENERIC_O1_CRYSTAL_SCHEMA
+                        if _generic_identity(self.identity)
+                        else LAYER_MLP_RESIDUAL_O1_CRYSTAL_SCHEMA
+                    ),
                     "source_o1_generation": self.source_o1_generation,
                     "source_o1_state_sha256": self.source_o1_state_sha256,
                 }
@@ -460,10 +687,12 @@ class Layer63MlpResidualCrystal:
         return record
 
     def to_bytes(self) -> bytes:
-        return _sealed_document(
-            self.to_record(),
-            LAYER_MLP_RESIDUAL_CRYSTAL_ENVELOPE_SCHEMA,
+        envelope_schema = (
+            LAYER_MLP_RESIDUAL_GENERIC_CRYSTAL_ENVELOPE_SCHEMA
+            if _generic_identity(self.identity)
+            else LAYER_MLP_RESIDUAL_CRYSTAL_ENVELOPE_SCHEMA
         )
+        return _sealed_document(self.to_record(), envelope_schema)
 
     @classmethod
     def from_record(cls, value: object) -> "Layer63MlpResidualCrystal":
@@ -491,17 +720,26 @@ class Layer63MlpResidualCrystal:
         }:
             raise LayerMlpCrystalIntegrityError("MLP crystal fields are invalid")
         is_o1 = actual_fields == frozenset(o1_fields)
-        expected_schema = (
+        schema = value["schema"]
+        legacy_schema = (
             LAYER_MLP_RESIDUAL_O1_CRYSTAL_SCHEMA
             if is_o1
             else LAYER_MLP_RESIDUAL_CRYSTAL_SCHEMA
         )
-        if value["schema"] != expected_schema:
+        generic_schema = (
+            LAYER_MLP_RESIDUAL_GENERIC_O1_CRYSTAL_SCHEMA
+            if is_o1
+            else LAYER_MLP_RESIDUAL_GENERIC_CRYSTAL_SCHEMA
+        )
+        if schema not in (legacy_schema, generic_schema):
             raise LayerMlpCrystalIntegrityError("MLP crystal schema is invalid")
         try:
-            identity = Layer63MlpResidualCrystalIdentity.from_record(value["identity"])
+            identity = _identity_from_record(value["identity"])
+            if (schema == generic_schema) != _generic_identity(identity):
+                raise ValueError("MLP crystal schema and identity generation differ")
             if value["identity_sha256"] != identity.identity_sha256:
                 raise ValueError("MLP crystal identity SHA-256 mismatch")
+            coverage_cls = _coverage_type(identity)
             return cls(
                 identity=identity,
                 operator=_tensor_from_record(value["operator"], field="operator"),
@@ -513,7 +751,7 @@ class Layer63MlpResidualCrystal:
                     value["residual_mean"],
                     field="residual_mean",
                 ),
-                coverage=Layer63MlpResidualCoverage.from_record(value["coverage"]),
+                coverage=coverage_cls.from_record(value["coverage"]),
                 packed_weight_bytes_avoided=value["packed_weight_bytes_avoided"],
                 ridge=value["ridge"],
                 source_o1_state_sha256=(
@@ -528,21 +766,35 @@ class Layer63MlpResidualCrystal:
 
     @classmethod
     def from_bytes(cls, value: bytes) -> "Layer63MlpResidualCrystal":
+        generic_envelope = False
         try:
-            body = _unseal_document(
-                value,
-                schema=LAYER_MLP_RESIDUAL_CRYSTAL_ENVELOPE_SCHEMA,
-                kind="layer-63 MLP residual crystal",
-            )
+            try:
+                body = _unseal_document(
+                    value,
+                    schema=LAYER_MLP_RESIDUAL_CRYSTAL_ENVELOPE_SCHEMA,
+                    kind="layer-63 MLP residual crystal",
+                )
+            except LayerTransitionCrystalIntegrityError:
+                generic_envelope = True
+                body = _unseal_document(
+                    value,
+                    schema=LAYER_MLP_RESIDUAL_GENERIC_CRYSTAL_ENVELOPE_SCHEMA,
+                    kind="layer-parametric MLP residual crystal",
+                )
         except LayerTransitionCrystalIntegrityError as exc:
             raise _as_integrity(exc) from exc
-        return cls.from_record(body)
+        result = cls.from_record(body)
+        if generic_envelope != _generic_identity(result.identity):
+            raise LayerMlpCrystalIntegrityError(
+                "MLP crystal envelope and identity generation differ"
+            )
+        return result
 
     @classmethod
     def fit(
         cls,
         *,
-        identity: Layer63MlpResidualCrystalIdentity,
+        identity: _LayerMlpIdentity,
         base_hidden: torch.Tensor,
         mlp_input: torch.Tensor,
         target_hidden: torch.Tensor,
@@ -553,8 +805,11 @@ class Layer63MlpResidualCrystal:
     ) -> "Layer63MlpResidualCrystal":
         """Fit ``D = mu + (uP - fbar)W`` from exact BF16 triples."""
 
-        if not isinstance(identity, Layer63MlpResidualCrystalIdentity):
-            raise TypeError("identity must be a Layer63MlpResidualCrystalIdentity")
+        if not isinstance(
+            identity,
+            (Layer63MlpResidualCrystalIdentity, LayerMlpResidualCrystalIdentity),
+        ):
+            raise TypeError("identity must be an MLP residual crystal identity")
         ridge_value = _finite_non_negative(ridge, "ridge")
         if ridge_value == 0.0:
             raise ValueError("ridge must be positive")
@@ -617,7 +872,7 @@ class Layer63MlpResidualCrystal:
             operator=operator,
             feature_mean=feature_mean,
             residual_mean=residual_mean,
-            coverage=Layer63MlpResidualCoverage(
+            coverage=_coverage_type(identity)(
                 center=feature_mean,
                 feature_radius=feature_radius,
                 error_radius=error_radius,
@@ -705,7 +960,12 @@ class Layer63MlpResidualCrystal:
             raise LayerMlpCrystalIntegrityError(
                 "BF16 MLP residual action produced a non-finite hidden row"
             )
-        return Layer63MlpResidualReplacement(
+        replacement_cls = (
+            LayerMlpResidualReplacement
+            if _generic_identity(self.identity)
+            else Layer63MlpResidualReplacement
+        )
+        return replacement_cls(
             output=output,
             crystal_sha256=self.crystal_sha256,
             coverage_distance=distance,
@@ -796,16 +1056,66 @@ class Layer63MlpResidualCrystalMetrics:
         }
 
 
+class LayerMlpResidualCrystal(Layer63MlpResidualCrystal):
+    """Layer-parametric v2 centered-ridge MLP residual action."""
+
+    __slots__ = ()
+
+    def __init__(
+        self,
+        *,
+        identity: LayerMlpResidualCrystalIdentity,
+        operator: torch.Tensor,
+        feature_mean: torch.Tensor,
+        residual_mean: torch.Tensor,
+        coverage: LayerMlpResidualCoverage,
+        packed_weight_bytes_avoided: int,
+        ridge: float,
+        source_o1_state_sha256: str | None = None,
+        source_o1_generation: int | None = None,
+    ) -> None:
+        if not isinstance(identity, LayerMlpResidualCrystalIdentity):
+            raise TypeError("identity must be a LayerMlpResidualCrystalIdentity")
+        if not isinstance(coverage, LayerMlpResidualCoverage):
+            raise TypeError("coverage must be a LayerMlpResidualCoverage")
+        super().__init__(
+            identity=identity,
+            operator=operator,
+            feature_mean=feature_mean,
+            residual_mean=residual_mean,
+            coverage=coverage,
+            packed_weight_bytes_avoided=packed_weight_bytes_avoided,
+            ridge=ridge,
+            source_o1_state_sha256=source_o1_state_sha256,
+            source_o1_generation=source_o1_generation,
+        )
+
+
+class LayerMlpResidualReplacement(Layer63MlpResidualReplacement):
+    """Successful replacement emitted by a generic MLP crystal."""
+
+    __slots__ = ()
+
+
+class LayerMlpResidualCrystalMetrics(Layer63MlpResidualCrystalMetrics):
+    """Settled metrics emitted by a generic MLP crystal bank."""
+
+    __slots__ = ()
+
+
 @dataclass(frozen=True, slots=True)
 class _LayerMlpBankState:
-    identity: Layer63MlpResidualCrystalIdentity
+    identity: _LayerMlpIdentity
     max_crystals: int
     generation: int = 0
     publications: int = 0
     crystals: tuple[Layer63MlpResidualCrystal, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.identity, Layer63MlpResidualCrystalIdentity):
+        if not isinstance(
+            self.identity,
+            (Layer63MlpResidualCrystalIdentity, LayerMlpResidualCrystalIdentity),
+        ):
             raise TypeError("bank identity is invalid")
         _uint(
             self.max_crystals,
@@ -837,26 +1147,41 @@ class _LayerMlpBankState:
             "identity_sha256": self.identity.identity_sha256,
             "max_crystals": self.max_crystals,
             "publications": self.publications,
-            "schema": LAYER_MLP_RESIDUAL_BANK_SCHEMA,
+            "schema": (
+                LAYER_MLP_RESIDUAL_GENERIC_BANK_SCHEMA
+                if _generic_identity(self.identity)
+                else LAYER_MLP_RESIDUAL_BANK_SCHEMA
+            ),
         }
 
     def to_bytes(self) -> bytes:
-        encoded = _sealed_document(
-            self.to_record(),
-            LAYER_MLP_RESIDUAL_BANK_ENVELOPE_SCHEMA,
+        envelope_schema = (
+            LAYER_MLP_RESIDUAL_GENERIC_BANK_ENVELOPE_SCHEMA
+            if _generic_identity(self.identity)
+            else LAYER_MLP_RESIDUAL_BANK_ENVELOPE_SCHEMA
         )
+        encoded = _sealed_document(self.to_record(), envelope_schema)
         if len(encoded) > _MAX_STATE_BYTES:
             raise LayerMlpCrystalIntegrityError("MLP residual bank exceeds byte limit")
         return encoded
 
     @classmethod
     def from_bytes(cls, value: bytes) -> "_LayerMlpBankState":
+        generic_envelope = False
         try:
-            body = _unseal_document(
-                value,
-                schema=LAYER_MLP_RESIDUAL_BANK_ENVELOPE_SCHEMA,
-                kind="layer-63 MLP residual bank",
-            )
+            try:
+                body = _unseal_document(
+                    value,
+                    schema=LAYER_MLP_RESIDUAL_BANK_ENVELOPE_SCHEMA,
+                    kind="layer-63 MLP residual bank",
+                )
+            except LayerTransitionCrystalIntegrityError:
+                generic_envelope = True
+                body = _unseal_document(
+                    value,
+                    schema=LAYER_MLP_RESIDUAL_GENERIC_BANK_ENVELOPE_SCHEMA,
+                    kind="layer-parametric MLP residual bank",
+                )
         except LayerTransitionCrystalIntegrityError as exc:
             raise _as_integrity(exc) from exc
         fields = {
@@ -870,10 +1195,23 @@ class _LayerMlpBankState:
         }
         if set(body) != fields:
             raise LayerMlpCrystalIntegrityError("MLP residual bank fields are invalid")
-        if body["schema"] != LAYER_MLP_RESIDUAL_BANK_SCHEMA:
+        if body["schema"] not in (
+            LAYER_MLP_RESIDUAL_BANK_SCHEMA,
+            LAYER_MLP_RESIDUAL_GENERIC_BANK_SCHEMA,
+        ):
             raise LayerMlpCrystalIntegrityError("MLP residual bank schema is invalid")
+        if generic_envelope != (
+            body["schema"] == LAYER_MLP_RESIDUAL_GENERIC_BANK_SCHEMA
+        ):
+            raise LayerMlpCrystalIntegrityError(
+                "MLP bank envelope and body generation differ"
+            )
         try:
-            identity = Layer63MlpResidualCrystalIdentity.from_record(body["identity"])
+            identity = _identity_from_record(body["identity"])
+            if (
+                body["schema"] == LAYER_MLP_RESIDUAL_GENERIC_BANK_SCHEMA
+            ) != _generic_identity(identity):
+                raise ValueError("MLP bank schema and identity generation differ")
             if body["identity_sha256"] != identity.identity_sha256:
                 raise ValueError("bank identity SHA-256 mismatch")
             raw_crystals = body["crystals"]
@@ -882,14 +1220,17 @@ class _LayerMlpBankState:
                 Sequence,
             ):
                 raise TypeError("bank crystals are not a sequence")
+            crystal_cls = (
+                LayerMlpResidualCrystal
+                if _generic_identity(identity)
+                else Layer63MlpResidualCrystal
+            )
             return cls(
                 identity=identity,
                 max_crystals=body["max_crystals"],
                 generation=body["generation"],
                 publications=body["publications"],
-                crystals=tuple(
-                    Layer63MlpResidualCrystal.from_record(item) for item in raw_crystals
-                ),
+                crystals=tuple(crystal_cls.from_record(item) for item in raw_crystals),
             )
         except (TypeError, ValueError) as exc:
             raise LayerMlpCrystalIntegrityError(
@@ -903,12 +1244,15 @@ class Layer63MlpResidualCrystalBank:
     def __init__(
         self,
         state_path: str | os.PathLike[str],
-        identity: Layer63MlpResidualCrystalIdentity,
+        identity: _LayerMlpIdentity,
         *,
         max_crystals: int = 64,
     ) -> None:
-        if not isinstance(identity, Layer63MlpResidualCrystalIdentity):
-            raise TypeError("identity must be a Layer63MlpResidualCrystalIdentity")
+        if not isinstance(
+            identity,
+            (Layer63MlpResidualCrystalIdentity, LayerMlpResidualCrystalIdentity),
+        ):
+            raise TypeError("identity must be an MLP residual crystal identity")
         self.state_path = Path(state_path)
         if not self.state_path.name:
             raise ValueError("state_path must name a file")
@@ -1175,7 +1519,12 @@ class Layer63MlpResidualCrystalBank:
     def metrics(self) -> Layer63MlpResidualCrystalMetrics:
         with self._lock:
             self._refresh_if_changed()
-            return Layer63MlpResidualCrystalMetrics(
+            metrics_cls = (
+                LayerMlpResidualCrystalMetrics
+                if _generic_identity(self.identity)
+                else Layer63MlpResidualCrystalMetrics
+            )
+            return metrics_cls(
                 identity_sha256=self.identity.identity_sha256,
                 crystal_count=len(self._state.crystals),
                 attempts=self._attempts,
@@ -1192,9 +1541,44 @@ class Layer63MlpResidualCrystalBank:
             return tuple(self._state.crystals)
 
 
+class LayerMlpResidualCrystalBank(Layer63MlpResidualCrystalBank):
+    """Persistent bounded bank for a layer-parametric v2 identity."""
+
+    def __init__(
+        self,
+        state_path: str | os.PathLike[str],
+        identity: LayerMlpResidualCrystalIdentity,
+        *,
+        max_crystals: int = 64,
+    ) -> None:
+        if not isinstance(identity, LayerMlpResidualCrystalIdentity):
+            raise TypeError("identity must be a LayerMlpResidualCrystalIdentity")
+        super().__init__(state_path, identity, max_crystals=max_crystals)
+
+    @classmethod
+    def load(
+        cls,
+        state_path: str | os.PathLike[str],
+    ) -> "LayerMlpResidualCrystalBank":
+        bank = super().load(state_path)
+        if not isinstance(bank.identity, LayerMlpResidualCrystalIdentity):
+            raise LayerMlpCrystalIdentityError(
+                "generic MLP bank loader rejected a layer-63 v1 identity"
+            )
+        return bank
+
+
 __all__ = [
     "FEATURE_STAGE",
     "LAYER_MLP_RESIDUAL_ACTION_ABI",
+    "LAYER_MLP_RESIDUAL_GENERIC_ACTION_ABI",
+    "LAYER_MLP_RESIDUAL_GENERIC_BANK_ENVELOPE_SCHEMA",
+    "LAYER_MLP_RESIDUAL_GENERIC_BANK_SCHEMA",
+    "LAYER_MLP_RESIDUAL_GENERIC_COVERAGE_SCHEMA",
+    "LAYER_MLP_RESIDUAL_GENERIC_CRYSTAL_ENVELOPE_SCHEMA",
+    "LAYER_MLP_RESIDUAL_GENERIC_CRYSTAL_SCHEMA",
+    "LAYER_MLP_RESIDUAL_GENERIC_IDENTITY_SCHEMA",
+    "LAYER_MLP_RESIDUAL_GENERIC_O1_CRYSTAL_SCHEMA",
     "LAYER_MLP_RESIDUAL_O1_CRYSTAL_SCHEMA",
     "Layer63MlpResidualCoverage",
     "Layer63MlpResidualCrystal",
@@ -1202,11 +1586,18 @@ __all__ = [
     "Layer63MlpResidualCrystalIdentity",
     "Layer63MlpResidualCrystalMetrics",
     "Layer63MlpResidualReplacement",
+    "LayerMlpResidualCoverage",
+    "LayerMlpResidualCrystal",
+    "LayerMlpResidualCrystalBank",
+    "LayerMlpResidualCrystalIdentity",
+    "LayerMlpResidualCrystalMetrics",
+    "LayerMlpResidualReplacement",
     "LayerMlpCrystalCapacityError",
     "LayerMlpCrystalError",
     "LayerMlpCrystalIdentityError",
     "LayerMlpCrystalIntegrityError",
     "SOURCE_STAGE",
+    "MAX_LAYER_INDEX",
     "TARGET_LAYER_INDEX",
     "TARGET_STAGE",
 ]
