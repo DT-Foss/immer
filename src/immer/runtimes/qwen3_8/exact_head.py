@@ -423,6 +423,7 @@ class ExactHeadIndex:
         self._metrics_lock = threading.Lock()
         self._runtime_lock = threading.RLock()
         self._closed = False
+        self._q4_zero_prune_disabled = False
 
     @property
     def supports_q4(self) -> bool:
@@ -1314,6 +1315,8 @@ class ExactHeadIndex:
             return False, "query-values"
         if _bf16_has_subnormal(hidden):
             return False, "query-subnormal"
+        if self.supports_q4 and self._q4_zero_prune_disabled:
+            return False, "q4-zero-prune-disabled"
         return True, ""
 
     def _query_bound_tables(self, hidden: torch.Tensor) -> _QueryBoundTables:
@@ -1694,6 +1697,27 @@ class ExactHeadIndex:
                     and row_bound_probe_pages >= _ROW_BOUND_PROBE_PAGES
                     and row_bound_saving_pages == 0
                 ):
+                    if (
+                        q4_bank is not None
+                        and pages_pruned == 0
+                        and rows_pruned == 0
+                    ):
+                        self._q4_zero_prune_disabled = True
+                        with self._metrics_lock:
+                            self._metrics.pages_scored += pages_scored
+                            self._metrics.rows_scored += rows_scored
+                            self._metrics.bound_nodes += bound_nodes
+                            self._metrics.row_bound_rows += row_bound_rows
+                            self._metrics.full_leaf_fallbacks += (
+                                full_leaf_fallbacks
+                            )
+                            self._metrics.row_bound_probe_pages += (
+                                row_bound_probe_pages
+                            )
+                            self._metrics.row_bound_disabled_calls += 1
+                            self._metrics.packed_rows_scored += rows_scored
+                        self._fallback("q4-zero-prune-probe")
+                        return None
                     row_bounds_enabled = False
                     row_bounds_disabled = True
                 token_ids = torch.tensor(

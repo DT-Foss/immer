@@ -302,6 +302,41 @@ class Qwen38ExactHeadTests(unittest.TestCase):
             self.assertTrue(
                 np.all(caps >= scores.float().numpy().astype(np.float64))
             )
+
+            pager.attach_exact_head_index(None)
+            expected_fallback = pager.topk_logits(
+                random_query[:1],
+                k=3,
+                block_rows=17,
+            )
+            loaded_q4_index._tensors["residual_radii"].fill_(1_000_000.0)
+            loaded_q4_index._tensors["node_max_residual"].fill_(1_000_000.0)
+            pager.attach_exact_head_index(loaded_q4_index)
+            with mock.patch(
+                "immer.runtimes.qwen3_8.exact_head._ROW_BOUND_PROBE_PAGES",
+                2,
+            ):
+                first_fallback = pager.topk_logits(
+                    random_query[:1],
+                    k=3,
+                    block_rows=17,
+                )
+                probe_rows = loaded_q4_index.metrics()["packed_rows_scored"]
+                second_fallback = pager.topk_logits(
+                    random_query[:1],
+                    k=3,
+                    block_rows=17,
+                )
+            self.assertTrue(torch.equal(first_fallback[0], expected_fallback[0]))
+            self.assertTrue(torch.equal(first_fallback[1], expected_fallback[1]))
+            self.assertTrue(torch.equal(second_fallback[0], expected_fallback[0]))
+            self.assertTrue(torch.equal(second_fallback[1], expected_fallback[1]))
+            fallback_metrics = loaded_q4_index.metrics()
+            self.assertEqual(
+                fallback_metrics["last_fallback_reason"],
+                "q4-zero-prune-disabled",
+            )
+            self.assertEqual(fallback_metrics["packed_rows_scored"], probe_rows)
         finally:
             pager.close()
             source.close()
