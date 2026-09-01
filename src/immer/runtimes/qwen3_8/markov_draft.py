@@ -31,6 +31,11 @@ from .contextual_continuation import (
     MAX_CONTINUATION_TOKENS,
 )
 from .draft_protocol import RollingDraftProposal
+from .layer_contextual_continuation import (
+    LayerContextualContinuationBank,
+    LayerContextualContinuationOption,
+    LayerContextualContinuationTransaction,
+)
 from .markov_composition import (
     CompositionBounds,
     ConfirmedTokenEpisode,
@@ -799,6 +804,8 @@ class MarkovPhraseOption:
     token_confidences: tuple[float, ...] = ()
     token_disagreements: tuple[float, ...] = ()
     cell_sha256: str | None = None
+    crystal_layer: int | None = None
+    crystal_transaction_sha256: str | None = None
 
     @property
     def confidence(self) -> float:
@@ -864,6 +871,19 @@ class MarkovPhraseOption:
                 or not isinstance(self.cell_sha256, str)
                 or len(self.cell_sha256) != 64
                 or bool(set(self.cell_sha256) - _HEX)
+                or (self.crystal_layer is None)
+                != (self.crystal_transaction_sha256 is None)
+                or (
+                    self.crystal_layer is not None
+                    and (
+                        isinstance(self.crystal_layer, bool)
+                        or not isinstance(self.crystal_layer, int)
+                        or self.crystal_layer < 0
+                        or not isinstance(self.crystal_transaction_sha256, str)
+                        or len(self.crystal_transaction_sha256) != 64
+                        or bool(set(self.crystal_transaction_sha256) - _HEX)
+                    )
+                )
             ):
                 raise ValueError("crystal phrase evidence is invalid")
         elif (
@@ -871,6 +891,8 @@ class MarkovPhraseOption:
             or self.token_confidences
             or self.token_disagreements
             or self.cell_sha256 is not None
+            or self.crystal_layer is not None
+            or self.crystal_transaction_sha256 is not None
         ):
             raise ValueError("non-crystal phrase carries crystal evidence")
 
@@ -1769,6 +1791,7 @@ class MarkovDraftMetrics:
     crystal_last_cosine: float = 0.0
     crystal_last_margin: float = 0.0
     crystal_last_cell_sha256: str | None = None
+    layer_context_crystal: Mapping[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         value = asdict(self)
@@ -1777,6 +1800,8 @@ class MarkovDraftMetrics:
         value["last_position_weights"] = dict(self.last_position_weights)
         value["recommended_windows"] = dict(self.recommended_windows)
         value["last_horizon_utilities"] = dict(self.last_horizon_utilities)
+        if self.layer_context_crystal is None:
+            value.pop("layer_context_crystal")
         return value
 
 
@@ -1849,6 +1874,19 @@ class FingerprintRollingK4DraftProvider:
             Callable[[tuple[int, ...], float], None] | None
         ) = None,
         contextual_continuation_bank: ContextualContinuationBank | None = None,
+        layer_contextual_continuation_bank: (
+            LayerContextualContinuationBank | None
+        ) = None,
+        layer_contextual_current_transaction: (
+            Callable[[], LayerContextualContinuationTransaction | None] | None
+        ) = None,
+        layer_contextual_transactions_since: (
+            Callable[
+                [int],
+                Sequence[LayerContextualContinuationTransaction],
+            ]
+            | None
+        ) = None,
     ) -> None:
         if (
             isinstance(vocab_size, bool)
@@ -1906,6 +1944,40 @@ class FingerprintRollingK4DraftProvider:
                 "contextual_continuation_bank must be a "
                 "ContextualContinuationBank or None"
             )
+        layer_dependencies = (
+            layer_contextual_continuation_bank,
+            layer_contextual_current_transaction,
+            layer_contextual_transactions_since,
+        )
+        if any(value is None for value in layer_dependencies) and any(
+            value is not None for value in layer_dependencies
+        ):
+            raise ValueError(
+                "layer contextual continuation dependencies must be provided "
+                "together"
+            )
+        if layer_contextual_continuation_bank is not None and not isinstance(
+            layer_contextual_continuation_bank,
+            LayerContextualContinuationBank,
+        ):
+            raise TypeError(
+                "layer_contextual_continuation_bank must be a "
+                "LayerContextualContinuationBank or None"
+            )
+        if (
+            layer_contextual_current_transaction is not None
+            and not callable(layer_contextual_current_transaction)
+        ):
+            raise TypeError(
+                "layer_contextual_current_transaction must be callable or None"
+            )
+        if (
+            layer_contextual_transactions_since is not None
+            and not callable(layer_contextual_transactions_since)
+        ):
+            raise TypeError(
+                "layer_contextual_transactions_since must be callable or None"
+            )
         self.vocab_size = vocab_size
         self.width = len(str(vocab_size - 1))
         self.state_path = (
@@ -1922,6 +1994,15 @@ class FingerprintRollingK4DraftProvider:
         self.episode_priority = episode_priority
         self.episode_priority_store = episode_priority_store
         self.contextual_continuation_bank = contextual_continuation_bank
+        self.layer_contextual_continuation_bank = (
+            layer_contextual_continuation_bank
+        )
+        self.layer_contextual_current_transaction = (
+            layer_contextual_current_transaction
+        )
+        self.layer_contextual_transactions_since = (
+            layer_contextual_transactions_since
+        )
         self._experts = _expert_specs(max_order, max_history_tokens)
         self._state_lock_descriptor: int | None = None
         self._persisted_state: MarkovDraftState | None = None
@@ -2087,6 +2168,30 @@ class FingerprintRollingK4DraftProvider:
         self._crystal_last_cosine = 0.0
         self._crystal_last_margin = 0.0
         self._crystal_last_cell_sha256: str | None = None
+        self._layer_context_crystal_request_start_boundary: int | None = None
+        self._layer_context_crystal_request_enabled = False
+        self._layer_context_crystal_options_by_transaction: dict[
+            str,
+            tuple[LayerContextualContinuationOption, ...],
+        ] = {}
+        self._layer_context_crystal_transactions: dict[
+            str,
+            LayerContextualContinuationTransaction,
+        ] = {}
+        self._layer_context_crystal_phrase_options: tuple[
+            MarkovPhraseOption, ...
+        ] = ()
+        self._layer_context_crystal_counters: Counter[str] = Counter()
+        self._layer_context_crystal_layer_counters: dict[
+            int, Counter[str]
+        ] = {}
+        self._layer_context_crystal_last_query: tuple[
+            Mapping[str, object], ...
+        ] = ()
+        self._layer_context_crystal_selected: Mapping[str, object] | None = None
+        self._layer_context_crystal_last_cosine = 0.0
+        self._layer_context_crystal_last_margin = 0.0
+        self._layer_context_crystal_last_cell_sha256: str | None = None
         self._phrase_option_calls = 0
         self._phrase_draft_tokens = 0
         self._phrase_accepted_tokens = 0
@@ -2490,12 +2595,108 @@ class FingerprintRollingK4DraftProvider:
             for value in raw
         )
 
+    def _validate_layer_context_crystal_transaction(
+        self,
+        transaction: object,
+        *,
+        label: str,
+    ) -> LayerContextualContinuationTransaction:
+        bank = self.layer_contextual_continuation_bank
+        if bank is None:
+            raise MarkovDraftError("layer context Crystal bank is not configured")
+        if not isinstance(transaction, LayerContextualContinuationTransaction):
+            raise TypeError(f"{label} must return a layer continuation transaction")
+        identity = bank.identity
+        if (
+            transaction.identity_sha256 != identity.identity_sha256
+            or transaction.layers != identity.layers
+            or any(key.sketch_dim != identity.sketch_dim for key in transaction.keys)
+        ):
+            raise MarkovDraftError(
+                f"{label} returned a transaction for another bank identity"
+            )
+        return transaction
+
+    def _current_layer_context_crystal_transaction(
+        self,
+        history: tuple[int, ...],
+    ) -> LayerContextualContinuationTransaction:
+        source = self.layer_contextual_current_transaction
+        if source is None:
+            raise MarkovDraftError("layer context Crystal source is not configured")
+        transaction = self._validate_layer_context_crystal_transaction(
+            source(),
+            label="layer_contextual_current_transaction",
+        )
+        if (
+            not history
+            or transaction.boundary_index != len(history) - 1
+            or transaction.known_token != history[-1]
+        ):
+            raise MarkovDraftError(
+                "layer context Crystal transaction differs from the history "
+                "boundary"
+            )
+        return transaction
+
+    def _reset_layer_context_crystal_request(self) -> None:
+        self._layer_context_crystal_request_enabled = False
+        self._layer_context_crystal_request_start_boundary = None
+        self._layer_context_crystal_options_by_transaction.clear()
+        self._layer_context_crystal_transactions.clear()
+        self._layer_context_crystal_phrase_options = ()
+        self._layer_context_crystal_counters.clear()
+        self._layer_context_crystal_layer_counters.clear()
+        self._layer_context_crystal_last_query = ()
+        self._layer_context_crystal_selected = None
+        self._layer_context_crystal_last_cosine = 0.0
+        self._layer_context_crystal_last_margin = 0.0
+        self._layer_context_crystal_last_cell_sha256 = None
+
+    def _layer_context_crystal_layer_counter(self, layer: int) -> Counter[str]:
+        return self._layer_context_crystal_layer_counters.setdefault(
+            layer,
+            Counter(),
+        )
+
+    def _record_layer_context_crystal_failure(
+        self,
+        layers: Sequence[int] | None = None,
+    ) -> None:
+        bank = self.layer_contextual_continuation_bank
+        selected = (
+            ()
+            if bank is None
+            else bank.identity.layers
+            if layers is None
+            else tuple(layers)
+        )
+        for layer in selected:
+            self._layer_context_crystal_layer_counter(layer)[
+                "crystal_failures"
+            ] += 1
+        self._layer_context_crystal_counters["crystal_failures"] += max(
+            1,
+            len(selected),
+        )
+
     def begin_request(self, history: tuple[int, ...], /) -> None:
         if self._closed:
             raise MarkovDraftError("Markov draft provider is closed")
         if self._request_started or self._request_completed:
             raise MarkovDraftError("Markov provider accepts exactly one request")
         committed = self._token_tuple(history, label="Markov request history")
+        self._reset_layer_context_crystal_request()
+        layer_start = None
+        if self.layer_contextual_continuation_bank is not None:
+            try:
+                layer_start = self._current_layer_context_crystal_transaction(
+                    committed
+                )
+            except Exception:
+                self._record_layer_context_crystal_failure()
+            else:
+                self._layer_context_crystal_request_enabled = True
         self._activate_dialect(committed)
         self._request_prompt = committed
         self._request_prompt_length = len(committed)
@@ -2505,6 +2706,9 @@ class FingerprintRollingK4DraftProvider:
         self._context_crystal_candidates = ()
         self._context_crystal_captures.clear()
         self._context_crystal_feedback.clear()
+        self._layer_context_crystal_request_start_boundary = (
+            None if layer_start is None else layer_start.boundary_index
+        )
         self._request_started = True
 
     def _load_context_crystal_boundary(
@@ -2593,6 +2797,122 @@ class FingerprintRollingK4DraftProvider:
             token_disagreements=disagreements,
             cell_sha256=candidate.cell_sha256,
         )
+
+    def _load_layer_context_crystal_boundary(
+        self,
+        history: tuple[int, ...],
+        known_token: int,
+    ) -> None:
+        self._layer_context_crystal_phrase_options = ()
+        bank = self.layer_contextual_continuation_bank
+        if bank is None or not self._layer_context_crystal_request_enabled:
+            return
+        try:
+            transaction = self._current_layer_context_crystal_transaction(history)
+        except Exception:
+            self._record_layer_context_crystal_failure()
+            self._layer_context_crystal_request_enabled = False
+            return
+        try:
+            raw_options = bank.query_options(transaction, limit_per_layer=1)
+            options = tuple(raw_options)
+            if any(
+                not isinstance(option, LayerContextualContinuationOption)
+                or option.transaction_sha256 != transaction.transaction_sha256
+                or option.layer not in transaction.layers
+                or option.known_token != transaction.known_token
+                or any(token >= self.vocab_size for token in option.target_tail)
+                for option in options
+            ):
+                raise MarkovDraftError(
+                    "layer context Crystal query returned an invalid option"
+                )
+            if len({option.layer for option in options}) != len(options):
+                raise MarkovDraftError(
+                    "layer context Crystal query returned duplicate layer options"
+                )
+        except Exception:
+            self._record_layer_context_crystal_failure(transaction.layers)
+            return
+
+        self._layer_context_crystal_transactions[
+            transaction.transaction_sha256
+        ] = transaction
+        previous = self._layer_context_crystal_options_by_transaction.get(
+            transaction.transaction_sha256,
+            (),
+        )
+        merged = {
+            (option.layer, option.cell_sha256): option
+            for option in (*previous, *options)
+        }
+        self._layer_context_crystal_options_by_transaction[
+            transaction.transaction_sha256
+        ] = tuple(merged[key] for key in sorted(merged))
+
+        by_layer = {option.layer: option for option in options}
+        phrase_options: list[MarkovPhraseOption] = []
+        query_evidence: list[Mapping[str, object]] = []
+        for layer in transaction.layers:
+            layer_counter = self._layer_context_crystal_layer_counter(layer)
+            layer_counter["crystal_queries"] += 1
+            layer_counter["crystal_option_calls"] += 1
+            self._layer_context_crystal_counters["crystal_queries"] += 1
+            self._layer_context_crystal_counters["crystal_option_calls"] += 1
+            option = by_layer.get(layer)
+            if option is None:
+                continue
+            layer_counter["crystal_query_hits"] += 1
+            self._layer_context_crystal_counters["crystal_query_hits"] += 1
+            margin = float(option.margin or 0.0)
+            layer_counter["crystal_last_cosine"] = option.cosine
+            layer_counter["crystal_last_margin"] = margin
+            layer_counter["crystal_last_cell_sha256"] = option.cell_sha256
+            self._layer_context_crystal_last_cosine = option.cosine
+            self._layer_context_crystal_last_margin = margin
+            self._layer_context_crystal_last_cell_sha256 = option.cell_sha256
+
+            # The model transaction is for history[-1].  Its stored tail starts
+            # with the target-known token supplied to this callback; only the
+            # suffix after that token is speculative.
+            eligible = option.target_tail[0] == known_token and option.width > 1
+            planner_tokens: tuple[int, ...] = ()
+            if eligible:
+                width = option.width - 1
+                planner_tokens = option.target_tail[1 : 1 + width]
+                confidences, disagreements = (
+                    self._context_crystal_probabilities(option, option.width)
+                )
+                phrase_options.append(
+                    MarkovPhraseOption(
+                        token_ids=planner_tokens,
+                        source="crystal",
+                        context_order=max(
+                            1,
+                            min(self.PHRASE_MAX_CONTEXT, len(history) + 1),
+                        ),
+                        support=max(1, option.support),
+                        total=max(1, option.support),
+                        kind="crystal",
+                        confidence_override=min(confidences[1 : 1 + width]),
+                        token_confidences=confidences[1 : 1 + width],
+                        token_disagreements=disagreements[1 : 1 + width],
+                        cell_sha256=option.cell_sha256,
+                        crystal_layer=option.layer,
+                        crystal_transaction_sha256=(
+                            option.transaction_sha256
+                        ),
+                    )
+                )
+            query_evidence.append(
+                option.to_dict()
+                | {
+                    "planner_eligible": eligible,
+                    "planner_token_ids": list(planner_tokens),
+                }
+            )
+        self._layer_context_crystal_phrase_options = tuple(phrase_options)
+        self._layer_context_crystal_last_query = tuple(query_evidence)
 
     def _persistent_symbols(self) -> tuple[str, ...]:
         cached = self._persistent_symbols_cache
@@ -3317,6 +3637,39 @@ class FingerprintRollingK4DraftProvider:
             option.source,
         )
 
+    def _crystal_dedupe_score(
+        self,
+        option: MarkovPhraseOption,
+    ) -> tuple[object, ...]:
+        layer = option.crystal_layer
+        return (
+            *self._phrase_option_score(option),
+            int(layer is None),
+            -(layer if layer is not None else -1),
+            option.cell_sha256 or "",
+        )
+
+    def _dedupe_crystal_phrase_options(
+        self,
+        candidates: Sequence[MarkovPhraseOption],
+    ) -> list[MarkovPhraseOption]:
+        result: list[MarkovPhraseOption] = []
+        crystal_positions: dict[tuple[int, ...], int] = {}
+        for option in candidates:
+            if option.kind != "crystal":
+                result.append(option)
+                continue
+            position = crystal_positions.get(option.token_ids)
+            if position is None:
+                crystal_positions[option.token_ids] = len(result)
+                result.append(option)
+                continue
+            if self._crystal_dedupe_score(option) > self._crystal_dedupe_score(
+                result[position]
+            ):
+                result[position] = option
+        return result
+
     def _phrase_option(self, history: tuple[int, ...]) -> MarkovPhraseOption | None:
         dialect = self._active_dialect
         candidates: list[MarkovPhraseOption] = []
@@ -3324,6 +3677,7 @@ class FingerprintRollingK4DraftProvider:
         crystal_option = self._context_crystal_option(history)
         if crystal_option is not None:
             candidates.append(crystal_option)
+        candidates.extend(self._layer_context_crystal_phrase_options)
         request_option = self._request_phrase_option(history)
         if request_option is not None:
             candidates.append(request_option)
@@ -3383,6 +3737,7 @@ class FingerprintRollingK4DraftProvider:
         composition_outputs = {row[0].token_ids for row in composition_rows}
         if len(composition_outputs) == 1:
             candidates.extend(row[0] for row in composition_rows)
+        candidates = self._dedupe_crystal_phrase_options(candidates)
         if not candidates:
             self._pending_composition_program = None
             return None
@@ -5525,12 +5880,30 @@ class FingerprintRollingK4DraftProvider:
                     len(option.token_ids),
                     self.proposal_width,
                 )
-            if option.kind == "crystal":
+            if option.kind == "crystal" and option.crystal_layer is None:
                 self._crystal_option_calls += 1
                 self._crystal_proposed_tokens += min(
                     len(option.token_ids),
                     self.proposal_width,
                 )
+            if option.kind == "crystal" and option.crystal_layer is not None:
+                selected_width = min(
+                    len(option.token_ids),
+                    self.proposal_width,
+                )
+                layer_counter = self._layer_context_crystal_layer_counter(
+                    option.crystal_layer
+                )
+                layer_counter["crystal_proposed_tokens"] += selected_width
+                self._layer_context_crystal_counters[
+                    "crystal_proposed_tokens"
+                ] += selected_width
+                self._layer_context_crystal_selected = {
+                    "cell_sha256": option.cell_sha256,
+                    "layer": option.crystal_layer,
+                    "token_ids": list(option.token_ids),
+                    "transaction_sha256": option.crystal_transaction_sha256,
+                }
         self._draft_calls += 1
         return (
             proposal,
@@ -5560,11 +5933,13 @@ class FingerprintRollingK4DraftProvider:
         """Use one immutable target boundary to query continuation Crystals."""
 
         self._load_context_crystal_boundary(history, known_token, target_hidden)
+        self._load_layer_context_crystal_boundary(history, known_token)
         try:
             return self.propose_after(history, known_token)
         finally:
             self._context_crystal_key = None
             self._context_crystal_candidates = ()
+            self._layer_context_crystal_phrase_options = ()
 
     def propose_round(
         self,
@@ -5620,11 +5995,13 @@ class FingerprintRollingK4DraftProvider:
         """Rank a hidden-state Crystal inside the existing phrase planner."""
 
         self._load_context_crystal_boundary(history, known_token, target_hidden)
+        self._load_layer_context_crystal_boundary(history, known_token)
         try:
             return self.propose_round(history, known_token)
         finally:
             self._context_crystal_key = None
             self._context_crystal_candidates = ()
+            self._layer_context_crystal_phrase_options = ()
 
     def atlas_evidence_for_pending(
         self,
@@ -5983,7 +6360,11 @@ class FingerprintRollingK4DraftProvider:
         verified_proposals: int,
     ) -> None:
         option = self._pending_phrase_option
-        if option is None or option.kind != "crystal":
+        if (
+            option is None
+            or option.kind != "crystal"
+            or option.crystal_layer is not None
+        ):
             return
         width = min(verified_proposals, len(option.token_ids))
         if width <= 0:
@@ -6000,6 +6381,36 @@ class FingerprintRollingK4DraftProvider:
         self._crystal_verified_tokens += width
         self._crystal_accepted_tokens += accepted
         self._crystal_mismatches += int(accepted < width)
+
+    def _record_layer_context_crystal_verification(
+        self,
+        accepted_prefix_length: int,
+        verified_proposals: int,
+    ) -> None:
+        """Count only the layer-Crystal suffix actually offered to the target."""
+
+        option = self._pending_phrase_option
+        if (
+            option is None
+            or option.kind != "crystal"
+            or option.crystal_layer is None
+        ):
+            return
+        width = min(verified_proposals, len(option.token_ids))
+        if width <= 0:
+            return
+        accepted = min(accepted_prefix_length, width)
+        layer_counter = self._layer_context_crystal_layer_counter(
+            option.crystal_layer
+        )
+        layer_counter["crystal_verified_tokens"] += width
+        layer_counter["crystal_accepted_tokens"] += accepted
+        layer_counter["crystal_mismatches"] += int(accepted < width)
+        self._layer_context_crystal_counters["crystal_verified_tokens"] += width
+        self._layer_context_crystal_counters["crystal_accepted_tokens"] += accepted
+        self._layer_context_crystal_counters["crystal_mismatches"] += int(
+            accepted < width
+        )
 
     def observe_verification(
         self,
@@ -6026,6 +6437,10 @@ class FingerprintRollingK4DraftProvider:
         self._pending_verified_proposals = verified_proposals
         self._pending_verification_virtual = False
         self._record_context_crystal_verification(
+            accepted_prefix_length,
+            verified_proposals,
+        )
+        self._record_layer_context_crystal_verification(
             accepted_prefix_length,
             verified_proposals,
         )
@@ -6057,6 +6472,10 @@ class FingerprintRollingK4DraftProvider:
         self._pending_verified_proposals = verified_proposals
         self._pending_verification_virtual = True
         self._record_context_crystal_verification(
+            accepted_prefix_length,
+            verified_proposals,
+        )
+        self._record_layer_context_crystal_verification(
             accepted_prefix_length,
             verified_proposals,
         )
@@ -6330,6 +6749,98 @@ class FingerprintRollingK4DraftProvider:
             self._context_crystal_captures.clear()
             self._context_crystal_feedback.clear()
 
+    def _settle_layer_context_crystals(self, committed: tuple[int, ...]) -> None:
+        bank = self.layer_contextual_continuation_bank
+        source = self.layer_contextual_transactions_since
+        start_boundary = self._layer_context_crystal_request_start_boundary
+        if (
+            bank is None
+            or source is None
+            or start_boundary is None
+            or not self._layer_context_crystal_request_enabled
+        ):
+            self._layer_context_crystal_options_by_transaction.clear()
+            self._layer_context_crystal_transactions.clear()
+            return
+        try:
+            raw_transactions = source(start_boundary - 1)
+            if (
+                isinstance(raw_transactions, (str, bytes, bytearray))
+                or not isinstance(raw_transactions, Sequence)
+            ):
+                raise TypeError(
+                    "layer_contextual_transactions_since must return a sequence"
+                )
+            transactions = tuple(
+                self._validate_layer_context_crystal_transaction(
+                    transaction,
+                    label="layer_contextual_transactions_since",
+                )
+                for transaction in raw_transactions
+            )
+            if (
+                len({row.boundary_index for row in transactions})
+                != len(transactions)
+                or len({row.transaction_sha256 for row in transactions})
+                != len(transactions)
+            ):
+                raise MarkovDraftError(
+                    "layer context Crystal transaction history contains duplicates"
+                )
+            transactions = tuple(
+                sorted(transactions, key=lambda row: row.boundary_index)
+            )
+            if any(
+                transaction.boundary_index < start_boundary
+                or transaction.boundary_index >= len(committed)
+                or committed[transaction.boundary_index]
+                != transaction.known_token
+                for transaction in transactions
+            ):
+                raise MarkovDraftError(
+                    "layer context Crystal transaction history differs from final "
+                    "target history"
+                )
+        except Exception:
+            self._record_layer_context_crystal_failure()
+            self._layer_context_crystal_options_by_transaction.clear()
+            self._layer_context_crystal_transactions.clear()
+            self._layer_context_crystal_request_enabled = False
+            return
+
+        try:
+            for transaction in transactions:
+                boundary = transaction.boundary_index
+                tail = committed[
+                    boundary + 1 : boundary + 1 + MAX_CONTINUATION_TOKENS
+                ]
+                if not tail:
+                    continue
+                options = self._layer_context_crystal_options_by_transaction.get(
+                    transaction.transaction_sha256,
+                    (),
+                )
+                try:
+                    bank.settle_verified_prefix(
+                        transaction,
+                        tail,
+                        options,
+                    )
+                except Exception:
+                    self._record_layer_context_crystal_failure(transaction.layers)
+                    continue
+                for layer in transaction.layers:
+                    self._layer_context_crystal_layer_counter(layer)[
+                        "crystal_captures"
+                    ] += 1
+                    self._layer_context_crystal_counters[
+                        "crystal_captures"
+                    ] += 1
+        finally:
+            self._layer_context_crystal_options_by_transaction.clear()
+            self._layer_context_crystal_transactions.clear()
+            self._layer_context_crystal_request_enabled = False
+
     def observe_final(self, history: tuple[int, ...], /) -> None:
         committed = self._token_tuple(history, label="final Markov history")
         if self._request_completed:
@@ -6549,6 +7060,7 @@ class FingerprintRollingK4DraftProvider:
             self._last_confirmed_length = len(committed)
             self._persist()
             self._settle_context_crystals(committed)
+            self._settle_layer_context_crystals(committed)
             self._request_completed = True
         except Exception:
             self._state = original_state
@@ -6675,6 +7187,94 @@ class FingerprintRollingK4DraftProvider:
         if self.state_path is not None and self._persisted_state is not self._state:
             self._persist()
 
+    def _layer_context_crystal_metrics_record(
+        self,
+        bank_metrics: object | None,
+    ) -> Mapping[str, object] | None:
+        bank = self.layer_contextual_continuation_bank
+        if bank is None:
+            return None
+        counter_names = (
+            "crystal_queries",
+            "crystal_query_hits",
+            "crystal_option_calls",
+            "crystal_proposed_tokens",
+            "crystal_verified_tokens",
+            "crystal_accepted_tokens",
+            "crystal_mismatches",
+            "crystal_captures",
+            "crystal_failures",
+        )
+        bank_layers = getattr(bank_metrics, "layers", {})
+        layers: dict[str, object] = {}
+        for layer in bank.identity.layers:
+            counters = self._layer_context_crystal_layer_counters.get(
+                layer,
+                Counter(),
+            )
+            inventory = (
+                None
+                if not isinstance(bank_layers, Mapping)
+                else bank_layers.get(str(layer))
+            )
+            layers[str(layer)] = {
+                name: int(counters.get(name, 0)) for name in counter_names
+            } | {
+                "crystal_bank_cells": int(
+                    getattr(inventory, "crystal_bank_cells", 0)
+                ),
+                "crystal_bank_support": int(
+                    getattr(inventory, "crystal_bank_support", 0)
+                ),
+                "crystal_last_cell_sha256": counters.get(
+                    "crystal_last_cell_sha256"
+                ),
+                "crystal_last_cosine": float(
+                    counters.get("crystal_last_cosine", 0.0)
+                ),
+                "crystal_last_margin": float(
+                    counters.get("crystal_last_margin", 0.0)
+                ),
+            }
+        record: dict[str, object] = {
+            "schema": "immer.qwen3.8-layer-context-crystal-provider-trace/v1",
+            "identity_sha256": bank.identity.identity_sha256,
+            "layers": layers,
+            "request_start_boundary": (
+                self._layer_context_crystal_request_start_boundary
+            ),
+            "last_query": [dict(row) for row in self._layer_context_crystal_last_query],
+            "selected": (
+                None
+                if self._layer_context_crystal_selected is None
+                else dict(self._layer_context_crystal_selected)
+            ),
+            **{
+                name: int(self._layer_context_crystal_counters.get(name, 0))
+                for name in counter_names
+            },
+            "crystal_bank_cells": int(
+                getattr(bank_metrics, "crystal_bank_cells", 0)
+            ),
+            "crystal_bank_support": int(
+                getattr(bank_metrics, "crystal_bank_support", 0)
+            ),
+            "crystal_enabled": True,
+            "crystal_last_cell_sha256": (
+                self._layer_context_crystal_last_cell_sha256
+            ),
+            "crystal_last_cosine": self._layer_context_crystal_last_cosine,
+            "crystal_last_margin": self._layer_context_crystal_last_margin,
+        }
+        if bank_metrics is not None:
+            record["bank"] = {
+                "clock": int(getattr(bank_metrics, "clock", 0)),
+                "receipt_count": int(getattr(bank_metrics, "receipt_count", 0)),
+                "settlements": int(getattr(bank_metrics, "settlements", 0)),
+                "state_sha256": getattr(bank_metrics, "state_sha256", None),
+            }
+        return record
+
     def metrics(self) -> MarkovDraftMetrics:
         weights = self._weights()
         crystal_metrics = None
@@ -6683,6 +7283,17 @@ class FingerprintRollingK4DraftProvider:
                 crystal_metrics = self.contextual_continuation_bank.metrics()
             except Exception:
                 self._crystal_failures += 1
+        layer_crystal_metrics = None
+        if self.layer_contextual_continuation_bank is not None:
+            try:
+                layer_crystal_metrics = (
+                    self.layer_contextual_continuation_bank.metrics()
+                )
+            except Exception:
+                self._record_layer_context_crystal_failure()
+        layer_crystal_record = self._layer_context_crystal_metrics_record(
+            layer_crystal_metrics
+        )
         dialect_neighbors = self._inference_dialects()
         active_plan_observations, active_plan_hits = (
             ((0,) * _MAX_PROPOSAL_POSITIONS,) * 2
@@ -6961,25 +7572,102 @@ class FingerprintRollingK4DraftProvider:
             recursive_trace_hits=self._recursive_trace_hits,
             recursive_trace_misses=self._recursive_trace_misses,
             recursive_trace_max_position=self._recursive_trace_max_position,
-            crystal_enabled=self.contextual_continuation_bank is not None,
-            crystal_queries=self._crystal_queries,
-            crystal_query_hits=self._crystal_query_hits,
-            crystal_option_calls=self._crystal_option_calls,
-            crystal_proposed_tokens=self._crystal_proposed_tokens,
-            crystal_verified_tokens=self._crystal_verified_tokens,
-            crystal_accepted_tokens=self._crystal_accepted_tokens,
-            crystal_mismatches=self._crystal_mismatches,
-            crystal_captures=self._crystal_captures,
-            crystal_failures=self._crystal_failures,
+            crystal_enabled=(
+                self.contextual_continuation_bank is not None
+                or self.layer_contextual_continuation_bank is not None
+            ),
+            crystal_queries=(
+                self._crystal_queries
+                + int(self._layer_context_crystal_counters["crystal_queries"])
+            ),
+            crystal_query_hits=(
+                self._crystal_query_hits
+                + int(
+                    self._layer_context_crystal_counters[
+                        "crystal_query_hits"
+                    ]
+                )
+            ),
+            crystal_option_calls=(
+                self._crystal_option_calls
+                + int(
+                    self._layer_context_crystal_counters[
+                        "crystal_option_calls"
+                    ]
+                )
+            ),
+            crystal_proposed_tokens=(
+                self._crystal_proposed_tokens
+                + int(
+                    self._layer_context_crystal_counters[
+                        "crystal_proposed_tokens"
+                    ]
+                )
+            ),
+            crystal_verified_tokens=(
+                self._crystal_verified_tokens
+                + int(
+                    self._layer_context_crystal_counters[
+                        "crystal_verified_tokens"
+                    ]
+                )
+            ),
+            crystal_accepted_tokens=(
+                self._crystal_accepted_tokens
+                + int(
+                    self._layer_context_crystal_counters[
+                        "crystal_accepted_tokens"
+                    ]
+                )
+            ),
+            crystal_mismatches=(
+                self._crystal_mismatches
+                + int(
+                    self._layer_context_crystal_counters[
+                        "crystal_mismatches"
+                    ]
+                )
+            ),
+            crystal_captures=(
+                self._crystal_captures
+                + int(self._layer_context_crystal_counters["crystal_captures"])
+            ),
+            crystal_failures=(
+                self._crystal_failures
+                + int(self._layer_context_crystal_counters["crystal_failures"])
+            ),
             crystal_bank_cells=(
-                0 if crystal_metrics is None else crystal_metrics.cell_count
+                (0 if crystal_metrics is None else crystal_metrics.cell_count)
+                + (
+                    0
+                    if layer_crystal_metrics is None
+                    else layer_crystal_metrics.crystal_bank_cells
+                )
             ),
             crystal_bank_support=(
-                0 if crystal_metrics is None else crystal_metrics.support
+                (0 if crystal_metrics is None else crystal_metrics.support)
+                + (
+                    0
+                    if layer_crystal_metrics is None
+                    else layer_crystal_metrics.crystal_bank_support
+                )
             ),
-            crystal_last_cosine=self._crystal_last_cosine,
-            crystal_last_margin=self._crystal_last_margin,
-            crystal_last_cell_sha256=self._crystal_last_cell_sha256,
+            crystal_last_cosine=(
+                self._crystal_last_cosine
+                if self._layer_context_crystal_last_cell_sha256 is None
+                else self._layer_context_crystal_last_cosine
+            ),
+            crystal_last_margin=(
+                self._crystal_last_margin
+                if self._layer_context_crystal_last_cell_sha256 is None
+                else self._layer_context_crystal_last_margin
+            ),
+            crystal_last_cell_sha256=(
+                self._crystal_last_cell_sha256
+                if self._layer_context_crystal_last_cell_sha256 is None
+                else self._layer_context_crystal_last_cell_sha256
+            ),
+            layer_context_crystal=layer_crystal_record,
         )
 
     def close(self) -> None:
@@ -7006,6 +7694,10 @@ class FingerprintRollingK4DraftProvider:
         self._context_crystal_candidates = ()
         self._context_crystal_captures.clear()
         self._context_crystal_feedback.clear()
+        self._layer_context_crystal_phrase_options = ()
+        self._layer_context_crystal_options_by_transaction.clear()
+        self._layer_context_crystal_transactions.clear()
+        self._layer_context_crystal_request_enabled = False
         self._pending_composition_program = None
         self._pending_import_digest = None
         self._request_expert_rapidities = None
