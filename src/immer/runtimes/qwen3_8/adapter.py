@@ -3739,6 +3739,14 @@ class Qwen38CausalChat:
             return ()
         identities: set[str] = set()
         if self._draft_mode in {"hybrid", "markov"}:
+            if self._draft_mode == "hybrid":
+                identities.add(
+                    self._draft_window_runtime_identity(
+                        hybrid_provider_abi=(
+                            "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
+                        ),
+                    )
+                )
             if self._layer_contextual_continuation_state_path is not None:
                 identities.add(
                     self._draft_window_runtime_identity(

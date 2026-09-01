@@ -1923,6 +1923,31 @@ class Qwen38CausalChatTests(unittest.TestCase):
             self.assertNotIn(current, compatible)
             chat.close()
 
+    def test_hybrid_wave_gate_migrates_v29_window_economics(self) -> None:
+        runtime = _Runtime()
+        chat = _chat(
+            runtime,
+            draft_mode="hybrid",
+            q4_root="/q4",
+        )
+        chat._runtime = runtime
+        chat._bundle_receipt = _BUNDLE_RECEIPT
+        chat._tokenizer_sha256 = _DIGEST
+        chat._draft_window_controller = Mock()
+        previous = chat._draft_window_runtime_identity(
+            hybrid_provider_abi=(
+                "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
+            ),
+        )
+        current = chat._draft_window_runtime_identity()
+
+        compatible = chat._draft_window_compatible_previous_identities()
+
+        self.assertNotEqual(previous, current)
+        self.assertIn(previous, compatible)
+        self.assertNotIn(current, compatible)
+        chat.close()
+
     def test_draft_window_migrates_from_authenticated_previous_context_bank(
         self,
     ) -> None:
