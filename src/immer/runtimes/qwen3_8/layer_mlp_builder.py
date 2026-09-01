@@ -22,6 +22,7 @@ from .layer_mlp_crystal import (
     Layer63MlpResidualCrystalBank,
     Layer63MlpResidualCrystalIdentity,
 )
+from .layer_mlp_o1 import Layer63MlpO1Accumulator
 from .layer_transition_builder import current_atlas_revision_sha256
 
 
@@ -54,6 +55,27 @@ class LayerMlpBuildResult:
     max_observed_error: float
     error_radius: float
     feature_radius: float
+    packed_weight_bytes_avoided: int
+
+
+@dataclass(frozen=True, slots=True)
+class LayerMlpO1BuildResult:
+    bank_path: Path
+    o1_state_path: Path
+    bank_identity_sha256: str
+    crystal_sha256: str | None
+    o1_state_sha256: str
+    graph_revision_sha256: str
+    atlas_revision_sha256: str
+    accumulated_rows: int
+    observation_batches: int
+    feature_rank: int
+    sketch_dim: int
+    state_generation: int
+    ready: bool
+    max_observed_error: float | None
+    error_radius: float | None
+    feature_radius: float | None
     packed_weight_bytes_avoided: int
 
 
@@ -156,18 +178,26 @@ def capture_exact_layer63_mlp(
     *,
     max_new_tokens: int,
     eos_token_ids: tuple[int, ...] = (),
+    include_prefill: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, ...], Any]:
     """Run one ordinary generation and return transient exact MLP triples."""
 
     if not prompt_token_ids:
         raise ValueError("prompt_token_ids must not be empty")
+    if not isinstance(include_prefill, bool):
+        raise TypeError("include_prefill must be boolean")
     collector = Layer63MlpTripleCollector(int(model.config.dim))
+
+    def observe(layer: int, stage: str, value: torch.Tensor) -> None:
+        if include_prefill or int(value.shape[1]) == 1:
+            collector(layer, stage, value)
+
     previous = (
         model.layer_boundary_observer,
         model.layer_boundary_stages,
         model.layer_boundary_layers,
     )
-    model.layer_boundary_observer = collector
+    model.layer_boundary_observer = observe
     model.layer_boundary_stages = (SOURCE_STAGE, FEATURE_STAGE, TARGET_STAGE)
     model.layer_boundary_layers = (TARGET_LAYER_INDEX,)
     try:
@@ -264,10 +294,68 @@ def publish_layer_mlp_residual_crystal(
     )
 
 
+def accumulate_layer_mlp_residual_crystal(
+    *,
+    bank_path: str | Path,
+    o1_state_path: str | Path,
+    identity: Layer63MlpResidualCrystalIdentity,
+    base_hidden: torch.Tensor,
+    mlp_input: torch.Tensor,
+    target_hidden: torch.Tensor,
+    packed_weight_bytes_avoided: int,
+    ridge: float = 1e-8,
+    coverage_guard: float = 0.0,
+    error_guard: float = 0.0,
+) -> LayerMlpO1BuildResult:
+    """Add one request to O1 stats and replace the current bank action if ready."""
+
+    try:
+        accumulator = Layer63MlpO1Accumulator(
+            o1_state_path,
+            identity,
+            packed_weight_bytes_avoided=packed_weight_bytes_avoided,
+            ridge=ridge,
+            coverage_guard=coverage_guard,
+            error_guard=error_guard,
+        )
+        snapshot, crystal = accumulator.observe_and_crystal(
+            base_hidden,
+            mlp_input,
+            target_hidden,
+        )
+        crystal_sha256: str | None = None
+        if crystal is not None:
+            bank = Layer63MlpResidualCrystalBank(bank_path, identity)
+            crystal_sha256 = bank.publish_latest(crystal)
+    except (TypeError, ValueError) as exc:
+        raise LayerMlpBuildError("layer-63 MLP O1 accumulation failed") from exc
+    return LayerMlpO1BuildResult(
+        bank_path=Path(bank_path).absolute(),
+        o1_state_path=Path(o1_state_path).absolute(),
+        bank_identity_sha256=identity.identity_sha256,
+        crystal_sha256=crystal_sha256,
+        o1_state_sha256=snapshot.state_sha256,
+        graph_revision_sha256=identity.graph_revision_sha256,
+        atlas_revision_sha256=identity.atlas_revision_sha256,
+        accumulated_rows=snapshot.accumulated_rows,
+        observation_batches=snapshot.observation_batches,
+        feature_rank=snapshot.feature_rank,
+        sketch_dim=snapshot.sketch_dim,
+        state_generation=snapshot.generation,
+        ready=snapshot.ready,
+        max_observed_error=snapshot.max_observed_error,
+        error_radius=snapshot.error_radius,
+        feature_radius=snapshot.feature_radius,
+        packed_weight_bytes_avoided=packed_weight_bytes_avoided,
+    )
+
+
 __all__ = [
     "Layer63MlpTripleCollector",
     "LayerMlpBuildError",
     "LayerMlpBuildResult",
+    "LayerMlpO1BuildResult",
+    "accumulate_layer_mlp_residual_crystal",
     "capture_exact_layer63_mlp",
     "current_atlas_revision_sha256",
     "current_compute_graph_revision_sha256",

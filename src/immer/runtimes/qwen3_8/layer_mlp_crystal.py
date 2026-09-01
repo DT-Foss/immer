@@ -70,6 +70,7 @@ LAYER_MLP_RESIDUAL_COVERAGE_SCHEMA = (
     "immer.qwen3.8-layer63-mlp-residual-crystal-coverage/v1"
 )
 LAYER_MLP_RESIDUAL_CRYSTAL_SCHEMA = "immer.qwen3.8-layer63-mlp-residual-crystal/v1"
+LAYER_MLP_RESIDUAL_O1_CRYSTAL_SCHEMA = "immer.qwen3.8-layer63-mlp-residual-crystal/v2"
 LAYER_MLP_RESIDUAL_CRYSTAL_ENVELOPE_SCHEMA = (
     "immer.qwen3.8-layer63-mlp-residual-crystal-envelope/v1"
 )
@@ -319,6 +320,8 @@ class Layer63MlpResidualCrystal:
         "_feature_mean",
         "_operator",
         "_residual_mean",
+        "source_o1_generation",
+        "source_o1_state_sha256",
     )
 
     def __init__(
@@ -331,6 +334,8 @@ class Layer63MlpResidualCrystal:
         coverage: Layer63MlpResidualCoverage,
         packed_weight_bytes_avoided: int,
         ridge: float,
+        source_o1_state_sha256: str | None = None,
+        source_o1_generation: int | None = None,
     ) -> None:
         if not isinstance(identity, Layer63MlpResidualCrystalIdentity):
             raise TypeError("identity must be a Layer63MlpResidualCrystalIdentity")
@@ -377,6 +382,22 @@ class Layer63MlpResidualCrystal:
         if ridge_value == 0.0:
             raise ValueError("ridge must be positive")
         self.ridge = ridge_value
+        if (source_o1_state_sha256 is None) != (source_o1_generation is None):
+            raise ValueError(
+                "O1 state SHA-256 and generation must be supplied together"
+            )
+        if source_o1_state_sha256 is not None:
+            source_o1_state_sha256 = _digest(
+                source_o1_state_sha256,
+                "source_o1_state_sha256",
+            )
+            source_o1_generation = _uint(
+                source_o1_generation,
+                field="source_o1_generation",
+                positive=True,
+            )
+        self.source_o1_state_sha256 = source_o1_state_sha256
+        self.source_o1_generation = source_o1_generation
         self._body_sha256 = _sha256_document(self.to_record())
 
     @property
@@ -414,7 +435,7 @@ class Layer63MlpResidualCrystal:
         )
 
     def to_record(self) -> dict[str, object]:
-        return {
+        record: dict[str, object] = {
             "coverage": self._coverage.to_record(),
             "feature_mean": _tensor_record(self._feature_mean, field="feature_mean"),
             "identity": self.identity.to_record(),
@@ -428,6 +449,15 @@ class Layer63MlpResidualCrystal:
             "ridge": self.ridge,
             "schema": LAYER_MLP_RESIDUAL_CRYSTAL_SCHEMA,
         }
+        if self.source_o1_state_sha256 is not None:
+            record.update(
+                {
+                    "schema": LAYER_MLP_RESIDUAL_O1_CRYSTAL_SCHEMA,
+                    "source_o1_generation": self.source_o1_generation,
+                    "source_o1_state_sha256": self.source_o1_state_sha256,
+                }
+            )
+        return record
 
     def to_bytes(self) -> bytes:
         return _sealed_document(
@@ -437,7 +467,7 @@ class Layer63MlpResidualCrystal:
 
     @classmethod
     def from_record(cls, value: object) -> "Layer63MlpResidualCrystal":
-        fields = {
+        legacy_fields = {
             "coverage",
             "feature_mean",
             "identity",
@@ -448,9 +478,25 @@ class Layer63MlpResidualCrystal:
             "ridge",
             "schema",
         }
-        if not isinstance(value, Mapping) or set(value) != fields:
+        o1_fields = legacy_fields | {
+            "source_o1_generation",
+            "source_o1_state_sha256",
+        }
+        if not isinstance(value, Mapping):
             raise LayerMlpCrystalIntegrityError("MLP crystal fields are invalid")
-        if value["schema"] != LAYER_MLP_RESIDUAL_CRYSTAL_SCHEMA:
+        actual_fields = frozenset(value)
+        if actual_fields not in {
+            frozenset(legacy_fields),
+            frozenset(o1_fields),
+        }:
+            raise LayerMlpCrystalIntegrityError("MLP crystal fields are invalid")
+        is_o1 = actual_fields == frozenset(o1_fields)
+        expected_schema = (
+            LAYER_MLP_RESIDUAL_O1_CRYSTAL_SCHEMA
+            if is_o1
+            else LAYER_MLP_RESIDUAL_CRYSTAL_SCHEMA
+        )
+        if value["schema"] != expected_schema:
             raise LayerMlpCrystalIntegrityError("MLP crystal schema is invalid")
         try:
             identity = Layer63MlpResidualCrystalIdentity.from_record(value["identity"])
@@ -470,6 +516,10 @@ class Layer63MlpResidualCrystal:
                 coverage=Layer63MlpResidualCoverage.from_record(value["coverage"]),
                 packed_weight_bytes_avoided=value["packed_weight_bytes_avoided"],
                 ridge=value["ridge"],
+                source_o1_state_sha256=(
+                    value["source_o1_state_sha256"] if is_o1 else None
+                ),
+                source_o1_generation=(value["source_o1_generation"] if is_o1 else None),
             )
         except (TypeError, ValueError, LayerTransitionCrystalIntegrityError) as exc:
             raise LayerMlpCrystalIntegrityError(
@@ -984,6 +1034,59 @@ class Layer63MlpResidualCrystalBank:
             self._had_persistent_state = True
         return crystal.crystal_sha256
 
+    def publish_latest(self, crystal: Layer63MlpResidualCrystal) -> str:
+        """Atomically make one refitted O1 crystal the only current action."""
+
+        if not isinstance(crystal, Layer63MlpResidualCrystal):
+            raise TypeError("crystal must be a Layer63MlpResidualCrystal")
+        if crystal.identity.identity_sha256 != self.identity.identity_sha256:
+            raise LayerMlpCrystalIdentityError(
+                "cannot publish a crystal from another identity"
+            )
+        if (
+            crystal.source_o1_state_sha256 is None
+            or crystal.source_o1_generation is None
+        ):
+            raise ValueError("publish_latest requires O1 state provenance")
+        with _state_lock(self.state_path):
+            self._reload(required=self._had_persistent_state)
+            if (
+                len(self._state.crystals) == 1
+                and self._state.crystals[0].crystal_sha256 == crystal.crystal_sha256
+            ):
+                return crystal.crystal_sha256
+            if len(self._state.crystals) == 1:
+                current = self._state.crystals[0]
+                current_generation = current.source_o1_generation
+                if current_generation is not None:
+                    if current_generation > crystal.source_o1_generation:
+                        return current.crystal_sha256
+                    if current_generation == crystal.source_o1_generation:
+                        if (
+                            current.source_o1_state_sha256
+                            != crystal.source_o1_state_sha256
+                        ):
+                            raise LayerMlpCrystalIntegrityError(
+                                "equal O1 generations name different states"
+                            )
+                        raise LayerMlpCrystalIntegrityError(
+                            "one O1 state produced two different crystals"
+                        )
+            next_state = _LayerMlpBankState(
+                identity=self.identity,
+                max_crystals=self.max_crystals,
+                generation=_bounded_add(self._state.generation, 1),
+                publications=_bounded_add(self._state.publications, 1),
+                crystals=(crystal,),
+            )
+            _publish_bytes(self.state_path, next_state.to_bytes())
+            self._state = next_state
+            self._file_signature = _stable_signature(os.lstat(self.state_path))
+            self._had_persistent_state = True
+        return crystal.crystal_sha256
+
+    replace_current = publish_latest
+
     def replace(
         self,
         base_hidden: torch.Tensor,
@@ -1092,6 +1195,7 @@ class Layer63MlpResidualCrystalBank:
 __all__ = [
     "FEATURE_STAGE",
     "LAYER_MLP_RESIDUAL_ACTION_ABI",
+    "LAYER_MLP_RESIDUAL_O1_CRYSTAL_SCHEMA",
     "Layer63MlpResidualCoverage",
     "Layer63MlpResidualCrystal",
     "Layer63MlpResidualCrystalBank",

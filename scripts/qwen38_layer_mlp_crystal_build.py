@@ -23,6 +23,7 @@ from immer.runtimes.qwen3_8.encoding import (
 )
 from immer.runtimes.qwen3_8.layer_mlp_builder import (
     LayerMlpBuildError,
+    accumulate_layer_mlp_residual_crystal,
     capture_exact_layer63_mlp,
     current_atlas_revision_sha256,
     current_compute_graph_revision_sha256,
@@ -215,6 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--atlas-root", required=True)
     parser.add_argument("--compute-root", required=True)
     parser.add_argument("--direct-fit", action="store_true")
+    parser.add_argument("--o1-state")
     parser.add_argument("--bundle", default=str(DEFAULT_ROOT))
     parser.add_argument("--tokenizer")
     parser.add_argument("--q4-root")
@@ -231,12 +233,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q4-resident-budget-mb", type=_non_negative, default=0)
     parser.add_argument("--q4-threads", type=_positive)
     parser.add_argument("--no-prefix-sinkhorn", action="store_true")
+    parser.add_argument(
+        "--include-prefill",
+        action="store_true",
+        help="include batched prefill rows; default learns only the K1 decode seam",
+    )
     return parser
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
-    if not args.direct_fit:
-        raise LayerMlpBuildError("pass --direct-fit to publish a direct ridge action")
+    if args.direct_fit == (args.o1_state is not None):
+        raise LayerMlpBuildError("choose exactly one of --direct-fit or --o1-state")
     if args.sketch_dim > 256:
         raise LayerMlpBuildError("O1-backed sketch_dim cannot exceed 256")
     bundle = Path(args.bundle).expanduser().absolute()
@@ -311,55 +318,94 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             atlas_revision_sha256=atlas_sha256,
             projection=projection,
         )
-        if len(prompt_ids) + args.max_new_tokens < args.sketch_dim + 1:
+        if args.direct_fit and (
+            (len(prompt_ids) if args.include_prefill else 0) + args.max_new_tokens
+            < args.sketch_dim + 1
+        ):
             raise LayerMlpBuildError(
-                "prompt tokens plus max_new_tokens cannot supply "
-                "sketch_dim + 1 capture rows"
+                "selected prefill/decode rows cannot supply sketch_dim + 1 capture rows"
             )
         base, feature, target, generated_ids, evidence = capture_exact_layer63_mlp(
             model,
             prompt_ids,
             max_new_tokens=args.max_new_tokens,
             eos_token_ids=(IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID),
+            include_prefill=args.include_prefill,
         )
-        rank_sweep = _rank_sweep(
-            base=base,
-            feature=feature,
-            target=target,
-            identity_fields=identity_fields,
-            selected_sketch_dim=args.sketch_dim,
-            projection_seed=args.projection_seed,
-            packed_weight_bytes_avoided=avoided_bytes,
-            ridge=args.ridge,
-        )
-        result = publish_layer_mlp_residual_crystal(
-            bank_path=Path(args.output_bank).expanduser().absolute(),
-            identity=identity,
-            base_hidden=base,
-            mlp_input=feature,
-            target_hidden=target,
-            packed_weight_bytes_avoided=avoided_bytes,
-            direct_fit=True,
-            ridge=args.ridge,
-            coverage_guard=args.coverage_guard,
-            error_guard=args.error_guard,
-        )
+        if args.direct_fit:
+            rank_sweep = _rank_sweep(
+                base=base,
+                feature=feature,
+                target=target,
+                identity_fields=identity_fields,
+                selected_sketch_dim=args.sketch_dim,
+                projection_seed=args.projection_seed,
+                packed_weight_bytes_avoided=avoided_bytes,
+                ridge=args.ridge,
+            )
+            result = publish_layer_mlp_residual_crystal(
+                bank_path=Path(args.output_bank).expanduser().absolute(),
+                identity=identity,
+                base_hidden=base,
+                mlp_input=feature,
+                target_hidden=target,
+                packed_weight_bytes_avoided=avoided_bytes,
+                direct_fit=True,
+                ridge=args.ridge,
+                coverage_guard=args.coverage_guard,
+                error_guard=args.error_guard,
+            )
+            accumulated_rows = result.calibration_rows
+            observation_batches = 1
+            state_generation = None
+            state_sha256 = None
+            ready = True
+        else:
+            rank_sweep = []
+            result = accumulate_layer_mlp_residual_crystal(
+                bank_path=Path(args.output_bank).expanduser().absolute(),
+                o1_state_path=Path(args.o1_state).expanduser().absolute(),
+                identity=identity,
+                base_hidden=base,
+                mlp_input=feature,
+                target_hidden=target,
+                packed_weight_bytes_avoided=avoided_bytes,
+                ridge=args.ridge,
+                coverage_guard=args.coverage_guard,
+                error_guard=args.error_guard,
+            )
+            accumulated_rows = result.accumulated_rows
+            observation_batches = result.observation_batches
+            state_generation = result.state_generation
+            state_sha256 = result.o1_state_sha256
+            ready = result.ready
         decoded = runtime.tokenizer.decode(generated_ids)
         body = {
             "atlas_revision_sha256": result.atlas_revision_sha256,
             "bank_identity_sha256": result.bank_identity_sha256,
             "bank_path": str(result.bank_path),
-            "calibration_rows": result.calibration_rows,
+            "accumulated_rows": accumulated_rows,
+            "calibration_rows": int(base.shape[0]),
             "crystal_sha256": result.crystal_sha256,
-            "direct_fit": True,
+            "direct_fit": bool(args.direct_fit),
             "error_radius": result.error_radius,
             "feature_radius": result.feature_radius,
             "feature_rank": result.feature_rank,
             "generated_token_ids": list(generated_ids),
             "generation_seconds": float(evidence.seconds),
             "graph_revision_sha256": result.graph_revision_sha256,
+            "include_prefill": bool(args.include_prefill),
             "max_observed_error": result.max_observed_error,
             "model_sha256": model_sha256,
+            "o1_observation_batches": observation_batches,
+            "o1_ready": ready,
+            "o1_state_generation": state_generation,
+            "o1_state_path": (
+                None
+                if args.o1_state is None
+                else str(Path(args.o1_state).expanduser().absolute())
+            ),
+            "o1_state_sha256": state_sha256,
             "output_sha256": hashlib.sha256(decoded.encode("utf-8")).hexdigest(),
             "packed_weight_bytes_avoided_per_hit": (result.packed_weight_bytes_avoided),
             "prefix_sinkhorn": prefix_sinkhorn,

@@ -7,7 +7,11 @@ import unittest
 
 import torch
 
-from scripts.qwen38_layer_mlp_crystal_build import _rank_sweep
+from scripts.qwen38_layer_mlp_crystal_build import (
+    _rank_sweep,
+    build_parser as build_script_parser,
+    run as run_build_script,
+)
 
 from immer.knowledge.livecausal import LiveGraph
 from immer.runtimes.qwen3_8.layer_mlp_builder import (
@@ -76,6 +80,25 @@ def _triples() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
 
 class LayerMlpBuilderTests(unittest.TestCase):
+    def test_build_script_requires_exactly_one_fit_mode_before_runtime_load(
+        self,
+    ) -> None:
+        common = [
+            "--text",
+            "enough text",
+            "--output-bank",
+            "/tmp/bank.json",
+            "--atlas-root",
+            "/tmp/atlas",
+            "--compute-root",
+            "/tmp/compute",
+        ]
+        for extra in ((), ("--direct-fit", "--o1-state", "/tmp/o1.json")):
+            with self.subTest(extra=extra):
+                args = build_script_parser().parse_args([*common, *extra])
+                with self.assertRaisesRegex(LayerMlpBuildError, "exactly one"):
+                    run_build_script(args)
+
     def test_rank_sweep_reuses_one_capture_and_reports_selected_width(self) -> None:
         base, feature, target = _triples()
         records = _rank_sweep(
@@ -148,6 +171,7 @@ class LayerMlpBuilderTests(unittest.TestCase):
             model,
             (1, 2, 3),
             max_new_tokens=2,
+            include_prefill=True,
         )
         self.assertEqual(tuple(base.shape), (3, 8))
         self.assertTrue(torch.equal(feature, base + 1))
@@ -158,6 +182,39 @@ class LayerMlpBuilderTests(unittest.TestCase):
         self.assertIsNone(model.layer_boundary_observer)
         self.assertEqual(model.layer_boundary_stages, ())
         self.assertIsNone(model.layer_boundary_layers)
+
+    def test_capture_default_excludes_prefill_and_keeps_k1_decode_rows(self) -> None:
+        class FakeModel:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(dim=8)
+                self.layer_boundary_observer = None
+                self.layer_boundary_stages = ()
+                self.layer_boundary_layers = None
+
+            @staticmethod
+            def reset_state(*, release=True):
+                pass
+
+            def generate_greedy(self, _prompt, **_kwargs):
+                for width in (3, 1, 1):
+                    base = torch.arange(width * 8, dtype=torch.float32).reshape(
+                        1, width, 8
+                    )
+                    base = base.to(torch.bfloat16)
+                    self.layer_boundary_observer(63, SOURCE_STAGE, base)
+                    self.layer_boundary_observer(63, FEATURE_STAGE, base + 1)
+                    self.layer_boundary_observer(63, TARGET_STAGE, base + 2)
+                return (7, 8), SimpleNamespace(seconds=1.0)
+
+        base, feature, target, _generated, _evidence = capture_exact_layer63_mlp(
+            FakeModel(),
+            (1, 2, 3),
+            max_new_tokens=2,
+        )
+
+        self.assertEqual(tuple(base.shape), (2, 8))
+        self.assertTrue(torch.equal(feature, base + 1))
+        self.assertTrue(torch.equal(target, base + 2))
 
     def test_direct_publish_enforces_rank_and_never_persists_raw_triples(self) -> None:
         base, feature, target = _triples()
